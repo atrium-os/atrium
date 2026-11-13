@@ -27,7 +27,7 @@ typed device events, that starts device drivers through jaild.
 | Piece | Where | What it does | Gap |
 |---|---|---|---|
 | `atrium-devevents` | crate | reads devd's seqpacket socket; `Event::{Added, Removed, Other}` by devnode; `hidclass` classifies a hidbus by its collections' usage pages from pnpinfo; `hidowner` turns devd lines + `devinfo -v` into operations | events are devnode strings, not typed (bus, pnpinfo, location); HID-only classification |
-| portcullisd `identity_devices.rs` | portcullisd | unhides input hidraw nodes in tactusd's own devfs mount (re-checked every 2 s); starts and stops one `sigillum-fido` jail per FIDO key via jaild `devfs_grant` | hard-coded to HID; lives inside the app-launch broker |
+| portcullisd `identity_devices.rs` | `atrium-portcullisd-daemon` (rc.d never starts the multi-tenant portcullisd; sigillum.md §16.2) | unhides input hidraw nodes in tactusd's own devfs mount (re-checked every 2 s); starts and stops one `sigillum-fido` jail per FIDO key via jaild `devfs_grant` | hard-coded to HID; lives inside the app-launch broker |
 | jaild `devfs_grant` + pinned rulesets | `etc/jaild.policy.toml` | ruleset pinned to a jail name/exec/uid; a grant unhides one node, owner = pin uid, mode 0600, before exec; fails the create if it can't | the right primitive; reuse it everywhere |
 | devfs rulesets 20–27 | `etc/atrium.devfs.rules` | per-service static rulesets; 24 (Lyra) unhides `dsp*`/`mixer*` wholesale; 26 (Tactus) now mode-only for `hidraw*` | wildcards hand every matching device to one service |
 | sysfil profile `device` | `jaild.policy.toml` | base calls + the device's own ioctls | per-driver profiles needed (USB transfer ioctls for ugen, etc.) |
@@ -130,7 +130,8 @@ typed device events, that starts device drivers through jaild.
    parent}`, `Notify{system, subsystem, type, data}`, plus a startup snapshot
    from the devinfo sysctls (`dev.<name>.<unit>.%pnpinfo/%location/%parent`)
    so a restart sees devices already present. Bounded, fuzzed parser; it
-   already does this for HID.
+   already does this for HID. On 16-CURRENT `devinfo -v` prints
+   `name <description> pnpinfo …`, so the parser skips the description.
 4. **Stable device id** = (bus path from `%location`, plus USB serial or PCI
    BDF, plus a generation bumped on every detach). A reused unit number is a
    new device and starts hidden (Sigillum §5.1's rule, generalised).
@@ -144,7 +145,8 @@ typed device events, that starts device drivers through jaild.
    usage_page = 0xF1D0                  # any top-level collection
    owner   = { driver = "sigillum-fido", jail_prefix = "atrium-sigillum-fido-",
                uid = "_sigillum-dev", ruleset = 27, sysfil = "device-hidraw",
-               nodes = ["hidraw{unit}"], firmware = "" }
+               nodes = ["u2f/{u2f_unit}", "hidraw{unit}"],   # first present wins
+               firmware = "" }
    priority = 100
 
    [[match]]
@@ -169,6 +171,16 @@ typed device events, that starts device drivers through jaild.
    never claim a device class by installing.
 
 ### 4.3 Claiming a device from a kernel driver
+
+**Kernel drivers that are fine as the node provider.** FreeBSD 15+ `u2f(4)`
+(loaded by default on 16-CURRENT) attaches to a FIDO collection as `/dev/u2f/N`
+(devd/devinfo name `uhidN`) and sets `HQ_NO_READAHEAD` on the hidbus, after
+which the key's `hidrawN` delivers only the first report of each answer. So
+the FIDO rule grants `/dev/u2f/N` when u2f is attached and falls back to
+`hidrawN` only when it is not (Sigillum S2e, `b680fa0`): jaild's `devfs_grant`
+takes `dir/name`, the pin's `grant_nodes` are `["hidraw#", "u2f/#"]`, and the
+driver's sysfil profile adds `USB_GET_DEVICEINFO` and `0x41705570`. A rule's
+`nodes` list is therefore ordered, first present wins.
 
 Two cases need more than "load the module":
 
@@ -277,7 +289,8 @@ Until Tessera encryption lands, every removable disk takes the jailed path.
 - **D1** typed `atrium-devevents` (Attach/Detach/Nomatch/Notify, devinfo
   snapshot, stable ids, generation), fuzz target, host tests against recorded
   devd traffic from the VM and the R9700.
-- **D2** match table format + evaluator (pure crate, host-tested), the agent
+- **D2** (boot prerequisite: `nullfs` preloaded; two concurrent first nullfs
+  mounts panicked 16-CURRENT, sigillum.md §16.2) match table format + evaluator (pure crate, host-tested), the agent
   daemon with Sigillum's current behaviour as its only entries; S2e VM gate
   re-run unchanged.
 - **D3** Tactus and Lyra onto per-node grants; ruleset 24 and 26 wildcards
