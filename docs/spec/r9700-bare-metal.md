@@ -1104,3 +1104,19 @@ work (self-test, scrub).
   dumped before and after. If any step fails, the existing mode 1 reset, re-init and
   reset blame run as before. On gpusim both suites are ALL OK. Box artifacts: pci
   c7db56c6…, gpu 67a565a0…, si-client-test unchanged (5801b269…), xfer 74f342a3.
+- **2026-11-13 09:26, per-queue recovery on the box (e88fd84e): it does not work.**
+  si-client-test 71/71. The ih_rb_base and cp_mes_cntl writes were refused, each
+  register was unchanged, and each uid was locked out. But both refusals still needed
+  a re-init, and both re-inits passed.
+  - With the CP halted (CPF_STATUS 0xb8008001), MES refuses SUSPEND (all gangs) with
+    status 0x8100060200000000.
+  - The hang-detect RESET times out or is refused. Its list holds every mapped queue
+    (the kernel queue's 0x6 too), not just the faulted one.
+  - The queue RESET is refused (0x81000800…), and so is REMOVE, with and without
+    remove_queue_after_reset (0x81000301…/0x81000303…). RESUME works.
+  - The CP state is unchanged before and after.
+  Conclusion: on this firmware a queue halted on a CP error blocks MES itself, and
+  nothing at MES level recovers it. Earlier runs showed that a MEC pipe reset wedges
+  the pipe. Options: stop privileged register writes before they reach the CP (submit-
+  time PM4 allowlist on kernel-mediated queues; user-mode queues are root only), or
+  accept the reset plus lockout. Logs: claude/project-thread-33aauq 363127f4.
