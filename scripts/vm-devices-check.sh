@@ -39,6 +39,9 @@ fails=0
 ok() { echo "  ok $1"; }
 bad() { echo "  FAIL $1"; fails=$((fails+1)); }
 
+# An unreachable guest would make every "does not contain" check pass.
+V true >/dev/null 2>&1 || { echo "the VM does not answer over ssh (scripts/cloud-vm.sh up)"; echo "devices: 1 failed"; exit 1; }
+
 echo "== cross-build"
 CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
 ( cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE ) || { echo "build failed"; exit 1; }

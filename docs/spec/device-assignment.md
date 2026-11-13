@@ -416,7 +416,12 @@ the way Ubuntu points at NVIDIA's?).
   2 s in its jail (no devd socket there), so per-node showing reaches it.
 - **Gate**: `scripts/vm-devices-check.sh` (rulesets, lyrad and tactusd
   mounts, `/dev/dsp` through the clone, isolation between the two, USB sound
-  card hot-plug and unplug). 10 host tests. **Not yet run in the VM.**
+  card hot-plug and unplug). 10 host tests. **Passed 2026-11-13** (Sigillum
+  thread's amd64 VM, intel-hda + PS/2, 0a76cb7): lyrad saw dsp0/mixer0 and
+  `/dev/dsp`/`/dev/mixer` resolved, tactusd saw atkbd0/bpsm0, neither saw the
+  other's nodes, a USB card came and went as dsp1. Both gate scripts now fail
+  at once when the VM does not answer (an empty answer had passed the
+  "does not contain" checks).
 - `deploy-portcullis.sh` now passes the cross sysroot flags when it builds
   dispensatord (the Sigillum gate found the plain build failing).
 

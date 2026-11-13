@@ -53,6 +53,8 @@ fails=0
 ok() { echo "  ok $1"; }
 bad() { echo "  FAIL $1"; fails=$((fails+1)); }
 
+V true >/dev/null 2>&1 || { echo "the VM does not answer over ssh (scripts/cloud-vm.sh up)"; echo "sigillum: 1 failed"; exit 1; }
+
 echo "== cross-build"
 # (cloud-vm.sh reads its verb from $1, so source it with "env" as $1.)
 CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
