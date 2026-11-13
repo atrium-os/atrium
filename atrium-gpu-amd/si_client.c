@@ -1144,7 +1144,7 @@ si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
 	 * (IBs, a queue's writeback and EOP pages), isolation.gpu_wx = 0
 	 * keeps the old mapping, X on every page.
 	 */
-	if (atomic_load_int(&vm->sc->gpu_wx) == 0)
+	if ((atomic_load_int(&vm->sc->gpu_wx) & AMD_WX_BO) == 0)
 		prot |= AMD_VM_EXEC;
 
 	if (vm->hw12 == NULL)

@@ -850,3 +850,18 @@ work (self-test, scrub).
   pages lose X. The default stays 0 until the box shows which fetches need X.
   si-client-test 13 sets it, runs code and IB bound EXEC, checks that a jump into a
   read-write data BO faults (EIO), and probes an IB without X (informational).
+- **2026-11-13 05:02, stage 5f on the box (05fdaebf): si-client-test 61/63; suites not
+  run (device lost).** Tests 1-11 passed again. Test 13 set `gpu_wx`, which also took
+  X off the user queue's writeback and EOP pages. The queue's first job was lost to a
+  fault within 8 ms (counter only, no fault line logged; rptr report 0xc, no fence).
+  Its HQD stayed active through the wave kill and HQD reset, MES refused REMOVE_QUEUE
+  (status 0x8100030100000000), and the driver did a mode 1 reset. Both suites then
+  stopped at their first VM_CREATE (ENXIO), as now intended. Detach was clean and the
+  card cold, but the reset path again leaked 1 MSI vector and memory resources. The
+  unrouted EOP tag was 0x4000026 with this queue's doorbell 0x26; the a0597b2d run
+  had 0x4000020 with doorbell 0x20. So it is the failing queue's own EOP, tagged
+  0x04000000 | doorbell. Conclusion: gfx12 needs X on a user queue's writeback/EOP
+  pages, and a CP-side fault leaves a queue MES cannot remove (open, with the
+  hostile-PM4 reset). Fix: `gpu_wx` is now bits: 1 = client BOs X only where bound EXEC;
+  2 = no X on the queue's pages (diagnostic only). Test 13 uses bit 1 and no longer
+  probes an IB without X.

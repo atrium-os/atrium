@@ -866,6 +866,9 @@ struct amd_vm12 {
 #define AMD_VM_READ	0x1u
 #define AMD_VM_WRITE	0x2u
 #define AMD_VM_EXEC	0x4u
+/* isolation.gpu_wx bits */
+#define AMD_WX_BO	0x1	/* client BOs: X only where bound EXEC */
+#define AMD_WX_UQ	0x2	/* user queue writeback/EOP pages: no X */
 #define AMD_VM_VRAM	0x8u	/* pa is a physical FB address (local VRAM) */
 int	amd_gmc12_vm_init(struct amd_gart *gt, struct amd_vm12 *vm, int mode,
 	    uint64_t flat_va);
@@ -1102,7 +1105,7 @@ struct atrium_amd_softc {
 	int		 vram_limit_pct; /* per-uid VRAM cap, % of VRAM (rs/quota.rs) */
 	int		 sys_limit_pct;	/* per-uid System BO cap, % of RAM */
 	int		 queue_limit;	/* per-uid live queue fds (rs/quota.rs) */
-	int		 gpu_wx;	/* 1: X only where bound EXEC (silicon PTEs) */
+	int		 gpu_wx;	/* AMD_WX_*: GPU W^X on silicon PTEs */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
 	struct atrium_amd_vram vram;	/* device VRAM allocator (base, vram.c) */
 	struct amd_clear_engine clear;	/* VRAM clear engine (gpu, clear.c) */

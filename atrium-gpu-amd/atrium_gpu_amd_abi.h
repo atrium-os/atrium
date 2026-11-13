@@ -202,7 +202,7 @@ struct atrium_gpu_vm_bind2 {
 #define ATRIUM_GPU_BIND_READONLY	0x1
 /* 2.3 (ABI v2 §5.4, GPU W^X): executable PTEs, only together with READONLY
  * (EINVAL otherwise). Shader code is bound READONLY|EXEC; data never gets
- * X. Silicon enforces it while isolation.gpu_wx is 1; gpusim has no X bit. */
+ * X. Silicon enforces it while isolation.gpu_wx has bit 1; gpusim has no X bit. */
 #define ATRIUM_GPU_BIND_EXEC		0x4
 
 /*

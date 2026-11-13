@@ -52,11 +52,10 @@
  *  12 real ops   (5e) gpusim's SIM_COMPUTE_KERNEL ops COPY, INC and FILL as
  *                real shaders (si_ops.h, oracle-built): each on its own
  *                code page, 64 elements, from a System and a VRAM source.
- *  13 W^X        with isolation.gpu_wx = 1: BIND_EXEC without READONLY is
- *                refused; code and IB bound EXEC run on a queue whose
- *                writeback and EOP pages have no X; the shader copied into a
- *                read-write data BO faults (EIO) and the VM runs on; an IB
- *                without X is probed (informational).
+ *  13 W^X        with isolation.gpu_wx = 1 (client BOs): BIND_EXEC without
+ *                READONLY is refused; code and IB bound EXEC run with data
+ *                pages without X; the shader copied into a read-write data
+ *                BO faults (EIO) and the VM runs on.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1155,10 +1154,11 @@ out:
 }
 
 /*
- * 13: GPU W^X (ABI 2.3 §5.4) with isolation.gpu_wx = 1, restored after.
- * Only pages bound EXEC (which needs READONLY) are executable; the queue's
- * writeback and EOP pages lose X too. Whether the CP fetches an IB as an
- * execute access is not known yet: that probe is informational.
+ * 13: GPU W^X (ABI 2.3 §5.4) with isolation.gpu_wx = 1 (client BOs only),
+ * restored after: only pages bound EXEC (which needs READONLY) are
+ * executable. The queue's writeback/EOP pages keep X (gpu_wx bit 2: box run
+ * 05fdaebf lost a queue without it, and MES would not remove it). No probe
+ * of an IB without X: a CP-side fault can wedge the queue the same way.
  */
 #define WX_SYSCTL	"dev.atrium_gpu_amd.0.isolation.gpu_wx"
 
@@ -1174,16 +1174,16 @@ static void
 wx(void)
 {
 	struct job j;
-	uint64_t va, data_va, ib2_va, code_va;
+	uint64_t va, data_va, code_va;
 	uint32_t first;
-	int old = 0, tmp, bo, data, ib2, r, n, ms;
+	int old = 0, tmp, bo, data, r, n, ms;
 
 	if (wx_set(1, &old) != 0) {
 		check(0, "13 W^X", "set %s: %s", WX_SYSCTL, strerror(errno));
 		return;
 	}
 	job_init(&j);
-	data = ib2 = -1;
+	data = -1;
 
 	/* a: EXEC without READONLY is refused. */
 	j.vm = vm_create();
@@ -1195,8 +1195,7 @@ wx(void)
 	if (bo >= 0)
 		close(bo);
 
-	/* b: shader and IB bound RO|EXEC, out RW; a new queue (WB, EOP
-	 * without X) runs write_42. */
+	/* b: shader and IB bound RO|EXEC, out RW (no X): write_42 runs. */
 	j.shader = bo_alloc(4096, 0);
 	j.ib = bo_alloc(4096, 0);
 	j.out = bo_alloc(4096, 0);
@@ -1213,8 +1212,7 @@ wx(void)
 		check(0, "13 W^X", "setup: %s", strerror(errno));
 		goto out;
 	}
-	run_clean(&j, "13 W^X: code and IB bound EXEC run, the queue's "
-	    "writeback and EOP without X");
+	run_clean(&j, "13 W^X: code and IB bound EXEC run, data without X");
 
 	/* c: the same shader in a read-write data BO (no X): the wave's
 	 * instruction fetch faults and the work fails. */
@@ -1245,29 +1243,9 @@ wx(void)
 	}
 	run_clean(&j, "13 W^X: the VM runs clean on a new queue after");
 
-	/* d (informational): an IB bound read-only without EXEC. */
-	ib2 = bo_alloc(4096, 0);
-	if (ib2 >= 0 && vm_bind(j.vm, ib2, ATRIUM_GPU_BIND_READONLY,
-	    &ib2_va) == 0) {
-		tmp = j.ib;
-		va = j.ib_va;
-		j.ib = ib2;
-		j.ib_va = ib2_va;
-		r = poison(j.out, POISON_A) != 0 ||
-		    job_submit(&j, j.out_va) != 0 ? errno : job_wait(&j, 15000,
-		    &ms);
-		n = count(j.out, SIW42_OUT_VALUE, &first);
-		printf("INFO: 13 W^X: an IB without X: %s, %d/64 words 42 "
-		    "(%s)\n", r == 0 ? "ok" : strerror(r), n, r == 0 ?
-		    "IB fetch needs no X" : "IB fetch is an execute access");
-		j.ib = tmp;
-		j.ib_va = va;
-	}
 out:
 	if (data >= 0)
 		close(data);
-	if (ib2 >= 0)
-		close(ib2);
 	job_close(&j);
 	if (wx_set(old, &tmp) != 0)
 		check(0, "13 W^X", "restore %s: %s", WX_SYSCTL,

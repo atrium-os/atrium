@@ -433,8 +433,9 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    "live queue fds one uid may hold (silicon has AMD_UQ_SLOTS in all)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gpu_wx",
 	    CTLFLAG_RW, &sc->gpu_wx, 0,
-	    "GPU W^X: 1 = execute only where bound EXEC, and no X on queue "
-	    "writeback/EOP pages (silicon; applies to new mappings)");
+	    "GPU W^X bits (silicon; new mappings): 1 = client BOs executable "
+	    "only where bound EXEC; 2 = also no X on a user queue's "
+	    "writeback/EOP pages (box 05fdaebf: a queue without it faulted)");
 	return (0);
 }
 
