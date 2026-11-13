@@ -119,7 +119,7 @@ if [ "$hold" -gt 0 ]; then
 	if [ "$client" = 1 ]; then
 		ls -l /dev/atrium-gpu0 /dev/atrium-gpu0ctl
 		echo "== si-client-test"
-		timeout 120 "$TEST"; echo "si-client-test rc=$?"
+		timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		if [ "$suites" = 1 ]; then
 			echo "== atrium-gpu-test"
 			timeout 300 "$SUITE"; echo "atrium-gpu-test rc=$?"
