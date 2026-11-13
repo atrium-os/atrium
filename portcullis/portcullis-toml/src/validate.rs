@@ -183,6 +183,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.audio-device = true: restricted to output device drivers \
              (vinculum-audio); requires explicit policy approval"));
     }
+    if c.removable_media == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.removable-media = true: restricted to Forum's bar (USB sticks and eject); \
+             requires explicit policy approval"));
+    }
     if c.media_control == Some(true) {
         r.warnings.push(format!(
             "{ctx}.media-control = true: restricted to now-playing and the media keys \

@@ -28,10 +28,12 @@
 //! atrium-dispensatord --plan FILE [--devinfo FILE]   print the ops for devd lines
 //! atrium-dispensatord --media [--media-socket PATH]  list the partitions served
 //! atrium-dispensatord --eject PART [--media-socket PATH]
+//! atrium-dispensatord --media-watch [--media-socket PATH]   print events
 //! ```
 //!
-//! The media socket takes one line, `list` or `eject PART`, from root or the
-//! active session's user, and answers `ok ...` or `error ...`.
+//! The media socket speaks Aqueduct class `media` (atrium-media, §6.6):
+//! list, eject and a subscription to added/removed events, for root or the
+//! active session's user.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -42,7 +44,7 @@ use dispensator::rules::Rules;
 const RULES_DIR: &str = "/usr/local/etc/atrium/devices.d";
 const JAILD_SOCKET: &str = "/var/run/atrium/jaild.sock";
 const STATE_FILE: &str = "/var/run/atrium/dispensator.state";
-const MEDIA_SOCKET: &str = "/atrium/sockets/dispensatord/media.sock";
+const MEDIA_SOCKET: &str = "/atrium/sockets/removable-media/removable-media.sock";
 
 struct Args {
     rules: PathBuf,
@@ -86,6 +88,7 @@ fn args() -> Result<Args, String> {
             "--seat" => a.seat = val()?.into(),
             "--media-socket" => a.media_socket = val()?.into(),
             "--media" => a.media_cmd = Some("list".into()),
+            "--media-watch" => a.media_cmd = Some("watch".into()),
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {x}")),
@@ -162,24 +165,55 @@ fn main() -> ExitCode {
     run::serve(rules, a.jaild, a.state, a.seat, a.media_socket)
 }
 
-/// One request to the daemon's media socket; prints its answer.
+/// One request to the daemon's media socket (Aqueduct `CLASS_MEDIA`);
+/// prints the answer.
 fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
-    use std::io::Write;
-    let mut s = match std::os::unix::net::UnixStream::connect(sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("atrium-dispensatord: {}: {e}", sock.display());
-            return ExitCode::FAILURE;
+    match cmd.split_once(' ') {
+        Some(("eject", part)) => match atrium_media::client::eject(sock, part) {
+            Ok(m) => {
+                println!("ok {m}");
+                ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        },
+        Some(_) | None if cmd == "watch" => {
+            use std::io::Write;
+            let mut ev = match atrium_media::client::Events::open(sock) {
+                Ok(e) => e,
+                Err(e) => {
+                    println!("error {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            loop {
+                match ev.next() {
+                    Ok(atrium_media::Event::Added(v)) => println!("added {} {}", v.part, v.mountpoint),
+                    Ok(atrium_media::Event::Removed { part, ejected }) => println!("removed {part}{}", if ejected { " ejected" } else { "" }),
+                    Err(_) => {
+                        println!("end");
+                        return ExitCode::SUCCESS;
+                    }
+                }
+                let _ = std::io::stdout().flush();
+            }
         }
-    };
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    if writeln!(s, "{cmd}").is_err() {
-        return ExitCode::FAILURE;
+        _ => match atrium_media::client::list(sock) {
+            Ok(vs) => {
+                println!("ok");
+                for v in vs {
+                    println!("{} {} {} {}{}", v.part, v.mountpoint, v.size_bytes, v.free_bytes, if v.read_only { " ro" } else { "" });
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                println!("error {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
-    let mut out = String::new();
-    let _ = std::io::Read::read_to_string(&mut s, &mut out);
-    print!("{out}");
-    if out.starts_with("ok") { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 
@@ -204,7 +238,10 @@ mod run {
     use dispensator::jail::{plan, stop_names, JailPlan};
     use dispensator::media::{Act, Media, Session};
     use dispensator::plan::{Op, Vars};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    use atrium_media::{server as mserver, status as mstatus, Volume};
     use jaild::client::Client;
     use jaild::protocol::{CreateJailRequest, ExecSpec, FuseServe, MountKind, MountSpec, NetworkConfig, Request, Response};
 
@@ -222,6 +259,45 @@ mod run {
         media: Media,
         session: Session,
         seat: PathBuf,
+        /// The media service: what the session is told, and eject requests
+        /// from its connection threads (with a byte on `wake` for each).
+        shared: Option<Arc<mserver::Shared>>,
+        session_shared: Arc<Mutex<Session>>,
+        ejects: Option<(mpsc::Receiver<EjectReq>, UnixStream)>,
+        ejected_now: Vec<String>,
+    }
+
+    type EjectReq = (String, mpsc::Sender<(u8, String)>);
+
+    /// The media service's view of the daemon, for its connection threads.
+    struct MediaHost {
+        session: Arc<Mutex<Session>>,
+        registry: String,
+        tx: Mutex<mpsc::Sender<EjectReq>>,
+        wake: Mutex<UnixStream>,
+    }
+
+    impl mserver::Host for MediaHost {
+        /// Root, the session's user, or one of that user's session
+        /// components (Forum: the launch registry marks them).
+        fn allowed(&self, uid: u32) -> bool {
+            let Session::Active { user, uid: su, .. } = self.session.lock().unwrap().clone() else { return uid == 0 };
+            if uid == 0 || uid == su {
+                return true;
+            }
+            let Ok(reg) = portcullis_peer::AppRegistry::load(&self.registry) else { return false };
+            reg.is_session(uid) && reg.resolve(uid).is_some_and(|(owner, _)| owner == user)
+        }
+
+        fn eject(&self, part: &str) -> (u8, String) {
+            use std::io::Write;
+            let (rtx, rrx) = mpsc::channel();
+            if self.tx.lock().unwrap().send((part.to_string(), rtx)).is_err() {
+                return (mstatus::FAILED, "dispensatord is shutting down".into());
+            }
+            let _ = self.wake.lock().unwrap().write_all(&[1]);
+            rrx.recv_timeout(Duration::from_secs(60)).unwrap_or((mstatus::FAILED, "no answer".into()))
+        }
     }
 
     pub fn serve(rules: Rules, jaild: String, state: PathBuf, seat: PathBuf, media_socket: PathBuf) -> ExitCode {
@@ -233,9 +309,26 @@ mod run {
             rules.drivers.len(),
             rules.services.len()
         );
-        let media = if rules.drivers.values().any(|d| d.fuse_mount.is_some()) { media_listener(&media_socket) } else { None };
-        let mut a = Agent { jaild, state, planner: Planner::new(rules), drivers: BTreeMap::new(), show_errors: BTreeMap::new(), media: Media::default(), session: Session::None, seat };
+        let wants_media = rules.drivers.values().any(|d| d.fuse_mount.is_some());
+        let mut a = Agent {
+            jaild,
+            state,
+            planner: Planner::new(rules),
+            drivers: BTreeMap::new(),
+            show_errors: BTreeMap::new(),
+            media: Media::default(),
+            session: Session::None,
+            seat,
+            shared: None,
+            session_shared: Arc::new(Mutex::new(Session::None)),
+            ejects: None,
+            ejected_now: Vec::new(),
+        };
         a.session = a.read_session();
+        *a.session_shared.lock().unwrap() = a.session.clone();
+        if wants_media {
+            a.start_media_service(&media_socket);
+        }
         eprintln!("atrium-dispensatord: session {:?}", a.session);
         loop {
             // Listen first, then enumerate, so nothing falls between.
@@ -259,7 +352,7 @@ mod run {
             let dev: Vec<String> = std::fs::read_dir("/dev").map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect()).unwrap_or_default();
             let ops = a.planner.disks_present(dev.iter().map(String::as_str));
             a.run(ops);
-            a.serve(&w, media.as_ref(), reshow);
+            a.serve(&w, reshow);
             eprintln!("atrium-dispensatord: devd connection lost; reconnecting");
         }
     }
@@ -278,7 +371,7 @@ mod run {
     }
 
     /// The media socket: in a directory of its own, so it can be mounted
-    /// into the session; any local user may connect, the daemon checks who.
+    /// into Forum's jail; any local user may connect, the service checks who.
     fn media_listener(path: &Path) -> Option<UnixListener> {
         use std::os::unix::fs::PermissionsExt;
         let dir = path.parent()?;
@@ -288,7 +381,6 @@ mod run {
         match UnixListener::bind(path) {
             Ok(l) => {
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
-                let _ = l.set_nonblocking(true);
                 Some(l)
             }
             Err(e) => {
@@ -296,6 +388,22 @@ mod run {
                 None
             }
         }
+    }
+
+    /// Size and free space of a mount, if it is a live fusefs mount.
+    fn fuse_space(mnt: &str) -> Option<(u64, u64)> {
+        let c = std::ffi::CString::new(mnt).ok()?;
+        // SAFETY: a zeroed statfs is a valid out-parameter.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid path and out-parameter.
+        if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        // SAFETY: f_fstypename and f_mntonname are NUL-terminated by the kernel.
+        let ty = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
+        let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
+        (ty.to_bytes() == b"fusefs" && on.to_bytes() == mnt.as_bytes())
+            .then(|| (st.f_blocks * st.f_bsize, st.f_bavail.max(0) as u64 * st.f_bsize))
     }
 
     /// A user name to (uid, gid), from the password database.
@@ -322,8 +430,10 @@ mod run {
             if s != self.session {
                 eprintln!("atrium-dispensatord: session {:?} -> {:?}", self.session, s);
                 self.session = s;
+                *self.session_shared.lock().unwrap() = self.session.clone();
                 let acts = self.media.sync(&self.session);
                 self.act(acts);
+                self.publish();
             }
         }
 
@@ -340,38 +450,65 @@ mod run {
             }
         }
 
-        /// One request on the media socket.
-        fn media_request(&mut self, l: &UnixListener) {
-            use std::io::{BufRead, BufReader, Write};
-            let Ok((mut c, _)) = l.accept() else { return };
-            let _ = c.set_nonblocking(false);
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut uid, mut gid) = (u32::MAX, u32::MAX);
-            // SAFETY: a connected socket and two out-parameters.
-            if unsafe { libc::getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-                return;
-            }
-            let mut line = String::new();
-            if BufReader::new(std::io::Read::take(&c, 256)).read_line(&mut line).is_err() {
-                return;
-            }
-            let allowed = uid == 0 || matches!(&self.session, Session::Active { uid: u, .. } if *u == uid);
-            let reply = if !allowed {
-                "error only the active session's user may do that".to_string()
-            } else {
-                match line.trim().split_once(' ').unwrap_or((line.trim(), "")) {
-                    ("list", "") => {
-                        let mut r = String::from("ok");
-                        for d in self.media.served() {
-                            r.push_str(&format!("\n{d} {}", self.mountpoint(d).unwrap_or_default()));
-                        }
-                        r
-                    }
-                    ("eject", dev) => self.eject(dev),
-                    _ => "error list | eject PART".into(),
-                }
+        fn start_media_service(&mut self, sock: &Path) {
+            let Some(l) = media_listener(sock) else { return };
+            let Ok((wake_rd, wake_wr)) = UnixStream::pair() else { return };
+            let _ = wake_rd.set_nonblocking(true);
+            let (tx, rx) = mpsc::channel();
+            let host = MediaHost {
+                session: self.session_shared.clone(),
+                registry: portcullis_peer::DEFAULT_REGISTRY.into(),
+                tx: Mutex::new(tx),
+                wake: Mutex::new(wake_wr),
             };
-            let _ = writeln!(c, "{reply}");
+            let shared = mserver::Shared::new(Box::new(host));
+            let sh = shared.clone();
+            std::thread::spawn(move || {
+                for c in l.incoming() {
+                    let Ok(c) = c else { continue };
+                    let Ok((uid, _)) = portcullis_peer::uid_gid(c.as_raw_fd()) else { continue };
+                    let sh = sh.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(conn) = aqueduct::Connection::wrap(c) {
+                            let _ = mserver::serve(conn, uid, sh);
+                        }
+                    });
+                }
+            });
+            eprintln!("atrium-dispensatord: media service on {}", sock.display());
+            self.shared = Some(shared);
+            self.ejects = Some((rx, wake_rd));
+        }
+
+        /// Tell the media service what is served now.
+        fn publish(&mut self) {
+            let Some(shared) = self.shared.clone() else { return };
+            let parts: Vec<String> = self.media.served().map(String::from).collect();
+            let mut vols = Vec::new();
+            for part in parts {
+                let Some(mnt) = self.mountpoint(&part) else { continue };
+                // A server that exited (not FAT, say) leaves no live mount.
+                let Some((size_bytes, free_bytes)) = fuse_space(&mnt) else { continue };
+                let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only });
+            }
+            shared.update(vols, &std::mem::take(&mut self.ejected_now));
+        }
+
+        /// Eject requests the connection threads handed over.
+        fn take_ejects(&mut self) {
+            use std::io::Read;
+            let mut reqs = Vec::new();
+            if let Some((rx, wake)) = &mut self.ejects {
+                let mut b = [0u8; 64];
+                while matches!(wake.read(&mut b), Ok(n) if n > 0) {}
+                while let Ok(r) = rx.try_recv() {
+                    reqs.push(r);
+                }
+            }
+            for (part, reply) in reqs {
+                let _ = reply.send(self.eject(&part));
+            }
         }
 
         fn mountpoint(&self, device: &str) -> Option<String> {
@@ -383,32 +520,34 @@ mod run {
         /// instead of losing what the program has not written yet. Then the
         /// server stops (its final writes are done) and stays down until the
         /// stick is unplugged.
-        fn eject(&mut self, device: &str) -> String {
-            let Some(mnt) = self.mountpoint(device) else { return format!("error {device} is not served") };
+        fn eject(&mut self, device: &str) -> (u8, String) {
+            let Some(mnt) = self.mountpoint(device) else { return (mstatus::NOT_FOUND, format!("{device} is not mounted")) };
             if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
                 // SAFETY: a valid NUL-terminated path.
                 if unsafe { libc::unmount(c.as_ptr(), 0) } != 0 {
                     let e = std::io::Error::last_os_error();
                     if e.raw_os_error() == Some(libc::EBUSY) {
-                        return format!("error {mnt} is busy: close the files open on it first");
+                        return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
                     }
                     if e.raw_os_error() != Some(libc::EINVAL) {
-                        return format!("error unmount {mnt}: {e}");
+                        return (mstatus::FAILED, format!("unmount {mnt}: {e}"));
                     }
                 }
             }
             let (_, acts) = self.media.eject(device, &self.session);
             self.act(acts);
+            self.ejected_now.push(device.to_string());
+            self.publish();
             eprintln!("atrium-dispensatord: {device} ejected");
-            format!("ok {device} ejected; it can be unplugged")
+            (mstatus::OK, format!("{device} ejected; it can be unplugged"))
         }
 
-        fn serve(&mut self, w: &DeviceWatcher, media: Option<&UnixListener>, reshow: Duration) {
+        fn serve(&mut self, w: &DeviceWatcher, reshow: Duration) {
             let mut last = Instant::now();
             loop {
                 let mut p = [
                     libc::pollfd { fd: w.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-                    libc::pollfd { fd: media.map_or(-1, |l| l.as_raw_fd()), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd { fd: self.ejects.as_ref().map_or(-1, |(_, w)| w.as_raw_fd()), events: libc::POLLIN, revents: 0 },
                 ];
                 // SAFETY: two valid pollfds (a negative fd is ignored).
                 let r = unsafe { libc::poll(p.as_mut_ptr(), 2, reshow.as_millis() as libc::c_int) };
@@ -416,9 +555,7 @@ mod run {
                     return;
                 }
                 if r > 0 && p[1].revents != 0 {
-                    if let Some(l) = media {
-                        self.media_request(l);
-                    }
+                    self.take_ejects();
                 }
                 if r > 0 && p[0].revents != 0 {
                     match w.recv_line() {
@@ -432,6 +569,7 @@ mod run {
                 if last.elapsed() >= reshow {
                     last = Instant::now();
                     self.follow_session();
+                    self.publish();
                     let mut ops = Vec::new();
                     for s in self.planner.rules().services.keys() {
                         ops.extend(self.planner.service_nodes(s).map(|n| Op::Show { service: s.clone(), node: n.to_string() }));

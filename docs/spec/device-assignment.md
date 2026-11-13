@@ -629,10 +629,9 @@ already owns the partitions:
   (2 s). Lock, logout and a user switch stop every server (jaild's forced
   unmount); unlock and login start them again; a switch restarts them as
   the new user.
-- **Eject.** `/atrium/sockets/dispensatord/media.sock` takes `list` or
-  `eject PART` from root or the active session's uid
-  (`getpeereid`); `atrium-dispensatord --media` / `--eject PART` is the
-  client. Eject unmounts without force first, so an open file answers
+- **Eject.** Over the media socket (§6.6; at first a line protocol on
+  `dispensatord/media.sock`), from root or the active session's user;
+  `atrium-dispensatord --media` / `--eject PART` is the client. Eject unmounts without force first, so an open file answers
   "busy" instead of losing data, then stops the server; the partition stays
   down (across relogins) until it is unplugged.
 - **ostiarius.** `Lock` and `Unlock { password }` requests on its control
@@ -659,8 +658,53 @@ shipped rule); ostiarius 17 and portcullis-peer 9 on FreeBSD.
 
 Not yet: the session's apps see `/media` through their jails only where a
 manifest grants it (storage.md `removable_media`, not wired); a whole-disk
-(superfloppy) stick; exFAT writes; the lock screen and a Forum eject button
-as the callers.
+(superfloppy) stick; exFAT writes; the lock screen as the caller of
+ostiarius `Lock`/`Unlock`. The Forum eject button came next (§6.6).
+
+### 6.6 As built: sticks in Forum, over Aqueduct (2026-11-13)
+
+Shankar 2026-11-13 asked whether the mount should reach Forum's desktop or
+its file manager, maybe via Aqueduct, and chose "events + Forum icon now";
+Scrinium (the file manager) attaches mounts later.
+
+- **The service.** Aqueduct class `media` (16, `aqueduct::classes`), crate
+  `atrium-media` (`dispensator/media`): `LIST` (the volumes served now),
+  `EJECT { part }` and `SUBSCRIBE`, after which the server pushes `EV`
+  events, an `Added(Volume)` for each volume served now and then every
+  `Added` / `Removed { part, ejected }`. A `Volume` is part, mountpoint,
+  size, free space and read-only; free space alone changing is no event.
+  Status bytes: OK, MALFORMED, NOT_ALLOWED, NOT_FOUND, BUSY, FAILED.
+- **Who.** dispensatord serves it on
+  `/atrium/sockets/removable-media/removable-media.sock` (dir 0755, socket
+  0666; the service checks). Allowed: root, the active unlocked session's
+  uid, or a session component the launch registry says that user owns
+  (Forum's bar runs under its own uid). The peer's uid comes from the
+  kernel. When the session locks, logs out or switches, every subscription
+  is dropped (the stream ends); the subscriber connects again and is
+  refused until it is its session again.
+- **Threads.** Connection threads ask the daemon's loop to eject over a
+  channel and a wake socket, and wait up to 60 s; the loop owns all state.
+  A volume is listed only while its fusefs mount is live (`statfs`), so a
+  server that exited (not a FAT volume) is not shown.
+- **Forum.** forum-bar draws a USB icon in its system row while a stick is
+  served: the menu lists each stick (size, free space) with "Eject", and
+  shows the refusal ("busy: close the files open on it first") when an
+  eject fails. A thread subscribes and re-subscribes every 2 s. The bar
+  draws it, as its other system icons, so no app can draw a fake one. It
+  reaches the socket through a new capability `removable-media` (restricted,
+  held only by `forum-bar`; portcullis-toml, -jail, -policy and ostiarius).
+- **CLI.** `atrium-dispensatord --media`, `--eject PART` and
+  `--media-watch` (prints `added PART MOUNT`, `removed PART [ejected]`,
+  `end`).
+
+Gate `vm-automount-check.sh`, extended: **passed** 2026-11-13 (0 failed).
+Alice lists the stick over Aqueduct and bob is refused (status 2); a
+subscriber running as alice hears it added, its stream ends on lock, a new
+one hears the eject as `removed da0s1 ejected` and ends on logout; bob's
+eject is refused, an open file answers BUSY (status 4), with everything
+from §6.5 still passing. Host tests: atrium-media 2, forum-bar 18
+(the icon only with a stick, the menu, events), portcullis-jail devfs and
+the Forum manifest tests (only the bar holds `removable-media`).
 
 ## 7. Not in scope
 

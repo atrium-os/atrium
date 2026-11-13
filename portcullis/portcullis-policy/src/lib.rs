@@ -191,6 +191,7 @@ pub struct CapabilityDelta {
     pub app_launch:      bool,
     pub audio_control:   bool,
     pub media_control:   bool,
+    pub removable_media: bool,
     pub status_item:     bool,
     pub audio_device:    bool,
     pub net_fetch:       bool,
@@ -232,6 +233,7 @@ impl CapabilityDelta {
             && !self.app_launch
             && !self.audio_control
             && !self.media_control
+            && !self.removable_media
             && !self.status_item
             && !self.audio_device
             && !self.net_fetch
@@ -269,6 +271,7 @@ impl CapabilityDelta {
         if self.app_launch      { out.push("List the installed apps and ask to launch them".into()); }
         if self.audio_control   { out.push("Change other apps' volume and the sound output (the volume control)".into()); }
         if self.media_control   { out.push("See what is playing and control it (now-playing and the media keys)".into()); }
+        if self.removable_media { out.push("See the USB sticks plugged in and eject them".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
@@ -357,6 +360,7 @@ pub fn compute_delta(
     bool_cap!(app_launch);
     bool_cap!(audio_control);
     bool_cap!(media_control);
+    bool_cap!(removable_media);
     bool_cap!(status_item);
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
@@ -550,6 +554,7 @@ mod tests {
             app_launch: None,
             audio_control: None,
             media_control: None,
+            removable_media: None,
             status_item: None,
             audio_device: None,
             net_fetch: None,

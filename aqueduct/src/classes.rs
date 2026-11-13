@@ -140,6 +140,11 @@ pub const CLASS_LIMEN:     u8 = 14;
 /// (the `nuntius` crate); an `Fd` event carries one descriptor.
 pub const CLASS_FETCH:     u8 = 15;
 
+/// Removable media (docs/spec/device-assignment.md §6.6): the USB sticks
+/// dispensatord serves for the active session, events when one comes or
+/// goes, and eject. Postcard payloads (the `atrium-media` crate).
+pub const CLASS_MEDIA:     u8 = 16;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -163,6 +168,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_GPU        => "gpu",
         CLASS_LOG        => "log",
         CLASS_VESTIBULUM => "vestibulum",
+        CLASS_MEDIA      => "media",
         CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",

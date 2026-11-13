@@ -51,6 +51,15 @@ fn the_bar_and_the_wm_hold_the_volume_control() {
 }
 
 #[test]
+fn only_the_bar_holds_removable_media() {
+    // The bar's USB stick icon and its Eject (device-assignment.md §6.6).
+    assert_eq!(load("forum-bar/atrium.toml").capabilities.removable_media, Some(true));
+    for rel in ["forum-wm/atrium.toml", "forum-dock/atrium.toml", "forum-overview/atrium.toml"] {
+        assert_eq!(load(rel).capabilities.removable_media, None, "{rel}");
+    }
+}
+
+#[test]
 fn the_bar_and_the_wm_hold_media_control() {
     // The bar shows now-playing; forum-wm sends the media keys and focus.
     for rel in ["forum-bar/atrium.toml", "forum-wm/atrium.toml"] {

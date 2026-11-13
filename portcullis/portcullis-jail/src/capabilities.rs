@@ -51,6 +51,10 @@ pub fn apply_all(
     if caps.media_control == Some(true) {
         apply_media_control(jc, opts);
     }
+    if caps.removable_media == Some(true) {
+        // dispensatord's media socket (device-assignment.md §6.6).
+        apply_socket("removable-media.sock", jc, opts);
+    }
     if caps.audio_device == Some(true) {
         apply_audio_device(jc, opts);
     }

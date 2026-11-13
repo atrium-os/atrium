@@ -101,6 +101,12 @@ struct BarView {
     /// A press on the icon of an app that draws its own panel: the main
     /// loop asks frescod for a grant and passes its token to the app.
     want_drawn: Mutable<Option<DrawnAsk>>,
+    /// The USB sticks served for this session (dispensatord), their menu,
+    /// the last eject's refusal, and the part an Eject pick asks for.
+    sticks: Mutable<Vec<atrium_media::Volume>>,
+    sticks_open: Mutable<MenuState>,
+    stick_note: Mutable<Option<String>>,
+    want_eject: Mutable<Option<String>>,
 }
 
 /// An app's own panel to open (forum-status-items.md §4): under the icon
@@ -484,6 +490,22 @@ impl View for BarView {
         // Right icon row.
         let row = ctx.push(Node::hstack(Rect::ZERO_SIZED, 14.0));
         ctx.set_flex(row, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+        // USB sticks (device-assignment.md §6.6): shown while one is
+        // served for this session; its menu ejects one. The bar draws it,
+        // like the other system icons; dispensatord decides who may eject.
+        let sticks = self.sticks.get_cloned();
+        if !sticks.is_empty() {
+            let (items, parts) = stick_menu(&sticks, self.stick_note.get_cloned().as_deref());
+            let want = self.want_eject.clone();
+            let button = MenuButton::new("USB sticks", self.sticks_open.clone(), items, move |i| {
+                if let Some(Some(p)) = parts.get(i) {
+                    want.set(Some(p.clone()));
+                }
+            })
+            .icon(phosphor::USB, 15.0, Some(t.text_secondary()))
+            .attached();
+            ctx.place(button);
+        }
         // The controller menu (fresco-capabilities.md §4): a drop-down from
         // its button, each pad and who holds it; picking a held one takes it
         // back. Attached (atrium-visual-language.md §14.2): the button is
@@ -787,6 +809,87 @@ fn follow_audio(send: Arc<std::sync::Mutex<Option<lyra_protocol::client::Control
     rx
 }
 
+/// dispensatord's media socket, in the bar's jail (`removable-media` capability).
+const STICKS_SOCKET: &str = "/atrium/sockets/removable-media/removable-media.sock";
+
+/// What the sticks thread tells the main loop.
+#[derive(Debug)]
+enum StickMsg {
+    /// (Re)subscribed: the list starts empty, `Added` events follow.
+    Reset,
+    Event(atrium_media::Event),
+    /// An eject's answer.
+    Ejected(Result<String, (u8, String)>),
+}
+
+/// Follow dispensatord's sticks on a thread of its own. The stream ends
+/// when the session changes (or dispensatord restarts): subscribe again,
+/// starting from an empty list; refused (not this session), try later.
+fn follow_sticks() -> (std::sync::mpsc::Receiver<StickMsg>, std::sync::mpsc::Sender<StickMsg>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = tx.clone();
+    std::thread::spawn(move || loop {
+        if let Ok(mut ev) = atrium_media::client::Events::open(std::path::Path::new(STICKS_SOCKET)) {
+            if t.send(StickMsg::Reset).is_err() {
+                return;
+            }
+            while let Ok(e) = ev.next() {
+                if t.send(StickMsg::Event(e)).is_err() {
+                    return;
+                }
+            }
+            if t.send(StickMsg::Reset).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    (rx, tx)
+}
+
+/// Apply one event to the list the bar shows.
+fn apply_stick(list: &mut Vec<atrium_media::Volume>, e: atrium_media::Event) {
+    match e {
+        atrium_media::Event::Added(v) => {
+            list.retain(|o| o.part != v.part);
+            list.push(v);
+            list.sort_by(|a, b| a.part.cmp(&b.part));
+        }
+        atrium_media::Event::Removed { part, .. } => list.retain(|o| o.part != part),
+    }
+}
+
+/// "80 MB", "1.9 GB" (decimal, as sticks are sold).
+fn human_size(b: u64) -> String {
+    let (v, unit) = match b {
+        b if b >= 1_000_000_000_000 => (b as f64 / 1e12, "TB"),
+        b if b >= 1_000_000_000 => (b as f64 / 1e9, "GB"),
+        b if b >= 1_000_000 => (b as f64 / 1e6, "MB"),
+        b => (b as f64 / 1e3, "KB"),
+    };
+    if v < 10.0 { format!("{v:.1} {unit}") } else { format!("{v:.0} {unit}") }
+}
+
+/// The sticks menu: the last refusal (if any), then per stick its name
+/// and space (not pickable) and "Eject". Also the part each item ejects.
+fn stick_menu(sticks: &[atrium_media::Volume], note: Option<&str>) -> (Vec<MenuItem>, Vec<Option<String>>) {
+    let mut items = Vec::new();
+    let mut parts = Vec::new();
+    if let Some(n) = note {
+        items.push(MenuItem::new(n.to_string()).enabled(false));
+        parts.push(None);
+    }
+    for (i, v) in sticks.iter().enumerate() {
+        let ro = if v.read_only { ", read-only" } else { "" };
+        let head = MenuItem::new(format!("{} · {}, {} free{ro}", v.part, human_size(v.size_bytes), human_size(v.free_bytes))).enabled(false);
+        items.push(if i > 0 || note.is_some() { head.separated() } else { head });
+        parts.push(None);
+        items.push(MenuItem::new(format!("Eject {}", v.part)));
+        parts.push(Some(v.part.clone()));
+    }
+    (items, parts)
+}
+
 fn main() -> std::io::Result<()> {
     // The system appearance decides (the Window follows it); `dark` only
     // seeds the first frame when frescod has none to give.
@@ -831,6 +934,11 @@ fn main() -> std::io::Result<()> {
     );
     let status_stale = Arc::new(AtomicBool::new(false));
     let want_drawn = Mutable::with_dirty(None, dirty.clone());
+    let sticks = Mutable::with_dirty(Vec::new(), dirty.clone());
+    let sticks_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let stick_note = Mutable::with_dirty(None, dirty.clone());
+    let want_eject = Mutable::with_dirty(None, dirty.clone());
+    let (stick_events, stick_tx) = follow_sticks();
     // The grants handed to apps for their own panels: token, app.
     let mut drawn: Vec<([u8; 16], String)> = Vec::new();
     let dirty_flag = dirty.clone();
@@ -856,6 +964,10 @@ fn main() -> std::io::Result<()> {
         status: status.clone(),
         status_stale: status_stale.clone(),
         want_drawn: want_drawn.clone(),
+        sticks: sticks.clone(),
+        sticks_open: sticks_open.clone(),
+        stick_note: stick_note.clone(),
+        want_eject: want_eject.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -974,6 +1086,36 @@ fn main() -> std::io::Result<()> {
                 Err(e) => eprintln!("forum-bar: grant for {}'s panel: {e}", ask.app_id),
             }
         }
+        // USB sticks: dispensatord's events and eject answers.
+        while let Ok(m) = stick_events.try_recv() {
+            let mut l = sticks.get_cloned();
+            match m {
+                StickMsg::Reset => l.clear(),
+                StickMsg::Event(e) => apply_stick(&mut l, e),
+                StickMsg::Ejected(Ok(_)) => stick_note.set(None),
+                StickMsg::Ejected(Err((_, msg))) => stick_note.set(Some(msg)),
+            }
+            if l.is_empty() {
+                if sticks_open.get().open {
+                    sticks_open.set(MenuState::default());
+                }
+                if stick_note.get_cloned().is_some() {
+                    stick_note.set(None);
+                }
+            }
+            if l != sticks.get_cloned() {
+                sticks.set(l);
+            }
+        }
+        // An Eject pick: on a thread, as an unmount can take a while.
+        if let Some(part) = want_eject.get_cloned() {
+            want_eject.set(None);
+            let tx = stick_tx.clone();
+            std::thread::spawn(move || {
+                let r = atrium_media::client::eject(std::path::Path::new(STICKS_SOCKET), &part);
+                let _ = tx.send(StickMsg::Ejected(r));
+            });
+        }
         // The volume drop-down: a slider drag, mute, an output.
         if let Some(a) = want_audio.get() {
             want_audio.set(None);
@@ -1035,7 +1177,46 @@ mod tests {
             status: Mutable::new(Vec::new()),
             status_stale: Arc::new(AtomicBool::new(false)),
             want_drawn: Mutable::new(None),
+            sticks: Mutable::new(Vec::new()),
+            sticks_open: Mutable::new(MenuState::default()),
+            stick_note: Mutable::new(None),
+            want_eject: Mutable::new(None),
         }
+    }
+
+    fn stick(p: &str) -> atrium_media::Volume {
+        atrium_media::Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 80_000_000, free_bytes: 1_900_000_000 / 100, read_only: false }
+    }
+
+    #[test]
+    fn sticks_follow_events_and_eject() {
+        let mut l = Vec::new();
+        apply_stick(&mut l, atrium_media::Event::Added(stick("da1s1")));
+        apply_stick(&mut l, atrium_media::Event::Added(stick("da0p1")));
+        assert_eq!(l.iter().map(|v| v.part.as_str()).collect::<Vec<_>>(), ["da0p1", "da1s1"]);
+        let (items, parts) = stick_menu(&l, None);
+        assert_eq!(items.len(), 4);
+        assert_eq!(parts, [None, Some("da0p1".to_string()), None, Some("da1s1".to_string())]);
+        let (items, parts) = stick_menu(&l[..1], Some("busy"));
+        assert_eq!((items.len(), parts[0].clone()), (3, None));
+        assert_eq!(human_size(80_000_000), "80 MB");
+        assert_eq!(human_size(1_900_000_000), "1.9 GB");
+        apply_stick(&mut l, atrium_media::Event::Removed { part: "da0p1".into(), ejected: true });
+        assert_eq!(l, [stick("da1s1")]);
+    }
+
+    #[test]
+    fn the_stick_icon_shows_only_with_a_stick() {
+        pergola::text::clear_measurer();
+        let v = sample_view();
+        let usb = |tree: &pergola::NodeTree| tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content.contains(phosphor::USB)));
+        assert!(!usb(&render(&v, Semantic::LIGHT).0));
+        v.sticks.set(vec![stick("da0p1")]);
+        assert!(usb(&render(&v, Semantic::LIGHT).0));
+        // Opened: the stick and its Eject.
+        v.sticks_open.set(MenuState::opened(None));
+        let (tree, _) = render(&v, Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, x)| matches!(x, Node::Text { content, .. } if content == "Eject da0p1")));
     }
 
     fn sample_item(generation: u64) -> StatusItem {

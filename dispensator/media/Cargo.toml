@@ -1,0 +1,17 @@
+[package]
+name        = "atrium-media"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Removable media on Aqueduct (CLASS_MEDIA, docs/spec/device-assignment.md §6.6): the USB sticks dispensatord serves for the active session, added/removed events and eject. Wire types, the server half dispensatord runs, and the client Forum uses."
+
+[lib]
+name = "atrium_media"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct = { path = "../../aqueduct" }
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+

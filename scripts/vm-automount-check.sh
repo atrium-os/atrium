@@ -19,6 +19,9 @@
 #   - alice logs in: /media/daNs1 appears, alice's alone (0700), the file on
 #     the stick reads back, alice can write, bob cannot even list it;
 #   - the screen locks: unmounted, the server's jail gone; unlocked: back;
+#   - Aqueduct media service (§6.6): alice lists and subscribes, bob is
+#     refused; the subscriber hears added and ejected; lock and logout
+#     end it.
 #   - eject: refused for bob, refused while alice has a file open ("busy"),
 #     then done for alice; stays down across a relogin, back after replug;
 #   - switch to bob: served as bob; logout: unmounted;
@@ -150,6 +153,14 @@ if mounted; then
   V "su -m alice -c 'echo from alice > $M/alice.txt'" && ok "alice writes" || bad "alice cannot write"
   V "su -m bob -c 'ls $M' >/dev/null 2>&1" && bad "bob can list alice's stick" || ok "bob cannot list it"
   V "jls -n name | grep -q 'name=atrium-capsa-$PART'" && ok "served from jail atrium-capsa-$PART" || bad "no jail atrium-capsa-$PART"
+  sleep 3
+  out=$(V "su -m alice -c '$DD --media'" | tr '\n' ';')
+  echo "$out" | grep -q "^ok;$PART $M " && ok "alice lists it over Aqueduct ($out)" || bad "alice's list: '$out'"
+  out=$(V "su -m bob -c '$DD --media' 2>&1")
+  echo "$out" | grep -q "status 2" && ok "bob may not list it ($out)" || bad "bob's list: '$out'"
+  # What Forum's bar hears: a subscription, as alice.
+  V "rm -f /tmp/mw.$RUN; daemon -f -o /tmp/mw.$RUN su -m alice -c '$DD --media-watch'"; sleep 2
+  V "grep -qx 'added $PART $M' /tmp/mw.$RUN" && ok "the subscriber hears it added" || bad "subscriber: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
 else
   bad "not mounted for alice ($(V "tail -4 /var/log/atrium/dispensatord.log | tr '\n' ';'"))"
 fi
@@ -158,21 +169,27 @@ echo "== lock and unlock"
 lock alice
 mounted && bad "still mounted while locked" || ok "locked: unmounted"
 V "jls -n name | grep -q 'name=atrium-capsa-$PART'" && bad "jail still up while locked" || ok "and the server's jail is gone"
+V "tail -1 /tmp/mw.$RUN | grep -qx end" && ok "locking ends the subscription" || bad "subscriber while locked: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
 lock ""
 mounted && [ "$(V "su -m alice -c 'cat $M/alice.txt'")" = "from alice" ] && ok "unlocked: back, with alice's file" || bad "not back after unlock"
+# Subscribe again, as the bar does.
+V "rm -f /tmp/mw.$RUN; daemon -f -o /tmp/mw.$RUN su -m alice -c '$DD --media-watch'"; sleep 2
 
 echo "== eject"
 out=$(V "su -m bob -c '$DD --eject $PART' 2>&1")
-echo "$out" | grep -q "^error only the active" && ok "bob may not eject ($out)" || bad "bob's eject: '$out'"
+echo "$out" | grep -q "^error only the session's user may eject (status 2)" && ok "bob may not eject ($out)" || bad "bob's eject: '$out'"
 V "daemon -f su -m alice -c 'sleep 20 < $M/alice.txt'"; sleep 2
 out=$(V "su -m alice -c '$DD --eject $PART' 2>&1")
-echo "$out" | grep -q "busy" && mounted && ok "refused while a file is open ($out)" || bad "eject with a file open: '$out'"
+echo "$out" | grep -q "busy.*(status 4)" && mounted && ok "refused while a file is open ($out)" || bad "eject with a file open: '$out'"
 V "pkill -u alice sleep"; sleep 1
 out=$(V "su -m alice -c '$DD --eject $PART' 2>&1")
 echo "$out" | grep -q "^ok" && ok "alice ejects ($out)" || bad "alice's eject: '$out'"
 sleep 2
 mounted && bad "still mounted after eject" || ok "unmounted"
-login ""; login alice
+V "grep -qx 'removed $PART ejected' /tmp/mw.$RUN" && ok "the subscriber hears it ejected" || bad "subscriber: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
+login ""
+V "tail -1 /tmp/mw.$RUN | grep -qx end" && ok "logout ends the subscription" || bad "subscriber after logout: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
+login alice
 mounted && bad "an ejected stick came back on relogin" || ok "stays ejected across a relogin"
 unplug 1$RUN
 plug 2$RUN

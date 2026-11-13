@@ -137,6 +137,12 @@ pub struct Capabilities {
     /// what others play or steer them (atrium-player-pip-keys.md §4).
     #[serde(rename = "media-control")]
     pub media_control: Option<bool>,
+    /// The USB sticks served for the session (Forum's bar): list them, hear
+    /// one come and go, and eject one, over dispensatord's `removable-media/`
+    /// socket (device-assignment.md §6.6). It reads no file on them: that is
+    /// the mount, which the session's user owns. Restricted.
+    #[serde(rename = "removable-media")]
+    pub removable_media: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -353,6 +359,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         app_launch:       ovr.app_launch.or(base.app_launch),
         audio_control:    ovr.audio_control.or(base.audio_control),
         media_control:    ovr.media_control.or(base.media_control),
+        removable_media:  ovr.removable_media.or(base.removable_media),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
