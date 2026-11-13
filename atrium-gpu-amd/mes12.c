@@ -3137,7 +3137,7 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	int err;
 
 	if (q->added && !uq2_done(q)) {
-		uq_report(q, "destroy: work in flight", q->fault_vmid < 8);
+		uq_report(q, "destroy: work in flight", false);
 		amd_gmc12_l2_note(m->gt, "evict: after the queue report");
 		/*
 		 * Run fc80fbea: test 15's GFXHUB L2 went busy for good (and
@@ -3147,13 +3147,21 @@ amd_mes12_uq_evict(struct amd_uq *q)
 		 * with MES idle and recovered. Probe: reuse the VMID the IH
 		 * found at the fault and do not scan HQDs here.
 		 */
+		/* A faulted queue: the VMID found at the fault; a hung or
+		 * closed one: by the hub's context base. An HQD scan only if
+		 * neither finds it (see amd_mes12_uq_vmid_by_base). */
 		vmid = q->fault_vmid;
 		q->fault_vmid = 0;
+		if (vmid < 8)
+			vmid = amd_mes12_uq_vmid_by_base(q, 0xff00u);
 		if (vmid >= 8)
-			device_printf(m->sc->dev, "uq%u: VMID %u from the "
-			    "fault, no HQD scan\n", q->slot, vmid);
+			device_printf(m->sc->dev, "uq%u: VMID %u, no HQD "
+			    "scan\n", q->slot, vmid);
 		else if (!uq2_hqd_find(m, q->db, &vmid))
 			vmid = 0;
+		else
+			device_printf(m->sc->dev, "uq%u: VMID %u found only "
+			    "by an HQD scan\n", q->slot, vmid);
 		amd_gmc12_l2_note(m->gt, "evict: after the HQD lookup");
 		if (vmid >= 8) {
 			cp_snap(m, "before the wave kill");
