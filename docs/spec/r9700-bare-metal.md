@@ -1274,3 +1274,16 @@ work (self-test, scrub).
   Next: SI15_PREFREE=1 (c087b183+1) binds and frees a page in the hostile VM
   before the submit, with the store at 0x10200000 (never mapped, wedged before).
   Logs: claude/project-thread-33aauq 9267a45b.
+- **2026-11-13 12:35, PREFREE probe (si-client-test 4e332912, kmods fc54eb53,
+  SI_SKIP13=1 SI_SKIPHANG=1 SI15_BYLATE=1 SI15_PREFREE=1 SI15_VA=0x10200000): still
+  WEDGED, so the suspend/resume is not it.** 57 passed, 2 failed. The hostile uq3
+  was "preempted for a free" (suspend fence landed, resume ok) before its fault;
+  the after-kill state was again CPC 0x80110400 / BUSY 0/0x4480 / CPF 0xb0000001,
+  then 183 flush timeouts. This time the first to time out was context 13 (8-12
+  passed), so it is not the faulted VMID's flush in particular: the hub stops
+  acking at some point during uq2_unmap_vm's flushes. gfx busy 0% just before,
+  95-100% after.
+  Left: test 15 has a bystander VM and queue added just before the fault (its
+  "first EOP IV" arrives with the fault); test 7's other VM had long been
+  running. Next: SI15_NOBY=1 (4e332912+1) runs test 15 with no bystander.
+  Logs: claude/project-thread-33aauq be7f9fa2.

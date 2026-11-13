@@ -1544,7 +1544,7 @@ hostile_isa(void)
 	struct job hc;
 	uint32_t first;
 	u_int i, nc = sizeof(c) / sizeof(c[0]);
-	int r, n, ms, ri0 = -1, ri = -1, bylate;
+	int r, n, ms, ri0 = -1, ri = -1, bylate, noby;
 	char what[160], vaname[64];
 	const char *env;
 
@@ -1573,6 +1573,17 @@ hostile_isa(void)
 	 * VMs; clean: something about VMID 12.
 	 */
 	bylate = (env = getenv("SI15_BYLATE")) != NULL && *env == '1';
+	/*
+	 * SI15_NOBY=1 (wedge bisection, run be7f9fa2: a BO free before the
+	 * store did not help): no bystander VM at all. Test 7's other VM
+	 * had long been running; test 15's bystander is a fresh VM and
+	 * queue added just before the fault.
+	 */
+	noby = (env = getenv("SI15_NOBY")) != NULL && *env == '1';
+	if (noby) {
+		bylate = 1;
+		printf("15: no bystander VM (SI15_NOBY)\n");
+	}
 	job_init(&by);
 	(void)preg_read(NULL, &ri0);
 	if (!bylate && job_open(&by, "15 bystander") != 0) {
@@ -1589,7 +1600,7 @@ hostile_isa(void)
 			job_close(&h);
 			continue;
 		}
-		if (bylate && i == 0) {
+		if (bylate && !noby && i == 0) {
 			printf("15: bystander opened after the hostile queue "
 			    "(SI15_BYLATE)\n");
 			if (job_open(&by, "15 bystander") != 0) {
@@ -1622,7 +1633,8 @@ hostile_isa(void)
 			    "submit (SI15_PREFREE): %s\n", r == 0 ? "ok" :
 			    strerror(errno));
 		}
-		(void)poison(by.out, POISON_B);
+		if (!noby)
+			(void)poison(by.out, POISON_B);
 		if (job_submit(&h, c[i].spin ? h.out_va : va) != 0) {
 			check(0, "15 hostile ISA", "%s: submit: %s", c[i].name,
 			    strerror(errno));
@@ -1636,18 +1648,21 @@ hostile_isa(void)
 		check(r == EIO, what, "got %s after %d ms", r == 0 ?
 		    "success" : strerror(r), ms);
 		printf("15: %s: time to fail %d ms\n", c[i].name, ms);
-		n = count(by.out, POISON_B, &first);
-		snprintf(what, sizeof(what), "15 hostile ISA: %s: the "
-		    "bystander's memory is untouched", c[i].name);
-		check(n == SIW42_OUT_DW, what, "%d/64 words intact, out[0] %#x",
-		    n, first);
+		if (!noby) {
+			n = count(by.out, POISON_B, &first);
+			snprintf(what, sizeof(what), "15 hostile ISA: %s: the "
+			    "bystander's memory is untouched", c[i].name);
+			check(n == SIW42_OUT_DW, what, "%d/64 words intact, "
+			    "out[0] %#x", n, first);
+		}
 		r = job_submit(&h, h.out_va) == 0 ? 0 : errno;
 		snprintf(what, sizeof(what), "15 hostile ISA: %s: the lost "
 		    "queue refuses new work", c[i].name);
 		check(r == EIO, what, "%s", r == 0 ? "accepted" : strerror(r));
 		snprintf(what, sizeof(what), "15 hostile ISA: after %s, "
 		    "another VM runs clean", c[i].name);
-		run_clean(&by, what);
+		if (!noby)
+			run_clean(&by, what);
 		job_close(&h);
 		/* A fresh VM: setting one up flushes its context. */
 		sleep(2);
