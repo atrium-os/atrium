@@ -1340,3 +1340,19 @@ work (self-test, scrub).
   queue's fd is still open. Test 7 closes its lost queue first (job_renew) and
   only frees BOs much later. Next: SI15_QFIRST=1 (ebce4d4e+1) closes the lost
   queue first. Logs: claude/project-thread-33aauq 6849e284.
+- **2026-11-13 13:36, QFIRST probe (si-client-test 553d5a34, kmods fc54eb53, the
+  SKIP 9-12 set plus SI15_QFIRST=1): test 15 CLEAN. Root cause found.** 30 passed,
+  0 failed, proven idle at detach. Same fault, same state after the wave kill; the
+  only change was closing the lost queue before freeing its VM's BOs. Its close
+  (unmap its pages, flush the kernel VMID and 8-15) passed, the BO frees after it
+  flushed only the kernel VMID, and the health VM ran clean. (Test 14 then ran in
+  full and passed; its 16 flush timeouts sit inside its own refused-PM4 cases,
+  before their mode 1 resets.)
+  So the wedge: after a client store fault, a PTE change in the VM followed by a
+  flush of the MES VMIDs (8-15), while the lost queue is still open, leaves
+  GFXHUB's invalidation engine never acking again. Test 7 never hit it only
+  because job_renew closes its lost queue first.
+  Fix (kmods dbfec631): si_uq_evict_task, once a lost queue is off MES, unmaps its
+  pages and flushes as its close would (amd_mes12_uq_unmap), and marks the slot
+  off MES, so the VM drops out of the MES-VMID flush and free-rule masks. Logs:
+  claude/project-thread-33aauq 1d72542a.
