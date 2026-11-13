@@ -1702,6 +1702,16 @@ amd_mes12_kq_close(struct amd_kq *kq)
 	free(kq, M_DEVBUF);
 }
 
+/* The card was reset with bus mastering off: free without the hardware. */
+void
+amd_mes12_kq_free_lost(struct amd_kq *kq)
+{
+	if (kq == NULL)
+		return;
+	contigfree(kq->d.blk, KQ_SIZE, M_DEVBUF);
+	free(kq, M_DEVBUF);
+}
+
 /*
  * The queue is wedged (a fence that never came): remove it and map it
  * afresh, ring and fence zeroed. Sequence numbers start over.
@@ -2470,71 +2480,6 @@ uq2_hqd_reset(struct amd_uq *q)
 	return (idle);
 }
 
-/* MEC pipe resets so far: si_client.c loses the other queues on a move. */
-volatile u_int amd_mes12_pipe_resets;
-
-/*
- * The last rung before a GPU reset, as amdgpu's mes_v12_0_reset_compute_
- * pipe_mmio: hold the queue's MEC pipe in reset, force every HQD on it
- * inactive, release the pipe (its firmware restarts at its start PC).
- * Box runs a0597b2d..a4073d89: a CP-side fault (client CPG) left an HQD
- * that neither a dequeue reset, REMOVE_QUEUE nor MES's RESET would stop.
- * Every queue on that pipe is lost; true if the stuck HQD is now inactive.
- */
-static bool
-uq2_pipe_reset(struct amd_uq *q)
-{
-	struct mes *m = q->m;
-	const struct mes_gen *g = m->g;
-	uint32_t d, pc0, pc1, start, busy0, busy1;
-	u_int vmid, pipe, qi, i, us;
-	bool idle, safe;
-
-	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
-		return (true);
-	/* amdgpu holds RLC safe mode around the pipe reset. */
-	safe = amd_gfx12_safe_mode(m->sc, true) == 0;
-	grbm_select_q(m, 1, pipe, qi);
-	pc0 = rd(m, g->mec_instr_pntr);
-	start = rd(m, g->mec_prgrm_start);
-	busy0 = rd(m, g->cp_cpc_busy);
-	d = rd(m, g->cp_mec_rs64_cntl);
-	wr(m, g->cp_mec_rs64_cntl, d | (MEC_RS64_PIPE0_RESET << pipe));
-	for (i = 0; i < 8; i++) {
-		grbm_select_q(m, 1, pipe, i);
-		wr(m, g->hqd_active, 0);
-		wr(m, g->hqd_dequeue_req, 0);
-	}
-	grbm_select_q(m, 1, pipe, qi);
-	/*
-	 * Re-arm the pipe's start (gfx12.c config_rs64 set it at init) before
-	 * it leaves reset. Box run 647da1b1: without it the pipe came back
-	 * busy (CP_CPC_BUSY_STAT 0x840) and MES never mapped a queue on it.
-	 */
-	wr(m, g->mec_prgrm_start, start);
-	wr(m, g->cp_mec_rs64_cntl, d & ~(MEC_RS64_PIPE0_RESET << pipe));
-	/* Wait for the pipe's firmware to move off its start. */
-	for (us = 0; us < 100000; us += 100) {
-		DELAY(100);
-		if (rd(m, g->mec_instr_pntr) != (start & 0x3fffffff))
-			break;
-	}
-	pc1 = rd(m, g->mec_instr_pntr);
-	busy1 = rd(m, g->cp_cpc_busy);
-	idle = (rd(m, g->hqd_active) & 1) == 0;
-	grbm_select_q(m, 0, 0, 0);
-	if (safe)
-		(void)amd_gfx12_safe_mode(m->sc, false);
-	atomic_add_int(&amd_mes12_pipe_resets, 1);
-	device_printf(m->sc->dev, "uq%u: MEC me1 pipe %u reset (VMID %u, queue "
-	    "%u%s): HQD %s; PC %#x -> %#x (start %#x) after %u us, "
-	    "CP_CPC_BUSY_STAT %#x -> %#x; every queue on the pipe is lost\n",
-	    q->slot, pipe, vmid, qi, safe ? "" : ", no RLC safe mode",
-	    idle ? "inactive" : "STILL ACTIVE", pc0, pc1, start, us, busy0,
-	    busy1);
-	return (idle);
-}
-
 /* EOP interrupts from every MEC1 pipe MES may place a user queue on. */
 void
 amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
@@ -2830,10 +2775,10 @@ amd_mes12_uq_report(struct amd_uq *q, const char *when)
  * reach the queue's memory, so free it without touching the hardware.
  */
 void
-amd_mes12_uq_free_lost(struct amd_uq *q)
+amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev)
 {
-	device_printf(q->m->sc->dev, "uq%u: freed after the GPU reset\n",
-	    q->slot);
+	/* Not q->m: a re-init may have freed that MES (amd_mes12_free_lost). */
+	device_printf(dev, "uq%u: freed after the GPU reset\n", q->slot);
 	if (!q->user)
 		contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
 	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
@@ -2870,28 +2815,24 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	}
 	/*
 	 * A queue whose HQD a dequeue reset cannot stop (a CP-side fault,
-	 * client CPG: box runs a0597b2d..a652163f) gets its MEC pipe reset
-	 * BEFORE MES is asked to remove it. Run a652163f: asked first, MES
-	 * refused REMOVE_QUEUE and its RESET, and after that still refused
-	 * REMOVE once the pipe reset had made the HQD inactive.
+	 * client CPG) is beyond MES: box runs a0597b2d..a652163f, MES refused
+	 * REMOVE_QUEUE and its own RESET for it; runs 647da1b1/fdadff06, a MEC
+	 * pipe reset cleared the HQD but left the MEC busy and wedged the
+	 * pipe's other queues, the kernel queue among them. Do not ask MES:
+	 * the caller resets and re-initialises the GPU (smu.c amd_si_reinit).
 	 */
-	if (q->added && !uq2_done(q) && !uq2_hqd_reset(q))
-		(void)uq2_pipe_reset(q);
+	if (q->added && !uq2_done(q) && !uq2_hqd_reset(q)) {
+		amd_mes12_uq_report(q, "HQD stuck after its reset");
+		device_printf(m->sc->dev, "uq%u: HQD will not stop; the GPU "
+		    "must be reset\n", q->slot);
+		return (EBUSY);
+	}
 	if (q->added) {
 		err = uq_remove_raw(m, q->gva, q->db);
 		if (err != 0 && uq2_hqd_reset(q)) {
 			device_printf(m->sc->dev, "uq%u: REMOVE_QUEUE refused "
 			    "(%d); HQD reset, trying once more\n", q->slot, err);
 			err = uq_remove_raw(m, q->gva, q->db);
-		}
-		if (err != 0 && uq2_hqd_find(m, q->db, &vmid) &&
-		    uq2_pipe_reset(q)) {
-			/* The pipe's other queues went with it: the caller
-			 * loses them (amd_mes12_pipe_resets moved). */
-			err = uq_remove_raw(m, q->gva, q->db);
-			device_printf(m->sc->dev, "uq%u: after MEC pipe reset: "
-			    "REMOVE_QUEUE %s\n", q->slot, err == 0 ? "ok" :
-			    "still refused");
 		}
 		if (err != 0) {
 			/* Still refused: MES's own queue reset, then once
@@ -3124,8 +3065,16 @@ amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt, bool kq,
 	m->r[1].db = m->g->db_pipe1;
 
 	m->dbrid = PCIR_BAR(2);
-	m->dbbar = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &m->dbrid,
-	    RF_ACTIVE);
+	if (sc->uq_dbbar != NULL) {
+		/* A re-init: the BAR (and its fictitious user doorbell
+		 * pages, which old queue fds may still map) carry over. */
+		m->dbbar = sc->uq_dbbar;
+		m->dbrid = sc->uq_dbrid;
+		m->udb_registered = sc->uq_db_registered;
+		sc->uq_dbbar = NULL;
+	} else
+		m->dbbar = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY,
+		    &m->dbrid, RF_ACTIVE);
 	if (m->dbbar == NULL || rman_get_size(m->dbbar) <
 	    (bus_size_t)(m->g->db_aggregated + 16) * 4) {
 		device_printf(sc->dev, "mes: doorbell BAR unusable\n");
@@ -3141,7 +3090,8 @@ amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt, bool kq,
 	 * fictitious pages, so a queue fd's pager (rs/uqueue.rs) can map
 	 * exactly one of them into its client and take it back.
 	 */
-	if (rman_get_size(m->dbbar) >= (bus_size_t)AMD_UQ_DOORBELL_USER(
+	if (!m->udb_registered &&
+	    rman_get_size(m->dbbar) >= (bus_size_t)AMD_UQ_DOORBELL_USER(
 	    AMD_UQ_SLOTS) * 4 && vm_phys_fictitious_reg_range(
 	    rman_get_start(m->dbbar) + AMD_UQ_DOORBELL_USER(0) * 4,
 	    rman_get_start(m->dbbar) + AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) * 4,
@@ -3249,6 +3199,46 @@ mes_free(struct mes *m)
 		    AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) * 4);
 	bus_release_resource(m->sc->dev, SYS_RES_MEMORY, m->dbrid, m->dbbar);
 	free(m, M_DEVBUF);
+}
+
+/*
+ * The card was reset (mode 1) with bus mastering off: free MES's memory
+ * without touching the hardware. The GART table is rewritten at the
+ * re-init, so its entries are left. The doorbell BAR is parked in the
+ * softc for the next amd_mes12_up (clients' old user doorbell mappings
+ * keep their fictitious pages); amd_mes12_db_release gives it back.
+ */
+void
+amd_mes12_free_lost(struct mes *m)
+{
+	struct atrium_amd_softc *sc;
+
+	if (m == NULL)
+		return;
+	sc = m->sc;
+	contigfree(m->blk, BLK_SIZE, M_DEVBUF);
+	if (m->scratch != NULL)
+		contigfree(m->scratch, 2 * MES_SCRATCH_SIZE, M_DEVBUF);
+	sc->uq_dbbar = m->dbbar;
+	sc->uq_dbrid = m->dbrid;
+	sc->uq_db_registered = m->udb_registered;
+	free(m, M_DEVBUF);
+}
+
+/* A doorbell BAR parked by amd_mes12_free_lost that no MES took (detach). */
+void
+amd_mes12_db_release(struct atrium_amd_softc *sc)
+{
+	if (sc->uq_dbbar == NULL)
+		return;
+	if (sc->uq_db_registered)
+		vm_phys_fictitious_unreg_range(rman_get_start(sc->uq_dbbar) +
+		    AMD_UQ_DOORBELL_USER(0) * 4, rman_get_start(sc->uq_dbbar) +
+		    AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) * 4);
+	bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->uq_dbrid,
+	    sc->uq_dbbar);
+	sc->uq_dbbar = NULL;
+	sc->uq_db_registered = false;
 }
 
 /*

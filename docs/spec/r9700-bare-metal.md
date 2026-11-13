@@ -963,3 +963,23 @@ work (self-test, scrub).
   drop the pipe reset; when a CP-faulted queue won't stop, do a mode 1 reset and
   re-initialise in the kernel (decision pending). Log: branch
   claude/project-thread-33aauq, docs/r9700-runs/20261113T055218Z-5f-fdadff06.log.
+- **Fix for the next run: reset and re-initialise the GPU for a queue that will not
+  stop** (Shankar's decision, 2026-11-13). The MEC pipe reset is gone. When a user
+  queue's HQD stays active after its dequeue reset (a CP-side fault), MES is not asked
+  to remove it; the driver resets and re-initialises the card instead:
+  - the client side fails every queue's work (EIO) and lets go of its kernel queue,
+    the IH consumer and the VRAM scrub engine;
+  - `amd_si_reinit` does the mode 1 reset with bus mastering off, then frees the old
+    MES, IH and kernel-queue memory without touching the hardware;
+  - it turns bus mastering back on and runs the attach sequence again: PSP firmware
+    load, SMU start and idle proof, GART, GFX, IH (a fresh MSI vector), MES, the
+    dispatch self-test and the idle proof;
+  - the client side opens a new kernel queue and re-registers the scrub engine (the
+    failed scrubs are retried).
+  Queues and VMs that existed at the reset stay lost until their fds close: their slots
+  and VMIDs stay taken, so nothing new shares them, and their calls fail with EIO.
+  New VMs and queues run on the new card. The doorbell BAR, with its fictitious user
+  doorbell pages, carries over to the new MES, because old fds may still map them. At
+  most 3 re-inits in 10 minutes; after that the GPU stays lost until the driver is
+  reloaded. A failed re-init also leaves it lost, as before. gpusim does not run this
+  path (both suites ALL OK there as a regression check).

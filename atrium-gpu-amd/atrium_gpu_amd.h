@@ -961,7 +961,15 @@ uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
 uint32_t amd_mes12_uq_seq(struct amd_uq *q);
 u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
 bool	amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue);
-void	amd_mes12_uq_free_lost(struct amd_uq *q);
+void	amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev);
+void	amd_mes12_free_lost(struct mes *m);
+void	amd_mes12_db_release(struct atrium_amd_softc *sc);
+void	amd_mes12_kq_free_lost(struct amd_kq *kq);
+/* A stuck CP queue: reset the card and bring it up again (smu.c). 0: the
+ * GPU is usable again, every old queue and VM lost; else it stays lost. */
+int	amd_si_reinit(struct atrium_amd_softc *sc);
+int	amd_psp_bootload_on(struct atrium_amd_softc *sc, struct resource *vram);
+void	amd_ih7_free_lost(struct amd_ih7 *ih);
 void	amd_si_lose(struct atrium_amd_softc *sc, const char *why);
 void	amd_mes12_uq_report(struct amd_uq *q, const char *when);
 void	amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved);
@@ -1015,6 +1023,11 @@ struct atrium_amd_softc {
 	uint32_t	 dcn_seg2_bytes; /* DMU segment 2 byte offset in BAR5 */
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
 	struct amd_si *si;		/* silicon, attached (smu.c, stage 5a) */
+	/* The doorbell BAR between a lost MES and the re-init's new one
+	 * (mes12.c amd_mes12_free_lost); NULL otherwise. */
+	struct resource *uq_dbbar;
+	int		 uq_dbrid;
+	bool		 uq_db_registered;
 	/* The PSP's own VRAM (FB_FW_RESERV_ADDR[_EXT], psp.c): offsets and
 	 * sizes in bytes; size 0 = not reported. The allocator keeps out. */
 	uint64_t	 psp_resv_off[2], psp_resv_size[2];
@@ -1227,7 +1240,6 @@ int	 amd_gfx12_safe_mode(struct atrium_amd_softc *sc, bool enter);
 void	 amd_ih7_vector_off(struct amd_ih7 *ih);
 bool	 amd_ih7_has_vector(struct amd_ih7 *ih);
 void	 amd_si_irqs(struct atrium_amd_softc *sc, uint64_t *count, uint32_t *vec);
-extern volatile u_int amd_mes12_pipe_resets;	/* mes12.c */
 int	 amd_vram_init(struct atrium_amd_softc *sc);
 /* Silicon: hand out [lo, hi) of `device` bytes. `dirty` = its contents are
  * unknown (silicon need not wipe VRAM), so all of it is scrubbed before it

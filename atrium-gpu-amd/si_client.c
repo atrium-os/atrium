@@ -86,6 +86,7 @@ struct si_uq {
 	bool	 dead;			/* lost (fault, hang): work fails, EIO */
 	bool	 evict;			/* lost, still on MES: the task removes it */
 	bool	 user;			/* user mode: the client's ring (step 3) */
+	bool	 stale;			/* of a generation a GPU re-init ended */
 	uint32_t prog_rptr;		/* user mode's hang clock: rptr at prog_tick */
 	uint32_t prog_fence;		/* hang clock: fence at prog_tick */
 	int	 prog_tick;
@@ -119,7 +120,10 @@ struct amd_si_client {
 	 * create and destroy; the slots' bookkeeping is under sc->lock). */
 	struct sx uq_sx;
 	struct si_uq uq[AMD_UQ_SLOTS];
-	u_int	 uq_live;
+	u_int	 uq_live;		/* slots taken, stale ones too */
+	u_int	 uq_cur;		/* ... of the current generation */
+	uint32_t vm_lost;		/* VMIDs of VMs a GPU re-init ended */
+	uint64_t reinits;		/* GPU re-inits that passed */
 	uint32_t uq_int_saved[4];	/* MEC1 pipes' INT_CNTL before */
 	struct callout uq_poll;
 	struct task uq_task;		/* evicts lost queues (taskqueue_thread) */
@@ -349,6 +353,82 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 	taskqueue_enqueue(taskqueue_thread, &c->uq_task);
 }
 
+static int si_vram_clear(struct atrium_amd_softc *, uint64_t, uint64_t);
+static void si_iv(void *, const uint32_t *);
+
+/*
+ * The last rung: a user queue that will not stop (its HQD stuck after a
+ * reset: a CP-side fault). Shankar 2026-11-13: reset the GPU and bring it up
+ * again rather than reset one MEC pipe (box runs 647da1b1/fdadff06: the
+ * pipe reset left the MEC busy and wedged the pipe's other queues, the
+ * kernel queue among them). Every queue's work fails (EIO); queues and VMs
+ * that exist now stay lost until their fds close (their VMIDs and slots
+ * stay taken until then, so nothing new shares them); new VMs and queues
+ * run on the new card. If the re-init fails, the GPU stays lost, as before.
+ * uq_sx held.
+ */
+static void
+si_recover(struct amd_si_client *c, const char *why)
+{
+	struct atrium_amd_softc *sc = c->sc;
+	struct amd_kq *kq;
+	u_int i;
+	int err;
+
+	sx_assert(&c->uq_sx, SA_XLOCKED);
+	amd_si_lose(sc, why);		/* the reset, bus mastering off */
+	mtx_lock(&sc->lock);
+	si_uq_lost_all(c);
+	for (i = 0; i < AMD_UQ_SLOTS; i++)
+		if (c->uq[i].busy) {
+			c->uq[i].stale = true;
+			c->uq[i].evict = false;
+		}
+	c->uq_cur = 0;
+	c->vm_lost |= c->vmids;
+	c->vmid = 0;
+	c->last_seq = 0;
+	c->last_ndw = 0;
+	c->sig_n = 0;
+	kq = c->kq;
+	c->kq = NULL;
+	mtx_unlock(&sc->lock);
+	/* Off the old card: the scrub engine (waits out a range in progress,
+	 * which fails at once now), the IV consumer, the kernel queue. */
+	amd_vram_set_clear(sc, NULL);
+	amd_ih7_set_consumer(c->ih, NULL, NULL);
+	c->ih = NULL;
+	amd_mes12_kq_free_lost(kq);
+
+	if ((err = amd_si_reinit(sc)) != 0)
+		return;		/* lost: every call fails, closes free */
+	c->ih = amd_si_ih(sc);
+	if ((err = amd_si_gfx_hold(sc)) == 0) {
+		err = amd_mes12_kq_open(amd_si_mes(sc), &kq);
+		amd_si_gfx_release(sc);
+	}
+	if (err != 0) {
+		device_printf(sc->dev, "si: no kernel queue after the GPU "
+		    "re-init (%d); the GPU is lost\n", err);
+		amd_si_lose(sc, "the kernel queue would not come up again");
+		return;
+	}
+	mtx_lock(&sc->lock);
+	c->kq = kq;
+	c->broken = false;
+	mtx_unlock(&sc->lock);
+	amd_ih7_set_consumer(c->ih, si_iv, c);
+	/* The scrub engine again (same card, same MC addresses: the attach
+	 * self-test's pages may be a client's now, so it is not rerun). What
+	 * failed to scrub before is retried. */
+	if (sc->vram.inited)
+		amd_vram_set_clear(sc, si_vram_clear);
+	c->reinits++;
+	device_printf(sc->dev, "si: GPU re-initialised (%ju so far): old "
+	    "VMs (%#x) and queues are lost (EIO) until closed; new ones run\n",
+	    (uintmax_t)c->reinits, c->vm_lost);
+}
+
 /*
  * Take lost queues off MES now, not at their close: a faulted wave or a
  * hung CP keeps the engine busy (and the card's power up) for as long as
@@ -360,7 +440,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 	struct amd_si_client *c = arg;
 	struct atrium_amd_softc *sc = c->sc;
 	struct amd_uq *hw;
-	u_int i, resets;
+	u_int i;
 	int err;
 
 	sx_xlock(&c->uq_sx);
@@ -371,20 +451,9 @@ si_uq_evict_task(void *arg, int pending __unused)
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
 			continue;
-		resets = amd_mes12_pipe_resets;
 		err = amd_mes12_uq_evict(hw);
-		if (err == 0 && amd_mes12_pipe_resets != resets) {
-			/* A MEC pipe reset took the queue off: the pipe's
-			 * other queues are gone too. */
-			mtx_lock(&sc->lock);
-			si_uq_lost_all(c);
-			mtx_unlock(&sc->lock);
-		}
 		if (err != 0) {
-			amd_si_lose(sc, "a lost user queue MES will not remove");
-			mtx_lock(&sc->lock);
-			si_uq_lost_all(c);
-			mtx_unlock(&sc->lock);
+			si_recover(c, "a lost user queue that will not stop");
 			break;
 		}
 		device_printf(sc->dev, "si: uq%u evicted (lost)\n", i);
@@ -849,6 +918,12 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		return (EINVAL);
 	sx_xlock(&c->uq_sx);
 	mtx_lock(&sc->lock);
+	if ((c->vm_lost & (1u << vm->vmid)) != 0) {
+		/* A VM of a generation a GPU re-init ended. */
+		mtx_unlock(&sc->lock);
+		sx_xunlock(&c->uq_sx);
+		return (EIO);
+	}
 	for (slot = 0; slot < AMD_UQ_SLOTS; slot++)
 		if (!c->uq[slot].busy)
 			break;
@@ -863,7 +938,7 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 	u->kvmid = vm->vmid;
 	mtx_unlock(&sc->lock);
 
-	if (c->uq_live == 0)
+	if (c->uq_cur == 0)
 		amd_mes12_uq_ints(amd_si_mes(sc), true, c->uq_int_saved);
 	/* MES priority: NORMAL (1) for every client in 5c-2b. */
 	err = amd_mes12_uq_create(amd_si_mes(sc), vm->hw12, vm->vmid, slot,
@@ -878,12 +953,13 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		u->user = upg != NULL;
 		u->prog_tick = ticks;
 		c->uq_live++;
+		c->uq_cur++;
 		/* User mode: the hang clock runs for as long as it lives. */
 		if (u->user && !callout_pending(&c->uq_poll))
 			callout_reset(&c->uq_poll, hz / 20, si_uq_poll, c);
 	}
 	mtx_unlock(&sc->lock);
-	if (err != 0 && c->uq_live == 0)
+	if (err != 0 && c->uq_cur == 0)
 		amd_mes12_uq_ints(amd_si_mes(sc), false, c->uq_int_saved);
 	sx_xunlock(&c->uq_sx);
 	if (err == 0)
@@ -905,7 +981,8 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	struct amd_uq *hw;
 	uint64_t submits;
 	uint16_t kvmid;
-	u_int done, resets = 0;
+	u_int done;
+	bool stale;
 	int err;
 
 	if (c == NULL || slot < 0 || slot >= AMD_UQ_SLOTS)
@@ -926,34 +1003,34 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	u->hw = NULL;
 	kvmid = u->kvmid;
 	submits = u->submits;
+	stale = u->stale;
 	mtx_unlock(&sc->lock);
 	if (hw == NULL) {
 		sx_xunlock(&c->uq_sx);
 		return (EINVAL);
 	}
-	if (!amd_si_usable(sc)) {
+	if (stale) {
+		/* Of a generation a GPU re-init ended: nothing of it is on
+		 * the card any more. */
+		amd_mes12_uq_free_lost(hw, sc->dev);
+		err = 0;
+	} else if (!amd_si_usable(sc)) {
 		/* Lost or failing: make sure it is reset with DMA off. */
 		amd_si_lose(sc, "card not usable at a queue's close");
-		amd_mes12_uq_free_lost(hw);
+		amd_mes12_uq_free_lost(hw, sc->dev);
 		err = 0;
-	} else if ((resets = amd_mes12_pipe_resets,
-	    err = amd_mes12_uq_destroy(hw, kvmid)) != 0) {
+	} else if ((err = amd_mes12_uq_destroy(hw, kvmid)) != 0) {
 		/*
-		 * MES kept the queue even after an HQD reset: the last rung.
-		 * Reset the card, fail what every queue owes, and free.
+		 * The queue will not stop (its HQD stuck: a CP-side fault):
+		 * the last rung resets the card and brings it up again. The
+		 * reset is what lets its memory go.
 		 */
-		amd_si_lose(sc, "a user queue MES will not remove");
+		si_recover(c, "a user queue that will not stop");
 		mtx_lock(&sc->lock);
-		si_uq_lost_all(c);
+		stale = u->stale;
 		mtx_unlock(&sc->lock);
-		amd_mes12_uq_free_lost(hw);
+		amd_mes12_uq_free_lost(hw, sc->dev);
 		err = 0;
-	} else if (amd_mes12_pipe_resets != resets) {
-		/* Removed after a MEC pipe reset: the pipe's other queues
-		 * went with it. */
-		mtx_lock(&sc->lock);
-		si_uq_lost_all(c);
-		mtx_unlock(&sc->lock);
 	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
 	    "routed %ju, unrouted %ju, MES own %ju, MES preemption %ju; "
@@ -977,9 +1054,12 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		mtx_lock(&sc->lock);
 		u->busy = false;
 		u->kvmid = 0;
+		u->stale = false;
 		c->uq_live--;
+		if (!stale)
+			c->uq_cur--;
 		mtx_unlock(&sc->lock);
-		if (c->uq_live == 0 && amd_si_usable(sc))
+		if (!stale && c->uq_cur == 0 && amd_si_usable(sc))
 			amd_mes12_uq_ints(amd_si_mes(sc), false,
 			    c->uq_int_saved);
 	}
@@ -1220,6 +1300,7 @@ si_vm_teardown(struct atrium_amd_vm *vm)
 	amd_si_gfx_release(sc);
 	mtx_lock(&sc->lock);
 	c->vmids &= ~(1u << vm->vmid);
+	c->vm_lost &= ~(1u << vm->vmid);
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
 }
@@ -1257,6 +1338,8 @@ si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
 		return (EINVAL);
 	if (!amd_si_usable(vm->sc))
 		return (ENXIO);
+	if ((atomic_load_32(&c->vm_lost) & (1u << vm->vmid)) != 0)
+		return (EIO);	/* a VM a GPU re-init ended */
 	if (vram) {
 		/* A VRAM offset from the allocator: never outside its range
 		 * (the driver's own area, the PSP's). PTE = FB physical. */

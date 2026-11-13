@@ -750,7 +750,14 @@ struct amd_si {
 	u_int nsample, strikes;
 	u_int gfx_holds;		/* GfxOff disallowed while > 0 (5c-2) */
 	bool client;			/* the client node is attached (5c-2) */
+	u_int reinits;			/* amd_si_reinit runs in the window */
+	sbintime_t reinit_first;	/* when that window began */
 };
+
+/* At most this many re-inits in SI_REINIT_WINDOW s; then the GPU stays lost
+ * (a client that wedges the CP on purpose does not get a reset loop). */
+#define SI_REINIT_MAX		3
+#define SI_REINIT_WINDOW	600
 
 /* Everything down to the GART, GfxOff disallowed meanwhile; then allowed. */
 static void
@@ -856,26 +863,18 @@ si_watch(void *arg, int pending __unused)
 	sx_xunlock(&si->lock);
 }
 
-int
-amd_si_attach(struct atrium_amd_softc *sc)
+/*
+ * Stages 4a-4e on a card whose SMU is started (smu_start): GART, GFX, IH,
+ * MES with the kernel compute queue, the first dispatch, and the idle proof.
+ * `attach`: also the attach-time test hooks (5b, 5c-1). On failure all of
+ * it is taken down again and *stepp names the step.
+ */
+static int
+si_up(struct amd_si *si, bool attach, const char **stepp)
 {
-	struct amd_si *si;
-	const char *step = "SMU link";
+	struct atrium_amd_softc *sc = si->sc;
+	const char *step;
 	int err, us, vm_test = 0, uq_test = 0;
-
-	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
-	si->sc = sc;
-	sx_init(&si->lock, "atrium-gpu-si");
-	TIMEOUT_TASK_INIT(taskqueue_thread, &si->watch, 0, si_watch, si);
-
-	err = smu_open(sc, &si->link, &si->vram, &si->vram_rid,
-	    &si->table_mc);
-	if (err != 0)
-		goto fail;
-	step = "SMU start and idle proof";
-	err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
-	if (err != 0)
-		goto fail;
 
 	/* Stages 4a-4e, GfxOff held off while we set GC up. */
 	(void)smu_send(&si->link, SMU_DISALLOW_GFXOFF, 0, NULL, false);
@@ -901,7 +900,8 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	    err == 0 ? "PASS" : "FAILED", amd_ih7_drain_eop(si->ih, 8));
 	if (err != 0)
 		goto down;
-	TUNABLE_INT_FETCH("hw.atrium_gpu.vm_test", &vm_test);
+	if (attach)
+		TUNABLE_INT_FETCH("hw.atrium_gpu.vm_test", &vm_test);
 	if (vm_test) {
 		step = "per-client page table (5b)";
 		err = amd_mes12_vmtest(si->mes);
@@ -911,7 +911,8 @@ amd_si_attach(struct atrium_amd_softc *sc)
 		if (err != 0)
 			goto down;
 	}
-	TUNABLE_INT_FETCH("hw.atrium_gpu.uq_test", &uq_test);
+	if (attach)
+		TUNABLE_INT_FETCH("hw.atrium_gpu.uq_test", &uq_test);
 	if (uq_test) {
 		step = "MES user queues (5c-1)";
 		err = amd_mes12_uqtest(si->mes);
@@ -935,6 +936,36 @@ amd_si_attach(struct atrium_amd_softc *sc)
 		err = EIO;
 		goto down;
 	}
+	return (0);
+down:
+	*stepp = step;
+	si_down(si, false);
+	return (err);
+}
+
+int
+amd_si_attach(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si;
+	const char *step = "SMU link";
+	int err;
+
+	si = malloc(sizeof(*si), M_DEVBUF, M_WAITOK | M_ZERO);
+	si->sc = sc;
+	sx_init(&si->lock, "atrium-gpu-si");
+	TIMEOUT_TASK_INIT(taskqueue_thread, &si->watch, 0, si_watch, si);
+
+	err = smu_open(sc, &si->link, &si->vram, &si->vram_rid,
+	    &si->table_mc);
+	if (err != 0)
+		goto fail;
+	step = "SMU start and idle proof";
+	err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
+	if (err != 0)
+		goto fail;
+
+	if ((err = si_up(si, true, &step)) != 0)
+		goto fail;
 	sc->si = si;
 	taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
 	    SI_WATCH_SECS * hz);
@@ -943,8 +974,6 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	    SI_WATCH_SECS);
 	return (0);
 
-down:
-	si_down(si, false);
 fail:
 	device_printf(sc->dev, "si: stage 5a: attach failed at %s (%d)\n",
 	    step, err);
@@ -1078,6 +1107,103 @@ amd_si_lose(struct atrium_amd_softc *sc, const char *why)
 	sx_xunlock(&si->lock);
 }
 
+/*
+ * A CP-side fault left a user queue whose HQD will not stop (box runs
+ * a0597b2d..fdadff06; Shankar 2026-11-13: reset and re-init the whole GPU,
+ * as amdgpu does). The client side (si_client.c si_recover) has failed every
+ * queue's work and let go of its kernel queue and the IH consumer. Here: the
+ * mode 1 reset (amd_si_lose, if not done yet), the old generation's memory
+ * freed without the hardware, bus mastering back on, the PSP firmware load
+ * and stages 3-4e again (si_up), as at attach. Old VMs and queues stay lost
+ * until their fds close; new ones run on the new generation. 0: usable
+ * again. Else the GPU stays lost (reset, bus mastering off) as before.
+ */
+int
+amd_si_reinit(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si = sc->si;
+	const char *step = "PSP firmware load";
+	sbintime_t now = sbinuptime();
+	int err, us;
+
+	if (si == NULL)
+		return (ENXIO);
+	sx_xlock(&si->lock);
+	if (si->stopping || si->link.failed) {
+		sx_xunlock(&si->lock);
+		return (EIO);
+	}
+	if (si->reinits == 0 ||
+	    now - si->reinit_first > SI_REINIT_WINDOW * SBT_1S) {
+		si->reinits = 0;
+		si->reinit_first = now;
+	}
+	if (si->reinits >= SI_REINIT_MAX) {
+		device_printf(sc->dev, "si: %u GPU re-inits in %d s; the GPU "
+		    "stays lost until the driver is reloaded\n", si->reinits,
+		    SI_REINIT_WINDOW);
+		sx_xunlock(&si->lock);
+		return (EIO);
+	}
+	si->reinits++;
+	if (!si->lost) {
+		device_printf(sc->dev, "si: resetting the GPU for a re-init\n");
+		(void)amd_smu_mode1_reset(sc);
+		si->lost = true;
+	}
+	if (!si->dma_off) {
+		pci_disable_busmaster(sc->dev);
+		si->dma_off = true;
+	}
+	/* The old generation: nothing of it can be reached any more. */
+	amd_mes12_free_lost(si->mes);
+	si->mes = NULL;
+	amd_ih7_free_lost(si->ih);
+	si->ih = NULL;
+	if (si->gart_up) {
+		amd_gmc12_gart_disable(&si->gt);
+		si->gart_up = false;
+	}
+
+	pci_enable_busmaster(sc->dev);
+	si->dma_off = false;
+	si->link.failed = false;
+	err = amd_psp_bootload_on(sc, si->vram);
+	if (err == 0) {
+		step = "SMU start and idle proof";
+		err = smu_start(&si->link, si->vram, si->table_mc, &si->ifver);
+	}
+	if (err == 0)
+		err = si_up(si, false, &step);
+	if (err != 0) {
+		device_printf(sc->dev, "si: GPU re-init %u failed at %s (%d); "
+		    "the GPU stays lost\n", si->reinits, step, err);
+		if (!si->link.failed)
+			(void)amd_smu_mode1_reset(sc);
+		pci_disable_busmaster(sc->dev);
+		si->dma_off = true;
+		sx_xunlock(&si->lock);
+		return (err);
+	}
+	/* Old VMs still hold GfxOff off; keep that true on the new card. */
+	if (si->gfx_holds > 0) {
+		(void)smu_send(&si->link, SMU_DISALLOW_GFXOFF, 0, NULL, false);
+		for (us = 0; us < GC_WAIT_US &&
+		    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0; us += 100)
+			DELAY(100);
+	}
+	si->lost = false;
+	si->strikes = 0;
+	/* The watcher stops itself once the card is lost: start it again. */
+	taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
+	    SI_WATCH_SECS * hz);
+	device_printf(sc->dev, "si: GPU re-init %u of %d in this window: "
+	    "PASS (MES up, kernel compute queue ready)\n", si->reinits,
+	    SI_REINIT_MAX);
+	sx_xunlock(&si->lock);
+	return (0);
+}
+
 bool
 amd_si_usable(struct atrium_amd_softc *sc)
 {
@@ -1163,6 +1289,8 @@ amd_si_detach(struct atrium_amd_softc *sc)
 		device_printf(sc->dev, "si: MES/IH blocks of a card reset "
 		    "under the client node are leaked, not freed (the IH "
 		    "vector was released)\n");
+	/* A doorbell BAR parked by a re-init that failed. */
+	amd_mes12_db_release(sc);
 	bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid, si->vram);
 	sc->si = NULL;
 	sx_destroy(&si->lock);

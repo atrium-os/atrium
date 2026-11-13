@@ -625,6 +625,26 @@ amd_ih7_vector_off(struct amd_ih7 *ih)
 	ih7_msi_teardown(ih);
 }
 
+/*
+ * The card was reset (mode 1) with bus mastering off: the vector back and
+ * the memory freed, without the hardware (the GART table is rewritten at the
+ * re-init). The consumer must already be off.
+ */
+void
+amd_ih7_free_lost(struct amd_ih7 *ih)
+{
+	if (ih == NULL)
+		return;
+	if (ih->fn != NULL)
+		amd_ih7_set_consumer(ih, NULL, NULL);
+	ih7_msi_teardown(ih);
+	callout_drain(&ih->poll);
+	contigfree(__DEVOLATILE(void *, ih->ring), IH_RING_SIZE, M_DEVBUF);
+	contigfree(__DEVOLATILE(void *, ih->wb), PAGE_SIZE, M_DEVBUF);
+	mtx_destroy(&ih->mtx);
+	free(ih, M_DEVBUF);
+}
+
 /* Ring off, wait, vector off (ih_v7_0_irq_disable), then unmap and free. */
 void
 amd_ih7_down(struct amd_ih7 *ih)

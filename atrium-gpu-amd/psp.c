@@ -548,8 +548,12 @@ out:
 	return (err);
 }
 
-int
-amd_psp_bootload(struct atrium_amd_softc *sc)
+/*
+ * `vram_in`: BAR0 as the caller already holds it (a re-init after a mode 1
+ * reset, smu.c amd_si_reinit), or NULL to take it for the load only.
+ */
+static int
+psp_bootload(struct atrium_amd_softc *sc, struct resource *vram_in)
 {
 	const struct firmware *fw = NULL;
 	struct amd_psp_step st[PSP_MAX_STEPS];
@@ -601,7 +605,8 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 	}
 
 	rid = PCIR_BAR(0);
-	vram = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
+	vram = vram_in != NULL ? vram_in : bus_alloc_resource_any(sc->dev,
+	    SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (vram == NULL ||
 	    rman_get_size(vram) < PSP_FW_VRAM_END) {
 		device_printf(sc->dev, "psp: BAR0 (VRAM window) unusable\n");
@@ -690,8 +695,20 @@ amd_psp_bootload(struct atrium_amd_softc *sc)
 		}
 	}
 out:
-	if (vram != NULL)
+	if (vram != NULL && vram_in == NULL)
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, rid, vram);
 	firmware_put(fw, FIRMWARE_UNLOAD);
 	return (err);
+}
+
+int
+amd_psp_bootload(struct atrium_amd_softc *sc)
+{
+	return (psp_bootload(sc, NULL));
+}
+
+int
+amd_psp_bootload_on(struct atrium_amd_softc *sc, struct resource *vram)
+{
+	return (psp_bootload(sc, vram));
 }
