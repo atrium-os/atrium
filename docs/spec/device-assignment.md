@@ -273,7 +273,7 @@ Until Tessera encryption lands, every removable disk takes the jailed path.
 
 ### 4.7 When nothing matches
 
-Proposed 2026-11-13 (Shankar asked: ignore it, or point the user at a driver
+Accepted 2026-11-13 (Shankar asked: ignore it, or point the user at a driver
 the way Ubuntu points at NVIDIA's?).
 
 1. **Always listed, never exposed.** The device stays visible to nobody (§8
@@ -390,17 +390,16 @@ the way Ubuntu points at NVIDIA's?).
     Decided in discussion; Tessera at-rest encryption with authenticated
     metadata moves up (Shankar: "needed sooner rather than later").
 13. **Kernel GEOM trimmed to GPT + MBR/EBR, label tasters off except GPT.**
-    *Recommend yes.* Open.
-14. **"FAT" = FAT12/16/32 + exFAT, all with VFAT long names.** *Recommend yes* (FAT16: SD ≤ 2 GB, cameras; FAT32: SDHC, most sticks, ESP; exFAT: SDXC > 32 GB).
-    Open.
+    Accepted 2026-11-13.
+14. **"FAT" = FAT12/16/32 + exFAT, all with VFAT long names.** Accepted 2026-11-13 (FAT16: SD ≤ 2 GB, cameras; FAT32: SDHC, most sticks, ESP; exFAT: SDXC > 32 GB).
 15. **Optical: ISO 9660 + UDF via a jailed read-only reader; audio CDs via
-    jailed MMC reads; no kernel `cd9660`/`udf` for media.** *Recommend yes.* Open.
+    jailed MMC reads; no kernel `cd9660`/`udf` for media.** Accepted 2026-11-13.
 
-**Unmatched devices (§4.7), proposed 2026-11-13:**
+**Unmatched devices (§4.7), accepted by Shankar 2026-11-13:**
 
 16. **Driver lookup against the locally downloaded Opifex index; device IDs
-    never leave the machine.** *Recommend yes.* Open.
+    never leave the machine.** Accepted 2026-11-13.
 17. **Notify only for user-facing or just-plugged devices with an available
-    driver; install through Opifex's trusted sheet.** *Recommend yes.* Open.
+    driver; install through Opifex's trusted sheet.** Accepted 2026-11-13.
 18. **No closed-source kernel drivers (e.g. NVIDIA's); fallback to efifb +
-    Tier-2 CPU rendering.** *Recommend yes.* Open.
+    Tier-2 CPU rendering.** Accepted 2026-11-13.
