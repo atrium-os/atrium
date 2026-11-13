@@ -1,0 +1,913 @@
+== fzdiag 2963f5db excerpt (si-fuzz 2963f5db, kmods 2963f5db, fz:3600:0x24f00d)
+== /root/runs/fzdiag-2963f5db.out lines 150-160, si-fuzz section (ENOSPC lines dropped), 357-360, 480-520, 1450-1474
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 92 passed, 0 failed: PASS
+si-client-test rc=0
+== si-fuzz all 3600 0x24f00d
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 610 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+== si-fuzz all 3600 0x24f00d
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 610 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2 re-init(s) before the start: waiting 610 s for the driver's window to close
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 6, findings 0
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 2 -> 3; workers stopped for 610 s
+  last op, slot 0 (35446 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 1 (34600 ops): create queue on fd 61 [in the kernel]
+  last op, slot 2 (39764 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 3 (42251 ops): create VM [in the kernel]
+  last op, slot 4 (34815 ops): create VM [in the kernel]
+  last op, slot 5 (41130 ops): close 74 [in the kernel]
+  last op, slot 16 (4 ops): blob packets: 98 dw, va 0x10001000 (IB 0x10001000) 392 bytes, w0 c0024900 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:   60 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 11, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  120 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 23, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  180 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 35, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  240 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 47, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  300 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 59, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  360 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 71, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  420 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 83, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  480 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 95, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  540 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 107, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz:  600 s: 228010 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 119, re-inits 3, cp_errors 2, vm_faults 9, hangs 8, findings 0
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz: blob generation 4: uid 62004, seed 0x24f011
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 3 -> 4; workers stopped for 610 s
+  last op, slot 0 (37787 ops): ioctl QUERY_CAPS on fd 250 [04 80 02 d5 f2 0e 00 00 92 09 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 1 (36804 ops): kevent on fd 37 [in the kernel]
+  last op, slot 2 (41412 ops): ioctl SYNCOBJ_WAIT on fd 250 [24 00 00 00 00 00 00 00 15 00 00 00 3c 00 00 00 ...] [in the kernel]
+  last op, slot 3 (45165 ops): kevent on fd 36 [in the kernel]
+  last op, slot 4 (36266 ops): ioctl SYNCOBJ_WAIT on fd 250 [2f 00 00 00 00 00 00 00 27 00 00 00 15 00 00 00 ...] [in the kernel]
+  last op, slot 5 (41732 ops): ioctl SYNCOBJ_WAIT on fd 250 [d3 ec d0 ad 0c f1 e3 c9 65 00 00 00 10 00 00 00 ...] [in the kernel]
+  last op, slot 16 (5 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 4 -> 5; workers stopped for 610 s
+  last op, slot 0 (37793 ops): kevent on fd 47
+  last op, slot 1 (36804 ops): kevent on fd 37 [in the kernel]
+  last op, slot 2 (41412 ops): ioctl SYNCOBJ_WAIT on fd 250 [24 00 00 00 00 00 00 00 15 00 00 00 3c 00 00 00 ...] [in the kernel]
+  last op, slot 3 (45165 ops): kevent on fd 36 [in the kernel]
+  last op, slot 4 (36299 ops): close 43
+  last op, slot 5 (41781 ops): ioctl SYNCOBJ_QUERY on fd 250 [b2 74 24 14 fe 63 d5 2a 35 00 00 00 00 00 00 00 ...]
+  last op, slot 16 (5 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:  660 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 128, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz:  720 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 140, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz:  780 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 152, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz:  840 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 164, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz:  900 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 176, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz:  960 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 188, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: 1020 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 200, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: 1080 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 212, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: 1140 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 224, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: 1200 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 236, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: 1260 s: 239259 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 248, re-inits 5, cp_errors 4, vm_faults 11, hangs 10, findings 0
+si-fuzz: ioctl generation 5: uid 61005, seed 0x24f012
+si-fuzz: blob generation 6: uid 62006, seed 0x24f013
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 5 -> 6; workers stopped for 610 s
+  last op, slot 0 (38617 ops): ioctl SYNCOBJ_WAIT on fd 250 [e5 9f e1 43 2b 1d bb fa 12 00 00 00 3f 00 00 00 ...] [in the kernel]
+  last op, slot 1 (38006 ops): kevent on fd 22 [in the kernel]
+  last op, slot 2 (42488 ops): kevent on fd 26 [in the kernel]
+  last op, slot 3 (46683 ops): kevent on fd 25 [in the kernel]
+  last op, slot 4 (37407 ops): ioctl SYNCOBJ_WAIT on fd 250 [d2 88 27 db f5 79 39 3e 1d 00 00 00 4e 00 00 00 ...] [in the kernel]
+  last op, slot 5 (42893 ops): kevent on fd 10 [in the kernel]
+  last op, slot 16 (6 ops): blob blob va/size: 56 dw, va 0x10000000 (IB 0x10001000) 224 bytes, w0 c0065802
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 1321 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 258, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1381 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 270, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1441 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 282, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1501 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 294, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1561 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 306, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1621 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 318, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1681 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 330, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1741 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 342, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1801 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 354, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: 1861 s: 246100 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 366, re-inits 6, cp_errors 5, vm_faults 12, hangs 11, findings 0
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 6 -> 7; workers stopped for 610 s
+  last op, slot 0 (38623 ops): dup2 20 over 14
+  last op, slot 1 (38044 ops): create VM [in the kernel]
+  last op, slot 2 (42531 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 3 (46721 ops): ioctl VM_CREATE on fd 250 [e7 b5 e9 78 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 4 (37418 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 16 c5 17 fd 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 5 (42893 ops): create VM [in the kernel]
+  last op, slot 16 (9 ops): blob packets: 1016 dw, va 0x10001000 (IB 0x10001000) 4064 bytes, w0 c0054900 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 1921 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 377, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1981 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 389, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2041 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 401, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2101 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 413, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2161 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 425, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2221 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 437, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2281 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 449, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2341 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 461, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2401 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 473, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 2461 s: 246239 calls, blob 10 jobs (1 ok, 6 failed, 2 clean after), canary 485, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: ioctl generation 9: uid 61009, seed 0x24f016
+si-fuzz: blob generation 10: uid 62010, seed 0x24f017
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 7 -> 8; workers stopped for 610 s
+  last op, slot 0 (38749 ops): bind fd 56 into fd 37 [in the kernel]
+  last op, slot 1 (38780 ops): kevent on fd 62 [in the kernel]
+  last op, slot 2 (43979 ops): ioctl SYNCOBJ_WAIT on fd 250 [3d 00 00 00 00 00 00 00 16 00 00 00 12 00 00 00 ...] [in the kernel]
+  last op, slot 3 (48794 ops): kevent on fd 22 [in the kernel]
+  last op, slot 4 (39302 ops): ioctl SYNCOBJ_WAIT on fd 250 [14 00 00 00 00 00 00 00 32 00 00 00 4c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (45142 ops): ioctl SYNCOBJ_WAIT on fd 250 [26 00 00 00 00 00 00 00 69 00 00 00 5e 00 00 00 ...] [in the kernel]
+  last op, slot 16 (10 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 8 -> 9; workers stopped for 610 s
+  last op, slot 0 (38749 ops): bind fd 56 into fd 37 [in the kernel]
+  last op, slot 1 (38780 ops): kevent on fd 62 [in the kernel]
+  last op, slot 2 (43979 ops): ioctl SYNCOBJ_WAIT on fd 250 [3d 00 00 00 00 00 00 00 16 00 00 00 12 00 00 00 ...] [in the kernel]
+  last op, slot 3 (48794 ops): kevent on fd 22 [in the kernel]
+  last op, slot 4 (39302 ops): ioctl SYNCOBJ_WAIT on fd 250 [14 00 00 00 00 00 00 00 32 00 00 00 4c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (45142 ops): ioctl SYNCOBJ_WAIT on fd 250 [26 00 00 00 00 00 00 00 69 00 00 00 5e 00 00 00 ...] [in the kernel]
+  last op, slot 16 (10 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2536 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 497, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2596 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 509, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2656 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 521, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2716 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 533, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2776 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 545, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2836 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 557, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2896 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 569, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2956 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 581, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 3016 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 593, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 3076 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 605, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: 3136 s: 254756 calls, blob 12 jobs (1 ok, 7 failed, 2 clean after), canary 617, re-inits 9, cp_errors 8, vm_faults 16, hangs 13, findings 0
+si-fuzz: ioctl generation 11: uid 61011, seed 0x24f018
+si-fuzz: blob generation 12: uid 62012, seed 0x24f019
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 9 -> 10; workers stopped for 610 s
+  last op, slot 0 (39974 ops): kevent on fd 25 [in the kernel]
+  last op, slot 1 (42405 ops): ioctl SYNCOBJ_WAIT on fd 250 [04 00 00 00 00 00 00 00 71 00 00 00 16 00 00 00 ...] [in the kernel]
+  last op, slot 2 (47111 ops): ioctl SYNCOBJ_WAIT on fd 250 [36 00 00 00 00 00 00 00 68 00 00 00 53 00 00 00 ...] [in the kernel]
+  last op, slot 3 (50479 ops): ioctl SYNCOBJ_WAIT on fd 250 [36 00 00 00 00 00 00 00 0d 00 00 00 37 00 00 00 ...] [in the kernel]
+  last op, slot 4 (40732 ops): ioctl SYNCOBJ_WAIT on fd 250 [ec 23 d1 90 58 28 7e 79 63 00 00 00 56 00 00 00 ...] [in the kernel]
+  last op, slot 5 (46362 ops): ioctl SYNCOBJ_WAIT on fd 250 [cc 4d 1a b2 86 2b 2c 2d 3f 00 00 00 52 00 00 00 ...] [in the kernel]
+  last op, slot 16 (11 ops): blob splice: 114 dw, va 0x10001000 (IB 0x10001000) 456 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 10 -> 11; workers stopped for 610 s
+  last op, slot 0 (39974 ops): kevent on fd 25 [in the kernel]
+  last op, slot 1 (42405 ops): ioctl SYNCOBJ_WAIT on fd 250 [04 00 00 00 00 00 00 00 71 00 00 00 16 00 00 00 ...] [in the kernel]
+  last op, slot 2 (47122 ops): dup2 87 over 55
+  last op, slot 3 (50479 ops): ioctl SYNCOBJ_WAIT on fd 250 [36 00 00 00 00 00 00 00 0d 00 00 00 37 00 00 00 ...] [in the kernel]
+  last op, slot 4 (40732 ops): ioctl SYNCOBJ_WAIT on fd 250 [ec 23 d1 90 58 28 7e 79 63 00 00 00 56 00 00 00 ...] [in the kernel]
+  last op, slot 5 (46362 ops): ioctl SYNCOBJ_WAIT on fd 250 [cc 4d 1a b2 86 2b 2c 2d 3f 00 00 00 52 00 00 00 ...] [in the kernel]
+  last op, slot 16 (11 ops): blob splice: 114 dw, va 0x10001000 (IB 0x10001000) 456 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 3196 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 624, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3256 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 636, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3316 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 648, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3376 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 660, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3436 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 672, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3496 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 684, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3556 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 696, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: 3600 s: 267085 calls, blob 14 jobs (1 ok, 8 failed, 2 clean after), canary 705, re-inits 11, cp_errors 10, vm_faults 18, hangs 16, findings 0
+si-fuzz: re-inits at the end 11
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: health: a new VM runs write_42 clean
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+                          ok     EINVAL      EBADF     EFAULT     ENOTTY      EPERM     ENOMEM     ENOSPC        EIO      EBUSY EOPNOTSUPP      other
+  BO_ALLOC              4444       1359        323          0       1924          0          0          0          0          0        144          0
+  BO_WRITE               275       4478        929        327       1953          0          0          0          0          0        109          0
+  BO_READ                237       4549        940        372       1880          0          0          0          0          0        141          0
+  GET_IRQS              5793          0        400          0       1968          0          0          0          0          0        142          0
+  SYNCOBJ_CREATE        5680          0        361          0       1851          0          0          0          0          0        141          0
+  SYNCOBJ_SIGNAL        2351       2739        934          0       1966          0          0          0          0          0        128          0
+  SYNCOBJ_QUERY         2403       2740        917          0       1967          0          0          0          0          0        137          0
+  SYNCOBJ_WAIT           300       2764        947          0       1926          0          0          0          0          0        148       2087
+  VM_CREATE              742          0        396          0       1958          0          0       4892          0          0        131          0
+  VM_BIND                128       4787       1193          0       1980          0          0          0          0          8        136         75
+  QUEUE_MAP                0       4744       1229          0       1947          0          0          0          0          0        143          0
+  QUERY_CAPS            1689          0        363       3234       2025          0        733          0          0          0        119          0
+  VM_BIND2                49       4944       1124          0       1953          0          0          0          0          5        145         29
+  QUEUE_CREATE            11        557       1219          0       5909          6          0          0          0          0        452          0
+  QUEUE_MAP2               0        158       1221          0       6359          0          0          0          0          0        472          0
+  QUEUE_SUBMIT             1        123       1156          0       6314          0          0          0          0          0        492          0
+  GPU_RESET                0          0        368          0       1907       5765          0          0          0          0        146          0
+  SCHED                    0          0        330          0       1958       5725          0          0          0          0        128          0
+  POWERGATE                0          0        367          0       1933       5671          0          0          0          0        128          0
+  old SUBMIT               0          0        375          0       7471          0          0          0          0          0        124          0
+si-fuzz: mmaps that succeeded 0, forks 248, blob VM reopens 12, queue renews 8
+RESULT: PASS (0 findings, seed 0x24f00d)
+si-fuzz rc=0
+reinits 11
+== re-inits during the fuzz (2 -> 11): waiting 610 s
+== re-inits during the fuzz (2 -> 11): waiting 610 s
+== si-client-test after the fuzz
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 62252: Operation not permitted after 5042 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 13 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 92 passed, 0 failed: PASS
+si-client-test rc=0
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 0
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 92
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 13
+dev.atrium_gpu_amd.0.isolation.cp_errors: 12
+dev.atrium_gpu_amd.0.isolation.quota_refused: 0
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 25
+dev.atrium_gpu_amd.0.isolation.hangs: 22
+dev.atrium_gpu_amd.0.isolation.reaped: 109
+dev.atrium_gpu_amd.0.isolation.deferred: 109
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 4
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 27.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 27.0C 
+detach + give-back rc=0 (try 1)
+== kernel log
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 28.0C 
+== done, log /root/runs/20261113T194413Z.log
+== kernel (messages.0.bz2 >= 19:44:13 + messages <= 21:09): key lines
+Nov 13 19:44:18 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 19:44:18 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:44:18 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:44:18 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff82019777 (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:44:18 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:44:18 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff82011cea (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:44:18 grbm: select 0x4 while MES runs (1 from here), from 0xffffffff82019c0c (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:44:19 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 19:44:19 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:19 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:19 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:19 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:25 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:25 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:25 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:25 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:30 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:30 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:35 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:36 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:36 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:36 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:37 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:37 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:40 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:45 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:46 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:46 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:49 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:49 si: unrouted EOP src_data[0]: 0x18000000 x1, 0 x0, 0 x0, 0 x0
+Nov 13 19:44:49 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:44:56 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 19:44:56 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:44:56 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:44:58 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 19:44:58 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:45:03 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 19:45:03 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:03 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:03 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff82019777 (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:45:03 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:03 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff82011cea (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:45:03 grbm: select 0x4 while MES runs (2 from here), from 0xffffffff82019c0c (amd_grbm_select_write at 0xffffffff8200a0c0)
+Nov 13 19:45:04 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:45:04 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 19:45:04 si: unrouted EOP src_data[0]: 0x18000000 x2, 0x4000028 x1, 0 x0, 0 x0
+Nov 13 19:45:05 si: unrouted EOP src_data[0]: 0x18000000 x2, 0x4000028 x1, 0 x0, 0 x0
+Nov 13 19:45:05 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 19:45:12 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 19:45:12 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:45:12 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:45:14 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 19:45:14 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:45:21 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 19:45:21 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:21 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:21 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:45:22 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:45:22 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:45:22 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:32 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:33 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:34 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:35 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:36 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:37 si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0 x0, 0 x0
+Nov 13 19:55:40 si: EOP IV with src_data[0] 0x400002c: no queue of ours; checked every user queue
+Nov 13 19:55:40 uq6: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 19:55:40 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 19:55:42 uq6: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 19:55:42 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 19:55:47 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 19:55:47 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:55:47 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:55:47 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 19:55:48 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 19:55:48 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:48 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:49 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 19:55:49 si: unrouted EOP src_data[0]: 0x18000000 x4, 0x4000028 x2, 0x400002c x1, 0 x0
+Nov 13 20:05:59 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:06:01 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 20:06:01 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:06:01 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:06:03 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:06:03 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:06:09 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:06:09 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:09 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:09 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:10 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:06:10 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:10 si: unrouted EOP src_data[0]: 0x18000000 x6, 0x4000028 x3, 0x400002c x1, 0 x0
+Nov 13 20:06:12 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:06:12 mes: pipe 0 SUSPEND (user gang): refused (fence 0x8 of 0x8, status 0x8100060200000000, rptr 0)
+Nov 13 20:06:12 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:06:14 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:06:14 mes: pipe 0 SUSPEND (user gang): refused (fence 0x9 of 0x9, status 0x8100060200000000, rptr 0)
+Nov 13 20:06:14 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:06:16 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:06:16 mes: pipe 0 SUSPEND (user gang): refused (fence 0xa of 0xa, status 0x8100060200000000, rptr 0)
+Nov 13 20:06:16 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:06:18 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:06:18 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:06:18 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:06:20 uq0: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:06:20 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:06:26 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:06:26 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:26 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:26 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:06:27 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:06:27 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:06:27 si: unrouted EOP src_data[0]: 0x18000000 x7, 0x4000028 x3, 0x400002c x1, 0x4000020 x4
+Nov 13 20:06:27 si: unrouted EOP src_data[0]: 0x18000000 x7, 0x4000028 x3, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:38 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:16:40 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 20:16:40 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:16:40 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:16:42 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:16:42 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:16:47 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:16:47 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:16:47 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:16:47 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:16:48 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:16:48 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:16:48 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:26:59 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:26:59 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:26:59 si: unrouted EOP src_data[0]: 0x18000000 x8, 0x4000028 x4, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:01 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 20:27:01 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:27:01 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:27:03 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:27:03 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:27:09 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:27:09 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:27:09 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:27:09 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:27:10 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:27:10 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:27:10 si: unrouted EOP src_data[0]: 0x18000000 x9, 0x4000028 x5, 0x400002c x1, 0x4000020 x4
+Nov 13 20:37:21 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:37:23 si: EOP IV with src_data[0] 0x400002c: no queue of ours; checked every user queue
+Nov 13 20:37:23 uq6: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:37:23 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:37:24 uq6: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:37:24 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:37:30 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:37:30 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:30 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:30 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:31 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:37:31 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:31 si: unrouted EOP src_data[0]: 0x18000000 x11, 0x4000028 x5, 0x400002c x2, 0x4000020 x4
+Nov 13 20:37:34 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:37:34 mes: pipe 0 SUSPEND (user gang): refused (fence 0x8 of 0x8, status 0x8100060200000000, rptr 0)
+Nov 13 20:37:34 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:37:35 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:37:35 mes: pipe 0 SUSPEND (user gang): refused (fence 0x9 of 0x9, status 0x8100060200000000, rptr 0)
+Nov 13 20:37:35 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:37:38 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:37:38 mes: pipe 0 SUSPEND (user gang): refused (fence 0xa of 0xa, status 0x8100060200000000, rptr 0)
+Nov 13 20:37:38 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:37:40 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:37:40 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:37:40 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:37:42 uq0: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:37:42 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:37:47 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:37:47 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:47 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:47 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:37:48 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:37:48 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:37:48 si: unrouted EOP src_data[0]: 0x18000000 x12, 0x4000028 x5, 0x400002c x2, 0x4000020 x8
+Nov 13 20:37:49 si: unrouted EOP src_data[0]: 0x18000000 x12, 0x4000028 x5, 0x400002c x2, 0x4000020 x8
+Nov 13 20:47:59 si: CP error on me1 HQDs 0x200: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:48:01 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 20:48:01 mes: pipe 0 SUSPEND (user gang): refused (fence 0x19 of 0x19, status 0x8100060200000000, rptr 0)
+Nov 13 20:48:01 si: uq4 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:48:03 si: EOP IV with src_data[0] 0x400002c: no queue of ours; checked every user queue
+Nov 13 20:48:03 mes: pipe 0 SUSPEND (user gang): refused (fence 0x1a of 0x1a, status 0x8100060200000000, rptr 0)
+Nov 13 20:48:03 si: uq6 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:48:03 si: unrouted EOP src_data[0]: 0x18000000 x12, 0x4000028 x6, 0x400002c x3, 0x4000020 x8
+Nov 13 20:48:05 si: EOP IV with src_data[0] 0x400002c: no queue of ours; checked every user queue
+Nov 13 20:48:05 uq6: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:48:05 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:48:07 uq6: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:48:07 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:48:13 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:48:13 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:13 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:13 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:14 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:48:14 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:14 si: CP error on me1 HQDs 0x100: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 20:48:14 si: unrouted EOP src_data[0]: 0x18000000 x13, 0x4000028 x6, 0x400002c x4, 0x4000020 x8
+Nov 13 20:48:16 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:48:16 mes: pipe 0 SUSPEND (user gang): refused (fence 0x8 of 0x8, status 0x8100060200000000, rptr 0)
+Nov 13 20:48:16 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:48:18 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:48:18 mes: pipe 0 SUSPEND (user gang): refused (fence 0x9 of 0x9, status 0x8100060200000000, rptr 0)
+Nov 13 20:48:18 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:48:20 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:48:20 mes: pipe 0 SUSPEND (user gang): refused (fence 0xa of 0xa, status 0x8100060200000000, rptr 0)
+Nov 13 20:48:20 si: uq0 could not be preempted (5); the BO waits for its queues to close
+Nov 13 20:48:22 si: EOP IV with src_data[0] 0x4000020: no queue of ours; checked every user queue
+Nov 13 20:48:22 uq0: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 20:48:22 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 20:48:24 uq0: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 20:48:24 si: a user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 20:48:30 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 20:48:30 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:30 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:30 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 20:48:31 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 20:48:31 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:48:31 si: unrouted EOP src_data[0]: 0x18000000 x14, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 20:48:31 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 20:48:31 si: unrouted EOP src_data[0]: 0x18000000 x15, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 20:55:32 si: unrouted EOP src_data[0]: 0x18000000 x15, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 20:55:35 si: unrouted EOP src_data[0]: 0x18000000 x16, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:45 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:45 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:46 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:46 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:51 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:51 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:51 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:51 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:56 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:05:56 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:01 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:02 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:02 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:02 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:03 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:03 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:06 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:11 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:12 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:12 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:15 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:15 si: unrouted EOP src_data[0]: 0x18000000 x17, 0x4000028 x6, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:15 si: CP error on me1 HQDs 0x400: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 21:06:22 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 21:06:22 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 21:06:22 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 21:06:24 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 21:06:24 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 21:06:29 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 21:06:29 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:29 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:29 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:31 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 21:06:31 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 21:06:31 si: unrouted EOP src_data[0]: 0x18000000 x18, 0x4000028 x7, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:31 si: unrouted EOP src_data[0]: 0x18000000 x18, 0x4000028 x7, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:31 si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+Nov 13 21:06:38 si: EOP IV with src_data[0] 0x4000028: no queue of ours; checked every user queue
+Nov 13 21:06:38 uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+Nov 13 21:06:38 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 13 21:06:40 uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+Nov 13 21:06:40 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 13 21:06:47 gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+Nov 13 21:06:47 gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:47 gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:47 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:48 si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 13 21:06:48 si: EOP IV with src_data[0] 0x18000000: no queue of ours; checked every user queue
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:48 si: unrouted EOP src_data[0]: 0x18000000 x19, 0x4000028 x8, 0x400002c x4, 0x4000020 x12
+Nov 13 21:06:59 gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+Nov 13 21:06:59 si: card proven idle at detach
