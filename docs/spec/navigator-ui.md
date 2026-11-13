@@ -4,7 +4,7 @@
 are all almost done, we can do the main navigator UI design … don't have to follow existing
 conventions … how to sandbox each window/tab, how the navigator ui layout is, is it intuitive to
 browse"). Nothing here is built. §13 lists the decisions, each with a recommendation.
-**Accepted 2026-11-13:** Shankar agreed to all twelve decisions (D1–D12) as recommended, including
+**Accepted 2026-11-13:** Shankar agreed to all decisions (D1–D12, then D13 "Tidy page") as recommended, including
 his own additions made the same day (tier indicator, per-trail sound, security light, status
 bar, private-by-default question).
 **Mockups:** rendered by Pergola on a live headless frescod in the FreeBSD VM
@@ -987,7 +987,7 @@ argued further on paper.
 | **D6** | Favicons | show site favicons (decoded in the page's jail, validated) · **monograms only** (§1) | **Monograms.** No site pixels in the chrome; lookalikes can't copy a monogram any better than the name |
 | **D7** | UI processes | **one per user session** · one per window (§2.3) | **One per session.** It holds nothing worth isolating per window, and the switch is cheap later |
 | **D9** | Malicious-site list for red (§6.5) | **off by default; local signals only** (cert failure, lookalike of an Arca login, jail monitor reports) · a downloaded hashed-prefix list on by default · per-visit online lookups | **Off by default, offered in settings.** The local signals catch what matters most with no data leaving; a list adds a dependency on its publisher |
-| **D13** | Ad residue (§6.6) | **optional "Tidy page", off by default, per site** · on by default · nothing | **Optional, off by default.** Conversion already removes every third-party ad; tidying first-party boxes is a heuristic, so the reader turns it on |
+| **D13** ✓ accepted | Ad residue (§6.6) | **optional "Tidy page", off by default, per site** · on by default · nothing | **Optional, off by default.** Conversion already removes every third-party ad; tidying first-party boxes is a heuristic, so the reader turns it on |
 | **D12** | Always private? (§2.4) | **Personal by default, with "start new trails Unrecorded" and a history retention setting** · Unrecorded always | **Personal by default.** Sites already see an anonymous reader; forgetting everything locally costs restore, history and the certificate-change signal |
 | **D11** | Status bar (§5.7) | **optional, off by default** · always on · none | **Optional, off by default.** The click check runs either way; the bar is for people who look before they click |
 | **D10** | Certificate errors (§6.5) | **no click-through on public sites; private addresses after typing the name** · click-through like other browsers | **No click-through.** A person who sees a red stop page and proceeds is the attack's success case |
