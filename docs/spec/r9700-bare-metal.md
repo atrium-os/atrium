@@ -1199,3 +1199,14 @@ work (self-test, scrub).
   gpusim suites ALL OK. Box artifacts: pci b472c51e…, gpu 75a2d04a…, display
   3d9cea12…, si-client-test unchanged (d59eb2d8…). Logs: claude/project-thread-33aauq
   54635188.
+- **2026-11-13 11:12, the IS_PTE fill on the box (664e9f08): the fault is clean, the
+  wedge stays.** 70 passed, 2 failed, the same as at 10:59. The store at
+  0x7ffffff00000 now faults with WALKER_ERROR 0 and MAPPING_ERROR 0, but the GFXHUB
+  still acks no invalidation. After the wave kill, GRBM_STATUS2 is 0x34118000: UTCL2,
+  EA and CPC/CPF busy. A store past a buffer, which faults at a 4 KiB PTE, never wedges.
+  The working theory: a fault at a large (directory-level) leaf, redirected to the
+  4 KiB default page, sends the access far past that page and hangs in the fabric.
+  fc54eb53 gives client VMs a chain of empty tables (PTB, PDB0, PDB1), so every empty
+  entry points down to a 4 KiB-level fault. gpusim suites ALL OK. Box artifacts: pci
+  2877ac32…, gpu 60da822b…, display 1a282bc0…, si-client-test unchanged (d59eb2d8…).
+  Logs: claude/project-thread-33aauq 96f0b6aa.
