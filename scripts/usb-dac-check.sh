@@ -86,7 +86,7 @@ for u in $UNITS; do
         pkill -f 'daemon.*lyra-dac' || true; pkill lyrad || true; pkill choragusd || true
         sleep 1
         sysctl -q hw.snd.default_unit=$u >/dev/null
-        sysctl -q dev.pcm.$u.bitperfect=1 >/dev/null 2>&1 || true
+        sysctl -q dev.pcm.$u.bitperfect=${BITPERFECT:-1} >/dev/null 2>&1 || true
         chmod 666 /dev/dsp$u
         rm -rf $T /var/db/choragus; install -d -o _choragus -g _choragus -m 0755 $T
         install -d -o _choragus -g _choragus -m 0700 /var/db/choragus
