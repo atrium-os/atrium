@@ -627,3 +627,10 @@ through fd passing, close and jail death.
   EDQUOT (0 % of no VRAM) instead of EOPNOTSUPP; the front-end now refuses VRAM BOs with
   EOPNOTSUPP when the device has no VRAM heap. Idle with the client node attached: 7 W
   (GfxOff allowed while no VM exists). Detach clean, mode 1 reset cold, stray 0.
+- 2026-11-13 02:07, **stage 5c-2a PASSED** (c540be71; log /root/runs/20261113T020625Z.log).
+  si-client-test 11 of 11: dispatch with kqueue completion; two VMs at the same VAs on their
+  own pages; the cross-VM write faulted (TCP, VMID 4) and failed only that submit (EIO), the
+  other VM's page untouched; the faulted VM (fresh syncobj) and the others then ran clean;
+  graphics, VRAM BOs and user-mode queues EOPNOTSUPP. vm_faults counts fault IVs (2 for the one
+  event). Idle with the client node attached 7 W; detach clean, dispatch PASS at detach, mode 1
+  reset cold, stray 0. Next: 5c-2b, client work on MES user queues behind queue fds.
