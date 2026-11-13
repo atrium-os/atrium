@@ -6,8 +6,8 @@ use hospes_rt::sys;
 
 #[repr(C)]
 pub struct Timeval {
-    sec: i64,
-    usec: i64,
+    pub(crate) sec: i64,
+    pub(crate) usec: i64,
 }
 
 #[repr(C)]

@@ -54,7 +54,7 @@ fn log_bytes(b: &[u8]) {
 // ---- formatted output --------------------------------------------------------------
 
 /// Format into a heap buffer: two passes, the first only counts.
-unsafe fn format_vec(fmt: *const u8, ap: &mut VaList) -> Vec<u8> {
+pub(crate) unsafe fn format_vec(fmt: *const u8, ap: &mut VaList) -> Vec<u8> {
     let mut probe = ap.clone();
     let mut b = Buf::new(core::ptr::null_mut(), 0);
     printf::format(&mut b, fmt, &mut probe);
@@ -286,6 +286,37 @@ pub unsafe extern "C" fn fgets(s: *mut u8, n: i32, f: *mut File) -> *mut u8 {
     }
     *s.add(i) = 0;
     s
+}
+
+/// `fileno`: 0, 1, 2 for the standard streams, the descriptor of a virtual file.
+pub(crate) unsafe fn fileno_of(f: *mut File) -> i32 {
+    let Some(r) = file(f) else { return -1 };
+    match r.target {
+        Target::Vfs(fd) => fd,
+        Target::In => 0,
+        Target::Log if core::ptr::eq(f, core::ptr::addr_of_mut!(STDOUT_FILE)) => 1,
+        Target::Log => 2,
+    }
+}
+/// `fdopen` of a virtual file (read-only); any other descriptor is not ours.
+pub(crate) unsafe fn fdopen_vfs(fd: i32) -> *mut File {
+    if !vfs::is_virtual(fd) {
+        set_errno(abi::EBADF);
+        return core::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(File { magic: MAGIC, target: Target::Vfs(fd), unget: EOF, eof: false, err: false }))
+}
+pub unsafe extern "C" fn clearerr(f: *mut File) {
+    if let Some(f) = file(f) {
+        f.eof = false;
+        f.err = false;
+    }
+}
+pub unsafe extern "C" fn feof(f: *mut File) -> i32 {
+    file(f).is_some_and(|f| f.eof && f.unget == EOF) as i32
+}
+pub unsafe extern "C" fn ferror(f: *mut File) -> i32 {
+    file(f).is_some_and(|f| f.err) as i32
 }
 
 // ---- descriptors ---------------------------------------------------------------------

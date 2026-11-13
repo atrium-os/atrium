@@ -109,3 +109,8 @@ mod tests {
         assert_eq!(super::udivti3(u128::MAX, 3), u128::MAX / 3);
     }
 }
+
+/// libgcc's `__popcountdi2` (64-bit `long` on both machines).
+pub extern "C" fn popcountdi2(x: u64) -> i32 {
+    x.count_ones() as i32
+}

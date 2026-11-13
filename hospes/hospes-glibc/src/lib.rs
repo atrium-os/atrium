@@ -9,6 +9,12 @@
 //! (`abort`, `bcmp`), H4 Widevine's (175 on x86_64, 172 on aarch64; `tests/imports.rs`
 //! checks each recorded import list resolves). Where Widevine and OpenH264 import the same
 //! name at different versions, both rows exist and point at the same function.
+//!
+//! S5 (sigillum.md §16.5) adds what the InnaIT PKCS#11 module and the real libstdc++ it is
+//! loaded with import: [`deny`] refuses the network, other processes and code, shared
+//! memory, signals and filesystem changes; [`posix`] computes the rest (strings, wide
+//! strings, the C locale's `_l` calls, stdio, time, maths). An unversioned import binds to
+//! the baseline row.
 #![no_std]
 #![cfg_attr(target_arch = "aarch64", feature(f128))]
 #![allow(clippy::missing_safety_doc, non_upper_case_globals, non_snake_case)]
@@ -19,12 +25,14 @@ extern crate std;
 
 pub mod abi;
 mod cxx;
+mod deny;
 mod jmp;
 mod locale;
 mod mem;
 mod misc;
 mod printf;
 mod process;
+mod posix;
 mod pthread;
 mod scanf;
 mod stdio;
@@ -234,6 +242,7 @@ static TABLE: &[Entry] = table! {
     "__cxa_finalize" B => fnaddr!(misc::__cxa_finalize);
     "_setjmp" B => fnaddr!(jmp::hospes_setjmp);
     "longjmp" B => fnaddr!(jmp::hospes_longjmp);
+    "_longjmp" B => fnaddr!(jmp::hospes_longjmp);
     // time (UTC: no zone data in the jail)
     "gettimeofday" B => fnaddr!(time::gettimeofday);
     "clock_gettime" "GLIBC_2.17" => fnaddr!(process::clock_gettime);
@@ -373,9 +382,191 @@ static TABLE: &[Entry] = table! {
     "_Unwind_GetRegionStart" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetRegionStart);
     "_Unwind_SetGR" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_SetGR);
     "_Unwind_SetIP" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_SetIP);
+    // libstdc++'s personality routine and rethrow need these too (S5)
+    "_Unwind_GetIPInfo" "GCC_4.2.0" => fnaddr!(unwinding::abi::_Unwind_GetIPInfo);
+    "_Unwind_GetDataRelBase" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetDataRelBase);
+    "_Unwind_GetTextRelBase" "GCC_3.0" => fnaddr!(unwinding::abi::_Unwind_GetTextRelBase);
+    "_Unwind_Resume_or_Rethrow" "GCC_3.3" => fnaddr!(unwinding::abi::_Unwind_Resume_or_Rethrow);
+    "__popcountdi2" "GCC_3.4" => fnaddr!(misc::popcountdi2);
     "_ZTVN10__cxxabiv117__class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::CLASS_TYPE_INFO_VTABLE);
     "_ZTVN10__cxxabiv120__si_class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::SI_CLASS_TYPE_INFO_VTABLE);
     "_ZTVN10__cxxabiv121__vmi_class_type_infoE" "CXXABI_1.3" => dataaddr!(cxx::VMI_CLASS_TYPE_INFO_VTABLE);
+    // S5 (sigillum.md §16.5): the InnaIT PKCS#11 module and the real libstdc++ it needs.
+    // Refused outright (deny.rs): the network, other processes and code, shared memory,
+    // signals, filesystem changes.
+    "socket" B => fnaddr!(deny::socket);
+    "bind" B => fnaddr!(deny::bind);
+    "connect" B => fnaddr!(deny::connect);
+    "listen" B => fnaddr!(deny::listen);
+    "accept" B => fnaddr!(deny::accept);
+    "recv" B => fnaddr!(deny::recv);
+    "recvfrom" B => fnaddr!(deny::recvfrom);
+    "send" B => fnaddr!(deny::send);
+    "sendto" B => fnaddr!(deny::sendto);
+    "sendmsg" B => fnaddr!(deny::sendmsg);
+    "getsockopt" B => fnaddr!(deny::getsockopt);
+    "setsockopt" B => fnaddr!(deny::setsockopt);
+    "getpeername" B => fnaddr!(deny::getpeername);
+    "getsockname" B => fnaddr!(deny::getsockname);
+    "shutdown" B => fnaddr!(deny::shutdown);
+    "getaddrinfo" B => fnaddr!(deny::getaddrinfo);
+    "freeaddrinfo" B => fnaddr!(deny::freeaddrinfo);
+    "gai_strerror" B => fnaddr!(deny::gai_strerror);
+    "getnameinfo" B => fnaddr!(deny::getnameinfo);
+    "gethostbyname" B => fnaddr!(deny::gethostbyname);
+    "fork" B => fnaddr!(deny::fork);
+    "execle" B => fnaddr!(deny::execle);
+    "popen" B => fnaddr!(deny::popen);
+    "pclose" B => fnaddr!(deny::pclose);
+    "getcontext" B => fnaddr!(deny::getcontext);
+    "setcontext" B => fnaddr!(deny::setcontext);
+    "makecontext" B => fnaddr!(deny::makecontext);
+    "dlopen" B => fnaddr!(deny::dlopen);
+    "dlerror" B => fnaddr!(deny::dlerror);
+    "dladdr" B => fnaddr!(deny::dladdr);
+    "dl_iterate_phdr" B => fnaddr!(deny::dl_iterate_phdr);
+    "shmget" B => fnaddr!(deny::shmget);
+    "shmat" B => fnaddr!(deny::shmat);
+    "shmdt" B => fnaddr!(deny::shmdt);
+    "sigaction" B => fnaddr!(deny::sigaction);
+    "signal" B => fnaddr!(deny::signal);
+    "__sysv_signal" B => fnaddr!(deny::signal);
+    "sigemptyset" B => fnaddr!(deny::sigemptyset);
+    "putenv" B => fnaddr!(deny::putenv);
+    "mlock" B => fnaddr!(deny::mlock);
+    "chdir" B => fnaddr!(deny::chdir);
+    "chmod" B => fnaddr!(deny::chmod);
+    "fchmod" B => fnaddr!(deny::fchmod);
+    "fchmodat" (pick!("GLIBC_2.4", "GLIBC_2.17")) => fnaddr!(deny::fchmodat);
+    "mkdir" B => fnaddr!(deny::mkdir);
+    "remove" B => fnaddr!(deny::remove);
+    "rename" B => fnaddr!(deny::rename);
+    "link" B => fnaddr!(deny::link);
+    "symlink" B => fnaddr!(deny::symlink);
+    "truncate" B => fnaddr!(deny::truncate);
+    "utimensat" (pick!("GLIBC_2.6", "GLIBC_2.17")) => fnaddr!(deny::utimensat);
+    "opendir" B => fnaddr!(deny::opendir);
+    "readdir" B => fnaddr!(deny::readdir);
+    "readdir64" B => fnaddr!(deny::readdir);
+    "closedir" B => fnaddr!(deny::closedir);
+    "statvfs" B => fnaddr!(deny::statvfs);
+    "sendfile" B => fnaddr!(deny::sendfile);
+    "dup" B => fnaddr!(deny::dup);
+    "dup2" B => fnaddr!(deny::dup2);
+    "ioctl" B => fnaddr!(deny::ioctl);
+    "tcgetattr" B => fnaddr!(deny::tcgetattr);
+    "tcsetattr" B => fnaddr!(deny::tcsetattr);
+    // Computed here (posix.rs): strings, wide strings, the C locale, stdio, time, maths.
+    "strcpy" B => fnaddr!(posix::strcpy);
+    "stpcpy" B => fnaddr!(posix::stpcpy);
+    "strcat" B => fnaddr!(posix::strcat);
+    "__strcpy_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__strcpy_chk);
+    "__strcat_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__strcat_chk);
+    "__memset_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__memset_chk);
+    "__fdelt_chk" (pick!("GLIBC_2.15", "GLIBC_2.17")) => fnaddr!(posix::__fdelt_chk);
+    "strdup" B => fnaddr!(posix::strdup);
+    "strcasecmp" B => fnaddr!(posix::strcasecmp);
+    "strncasecmp" B => fnaddr!(posix::strncasecmp);
+    "strspn" B => fnaddr!(posix::strspn);
+    "strcspn" B => fnaddr!(posix::strcspn);
+    "strstr" B => fnaddr!(posix::strstr);
+    "strtok" B => fnaddr!(posix::strtok);
+    "strtok_r" B => fnaddr!(posix::strtok_r);
+    "__xpg_strerror_r" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__xpg_strerror_r);
+    "tolower" B => fnaddr!(posix::tolower);
+    "isalnum" B => fnaddr!(posix::isalnum);
+    "isspace" B => fnaddr!(posix::isspace);
+    "strtod" B => fnaddr!(string::strtod);
+    "strtoll" B => fnaddr!(string::strtoll);
+    "wcscmp" B => fnaddr!(posix::wcscmp);
+    "wcsdup" B => fnaddr!(posix::wcsdup);
+    "wcsncpy" B => fnaddr!(posix::wcsncpy);
+    "wmemcpy" B => fnaddr!(posix::wmemcpy);
+    "wmemmove" B => fnaddr!(posix::wmemmove);
+    "wmemset" B => fnaddr!(posix::wmemset);
+    "wmemcmp" B => fnaddr!(posix::wmemcmp);
+    "btowc" B => fnaddr!(posix::btowc);
+    "wctob" B => fnaddr!(posix::wctob);
+    "mbstowcs" B => fnaddr!(posix::mbstowcs);
+    "setlocale" B => fnaddr!(posix::setlocale);
+    "localeconv" B => fnaddr!(posix::localeconv);
+    "__newlocale" B => fnaddr!(locale::newlocale);
+    "__freelocale" B => fnaddr!(locale::freelocale);
+    "__uselocale" (pick!("GLIBC_2.3", "GLIBC_2.17")) => fnaddr!(locale::uselocale);
+    "__duplocale" B => fnaddr!(posix::__duplocale);
+    "__nl_langinfo_l" B => fnaddr!(posix::__nl_langinfo_l);
+    "__wctype_l" B => fnaddr!(posix::__wctype_l);
+    "__iswctype_l" B => fnaddr!(posix::__iswctype_l);
+    "__towlower_l" B => fnaddr!(posix::__towlower_l);
+    "__towupper_l" B => fnaddr!(posix::__towupper_l);
+    "__strcoll_l" B => fnaddr!(posix::__strcoll_l);
+    "__strxfrm_l" B => fnaddr!(posix::__strxfrm_l);
+    "__wcscoll_l" B => fnaddr!(posix::__wcscoll_l);
+    "__wcsxfrm_l" B => fnaddr!(posix::__wcsxfrm_l);
+    "__strftime_l" (pick!("GLIBC_2.3", "GLIBC_2.17")) => fnaddr!(time::strftime_l);
+    "__wcsftime_l" (pick!("GLIBC_2.3", "GLIBC_2.17")) => fnaddr!(posix::__wcsftime_l);
+    "__strtod_l" B => fnaddr!(string::strtod_l);
+    "__strtof_l" B => fnaddr!(string::strtof_l);
+    "gettext" B => fnaddr!(posix::gettext);
+    "dgettext" B => fnaddr!(posix::dgettext);
+    "bindtextdomain" B => fnaddr!(posix::bindtextdomain);
+    "bind_textdomain_codeset" B => fnaddr!(posix::bind_textdomain_codeset);
+    "iconv_open" B => fnaddr!(posix::iconv_open);
+    "iconv" B => fnaddr!(posix::iconv);
+    "iconv_close" B => fnaddr!(posix::iconv_close);
+    "open" B => fnaddr!(stdio::open64);
+    "close" B => fnaddr!(posix::close);
+    "lseek" B => fnaddr!(posix::lseek64);
+    "lseek64" B => fnaddr!(posix::lseek64);
+    "mmap" B => fnaddr!(process::mmap64);
+    "fcntl64" (pick!("GLIBC_2.28", "GLIBC_2.28")) => fnaddr!(stdio::fcntl);
+    "__xstat" B => fnaddr!(stdio::__xstat64);
+    "__lxstat" B => fnaddr!(stdio::__xstat64);
+    "__fxstat" B => fnaddr!(stdio::__fxstat64);
+    "writev" B => fnaddr!(posix::writev);
+    "poll" B => fnaddr!(posix::poll);
+    "select" B => fnaddr!(posix::select);
+    "getcwd" B => fnaddr!(posix::getcwd);
+    "realpath" (pick!("GLIBC_2.3", "GLIBC_2.17")) => fnaddr!(posix::realpath);
+    "readlink" B => fnaddr!(posix::readlink);
+    "clearerr" B => fnaddr!(stdio::clearerr);
+    "feof" B => fnaddr!(stdio::feof);
+    "ferror" B => fnaddr!(stdio::ferror);
+    "fileno" B => fnaddr!(posix::fileno);
+    "fgetc" B => fnaddr!(stdio::getc);
+    "putc" B => fnaddr!(stdio::fputc);
+    "putwc" B => fnaddr!(stdio::fputwc);
+    "fputs" B => fnaddr!(posix::fputs);
+    "fread" B => fnaddr!(posix::fread);
+    "__fread_chk" (pick!("GLIBC_2.7", "GLIBC_2.17")) => fnaddr!(posix::__fread_chk);
+    "ftell" B => fnaddr!(posix::ftello64);
+    "ftello64" B => fnaddr!(posix::ftello64);
+    "fseeko64" B => fnaddr!(stdio::fseek);
+    "fdopen" B => fnaddr!(posix::fdopen);
+    "setbuf" B => fnaddr!(posix::setbuf);
+    "setvbuf" B => fnaddr!(posix::setvbuf);
+    "sprintf" B => fnaddr!(posix::sprintf);
+    "__sprintf_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__sprintf_chk);
+    "__snprintf_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__snprintf_chk);
+    "__printf_chk" (pick!("GLIBC_2.3.4", "GLIBC_2.17")) => fnaddr!(posix::__printf_chk);
+    "openlog" B => fnaddr!(posix::openlog);
+    "closelog" B => fnaddr!(posix::closelog);
+    "__syslog_chk" (pick!("GLIBC_2.4", "GLIBC_2.17")) => fnaddr!(posix::__syslog_chk);
+    "__assert_fail" B => fnaddr!(posix::__assert_fail);
+    "time" B => fnaddr!(posix::time);
+    "tzset" B => fnaddr!(posix::tzset);
+    "gmtime" B => fnaddr!(posix::gmtime);
+    "get_nprocs" B => fnaddr!(posix::get_nprocs);
+    "getentropy" "GLIBC_2.25" => fnaddr!(posix::getentropy);
+    "secure_getenv" "GLIBC_2.17" => fnaddr!(process::getenv);
+    "__cxa_thread_atexit_impl" "GLIBC_2.18" => fnaddr!(posix::__cxa_thread_atexit_impl);
+    "__pthread_key_create" B => fnaddr!(pthread::pthread_key_create);
+    "pthread_key_delete" B => fnaddr!(posix::pthread_key_delete);
+    "inet_ntoa" B => fnaddr!(posix::inet_ntoa);
+    "inet_ntop" B => fnaddr!(posix::inet_ntop);
+    "fmod" B => fnaddr!(posix::fmod);
+    "modf" B => fnaddr!(posix::modf);
+    "frexpl" B => posix::frexpl_addr;
     // glibc-internal TLS entry for general-dynamic access
     "__tls_get_addr" (pick!("GLIBC_2.3", "GLIBC_2.17")) => fnaddr!(hospes_rt::tls::hospes_tls_get_addr);
 };
@@ -385,7 +576,14 @@ pub struct Glibc;
 
 impl Resolver for Glibc {
     fn resolve(&self, name: &str, version: Option<&str>) -> Option<usize> {
-        TABLE.iter().find(|e| e.name == name && e.version == version).map(|e| (e.addr)())
+        // An unversioned reference binds to the baseline definition, as ld.so binds it to
+        // the oldest (the module was linked against a glibc without version info for it,
+        // e.g. libpthread's names in the InnaIT module).
+        TABLE
+            .iter()
+            .find(|e| e.name == name && e.version == version)
+            .or_else(|| version.is_none().then(|| TABLE.iter().find(|e| e.name == name && e.version == Some(BASE))).flatten())
+            .map(|e| (e.addr)())
     }
 }
 
