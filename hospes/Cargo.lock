@@ -1220,6 +1220,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "portcullis-peer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
@@ -1545,6 +1552,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sigillum-p11-usb"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sigillum-proto",
+ "sigillumd",
+ "zeroize",
+]
+
+[[package]]
 name = "sigillum-pcsc"
 version = "0.1.0"
 dependencies = [
@@ -1558,6 +1575,21 @@ dependencies = [
  "postcard",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "sigillumd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "p256",
+ "p384",
+ "portcullis-peer",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sigillum-proto",
 ]
 
 [[package]]

@@ -10,7 +10,8 @@
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
-use sha2::{Digest, Sha256, Sha384, Sha512};
+pub use sha2::{Digest, Sha256};
+use sha2::{Sha384, Sha512};
 use sigillum_proto::driver::{cap, HashAlg, SignScheme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
