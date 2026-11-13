@@ -361,6 +361,7 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	sc->sys_limit_pct = ATRIUM_AMD_SYS_LIMIT_PCT;
 	sc->queue_limit = ATRIUM_AMD_QUEUE_LIMIT;
 	sc->gpu_wx = 0;
+	sc->reset_lockout_s = ATRIUM_AMD_RESET_LOCKOUT_S;
 	sc->hwq_inited = 1;
 
 	err = amd_dma_page_alloc(sc, &sc->null_pd);	/* zeroed: all invalid */
@@ -409,6 +410,10 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_U64("cp_errors", cp_errors,
 	    "CP error interrupts (bad opcode, privileged register or "
 	    "instruction) from client streams");
+	AMD_ISO_U64("resets_blamed", resets_blamed,
+	    "whole-GPU resets a client queue forced");
+	AMD_ISO_U64("lockout_refused", lockout_refused,
+	    "queue creates refused: the uid forced a GPU reset recently");
 	AMD_ISO_INT("deferred_now", deferred_now, "deferred BO frees pending");
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64
@@ -434,6 +439,10 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    amd_iso_sysctl_queue_limit, "I",
 	    "live queue fds one uid may hold (silicon has AMD_UQ_SLOTS in all)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "reset_lockout_s",
+	    CTLFLAG_RW, &sc->reset_lockout_s, 0,
+	    "seconds a uid gets no new queues after its queue forced a GPU "
+	    "reset (root exempt; 0 = off)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gpu_wx",
 	    CTLFLAG_RW, &sc->gpu_wx, 0,
 	    "GPU W^X bits (silicon; new mappings): 1 = client BOs executable "

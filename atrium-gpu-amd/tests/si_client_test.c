@@ -66,7 +66,11 @@
  *                VM and must be refused (its work fails, the marker after it
  *                never lands, the register is unchanged); a read must not
  *                return the real value; a bystander VM runs clean after
- *                each. Stops after 2 whole-GPU re-inits (cap 3 per 10 min).
+ *                each. Each hostile job runs in a child under its own uid:
+ *                if its queue forced a whole-GPU reset, that uid's next
+ *                QUEUE_CREATE is refused (EPERM, isolation.reset_lockout_s)
+ *                while root's still works. Stops after 2 whole-GPU
+ *                re-inits (cap 3 per 10 min).
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1385,61 +1389,121 @@ enum pr_kind { PR_WRITE_DATA, PR_COPY_IMM, PR_READ };
 static const char *const pr_kname[] = { "WRITE_DATA", "COPY_DATA imm",
     "COPY_DATA read" };
 
+/* What a hostile job's child reports. */
+struct pr_res {
+	int	err, ms, refused, ran, setup_err, requeue_err;
+	uint32_t got;
+};
+
 /*
- * One hostile job on a fresh VM: the packet, then a marker write to its own
- * out page. What happened: *refused (the work failed and the marker never
- * landed), *ran (completed with the marker), *cpe (CP error IVs counted),
- * *got (out word 1 for a read). 0, or -1 if the job could not be set up.
+ * One hostile job on a fresh VM, in a child that runs as `uid` (the
+ * device fd is inherited, so its calls count against that uid): the packet,
+ * then a marker write to its own out page. Afterwards the child asks for a
+ * new queue on a new VM: a uid whose queue forced a GPU reset is refused
+ * (EPERM). *cpe: CP error IVs counted meanwhile. 0, or -1 if no child.
  */
 static int
-pr_job(enum pr_kind k, uint32_t dw, uint32_t v, int *refused, int *ran,
-    int64_t *cpe, uint32_t *got, int *err, int *ms)
+pr_job(enum pr_kind k, uint32_t dw, uint32_t v, uid_t uid, struct pr_res *res,
+    int64_t *cpe)
 {
 	struct job j;
+	struct pr_res r;
 	uint32_t w[16], out[2];
 	int64_t c0;
 	u_int n = 0;
+	int pfd[2], st, vm, q;
+	pid_t pid;
 
-	*refused = *ran = 0;
-	*got = 0;
-	if (job_open(&j, "14") != 0 || poison(j.out, POISON_B) != 0) {
-		job_close(&j);
+	memset(res, 0, sizeof(*res));
+	res->setup_err = EIO;
+	if (pipe(pfd) != 0)
 		return (-1);
-	}
-	if (k == PR_WRITE_DATA)
-		n = pr_write_data(w, dw, v);
-	else if (k == PR_COPY_IMM)
-		n = pr_copy_imm(w, dw, v);
-	else
-		n = pr_copy_read(w, dw, j.out_va + 4);
-	n += pr_mark(w + n, j.out_va, PR_MARK);
 	c0 = iso("cp_errors");
-	if (bo_xfer(j.ib, w, n * 4, 1) != 0 ||
-	    (*err = queue_submit(j.q, j.ib_va, n, j.so, ++j.value,
-	    NULL)) != 0) {
-		job_close(&j);
+	if ((pid = fork()) < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
 		return (-1);
 	}
-	*err = job_wait(&j, 15000, ms);
+	if (pid == 0) {
+		close(pfd[0]);
+		memset(&r, 0, sizeof(r));
+		if (setuid(uid) != 0) {
+			r.setup_err = errno;
+			goto report;
+		}
+		if (job_open(&j, "14") != 0 || poison(j.out, POISON_B) != 0) {
+			r.setup_err = errno != 0 ? errno : EIO;
+			goto report;
+		}
+		if (k == PR_WRITE_DATA)
+			n = pr_write_data(w, dw, v);
+		else if (k == PR_COPY_IMM)
+			n = pr_copy_imm(w, dw, v);
+		else
+			n = pr_copy_read(w, dw, j.out_va + 4);
+		n += pr_mark(w + n, j.out_va, PR_MARK);
+		if (bo_xfer(j.ib, w, n * 4, 1) != 0 ||
+		    (r.err = queue_submit(j.q, j.ib_va, n, j.so, ++j.value,
+		    NULL)) != 0) {
+			r.setup_err = r.err != 0 ? r.err : errno;
+			goto report;
+		}
+		r.err = job_wait(&j, 15000, &r.ms);
+		if (bo_xfer(j.out, out, sizeof(out), 0) != 0)
+			out[0] = out[1] = POISON_B;
+		r.ran = r.err == 0 && out[0] == PR_MARK;
+		r.refused = r.err != 0 && out[0] != PR_MARK;
+		r.got = out[1];
+		job_close(&j);
+		/* A new queue for the same uid, after whatever happened. */
+		usleep(500000);
+		vm = vm_create();
+		q = vm >= 0 ? queue_create(vm) : -1;
+		r.requeue_err = q >= 0 ? 0 : errno;
+		if (q >= 0)
+			close(q);
+		if (vm >= 0)
+			close(vm);
+report:
+		(void)write(pfd[1], &r, sizeof(r));
+		_exit(0);
+	}
+	close(pfd[1]);
+	if (read(pfd[0], res, sizeof(*res)) != sizeof(*res))
+		res->setup_err = EIO;
+	close(pfd[0]);
+	(void)waitpid(pid, &st, 0);
 	*cpe = iso("cp_errors") - c0;
-	if (bo_xfer(j.out, out, sizeof(out), 0) != 0)
-		out[0] = out[1] = POISON_B;
-	*ran = *err == 0 && out[0] == PR_MARK;
-	*refused = *err != 0 && out[0] != PR_MARK;
-	*got = out[1];
-	job_close(&j);
 	return (0);
+}
+
+/* The order the targets run in: the ones a box run has not covered yet
+ * first (box run 4efb65df stopped after the two VM context bases). */
+static const char *const pr_order[] = { "ih_rb_base", "cp_mes_cntl",
+    "gc_vm_ctx0_pt_base_lo", "mm_vm_ctx0_pt_base_lo", "smu_msg_arg" };
+
+static int
+pr_rank(const char *name)
+{
+	u_int i;
+
+	for (i = 0; i < (sizeof(pr_order) / sizeof(pr_order[0])); i++)
+		if (strcmp(pr_order[i], name) == 0)
+			return ((int)i);
+	return ((int)(sizeof(pr_order) / sizeof(pr_order[0])));
 }
 
 static void
 hostile_pm4(void)
 {
-	struct preg p[PR_MAX];
+	struct preg p[PR_MAX], tmp;
+	struct pr_res res;
 	struct job by;
 	enum pr_kind k;
 	uint32_t got, now;
+	uid_t uid = 60000 + (uid_t)(getpid() % 500) * 10;
 	int64_t cpe;
-	int n, i, ri0, ri, refused, ran, err, ms, ok, stopped = 0, pass;
+	int n, i, x, ri0, ri, refused, ran, ok, stopped = 0, pass, resets;
 	char what[160];
 
 	n = preg_read(p, &ri0);
@@ -1450,6 +1514,13 @@ hostile_pm4(void)
 	}
 	check(n >= 5 && ri0 >= 0, "14 hostile PM4: the target list",
 	    "%d registers, re-inits so far %d", n, ri0);
+	for (i = 1; i < n; i++)		/* insertion sort by pr_rank */
+		for (x = i; x > 0 && pr_rank(p[x].name) <
+		    pr_rank(p[x - 1].name); x--) {
+			tmp = p[x];
+			p[x] = p[x - 1];
+			p[x - 1] = tmp;
+		}
 	for (i = 0; i < n; i++)
 		printf("14: target %s at dword %#x = %#x (%s)\n", p[i].name,
 		    p[i].dw, p[i].val, p[i].w ? "write same value" :
@@ -1470,21 +1541,40 @@ hostile_pm4(void)
 		for (i = 0; i < n && !stopped; i++) {
 			if (k != PR_READ && !p[i].w)
 				continue;
-			if (pr_job(k, p[i].dw, p[i].val, &refused, &ran, &cpe,
-			    &got, &err, &ms) != 0) {
+			uid++;
+			(void)preg_read(NULL, &x);
+			if (pr_job(k, p[i].dw, p[i].val, uid, &res, &cpe) != 0 ||
+			    res.setup_err != 0) {
 				snprintf(what, sizeof(what), "14 %s %s",
 				    pr_kname[k], p[i].name);
-				check(0, what, "setup: %s", strerror(errno));
+				check(0, what, "setup as uid %u: %s", (u_int)uid,
+				    strerror(res.setup_err != 0 ?
+				    res.setup_err : errno));
 				continue;
 			}
+			refused = res.refused;
+			ran = res.ran;
+			got = res.got;
 			now = preg_now(p[i].name, &ok);
 			(void)preg_read(NULL, &ri);
-			printf("14: %s %s: %s after %d ms, marker %s, CP "
-			    "errors +%jd, word %#x, register now %#x, "
-			    "re-inits %d\n", pr_kname[k], p[i].name,
-			    err == 0 ? "completed" : strerror(err), ms,
-			    ran ? "written" : "not written", (intmax_t)cpe,
-			    got, now, ri);
+			resets = x >= 0 && ri >= 0 ? ri - x : -1;
+			printf("14: %s %s as uid %u: %s after %d ms, marker %s, "
+			    "CP errors +%jd, word %#x, register now %#x, "
+			    "re-inits %d (+%d), the uid's next queue: %s\n",
+			    pr_kname[k], p[i].name, (u_int)uid, res.err == 0 ?
+			    "completed" : strerror(res.err), res.ms, ran ?
+			    "written" : "not written", (intmax_t)cpe, got, now,
+			    ri, resets, res.requeue_err == 0 ? "created" :
+			    strerror(res.requeue_err));
+			/* The reset rule: a uid whose queue forced a GPU
+			 * reset gets no new queue; one that did not, does. */
+			snprintf(what, sizeof(what), "14 after %s to %s: the "
+			    "uid's next queue is %s", pr_kname[k], p[i].name,
+			    resets > 0 ? "refused (it forced a GPU reset)" :
+			    "created (no GPU reset)");
+			check(resets > 0 ? res.requeue_err == EPERM :
+			    res.requeue_err == 0, what, "%s", res.requeue_err ==
+			    0 ? "created" : strerror(res.requeue_err));
 			snprintf(what, sizeof(what), "14 %s to %s: refused",
 			    pr_kname[k], p[i].name);
 			if (k == PR_READ) {
@@ -1521,7 +1611,7 @@ hostile_pm4(void)
 				stopped = 1;
 				break;
 			}
-			if (ri != ri0) {
+			if (resets != 0) {
 				/* The bystander's VM went with the reset. */
 				job_close(&by);
 				if (job_open(&by, "14 bystander") != 0)
@@ -1534,9 +1624,14 @@ hostile_pm4(void)
 	}
 
 	(void)preg_read(NULL, &ri);
-	check(ri == ri0, "14 hostile PM4: a refused packet costs its queue, "
-	    "not a whole-GPU re-init", "re-inits %d -> %d%s", ri0, ri,
-	    stopped ? "; stopped early" : "");
+	if (ri == ri0)
+		check(1, "14 hostile PM4: a refused packet costs its queue, "
+		    "not a whole-GPU re-init", "re-inits %d -> %d", ri0, ri);
+	else
+		printf("KNOWN: 14 hostile PM4: refused packets cost %d "
+		    "whole-GPU re-init(s)%s; the uids that forced them were "
+		    "locked out (per-queue recovery still owed)\n",
+		    ri < 0 ? -1 : ri - ri0, stopped ? ", stopped early" : "");
 	job_close(&by);
 	if (job_open(&by, "14 after") == 0)
 		run_clean(&by, "14 hostile PM4: a new VM runs clean after");

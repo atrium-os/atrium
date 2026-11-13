@@ -696,6 +696,7 @@ struct atrium_amd_reset_hooks {
 #define ATRIUM_AMD_VRAM_LIMIT_PCT 75	/* default per-uid VRAM cap (kmod audit G2) */
 #define ATRIUM_AMD_SYS_LIMIT_PCT 50	/* default per-uid System BO cap */
 #define ATRIUM_AMD_QUEUE_LIMIT	32	/* default per-uid live queue fds (ABI §4.2) */
+#define ATRIUM_AMD_RESET_LOCKOUT_S 600	/* default reset-blame lockout */
 
 struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
@@ -713,6 +714,8 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 vm_faults;	/* VM fault interrupts */
 	uint64_t	 quota_refused;	/* BO_ALLOCs refused with EDQUOT */
 	uint64_t	 cp_errors;	/* CP error IVs: bad opcode, priv reg/instr */
+	uint64_t	 resets_blamed;	/* GPU resets a client queue forced */
+	uint64_t	 lockout_refused; /* QUEUE_CREATEs refused: uid locked out */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
 };
@@ -1129,6 +1132,8 @@ struct atrium_amd_softc {
 	int		 sys_limit_pct;	/* per-uid System BO cap, % of RAM */
 	int		 queue_limit;	/* per-uid live queue fds (rs/quota.rs) */
 	int		 gpu_wx;	/* AMD_WX_*: GPU W^X on silicon PTEs */
+	int		 reset_lockout_s; /* no new queues for a uid whose queue
+					   * forced a GPU reset; 0 = off */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
 	struct atrium_amd_vram vram;	/* device VRAM allocator (base, vram.c) */
 	struct amd_clear_engine clear;	/* VRAM clear engine (gpu, clear.c) */

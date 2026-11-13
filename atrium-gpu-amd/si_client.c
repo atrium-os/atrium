@@ -87,6 +87,7 @@ struct si_uq {
 	bool	 evict;			/* lost, still on MES: the task removes it */
 	bool	 user;			/* user mode: the client's ring (step 3) */
 	bool	 stale;			/* of a generation a GPU re-init ended */
+	uid_t	 ruid;			/* its creator's real uid (reset blame) */
 	uint32_t prog_rptr;		/* user mode's hang clock: rptr at prog_tick */
 	uint32_t prog_fence;		/* hang clock: fence at prog_tick */
 	int	 prog_tick;
@@ -94,6 +95,9 @@ struct si_uq {
 	u_int	 head, n;
 	uint64_t submits;
 };
+
+/* Uids remembered as having forced a GPU reset (the oldest is replaced). */
+#define SI_BLAME_SLOTS		16
 
 /* The 5c-2a path (client SUBMIT on the kernel queue): off from 5c-2b. */
 static bool si_legacy_submit = false;
@@ -124,6 +128,13 @@ struct amd_si_client {
 	u_int	 uq_cur;		/* ... of the current generation */
 	uint32_t vm_lost;		/* VMIDs of VMs a GPU re-init ended */
 	uint64_t reinits;		/* GPU re-inits that passed */
+	/* Reset blame (sc->lock): uids whose queue forced a whole-GPU reset
+	 * get no new queues until `until` (ticks). */
+	struct si_blame {
+		uid_t	 uid;
+		int	 until;
+		bool	 used;
+	} blame[SI_BLAME_SLOTS];
 	uint32_t uq_int_saved[4];	/* MEC1 pipes' INT_CNTL before */
 	struct callout uq_poll;
 	struct task uq_task;		/* evicts lost queues (taskqueue_thread) */
@@ -368,7 +379,60 @@ static void si_iv(void *, const uint32_t *);
  * uq_sx held.
  */
 static void
-si_recover(struct amd_si_client *c, const char *why)
+si_blame(struct amd_si_client *c, uid_t uid)
+{
+	struct atrium_amd_softc *sc = c->sc;
+	struct si_blame *b, *old = NULL;
+	int secs;
+	u_int i;
+
+	mtx_lock(&sc->lock);
+	secs = sc->reset_lockout_s;
+	sc->iso.resets_blamed++;
+	if (uid == 0 || secs <= 0) {
+		/* Root holds PRIV_DRIVER anyway; 0 turns the rule off. */
+		mtx_unlock(&sc->lock);
+		device_printf(sc->dev, "si: uid %u's queue forced a GPU reset "
+		    "(no lockout: %s)\n", (u_int)uid, uid == 0 ? "root" :
+		    "reset_lockout_s is 0");
+		return;
+	}
+	for (i = 0, b = NULL; i < SI_BLAME_SLOTS; i++) {
+		if (c->blame[i].used && c->blame[i].uid == uid) {
+			b = &c->blame[i];
+			break;
+		}
+		if (!c->blame[i].used || (int)(c->blame[i].until - ticks) <= 0)
+			b = b != NULL ? b : &c->blame[i];
+		else if (old == NULL || (int)(c->blame[i].until -
+		    old->until) < 0)
+			old = &c->blame[i];
+	}
+	if (b == NULL)
+		b = old;
+	b->used = true;
+	b->uid = uid;
+	b->until = ticks + secs * hz;
+	mtx_unlock(&sc->lock);
+	device_printf(sc->dev, "si: uid %u's queue forced a GPU reset: no new "
+	    "queues for it for %d s\n", (u_int)uid, secs);
+}
+
+/* The caller's uid is locked out (sc->lock held). */
+static bool
+si_blamed(struct amd_si_client *c, uid_t uid)
+{
+	u_int i;
+
+	mtx_assert(&c->sc->lock, MA_OWNED);
+	for (i = 0; i < SI_BLAME_SLOTS; i++)
+		if (c->blame[i].used && c->blame[i].uid == uid)
+			return ((int)(c->blame[i].until - ticks) > 0);
+	return (false);
+}
+
+static void
+si_recover(struct amd_si_client *c, const char *why, uid_t blamed)
 {
 	struct atrium_amd_softc *sc = c->sc;
 	struct amd_kq *kq;
@@ -377,6 +441,7 @@ si_recover(struct amd_si_client *c, const char *why)
 
 	sx_assert(&c->uq_sx, SA_XLOCKED);
 	amd_si_lose(sc, why);		/* the reset, bus mastering off */
+	si_blame(c, blamed);
 	/*
 	 * The scrub engine off first: it waits out a range in progress (which
 	 * fails at once now) that still uses the kernel queue (ce098609 took
@@ -444,6 +509,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 	struct amd_si_client *c = arg;
 	struct atrium_amd_softc *sc = c->sc;
 	struct amd_uq *hw;
+	uid_t uid;
 	u_int i;
 	int err;
 
@@ -451,13 +517,15 @@ si_uq_evict_task(void *arg, int pending __unused)
 	for (i = 0; i < AMD_UQ_SLOTS; i++) {
 		mtx_lock(&sc->lock);
 		hw = c->uq[i].evict ? c->uq[i].hw : NULL;
+		uid = c->uq[i].ruid;
 		c->uq[i].evict = false;
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
 			continue;
 		err = amd_mes12_uq_evict(hw);
 		if (err != 0) {
-			si_recover(c, "a lost user queue that will not stop");
+			si_recover(c, "a lost user queue that will not stop",
+			    uid);
 			break;
 		}
 		device_printf(sc->dev, "si: uq%u evicted (lost)\n", i);
@@ -929,6 +997,13 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		sx_xunlock(&c->uq_sx);
 		return (EIO);
 	}
+	if (si_blamed(c, curthread->td_ucred->cr_ruid)) {
+		/* Its queue forced a GPU reset a short while ago. */
+		sc->iso.lockout_refused++;
+		mtx_unlock(&sc->lock);
+		sx_xunlock(&c->uq_sx);
+		return (EPERM);
+	}
 	for (slot = 0; slot < AMD_UQ_SLOTS; slot++)
 		if (!c->uq[slot].busy)
 			break;
@@ -941,6 +1016,7 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 	memset(u, 0, sizeof(*u));
 	u->busy = true;
 	u->kvmid = vm->vmid;
+	u->ruid = curthread->td_ucred->cr_ruid;
 	mtx_unlock(&sc->lock);
 
 	if (c->uq_cur == 0)
@@ -1030,7 +1106,7 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		 * the last rung resets the card and brings it up again. The
 		 * reset is what lets its memory go.
 		 */
-		si_recover(c, "a user queue that will not stop");
+		si_recover(c, "a user queue that will not stop", u->ruid);
 		mtx_lock(&sc->lock);
 		stale = u->stale;
 		mtx_unlock(&sc->lock);
