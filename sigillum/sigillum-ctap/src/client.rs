@@ -1,6 +1,9 @@
 //! A blocking CTAP 2.1 client over any [`HidDevice`]: the platform side of
 //! one authenticator, as `sigillum-fido` runs it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use zeroize::Zeroizing;
 
 use crate::cmd::{self, Assertion, Attestation, ClientPin, ClientPinResponse, GetAssertion, Info, MakeCredential, PinAuth};
@@ -8,10 +11,13 @@ use crate::hid::{self, Event, HidDevice, InitResponse, Reassembler};
 use crate::pin::{self, Shared};
 use crate::{status, Error};
 
-/// How long one CTAPHID transaction may run. A user-presence wait sends
-/// keepalives every 100 ms or so, which restart the clock; the ceremony's
-/// own 120 s limit is the broker's (sigillum.md §7.2).
+/// How long a transaction may go without hearing from the device. A
+/// user-presence wait sends keepalives every 100 ms or so, which restart
+/// the clock; the ceremony's own 120 s limit is the broker's (sigillum.md
+/// §7.2).
 pub const READ_TIMEOUT_MS: u32 = 1000;
+/// One read's wait, so a cancel is noticed promptly.
+pub const POLL_MS: u32 = 100;
 
 pub struct Client<D: HidDevice> {
     dev: D,
@@ -20,6 +26,9 @@ pub struct Client<D: HidDevice> {
     /// Called with each keepalive status (`UP_NEEDED`: tell the sheet to
     /// say "touch your key").
     pub on_keepalive: Option<Box<dyn FnMut(u8)>>,
+    /// Set by the driver's socket reader when the broker cancels: the
+    /// pending command gets `CTAPHID_CANCEL` and ends.
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl<D: HidDevice> Client<D> {
@@ -44,45 +53,88 @@ impl<D: HidDevice> Client<D> {
                     r = Reassembler::new(hid::BROADCAST);
                     continue;
                 }
-                if init.caps & hid::caps::CBOR == 0 {
-                    return Err(Error::Protocol("authenticator has no CTAP2 (U2F-only keys arrive with S2)"));
-                }
-                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None });
+                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None, cancel: Arc::new(AtomicBool::new(false)) });
             }
         }
         Err(Error::Timeout)
     }
 
-    /// Send one CTAP2 command, return the response body after a success
-    /// status.
-    pub fn cbor(&mut self, command: u8, params: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut msg = Vec::with_capacity(1 + params.len());
-        msg.push(command);
-        msg.extend_from_slice(params);
-        for p in hid::frame(self.cid, hid::cmd::CBOR, &msg)? {
+    pub fn ctap2(&self) -> bool {
+        self.init.caps & hid::caps::CBOR != 0
+    }
+
+    /// One CTAPHID transaction: send, then read until a message on our
+    /// channel, passing keepalives on and honouring a cancel.
+    fn transact(&mut self, command: u8, payload: &[u8]) -> Result<(u8, Vec<u8>), Error> {
+        for p in hid::frame(self.cid, command, payload)? {
             self.dev.write_report(&p)?;
         }
         let mut r = Reassembler::new(self.cid);
+        let mut idle = 0;
+        let mut cancel_sent = false;
         loop {
-            let p = self.dev.read_report(READ_TIMEOUT_MS)?;
+            if !cancel_sent && self.cancel.load(Ordering::SeqCst) {
+                self.cancel()?;
+                cancel_sent = true;
+            }
+            let p = match self.dev.read_report(POLL_MS) {
+                Ok(p) => p,
+                Err(Error::Timeout) => {
+                    idle += POLL_MS;
+                    if idle >= READ_TIMEOUT_MS {
+                        return Err(if cancel_sent { Error::Cancelled } else { Error::Timeout });
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match r.feed(&p)? {
                 Event::Ignored | Event::Partial => {}
                 Event::Keepalive(s) => {
+                    idle = 0;
                     if let Some(f) = self.on_keepalive.as_mut() {
                         f(s);
                     }
                 }
-                Event::Message(c, body) => {
-                    if c != hid::cmd::CBOR || body.is_empty() {
-                        return Err(Error::Protocol("unexpected CTAPHID response"));
-                    }
-                    if body[0] != status::OK {
-                        return Err(Error::Status(body[0]));
-                    }
-                    return Ok(body[1..].to_vec());
-                }
+                Event::Message(c, body) => return Ok((c, body)),
             }
         }
+    }
+
+    /// Send one CTAP2 command, return the response body after a success
+    /// status.
+    pub fn cbor(&mut self, command: u8, params: &[u8]) -> Result<Vec<u8>, Error> {
+        if !self.ctap2() {
+            return Err(Error::NoCtap2);
+        }
+        let mut msg = Vec::with_capacity(1 + params.len());
+        msg.push(command);
+        msg.extend_from_slice(params);
+        let (c, body) = self.transact(hid::cmd::CBOR, &msg)?;
+        if c != hid::cmd::CBOR || body.is_empty() {
+            return Err(Error::Protocol("unexpected CTAPHID response"));
+        }
+        if body[0] == status::KEEPALIVE_CANCEL && self.cancel.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
+        if body[0] != status::OK {
+            return Err(Error::Status(body[0]));
+        }
+        Ok(body[1..].to_vec())
+    }
+
+    /// One U2F APDU over `CTAPHID_MSG`: (body, status word).
+    pub fn msg(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), Error> {
+        let (c, body) = self.transact(hid::cmd::MSG, apdu)?;
+        if c != hid::cmd::MSG {
+            return Err(Error::Protocol("unexpected CTAPHID response"));
+        }
+        let (b, sw) = crate::u2f::split(&body)?;
+        Ok((b.to_vec(), sw))
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     /// `CTAPHID_CANCEL`: no response is expected; the pending command ends

@@ -7,6 +7,7 @@
 //! - [`authdata`] and [`cose`]: authenticator data and credential public
 //!   keys, checked (the point is on the curve, lengths are in range).
 //! - [`pin`]: PIN/UV auth protocol 2.
+//! - [`u2f`]: CTAP1/U2F for keys without CTAP2, mapped onto WebAuthn.
 //! - [`client`]: a blocking client over any [`hid::HidDevice`].
 //!
 //! Everything here parses bytes a device chose. It runs in the driver jail,
@@ -19,6 +20,7 @@ pub mod cmd;
 pub mod cose;
 pub mod hid;
 pub mod pin;
+pub mod u2f;
 
 use std::fmt;
 
@@ -37,6 +39,10 @@ pub enum Error {
     Io(String),
     /// Our own request was invalid (too large, bad parameter).
     Request(&'static str),
+    /// The broker cancelled the ceremony (`CTAPHID_CANCEL` was sent).
+    Cancelled,
+    /// The authenticator has no CTAP2 (`CBOR` capability); use [`u2f`].
+    NoCtap2,
 }
 
 impl fmt::Display for Error {

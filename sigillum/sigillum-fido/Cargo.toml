@@ -11,6 +11,11 @@ sigillum-ctap = { path = "../sigillum-ctap" }
 sigillum-proto = { path = "../sigillum-proto" }
 sha2 = { workspace = true }
 p256 = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 sigillum-softkey = { path = "../sigillum-softkey" }
+
+[[bin]]
+name = "sigillum-fido"
+path = "src/bin/sigillum-fido.rs"

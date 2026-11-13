@@ -504,6 +504,7 @@ dependencies = [
 name = "sigillum-fido"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "p256",
  "sha2",
  "sigillum-cbor",

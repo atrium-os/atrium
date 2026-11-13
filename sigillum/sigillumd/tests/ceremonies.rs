@@ -62,7 +62,8 @@ struct Rig {
 impl Rig {
     fn new(soft: SoftKey) -> Rig {
         let key = Rc::new(RefCell::new(soft));
-        let (driver, hello) = Driver::open(Key_(key.clone()), 0x1050, 0x0407, "Soft Key").unwrap();
+        let (mut driver, hello) = Driver::open(Key_(key.clone()), 0x1050, 0x0407, "Soft Key").unwrap();
+        driver.u2f_poll = std::time::Duration::ZERO;
         let mut broker = Broker::new(Config { web_broker: broker_app(), ceremony_ms: 120_000 });
         let a = broker.driver(DEV, hello);
         assert!(matches!(a[0], Action::Audit(_)));
@@ -418,4 +419,55 @@ fn unplugging_ends_the_ceremony() {
     r.run(a);
     assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
     assert_eq!(r.broker.devices().count(), 0);
+}
+
+fn u2f_key() -> SoftKey {
+    let mut k = SoftKey::new(None);
+    k.u2f_only = true;
+    k
+}
+
+#[test]
+fn u2f_only_key_registers_and_signs_in() {
+    let mut r = Rig::new(u2f_key());
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    let (cred, vk) = rp_check_registration(&r.reply(), "example.com");
+
+    r.request(&web_broker(), assert_req("example.com", vec![vec![7; 32], cred.clone()], Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    let reply = r.reply();
+    assert!(matches!(&reply, Reply::Asserted { cred_id, .. } if *cred_id == cred));
+    assert_eq!(rp_check_assertion(&reply, "example.com", &vk) & flags::UP, flags::UP);
+
+    // Another RP's handle is not usable here.
+    r.request(&web_broker(), assert_req("other.example", vec![cred.clone()], Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 2, reason: Refusal::NotAllowed });
+
+    // Excluded, after a touch.
+    let Request::Register(mut reg) = register("example.com", Uv::Discouraged) else { unreachable!() };
+    reg.exclude = vec![cred];
+    r.request(&web_broker(), Request::Register(reg));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::Excluded });
+}
+
+#[test]
+fn u2f_only_key_refusals() {
+    let mut r = Rig::new(u2f_key());
+    r.request(&web_broker(), register("example.com", Uv::Required));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
+
+    r.key.borrow_mut().touch = false;
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
+
+    // U2F has no discoverable credentials.
+    r.key.borrow_mut().touch = true;
+    r.request(&web_broker(), assert_req("example.com", vec![], Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 2, reason: Refusal::NotAllowed });
 }

@@ -40,7 +40,8 @@ pub enum Lie {
 
 struct Cred {
     id: Vec<u8>,
-    rp_id: String,
+    /// SHA-256 of the RP ID (the U2F application parameter).
+    app: [u8; 32],
     user_id: Vec<u8>,
     resident: bool,
     key: SigningKey,
@@ -69,6 +70,9 @@ pub struct SoftKey {
     pub lie: Option<Lie>,
     /// Commands seen, for tests that check nothing reached the key.
     pub commands: Vec<u8>,
+    /// Behave as a U2F-only key (no `CBOR` capability), like QEMU's
+    /// `u2f-emulated`.
+    pub u2f_only: bool,
 }
 
 impl Default for SoftKey {
@@ -81,6 +85,10 @@ fn random<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::getrandom(&mut b).expect("getrandom");
     b
+}
+
+fn app_of(rp_id: &str) -> [u8; 32] {
+    Sha256::digest(rp_id.as_bytes()).into()
 }
 
 fn new_secret() -> p256::SecretKey {
@@ -103,6 +111,7 @@ impl SoftKey {
             keepalives: true,
             lie: None,
             commands: Vec::new(),
+            u2f_only: false,
         }
     }
 
@@ -134,11 +143,15 @@ impl SoftKey {
                     cid: new,
                     protocol: 2,
                     version: (1, 0, 0),
-                    caps: hid::caps::CBOR | hid::caps::NMSG,
+                    caps: if self.u2f_only { hid::caps::WINK } else { hid::caps::CBOR | hid::caps::NMSG },
                 };
                 self.send(cid, hid::cmd::INIT, &r.encode());
             }
-            hid::cmd::CBOR if cid != hid::BROADCAST && !body.is_empty() => {
+            hid::cmd::MSG if cid != hid::BROADCAST && self.u2f_only => {
+                let out = self.u2f(&body);
+                self.send(cid, hid::cmd::MSG, &out);
+            }
+            hid::cmd::CBOR if cid != hid::BROADCAST && !body.is_empty() && !self.u2f_only => {
                 self.commands.push(body[0]);
                 let (st, resp, needed_touch) = match self.cbor(body[0], &body[1..]) {
                     Ok((r, t)) => (status::OK, r, t),
@@ -165,6 +178,80 @@ impl SoftKey {
             cmd::GET_ASSERTION => self.get_assertion(GetAssertion::parse(params)?),
             cmd::CLIENT_PIN => Ok((self.client_pin(ClientPin::parse(params)?)?, false)),
             _ => Err(Error::Status(status::INVALID_COMMAND)),
+        }
+    }
+
+    /// One U2F APDU (extended length) → response with status word.
+    fn u2f(&mut self, apdu: &[u8]) -> Vec<u8> {
+        use sigillum_ctap::u2f;
+        let sw = |s: u16| s.to_be_bytes().to_vec();
+        if apdu.len() < 7 || apdu[0] != 0 || apdu[4] != 0 {
+            return sw(0x6700);
+        }
+        let (ins, p1) = (apdu[1], apdu[2]);
+        let n = u16::from_be_bytes([apdu[5], apdu[6]]) as usize;
+        let Some(data) = apdu.get(7..7 + n) else { return sw(0x6700) };
+        self.commands.push(0x80 | ins);
+        match ins {
+            u2f::REGISTER if n == 64 => {
+                if !self.touch {
+                    return sw(u2f::sw::CONDITIONS_NOT_SATISFIED);
+                }
+                let cdh: [u8; 32] = data[..32].try_into().unwrap();
+                let app: [u8; 32] = data[32..].try_into().unwrap();
+                let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+                let id = random::<32>().to_vec();
+                let pk = p256::PublicKey::from(key.verifying_key());
+                use p256::elliptic_curve::sec1::ToEncodedPoint;
+                let point = pk.to_encoded_point(false);
+                // Self-signed "attestation": the signature is over
+                // 00 | app | cdh | handle | pubkey with the credential key.
+                let mut signed = vec![0u8];
+                signed.extend_from_slice(&app);
+                signed.extend_from_slice(&cdh);
+                signed.extend_from_slice(&id);
+                signed.extend_from_slice(point.as_bytes());
+                let sig: Signature = key.sign(&signed);
+                let mut out = vec![0x05];
+                out.extend_from_slice(point.as_bytes());
+                out.push(id.len() as u8);
+                out.extend_from_slice(&id);
+                out.extend_from_slice(&[0x30, 0x03, 0x02, 0x01, 0x00]); // a stub DER "certificate"
+                out.extend_from_slice(sig.to_der().as_bytes());
+                self.creds.push(Cred { id, app, user_id: Vec::new(), resident: false, key });
+                out.extend_from_slice(&sw(u2f::sw::OK));
+                out
+            }
+            u2f::AUTHENTICATE if n >= 65 => {
+                let cdh: [u8; 32] = data[..32].try_into().unwrap();
+                let app: [u8; 32] = data[32..64].try_into().unwrap();
+                let l = data[64] as usize;
+                let Some(handle) = data.get(65..65 + l) else { return sw(0x6700) };
+                let Some(i) = self.creds.iter().position(|c| c.id == handle && c.app == app) else {
+                    return sw(u2f::sw::WRONG_DATA);
+                };
+                if p1 == u2f::P1_CHECK_ONLY || !self.touch {
+                    return sw(u2f::sw::CONDITIONS_NOT_SATISFIED);
+                }
+                self.sign_count += 1;
+                let up = self.up_flag();
+                let mut signed = app.to_vec();
+                signed.push(up);
+                signed.extend_from_slice(&self.sign_count.to_be_bytes());
+                signed.extend_from_slice(&cdh);
+                let sig: Signature = self.creds[i].key.sign(&signed);
+                let mut out = vec![up];
+                out.extend_from_slice(&self.sign_count.to_be_bytes());
+                out.extend_from_slice(sig.to_der().as_bytes());
+                out.extend_from_slice(&sw(u2f::sw::OK));
+                out
+            }
+            u2f::VERSION => {
+                let mut out = b"U2F_V2".to_vec();
+                out.extend_from_slice(&sw(u2f::sw::OK));
+                out
+            }
+            _ => sw(0x6d00),
         }
     }
 
@@ -224,7 +311,7 @@ impl SoftKey {
 
     fn make_credential(&mut self, req: MakeCredential) -> Result<(Vec<u8>, bool), Error> {
         let uv = self.check_pin_auth(&req.pin_auth, &req.client_data_hash, permission::MAKE_CREDENTIAL, &req.rp_id)?;
-        if self.creds.iter().any(|c| c.rp_id == req.rp_id && req.exclude.contains(&c.id)) {
+        if self.creds.iter().any(|c| c.app == app_of(&req.rp_id) && req.exclude.contains(&c.id)) {
             // The spec asks for a touch first, so excluded-ness can't be probed.
             return Err(Error::Status(if self.touch { status::CREDENTIAL_EXCLUDED } else { status::OPERATION_DENIED }));
         }
@@ -266,7 +353,7 @@ impl SoftKey {
                 (Value::text("sig"), Value::bytes(sig.to_der().as_bytes())),
             ]),
         };
-        self.creds.push(Cred { id, rp_id: req.rp_id, user_id: req.user.id, resident: req.resident_key, key });
+        self.creds.push(Cred { id, app: app_of(&req.rp_id), user_id: req.user.id, resident: req.resident_key, key });
         Ok((att.encode(), true))
     }
 
@@ -276,7 +363,7 @@ impl SoftKey {
             .creds
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.rp_id == req.rp_id && (if req.allow.is_empty() { c.resident } else { req.allow.contains(&c.id) }))
+            .filter(|(_, c)| c.app == app_of(&req.rp_id) && (if req.allow.is_empty() { c.resident } else { req.allow.contains(&c.id) }))
             .map(|(i, _)| i)
             .collect();
         let Some(&first) = matching.first() else {
