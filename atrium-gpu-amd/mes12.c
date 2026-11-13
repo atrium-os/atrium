@@ -1735,7 +1735,7 @@ amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
 	pkt[n++] = (uint32_t)(fence >> 32);
 	pkt[n++] = s;
 	pkt[n++] = 0;
-	pkt[n++] = 0;
+	pkt[n++] = AMD_KQ_CTXID;			/* INT_CTXID */
 	for (i = 0; i < n; i++)
 		ring[(kq->wptr + i) & (RING_DW - 1)] = pkt[i];
 	kq->wptr += n;
@@ -2454,7 +2454,9 @@ amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 	pkt[n++] = (uint32_t)(fence >> 32);
 	pkt[n++] = s;
 	pkt[n++] = 0;
-	pkt[n++] = 0;
+	/* INT_CTXID: the EOP IV's src_data[0] (gfx_v11_0_eop_irq's
+	 * AMDGPU_FENCE_MES_QUEUE_FLAG scheme); names this queue. */
+	pkt[n++] = AMD_UQ_CTXID(q->db);
 	for (i = 0; i < n; i++)
 		ring[(q->wptr + i) & (RING_DW - 1)] = pkt[i];
 	q->wptr += n;
@@ -2495,14 +2497,15 @@ amd_mes12_uq_free_lost(struct amd_uq *q)
 }
 
 /*
- * Take the queue off MES and free it. If its last job has not fenced,
+ * Evict: take the queue off MES, keeping its memory (a lost queue: its
+ * close frees it later). Destroy: evict and free. If its last job has not fenced,
  * first kill the waves of the VMID MES runs it under and give the fence a
  * moment. 0: removed, nothing of it is mapped, its memory is freed.
  * EBUSY: MES did not let go of it; its memory is leaked (never freed under
  * the GPU), and the caller must keep the VM's page tables alive too.
  */
 int
-amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
+amd_mes12_uq_evict(struct amd_uq *q)
 {
 	struct mes *m = q->m;
 	u_int vmid, us;
@@ -2539,9 +2542,19 @@ amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
 			return (EBUSY);
 		}
 		q->added = false;
+		device_printf(m->sc->dev, "uq%u: removed (seq %u, fence %u)\n",
+		    q->slot, q->seq, amd_mes12_uq_fence(q));
 	}
-	device_printf(m->sc->dev, "uq%u: removed (seq %u, fence %u)\n",
-	    q->slot, q->seq, amd_mes12_uq_fence(q));
+	return (0);
+}
+
+int
+amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
+{
+	int err;
+
+	if ((err = amd_mes12_uq_evict(q)) != 0)
+		return (err);
 	uq2_free(q, kvmid);
 	return (0);
 }

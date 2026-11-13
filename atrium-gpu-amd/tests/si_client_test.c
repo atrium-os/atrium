@@ -23,6 +23,14 @@
  *   6 refusals   the 5c-2a SUBMIT on the client node, user-mode queues,
  *                other families and priorities, in-dependencies, bad blobs,
  *                the ioctls on the wrong fd, VRAM BOs.
+ *   7 fault      (step 2) a queue whose job writes to a VA its VM does not
+ *                map: its completion fails with EIO, the queue refuses more
+ *                work, another VM's queue runs on, and the faulting VM runs
+ *                clean on a new queue.
+ *   8 hang       (step 2) a queue whose job waits forever (WAIT_REG_MEM on a
+ *                value never written): after hang_ms its completion fails
+ *                with EIO, the queue refuses more work, others run on, and
+ *                the VM runs clean on a new queue.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -370,6 +378,22 @@ run_clean_on(struct job *j, int q, const char *what)
 	    first);
 }
 
+/* After its queue was lost: a new queue, a fresh syncobj, an out page. */
+static int
+job_renew(struct job *j)
+{
+	close(j->q);
+	close(j->so);
+	j->so = syncobj();
+	j->value = 0;
+	if (j->so < 0 || (j->q = queue_create(j->vm)) < 0)
+		return (-1);
+	if (j->out < 0 && ((j->out = bo_alloc(4096, 0)) < 0 ||
+	    vm_bind(j->vm, j->out, 0, &j->out_va) != 0))
+		return (-1);
+	return (0);
+}
+
 static void
 run_clean(struct job *j, const char *what)
 {
@@ -447,7 +471,7 @@ ioerr(int f, unsigned long cmd, void *arg)
 int
 main(void)
 {
-	struct job a, b, c, e;
+	struct job a, b, c, e, f;
 	struct atrium_gpu_submit s;
 	struct atrium_gpu_queue_submit qs;
 	struct atrium_gpu_queue_create qc;
@@ -461,6 +485,7 @@ main(void)
 	job_init(&b);
 	job_init(&c);
 	job_init(&e);
+	job_init(&f);
 	fd = open(DEV, O_RDWR);
 	if (fd < 0) {
 		printf("FAIL: open %s: %s\n", DEV, strerror(errno));
@@ -656,11 +681,73 @@ main(void)
 	run_clean(&a, "6 the first queue still runs after the refusals");
 	(void)seq2;
 
+	/* 7: a fault loses only its own queue (needs a free VM: drop 4's). */
+	job_close(&e);
+	if (job_open(&f, "7") == 0) {
+		uint64_t target = f.out_va;
+
+		close(f.out);		/* unbound: the VA faults in F */
+		f.out = -1;
+		if (job_submit(&f, target) != 0) {
+			check(0, "7 fault", "submit: %s", strerror(errno));
+		} else {
+			r = job_wait(&f, 8000, &ms);
+			check(r == EIO, "7 fault: the faulting queue's work fails "
+			    "with EIO", "got %s after %d ms", r == 0 ? "success" :
+			    strerror(r), ms);
+			r = job_submit(&f, target) == 0 ? 0 : errno;
+			check(r == EIO, "7 fault: the lost queue refuses new "
+			    "work", "%s", r == 0 ? "accepted" : strerror(r));
+			run_clean(&a, "7 fault: another VM's queue runs on");
+			if (job_renew(&f) != 0)
+				check(0, "7 fault: renew", "%s",
+				    strerror(errno));
+			else
+				run_clean(&f, "7 fault: the faulting VM runs "
+				    "clean on a new queue");
+		}
+	}
+
+	/* 8: a job that never ends loses its queue after hang_ms. */
+	if (f.vm >= 0 && f.q >= 0 && f.out >= 0) {
+		uint32_t w[7];
+
+		(void)poison(f.out, POISON_A);
+		w[0] = 3u << 30 | 5u << 16 | 0x3cu << 8;  /* WAIT_REG_MEM */
+		w[1] = 3u | 1u << 4;		/* equal, memory */
+		w[2] = (uint32_t)f.out_va;
+		w[3] = (uint32_t)(f.out_va >> 32);
+		w[4] = 0x12345678u;		/* never written */
+		w[5] = 0xffffffffu;
+		w[6] = 0x20u;			/* poll interval */
+		if (bo_xfer(f.ib, w, sizeof(w), 1) != 0 ||
+		    (r = queue_submit(f.q, f.ib_va, 7, f.so, ++f.value,
+		    NULL)) != 0) {
+			check(0, "8 hang", "submit: %s", strerror(errno));
+		} else {
+			r = job_wait(&f, 15000, &ms);
+			check(r == EIO && ms >= 3000, "8 hang: the hung queue's "
+			    "work fails with EIO after hang_ms", "got %s after "
+			    "%d ms", r == 0 ? "success" : strerror(r), ms);
+			r = queue_submit(f.q, f.ib_va, 7, -1, 0, NULL);
+			check(r == EIO, "8 hang: the lost queue refuses new work",
+			    "%s", r == 0 ? "accepted" : strerror(r));
+			run_clean(&a, "8 hang: another VM's queue runs on");
+			if (job_renew(&f) != 0)
+				check(0, "8 hang: renew", "%s",
+				    strerror(errno));
+			else
+				run_clean(&f, "8 hang: the hung VM runs clean on "
+				    "a new queue");
+		}
+	}
+
 out:
 	job_close(&a);
 	job_close(&b);
 	job_close(&c);
 	job_close(&e);
+	job_close(&f);
 	close(fd);
 	printf("si_client_test: %d passed, %d failed: %s\n", npass, nfail,
 	    nfail == 0 && npass > 0 ? "PASS" : "FAIL");

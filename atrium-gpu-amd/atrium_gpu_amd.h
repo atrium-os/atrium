@@ -914,10 +914,15 @@ uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
 void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
 #define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
 #define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
+/* RELEASE_MEM INT_CTXID, which an EOP IV carries in src_data[0]. */
+#define AMD_UQ_CTXID_FLAG	0x01000000u
+#define AMD_UQ_CTXID(db)	(AMD_UQ_CTXID_FLAG | ((db) & 0x00ffffffu))
+#define AMD_KQ_CTXID		0x02000006u
 struct amd_uq;
 int	amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	    u_int slot, uint64_t va, uint32_t prio, struct amd_uq **out);
 int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
+int	amd_mes12_uq_evict(struct amd_uq *q);
 int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 	    uint32_t *seq);
 uint32_t amd_mes12_uq_fence(struct amd_uq *q);
