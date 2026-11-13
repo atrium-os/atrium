@@ -1,0 +1,133 @@
+== fuzz24h-stop excerpt, taken Fri Nov 13 16:56:41 UTC 2026
+== TERM sent to 9392 (timeout) at 16:54:33 UTC, then 9393 (already gone)
+== /root/runs/fuzz24h.out: si-fuzz tail (blob ENOSPC lines removed)
+si-fuzz: blob generation 17: uid 62017, seed 0x24f01e
+si-fuzz:  601 s: 177736 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 121, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+si-fuzz: ioctl generation 18: uid 61018, seed 0x24f01f
+si-fuzz:  661 s: 195711 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 133, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+si-fuzz: ioctl generation 19: uid 61019, seed 0x24f020
+si-fuzz: blob generation 20: uid 62020, seed 0x24f021
+si-fuzz:  722 s: 221376 calls, blob 1 jobs (0 ok, 1 failed, 0 clean after), canary 145, re-inits 2, cp_errors 2, vm_faults 7, hangs 5, findings 0
+blob: setup failed: Operation timed out
+blob: setup failed: Operation timed out
+Terminated
+si-fuzz rc=143
+== blob ENOSPC count: 683
+== /root/runs/fuzz24h.out lines 921-958
+si-fuzz rc=143
+reinits 2
+== si-client-test after the fuzz
+1: setup failed: Operation timed out
+2b: setup failed: Operation timed out
+4: setup failed: Operation timed out
+FAIL: 4 queue fd over SCM_RIGHTS (setup: Operation timed out)
+FAIL: 6 refusals (no VM and queue from test 1)
+si_client_test: 0 passed, 2 failed: FAIL
+si-client-test rc=1
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 0
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 2
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 2
+dev.atrium_gpu_amd.0.isolation.cp_errors: 2
+dev.atrium_gpu_amd.0.isolation.quota_refused: 0
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 7
+dev.atrium_gpu_amd.0.isolation.hangs: 5
+dev.atrium_gpu_amd.0.isolation.reaped: 33
+dev.atrium_gpu_amd.0.isolation.deferred: 33
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 2
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 34.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 34.0C 
+detach + give-back rc=0 (try 1)
+== /root/runs/fuzz24h.out lines 1700-end
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #961: edge 49 C, hotspot 59 C, mem 48 C, VR 49 C; power 66 W of 300 W limit, board 66 W; fan 893 rpm (20%); gfx 3395 MHz, mem 8 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: si: card NOT idle at detach
+atrium_gpu_amd_pci0: si: stage 5a: detached
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 34.0C 
+== done, log /root/runs/20261113T164046Z.log
+unload marker: 16369:Nov 13 16:54:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: detached
+flush timeouts after 16:54:57: 0
+last flush timeout: Nov 13 16:54:38 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 1 timed out: INV_REQ 0x
+total flush timeouts this run: 7376
+== 30 kernel lines before the first flush timeout (line 1160), unfiltered
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x35325c000), MQD GART 0x80000, doorbell 0x20
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: added: VM base 0x8021001, queue pages at VA 0x200010000 (pa 0x353254000), MQD GART 0x84000, doorbell 0x22
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq2: added: VM base 0x802f001, queue pages at VA 0x200020000 (pa 0x2a3720000), MQD GART 0x88000, doorbell 0x24
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq3: added: VM base 0x803d001, queue pages at VA 0x200030000 (pa 0x2f61f2000), MQD GART 0x8c000, doorbell 0x26
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 220 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: added: VM base 0x8047001, queue pages at VA 0x200040000 (pa 0x303c01000), MQD GART 0x90000, doorbell 0x28
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 230 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq5: added: VM base 0x802a001, queue pages at VA 0x200050000 (pa 0x303c08000), MQD GART 0x94000, doorbell 0x2a
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 220 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq6: added: VM base 0x802b001, queue pages at VA 0x200060000 (pa 0x303c0f000), MQD GART 0x98000, doorbell 0x2c
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 190 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq6: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 290 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq1: removed (seq 0, fence 0)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: uq1 closed: 0 submits; EOP IVs routed 51, unrouted 7, MES own 312, MES preemption 40; retired by IV 44, by poll 0; queues lost to faults 7, hangs 4; preempted for frees 40 (failed 0)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x3, 0x4000028 x2, 0xc000000 x2, 0 x0
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq5: preempted for a free: suspend fence landed after 0 us, resume ok
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 420 us (status 0x1)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+Nov 13 16:41:57 atrium-r9700 kernel: atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) flush of context 4 timed out: INV_REQ 0xf80010, INV_ACK 0
