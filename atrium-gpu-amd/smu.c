@@ -747,6 +747,8 @@ struct amd_si {
 	struct timeout_task watch;
 	bool stopping, lost;
 	u_int nsample, strikes;
+	u_int gfx_holds;		/* GfxOff disallowed while > 0 (5c-2) */
+	bool client;			/* the client node is attached (5c-2) */
 };
 
 /* Everything down to the GART, GfxOff disallowed meanwhile; then allowed. */
@@ -801,7 +803,9 @@ si_watch(void *arg, int pending __unused)
 	ok = smu_metrics(&si->link, si->vram, si->ifver, false, &t);
 	if (ok) {
 		hot = t.hotspot_c != 0xffff && t.hotspot_c >= SI_HOT_C;
-		busy = atrium_gpu_power_idle_suspicious(&t);
+		/* Clients' VMs exist (gfx_holds): work may be running. */
+		busy = si->gfx_holds == 0 &&
+		    atrium_gpu_power_idle_suspicious(&t);
 		si->strikes = busy ? si->strikes + 1 : 0;
 	}
 	if (log || !ok || hot || busy)
@@ -813,7 +817,13 @@ si_watch(void *arg, int pending __unused)
 		    "resetting it (A3.7)\n", si->link.failed ? "SMU link "
 		    "failed" : hot ? "hotspot at the limit" : "not idle "
 		    "with no work queued");
-		if (!si->link.failed)
+		/*
+		 * With the client node attached its queue and IH consumer
+		 * still point at the MES and IH blocks: reset the card
+		 * without freeing them (the client refuses all work once
+		 * lost; the blocks are leaked at detach).
+		 */
+		if (!si->link.failed && !si->client)
 			si_down(si, false);
 		(void)amd_smu_mode1_reset(sc);
 		si->lost = true;
@@ -923,6 +933,97 @@ fail:
 	return (err);
 }
 
+/*
+ * Stage 5c-2: what the client node (si_client.c, in the gpu module) uses.
+ * GC registers read 0 and drop writes while GfxOff is in effect, so the
+ * client node holds GfxOff off while it has VMs (whose GFXHUB contexts,
+ * fault status and wave kills are GC registers) and around its own
+ * register work; the last release allows GfxOff again.
+ */
+struct amd_gart *
+amd_si_gart(struct atrium_amd_softc *sc)
+{
+	return (sc->si != NULL ? &sc->si->gt : NULL);
+}
+
+struct mes *
+amd_si_mes(struct atrium_amd_softc *sc)
+{
+	return (sc->si != NULL ? sc->si->mes : NULL);
+}
+
+struct amd_ih7 *
+amd_si_ih(struct atrium_amd_softc *sc)
+{
+	return (sc->si != NULL ? sc->si->ih : NULL);
+}
+
+/* Up, and not taken down by the watch (A3.7) or a failed SMU link. */
+void
+amd_si_client_attached(struct atrium_amd_softc *sc, bool on)
+{
+	struct amd_si *si = sc->si;
+
+	if (si == NULL)
+		return;
+	sx_xlock(&si->lock);
+	si->client = on;
+	sx_xunlock(&si->lock);
+}
+
+bool
+amd_si_usable(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si = sc->si;
+
+	return (si != NULL && !si->lost && !si->stopping && !si->link.failed);
+}
+
+int
+amd_si_gfx_hold(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si = sc->si;
+	int err = 0, us;
+
+	if (si == NULL)
+		return (ENXIO);
+	sx_xlock(&si->lock);
+	if (si->lost || si->link.failed) {
+		sx_xunlock(&si->lock);
+		return (EIO);
+	}
+	if (si->gfx_holds++ == 0) {
+		err = smu_send(&si->link, SMU_DISALLOW_GFXOFF, 0, NULL,
+		    false) == SMU_RESP_OK ? 0 : EIO;
+		for (us = 0; err == 0 && us < GC_WAIT_US &&
+		    gc_rd(sc, 0, GC12_GB_ADDR_CONFIG) == 0; us += 100)
+			DELAY(100);
+		if (err == 0 && us >= GC_WAIT_US)
+			err = ETIMEDOUT;
+		if (err != 0) {
+			device_printf(sc->dev, "si: DisallowGfxOff failed "
+			    "(%d)\n", err);
+			si->gfx_holds--;
+		}
+	}
+	sx_xunlock(&si->lock);
+	return (err);
+}
+
+void
+amd_si_gfx_release(struct atrium_amd_softc *sc)
+{
+	struct amd_si *si = sc->si;
+
+	if (si == NULL)
+		return;
+	sx_xlock(&si->lock);
+	KASSERT(si->gfx_holds > 0, ("si: GfxOff hold underflow"));
+	if (--si->gfx_holds == 0 && !si->lost && !si->link.failed)
+		(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
+	sx_xunlock(&si->lock);
+}
+
 /* Detach: everything down, idle proven, the caller resets the card. */
 void
 amd_si_detach(struct atrium_amd_softc *sc)
@@ -949,6 +1050,9 @@ amd_si_detach(struct atrium_amd_softc *sc)
 		device_printf(sc->dev, "si: detach after the GPU was taken "
 		    "down (%s)\n", si->lost ? "watcher reset it" :
 		    "SMU link failed");
+	if (si->mes != NULL || si->ih != NULL)
+		device_printf(sc->dev, "si: MES/IH blocks of a card reset "
+		    "under the client node are leaked, not freed\n");
 	bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid, si->vram);
 	sc->si = NULL;
 	sx_destroy(&si->lock);

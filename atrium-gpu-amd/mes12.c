@@ -1548,6 +1548,220 @@ out_unmap:
 }
 
 /*
+ * Stage 5c-2: the kernel compute queue that client SUBMITs run on (the
+ * client node, si_client.c). The 4e/5b queue (MEC1 pipe 0 queue 0, VMID
+ * 0, the KCQ doorbell) in a block of its own, kept mapped while the client
+ * node is up. A submit is an INDIRECT_BUFFER under the client VM's kernel
+ * VMID (1-7) and a RELEASE_MEM that writes the next sequence number to the
+ * fence and raises an EOP interrupt. The ring and the fence are in VMID 0,
+ * which nothing a client's IB does can reach, so the fence is the truth
+ * about completion: an EOP interrupt a client raises with a RELEASE_MEM of
+ * its own does not move it. The attach self-tests (4e, 5b) use the same
+ * MEC slot and doorbell, before this queue is opened and after it closes.
+ * Callers serialise (si_client.c holds its queue lock).
+ */
+#define KQ_GART_VA		0x00070000ull	/* after 5c-1's blocks */
+#define KQ_SIZE			DISP_CODE	/* ring, MQD, EOP, WB */
+#define KQ_PKT_DW		12u
+
+struct amd_kq {
+	struct mes *m;
+	struct disp d;
+	uint64_t wptr;		/* dwords emitted since the queue was mapped */
+	uint32_t seq;		/* last sequence number emitted */
+	bool mapped;
+};
+
+static void
+gart_unmap_blk(struct amd_gart *gt, uint64_t va, u_int size)
+{
+	u_int i;
+
+	for (i = 0; i < size / PAGE_SIZE; i++) {
+		uint64_t idx = (va - gt->gart_start) / PAGE_SIZE + i;
+
+		bus_write_4(gt->vram, gt->table_off + idx * 8, 0);
+		bus_write_4(gt->vram, gt->table_off + idx * 8 + 4, 0);
+	}
+	(void)amd_gmc12_flush(gt);
+}
+
+static void
+kq_int(struct amd_kq *kq, bool on)
+{
+	struct mes *m = kq->m;
+
+	grbm_select(m, 1, 0);
+	if (on) {
+		kq->d.int_cntl = rd(m, m->g->cpc_int_cntl);
+		wr(m, m->g->cpc_int_cntl, kq->d.int_cntl |
+		    TIME_STAMP_INT_ENABLE);
+	} else
+		wr(m, m->g->cpc_int_cntl, kq->d.int_cntl);
+	grbm_select(m, 0, 0);
+}
+
+int
+amd_mes12_kq_open(struct mes *m, struct amd_kq **out)
+{
+	struct amd_gart *gt = m->gt;
+	struct amd_kq *kq;
+	u_int i;
+	int err;
+
+	*out = NULL;
+	kq = malloc(sizeof(*kq), M_DEVBUF, M_WAITOK | M_ZERO);
+	kq->m = m;
+	kq->d.va = gt->gart_start + KQ_GART_VA;
+	if (kq->d.va + KQ_SIZE > gt->gart_end + 1) {
+		free(kq, M_DEVBUF);
+		return (EINVAL);
+	}
+	kq->d.blk = contigmalloc(KQ_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	kq->d.pa = vtophys(kq->d.blk);
+	for (i = 0; i < KQ_SIZE / PAGE_SIZE; i++)
+		(void)amd_gmc12_gart_map(gt, kq->d.va + i * PAGE_SIZE,
+		    kq->d.pa + i * PAGE_SIZE);
+	if ((err = amd_gmc12_flush(gt)) != 0)
+		goto fail;
+	kq_int(kq, true);
+	if ((err = vmt_qopen(m, &kq->d)) != 0) {
+		kq_int(kq, false);
+		if (!hqd_dequeue_me(m, 1, 0)) {
+			/* The HQD may still use the block: leak it. */
+			gart_unmap_blk(gt, kq->d.va, KQ_SIZE);
+			device_printf(m->sc->dev, "kq: ADD_QUEUE failed and "
+			    "the HQD is still active; block leaked\n");
+			free(kq, M_DEVBUF);
+			return (err);
+		}
+		goto fail;
+	}
+	kq->mapped = true;
+	device_printf(m->sc->dev, "kq: client queue up: MEC1 pipe 0 queue 0, "
+	    "block at GART %#jx, doorbell %#x\n", (uintmax_t)kq->d.va,
+	    KCQ_DOORBELL);
+	*out = kq;
+	return (0);
+fail:
+	gart_unmap_blk(gt, kq->d.va, KQ_SIZE);
+	contigfree(kq->d.blk, KQ_SIZE, M_DEVBUF);
+	free(kq, M_DEVBUF);
+	return (err);
+}
+
+void
+amd_mes12_kq_close(struct amd_kq *kq)
+{
+	struct amd_gart *gt;
+	bool gone = true;
+
+	if (kq == NULL)
+		return;
+	gt = kq->m->gt;
+	if (kq->mapped) {
+		gone = vmt_qclose(kq->m, &kq->d);
+		kq_int(kq, false);
+	}
+	gart_unmap_blk(gt, kq->d.va, KQ_SIZE);
+	if (gone)
+		contigfree(kq->d.blk, KQ_SIZE, M_DEVBUF);
+	else
+		device_printf(kq->m->sc->dev, "kq: queue still active at "
+		    "close; its block is leaked, not freed\n");
+	free(kq, M_DEVBUF);
+}
+
+/*
+ * The queue is wedged (a fence that never came): remove it and map it
+ * afresh, ring and fence zeroed. Sequence numbers start over.
+ */
+int
+amd_mes12_kq_reset(struct amd_kq *kq)
+{
+	struct mes *m = kq->m;
+	int err;
+
+	if (kq->mapped) {
+		kq->mapped = false;
+		if (!vmt_qclose(m, &kq->d)) {
+			device_printf(m->sc->dev, "kq: reset: HQD still "
+			    "active; queue left down\n");
+			return (EIO);
+		}
+	}
+	kq->wptr = 0;
+	kq->seq = 0;
+	if ((err = vmt_qopen(m, &kq->d)) != 0)
+		return (err);
+	kq->mapped = true;
+	device_printf(m->sc->dev, "kq: reset: queue mapped afresh\n");
+	return (0);
+}
+
+/*
+ * Emit one job: IB at `ib` (`ib_dw` dwords) under `vmid`, then the fence
+ * and EOP interrupt; ring the doorbell. *seq is the job's fence value.
+ * EBUSY if the ring has no room (more than a ring's worth in flight).
+ */
+int
+amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
+    u_int vmid, uint32_t *seq)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(kq->d.blk + DISP_RING);
+	uint64_t fence = kq->d.va + DISP_WB + 0x10;
+	uint32_t pkt[KQ_PKT_DW], s, inflight;
+	u_int i, n = 0;
+
+	if (!kq->mapped)
+		return (ENXIO);
+	if (ib_dw == 0 || ib_dw > 0xfffffu || vmid == 0 || vmid > 15 ||
+	    (ib & 3) != 0)
+		return (EINVAL);
+	inflight = kq->seq - amd_mes12_kq_fence(kq);
+	if ((inflight + 1) * KQ_PKT_DW >= RING_DW)
+		return (EBUSY);
+	s = kq->seq + 1;
+	pkt[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
+	pkt[n++] = (uint32_t)ib;
+	pkt[n++] = (uint32_t)(ib >> 32);
+	pkt[n++] = IB_VALID | ib_dw | (vmid & 0xf) << 24;
+	pkt[n++] = PKT3(IT_RELEASE_MEM, 6);
+	pkt[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	pkt[n++] = RM_DATA_SEL(1) | RM_INT_SEL(2);
+	pkt[n++] = (uint32_t)fence;
+	pkt[n++] = (uint32_t)(fence >> 32);
+	pkt[n++] = s;
+	pkt[n++] = 0;
+	pkt[n++] = 0;
+	for (i = 0; i < n; i++)
+		ring[(kq->wptr + i) & (RING_DW - 1)] = pkt[i];
+	kq->wptr += n;
+	kq->seq = s;
+	*(volatile uint64_t *)(kq->d.blk + DISP_WB + 8) = kq->wptr;
+	wmb();
+	bus_write_8(kq->m->dbbar, (bus_size_t)KCQ_DOORBELL * 4, kq->wptr);
+	*seq = s;
+	return (0);
+}
+
+uint32_t
+amd_mes12_kq_fence(struct amd_kq *kq)
+{
+	return (*(volatile uint32_t *)(kq->d.blk + DISP_WB + 0x10));
+}
+
+void
+amd_mes12_kq_report(struct amd_kq *kq, const char *when)
+{
+	device_printf(kq->m->sc->dev, "kq: %s: seq %u, fence %u, wptr %ju\n",
+	    when, kq->seq, amd_mes12_kq_fence(kq), (uintmax_t)kq->wptr);
+	kcq_report(kq->m, &kq->d, when);
+}
+
+/*
  * Stage 5c, step 1: MES user queues on silicon, driven from the kernel
  * (the fd/kqueue interface comes on top in step 2). Two "processes", each
  * with its own four-level VM (5b) and one compute user queue added with a

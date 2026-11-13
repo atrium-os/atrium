@@ -29,6 +29,9 @@ int
 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
     uint32_t engine, uint16_t vmid, uint32_t *doorbell_off)
 {
+	if (amd_is_si(sc))
+		return (amd_si_q_program(sc, ring_va, engine, vmid,
+		    doorbell_off));
 	switch (engine) {
 	case ATRIUM_GPU_ENGINE_GFX:
 		/* Graphics ring = queue 0, direct CP_RB0_* MMIO (base holds VA>>8). */
@@ -68,6 +71,10 @@ amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 void
 amd_queue_stop(struct atrium_amd_softc *sc, uint32_t qid)
 {
+	if (amd_is_si(sc)) {
+		amd_si_q_stop(sc, qid);
+		return;
+	}
 	if (qid == ATRIUM_AMD_GFX_QID) {
 		amd_mmio_write32(sc, regCP_ME_CNTL, 1);	/* halt */
 	} else {

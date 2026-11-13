@@ -260,8 +260,10 @@ impl Dev {
         unsafe { sys::amd_rs_q_deadline(self.0, ns) }
     }
 
-    pub fn q_doorbell(self, off: u32, wptr: u32) {
-        unsafe { sys::amd_rs_q_doorbell(self.0, off, wptr) }
+    /// Ring the doorbell. `signalled`: the submit put a completion on the queue's list, so
+    /// silicon counts its fence against that list (gpusim ignores it).
+    pub fn q_doorbell(self, off: u32, wptr: u32, signalled: bool) {
+        unsafe { sys::amd_rs_q_doorbell(self.0, off, wptr, signalled as c_int) }
     }
 
     /// The doorbell BAR's base physical address, 0 if it cannot be mapped.

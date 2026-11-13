@@ -599,3 +599,19 @@ through fd passing, close and jail death.
   VMID 8, me1 pipe 0 queue 1 VMID 9); no faults in the user-queue phase; both removed,
   no HQD left. Attached 30 s at 13 W, dispatch PASS at detach, mode 1 reset cold, stray 0.
   Next: 5c-2, the queue fd / kqueue / doorbell-mapping interface on top.
+- 2026-11-13 02:20, 5c-2 split. **5c-2a** puts the client node on silicon: the gpu module
+  (atrium_gpu_amd.ko) attaches as the base's child when kenv `hw.atrium_gpu.client=1`, and the
+  unchanged Rust front-end runs over a silicon backend (si_client.c): VM fds on kernel VMIDs 1–7
+  with their own four-level tables (5b), System BOs (VRAM BOs wait for 5d), compute SUBMIT, and
+  the IH ring's IVs routed to the front-end (ih7.c consumer in the interrupt thread). As an
+  interim path SUBMIT runs on the kernel compute queue (4e/5b: VMID 0 ring, IB under the VM's
+  VMID, fence in VMID 0, so a client cannot forge its completion); the front-end retires a
+  signalled submit only when that fence passes. UTCL2 fault IVs fail the faulting submit (EIO)
+  and the watchdog stops it: wave kill for the VMID, then the fence (5b), else the queue is
+  mapped afresh. GfxOff stays off while any VM exists. Userspace test tests/si_client_test.c
+  (static cross-build, scripts/r9700/build-si-client-test.sh; IB from the oracle,
+  examples/si_client_w42.rs, patched for kernel-chosen VAs): dispatch with kqueue completion,
+  two VMs at the same VAs, a cross-VM write that must fault with EIO and leave the other VM's
+  page alone, recovery, refusals. Runner stage 5c2. **5c-2b** then moves SUBMIT onto MES user
+  queues per the 2026-11-12 decision (queue fd = MES user queue, doorbell mapping, device-lost
+  on the queue's fd), after which client work no longer runs on the kernel queue.

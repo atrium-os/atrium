@@ -45,7 +45,8 @@ void	amd_rs_count_locked(struct atrium_amd_softc *sc, int what, uint32_t n);
 void	amd_rs_q_report_stop(struct atrium_amd_softc *sc, uint32_t qid,
 	    uint16_t vmid, int what);
 void	amd_rs_q_deadline(struct atrium_amd_softc *sc, uint32_t ns);
-void	amd_rs_q_doorbell(struct atrium_amd_softc *sc, uint32_t off, uint32_t wptr);
+void	amd_rs_q_doorbell(struct atrium_amd_softc *sc, uint32_t off, uint32_t wptr,
+	    int signalled);
 uint64_t amd_rs_doorbell_pa(struct atrium_amd_softc *sc);
 void	amd_rs_vm_null_pd(struct atrium_amd_softc *sc, uint16_t vmid);
 void	amd_rs_watchdog_arm(struct atrium_amd_softc *sc);

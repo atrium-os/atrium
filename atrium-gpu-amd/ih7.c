@@ -123,6 +123,15 @@ struct amd_ih7 {
 	const char *kind;		/* MSI-X, MSI or polling */
 	volatile u_int nintr;
 	uint16_t pci_cmd;
+	/*
+	 * Stage 5c-2: a consumer (the client node, si_client.c) takes every
+	 * IV from the interrupt thread, or from a 10 ms poll without a
+	 * vector. `mtx` serialises draining the ring.
+	 */
+	struct mtx mtx;
+	amd_ih7_consumer_fn *fn;
+	void *fn_arg;
+	struct callout poll;
 };
 
 static bus_size_t
@@ -155,13 +164,24 @@ mp1(struct atrium_amd_softc *sc, uint32_t dw)
 	return (((bus_size_t)sc->ip.mp1.base[1] + dw) * 4);
 }
 
+static void ih7_consume(struct amd_ih7 *ih);
+
 static int
 ih7_filter(void *arg)
 {
 	struct amd_ih7 *ih = arg;
 
 	atomic_add_int(&ih->nintr, 1);
+	/* With a consumer the ring is drained in the interrupt thread. */
+	if (atomic_load_ptr(&ih->fn) != NULL)
+		return (FILTER_SCHEDULE_THREAD);
 	return (FILTER_HANDLED);
+}
+
+static void
+ih7_ithread(void *arg)
+{
+	ih7_consume(arg);
 }
 
 /*
@@ -200,7 +220,7 @@ ih7_msi_setup(struct amd_ih7 *ih)
 	if (ih->irq == NULL)
 		goto fail_msi;
 	if (bus_setup_intr(dev, ih->irq, INTR_TYPE_MISC | INTR_MPSAFE,
-	    ih7_filter, NULL, ih, &ih->intr_cookie) != 0)
+	    ih7_filter, ih7_ithread, ih, &ih->intr_cookie) != 0)
 		goto fail_irq;
 	ih->msi = true;
 	device_printf(dev, "ih: %s, 1 vector, for every IH client\n",
@@ -277,6 +297,7 @@ ih7_drain(struct amd_ih7 *ih, uint32_t client, uint32_t src, int max_log)
 	volatile uint32_t *iv;
 	int n = 0, seen = 0;
 
+	mtx_lock(&ih->mtx);
 	wptr = ih->wb[0];
 	if (wptr & WPTR_RB_OVERFLOW) {
 		device_printf(ih->sc->dev, "ih: ring overflow (wptr %#x)\n",
@@ -304,7 +325,76 @@ ih7_drain(struct amd_ih7 *ih, uint32_t client, uint32_t src, int max_log)
 		device_printf(ih->sc->dev, "ih: ... %d more IVs\n",
 		    n - max_log);
 	ihw(ih, ih->g->rb_rptr, ih->rptr);
+	mtx_unlock(&ih->mtx);
 	return (seen);
+}
+
+/*
+ * The consumer's drain: each IV between our read pointer and the
+ * writeback wptr goes to the consumer, then a NULL marks the end of the
+ * batch, then the read pointer is written (re-arming the MSI).
+ */
+static void
+ih7_consume(struct amd_ih7 *ih)
+{
+	uint32_t wptr, c, iv[IH_IV_SIZE / 4];
+	u_int i;
+
+	mtx_lock(&ih->mtx);
+	if (ih->fn == NULL) {
+		mtx_unlock(&ih->mtx);
+		return;
+	}
+	wptr = ih->wb[0];
+	if (wptr & WPTR_RB_OVERFLOW) {
+		ih->sc->ih_overflows++;
+		wptr &= ~WPTR_RB_OVERFLOW;
+		ih->rptr = (wptr + IH_IV_SIZE) & (IH_RING_SIZE - 1);
+		c = ihr(ih, ih->g->rb_cntl);
+		ihw(ih, ih->g->rb_cntl, c | WPTR_OVERFLOW_CLEAR);
+		ihw(ih, ih->g->rb_cntl, c & ~WPTR_OVERFLOW_CLEAR);
+	}
+	wptr &= IH_RING_SIZE - 1;
+	while (ih->rptr != wptr) {
+		for (i = 0; i < nitems(iv); i++)
+			iv[i] = ih->ring[ih->rptr / 4 + i];
+		ih->fn(ih->fn_arg, iv);
+		ih->rptr = (ih->rptr + IH_IV_SIZE) & (IH_RING_SIZE - 1);
+	}
+	ih->fn(ih->fn_arg, NULL);
+	ihw(ih, ih->g->rb_rptr, ih->rptr);
+	mtx_unlock(&ih->mtx);
+}
+
+static void
+ih7_poll(void *arg)
+{
+	struct amd_ih7 *ih = arg;
+
+	ih7_consume(ih);
+	if (atomic_load_ptr(&ih->fn) != NULL)
+		callout_reset(&ih->poll, MAX(1, hz / 100), ih7_poll, ih);
+}
+
+/*
+ * Install (fn != NULL) or remove the consumer. Once removal returns, fn
+ * is not running and will not be called again.
+ */
+void
+amd_ih7_set_consumer(struct amd_ih7 *ih, amd_ih7_consumer_fn *fn, void *arg)
+{
+	mtx_lock(&ih->mtx);
+	ih->fn_arg = arg;
+	atomic_store_ptr(&ih->fn, fn);
+	mtx_unlock(&ih->mtx);
+	if (fn != NULL) {
+		if (!ih->msi)
+			callout_reset(&ih->poll, MAX(1, hz / 100), ih7_poll,
+			    ih);
+		/* Whatever arrived before: take it now. */
+		ih7_consume(ih);
+	} else
+		callout_drain(&ih->poll);
 }
 
 static int
@@ -422,6 +512,8 @@ amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
 		return (ENXIO);
 	ihp = malloc(sizeof(*ihp), M_DEVBUF, M_WAITOK | M_ZERO);
 #define ih (*ihp)
+	mtx_init(&ih.mtx, "atrium-gpu-ih", NULL, MTX_DEF);
+	callout_init(&ih.poll, 1);
 	ih.sc = sc;
 	ih.gt = gt;
 	ih.g = g;
@@ -512,6 +604,7 @@ ih7_unmap_free(struct amd_ih7 *ih)
 	(void)amd_gmc12_flush(gt);
 	contigfree(__DEVOLATILE(void *, ih->ring), IH_RING_SIZE, M_DEVBUF);
 	contigfree(__DEVOLATILE(void *, ih->wb), PAGE_SIZE, M_DEVBUF);
+	mtx_destroy(&ih->mtx);
 	free(ih, M_DEVBUF);
 }
 
@@ -524,6 +617,8 @@ amd_ih7_down(struct amd_ih7 *ih)
 	if (ih == NULL)
 		return;
 	dev = ih->sc->dev;
+	if (ih->fn != NULL)
+		amd_ih7_set_consumer(ih, NULL, NULL);
 	ih7_ring_off(ih);
 	DELAY(1000);
 	ih7_report(ih, "disabled");

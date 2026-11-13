@@ -286,7 +286,7 @@ pub unsafe extern "C" fn amd_hwq_submit(
     st.wptr = n_dwords;
     st.generation += 1;
     dev.q_started(q.qid, so, signal_value);
-    dev.q_doorbell(off, n_dwords);
+    dev.q_doorbell(off, n_dwords, !so.is_null());
     drop(st);
     dev.watchdog_arm();
     0

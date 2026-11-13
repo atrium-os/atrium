@@ -553,6 +553,7 @@ struct atrium_amd_vm {
 	uint16_t	 vmid;		/* 1..15 */
 	struct atrium_amd_dma_page pdb;	/* page-directory page */
 	struct atrium_amd_dma_page pt[ATRIUM_AMD_VM_NUM_PT]; /* page-table pages */
+	void		*hw12;		/* silicon: its struct amd_vm12 (si_client.c) */
 };
 /*
  * Front-end/back-end split (rs/README.md). The struct above is the backend's
@@ -887,6 +888,10 @@ int	amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
 void	amd_ih7_down(struct amd_ih7 *ih);
 int	amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log);
 u_int	amd_ih7_nintr(struct amd_ih7 *ih);
+/* One IV (8 dwords), or NULL at the end of a batch (5c-2). */
+typedef void amd_ih7_consumer_fn(void *arg, const uint32_t *iv);
+void	amd_ih7_set_consumer(struct amd_ih7 *ih, amd_ih7_consumer_fn *fn,
+	    void *arg);
 int	amd_gfx12_setup(struct atrium_amd_softc *sc);	/* gfx12.c, 4c */
 int	atrium_amd_rs64_start(const uint8_t *bin, size_t len, uint64_t *out);
 int	atrium_amd_mes_start(const uint8_t *bin, size_t len, uint64_t *out);
@@ -898,9 +903,26 @@ int	amd_mes12_selftest(struct mes *m);
 int	amd_mes12_vmtest(struct mes *m);	/* 5b */
 int	amd_mes12_uqtest(struct mes *m);	/* 5c-1 */
 void	amd_mes12_down(struct mes *m);
+/* 5c-2: the kernel compute queue client SUBMITs run on (mes12.c). */
+struct amd_kq;
+int	amd_mes12_kq_open(struct mes *m, struct amd_kq **out);
+void	amd_mes12_kq_close(struct amd_kq *kq);
+int	amd_mes12_kq_reset(struct amd_kq *kq);
+int	amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
+	    u_int vmid, uint32_t *seq);
+uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
+void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */
 void	amd_si_detach(struct atrium_amd_softc *sc);
+/* 5c-2: what the client node (si_client.c, gpu module) needs of smu.c. */
+struct amd_gart *amd_si_gart(struct atrium_amd_softc *sc);
+struct mes *amd_si_mes(struct atrium_amd_softc *sc);
+struct amd_ih7 *amd_si_ih(struct atrium_amd_softc *sc);
+bool	amd_si_usable(struct atrium_amd_softc *sc);
+void	amd_si_client_attached(struct atrium_amd_softc *sc, bool on);
+int	amd_si_gfx_hold(struct atrium_amd_softc *sc);
+void	amd_si_gfx_release(struct atrium_amd_softc *sc);
 
 /*
  * One vendor-neutral GPU power telemetry sample (rs/power.rs Telemetry;
@@ -1020,6 +1042,7 @@ struct atrium_amd_softc {
 	struct atrium_amd_dma_page null_pd; /* all-invalid page directory */
 	int		 db_fict_registered;
 	void		*rs_state;	/* the Rust front-end's (rs/defer.rs) */
+	struct amd_si_client *si_client; /* silicon client node (si_client.c) */
 	struct timeout_task defer_task;
 	struct atrium_amd_isolation_stats iso;
 	struct timeout_task watchdog_task;
@@ -1254,5 +1277,27 @@ void	 amd_hwq_kick_watchdog(struct atrium_amd_softc *sc);
 /* glue.c — the client and control cdevsws (entry points in rs/ioctl.rs) */
 extern struct cdevsw atrium_amd_cdevsw;
 extern struct cdevsw atrium_amd_ctl_cdevsw;
+
+/*
+ * si_client.c (gpu module, stage 5c-2): the client node on silicon. The
+ * backend vtable, and the queue hardware the Rust front-end drives through
+ * cp.c and queue.c, which branch here on silicon.
+ */
+static inline bool
+amd_is_si(const struct atrium_amd_softc *sc)
+{
+	return (sc->hw_kind != AMD_HW_GPUSIM);
+}
+struct amd_si_client;
+extern const struct atrium_gpu_backend_ops amd_si_backend;
+int	amd_si_client_up(struct atrium_amd_softc *sc);
+void	amd_si_client_down(struct atrium_amd_softc *sc);
+int	amd_si_q_program(struct atrium_amd_softc *sc, uint64_t ring_va,
+	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+void	amd_si_q_stop(struct atrium_amd_softc *sc, uint32_t qid);
+uint32_t amd_si_q_rptr(struct atrium_amd_softc *sc, uint32_t qid);
+void	amd_si_q_kick(struct atrium_amd_softc *sc, uint32_t n_dwords,
+	    bool signalled);
+void	amd_si_vm_unbind(struct atrium_amd_softc *sc, uint16_t vmid);
 
 #endif /* _ATRIUM_GPU_AMD_H_ */

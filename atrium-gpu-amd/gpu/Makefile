@@ -4,7 +4,7 @@
 # Depends on the base module.
 KMOD=	atrium_gpu_amd
 # The display engine is its own module now (../display/) — see the §4.1 split.
-SRCS=	module.c firmware.c gmc.c bo.c cp.c irq.c vm.c glue.c pgate.c queue.c clear.c
+SRCS=	module.c firmware.c gmc.c bo.c cp.c irq.c vm.c glue.c pgate.c queue.c clear.c si_client.c
 SRCS+=	device_if.h bus_if.h pci_if.h
 
 .PATH:	${.CURDIR}/..

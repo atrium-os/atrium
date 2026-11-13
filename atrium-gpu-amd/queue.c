@@ -35,6 +35,8 @@
 uint32_t
 amd_rs_q_rptr(struct atrium_amd_softc *sc, uint32_t qid)
 {
+	if (amd_is_si(sc))
+		return (amd_si_q_rptr(sc, qid));
 	return (amd_mmio_read32(sc, ATRIUM_AMD_Q_BASE +
 	    qid * ATRIUM_AMD_Q_STRIDE + ATRIUM_AMD_QF_RPTR));
 }
@@ -122,13 +124,20 @@ amd_rs_q_count(struct atrium_amd_softc *sc, int what)
 void
 amd_rs_q_deadline(struct atrium_amd_softc *sc, uint32_t ns)
 {
+	if (amd_is_si(sc))	/* no firmware deadline scheduler yet */
+		return;
 	if (sc->regs != NULL)
 		amd_mmio_write32(sc, regCP_SUBMIT_DEADLINE_NS, ns);
 }
 
 void
-amd_rs_q_doorbell(struct atrium_amd_softc *sc, uint32_t off, uint32_t wptr)
+amd_rs_q_doorbell(struct atrium_amd_softc *sc, uint32_t off, uint32_t wptr,
+    int signalled)
 {
+	if (amd_is_si(sc)) {
+		amd_si_q_kick(sc, wptr, signalled != 0);
+		return;
+	}
 	bus_write_4(sc->doorbell, off, wptr);
 }
 
@@ -145,6 +154,10 @@ amd_rs_doorbell_pa(struct atrium_amd_softc *sc)
 void
 amd_rs_vm_null_pd(struct atrium_amd_softc *sc, uint16_t vmid)
 {
+	if (amd_is_si(sc)) {
+		amd_si_vm_unbind(sc, vmid);
+		return;
+	}
 	mtx_lock(&sc->lock);
 	amd_mmio_write32(sc, regVM_CTX_SELECT, vmid);
 	amd_mmio_write32(sc, regVM_CTX_PT_BASE_LO,

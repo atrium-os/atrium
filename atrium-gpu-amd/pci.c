@@ -126,8 +126,27 @@ atrium_amd_pci_attach(device_t dev)
 		TUNABLE_INT_FETCH("hw.atrium_gpu.attach", &attach);
 		if (attach && psp_bootload) {
 			if (amd_si_attach(sc) == 0) {
+				int client = 0;
+
+				/*
+				 * Stage 5c-2a (kenv hw.atrium_gpu.client=1):
+				 * the gpu child, so atrium_gpu_amd.ko publishes
+				 * the client node over the silicon backend. No
+				 * display child yet.
+				 */
+				TUNABLE_INT_FETCH("hw.atrium_gpu.client",
+				    &client);
+				if (client) {
+					child = device_add_child(dev,
+					    "atrium_gpu_amd", DEVICE_UNIT_ANY);
+					if (child == NULL)
+						device_printf(dev, "could not "
+						    "add the gpu child\n");
+					bus_attach_children(dev);
+				}
 				device_printf(dev, "silicon attached (stage "
-				    "5a); no gpu/display children yet\n");
+				    "5a)%s\n", client ? "; gpu child added "
+				    "(5c-2a)" : "; no gpu/display children");
 				return (0);
 			}
 			(void)amd_smu_mode1_reset(sc);

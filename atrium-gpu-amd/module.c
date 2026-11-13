@@ -181,7 +181,8 @@ amd_teardown(struct atrium_amd_softc *sc)
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, NULL);
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VM_FAULT, NULL);
-	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, NULL);
+	if (!amd_is_si(sc))
+		amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, NULL);
 	if (sc->ctl_cdev != NULL) {
 		destroy_dev(sc->ctl_cdev);
 		sc->ctl_cdev = NULL;
@@ -192,8 +193,12 @@ amd_teardown(struct atrium_amd_softc *sc)
 	}
 	/* After destroy_dev: no ioctl, mmap or cdevpriv dtor is still running.
 	 * The clear engine goes first: it uses the null page directory. */
-	amd_clear_fini(sc);
+	if (!amd_is_si(sc))
+		amd_clear_fini(sc);
 	amd_hwq_fini(sc);
+	/* Silicon: the kernel queue and the IV consumer, after the queues
+	 * are stopped. */
+	amd_si_client_down(sc);
 	/*
 	 * Reset this module's footprint in the SHARED softc back to the pristine
 	 * state the base left it in, so a re-attach (driver hot-swap,
@@ -216,7 +221,9 @@ atrium_amd_probe(device_t dev)
 	/* The base module names our child "atrium_gpu_amd" (our driver name), so
 	 * only we probe it; confirm + claim it. */
 	if (name != NULL && strcmp(name, "atrium_gpu_amd") == 0) {
-		device_set_desc(dev, "Atrium AMD RDNA4 GPU (gpusim)");
+		device_set_desc(dev, amd_is_si(device_get_softc(
+		    device_get_parent(dev))) ? "Atrium AMD RDNA4 GPU" :
+		    "Atrium AMD RDNA4 GPU (gpusim)");
 		return (BUS_PROBE_DEFAULT);
 	}
 	return (ENXIO);
@@ -246,6 +253,44 @@ amd_energy_actuate(void *arg, uint64_t mw, int posture)
 	    mw > UINT32_MAX ? UINT32_MAX : (uint32_t)mw);
 }
 
+static int atrium_amd_publish(device_t dev, struct atrium_amd_softc *sc);
+
+/*
+ * Silicon (stage 5c-2a): the base module has brought the card up and left it
+ * idle (amd_si_attach); none of gpusim's bring-up or register model applies.
+ * The same Rust front-end runs over the silicon backend (si_client.c): VMs,
+ * System BOs and compute SUBMIT on the kernel compute queue. No VRAM clear
+ * engine, device reset, scheduler, power gating or energy member yet.
+ */
+static int
+atrium_amd_attach_si(device_t dev, struct atrium_amd_softc *sc)
+{
+	int err;
+
+	sc->backend = &amd_si_backend;
+	SYSCTL_ADD_STRING(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "build_id",
+	    CTLFLAG_RD, __DECONST(char *, amd_build_id), 0,
+	    "driver build (git describe; -dirty = untested tree)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "abi_rev",
+	    CTLFLAG_RD, NULL, ATRIUM_AMD_ABI_REV, "client ABI revision");
+	if ((err = amd_hwq_init(sc, dev)) != 0) {
+		device_printf(dev, "queue isolation init failed: %d\n", err);
+		amd_teardown(sc);
+		return (err);
+	}
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, amd_eop_handler);
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VM_FAULT, amd_fault_handler);
+	if ((err = amd_si_client_up(sc)) != 0) {
+		device_printf(dev, "silicon client node: kernel queue not up "
+		    "(%d)\n", err);
+		amd_teardown(sc);
+		return (err);
+	}
+	return (atrium_amd_publish(dev, sc));
+}
+
 static int
 atrium_amd_attach(device_t dev)
 {
@@ -259,6 +304,9 @@ atrium_amd_attach(device_t dev)
 	struct atrium_amd_softc *sc = device_get_softc(device_get_parent(dev));
 	uint32_t id, grbm;
 	int err;
+
+	if (amd_is_si(sc))
+		return (atrium_amd_attach_si(dev, sc));
 
 	/* This module is the amd hardware backend under the shared front-end. */
 	sc->backend = &amd_backend;
@@ -338,6 +386,25 @@ atrium_amd_attach(device_t dev)
 	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, amd_gpu_reset_prepare,
 	    amd_gpu_reset_restore);
 
+	if ((err = atrium_amd_publish(dev, sc)) != 0)
+		return (err);
+
+	/*
+	 * Energy-budget federation member (P6): the kernel water_fills
+	 * the shared power cap; this device OBEYS its budget (the model
+	 * throttles execution to it) and exposes demand telemetry.
+	 */
+	sc->energy_member = energy_member_register("gpu0",
+	    amd_energy_demand_mw, amd_energy_actuate, sc, 1);
+	return (0);
+}
+
+/* The client and control nodes. */
+static int
+atrium_amd_publish(device_t dev, struct atrium_amd_softc *sc)
+{
+	int err;
+
 	/*
 	 * Publish the userspace interface. From here a user-mode driver (or the
 	 * in-tree test) allocates BOs, lays PM4 rings, and submits — the M3/M4
@@ -372,15 +439,8 @@ atrium_amd_attach(device_t dev)
 	}
 	sc->ctl_cdev->si_drv1 = sc;
 
-	/*
-	 * Energy-budget federation member (P6): the kernel water_fills
-	 * the shared power cap; this device OBEYS its budget (the model
-	 * throttles execution to it) and exposes demand telemetry.
-	 */
-	sc->energy_member = energy_member_register("gpu0",
-	    amd_energy_demand_mw, amd_energy_actuate, sc, 1);
-
-	device_printf(dev, "ready: /dev/atrium-gpu%d\n", device_get_unit(dev));
+	device_printf(dev, "ready: /dev/atrium-gpu%d (%s backend)\n",
+	    device_get_unit(dev), sc->backend->name);
 	return (0);
 }
 
