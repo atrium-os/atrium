@@ -1,0 +1,11 @@
+[package]
+name = "capsa-fat"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Capsa: FAT12/16/32 (and exFAT) for removable media, read by a jailed FUSE server. Panic-free on any input. docs/spec/device-assignment.md §4.6."
+
+[dependencies]
+
+[dev-dependencies]

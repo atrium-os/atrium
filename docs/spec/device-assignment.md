@@ -489,6 +489,36 @@ CCID driver, S3) do not exist yet. What they need from this layer does:
   jaild-policy grant patterns; jaild's validator and grant-name tests run on
   FreeBSD (type-checked here).
 
+### 6.4 As built: D5b, FAT library (2026-11-13, in progress)
+
+The removable-storage step starts with the part that parses untrusted
+bytes. `capsa/capsa-fat` (Capsa, NAMING.md) reads FAT12/16/32 with long
+file names:
+
+- boot sector checked against itself and the device size (sector and
+  cluster sizes, FAT size against the cluster count, FAT32 version, root
+  cluster, active FAT); FAT type by cluster count, as the specification
+  defines it; exFAT is recognised and refused here (its own module comes
+  next);
+- the FAT through a bounded sector cache; every chain walk is bounded by
+  the cluster count, so a loop is an error, not a hang; links outside the
+  volume, free or bad clusters inside a chain are errors for that
+  operation only;
+- directories capped at 65536 slots; long names only when their slots are
+  complete, in order and match the 8.3 checksum, else the 8.3 name (CP437,
+  with NT's lowercase bits); names with `/`, NUL, control characters, `.`,
+  `..` or over 255 bytes are skipped, never handed up; lookup is
+  case-insensitive by long or 8.3 name;
+- byte-addressed `BlockDev`, with `Aligned` for disk devices that take
+  whole sectors only.
+
+Tests: volumes made by `mkfs.fat` and `mtools` as FAT12, FAT16 and FAT32
+(long and Unicode names, nested directories, a 300-entry directory over
+several clusters, files across cluster edges read in odd-sized pieces, 8.3
+lookups, label), and 300 randomly damaged volumes walked end to end with no
+panic or hang. Next: the write path (checked with `fsck.fat`), exFAT, a
+fuzz target, then the FUSE server and jaild's outside mount.
+
 ## 7. Not in scope
 
 - New kernel drivers or hardware coverage (Wi-Fi, laptop I²C/SPI sensors).
