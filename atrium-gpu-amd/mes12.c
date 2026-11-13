@@ -413,6 +413,39 @@ mes_report(struct mes *m, const char *when)
  */
 #define CPF_STAT_BUSY_HI	0x10000000u
 
+#define GCVM_L2_STATUS		S0(0x15c7)	/* L2_BUSY, CONTEXT_DOMAIN_BUSY[16:1] */
+
+/* MES pipe 0's program counter (GRBM-selected). */
+static uint32_t
+mes_pc0(struct mes *m)
+{
+	uint32_t v;
+
+	grbm_select(m, 3, 0);
+	v = rd(m, m->g->mes_instr_pntr);
+	grbm_select(m, 0, 0);
+	return (v);
+}
+
+/*
+ * Run 8f3d4517: the wedge state (CPF bit 28 set, MES pipe 0 away from its
+ * idle loop, MES_TC_BUSY) was there right after the kill. Is it there
+ * before the kill, i.e. does the kill cause it or only meet it?
+ */
+static void
+cp_snap(struct mes *m, const char *when)
+{
+	const struct mes_gen *g = m->g;
+
+	device_printf(m->sc->dev, "mes: %s: MES pipe 0 PC %#x, CP_CPF_STATUS "
+	    "%#x, CP_CPC_STATUS %#x, CP_CPC_BUSY_STAT %#x/%#x, GRBM_STATUS2 "
+	    "%#x, RLC_GPM_STAT %#x, GCVM_L2_STATUS %#x\n", when, mes_pc0(m),
+	    rd(m, g->cp_cpf_status), rd(m, g->cp_cpc_status),
+	    rd(m, g->cp_cpc_busy), rd(m, g->cp_cpc_busy2),
+	    rd(m, g->grbm_status2), rd(m, g->rlc_gpm_stat),
+	    rd(m, GCVM_L2_STATUS));
+}
+
 static void
 cp_stall_watch(struct mes *m, const char *when, int ms)
 {
@@ -433,6 +466,7 @@ cp_stall_watch(struct mes *m, const char *when, int ms)
 			break;
 		DELAY(1000);
 	}
+	cp_snap(m, "end of the CPF watch");
 	device_printf(m->sc->dev, "mes: %s: CPF bit 28 %s after %d ms "
 	    "(CP_CPF_STATUS %#x); CP_CPF_BUSY_STAT %#x/%#x, "
 	    "CP_CPF_STALLED_STAT1 %#x, CP_CPC_BUSY_STAT %#x/%#x, "
@@ -3063,7 +3097,9 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	if (q->added && !uq2_done(q)) {
 		amd_mes12_uq_report(q, "destroy: work in flight");
 		if (uq2_hqd_find(m, q->db, &vmid) && vmid >= 8) {
+			cp_snap(m, "before the wave kill");
 			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);
+			cp_snap(m, "right after the wave kill");
 			for (us = 0; us < UQ2_KILL_WAIT_US && !uq2_done(q);
 			    us += 100)
 				DELAY(100);
