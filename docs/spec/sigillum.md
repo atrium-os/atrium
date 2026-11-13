@@ -724,11 +724,15 @@ otherwise passes the blobs on without reading them.
   checks pass on it: `atrium-sigillum-fido-0`, `/dev/u2f/0` only, `_sigillum-dev` 0600,
   `ip4=disable`. The scripted UI never sends a PIN; `sigillum-probe ui-tty`
   (`scripts/sigillum-real-key-ceremony.sh`) takes one typed at the terminal, one try per
-  ceremony. Found: the key has a PIN, and it lists only PIN/UV protocol 1, so it answered
-  protocol 2's `getPinUvAuthTokenUsingPinWithPermissions` with `INVALID_COMMAND`.
-  `sigillum-ctap` now speaks protocol 1 (`SHA-256(Z)` secret, zero-IV AES-CBC, 16-byte
-  HMAC) and CTAP 2.0's `getPinToken` with such keys. The soft key emulates such a key
-  (`pin_protocols = [1]`, `ceremonies.rs`). Register and assert on the real key are not yet run.
+  ceremony. Found: the key has a PIN and is `FIDO_2_1_PRE` (GetInfo: versions U2F_V2,
+  FIDO_2_0, FIDO_2_1_PRE; pinUvAuthProtocols [2, 1]; no `pinUvAuthToken` option), so it
+  answers `getPinUvAuthTokenUsingPinWithPermissions` (0x09) with `INVALID_COMMAND`
+  (CTAP status 0x01; no try spent, getPinRetries still 8). The token subcommand now
+  follows the `pinUvAuthToken` option, as libfido2's does: 0x09 with it, `getPinToken`
+  (0x05) without. `sigillum-ctap` also speaks protocol 1 (`SHA-256(Z)` secret, zero-IV
+  AES-CBC, 16-byte HMAC) for keys that list only 1. The soft key emulates both
+  (`pin_protocols`, `pin_uv_auth_token`; `ceremonies.rs`), and the driver logs the key's
+  GetInfo when it opens. Register and assert on the real key are not yet run.
 - **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
 

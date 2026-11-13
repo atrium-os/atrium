@@ -130,6 +130,17 @@ impl<D: HidDevice> Driver<D> {
         } else {
             sigillum_ctap::pin::PROTOCOL_ONE
         };
+        client.pin_uv_token = info.option("pinUvAuthToken") == Some(true);
+        // What the key says it is (no secrets): the first thing to read when
+        // a real key refuses a command.
+        eprintln!(
+            "sigillum-fido: GetInfo versions={:?} pin_protocols={:?} options={:?} -> protocol {} {}",
+            info.versions,
+            info.pin_protocols,
+            info.options,
+            client.pin_protocol,
+            if client.pin_uv_token { "getPinUvAuthTokenUsingPinWithPermissions" } else { "getPinToken" }
+        );
         let opt = |k| info.option(k).unwrap_or(false);
         let ext = |k: &str| info.extensions.iter().any(|e| e == k);
         let hello = FromDriver::Hello {
@@ -220,7 +231,11 @@ impl<D: HidDevice> Driver<D> {
             let retries = self.client.pin_retries().map(|r| r.min(255) as u8).unwrap_or(0);
             return Err(FromDriver::NeedPin { ceremony, retries });
         };
-        match self.client.pin_token(&pin.0, perm, rp_id) {
+        let r = self.client.pin_token(&pin.0, perm, rp_id);
+        if let Err(e) = &r {
+            eprintln!("sigillum-fido: PIN token request failed: {e:?}");
+        }
+        match r {
             Ok(t) => Ok(Some(t.auth(cdh))),
             Err(Error::Status(status::PIN_INVALID)) => {
                 let retries = self.client.pin_retries().map(|r| r.min(255) as u8).unwrap_or(0);

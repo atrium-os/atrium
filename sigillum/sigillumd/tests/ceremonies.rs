@@ -251,6 +251,7 @@ fn navigator_registers_and_signs_in_with_a_pin_protected_key() {
 fn pin_protocol_one_key_registers_and_signs_in() {
     let mut soft = SoftKey::new(Some(PIN));
     soft.pin_protocols = vec![sigillum_ctap::pin::PROTOCOL_ONE];
+    soft.pin_uv_auth_token = false;
     let mut r = Rig::new(soft);
     r.request(&web_broker(), register("example.com", Uv::Discouraged));
     r.press_last(Choice::Device(DEV));
@@ -265,10 +266,29 @@ fn pin_protocol_one_key_registers_and_signs_in() {
     assert_eq!(r.key.borrow().pin_retries, 8);
 }
 
+/// A CTAP 2.1-PRE key: protocols 2 and 1 listed, but no `pinUvAuthToken`
+/// option, so 0x09 is INVALID_COMMAND and the token comes from getPinToken.
+#[test]
+fn pre_2_1_key_gets_its_token_with_get_pin_token() {
+    let mut soft = SoftKey::new(Some(PIN));
+    soft.pin_protocols = vec![sigillum_ctap::pin::PROTOCOL, sigillum_ctap::pin::PROTOCOL_ONE];
+    soft.pin_uv_auth_token = false;
+    let mut r = Rig::new(soft);
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.pin_asks, 1);
+    let (cred, vk) = rp_check_registration(&r.reply(), "example.com");
+    r.request(&web_broker(), assert_req("example.com", vec![cred], Uv::Discouraged));
+    r.press_last(Choice::Device(DEV));
+    rp_check_assertion(&r.reply(), "example.com", &vk);
+    assert_eq!(r.key.borrow().pin_retries, 8);
+}
+
 #[test]
 fn pin_protocol_one_wrong_pin_costs_one_try() {
     let mut soft = SoftKey::new(Some(PIN));
     soft.pin_protocols = vec![sigillum_ctap::pin::PROTOCOL_ONE];
+    soft.pin_uv_auth_token = false;
     let mut r = Rig::new(soft);
     r.request(&web_broker(), register("example.com", Uv::Discouraged));
     let key = r.sheets[0].0;

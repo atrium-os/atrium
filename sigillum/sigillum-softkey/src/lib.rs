@@ -81,6 +81,9 @@ pub struct SoftKey {
     /// CTAP 2.0 key (a YubiKey 5 on firmware 5.4): `getPinToken` only, and
     /// protocol 2's token subcommand is INVALID_COMMAND.
     pub pin_protocols: Vec<u8>,
+    /// Lists the `pinUvAuthToken` option and answers 0x09; false behaves
+    /// as a CTAP 2.0 / 2.1-PRE key (0x09 is INVALID_COMMAND).
+    pub pin_uv_auth_token: bool,
 }
 
 impl Default for SoftKey {
@@ -122,6 +125,7 @@ impl SoftKey {
             commands: Vec::new(),
             u2f_only: false,
             pin_protocols: vec![pin::PROTOCOL],
+            pin_uv_auth_token: true,
         }
     }
 
@@ -274,7 +278,7 @@ impl SoftKey {
                 ("rk".into(), true),
                 ("up".into(), true),
                 ("clientPin".into(), self.pin_hash.is_some()),
-                ("pinUvAuthToken".into(), true),
+                ("pinUvAuthToken".into(), self.pin_uv_auth_token),
             ],
             max_msg_size: Some(1200),
             pin_protocols: self.pin_protocols.clone(),
@@ -417,7 +421,7 @@ impl SoftKey {
         if !self.pin_protocols.contains(&req.protocol) {
             return Err(Error::Status(status::INVALID_PARAMETER));
         }
-        let v21 = self.pin_protocols.contains(&pin::PROTOCOL);
+        let v21 = self.pin_uv_auth_token;
         match req.sub {
             cmd::pin_sub::GET_PIN_RETRIES => Ok(ClientPinResponse { retries: Some(self.pin_retries), ..Default::default() }.encode()),
             cmd::pin_sub::GET_KEY_AGREEMENT => Ok(ClientPinResponse {
@@ -428,7 +432,7 @@ impl SoftKey {
             cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS if !v21 => Err(Error::Status(status::INVALID_COMMAND)),
             // CTAP 2.0's getPinToken: a token for MakeCredential and
             // GetAssertion on any RP.
-            cmd::pin_sub::GET_PIN_TOKEN if req.protocol == pin::PROTOCOL_ONE => {
+            cmd::pin_sub::GET_PIN_TOKEN => {
                 let Some(stored) = self.pin_hash.as_ref() else {
                     return Err(Error::Status(status::PIN_NOT_SET));
                 };
@@ -438,7 +442,7 @@ impl SoftKey {
                 let (Some(peer), Some(enc)) = (req.key_agreement, req.pin_hash_enc) else {
                     return Err(Error::Status(status::MISSING_PARAMETER));
                 };
-                let shared = Shared::agree_with(pin::PROTOCOL_ONE, &self.key_agreement, &peer)?;
+                let shared = Shared::agree_with(req.protocol, &self.key_agreement, &peer)?;
                 let got = shared.decrypt(&enc)?;
                 self.pin_retries -= 1;
                 if got.len() != 16 || got[..] != stored[..] {
@@ -448,7 +452,7 @@ impl SoftKey {
                 self.pin_retries = 8;
                 let value = Zeroizing::new(random::<32>());
                 let enc = shared.encrypt(&*value)?;
-                self.token = Some(Token { value, permissions: permission::MAKE_CREDENTIAL | permission::GET_ASSERTION, rp_id: None, proto: pin::PROTOCOL_ONE });
+                self.token = Some(Token { value, permissions: permission::MAKE_CREDENTIAL | permission::GET_ASSERTION, rp_id: None, proto: req.protocol });
                 Ok(ClientPinResponse { token_enc: Some(enc), ..Default::default() }.encode())
             }
             cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS if req.protocol == pin::PROTOCOL => {

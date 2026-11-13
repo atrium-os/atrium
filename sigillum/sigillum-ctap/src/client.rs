@@ -34,6 +34,11 @@ pub struct Client<D: HidDevice> {
     /// The PIN/UV auth protocol to speak: 2 by default; the driver sets 1
     /// for a key whose `GetInfo` lists only 1 (CTAP 2.0 keys).
     pub pin_protocol: u8,
+    /// Whether the key has `getPinUvAuthTokenUsingPinWithPermissions`
+    /// (GetInfo option `pinUvAuthToken`); without it, `getPinToken` (0x05),
+    /// as libfido2 does. A YubiKey 5 on 5.4 firmware ("FIDO_2_1_PRE")
+    /// answers 0x09 with INVALID_COMMAND.
+    pub pin_uv_token: bool,
 }
 
 impl<D: HidDevice> Client<D> {
@@ -67,7 +72,7 @@ impl<D: HidDevice> Client<D> {
                     r = Reassembler::new(hid::BROADCAST);
                     continue;
                 }
-                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None, cancel: Arc::new(AtomicBool::new(false)), pin_protocol: pin::PROTOCOL });
+                return Ok(Client { dev, cid: init.cid, init, on_keepalive: None, cancel: Arc::new(AtomicBool::new(false)), pin_protocol: pin::PROTOCOL, pin_uv_token: true });
             }
         }
         Err(Error::Timeout)
@@ -188,7 +193,7 @@ impl<D: HidDevice> Client<D> {
 
     /// `getPinUvAuthTokenUsingPinWithPermissions` (protocol 2). The token is
     /// good for `permissions` on `rp_id` until the authenticator expires it.
-    /// With protocol 1, CTAP 2.0's `getPinToken`: no permissions, no RP.
+    /// Without `pin_uv_token`, CTAP 2.0's `getPinToken`: no permissions, no RP.
     pub fn pin_token(&mut self, pin_utf8: &[u8], permissions: u8, rp_id: &str) -> Result<PinToken, Error> {
         if pin_utf8.len() < 4 || pin_utf8.len() > 63 {
             return Err(Error::Request("PIN length"));
@@ -196,13 +201,14 @@ impl<D: HidDevice> Client<D> {
         let (shared, ours) = self.shared()?;
         let hash = pin::pin_hash(pin_utf8);
         let one = self.pin_protocol == pin::PROTOCOL_ONE;
+        let legacy = !self.pin_uv_token;
         let req = ClientPin {
             protocol: self.pin_protocol,
-            sub: if one { cmd::pin_sub::GET_PIN_TOKEN } else { cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS },
+            sub: if legacy { cmd::pin_sub::GET_PIN_TOKEN } else { cmd::pin_sub::GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS },
             key_agreement: Some(ours),
             pin_hash_enc: Some(shared.encrypt(&*hash)?),
-            permissions: if one { None } else { Some(permissions) },
-            rp_id: if one { None } else { Some(rp_id.to_owned()) },
+            permissions: if legacy { None } else { Some(permissions) },
+            rp_id: if legacy { None } else { Some(rp_id.to_owned()) },
             ..ClientPin::default()
         };
         let resp = ClientPinResponse::parse(&self.cbor(cmd::CLIENT_PIN, &req.encode())?)?;
