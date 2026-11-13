@@ -117,6 +117,7 @@ struct amd_si_client {
 	struct task uq_task;		/* evicts lost queues (taskqueue_thread) */
 	uint64_t uq_hangs, uq_faults;
 	uint64_t uq_preempts, uq_preempt_fails;	/* the free rule */
+	uint64_t uq_eop_preempt;	/* MES's suspend/resume EOPs */
 	uint64_t uq_eop_routed, uq_eop_unrouted, uq_eop_mes, uq_retired_iv,
 		 uq_retired_poll;
 
@@ -465,6 +466,16 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 	}
 	if (ctx == AMD_KQ_CTXID)
 		return;
+	/* A bare doorbell (no AMD_UQ_CTXID_FLAG): MES's EOP for a SUSPEND or
+	 * RESUME of that queue (5d run: they track the free-rule preemptions
+	 * one for one). Nothing of the queue's own work to retire. */
+	if ((ctx & 0xff000000u) == 0 && ((ctx >= AMD_UQ_DOORBELL(0) &&
+	    ctx < AMD_UQ_DOORBELL(AMD_UQ_SLOTS) && (ctx & 1) == 0) ||
+	    (ctx >= AMD_UQ_DOORBELL_USER(0) &&
+	    ctx < AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) && (ctx & 0x3ffu) == 0))) {
+		c->uq_eop_preempt++;
+		return;
+	}
 	/* MES's own scheduler EOPs (seen on silicon: 0x2000000b,
 	 * 0x20000002, 0x20000003): not a queue of ours, nothing to scan. */
 	if ((ctx & 0xff000000u) == AMD_MES_CTXID_FLAG) {
@@ -839,11 +850,12 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		err = 0;
 	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
-	    "routed %ju, unrouted %ju, MES own %ju; retired by IV %ju, "
-	    "by poll %ju; queues lost to faults %ju, hangs %ju; preempted "
-	    "for frees %ju (failed %ju)\n",
+	    "routed %ju, unrouted %ju, MES own %ju, MES preemption %ju; "
+	    "retired by IV %ju, by poll %ju; queues lost to faults %ju, "
+	    "hangs %ju; preempted for frees %ju (failed %ju)\n",
 	    slot, (uintmax_t)submits, (uintmax_t)c->uq_eop_routed,
 	    (uintmax_t)c->uq_eop_unrouted, (uintmax_t)c->uq_eop_mes,
+	    (uintmax_t)c->uq_eop_preempt,
 	    (uintmax_t)c->uq_retired_iv,
 	    (uintmax_t)c->uq_retired_poll, (uintmax_t)c->uq_faults,
 	    (uintmax_t)c->uq_hangs, (uintmax_t)c->uq_preempts,

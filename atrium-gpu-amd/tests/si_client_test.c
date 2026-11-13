@@ -49,12 +49,16 @@
  *                reads zero (CP DMA copy into a System BO), takes a fill and
  *                reads it back, refuses CPU reads; freed, it is scrubbed
  *                (vram sysctls), and a new VRAM BO reads zero again.
+ *  12 real ops   (5e) gpusim's SIM_COMPUTE_KERNEL ops COPY, INC and FILL as
+ *                real shaders (si_ops.h, oracle-built): each on its own
+ *                code page, 64 elements, from a System and a VRAM source.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
  */
 #include "../atrium_gpu_amd_abi.h"
 #include "si_w42.h"
+#include "si_ops.h"
 
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -1040,6 +1044,102 @@ vram(struct job *a)
 	run_clean(a, "11 VRAM: the queue runs on after the VRAM work");
 }
 
+/* ---- 12: gpusim's compute ops as real shaders (5e) ---- */
+
+/* Run `code` (one of si_ops.h's shaders) over src -> dst with `value`. */
+static int
+ops_run(struct job *j, int code_bo, uint64_t code_va, const uint32_t *code,
+    size_t code_bytes, uint64_t src, uint64_t dst, uint32_t value)
+{
+	uint32_t ib[SIOPS_IB_DW];
+	uint64_t prm[4] = { code_va, src, dst, value };
+	u_int i;
+
+	if (bo_xfer(code_bo, __DECONST(void *, code), code_bytes, 1) != 0)
+		return (errno);
+	memcpy(ib, siops_ib, sizeof(ib));
+	for (i = 0; i < SIOPS_NPATCH; i++)
+		ib[siops_patch[i].dw] = (uint32_t)(prm[siops_patch[i].which] >>
+		    siops_patch[i].shift);
+	return (dma_run(j, ib, SIOPS_IB_DW));
+}
+
+static void
+real_ops(struct job *a)
+{
+	static const struct {
+		const char *name;
+		const uint32_t *code;
+		size_t bytes;
+		int op;			/* 0 copy, 1 inc, 2 fill */
+	} ops[] = {
+		{ "COPY", siops_copy, sizeof(siops_copy), 0 },
+		{ "INC", siops_inc, sizeof(siops_inc), 1 },
+		{ "FILL", siops_fill, sizeof(siops_fill), 2 },
+	};
+	uint32_t in[SIOPS_N], out[SIOPS_N], want, w[7];
+	char name[64];
+	uint64_t code_va, src_va, vsrc_va;
+	int code, src, vsrc, r, bad;
+	u_int i, k, v;
+
+	memset(out, 0, sizeof(out));
+	code = bo_alloc(4096, 0);
+	src = bo_alloc(4096, 0);
+	vsrc = bo_alloc(4096, ATRIUM_GPU_BO_VRAM);
+	if (code < 0 || src < 0 || vsrc < 0 ||
+	    vm_bind(a->vm, code, ATRIUM_GPU_BIND_READONLY, &code_va) != 0 ||
+	    vm_bind(a->vm, src, ATRIUM_GPU_BIND_READONLY, &src_va) != 0 ||
+	    vm_bind(a->vm, vsrc, 0, &vsrc_va) != 0) {
+		check(0, "12 real ops", "setup: %s", strerror(errno));
+		goto out;
+	}
+	for (i = 0; i < SIOPS_N; i++)
+		in[i] = 7u + 3u * i;
+	if (bo_xfer(src, in, sizeof(in), 1) != 0) {
+		check(0, "12 real ops", "src: %s", strerror(errno));
+		goto out;
+	}
+	/* The VRAM source: a CP DMA copy of the System one. */
+	(void)dma_pkt(w, vsrc_va, src_va, sizeof(in), 0);
+	if ((r = dma_run(a, w, 7)) != 0) {
+		check(0, "12 real ops", "VRAM src copy: %s", strerror(r));
+		goto out;
+	}
+	for (v = 0; v < 2; v++) {
+		for (k = 0; k < sizeof(ops) / sizeof(ops[0]); k++) {
+			if (poison(a->out, POISON_A) != 0) {
+				check(0, "12 real ops", "poison: %s",
+				    strerror(errno));
+				goto out;
+			}
+			r = ops_run(a, code, code_va, ops[k].code, ops[k].bytes,
+			    v ? vsrc_va : src_va, a->out_va, 0x600dbeefu);
+			bad = -1;
+			if (r == 0 && bo_xfer(a->out, out, sizeof(out), 0) == 0)
+				for (i = 0, bad = 0; i < SIOPS_N; i++) {
+					want = ops[k].op == 0 ? in[i] :
+					    ops[k].op == 1 ? in[i] + 1 :
+					    0x600dbeefu;
+					bad += out[i] != want;
+				}
+			snprintf(name, sizeof(name), "12 real ops: %s, %s "
+			    "source", ops[k].name, v ? "VRAM" : "System");
+			check(r == 0 && bad == 0, name, "%s, %d/64 wrong; "
+			    "out[0] %#x out[63] %#x", r == 0 ? "ok" :
+			    strerror(r), bad, out[0], out[SIOPS_N - 1]);
+		}
+	}
+out:
+	if (code >= 0)
+		close(code);
+	if (src >= 0)
+		close(src);
+	if (vsrc >= 0)
+		close(vsrc);
+	run_clean(a, "12 real ops: write_42 runs on after");
+}
+
 static int
 ioerr(int f, unsigned long cmd, void *arg)
 {
@@ -1319,6 +1419,9 @@ main(void)
 
 	/* 11: VRAM BOs (5d). */
 	vram(&a);
+
+	/* 12: real-shader variants of gpusim's compute ops (5e). */
+	real_ops(&a);
 
 out:
 	job_close(&a);

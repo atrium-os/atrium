@@ -791,3 +791,11 @@ work (self-test, scrub).
   queue doorbell (0x20/0x22/0x26, no 0x1000000 tag) and track the free-rule preemptions:
   MES's SUSPEND/RESUME EOPs, to be counted as preemption EOPs. Idle 7 W, detach clean, card
   cold. Next: 5e (real-shader test variants).
+- **2026-11-13, stage 5e step 1 built (box run pending): gpusim's compute ops as real
+  shaders.** `atrium-rdna4-oracle/examples/si_ops.rs` builds COPY, INC and FILL (64
+  threads, dst[i] = src[i], src[i] + 1, value; params in user SGPRs s[0:4]) and one shared
+  IB with a derived patch table (`tests/si_ops.h`). si-client-test 12 runs each from a System
+  and a VRAM source. The acceptance suites (`atrium_gpu_test`, `test_gpu_isolation`) still
+  use the old ring SUBMIT, SIM kernels, draws, display and reset, none of which exist on
+  silicon; how they run there is an open choice (dual-mode recommended). Also: bare
+  user-queue doorbells in an EOP's `src_data[0]` are counted as MES preemption EOPs.
