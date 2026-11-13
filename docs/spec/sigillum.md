@@ -1012,8 +1012,13 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
   on the sheet, and only ostiarius enrols; a wrong passcode enrols nothing; a forged
   signature, a replayed answer (same sign count) and an unenrolled credential are refused.
   `keys.rs` unit test (store round trip, mode, bad user names); `sigillum-ui` sheet tests.
-- **Not yet:** the run on Shankar's YubiKey (enrol, then unlock, through the jailed
-  driver); ostiarius's lock screen asking `sigillumd` (`VERIFY_USER` with `key-uv`) instead of
+- **Gate (real key, 2026-11-13 18:52 UTC, PASS):** `scripts/sigillum-real-key-unlock.sh` in
+  the arm64 VM, Shankar's YubiKey 5 through the jailed driver, his PIN typed by him: as
+  ostiarius, `EnrolKey veutest` (PAM passcode, PIN, touch) answered `KeyEnrolled`, stored
+  `veutest.json` 0600 `_sigillum` (64-byte credential id, sign count 3); then `VERIFY_USER
+  veutest` (unlock, `key-uv`, PIN, touch) answered `Verified { SecurityKey, KeyUv }` and
+  the count was stored as 5.
+- **Not yet:** ostiarius's lock screen asking `sigillumd` (`VERIFY_USER` with `key-uv`) instead of
   checking the passcode itself, and an "Add a security key" entry in its settings that
   sends `EnrolKey`; removing a key (a user deletes its file entry
   through ostiarius, to be added with the settings page).
