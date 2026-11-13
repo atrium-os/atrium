@@ -353,7 +353,7 @@ Until Tessera encryption lands, every removable disk takes the jailed path.
     metadata moves up (Shankar: "needed sooner rather than later").
 13. **Kernel GEOM trimmed to GPT + MBR/EBR, label tasters off except GPT.**
     *Recommend yes.* Open.
-14. **exFAT included under "FAT".** *Recommend yes* (most sticks over 32 GB).
+14. **"FAT" = FAT12/16/32 + exFAT, all with VFAT long names.** *Recommend yes* (FAT16: SD ≤ 2 GB, cameras; FAT32: SDHC, most sticks, ESP; exFAT: SDXC > 32 GB).
     Open.
 15. **Optical: ISO 9660 + UDF via a jailed read-only reader; audio CDs via
     jailed MMC reads; no kernel `cd9660`/`udf` for media.** *Recommend yes.* Open.
