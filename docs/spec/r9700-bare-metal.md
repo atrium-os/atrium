@@ -1485,3 +1485,10 @@ work (self-test, scrub).
   idle at detach. G5 wedge fixed. Follow-up d9391a26: the MEC1 interrupt enables
   are set once at MES start instead of by GRBM selects at the first queue
   create and last destroy. Logs: claude/project-thread-33aauq a5a8b3f9.
+- **2026-11-13 15:29, full suite with a9288de6 (MEC1 interrupt enables set once
+  at MES start): CLEAN, 92 passed, 0 failed (3rd clean run in a row).** 0 flush
+  timeouts, bit 28 clear within 1 ms after all 12 kills, L2 idle at every end of
+  watch. EOP IVs (23) and test 14's CP-error IVs still arrive, also after a
+  mode 1 reset and re-init. Card proven idle at detach. G5 done; next on the
+  security gate: the §10.5 24 h fuzz gate. Logs: claude/project-thread-33aauq
+  13f24c23.
