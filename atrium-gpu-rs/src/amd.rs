@@ -25,6 +25,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use libc::{c_int, c_void, ioctl};
 
@@ -88,17 +89,32 @@ struct VmBind { va: u64, vm_fd: u32, bo_fd: u32 }
 struct VmBind2 { va: u64, vm_fd: u32, bo_fd: u32, flags: u32, pad: u32 }
 /// `VM_BIND2` flag: map without GPU write access (driver ABI rev 3).
 pub const BIND_READONLY: u32 = 0x1;
+/// `QUEUE_CREATE` (on a VM fd) and `QUEUE_SUBMIT` (on a queue fd): GPU ABI
+/// v2 §5.5/§5.9. The old ring `SUBMIT` ('A',4) is gone.
 #[repr(C)]
 #[derive(Default)]
-struct Submit {
-    signal_value: u64,
-    vm_fd: u32,
-    ring_fd: u32,
-    n_dwords: u32,
-    engine: u32,
-    signal_syncobj_fd: i32,
+struct QueueCreate { struct_size: u32, family_id: u32, priority: u32, flags: u32, out_queue_fd: i32, pad: u32 }
+#[repr(C)]
+#[derive(Default)]
+struct SyncobjPoint { syncobj_fd: i32, pad: u32, value: u64 }
+#[repr(C)]
+#[derive(Default)]
+struct QueueSubmit {
+    struct_size: u32,
+    flags: u32,
+    blob_va: u64,
+    blob_size: u64,
+    in_dep_ptr: u64,
+    in_dep_count: u32,
     deadline_ns: u32,
+    out_dep_ptr: u64,
+    out_dep_count: u32,
+    pad2: u32,
+    out_seqno: u64,
 }
+const QUEUE_FAMILY_COMPUTE: u32 = 0;
+/// gpusim only: silicon has no gfx queue, so gfx work runs on compute there.
+const QUEUE_FAMILY_GFX: u32 = 1;
 #[repr(C)]
 #[derive(Default)]
 struct SyncobjCreate { out_fd: u32, pad: u32 }
@@ -533,7 +549,7 @@ impl Gpu {
     pub fn create_vm(&self) -> io::Result<Vm<'_>> {
         let mut v = VmCreate::default();
         unsafe { call(self.fd, iowr(G, 12, std::mem::size_of::<VmCreate>()), &mut v)? };
-        Ok(Vm { gpu: self, fd: v.out_fd as RawFd })
+        Ok(Vm { gpu: self, fd: v.out_fd as RawFd, queues: [AtomicI32::new(-1), AtomicI32::new(-1)] })
     }
 
     /// Create a timeline syncobj (its fd is kqueue-able, see [`Syncobj`]).
@@ -607,7 +623,9 @@ impl Drop for GpuCtl { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 // Vm — a per-process GPU address space
 // ---------------------------------------------------------------------------
 
-pub struct Vm<'a> { gpu: &'a Gpu, fd: RawFd }
+/// A VM and, made on first use, one queue fd per engine (`queues[engine]`;
+/// -1 until then). Queues are closed before the VM.
+pub struct Vm<'a> { gpu: &'a Gpu, fd: RawFd, queues: [AtomicI32; 2] }
 
 impl<'a> Vm<'a> {
     /// The device this address space belongs to.
@@ -670,8 +688,38 @@ impl<'a> Vm<'a> {
         Ok(Bo { gpu: self.gpu, fd: bo_fd, gpu_va: b.va, size })
     }
 
+    /// This VM's queue fd for `engine`, made on first use. On silicon (no
+    /// gfx queue family) gfx work goes to a compute queue of its own.
+    fn queue(&self, engine: u32) -> io::Result<RawFd> {
+        let slot = self.queues.get(engine as usize).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let q = slot.load(Ordering::Acquire);
+        if q >= 0 {
+            return Ok(q);
+        }
+        let family = if engine == ENGINE_GFX { QUEUE_FAMILY_GFX } else { QUEUE_FAMILY_COMPUTE };
+        let mut c = QueueCreate { struct_size: std::mem::size_of::<QueueCreate>() as u32, family_id: family, ..Default::default() };
+        let create = iowr(G, 79, std::mem::size_of::<QueueCreate>());
+        if let Err(e) = unsafe { call(self.fd, create, &mut c) } {
+            if family != QUEUE_FAMILY_GFX || e.raw_os_error() != Some(libc::EINVAL) {
+                return Err(e);
+            }
+            c = QueueCreate { struct_size: std::mem::size_of::<QueueCreate>() as u32, family_id: QUEUE_FAMILY_COMPUTE, ..Default::default() };
+            unsafe { call(self.fd, create, &mut c)? };
+        }
+        match slot.compare_exchange(-1, c.out_queue_fd, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(c.out_queue_fd),
+            Err(other) => {
+                unsafe { libc::close(c.out_queue_fd) };
+                Ok(other)
+            }
+        }
+    }
+
     /// Submit a PM4 ring (already laid into `ring`) on an engine, optionally
-    /// signalling `signal` (a syncobj + value) on completion.
+    /// signalling `signal` (a syncobj + value) on completion. The ring runs
+    /// as a blob on this VM's queue fd for `engine`: on gpusim the submit
+    /// returns once the work is queued on the engine (as the old SUBMIT
+    /// did); on silicon it returns at once, so wait on `signal`.
     pub fn submit(
         &self,
         ring: &Bo<'_>,
@@ -693,21 +741,32 @@ impl<'a> Vm<'a> {
         signal: Option<(&Syncobj<'_>, u64)>,
         deadline_ns: u32,
     ) -> io::Result<()> {
-        let (sfd, sval) = signal.map_or((-1i32, 0u64), |(s, v)| (s.fd, v));
-        let mut s = Submit {
-            signal_value: sval,
-            vm_fd: self.fd as u32,
-            ring_fd: ring.fd as u32,
-            n_dwords,
-            engine,
-            signal_syncobj_fd: sfd,
+        let q = self.queue(engine)?;
+        let pt = signal.map(|(s, v)| SyncobjPoint { syncobj_fd: s.fd, pad: 0, value: v });
+        let mut s = QueueSubmit {
+            struct_size: std::mem::size_of::<QueueSubmit>() as u32,
+            blob_va: ring.gpu_va,
+            blob_size: n_dwords as u64 * 4,
             deadline_ns,
+            out_dep_ptr: pt.as_ref().map_or(0, |p| p as *const SyncobjPoint as u64),
+            out_dep_count: pt.is_some() as u32,
+            ..Default::default()
         };
-        unsafe { call(self.gpu.fd, iow(G, 4, std::mem::size_of::<Submit>()), &mut s) }
+        unsafe { call(q, iowr(G, 83, std::mem::size_of::<QueueSubmit>()), &mut s) }
     }
 }
 
-impl Drop for Vm<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
+impl Drop for Vm<'_> {
+    fn drop(&mut self) {
+        for q in &self.queues {
+            let fd = q.load(Ordering::Acquire);
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+        unsafe { libc::close(self.fd) };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Bo — a buffer object (fd-as-handle)

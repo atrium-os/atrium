@@ -105,23 +105,53 @@ bo_read(int fd, uint32_t handle, void *dst, uint64_t len)
 	return (ioctl(fd, ATRIUM_GPU_IOC_BO_READ, &x));
 }
 
+/* Run `n_dwords` of PM4 at `ring_va` on a gfx queue fd of `vm` and wait for
+ * it (the old ring SUBMIT is gone: GPU ABI v2 queue fds). */
 static int
-submit(int fd, int vm, uint32_t ring_handle, uint32_t n_dwords)
+submit(int fd, int vm, uint64_t ring_va, uint32_t n_dwords)
 {
-	struct atrium_gpu_submit s;
+	struct atrium_gpu_queue_create qc;
+	struct atrium_gpu_queue_submit qs;
+	struct atrium_gpu_syncobj_create sc;
+	struct atrium_gpu_syncobj_point pt;
+	struct atrium_gpu_syncobj_wait w;
+	int r;
 
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring_handle;
-	s.n_dwords = n_dwords;
-	s.engine = ATRIUM_GPU_ENGINE_GFX;
-	s.signal_syncobj_fd = -1;
-	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s));
+	memset(&sc, 0, sizeof(sc));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &sc) != 0)
+		return (-1);
+	memset(&qc, 0, sizeof(qc));
+	qc.struct_size = sizeof(qc);
+	qc.family_id = ATRIUM_GPU_QUEUE_FAMILY_GFX;
+	if (ioctl(vm, ATRIUM_GPU_IOC_QUEUE_CREATE, &qc) != 0) {
+		close((int)sc.out_fd);
+		return (-1);
+	}
+	memset(&pt, 0, sizeof(pt));
+	pt.syncobj_fd = (int32_t)sc.out_fd;
+	pt.value = 1;
+	memset(&qs, 0, sizeof(qs));
+	qs.struct_size = sizeof(qs);
+	qs.blob_va = ring_va;
+	qs.blob_size = (uint64_t)n_dwords * 4;
+	qs.out_dep_ptr = (uint64_t)(uintptr_t)&pt;
+	qs.out_dep_count = 1;
+	r = ioctl(qc.out_queue_fd, ATRIUM_GPU_IOC_QUEUE_SUBMIT, &qs);
+	if (r == 0) {
+		memset(&w, 0, sizeof(w));
+		w.syncobj_fd = sc.out_fd;
+		w.value = 1;
+		w.timeout_ms = 5000;
+		r = ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &w);
+	}
+	close(qc.out_queue_fd);
+	close((int)sc.out_fd);
+	return (r);
 }
 
 /* GPU DMA-copy src_va -> dst_va (mem->mem), `bytes` long. */
 static int
-dma_copy(int fd, int vm, uint32_t ring_h, uint64_t src_va, uint64_t dst_va,
+dma_copy(int fd, int vm, uint32_t ring_h, uint64_t ring_va, uint64_t src_va, uint64_t dst_va,
     uint32_t bytes)
 {
 	uint32_t ring[7];
@@ -135,7 +165,7 @@ dma_copy(int fd, int vm, uint32_t ring_h, uint64_t src_va, uint64_t dst_va,
 	ring[6] = bytes;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0)
 		return (-1);
-	return (submit(fd, vm, ring_h, 7));
+	return (submit(fd, vm, ring_va, 7));
 }
 
 /* Draw state (vtx/rt/dim/tex/filter) carried in the ring as a SET_SH_REG. */
@@ -214,14 +244,14 @@ main(void)
 	n = emit_draw_sh(ring, vtx_va, scan_va, W, H, tex_va, 2, 2, 0, 0, 0);
 	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
 	ring[n++] = 6;
-	if (bo_write(fd, ring_h, ring, n * 4) != 0 || submit(fd, vm, ring_h, n) != 0) {
+	if (bo_write(fd, ring_h, ring, n * 4) != 0 || submit(fd, vm, ring_va, n) != 0) {
 		fprintf(stderr, "draw submit failed\n");
 		return (1);
 	}
 
 	/* Verify the render reached VRAM: DMA-copy the first page out and check two
 	 * top-row pixels (left = red texel, right = green texel). */
-	if (dma_copy(fd, vm, ring_h, scan_va, rb_va, 4096) != 0) {
+	if (dma_copy(fd, vm, ring_h, ring_va, scan_va, rb_va, 4096) != 0) {
 		fprintf(stderr, "scanout readback (dma_copy) failed\n");
 		return (1);
 	}

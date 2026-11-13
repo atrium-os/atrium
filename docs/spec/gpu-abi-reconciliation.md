@@ -77,7 +77,7 @@ capability is the mapped doorbell page).
 | Bind | `VM_BIND` (async, persistent) | ✓ `'A',13` | **absent → add** |
 | BO create | `BO_CREATE` → bo_fd (VM-agnostic until bind) | `BO_ALLOC 'A',0` (fd) | `ALLOC 'G',1` → **handle → fd** |
 | BO map | `BO_MMAP_INFO` → offset, `mmap(device_fd)` | xfer via `BO_WRITE/READ 'A',1/2` (+ mmap d_mmap) | `mmap_offset` in alloc |
-| Submit | `SUBMIT(opaque blob)` on queue_fd | `SUBMIT 'A',4` (ring_fd + n_dwords) → **converge to queue_fd + blob** | `SUBMIT 'G',4` (cmd_handle) → **port** |
+| Submit | `SUBMIT(opaque blob)` on queue_fd | `SUBMIT 'A',4` (ring_fd + n_dwords) → **done 2026-11-13: retired; queue_fd + blob on gpusim and silicon** | `SUBMIT 'G',4` (cmd_handle) → **port** |
 | Queues | `QUEUE_CREATE` → queue_fd; `QUEUE_MAP` (UMQ) | `QUEUE_MAP 'A',14` (no queue_fd yet) → **add queue_fd** | **absent → add** |
 | Sync | timeline syncobj fd | `SYNCOBJ_CREATE/SIGNAL/QUERY/WAIT 'A',8–11` | int fences `FENCE_WAIT/QUERY 'G',5/6` → **replace** |
 | Completion→kqueue | the syncobj fd is `EVFILT_READ`-able | ✓ (direct) | **absent → add** |

@@ -46,7 +46,6 @@ macro_rules! abi_structs {
 abi_structs! {
     atrium_gpu_bo_alloc = 16;
     atrium_gpu_bo_xfer = 32;
-    atrium_gpu_submit = 32;
     atrium_gpu_irqs = 16;
     atrium_gpu_syncobj_create = 8;
     atrium_gpu_syncobj_op = 16;
@@ -222,10 +221,6 @@ fn client_ioctl(dev: Dev, client: &Client, cmd: u_long, data: &mut IoctlData<'_>
             0
         }),
 
-        sys::ATRIUM_RS_IOC_SUBMIT => with_arg(data, |a: &mut sys::atrium_gpu_submit| {
-            errno(submit(dev, client, a))
-        }),
-
         sys::ATRIUM_RS_IOC_QUERY_CAPS => with_arg(data, |a: &mut sys::atrium_gpu_caps_query| {
             errno(query_caps(dev, a))
         }),
@@ -280,29 +275,6 @@ fn bo_xfer(a: &sys::atrium_gpu_bo_xfer, write: bool) -> Result<()> {
         let p = kva.as_ptr().add(a.offset as usize);
         if write { user.copy_in_raw(p) } else { user.copy_out_raw(p) }
     }
-}
-
-fn submit(dev: Dev, client: &Client, a: &sys::atrium_gpu_submit) -> Result<()> {
-    let vm = FileRef::<Vm>::get(fd(a.vm_fd))?;
-    let ring = FileRef::<BoFile>::get(fd(a.ring_fd))?;
-    // A non-empty ring that fits the BO (each dword is 4 bytes)...
-    if a.n_dwords == 0 || a.n_dwords as u64 * 4 > ring.size() {
-        return Err(EINVAL);
-    }
-    // ...bound in the VM it runs under. The binding cannot go away during the submit: only
-    // the BO file's last close removes it, and we hold the file.
-    let ring_va = ring.gpu_va(&vm).ok_or(EINVAL)?;
-    let so = if a.signal_syncobj_fd >= 0 {
-        Some(FileRef::<SyncObj>::get(a.signal_syncobj_fd)?)
-    } else {
-        None
-    };
-    let so_ptr = so.as_ref().map_or(core::ptr::null_mut(), |s| s.as_c());
-    // The backend stages the frame deadline, programs the queue, registers the completion on
-    // that queue's list BEFORE ringing the doorbell (the ISR signals it on the end-of-pipe
-    // interrupt, which for a ring parked on a cross-queue WAIT comes on a later doorbell), and
-    // rings it, all under the queue's lock.
-    dev.submit(client.as_c(), ring_va, a.n_dwords, a.engine, vm.as_c(), a.deadline_ns, so_ptr, a.signal_value)
 }
 
 /// A TLV writer over a fixed buffer: every record is bounds-checked.

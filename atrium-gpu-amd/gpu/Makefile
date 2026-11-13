@@ -19,7 +19,7 @@ CFLAGS+= -I${.CURDIR}/..
 # (declared in ../rs/sys.rs).
 RUST_SRCS=	amd_frontend.rs
 RUST_BINDGEN_HDR= ../rs/sys.h
-RUST_BINDGEN_ALLOW= atrium_amd_(bo|vm|dma_page|syncobj|client)|atrium_gpu_.*|ATRIUM_GPU_.*|ATRIUM_AMD_(BO_MAX_PAGES|BO_MAX_BIND|NHWQ|BO_VA_BASE|VM_MAX_BO|VM_NUM_PT)|atrium_rs_ioc|ATRIUM_RS_IOC_.*|amd_rs_(cur_ruid|quota_limit|quota_refused|backend|irqs|syncobj_count|grant_count|cdev_softc|state|defer_count|q_.*|doorbell_pa|vm_null_pd|watchdog_arm)|AMD_RS_(Q|CNT|STOP)_.*|amd_rs_q_count|amd_rs_cnt|amd_rs_stop|amd_rs_(sc_lock|sc_unlock|sc_assert|ticks|hang_ticks_locked|count_locked|q_report_stop)|ATRIUM_AMD_MAX_PENDING|amd_hwq_defer_kick|amd_queue_(program|stop)|ATRIUM_AMD_(GFX|COMPUTE)_(QID|DOORBELL)|ATRIUM_AMD_QUEUE_WAIT_MS|amd_si_uq_.*|amd_rs_(priv_driver|mmap_object)
+RUST_BINDGEN_ALLOW= atrium_amd_(bo|vm|dma_page|syncobj|client)|atrium_gpu_.*|ATRIUM_GPU_.*|ATRIUM_AMD_(BO_MAX_PAGES|BO_MAX_BIND|NHWQ|BO_VA_BASE|VM_MAX_BO|VM_NUM_PT)|atrium_rs_ioc|ATRIUM_RS_IOC_.*|amd_rs_(cur_ruid|quota_limit|quota_refused|backend|irqs|syncobj_count|grant_count|cdev_softc|state|defer_count|q_.*|doorbell_pa|vm_null_pd|watchdog_arm)|AMD_RS_(Q|CNT|STOP)_.*|amd_rs_q_count|amd_rs_cnt|amd_rs_stop|amd_rs_(sc_lock|sc_unlock|sc_assert|ticks|hang_ticks_locked|count_locked|q_report_stop)|ATRIUM_AMD_MAX_PENDING|amd_hwq_defer_kick|amd_queue_(program|stop)|ATRIUM_AMD_(GFX|COMPUTE)_(QID|DOORBELL)|ATRIUM_AMD_QUEUE_WAIT_MS|amd_si_uq_.*|amd_rs_(priv_driver|mmap_object|is_si)
 
 # Build identity for the gpu-isolation attestation gate (gpu-isolation.md,
 # "Attestation freshness"): the last commit that touched the driver tree, with

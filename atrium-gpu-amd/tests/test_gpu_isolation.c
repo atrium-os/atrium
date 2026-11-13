@@ -9,6 +9,14 @@
  * with a ring parked on an unsatisfied WAIT_REG_MEM; the driver sees it through
  * the queue read pointer (gpusim 1ea93e5 or later).
  *
+ * All work goes through queue fds (QUEUE_CREATE on a VM, QUEUE_SUBMIT of a blob
+ * VA); the old ring SUBMIT is gone. On gpusim a queue fd runs on the shared
+ * engine queues, so breaks 1-3 still test their sharing rules there. On
+ * silicon (no GRAPHICS feature) every queue fd is its own MES user queue in its
+ * own VMID, gfx work runs on compute, and the parts that test the shared-queue
+ * model, QUEUE_MAP, the display or the gpusim watchdog print SKIP; their
+ * silicon counterparts are in si_client_test.c (tests 7-10).
+ *
  * Run as root in the guest with the three modules loaded:
  *   cc -Wall -o /tmp/test_gpu_isolation tests/test_gpu_isolation.c
  *   /tmp/test_gpu_isolation [--attest]
@@ -53,8 +61,12 @@
 #define ISO		"dev.atrium_gpu_amd.0.isolation."
 #define SENTINEL	0x5e57a11eu
 #define RESULT		0x000a11ceu
+/* DMA_DATA control word for a memory-to-memory copy (SRC/DST_SEL L2): what
+ * silicon needs; gpusim treats any non-DATA source as a copy. */
+#define DMA_CTL_COPY	0xe0300000u
 
 static int failures;
+static int g_si;	/* silicon: no GRAPHICS feature (detect_si) */
 
 #define CHECK(cond, ...) do {						\
 	if (cond) {							\
@@ -152,19 +164,149 @@ bo_read32(int fd, int bo)
 	return (v);
 }
 
-/* Submit; returns 0 or the errno. */
 static int
-submit(int fd, int vm, int ring, uint32_t n, uint32_t engine)
+syncobj_new(int fd)
 {
-	struct atrium_gpu_submit s;
+	struct atrium_gpu_syncobj_create c;
+
+	memset(&c, 0, sizeof(c));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &c) != 0) {
+		perror("SYNCOBJ_CREATE");
+		exit(2);
+	}
+	return ((int)c.out_fd);
+}
+
+/* A queue fd on `vm` for `engine`: gfx is gpusim only, so on silicon gfx work
+ * runs on a compute queue. -1 with errno on failure. */
+static int
+queue_new(int vm, uint32_t engine)
+{
+	struct atrium_gpu_queue_create c;
+
+	memset(&c, 0, sizeof(c));
+	c.struct_size = sizeof(c);
+	c.family_id = engine == ATRIUM_GPU_ENGINE_GFX && !g_si ?
+	    ATRIUM_GPU_QUEUE_FAMILY_GFX : ATRIUM_GPU_QUEUE_FAMILY_COMPUTE;
+	if (ioctl(vm, ATRIUM_GPU_IOC_QUEUE_CREATE, &c) != 0)
+		return (-1);
+	return ((int)c.out_queue_fd);
+}
+
+/* QUEUE_SUBMIT `n` dwords at `va`, signalling `so` (if >= 0) to `value`.
+ * 0 or the errno. */
+static int
+queue_submit(int q, uint64_t va, uint32_t n, int so, uint64_t value)
+{
+	struct atrium_gpu_queue_submit s;
+	struct atrium_gpu_syncobj_point pt;
 
 	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring;
-	s.n_dwords = n;
-	s.engine = engine;
-	s.signal_syncobj_fd = -1;
-	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) == 0 ? 0 : errno);
+	memset(&pt, 0, sizeof(pt));
+	s.struct_size = sizeof(s);
+	s.blob_va = va;
+	s.blob_size = (uint64_t)n * 4;
+	if (so >= 0) {
+		pt.syncobj_fd = so;
+		pt.value = value;
+		s.out_dep_ptr = (uint64_t)(uintptr_t)&pt;
+		s.out_dep_count = 1;
+	}
+	return (ioctl(q, ATRIUM_GPU_IOC_QUEUE_SUBMIT, &s) == 0 ? 0 : errno);
+}
+
+/*
+ * Queues of async submits (submit_so, park), closed at the end of each part
+ * (qreap) or before a test closes the VM they run on: a queue fd holds its VM.
+ * On silicon each is a MES user queue, and there are only a few.
+ */
+static int g_q[16];
+static int g_nq;
+
+static void
+qreap(void)
+{
+	while (g_nq > 0)
+		close(g_q[--g_nq]);
+}
+
+/* Submit on a queue of its own and return at once (the work may park),
+ * signalling `so` (if >= 0) to `value`. 0 or the errno. */
+static int
+submit_so(int fd __unused, int vm, uint64_t va, uint32_t n, uint32_t engine,
+    int so, uint64_t value)
+{
+	int q, err;
+
+	if (g_nq == (int)(sizeof(g_q) / sizeof(g_q[0])))
+		qreap();
+	if ((q = queue_new(vm, engine)) < 0)
+		return (errno);
+	if ((err = queue_submit(q, va, n, so, value)) != 0) {
+		close(q);
+		return (err);
+	}
+	g_q[g_nq++] = q;
+	return (0);
+}
+
+/* Submit on a queue of its own and wait (up to 5 s) for the work to finish:
+ * the old SUBMIT's synchronous use. 0 or the errno. */
+static int
+submit(int fd, int vm, uint64_t va, uint32_t n, uint32_t engine)
+{
+	struct atrium_gpu_syncobj_wait w;
+	int q, so, err;
+
+	so = syncobj_new(fd);
+	if ((q = queue_new(vm, engine)) < 0)
+		err = errno;
+	else
+		err = queue_submit(q, va, n, so, 1);
+	if (err == 0) {
+		memset(&w, 0, sizeof(w));
+		w.syncobj_fd = so;
+		w.value = 1;
+		w.timeout_ms = 5000;
+		if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &w) != 0)
+			err = errno;
+	}
+	if (q >= 0)
+		close(q);
+	close(so);
+	return (err);
+}
+
+/* Silicon or gpusim: silicon has no GRAPHICS feature. */
+static void
+detect_si(void)
+{
+	struct atrium_gpu_caps_query q;
+	uint8_t buf[256];
+	uint32_t feat = 0;
+	size_t off = 0;
+	int fd = xopen(GPU);
+
+	memset(&q, 0, sizeof(q));
+	q.caps_ptr = (uint64_t)(uintptr_t)buf;
+	q.caps_size = sizeof(buf);
+	if (ioctl(fd, ATRIUM_GPU_IOC_QUERY_CAPS, &q) != 0) {
+		perror("QUERY_CAPS");
+		exit(2);
+	}
+	while (off + sizeof(struct atrium_gpu_cap_record) <= q.caps_size) {
+		struct atrium_gpu_cap_record *r =
+		    (struct atrium_gpu_cap_record *)(buf + off);
+
+		if (r->cap_id == ATRIUM_GPU_CAP_FEATURES_V1)
+			memcpy(&feat, buf + off + sizeof(*r), sizeof(feat));
+		off += sizeof(*r) + r->cap_size;
+		off = (off + 3u) & ~(size_t)3u;
+	}
+	close(fd);
+	g_si = !(feat & ATRIUM_GPU_FEAT_GRAPHICS);
+	printf("%s (features 0x%x)\n", g_si ? "silicon: MES user queues, "
+	    "gfx work on compute" : "gpusim: shared engine queues", feat);
 }
 
 static int
@@ -243,7 +385,7 @@ kick(int fd, int vm)
 	int ring = bo_new(fd, vm, 4096, 0, &va), err;
 
 	bo_write(fd, ring, r, sizeof(r));
-	err = submit(fd, vm, ring, 2, ATRIUM_GPU_ENGINE_COMPUTE);
+	err = submit(fd, vm, va, 2, ATRIUM_GPU_ENGINE_COMPUTE);
 	close(ring);
 	return (err);
 }
@@ -278,7 +420,7 @@ park(struct parked *p, int fd, uint64_t extra_va, int extra_in_vm)
 	if (extra_va != 0)
 		n += emit_write(r + n, extra_va, SENTINEL);
 	bo_write(fd, p->ring, r, n * 4);
-	return (submit(fd, p->vm, p->ring, n, ATRIUM_GPU_ENGINE_GFX));
+	return (submit_so(fd, p->vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX, -1, 0));
 }
 
 static void
@@ -330,7 +472,7 @@ part_a(void)
 	b[0] = bo_new(fdb, vmb, 4096, 0, &va_b[0]);	/* ring */
 	b[1] = bo_new(fdb, vmb, 4096, 0, &va_b[1]);	/* destination */
 	r[0] = type3(IT_DMA_DATA, 6);
-	r[1] = 0;
+	r[1] = DMA_CTL_COPY;
 	r[2] = (uint32_t)(va_a[2] & 0xffffffff);
 	r[3] = (uint32_t)(va_a[2] >> 32);
 	r[4] = (uint32_t)(va_b[1] & 0xffffffff);
@@ -339,7 +481,7 @@ part_a(void)
 	bo_write(fdb, b[0], r, 7 * 4);
 	v = 0;
 	bo_write(fdb, b[1], &v, 4);
-	submit(fdb, vmb, b[0], 7, ATRIUM_GPU_ENGINE_GFX);
+	submit(fdb, vmb, va_b[0], 7, ATRIUM_GPU_ENGINE_GFX);
 	v = bo_read32(fdb, b[1]);
 	CHECK(v != SENTINEL,
 	    "4/5. B's copy from A's VA did not return A's data (got 0x%08x)", v);
@@ -380,10 +522,10 @@ static void
 break1(void)
 {
 	struct parked p;
-	uint64_t refused0, waits0, va;
+	uint64_t refused0, waits0, va, rvb;
 	uint32_t r[8];
 	double t0, dt;
-	int fda, fdb, vmb, ringb, resb, err, n;
+	int fda, fdb, vmb, ringb, resb, err, n, i;
 
 	printf("Break 1: shared-queue reprogramming under another VMID\n");
 	fda = xopen(GPU);
@@ -391,14 +533,30 @@ break1(void)
 	CHECK(park(&p, fda, 0, 0) == 0, "A's gfx ring submitted and parked");
 
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &va);
+	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
 	resb = bo_new(fdb, vmb, 4096, 0, &va);
 	n = emit_write(r, va, 0xb0b);
 	bo_write(fdb, ringb, r, n * 4);
+	if (g_si) {
+		/* Per-VM MES queues: nothing to share, so nothing to wait for. */
+		t0 = now_s();
+		err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_GFX);
+		dt = now_s() - t0;
+		CHECK(err == 0 && bo_read32(fdb, resb) == 0xb0b && dt < 1.0,
+		    "B's work runs at once on its own queue while A's is parked "
+		    "(%s, %.3f s)", strerror(err), dt);
+		CHECK(bo_read32(fda, p.res) == 0, "A's parked work has not run");
+		unpark(&p);
+		for (i = 0; i < 200 && bo_read32(fda, p.res) != RESULT; i++)
+			usleep(10 * 1000);
+		CHECK(bo_read32(fda, p.res) == RESULT,
+		    "A's work ran to completion in A's VM once unblocked");
+		goto out;
+	}
 	refused0 = iso("queue_refused");
 	waits0 = iso("queue_waits");
 	t0 = now_s();
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_GFX);
 	dt = now_s() - t0;
 	CHECK(err == EBUSY, "B's gfx submit while A's work is queued: %s "
 	    "after %.1f s (want EBUSY)", strerror(err), dt);
@@ -410,9 +568,11 @@ break1(void)
 	unpark(&p);
 	CHECK(bo_read32(fda, p.res) == RESULT,
 	    "A's work ran to completion in A's VM once unblocked");
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_GFX);
 	CHECK(err == 0 && bo_read32(fdb, resb) == 0xb0b,
 	    "B's submit runs once A's work has drained");
+out:
+	qreap();
 	close(ringb);
 	close(resb);
 	close(vmb);
@@ -429,7 +589,7 @@ static void
 break2(void)
 {
 	struct parked p;
-	uint64_t deferred0, reaped0, dequeues0, waits0, tva, va;
+	uint64_t deferred0, reaped0, dequeues0, waits0, tva, va, rvd;
 	uint32_t r[8];
 	int now0, fda, target, fdd, vmd, ringd, resd, n;
 
@@ -458,6 +618,7 @@ break2(void)
 
 	/* Close the rest of A: the VM teardown stops any queue still under its
 	 * VMID before freeing page tables, which retires every deferral. */
+	qreap();	/* a queue fd holds its VM */
 	close(p.word);
 	close(p.res);
 	close(p.ring);
@@ -471,6 +632,7 @@ break2(void)
 	/* A VM whose ring is parked forever, closed outright. */
 	CHECK(park(&p, fda, 0, 0) == 0, "A parked a ring that never resumes");
 	dequeues0 = iso("dequeues");
+	qreap();
 	close(p.word);
 	close(p.res);
 	close(p.ring);
@@ -483,12 +645,12 @@ break2(void)
 	/* The VMID is free and the queue idle: a new VM runs at once. */
 	fdd = xopen(GPU);
 	vmd = vm_create(fdd);
-	ringd = bo_new(fdd, vmd, 4096, 0, &va);
+	ringd = bo_new(fdd, vmd, 4096, 0, &rvd);
 	resd = bo_new(fdd, vmd, 4096, 0, &va);
 	n = emit_write(r, va, 0xd00d);
 	bo_write(fdd, ringd, r, n * 4);
 	waits0 = iso("queue_waits");
-	CHECK(submit(fdd, vmd, ringd, n, ATRIUM_GPU_ENGINE_GFX) == 0 &&
+	CHECK(submit(fdd, vmd, rvd, n, ATRIUM_GPU_ENGINE_GFX) == 0 &&
 	    bo_read32(fdd, resd) == 0xd00d && iso("queue_waits") == waits0,
 	    "a new VM (VMID reused) submits on gfx without waiting");
 	close(ringd);
@@ -503,7 +665,7 @@ static void
 break3(void)
 {
 	struct atrium_gpu_queue_map m1, m2, mg;
-	uint64_t va, revokes0;
+	uint64_t va, rv2, revokes0;
 	uint32_t r[8];
 	volatile uint32_t *db;
 	void *map, *bad;
@@ -519,7 +681,7 @@ break3(void)
 	res1 = bo_new(fd1, vm1, 4096, 0, &va);
 	n = emit_write(r, va, 0x1111);
 	bo_write(fd1, ring1, r, n * 4);
-	ring2 = bo_new(fd2, vm2, 4096, 0, &va);
+	ring2 = bo_new(fd2, vm2, 4096, 0, &rv2);
 	bo_write(fd2, ring2, r, n * 4);
 
 	/* Nobody owns compute yet: no one can map its doorbell. */
@@ -533,7 +695,7 @@ break3(void)
 	    (unsigned long long)m1.doorbell_mmap_offset);
 	CHECK(queue_map(fd2, vm2, ring2, ATRIUM_GPU_ENGINE_COMPUTE, &m2) == EBUSY,
 	    "client 2 cannot take the compute queue (EBUSY)");
-	CHECK(submit(fd2, vm2, ring2, n, ATRIUM_GPU_ENGINE_COMPUTE) == EBUSY,
+	CHECK(submit(fd2, vm2, rv2, n, ATRIUM_GPU_ENGINE_COMPUTE) == EBUSY,
 	    "client 2 cannot submit on client 1's queue (EBUSY)");
 	bad = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd2,
 	    m1.doorbell_mmap_offset);
@@ -658,27 +820,19 @@ break5(void)
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
 	    "a non-root process cannot open the control node");
 	fd = xopen(GPUCTL);
-	CHECK(ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s) == 0,
-	    "SCHED works on the control node");
+	if (g_si)	/* silicon has no scheduler op yet (si_client.c) */
+		CHECK(ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s) != 0 &&
+		    errno == EOPNOTSUPP, "SCHED on the control node reaches "
+		    "the driver (EOPNOTSUPP on silicon, not EPERM)");
+	else
+		CHECK(ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s) == 0,
+		    "SCHED works on the control node");
 	close(fd);
 }
 
 /* ---------------------------------------------------------------------------
  * Part C: completion attribution and the hang watchdog (review §A2.2, §A2.6).
  */
-static int
-syncobj_new(int fd)
-{
-	struct atrium_gpu_syncobj_create c;
-
-	memset(&c, 0, sizeof(c));
-	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &c) != 0) {
-		perror("SYNCOBJ_CREATE");
-		exit(2);
-	}
-	return ((int)c.out_fd);
-}
-
 static uint64_t
 syncobj_value(int fd, int so)
 {
@@ -734,10 +888,9 @@ hang_ms(int v)
 static void
 part_c(void)
 {
-	struct atrium_gpu_submit s;
 	struct kevent kev;
 	struct timespec ts = { 1, 0 };
-	uint64_t hangs0, failed0, word_va, ring_va, fence_va, va;
+	uint64_t hangs0, failed0, word_va, ring_va, fence_va, va, rvb;
 	uint32_t r[32], zero = 0;
 	int fda, fdb, vma, vmb, word, ring, fence, so, ringb, fenceb, resb;
 	int kq, n, err, old;
@@ -759,24 +912,18 @@ part_c(void)
 	n = emit_wait(r, word_va);
 	n += emit_eop(r + n, fence_va, 0xa);
 	bo_write(fda, ring, r, n * 4);
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vma;
-	s.ring_fd = ring;
-	s.n_dwords = n;
-	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
-	s.signal_syncobj_fd = so;
-	s.signal_value = 1;
-	CHECK(ioctl(fda, ATRIUM_GPU_IOC_SUBMIT, &s) == 0,
+	CHECK(submit_so(fda, vma, ring_va, n, ATRIUM_GPU_ENGINE_COMPUTE, so,
+	    1) == 0,
 	    "A's compute ring parked, owing its syncobj value 1");
 
 	/* B: an end-of-pipe on gfx must not retire A's compute completion. */
 	fdb = xopen(GPU);
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &va);
+	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
 	fenceb = bo_new(fdb, vmb, 4096, 0, &fence_va);
 	n = emit_eop(r, fence_va, 0xb);
 	bo_write(fdb, ringb, r, n * 4);
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_GFX);
 	CHECK(err == 0 && bo_read32(fdb, fenceb) == 0xb,
 	    "B's gfx ring raised its end-of-pipe");
 	CHECK(syncobj_value(fda, so) == 0,
@@ -787,7 +934,7 @@ part_c(void)
 	n = emit_write(r, va, 0xb0b);
 	bo_write(fdb, ringb, r, n * 4);
 	t0 = now_s();
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_COMPUTE);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_COMPUTE);
 	dt = now_s() - t0;
 	CHECK(err == 0 && bo_read32(fdb, resb) == 0xb0b,
 	    "B's compute submit ran after %.2f s (hang_ms 500; %s)", dt,
@@ -820,16 +967,15 @@ part_c(void)
 
 		n = emit_eop(r, fva, 0xc);
 		bo_write(fda, ring, r, n * 4);
-		s.n_dwords = n;
-		s.signal_syncobj_fd = so;
-		s.signal_value = 7;
-		err = ioctl(fda, ATRIUM_GPU_IOC_SUBMIT, &s) == 0 ? 0 : errno;
+		err = submit_so(fda, vma, ring_va, n,
+		    ATRIUM_GPU_ENGINE_COMPUTE, so, 7);
 		CHECK(err == 0 && syncobj_wait(fda, so, 7, 1000) == 0 &&
 		    bo_read32(fda, f2) == 0xc,
 		    "A's next compute submit signals its new syncobj");
 		close(f2);
 	}
 
+	qreap();
 	close(so);
 	close(word);
 	close(fence);
@@ -849,27 +995,11 @@ part_c(void)
  * hostile app's shader or packet stream will touch unmapped VAs; if that
  * wedges the whole engine until a reset, any app can stall every other.
  */
-static int
-submit_so(int fd, int vm, int ring, uint32_t n, uint32_t engine, int so,
-    uint64_t value)
-{
-	struct atrium_gpu_submit s;
-
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring;
-	s.n_dwords = n;
-	s.engine = engine;
-	s.signal_syncobj_fd = so;
-	s.signal_value = value;
-	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) == 0 ? 0 : errno);
-}
-
 static void
 part_d(void)
 {
 	struct atrium_gpu_vm_bind2 b2;
-	uint64_t va, rva, fva, faults0, ro_va;
+	uint64_t va, rva, rvb, fva, faults0, ro_va;
 	uint32_t r[32], v;
 	int fda, fdb, vma, vmb, ringa, ringb, resb, fence, ro, so, n, err;
 
@@ -884,7 +1014,7 @@ part_d(void)
 	n = emit_write(r, 0x7f0000000000ull, 0xbad);
 	n += emit_eop(r + n, fva, 1);
 	bo_write(fda, ringa, r, n * 4);
-	err = submit_so(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
+	err = submit_so(fda, vma, rva, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
 	CHECK(err == 0 && syncobj_wait(fda, so, 1, 3000) == EIO,
 	    "A's faulting work completes with EIO, not success");
 	CHECK(iso("vm_faults") > faults0, "the fault was reported (%llu)",
@@ -892,17 +1022,17 @@ part_d(void)
 
 	fdb = xopen(GPU);
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &rva);
+	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
 	resb = bo_new(fdb, vmb, 4096, 0, &va);
 	n = emit_write(r, va, 0xd0d0);
 	bo_write(fdb, ringb, r, n * 4);
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_GFX);
 	CHECK(err == 0 && bo_read32(fdb, resb) == 0xd0d0,
 	    "B's gfx work runs after A faulted on compute (%s, 0x%x)",
 	    strerror(err), bo_read32(fdb, resb));
 	n = emit_write(r, va, 0xc0c0);
 	bo_write(fdb, ringb, r, n * 4);
-	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_COMPUTE);
+	err = submit(fdb, vmb, rvb, n, ATRIUM_GPU_ENGINE_COMPUTE);
 	CHECK(err == 0 && bo_read32(fdb, resb) == 0xc0c0,
 	    "B's compute work runs on the queue A faulted on (%s, 0x%x)",
 	    strerror(err), bo_read32(fdb, resb));
@@ -926,11 +1056,12 @@ part_d(void)
 	n = emit_write(r, b2.va, 0xbad);
 	n += emit_eop(r + n, fva, 2);
 	bo_write(fda, ringa, r, n * 4);
-	err = submit_so(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
+	err = submit_so(fda, vma, rva, n, ATRIUM_GPU_ENGINE_COMPUTE, so, 1);
 	CHECK(err == 0 && syncobj_wait(fda, so, 1, 3000) == EIO &&
 	    bo_read32(fda, ro) == SENTINEL && iso("vm_faults") > faults0,
 	    "a GPU store to it faults, leaves it intact, and fails the work");
 
+	qreap();
 	close(so);
 	close(ro);
 	close(fence);
@@ -1022,7 +1153,8 @@ bo_read(int fd, int bo, void *dst, uint64_t len)
 	return (ioctl(fd, ATRIUM_GPU_IOC_BO_READ, &x) == 0 ? 0 : errno);
 }
 
-/* DMA_DATA copy src_va -> dst_va (bytes) on gfx; returns the submit errno. */
+/* DMA_DATA copy src_va -> dst_va (bytes) on gfx (compute on silicon);
+ * returns the submit errno. */
 static int
 gpu_copy(int fd, int vm, uint64_t src_va, uint64_t dst_va, uint32_t bytes)
 {
@@ -1031,14 +1163,14 @@ gpu_copy(int fd, int vm, uint64_t src_va, uint64_t dst_va, uint32_t bytes)
 	int ring = bo_new(fd, vm, 4096, 0, &ring_va), err;
 
 	r[0] = type3(IT_DMA_DATA, 6);
-	r[1] = 0;
+	r[1] = DMA_CTL_COPY;
 	r[2] = (uint32_t)(src_va & 0xffffffff);
 	r[3] = (uint32_t)(src_va >> 32);
 	r[4] = (uint32_t)(dst_va & 0xffffffff);
 	r[5] = (uint32_t)(dst_va >> 32);
 	r[6] = bytes;
 	bo_write(fd, ring, r, sizeof(r));
-	err = submit(fd, vm, ring, 7, ATRIUM_GPU_ENGINE_GFX);
+	err = submit(fd, vm, ring_va, 7, ATRIUM_GPU_ENGINE_GFX);
 	close(ring);
 	return (err);
 }
@@ -1278,27 +1410,36 @@ attest(void)
 	    "isolation_test_date     = \"%s\"\n"
 	    "isolation_test_commit   = \"%s\"\n"
 	    "abi_rev                 = %d\n"
-	    "notes = \"test_gpu_isolation on gpusim; shared queues until per-VM "
-	    "MES queues\"\n",
+	    "notes = \"test_gpu_isolation on %s\"\n",
 	    failures == 0 && strstr(build, "dirty") == NULL ? "true" : "false",
-	    date, build, rev);
+	    date, build, rev, g_si ? "silicon; per-VM MES user queues" :
+	    "gpusim; shared engine queues");
 }
 
 int
 main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
-	part_a();
-	break5();
-	break3();
-	break1();
-	break2();
-	break4();
-	part_c();
-	part_d();
-	part_e();
-	part_f();
-	part_g();
+	detect_si();
+#define RUN(f)		do { f(); qreap(); } while (0)
+#define GPUSIM(f, why)	do {						\
+	if (g_si)							\
+		printf(#f " SKIP: gpusim only (%s)\n", why);		\
+	else								\
+		RUN(f);							\
+} while (0)
+	RUN(part_a);
+	RUN(break5);
+	GPUSIM(break3, "QUEUE_MAP; silicon doorbells: si_client_test 9");
+	RUN(break1);
+	GPUSIM(break2, "shared-queue deferral; silicon free rule: "
+	    "si_client_test 10");
+	GPUSIM(break4, "display");
+	GPUSIM(part_c, "shared-queue watchdog; silicon hangs: si_client_test 8");
+	GPUSIM(part_d, "shared-queue faults; silicon faults: si_client_test 7");
+	GPUSIM(part_e, "display");
+	RUN(part_f);
+	RUN(part_g);
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);

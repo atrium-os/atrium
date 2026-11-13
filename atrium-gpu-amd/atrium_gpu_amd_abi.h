@@ -158,22 +158,6 @@ struct atrium_gpu_bo_xfer {
 	uint32_t	pad;
 };
 
-/*
- * Submit a PM4 ring (already laid into the ring BO) on an engine, optionally
- * signalling a syncobj timeline to `signal_value` on completion.
- */
-struct atrium_gpu_submit {
-	uint64_t	signal_value;	/* in: timeline value to signal on done */
-	uint32_t	vm_fd;		/* in: address space to submit under */
-	uint32_t	ring_fd;	/* in: BO fd holding the PM4 ring */
-	uint32_t	n_dwords;	/* in: ring length in dwords (the wptr) */
-	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
-	int32_t		signal_syncobj_fd; /* in: syncobj to signal (-1 = none) */
-	uint32_t	deadline_ns;	/* in: frame deadline (ns) for this submit's queue,
-					 * 0 = none. The firmware scheduler drains
-					 * earliest-deadline-first (frame-pacing). */
-};
-
 /* Query interrupt state: how many completions the ISR has serviced. */
 struct atrium_gpu_irqs {
 	uint64_t	count;		/* out: interrupts serviced so far */
@@ -219,12 +203,14 @@ struct atrium_gpu_vm_bind2 {
 /*
  * Queue fds (GPU ABI v2 §5.5, §5.7; stage 5c-2b). Layouts and numbers are
  * v2's (include/atrium/gpu_abi_v2.h: atrium_gpu_queue_create, and
- * atrium_gpu_submit, here named atrium_gpu_queue_submit because the v1
- * SUBMIT above holds the name).
+ * atrium_gpu_submit, here named atrium_gpu_queue_submit after the retired
+ * v1 SUBMIT, 'A',4, which held the name).
  *
  * QUEUE_CREATE is an ioctl on a VM fd: a queue that runs in that VM, as a
  * new fd holding a reference on the VM. family_id 0 is compute (the only
- * family on silicon so far); priority 0 only; flags 0 or USER_MODE (below).
+ * family on silicon so far; gpusim also has 1, gfx); priority 0 only; flags
+ * 0 or USER_MODE (below, silicon only: gpusim refuses it, EOPNOTSUPP). On
+ * gpusim a queue fd's work runs on the shared engine queue, in its VM.
  * The fd is the right to submit: it passes over SCM_RIGHTS, and its
  * last close takes the queue off the GPU, cancelling (ECANCELED) what has
  * not completed.
@@ -235,7 +221,9 @@ struct atrium_gpu_vm_bind2 {
  * out_seqno is the submit's number on this queue, from 1.
  *
  * USER_MODE (5c-2b step 3; interim: PRIV_DRIVER only): the client writes
- * the ring itself. QUEUE_MAP2 on the queue fd gives the mmap(queue_fd)
+ * the ring itself, so the holder is its own packet writer. It is only for a
+ * trusted renderer's own path (frescod's GPU renderer, aqueduct-gpu-host),
+ * never minted for an app or a per-client renderer (2026-11-13). QUEUE_MAP2 on the queue fd gives the mmap(queue_fd)
  * layout: the ring (PM4, ring_size bytes; the CP fetches it read-only),
  * the writeback page and the queue's own doorbell page. Map MAP_SHARED,
  * read-write; never executable. The writeback page, from wptr_offset - 8:
@@ -252,6 +240,8 @@ struct atrium_gpu_vm_bind2 {
  * touch is SIGBUS.
  */
 #define ATRIUM_GPU_QUEUE_FAMILY_COMPUTE	0u
+/* gpusim only (its rasterizer runs on the GFX engine); silicon: EINVAL. */
+#define ATRIUM_GPU_QUEUE_FAMILY_GFX	1u
 #define ATRIUM_GPU_QUEUE_FLAG_USER_MODE	0x1u
 
 struct atrium_gpu_queue_create {	/* on vm_fd */
@@ -304,7 +294,9 @@ struct atrium_gpu_queue_submit {	/* on queue_fd */
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
 /* 'A',3 (SET_COMPUTE) and 'A',5 (SET_DRAW) retired: compute/draw state now
  * travels in the ring as SET_SH_REG packets (opaque-blob submit, ABI-v2). */
-#define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
+/* 'A',4 (the v1 ring SUBMIT: a ring BO fd on a shared engine queue) retired
+ * 2026-11-13: all work goes through queue fds (QUEUE_CREATE/QUEUE_SUBMIT
+ * below), on gpusim and silicon alike. The number stays reserved. */
 #define ATRIUM_GPU_IOC_GET_IRQS		_IOR('A', 6, struct atrium_gpu_irqs)
 #define ATRIUM_GPU_IOC_SYNCOBJ_CREATE	_IOWR('A', 8, struct atrium_gpu_syncobj_create)
 #define ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL	_IOW('A', 9, struct atrium_gpu_syncobj_op)

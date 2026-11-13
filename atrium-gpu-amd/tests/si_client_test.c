@@ -20,7 +20,7 @@
  *   5 close      a queue closed right after a submit: the completion either
  *                lands or is cancelled (ECANCELED), never hangs; the VM then
  *                runs clean on a new queue.
- *   6 refusals   the 5c-2a SUBMIT on the client node, user-mode queues,
+ *   6 refusals   the retired ring SUBMIT ('A',4), user-mode queues,
  *                other families and priorities, in-dependencies, bad blobs,
  *                the ioctls on the wrong fd.
  *   7 fault      (step 2) a queue whose job writes to a VA its VM does not
@@ -80,6 +80,15 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+/* The retired v1 ring SUBMIT ('A',4), kept here only to check it is gone. */
+struct si_old_submit {
+	uint64_t	signal_value;
+	uint32_t	vm_fd, ring_fd, n_dwords, engine;
+	int32_t		signal_syncobj_fd;
+	uint32_t	deadline_ns;
+};
+#define SI_OLD_IOC_SUBMIT	_IOW('A', 4, struct si_old_submit)
 
 #define DEV		"/dev/atrium-gpu0"
 #define POISON_A	0xa5a5a5a5u
@@ -1150,7 +1159,7 @@ int
 main(void)
 {
 	struct job a, b, c, e, f;
-	struct atrium_gpu_submit s;
+	struct si_old_submit s;
 	struct atrium_gpu_queue_submit qs;
 	struct atrium_gpu_queue_create qc;
 	uint64_t seq1 = 0, seq2 = 0;
@@ -1311,10 +1320,10 @@ main(void)
 	s.n_dwords = SIW42_IB_DW;
 	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
 	s.signal_syncobj_fd = -1;
-	r = ioerr(fd, ATRIUM_GPU_IOC_SUBMIT, &s);
-	check(r == EOPNOTSUPP, "6 the 5c-2a SUBMIT on the client node is "
-	    "gone", "%s", r == 0 ? "accepted" : strerror(r));
-	r = queue_create2(a.vm, 1, 0, 0) >= 0 ? 0 : errno;
+	r = ioerr(fd, SI_OLD_IOC_SUBMIT, &s);
+	check(r == ENOTTY, "6 the retired ring SUBMIT ('A',4) is unknown",
+	    "%s", r == 0 ? "accepted" : strerror(r));
+	r = queue_create2(a.vm, 7, 0, 0) >= 0 ? 0 : errno;
 	check(r == EINVAL, "6 unknown queue family refused", "%s",
 	    r == 0 ? "accepted" : strerror(r));
 	r = queue_create2(a.vm, ATRIUM_GPU_QUEUE_FAMILY_COMPUTE, 1, 0) >= 0 ?

@@ -805,3 +805,19 @@ work (self-test, scrub).
   stays at 1 (0x18000000 at attach). Tests 1-11 passed again; idle 7 W, detach clean, card
   cold. Decided (Shankar): gpusim gets queue fds too, both acceptance suites move to queue
   fds and the old ring SUBMIT retires.
+- **2026-11-13, stage 5f built (box run pending): queue fds everywhere, ring SUBMIT
+  retired.** gpusim gets queue fds: a kernel-mode queue fd runs its blob on the shared
+  engine queue in its VM (`rs/uqueue.rs`, `SIM_SLOT`), with a gfx family
+  (`ATRIUM_GPU_QUEUE_FAMILY_GFX`, gpusim only; silicon EINVAL); USER_MODE stays silicon
+  only. The v1 ring SUBMIT ('A',4) is gone from the ABI and the client node (ENOTTY;
+  si-client-test 6 checks it). `atrium-gpu-rs` `Vm::submit`/`submit_deadline` keep their
+  signatures and run the ring BO as a blob on a per-VM, per-engine queue fd (gfx falls
+  back to compute where there is no gfx family), so frescod, atrium-gpu-app and the bins
+  need no change. `atrium_gpu_test` and `test_gpu_isolation` use queue fds only and detect
+  silicon (no GRAPHICS feature): there gfx work runs on compute, DMA_DATA uses the copy
+  control word, the SIM INC kernel is the real INC shader, and the gpusim-only parts
+  (draws, QUEUE_MAP, display, GPU_RESET, shared-queue deferral, watchdog and fault
+  counters) print SKIP with their si-client-test counterpart. On silicon the isolation
+  suite runs part A, breaks 1 (B is never blocked by A's parked work) and 5, F (VRAM
+  scrub) and G (quotas). Also written into the ABI header: USER_MODE queues are only for a
+  trusted renderer's own path, never an app or a per-client renderer (Shankar agreed).

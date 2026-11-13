@@ -79,6 +79,7 @@ uint32_t amd_si_uq_preempt(struct atrium_amd_softc *sc, uint32_t mask);
 
 /* C, for Rust (glue.c): the user-mode queue gate, and a queue fd's mmap. */
 int	amd_rs_priv_driver(void);
+int	amd_rs_is_si(struct atrium_amd_softc *sc);
 int	amd_rs_mmap_object(vm_map_t map, vm_offset_t *addr, vm_size_t size,
 	    vm_prot_t prot, vm_prot_t cap_maxprot, int flags, vm_object_t obj,
 	    vm_ooffset_t foff, struct thread *td);

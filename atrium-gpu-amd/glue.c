@@ -130,6 +130,13 @@ amd_rs_priv_driver(void)
 	return (priv_check(curthread, PRIV_DRIVER));
 }
 
+/* The silicon backend (MES user queues), not gpusim (rs/uqueue.rs). */
+int
+amd_rs_is_si(struct atrium_amd_softc *sc)
+{
+	return (amd_is_si(sc) ? 1 : 0);
+}
+
 /*
  * A queue fd's fo_mmap (rs/uqueue.rs): map `obj` (a reference the caller
  * gives up, consumed either way) shared, read-write, never executable.

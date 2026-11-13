@@ -6,6 +6,14 @@
  * VM, wait via a kqueue-able syncobj, read results back. The final test proves
  * per-VM isolation: the same GPU-VA in two VMs resolves to different memory.
  *
+ * Work goes through queue fds (QUEUE_CREATE on a VM fd, QUEUE_SUBMIT on the
+ * queue fd; the old ring SUBMIT is retired, decided 2026-11-13), on gpusim and
+ * on silicon alike. On silicon (no GRAPHICS feature) compute uses real shaders
+ * (si_ops.h, oracle-built) where gpusim uses its SIM_COMPUTE_KERNEL ops, GFX
+ * engine work runs on a compute queue, and the gpusim-only checks (draws, the
+ * old QUEUE_MAP doorbells, GPU_RESET, VRAM reset loss, display, scheduler)
+ * print SKIP.
+ *
  * Build + run in the guest:
  *   cc -Wall -o /tmp/atrium_gpu_test tests/atrium_gpu_test.c
  *   /tmp/atrium_gpu_test
@@ -13,6 +21,7 @@
 #include "atrium_gpu_amd_abi.h"
 #include "atrium_display_abi.h"
 #include "../../include/atrium/display_abi_v2.h"
+#include "si_ops.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,6 +52,11 @@ static uint32_t type3(uint32_t opcode, uint32_t body_dwords);	/* defined below *
 
 /* /dev/atrium-gpu0ctl: reset, scheduler and power gating live only there. */
 static int ctlfd = -1;
+/* Silicon (no GRAPHICS feature): real shaders, no GFX engine (test_caps). */
+static int g_si;
+/* DMA_DATA DW1: copy memory -> memory through the L2, CP_SYNC (GFX9+ form;
+ * gpusim reads any non-DATA SRC_SEL as a copy). */
+#define DMA_CTL_COPY		0xe0300000u
 
 /* Vertex the rasterizer consumes: NDC position + texcoord + RGBA color = 24B. */
 struct vtx {
@@ -192,18 +206,157 @@ bo_read(int fd, uint32_t handle, void *dst, uint64_t len)
 	return (ioctl(fd, ATRIUM_GPU_IOC_BO_READ, &x));
 }
 
+/* A queue fd on `vm` for `engine` (GFX work runs on compute on silicon). */
 static int
-submit(int fd, int vm, uint32_t ring_handle, uint32_t n_dwords, uint32_t engine)
+queue_new(int vm, uint32_t engine)
 {
-	struct atrium_gpu_submit s;
+	struct atrium_gpu_queue_create c;
+
+	memset(&c, 0, sizeof(c));
+	c.struct_size = sizeof(c);
+	c.family_id = engine == ATRIUM_GPU_ENGINE_GFX && !g_si ?
+	    ATRIUM_GPU_QUEUE_FAMILY_GFX : ATRIUM_GPU_QUEUE_FAMILY_COMPUTE;
+	if (ioctl(vm, ATRIUM_GPU_IOC_QUEUE_CREATE, &c) != 0)
+		return (-1);
+	return (c.out_queue_fd);
+}
+
+/* QUEUE_SUBMIT `n` dwords at `va` on queue `q`, signalling `so` to `value`
+ * (so < 0: nothing). 0, or -1 with errno. */
+static int
+queue_submit(int q, uint64_t va, uint32_t n, int so, uint64_t value)
+{
+	struct atrium_gpu_queue_submit s;
+	struct atrium_gpu_syncobj_point pt;
 
 	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring_handle;
-	s.n_dwords = n_dwords;
-	s.engine = engine;
-	s.signal_syncobj_fd = -1;	/* no completion syncobj */
-	return (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s));
+	memset(&pt, 0, sizeof(pt));
+	s.struct_size = sizeof(s);
+	s.blob_va = va;
+	s.blob_size = (uint64_t)n * 4;
+	if (so >= 0) {
+		pt.syncobj_fd = so;
+		pt.value = value;
+		s.out_dep_ptr = (uint64_t)(uintptr_t)&pt;
+		s.out_dep_count = 1;
+	}
+	return (ioctl(q, ATRIUM_GPU_IOC_QUEUE_SUBMIT, &s));
+}
+
+static int
+syncobj_new(int fd)
+{
+	struct atrium_gpu_syncobj_create cr;
+
+	memset(&cr, 0, sizeof(cr));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0)
+		return (-1);
+	return ((int)cr.out_fd);
+}
+
+/* Queues of async submits (submit_so), closed between tests (qreap): on
+ * silicon each is a MES user queue, and there are only a few. */
+static int g_q[16];
+static int g_nq;
+
+static void
+qreap(void)
+{
+	while (g_nq > 0)
+		close(g_q[--g_nq]);
+}
+
+/*
+ * Submit on a queue fd of its own, signalling `so` (if >= 0) to `value`, and
+ * return at once (the work may park). The queue stays open until qreap().
+ */
+static int
+submit_so(int fd __unused, int vm, uint64_t va, uint32_t n, uint32_t engine,
+    int so, uint64_t value)
+{
+	int q, e;
+
+	if (g_nq == (int)(sizeof(g_q) / sizeof(g_q[0])))
+		qreap();
+	if ((q = queue_new(vm, engine)) < 0)
+		return (-1);
+	if (queue_submit(q, va, n, so, value) != 0) {
+		e = errno;
+		close(q);
+		errno = e;
+		return (-1);
+	}
+	g_q[g_nq++] = q;
+	return (0);
+}
+
+/* Submit and wait (up to 5 s) for the work to finish: the old SUBMIT's
+ * synchronous use. 0, or -1 with errno. */
+static int
+submit_va(int fd, int vm, uint64_t va, uint32_t n, uint32_t engine)
+{
+	struct atrium_gpu_syncobj_wait wt;
+	int q, so, r = 0;
+
+	if ((so = syncobj_new(fd)) < 0)
+		return (-1);
+	if ((q = queue_new(vm, engine)) < 0 || queue_submit(q, va, n, so, 1) != 0)
+		r = errno;
+	if (r == 0) {
+		memset(&wt, 0, sizeof(wt));
+		wt.syncobj_fd = so;
+		wt.value = 1;
+		wt.timeout_ms = 5000;
+		if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) != 0)
+			r = errno;
+	}
+	if (q >= 0)
+		close(q);
+	close(so);
+	errno = r;
+	return (r == 0 ? 0 : -1);
+}
+
+/*
+ * The INC compute op over src -> dst, as the ring a queue submit runs:
+ * gpusim's SIM kernel (n elements), or on silicon the real shader (64
+ * elements; si_ops.h) on a code BO of its own in `vm`. Returns dwords, or
+ * -1. `ring` holds at least SIOPS_IB_DW dwords.
+ */
+static int
+emit_inc(int fd, int vm, uint32_t *ring, uint64_t src, uint64_t dst,
+    uint32_t n);
+
+static int
+emit_inc(int fd, int vm, uint32_t *ring, uint64_t src, uint64_t dst,
+    uint32_t n)
+{
+	uint64_t prm[4], code_va;
+	uint32_t code_h;
+	u_int i;
+	int k;
+
+	if (!g_si) {
+		k = emit_compute_sh(ring, KERNEL_INC, src, dst);
+		ring[k++] = type3(IT_DISPATCH_DIRECT, 3);
+		ring[k++] = n;
+		ring[k++] = 1;
+		ring[k++] = 1;
+		return (k);
+	}
+	/* The code BO stays open (and bound) for the process: tests are short. */
+	if (bo_alloc(fd, vm, 4096, &code_h, &code_va) != 0 ||
+	    bo_write(fd, code_h, siops_inc, sizeof(siops_inc)) != 0)
+		return (-1);
+	prm[0] = code_va;
+	prm[1] = src;
+	prm[2] = dst;
+	prm[3] = 0;
+	memcpy(ring, siops_ib, sizeof(siops_ib));
+	for (i = 0; i < SIOPS_NPATCH; i++)
+		ring[siops_patch[i].dw] = (uint32_t)(prm[siops_patch[i].which] >>
+		    siops_patch[i].shift);
+	return ((int)SIOPS_IB_DW);
 }
 
 /* M9a: a BO is a file descriptor — write/read, then close reclaims it. */
@@ -259,7 +412,7 @@ test_gfx_fence(int fd, int vm)
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, fence_h, &fence, sizeof(fence)) != 0) {
 		printf("gfx: ioctl failed\n");
 		return (1);
@@ -277,7 +430,7 @@ test_gfx_fence(int fd, int vm)
 static int
 test_compute(int fd, int vm)
 {
-	uint32_t src_h, dst_h, ring_h, ring[11];
+	uint32_t src_h, dst_h, ring_h, ring[SIOPS_IB_DW];
 	uint32_t in[4] = { 10, 20, 30, 40 }, out[4] = { 0 };
 	uint64_t src_va, dst_va, ring_va;
 	int i, n;
@@ -293,16 +446,15 @@ test_compute(int fd, int vm)
 		return (1);
 	}
 	/* Compute state rides in the ring (SET_SH_REG), then DISPATCH reads it. */
-	n = emit_compute_sh(ring, KERNEL_INC, src_va, dst_va);
-	ring[n++] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[n++] = 4;
-	ring[n++] = 1;
-	ring[n++] = 1;
+	if ((n = emit_inc(fd, vm, ring, src_va, dst_va, 4)) < 0) {
+		printf("compute: code BO failed\n");
+		return (1);
+	}
 	if (bo_write(fd, ring_h, ring, n * 4) != 0) {
 		printf("compute: write ring failed\n");
 		return (1);
 	}
-	if (submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
+	if (submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0 ||
 	    bo_read(fd, dst_h, out, sizeof(out)) != 0) {
 		printf("compute: submit/read failed\n");
 		return (1);
@@ -360,7 +512,7 @@ test_draw(int fd, int vm)
 	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, v, sizeof(v)) != 0 ||
 	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
-	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("draw: submit failed\n");
 		return (1);
@@ -407,7 +559,7 @@ test_irq(int fd, int vm)
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    submit_va(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("irq: submit failed\n");
 		return (1);
 	}
@@ -434,7 +586,6 @@ test_syncobj(int fd, int vm)
 	struct atrium_gpu_syncobj_create cr;
 	struct atrium_gpu_syncobj_op q;
 	struct atrium_gpu_syncobj_wait wt;
-	struct atrium_gpu_submit s;
 	struct timespec ts = { 2, 0 };
 	struct kevent kev;
 	uint32_t ring_h, fence_h, ring[9];
@@ -469,15 +620,8 @@ test_syncobj(int fd, int vm)
 	ring[6] = (uint32_t)(fence_va >> 32);
 	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring_h;
-	s.n_dwords = 9;
-	s.engine = ATRIUM_GPU_ENGINE_GFX;
-	s.signal_syncobj_fd = so_fd;
-	s.signal_value = 1;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+	    submit_so(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX, so_fd, 1) != 0) {
 		printf("syncobj: submit failed\n");
 		return (1);
 	}
@@ -515,7 +659,7 @@ test_syncobj(int fd, int vm)
 static long
 inc_one(int fd, int vm, uint32_t input)
 {
-	uint32_t src_h, dst_h, ring_h, ring[11], out = 0;
+	uint32_t src_h, dst_h, ring_h, ring[SIOPS_IB_DW], out = 0;
 	uint64_t src_va, dst_va, ring_va;
 	int n;
 
@@ -526,14 +670,11 @@ inc_one(int fd, int vm, uint32_t input)
 	if (bo_write(fd, src_h, &input, sizeof(input)) != 0)
 		return (-1);
 	/* Same src VA for both VMs — that's the point; state rides in the ring. */
-	n = emit_compute_sh(ring, KERNEL_INC, src_va, dst_va);
-	ring[n++] = type3(IT_DISPATCH_DIRECT, 3);
-	ring[n++] = 1;
-	ring[n++] = 1;
-	ring[n++] = 1;
+	if ((n = emit_inc(fd, vm, ring, src_va, dst_va, 1)) < 0)
+		return (-1);
 	if (bo_write(fd, ring_h, ring, n * 4) != 0)
 		return (-1);
-	if (submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0)
+	if (submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_COMPUTE) != 0)
 		return (-1);
 	if (bo_read(fd, dst_h, &out, sizeof(out)) != 0)
 		return (-1);
@@ -797,18 +938,22 @@ test_caps(int fd)
 		off += sizeof(*r) + r->cap_size;
 		off = (off + 3u) & ~(size_t)3u;
 	}
+	/* Silicon has no GFX engine (and no QUEUE_MAP user queues: its queue
+	 * fds are MES user queues); gpusim has both. */
+	g_si = !(feat & ATRIUM_GPU_FEAT_GRAPHICS);
 	if (!saw_ver || vendor == NULL ||
 	    isa.family != ATRIUM_GPU_ISA_AMD_RDNA4 ||
 	    strcmp(isa.name, "gfx1201") != 0 ||
-	    !(feat & ATRIUM_GPU_FEAT_USER_QUEUES) ||
+	    !(feat & ATRIUM_GPU_FEAT_COMPUTE) ||
+	    (!g_si && !(feat & ATRIUM_GPU_FEAT_USER_QUEUES)) ||
 	    !(feat & ATRIUM_GPU_FEAT_SYNCOBJ)) {
 		printf("caps FAILED: vendor=%s feat=0x%x isa=%u/%.24s\n",
 		    vendor ? vendor : "(none)", feat, isa.family, isa.name);
 		return (1);
 	}
-	printf("caps OK: \"%s\", features 0x%x (graphics+compute+UMQ+syncobj+"
-	    "vm_bind), ISA family %u %.24s\n", vendor, feat, isa.family,
-	    isa.name);
+	printf("caps OK: \"%s\", features 0x%x (%s), ISA family %u %.24s\n",
+	    vendor, feat, g_si ? "silicon: compute+syncobj+vm_bind" :
+	    "graphics+compute+UMQ+syncobj+vm_bind", isa.family, isa.name);
 	return (0);
 }
 
@@ -828,7 +973,6 @@ test_cross_queue(int fd, int vm)
 	struct atrium_gpu_syncobj_create cr;
 	struct atrium_gpu_syncobj_op q;
 	struct atrium_gpu_syncobj_wait wt;
-	struct atrium_gpu_submit s;
 	uint32_t addr_h, fence_h, ringa_h, ringb_h;
 	uint32_t ringa[14], ringb[6], zero = 0;
 	uint64_t addr_va, fence_va, ringa_va, ringb_va, fb = 0;
@@ -884,14 +1028,8 @@ test_cross_queue(int fd, int vm)
 	}
 
 	/* Submit A first; its ring parks on the WAIT (addr is still 0). */
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ringa_h;
-	s.n_dwords = 14;
-	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
-	s.signal_syncobj_fd = so_fd;
-	s.signal_value = 1;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+	if (submit_so(fd, vm, ringa_va, 14, ATRIUM_GPU_ENGINE_COMPUTE, so_fd,
+	    1) != 0) {
 		printf("cross_queue: submit A failed\n");
 		return (1);
 	}
@@ -911,13 +1049,7 @@ test_cross_queue(int fd, int vm)
 	}
 
 	/* Submit B; writing the word unblocks A, which completes + raises IRQ. */
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ringb_h;
-	s.n_dwords = 6;
-	s.engine = ATRIUM_GPU_ENGINE_GFX;
-	s.signal_syncobj_fd = -1;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+	if (submit_so(fd, vm, ringb_va, 6, ATRIUM_GPU_ENGINE_GFX, -1, 0) != 0) {
 		printf("cross_queue: submit B failed\n");
 		return (1);
 	}
@@ -957,7 +1089,6 @@ test_fault_reset(int fd, int vm)
 {
 	struct atrium_gpu_syncobj_create cr;
 	struct atrium_gpu_syncobj_wait wt;
-	struct atrium_gpu_submit s;
 	uint32_t stuck_h, ring_h, fence_h, ring[7], gring[9], zero = 0;
 	uint64_t stuck_va, ring_va, fence_va, fb = 0;
 	int so_fd;
@@ -992,14 +1123,8 @@ test_fault_reset(int fd, int vm)
 		printf("fault_reset: ring write failed\n");
 		return (1);
 	}
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring_h;
-	s.n_dwords = 7;
-	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
-	s.signal_syncobj_fd = so_fd;
-	s.signal_value = 1;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0) {
+	if (submit_so(fd, vm, ring_va, 7, ATRIUM_GPU_ENGINE_COMPUTE, so_fd,
+	    1) != 0) {
 		printf("fault_reset: submit failed\n");
 		return (1);
 	}
@@ -1039,7 +1164,7 @@ test_fault_reset(int fd, int vm)
 	gring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
 	gring[8] = (uint32_t)(FENCE_MAGIC >> 32);
 	if (bo_write(fd, ring_h, gring, sizeof(gring)) != 0 ||
-	    submit(fd, vm, ring_h, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    submit_va(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("fault_reset FAILED: post-reset submit\n");
 		return (1);
 	}
@@ -1059,17 +1184,10 @@ test_fault_reset(int fd, int vm)
 		return (1);
 	}
 	so_fd = (int)cr.out_fd;
-	memset(&s, 0, sizeof(s));
-	s.vm_fd = vm;
-	s.ring_fd = ring_h;
-	s.n_dwords = 9;
-	s.engine = ATRIUM_GPU_ENGINE_GFX;
-	s.signal_syncobj_fd = so_fd;
-	s.signal_value = 1;
 	wt.syncobj_fd = so_fd;
 	wt.value = 1;
 	wt.timeout_ms = 2000;
-	if (ioctl(fd, ATRIUM_GPU_IOC_SUBMIT, &s) != 0 ||
+	if (submit_so(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX, so_fd, 1) != 0 ||
 	    ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) != 0) {
 		printf("fault_reset FAILED: no EOP interrupt after the reset "
 		    "(%s)\n", strerror(errno));
@@ -1119,7 +1237,7 @@ test_textured_draw(int fd, int vm)
 	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
 	ring[n++] = 6;
 	if (bo_write(fd, ring_h, ring, n * 4) != 0 ||
-	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("textured: draw/readback failed\n");
 		return (1);
@@ -1168,7 +1286,7 @@ test_blend(int fd, int vm)
 	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
 	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
-	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("blend: fill pass failed\n");
 		return (1);
 	}
@@ -1180,7 +1298,7 @@ test_blend(int fd, int vm)
 	ring[n++] = 6;
 	if (bo_write(fd, vtx_h, q, sizeof(q)) != 0 ||
 	    bo_write(fd, ring_h, ring, n * 4) != 0 ||
-	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("blend: blend pass failed\n");
 		return (1);
@@ -1230,14 +1348,14 @@ test_dma_copy(int fd, int vm)
 	bo_write(fd, dst_h, dst, sizeof(dst));
 
 	ring[0] = type3(IT_DMA_DATA, 6);
-	ring[1] = 0;				/* control (mem->mem) */
+	ring[1] = DMA_CTL_COPY;
 	ring[2] = (uint32_t)(src_va & 0xffffffff);
 	ring[3] = (uint32_t)(src_va >> 32);
 	ring[4] = (uint32_t)(dst_va & 0xffffffff);
 	ring[5] = (uint32_t)(dst_va >> 32);
 	ring[6] = sizeof(src);			/* byte count */
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, dst_h, dst, sizeof(dst)) != 0) {
 		printf("dma_copy: submit/readback failed\n");
 		return (1);
@@ -1290,10 +1408,10 @@ test_depth(int fd, int vm)
 	/* near quad (z=0.5), then a farther quad (z=0.8) that must be occluded. */
 	fill_quad(q, 0.5f, cA);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
+	submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX);
 	fill_quad(q, 0.8f, cB);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
+	submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX);
 	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cA) {
 		printf("depth FAILED: farther quad not occluded (%08x)\n",
 		    rt[8 * 16 + 8]);
@@ -1302,7 +1420,7 @@ test_depth(int fd, int vm)
 	/* a nearer quad (z=0.2) drawn last must win. */
 	fill_quad(q, 0.2f, cC);
 	bo_write(fd, vtx_h, q, sizeof(q));
-	submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX);
+	submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX);
 	if (bo_read(fd, rt_h, rt, sizeof(rt)) != 0 || rt[8 * 16 + 8] != cC) {
 		printf("depth FAILED: nearer quad did not win (%08x)\n",
 		    rt[8 * 16 + 8]);
@@ -1343,7 +1461,7 @@ test_bilinear(int fd, int vm)
 	ring[n++] = type3(IT_DRAW_INDEX_AUTO, 1);
 	ring[n++] = 6;
 	if (bo_write(fd, ring_h, ring, n * 4) != 0 ||
-	    submit(fd, vm, ring_h, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, rt_h, rt, sizeof(rt)) != 0) {
 		printf("bilinear: draw/readback failed\n");
 		return (1);
@@ -1398,14 +1516,14 @@ test_multipage(int fd, int vm)
 	}
 	/* DMA_DATA copy of the whole 3-page BO, src -> dst. */
 	ring[0] = type3(IT_DMA_DATA, 6);
-	ring[1] = 0;
+	ring[1] = DMA_CTL_COPY;
 	ring[2] = (uint32_t)(src_va & 0xffffffff);
 	ring[3] = (uint32_t)(src_va >> 32);
 	ring[4] = (uint32_t)(dst_va & 0xffffffff);
 	ring[5] = (uint32_t)(dst_va >> 32);
 	ring[6] = BYTES;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, 7, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, dst_h, dst, BYTES) != 0) {
 		printf("multipage: copy/readback failed\n");
 		goto out;
@@ -1533,13 +1651,13 @@ bo_alloc_flags(int fd, int vm, uint64_t size, uint32_t flags, uint32_t *handle,
 
 /* GPU-side DMA copy of `bytes` from src_va to dst_va via a DMA_DATA ring. */
 static int
-dma_copy(int fd, int vm, uint32_t ring_h, uint64_t src_va, uint64_t dst_va,
-    uint32_t bytes)
+dma_copy(int fd, int vm, uint32_t ring_h, uint64_t ring_va, uint64_t src_va,
+    uint64_t dst_va, uint32_t bytes)
 {
 	uint32_t ring[7];
 
 	ring[0] = type3(IT_DMA_DATA, 6);
-	ring[1] = 0;
+	ring[1] = DMA_CTL_COPY;
 	ring[2] = (uint32_t)(src_va & 0xffffffff);
 	ring[3] = (uint32_t)(src_va >> 32);
 	ring[4] = (uint32_t)(dst_va & 0xffffffff);
@@ -1547,7 +1665,7 @@ dma_copy(int fd, int vm, uint32_t ring_h, uint64_t src_va, uint64_t dst_va,
 	ring[6] = bytes;
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0)
 		return (-1);
-	return (submit(fd, vm, ring_h, 7, ATRIUM_GPU_ENGINE_GFX));
+	return (submit_va(fd, vm, ring_va, 7, ATRIUM_GPU_ENGINE_GFX));
 }
 
 /*
@@ -1587,8 +1705,8 @@ test_vram(int fd, int vm)
 		return (1);
 	}
 	/* Upload staging(System) -> VRAM, then read VRAM -> result(System). */
-	if (dma_copy(fd, vm, ring_h, stg_va, vbo_va, sizeof(pat)) != 0 ||
-	    dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	if (dma_copy(fd, vm, ring_h, ring_va, stg_va, vbo_va, sizeof(pat)) != 0 ||
+	    dma_copy(fd, vm, ring_h, ring_va, vbo_va, res_va, sizeof(pat)) != 0 ||
 	    bo_read(fd, res_h, out, sizeof(out)) != 0) {
 		printf("vram: round-trip copy failed\n");
 		return (1);
@@ -1604,7 +1722,7 @@ test_vram(int fd, int vm)
 		return (1);
 	}
 	memset(out, 0xff, sizeof(out));
-	if (dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	if (dma_copy(fd, vm, ring_h, ring_va, vbo_va, res_va, sizeof(pat)) != 0 ||
 	    bo_read(fd, res_h, out, sizeof(out)) != 0) {
 		printf("vram: post-reset read failed\n");
 		return (1);
@@ -1616,8 +1734,8 @@ test_vram(int fd, int vm)
 			return (1);
 		}
 	/* Re-upload from the CPU shadow restores it. */
-	if (dma_copy(fd, vm, ring_h, stg_va, vbo_va, sizeof(pat)) != 0 ||
-	    dma_copy(fd, vm, ring_h, vbo_va, res_va, sizeof(pat)) != 0 ||
+	if (dma_copy(fd, vm, ring_h, ring_va, stg_va, vbo_va, sizeof(pat)) != 0 ||
+	    dma_copy(fd, vm, ring_h, ring_va, vbo_va, res_va, sizeof(pat)) != 0 ||
 	    bo_read(fd, res_h, out, sizeof(out)) != 0 ||
 	    memcmp(pat, out, sizeof(pat)) != 0) {
 		printf("vram FAILED: re-upload after reset did not restore\n");
@@ -2123,18 +2241,10 @@ main(void)
 		perror("open /dev/atrium-gpu0");
 		return (1);
 	}
-	/* The display engine is a separate device (atrium_gpu_amd_display.ko). */
+	/* The display engine is a separate device (atrium_gpu_amd_display.ko;
+	 * gpusim only for now). */
 	dfd = open("/dev/atrium-display0", O_RDWR);
-	if (dfd < 0) {
-		perror("open /dev/atrium-display0");
-		close(fd);
-		return (1);
-	}
 	ctlfd = open("/dev/atrium-gpu0ctl", O_RDWR);
-	if (ctlfd < 0) {
-		perror("open /dev/atrium-gpu0ctl");
-		return (1);
-	}
 	vm = vm_create(fd);
 	if (vm < 0) {
 		printf("VM_CREATE failed\n");
@@ -2142,34 +2252,47 @@ main(void)
 		return (1);
 	}
 	rc = test_caps(fd);
-	rc |= test_bo_fd(fd, vm);
-	rc |= test_gfx_fence(fd, vm);
-	rc |= test_compute(fd, vm);
-	rc |= test_draw(fd, vm);
-	rc |= test_irq(fd, vm);
-	rc |= test_syncobj(fd, vm);
-	rc |= test_vm_bind(fd);
-	rc |= test_va_reuse(fd);
-	rc |= test_isolation(fd);
-	rc |= test_umq(fd, vm);
-	rc |= test_cross_queue(fd, vm);
-	rc |= test_fault_reset(fd, vm);
-	rc |= test_textured_draw(fd, vm);
-	rc |= test_blend(fd, vm);
-	rc |= test_dma_copy(fd, vm);
-	rc |= test_depth(fd, vm);
-	rc |= test_bilinear(fd, vm);
-	rc |= test_multipage(fd, vm);
-	rc |= test_doorbell_pages(fd, vm);
-	rc |= test_vram(fd, vm);
-	rc |= test_display(fd, dfd);
-	rc |= test_display_link(fd, dfd);
-	rc |= test_display_usbc(fd, dfd);
-	rc |= test_display_mst(dfd);
-	rc |= test_display_dptrain(dfd);
-	rc |= test_sched(fd);
+	if (!g_si && (dfd < 0 || ctlfd < 0)) {
+		printf("gpusim: /dev/atrium-display0 or /dev/atrium-gpu0ctl "
+		    "missing\n");
+		return (1);
+	}
+#define RUN(t)		do { rc |= (t); qreap(); } while (0)
+#define GPUSIM(name, t)	do {						\
+	if (g_si)							\
+		printf("%s SKIP: gpusim only\n", name);			\
+	else								\
+		RUN(t);							\
+} while (0)
+	RUN(test_bo_fd(fd, vm));
+	RUN(test_gfx_fence(fd, vm));
+	RUN(test_compute(fd, vm));
+	GPUSIM("draw", test_draw(fd, vm));
+	RUN(test_irq(fd, vm));
+	RUN(test_syncobj(fd, vm));
+	RUN(test_vm_bind(fd));
+	RUN(test_va_reuse(fd));
+	RUN(test_isolation(fd));
+	GPUSIM("umq (QUEUE_MAP)", test_umq(fd, vm));
+	RUN(test_cross_queue(fd, vm));
+	GPUSIM("fault_reset (GPU_RESET)", test_fault_reset(fd, vm));
+	GPUSIM("textured_draw", test_textured_draw(fd, vm));
+	GPUSIM("blend", test_blend(fd, vm));
+	RUN(test_dma_copy(fd, vm));
+	GPUSIM("depth", test_depth(fd, vm));
+	GPUSIM("bilinear", test_bilinear(fd, vm));
+	RUN(test_multipage(fd, vm));
+	GPUSIM("doorbell_pages (QUEUE_MAP)", test_doorbell_pages(fd, vm));
+	GPUSIM("vram (GPU_RESET loses VRAM)", test_vram(fd, vm));
+	GPUSIM("display", test_display(fd, dfd));
+	GPUSIM("display_link", test_display_link(fd, dfd));
+	GPUSIM("display_usbc", test_display_usbc(fd, dfd));
+	GPUSIM("display_mst", test_display_mst(dfd));
+	GPUSIM("display_dptrain", test_display_dptrain(dfd));
+	GPUSIM("sched", test_sched(fd));
 	close(vm);
-	close(dfd);
+	if (dfd >= 0)
+		close(dfd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

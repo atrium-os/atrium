@@ -7,8 +7,12 @@
  * A queue is made on the VM it runs in (QUEUE_CREATE, an ioctl on the VM fd)
  * and is itself an fd: the right to submit. It holds a reference on its VM,
  * so the VM's page tables outlive the queue. Each one is a MES user queue of
- * its own on silicon (si_client.c, mes12.c); a backend without them refuses
- * with EOPNOTSUPP.
+ * its own on silicon (si_client.c, mes12.c). On gpusim (no MES user queues;
+ * decided 2026-11-13 so both backends share one submit path) a kernel-mode
+ * queue fd runs its blobs on the device's compute queue under its VM: the
+ * blob is the ring the queue is programmed with (queue.rs), so it runs one
+ * submit at a time with the other queue fds of the device, and a fault or
+ * hang fails what that queue owes. USER_MODE needs MES: EOPNOTSUPP there.
  *
  * QUEUE_SUBMIT (an ioctl on the queue fd) is kernel-mediated: the kernel puts
  * the client's PM4 (an indirect buffer at a VA of the queue's VM) on the
@@ -48,6 +52,8 @@ use kpi::ErrCode;
 
 /// The most dwords one INDIRECT_BUFFER packet can name.
 const IB_MAX_DW: u64 = 0xfffff;
+/// `Queue::slot` of a gpusim queue fd (no backend queue of its own).
+const SIM_SLOT: c_int = -1;
 
 /// A user-mode queue's pages (mes12.c's UQ2_PAGES: ring, writeback, EOP), and its mmap
 /// layout: ring, writeback page, doorbell page.
@@ -110,8 +116,12 @@ pub struct Queue {
     dev: Dev,
     /// Held while the queue may run; leaked (never dropped) if the hardware kept it.
     vm: ManuallyDrop<FileRef<Vm>>,
-    /// The backend's queue (si_client.c's slot).
+    /// The backend's queue (si_client.c's slot), or SIM_SLOT.
     slot: c_int,
+    /// gpusim: the engine the queue runs on (ATRIUM_GPU_ENGINE_*).
+    engine: u32,
+    /// gpusim: submits so far (out_seqno counts from 1).
+    sim_seq: AtomicU64,
     /// A user-mode queue's pager object; leaked with the VM if the hardware kept the queue.
     map: ManuallyDrop<Option<VmObject<UqMap>>>,
 }
@@ -135,7 +145,14 @@ impl Drop for Queue {
             }
             map.free_pages();
         }
-        match self.dev.uq_destroy(self.slot) {
+        let gone = if self.slot == SIM_SLOT {
+            // gpusim: the VM's teardown (its last reference may be this one) stops what
+            // still runs under it, and fails what it owes.
+            Ok(())
+        } else {
+            self.dev.uq_destroy(self.slot)
+        };
+        match gone {
             // SAFETY: dropped once, here; the queue no longer runs, so neither its VM nor its
             // pages are in use.
             Ok(()) => unsafe {
@@ -160,7 +177,8 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     if a.struct_size as usize != size_of::<sys::atrium_gpu_queue_create>() || a._pad != 0 {
         return Err(EINVAL);
     }
-    if a.family_id != sys::ATRIUM_GPU_QUEUE_FAMILY_COMPUTE as u32 {
+    let gfx = a.family_id == sys::ATRIUM_GPU_QUEUE_FAMILY_GFX as u32;
+    if a.family_id != sys::ATRIUM_GPU_QUEUE_FAMILY_COMPUTE as u32 && !gfx {
         return Err(EINVAL);
     }
     let user_mode = sys::ATRIUM_GPU_QUEUE_FLAG_USER_MODE as u32;
@@ -175,10 +193,21 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     // SAFETY: the kernel holds vm_fp for the duration of its fo_ioctl.
     let vm = unsafe { FileRef::<Vm>::from_file(vm_fp)? };
     let dev = vm.dev();
+    let si = unsafe { sys::amd_rs_is_si(dev.raw()) } != 0;
+    // GFX queues: gpusim's rasterizer only (kernel-mode, on its GFX queue).
+    if gfx && (si || user) {
+        return Err(EINVAL);
+    }
     let map = if user { Some(user_map(dev)?) } else { None };
     let pages = map.as_ref().map(|m| (m.handle().ram.kva(), m.handle().ram.pa()));
     // On failure `map` drops: nothing mapped it yet, so its pages free.
-    let slot = dev.uq_create(vm.as_c(), a.priority, pages)?;
+    // No MES user queues (gpusim): a kernel-mode queue on the device's own queue.
+    let slot = if si { dev.uq_create(vm.as_c(), a.priority, pages)? } else if user {
+        return Err(EOPNOTSUPP);
+    } else {
+        SIM_SLOT
+    };
+    let engine = if gfx { sys::ATRIUM_GPU_ENGINE_GFX } else { sys::ATRIUM_GPU_ENGINE_COMPUTE } as u32;
     if let Some(m) = &map {
         let _g = m.lock();
         m.handle().db_pa.store(dev.uq_doorbell_pa(slot), Ordering::Relaxed);
@@ -186,7 +215,17 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     }
     // From here the Box owns the queue: on any failure its drop takes it off the GPU.
     let q: Box<Queue> =
-        Box::new(Queue { dev, vm: ManuallyDrop::new(vm), slot, map: ManuallyDrop::new(map) }, M_WAITOK);
+        Box::new(
+            Queue {
+                dev,
+                vm: ManuallyDrop::new(vm),
+                slot,
+                engine,
+                sim_seq: AtomicU64::new(0),
+                map: ManuallyDrop::new(map),
+            },
+            M_WAITOK,
+        );
     let fd = kfile::install(q, (bindings::FREAD | bindings::FWRITE) as c_int)?;
     a.out_queue_fd = fd;
     Ok(())
@@ -228,7 +267,7 @@ impl Queue {
         if self.map.is_none() {
             return Err(EINVAL); // a kernel-mode queue: nothing to map
         }
-        if !self.dev.uq_alive(self.slot) {
+        if self.slot == SIM_SLOT || !self.dev.uq_alive(self.slot) {
             return Err(EIO); // lost (fault, hang): its pages map no more
         }
         a.out_ring_offset = MAP_RING;
@@ -274,7 +313,23 @@ impl Queue {
         };
         // The backend records the completion before the EOP can retire it (sc->lock), so the
         // syncobj reference can go when this returns: its close scrubs the entry.
-        a.out_seqno = self.dev.uq_submit(self.slot, a.blob_va, (a.blob_size / 4) as u32, so, value)?;
+        let dw = (a.blob_size / 4) as u32;
+        if self.slot == SIM_SLOT {
+            // The blob is the ring (gpusim). No client: no user-mode queue owner to match.
+            self.dev.submit(
+                core::ptr::null_mut(),
+                a.blob_va,
+                dw,
+                self.engine,
+                self.vm.as_c(),
+                a.deadline_ns,
+                so,
+                value,
+            )?;
+            a.out_seqno = self.sim_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            return Ok(());
+        }
+        a.out_seqno = self.dev.uq_submit(self.slot, a.blob_va, dw, so, value)?;
         Ok(())
     }
 }
