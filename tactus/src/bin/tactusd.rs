@@ -157,6 +157,12 @@ fn info(f: &File, path: &str) -> (Bus, u16, u16, String) {
 fn probe(path: &str) -> Option<(File, Decoder, Bus, u16, u16, String)> {
     let f = File::open(path).ok()?;
     let d = Decoder::new(Descriptor::parse(&descriptor(&f)?)?);
+    // A device with a FIDO collection is Sigillum's, even if it also has
+    // input collections (sigillum.md §5.1): let go of it at once.
+    if d.descriptor().classes().contains(&tactus::hid::Class::Identity) {
+        eprintln!("tactusd: {path} is a security key; leaving it to Sigillum");
+        return None;
+    }
     if !d.decodes_anything() {
         return None;
     }

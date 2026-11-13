@@ -38,6 +38,9 @@ pub enum Class {
     Touch,
     Touchpad,
     Pen,
+    /// A FIDO authenticator (usage page 0xF1D0). Never opened, never `Raw`:
+    /// security keys belong to Sigillum (sigillum.md §5.1).
+    Identity,
     Raw,
 }
 
@@ -53,6 +56,7 @@ impl Class {
             0x000d_0004 => Class::Touch,
             0x000d_0005 => Class::Touchpad,
             0x000d_0002 => Class::Pen,
+            a if a >> 16 == 0xf1d0 => Class::Identity,
             _ => Class::Raw,
         }
     }
@@ -358,6 +362,13 @@ pub fn bits(data: &[u8], at: u32, size: u32) -> Option<u64> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn fido_collections_are_identity_not_raw() {
+        assert_eq!(Class::of(0xf1d0_0001), Class::Identity);
+        assert_eq!(Class::of(0xff00_0001), Class::Raw);
+    }
+
     use super::*;
 
     /// The USB boot keyboard descriptor (HID 1.11 appendix B.1).

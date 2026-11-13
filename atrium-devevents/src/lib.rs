@@ -22,6 +22,8 @@
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 
+pub mod hidclass;
+
 #[cfg(target_os = "freebsd")]
 pub use freebsd::DeviceWatcher;
 
@@ -36,6 +38,6 @@ pub enum Event {
     Other   { raw: String },
 }
 
-#[cfg(not(target_os = "freebsd"))]
-compile_error!("atrium-devevents currently has only a FreeBSD backend; \
-                add an OpenBSD/NetBSD backend or build on FreeBSD");
+// Only a FreeBSD backend exists: elsewhere `DeviceWatcher` is absent, so a
+// consumer fails to build, while the portable parts (`hidclass`) build and
+// test anywhere.
