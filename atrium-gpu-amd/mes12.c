@@ -80,6 +80,8 @@ struct mes_gen {
 	/* Compute queue reset (mes_v12_0_reset_queue_mmio) and the MEC
 	 * pipe's program counter (start, current) for a pipe reset. */
 	uint32_t spi_compute_queue_reset, mec_prgrm_start, mec_instr_pntr;
+	/* CP front-end/compute busy and stall detail (wedge diagnosis). */
+	uint32_t cp_cpc_stall, cp_cpf_busy, cp_cpf_stall, cp_cpf_busy2;
 };
 
 static const struct mes_gen mes_gens[] = {
@@ -103,7 +105,8 @@ static const struct mes_gen mes_gens[] = {
 	  (0x8b * 2) << 2, (0xff * 2) << 2, 0, (0x8a * 2) << 2,
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400,
-	  S0(0x1f73), S1(0x2900), S1(0x2908) },
+	  S0(0x1f73), S1(0x2900), S1(0x2908),
+	  S0(0x0e26), S0(0x0e28), S0(0x0e29), S0(0x0e33) },
 };
 
 /* CP_MES_CNTL */
@@ -401,6 +404,46 @@ mes_report(struct mes *m, const char *when)
 }
 
 #define GRBM_BUSY_BITS	0xa8000000u	/* GUI_ACTIVE | CP_BUSY | ANY_ACTIVE */
+
+/*
+ * Box runs to de56be23: after a hostile shader's wave kill, CP_CPF_STATUS
+ * bit 28 (GRBM_CPF_STAT_BUSY's high bit) set predicted the GFXHUB wedge
+ * in all 13 runs. Say what the CP front end and compute are busy on or
+ * stalled by, and whether bit 28 clears by itself within `ms`.
+ */
+#define CPF_STAT_BUSY_HI	0x10000000u
+
+static void
+cp_stall_watch(struct mes *m, const char *when, int ms)
+{
+	const struct mes_gen *g = m->g;
+	uint32_t first = rd(m, g->cp_cpf_status), v = first;
+	int us;
+
+	device_printf(m->sc->dev, "mes: %s: CP_CPF_STATUS %#x, "
+	    "CP_CPF_BUSY_STAT %#x/%#x, CP_CPF_STALLED_STAT1 %#x, "
+	    "CP_CPC_BUSY_STAT %#x/%#x, CP_CPC_STALLED_STAT1 %#x, "
+	    "GRBM_STATUS2 %#x\n", when, first, rd(m, g->cp_cpf_busy),
+	    rd(m, g->cp_cpf_busy2), rd(m, g->cp_cpf_stall),
+	    rd(m, g->cp_cpc_busy), rd(m, g->cp_cpc_busy2),
+	    rd(m, g->cp_cpc_stall), rd(m, g->grbm_status2));
+	for (us = 0; us < ms * 1000; us += 1000) {
+		v = rd(m, g->cp_cpf_status);
+		if ((v & CPF_STAT_BUSY_HI) == 0)
+			break;
+		DELAY(1000);
+	}
+	device_printf(m->sc->dev, "mes: %s: CPF bit 28 %s after %d ms "
+	    "(CP_CPF_STATUS %#x); CP_CPF_BUSY_STAT %#x/%#x, "
+	    "CP_CPF_STALLED_STAT1 %#x, CP_CPC_BUSY_STAT %#x/%#x, "
+	    "CP_CPC_STALLED_STAT1 %#x, CP_CPC_STATUS %#x, GRBM_STATUS2 %#x, "
+	    "RLC_GPM_STAT %#x\n", when, (v & CPF_STAT_BUSY_HI) == 0 ?
+	    "clear" : "still set", us / 1000, v, rd(m, g->cp_cpf_busy),
+	    rd(m, g->cp_cpf_busy2), rd(m, g->cp_cpf_stall),
+	    rd(m, g->cp_cpc_busy), rd(m, g->cp_cpc_busy2),
+	    rd(m, g->cp_cpc_stall), rd(m, g->cp_cpc_status),
+	    rd(m, g->grbm_status2), rd(m, g->rlc_gpm_stat));
+}
 
 /*
  * Box runs 84bd8b3f/7c536595: GRBM_STATUS took GUI_ACTIVE|CP_BUSY|
@@ -3031,6 +3074,7 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			/* Box run 1b71cafd: the GPU stayed busy after a
 			 * hostile shader's kill; where it is busy. */
 			mes_report(m, "after the wave kill");
+			cp_stall_watch(m, "after the wave kill", 500);
 		}
 	}
 	/*
