@@ -945,3 +945,21 @@ work (self-test, scrub).
   - a stuck HQD logs its rptr/wptr and the CPC/CPF status registers;
   - unrouted IVs log client, source, ring, VMID and src_data[0] (still unexplained:
     EOP tags 0x04000000|doorbell from the faulting queue, and 0x18000000).
+- **2026-11-13 05:52, stage 5f on the box (fdadff06): si-client-test 64/64; suite ALL OK;
+  isolation 12 FAILs. Interrupts are back:** "ih: MSI, 1 vector", 300 interrupts,
+  completions "after 0 ms", and detach released the vector. The MEC pipe reset made
+  things worse:
+  - step 7's CPG fault (VMID 8, pipe 1) got its pipe reset. The HQD went inactive, but
+    CP_CPC_BUSY_STAT stayed 0x4 and the pipe's PC came back at 0x4198, not the start
+    0xc00;
+  - the next test's queue on pipe 0 (VMID 9, no fault of its own) never fetched, so
+    pipe 0 was reset too. That killed the kernel queue (MEC1 pipe 0 queue 0), so every
+    later VRAM scrub failed (scrub_failed 43, 33.5 GB dirty), and Parts F and G hit
+    ENOMEM;
+  - at detach, the kernel queue's self-test got no fence, GC was busy at about 69 W,
+    and the mode 1 reset left the card cold.
+  The CP error interrupts never fired. Only one unrouted EOP was seen, 0x18000000.
+  Conclusion: across two runs a pipe reset never recovers the MEC. Proposed instead:
+  drop the pipe reset; when a CP-faulted queue won't stop, do a mode 1 reset and
+  re-initialise in the kernel (decision pending). Log: branch
+  claude/project-thread-33aauq, docs/r9700-runs/20261113T055218Z-5f-fdadff06.log.
