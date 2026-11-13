@@ -2,7 +2,7 @@
 # gpu-stage-run.sh: one silicon bring-up run of atrium_gpu_amd_pci on the
 # R9700 box, done in a single ssh call (docs/spec/r9700-bare-metal.md).
 #
-#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a 5b
+#   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a 5b 5c1
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. The script
 # checks its sha256, probes before, clears the kernel message buffer, sets
@@ -21,7 +21,7 @@ KO=/root/kmod/atrium_gpu_amd_pci.ko
 PROBE=/root/atrium-gpu-probe
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
-KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch vm_test"
+KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch vm_test uq_test"
 
 [ $# -ge 2 ] || { echo "usage: $0 <sha256> <stage>..." >&2; exit 2; }
 want=$1; shift
@@ -38,6 +38,7 @@ for s in "$@"; do
 	4e) kenvs="$kenvs dispatch" ;;	# needs 4d
 	5a) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach"; hold=60 ;;
 	5b) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test"; hold=30 ;;
+	5c1) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test uq_test"; hold=30 ;;
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done
