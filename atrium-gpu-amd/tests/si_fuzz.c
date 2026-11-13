@@ -187,7 +187,7 @@ reinits(void)
 
 /* ---- target 1: ioctl structs ---- */
 
-enum fk { F_FD, F_PTR, F_DEPPTR, F_SIZE, F_BOSIZE, F_FLAGS, F_VA, F_OUT,
+enum fk { F_FD, F_VMFD, F_BOFD, F_SOFD, F_BLOBSZ, F_PTR, F_DEPPTR, F_SIZE, F_BOSIZE, F_FLAGS, F_VA, F_OUT,
 	F_PAD, F_SSIZE, F_VAL, F_TIMEOUT, F_COUNT, F_END };
 
 struct field { uint8_t off, size, kind; };
@@ -212,13 +212,13 @@ static const struct cdesc cmds[NCMD] = {
 	    FLD(struct atrium_gpu_bo_xfer, offset, F_SIZE),
 	    FLD(struct atrium_gpu_bo_xfer, len, F_SIZE),
 	    FLD(struct atrium_gpu_bo_xfer, user_ptr, F_PTR),
-	    FLD(struct atrium_gpu_bo_xfer, bo_fd, F_FD),
+	    FLD(struct atrium_gpu_bo_xfer, bo_fd, F_BOFD),
 	    FLD(struct atrium_gpu_bo_xfer, pad, F_PAD), FEND } },
 	{ "BO_READ", ATRIUM_GPU_IOC_BO_READ, sizeof(struct atrium_gpu_bo_xfer), 0, {
 	    FLD(struct atrium_gpu_bo_xfer, offset, F_SIZE),
 	    FLD(struct atrium_gpu_bo_xfer, len, F_SIZE),
 	    FLD(struct atrium_gpu_bo_xfer, user_ptr, F_PTR),
-	    FLD(struct atrium_gpu_bo_xfer, bo_fd, F_FD),
+	    FLD(struct atrium_gpu_bo_xfer, bo_fd, F_BOFD),
 	    FLD(struct atrium_gpu_bo_xfer, pad, F_PAD), FEND } },
 	{ "GET_IRQS", ATRIUM_GPU_IOC_GET_IRQS, sizeof(struct atrium_gpu_irqs), 0, {
 	    FLD(struct atrium_gpu_irqs, count, F_OUT), FEND } },
@@ -227,35 +227,35 @@ static const struct cdesc cmds[NCMD] = {
 	    FLD(struct atrium_gpu_syncobj_create, pad, F_PAD), FEND } },
 	{ "SYNCOBJ_SIGNAL", ATRIUM_GPU_IOC_SYNCOBJ_SIGNAL, sizeof(struct atrium_gpu_syncobj_op), 0, {
 	    FLD(struct atrium_gpu_syncobj_op, value, F_VAL),
-	    FLD(struct atrium_gpu_syncobj_op, syncobj_fd, F_FD),
+	    FLD(struct atrium_gpu_syncobj_op, syncobj_fd, F_SOFD),
 	    FLD(struct atrium_gpu_syncobj_op, pad, F_PAD), FEND } },
 	{ "SYNCOBJ_QUERY", ATRIUM_GPU_IOC_SYNCOBJ_QUERY, sizeof(struct atrium_gpu_syncobj_op), 0, {
 	    FLD(struct atrium_gpu_syncobj_op, value, F_VAL),
-	    FLD(struct atrium_gpu_syncobj_op, syncobj_fd, F_FD),
+	    FLD(struct atrium_gpu_syncobj_op, syncobj_fd, F_SOFD),
 	    FLD(struct atrium_gpu_syncobj_op, pad, F_PAD), FEND } },
 	{ "SYNCOBJ_WAIT", ATRIUM_GPU_IOC_SYNCOBJ_WAIT, sizeof(struct atrium_gpu_syncobj_wait), 0, {
 	    FLD(struct atrium_gpu_syncobj_wait, value, F_VAL),
-	    FLD(struct atrium_gpu_syncobj_wait, syncobj_fd, F_FD),
+	    FLD(struct atrium_gpu_syncobj_wait, syncobj_fd, F_SOFD),
 	    FLD(struct atrium_gpu_syncobj_wait, timeout_ms, F_TIMEOUT), FEND } },
 	{ "VM_CREATE", ATRIUM_GPU_IOC_VM_CREATE, sizeof(struct atrium_gpu_vm_create), 0, {
 	    FLD(struct atrium_gpu_vm_create, out_fd, F_OUT),
 	    FLD(struct atrium_gpu_vm_create, pad, F_PAD), FEND } },
 	{ "VM_BIND", ATRIUM_GPU_IOC_VM_BIND, sizeof(struct atrium_gpu_vm_bind), 0, {
 	    FLD(struct atrium_gpu_vm_bind, va, F_VA),
-	    FLD(struct atrium_gpu_vm_bind, vm_fd, F_FD),
-	    FLD(struct atrium_gpu_vm_bind, bo_fd, F_FD), FEND } },
+	    FLD(struct atrium_gpu_vm_bind, vm_fd, F_VMFD),
+	    FLD(struct atrium_gpu_vm_bind, bo_fd, F_BOFD), FEND } },
 	{ "QUEUE_MAP", ATRIUM_GPU_IOC_QUEUE_MAP, sizeof(struct atrium_gpu_queue_map), 0, {
 	    FLD(struct atrium_gpu_queue_map, doorbell_mmap_offset, F_OUT),
-	    FLD(struct atrium_gpu_queue_map, vm_fd, F_FD),
-	    FLD(struct atrium_gpu_queue_map, ring_fd, F_FD),
+	    FLD(struct atrium_gpu_queue_map, vm_fd, F_VMFD),
+	    FLD(struct atrium_gpu_queue_map, ring_fd, F_BOFD),
 	    FLD(struct atrium_gpu_queue_map, engine, F_FLAGS), FEND } },
 	{ "QUERY_CAPS", ATRIUM_GPU_IOC_QUERY_CAPS, sizeof(struct atrium_gpu_caps_query), 0, {
 	    FLD(struct atrium_gpu_caps_query, caps_ptr, F_PTR),
 	    FLD(struct atrium_gpu_caps_query, caps_size, F_SIZE), FEND } },
 	{ "VM_BIND2", ATRIUM_GPU_IOC_VM_BIND2, sizeof(struct atrium_gpu_vm_bind2), 0, {
 	    FLD(struct atrium_gpu_vm_bind2, va, F_VA),
-	    FLD(struct atrium_gpu_vm_bind2, vm_fd, F_FD),
-	    FLD(struct atrium_gpu_vm_bind2, bo_fd, F_FD),
+	    FLD(struct atrium_gpu_vm_bind2, vm_fd, F_VMFD),
+	    FLD(struct atrium_gpu_vm_bind2, bo_fd, F_BOFD),
 	    FLD(struct atrium_gpu_vm_bind2, flags, F_FLAGS),
 	    FLD(struct atrium_gpu_vm_bind2, pad, F_PAD), FEND } },
 	{ "QUEUE_CREATE", ATRIUM_GPU_IOC_QUEUE_CREATE, sizeof(struct atrium_gpu_queue_create), 0, {
@@ -273,7 +273,7 @@ static const struct cdesc cmds[NCMD] = {
 	    FLD(struct atrium_gpu_queue_submit, struct_size, F_SSIZE),
 	    FLD(struct atrium_gpu_queue_submit, flags, F_FLAGS),
 	    FLD(struct atrium_gpu_queue_submit, blob_va, F_VA),
-	    FLD(struct atrium_gpu_queue_submit, blob_size, F_SIZE),
+	    FLD(struct atrium_gpu_queue_submit, blob_size, F_BLOBSZ),
 	    FLD(struct atrium_gpu_queue_submit, in_dep_ptr, F_DEPPTR),
 	    FLD(struct atrium_gpu_queue_submit, in_dep_count, F_COUNT),
 	    FLD(struct atrium_gpu_queue_submit, deadline_ns, F_FLAGS),
@@ -307,6 +307,10 @@ static char *flap;
 static char *ro;
 static size_t pgsz;
 static int fuzz_uid_root;		/* running as root: user mode allowed */
+/* SI_FUZZ_NOCHECK=1: no canary and no clean-run checks, for a model whose
+ * queue-fd completions do not arrive (gpusim b035966: the IB's work lands,
+ * the fence never does); the kernel paths are still fuzzed. */
+static int nocheck;
 
 struct tctx {
 	int		 id;
@@ -315,7 +319,21 @@ struct tctx {
 	struct atrium_gpu_syncobj_point *deps;
 	uint64_t	 vas[16];
 	int		 nva;
+	int		 typed[4][8];	/* recent VM, BO, syncobj, queue fds */
+	int		 ntyped[4];
 };
+enum { TY_VM, TY_BO, TY_SO, TY_Q };
+
+static void
+remember(struct tctx *t, int ty, int f)
+{
+	if (f < 0)
+		return;
+	if (t->ntyped[ty] < 8)
+		t->typed[ty][t->ntyped[ty]++] = f;
+	else
+		t->typed[ty][rnd(&t->rs) % 8] = f;
+}
 
 static uint64_t
 pick_fd(struct tctx *t)
@@ -331,6 +349,16 @@ pick_fd(struct tctx *t)
 	if (r < 97)
 		return ((uint32_t)odd[rn(&t->rs, nitems(odd))]);
 	return ((uint32_t)rnd(&t->rs));
+}
+
+/* Mostly a recent fd of the type the field wants (it may have been closed
+ * or replaced since: that is the point); else any fd. */
+static uint64_t
+pick_typed(struct tctx *t, int ty)
+{
+	if (t->ntyped[ty] > 0 && rn(&t->rs, 10) < 7)
+		return ((uint32_t)t->typed[ty][rn(&t->rs, t->ntyped[ty])]);
+	return (pick_fd(t));
 }
 
 static uint64_t
@@ -420,6 +448,13 @@ fill_field(struct tctx *t, char *s, const struct field *f, uint32_t ssize)
 
 	switch (f->kind) {
 	case F_FD: v = pick_fd(t); break;
+	case F_VMFD: v = pick_typed(t, TY_VM); break;
+	case F_BOFD: v = pick_typed(t, TY_BO); break;
+	case F_SOFD: v = pick_typed(t, TY_SO); break;
+	case F_BLOBSZ:
+		v = rn(&t->rs, 4) ? 4 * (uint64_t)(1 + rn(&t->rs, 64)) :
+		    pick_size(t, 0);
+		break;
 	case F_PTR: v = pick_ptr(t, 0); break;
 	case F_DEPPTR: v = rn(&t->rs, 3) == 0 ? 0 : pick_ptr(t, rn(&t->rs, 3) != 0); break;
 	case F_SIZE: v = pick_size(t, 0); break;
@@ -500,16 +535,25 @@ op_ioctl(struct tctx *t)
 		fill_field(t, s, &c->f[i], c->ssize);
 	/* The deps the pointers may aim at: random fds and values. */
 	for (i = 0; i < 4; i++) {
-		t->deps[i].syncobj_fd = (int32_t)pick_fd(t);
+		t->deps[i].syncobj_fd = (int32_t)pick_typed(t, TY_SO);
 		t->deps[i]._pad = rn(&t->rs, 8) == 0 ? (uint32_t)rnd(&t->rs) : 0;
 		t->deps[i].value = rn(&t->rs, 2) ? rn(&t->rs, 64) : rnd(&t->rs);
 	}
 	if (ci == C_QUEUE_CREATE)
 		memcpy(&sent_flags, s + offsetof(struct atrium_gpu_queue_create,
 		    flags), 4);
-	/* Mostly a node of ours; sometimes any fd at all. */
-	f = pick_fd(t);
-	target = rn(&t->rs, 3) == 0 ? MASTER_FD : (int)(uint32_t)f;
+	/* Mostly the fd the call belongs on; sometimes any fd at all. */
+	if (rn(&t->rs, 10) < 7) {
+		if (c->cmd == ATRIUM_GPU_IOC_QUEUE_CREATE)
+			f = pick_typed(t, TY_VM);
+		else if (c->cmd == ATRIUM_GPU_IOC_QUEUE_SUBMIT ||
+		    c->cmd == ATRIUM_GPU_IOC_QUEUE_MAP2)
+			f = pick_typed(t, TY_Q);
+		else
+			f = MASTER_FD;
+	} else
+		f = pick_fd(t);
+	target = (int)(uint32_t)f;
 	note(t, "ioctl %s on fd %d [%02x %02x %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x %02x %02x %02x %02x %02x %02x ...]", c->name, target,
 	    (uint8_t)s[0], (uint8_t)s[1], (uint8_t)s[2], (uint8_t)s[3],
@@ -530,6 +574,14 @@ op_ioctl(struct tctx *t)
 	    (sent_flags & ATRIUM_GPU_QUEUE_FLAG_USER_MODE) && !fuzz_uid_root)
 		finding("QUEUE_CREATE USER_MODE succeeded for uid %d",
 		    (int)getuid());
+	if (c->cmd == ATRIUM_GPU_IOC_VM_CREATE)
+		remember(t, TY_VM, (int)((struct atrium_gpu_vm_create *)(void *)s)->out_fd);
+	else if (c->cmd == ATRIUM_GPU_IOC_BO_ALLOC)
+		remember(t, TY_BO, (int)((struct atrium_gpu_bo_alloc *)(void *)s)->bo_fd);
+	else if (c->cmd == ATRIUM_GPU_IOC_SYNCOBJ_CREATE)
+		remember(t, TY_SO, (int)((struct atrium_gpu_syncobj_create *)(void *)s)->out_fd);
+	else if (c->cmd == ATRIUM_GPU_IOC_QUEUE_CREATE)
+		remember(t, TY_Q, ((struct atrium_gpu_queue_create *)(void *)s)->out_queue_fd);
 	if (c->cmd == ATRIUM_GPU_IOC_VM_BIND2 || c->cmd == ATRIUM_GPU_IOC_VM_BIND) {
 		uint64_t va;
 
@@ -574,27 +626,27 @@ op_create(struct tctx *t)
 	switch (rn(&t->rs, 8)) {
 	case 0:
 		note(t, "create VM");
-		enter(t); (void)vm_create(); leave(t);
+		enter(t); remember(t, TY_VM, vm_create()); leave(t);
 		break;
 	case 1: case 2:
 		note(t, "create BO");
 		enter(t);
-		(void)bo_alloc(4096ULL * (1 + rn(&t->rs, 4)),
-		    rn(&t->rs, 4) == 0 ? ATRIUM_GPU_BO_VRAM : 0);
+		remember(t, TY_BO, bo_alloc(4096ULL * (1 + rn(&t->rs, 4)),
+		    rn(&t->rs, 4) == 0 ? ATRIUM_GPU_BO_VRAM : 0));
 		leave(t);
 		break;
 	case 3:
 		note(t, "create syncobj");
-		enter(t); (void)syncobj(); leave(t);
+		enter(t); remember(t, TY_SO, syncobj()); leave(t);
 		break;
 	case 4:
-		a = (int)rn(&t->rs, 64);
+		a = (int)pick_typed(t, TY_VM);
 		note(t, "create queue on fd %d", a);
-		enter(t); (void)queue_create(a); leave(t);
+		enter(t); remember(t, TY_Q, queue_create(a)); leave(t);
 		break;
 	case 5:
-		a = (int)rn(&t->rs, 64);
-		b = (int)rn(&t->rs, 64);
+		a = (int)pick_typed(t, TY_VM);
+		b = (int)pick_typed(t, TY_BO);
 		note(t, "bind fd %d into fd %d", b, a);
 		enter(t);
 		if (vm_bind(a, b, rn(&t->rs, 2) ? ATRIUM_GPU_BIND_READONLY : 0,
@@ -627,7 +679,15 @@ op_close(struct tctx *t)
 
 	a = POOL_LO + (int)rn(&t->rs, rn(&t->rs, 2) ? POOL_HI - POOL_LO :
 	    FD_SOFTMAX + 20 - POOL_LO);
-	if (a == MASTER_FD)
+	/* Often a recent VM, BO, syncobj or queue: VMs are a scarce
+	 * resource (ENOSPC), and closing a live object is the torn case. */
+	if (rn(&t->rs, 5) < 2) {
+		int ty = (int)rn(&t->rs, 4);
+
+		if (t->ntyped[ty] > 0)
+			a = t->typed[ty][rn(&t->rs, t->ntyped[ty])];
+	}
+	if (a == MASTER_FD || a < POOL_LO)
 		return;
 	if (rn(&t->rs, 3) == 0) {
 		b = POOL_LO + (int)rn(&t->rs, POOL_HI - POOL_LO);
@@ -772,6 +832,17 @@ ioctl_thread(void *arg)
 			op_mmap(t);
 		else if (r < 961)
 			op_fork(t);
+		else if (r < 962 && rn(&t->rs, 8) == 0) {
+			/* A purge: every fd but the device's, while the
+			 * other threads keep calling on them. */
+			int i;
+
+			note(t, "purge");
+			for (i = POOL_LO; i < FD_SOFTMAX + 20; i++)
+				if (i != MASTER_FD)
+					(void)close(i);
+			memset(t->ntyped, 0, sizeof(t->ntyped));
+		}
 		else
 			op_ioctl(t);
 	}
@@ -1129,7 +1200,7 @@ blob_worker(uint64_t seed, uid_t uid, int hang_wait)
 			b.j.value--;	/* refused: nothing owed */
 		leave(&nt);
 		if (r == ETIMEDOUT) {
-			if (reinits() == ri0)
+			if (reinits() == ri0 && !nocheck)
 				finding("blob job: no completion within %d ms "
 				    "(%s)", b.hang_wait, sl->last);
 			job_close(&b.j);
@@ -1159,7 +1230,7 @@ blob_worker(uint64_t seed, uid_t uid, int hang_wait)
 			atomic_fetch_add(&S->blob_clean, 1);
 			continue;
 		}
-		if (reinits() == ri0 && ri0 != -2)
+		if (!nocheck && reinits() == ri0 && ri0 != -2)
 			finding("blob: the VM did not run clean on a new queue "
 			    "after a contained failure (%s; after: %s)",
 			    strerror(err), sl->last);
@@ -1344,6 +1415,8 @@ main(int argc, char **argv)
 		nthreads = MAX(1, MIN(atoi(argv[4]), MAXT - 1));
 	if ((e = getenv("SI_FUZZ_PACE")) != NULL)
 		pace = atoi(e);
+	if ((e = getenv("SI_FUZZ_NOCHECK")) != NULL && *e == '1')
+		nocheck = 1;
 	if ((e = getenv("SI_FUZZ_GEN")) != NULL)
 		gen_s = MAX(5, atoi(e));
 	pgsz = (size_t)getpagesize();
@@ -1398,7 +1471,10 @@ main(int argc, char **argv)
 	job_init(&can.j);
 	can.seal = -1;
 	can.bad = 0;
-	if (canary_open(&can) != 0 || canary_run(&can, hang_wait, why,
+	if (nocheck)
+		printf("si-fuzz: SI_FUZZ_NOCHECK: no canary, no clean-run "
+		    "checks\n");
+	else if (canary_open(&can) != 0 || canary_run(&can, hang_wait, why,
 	    sizeof(why)) != 0) {
 		printf("FAIL: the canary does not run before the fuzz: %s\n",
 		    why);
@@ -1495,7 +1571,7 @@ main(int argc, char **argv)
 		}
 
 		/* The canary. */
-		if (now >= next_canary) {
+		if (!nocheck && now >= next_canary) {
 			next_canary = now + 5000;
 			if (can.j.vm < 0 && canary_open(&can) != 0) {
 				canary_close(&can);
@@ -1561,6 +1637,8 @@ main(int argc, char **argv)
 		if (canary_open(&h) != 0)
 			finding("health: no new VM after the fuzz: %s",
 			    strerror(errno));
+		else if (nocheck)
+			printf("si-fuzz: health: a new VM and queue open\n");
 		else if (canary_run(&h, hang_wait, why, sizeof(why)) != 0)
 			finding("health: a new VM does not run clean: %s", why);
 		else

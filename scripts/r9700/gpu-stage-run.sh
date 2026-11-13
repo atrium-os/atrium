@@ -5,6 +5,7 @@
 #   gpu-stage-run.sh <sha256> <stage>...     stages: 3 4a 4b 4c 4d 4e 5a 5b 5c1
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> 5c2
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256>,<suite sha256>,<iso sha256> 5f
+#   FUZZ_SHA=<sha256> gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> fz:<seconds>:<seed>
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. Stage 5c2
 # (the client node on silicon) also needs the gpu module at
@@ -20,7 +21,11 @@
 # ends in ENXIO after the mode 1 reset, as designed; with stage 5a it stays
 # attached for 60 s with telemetry watched, then detaches), saves the kernel log,
 # gives the GPU back to vgapci, unsets the kenvs, unloads, probes after, and
-# takes one temperature reading 30 s later. The whole report is printed and
+# takes one temperature reading 30 s later. Stage fz is 5c2 plus the §10.5
+# fuzz gate after si-client-test: /root/si-fuzz (tests/si_fuzz.c, checked
+# against FUZZ_SHA) in mode "all" for <seconds> with <seed>, then
+# si-client-test once more as the health check. The kernel's messages over
+# the whole run are in /var/log/messages (the buffer wraps). The whole report is printed and
 # kept in /root/runs/. It never sets keep_state, gfx_cg or mode1_reset.
 #
 # This loads a kernel module and writes the GPU: only run it with the
@@ -33,6 +38,7 @@ TEST=/root/si-client-test
 SUITE=/root/atrium-gpu-test
 ISO=/root/test-gpu-isolation
 PROBE=/root/atrium-gpu-probe
+FUZZ=/root/si-fuzz
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
 KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch vm_test uq_test client"
@@ -52,6 +58,7 @@ kenvs=""
 hold=0
 client=0
 suites=0
+fuzz=""
 for s in "$@"; do
 	case $s in
 	3)  kenvs="$kenvs psp_bootload psp_ipfw smu_init gc_up_ok" ;;
@@ -65,6 +72,7 @@ for s in "$@"; do
 	5c1) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach vm_test uq_test"; hold=30 ;;
 	5c2) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1 ;;
 	5f) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; suites=1 ;;
+	fz:*:*) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; fuzz=${s#fz:} ;;
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done
@@ -102,6 +110,14 @@ if [ "$suites" = 1 ]; then
 	fi
 	echo "sha256 ok: suite $u, isolation $i"
 fi
+if [ -n "$fuzz" ]; then
+	f=$(sha256 -q "$FUZZ" 2>/dev/null)
+	if [ -z "${FUZZ_SHA:-}" ] || [ "$f" != "$FUZZ_SHA" ]; then
+		echo "REFUSED: $FUZZ sha256 $f (want ${FUZZ_SHA:-unset})"
+		exit 1
+	fi
+	echo "sha256 ok: si-fuzz $f"
+fi
 if kldstat -q -m atrium_gpu_amd_pci 2>/dev/null || kldstat | grep -q atrium_gpu_amd; then
 	echo "REFUSED: an atrium_gpu_amd module is already loaded"
 	exit 1
@@ -126,6 +142,14 @@ if [ "$hold" -gt 0 ]; then
 			echo "== test-gpu-isolation"
 			timeout 600 "$ISO"; echo "test-gpu-isolation rc=$?"
 			sysctl dev.atrium_gpu_amd_pci.0.vram 2>/dev/null
+		fi
+		if [ -n "$fuzz" ]; then
+			fsecs=${fuzz%%:*}; fseed=${fuzz#*:}
+			echo "== si-fuzz all $fsecs $fseed"
+			timeout $((fsecs + 1800)) "$FUZZ" all "$fsecs" "$fseed"; echo "si-fuzz rc=$?"
+			sysctl dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | grep reinits
+			echo "== si-client-test after the fuzz"
+			timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		fi
 		sysctl dev.atrium_gpu_amd.0.isolation 2>/dev/null
 	fi
