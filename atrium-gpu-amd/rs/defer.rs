@@ -35,12 +35,16 @@ const NHWQ: usize = sys::ATRIUM_AMD_NHWQ as usize;
 pub struct BusyAt {
     pub mask: u32,
     pub gens: [u64; NHWQ],
+    /// Kernel VMIDs of the BO's VMs that had a user queue (5c-2b). Until the free rule
+    /// (spec §4.5.1 step 4: MES suspend/resume) the BO waits until those VMs have none:
+    /// a user queue's progress is only its own fence, which its client can write.
+    pub uq: u32,
 }
 
 impl BusyAt {
     /// Has every queue that was busy then moved on, given the queues' state `now`?
     fn retired(&self, now: &BusyAt) -> bool {
-        (0..NHWQ).all(|i| {
+        self.uq & now.uq == 0 && (0..NHWQ).all(|i| {
             let was_busy = self.mask & (1 << i) != 0;
             let same_work = now.gens[i] == self.gens[i];
             let still_busy = now.mask & (1 << i) != 0;

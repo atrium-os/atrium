@@ -912,6 +912,19 @@ int	amd_mes12_kq_submit(struct amd_kq *kq, uint64_t ib, uint32_t ib_dw,
 	    u_int vmid, uint32_t *seq);
 uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
 void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
+#define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
+#define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
+struct amd_uq;
+int	amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
+	    u_int slot, uint64_t va, uint32_t prio, struct amd_uq **out);
+int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
+int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
+	    uint32_t *seq);
+uint32_t amd_mes12_uq_fence(struct amd_uq *q);
+uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
+uint32_t amd_mes12_uq_seq(struct amd_uq *q);
+void	amd_mes12_uq_report(struct amd_uq *q, const char *when);
+void	amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved);
 int	amd_smu_init(struct atrium_amd_softc *sc);	/* smu.c, silicon test */
 int	amd_si_attach(struct atrium_amd_softc *sc);	/* smu.c, stage 5a */
 void	amd_si_detach(struct atrium_amd_softc *sc);

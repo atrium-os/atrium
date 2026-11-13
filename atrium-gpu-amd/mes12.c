@@ -1794,7 +1794,7 @@ amd_mes12_kq_report(struct amd_kq *kq, const char *when)
 #define UQ_G_GANG		0x2000u
 #define UQ_G_WB			0x3000u		/* alias of the WB page */
 #define UQ_G_SIZE		0x4000u
-#define UQ_DOORBELL(p)		((0x10u + (p)) << 1)	/* userqueue range */
+#define UQ_DOORBELL(p)		AMD_UQ_DOORBELL(p)	/* userqueue range */
 #define UQ_SEQ			0x5c000001u
 
 struct uqp {
@@ -1814,13 +1814,15 @@ grbm_select_q(struct mes *m, u_int me, u_int pipe, u_int queue)
 	    (queue & 7) << 8);
 }
 
-/* gfx_v12_0_compute_mqd_init for a user queue (prop->kernel_queue false). */
+/*
+ * gfx_v12_0_compute_mqd_init for a user queue (prop->kernel_queue false):
+ * the MQD at GART `mqd`, ring/EOP/writeback at VAs of the process's VM,
+ * doorbell dword index `db`.
+ */
 static void
-uq_mqd_init(struct uqp *u, u_int p)
+uq_mqd_build(uint8_t *q, uint64_t mqd, uint64_t ring, uint64_t eop,
+    uint64_t wb, uint32_t db)
 {
-	uint8_t *q = u->g + UQ_G_MQD;
-	uint64_t mqd = u->gva + UQ_G_MQD, ring = UQ_VA + UQ_RING;
-	uint64_t eop = UQ_VA + UQ_EOP, wb = UQ_VA + UQ_WB;
 	uint32_t t;
 
 	memset(q, 0, MQD_SIZE);
@@ -1848,7 +1850,7 @@ uq_mqd_init(struct uqp *u, u_int p)
 	put32(q, MQD_RPTR_REPORT_HI, (uint32_t)(wb >> 32) & 0xffff);
 	put32(q, MQD_WPTR_POLL_LO, (uint32_t)(wb + 8) & 0xfffffffcu);
 	put32(q, MQD_WPTR_POLL_HI, (uint32_t)((wb + 8) >> 32) & 0xffff);
-	put32(q, MQD_DOORBELL, (UQ_DOORBELL(p) << 2) | (1u << 30));
+	put32(q, MQD_DOORBELL, (db << 2) | (1u << 30));
 	put32(q, MQD_PQ_RPTR, 0);
 	put32(q, MQD_HQD_VMID, 0);			/* MES sets it */
 	put32(q, MQD_PERSISTENT, (PERSISTENT_DEFAULT & ~0x3ff00u) |
@@ -1858,27 +1860,40 @@ uq_mqd_init(struct uqp *u, u_int p)
 	put32(q, MQD_HQD_ACTIVE, 0);
 }
 
+static void
+uq_mqd_init(struct uqp *u, u_int p)
+{
+	uq_mqd_build(u->g + UQ_G_MQD, u->gva + UQ_G_MQD, UQ_VA + UQ_RING,
+	    UQ_VA + UQ_EOP, UQ_VA + UQ_WB, UQ_DOORBELL(p));
+}
+
+/*
+ * mes_userq_map's ADD_QUEUE: one gang (context at gva + UQ_G_GANG) of a
+ * process (context at gva + UQ_G_PROC) whose page tables are `vm`; the MQD
+ * at gva + UQ_G_MQD and MES's wptr alias at gva + UQ_G_WB + 8.
+ */
 static int
-uq_add(struct mes *m, struct uqp *u, u_int p)
+uq_add_raw(struct mes *m, struct amd_vm12 *vm, uint64_t gva, uint32_t pid,
+    uint32_t db, uint32_t prio)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
 
 	memset(pkt, 0, sizeof(pkt));
 	pkt[0] = HDR_ADD_QUEUE;
-	put32(b, AQ_PROCESS_ID, 0x100 + p);		/* a pasid-like id */
-	put64(b, AQ_PTB, amd_gmc12_vm_pd_addr(&u->vm));
+	put32(b, AQ_PROCESS_ID, pid);			/* a pasid-like id */
+	put64(b, AQ_PTB, amd_gmc12_vm_pd_addr(vm));
 	put64(b, AQ_VA_START, 0);
 	put64(b, AQ_VA_END, (1ull << 36) - 1);		/* max_pfn - 1 */
 	put64(b, AQ_PROC_QUANTUM, 100000);		/* 10 ms */
-	put64(b, AQ_PROC_CTX, u->gva + UQ_G_PROC);
+	put64(b, AQ_PROC_CTX, gva + UQ_G_PROC);
 	put64(b, AQ_GANG_QUANTUM, 10000);		/* 1 ms */
-	put64(b, AQ_GANG_CTX, u->gva + UQ_G_GANG);
-	put32(b, AQ_INPROC_PRIO, 1);			/* NORMAL */
-	put32(b, AQ_GANG_PRIO, 1);
-	put32(b, AQ_DOORBELL, UQ_DOORBELL(p));
-	put64(b, AQ_MQD_ADDR, u->gva + UQ_G_MQD);
-	put64(b, AQ_WPTR_ADDR, u->gva + UQ_G_WB + 8);
+	put64(b, AQ_GANG_CTX, gva + UQ_G_GANG);
+	put32(b, AQ_INPROC_PRIO, prio);
+	put32(b, AQ_GANG_PRIO, prio);
+	put32(b, AQ_DOORBELL, db);
+	put64(b, AQ_MQD_ADDR, gva + UQ_G_MQD);
+	put64(b, AQ_WPTR_ADDR, gva + UQ_G_WB + 8);
 	put32(b, AQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
 	put32(b, AQ_GDS_SIZE, RING_DW);
 	put32(b, AQ_VM_CNTX_CNTL, amd_gmc12_ctx_cntl(m->gt, 8));
@@ -1886,18 +1901,30 @@ uq_add(struct mes *m, struct uqp *u, u_int p)
 }
 
 static int
-uq_remove(struct mes *m, struct uqp *u, u_int p)
+uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
 
 	memset(pkt, 0, sizeof(pkt));
 	pkt[0] = HDR_REMOVE_QUEUE;
-	put32(b, RQ_DOORBELL, UQ_DOORBELL(p));
-	put64(b, RQ_GANG_CTX, u->gva + UQ_G_GANG);
+	put32(b, RQ_DOORBELL, db);
+	put64(b, RQ_GANG_CTX, gva + UQ_G_GANG);
 	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
 	return (mes_api(m, 0, pkt, RQ_API_STATUS,
 	    "REMOVE_QUEUE (user compute)"));
+}
+
+static int
+uq_add(struct mes *m, struct uqp *u, u_int p)
+{
+	return (uq_add_raw(m, &u->vm, u->gva, 0x100 + p, UQ_DOORBELL(p), 1));
+}
+
+static int
+uq_remove(struct mes *m, struct uqp *u, u_int p)
+{
+	return (uq_remove_raw(m, u->gva, UQ_DOORBELL(p)));
 }
 
 /*
@@ -2131,6 +2158,319 @@ out:
 	    "PASS (two MES user queues, own VMs and VMIDs, same VAs, own "
 	    "pages)" : "FAILED");
 	return (err);
+}
+
+/*
+ * Stage 5c-2b: MES user queues for client queue fds (si_client.c). One
+ * compute queue per struct amd_uq, as 5c-1 proved them, generalised:
+ *
+ *   slot     0..AMD_UQ_SLOTS-1, chosen by the caller; it fixes the
+ *            doorbell (5c-1's userqueue range, UQ_DOORBELL(slot)), the GART
+ *            block (MQD, process and gang contexts, the writeback page's
+ *            alias for MES) and the process id MES sees.
+ *   memory   ring, writeback (rptr 0, wptr 8, fence 0x10) and EOP buffer:
+ *            three kernel-allocated pages mapped into the client's VM at
+ *            `va` (a kernel-reserved range above the BO window, never handed
+ *            to a BO). The ring is mapped read-only: the CP reads it, and a
+ *            client shader cannot rewrite it under the kernel.
+ *   process  one MES process (and gang) per queue, so two queues of one VM
+ *            are two MES processes on the same page tables. MES picks the
+ *            HQD and the VMID (8-15) when the queue has work.
+ *
+ * The fence is in the client's own VM, so a client can lie about its own
+ * queue's progress and nothing else's. Callers serialise per queue.
+ */
+#define UQ2_GART_VA		0x00080000ull	/* after the kq's block */
+#define UQ2_PAGES		3u
+#define UQ2_RING		0x0000u
+#define UQ2_WB			0x1000u
+#define UQ2_EOP			0x2000u
+#define UQ2_PID(slot)		(0x200u + (slot))
+#define UQ2_PKT_DW		12u
+#define UQ2_KILL_WAIT_US	200000
+
+struct amd_uq {
+	struct mes *m;
+	struct amd_vm12 *vm;
+	u_int	 slot;
+	uint32_t db;
+	uint64_t va;		/* ring/WB/EOP in the client's VM */
+	uint8_t	*pg;		/* their KVA */
+	vm_paddr_t pg_pa;
+	uint8_t	*g;		/* MQD, process ctx, gang ctx */
+	vm_paddr_t g_pa;
+	uint64_t gva;		/* GART VA of the block */
+	uint64_t wptr;		/* dwords emitted */
+	uint32_t seq;		/* last fence value emitted */
+	bool	 mapped_vm, added;
+};
+
+static bool
+uq2_seq_passed(uint32_t fence, uint32_t seq)
+{
+	return ((int32_t)(fence - seq) >= 0);
+}
+
+/* The active MEC1 HQD (any pipe and queue) whose doorbell is `db`. */
+static bool
+uq2_hqd_find(struct mes *m, uint32_t db, u_int *vmid)
+{
+	const struct mes_gen *g = m->g;
+	u_int pipe, q;
+	bool found = false;
+
+	for (pipe = 0; pipe < 4 && !found; pipe++)
+		for (q = 0; q < 8 && !found; q++) {
+			grbm_select_q(m, 1, pipe, q);
+			if ((rd(m, g->hqd_active) & 1) == 0)
+				continue;
+			if (((rd(m, g->hqd_doorbell) >> 2) & 0x03ffffff) != db)
+				continue;
+			*vmid = rd(m, g->hqd_vmid) & 0xf;
+			found = true;
+		}
+	grbm_select_q(m, 0, 0, 0);
+	return (found);
+}
+
+/* EOP interrupts from every MEC1 pipe MES may place a user queue on. */
+void
+amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
+{
+	u_int pipe;
+
+	for (pipe = 0; pipe < 4; pipe++) {
+		grbm_select(m, 1, pipe);
+		if (on) {
+			saved[pipe] = rd(m, m->g->cpc_int_cntl);
+			wr(m, m->g->cpc_int_cntl, saved[pipe] |
+			    TIME_STAMP_INT_ENABLE);
+		} else
+			wr(m, m->g->cpc_int_cntl, saved[pipe]);
+	}
+	grbm_select(m, 0, 0);
+}
+
+static void
+uq2_unmap_vm(struct amd_uq *q, u_int kvmid)
+{
+	u_int i, vmid;
+
+	if (!q->mapped_vm)
+		return;
+	for (i = 0; i < UQ2_PAGES; i++)
+		(void)amd_gmc12_vm_unmap(q->vm, q->va + i * PAGE_SIZE);
+	/* The kernel's VMID for the VM, and every MES VMID: any of them
+	 * may hold a translation of these pages. */
+	(void)amd_gmc12_vm_flush(q->m->gt, kvmid);
+	for (vmid = 8; vmid < 16; vmid++)
+		(void)amd_gmc12_vm_flush(q->m->gt, vmid);
+	q->mapped_vm = false;
+}
+
+static void
+uq2_free(struct amd_uq *q, u_int kvmid)
+{
+	uq2_unmap_vm(q, kvmid);
+	gart_unmap_blk(q->m->gt, q->gva, UQ_G_SIZE);
+	contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
+	free(q, M_DEVBUF);
+}
+
+int
+amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
+    u_int slot, uint64_t va, uint32_t prio, struct amd_uq **out)
+{
+	struct amd_gart *gt = m->gt;
+	struct amd_uq *q;
+	u_int i;
+	int err;
+
+	*out = NULL;
+	if (slot >= AMD_UQ_SLOTS || (va & PAGE_MASK) != 0)
+		return (EINVAL);
+	q = malloc(sizeof(*q), M_DEVBUF, M_WAITOK | M_ZERO);
+	q->m = m;
+	q->vm = vm;
+	q->slot = slot;
+	q->db = AMD_UQ_DOORBELL(slot);
+	q->va = va;
+	q->gva = gt->gart_start + UQ2_GART_VA + (uint64_t)slot * UQ_G_SIZE;
+	if (q->gva + UQ_G_SIZE > gt->gart_end + 1) {
+		free(q, M_DEVBUF);
+		return (EINVAL);
+	}
+	q->pg = contigmalloc(UQ2_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK |
+	    M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	q->pg_pa = vtophys(q->pg);
+	q->g = contigmalloc(UQ_G_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	q->g_pa = vtophys(q->g);
+
+	/* GART: MQD, process ctx, gang ctx, and the writeback alias. */
+	for (i = 0; i < 3; i++)
+		(void)amd_gmc12_gart_map(gt, q->gva + i * PAGE_SIZE,
+		    q->g_pa + i * PAGE_SIZE);
+	(void)amd_gmc12_gart_map(gt, q->gva + UQ_G_WB, q->pg_pa + UQ2_WB);
+	if ((err = amd_gmc12_flush(gt)) != 0)
+		goto fail;
+
+	/* The client's VM: ring read-only, writeback and EOP read-write. */
+	q->mapped_vm = true;
+	for (i = 0; i < UQ2_PAGES; i++)
+		if ((err = amd_gmc12_vm_map(vm, va + i * PAGE_SIZE,
+		    q->pg_pa + i * PAGE_SIZE, i * PAGE_SIZE == UQ2_RING ?
+		    AMD_VM_READ : AMD_VM_READ | AMD_VM_WRITE)) != 0)
+			goto fail;
+	if ((err = amd_gmc12_vm_flush(gt, kvmid)) != 0)
+		goto fail;
+
+	uq_mqd_build(q->g + UQ_G_MQD, q->gva + UQ_G_MQD, va + UQ2_RING,
+	    va + UQ2_EOP, va + UQ2_WB, q->db);
+	if ((err = uq_add_raw(m, vm, q->gva, UQ2_PID(slot), q->db,
+	    prio)) != 0)
+		goto fail;
+	q->added = true;
+	device_printf(m->sc->dev, "uq%u: added: VM base %#jx, queue pages at "
+	    "VA %#jx (pa %#jx), MQD GART %#jx, doorbell %#x\n", slot,
+	    (uintmax_t)amd_gmc12_vm_pd_addr(vm), (uintmax_t)va,
+	    (uintmax_t)q->pg_pa, (uintmax_t)(q->gva + UQ_G_MQD), q->db);
+	*out = q;
+	return (0);
+fail:
+	/* Not added: MES never saw the block. */
+	uq2_free(q, kvmid);
+	return (err);
+}
+
+uint32_t
+amd_mes12_uq_fence(struct amd_uq *q)
+{
+	return (*(volatile uint32_t *)(q->pg + UQ2_WB + 0x10));
+}
+
+uint32_t
+amd_mes12_uq_doorbell(struct amd_uq *q)
+{
+	return (q->db);
+}
+
+uint32_t
+amd_mes12_uq_seq(struct amd_uq *q)
+{
+	return (q->seq);
+}
+
+/*
+ * Emit one job: IB at `ib` (`ib_dw` dwords; the VMID is the HQD's), then
+ * the fence and an EOP interrupt; write wptr and ring the doorbell. *seq
+ * is the job's fence value. EBUSY if a ring's worth is in flight. Does
+ * not sleep (the caller holds sc->lock).
+ */
+int
+amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
+    uint32_t *seq)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(q->pg + UQ2_RING);
+	uint64_t fence = q->va + UQ2_WB + 0x10;
+	uint32_t pkt[UQ2_PKT_DW], s, inflight;
+	u_int i, n = 0;
+
+	if (!q->added)
+		return (ENXIO);
+	if (ib_dw == 0 || ib_dw > 0xfffffu || (ib & 3) != 0)
+		return (EINVAL);
+	/* The fence is the client's to write: a lie only makes its own
+	 * ring look emptier, and the ring is ours (read-only to it). */
+	inflight = q->seq - amd_mes12_uq_fence(q);
+	if (inflight > RING_DW / UQ2_PKT_DW ||
+	    (inflight + 1) * UQ2_PKT_DW >= RING_DW)
+		return (EBUSY);
+	s = q->seq + 1;
+	if (s == 0)
+		s = 1;
+	pkt[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
+	pkt[n++] = (uint32_t)ib;
+	pkt[n++] = (uint32_t)(ib >> 32);
+	pkt[n++] = IB_VALID | ib_dw;			/* VMID from the HQD */
+	pkt[n++] = PKT3(IT_RELEASE_MEM, 6);
+	pkt[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
+	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
+	pkt[n++] = RM_DATA_SEL(1) | RM_INT_SEL(2);
+	pkt[n++] = (uint32_t)fence;
+	pkt[n++] = (uint32_t)(fence >> 32);
+	pkt[n++] = s;
+	pkt[n++] = 0;
+	pkt[n++] = 0;
+	for (i = 0; i < n; i++)
+		ring[(q->wptr + i) & (RING_DW - 1)] = pkt[i];
+	q->wptr += n;
+	q->seq = s;
+	*(volatile uint64_t *)(q->pg + UQ2_WB + 8) = q->wptr;
+	wmb();
+	bus_write_8(q->m->dbbar, (bus_size_t)q->db * 4, q->wptr);
+	*seq = s;
+	return (0);
+}
+
+void
+amd_mes12_uq_report(struct amd_uq *q, const char *when)
+{
+	volatile uint32_t *wb = (volatile uint32_t *)(q->pg + UQ2_WB);
+	u_int vmid = 0;
+	bool on;
+
+	on = uq2_hqd_find(q->m, q->db, &vmid);
+	device_printf(q->m->sc->dev, "uq%u: %s: seq %u, fence %u, wptr %ju, "
+	    "rptr report %#x; HQD %s (VMID %u)\n", q->slot, when, q->seq,
+	    wb[4], (uintmax_t)q->wptr, wb[0], on ? "active" : "not mapped",
+	    vmid);
+}
+
+/*
+ * Take the queue off MES and free it. If its last job has not fenced,
+ * first kill the waves of the VMID MES runs it under and give the fence a
+ * moment. 0: removed, nothing of it is mapped, its memory is freed.
+ * EBUSY: MES did not let go of it; its memory is leaked (never freed under
+ * the GPU), and the caller must keep the VM's page tables alive too.
+ */
+int
+amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid)
+{
+	struct mes *m = q->m;
+	u_int vmid, us;
+	int err;
+
+	if (q->added && !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq)) {
+		amd_mes12_uq_report(q, "destroy: work in flight");
+		if (uq2_hqd_find(m, q->db, &vmid) && vmid >= 8) {
+			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);
+			for (us = 0; us < UQ2_KILL_WAIT_US &&
+			    !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq);
+			    us += 100)
+				DELAY(100);
+			device_printf(m->sc->dev, "uq%u: VMID %u's waves "
+			    "killed (%d); fence %s after %u us\n", q->slot,
+			    vmid, err, uq2_seq_passed(amd_mes12_uq_fence(q),
+			    q->seq) ? "landed" : "still behind", us);
+		}
+	}
+	if (q->added) {
+		if ((err = uq_remove_raw(m, q->gva, q->db)) != 0 ||
+		    uq2_hqd_find(m, q->db, &vmid)) {
+			amd_mes12_uq_report(q, "REMOVE_QUEUE failed");
+			device_printf(m->sc->dev, "uq%u: still mapped after "
+			    "REMOVE_QUEUE (%d); its memory and VM are "
+			    "leaked\n", q->slot, err);
+			return (EBUSY);
+		}
+		q->added = false;
+	}
+	device_printf(m->sc->dev, "uq%u: removed (seq %u, fence %u)\n",
+	    q->slot, q->seq, amd_mes12_uq_fence(q));
+	uq2_free(q, kvmid);
+	return (0);
 }
 
 static void mes_free(struct mes *m);

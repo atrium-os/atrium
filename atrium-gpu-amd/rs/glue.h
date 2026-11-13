@@ -68,4 +68,16 @@ void	amd_rs_eop(struct atrium_amd_softc *sc, const uint32_t *eop,
 	    const uint32_t *fault);
 void	amd_rs_q_faulted_locked(struct atrium_amd_softc *sc, uint32_t qid);
 
+/* C, for Rust (rs/uqueue.rs; si_client.c): client queue fds on MES user
+ * queues (5c-2b). EOPNOTSUPP/0 on a backend without them. */
+int	amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
+	    uint32_t prio, int *slot);
+int	amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot);
+int	amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
+	    uint32_t ib_dw, struct atrium_amd_syncobj *so, uint64_t value,
+	    uint64_t *seqno);
+void	amd_si_uq_scrub(struct atrium_amd_softc *sc,
+	    struct atrium_amd_syncobj *so);
+uint32_t amd_si_uq_vmids(struct atrium_amd_softc *sc);
+
 #endif

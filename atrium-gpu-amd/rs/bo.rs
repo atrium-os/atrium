@@ -212,7 +212,7 @@ impl Drop for BoFile {
         // SAFETY: created by create_fd with Box; this was the last user and nothing else
         // refers to it (no bindings left).
         let mut bo = unsafe { Box::<Bo>::from_raw(self.0.as_ptr()) };
-        if at.mask != 0 {
+        if at.mask != 0 || at.uq != 0 {
             // Freed by the reaper once those queues have moved on (defer.rs).
             defer::defer(dev, bo, at);
             return;

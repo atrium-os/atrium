@@ -216,6 +216,59 @@ struct atrium_gpu_vm_bind2 {
 };
 #define ATRIUM_GPU_BIND_READONLY	0x1
 
+/*
+ * Queue fds (GPU ABI v2 §5.5, §5.7; stage 5c-2b). Layouts and numbers are
+ * v2's (include/atrium/gpu_abi_v2.h: atrium_gpu_queue_create, and
+ * atrium_gpu_submit, here named atrium_gpu_queue_submit because the v1
+ * SUBMIT above holds the name).
+ *
+ * QUEUE_CREATE is an ioctl on a VM fd: a queue that runs in that VM, as a
+ * new fd holding a reference on the VM. family_id 0 is compute (the only
+ * family on silicon so far); priority 0 only; flags 0 (USER_MODE comes
+ * later). The fd is the right to submit: it passes over SCM_RIGHTS, and its
+ * last close takes the queue off the GPU, cancelling (ECANCELED) what has
+ * not completed.
+ *
+ * QUEUE_SUBMIT is an ioctl on the queue fd: run blob_size bytes of PM4 at
+ * blob_va (in the queue's VM) as one indirect buffer; on completion signal
+ * the out dependency (at most one in 5c-2b; in_dep_count must be 0).
+ * out_seqno is the submit's number on this queue, from 1.
+ */
+#define ATRIUM_GPU_QUEUE_FAMILY_COMPUTE	0u
+#define ATRIUM_GPU_QUEUE_FLAG_USER_MODE	0x1u
+
+struct atrium_gpu_queue_create {	/* on vm_fd */
+	uint32_t	struct_size;
+	uint32_t	family_id;
+	uint32_t	priority;
+	uint32_t	flags;
+	int32_t		out_queue_fd;
+	uint32_t	_pad;
+};
+
+struct atrium_gpu_syncobj_point {
+	int32_t		syncobj_fd;
+	uint32_t	_pad;
+	uint64_t	value;
+};
+
+struct atrium_gpu_queue_submit {	/* on queue_fd */
+	uint32_t	struct_size;
+	uint32_t	flags;		/* must be 0 */
+	uint64_t	blob_va;
+	uint64_t	blob_size;	/* bytes, a multiple of 4 */
+	uint64_t	in_dep_ptr;	/* atrium_gpu_syncobj_point[] */
+	uint32_t	in_dep_count;
+	uint32_t	deadline_ns;
+	uint64_t	out_dep_ptr;	/* atrium_gpu_syncobj_point[] */
+	uint32_t	out_dep_count;
+	uint32_t	_pad2;
+	uint64_t	out_seqno;
+};
+
+#define ATRIUM_GPU_IOC_QUEUE_CREATE	_IOWR('A', 79, struct atrium_gpu_queue_create)
+#define ATRIUM_GPU_IOC_QUEUE_SUBMIT	_IOWR('A', 83, struct atrium_gpu_queue_submit)
+
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)

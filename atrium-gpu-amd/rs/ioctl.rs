@@ -58,6 +58,9 @@ abi_structs! {
     atrium_gpu_caps_query = 16;
     atrium_gpu_sched = 40;
     atrium_gpu_powergate = 24;
+    atrium_gpu_queue_create = 24;
+    atrium_gpu_queue_submit = 64;
+    atrium_gpu_syncobj_point = 16;
 }
 
 /// One open of the client node. Queue ownership and doorbell grants (queue.c) are keyed by

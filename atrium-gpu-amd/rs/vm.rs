@@ -39,7 +39,10 @@ pub struct Vm {
 unsafe impl Send for Vm {}
 unsafe impl Sync for Vm {}
 
-kpi::file_ops!(Vm);
+kpi::file_ops!(Vm, |ops| {
+    // QUEUE_CREATE (uqueue.rs): a queue is made on the VM it runs in.
+    ops.fo_ioctl = Some(crate::uqueue::vm_ioctl);
+});
 
 impl Vm {
     pub fn as_c(&self) -> *mut sys::atrium_amd_vm {

@@ -1,0 +1,53 @@
+From 5ad3da1b168870f43e99e15eedda105376c459ed Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 02:18:48 +0000
+Subject: [PATCH] kpi: FileRef::from_file, a reference from a held file
+
+An object's own fo_ioctl is called with its struct file, not a
+descriptor: from_file type-checks it like get() and takes a new
+reference (fhold), so the object can be kept (a queue fd holding its VM).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kpi/src/file.rs | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/kpi/src/file.rs b/kpi/src/file.rs
+index ae22e44..7b7b1d1 100644
+--- a/kpi/src/file.rs
++++ b/kpi/src/file.rs
+@@ -226,6 +226,31 @@ impl<T: FileObject> FileRef<T> {
+         Ok(r)
+     }
+ 
++    /// Take a new reference on a file the caller already holds, e.g. the `fp` a `fo_ioctl`
++    /// is called with (an object's own ioctl, which has no descriptor to resolve). `EINVAL`
++    /// if it is not a `T`.
++    ///
++    /// # Safety
++    ///
++    /// `fp` is a live file the caller holds a reference to for the duration of this call.
++    pub unsafe fn from_file(fp: *mut file) -> Result<Self> {
++        let fp = NonNull::new(fp).ok_or(EBADF)?;
++        // SAFETY: live and held (contract), so its ops and data are stable.
++        let (ops, data) = unsafe { ((*fp.as_ptr()).f_ops, (*fp.as_ptr()).f_data) };
++        if !core::ptr::eq(ops, &T::fileops().0) {
++            return Err(EINVAL);
++        }
++        if data.is_null() {
++            return Err(EBADF);
++        }
++        // SAFETY: held by the caller, so the count is non-zero.
++        let ok = unsafe { bindings::rust_bindings_fhold(fp.as_ptr()) };
++        if !ok {
++            return Err(EBADF);
++        }
++        Ok(FileRef { fp, _t: PhantomData })
++    }
++
+     /// The `struct file`, for C code that keeps its own reference or compares identity.
+     pub fn as_file_ptr(&self) -> *mut file {
+         self.fp.as_ptr()
+-- 
+2.43.0
+
