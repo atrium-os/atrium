@@ -18,7 +18,8 @@
 //!   real domain: the sheet lists the user's passkeys for the RP (from
 //!   `P_LIST`) before security keys. Arca builds the authenticator data;
 //!   the same checks apply to it. UV for a passkey is the passcode, asked
-//!   on the sheet, only when the RP requires UV.
+//!   on the sheet when the RP requires or prefers UV (checked by ostiarius
+//!   through the daemon's `Passcode`).
 //! - **One ceremony per seat**, 120 s each; ending one cancels its driver
 //!   work and closes its sheet.
 
@@ -47,6 +48,8 @@ pub const CEREMONY_MS: u64 = 300_000;
 /// and type a PIN, no longer than WebAuthn's suggested ceiling.
 pub const MIN_CEREMONY_MS: u64 = 30_000;
 pub const MAX_CEREMONY_MS: u64 = 600_000;
+/// Wrong passcodes one ceremony takes before it ends.
+pub const MAX_PASSCODE_TRIES: u32 = 3;
 
 /// How long a ceremony may last: the site's timeout kept within
 /// [`MIN_CEREMONY_MS`]..=[`MAX_CEREMONY_MS`], or `default` if it gave none.
@@ -83,7 +86,8 @@ pub enum Action {
     CloseSheet { key: Key },
     ToDriver { device: DeviceId, msg: ToDriver },
     /// Ask ostiarius to check the passcode the user typed on the sheet.
-    CheckPasscode { key: Key, user: String },
+    /// `retry`: the last one was wrong.
+    CheckPasscode { key: Key, user: String, retry: bool },
     /// Ask Arca for the user's passkeys for this RP (`P_LIST`); answer
     /// with [`Broker::passkeys`].
     ListPasskeys { key: Key, user: String, rp_id: String },
@@ -145,6 +149,9 @@ struct Ceremony {
     kind: Kind,
     rp_hash: [u8; 32],
     uv_required: bool,
+    /// The RP asked for UV as `preferred`: Arca asks the passcode then too
+    /// (a platform authenticator with UV does UV), a security key doesn't.
+    uv_preferred: bool,
     state: State,
     /// When it ends with `NotAllowed` if still open (ms, the daemon's clock).
     deadline: u64,
@@ -157,6 +164,7 @@ struct Ceremony {
     passkeys: Option<Vec<Passkey>>,
     /// The Arca choice made on the sheet.
     pick: Option<Pick>,
+    passcode_failures: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -224,12 +232,18 @@ impl Broker {
     fn start(&mut self, conn: ConnId, id: CeremonyId, kind: Kind, rp_id: &str, uv_required: bool, now: u64, limit_ms: u64, requester: String, user: Option<String>) -> Vec<Action> {
         let key = self.next_key;
         self.next_key += 1;
+        let uv_preferred = match &kind {
+            Kind::Register(r) => r.uv == Uv::Preferred,
+            Kind::Assert(a) => a.uv == Uv::Preferred,
+            Kind::Verify(_) => false,
+        };
         let c = Ceremony {
             conn,
             id,
             kind,
             rp_hash: Sha256::digest(rp_id.as_bytes()).into(),
             uv_required,
+            uv_preferred,
             state: if user.is_some() { State::Listing } else { State::AwaitingPress },
             deadline: now.saturating_add(limit_ms),
             device: None,
@@ -237,6 +251,7 @@ impl Broker {
             user: user.clone(),
             passkeys: None,
             pick: None,
+            passcode_failures: 0,
         };
         let sheet = sheet_for(&c);
         self.ceremonies.insert(key, c);
@@ -290,10 +305,10 @@ impl Broker {
     fn pick(&mut self, key: Key, pick: Pick) -> Vec<Action> {
         let c = self.ceremonies.get_mut(&key).expect("live");
         c.pick = Some(pick);
-        if c.uv_required {
+        if c.uv_required || c.uv_preferred {
             c.state = State::AwaitingPasscode;
             let user = c.user.clone().expect("Arca is offered only with a user");
-            return vec![Action::CheckPasscode { key, user }];
+            return vec![Action::CheckPasscode { key, user, retry: false }];
         }
         self.platform_action(key, false)
     }
@@ -466,7 +481,7 @@ impl Broker {
             (Choice::Passcode, Kind::Verify(v)) => {
                 let user = v.user.clone();
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPasscode;
-                vec![Action::CheckPasscode { key, user }]
+                vec![Action::CheckPasscode { key, user, retry: false }]
             }
             _ => Vec::new(),
         }
@@ -491,9 +506,18 @@ impl Broker {
             return Vec::new();
         }
         if !ok {
-            // The sheet stays; portcullisd delays and rate-limits failures.
-            c.state = State::AwaitingPress;
-            return vec![Action::Audit(format!("passcode wrong key={key}"))];
+            // Asked again, at most MAX_PASSCODE_TRIES in one ceremony;
+            // ostiarius locks a user out across ceremonies.
+            c.passcode_failures += 1;
+            if c.passcode_failures >= MAX_PASSCODE_TRIES {
+                let id = c.id;
+                return self.end(key, Reply::Refused { ceremony: id, reason: Refusal::NotAllowed }, "passcode wrong too often");
+            }
+            let user = match &c.kind {
+                Kind::Verify(v) => v.user.clone(),
+                _ => c.user.clone().unwrap_or_default(),
+            };
+            return vec![Action::Audit(format!("passcode wrong key={key}")), Action::CheckPasscode { key, user, retry: true }];
         }
         if c.pick.is_some() {
             return self.platform_action(key, true);

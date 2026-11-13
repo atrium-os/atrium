@@ -42,18 +42,53 @@ pub const MAX_DRIVERS: usize = 8;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(250);
 
-/// Checks a passcode typed on a verify sheet. S4 wires ostiarius; until
-/// then [`NoPasscode`] refuses every one, so `VerifyUser` succeeds only
-/// with a method the broker verifies itself.
-pub trait Passcode: Send {
-    fn check(&mut self, user: &str, passcode: &[u8]) -> bool;
+/// Checks a passcode typed on a sheet. The daemon calls it on a thread of
+/// its own, so a slow check (PAM's failure delay) never stalls the broker.
+/// [`Ostiarius`] is the real one; [`NoPasscode`] refuses every passcode.
+pub trait Passcode: Send + Sync {
+    fn check(&self, user: &str, passcode: &[u8]) -> bool;
 }
 
 pub struct NoPasscode;
 
 impl Passcode for NoPasscode {
-    fn check(&mut self, _: &str, _: &[u8]) -> bool {
+    fn check(&self, _: &str, _: &[u8]) -> bool {
         false
+    }
+}
+
+/// ostiarius's passcode socket (`ostiarius::verify`): one JSON line each
+/// way, the same PAM check as a login, rate-limited there.
+pub struct Ostiarius(pub PathBuf);
+
+/// ostiarius's default socket for passcode checks.
+pub const OSTIARIUS_VERIFY: &str = "/atrium/sockets/ostiarius/verify.sock";
+
+impl Passcode for Ostiarius {
+    fn check(&self, user: &str, passcode: &[u8]) -> bool {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let Ok(pass) = std::str::from_utf8(passcode) else { return false };
+        let run = || -> io::Result<bool> {
+            let mut s = UnixStream::connect(&self.0)?;
+            s.set_read_timeout(Some(Duration::from_secs(20)))?;
+            s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+            let mut line = serde_json::to_vec(&serde_json::json!({ "user": user, "passcode": pass }))?;
+            line.push(b'\n');
+            let sent = s.write_all(&line);
+            line.fill(0);
+            sent?;
+            let mut answer = String::new();
+            BufReader::new(s).take(256).read_line(&mut answer)?;
+            let v: serde_json::Value = serde_json::from_str(answer.trim_end())?;
+            if v["locked_secs"].as_u64().unwrap_or(0) > 0 {
+                eprintln!("sigillumd: passcode checks for {user} locked by ostiarius for {}s", v["locked_secs"]);
+            }
+            Ok(v["ok"] == serde_json::Value::Bool(true))
+        };
+        run().unwrap_or_else(|e| {
+            eprintln!("sigillumd: ostiarius: {e}");
+            false
+        })
     }
 }
 
@@ -92,6 +127,7 @@ enum Ev {
     Ui(UnixStream, u32),
     UiMsg(u64, FromUi),
     UiGone(u64),
+    Passcode(Key, bool),
 }
 
 struct ClientConn {
@@ -113,7 +149,7 @@ pub struct Daemon {
     ui: Option<(u64, UnixStream)>,
     next: u64,
     started: Instant,
-    passcode: Box<dyn Passcode>,
+    passcode: Arc<dyn Passcode>,
     platform: Box<dyn crate::platform::Platform>,
     /// The verify ceremony waiting for a passcode, and its user.
     asked_passcode: Option<(Key, String)>,
@@ -191,7 +227,7 @@ impl Daemon {
             ui: None,
             next: 1,
             started: Instant::now(),
-            passcode,
+            passcode: Arc::from(passcode),
             platform: Box::new(crate::platform::NoPlatform),
             asked_passcode: None,
             settings,
@@ -307,8 +343,13 @@ impl Daemon {
                     FromUi::Pin { key, pin } => self.broker.pin(key, pin),
                     FromUi::Passcode { key, passcode } => match self.asked_passcode.take() {
                         Some((k, user)) if k == key => {
-                            let ok = self.passcode.check(&user, &passcode.0);
-                            self.broker.passcode_result(key, ok)
+                            let (p, tx) = (self.passcode.clone(), self.tx.clone());
+                            std::thread::spawn(move || {
+                                let ok = p.check(&user, &passcode.0);
+                                drop(passcode);
+                                let _ = tx.send(Ev::Passcode(key, ok));
+                            });
+                            Vec::new()
                         }
                         other => {
                             self.asked_passcode = other;
@@ -317,6 +358,7 @@ impl Daemon {
                     },
                 }
             }
+            Ev::Passcode(key, ok) => self.broker.passcode_result(key, ok),
             Ev::UiGone(id) => {
                 if self.ui.as_ref().map(|(i, _)| *i) != Some(id) {
                     return Vec::new();
@@ -402,9 +444,9 @@ impl Daemon {
                     }
                     self.ui_or_drop(ToUi::Close { key })
                 }
-                Action::CheckPasscode { key, user } => {
+                Action::CheckPasscode { key, user, retry } => {
                     self.asked_passcode = Some((key, user));
-                    self.ui_or_drop(ToUi::AskPasscode { key })
+                    self.ui_or_drop(ToUi::AskPasscode { key, wrong: retry })
                 }
                 Action::ListPasskeys { key, user, rp_id } => {
                     let list = self.platform.list(&user, &rp_id);

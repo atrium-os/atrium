@@ -163,7 +163,7 @@ fn main() -> ExitCode {
             Ok(m) => {
                 if let Some(o) = sheet.as_mut() {
                     let key = match &m {
-                        ToUi::AskPin { key, .. } | ToUi::Touch { key, .. } | ToUi::AskPasscode { key } => *key,
+                        ToUi::AskPin { key, .. } | ToUi::Touch { key, .. } | ToUi::AskPasscode { key, .. } => *key,
                         _ => 0,
                     };
                     if o.state.key == key {

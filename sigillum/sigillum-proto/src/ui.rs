@@ -63,7 +63,8 @@ pub enum ToUi {
     Touch { key: SheetKey, device: u64 },
     /// The user chose "use passcode" on a verify sheet: take it in secure
     /// input and send it back as [`FromUi::Passcode`].
-    AskPasscode { key: SheetKey },
+    /// `wrong`: the last passcode typed was wrong.
+    AskPasscode { key: SheetKey, wrong: bool },
     Close { key: SheetKey },
 }
 

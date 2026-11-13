@@ -121,8 +121,9 @@ impl State {
                 self.stage = Stage::Pin { device, retries };
             }
             ToUi::Touch { device, .. } => self.stage = Stage::Touch { device },
-            ToUi::AskPasscode { .. } => {
+            ToUi::AskPasscode { wrong, .. } => {
                 self.secret.clear();
+                self.notice = wrong.then_some("Wrong passcode. Try again.");
                 self.stage = Stage::Passcode;
             }
             ToUi::Show { .. } | ToUi::Close { .. } => return Vec::new(),
@@ -303,7 +304,7 @@ mod tests {
         assert_eq!(s.text().1[0], "Arca asks to use \u{201c}Bank\u{201d}");
         assert_eq!(s.key(Key::Enter, T), vec![Do::Spend { choice: Choice::Passcode, token: T }]);
         s.spent(Choice::Passcode, true);
-        s.from_broker(&ToUi::AskPasscode { key: 2 });
+        s.from_broker(&ToUi::AskPasscode { key: 2, wrong: false });
         s.key(Key::Char(b'p'), [0; 16]);
         assert!(matches!(&s.key(Key::Enter, T)[0], Do::Send(FromUi::Passcode { key: 2, .. })));
     }

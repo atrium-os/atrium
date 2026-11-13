@@ -75,6 +75,21 @@ fn wait_for_frescod() -> bool {
     false
 }
 
+/// Serve Sigillum's passcode checks (ostiarius::verify) on their own thread,
+/// through the same broker `VerifyCredential` as logins.
+/// $OSTIARIUS_VERIFY_SOCK and $OSTIARIUS_SIGILLUM_UID override.
+fn spawn_verify(broker_sock: String) {
+    let sock = std::env::var("OSTIARIUS_VERIFY_SOCK").unwrap_or_else(|_| ostiarius::verify::SOCKET.into());
+    let uid = std::env::var("OSTIARIUS_SIGILLUM_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(ostiarius::verify::SIGILLUM_UID);
+    std::thread::spawn(move || {
+        let l = JaildLauncher { broker_sock };
+        eprintln!("ostiarius: passcode checks for uid {uid} on {sock}");
+        if let Err(e) = ostiarius::verify::serve(&sock, uid, |u, p| l.verify_credential(u, p)) {
+            eprintln!("ostiarius: verify socket {sock}: {e}");
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--demo") {
@@ -140,6 +155,7 @@ fn main() {
         let mut launcher = JaildLauncher::default();
         // De-rooted: ostiarius launches via the portcullisd broker, not jaild.
         if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
+        spawn_verify(launcher.broker_sock.clone());
         let arca = std::env::var("ARCA_SOCKET")
             .unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
         let mut o = Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca); // stub auth (no with_pam)
@@ -185,6 +201,7 @@ fn main() {
     // root; this jailed ostiarius never reads shadow). $BROKER_SOCK overrides.
     let mut launcher = JaildLauncher::default();
     if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
+    spawn_verify(launcher.broker_sock.clone());
     let mut o = Ostiarius::new(launcher);
     if let Err(e) = o.boot() {
         eprintln!("ostiarius: boot (launch vestibulum): {e}");

@@ -16,6 +16,9 @@
 //!   arcad, for Arca's passkeys (§9.2); `none` turns Arca off. arcad
 //!   serves the passkey ops to sigillumd only when its `ARCA_SERVICES`
 //!   names `sigillumd` with this uid.
+//! - `SIGILLUM_OSTIARIUS_VERIFY` (default
+//!   `/atrium/sockets/ostiarius/verify.sock`): ostiarius's passcode checks
+//!   (`ostiarius::verify`); `none` refuses every passcode.
 //!
 //! It hardens itself before anything else (no core dumps, not traceable)
 //! and never opens a device or a network socket.
@@ -82,7 +85,11 @@ fn main() -> ExitCode {
         }
     }
     let arca = std::env::var("SIGILLUM_ARCA_SOCKET").unwrap_or_else(|_| sigillumd::platform::DEFAULT_SOCKET.into());
-    let daemon = match Daemon::bind(settings.clone(), Arc::new(resolver), Box::new(NoPasscode)) {
+    let passcode: Box<dyn sigillumd::daemon::Passcode> = match std::env::var("SIGILLUM_OSTIARIUS_VERIFY") {
+        Ok(v) if v == "none" => Box::new(NoPasscode),
+        v => Box::new(sigillumd::daemon::Ostiarius(v.unwrap_or_else(|_| sigillumd::daemon::OSTIARIUS_VERIFY.into()).into())),
+    };
+    let daemon = match Daemon::bind(settings.clone(), Arc::new(resolver), passcode) {
         Ok(d) if arca == "none" => d,
         Ok(d) => d.with_platform(Box::new(sigillumd::platform::Arca(sigillumd::platform::Socket(arca.into())))),
         Err(e) => {

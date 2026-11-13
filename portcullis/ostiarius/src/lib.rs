@@ -264,6 +264,8 @@ impl<L: Launcher> Ostiarius<L> {
 /// The control wire: vestibulum hands an authenticated login to ostiarius, and
 /// asks for logout. Newline-delimited JSON over a Unix socket (the workspace IPC
 /// shape), peer-gated by `getpeereid` — only the trusted login UI may drive it.
+pub mod verify;
+
 pub mod control {
     use super::{Frontend, Launcher, Ostiarius};
     use serde::{Deserialize, Serialize};

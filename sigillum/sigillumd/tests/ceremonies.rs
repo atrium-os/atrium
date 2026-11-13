@@ -65,6 +65,8 @@ struct Rig {
     /// What ostiarius answers when the passcode is asked.
     passcode_ok: bool,
     passcode_asks: usize,
+    /// Answers for the next passcode checks, before `passcode_ok`.
+    passcode_answers: std::collections::VecDeque<bool>,
     /// Substitute for Arca's next answer (a lying arcad).
     arca_tamper: Option<Box<dyn FnMut(PlatformResult) -> PlatformResult>>,
 }
@@ -99,7 +101,7 @@ impl Rig {
         let mut broker = Broker::new(Config { web_broker: Some(broker_app()), ceremony_ms: 120_000 });
         let a = broker.driver(DEV, hello);
         assert!(matches!(a[0], Action::Audit(_)));
-        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, arca_tamper: None }
+        Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, passcode_answers: Default::default(), arca_tamper: None }
     }
 
     fn run(&mut self, actions: Vec<Action>) {
@@ -128,7 +130,8 @@ impl Rig {
                 Action::CheckPasscode { key, .. } => {
                     self.passcode_asks += 1;
                     assert!(self.passcode_asks < 10, "passcode loop");
-                    queue.extend(self.broker.passcode_result(key, self.passcode_ok));
+                    let ok = self.passcode_answers.pop_front().unwrap_or(self.passcode_ok);
+                    queue.extend(self.broker.passcode_result(key, ok));
                 }
                 Action::ListPasskeys { key, user, rp_id } => {
                     let l = self.arca.as_mut().and_then(|a| a.list(&user, &rp_id));
@@ -498,12 +501,10 @@ fn verify_user_is_for_arca_and_ostiarius_only() {
     let key = r.sheets.last().unwrap().0;
     assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { requester, .. } if requester == "Arca"));
     let a = r.broker.press(key, Choice::Passcode, true);
-    assert_eq!(a, vec![Action::CheckPasscode { key, user: "shankar".into() }]);
+    assert_eq!(a, vec![Action::CheckPasscode { key, user: "shankar".into(), retry: false }]);
     let a = r.broker.passcode_result(key, false);
-    r.run(a);
-    assert!(r.replies.is_empty(), "a wrong passcode leaves the sheet up");
-    let a = r.broker.press(key, Choice::Passcode, true);
-    r.run(a);
+    assert!(a.contains(&Action::CheckPasscode { key, user: "shankar".into(), retry: true }), "a wrong passcode is asked again");
+    assert!(!a.iter().any(|x| matches!(x, Action::Reply { .. })));
     let a = r.broker.passcode_result(key, true);
     r.run(a);
     assert!(matches!(r.reply(), Reply::Verified { ceremony: 3, strength: Strength::Passcode, .. }));
@@ -585,14 +586,14 @@ fn with_arca() -> Rig {
 #[test]
 fn arca_passkey_registers_and_signs_in_verified_by_the_rp() {
     let mut r = with_arca();
-    r.request(&web_broker(), register("example.com", Uv::Preferred));
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
     assert!(matches!(&r.sheets[0].1, Sheet::Register { platform: true, .. }));
     r.press_last(Choice::Platform);
     let reply = r.reply();
     assert!(matches!(reply, Reply::Registered { authenticator: sigillum_proto::client::AuthenticatorClass::Platform, .. }));
     let (cred, vk) = rp_check_registration(&reply, "example.com");
     assert_eq!(cred.len(), 16);
-    assert_eq!(r.passcode_asks, 0, "UV only when required");
+    assert_eq!(r.passcode_asks, 0, "no UV when discouraged");
     assert!(r.key.borrow().commands.iter().all(|c| *c == sigillum_ctap::cmd::GET_INFO), "the security key was never asked");
 
     // Discoverable sign-in: the sheet lists the passkey first.
@@ -640,18 +641,26 @@ fn arca_honours_exclude_and_allow_lists() {
 }
 
 #[test]
-fn a_wrong_passcode_keeps_the_sheet_and_signs_nothing() {
+fn a_wrong_passcode_is_asked_again_three_times_at_most() {
+    // Wrong, then right: the UV flag is set.
     let mut r = with_arca();
+    r.passcode_answers = [false].into();
     r.request(&web_broker(), register("example.com", Uv::Required));
-    r.passcode_ok = false;
     r.press_last(Choice::Platform);
-    assert_eq!(r.passcode_asks, 1);
-    assert!(r.replies.is_empty(), "still open");
-    r.passcode_ok = true;
-    r.press_last(Choice::Platform);
+    assert_eq!(r.passcode_asks, 2);
     let reply = r.reply();
     let Reply::Registered { auth_data, .. } = &reply else { panic!("{reply:?}") };
     assert!(auth_data[32] & flags::UV != 0);
+
+    // Three wrong: the ceremony ends, nothing is made.
+    let mut r = with_arca();
+    r.passcode_ok = false;
+    r.request(&web_broker(), register("example.com", Uv::Preferred));
+    r.press_last(Choice::Platform);
+    assert_eq!(r.passcode_asks, 3);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
+    r.request(&web_broker(), assert_req("example.com", vec![], Uv::Discouraged));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Assert { passkeys, .. } if passkeys.is_empty()), "no passkey was made");
 }
 
 #[test]
