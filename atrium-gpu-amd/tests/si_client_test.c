@@ -1523,7 +1523,7 @@ hostile_isa(void)
 	struct job hc;
 	uint32_t first;
 	u_int i, nc = sizeof(c) / sizeof(c[0]);
-	int r, n, ms, ri0 = -1, ri = -1;
+	int r, n, ms, ri0 = -1, ri = -1, bylate;
 	char what[160], vaname[64];
 	const char *env;
 
@@ -1544,8 +1544,17 @@ hostile_isa(void)
 		c[0] = c[2];
 		nc = 1;
 	}
+	/*
+	 * SI15_BYLATE=1 (wedge bisection, run 07740286: every wedging fault
+	 * was on VMID 12 with the bystander on 11, every clean one on 11):
+	 * the hostile queue opens first, so it gets the lower slot and
+	 * VMID, and the bystander opens after it. Wedge still: two live
+	 * VMs; clean: something about VMID 12.
+	 */
+	bylate = (env = getenv("SI15_BYLATE")) != NULL && *env == '1';
+	job_init(&by);
 	(void)preg_read(NULL, &ri0);
-	if (job_open(&by, "15 bystander") != 0) {
+	if (!bylate && job_open(&by, "15 bystander") != 0) {
 		check(0, "15 hostile ISA", "bystander: %s", strerror(errno));
 		job_close(&by);
 		return;
@@ -1558,6 +1567,17 @@ hostile_isa(void)
 			    strerror(errno));
 			job_close(&h);
 			continue;
+		}
+		if (bylate && i == 0) {
+			printf("15: bystander opened after the hostile queue "
+			    "(SI15_BYLATE)\n");
+			if (job_open(&by, "15 bystander") != 0) {
+				check(0, "15 hostile ISA", "bystander: %s",
+				    strerror(errno));
+				job_close(&by);
+				job_close(&h);
+				return;
+			}
 		}
 		va = c[i].va == 1 ? 0 : c[i].va != 0 ? c[i].va :
 		    h.out_va + 4096;

@@ -1233,3 +1233,14 @@ work (self-test, scrub).
   instruction fault (W^X) just before its store fault.
   Next: 48dad7ab+1 adds SI_SKIP13=1. Logs: claude/project-thread-33aauq 4446d344,
   412231c3.
+- **2026-11-13 12:05, skip-13 probe (si-client-test 45556b14, kmods fc54eb53,
+  SI_SKIP13=1 SI15_VA=0x10003000): still WEDGED, so test 13 is not the trigger.**
+  The new pattern: every wedging store fault so far was on VMID 12 (uq slot 4, its
+  first use in the run, with the bystander on uq slot 3 / VMID 11). Every clean
+  fault (test 7's store, test 13's SQC) was on VMID 11, with no second VM live.
+  The per-VMID setup is identical for 8-15 (SH_MEM, SPI_GDBG trap, CONTEXTn_CNTL,
+  MES vm_cntx_cntl), so the open question is VMID 12 versus a second live VM.
+  Shankar (12:11) chose to keep root-causing over shipping reset + lockout.
+  Next: SI15_BYLATE=1 opens the hostile queue before the bystander, so the
+  hostile faults on VMID 11 while a second VM is live. Logs:
+  claude/project-thread-33aauq 07740286.
