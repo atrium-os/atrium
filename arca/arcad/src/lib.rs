@@ -21,6 +21,7 @@ pub mod passkey;
 pub mod proto;
 pub mod server;
 pub mod tickets;
+pub mod verify;
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -30,6 +31,13 @@ use std::time::Duration;
 /// Serve one connection until it closes or misbehaves. `label` was resolved
 /// from the kernel's peer uid before the first byte was read.
 pub fn serve_conn(stream: UnixStream, label: &label::Label, state: &Mutex<server::State>) -> io::Result<()> {
+    serve_conn_with(stream, label, state, None)
+}
+
+/// As [`serve_conn`], asking `verifier` (Sigillum) when a request needs
+/// the user verified for a verify-each-use item, with the state unlocked
+/// while the user answers.
+pub fn serve_conn_with(stream: UnixStream, label: &label::Label, state: &Mutex<server::State>, verifier: Option<&dyn verify::Verify>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut rd = stream.try_clone()?;
@@ -37,7 +45,16 @@ pub fn serve_conn(stream: UnixStream, label: &label::Label, state: &Mutex<server
     while let Some(frame) = proto::read_frame(&mut rd)? {
         let b = frame.as_ref();
         let op = u16::from_le_bytes([b[0], b[1]]);
-        let r = state.lock().unwrap_or_else(|p| p.into_inner()).handle(label, op, &b[2..]);
+        let lock = || state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut r = lock().handle(label, op, &b[2..]);
+        if r.status == proto::status::NEEDS_VERIFICATION {
+            let prompt = verifier.and_then(|v| Some((v, lock().verify_prompt(label, op, &b[2..])?)));
+            if let Some((v, (user, description))) = prompt {
+                if v.verify(&user, &description) {
+                    r = lock().handle_verified(label, op, &b[2..]);
+                }
+            }
+        }
         drop(frame);
         proto::write_reply(&mut wr, r.status, r.body.bytes())?;
     }

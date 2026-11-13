@@ -347,6 +347,14 @@ or a machine secret on disk) instead of a user's, with one class, after boot.
 | while-unlocked | only while the session is unlocked; the key is evicted at lock | passwords, refresh tokens, API keys |
 | verify-each-use | each use passes a Vestibulum check (biometric or passcode) | revealing a password, exporting, passkey assertions with user verification, high-value items the user marks |
 
+*As built (2026-11-13, sigillum.md §16.4):* the check is Sigillum's `VERIFY_USER`. An app's
+`PUBKEY`, `SIGN` or `RELEASE` of its own verify-each-use item answers `NEEDS_VERIFICATION`
+inside arcad; `serve_conn_with` then asks sigillumd (`ARCA_SIGILLUM_SOCKET`, with the
+item's account and app id as the sheet's description) with the state unlocked, and on
+`Verified` (at least biometric-secure) reruns the request with one `UserVerified`. No
+answer or a refusal leaves the item unused (`NEEDS_VERIFICATION` to the app). Apps may now
+`MINT` and `STORE` in this class. Not yet: couriers' `FILL` of such an item.
+
 ### 6.3 Arca's own process
 
 - **No network, no parser of anything external.** Arca reads only its own store and the

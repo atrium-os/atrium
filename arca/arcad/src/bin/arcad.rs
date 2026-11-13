@@ -8,6 +8,10 @@
 //!   tickets (arca.md §8.2); unset, no web courier gets a cookie.
 //! - `ARCA_VESTIBULUM_UID`, `ARCA_UI_UID`: the system uids allowed the
 //!   Vestibulum and trusted-UI ops. Unset = nobody.
+//! - `ARCA_SIGILLUM_SOCKET` (default `/atrium/sockets/sigillum/sigillumd.sock`):
+//!   sigillumd, which verifies the user before each use of a
+//!   verify-each-use item (sigillum.md §8); `none`: those items stay
+//!   unusable (`NEEDS_VERIFICATION`).
 //! - `ARCA_ALLOW_UNSIGNED=1`: development only; serves apps launched without
 //!   a verified publisher. Logged loudly.
 //!
@@ -77,6 +81,10 @@ fn main() -> ExitCode {
     // Anyone may connect: identity is the peer uid, checked per connection.
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666));
     eprintln!("arcad: listening on {sock}, stores in {dir}");
+    let verifier: Option<Arc<dyn arcad::verify::Verify>> = match std::env::var("ARCA_SIGILLUM_SOCKET") {
+        Ok(v) if v == "none" => None,
+        v => Some(Arc::new(arcad::verify::Sigillum::new(v.unwrap_or_else(|_| "/atrium/sockets/sigillum/sigillumd.sock".into())))),
+    };
     let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -89,9 +97,10 @@ fn main() -> ExitCode {
         };
         let state = state.clone();
         let live = live.clone();
+        let verifier = verifier.clone();
         live.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            if let Err(e) = arcad::serve_conn(stream, &label, &state) {
+            if let Err(e) = arcad::serve_conn_with(stream, &label, &state, verifier.as_deref()) {
                 // No content, only the kind of failure and the peer uid.
                 eprintln!("arcad: connection from uid {uid} ended: {:?}", e.kind());
             }

@@ -46,6 +46,7 @@ dependencies = [
  "portcullis-peer",
  "psl",
  "sha2",
+ "sigillum-proto",
 ]
 
 [[package]]

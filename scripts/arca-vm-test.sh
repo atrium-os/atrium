@@ -97,9 +97,9 @@ g "pw usershow _arca >/dev/null 2>&1 || pw useradd _arca -u 65020 -d /nonexisten
 g "pw usershow _ostiarius >/dev/null 2>&1 || pw useradd _ostiarius -u 50093 -d /nonexistent -s /usr/sbin/nologin"
 g "pw usershow _arca-ui >/dev/null 2>&1 || pw useradd _arca-ui -u 65021 -d /nonexistent -s /usr/sbin/nologin"
 g "install -m 755 /root/arca-test/arcad /usr/local/bin/atrium-arcad && install -m 755 /root/arca-test/arca-probe /usr/local/bin/arca-probe && install -m 755 /root/arca-test/arca-courier /usr/local/bin/arca-courier"
-g "mkdir -p /var/db/arca /atrium/sockets/arca /var/run/atrium && chown _arca:_arca /var/db/arca /atrium/sockets/arca && chmod 700 /var/db/arca"
+g "mkdir -p /var/db/arca /atrium/sockets/arca /atrium/sockets/sigillum /var/run/atrium && chown _arca:_arca /var/db/arca /atrium/sockets/arca && chmod 700 /var/db/arca"
 g "touch /var/run/atrium/app-registry /var/run/atrium/courier-registry"
-g "mkdir -p $J/dev $J/libexec $J/lib $J/usr/lib $J/usr/local/lib $J/usr/local/bin $J/atrium/sockets/arca $J/var/db/arca $J/var/run/atrium && for f in app-registry courier-registry; do test -e $J/var/run/atrium/\$f || touch $J/var/run/atrium/\$f; done"
+g "mkdir -p $J/dev $J/libexec $J/lib $J/usr/lib $J/usr/local/lib $J/usr/local/bin $J/atrium/sockets/arca $J/atrium/sockets/sigillum $J/var/db/arca $J/var/run/atrium && for f in app-registry courier-registry; do test -e $J/var/run/atrium/\$f || touch $J/var/run/atrium/\$f; done"
 # jaild policy: the repo's (which carries _arca and Arca's mount sources),
 # merged with the live one exactly as deploy-portcullis.sh does.
 tmpd=$(mktemp -d)

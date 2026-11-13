@@ -40,6 +40,9 @@ pub struct State {
     machine: Option<Store>,
     /// Unix seconds; tests move it to expire cookies.
     pub clock: fn() -> u64,
+    /// Set only by [`State::handle_verified`], for the one request it runs:
+    /// Sigillum verified the user for this use of a verify-each-use item.
+    verified: bool,
 }
 
 fn system_now() -> u64 {
@@ -103,7 +106,8 @@ fn malformed() -> Reply {
 
 fn class_for_app(v: u8) -> Result<Class, Reply> {
     match Class::from_u8(v) {
-        Ok(Class::VerifyEachUse) => Err(reply(status::UNSUPPORTED)), // needs Vestibulum's check (A0c)
+        // Verify-each-use: each use passes Sigillum's VERIFY_USER first
+        // (crate::verify, sigillum.md §8).
         Ok(c) => Ok(c),
         Err(_) => Err(malformed()),
     }
@@ -114,7 +118,31 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, clock: system_now })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, clock: system_now, verified: false })
+    }
+
+    /// Run a request that answered `NEEDS_VERIFICATION` again, after
+    /// Sigillum's `VERIFY_USER` for it succeeded: the store gets one
+    /// `UserVerified`, for this request only.
+    pub fn handle_verified(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
+        self.verified = true;
+        let r = self.handle(who, op, body);
+        self.verified = false;
+        r
+    }
+
+    /// What to ask Sigillum about a request that answered
+    /// `NEEDS_VERIFICATION`: the user, and the item's description for the
+    /// sheet. Only an app's own verify-each-use item, by the ops that use one.
+    pub fn verify_prompt(&self, who: &Label, op: u16, body: &[u8]) -> Option<(String, String)> {
+        let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id }) = who else { return None };
+        if !matches!(op, op::PUBKEY | op::SIGN | op::RELEASE) || body.len() < 16 {
+            return None;
+        }
+        let me = Recipient::app(*publisher, app_id).ok()?;
+        let id = ItemId(body[..16].try_into().ok()?);
+        let m = self.stores.get(user)?.meta(&id, &Access { persona: PERSONA, recipient: &me }).ok()?;
+        (m.class == Class::VerifyEachUse).then(|| (user.clone(), format!("\u{201c}{}\u{201d} for {app_id}", m.account)))
     }
 
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
@@ -178,6 +206,8 @@ impl State {
         ) {
             return reply(status::DENIED);
         }
+        let verified = std::mem::take(&mut self.verified);
+        let uv = || verified.then(arca_store::UserVerified::vouched_by_vestibulum);
         let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
         let who = Access { persona: PERSONA, recipient: me };
         let mut r = Reader::new(body);
@@ -233,7 +263,7 @@ impl State {
                 let i = rep!(id(&mut r));
                 let msg = if op == op::SIGN { field!(r.bytes(MAX_SIGN_MSG)) } else { &[][..] };
                 field!(r.end());
-                let (m, seed) = tri!(store.release(&i, &who, None));
+                let (m, seed) = tri!(store.release(&i, &who, uv()));
                 if m.kind != Kind::Ed25519 {
                     return reply(status::UNSUPPORTED);
                 }
@@ -280,7 +310,7 @@ impl State {
                 if m.flags & flags::APP_HELD_GRANTED == 0 {
                     return reply(status::GRANT_REQUIRED);
                 }
-                let (_, v) = tri!(store.release(&i, &who, None));
+                let (_, v) = tri!(store.release(&i, &who, uv()));
                 let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
                 out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
                 out.as_mut()[4..].copy_from_slice(v.as_ref());

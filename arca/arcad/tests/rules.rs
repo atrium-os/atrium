@@ -162,9 +162,12 @@ fn malformed_bodies_are_refused_cleanly() {
     let mut long = good.clone();
     long.push(0);
     assert_eq!(s.handle(&a, op::STORE, &long).status, status::MALFORMED);
-    // Verify-each-use isn't offered to apps until Vestibulum's check is wired.
+    // Verify-each-use is stored; each use then needs Sigillum's check
+    // (tests/verify_each_use.rs).
     let veu = body(|w| { w.u16(1); w.u8(3); w.str("db"); w.bytes(b"v"); });
-    assert_eq!(s.handle(&a, op::STORE, &veu).status, status::UNSUPPORTED);
+    assert_eq!(s.handle(&a, op::STORE, &veu).status, status::OK);
+    let bad_class = body(|w| { w.u16(1); w.u8(4); w.str("db"); w.bytes(b"v"); });
+    assert_eq!(s.handle(&a, op::STORE, &bad_class).status, status::MALFORMED);
     // A huge length prefix allocates nothing and fails.
     let huge = body(|w| { w.u16(1); w.u8(2); w.u32(u32::MAX); });
     assert_eq!(s.handle(&a, op::STORE, &huge).status, status::MALFORMED);
