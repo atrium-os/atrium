@@ -1493,6 +1493,93 @@ pr_rank(const char *name)
 	return ((int)(sizeof(pr_order) / sizeof(pr_order[0])));
 }
 
+/*
+ * 15: hostile ISA (F6 G5). The app path runs the app's own machine code, so
+ * only the VMID confines it: a shader that never ends and shaders that store
+ * where nothing of theirs is mapped must lose only their own queue, leave a
+ * bystander VM's memory untouched, and let it run on. Measures the time to
+ * fail on this GPU.
+ */
+#define HI_SPIN		0xbfa0ffffu	/* s_branch -1: branch to itself */
+
+static void
+hostile_isa(void)
+{
+	static const uint32_t spin[4] = { HI_SPIN, HI_SPIN, HI_SPIN, HI_SPIN };
+	struct job h, by;
+	struct {
+		const char *name;
+		int spin;
+		uint64_t va;		/* 0: from the job (past its buffer) */
+	} c[] = {
+		{ "a shader that never ends", 1, 0 },
+		{ "stores at VA 0", 0, 1 },
+		{ "stores at a high VA", 0, 0x7ffffff00000ull },
+		{ "stores past its own buffer", 0, 0 },
+	};
+	uint32_t first;
+	u_int i;
+	int r, n, ms, ri0 = -1, ri = -1;
+	char what[160];
+
+	(void)preg_read(NULL, &ri0);
+	if (job_open(&by, "15 bystander") != 0) {
+		check(0, "15 hostile ISA", "bystander: %s", strerror(errno));
+		job_close(&by);
+		return;
+	}
+	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+		uint64_t va;
+
+		if (job_open(&h, "15 hostile") != 0) {
+			check(0, "15 hostile ISA", "%s: setup: %s", c[i].name,
+			    strerror(errno));
+			job_close(&h);
+			continue;
+		}
+		va = c[i].va == 1 ? 0 : c[i].va != 0 ? c[i].va :
+		    h.out_va + 4096;
+		if (c[i].spin && bo_xfer(h.shader, __DECONST(void *, spin),
+		    sizeof(spin), 1) != 0) {
+			check(0, "15 hostile ISA", "%s: shader: %s", c[i].name,
+			    strerror(errno));
+			job_close(&h);
+			continue;
+		}
+		(void)poison(by.out, POISON_B);
+		if (job_submit(&h, c[i].spin ? h.out_va : va) != 0) {
+			check(0, "15 hostile ISA", "%s: submit: %s", c[i].name,
+			    strerror(errno));
+			job_close(&h);
+			continue;
+		}
+		r = job_wait(&h, 15000, &ms);
+		snprintf(what, sizeof(what), "15 hostile ISA: %s (VA %#jx) is "
+		    "lost with EIO", c[i].name, (uintmax_t)(c[i].spin ?
+		    h.out_va : va));
+		check(r == EIO, what, "got %s after %d ms", r == 0 ?
+		    "success" : strerror(r), ms);
+		printf("15: %s: time to fail %d ms\n", c[i].name, ms);
+		n = count(by.out, POISON_B, &first);
+		snprintf(what, sizeof(what), "15 hostile ISA: %s: the "
+		    "bystander's memory is untouched", c[i].name);
+		check(n == SIW42_OUT_DW, what, "%d/64 words intact, out[0] %#x",
+		    n, first);
+		r = job_submit(&h, h.out_va) == 0 ? 0 : errno;
+		snprintf(what, sizeof(what), "15 hostile ISA: %s: the lost "
+		    "queue refuses new work", c[i].name);
+		check(r == EIO, what, "%s", r == 0 ? "accepted" : strerror(r));
+		snprintf(what, sizeof(what), "15 hostile ISA: after %s, "
+		    "another VM runs clean", c[i].name);
+		run_clean(&by, what);
+		job_close(&h);
+	}
+	job_close(&by);
+	if (preg_read(NULL, &ri) >= 0)
+		check(ri == ri0, "15 hostile ISA: no GPU re-init was needed",
+		    "re-inits %d -> %d", ri0, ri);
+}
+
 static void
 hostile_pm4(void)
 {
@@ -1917,6 +2004,9 @@ main(void)
 
 	/* 13: GPU W^X. */
 	wx();
+
+	/* 15: hostile ISA (F6 G5). Before 14, whose refusals use up re-inits. */
+	hostile_isa();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();
