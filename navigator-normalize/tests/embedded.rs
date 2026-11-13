@@ -10,7 +10,7 @@ use navigator_style::cascade::Env;
 
 const PAGE: &str = r#"<html><head><style>
   .ad iframe { width: 300px; height: 250px }
-  .tiny iframe { width: 120px; height: 60px }
+  .tiny iframe { width: 120px; height: 20px }
   p:nth-child(3) { color: #ff0000 }
 </style></head><body>
   <div class="ad"><iframe src="https://ads.example/slot?id=1"></iframe></div>
@@ -61,7 +61,7 @@ fn frames_with_a_web_address_become_island_boxes_and_nothing_else_survives() {
         ("https://lazy.example/player".to_string(), 640, 360),  // read from data-src
         ("https://maps.example/embed?q=paris".to_string(), 600, 450),
         ("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ".to_string(), 560, 315), // a known player, canonical
-    ], "hidden.example (display:none) and small.example (120×60 by CSS) get no slot");
+    ], "hidden.example (display:none) and small.example (120×20 by CSS) get no slot");
     // The page's title is kept for the accessibility tree, never as the label.
     assert!(out.contains(r#"title="Your bank""#));
 }

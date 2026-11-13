@@ -81,11 +81,15 @@ pub fn island_url(raw: &str) -> Option<String> {
 
 /// The longest island URL kept.
 pub const ISLAND_URL_MAX: usize = 2048;
-/// ★ The smallest box that is content, in CSS px: below it a frame is an ad
-/// beacon, a tracker or a utility frame (on the corpus, every ad and
-/// tracker iframe was 0 or 1 px), and the renderer gives it no slot.
-pub const ISLAND_MIN_W: i64 = 200;
-pub const ISLAND_MIN_H: i64 = 150;
+/// ★ The smallest box that is content, in CSS px. Below it a frame is a
+/// beacon or a utility frame (on the corpus, the only ad iframe declared
+/// 0 × 0 and the trackers 1 × 1), and the renderer gives it no slot, so
+/// the box it still takes is at most this big. 200 × 150 was tried first:
+/// it left empty boxes for two real widgets (88 and 139 px tall), and an
+/// ad that shows is that size or larger anyway, so a higher gate filters
+/// no ads, only content. This is enough for the origin label.
+pub const ISLAND_MIN_W: i64 = 48;
+pub const ISLAND_MIN_H: i64 = 24;
 
 pub fn recognised_embed(src: &str) -> Option<String> {
     let s = src.trim();

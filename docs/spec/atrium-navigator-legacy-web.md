@@ -2465,9 +2465,10 @@ for each `<iframe>`:
    `data-lazy-src`, `data-delayed-url`). Any other scheme (`javascript:`, `data:`, `blob:`,
    `about:`, `file:`), userinfo, or a `srcdoc` frame (no URL) is dropped. Whether the
    address is public is the fetcher's rule at press time (threat model §2.1).
-2. **It must be content-sized.** One that declares less than 200 × 150 is dropped; one CSS
+2. **It must be content-sized.** One that declares less than 48 × 24 is dropped; one CSS
    sizes below that, or hides, gets no slot from the renderer. On the corpus every ad and
-   tracker iframe was 0 or 1 px. A content-sized ad frame left over is Tidy page's (§6.6),
+   tracker iframe was 0 or 1 px. (200 × 150 was tried first; it left empty boxes for two
+   real widgets, 88 and 139 px tall, and filtered no ad, since an ad that shows is larger.) A content-sized ad frame left over is Tidy page's (§6.6),
    not this rule's.
 3. **It becomes a `<video>` box carrying `atrium-island`** = the URL, its generated class,
    `id`, `title` and declared size. The renderer gives it an embed slot of role `island`
@@ -2485,9 +2486,14 @@ for each `<iframe>`:
 
 Only the normalizer writes `atrium-island`: one the page wrote is removed, and the renderer
 reads it back through the same rule. Before this, 68 iframes survived normalization on the
-119-page corpus (navigator-ui §6.6). A short list of players was tried first and caught
-2 of the corpus's 4 real embeds; Samsung's, inserted by a cross-origin script, is caught by
-neither rule.
+119-page corpus (navigator-ui §6.6). Measured with the rule (2026-11-13): 12 frames on 11
+pages become boxes, 8 visible as slots on 7 pages at the 200 × 150 gate (election widgets on
+Al Jazeera, Corriere, El País and BBC Arabic, an Infogram chart, LinkedIn's YouTube video),
+**none on an ad or tracker host**; the only ad iframe, declared 0 × 0, is dropped. Text,
+tiers and ad residue are unchanged on all 119 documents. A short list of players, tried
+first, caught none of the 4 real video embeds before lazy attributes and 2 with them.
+Samsung's (inserted by a cross-origin script) and The Verge's (only in a script's JSON) exist
+only with the site's code.
 
 **Nesting: a CDM is an island inside an island.** Where DRM applies (§11.8.3: Spotify,
 paid video), the decryption module is the only part that must be a closed binary. Settled
