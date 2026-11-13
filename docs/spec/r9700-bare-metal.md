@@ -1385,3 +1385,18 @@ work (self-test, scrub).
   Next: a diagnostic kmod that, after the wave kill, decodes CPF_STATUS and the
   CPF/CPC stall registers and polls whether bit 28 clears by itself, to find
   what the CP front end is waiting on. Logs: claude/project-thread-33aauq 0a5dd03c.
+- **2026-11-13 14:14, full suite with 8f3d4517 (CP stall decode): WEDGED, and the
+  decode narrows it.** 70 passed, 2 failed, 189 timeouts. Every recovering kill
+  (tests 5, 7, 8, 9, 10, 13) had bit 28 clear within 0 ms. Test 15's stayed set
+  for the full 500 ms: CP_CPF_STATUS 0xb0000001 then 0x90000001 (CPF_BUSY,
+  GRBM_CPF_STAT_BUSY, nothing else), every CPF/CPC busy and stall bit 0,
+  GRBM_STATUS2 0x14008000 (CPF_BUSY, RLC_BUSY, UTCL2_BUSY), RLC_GPM_STAT 0x160037.
+  MES pipe 0 sat at PC 0xd1cb (its idle loop is 0x7ec4) with MES_TC_BUSY at the
+  first read. The first flush timeouts (contexts 5, 8, 9, 10) came inside the
+  500 ms wait, before REMOVE_QUEUE: the hub is wedged by the time of the kill,
+  not by anything teardown does. Test 7's fault is the same kind (TCP write,
+  PERMISSION_FAULTS 0x5, WALKER_ERROR 0) and recovers.
+  Next (kmods 8e13d8ce): snapshot MES pipe 0's PC, CPF/CPC status, GRBM_STATUS2,
+  RLC_GPM_STAT and GCVM_L2_STATUS before the kill, right after it and at the end
+  of the watch, to tell whether the kill causes the state or only finds it.
+  Logs: claude/project-thread-33aauq 8845a1e3.
