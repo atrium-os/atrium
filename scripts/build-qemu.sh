@@ -18,7 +18,32 @@
 #   LDFLAGS="-Wl,-rpath,$HOME/u2f-prefix/lib" TARGETS=x86_64-softmmu sh scripts/build-qemu.sh
 # (libu2f-emu: cmake with -DCMAKE_C_FLAGS=-Wno-error=deprecated-declarations
 # for OpenSSL 3.)
+#
+# On macOS it builds into external/qemu-build/build of this checkout, where
+# run-vm.sh and sigillum-fido-vm.sh look, with HVF, Cocoa and libusb (for
+# usb-host) and without apple-gfx (PVG), whose source does not build with the
+# macOS 27 SDK. Needs Homebrew's glib, pixman, libslirp, libusb, ninja, meson.
 set -eu
+if [ "$(uname -s)" = Darwin ]; then
+    ROOT=$(cd "$(dirname "$0")/.." && pwd)
+    SRC="${QEMU_SRC:-$ROOT/external/qemu-build}"
+    [ -d "$SRC/.git" ] || git clone --depth 1 https://github.com/atrium-os/qemu "$SRC"
+    mkdir -p "$SRC/build"
+    cd "$SRC/build"
+    # --prefix=/opt/homebrew: the EFI firmware lands where run-vm.sh's EFI_SRC expects
+    # (build/qemu-bundle/opt/homebrew/share/qemu/edk2-aarch64-code.fd).
+    ../configure --prefix=/opt/homebrew --target-list=aarch64-softmmu --enable-hvf --enable-slirp \
+        --enable-cocoa --enable-libusb --disable-pvg --disable-docs --disable-werror --disable-gtk \
+        --disable-sdl --disable-spice --disable-tools --disable-guest-agent >/dev/null
+    ninja -j"${JOBS:-$(sysctl -n hw.ncpu)}" qemu-system-aarch64
+    # HVF needs the hypervisor entitlement on the binary.
+    ent=$(mktemp)
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n' > "$ent"
+    codesign -s - --entitlements "$ent" --force qemu-system-aarch64
+    rm -f "$ent"
+    ./qemu-system-aarch64 --version | head -1
+    exit 0
+fi
 SRC="${QEMU_SRC:-$HOME/qemu-atrium}"
 TARGETS="${TARGETS:-aarch64-softmmu}"
 JOBS="${JOBS:-$(nproc)}"

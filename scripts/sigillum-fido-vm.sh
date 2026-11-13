@@ -1,6 +1,6 @@
 #!/bin/sh
 # The Sigillum S2 gate's VM with a REAL FIDO key (docs/spec/sigillum.md §16.2):
-# the Mac's arm64 FreeBSD 16-CURRENT guest (~/atrium-vm, Homebrew qemu, HVF)
+# the Mac's arm64 FreeBSD 16-CURRENT guest (~/atrium-vm, our qemu fork, HVF)
 # with the key passed through by QEMU usb-host on an xHCI controller, in
 # place of u2f-emulated. qemu needs root for usb-host on macOS (else macOS
 # keeps the interfaces and the guest's SET_CONFIGURATION stalls), so:
@@ -18,7 +18,10 @@ H=$(eval echo "~$U")
 VMDIR=${VMDIR:-$H/atrium-vm}
 KEY=${KEY:-1050:0406}
 VID=${KEY%%:*}; PID=${KEY##*:}
-QEMU=${QEMU:-/opt/homebrew/bin/qemu-system-aarch64}
+# The atrium-os/qemu fork (HVF fixes), built by scripts/build-qemu.sh into
+# ~/src/bsd/external/qemu-build/build; Homebrew's qemu if it is not there.
+FORK=${ATRIUM_SRC:-$H/src/bsd}/external/qemu-build/build/qemu-system-aarch64
+if [ -x "$FORK" ]; then QEMU=${QEMU:-$FORK}; else QEMU=${QEMU:-/opt/homebrew/bin/qemu-system-aarch64}; fi
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo): usb-host needs it on macOS" >&2; exit 1; }
 cd "$VMDIR"
 if [ -f qemu.pid ] && kill -0 "$(cat qemu.pid)" 2>/dev/null; then echo "VM already running (pid $(cat qemu.pid))"; exit 0; fi

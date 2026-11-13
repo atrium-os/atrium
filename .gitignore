@@ -40,6 +40,7 @@ fresco-kmod/test_roundtrip
 # and/or licensing-sensitive to ship in-repo. Contributors recreate
 # these from FreeBSD's own distfiles per RUNBOOK.
 sysroot/
+/sysroot
 freebsd-src/
 vm/*.qcow2
 vm/*.qcow2.xz
