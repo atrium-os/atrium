@@ -1258,3 +1258,19 @@ work (self-test, scrub).
   The last of them was 1 s before test 15.
   Next: SI_SKIPHANG=1 (19deaa3c+1) leaves those three out. Logs:
   claude/project-thread-33aauq 6eed21f1.
+- **2026-11-13 12:27, SKIPHANG probe (si-client-test c087b183, kmods fc54eb53,
+  SI_SKIP13=1 SI_SKIPHANG=1 SI15_BYLATE=1 SI15_VA=0x10003000): still WEDGED, so
+  the hang recoveries are not it.** 57 passed, 2 failed. The GPU was idle at
+  12:27:36, and test 7's clean fault and test 15's wedging fault both fell in
+  12:27:37, on uq3 / VMID 11 with status 0xb41050.
+  Where it breaks: right after test 15's REMOVE_QUEUE, uq2_unmap_vm's flushes of
+  the kernel VMID and of 8, 9, 10 succeed and the flush of 11, the faulted VMID,
+  is the first to time out. Every flush after it times out too.
+  What still differs from test 7: test 7 frees a BO of its VM just before its
+  store, so MES suspends and resumes the queue ("preempted for a free") before
+  the fault. Test 15's queue faults on its first run after ADD_QUEUE. A wave
+  kill earlier in the run (test 5) left the same CPC 0x80110400 / BUSY 0x4480
+  state without harm, so that state alone is not the wedge.
+  Next: SI15_PREFREE=1 (c087b183+1) binds and frees a page in the hostile VM
+  before the submit, with the store at 0x10200000 (never mapped, wedged before).
+  Logs: claude/project-thread-33aauq 9267a45b.

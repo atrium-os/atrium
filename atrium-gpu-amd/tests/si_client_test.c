@@ -1609,6 +1609,19 @@ hostile_isa(void)
 			job_close(&h);
 			continue;
 		}
+		/*
+		 * SI15_PREFREE=1 (wedge bisection, run 9267a45b: with the
+		 * hang tests left out it still wedges): test 7, which
+		 * recovers, frees a BO of its VM just before its store, so
+		 * MES suspends and resumes its queue first. Do the same
+		 * here: bind a page, free it, then submit.
+		 */
+		if ((env = getenv("SI15_PREFREE")) != NULL && *env == '1') {
+			r = bo_bind_close(h.vm);
+			printf("15: a BO of the hostile VM freed before the "
+			    "submit (SI15_PREFREE): %s\n", r == 0 ? "ok" :
+			    strerror(errno));
+		}
 		(void)poison(by.out, POISON_B);
 		if (job_submit(&h, c[i].spin ? h.out_va : va) != 0) {
 			check(0, "15 hostile ISA", "%s: submit: %s", c[i].name,
