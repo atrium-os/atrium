@@ -1,9 +1,12 @@
 # Navigator UI: trails, pages and the window
 
-**Status:** proposed 2026-11-13, at Shankar's request ("now that pergola and navigator backends
+**Status:** accepted 2026-11-13 (proposed the same day), at Shankar's request ("now that pergola and navigator backends
 are all almost done, we can do the main navigator UI design … don't have to follow existing
 conventions … how to sandbox each window/tab, how the navigator ui layout is, is it intuitive to
 browse"). Nothing here is built. §13 lists the decisions, each with a recommendation.
+**Accepted 2026-11-13:** Shankar agreed to all twelve decisions (D1–D12) as recommended, including
+his own additions made the same day (tier indicator, per-trail sound, security light, status
+bar, private-by-default question).
 **Mockups:** rendered by Pergola on a live headless frescod in the FreeBSD VM
 (`pergola-document/examples/navigator_mockup.rs`; run with
 `EXAMPLE=navigator_mockup sh scripts/pergola-showcase-vm.sh main|dark|start`). The PNGs are in
@@ -915,6 +918,8 @@ argued further on paper.
 ---
 
 ## 13. Decisions, with recommendations
+
+**Accepted by Shankar, 2026-11-13: all twelve, as recommended.**
 
 | # | question | options | recommend |
 |---|---|---|---|
