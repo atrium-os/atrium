@@ -1537,3 +1537,21 @@ work (self-test, scrub).
   VMIDs were marked lost came out on the new card neither lost nor bound).
   Whether that race explains the VMID 0 faults is not proven. Logs:
   claude/project-thread-33aauq 929ba7c6.
+- **2026-11-13 17:59, 1 h fuzz diagnostic (64f44616): the first full 3600 s,
+  no GPU loss, no flush wedge during the fuzz, but RESULT: FAIL (3
+  findings).** si-client-test 92/0 before; 11 re-inits during the fuzz,
+  always in pairs about 17 s apart, each followed by the 610 s pause; the
+  end health check passed (a new VM runs write_42 clean). Findings: one blob
+  "VM did not run clean on a new queue after a contained failure (EIO)" and
+  two slow-canary EIOs. si-client-test after the fuzz 89/2: both in test 14,
+  which hit the re-init cap because the runner starts it with no wait after
+  the fuzz. Select log: 3 selects while MES ran, all in re-init 1 bring-up;
+  0 HQD scans skipped. 8 flush timeouts, all inside the 18:11 mode 1 reset
+  with every register 0: invalidations sent while the card was cold, not the
+  old wedge. The second re-init of each pair: a queue made on the fresh card
+  (doorbell 0x22) gets an EOP IV with src_data 0x4000022 (type 0x04, not
+  0x01) that matches no queue, MES SUSPEND is refused, the queue hangs and
+  REMOVE_QUEUE is refused, then a CPC fault on VMID 0. Next: the runner waits
+  out the re-init window before the last si-client-test; no TLB flushes while
+  the card is lost or in reset; find what the type 0x04 EOP IV is. Logs:
+  claude/project-thread-33aauq 1c503465.
