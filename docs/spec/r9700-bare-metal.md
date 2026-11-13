@@ -1120,3 +1120,17 @@ work (self-test, scrub).
   the pipe. Options: stop privileged register writes before they reach the CP (submit-
   time PM4 allowlist on kernel-mediated queues; user-mode queues are root only), or
   accept the reset plus lockout. Logs: claude/project-thread-33aauq 363127f4.
+- **2026-11-13 09:55, amdgpu-exact MEC pipe reset staged (4e443a80).** Shankar chose
+  one more try. amdgpu does not filter packets either; on gfx12 it resets a compute
+  pipe over MMIO (mes_v12_0_reset_compute_pipe_mmio, mec.use_mmio_for_reset). The
+  driver now copies it step for step: RLC safe mode; set MEC_PIPEn_RESET; clear
+  CP_HQD_ACTIVE and CP_HQD_DEQUEUE_REQUEST on all 8 queues of the pipe; release. Unlike
+  fdadff06 it does not rewrite the pipe's PRGRM_START. Then REMOVE_QUEUE (plain, else
+  after reset). It runs only when the guilty queue is alone on a pipe other than 0
+  (the kernel queue's pipe), because a pipe reset loses every queue on the pipe and
+  MES would not know. PC, start, CPC busy/status and CPF status are logged before and
+  after. Success means the HQD is gone and REMOVE worked. Otherwise the earlier
+  MES-level attempt, then mode 1 + blame as before. In the 08:36 and 09:26 runs the
+  first stuck queue sat on pipe 1 (tried) and the second on pipe 0 (skipped, mode 1).
+  On gpusim both suites are ALL OK. Box artifacts: pci 4ed2ead4…, gpu d3d29df1…,
+  display 3d9cea12…, si-client-test unchanged (5801b269…), xfer b542f672.
