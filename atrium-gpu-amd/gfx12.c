@@ -100,10 +100,25 @@ wr(struct atrium_amd_softc *sc, uint32_t r, uint32_t v)
 static struct mtx amd_grbm_mtx;
 MTX_SYSINIT(amd_grbm, &amd_grbm_mtx, "amd grbm select", MTX_DEF);
 
+/*
+ * Set while MES runs (mes12.c mes_run .. mes_teardown/free_lost). A GRBM
+ * select then breaks spec §5's rule (audit F7): each is logged with its
+ * caller, the first 32 per load (fuzz run 78169ef0: the GFXHUB flush wedge
+ * came back after two re-inits, with no fault in sight).
+ */
+volatile int amd_mes_live;
+static int amd_grbm_live_logged;
+
 void
 amd_grbm_select_write(struct atrium_amd_softc *sc, bus_size_t off,
     uint32_t v)
 {
+	if (v != 0 && amd_mes_live && amd_grbm_live_logged < 32) {
+		amd_grbm_live_logged++;
+		device_printf(sc->dev, "grbm: select %#x while MES runs, from "
+		    "%p (amd_grbm_select_write at %p)\n", v,
+		    __builtin_return_address(0), (void *)amd_grbm_select_write);
+	}
 	if (!mtx_owned(&amd_grbm_mtx))
 		mtx_lock(&amd_grbm_mtx);
 	amd_mmio_write32(sc, off, v);

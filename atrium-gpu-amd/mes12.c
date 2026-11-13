@@ -961,6 +961,7 @@ mes_teardown(struct mes *m)
 	const struct mes_gen *g = m->g;
 	int p;
 
+	amd_mes_live = 0;	/* teardown's selects are its own */
 	if (m->sched_mapped)
 		(void)unmap_sched_queue(m);
 	hqd_dequeue(m, 0);
@@ -3421,6 +3422,7 @@ mes_run(struct mes *m)
 	 * MES has nothing to schedule (amd_mes12_uq_ints). */
 	mec_ints(m, true, m->mec_int_cntl);
 	m->uq_ints_on = true;
+	amd_mes_live = 1;
 	return (query_status(m, 0));
 }
 
@@ -3616,6 +3618,7 @@ amd_mes12_free_lost(struct mes *m)
 
 	if (m == NULL)
 		return;
+	amd_mes_live = 0;
 	sc = m->sc;
 	contigfree(m->blk, BLK_SIZE, M_DEVBUF);
 	if (m->scratch != NULL)

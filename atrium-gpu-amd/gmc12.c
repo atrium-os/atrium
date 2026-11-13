@@ -420,17 +420,46 @@ hub_report(struct hub *h, const char *when)
 
 /* A context flush that never got its ack: what the hub looks like (box
  * run 1b71cafd: after a hostile shader every flush timed out). */
+static u_int gmc12_flush_timeouts;
+
+/*
+ * Run 78169ef0 logged 7376 of these: the first 8 in full, then one in
+ * 500. The full ones add the L2 and CPF state and whether another engine
+ * (16) still gets its ack, i.e. one stuck engine or the whole hub.
+ */
 static void
 hub_flush_report(struct hub *h, u_int vmid)
 {
 	const struct hub_gen *g = h->g;
 	uint32_t e = INV_ENG_GART * g->eng_distance;
+	uint32_t e16 = 16 * g->eng_distance;
+	u_int n = ++gmc12_flush_timeouts;
+	int us;
 
-	device_printf(h->sc->dev, "gmc: %s flush of context %u timed out: "
-	    "INV_REQ %#x, INV_ACK %#x%s\n", g->name, vmid,
+	if (n > 8 && n % 500 != 0)
+		return;
+	device_printf(h->sc->dev, "gmc: %s flush of context %u timed out "
+	    "(%u so far): INV_REQ %#x, INV_ACK %#x%s\n", g->name, vmid, n,
 	    hr(h, g->inv_req + e), hr(h, g->inv_ack + e), g->use_sem ?
 	    (hr(h, g->inv_sem + e) & 1 ? ", semaphore held" :
 	    ", semaphore free") : "");
+	if (n > 8)
+		return;
+	if (!g->use_sem)	/* GFXHUB: the GC registers are its */
+		device_printf(h->sc->dev, "gmc: %s at the timeout: "
+		    "GCVM_L2_STATUS %#x, CP_CPF_STATUS %#x\n", g->name,
+		    hr(h, GC12_GCVM_L2_STATUS), hr(h, GC12_CP_CPF_STATUS));
+	if (!g->use_sem) {
+		hw(h, g->inv_req + e16, (1u << vmid) | INV_L2_PTES |
+		    INV_L2_PDE0 | INV_L2_PDE1 | INV_L2_PDE2 | INV_L1_PTES);
+		for (us = 0; us < 100000; us++) {
+			if (hr(h, g->inv_ack + e16) & (1u << vmid))
+				break;
+			DELAY(1);
+		}
+		device_printf(h->sc->dev, "gmc: %s engine 16, same context: "
+		    "%s\n", g->name, us < 100000 ? "acked" : "NO ack either");
+	}
 	hub_report(h, "after the timeout");
 }
 

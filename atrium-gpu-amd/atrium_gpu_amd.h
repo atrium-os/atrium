@@ -827,6 +827,7 @@ int	amd_smu_mode1_reset(struct atrium_amd_softc *sc);	/* smu.c */
 int	amd_gfx12_srm_enable(struct atrium_amd_softc *sc);	/* gfx12_pm.c */
 int	amd_gfx12_clock_gating(struct atrium_amd_softc *sc, bool enable);
 int	amd_gfx12_sq_kill_vmid(struct atrium_amd_softc *sc, u_int vmid);
+extern volatile int amd_mes_live;
 void	amd_grbm_select_write(struct atrium_amd_softc *sc, bus_size_t off,
 	    uint32_t v);
 void	amd_gfx12_pm_report(struct atrium_amd_softc *sc, const char *when);

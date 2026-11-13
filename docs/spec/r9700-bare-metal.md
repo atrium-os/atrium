@@ -1492,3 +1492,19 @@ work (self-test, scrub).
   mode 1 reset and re-init. Card proven idle at detach. G5 done; next on the
   security gate: the §10.5 24 h fuzz gate. Logs: claude/project-thread-33aauq
   13f24c23.
+- **2026-11-13 16:40, §10.5 fuzz gate, first 24 h attempt (si-fuzz 78169ef0,
+  kmods 78169ef0): STOPPED after 14 min, not a valid gate run.** Before it, a
+  30 min KASAN run on the cloud amd64 gpusim VM was clean (2.6 M calls, no
+  KASAN or WITNESS reports). On the box, si-client-test passed 92/0 first (test
+  14's two re-inits included). One second after re-init 2, si-fuzz opened 7
+  queues, two preempt-for-free cycles and two REMOVE_QUEUEs of queues that
+  never ran, then the first flush after REMOVE_QUEUE uq4 timed out on GFXHUB
+  context 4 (INV_REQ 0xf80010, INV_ACK 0), and every flush after it did (7376,
+  contexts 1-15). No fault, hang or wave kill in that window. The canary VM made
+  before it kept running; every new job setup failed (ETIMEDOUT, then ENOSPC).
+  Stopped by SIGTERM; detach, mode 1 reset and unload clean; the timeouts ended
+  with the unload. The trigger is not yet known. Next: kmods log every GRBM
+  select made while MES runs (with its caller) and, at a flush timeout, the L2
+  and CPF state and whether engine 16 still acks; si-fuzz ends the run after 10
+  timed-out job setups and prints its end block on SIGTERM. Logs:
+  claude/project-thread-33aauq 691516f0, 5ab6bf66.

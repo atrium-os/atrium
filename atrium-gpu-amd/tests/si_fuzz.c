@@ -94,6 +94,7 @@ struct shm {
 	_Atomic int	 nfind;
 	char		 find[NFIND][200];
 	_Atomic int	 gen_reinit;	/* a worker saw "reinits" move */
+	_Atomic int	 setup_fails;	/* blob job opens timed out in a row */
 };
 static struct shm *S;
 
@@ -1168,12 +1169,17 @@ blob_worker(uint64_t seed, uid_t uid, int hang_wait)
 			if (job_open(&b.j, "blob") != 0) {
 				if (errno == EPERM)
 					_exit(BLOB_LOCKED);
+				/* ENOSPC is the ioctl workers holding every
+				 * VM; ETIMEDOUT is the GPU not answering. */
+				if (errno == ETIMEDOUT)
+					atomic_fetch_add(&S->setup_fails, 1);
 				job_close(&b.j);
 				job_init(&b.j);
 				sleep(1);
 				continue;
 			}
 		}
+		atomic_store(&S->setup_fails, 0);
 		ri0 = reinits();
 		bytes = 0;
 		n = blob_make(&b, w, &va, &bytes, &kind);
@@ -1380,6 +1386,15 @@ status(int64_t t0, int ri, uint64_t canary_runs)
 	    (int)S->nfind);
 }
 
+static volatile sig_atomic_t stop_now;
+
+static void
+on_term(int sig)
+{
+	(void)sig;
+	stop_now = 1;
+}
+
 static void
 usage(void)
 {
@@ -1421,6 +1436,8 @@ main(int argc, char **argv)
 		gen_s = MAX(5, atoi(e));
 	pgsz = (size_t)getpagesize();
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGTERM, on_term);	/* end early, with the end block */
+	signal(SIGINT, on_term);
 	signal(SIGSEGV, on_fault);
 	signal(SIGBUS, on_fault);
 
@@ -1483,8 +1500,18 @@ main(int argc, char **argv)
 
 	t0 = now_ms();
 	end = t0 + 1000LL * strtoll(argv[2], NULL, 10);
-	while (now_ms() < end) {
+	while (now_ms() < end && !stop_now) {
 		int64_t now = now_ms();
+
+		/* A GPU on which no new job can be set up any more (run
+		 * 78169ef0: the GFXHUB stopped acking flushes; the canary's
+		 * old VM kept running while every new one failed). */
+		if (S->setup_fails >= 10) {
+			finding("10 blob job setups timed out with no success "
+			    "between: the GPU takes no new work");
+			dump_last();
+			break;
+		}
 
 		/* Reap workers that ended on their own. */
 		while ((pid = waitpid(-1, &st, WNOHANG)) > 0) {
@@ -1508,6 +1535,7 @@ main(int argc, char **argv)
 			worker_stop(&wi);
 			worker_stop(&wb);
 			pause_until = now + 1000LL * pace;
+			S->setup_fails = 0;
 			canary_close(&can);
 			can.bad = 0;
 		}
@@ -1605,6 +1633,9 @@ main(int argc, char **argv)
 		usleep(200000);
 	}
 
+	if (stop_now)
+		printf("si-fuzz: stopped by a signal at %jd s\n",
+		    (intmax_t)((now_ms() - t0) / 1000));
 	/* The end: stop, let the driver settle, then the health check. */
 	worker_stop(&wi);
 	worker_stop(&wb);
