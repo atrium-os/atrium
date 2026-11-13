@@ -1287,3 +1287,16 @@ work (self-test, scrub).
   "first EOP IV" arrives with the fault); test 7's other VM had long been
   running. Next: SI15_NOBY=1 (4e332912+1) runs test 15 with no bystander.
   Logs: claude/project-thread-33aauq be7f9fa2.
+- **2026-11-13 12:40, NOBY probe (si-client-test 14a57259, kmods fc54eb53,
+  SI_SKIP13=1 SI_SKIPHANG=1 SI15_NOBY=1 SI15_VA=0x10003000): still WEDGED with no
+  bystander VM at all.** 55 passed, 2 failed. Only the hostile uq3 / VMID 11 (and
+  test 1's idle uq0) was live; it faulted, was removed cleanly, and the very first
+  flush after REMOVE (context 8) timed out; 151 timeouts in all. Test 7's after-kill
+  snapshot was fully idle this time (CPC 0, BUSY 0/0) and it recovered; test 15's
+  was the usual CPC 0x80110400 / BUSY 0/0x4480 / CPF 0xb0000001.
+  Ruled out so far: the address region, test 13, the VMID, the hang tests, a
+  suspend/resume before the fault, a second fresh VM. Left: test 7 stores to a page
+  that was mapped and then unmapped (its out BO is closed first); every wedging
+  store hit a page that was never mapped (the page tables hold the same invalid
+  pattern either way). Next: SI15_CLOSEOUT=1 (14a57259+1) does exactly test 7's
+  fault inside test 15. Logs: claude/project-thread-33aauq d8436096.

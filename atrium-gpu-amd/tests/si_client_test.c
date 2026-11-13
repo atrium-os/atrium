@@ -1633,6 +1633,21 @@ hostile_isa(void)
 			    "submit (SI15_PREFREE): %s\n", r == 0 ? "ok" :
 			    strerror(errno));
 		}
+		/*
+		 * SI15_CLOSEOUT=1 (wedge bisection, run d8436096: no
+		 * bystander, still wedged): exactly test 7's fault. Close
+		 * the job's own out BO, then store to where it was, so the
+		 * faulting page is one that was mapped and is now unmapped.
+		 * Every wedging store so far hit a page never mapped.
+		 */
+		if ((env = getenv("SI15_CLOSEOUT")) != NULL && *env == '1' &&
+		    !c[i].spin) {
+			close(h.out);
+			h.out = -1;
+			va = h.out_va;
+			printf("15: out BO closed, store at its old VA %#jx "
+			    "(SI15_CLOSEOUT)\n", (uintmax_t)va);
+		}
 		if (!noby)
 			(void)poison(by.out, POISON_B);
 		if (job_submit(&h, c[i].spin ? h.out_va : va) != 0) {
