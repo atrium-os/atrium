@@ -1075,3 +1075,17 @@ work (self-test, scrub).
   OK. Box artifacts: pci 80cd52f5…, gpu f6aae609…, si-client-test 5801b269…, staged
   in xfer b40b243d. Still owed: recovering a halted CP queue on its own, without a
   full reset.
+- **2026-11-13 08:36, reset blame on the box (9e337339 kmods, stage 5c2): si-client-test
+  71/71 PASS.** Test 14, with the targets the 08:22 run missed going first:
+  - WRITE_DATA to ih_rb_base (uid 61081) and to cp_mes_cntl (uid 61082) were both
+    refused: CP error +1, register unchanged, marker not written.
+  - Each still cost a GPU re-init. Both re-inits passed, and the kernel logged "uid N's
+    queue forced a GPU reset: no new queues for it for 600 s". Each uid's next
+    QUEUE_CREATE got EPERM, while root's bystander VM and a new VM ran clean.
+  - The run stopped at 2 re-inits (reported as KNOWN). The VM context bases (done at
+    08:22) and the SMU read were not run this time.
+  - The card was proven idle at detach (8 W) and the vector was released.
+  - Oddity to check: the child's completion error printed as EPERM where root's job at
+    08:22 got EIO. Every other sign shows the refusal.
+  Logs: claude/project-thread-33aauq 6658138c. Still owed: per-queue recovery of a CP
+  queue halted on an error, and the SMU-mailbox read probe.
