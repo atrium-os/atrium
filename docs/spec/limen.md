@@ -133,11 +133,16 @@ window (pergola.md §10).
 | parent → child | `Load` | `doc: DocRef` (a Tabula-style blob the parent uploaded, or a URL the child fetches through its own jailed fetcher), `theme` |
 | parent → child | `SetTheme` | `theme` |
 | parent → child | `ScrollTo` | `anchor: String` |
-| parent → child | `Open` | the Navigator's page: `ticket: [u8; 16]` redeemed on navigatord's page socket, `dark`, `scroll: f32` (px from the top, at most 10⁷; a parked page coming back where it was) |
+| parent → child | `Open` | the Navigator's page: `ticket: [u8; 16]` redeemed on navigatord's page socket, `reading`, `scroll: f32` (px from the top, at most 10⁷; a parked page coming back where it was) |
+| parent → child | `SetReading` | `reading: { text_64: u16 (32–256), zoom_64: u16 (16–512), dark: bool, comfortable: bool }`, the reader's choices (navigator-ui.md §7); the child lays the page out again keeping its place, nothing fetched |
+| parent → child | `Find` | `query: String` (at most 256 bytes, no control characters; empty clears), `step: i8` (0 the first match from the top of the view, 1 the next, -1 the one before); answered by `Found` |
 | parent → child | `Park` | the parent will close the child (navigator-ui.md §4.4); answered by `Parked` |
 | child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
 | child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
 | child → parent | `Error` | `code: u16` |
+| child → parent | `Found` | `count: u32` (at most 1000), `current: u32` (from 1; 0 with none), `rect: Option<[x, y, w, h]>` of the current match in the child's window. Counts and a rect, never the text |
+| child → parent | `Zoomed` | `zoom_64: u16`: the person zoomed in the child (keys, a pinch) and it settled, for the parent to remember |
+| child → parent | `Key` | `key: Char \| Tab \| Left \| Right \| Escape`, `chars` (one character), `ctrl`, `shift`, `alt`: a chrome shortcut the child does not use (Ctrl or Alt with a key, or Escape; not Ctrl-plus, -minus, -0, which are the child's zoom). The parent runs it through its own keyboard map, so it is no more than a press the person could have made with the chrome focused |
 | child → parent | `Parked` | `scroll: f32`, how far down the page is (finite, 0 to 10⁷). Only a number: the page's state that comes back is its address, kept by navigatord, and this offset |
 | child → parent | `Embeds` | `list: Vec<{ key: u64, rect: Option<[x, y, w, h]>, role: String, src: EmbedSrc }>`, every embed the child has in view, `rect` in the child's window px (`None`: scrolled partly or wholly out). At most 64. Sent when the list or a rect changes, after the frame that shows it |
 
@@ -489,9 +494,14 @@ instance is gone (system roles). The parent gets `Detached`.
 - **Pointer**: the slot is the topmost window at that point, so frescod sends the event to the
   child, in the child's coordinates. The parent never sees it.
 - **Keyboard**: focus is per window. A click in the slot focuses the child's window, so keys
-  go to the child. Tab at the end of the child's focus order and Shift-Tab at the start send
-  `FocusOut { forward }` to limend, which tells the parent to focus its next widget. frescod
-  focuses the parent window. System shortcuts go to Forum, as always.
+  go to the child. (Not yet: forum-wm moves focus on a click only to top-level surfaces, so
+  today a press in a slot leaves the keys with the parent; found 2026-11-14.) Tab at the end of the child's focus order and Shift-Tab at the start send
+  `FocusOut { forward }` to limend, which tells the parent to focus its next widget. The
+  child gives the parent window the focus with frescod's `OP_WINDOW_FOCUS_PARENT` (built
+  2026-11-14): only for its own embedded window, only while that window has the focus, so a
+  child can give focus away but never take it. The Navigator's page does this after handing
+  back a shortcut that opens a field in the chrome (Ctrl-F, Ctrl-L, Ctrl-H, Ctrl-T,
+  Ctrl-Shift-N; doc-viewer `Key`). System shortcuts go to Forum, as always.
 - **Clipboard and drag and drop** are Tabula's, with the child as one more window: a paste in
   the child needs a press in the child (tabula.md §2), and a drop onto the slot goes to the
   child (tabula.md §4).

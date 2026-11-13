@@ -46,13 +46,50 @@ pub enum ToChild {
     ScrollTo { anchor: String },
     /// The Navigator's page: redeem `ticket` on navigatord's page socket
     /// for the recording and its address, and show it scrolled to `scroll`
-    /// px from the top (a parked page coming back where it was).
-    Open { ticket: [u8; 16], dark: bool, scroll: f32 },
+    /// px from the top (a parked page coming back where it was), laid out
+    /// as `reading` says.
+    Open { ticket: [u8; 16], reading: Reading, scroll: f32 },
+    /// The reader's controls changed (navigator-ui.md §7): lay the page out
+    /// again with them, keeping the reader's place.
+    SetReading { reading: Reading },
+    /// Find `query` in the page (case folded; empty clears): `step` 0 goes
+    /// to the first match at or after the top of the view, 1 to the next,
+    /// -1 to the previous. Answered by `Found`. The child scrolls to the
+    /// match and marks it; the parent never gets the page's text.
+    Find { query: String, step: i8 },
     /// The parent is about to close this child (the page is being parked,
     /// navigator-ui.md §4.4): answer `Parked` with what it needs to bring
     /// the page back as it was.
     Park,
 }
+
+/// How the reader wants the page laid out (navigator-ui.md §7; backend
+/// §4.9): text size and page zoom in 1/64 (64 = 100%), the appearance,
+/// and whether the measure is held to a comfortable line length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reading {
+    pub text_64: u16,
+    pub zoom_64: u16,
+    pub dark: bool,
+    pub comfortable: bool,
+}
+
+impl Reading {
+    pub const TEXT_MIN: u16 = 32;
+    pub const TEXT_MAX: u16 = 256;
+    pub const ZOOM_MIN: u16 = 16;
+    pub const ZOOM_MAX: u16 = 512;
+
+    pub fn plain(dark: bool) -> Self { Reading { text_64: 64, zoom_64: 64, dark, comfortable: false } }
+
+    pub fn ok(&self) -> bool {
+        (Self::TEXT_MIN..=Self::TEXT_MAX).contains(&self.text_64) && (Self::ZOOM_MIN..=Self::ZOOM_MAX).contains(&self.zoom_64)
+    }
+}
+
+/// Longest find query, and the most matches a child counts.
+pub const QUERY_MAX: usize = 256;
+pub const FOUND_MAX: u32 = 1000;
 
 /// Child to parent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,7 +106,34 @@ pub enum ToParent {
     Error { code: u16 },
     /// The answer to `Park`: how far down the page is scrolled, in px.
     Parked { scroll: f32 },
+    /// The answer to `Find`: how many matches (at most `FOUND_MAX`), which
+    /// one is current (from 1; 0 with none), and where it is now in the
+    /// child's window (x, y, w, h px), for the parent to point at.
+    Found { count: u32, current: u32, rect: Option<[f32; 4]> },
+    /// A chrome shortcut pressed while the child had focus, which the
+    /// child does not use itself (navigator-ui.md §9): Ctrl or Alt with a
+    /// character, Tab, Left or Right, or Escape. The parent runs it through
+    /// its own keyboard map and acts only on what that map has; it is no
+    /// more than a press the person could have made with the chrome focused.
+    Key { key: ChromeKey, chars: String, ctrl: bool, shift: bool, alt: bool },
+    /// The person zoomed the page in the child (Ctrl-plus, Ctrl-minus,
+    /// Ctrl-0, a pinch) and it settled here, in 1/64: for the parent to
+    /// remember (navigator-ui.md §7).
+    Zoomed { zoom_64: u16 },
 }
+
+/// The keys `Key` may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChromeKey {
+    Char,
+    Tab,
+    Left,
+    Right,
+    Escape,
+}
+
+/// The longest `chars` in `Key` (one character).
+pub const KEY_CHARS_MAX: usize = 4;
 
 /// `Error` codes.
 pub mod error {
@@ -99,7 +163,9 @@ impl ToChild {
             ToChild::Load { base, .. } => clean_text(base, URL_MAX),
             ToChild::SetTheme { .. } => true,
             ToChild::ScrollTo { anchor } => clean_text(anchor, ANCHOR_MAX),
-            ToChild::Open { scroll, .. } => scroll_ok(*scroll),
+            ToChild::Open { scroll, reading, .. } => scroll_ok(*scroll) && reading.ok(),
+            ToChild::SetReading { reading } => reading.ok(),
+            ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
             ToChild::Park => true,
         };
         ok.then_some(m)
@@ -121,6 +187,15 @@ impl ToParent {
             ToParent::LinkHover { url } => url.as_ref().is_none_or(|u| clean_text(u, URL_MAX)),
             ToParent::Error { .. } => true,
             ToParent::Parked { scroll } => scroll_ok(*scroll),
+            ToParent::Found { count, current, rect } => {
+                *count <= FOUND_MAX && *current <= *count && (*current == 0) == rect.is_none()
+                    && rect.is_none_or(|r| r.iter().all(|v| v.is_finite() && v.abs() <= SCROLL_MAX))
+            }
+            ToParent::Zoomed { zoom_64 } => (Reading::ZOOM_MIN..=Reading::ZOOM_MAX).contains(zoom_64),
+            ToParent::Key { key, chars, ctrl, alt, .. } => {
+                clean_text(chars, KEY_CHARS_MAX) && chars.chars().count() <= 1 && (*key != ChromeKey::Char || !chars.is_empty())
+                    && (*key == ChromeKey::Escape || *ctrl || *alt)
+            }
         };
         ok.then_some(m)
     }
@@ -154,7 +229,9 @@ mod tests {
             ToChild::Load { kind: DocKind::Recording, base: "https://atlas.example/wiki/A".into(), dark: false },
             ToChild::SetTheme { dark: true },
             ToChild::ScrollTo { anchor: "plan".into() },
-            ToChild::Open { ticket: [7; 16], dark: true, scroll: 240.0 },
+            ToChild::Open { ticket: [7; 16], reading: Reading::plain(true), scroll: 240.0 },
+            ToChild::SetReading { reading: Reading { text_64: 96, zoom_64: 128, dark: false, comfortable: true } },
+            ToChild::Find { query: "impluvium".into(), step: 1 },
             ToChild::Park,
         ] {
             assert_eq!(ToChild::decode(&m.encode()), Some(m));
@@ -165,6 +242,11 @@ mod tests {
             ToParent::LinkHover { url: None },
             ToParent::Error { code: error::UNREADABLE },
             ToParent::Parked { scroll: 0.0 },
+            ToParent::Found { count: 3, current: 2, rect: Some([10.0, 200.0, 80.0, 18.0]) },
+            ToParent::Found { count: 0, current: 0, rect: None },
+            ToParent::Key { key: ChromeKey::Char, chars: "f".into(), ctrl: true, shift: false, alt: false },
+            ToParent::Zoomed { zoom_64: 96 },
+            ToParent::Key { key: ChromeKey::Escape, chars: String::new(), ctrl: false, shift: false, alt: false },
         ] {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
         }
@@ -174,8 +256,21 @@ mod tests {
         assert_eq!(ToParent::decode(&[0xff, 0x00]), None);
         for y in [f32::NAN, f32::INFINITY, -1.0, SCROLL_MAX * 2.0] {
             assert_eq!(ToParent::decode(&ToParent::Parked { scroll: y }.encode()), None);
-            assert_eq!(ToChild::decode(&ToChild::Open { ticket: [0; 16], dark: false, scroll: y }.encode()), None);
+            assert_eq!(ToChild::decode(&ToChild::Open { ticket: [0; 16], reading: Reading::plain(false), scroll: y }.encode()), None);
         }
+        let r = |text_64, zoom_64| ToChild::SetReading { reading: Reading { text_64, zoom_64, dark: false, comfortable: false } };
+        for bad in [r(0, 64), r(64, 0), r(Reading::TEXT_MAX + 1, 64), r(64, Reading::ZOOM_MAX + 1)] {
+            assert_eq!(ToChild::decode(&bad.encode()), None);
+        }
+        assert_eq!(ToChild::decode(&ToChild::Find { query: "x".repeat(QUERY_MAX + 1), step: 0 }.encode()), None);
+        assert_eq!(ToChild::decode(&ToChild::Find { query: "a\nb".into(), step: 0 }.encode()), None);
+        assert_eq!(ToChild::decode(&ToChild::Find { query: "a".into(), step: 2 }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Found { count: 2, current: 3, rect: Some([0.0; 4]) }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Found { count: FOUND_MAX + 1, current: 0, rect: None }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Found { count: 1, current: 1, rect: None }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Key { key: ChromeKey::Char, chars: "f".into(), ctrl: false, shift: false, alt: false }.encode()), None, "a plain letter is typing");
+        assert_eq!(ToParent::decode(&ToParent::Key { key: ChromeKey::Char, chars: "fw".into(), ctrl: true, shift: false, alt: false }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Key { key: ChromeKey::Char, chars: String::new(), ctrl: true, shift: false, alt: false }.encode()), None);
         assert_eq!(cut("héllo", 2), "h");
     }
 }

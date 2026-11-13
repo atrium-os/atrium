@@ -21,7 +21,7 @@ use pergola::widgets::Glyph;
 use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use crate::fake;
-use crate::shell::{self, Geo, Shell, DROP_LABEL, DROP_ROW, PAGE_SLOT};
+use crate::shell::{self, Geo, Shell, DROP_LABEL, DROP_ROW, HIST_DAY, PAGE_SLOT};
 use crate::trail::{self, Light, Prompt, RowMedia, Tier};
 use crate::where_field::Source;
 
@@ -37,6 +37,8 @@ pub mod ph {
     pub const USER: char = '\u{e4c2}';
     pub const USER_CIRCLE: char = '\u{e4c4}';
     pub const CARET_DOWN: char = '\u{e136}';
+    pub const CARET_UP: char = '\u{e13c}';
+    pub const MINUS: char = '\u{e32a}';
     pub const DOWNLOAD: char = '\u{e20c}';
     pub const CLOCK: char = '\u{e1a0}';
     pub const BOOKMARK: char = '\u{e0ea}';
@@ -71,6 +73,18 @@ fn with(state: &Mutable<Shell>, f: impl FnOnce(&mut Shell)) {
 pub fn trace(s: &mut Shell) {
     if let Some(n) = s.last_note.take() {
         eprintln!("navigator-ui: {n}");
+    }
+    if std::env::var_os("NAVIGATOR_UI_AX").is_some() {
+        // The accessibility tree (§10), when it changed.
+        static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        let o = crate::ax::outline(&crate::ax::tree(s));
+        let mut last = LAST.lock().unwrap();
+        if *last != o {
+            for l in o.lines() {
+                eprintln!("navigator-ui: ax {l}");
+            }
+            *last = o;
+        }
     }
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
@@ -253,6 +267,7 @@ impl View for ShellView {
         let page = s.store.trail().page().cloned();
         let mut hovered: Option<String> = None;
         match &page {
+            _ if s.history.is_some() => history(ctx, &s, &g, &self.state),
             None => start(ctx, &s, &g, &self.state),
             Some(p) if p.facts.light == Light::Red => stop_page(ctx, &g, p, &self.state),
             Some(p) => hovered = page_slot(ctx, &g, p, &self.state),
@@ -265,6 +280,9 @@ impl View for ShellView {
                 prompt_row(ctx, r, &a.prompt, &self.state);
             }
         }
+        if let (Some(r), Some(f)) = (g.find, &s.find) {
+            find_bar(ctx, r, f, &self.state);
+        }
         if g.rail > shell::RAIL_NARROW {
             rail(ctx, &s, &g, &self.state);
         } else {
@@ -274,10 +292,30 @@ impl View for ShellView {
         if let Some(r) = g.drop {
             suggestions(ctx, &s, r, &self.state);
         }
-        if let (Some(r), Some(p)) = (g.popover, &page) {
-            popover(ctx, &s, r, p);
+        // The tier popover and Aa are pop-up windows where there is a
+        // frescod (the page's window is above this one), else drawn here.
+        if let (Some(r), Some(p)) = (g.popover, page.clone()) {
+            let st = self.state.clone();
+            floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p));
+        }
+        if let (Some(r), Some(p)) = (g.reading, &page) {
+            let (st, st2) = (self.state.clone(), self.state.clone());
+            let (prefs, site) = (s.store.reading(), trail::site(&p.url).to_string());
+            floating(ctx, r, g.aa, move || with(&st, |s| s.reading_open = false), move |ctx| reading_controls(ctx, r, prefs, &site, &st2));
         }
     }
+}
+
+/// A pop-up window hung below `anchor` (fresco-popups.md), or, with no
+/// frescod to place one (screenshots, tests), drawn at `r` in the window.
+fn floating(ctx: &mut Ctx, r: Rect, anchor: Rect, on_dismiss: impl Fn() + 'static, draw: impl FnOnce(&mut Ctx) + 'static) {
+    if !ctx.popups_enabled() {
+        return draw(ctx);
+    }
+    ctx.overlay(move |ctx| {
+        let spec = pergola::popup::Spec { anchor, side: pergola::popup::Side::Below, align: pergola::popup::Align::Start, grab: true };
+        ctx.popup(r, spec, on_dismiss, draw);
+    });
 }
 
 // -- the rail -----------------------------------------------------------------
@@ -588,7 +626,12 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         ctx.tooltip(id, if knows { format!("{site} knows you · click to forget this site") } else { format!("{site} doesn't know you · click to let it remember you") });
     }
     let has = page.is_some();
-    icon_button(ctx, g.w - 104.0, 6.0, ph::TEXT_AA, has, t.text_secondary(), "Reading controls", || {});
+    let st2 = st.clone();
+    let aa = s.reading_open;
+    icon_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| {
+        s.popover = false;
+        s.reading_open = !aa;
+    }));
     let kept = page.is_some_and(|p| s.store.is_kept(&p.url));
     let st2 = st.clone();
     icon_button(ctx, g.w - 72.0, 6.0, ph::STAR, has, if kept { t.accent_fg() } else { t.text_secondary() }, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" }, move || with(&st2, |s| s.store.toggle_keep()));
@@ -694,28 +737,34 @@ fn tier_chip(ctx: &mut Ctx, s: &Shell, x: f32, y: f32, p: &trail::Page, st: &Mut
 
 /// The Where field focused: a text field with the full address (§5.3).
 fn where_editing(ctx: &mut Ctx, f: Rect, e: &shell::WhereEdit) {
+    text_field(ctx, f, &e.edit, "Search or type an address");
+}
+
+/// A focused one-line field: ring, box, magnifier, text with its
+/// selection and caret, or the placeholder.
+fn text_field(ctx: &mut Ctx, f: Rect, edit: &pergola::text_edit::TextEdit, placeholder: &str) {
     let t = ctx.theme;
     boxed(ctx, f.x() - 2.0, f.y() - 2.0, f.w() + 4.0, f.h() + 4.0, t.focus_ring(), t.focus_ring(), 8.0);
     boxed(ctx, f.x(), f.y(), f.w(), f.h(), t.border_control(), t.bg_canvas(), 6.0);
-    icon(ctx, f.x() + 10.0, f.y() + 7.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
+    icon(ctx, f.x() + 10.0, f.y() + (f.h() - 14.0) / 2.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
     let st = sans(type_size::SM, Weight::Regular, t.text_primary());
     let tx = f.x() + 30.0;
-    let s = e.edit.text();
+    let s = edit.text();
     let cy = f.y() + f.h() / 2.0;
     let line = Node::measure_text("Mg", &st).h;
-    let sel = e.edit.selection();
+    let sel = edit.selection();
     if !sel.is_empty() {
         let a = tx + width(&s[..sel.start], &st);
         let b = tx + width(&s[..sel.end], &st);
         rect(ctx, a, cy - line / 2.0, (b - a).min(f.x() + f.w() - 8.0 - a), line, t.selection_bg(), 0.0);
     }
     if s.is_empty() {
-        text(ctx, tx, cy, "Search or type an address", type_size::SM, Weight::Regular, t.text_tertiary());
+        text(ctx, tx, cy, placeholder, type_size::SM, Weight::Regular, t.text_tertiary());
     } else {
         text(ctx, tx, cy, &fit(s, &st, f.w() - 40.0), type_size::SM, Weight::Regular, t.text_primary());
     }
     if sel.is_empty() {
-        let cx = tx + width(&s[..e.edit.caret()], &st);
+        let cx = tx + width(&s[..edit.caret()], &st);
         rect(ctx, cx, cy - line / 2.0, 1.5, line, t.accent_fg(), 0.0);
     }
 }
@@ -782,7 +831,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 
 /// The tier chip's popover (§6.5): Connection, What runs, the reasons,
 /// and the line that says what green does not mean.
-fn popover(ctx: &mut Ctx, _s: &Shell, r: Rect, p: &trail::Page) {
+fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
     let f = &p.facts;
@@ -837,6 +886,176 @@ fn wrapped(ctx: &mut Ctx, x: f32, mut y: f32, w: f32, s: &str, c: Color) -> f32 
         y += 16.0;
     }
     y
+}
+
+// -- reading controls and find (§7) ----------------------------------------------
+
+/// A small bordered button with a glyph or a word.
+fn small_button(ctx: &mut Ctx, r: Rect, g: Option<char>, label: &str, on: bool, tip: &str, press: impl Fn() + 'static) {
+    let t = ctx.theme;
+    let (edge, fill, fg) = if on { (t.accent_mark(), t.accent_bg(), t.accent_strong()) } else { (t.border_control(), t.bg_surface(), t.text_primary()) };
+    rect(ctx, r.x(), r.y(), r.w(), r.h(), edge, 6.0);
+    let id = area(ctx, Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), 5.0, fill, t.state_hover(), press);
+    match g {
+        Some(g) => {
+            icon(ctx, r.x() + (r.w() - 16.0) / 2.0, r.y() + (r.h() - 16.0) / 2.0, g, 16.0, fg);
+        }
+        None => {
+            let st = sans(type_size::XS, Weight::Medium, fg);
+            let w = width(label, &st);
+            text(ctx, r.x() + (r.w() - w) / 2.0, r.y() + r.h() / 2.0, label, type_size::XS, Weight::Medium, fg);
+        }
+    }
+    ctx.pop();
+    if !tip.is_empty() {
+        ctx.tooltip(id, tip.to_string());
+    }
+}
+
+fn percent(v: u16) -> String {
+    format!("{}%", (v as u32 * 100 + 32) / 64)
+}
+
+/// The Aa pop-up (§7): text size and zoom steppers with a reset, the
+/// theme, the reading width. Remembered per site and persona.
+fn reading_controls(ctx: &mut Ctx, r: Rect, p: trail::ReadingPrefs, site: &str, st: &Mutable<Shell>) {
+    use trail::{ReadingPrefs as R, Theme};
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
+    let x = r.x() + 16.0;
+    let right = r.x() + r.w() - 16.0;
+    let mut y = r.y() + 12.0;
+    text(ctx, x, y + 10.0, "Reading", type_size::SM, Weight::Semibold, t.text_primary());
+    y += 30.0;
+    let stepper = |ctx: &mut Ctx, y: f32, name: &str, v: u16, f: fn(&mut R, Option<bool>)| {
+        let t = ctx.theme;
+        text(ctx, x, y + 14.0, name, type_size::XS, Weight::Medium, t.text_secondary());
+        let bx = right - 172.0;
+        let (a, b, c) = (st.clone(), st.clone(), st.clone());
+        small_button(ctx, Rect::new(bx, y, 28.0, 28.0), Some(ph::MINUS), "", false, &format!("Smaller {}", name.to_lowercase()), move || with(&a, |s| s.reading_change(|r| f(r, Some(false)))));
+        let vs = sans(type_size::SM, Weight::Semibold, t.text_primary());
+        let label = percent(v);
+        let w = width(&label, &vs);
+        text(ctx, bx + 28.0 + (56.0 - w) / 2.0, y + 14.0, &label, type_size::SM, Weight::Semibold, t.text_primary());
+        small_button(ctx, Rect::new(bx + 84.0, y, 28.0, 28.0), Some(ph::PLUS), "", false, &format!("Larger {}", name.to_lowercase()), move || with(&b, |s| s.reading_change(|r| f(r, Some(true)))));
+        small_button(ctx, Rect::new(bx + 120.0, y, 52.0, 28.0), None, "Reset", false, "", move || with(&c, |s| s.reading_change(|r| f(r, None))));
+    };
+    stepper(ctx, y, "Text size", p.text_64, |r, up| r.text_64 = up.map_or(64, |u| R::step(r.text_64, u)));
+    y += 38.0;
+    stepper(ctx, y, "Zoom", p.zoom_64, |r, up| r.zoom_64 = up.map_or(64, |u| R::step_zoom(r.zoom_64, u)));
+    y += 42.0;
+    text(ctx, x, y + 14.0, "Theme", type_size::XS, Weight::Medium, t.text_secondary());
+    let mut bx = right - 196.0;
+    for (theme, label, w) in [(Theme::System, "System", 72.0), (Theme::Light, "Light", 58.0), (Theme::Dark, "Dark", 58.0)] {
+        let s2 = st.clone();
+        let tip = if theme == Theme::System { "Follow the desktop's appearance" } else { "" };
+        small_button(ctx, Rect::new(bx, y, w, 28.0), None, label, p.theme == theme, tip, move || with(&s2, |s| s.reading_change(|r| r.theme = theme)));
+        bx += w + 4.0;
+    }
+    y += 38.0;
+    text(ctx, x, y + 14.0, "Width", type_size::XS, Weight::Medium, t.text_secondary());
+    let mut bx = right - 196.0;
+    for (comfortable, label, w) in [(false, "Full", 72.0), (true, "Comfortable", 120.0)] {
+        let s2 = st.clone();
+        let tip = if comfortable { "About 70 characters a line, centred" } else { "" };
+        small_button(ctx, Rect::new(bx, y, w, 28.0), None, label, p.comfortable == comfortable, tip, move || with(&s2, |s| s.reading_change(|r| r.comfortable = comfortable)));
+        bx += w + 4.0;
+    }
+    y += 44.0;
+    let ns = sans(type_size::XXS, Weight::Regular, t.text_tertiary());
+    text(ctx, x, y + 6.0, &fit(&format!("Remembered for {site} in this persona."), &ns, r.w() - 32.0), type_size::XXS, Weight::Regular, t.text_tertiary());
+}
+
+/// The find bar (§7), under the toolbar: the field, "n of m" as the page
+/// worker counts them, previous and next, close.
+fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_surface(), 0.0);
+    rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
+    let fw = 320.0f32.min(r.w() - 220.0).max(120.0);
+    text_field(ctx, Rect::new(r.x() + 12.0, r.y() + 6.0, fw, 28.0), &f.edit, "Find in page");
+    let x = r.x() + 24.0 + fw;
+    let what = if f.edit.text().is_empty() {
+        String::new()
+    } else if !f.answered {
+        "…".into()
+    } else if f.count == 0 {
+        "No matches".into()
+    } else if f.count >= limen::doc_viewer::FOUND_MAX {
+        format!("{} of {}+", f.current, f.count)
+    } else {
+        format!("{} of {}", f.current, f.count)
+    };
+    let c = if f.answered && f.count == 0 && !f.edit.text().is_empty() { t.danger_fg() } else { t.text_secondary() };
+    text(ctx, x, r.y() + 20.0, &what, type_size::XS, Weight::Medium, c);
+    let has = f.count > 0;
+    let (a, b, c2) = (st.clone(), st.clone(), st.clone());
+    let enter = |up: bool| pergola::Modifiers { shift: up, ..Default::default() };
+    icon_button(ctx, x + 96.0, r.y() + 6.0, ph::CARET_UP, has, t.text_secondary(), "Previous match (Shift-Enter)", move || with(&a, |s| { s.find_key(pergola::Key::Enter, enter(true), ""); }));
+    icon_button(ctx, x + 126.0, r.y() + 6.0, ph::CARET_DOWN, has, t.text_secondary(), "Next match (Enter)", move || with(&b, |s| { s.find_key(pergola::Key::Enter, enter(false), ""); }));
+    icon_button(ctx, r.x() + r.w() - 40.0, r.y() + 6.0, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&c2, |s| s.close_find()));
+}
+
+// -- the history view (§5.5) ---------------------------------------------------------
+
+/// Ctrl-H: every page of the open trails and of Earlier, newest first,
+/// by day; a filter; a press goes to the page, in its trail.
+fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    let r = g.page;
+    rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_canvas(), 0.0);
+    let Some(h) = &s.history else { return };
+    let col = 720.0f32.min(r.w() - 64.0);
+    let x = r.x() + ((r.w() - col) / 2.0).max(32.0);
+    let mut y = r.y() + 24.0;
+    text(ctx, x, y + 12.0, "History", type_size::XL, Weight::Semibold, t.text_primary());
+    let st2 = st.clone();
+    icon_button(ctx, x + col - 28.0, y, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&st2, |s| s.history = None));
+    y += 40.0;
+    text_field(ctx, Rect::new(x, y, col, 32.0), &h.edit, "Filter by title or address");
+    y += 48.0;
+    let rows = s.history_rows();
+    if rows.is_empty() {
+        let msg = if h.edit.text().is_empty() { "Nothing yet. Pages you open in recorded trails are listed here." } else { "No page matches." };
+        text(ctx, x, y + 10.0, msg, type_size::SM, Weight::Regular, t.text_secondary());
+        return;
+    }
+    let now = crate::clock::now_s();
+    let mut day = String::new();
+    let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
+    let us = TextStyle { family: font::MONO.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() };
+    for (i, row) in rows.iter().enumerate() {
+        let d = if row.at_s == 0 { "Earlier".to_string() } else { crate::clock::day_label(row.at_s, now) };
+        if d != day {
+            if y + HIST_DAY + shell::HIST_ROW > r.y() + r.h() {
+                break;
+            }
+            text(ctx, x, y + 16.0, &d.to_uppercase(), type_size::XXS, Weight::Semibold, t.text_tertiary());
+            y += shell::HIST_DAY;
+            day = d;
+        }
+        if y + shell::HIST_ROW > r.y() + r.h() {
+            break;
+        }
+        let st2 = st.clone();
+        let row2 = row.clone();
+        let fill = if i == h.selected { t.state_hover() } else { Color::TRANSPARENT };
+        area(ctx, Rect::new(x - 8.0, y, col + 16.0, shell::HIST_ROW), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.open_history_row(&row2)));
+        monogram(ctx, x, y + 7.0, &row.url, false);
+        text(ctx, x + 30.0, y + 17.0, &fit(&row.title, &ts, col * 0.45), type_size::SM, Weight::Medium, t.text_primary());
+        let ux = x + 40.0 + col * 0.45;
+        ctx.add(Node::Text { rect: Rect::new(ux, y + 9.0, 0.0, 16.0), content: fit(&row.url, &us, col - (ux - x) - 110.0), style: us.clone() });
+        let when = if row.at_s == 0 { String::new() } else { crate::clock::when_label(row.at_s, now).rsplit(' ').next().unwrap_or("").to_string() };
+        let label = match row.place {
+            crate::history::Place::Open(_) => when,
+            crate::history::Place::Earlier(_) => format!("put away · {when}"),
+        };
+        let ls = sans(type_size::XS, Weight::Regular, t.text_tertiary());
+        let lw = width(&label, &ls);
+        text(ctx, x + col - lw, y + 17.0, &label, type_size::XS, Weight::Regular, t.text_tertiary());
+        ctx.pop();
+        y += shell::HIST_ROW;
+    }
 }
 
 // -- the prompt row ---------------------------------------------------------------

@@ -1197,4 +1197,63 @@ Each step runs in the VM on headless frescod before the next.
      2026-11-14. The one miss was the check itself, which read the first navigatord's log
      after the parking section had restarted it. The line was in the second log, and the
      check now reads both.
-7. **Reading controls, find, history view, keyboard map, accessibility tree.**
+7. **Reading controls, find, history view, keyboard map, accessibility tree.** Built
+   2026-11-14.
+   - **Reading controls** (§7). The Aa button opens a pop-up window (fresco-popups.md, so it
+     sits above the page's window; drawn in the window where there is no frescod). Text size
+     (50% to 300%) and zoom (Pergola's zoom levels, 25% to 500%) are steppers with a reset;
+     the theme is System, Light or Dark; the width is Full or Comfortable.
+     - Choices are `ReadingPrefs` in the trail store, per (persona jar, registrable domain).
+       Only the Personal persona's go to disk (`reading` in trails.json, clamped on load);
+       an Unrecorded trail's stay in memory. The defaults are not stored.
+     - The page child gets them in `Open` and `SetReading` (limen `Reading`). It lays the page
+       out again from the converted document it already has, keeping its place: text size
+       through the cascade's `text_scale_64`, zoom through its ScrollView, Comfortable as a
+       measure of 680 px × text size × zoom, centred.
+     - Ctrl-plus, Ctrl-minus, Ctrl-0 and pinch in the page stay the ScrollView's. Once a zoom
+       settles the child lays out again and sends `Zoomed`, and the UI remembers it. With the
+       chrome focused the same keys step the remembered zoom.
+   - **Find** (§7). Ctrl-F opens a bar under the toolbar that pushes the page down (and
+     restarts the prompt row's 500 ms). Typing sends `Find { query, step: 0 }`, Enter step 1,
+     Shift-Enter step -1, Esc an empty query. The child searches the page's laid-out text
+     runs case-folded (`navigator_render::find`), scrolls the match a third of the way down,
+     marks it, and answers `Found { count, current, rect }`: counts and a rect, never text.
+     A match across two text runs is not found yet. Showing another page closes find.
+   - **History view** (§5.5). Ctrl-H draws it where the page is, with the page's window
+     withdrawn (`hide(PAGE_SLOT)`) and the prompt row hidden. It lists the pages of open
+     trails and Earlier, newest first, by day (`Page::at_s`, now in the store), once per
+     address. Unrecorded trails are left out. Typing filters by title or address, Up and
+     Down move, Enter or a press goes to the page in its trail, bringing an Earlier trail
+     back, so it opens as the version navigatord stored. Not yet: "Fetch the current
+     version", and clearing by day or site.
+   - **Keyboard map** (§9). Ctrl-F, Ctrl-H and Ctrl-plus/minus/0 are added; Escape closes
+     what is on top (a pop-up, the Where field, history, find). With the page focused, the
+     child hands back keys it does not use as limen `Key` (Ctrl or Alt with a key, Escape),
+     and the UI runs them through the same map, so the child can do no more than a press in
+     the chrome. For the shortcuts that open a field in the chrome (Ctrl-F, Ctrl-L, Ctrl-H,
+     Ctrl-T, Ctrl-Shift-N) the child also gives the chrome the keyboard focus with frescod's
+     new `OP_WINDOW_FOCUS_PARENT`, which works only for the caller's own embedded window
+     while it has the focus.
+     - Found in the VM run: a press in the page does not give the child the keyboard today.
+       forum-wm moves focus on a click to top-level surfaces only, and an embedded child is
+       not one, so keys (arrows, Ctrl-plus in the ScrollView) stay with the chrome, which is
+       why every §9 key works there. Focusing the slot's child on a press inside it (limen.md
+       §6) is frescod and Forum work still to do; the hand-back above is ready for it and
+       unit-tested.
+     - Not yet: F6 (Pergola has no function keys).
+   - **Accessibility tree** (§10). `navigator_ui::ax` builds the window's tree in atrium-ax's
+     roles: the rail a `tree` with each trail an item and the current one's path nested, the
+     toolbar a `toolbar` (the Where field a `combo-box`, presence and Keep `switch`es), the
+     find bar and the prompt row polite live regions, the page an `embedded-content` node
+     (hidden under the history view), the Aa pop-up a `dialog`, history a `document` with a
+     `list`. There is no atrium-ax daemon or Pergola publisher yet, so the tree is checked by
+     unit tests and logged with `NAVIGATOR_UI_AX=1`.
+   - Checked by unit tests (navigator-ui 42, limen doc_viewer, navigator-render find,
+     fresco-scene-server `an_embed_gives_focus_back_to_its_parent_only`), the scenes
+     `reading` and `history` in `scripts/navigator-ui-vm.sh`, and `scripts/navigator-live-vm.sh`
+     §"step 7". The whole script ran 52/52 on 2026-11-14. Its first run (50/54) found a
+     resend bug: the UI wrote its state back only when a tick changed something, so a request
+     taken from the outbox was sent again every tick until then (Enter stepped three matches).
+   - Not yet, beyond the above: the find mark sits a few px short on bold text (the search
+     measures runs as laid out but the mark is a run-relative rect); "Jump to section" from
+     the anchors list.

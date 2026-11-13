@@ -135,6 +135,12 @@ pub mod control {
     /// window id, as `OP_POPUP_CREATE` answers. It grabs, and cannot be
     /// placed again: a closed one is destroyed and claimed anew.
     pub const OP_POPUP_CLAIM:           u16 = 0x050a;
+    /// An embedded child gives the keyboard focus back to the window it
+    /// is embedded in (limen.md §6: Tab past its end, or a chrome shortcut
+    /// such as the Navigator's Ctrl-F): `WindowFocusParentPayload`, no
+    /// reply. Only while that child has the focus; it can give focus
+    /// away, never take it.
+    pub const OP_WINDOW_FOCUS_PARENT:   u16 = 0x050b;
 
     /// Deadline-lane sponsorship request (scheduler federation §1.1,
     /// Laminar phase J): the client asks frescod — the vblank deadline
@@ -981,6 +987,12 @@ pub struct WindowHints {
 /// the toolkit may want to confirm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowRequestClosePayload {
+    pub window_id: u32,
+}
+
+/// `OP_WINDOW_FOCUS_PARENT`: the caller's embedded window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowFocusParentPayload {
     pub window_id: u32,
 }
 

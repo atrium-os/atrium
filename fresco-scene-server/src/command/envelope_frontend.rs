@@ -44,7 +44,7 @@ use fresco_protocol::{
     RectParams, TextureParams, PathParams, GlyphRunParams, FillParams, FillTransformParams,
     WindowCreatePayload, WindowDestroyPayload,
     WindowSetTitlePayload, WindowSetHintsPayload,
-    WindowRequestClosePayload, WindowPresentPayload,
+    WindowRequestClosePayload, WindowPresentPayload, WindowFocusParentPayload,
     WindowPresentDamagePayload, DamageRect,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse, DisplayInfoResponse,
@@ -697,6 +697,7 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_SET_TITLE     => self.handle_window_set_title(msg),
             control::OP_WINDOW_SET_HINTS     => self.handle_window_set_hints(msg),
             control::OP_WINDOW_REQUEST_CLOSE => self.handle_window_request_close(msg),
+            control::OP_WINDOW_FOCUS_PARENT  => self.handle_window_focus_parent(msg),
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
             control::OP_POPUP_CREATE         => self.handle_popup_create(msg),
@@ -1788,6 +1789,18 @@ impl EnvelopeFrontend {
         if ok {
             drop(comp);
             self.forget_window(p.window_id);
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_window_focus_parent(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: WindowFocusParentPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let id = u16::try_from(p.window_id).map_err(|_| DispatchError::UnknownWindow)?;
+        if !self.compositor.lock().unwrap().focus_parent(id, self.current_client as u32) {
+            eprintln!("frescod: client {} may not give focus from window {}", self.current_client, p.window_id);
         }
         Ok(Vec::new())
     }

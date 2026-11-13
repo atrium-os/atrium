@@ -24,6 +24,14 @@ pub const STATUS: f32 = 24.0;
 pub const DROP_ROW: f32 = 30.0;
 pub const DROP_LABEL: f32 = 22.0;
 pub const POPOVER_W: f32 = 380.0;
+/// The find bar's height (§7), under the toolbar.
+pub const FIND: f32 = 40.0;
+/// The Aa pop-up (§7).
+pub const READING_W: f32 = 300.0;
+pub const READING_H: f32 = 236.0;
+/// The history view's rows and day labels (§5.5).
+pub const HIST_ROW: f32 = 34.0;
+pub const HIST_DAY: f32 = 28.0;
 
 /// The page slot's key (pergola::slot): where Limen binds the page.
 pub const PAGE_SLOT: u64 = 0x5041_4745; // "PAGE"
@@ -34,6 +42,25 @@ pub struct WhereEdit {
     pub edit: TextEdit,
     /// The highlighted suggestion (arrow keys, hover), if any.
     pub selected: Option<usize>,
+}
+
+/// The find bar (§7): what is typed, and what the page child said of it.
+#[derive(Clone, Debug)]
+pub struct FindBar {
+    pub edit: TextEdit,
+    /// The page it finds in: another page shown closes it.
+    pub key: Option<(u64, PageId)>,
+    pub count: u32,
+    pub current: u32,
+    /// Whether the page has answered since the last change.
+    pub answered: bool,
+}
+
+/// The history view (§5.5): its filter and the highlighted row.
+#[derive(Clone, Debug)]
+pub struct HistoryView {
+    pub edit: TextEdit,
+    pub selected: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +90,12 @@ pub struct Shell {
     /// Where the prompt row was last drawn: a row that moves starts its
     /// 500 ms again (§6.4).
     pub prompt_at: Option<Rect>,
+    /// Ctrl-F (§7).
+    pub find: Option<FindBar>,
+    /// The Aa pop-up is open (§7).
+    pub reading_open: bool,
+    /// Ctrl-H (§5.5): drawn where the page is, the page's slot withdrawn.
+    pub history: Option<HistoryView>,
 }
 
 /// The live page's state, as navigatord and the page child reported it.
@@ -90,6 +123,8 @@ pub enum Out {
     Discard { id: u32 },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand },
+    /// Find in the page on screen (§7; limen `ToChild::Find`).
+    Find { query: String, step: i8 },
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -117,13 +152,18 @@ pub struct Geo {
     /// The suggestion list, while the Where field is typed in.
     pub drop: Option<Rect>,
     pub popover: Option<Rect>,
+    /// The find bar, under the toolbar.
+    pub find: Option<Rect>,
+    /// The Aa pop-up, and the Aa button it hangs from.
+    pub reading: Option<Rect>,
+    pub aa: Rect,
     /// Space on the toolbar for the current page's media glyph.
     pub media: bool,
 }
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -203,6 +243,36 @@ impl Shell {
                 s.status_bar = true;
                 s.hover_hint = Some("https://n0rthbank.example/login".into());
             }
+            fake::Scene::Reading => {
+                s.reading_change(|r| {
+                    r.text_64 = 80;
+                    r.comfortable = true;
+                });
+                s.reading_open = true;
+                s.open_find();
+                if let Some(f) = &mut s.find {
+                    f.edit.set_text("atrium");
+                    (f.count, f.current) = (4, 2);
+                }
+            }
+            fake::Scene::History => {
+                let now = crate::clock::now_s();
+                // Spread the stand-in pages over a few days.
+                for (i, t) in s.store.trails.iter_mut().enumerate() {
+                    for (j, p) in t.pages.iter_mut().enumerate() {
+                        p.at_s = now.saturating_sub(i as u64 * 86_400 + j as u64 * 1_400);
+                    }
+                }
+                for (i, e) in s.store.earlier.iter_mut().enumerate() {
+                    for (j, p) in e.trail.pages.iter_mut().enumerate() {
+                        p.at_s = e.at_s.min(now).saturating_sub(i as u64 * 3_600 + j as u64 * 600);
+                    }
+                }
+                s.open_history();
+                if let Some(h) = &mut s.history {
+                    h.selected = 1;
+                }
+            }
             fake::Scene::Prompt | fake::Scene::Stop => {}
         }
         s
@@ -229,7 +299,12 @@ impl Shell {
         let where_ = Rect::new(fx, 6.0, (w - fx - right).max(160.0), 28.0);
         let mut y = BAR + 1.0;
         let page = self.store.trail().page();
-        let prompt = page.and_then(|p| p.asked.as_ref()).map(|_| {
+        let find = (self.find.is_some() && page.is_some() && self.history.is_none()).then(|| {
+            let r = Rect::new(x0, y, w - x0, FIND);
+            y += FIND;
+            r
+        });
+        let prompt = page.filter(|_| self.history.is_none()).and_then(|p| p.asked.as_ref()).map(|_| {
             let r = Rect::new(x0, y, w - x0, PROMPT);
             y += PROMPT;
             r
@@ -243,7 +318,10 @@ impl Shell {
         });
         let popover = (self.popover && self.store.trail().page().is_some())
             .then(|| Rect::new(where_.x(), BAR + 4.0, POPOVER_W.min(w - where_.x() - 8.0), popover_height(self)));
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, media }
+        let aa = Rect::new(w - 104.0, 6.0, 28.0, 28.0);
+        let reading = (self.reading_open && self.store.trail().page().is_some())
+            .then(|| Rect::new((aa.x() + aa.w() - READING_W).max(x0 + 8.0), BAR + 4.0, READING_W, READING_H));
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -389,12 +467,16 @@ impl Shell {
         let g = self.geo();
         let Some(r) = g.prompt else { return false };
         let over = |o: Option<Rect>| o.is_some_and(|o| o.x() < r.x() + r.w() && r.x() < o.x() + o.w() && o.y() < r.y() + r.h() && r.y() < o.y() + o.h());
-        over(g.drop) || over(g.popover)
+        over(g.drop) || over(g.popover) || over(g.reading)
     }
 
     /// Called every frame: a prompt row that moved, or is covered, starts
     /// its 500 ms again. Returns whether anything changed.
     pub fn settle(&mut self, now: f64) -> bool {
+        // Find belongs to the page it was opened on.
+        if self.find.as_ref().is_some_and(|f| f.key != self.shown_key()) {
+            self.find = None;
+        }
         let at = self.geo().prompt;
         let covered = self.prompt_obscured();
         let moved = at != self.prompt_at;
@@ -497,6 +579,10 @@ impl Shell {
 
     pub fn apply(&mut self, a: Action, _now: f64) {
         self.popover = false;
+        self.reading_open = false;
+        if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail) {
+            self.history = None;
+        }
         match a {
             Action::FocusWhere => self.begin_edit(),
             Action::NewTrail => self.new_trail(false),
@@ -538,7 +624,156 @@ impl Shell {
                 self.toggle_mute(c);
             }
             Action::ToggleStatus => self.status_bar = !self.status_bar,
+            Action::Find => self.open_find(),
+            Action::History => {
+                if self.history.take().is_none() {
+                    self.open_history();
+                }
+            }
+            Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
+                let mut r = self.store.reading();
+                r.zoom_64 = match a {
+                    Action::ZoomIn => crate::trail::ReadingPrefs::step_zoom(r.zoom_64, true),
+                    Action::ZoomOut => crate::trail::ReadingPrefs::step_zoom(r.zoom_64, false),
+                    _ => 64,
+                };
+                self.store.set_reading(r);
+            }
         }
+    }
+
+    // -- Escape ------------------------------------------------------------
+
+    /// Escape closes what is on top: a pop-up, then the Where field, then
+    /// the history view, then find. Returns whether it closed anything.
+    pub fn escape(&mut self) -> bool {
+        if self.popover || self.reading_open {
+            self.popover = false;
+            self.reading_open = false;
+        } else if self.editing.is_some() {
+            self.end_edit();
+        } else if self.history.is_some() {
+            self.history = None;
+        } else if self.find.is_some() {
+            self.close_find();
+        } else {
+            return false;
+        }
+        true
+    }
+
+    // -- reading controls (§7) ---------------------------------------------
+
+    /// Change the current site's reading choices (the Aa pop-up).
+    pub fn reading_change(&mut self, f: impl FnOnce(&mut crate::trail::ReadingPrefs)) {
+        let mut r = self.store.reading();
+        f(&mut r);
+        self.store.set_reading(r);
+    }
+
+    // -- find (§7) -----------------------------------------------------------
+
+    /// Ctrl-F: the find bar, its text selected (what was looked for last
+    /// on this page stays).
+    pub fn open_find(&mut self) {
+        if self.store.trail().page().is_none() {
+            return;
+        }
+        self.end_edit();
+        let key = self.shown_key();
+        match &mut self.find {
+            Some(f) if f.key == key => f.edit.select_all(),
+            _ => self.find = Some(FindBar { edit: TextEdit::new(""), key, count: 0, current: 0, answered: true }),
+        }
+    }
+
+    /// Esc on the find bar: closed, and the page's mark cleared.
+    pub fn close_find(&mut self) {
+        if self.find.take().is_some() {
+            self.outbox.push(Out::Find { query: String::new(), step: 0 });
+        }
+    }
+
+    /// The page child's answer.
+    pub fn found(&mut self, count: u32, current: u32) {
+        if let Some(f) = &mut self.find {
+            (f.count, f.current, f.answered) = (count, current, true);
+        }
+    }
+
+    /// A key while the find bar has the keys: typing finds from the top
+    /// of the view, Enter the next match, Shift-Enter the one before.
+    pub fn find_key(&mut self, key: Key, m: Modifiers, chars: &str) -> bool {
+        let Some(f) = &mut self.find else { return false };
+        let step = match key {
+            Key::Escape => {
+                self.close_find();
+                return true;
+            }
+            Key::Enter => if m.shift { -1 } else { 1 },
+            _ => match f.edit.key(key, m, chars) {
+                KeyOutcome::Changed => 0,
+                KeyOutcome::Submit => if m.shift { -1 } else { 1 },
+                KeyOutcome::Copy(t) => {
+                    let _ = pergola::clipboard::copy_text(&t, false);
+                    return true;
+                }
+                KeyOutcome::Paste | KeyOutcome::Ignored => return false,
+            },
+        };
+        let query: String = f.edit.text().chars().filter(|c| !c.is_control()).collect();
+        let query = limen::doc_viewer::cut(&query, limen::doc_viewer::QUERY_MAX);
+        if query.is_empty() {
+            (f.count, f.current) = (0, 0);
+        }
+        f.answered = query.is_empty();
+        self.outbox.push(Out::Find { query, step });
+        true
+    }
+
+    // -- the history view (§5.5) ---------------------------------------------
+
+    pub fn open_history(&mut self) {
+        self.end_edit();
+        self.popover = false;
+        self.reading_open = false;
+        self.history = Some(HistoryView { edit: TextEdit::new(""), selected: 0 });
+    }
+
+    pub fn history_rows(&self) -> Vec<crate::history::Row> {
+        self.history.as_ref().map_or_else(Vec::new, |h| crate::history::rows(&self.store, h.edit.text()))
+    }
+
+    /// A row pressed (or Enter on it): its page, in its trail.
+    pub fn open_history_row(&mut self, r: &crate::history::Row) {
+        self.history = None;
+        if crate::history::open(&mut self.store, r) {
+            self.last_note = Some(format!("history: opened {}", r.url));
+        }
+    }
+
+    /// A key in the history view: typing filters, Up and Down move,
+    /// Enter opens, Escape closes.
+    pub fn history_key(&mut self, key: Key, m: Modifiers, chars: &str) -> bool {
+        let n = self.history_rows().len();
+        let Some(h) = &mut self.history else { return false };
+        match key {
+            Key::Escape => self.history = None,
+            Key::Down => h.selected = (h.selected + 1).min(n.saturating_sub(1)),
+            Key::Up => h.selected = h.selected.saturating_sub(1),
+            Key::Enter => {
+                let at = h.selected;
+                if let Some(r) = self.history_rows().get(at).cloned() {
+                    self.open_history_row(&r);
+                }
+            }
+            _ => match h.edit.key(key, m, chars) {
+                KeyOutcome::Changed => h.selected = 0,
+                KeyOutcome::Ignored | KeyOutcome::Paste => return false,
+                _ => {}
+            },
+        }
+        true
     }
 
     /// A trail on Start has its Where field focused.
@@ -566,6 +801,9 @@ impl Shell {
         }
         if self.popover && !inside(g.popover) && !inside(Some(chip_rect(&g))) {
             self.popover = false;
+        }
+        if self.reading_open && !inside(g.reading) && !inside(Some(g.aa)) {
+            self.reading_open = false;
         }
     }
 }
@@ -710,6 +948,74 @@ mod tests {
         assert!(s.geo().prompt.is_none());
         s.activate(&links[0], 2000.0);
         assert_ne!(s.store.trail().current, cur);
+    }
+
+    #[test]
+    fn find_asks_the_page_and_shows_its_count() {
+        let mut s = shell();
+        let none = Modifiers::default();
+        s.apply(Action::Find, 0.0);
+        assert!(s.find.is_some() && s.geo().find.is_some());
+        assert!(s.geo().page.y() > BAR + FIND, "the bar pushes the page down");
+        for c in ["a", "t"] {
+            s.find_key(Key::Char, none, c);
+        }
+        assert_eq!(s.outbox.last(), Some(&Out::Find { query: "at".into(), step: 0 }));
+        assert!(!s.find.as_ref().unwrap().answered);
+        s.found(3, 1);
+        s.find_key(Key::Enter, none, "");
+        assert_eq!(s.outbox.last(), Some(&Out::Find { query: "at".into(), step: 1 }));
+        s.find_key(Key::Enter, Modifiers { shift: true, ..none }, "");
+        assert_eq!(s.outbox.last(), Some(&Out::Find { query: "at".into(), step: -1 }));
+        // Another page shown: find closes with it.
+        s.store.trail_mut().back();
+        s.settle(0.0);
+        assert!(s.find.is_none());
+        s.apply(Action::Find, 0.0);
+        assert!(s.escape());
+        assert!(s.find.is_none());
+        assert_eq!(s.outbox.last(), Some(&Out::Find { query: String::new(), step: 0 }), "Esc clears the page's mark");
+    }
+
+    #[test]
+    fn reading_choices_are_per_site_and_zoom_keys_step() {
+        let mut s = shell();
+        let url = s.shown_url().unwrap();
+        s.reading_change(|r| r.text_64 = crate::trail::ReadingPrefs::step(r.text_64, true));
+        assert_eq!(s.store.reading().text_64, 72);
+        s.apply(Action::ZoomIn, 0.0);
+        s.apply(Action::ZoomIn, 0.0);
+        assert_eq!(s.store.reading().zoom_64, 80, "110% then 125%");
+        s.apply(Action::ZoomReset, 0.0);
+        assert_eq!(s.store.reading().zoom_64, 64);
+        let t = s.store.trail().id;
+        assert_eq!(s.store.reading_of(t, &url).text_64, 72);
+        assert_eq!(s.store.reading_of(t, "https://elsewhere.example/").text_64, 64, "another site keeps its own");
+        s.reading_open = true;
+        assert!(s.geo().reading.is_some());
+        s.apply(Action::Back, 0.0);
+        assert!(!s.reading_open, "a key closes the pop-up");
+    }
+
+    #[test]
+    fn history_filters_moves_and_opens() {
+        let mut s = shell();
+        s.apply(Action::History, 0.0);
+        assert!(s.history.is_some() && s.geo().prompt.is_none());
+        let all = s.history_rows().len();
+        assert!(all > 1);
+        let pick = s.history_rows()[1].clone();
+        s.history_key(Key::Down, Modifiers::default(), "");
+        s.history_key(Key::Enter, Modifiers::default(), "");
+        assert!(s.history.is_none());
+        assert_eq!(s.shown_url().as_deref(), Some(pick.url.as_str()));
+        s.apply(Action::History, 0.0);
+        for c in "zzzz".chars() {
+            s.history_key(Key::Char, Modifiers::default(), &c.to_string());
+        }
+        assert!(s.history_rows().is_empty());
+        s.apply(Action::History, 0.0);
+        assert!(s.history.is_none(), "Ctrl-H again closes it");
     }
 
     #[test]

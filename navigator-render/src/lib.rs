@@ -14,6 +14,7 @@
 pub mod anchor;
 pub mod bands;
 pub mod conformance;
+pub mod find;
 pub mod flag;
 pub mod fontset;
 pub mod html;

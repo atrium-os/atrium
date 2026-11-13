@@ -1044,6 +1044,17 @@ impl Compositor {
 
     /// Backward-compat wrapper. New callers should prefer
     /// `destroy_with_focus_shift` so they can emit FOCUS completions.
+    /// `OP_WINDOW_FOCUS_PARENT`: `by`'s embedded window `id`, focused,
+    /// gives the focus to the window it is embedded in. Refused (false)
+    /// for another client's window, one in no slot, or one without the
+    /// focus: a child gives focus away, it never takes it.
+    pub fn focus_parent(&mut self, id: WindowId, by: ClientId) -> bool {
+        let Some(w) = self.windows.get(&id) else { return false };
+        let Some(slot) = w.slot.filter(|_| w.owner == by && self.focus == Some(id)) else { return false };
+        self.set_focus_no_raise_by(Some(slot.parent), fresco_protocol::focus_cause::KEYBOARD);
+        self.focus == Some(slot.parent)
+    }
+
     pub fn destroy(&mut self, id: WindowId, by: ClientId) -> bool {
         let allowed = self.windows.get(&id).map(|w| w.owner == by).unwrap_or(false);
         if !allowed { return false; }
@@ -1931,6 +1942,25 @@ mod notification_tests {
         assert!(c.z_order.contains(&e));
         assert!(c.destroy(p, 1));
         assert!(c.windows[&e].slot.is_none() && !c.z_order.contains(&e), "its parent went: released and hidden");
+    }
+
+    #[test]
+    fn an_embed_gives_focus_back_to_its_parent_only() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (400, 300));
+        let e = c.create(2, (10, 10));
+        let other = c.create(3, (100, 100));
+        assert!(!c.focus_parent(e, 2), "in no slot");
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([0.0, 40.0, 400.0, 260.0]), 0), Ok(()));
+        c.set_focus_no_raise(Some(other));
+        assert!(!c.focus_parent(e, 2), "it has no focus to give");
+        assert_eq!(c.focus, Some(other));
+        c.set_focus_no_raise(Some(e));
+        assert!(!c.focus_parent(e, 3), "not the caller's window");
+        assert!(!c.focus_parent(p, 1), "a parent is in no slot");
+        assert!(c.focus_parent(e, 2));
+        assert_eq!(c.focus, Some(p));
     }
 
     #[test]

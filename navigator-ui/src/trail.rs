@@ -83,6 +83,74 @@ pub enum RowMedia {
     Silent,
 }
 
+/// The page's appearance (§7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Theme {
+    /// The desktop's appearance.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// The reader's choices for a site (§7): text size and zoom in 1/64,
+/// the theme, and a comfortable reading width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadingPrefs {
+    pub text_64: u16,
+    pub zoom_64: u16,
+    pub theme: Theme,
+    pub comfortable: bool,
+}
+
+impl Default for ReadingPrefs {
+    fn default() -> Self { ReadingPrefs { text_64: 64, zoom_64: 64, theme: Theme::System, comfortable: false } }
+}
+
+/// The steps of the text size stepper, in 1/64 (50% to 300%).
+pub const READING_STEPS: &[u16] = &[32, 40, 48, 56, 64, 72, 80, 96, 112, 128, 160, 192];
+/// Zoom's bounds in 1/64: the page's ScrollView's (25% to 500%).
+pub const ZOOM_MIN_64: u16 = 16;
+pub const ZOOM_MAX_64: u16 = 320;
+
+impl ReadingPrefs {
+    pub fn clamped(mut self) -> Self {
+        self.text_64 = self.text_64.clamp(32, 192);
+        self.zoom_64 = self.zoom_64.clamp(ZOOM_MIN_64, ZOOM_MAX_64);
+        self
+    }
+
+    /// One zoom level up or down from `v`, on the levels Ctrl-plus and
+    /// Ctrl-minus take in the page (pergola's `ZOOM_STEPS`).
+    pub fn step_zoom(v: u16, up: bool) -> u16 {
+        let steps = pergola::scroll::ZOOM_STEPS.map(|z| (z * 64.0).round() as u16);
+        if up {
+            steps.iter().copied().find(|&s| s > v).unwrap_or(steps[steps.len() - 1])
+        } else {
+            steps.iter().rev().copied().find(|&s| s < v).unwrap_or(steps[0])
+        }
+    }
+
+    /// One step up or down from `v` on [`READING_STEPS`].
+    pub fn step(v: u16, up: bool) -> u16 {
+        if up {
+            READING_STEPS.iter().copied().find(|&s| s > v).unwrap_or(*READING_STEPS.last().unwrap())
+        } else {
+            READING_STEPS.iter().rev().copied().find(|&s| s < v).unwrap_or(READING_STEPS[0])
+        }
+    }
+
+    /// What the page child is told, the system appearance being `dark`.
+    pub fn for_child(&self, dark: bool) -> limen::doc_viewer::Reading {
+        let dark = match self.theme {
+            Theme::System => dark,
+            Theme::Light => false,
+            Theme::Dark => true,
+        };
+        limen::doc_viewer::Reading { text_64: self.text_64, zoom_64: self.zoom_64, dark, comfortable: self.comfortable }
+    }
+}
+
 /// A question in the prompt row (§6.4).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
@@ -178,6 +246,9 @@ pub struct Page {
     pub saved: Option<String>,
     /// How far down it was scrolled when it was parked (px).
     pub scroll: f32,
+    /// When it was opened (Unix s; 0: not known), for the history view's
+    /// days (§5.5).
+    pub at_s: u64,
 }
 
 /// What it takes to add a page (from the broker in step 2).
@@ -263,6 +334,7 @@ impl Trail {
             prompts: Prompts::default(),
             saved: None,
             scroll: 0.0,
+            at_s: crate::clock::now_s(),
         });
         if let Some(p) = parent {
             self.pages[p].children.push(id);
@@ -423,6 +495,9 @@ pub struct TrailStore {
     /// Sites that know you, per jar: "personal" or the Unrecorded trail's
     /// own jar (§6.2; one throwaway jar per Unrecorded trail).
     pub(crate) known: BTreeSet<(String, String)>,
+    /// Reading choices per jar and site (§7): only the Personal jar's are
+    /// written.
+    pub(crate) reading: std::collections::BTreeMap<(String, String), ReadingPrefs>,
     pub(crate) clock: u64,
     pub(crate) next_id: u64,
 }
@@ -436,6 +511,7 @@ impl Default for TrailStore {
             earlier: vec![],
             kept: vec![],
             known: BTreeSet::new(),
+            reading: Default::default(),
             clock: 0,
             next_id: 1,
         };
@@ -585,6 +661,33 @@ impl TrailStore {
     pub fn presence_of(&self, trail: u64, url: &str) -> Option<(navigator_control::Jar, bool)> {
         let t = self.trails.iter().find(|t| t.id == trail)?;
         Some((t.jar(), self.known.contains(&(Self::jar_of(t), site(url).to_string()))))
+    }
+
+    /// The reading choices for `url`'s site in trail `trail`'s persona
+    /// (§7), the defaults when none were made.
+    pub fn reading_of(&self, trail: u64, url: &str) -> ReadingPrefs {
+        let Some(t) = self.trails.iter().chain(self.earlier.iter().map(|e| &e.trail)).find(|t| t.id == trail) else { return ReadingPrefs::default() };
+        self.reading.get(&(Self::jar_of(t), site(url).to_string())).copied().unwrap_or_default()
+    }
+
+    /// The current page's reading choices.
+    pub fn reading(&self) -> ReadingPrefs {
+        match self.trail().page() {
+            Some(p) => self.reading_of(self.trail().id, &p.url),
+            None => ReadingPrefs::default(),
+        }
+    }
+
+    /// Change the current page's site's reading choices; the defaults are
+    /// not stored.
+    pub fn set_reading(&mut self, r: ReadingPrefs) {
+        let Some(p) = self.trail().page() else { return };
+        let key = (Self::jar_of(self.trail()), site(&p.url).to_string());
+        if r == ReadingPrefs::default() {
+            self.reading.remove(&key);
+        } else {
+            self.reading.insert(key, r.clamped());
+        }
     }
 
     /// Whether `site` knows you in the current trail's jar (§6.2).

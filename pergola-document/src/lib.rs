@@ -109,7 +109,13 @@ impl Doc {
     /// for the page's `prefers-color-scheme` rules (its colours stay its
     /// own otherwise).
     pub fn html(html: String, subs: Subresources, width: f32, height: f32, dark: bool, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
-        let src = DocumentSource::new(html, FontSet::shared()?, subs, (width as f64, height as f64), (height * 64.0) as i64).with_dark(dark);
+        Self::html_scaled(html, subs, width, height, dark, 64, images)
+    }
+
+    /// [`Doc::html`] with the reader's text size, in 1/64 (backend §4.9
+    /// item 2; 64 is the profile's own).
+    pub fn html_scaled(html: String, subs: Subresources, width: f32, height: f32, dark: bool, text_64: u32, images: impl Fn(&str) -> Option<Image> + 'static) -> Result<Self, String> {
+        let src = DocumentSource::new(html, FontSet::shared()?, subs, (width as f64, height as f64), (height * 64.0) as i64).with_dark(dark).with_text_scale(text_64);
         Self::new(Box::new(src), images)
     }
 

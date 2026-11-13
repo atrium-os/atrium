@@ -698,6 +698,13 @@ impl Connection {
             &WindowSetHintsPayload { window_id, hints })
     }
 
+    /// An embedded window, focused, gives the focus to the window it is
+    /// embedded in (`OP_WINDOW_FOCUS_PARENT`).
+    pub fn window_focus_parent(&mut self, window_id: u32) -> io::Result<()> {
+        self.send_window_managed(control::OP_WINDOW_FOCUS_PARENT,
+            &fresco_protocol::WindowFocusParentPayload { window_id })
+    }
+
     pub fn window_request_close(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_REQUEST_CLOSE,
             &WindowRequestClosePayload { window_id })

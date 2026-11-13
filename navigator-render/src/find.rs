@@ -1,0 +1,84 @@
+//! Find in page (navigator-ui.md §7): where a query's matches are in a
+//! laid-out document, as rects, never as text leaving the worker.
+//!
+//! The document is laid out whole, the same way its view lays it out
+//! (same window, zoom, text scale and appearance), and each text run of
+//! each band is searched, case folded. A match must lie inside one run:
+//! one that a line break or a change of style splits is not found.
+
+use crate::bands::Banded;
+use crate::fontset::FontSet;
+use crate::{Subresources, U};
+use navigator_style::cascade::Env;
+
+/// 1/64 px.
+const PX: f64 = 64.0;
+
+/// Each match of `query` in `html` laid out at `env`, in document order,
+/// as `[x, y, w, h]` in CSS px from the document's top left; at most `max`.
+pub fn find(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, query: &str, max: usize) -> Vec<[f32; 4]> {
+    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if q.is_empty() || max == 0 {
+        return vec![];
+    }
+    let mut b = Banded::new(html, fonts, env, subs, (env.height_px * PX) as U);
+    let mut out = Vec::new();
+    let mut k = 0;
+    while out.len() < max {
+        if !b.ensure(k) {
+            if b.scene(k).is_none() {
+                break;
+            }
+        }
+        let Some(scene) = b.scene(k) else { break };
+        let mut runs: Vec<&crate::Run> = scene.runs.iter().collect();
+        runs.sort_by_key(|r| (r.y, r.x));
+        for r in runs {
+            matches_in(r, &q, &mut out, max);
+            if out.len() >= max {
+                break;
+            }
+        }
+        b.evict(k);
+        k += 1;
+    }
+    out
+}
+
+/// The matches of `q` (folded) in one run.
+fn matches_in(r: &crate::Run, q: &[char], out: &mut Vec<[f32; 4]>, max: usize) {
+    let chars: Vec<char> = r.text.chars().collect();
+    // Folding can change the length (ß, İ): only fold when it keeps it,
+    // so indexes still name the run's characters.
+    let folded: Vec<char> = chars.iter().map(|c| c.to_lowercase().next().unwrap_or(*c)).collect();
+    if folded.len() < q.len() {
+        return;
+    }
+    let n = chars.len();
+    let size = r.size as f64 / PX;
+    // Where each character starts: the glyph's offset when there is one
+    // glyph per character, else in proportion along the run.
+    let width = r.glyphs.last().map_or(0.0, |g| g.1 as f64 / PX) + size * 0.55;
+    let at = |i: usize| -> f64 {
+        if r.glyphs.len() == n {
+            if i < n { r.glyphs[i].1 as f64 / PX } else { width }
+        } else {
+            width * i as f64 / n.max(1) as f64
+        }
+    };
+    let mut i = 0;
+    while i + q.len() <= n {
+        if folded[i..i + q.len()] == *q {
+            let x0 = r.x as f64 / PX + at(i);
+            let x1 = r.x as f64 / PX + at(i + q.len());
+            let top = r.y as f64 / PX - size * 0.85;
+            out.push([x0 as f32, top as f32, (x1 - x0).max(1.0) as f32, (size * 1.1) as f32]);
+            if out.len() >= max {
+                return;
+            }
+            i += q.len();
+        } else {
+            i += 1;
+        }
+    }
+}

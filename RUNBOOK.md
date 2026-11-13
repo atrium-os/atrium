@@ -5612,9 +5612,9 @@ Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coo
 forum-wm's placement (window top at y 62 with no bar running). By hand:
 `FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
 
-### 13.6d Navigator: live pages, trails on disk, parking, prompts (`scripts/navigator-live-vm.sh`)
+### 13.6d Navigator: live pages, trails on disk, parking, prompts, reading and find (`scripts/navigator-live-vm.sh`)
 
-Steps 2 to 6 of docs/spec/navigator-ui.md §14. With the VM up:
+Steps 2 to 7 of docs/spec/navigator-ui.md §14. With the VM up:
 
     sh scripts/navigator-live-vm.sh [out-dir]       # ~20 min under TCG, BUILD=0 skips the cross-build
 
@@ -5665,6 +5665,16 @@ clicks. `scripts/island-probe-vm.sh` (logs in `$OUT`, default /tmp) deploys the 
 full session with Forum, and fail without one. frescod's unit tests run only on FreeBSD: cross-build
 them with `cargo test --release --target aarch64-unknown-freebsd --no-run`, then copy and run the binary
 in the VM (61/61).
+
+Step 7 runs last (ui9.log, with `NAVIGATOR_UI_AX=1` so the accessibility tree is logged as `ax` lines):
+Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in limend.log, the UI's
+`find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
+coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
+the child's `laid out again: text 112%` and the `reading` record in trails.json; Ctrl-plus; Ctrl-H,
+typing `impl` and Enter opening Impluvium from history. Keys are injected with the press held 1 s, and
+a press in the page leaves the keyboard with the chrome (forum-wm focuses top-level surfaces only).
+The scenes `reading` and `history` in `scripts/navigator-ui-vm.sh` (`SCENES="reading history" DRIVE=0`)
+show the Aa pop-up as a real frescod pop-up window and the history view.
 
 Don't run host builds while a VM script runs: under TCG they starve the guest (ssh times out in banner
 exchange). A full host disk hangs the guest outright. Free `*/target/debug` first, and check the image

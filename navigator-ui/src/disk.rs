@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::trail::{Facts, Kept, Media, Page, Persona, PutAway, Trail, TrailStore};
+use crate::trail::{Facts, Kept, Media, Page, Persona, PutAway, ReadingPrefs, Theme, Trail, TrailStore};
 
 pub const FORMAT: &str = "atrium-navigator-trails/1";
 pub const MAX_TRAILS: usize = 512;
@@ -46,6 +46,19 @@ struct File {
     kept: Vec<KeptRec>,
     /// Sites that know you in the Personal jar (§6.2).
     knows: Vec<String>,
+    /// Reading choices per site in the Personal jar (§7).
+    #[serde(default)]
+    reading: Vec<ReadingRec>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct ReadingRec {
+    site: String,
+    text: u16,
+    zoom: u16,
+    /// "system", "light" or "dark".
+    theme: String,
+    comfortable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -74,7 +87,12 @@ struct PageRec {
     /// Where it was scrolled to when parked (px).
     #[serde(default, skip_serializing_if = "is_zero")]
     scroll: f32,
+    /// When it was opened (Unix s).
+    #[serde(default, skip_serializing_if = "is_never")]
+    at_s: u64,
 }
+
+fn is_never(t: &u64) -> bool { *t == 0 }
 
 fn is_zero(y: &f32) -> bool { *y == 0.0 }
 
@@ -118,7 +136,7 @@ fn cut(s: &str, max: usize) -> String {
 
 fn trail_rec(t: &Trail) -> TrailRec {
     TrailRec {
-        pages: t.pages.iter().map(|p| PageRec { url: p.url.clone(), title: cut(&p.title, MAX_TITLE), search: p.search.clone(), parent: p.parent, seen: p.seen, saved: p.saved.clone(), scroll: p.scroll }).collect(),
+        pages: t.pages.iter().map(|p| PageRec { url: p.url.clone(), title: cut(&p.title, MAX_TITLE), search: p.search.clone(), parent: p.parent, seen: p.seen, saved: p.saved.clone(), scroll: p.scroll, at_s: p.at_s }).collect(),
         current: t.current,
         muted: t.muted,
         active: t.active,
@@ -158,6 +176,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
             prompts: crate::trail::Prompts::default(),
             saved,
             scroll,
+            at_s: p.at_s,
         });
         if let Some(q) = p.parent {
             t.pages[q].children.push(i);
@@ -187,6 +206,13 @@ pub fn encode(s: &TrailStore) -> String {
         earlier: s.earlier.iter().filter(|e| !e.trail.unrecorded).map(|e| EarlierRec { at_s: e.at_s, trail: trail_rec(&e.trail) }).collect(),
         kept: s.kept.iter().map(|k| KeptRec { url: k.url.clone(), title: cut(&k.title, MAX_TITLE) }).collect(),
         knows: s.known.iter().filter(|(j, _)| j == "personal").map(|(_, site)| site.clone()).collect(),
+        reading: s.reading.iter().filter(|((j, _), _)| j == "personal").map(|((_, site), r)| ReadingRec {
+            site: site.clone(),
+            text: r.text_64,
+            zoom: r.zoom_64,
+            theme: match r.theme { Theme::System => "system", Theme::Light => "light", Theme::Dark => "dark" }.into(),
+            comfortable: r.comfortable,
+        }).collect(),
     };
     serde_json::to_string_pretty(&f).expect("encodes")
 }
@@ -238,6 +264,13 @@ pub fn decode(text: &str, facts: &dyn Fn(&str) -> Facts) -> Result<(TrailStore, 
     for site in f.knows.into_iter().take(MAX_KEPT) {
         if clean(&site, 253) && !site.is_empty() {
             s.known.insert(("personal".into(), site));
+        }
+    }
+    for r in f.reading.into_iter().take(MAX_KEPT) {
+        let theme = match r.theme.as_str() { "light" => Theme::Light, "dark" => Theme::Dark, _ => Theme::System };
+        if clean(&r.site, 253) && !r.site.is_empty() {
+            let p = ReadingPrefs { text_64: r.text, zoom_64: r.zoom, theme, comfortable: r.comfortable }.clamped();
+            s.reading.insert(("personal".into(), r.site), p);
         }
     }
     if s.trails.is_empty() {
@@ -344,6 +377,28 @@ mod tests {
         assert!(dropped.is_empty());
         let p = back.trail().page().unwrap();
         assert_eq!((p.saved.as_deref(), p.scroll), (None, 0.0));
+    }
+
+    #[test]
+    fn reading_choices_and_page_times_are_kept_for_the_persona_only() {
+        use crate::trail::{ReadingPrefs, Theme};
+        let mut s = TrailStore::default();
+        s.follow(spec("https://a.example/x"));
+        s.trail_mut().page_mut().unwrap().at_s = 1_700_000_000;
+        let r = ReadingPrefs { text_64: 96, zoom_64: 80, theme: Theme::Dark, comfortable: true };
+        s.set_reading(r);
+        s.new_trail(true);
+        s.follow(spec("https://b.example/"));
+        s.set_reading(ReadingPrefs { text_64: 128, ..ReadingPrefs::default() });
+        let text = encode(&s);
+        assert!(!text.contains("b.example"), "nothing of an Unrecorded trail");
+        let (back, _) = decode(&text, &facts).unwrap();
+        let t = back.trails[0].id;
+        assert_eq!(back.reading_of(t, "https://a.example/other"), r, "per site");
+        assert_eq!(back.trails[0].pages[0].at_s, 1_700_000_000);
+        // Out of range on disk: clamped, not refused.
+        let (back, _) = decode(&text.replace("\"text\": 96", "\"text\": 9000"), &facts).unwrap();
+        assert_eq!(back.reading_of(back.trails[0].id, "https://a.example/").text_64, 192);
     }
 
     #[test]

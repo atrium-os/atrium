@@ -137,8 +137,7 @@ until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "Alt-Left w
 press $((PX + 50)) $((TOP + PY + 64 + 60))
 until_trace 'url=http://old-atlas.example/ live=shown' && ok "an http link opened (amber)" || bad "http link: $(last)"
 shot live-3-http
-# The page child has the focus now, and the Navigator's keys don't reach
-# it yet (step 7's keyboard map): Back with the toolbar.
+# Back with the toolbar (keys from the page are step 7's, below).
 press 270 $((TOP + 20))
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "back from http: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 100))
@@ -265,8 +264,63 @@ echo "--- park and restore times (TCG)"
 g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
 g "pkill -x navigator-ui; sleep 2; true"
 
+echo "=== reading, find, history, keys, accessibility (step 7)"
+last() { g "grep 'trace' $S/ui9.log | tail -1"; }
+UIENV=NAVIGATOR_UI_AX=1 ui https://atlas.example/wiki/Atrium ui9
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "step 7: first page: $(last)"
+P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
+W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
+inpage() { press $((PX + 300)) $((TOP + PY + 260)); }
+typed() { for k in "$@"; do key "$k"; done; }
+# A press in the page leaves the keyboard with the chrome (forum-wm
+# focuses top-level surfaces only), so these keys reach the UI's own map.
+# A child that has the focus hands them back (limen Key), unit-tested.
+inpage
+key 0x09 0x01               # Ctrl-F
+g "grep -q 'ax  *text-input \"Find in page\" \[focused\]' $S/ui9.log" && ok "Ctrl-F opened the find bar, focused" || bad "ctrl-f: $(g "grep -v trace $S/ui9.log | tail -3")"
+typed 0x04 0x17 0x15 0x0c 0x18 0x10    # a t r i u m
+sleep 3
+g "grep -q 'navigator-page: find: [1-9][0-9]* matches' $S/limend.log" && ok "typing in the find bar found matches in the page" || bad "find: $(g "grep 'find' $S/limend.log $S/ui9.log | tail -4")"
+N=$(g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | sed -n 's/.*find: \([0-9]*\) matches.*/\1/p')
+[ "${N:-0}" -gt 0 ] && ok "…and the chrome got a count ($N), not text" || bad "count: $(g "grep 'find:' $S/ui9.log | tail -2")"
+key 0x28                    # Enter: the next match
+g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q ', at 2' && ok "Enter went to the next match" || bad "next: $(g "grep 'find:' $S/ui9.log | tail -2")"
+shot live-10-find
+key 0x29                    # Esc
+g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q 'find: 0 matches' && ok "Esc closed find and cleared the mark" || bad "esc: $(g "grep 'find:' $S/ui9.log | tail -2")"
+# Aa: the pop-up hangs under its button, above the page's window.
+press $((W - 90)) $((TOP + 20))
+sleep "$GAP"
+shot live-11-aa
+press 1190 152              # Text size +
+g "grep -q 'reading changed: text 72 ' $S/ui9.log" && ok "Aa: a larger text size went to the page" || bad "aa text: $(g "grep -v trace $S/ui9.log | tail -3")"
+g "grep -q 'laid out again: text 112%' $S/limend.log" && ok "…which laid the page out again, without fetching it" || bad "relayout: $(g "grep 'laid out again' $S/limend.log | tail -2")"
+press 1204 270              # Comfortable
+g "grep -q 'reading changed: .* comfortable' $S/ui9.log" && ok "Aa: comfortable width" || bad "aa width: $(g "grep 'reading changed' $S/ui9.log | tail -2")"
+shot live-12-comfortable
+key 0x29                    # Esc: the pop-up goes
+sleep 3
+g "grep -q '\"site\": \"atlas.example\"' $S/trails.json" && g "grep -A2 '\"site\": \"atlas.example\"' $S/trails.json | grep -q '\"text\": 72'" \
+    && ok "the choice is remembered for the site in the trail store" || bad "store: $(g "grep -A6 reading $S/trails.json")"
+# Ctrl-plus: the remembered zoom steps (110%), and the page lays out at it.
+inpage
+key 0x2e 0x01               # Ctrl-=
+sleep 5
+g "grep -q 'reading changed: text 72 zoom 70 ' $S/ui9.log" && g "grep -q 'laid out again: .* zoom 109%' $S/limend.log" && ok "Ctrl-plus zoomed the page and the step was remembered" || bad "zoom: $(g "grep -i zoom $S/ui9.log $S/limend.log | tail -3")"
+# Ctrl-H: the history view in place of the page.
+inpage
+key 0x0b 0x01               # Ctrl-H
+g "grep -q 'history view open; the page is withdrawn' $S/ui9.log" && ok "Ctrl-H opened the history view, the page withdrawn" || bad "history: $(g "grep -v trace $S/ui9.log | tail -3")"
+shot live-13-history
+typed 0x0c 0x10 0x13 0x0f   # i m p l
+key 0x28
+until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && ok "filtering and Enter opened Impluvium from history" || bad "history open: $(last)"
+g "grep -q 'ax  *tree \"Trails\"' $S/ui9.log" && g "grep -q 'ax  *embedded-content \"Impluvium' $S/ui9.log" && g "grep -q 'ax  *document \"History' $S/ui9.log" \
+    && ok "the accessibility tree has the rail as a tree, the page slot, the history view" || bad "ax: $(g "grep ' ax ' $S/ui9.log | tail -12")"
+g "pkill -x navigator-ui; sleep 2; true"
+
 echo "=== logs"
-for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

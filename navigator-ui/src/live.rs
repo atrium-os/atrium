@@ -29,7 +29,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use limen::doc_viewer::{ToChild, ToParent};
+use limen::doc_viewer::{Reading, ToChild, ToParent};
 use navigator_control::{self as ctl, Event, Jar, LinkAction, Request, Source, Ticket};
 use pergola::embed::{EmbedId, Embeds, ParentEvent, WindowToken};
 
@@ -66,6 +66,8 @@ struct Child {
     /// person changes that, the child no longer shows the page they asked
     /// for, and is closed.
     knows: bool,
+    /// The reading choices the child was last told (§9.1).
+    reading: Reading,
 }
 
 pub struct Live {
@@ -86,6 +88,8 @@ pub struct Live {
     /// The Unrecorded jars of open trails: one that goes (its trail
     /// closed) is forgotten in navigatord and Arca.
     jars: HashSet<u64>,
+    /// The history view is open, the page's slot withdrawn.
+    history: bool,
 }
 
 fn send(w: &mut UnixStream, r: &Request) {
@@ -152,6 +156,7 @@ impl Live {
                 dark: false,
                 budget,
                 jars: HashSet::new(),
+                history: false,
             },
             fd,
         ))
@@ -201,8 +206,8 @@ impl Live {
     fn give(&mut self, i: usize, ticket: Ticket) {
         let c = &mut self.children[i];
         if c.attached {
-            let (embed, scroll, dark) = (c.embed, c.scroll, self.dark);
-            self.to_child(embed, &ToChild::Open { ticket, dark, scroll });
+            let (embed, scroll, reading) = (c.embed, c.scroll, c.reading);
+            self.to_child(embed, &ToChild::Open { ticket, reading, scroll });
         } else {
             c.pending = Some(ticket);
         }
@@ -228,6 +233,7 @@ impl Live {
                 }
             }
         };
+        let reading = s.store.reading_of(key.0, &url).for_child(self.dark);
         let id = self.id();
         eprintln!("navigator-ui: asked limend for a page child for {url} (embed {embed}){}", if saved.is_some() { ", bringing back a parked page" } else { "" });
         self.children.push(Child {
@@ -242,6 +248,7 @@ impl Live {
             seen: Instant::now(),
             parking: None,
             knows,
+            reading,
         });
         s.live = Some(LivePage::Loading(url.clone()));
         send(&mut self.w, &Request::Open { id, url, saved, jar, knows });
@@ -432,6 +439,36 @@ impl Live {
                         }
                         changed = true;
                     }
+                    Some(ToParent::Found { count, current, .. }) => {
+                        if on_screen {
+                            eprintln!("navigator-ui: find: {count} matches, at {current}");
+                            s.found(count, current);
+                            changed = true;
+                        }
+                    }
+                    Some(ToParent::Zoomed { zoom_64 }) => {
+                        // The person zoomed in the page: remembered for its
+                        // site, and the child is not told what it did.
+                        self.children[i].reading.zoom_64 = zoom_64;
+                        if on_screen {
+                            eprintln!("navigator-ui: the page zoomed to {}%", zoom_64 as u32 * 100 / 64);
+                            s.reading_change(|r| r.zoom_64 = zoom_64);
+                            changed = true;
+                        }
+                    }
+                    Some(ToParent::Key { key, chars, ctrl, shift, alt }) if on_screen => {
+                        // Only what the chrome's own map has: the child
+                        // can do no more than a press in the chrome.
+                        let ev = crate::keys::from_child(key, &chars, ctrl, shift, alt);
+                        if let Some(a) = crate::keys::action(&ev) {
+                            eprintln!("navigator-ui: a key from the page: {a:?}");
+                            s.apply(a, crate::ui::now_ms());
+                            changed = true;
+                        } else if key == limen::doc_viewer::ChromeKey::Escape {
+                            changed |= s.escape();
+                        }
+                    }
+                    Some(ToParent::Key { .. }) => {}
                     Some(ToParent::Error { code }) => {
                         eprintln!("navigator-ui: a page child failed ({code})");
                         if on_screen {
@@ -460,7 +497,10 @@ impl Live {
             eprintln!("navigator-ui: {} did not answer Park; closed", self.children[i].url);
             self.close(i);
         }
-        // Links the shell wants decided.
+        // Links the shell wants decided. Taking them is a change: the
+        // caller writes the shell back only when this returns true, and an
+        // outbox left in it would be sent again next tick.
+        changed |= !s.outbox.is_empty();
         for o in std::mem::take(&mut s.outbox) {
             match o {
                 Out::Activate { page, href, beside } => {
@@ -472,6 +512,11 @@ impl Live {
                 Out::Save { id } => send(&mut self.w, &Request::Save { id }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
                 Out::Hand { url, how } => send(&mut self.w, &Request::Hand { url, how }),
+                Out::Find { query, step } => {
+                    if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
+                        self.to_child(c.embed, &ToChild::Find { query, step });
+                    }
+                }
             }
         }
         // Unrecorded trails that closed: their jars are forgotten.
@@ -493,8 +538,22 @@ impl Live {
                 self.started = false;
             }
         }
+        // The history view is drawn where the page is: the page's window
+        // is withdrawn while it is open, and shown again after.
+        if s.history.is_some() != self.history {
+            self.history = s.history.is_some();
+            changed = true;
+            if self.history {
+                if let Some(e) = &self.embeds {
+                    let _ = e.borrow_mut().hide(PAGE_SLOT);
+                }
+                eprintln!("navigator-ui: history view open; the page is withdrawn");
+            } else {
+                self.started = false;
+            }
+        }
         // The page the current trail shows.
-        let want = s.shown_key();
+        let want = if self.history { self.shown } else { s.shown_key() };
         if want != self.shown || !self.started {
             changed = true;
             self.started = true;
@@ -531,6 +590,22 @@ impl Live {
             if let Some(c) = self.children.iter_mut().find(|c| c.key == key) {
                 c.seen = Instant::now();
             }
+        }
+        // Reading choices changed (Aa, or the system appearance): the live
+        // children of that site lay out again.
+        let mut tell = vec![];
+        for c in self.children.iter_mut().filter(|c| c.parking.is_none()) {
+            let want = s.store.reading_of(c.key.0, &c.url).for_child(self.dark);
+            if want != c.reading {
+                c.reading = want;
+                if c.attached && c.pending.is_none() {
+                    tell.push((c.embed, want));
+                }
+            }
+        }
+        for (embed, reading) in tell {
+            eprintln!("navigator-ui: reading changed: text {} zoom {} {} {}", reading.text_64, reading.zoom_64, if reading.dark { "dark" } else { "light" }, if reading.comfortable { "comfortable" } else { "full" });
+            self.to_child(embed, &ToChild::SetReading { reading });
         }
         self.park(s);
         changed

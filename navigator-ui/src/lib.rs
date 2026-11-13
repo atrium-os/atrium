@@ -10,9 +10,11 @@
 //! Step 2 ([`live`]): with `NAVIGATORD_SOCKET` set, pages come from
 //! navigatord and the page slot holds a doc-viewer child (Limen L6).
 
+pub mod ax;
 pub mod clock;
 pub mod disk;
 pub mod fake;
+pub mod history;
 pub mod keys;
 pub mod live;
 pub mod shell;

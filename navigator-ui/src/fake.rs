@@ -200,6 +200,10 @@ pub enum Scene {
     Live,
     /// A red page: the stop page in place of the page (§6.5).
     Stop,
+    /// Step 7: the Aa pop-up open and the find bar with matches (§7).
+    Reading,
+    /// Step 7: the history view (§5.5).
+    History,
 }
 
 impl Scene {
@@ -210,6 +214,8 @@ impl Scene {
             "start" => Scene::Start,
             "live" => Scene::Live,
             "stop" => Scene::Stop,
+            "reading" => Scene::Reading,
+            "history" => Scene::History,
             _ => return None,
         })
     }
@@ -219,7 +225,7 @@ impl Scene {
 pub fn scene(sc: Scene) -> (TrailStore, Option<Prompt>) {
     let mut s = store();
     match sc {
-        Scene::Main | Scene::Start => (s, None),
+        Scene::Main | Scene::Start | Scene::Reading | Scene::History => (s, None),
         Scene::Prompt => {
             s.set_knows("atlas.example", true);
             (s, Some(Prompt::Download { id: 0, file: "impluvium-survey.pdf".into(), size: "2.4 MB".into(), origin: "atlas.example".into(), kind: "PDF".into() }))

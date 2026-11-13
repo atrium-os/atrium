@@ -284,10 +284,15 @@ fn event(raw: &fresco_client::Event, state: &Mutable<Shell>) {
             let now = now_ms();
             if let Some(a) = keys::action(&ev) {
                 s.apply(a, now);
-            } else if s.editing.is_some() && kind.pressed() {
+            } else if !kind.pressed() {
+            } else if s.editing.is_some() {
                 s.edit_key(*key, *modifiers, chars, now);
-            } else if *key == pergola::Key::Escape && s.popover {
-                s.popover = false;
+            } else if *key == pergola::Key::Escape {
+                s.escape();
+            } else if s.history.is_some() {
+                s.history_key(*key, *modifiers, chars);
+            } else if s.find.is_some() {
+                s.find_key(*key, *modifiers, chars);
             }
             if kind.pressed() {
                 navigator_ui::ui::trace(&mut s);

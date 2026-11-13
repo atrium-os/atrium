@@ -78,6 +78,7 @@ pub struct DocumentSource<'f> {
     subs: Subresources,
     window: (f64, f64),
     zoom_64: u32,
+    text_64: u32,
     /// The reader's appearance: `prefers-color-scheme: dark` matches when set.
     dark: bool,
     band_h: U,
@@ -106,7 +107,7 @@ impl<'f> DocumentSource<'f> {
     /// first checkpoint below `band_h` (1/64 px; about a viewport).
     pub fn new(html: String, fonts: &'f FontSet, subs: Subresources, window: (f64, f64), band_h: U) -> Self {
         let doc = Banded::new(&html, fonts, &Env::zoomed(window.0, window.1, 64), &subs, band_h);
-        DocumentSource { html, fonts, subs, window, zoom_64: 64, dark: false, band_h, doc, resident: BTreeMap::new(),
+        DocumentSource { html, fonts, subs, window, zoom_64: 64, text_64: 64, dark: false, band_h, doc, resident: BTreeMap::new(),
                          last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0, replaced_from: None, previous: None }
     }
 
@@ -121,7 +122,19 @@ impl<'f> DocumentSource<'f> {
         self
     }
 
-    fn env(&self, zoom_64: u32) -> Env { Env { dark: self.dark, ..Env::zoomed(self.window.0, self.window.1, zoom_64) } }
+    fn env(&self, zoom_64: u32) -> Env { Env { dark: self.dark, text_scale_64: self.text_64, ..Env::zoomed(self.window.0, self.window.1, zoom_64) } }
+
+    /// The reader's text size in 1/64 (backend §4.9 item 2; 64 = the
+    /// profile's own). Set it before the first `want`: it lays the
+    /// document out again.
+    pub fn with_text_scale(mut self, text_64: u32) -> Self {
+        let t = text_64.clamp(16, 1024);
+        if t != self.text_64 {
+            self.text_64 = t;
+            self.doc = Banded::new(&self.html, self.fonts, &self.env(self.zoom_64), &self.subs, self.band_h);
+        }
+        self
+    }
 
     /// The layout state (for measurement and checks).
     pub fn banded(&self) -> &Banded<'f> { &self.doc }
@@ -170,7 +183,7 @@ impl<'f> DocumentSource<'f> {
     /// appearance `dark`: `with_dark`).
     pub fn from_prepared(html: String, prep: crate::html::Prepared, fonts: &'f FontSet, subs: Subresources, window: (f64, f64), band_h: U, zoom_64: u32, dark: bool) -> Self {
         let doc = Banded::from_prepared(prep, fonts, &Env { dark, ..Env::zoomed(window.0, window.1, zoom_64) }, &subs, band_h);
-        DocumentSource { html, fonts, subs, window, zoom_64, dark, band_h, doc, resident: BTreeMap::new(),
+        DocumentSource { html, fonts, subs, window, zoom_64, text_64: 64, dark, band_h, doc, resident: BTreeMap::new(),
                          last_extent: None, overlay_sig: None, last_want: None, prov: None, prov_seq: 0, replaced_from: None, previous: None }
     }
 
