@@ -328,7 +328,7 @@ the primary button of a prompt. No shadows except on pop-ups (§5 shadow policy)
 - **Today** lists open trails, newest activity first; **Pinned** above it once something is
   pinned; **Earlier** below, put-away trails by day.
 - A trail row: monogram tile, title on one line (truncated), and state glyphs on the right:
-  a speaker while audio plays, a person while a site there knows you, a dot for an unseen
+  the media glyph (§8a: speaker, muted speaker or play, and clicking it mutes the trail), a person while a site there knows you, a dot for an unseen
   branch.
 - The **current trail is expanded** into its path: every page from the root to the current
   one, then the current page's branches, indented. Older side branches fold into "2 more".
@@ -595,6 +595,81 @@ Navigator does not reimplement them.
 
 ---
 
+## 8a. Sound and video: what is playing, and per-trail volume
+
+*Asked by Shankar, 2026-11-13: "audio/video - indication that it is playing audio/video, with per
+trail volume mute/control?"*
+
+### 8a.1 What exists to build on
+
+- Every sound a page makes comes from a Limen `media-player` child (limen.md §2.2): a plain
+  `<video>` loaded by the document lane, or an island engine's `<video>`/`MediaSource` backed by
+  the native player (legacy-web §8.1). The role already has `SetVolume { volume }` from parent to
+  child and `Playing`/`Paused` back.
+- choragusd counts an embedded player's sound **as its parent's** (lyra-v1.md §10 item 4), so the
+  Forum volume list shows one entry, "Navigator", and its volume and mute are the user's level
+  for the whole Navigator. User volumes persist per (user, app id) (lyra-v1.md §7).
+- The player is the only process that holds the audio stream; the Navigator UI never does.
+
+So per-trail control is the **Navigator's** job, done by sending `SetVolume` to each player in
+the trail. choragusd needs nothing new: the stream's level is user volume × the app's own
+`SetVolume` × policy (lyra-v1.md §7), and the trail's level is the middle term.
+
+### 8a.2 What the person sees
+
+**In the rail**, each trail row shows its media state after the title, as the one glyph there:
+
+| glyph | state |
+|---|---|
+| speaker | something in the trail is playing with sound |
+| speaker with a slash | playing, but this trail is muted |
+| play triangle | video playing with no sound (muted by the page, or no audio track) |
+| (none) | nothing playing |
+
+Clicking the glyph **mutes or unmutes the trail**, without switching to it. Right-click, or a
+long press, opens a small pop-up with a **volume slider for the trail**, *Mute other trails*,
+and *Pause* (sent as `Pause` to every player in the trail).
+
+**In the toolbar**, when the current page itself is playing, the same glyph appears just left of
+presence, with the same click and slider. The page's own player controls stay the page's.
+
+**A "Playing" line at the top of the rail** appears while any trail other than the current one
+is making sound: the trail's monogram, its title and the media title from the player (its
+`Session` title, atrium-player-pip-keys.md §4), with pause and mute. It answers "where is that
+sound coming from?" without hunting through the rail. Forum's bar shows the same now-playing
+entry for the whole system (choragusd media sessions); this one is per trail.
+
+### 8a.3 Rules
+
+- **The level belongs to the trail**, not the page and not the site: it covers every page and
+  branch in the trail, including pages opened later. It is kept in the trail store and survives a
+  restart. New trails start at full level, unmuted. (Per-site defaults, "always mute
+  video.example", can come later as a site setting in Aa if wanted.)
+- **The player's own volume control** still works inside its slot. It sets its own level; the
+  trail's level multiplies it. The player reports a change with a new `VolumeChanged { volume }`
+  message so the UI can show the right state. A page cannot raise the trail's level, only its own
+  share under it.
+- **Muted is not paused.** Muting keeps the video playing silently; *Pause* is the separate action.
+- **Background branches don't start sound.** A page opened on the side (§4.2) loads without
+  starting any player until it has been on screen once, so opening ten links doesn't start ten
+  videos. A page already playing that goes off screen keeps playing (that is how music in a
+  background trail works) unless the person pauses it.
+- **Parking stops the sound**, so a page that is playing is never parked (§4.4); it parks after
+  it stops or is paused, and the player keeps its position for when it comes back.
+- **PiP** (§8) keeps the trail's level: the video in the corner is still that trail's.
+- **Media keys** go to the last player that played (choragusd's rule, atrium-player-pip-keys.md
+  §4.3), whichever trail it is in; the "Playing" line shows which one that is.
+- **Unrecorded trails** follow the same rules; their levels are not written to disk.
+
+### 8a.4 What it needs
+
+| owner | change |
+|---|---|
+| Limen (`media-player` role) | child → parent `Audible { on }` (playing with an audio track and a non-zero level) and `VolumeChanged { volume }`; `Playing`/`Paused` already exist |
+| player | apply the parent's `SetVolume` as a factor on its own level, report `VolumeChanged` and `Audible` |
+| navigatord / UI | a trail's level and mute in the trail store; `SetVolume` to each player of the trail on change and on attach; hold players in branches not yet seen |
+| island engines | a tier-4 engine that ever plays sound without the native player (Web Audio, not designed yet) must take the same `SetVolume` over its typed island channel, or it is silent |
+
 ## 9. Keyboard
 
 System shortcuts go to Forum first (limen.md §6). Within the Navigator:
@@ -614,6 +689,7 @@ System shortcuts go to Forum first (limen.md §6). Within the Navigator:
 | Ctrl-F, Esc | find, close find |
 | Ctrl-plus, Ctrl-minus, Ctrl-0 | zoom (ScrollView) |
 | Ctrl-Shift-N | new Unrecorded trail |
+| Ctrl-M | mute or unmute the current trail |
 | F6 | move focus between rail, toolbar and page |
 | Ctrl-Enter on a link | open beside (§4.2) |
 
