@@ -1,5 +1,5 @@
 //! What the server needs from a filesystem, implemented for capsa-fat's
-//! FAT volumes (read-write) and exFAT volumes (read-only so far).
+//! FAT and exFAT volumes, both read-write.
 
 use std::hash::Hash;
 
@@ -155,7 +155,7 @@ impl<D: BlockDev> Backend for ExVolume<D> {
         ExVolume::lookup(self, d, name)
     }
     fn refresh(&mut self, (d, i): (ExDir, u32)) -> Result<ExEntry> {
-        self.read_dir(d)?.into_iter().find(|e| e.index == i).ok_or(Error::NotFound)
+        self.entry_at(d, i)
     }
     fn read(&mut self, n: &ExEntry, off: u64, buf: &mut [u8]) -> Result<usize> {
         ExVolume::read(self, n, off, buf)
@@ -164,5 +164,32 @@ impl<D: BlockDev> Backend for ExVolume<D> {
         let g = self.geometry().clone();
         let free = self.free_clusters().unwrap_or(0);
         Ok((g.cluster_size, u64::from(g.clusters), u64::from(free)))
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn create(&mut self, d: ExDir, name: &str, dir: bool, now: i64) -> Result<ExEntry> {
+        ExVolume::create(self, d, name, dir, now)
+    }
+    fn write(&mut self, n: &mut ExEntry, off: u64, data: &[u8], now: i64) -> Result<usize> {
+        ExVolume::write(self, n, off, data, now)
+    }
+    fn truncate(&mut self, n: &mut ExEntry, len: u64, now: i64) -> Result<()> {
+        ExVolume::truncate(self, n, len, now)
+    }
+    fn set_mtime(&mut self, n: &mut ExEntry, t: i64) -> Result<()> {
+        ExVolume::set_mtime(self, n, t)
+    }
+    fn unlink(&mut self, n: &ExEntry) -> Result<()> {
+        ExVolume::unlink(self, n)
+    }
+    fn rmdir(&mut self, n: &ExEntry) -> Result<()> {
+        ExVolume::rmdir(self, n)
+    }
+    fn rename(&mut self, n: &ExEntry, to: ExDir, name: &str, now: i64) -> Result<ExEntry> {
+        ExVolume::rename(self, n, to, name, now)
+    }
+    fn sync(&mut self) -> Result<()> {
+        ExVolume::sync(self)
     }
 }

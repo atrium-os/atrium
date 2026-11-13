@@ -23,6 +23,7 @@
 #     refused; the subscriber hears added and ejected; lock and logout
 #     end it.
 #   - a stick with FAT straight on the disk is served whole (/media/daN).
+#   - an exFAT stick takes alice's writes; fsck.exfat and Linux agree.
 #   - eject: refused for bob, refused while alice has a file open ("busy"),
 #     then done for alice; stays down across a relogin, back after replug;
 #   - switch to bob: served as bob; logout: unmounted;
@@ -77,6 +78,9 @@ PY
 mkfs.fat -F 32 --offset 2048 -n STICK "$IMG" $(( (96*1024*1024 - 1048576) / 1024 )) >/dev/null \
   && printf 'on the stick\n' > /tmp/automount-hello.txt && MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" /tmp/automount-hello.txt ::hello.txt \
   && echo "  stick image ready" || { echo "  could not build the stick image"; exit 1; }
+# An exFAT stick (no partition table, as many come).
+IMG3=$VMDIR/exfat.img
+rm -f "$IMG3"; truncate -s 128M "$IMG3"; mkfs.exfat -L XSTICK "$IMG3" >/dev/null && echo "  exFAT stick image ready" || { echo "  could not build the exFAT image"; exit 1; }
 # And one with FAT straight on the disk ("superfloppy").
 IMG2=$VMDIR/bare.img
 rm -f "$IMG2"; mkfs.fat -C -F 32 -n BARE "$IMG2" $((80*1024)) >/dev/null \
@@ -223,6 +227,30 @@ else
 fi
 unplug 3$RUN
 mounted && bad "still mounted after unplug" || ok "unplugged: unmounted"
+
+echo "== an exFAT stick, written"
+plug 4$RUN "$IMG3"
+PART=$DA; M=/media/$DA
+if [ -n "$DA" ] && mounted; then
+  ok "exFAT served at $M"
+  V "su -m alice -c 'mkdir -p \"$M/Photos 2026\" && dd if=/dev/random of=\"$M/Photos 2026/big.bin\" bs=1m count=20 2>/dev/null && echo exfat from alice > $M/Ünïcödé.txt && sha256 -q \"$M/Photos 2026/big.bin\" > /tmp/exfat-sum.$RUN'" && ok "alice writes 20 MB and a Unicode name" || bad "alice cannot write on exFAT"
+  out=$(V "su -m alice -c '$DD --eject $PART' 2>&1")
+  echo "$out" | grep -q "^ok" && ok "ejected ($out)" || bad "eject: '$out'"
+  SUM=$(V "cat /tmp/exfat-sum.$RUN")
+else
+  bad "exFAT not served ($(V "tail -3 /var/log/atrium/dispensatord.log | tr '\n' ';'"))"
+fi
+unplug 4$RUN
+if fsck.exfat -n "$IMG3" >/tmp/automount-fsck-x 2>&1; then ok "fsck.exfat finds it clean"; else bad "fsck.exfat: $(tr '\n' ';' < /tmp/automount-fsck-x)"; fi
+L=$(losetup -f --show "$IMG3" 2>/dev/null)
+if [ -n "$L" ] && mkdir -p /tmp/automount-x && mount.exfat-fuse -o ro "$L" /tmp/automount-x 2>/dev/null; then
+  [ "$(cat /tmp/automount-x/Ünïcödé.txt)" = "exfat from alice" ] && ok "Linux reads alice's Unicode file" || bad "Ünïcödé.txt: '$(cat /tmp/automount-x/Ünïcödé.txt 2>&1)'"
+  [ "$(sha256sum "/tmp/automount-x/Photos 2026/big.bin" | cut -d' ' -f1)" = "$SUM" ] && ok "and the 20 MB file, byte for byte" || bad "big.bin differs"
+  umount /tmp/automount-x
+else
+  echo "  (no exfat-fuse here: cross-read skipped)"
+fi
+[ -n "$L" ] && losetup -d "$L"
 login ""
 V "grep -E 'capsa|session|eject' /var/log/atrium/dispensatord.log | tail -8" | sed 's/^/  log: /'
 

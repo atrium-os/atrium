@@ -8,8 +8,7 @@
 //! In Atrium jaild opens the partition and `/dev/fuse`, mounts fusefs on
 //! the session's media directory from outside the jail, and starts this in
 //! a jail with only those two descriptors (docs/spec/device-assignment.md
-//! §4.6). FAT12/16/32 is served read-write unless `--ro`; exFAT read-only
-//! for now.
+//! §4.6). FAT12/16/32 and exFAT are served read-write unless `--ro`.
 
 use std::fs::File;
 use std::os::fd::FromRawFd;
@@ -99,10 +98,7 @@ fn main() -> ExitCode {
     }
     let r = if &head[3..11] == b"EXFAT   " {
         match ExVolume::open(dev) {
-            Ok(v) => {
-                eprintln!("atrium-capsa-fuse: exFAT, served read-only");
-                serve(v, fuse, opts)
-            }
+            Ok(v) => serve(v, fuse, opts),
             Err(e) => return fail(e),
         }
     } else {

@@ -160,3 +160,46 @@ fn read_only_option() {
     m.unmount().unwrap();
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// exFAT, read-write through the kernel; fsck.exfat agrees afterwards.
+#[test]
+fn exfat_through_the_kernel() {
+    let d = tmp("exfat");
+    let img = d.join("x.img");
+    std::fs::File::create(&img).unwrap().set_len(96 << 20).unwrap();
+    if !Command::new("mkfs.exfat").args(["-L", "CAPSAX"]).arg(&img).output().map(|o| o.status.success()).unwrap_or(false) {
+        return eprintln!("SKIP: mkfs.exfat");
+    }
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
+    let v = capsa_fat::exfat::ExVolume::open(f).unwrap();
+    let m_dir = d.join("mnt");
+    let Some(m) = Mount::new(v, &m_dir, Options { uid: 1234, gid: 5678, umask: 0o077, ..Options::default() }) else { return };
+    let p = |s: &str| m_dir.join(s);
+    let big = bytes(9, 5_000_000);
+    std::fs::write(p("A long name with spaces, past fifteen.bin"), &big).unwrap();
+    std::fs::create_dir_all(p("Photos/2026/Nov")).unwrap();
+    for k in 0..150 {
+        std::fs::write(p(&format!("Photos/2026/Nov/IMG_{k:04}.JPG")), bytes(k, 1000 + k as usize)).unwrap();
+    }
+    std::fs::write(p("Ünïcödé ✓.txt"), b"u").unwrap();
+    assert_eq!(std::fs::read(p("A long name with spaces, past fifteen.bin")).unwrap(), big);
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(p("Ünïcödé ✓.txt")).unwrap();
+    f.write_all(b" more").unwrap();
+    drop(f);
+    assert_eq!(std::fs::read(p("ünïcödé ✓.TXT")).unwrap(), b"u more", "case-insensitive");
+    std::fs::rename(p("Photos/2026"), p("Archive")).unwrap();
+    assert_eq!(std::fs::read(p("Archive/Nov/IMG_0007.JPG")).unwrap(), bytes(7, 1007));
+    std::fs::remove_file(p("Archive/Nov/IMG_0003.JPG")).unwrap();
+    std::fs::remove_dir(p("Photos")).unwrap();
+    assert!(std::fs::write(p("bad:name"), b"x").is_err());
+    m.unmount().unwrap();
+    let o = Command::new("fsck.exfat").args(["-n"]).arg(&img).output().unwrap();
+    assert!(o.status.success(), "fsck.exfat: {}", String::from_utf8_lossy(&o.stdout));
+    let b = std::fs::read(&img).unwrap();
+    let mut v = capsa_fat::exfat::ExVolume::open(capsa_fat::ReadOnly(&b)).unwrap();
+    let e = v.resolve("Archive/Nov/IMG_0149.JPG").unwrap().unwrap();
+    assert_eq!(e.len, 1149);
+    assert!(!matches!(v.resolve("Archive/Nov/IMG_0003.JPG"), Ok(Some(_))), "removed");
+    std::fs::remove_dir_all(&d).unwrap();
+}

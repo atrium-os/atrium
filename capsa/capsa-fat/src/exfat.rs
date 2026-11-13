@@ -15,12 +15,27 @@ use crate::{le16, le32, BlockDev, Error, Result};
 /// Largest directory read, in bytes (16 MiB: 524288 entries).
 pub const MAX_DIR_BYTES: u64 = 16 << 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// A directory, known by its first cluster: its length and layout change
+/// as it grows, its identity does not.
+#[derive(Debug, Clone, Copy)]
 pub struct ExDir {
     pub first: u32,
-    /// Bytes; `0` for the root, whose size is its chain's.
+    /// Bytes; `0` for the root, whose size is its chain's. A chained
+    /// directory is read to the end of its chain.
     pub len: u64,
     pub contiguous: bool,
+}
+
+impl PartialEq for ExDir {
+    fn eq(&self, o: &Self) -> bool {
+        self.first == o.first
+    }
+}
+impl Eq for ExDir {}
+impl std::hash::Hash for ExDir {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.first.hash(h)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +69,14 @@ impl ExEntry {
 }
 
 pub struct ExVolume<D> {
-    dev: D,
-    g: Geometry,
-    fat: Table,
+    pub(crate) dev: D,
+    pub(crate) g: Geometry,
+    pub(crate) fat: Table,
     pub label: Option<String>,
-    bitmap: Option<(u32, u64)>,
+    pub(crate) bitmap: Option<(u32, u64)>,
+    /// The up-case table's (first cluster, bytes), for name hashes.
+    pub(crate) upcase_at: Option<(u32, u64)>,
+    pub(crate) w: crate::exwrite::State,
 }
 
 /// An exFAT timestamp (and its 10 ms and UTC-offset bytes) as Unix seconds.
@@ -172,7 +190,9 @@ impl<D: BlockDev> ExVolume<D> {
         if !g.valid_cluster(root) {
             return Err(Error::NotFat("exFAT root cluster"));
         }
-        let mut v = Self { dev, g, fat: Table::default(), label: None, bitmap: None };
+        let mut fat = Table::default();
+        fat.exfat = true;
+        let mut v = Self { dev, g, fat, label: None, bitmap: None, upcase_at: None, w: Default::default() };
         // Label and allocation bitmap live in the root.
         let r = v.root();
         let data = v.dir_bytes(r)?;
@@ -185,9 +205,11 @@ impl<D: BlockDev> ExVolume<D> {
                     v.label = String::from_utf16(&units).ok().filter(|s| !s.is_empty());
                 }
                 0x81 if v.bitmap.is_none() => v.bitmap = Some((le32(e, 20), u64::from_le_bytes(e[24..32].try_into().unwrap_or([0; 8])))),
+                0x82 if v.upcase_at.is_none() => v.upcase_at = Some((le32(e, 20), u64::from_le_bytes(e[24..32].try_into().unwrap_or([0; 8])))),
                 _ => {}
             }
         }
+        v.load_upcase();
         Ok(v)
     }
 
@@ -200,7 +222,7 @@ impl<D: BlockDev> ExVolume<D> {
     }
 
     /// The clusters of `first`, for `len` bytes (or the whole chain).
-    fn clusters(&mut self, first: u32, len: u64, contiguous: bool) -> Result<Vec<u32>> {
+    pub(crate) fn clusters(&mut self, first: u32, len: u64, contiguous: bool) -> Result<Vec<u32>> {
         let cs = u64::from(self.g.cluster_size);
         if contiguous {
             let n = len.div_ceil(cs);
@@ -216,10 +238,10 @@ impl<D: BlockDev> ExVolume<D> {
         Ok(chain)
     }
 
-    fn dir_bytes(&mut self, d: ExDir) -> Result<Vec<u8>> {
-        let cl = self.clusters(d.first, d.len, d.contiguous)?;
+    pub(crate) fn dir_bytes(&mut self, d: ExDir) -> Result<Vec<u8>> {
+        let cl = self.dir_clusters(d)?;
         let cs = self.g.cluster_size as usize;
-        let total = (cl.len() as u64 * cs as u64).min(if d.len > 0 { d.len } else { u64::MAX });
+        let total = cl.len() as u64 * cs as u64;
         if total > MAX_DIR_BYTES {
             return Err(Error::Corrupt("directory too large"));
         }
@@ -236,6 +258,16 @@ impl<D: BlockDev> ExVolume<D> {
         Ok(b)
     }
 
+    /// A directory's clusters: a contiguous one's run, a chained one's
+    /// whole chain (it only grows by whole clusters).
+    pub(crate) fn dir_clusters(&mut self, d: ExDir) -> Result<Vec<u32>> {
+        if d.contiguous {
+            self.clusters(d.first, d.len, true)
+        } else {
+            self.clusters(d.first, 0, false)
+        }
+    }
+
     pub fn read_dir(&mut self, d: ExDir) -> Result<Vec<ExEntry>> {
         let data = self.dir_bytes(d)?;
         let n = data.len() / 32;
@@ -249,6 +281,9 @@ impl<D: BlockDev> ExVolume<D> {
                     let sec = usize::from(e[1]);
                     if (2..=18).contains(&sec) && i + sec < n {
                         if let Some(x) = self.entry_set(d, i as u32, &data[i * 32..(i + sec + 1) * 32]) {
+                            if x.is_dir() {
+                                self.w.parents_put(x.first, &x);
+                            }
                             out.push(x);
                         }
                         i += sec + 1;
@@ -303,9 +338,11 @@ impl<D: BlockDev> ExVolume<D> {
         })
     }
 
+    /// By name, as exFAT compares them: through the volume's up-case table.
     pub fn lookup(&mut self, d: ExDir, name: &str) -> Result<ExEntry> {
-        let want = name.to_lowercase();
-        self.read_dir(d)?.into_iter().find(|e| e.name.to_lowercase() == want).ok_or(Error::NotFound)
+        let want = self.upcased(name);
+        let all = self.read_dir(d)?;
+        all.into_iter().find(|e| self.upcased(&e.name) == want).ok_or(Error::NotFound)
     }
 
     pub fn resolve(&mut self, path: &str) -> Result<Option<ExEntry>> {
@@ -369,7 +406,7 @@ impl<D: BlockDev> ExVolume<D> {
         Ok(n)
     }
 
-    fn follow(&mut self, c: u32) -> Result<u32> {
+    pub(crate) fn follow(&mut self, c: u32) -> Result<u32> {
         match self.fat.next(&mut self.dev, &self.g, c)? {
             Next::Cluster(n) => Ok(n),
             Next::End => Err(Error::Corrupt("file shorter than its size")),
@@ -379,6 +416,9 @@ impl<D: BlockDev> ExVolume<D> {
 
     /// Free clusters, from the allocation bitmap.
     pub fn free_clusters(&mut self) -> Result<u32> {
+        if let Some(b) = &self.w.bits {
+            return Ok(b.free);
+        }
         let (first, len) = self.bitmap.ok_or(Error::Corrupt("no allocation bitmap"))?;
         let need = u64::from(self.g.clusters).div_ceil(8);
         if len < need {

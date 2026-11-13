@@ -559,7 +559,7 @@ rename2 (`NOREPLACE`), truncate and mtime, statfs, fsync/flush (the FAT is
 synced on close and after every directory change). Node ids follow
 renames; a removed or replaced entry's id answers `ESTALE` instead of
 reaching whatever reuses its slot. Request framing is checked before any
-field is read. FAT is served read-write, exFAT read-only. Disk devices go
+field is read. FAT is served read-write, exFAT read-only (read-write since §6.8). Disk devices go
 through `Aligned` with `DIOCGSECTORSIZE`/`DIOCGMEDIASIZE`. Tested under a
 real kernel FUSE mount in the cloud container (Linux's fuse speaks the same
 protocol): a FAT32 volume written through `std::fs` (3 MB file, nested
@@ -658,7 +658,7 @@ shipped rule); ostiarius 17 and portcullis-peer 9 on FreeBSD.
 
 Not yet: the session's apps see `/media` through their jails only where a
 manifest grants it (storage.md `removable_media`, not wired); a whole-disk
-(superfloppy) stick (done, §6.7); exFAT writes; the lock screen as the caller of
+(superfloppy) stick (done, §6.7); exFAT writes (done, §6.8); the lock screen as the caller of
 ostiarius `Lock`/`Unlock`. The Forum eject button came next (§6.6).
 
 ### 6.6 As built: sticks in Forum, over Aqueduct (2026-11-13)
@@ -718,6 +718,47 @@ settle at once. jaild pin 31 adds `da#` to `fuse_devices`. Host test
 `superfloppy`; gate `vm-automount-check.sh` adds a bare FAT32 stick
 (`mkfs.fat -C`, no MBR): served whole at `/media/da0`, alice reads it, no
 partition nodes, unmounted on unplug; **0 failed** 2026-11-13.
+
+### 6.8 As built: exFAT writes (2026-11-14)
+
+`capsa_fat::exfat` writes now (`exwrite.rs`), and atrium-capsa-fuse
+serves exFAT read-write like FAT:
+
+- **Allocation** is the bitmap's, held in memory once anything is written
+  (at most `clusters / 8` bytes, 32 MiB for the largest volume) and written
+  back by dirty 4 KiB chunks. The FAT is never asked what is free: a
+  contiguous (`NoFatChain`) file's FAT entries mean nothing. A file this
+  side grows gets a FAT chain; a contiguous file is given one first. FAT
+  entries are full 32-bit (end `0xFFFFFFFF`), as exFAT has them.
+- **Entry sets** (File, Stream, Names) are written whole with their
+  checksum and the name hash, computed through the volume's own up-case
+  table (decompressed at open; ASCII if it is missing), which is also what
+  name lookups compare through. Times are written as UTC.
+- **Directories** have no `.`/`..`; one grows by a zeroed cluster and its
+  stream's length follows. A directory is known by its first cluster, so a
+  handle stays valid while it grows. exFAT keeps no parent links, so the
+  writer remembers where each directory's entry is as it reads them (and
+  searches from the root, bounded, otherwise). A directory cannot be moved
+  below itself.
+- **Writes past the valid data** zero the gap on disk first; truncating up
+  leaves ValidDataLength where it was, so the new part reads as zeros.
+- **VolumeDirty** is set in the boot sector at the first change and
+  cleared by `sync` (with PercentInUse) once the FAT and bitmap are
+  written; the boot checksum leaves those fields out. A stick pulled
+  without eject is marked dirty, and other systems offer to check it.
+
+Tests: `capsa-fat/tests/exwrite.rs` makes volumes with mkfs.exfat (512 B,
+4 KiB and 128 KiB clusters), writes through capsa-fat (long, Unicode and
+case-only names, interleaved chains, a directory grown past a cluster,
+gaps, truncation, renames across directories and replacing, rmdir, files
+another system wrote contiguously), then checks them with `fsck.exfat -n`
+and reads them back both with capsa-fat and through the exfat-fuse driver:
+both trees must equal the model; 600 random operations the same way; 300
+damaged volumes take writes without a panic or hang. capsa-fuse
+`exfat_through_the_kernel` does the same under a real FUSE mount. Gate
+`vm-automount-check.sh` adds an exFAT stick: alice writes 20 MB and a
+Unicode name on FreeBSD, ejects, and on the host fsck.exfat finds it clean
+and Linux reads both files byte for byte: **0 failed** 2026-11-14.
 
 ## 7. Not in scope
 

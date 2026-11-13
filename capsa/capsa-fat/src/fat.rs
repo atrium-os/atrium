@@ -25,6 +25,9 @@ pub struct Table {
     cache: BTreeMap<u64, (Vec<u8>, bool)>,
     /// Where the next free-cluster search starts.
     pub hint: u32,
+    /// exFAT: entries are full 32-bit (end 0xFFFFFFFF, bad 0xFFFFFFF7) and
+    /// the allocation bitmap, not the FAT, says what is free.
+    pub exfat: bool,
 }
 
 impl Table {
@@ -83,11 +86,12 @@ impl Table {
             }
             let bps = u64::from(g.bytes_per_sector);
             let i = (off % bps) as usize;
+            let mask = if self.exfat { u32::MAX } else { 0x0FFF_FFFF };
             let b = &self.sector(dev, g, off / bps)?.0;
             return Ok(if w == 2 {
                 u32::from(u16::from_le_bytes([b[i], b[i + 1]]))
             } else {
-                u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) & 0x0FFF_FFFF
+                u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) & mask
             });
         }
         Ok(match g.fat_type {
@@ -113,6 +117,7 @@ impl Table {
         }
         let v = self.raw(dev, g, n)?;
         let (bad, eoc) = match g.fat_type {
+            _ if self.exfat => (0xFFFF_FFF7, 0xFFFF_FFF8),
             FatType::Fat12 => (0xFF7, 0xFF8),
             FatType::Fat16 => (0xFFF7, 0xFFF8),
             FatType::Fat32 => (0x0FFF_FFF7, 0x0FFF_FFF8),
@@ -133,6 +138,7 @@ impl Table {
         }
         let v = match (to, g.fat_type) {
             (Next::Free, _) => 0,
+            (Next::End, _) if self.exfat => u32::MAX,
             (Next::End, FatType::Fat12) => 0xFFF,
             (Next::End, FatType::Fat16) => 0xFFFF,
             (Next::End, FatType::Fat32) => 0x0FFF_FFFF,
@@ -153,6 +159,11 @@ impl Table {
             FatType::Fat16 => {
                 self.set_byte(dev, g, n64 * 2, v as u8)?;
                 self.set_byte(dev, g, n64 * 2 + 1, (v >> 8) as u8)?;
+            }
+            FatType::Fat32 if self.exfat => {
+                for (k, b) in v.to_le_bytes().into_iter().enumerate() {
+                    self.set_byte(dev, g, n64 * 4 + k as u64, b)?;
+                }
             }
             FatType::Fat32 => {
                 // The top four bits are reserved: keep them.
