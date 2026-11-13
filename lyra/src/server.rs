@@ -1237,7 +1237,7 @@ pub fn run(cfg: Config) -> ! {
                 continue;
             }
         };
-        eprintln!("lyrad: OSS device open ({} Hz, {} ch)", sink.rate_hz(), sink.channels());
+        eprintln!("lyrad: OSS device open ({} Hz, {} ch, {:?})", sink.rate_hz(), sink.channels(), sink.format());
         engine.set_channels(channels as usize);
         mix.resize(cfg.period_frames as usize * channels as usize, 0.0);
         out.resize(mix.len(), 0);

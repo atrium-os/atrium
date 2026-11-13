@@ -59,6 +59,37 @@ struct AudioErrInfo {
 }
 
 const AFMT_S16_NE: i32 = 0x0000_0010; // AFMT_S16_LE on little-endian (aarch64)
+const AFMT_S32_NE: i32 = 0x0000_1000; // AFMT_S32_LE on little-endian
+
+/// The sample format the device took. Lyra mixes to S16; a device whose only
+/// bit-perfect format is 32-bit (USB Audio 2 DACs such as the ESS ES9281 in an
+/// EarMen Sparrow offer S32_LE alone) gets each sample widened exactly
+/// (`s << 16`): the same 16-bit word, so still bit-perfect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    S16,
+    S32,
+}
+
+impl Format {
+    fn bytes(self) -> u32 {
+        match self { Format::S16 => 2, Format::S32 => 4 }
+    }
+    /// The OSS format the device granted, if Lyra can feed it.
+    fn from_afmt(afmt: i32) -> Option<Self> {
+        match afmt {
+            AFMT_S16_NE => Some(Format::S16),
+            AFMT_S32_NE => Some(Format::S32),
+            _ => None,
+        }
+    }
+}
+
+/// S16 samples widened to S32 (`s << 16`), into `out` (cleared first).
+pub fn widen_s16_to_s32(samples: &[i16], out: &mut Vec<i32>) {
+    out.clear();
+    out.extend(samples.iter().map(|&s| (s as i32) << 16));
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -68,12 +99,15 @@ struct CountInfo {
     ptr: i32,    // current DMA pointer within the buffer
 }
 
-/// A bit-perfect OSS playback sink. Signed 16-bit native-endian PCM.
+/// A bit-perfect OSS playback sink. Fed signed 16-bit native-endian PCM;
+/// writes S16, or S32 when that is the device's format (see [`Format`]).
 pub struct OssSink {
     fd: OwnedFd,
     rate_hz: u32,
     channels: u32,
-    frame_bytes: u32, // channels * 2 (S16)
+    format: Format,
+    frame_bytes: u32, // channels * format bytes
+    wide: std::cell::RefCell<Vec<i32>>, // S32 staging, reused
 }
 
 impl OssSink {
@@ -88,11 +122,13 @@ impl OssSink {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let sink = OssSink {
+        let mut sink = OssSink {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             rate_hz,
             channels,
+            format: Format::S16,
             frame_bytes: channels * 2,
+            wide: std::cell::RefCell::new(Vec::new()),
         };
         // fragment first (latency), then format, channels, rate. Each ioctl
         // writes back the granted value; we require the device accept ours
@@ -102,7 +138,20 @@ impl OssSink {
         // total buffer = the latency; the device may grant fewer.
         let sz_sel = (31 - (frag_bytes.max(1)).leading_zeros()) as i32;
         sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | sz_sel)?;
-        sink.require(SNDCTL_DSP_SETFMT, AFMT_S16_NE, "format")?;
+        // Ask for S16. A bit-perfect device answers with the format it has;
+        // take S32 (widened exactly), refuse anything else.
+        let got = sink.set(SNDCTL_DSP_SETFMT, AFMT_S16_NE)?;
+        sink.format = Format::from_afmt(got).ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("device coerced format: asked {AFMT_S16_NE}, got {got} (neither S16 nor S32)"),
+        ))?;
+        if sink.format == Format::S32 {
+            sink.require(SNDCTL_DSP_SETFMT, AFMT_S32_NE, "format")?;
+            // The fragment was sized in S16 bytes: ask again at twice the
+            // bytes, so the buffer holds the same frames (the same latency).
+            sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | (sz_sel + 1))?;
+        }
+        sink.frame_bytes = channels * sink.format.bytes();
         sink.require(SNDCTL_DSP_CHANNELS, channels as i32, "channels")?;
         sink.require(SNDCTL_DSP_SPEED, rate_hz as i32, "rate")?;
         Ok(sink)
@@ -134,12 +183,28 @@ impl OssSink {
     pub fn channels(&self) -> u32 {
         self.channels
     }
+    pub fn format(&self) -> Format {
+        self.format
+    }
 
-    /// Write interleaved S16 frames; blocks until the kernel buffer accepts them.
+    /// Write interleaved S16 frames (widened for an S32 device); blocks until
+    /// the kernel buffer accepts them.
     pub fn write_i16(&self, samples: &[i16]) -> io::Result<()> {
+        if self.format == Format::S32 {
+            let mut wide = self.wide.borrow_mut();
+            widen_s16_to_s32(samples, &mut wide);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(wide.as_ptr() as *const u8, std::mem::size_of_val(&wide[..]))
+            };
+            return self.write_bytes(bytes);
+        }
         let bytes = unsafe {
             std::slice::from_raw_parts(samples.as_ptr() as *const u8, std::mem::size_of_val(samples))
         };
+        self.write_bytes(bytes)
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         let mut off = 0;
         while off < bytes.len() {
             let n = unsafe {
@@ -221,6 +286,18 @@ mod tests {
         assert_eq!(SNDCTL_DSP_SETFRAGMENT, 0xC004_500A);
         assert_eq!(SNDCTL_DSP_GETOPTR, 0x400C_5012); // _IOR('P',18,count_info=12)
         assert_eq!(SNDCTL_DSP_GETODELAY, 0x4004_5017); // _IOR('P',23,int=4)
+    }
+
+    #[test]
+    fn formats_and_widening() {
+        assert_eq!(Format::from_afmt(AFMT_S16_NE), Some(Format::S16));
+        assert_eq!(Format::from_afmt(AFMT_S32_NE), Some(Format::S32));
+        assert_eq!(Format::from_afmt(0x0000_0008), None); // AFMT_U8
+        let mut out = Vec::new();
+        widen_s16_to_s32(&[0, 1, -1, i16::MAX, i16::MIN], &mut out);
+        assert_eq!(out, vec![0, 0x1_0000, -0x1_0000, 0x7fff_0000, i32::MIN]);
+        // The widened word's top half is the S16 sample: still bit-perfect.
+        assert!(out.iter().zip([0i16, 1, -1, i16::MAX, i16::MIN]).all(|(w, s)| (w >> 16) as i16 == s));
     }
 
     #[test]
