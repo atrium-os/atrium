@@ -1,6 +1,6 @@
 # Lock screen
 
-Status: built 2026-11-13 (§4), not yet gated in a VM. Shankar asked for "unlock with a security key on
+Status: built and gated in a VM 2026-11-13 (§4); the full run with vestibulum and a real key is next. Shankar asked for "unlock with a security key on
 the lock screen"; there was no lock screen. This fills in vestibulum.md §2.2 (session
 unlock) with what each part does. Sigillum's side is sigillum.md §12 and §16.6.
 
@@ -55,8 +55,14 @@ ostiarius writes; it does not trust any client to tell it the screen is locked o
   launch lifts the lock, the lock socket passes on `lock` and nothing else).
 - vestibulum `--lock USER`; forum-bar's Lock icon; `session-lock` in portcullis-toml,
   -policy and -jail (mounts `ostiarius-lock/`), tests.
-- Not yet run: the FreeBSD tests of frescod and ostiarius, and a VM gate with frescod up
-  (lock, check the session is not composed and gets no keys, unlock with a key).
+- FreeBSD tests (Mac VM, 2026-11-13): ostiarius --lib 22/22, portcullis-jail devfs 4/4,
+  frescod 60/60.
+- VM gate `scripts/vm-lock-check.sh` (headless frescod, direct and split): 22/22. While
+  locked no pixel of the app or the WM (red 0.000, green 0.000; blue 1.000 direct, 0.967
+  split), a key reaches only the lock screen; another user's lock file locks nothing; on
+  unlock the app is back on top and gets keys.
+- Not yet run: the full lock with the real vestibulum lock screen, ostiarius, sigillum-ui
+  and a YubiKey.
 
 ## 5. Not in this step
 

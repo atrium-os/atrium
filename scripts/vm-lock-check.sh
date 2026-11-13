@@ -58,7 +58,8 @@ print("%.3f" % (hits / max(total, 1)))
 num() { awk -v a="$1" -v b="$3" -v o="$2" 'BEGIN { exit !(o == ">" ? a > b : a < b) }'; }
 shot() { sleep 1.5; V 'cp /tmp/lk/hl/f.png /tmp/lk/shot.png'; scp -q $K -P 2222 root@localhost:/tmp/lk/shot.png "$T/$1.png"; }
 key() { V "printf 'KEY 0x04 1\nKEY 0x04 0\n' | nc -U -N /tmp/lk/inject.sock 2>/dev/null || printf 'KEY 0x04 1\nKEY 0x04 0\n' | nc -U /tmp/lk/inject.sock"; sleep 1; }
-keys() { V "grep -c '^key .*usage=0x0004 pressed=1' /tmp/lk/$1.log 2>/dev/null || echo 0"; }
+# grep -c prints 0 AND exits 1 on no match, so never `|| echo 0` (that gives "0\n0").
+keys() { V "cat /tmp/lk/$1.log 2>/dev/null | grep -c '^key .*usage=0x0004 pressed=1'; true"; }
 
 V 'pkill -x frescod; pkill -f atrium-input-probe; sleep 1; rm -rf /tmp/lk; mkdir -p /tmp/lk/hl; chmod 755 /tmp/lk
    id _lkprobe >/dev/null 2>&1 || pw useradd _lkprobe -u 65031 -d /nonexistent -s /usr/sbin/nologin -c "lock gate"'

@@ -59,7 +59,12 @@
 set -eu
 
 BSD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-QEMU_DIR="$BSD_DIR/external/qemu-build"
+QEMU_DIR="${QEMU_DIR:-$BSD_DIR/external/qemu-build}"
+# A scratch worktree has no qemu build of its own; use the main checkout's.
+if [ ! -x "$QEMU_DIR/build/qemu-system-aarch64" ]; then
+    MAIN="$(cd "$(git -C "$BSD_DIR" rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || MAIN=""
+    [ -n "$MAIN" ] && [ -x "$MAIN/external/qemu-build/build/qemu-system-aarch64" ] && QEMU_DIR="$MAIN/external/qemu-build"
+fi
 QEMU="$QEMU_DIR/build/qemu-system-aarch64"
 SMP="${SMP:-4}"
 MEM="${MEM:-4096}"
@@ -74,7 +79,7 @@ DISK="$BSD_DIR/vm/vm.qcow2"
 SHARE_DIR="$BSD_DIR"
 
 # qemu wants exactly 64MiB for the EFI flash; pad if needed.
-if [ ! -f "$EFI_PAD" ]; then
+if [ ! -f "$EFI_PAD" ] && [ -f "$EFI_SRC" ]; then
     cp "$EFI_SRC" "$EFI_PAD"
     # pad to 64 MiB
     truncate -s 67108864 "$EFI_PAD"
