@@ -4,10 +4,13 @@
 #
 #   sh scripts/cloud-vm.sh up
 #   sh scripts/pergola-showcase-vm.sh [light|dark|dark-dialog|light-dialog] [out.png]
+#   EXAMPLE=navigator_mockup sh scripts/pergola-showcase-vm.sh [main|dark|start] [out.png]
+#     (the Navigator UI mockups of docs/spec/navigator-ui.md)
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+EX="${EXAMPLE:-showcase}"
 MODE="${1:-light}"
-OUT="${2:-$ROOT/scratch/pergola-showcase-$MODE.png}"
+OUT="${2:-$ROOT/scratch/pergola-$EX-$MODE.png}"
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
@@ -20,11 +23,11 @@ get() { scp $SSHOPT -P 2222 -q "root@localhost:$1" "$2"; }
 echo "=== cross-build"
 xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2); }
 xb frescod "--bin frescod"
-xb pergola-document "--example showcase"
+xb pergola-document "--example $EX"
 
 D=/opt/pergola-showcase
-g "pkill -x frescod; pkill -x showcase; sleep 1; rm -rf $D /tmp/ps; mkdir -p $D /tmp/ps; chmod 777 /tmp/ps; true"
-for b in "$ROOT/frescod/target/$TARGET/release/frescod" "$ROOT/pergola-document/target/$TARGET/release/examples/showcase"; do
+g "pkill -x frescod; pkill -x $EX; sleep 1; rm -rf $D /tmp/ps; mkdir -p $D /tmp/ps; chmod 777 /tmp/ps; true"
+for b in "$ROOT/frescod/target/$TARGET/release/frescod" "$ROOT/pergola-document/target/$TARGET/release/examples/$EX"; do
     put "$b" "$D/"
     [ "$(sha256sum "$b" | cut -d' ' -f1)" = "$(g "sha256 -q $D/$(basename "$b")")" ] || { echo "ABORT: hash mismatch for $(basename "$b")"; exit 1; }
 done
@@ -41,7 +44,7 @@ g "cd /tmp/ps && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/ps/screen FRESCOD
 i=0; while [ $i -lt 60 ] && ! g "test -S /tmp/ps/fresco.sock"; do sleep 2; i=$((i+1)); done
 arg="$(echo "$MODE" | tr - " ")"
 S=${SECS:-90}
-g "cd /tmp/ps && env FRESCO_SOCKET=/tmp/ps/fresco.sock SHOWCASE_SECS=$S daemon -f -o /tmp/ps/showcase.log $D/showcase $arg </dev/null"
+g "cd /tmp/ps && env FRESCO_SOCKET=/tmp/ps/fresco.sock SHOWCASE_SECS=$S daemon -f -o /tmp/ps/showcase.log $D/$EX $arg </dev/null"
 # CLICKS="x,y x,y": presses through frescod's input injector once the
 # window is up (a menu opens only from a press: frescod's pop-up rule).
 if [ -n "${CLICKS:-}" ]; then
