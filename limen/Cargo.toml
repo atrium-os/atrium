@@ -37,3 +37,7 @@ path = "examples/embed_probe.rs"
 [[example]]
 name = "limen-arca-probe"
 path = "examples/arca_fill_probe.rs"
+
+[[example]]
+name = "limend-dev"
+path = "examples/limend_dev.rs"

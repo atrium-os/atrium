@@ -9,6 +9,11 @@
 //! `NAVIGATOR_UI_SECS=n` exits after n seconds (for VM screenshots);
 //! `NAVIGATOR_UI_SIZE=WxH` sets the window's size (default 1280x696, the
 //! 720-line screen under frescod's 24 px origin strip).
+//!
+//! Step 2 (`navigator_ui::live`): with `NAVIGATORD_SOCKET`, the window
+//! opens on a fresh trail on Start; pages come from navigatord and are
+//! drawn by a doc-viewer child that limend (`LIMEN_SOCKET`) binds into the
+//! page slot. `NAVIGATOR_UI_OPEN=url` opens one at start.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -16,11 +21,18 @@ use std::time::Duration;
 
 use navigator_ui::fake::Scene;
 use navigator_ui::keys;
+use navigator_ui::live::Live;
 use navigator_ui::shell::{Shell, PAGE_SLOT};
+use navigator_ui::trail::TrailStore;
 use navigator_ui::ui::{now_ms, ShellView};
 
 use pergola::theme::Semantic;
+use pergola::window::StepResult;
 use pergola::{App, Event, Mutable, SizeSpec, Window, WindowDesc};
+
+/// How long a step waits for frescod before navigatord and limend are
+/// looked at (live mode).
+const TICK: Duration = Duration::from_millis(30);
 
 /// Where the page slot is, for the log, until Limen binds it (step 2).
 struct LogBinder;
@@ -31,6 +43,11 @@ impl pergola::slot::SlotBinder for LogBinder {
             eprintln!("navigator-ui: page slot of window {window_id} -> {rect:?}");
         }
     }
+}
+
+fn die(m: impl std::fmt::Display) -> ! {
+    eprintln!("navigator-ui: {m}");
+    std::process::exit(1)
 }
 
 fn main() -> std::io::Result<()> {
@@ -67,13 +84,49 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let mut window = Window::open(&WindowDesc::new("Navigator", SizeSpec::Fixed(w, h)))?;
-    window.set_slot_binder(Box::new(LogBinder));
+    let desc = WindowDesc::new("Navigator", SizeSpec::Fixed(w, h));
+    // Live: navigatord first, since it may open the window's connection.
+    let mut live = None;
+    let mut window = match std::env::var("NAVIGATORD_SOCKET").ok().filter(|_| scene.is_none()) {
+        Some(path) => {
+            let (l, fd) = Live::connect(&path, true).unwrap_or_else(|e| die(format_args!("navigatord at {path}: {e}")));
+            live = Some(l);
+            match fd {
+                Some(fd) => {
+                    // Text is measured on a connection of its own, as
+                    // Window::open does.
+                    let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
+                    match pergola::text::WireMeasurer::connect(&sock) {
+                        Ok(m) => pergola::text::install_measurer(Box::new(m)),
+                        Err(e) => eprintln!("navigator-ui: no text measurer ({e}); using estimates"),
+                    }
+                    let conn = fresco_client::Connection::wrap(std::os::unix::net::UnixStream::from(fd))?;
+                    Window::open_on(conn, &desc)?
+                }
+                None => {
+                    eprintln!("navigator-ui: no chrome channel: the strip will not name the page");
+                    Window::open(&desc)?
+                }
+            }
+        }
+        None => Window::open(&desc)?,
+    };
     window.follow_appearance(theme.is_none());
     let dirty = Arc::new(AtomicBool::new(true));
-    let mut shell = match scene {
-        Some(sc) => Shell::scene(sc, window.width, window.height),
-        None => Shell::new(navigator_ui::fake::store(), window.width, window.height),
+    let mut shell = match (scene, &live) {
+        (Some(sc), _) => Shell::scene(sc, window.width, window.height),
+        (None, Some(_)) => {
+            let mut s = Shell::new(TrailStore::empty(), window.width, window.height);
+            s.live = Some(navigator_ui::shell::LivePage::Loading(String::new()));
+            s.store.new_trail(false);
+            if let Ok(u) = std::env::var("NAVIGATOR_UI_OPEN") {
+                s.enter(&u);
+            } else {
+                s.begin_edit();
+            }
+            s
+        }
+        (None, None) => Shell::new(navigator_ui::fake::store(), window.width, window.height),
     };
     shell.w = window.width;
     shell.h = window.height;
@@ -83,42 +136,77 @@ fn main() -> std::io::Result<()> {
         app = app.with_theme(t);
     }
 
-    window.run(&mut app, move |raw, _app, flow| {
-        if let fresco_client::Event::Resized { width, height, .. } = raw {
+    match &mut live {
+        Some(l) => {
+            l.dark = theme == Some(Semantic::DARK);
+            l.window(window.id());
+            let embeds = pergola::embed::Embeds::connect().unwrap_or_else(|e| die(format_args!("limend: {e:?}")));
+            window.set_slot_binder(pergola::embed::Embeds::binder(&embeds));
+            // frescod names the window with an embed token; limend wants it.
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while window.embed_token().is_none() {
+                if std::time::Instant::now() > until {
+                    die("no embed token from frescod");
+                }
+                if let StepResult::Closed = window.step(&mut app, Some(Duration::from_millis(100)))? {
+                    return Ok(());
+                }
+            }
+            l.embed(embeds, window.embed_token().unwrap());
+        }
+        None => window.set_slot_binder(Box::new(LogBinder)),
+    }
+
+    loop {
+        match window.step(&mut app, Some(TICK))? {
+            StepResult::Event(raw) => event(&raw, &state),
+            StepResult::Closed => return Ok(()),
+            StepResult::Timeout => {}
+        }
+        if let Some(l) = &mut live {
             let mut s = state.get_cloned();
-            s.w = *width as f32;
-            s.h = *height as f32;
+            if l.tick(&mut s) {
+                navigator_ui::ui::trace(&mut s);
+                state.set(s);
+            }
+        }
+    }
+}
+
+/// The window's raw events the shell handles itself: its size, the
+/// keyboard map and the Where field's typing, and presses (which close
+/// the field and the popover when they land outside them).
+fn event(raw: &fresco_client::Event, state: &Mutable<Shell>) {
+    if let fresco_client::Event::Resized { width, height, .. } = raw {
+        let mut s = state.get_cloned();
+        s.w = *width as f32;
+        s.h = *height as f32;
+        state.set(s);
+        return;
+    }
+    let Some(ev) = pergola::input::translate(raw) else { return };
+    match &ev {
+        Event::Key { modifiers, kind, key, chars } => {
+            let mut s = state.get_cloned();
+            s.mods = *modifiers;
+            let now = now_ms();
+            if let Some(a) = keys::action(&ev) {
+                s.apply(a, now);
+            } else if s.editing.is_some() && kind.pressed() {
+                s.edit_key(*key, *modifiers, chars, now);
+            } else if *key == pergola::Key::Escape && s.popover {
+                s.popover = false;
+            }
+            if kind.pressed() {
+                navigator_ui::ui::trace(&mut s);
+            }
             state.set(s);
-            return;
         }
-        let Some(ev) = pergola::input::translate(raw) else { return };
-        match &ev {
-            Event::Key { modifiers, kind, key, chars } => {
-                let mut s = state.get_cloned();
-                s.mods = *modifiers;
-                let now = now_ms();
-                if let Some(a) = keys::action(&ev) {
-                    s.apply(a, now);
-                    flow.consume();
-                } else if s.editing.is_some() && kind.pressed() {
-                    if s.edit_key(*key, *modifiers, chars, now) {
-                        flow.consume();
-                    }
-                } else if *key == pergola::Key::Escape && s.popover {
-                    s.popover = false;
-                    flow.consume();
-                }
-                if kind.pressed() {
-                    navigator_ui::ui::trace(&mut s);
-                }
-                state.set(s);
-            }
-            Event::PointerDown { at } => {
-                let mut s = state.get_cloned();
-                s.press_at(at.x, at.y);
-                state.set(s);
-            }
-            _ => {}
+        Event::PointerDown { at } => {
+            let mut s = state.get_cloned();
+            s.press_at(at.x, at.y);
+            state.set(s);
         }
-    })
+        _ => {}
+    }
 }

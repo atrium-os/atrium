@@ -1,0 +1,31 @@
+[package]
+name = "navigator-page"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "navigator-page — the doc-viewer child (limen.md §2.1, L6): a jailed worker that reads one recording from a read-only descriptor, normalizes and lays it out, draws it with DocumentView in its own embedded window, and reports links back to the parent. The Navigator's page (docs/spec/navigator-ui.md §14 step 2)."
+
+[lib]
+name = "navigator_page"
+path = "src/lib.rs"
+
+[[bin]]
+name = "navigator-page"
+path = "src/bin/navigator-page.rs"
+
+[dependencies]
+limen = { path = "../limen" }
+navigator-control = { path = "../navigator-control" }
+pergola = { path = "../pergola" }
+pergola-document = { path = "../pergola-document" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+navigator-normalize = { path = "../navigator-normalize" }
+navigator-render = { path = "../navigator-render" }
+navigator-style = { path = "../navigator-style" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

@@ -9,7 +9,7 @@ use pergola::{Key, Modifiers, Rect};
 
 use crate::fake::{self, Link};
 use crate::keys::Action;
-use crate::trail::{Asked, Light, Prompt, TrailStore, PROMPT_STILL_MS};
+use crate::trail::{Asked, Facts, Light, Media, PageSpec, Prompt, TrailStore, PROMPT_STILL_MS};
 use crate::where_field::{self, Entry, Source, Suggestion};
 
 /// Rail width, wide and collapsed (§5.2; collapsed = Forum's dock rail).
@@ -56,6 +56,38 @@ pub struct Shell {
     /// The last thing a press did that has no visible effect yet in step 1
     /// (a prompt's answer, Reload), for the log.
     pub last_note: Option<String>,
+    /// Pages come from navigatord (step 2): `None` is the stand-in store.
+    pub live: Option<LivePage>,
+    /// What the UI asks navigatord next (drained by the main loop).
+    pub outbox: Vec<Out>,
+}
+
+/// The live page's state, as navigatord and the page child reported it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LivePage {
+    /// Asked for, not yet converted.
+    Loading(String),
+    /// Opened and handed to the page child.
+    Shown(String),
+    /// navigatord could not open it.
+    Failed { url: String, why: String },
+}
+
+/// A request for navigatord the shell can't send itself.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Out {
+    /// A link pressed in the page (the href as the page spells it).
+    Activate { page: String, href: String, beside: bool },
+}
+
+/// A page about to be opened by navigatord: its title is its host until
+/// navigatord names it, and its light is what its scheme earns (§6.5).
+pub fn live_spec(url: &str) -> PageSpec {
+    let insecure = url.starts_with("http:");
+    let host = crate::trail::host(url).to_string();
+    let conn = if insecure { "Not private: http, anyone on the path can read and change it" } else { "Private: https" };
+    let facts = Facts { insecure, ..Facts::green(conn) }.settle();
+    PageSpec { url: url.into(), title: host, search: None, facts, media: Media::None }
 }
 
 /// Where everything is, from the window's size and state.
@@ -79,7 +111,50 @@ pub struct Geo {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new() }
+    }
+
+    /// A page for `url`: from navigatord when live, else the stand-in.
+    fn spec(&self, url: &str) -> PageSpec {
+        if self.live.is_some() { live_spec(url) } else { fake::spec(url) }
+    }
+
+    /// The address the current trail shows, if it shows a page.
+    pub fn shown_url(&self) -> Option<String> {
+        self.store.trail().page().map(|p| p.url.clone())
+    }
+
+    /// navigatord opened `asked` (as `url`, after any redirect).
+    pub fn opened(&mut self, asked: &str, url: &str, title: &str, insecure: bool) {
+        for t in &mut self.store.trails {
+            for p in t.pages.iter_mut().filter(|p| p.url == asked) {
+                p.url = url.to_string();
+                if !title.is_empty() {
+                    p.title = title.to_string();
+                }
+                p.facts = live_spec(url).facts;
+                p.facts.insecure |= insecure;
+                p.facts = p.facts.clone().settle();
+            }
+        }
+        self.live = Some(LivePage::Shown(url.into()));
+    }
+
+    /// A link pressed in the live page: navigatord decides what it does.
+    pub fn link_pressed(&mut self, href: &str) {
+        if let Some(page) = self.shown_url() {
+            self.outbox.push(Out::Activate { page, href: href.into(), beside: self.mods.ctrl });
+        }
+    }
+
+    /// navigatord's decision: follow (or open beside) a link.
+    pub fn follow_link(&mut self, url: &str, beside: bool) {
+        let spec = self.spec(url);
+        if beside {
+            self.store.trail_mut().open_beside(spec);
+        } else {
+            self.store.follow(spec);
+        }
     }
 
     /// The stand-in scenes of navigator-ui.md §5.8 (and a stop page).
@@ -217,7 +292,8 @@ impl Shell {
             None => return,
         };
         self.end_edit();
-        self.store.follow(fake::spec(&url));
+        let spec = self.spec(&url);
+        self.store.follow(spec);
     }
 
     pub fn take_suggestion(&mut self, s: &Suggestion, _now: f64) {
@@ -228,10 +304,12 @@ impl Shell {
                 self.store.trail_mut().go(*page);
             }
             Source::Kept | Source::History => {
-                self.store.follow(fake::spec(&s.url));
+                let spec = self.spec(&s.url);
+                self.store.follow(spec);
             }
             Source::Search => {
-                self.store.follow(fake::spec(&fake::search_url(&s.title)));
+                let spec = self.spec(&fake::search_url(&s.title));
+                self.store.follow(spec);
             }
         }
     }
@@ -420,6 +498,30 @@ mod tests {
 
     fn shell() -> Shell {
         Shell::new(fake::store(), 1280.0, 696.0)
+    }
+
+    #[test]
+    fn a_live_trail_follows_what_navigatord_decides() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(false);
+        s.enter("http://atlas.example/wiki/Atrium");
+        assert_eq!(s.shown_url().as_deref(), Some("http://atlas.example/wiki/Atrium"));
+        assert_eq!(s.store.trail().page().unwrap().title, "atlas.example", "the host until navigatord names it");
+        assert_eq!(s.store.trail().page().unwrap().facts.light, Light::Amber, "http is not private");
+        // Redirected to https, and named.
+        s.opened("http://atlas.example/wiki/Atrium", "https://atlas.example/wiki/Atrium", "Atrium", false);
+        let p = s.store.trail().page().unwrap();
+        assert_eq!((p.url.as_str(), p.title.as_str(), p.facts.light), ("https://atlas.example/wiki/Atrium", "Atrium", Light::Green));
+        // A press in the page goes to navigatord; its answer moves the trail.
+        s.link_pressed("/wiki/Impluvium");
+        assert_eq!(s.outbox, vec![Out::Activate { page: "https://atlas.example/wiki/Atrium".into(), href: "/wiki/Impluvium".into(), beside: false }]);
+        s.follow_link("https://atlas.example/wiki/Impluvium", false);
+        assert_eq!(s.store.trail().pages.len(), 2);
+        s.apply(Action::Back, 0.0);
+        assert_eq!(s.shown_url().as_deref(), Some("https://atlas.example/wiki/Atrium"));
+        s.apply(Action::Forward, 0.0);
+        assert_eq!(s.shown_url().as_deref(), Some("https://atlas.example/wiki/Impluvium"));
     }
 
     #[test]

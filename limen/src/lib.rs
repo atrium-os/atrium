@@ -7,13 +7,14 @@
 //! - [`client`]: the parent's and the child's ends.
 //! - [`audio`]: choragusd's attribution tickets for embedded players.
 //! - [`fdpass`]: the checks on a descriptor a parent passes with a message.
-//! - one module per role's messages: [`credential`], [`media_player`].
+//! - one module per role's messages: [`credential`], [`doc_viewer`], [`media_player`].
 
 pub mod audio;
 pub mod catalogue;
 pub mod client;
 pub mod credential;
 pub mod daemon;
+pub mod doc_viewer;
 pub mod fdpass;
 pub mod fresco;
 pub mod launch;

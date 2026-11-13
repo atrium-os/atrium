@@ -1,0 +1,12 @@
+[package]
+name = "navigator-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The Navigator's control plane (docs/spec/navigator-ui.md §2, backend §3): what the UI and navigatord say to each other, and what a page child says to navigatord to fetch its document. Postcard frames on a Unix socket, descriptors over SCM_RIGHTS."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }

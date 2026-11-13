@@ -75,7 +75,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -83,6 +83,15 @@ pub fn trace(s: &mut Shell) {
             s.editing.as_ref().map_or("-".to_string(), |e| format!("\"{}\"", e.edit.text())),
             t.page().is_some_and(|p| p.asked.is_some()),
             s.rail_w(),
+            t.page().map_or("-", |p| p.url.as_str()),
+            match &s.live {
+                None => "-".to_string(),
+                Some(crate::shell::LivePage::Loading(_)) => "loading".into(),
+                Some(crate::shell::LivePage::Shown(_)) => "shown".into(),
+                Some(crate::shell::LivePage::Failed { why, .. }) => format!("failed:{}", why.replace(' ', "_")),
+            },
+            s.geo().page.x(),
+            s.geo().page.y(),
         );
     }
 }
@@ -884,6 +893,32 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
 fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Option<String> {
     let t = ctx.theme;
     let r = g.page;
+    if let Some(live) = &st.get_cloned().live {
+        // The page is the doc-viewer child's window, bound into this slot
+        // once navigatord has opened it; until then (or when it failed)
+        // the slot is withdrawn and the UI says what is happening.
+        let shown = matches!(live, crate::shell::LivePage::Shown(_));
+        let slot = ctx.push(Node::Rect { rect: r, fill: if shown { Color::rgba(1.0, 1.0, 1.0, 1.0) } else { t.bg_canvas() }, radius: 0.0 });
+        if shown {
+            ctx.slot(slot, PAGE_SLOT);
+        }
+        let col = 640.0f32.min(r.w() - 64.0);
+        let x = r.x() + ((r.w() - col) / 2.0).max(32.0);
+        let y = r.y() + 48.0;
+        let ns = sans(type_size::SM, Weight::Regular, t.text_secondary());
+        match live {
+            crate::shell::LivePage::Loading(u) => {
+                text(ctx, x, y, &fit(&format!("Opening {}…", crate::trail::host(u)), &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            crate::shell::LivePage::Failed { url, why } => {
+                text(ctx, x, y, &fit(&format!("{} could not be opened", crate::trail::host(url)), &ns, col), type_size::LG, Weight::Semibold, t.text_primary());
+                text(ctx, x, y + 28.0, &fit(why, &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            crate::shell::LivePage::Shown(_) => {}
+        }
+        ctx.pop();
+        return None;
+    }
     let slot = ctx.push(Node::Rect { rect: r, fill: t.bg_canvas(), radius: 0.0 });
     ctx.slot(slot, PAGE_SLOT);
     let col = 640.0f32.min(r.w() - 64.0);

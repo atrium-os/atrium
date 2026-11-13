@@ -47,6 +47,8 @@ pub const IDLE_BANDS: usize = 2;
 /// view's origin (cached until the origin moves).
 struct Group {
     nodes: Rc<Vec<Node>>,
+    /// The scene's link areas, document px, and where they go.
+    links: Vec<(Rect, String)>,
     placed: Option<(Point, Rc<Vec<Node>>)>,
 }
 
@@ -75,7 +77,11 @@ impl SceneSink for Sink<'_> {
         if let Some((a, b)) = clip {
             convert::clip_rows(&mut nodes, a as f32 / 64.0, b as f32 / 64.0);
         }
-        self.groups.insert(group, Group { nodes: Rc::new(nodes), placed: None });
+        let links = scene.links.iter()
+            .filter(|l| clip.map_or(true, |(a, b)| l.y + l.h > a && l.y < b))
+            .map(|l| (Rect::new(l.x as f32 / 64.0, l.y as f32 / 64.0, l.w as f32 / 64.0, l.h as f32 / 64.0), l.href.clone()))
+            .collect();
+        self.groups.insert(group, Group { nodes: Rc::new(nodes), links, placed: None });
     }
     fn clear(&mut self, group: GroupId) {
         self.groups.remove(&group);
@@ -138,6 +144,20 @@ impl Doc {
         (top, !self.viewport.settled)
     }
 
+    /// The link under the document point (`x`, `y`) in px, if any: the
+    /// topmost (last painted) wins.
+    pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
+        let mut hit = None;
+        for g in self.groups.values() {
+            for (r, href) in &g.links {
+                if x >= r.x() && x < r.x() + r.w() && y >= r.y() && y < r.y() + r.h() {
+                    hit = Some(href.as_str());
+                }
+            }
+        }
+        hit
+    }
+
     /// `group`'s nodes moved to `origin`.
     fn placed(&mut self, group: GroupId, origin: Point) -> Option<Rc<Vec<Node>>> {
         let g = self.groups.get_mut(&group)?;
@@ -173,6 +193,19 @@ impl DocumentView {
     pub fn key(mut self, k: u64) -> Self {
         self.key = Some(k);
         self
+    }
+
+    /// The link under the window point `p`, from the view's rect, scroll
+    /// position and settled zoom.
+    pub fn link_at(&self, p: Point) -> Option<String> {
+        if !self.rect.contains(p) {
+            return None;
+        }
+        let st = self.state.get();
+        let z = st.zoom.settled.max(0.01) as f32;
+        let x = (p.x - self.rect.x()) / z;
+        let y = (p.y - self.rect.y()) / z + st.physics.y as f32;
+        self.doc.borrow().link_at(x, y).map(str::to_string)
     }
 
     pub fn emit(&self, ctx: &mut Ctx) -> NodeId {

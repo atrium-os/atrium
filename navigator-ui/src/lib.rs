@@ -6,9 +6,13 @@
 //! ([`fake`]), with the page as a placeholder slot ([`shell::PAGE_SLOT`])
 //! where Limen binds the jailed page from step 2. The origin strip above
 //! the window is frescod's, never drawn here (§6.1).
+//!
+//! Step 2 ([`live`]): with `NAVIGATORD_SOCKET` set, pages come from
+//! navigatord and the page slot holds a doc-viewer child (Limen L6).
 
 pub mod fake;
 pub mod keys;
+pub mod live;
 pub mod shell;
 pub mod trail;
 pub mod ui;

@@ -152,7 +152,19 @@ impl Window {
     /// is non-fatal: layout falls back to estimates.
     pub fn open(desc: &WindowDesc) -> io::Result<Self> {
         let socket = socket_path();
-        let mut conn = Connection::connect(&socket)?;
+        let conn = Connection::connect(&socket)?;
+        match WireMeasurer::connect(&socket) {
+            Ok(m) => install_measurer(Box::new(m)),
+            Err(e) => log::warn!("window: no text measurer ({e}); using estimates"),
+        }
+        Self::open_on(conn, desc)
+    }
+
+    /// Open the window on a connection the app was handed (a Limen
+    /// child's embed-only connection, limen.md §2: it can't dial the
+    /// socket). No text measurer is installed here: an app that lays
+    /// out Pergola text installs one itself, or gets estimates.
+    pub fn open_on(mut conn: Connection, desc: &WindowDesc) -> io::Result<Self> {
 
         let (w, h) = match desc.size {
             SizeSpec::Fixed(w, h) => (w, h),
@@ -183,11 +195,6 @@ impl Window {
                 None
             }
         };
-
-        match WireMeasurer::connect(&socket) {
-            Ok(m) => install_measurer(Box::new(m)),
-            Err(e) => log::warn!("window: no text measurer ({e}); using estimates"),
-        }
 
         Ok(Self {
             surface: FrescoSurface::new(conn, win),

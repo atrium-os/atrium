@@ -581,7 +581,7 @@ The C SDK waits for an Insula app that needs it.
 | L3 ✓ (not run on FreeBSD yet) | portcullisd: `ExecInstance` in embed mode, with the channel inherited | Pergola thread, reviewed by portcullisd's owner |
 | L4 | Pergola: `limen::Parent` as the `Window`'s `SlotBinder`, `CredentialField` on it, and the child side for Pergola apps | Pergola thread |
 | L5 ✓ (with a stand-in Arca) | `credential` end to end against a stand-in Arca child, in the VM in split mode. The activation probe's covers are still refused | Pergola thread |
-| L6 | `doc-viewer` with the Navigator's document worker as the child | Pergola thread, with the Navigator thread |
+| L6 (built 2026-11-13, unconfined in the VM run) | `doc-viewer` with the Navigator's document worker as the child: `navigator-page`, `limen::doc_viewer` (`Load` with a descriptor, `Open` with a navigatord ticket); driven by `scripts/navigator-live-vm.sh` through `limend-dev` | Pergola thread, with the Navigator thread |
 
 **As built (2026-11-06, d6f1401).** L0 and L1 are in `limen/`:
 - `catalogue`, `proto` (CLASS_LIMEN 14), `daemon`, `client::{Parent, Child}` and

@@ -1,0 +1,24 @@
+[package]
+name = "navigatord"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "navigatord — the Navigator's broker as a daemon (docs/spec/navigator-ui.md §14 step 2): the UI's control socket (open a page, decide a link), the page socket where a doc-viewer child redeems a ticket, each page fetched and converted in one-shot jails, and its origin set in frescod's strip over the chrome channel."
+
+[[bin]]
+name = "navigatord"
+path = "src/main.rs"
+
+[dependencies]
+navigator-control = { path = "../navigator-control" }
+navigator-backend = { path = "../navigator-backend" }
+navigator-prerender = { path = "../navigator-prerender" }
+fresco-split = { path = "../fresco-split" }
+url = "2"
+libc = "0.2"
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent crate
+# must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

@@ -34,7 +34,7 @@ pub const VESTIBULUM: &str = "org.atrium.vestibulum";
 pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false },
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false },
-    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },
     Role { name: "picker", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
     Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },

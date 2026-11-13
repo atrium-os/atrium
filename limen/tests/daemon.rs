@@ -60,7 +60,7 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert!(app == "org.example.viewer" || app == "org.example.player", "{app}");
+        assert!(["org.example.viewer", "org.example.player", "org.example.picker"].contains(&app), "{app}");
         self.0.send((embed, ch)).unwrap();
         Ok(if app == "org.example.player" { PLAYER_UID } else { VIEWER_UID })
     }
@@ -95,6 +95,7 @@ impl World {
         let defaults = Box::new(|_: &str, role: &str| match role {
             "doc-viewer" => Some("org.example.viewer".to_string()),
             "media-player" => Some("org.example.player".to_string()),
+            "picker" => Some("org.example.picker".to_string()),
             _ => None,
         });
         let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone())), resolve, defaults);
@@ -397,8 +398,8 @@ fn a_player_gets_a_read_only_file_or_pipe_with_a_message_and_nothing_else() {
     assert!(player.take_fd().is_none());
 
     // A role that takes no descriptor, and someone else's embed.
-    let v = app.request("doc-viewer", W_APP).unwrap();
-    let _viewer = w.spawned();
+    let v = app.request("picker", W_APP).unwrap();
+    let _picker = w.spawned();
     assert_eq!(refused(app.send_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
     let mut other = w.parent(OTHER);
     assert_eq!(refused(other.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::NOT_YOURS);

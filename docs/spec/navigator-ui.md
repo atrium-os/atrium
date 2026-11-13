@@ -1042,6 +1042,25 @@ Each step runs in the VM on headless frescod before the next.
    suggestion list and the popover. Run with `scripts/navigator-ui-vm.sh` (RUNBOOK §13.6c).
 2. **One live page.** Connect to `navigatord`: open a session, bind the page through Limen L6,
    Back/Forward along a one-page trail, link activation, the origin strip following the slot.
+   *Built 2026-11-13:*
+   - `navigatord/`: the broker as a daemon. A control socket for the UI (`navigator-control`:
+     `Open`, `Activate`, `Blank`) and a page socket where the page child redeems a one-shot ticket
+     for the recording, so the UI never holds a page's bytes (§1). Each page is fetched through a
+     per-conversion fetcher and converted in a one-shot converter (`NAVIGATORD_FETCHD`,
+     `NAVIGATORD_CONVERTER`, `{instance}` filled in), recent ones cached for Back. A link is
+     followed only if the recording carries it (`links::recording_spellings`) and `links::decide`
+     says so. On `Hello` navigatord opens the UI's frescod connection over the chrome channel and
+     sets the shown page's origin on its window.
+   - `navigator-page/`: the doc-viewer child (L6). It runs DocumentView (now with link areas) in its
+     embedded window, takes `Open { ticket }` (and `Load` with a descriptor for other parents),
+     reports `Loaded`, `LinkActivated` (the href as written) and `LinkHover` (resolved).
+   - frescod: a focused slot child with no origin of its own is named by the window it is bound
+     into, so the strip keeps naming the page when the focus is in it.
+   - The UI's live mode (`NAVIGATORD_SOCKET`): `Embeds` binds the page slot; whenever the trail's
+     shown page changes (Enter, a link, Back, Forward) it asks navigatord to open it.
+   - Run with `scripts/navigator-live-vm.sh` (RUNBOOK §13.6d). In that run the page child and the
+     converter are not yet jailed and pages come from fixtures. Open: their bundles and worker
+     rules, the Navigator's keys while the page has the focus, images and anchors in the child.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.
 4. **Parking.** Save and restore under the broker's budget; measure restore time on the Mac
    (HVF) and the R9700 box, and set the live budget from it.

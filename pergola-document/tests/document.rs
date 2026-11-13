@@ -110,3 +110,29 @@ fn a_long_document_scrolls_with_a_few_screens_resident() {
     let nodes = app.tree().iter().count();
     eprintln!("document: {h:.0} px, settled in {ticks} renders; {far} runs resident, {nodes} nodes; {per:.2} ms per scroll frame; skipped {:?}", doc.borrow().skipped);
 }
+
+#[test]
+fn a_link_is_found_under_the_pointer_and_moves_with_the_scroll() {
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+    let more = Mutable::with_dirty(0u64, dirty.clone());
+    let page = r#"<html><head><style>body { margin: 0px } p { margin: 0px; height: 40px } </style></head><body>
+        <p>One</p><p><a href="https://atlas.example/two">Two</a></p><p>Three</p></body></html>"#;
+    let doc = Rc::new(RefCell::new(Doc::html(page.into(), Default::default(), 400.0, 300.0, false, |_| None).unwrap()));
+    let view = DocumentView::new(state.clone(), Rect::new(10.0, 50.0, 400.0, 300.0), doc.clone(), more);
+    let probe = DocumentView::new(state.clone(), view.rect, doc.clone(), Mutable::new(0));
+    let mut app = App::new_with_flag(Page { view }, dirty);
+    app.tick();
+    use pergola::geom::Point;
+    // Where the link's line is, in document px.
+    let y0 = (0..400).map(|y| y as f32).find(|&y| doc.borrow().link_at(15.0, y).is_some()).expect("a link area");
+    assert!(y0 > 20.0, "below the first paragraph: {y0}");
+    let at = |y: f32| probe.link_at(Point::new(25.0, 50.0 + y));
+    assert_eq!(at(y0 + 4.0).as_deref(), Some("https://atlas.example/two"));
+    assert_eq!(at(y0 - 15.0), None, "the paragraph above is no link");
+    assert_eq!(probe.link_at(Point::new(5.0, 50.0 + y0 + 4.0)), None, "outside the view");
+    let mut st = state.get();
+    st.physics.y = 30.0;
+    state.set(st);
+    assert_eq!(at(y0 + 4.0 - 30.0).as_deref(), Some("https://atlas.example/two"), "scrolled 30 px up");
+}

@@ -1419,8 +1419,12 @@ fn render_one_frame(
     if let Some(b) = split {
         /* The focus read and released first: origin() takes the broker's
          * window locks, which a renderer's thread takes before comp. */
-        let (focus, covers, hosted) = {
+        let (focus, covers, hosted, focus_parent) = {
             let c = comp.lock().unwrap();
+            /* The strip follows the page (navigator-ui.md §6.1): a focused
+             * slot child with no origin of its own (a Limen child, the
+             * Navigator's page) is named by the window it is bound into. */
+            let focus_parent = c.focus.and_then(|f| c.windows.get(&(f as u16))).and_then(|w| w.slot.map(|s| s.parent));
             /* Panels apps hang from the bar by its grant: a label over
              * each names the app (forum-status-items.md §4). */
             let hosted: Vec<([i32; 4], String, bool)> = rects.iter()
@@ -1437,9 +1441,10 @@ fn render_one_frame(
                 .filter(|(id, _)| Some(*id as u16) != c.focus.map(|f| f as u16) && u16::try_from(*id).is_ok_and(|w| c.shell_layer(w)))
                 .map(|&(_, r)| r)
                 .collect();
-            (c.focus, covers, hosted)
+            (c.focus, covers, hosted, focus_parent)
         };
-        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects, &slots, &covers, &hosted);
+        let origin = |id: u16| b.origin(id).or_else(|| focus_parent.filter(|_| focus.map(|f| f as u16) == Some(id)).and_then(|p| b.origin(p)));
+        let mut c = chrome::build(screen_w, focus, origin, &rects, &slots, &covers, &hosted);
         c.size.1 = c.size.1.min(screen_h);
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);

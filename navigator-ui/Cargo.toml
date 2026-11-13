@@ -17,3 +17,5 @@ path = "src/main.rs"
 [dependencies]
 pergola = { path = "../pergola" }
 fresco-client = { path = "../fresco-client" }
+limen = { path = "../limen" }
+navigator-control = { path = "../navigator-control" }

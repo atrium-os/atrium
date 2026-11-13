@@ -5577,6 +5577,27 @@ Ctrl-B through frescod's injector and checks the `NAVIGATOR_UI_TRACE` lines. Coo
 forum-wm's placement (window top at y 62 with no bar running). By hand:
 `FRESCO_SOCKET=… navigator-ui --scene start --dark`; `NAVIGATOR_UI_SECS`, `NAVIGATOR_UI_SIZE=WxH`.
 
+### 13.6d Navigator: one live page (`scripts/navigator-live-vm.sh`)
+
+Step 2 of docs/spec/navigator-ui.md §14. With the VM up:
+
+    sh scripts/navigator-live-vm.sh [out-dir]       # ~20 min under TCG, BUILD=0 skips the cross-build
+
+It runs split-mode frescod with its chrome channel (`FRESCOD_CHROME_SOCK`) and `FRESCOD_SLOT_UIDS=0`,
+forum-wm, `limend-dev` (limen/examples: limend's code with providers started as ordinary processes,
+as user `navpage` 50901, since frescod gives embed connections only to non-binder uids), `navigatord
+--unconfined-for-testing` (pages from `navigator-ui/fixtures/<host>/<path>`, the converter as the
+`prerender` binary in serve mode) and navigator-ui with `NAVIGATORD_SOCKET`. It checks: the page opens,
+limend binds `navigator-page` into the page slot, the child redeems its ticket, a link press goes through
+navigatord, Back / Alt-Right / Alt-Left, an http link (amber), a `javascript:` link refused. Frames in
+`scratch/navigator-live/`. Not the shipped confinement: no bundles or worker rules for the page child
+and converter yet.
+
+Cross-building prerender and navigatord compiles ring's C: the script sets `CC_aarch64_unknown_freebsd`
+to clang with `--sysroot`, which needs FreeBSD's headers in the sysroot. If `assert.h` is missing:
+`ssh … root@localhost "tar czf - -C / usr/include" | tar xzf - -C ~/atrium-vm/sysroot`, then
+`cargo clean -p ring --release --target aarch64-unknown-freebsd` in both crates.
+
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
 - Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.
