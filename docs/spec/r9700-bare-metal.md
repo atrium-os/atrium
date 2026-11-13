@@ -1425,3 +1425,17 @@ work (self-test, scrub).
   arrives. That is the window of audit F1.
   Next (kmods fc80fbea): F1/F2 in, plus the L2/CPF state and time since the
   fault at each of those steps. Logs: claude/project-thread-33aauq 8cd0e5be.
+- **2026-11-13 14:47, full suite with fc80fbea (F1/F2 locks + step readings):
+  WEDGED; no lock warnings; the window is the eviction's HQD lookup.** 70 passed,
+  2 failed, 189 timeouts. Test 15: L2_STATUS 0 and CPF 0xa0000001 at the fault,
+  when the IH marks the queue lost (101 us), when the eviction starts (114 us)
+  and after the queue report (153 us); L2_STATUS 0x1 and CPF 0xb0000001 after the
+  HQD lookup (210 us), for good. The lookup is a GRBM-selected scan of the 32
+  compute HQDs; the bystander's EOP IV arrived just before it and MES pipe 0 was
+  busy right after (PC 0x1882, MES_TC_BUSY). Tests 7 and 13 ran the same steps
+  with MES idle (PC 0x7ec4) and stayed clean. F1's lock serialises the driver's
+  own threads, not the driver against MES, so it did not help.
+  Hypothesis: driver HQD register scans while MES is scheduling corrupt MES's
+  own HQD accesses (amdgpu does not touch MES-owned HQDs by MMIO while MES runs).
+  Probe (kmods b4d6e8f9): the eviction kills the waves on the VMID the IH found
+  at the fault, with no second scan. Logs: claude/project-thread-33aauq 71bced9e.
