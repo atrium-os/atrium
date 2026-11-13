@@ -1439,3 +1439,18 @@ work (self-test, scrub).
   own HQD accesses (amdgpu does not touch MES-owned HQDs by MMIO while MES runs).
   Probe (kmods b4d6e8f9): the eviction kills the waves on the VMID the IH found
   at the fault, with no second scan. Logs: claude/project-thread-33aauq 71bced9e.
+- **2026-11-13 14:56, full suite with b4d6e8f9 (no HQD scan in the eviction):
+  75 passed, 2 failed; the high-VA case recovers for the first time in the
+  full suite, the next case wedges.** "Stores past its own buffer" (VMID 12,
+  0x10003000) went L2 0x1 / CPF 0xb0000001 between the eviction's start (281 us,
+  clean) and the end of its queue report (455 us). The queue report scans the
+  HQDs too (amd_mes12_uq_report -> uq2_hqd_find), so this fits the hypothesis
+  rather than breaking it: every wedge so far starts during a GRBM-selected
+  scan of the MES-owned HQDs while CP/MES is busy. The watcher now caught the
+  busy-with-no-work card itself and mode-1 reset it (A3.7).
+  Fix (kmods 3b6c6dfc): on a VM fault the IH finds the queue's VMID by the
+  hub's context page-table base, not an HQD scan (scan only as a logged
+  fallback); the eviction reports a faulted queue without scanning and kills
+  on the VMID from the fault. Still scanning: the uq_poll hang check, CP-error
+  IVs, the HQD reset of a queue that will not stop. Logs:
+  claude/project-thread-33aauq 2bcbeacc.
