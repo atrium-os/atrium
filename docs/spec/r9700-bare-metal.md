@@ -1400,3 +1400,16 @@ work (self-test, scrub).
   RLC_GPM_STAT and GCVM_L2_STATUS before the kill, right after it and at the end
   of the watch, to tell whether the kill causes the state or only finds it.
   Logs: claude/project-thread-33aauq 8845a1e3.
+- **2026-11-13 14:23, full suite with 8e13d8ce (snapshots before and after the
+  kill): WEDGED, and the kill is innocent.** 70 passed, 2 failed, 189 timeouts.
+  Test 15's state was already there before the kill: CP_CPF_STATUS 0xb0000001
+  and GCVM_L2_STATUS 0x1 (L2_BUSY) before it, right after it and 500 ms later.
+  Every recovering kill had bit 28 clear and L2_STATUS 0 before the kill (test 8
+  read 0x201 and cleared at once). So the GFXHUB L2 goes busy for good at or
+  just after test 15's fault, and the kill and teardown only meet it. Test 7's
+  fault is the same kind on a fresh VM and does not.
+  Next (kmods 880c3ce7, built with and without the audit's F1/F2 locks): at the
+  fault, print GCVM_L2_STATUS, whether L2_BUSY clears within 1 ms, and when the
+  last TLB invalidation (and for which context) started and ended, to see
+  whether an invalidation overlaps the fault. Logs: claude/project-thread-33aauq
+  b5d8c2d4.
