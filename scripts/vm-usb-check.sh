@@ -15,10 +15,12 @@
 # grant_nodes ugen#.# and usb/#.#.0) and a devices.d file with two rules.
 # Then it hot-plugs through the QEMU monitor:
 #
-#   - usb-serial (FTDI 0403:6001, which uftdi(4) claims): the rule has
-#     detach_kernel, so dispensatord detaches uftdi and starts the probe;
+#   - usb-audio (46f4:0002, which uaudio(4) claims): the rule has
+#     detach_kernel, so dispensatord detaches uaudio and starts the probe;
 #   - usb-ccid (class 0x0B, no kernel driver) when this QEMU has it: the
-#     nomatch path.
+#     nomatch path; then dispensatord is restarted and must find the reader
+#     again through usbconfig, since devinfo never lists an unclaimed USB
+#     interface.
 #
 # For each: the probe's jail is up and stays up (the probe exits, ending its
 # jail, unless it can open both nodes, read the device's ids, and sees no
@@ -99,13 +101,14 @@ grep -q '^allowed_ids = .*29\]' $P && echo "  ok policy allows ruleset 29" || ec
 grep -q '^allowed_system_uids = \[ 65060,' $P && echo "  ok policy allows uid 65060" || echo "  FAIL could not add 65060 to allowed_system_uids"
 cat > /usr/local/etc/atrium/devices.d/90-usbtest.toml <<'EOR'
 [[rule]]
-name          = "usbtest-serial"
+name          = "usbtest-audio"
 class         = "usb"
-usb_ids       = ["0403:6001"]
+usb_ids       = ["46f4:0002"]
+usb_interface = [0x01, 0x01]
 detach_kernel = true
 nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
 all_nodes     = true
-owner         = "driver:usbtest-serial"
+owner         = "driver:usbtest-audio"
 
 [[rule]]
 name          = "usbtest-ccid"
@@ -115,13 +118,13 @@ nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
 all_nodes     = true
 owner         = "driver:usbtest-ccid"
 
-[driver.usbtest-serial]
+[driver.usbtest-audio]
 exec          = "/usr/local/bin/atrium-usbprobe"
-argv          = ["atrium-usbprobe", "/dev/{node}", "/dev/usb/{bus}.{addr}.0", "0403:6001"]
+argv          = ["atrium-usbprobe", "/dev/{node}", "/dev/usb/{bus}.{addr}.0", "46f4:0002"]
 uid           = 65060
 gid           = 65060
-jail          = "atrium-usbprobe-s-{usb}"
-root          = "/var/lib/atrium/jails/usbprobe-s-{usb}"
+jail          = "atrium-usbprobe-a-{usb}"
+root          = "/var/lib/atrium/jails/usbprobe-a-{usb}"
 devfs_ruleset = 29
 sysfil        = "device"
 mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin"]
@@ -139,7 +142,7 @@ mounts_ro     = ["/libexec", "/lib", "/usr/lib", "/usr/local/bin"]
 EOR
 chown root:wheel /usr/local/etc/atrium/devices.d/90-usbtest.toml; chmod 0644 /usr/local/etc/atrium/devices.d/90-usbtest.toml
 /usr/local/bin/atrium-dispensatord --check | grep usbtest | sed 's/^/  rules: /'
-kldload -n uftdi 2>/dev/null
+kldload -n snd_uaudio 2>/dev/null
 service atrium-jaild start >/dev/null 2>&1; sleep 2
 pgrep -qf atrium-jaild && echo "  ok jaild running" || echo "  FAIL jaild not running"
 : > /var/log/atrium/dispensatord.log
@@ -150,8 +153,8 @@ EOF
 # check RULE PREFIX VENDOR:PRODUCT
 check() {
   rule=$1 pfx=$2
-  line=$(V "grep 'rule=$rule ' /var/run/atrium/dispensator.state")
-  [ -n "$line" ] || { V 'echo "  usbconfig:"; usbconfig list | sed "s/^/    /"; echo "  devinfo:"; devinfo -v | grep -E "ugen=" | sed "s/^/    /"; echo "  devd (last USB lines in messages):"; grep -E "USB|uftdi|ugen" /var/log/messages | tail -6 | sed "s/^/    /"; echo "  the planner on devinfo -v now:"; devinfo -v > /tmp/usbgate.di; : > /tmp/usbgate.empty; /usr/local/bin/atrium-dispensatord --plan /tmp/usbgate.empty --devinfo /tmp/usbgate.di | grep -iE "ugen|usbtest|detach" | sed "s/^/    /"'; bad "$rule: no device assigned (state: $(V 'cat /var/run/atrium/dispensator.state | tr "\n" ";"'); log: $(V 'tail -5 /var/log/atrium/dispensatord.log | tr "\n" ";"'))"; return 1; }
+  line=$(V "grep 'rule=$rule ' /var/run/atrium/dispensator.state | head -1")
+  [ -n "$line" ] || { V 'echo "  usbconfig:"; usbconfig list | sed "s/^/    /"; echo "  devinfo:"; devinfo -v | grep -E "ugen=" | sed "s/^/    /"; echo "  devd (last USB lines in messages):"; grep -E "USB|uaudio|ugen" /var/log/messages | tail -6 | sed "s/^/    /"; echo "  the planner on devinfo -v now:"; devinfo -v > /tmp/usbgate.di; : > /tmp/usbgate.empty; /usr/local/bin/atrium-dispensatord --plan /tmp/usbgate.empty --devinfo /tmp/usbgate.di | grep -iE "ugen|usbtest|detach" | sed "s/^/    /"'; bad "$rule: no device assigned (state: $(V 'cat /var/run/atrium/dispensator.state | tr "\n" ";"'); log: $(V 'tail -5 /var/log/atrium/dispensatord.log | tr "\n" ";"'))"; return 1; }
   key=${line%% *}; ugen=${key%:*}; i=${key#*:}; ba=${ugen#ugen}; b=${ba%.*}; a=${ba#*.}
   inst="$b-$a-$i"; J=atrium-usbprobe-$pfx-$inst; R=/var/lib/atrium/jails/usbprobe-$pfx-$inst/dev
   ok "$rule: $key assigned ($line)"
@@ -174,22 +177,31 @@ gone() {
   V "grep -q '^$key ' /var/run/atrium/dispensator.state" && bad "$key still in the state file" || ok "$key released"
 }
 
-echo "== usb-serial (uftdi claims it; detach_kernel)"
-mon "chardev-add null,id=usbgate-nul" "device_add usb-serial,chardev=usbgate-nul,id=usbgate-ser" | tr -d '\r' | grep -vE '^\(qemu\)|^QEMU|^$|chardev-add|device_add' | sed 's/^/  qemu: /'
+RUN=$$
+# Leftovers of an earlier run that did not finish.
+mon "device_del usbgate-ccid" "device_del usbgate-aud" >/dev/null 2>&1; sleep 2
+
+echo "== usb-audio (uaudio claims it; detach_kernel)"
+mon "device_add usb-audio,id=usbgate-aud$RUN" | tr -d '\r' | grep -iE "error|warn" | sed 's/^/  qemu: /'
 sleep 6
-if check usbtest-serial s; then
-  V "grep -q 'kernel driver detached' /var/log/atrium/dispensatord.log" && ok "uftdi was detached first" || echo "  (no kernel driver had it: the nomatch path ran instead; is uftdi.ko there?)"
-  mon "device_del usbgate-ser" >/dev/null; gone
+if check usbtest-audio a; then
+  V "grep -q 'kernel driver detached' /var/log/atrium/dispensatord.log" && ok "uaudio was detached first" || echo "  (no kernel driver had it: the nomatch path ran instead; is snd_uaudio loaded?)"
+  mon "device_del usbgate-aud$RUN" >/dev/null; gone
 fi
-mon "chardev-remove usbgate-nul" >/dev/null
 
 echo "== usb-ccid (no kernel driver)"
-out=$(mon "device_add usb-ccid,id=usbgate-ccid")
+out=$(mon "device_add usb-ccid,id=usbgate-ccid$RUN" | tr -d '\r')
 if echo "$out" | grep -qiE "not a valid device|error"; then
-  echo "  skip: this QEMU has no usb-ccid ($(echo "$out" | tr -d '\r' | grep -iE 'error|valid' | head -1))"
+  echo "  skip: this QEMU has no usb-ccid ($(echo "$out" | grep -iE 'error|valid' | head -1))"
 else
   sleep 6
-  check usbtest-ccid c && { mon "device_del usbgate-ccid" >/dev/null; gone; }
+  if check usbtest-ccid c; then
+    echo "== restart dispensatord with the reader plugged in (usbconfig at start)"
+    read J key < /tmp/usb-last
+    V 'service atrium-dispensatord restart >/dev/null 2>&1'; sleep 8
+    V "jls -n name | grep -qx 'name=$J'" && ok "after a restart the reader has its jail again ($J)" || bad "after a restart no jail for $key: $(V "tail -4 /var/log/atrium/dispensatord.log | tr '\n' ';'")"
+    mon "device_del usbgate-ccid$RUN" >/dev/null; gone
+  fi
 fi
 
 echo "== clean up"

@@ -202,9 +202,24 @@ mod run {
                 }
                 other => eprintln!("atrium-dispensatord: devinfo -v: {other:?}"),
             }
+            let ops = a.planner.usb_present(&usb_dumps());
+            a.run(ops);
             a.serve(&w, reshow);
             eprintln!("atrium-dispensatord: devd connection lost; reconnecting");
         }
+    }
+
+    /// Every USB device's descriptors as `usbconfig` prints them: USB
+    /// interfaces no kernel driver claimed are not in `devinfo -v`.
+    fn usb_dumps() -> Vec<(String, String)> {
+        let run = |args: &[&str]| {
+            std::process::Command::new("usbconfig").args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let Some(list) = run(&[]) else { return Vec::new() };
+        dispensator::plan::parse_usbconfig_list(&list)
+            .into_iter()
+            .filter_map(|u| run(&["-d", &u, "dump_device_desc", "dump_curr_config_desc"]).map(|t| (u, t)))
+            .collect()
     }
 
     impl Agent {

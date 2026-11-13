@@ -80,6 +80,52 @@ pub fn ugen_numbers(s: &str) -> Option<(u32, u32)> {
     Some((num(b)?, num(a)?))
 }
 
+/// `usbconfig dump_device_desc dump_curr_config_desc` output: the ids and
+/// each interface's (number, class, subclass, protocol), alternate setting
+/// 0 only. Only `name = 0xHHHH` lines are read; string descriptors (the
+/// device's own text) are ignored. A device can describe itself however it
+/// likes anyway, so nothing here is trusted beyond choosing a rule.
+pub fn parse_usbconfig(text: &str) -> Option<(u16, u16, Vec<(u8, u8, u8, u8)>)> {
+    let (mut vendor, mut product) = (None, None);
+    let mut out: Vec<(u8, u8, u8, u8)> = Vec::new();
+    // (number, alt, class, subclass, protocol) of the interface being read.
+    let mut cur: Option<[u32; 5]> = None;
+    let flush = |c: Option<[u32; 5]>, out: &mut Vec<(u8, u8, u8, u8)>| {
+        if let Some([n, 0, c, s, p]) = c {
+            if out.len() < 32 && !out.iter().any(|x| u32::from(x.0) == n) {
+                if let (Ok(n), Ok(c), Ok(s), Ok(p)) = (u8::try_from(n), u8::try_from(c), u8::try_from(s), u8::try_from(p)) {
+                    out.push((n, c, s, p));
+                }
+            }
+        }
+    };
+    for l in text.lines().take(4096) {
+        let Some((k, v)) = l.trim().split_once(" = ") else { continue };
+        let Some(h) = v.split_whitespace().next().and_then(|v| v.strip_prefix("0x")) else { continue };
+        let Ok(v) = u32::from_str_radix(h, 16) else { continue };
+        match k {
+            "idVendor" => vendor = u16::try_from(v).ok(),
+            "idProduct" => product = u16::try_from(v).ok(),
+            "bInterfaceNumber" => {
+                flush(cur.take(), &mut out);
+                cur = Some([v, u32::MAX, u32::MAX, u32::MAX, u32::MAX]);
+            }
+            "bAlternateSetting" => cur.iter_mut().for_each(|c| c[1] = v),
+            "bInterfaceClass" => cur.iter_mut().for_each(|c| c[2] = v),
+            "bInterfaceSubClass" => cur.iter_mut().for_each(|c| c[3] = v),
+            "bInterfaceProtocol" => cur.iter_mut().for_each(|c| c[4] = v),
+            _ => {}
+        }
+    }
+    flush(cur, &mut out);
+    Some((vendor?, product?, out))
+}
+
+/// `usbconfig` (list): the `ugenB.A` names.
+pub fn parse_usbconfig_list(text: &str) -> Vec<String> {
+    text.lines().take(1024).filter_map(|l| l.split_once(':').map(|(u, _)| u.trim().to_string())).filter(|u| ugen_numbers(u).is_some()).collect()
+}
+
 fn vars(pairs: &[(&str, Option<String>)]) -> Vars {
     pairs.iter().filter_map(|(k, v)| Some((k.to_string(), v.clone()?))).collect()
 }
@@ -276,6 +322,34 @@ impl Planner {
         for l in atrium_devevents::hidowner::devinfo_lines(text) {
             if let Some(n) = hidclass::parse(&l) {
                 out.extend(self.hid_notice(n));
+            }
+        }
+        out
+    }
+
+    /// USB interfaces present at start that no kernel driver claimed. The
+    /// USB stack keeps no newbus child for those (it only sent a nomatch
+    /// when the device arrived), so `devinfo -v` cannot show them; the
+    /// daemon asks `usbconfig` instead. `dumps`: per `ugenB.A`, the output
+    /// of `usbconfig -d ugenB.A dump_device_desc dump_curr_config_desc`.
+    /// Claimed interfaces (named in the registry) and hubs are skipped.
+    pub fn usb_present(&mut self, dumps: &[(String, String)]) -> Vec<Op> {
+        let mut out = Vec::new();
+        for (ugen, text) in dumps {
+            let Some((bus, addr)) = ugen_numbers(ugen) else { continue };
+            let Some((vendor, product, ifaces)) = parse_usbconfig(text) else { continue };
+            for (n, class, sub, proto) in ifaces {
+                if class == 0x09 {
+                    continue;
+                }
+                let claimed = self.registry.devices().any(|d| d.name.is_some() && d.fields.get("ugen") == Some(ugen.as_str()) && d.fields.get("interface") == Some(n.to_string().as_str()));
+                if claimed {
+                    continue;
+                }
+                let line = format!(
+                    "? at bus={bus} hubaddr=0 port=0 devaddr={addr} interface={n} ugen={ugen} vendor=0x{vendor:04x} product=0x{product:04x} intclass=0x{class:02x} intsubclass=0x{sub:02x} intprotocol=0x{proto:02x} on uhub"
+                );
+                out.extend(self.line(&line));
             }
         }
         out
@@ -593,5 +667,62 @@ nexus0
 ";
         let ops = p.devinfo(tree);
         assert!(matches!(&ops[..], [Op::StartDriver { device, nodes, .. }] if device == "ugen0.2:0" && nodes == &["ugen0.2", "usb/0.2.0"]), "{ops:?}");
+    }
+
+    const USBCONFIG_CCID: &str = "\
+ugen0.5: <QEMU QEMU USB CCID> at usbus0, cfg=0 md=HOST spd=FULL (12Mbps) pwr=ON (100mA)
+
+  bLength = 0x0012 
+  bDescriptorType = 0x0001 
+  bDeviceClass = 0x0000  <Probed by interface class>
+  idVendor = 0x08e6 
+  idProduct = 0x4433 
+  iProduct = 0x0002  <QEMU USB CCID
+      bInterfaceNumber = 0x0007 
+      bInterfaceClass = 0x00ff>
+
+
+ Configuration index 0
+
+    bLength = 0x0009 
+    Interface 0
+      bLength = 0x0009 
+      bDescriptorType = 0x0004 
+      bInterfaceNumber = 0x0000 
+      bAlternateSetting = 0x0000 
+      bNumEndpoints = 0x0003 
+      bInterfaceClass = 0x000b  <Smart card>
+      bInterfaceSubClass = 0x0000 
+      bInterfaceProtocol = 0x0000 
+      iInterface = 0x0000  <no string>
+    Interface 1
+      bInterfaceNumber = 0x0001 
+      bAlternateSetting = 0x0001 
+      bInterfaceClass = 0x00ff 
+      bInterfaceSubClass = 0x0000 
+      bInterfaceProtocol = 0x0000 
+";
+
+    #[test]
+    fn usb_present_at_start() {
+        let (v, p, i) = parse_usbconfig(USBCONFIG_CCID).unwrap();
+        // The string's fake lines are on lines of their own, so they parse;
+        // the device only lies about itself, as it could anyway. The real
+        // interface 0 is still read, alt settings other than 0 are not.
+        assert_eq!((v, p), (0x08e6, 0x4433));
+        assert!(i.contains(&(0, 0x0b, 0, 0)), "{i:?}");
+        assert!(!i.iter().any(|x| x.0 == 1), "alternate setting 1 is not an interface of its own");
+        assert_eq!(parse_usbconfig_list("ugen0.1: <XHCI root HUB> at usbus0\nugen0.5: <x> at usbus0\nnonsense\nugenx.1: y\n"), ["ugen0.1", "ugen0.5"]);
+        let mut r = Rules::default();
+        r.add_toml("u", USB_RULES).unwrap();
+        let mut pl = Planner::new(r.finish().unwrap());
+        // A claimed interface (in devinfo) is the kernel's: not re-reported.
+        pl.devinfo("nexus0\n  uhub0\n    uftdi0 pnpinfo vendor=0x0403 product=0x6001 intclass=0xff intsubclass=0xff intprotocol=0xff at bus=0 hubaddr=1 port=2 devaddr=2 interface=0 ugen=ugen0.2\n");
+        let hub = "  idVendor = 0x0000 \n  idProduct = 0x0000 \n      bInterfaceNumber = 0x0000 \n      bAlternateSetting = 0x0000 \n      bInterfaceClass = 0x0009 \n      bInterfaceSubClass = 0x0000 \n      bInterfaceProtocol = 0x0000 \n";
+        let ftdi = "  idVendor = 0x0403 \n  idProduct = 0x6001 \n      bInterfaceNumber = 0x0000 \n      bAlternateSetting = 0x0000 \n      bInterfaceClass = 0x00ff \n      bInterfaceSubClass = 0x00ff \n      bInterfaceProtocol = 0x00ff \n";
+        let ops = pl.usb_present(&[("ugen0.1".into(), hub.into()), ("ugen0.2".into(), ftdi.into()), ("ugen0.5".into(), USBCONFIG_CCID.into())]);
+        assert!(matches!(&ops[..], [Op::StartDriver { device, nodes, .. }] if device == "ugen0.5:0" && nodes == &["ugen0.5", "usb/0.5.0"]), "{ops:?}");
+        // devd's own nomatch for the same interface later changes nothing.
+        assert_eq!(pl.line(&usb_line("?", 5, "08e6:4433", "0b/00/00")), vec![]);
     }
 }

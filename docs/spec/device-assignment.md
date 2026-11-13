@@ -462,6 +462,24 @@ CCID driver, S3) do not exist yet. What they need from this layer does:
   0600. Grant patterns take `#` anywhere (1 to 4 digits): `ugen#.#`,
   `usb/#.#.0`; grant names may hold dots between digits and letters. Driver
   owners may now use `all_nodes`; `{node}` in argv is the first node.
+- **At start**: the USB stack keeps no newbus child for an interface no
+  driver claimed (it probes with a temporary device and deletes it after
+  the nomatch), so `devinfo -v` never shows one. dispensatord therefore also
+  runs `usbconfig` at start (`dump_device_desc dump_curr_config_desc` per
+  `ugenB.A`), reads only the numeric `idVendor`/`idProduct`/`bInterface*`
+  fields (alternate setting 0), and treats each interface devinfo did not
+  show as claimed, hubs excepted, as a nomatch. A device can describe
+  itself however it likes anyway, so this trusts it no further than devd's
+  own lines do. Found by the first VM gate run (an unclaimed CCID reader
+  was missing from `devinfo -v`).
+- **Gate**: `scripts/vm-usb-check.sh` with a stand-in driver
+  (`dispensator/examples/usb-probe.rs`), QEMU `usb-audio` (uaudio detached
+  for the rule) and `usb-ccid` (nomatch, then a daemon restart). First two
+  runs (Sigillum thread's VM): the reader was assigned `ugen0.5` +
+  `usb/0.5.0`, and the jail was refused for the gate's own test uid (fixed);
+  QEMU's `usb-serial`, the first choice for the kernel-claimed case, never
+  enumerated in the guest behind QEMU's added hub, so the gate uses
+  `usb-audio`.
 - **Not shipped yet**: rule files and jaild pins for `vinculum-hci`
   (ruleset 25) and `sigillum-ccid`; each is one `devices.d` file plus one
   `[[devfs_rulesets.pinned]]` entry with `grant_nodes = ["ugen#.#",
