@@ -8,6 +8,8 @@
 # active and unlocked, as that human, private to them (umask 077), and stops
 # it on logout, user switch, lock and eject. A partition that is not FAT or
 # exFAT makes the server exit at once, and nothing is mounted for long.
+# --control-fd 5: dispensatord adds grants (a folder in an app's jail,
+# §4.8) over a socket jaild hands the server as fd 5.
 
 [[rule]]
 name  = "capsa-usb-disk"
@@ -19,7 +21,8 @@ owner = "driver:capsa"
 [driver.capsa]
 exec          = "/usr/local/bin/atrium-capsa-fuse"
 argv          = ["atrium-capsa-fuse", "--dev-fd", "3", "--fuse-fd", "4",
-                 "--uid", "{session_uid}", "--gid", "{session_gid}", "--umask", "077"]
+                 "--uid", "{session_uid}", "--gid", "{session_gid}", "--umask", "077",
+                 "--control-fd", "5"]
 uid           = 65031
 gid           = 65031
 jail          = "atrium-capsa-{part}"

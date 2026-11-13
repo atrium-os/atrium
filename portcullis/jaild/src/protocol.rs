@@ -353,6 +353,11 @@ pub struct FuseServe {
     /// Open the device read-only and mount with `ro`.
     #[serde(default)]
     pub read_only:  bool,
+    /// The caller sends one descriptor with the request, a socket, which
+    /// the server gets as fd 5: how dispensatord hands it grant mounts
+    /// (device-assignment.md §4.8).
+    #[serde(default)]
+    pub control:    bool,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host

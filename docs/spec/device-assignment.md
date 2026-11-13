@@ -309,6 +309,38 @@ the way Ubuntu points at NVIDIA's?).
    Closed *user-space* pieces, if ever needed, would go through Hospes in a
    jail, never into the kernel.
 
+### 4.8 Apps and the files on a stick
+
+Shankar 2026-11-14: a stick typically goes to the file manager, but an app
+that wants to open a file on it should be able to, with one-shot permission.
+
+1. **No app sees `/media`.** The session's own mount (§6.5) stays the
+   user's; app jails run under their own uids (portcullis-peer) and get
+   nothing from it by default.
+2. **The file manager** (Scrinium) holds the restricted capability
+   `removable-files` and is given the whole stick, read-write, for as long
+   as it runs.
+3. **Every other app asks the system picker.** The picker (Scrinium's,
+   drawn outside the app's jail) shows the sticks and the user picks a file
+   or a folder; the app never names the scope. A file comes back as an open
+   descriptor over Aqueduct; a folder as a mount of that folder alone in
+   the app's jail.
+4. **One shot.** A grant ends when the app's jail goes, the stick is
+   ejected or unplugged, or the session locks or ends. The next launch asks
+   again. "Always allow for this app" may come later, listed and revocable
+   in Curia.
+5. **One writer.** A grant is another FUSE mount served by the stick's own
+   server: dispensatord mounts fusefs at `/media/.grants/<n>` and passes the
+   `/dev/fuse` descriptor to the server over its control socket with the
+   folder's path and the app's uid. The server serves that mount rooted at
+   the folder, owned by the app's uid (0700, so the kernel still checks
+   modes), from the same open volume, so the stick never has two writers.
+   jaild attaches it into the app's jail as a nullfs runtime mount, which it
+   removes with the jail.
+6. **Who may grant.** dispensatord's grant op takes root only (portcullisd,
+   and the picker through it). The picker and Scrinium themselves are
+   Scrinium's work; the mount side is built (§6.11).
+
 ## 5. How existing work maps onto it
 
 | Today | Becomes |
@@ -836,6 +868,47 @@ unclaimed device, QEMU's fw_cfg (`acpi0:\_SB_.PCI0.FWCF`).
 
 Not yet: Curia itself (its Devices page reads this), and the Opifex
 catalog lookup for a `nobody` device (§4.7, point 2).
+
+### 6.11 As built: grants, a stick's folder in an app's jail (2026-11-14)
+
+The mount side of §4.8:
+
+- **One server, several mounts.** atrium-capsa-fuse takes `--control-fd 5`:
+  a socket jaild hands it with the partition and `/dev/fuse`
+  (`FuseServe::control`; jaild accepts exactly one descriptor there and
+  checks it is a socket; a service may still not take the caller's stdio).
+  dispensatord sends `mount UID GID RO PATH` with a mounted `/dev/fuse`
+  descriptor; the server resolves `PATH` from the root (no `.`/`..`, a
+  folder only), and serves that mount rooted there, owned by the app's uid
+  and 0700 (the kernel's `default_permissions` still checks), from the same
+  open volume (`server::Shared`). A remove or rename on one mount is
+  followed by the others, so a grant never sees a stale node. At most 64
+  grants per server; one ending ends only itself; the session's mount
+  ending ends them all.
+- **dispensatord** gains `GRANT {part, path, jail, uid, gid, read_only}`
+  and `REVOKE {jail}` on the media socket (class `media`, ops 2 and 3),
+  for root only: not the session's user, whose own mount has everything,
+  and not an app. A grant needs an unlocked session, a served stick and a
+  running jail; it mounts fusefs at `/media/.grants/<n>` (0711 above), hands
+  the descriptor to the server, and asks jaild to nullfs it into the jail
+  at `/media/<part>` (policy `rw_patterns` gains `/media/.grants/*`). It
+  ends when the jail goes (checked every reshow), on `REVOKE`, eject,
+  unplug, lock and logout. CLI: `atrium-dispensatord --grant PART PATH
+  --jail NAME --uid U [--gid G] [--ro]`, `--revoke JAIL`.
+- **Not yet:** the picker and the file manager, which are Scrinium's; the
+  `removable-files` capability is wired with them (portcullisd asks for the
+  whole stick when it launches the file manager); a single file handed as a
+  descriptor.
+
+Tests: capsa-fuse `grants` (a real FUSE mount on Linux: refusals, only the
+folder, owner and mode, `..`, writes seen by the session, the session's
+rename followed, a grant ending alone, a read-only whole-stick grant,
+fsck.fat clean after); atrium-media `grants_are_roots_and_checked`. Gate
+`vm-automount-check.sh` on FreeBSD: alice may not grant; root grants
+`/Docs` into a jail (uid 50601, 0700, only `note.txt`); the app reads it
+and writes, alice sees the write and cannot read the grant; the whole stick
+read-only into a second jail, which cannot write; the first jail removed
+ends its grant; locking ends the other: **0 failed** 2026-11-14.
 
 ## 7. Not in scope
 

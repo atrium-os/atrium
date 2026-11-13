@@ -901,6 +901,16 @@ pub fn install_child_fds(fds: &[i32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Is `fd` a socket?
+pub fn is_socket(fd: &impl std::os::fd::AsRawFd) -> bool {
+    // SAFETY: fstat fills a zeroed stat for a descriptor we hold.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd.as_raw_fd(), &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK
+    }
+}
+
 /// Unmount, ignoring errors (cleanup after a failed create).
 pub fn unmount_quiet(path: &str) {
     if let Ok(c) = CString::new(path) {

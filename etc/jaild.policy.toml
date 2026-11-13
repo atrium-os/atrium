@@ -123,6 +123,10 @@ rw_paths = [
     "/var/run/atrium",
 ]
 rw_patterns = [
+    # A folder of a USB stick granted into an app's jail: dispensatord's
+    # FUSE mount of the stick's own server (device-assignment.md §4.8).
+    "/media/.grants/*",
+
     # Per-jail root directories — the per-jail-root isolation fix
     # (§9.1). ostiarius/JaildLauncher creates <id> under here and
     # uses it as the session app's jail path (single-segment glob).

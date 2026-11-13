@@ -221,6 +221,27 @@ fn dispatch(
      * closed: a caller that sent a pipe is waiting on it. */
     let wants_stdio = matches!(&req,
         Request::CreateJail(r) if r.exec.as_ref().is_some_and(|e| e.stdio));
+    /* ★ And a FUSE server's control socket (FuseServe::control, device-
+     * assignment.md §4.8): exactly one descriptor, and it must be a socket,
+     * which the server gets as fd 5. Nothing else rides along. */
+    let fuse_control = !wants_stdio && matches!(&req,
+        Request::CreateJail(r) if r.fuse.as_ref().is_some_and(|f| f.control));
+    let mut fds = fds;
+    let control: Option<OwnedFd> = if fuse_control {
+        match <[OwnedFd; 1]>::try_from(std::mem::take(&mut fds)) {
+            Ok([fd]) if ffi::is_socket(&fd) => Some(fd),
+            Ok(_) => return (Response::PolicyDenied {
+                rule:   "fuse.control.not_socket".into(),
+                detail: "fuse.control's descriptor must be a socket".into(),
+            }, Vec::new()),
+            Err(v) => return (Response::PolicyDenied {
+                rule:   "fuse.control.fd_count".into(),
+                detail: format!("fuse.control needs exactly 1 descriptor on the request; got {}", v.len()),
+            }, Vec::new()),
+        }
+    } else {
+        None
+    };
     let stdio: Option<[OwnedFd; 3]> = if wants_stdio {
         match <[OwnedFd; 3]>::try_from(fds) {
             Ok(three) => Some(three),
@@ -230,6 +251,8 @@ fn dispatch(
                                  stderr) on the request; got {}", v.len()),
             }, Vec::new()),
         }
+    } else if fuse_control {
+        None
     } else if !fds.is_empty() {
         return (Response::PolicyDenied {
             rule:   "fds.unexpected".into(),
@@ -242,7 +265,7 @@ fn dispatch(
         Request::Ping => (Response::Ok, Vec::new()),
 
         Request::CreateJail(spec) => {
-            match handle_create(&spec, stdio, policy, dry_run, state, state_path) {
+            match handle_create(&spec, stdio, control, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
                     (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
                 }
@@ -791,6 +814,7 @@ fn handle_remove(
 fn handle_create(
     req:        &CreateJailRequest,
     stdio:      Option<[OwnedFd; 3]>,
+    control:    Option<OwnedFd>,
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
@@ -1000,7 +1024,7 @@ fn handle_create(
 
     if let Some(exec) = &req.exec {
         let r = handle_create_with_exec(
-            req, exec, stdio, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
+            req, exec, stdio, control, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
             policy.mount_sources.max_tmpfs_mb, pre_created, sysfil,
         );
         match &r {
@@ -1275,6 +1299,7 @@ fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
     stdio:       Option<[OwnedFd; 3]>,
+    control:     Option<OwnedFd>,
     lo0_alias:   Option<String>,
     ip4_addr:    Option<String>,
     ip4_inherit: bool,
@@ -1354,7 +1379,11 @@ fn handle_create_with_exec(
 
         if let Some((dev, fusefd)) = &fuse {
             use std::os::unix::io::AsRawFd;
-            if let Err(e) = ffi::install_child_fds(&[dev.as_raw_fd(), fusefd.as_raw_fd()]) {
+            let mut fds = vec![dev.as_raw_fd(), fusefd.as_raw_fd()];
+            if let Some(c) = &control {
+                fds.push(c.as_raw_fd());
+            }
+            if let Err(e) = ffi::install_child_fds(&fds) {
                 eprintln!("jaild-child[{}]: install fuse fds: {e}", req.name);
                 ffi::child_exit(105);
             }
@@ -1440,6 +1469,7 @@ fn handle_create_with_exec(
     drop(stdio);
     /* Likewise the partition and /dev/fuse: the server holds them now. */
     drop(fuse);
+    drop(control);
     /* ★ A pre-created (Routed) jail was made persistent so it could be
      * networked before anything ran in it. Clear that now, so it dies with its
      * processes exactly like a create-and-attach jail. If the child has

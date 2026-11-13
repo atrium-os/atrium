@@ -1503,7 +1503,7 @@ mod tests {
         let req = |dev: &str, mnt: &str| {
             let mut r = frescod_req("atrium-capsa-da0p1", "/usr/local/bin/atrium-capsa-fuse", 65070);
             r.devfs_ruleset = 28;
-            r.fuse = Some(crate::protocol::FuseServe { device: dev.into(), mountpoint: mnt.into(), read_only: false });
+            r.fuse = Some(crate::protocol::FuseServe { device: dev.into(), mountpoint: mnt.into(), read_only: false, control: false });
             r
         };
         validate_devfs_pin(&req("da0p1", "/media/usb-da0p1"), &p).unwrap();

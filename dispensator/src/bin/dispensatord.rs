@@ -30,6 +30,8 @@
 //! atrium-dispensatord --eject PART [--media-socket PATH]
 //! atrium-dispensatord --media-watch [--media-socket PATH]   print events
 //! atrium-dispensatord --devices [--devices-socket PATH]     the Devices list
+//! atrium-dispensatord --grant PART PATH --jail NAME --uid U [--gid G] [--ro]
+//! atrium-dispensatord --revoke JAIL      (root: a folder of a stick in an app's jail, §4.8)
 //! ```
 //!
 //! The media socket speaks Aqueduct class `media` (atrium-media, §6.6):
@@ -64,6 +66,11 @@ struct Args {
     media_socket: PathBuf,
     devices_socket: PathBuf,
     devices_cmd: bool,
+    grant: Option<atrium_media::Grant>,
+    grant_jail: String,
+    grant_uid: u32,
+    grant_gid: Option<u32>,
+    grant_ro: bool,
     /// Client: `list` or `eject PART`.
     media_cmd: Option<String>,
 }
@@ -81,6 +88,11 @@ fn args() -> Result<Args, String> {
         media_socket: MEDIA_SOCKET.into(),
         devices_socket: DEVICES_SOCKET.into(),
         devices_cmd: false,
+        grant: None,
+        grant_jail: String::new(),
+        grant_uid: 0,
+        grant_gid: None,
+        grant_ro: false,
         media_cmd: None,
     };
     let mut it = std::env::args().skip(1);
@@ -100,6 +112,16 @@ fn args() -> Result<Args, String> {
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
             "--devices-socket" => a.devices_socket = val()?.into(),
             "--devices" => a.devices_cmd = true,
+            "--grant" => {
+                let part = val()?;
+                let path = it.next().ok_or("--grant needs PART PATH")?;
+                a.grant = Some(atrium_media::Grant { part, path, jail: String::new(), uid: 0, gid: 0, read_only: false });
+            }
+            "--jail" => a.grant_jail = val()?,
+            "--uid" => a.grant_uid = val()?.parse().map_err(|_| "--uid: a number")?,
+            "--gid" => a.grant_gid = Some(val()?.parse().map_err(|_| "--gid: a number")?),
+            "--ro" => a.grant_ro = true,
+            "--revoke" => a.media_cmd = Some(format!("revoke {}", val()?)),
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {x}")),
         }
@@ -121,6 +143,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(g) = &a.grant {
+        let g = atrium_media::Grant { jail: a.grant_jail.clone(), uid: a.grant_uid, gid: a.grant_gid.unwrap_or(a.grant_uid), read_only: a.grant_ro, ..g.clone() };
+        return match atrium_media::client::grant(&a.media_socket, &g) {
+            Ok(m) => {
+                println!("ok {m}");
+                ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(cmd) = &a.media_cmd {
         return media_client(&a.media_socket, cmd);
     }
@@ -210,6 +245,16 @@ fn print_devices(ds: &[atrium_devices::Device]) {
 /// prints the answer.
 fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
     match cmd.split_once(' ') {
+        Some(("revoke", jail)) => match atrium_media::client::revoke(sock, jail) {
+            Ok(m) => {
+                println!("ok {m}");
+                ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        },
         Some(("eject", part)) => match atrium_media::client::eject(sock, part) {
             Ok(m) => {
                 println!("ok {m}");
@@ -311,9 +356,65 @@ mod run {
         settling: Vec<(Instant, String)>,
         /// The Devices list service (§6.10).
         devices: Option<Arc<dserver::Shared>>,
+        /// Each stick server's control socket, by partition (§4.8).
+        controls: BTreeMap<String, UnixStream>,
+        /// Folders of served sticks in app jails.
+        grants: Vec<GrantRec>,
+        next_grant: u64,
     }
 
-    type EjectReq = (String, mpsc::Sender<(u8, String)>);
+    /// A grant: a FUSE mount at `dir` (the stick's server, rooted at the
+    /// folder, owned by the app), nullfs'd into `jail` at `dest`.
+    struct GrantRec {
+        part: String,
+        jail: String,
+        dir: PathBuf,
+        dest: String,
+    }
+
+    enum Req {
+        Eject(String),
+        Grant(atrium_media::Grant),
+        Revoke(String),
+    }
+
+    type EjectReq = (Req, mpsc::Sender<(u8, String)>);
+
+    /// Is a jail of that name running?
+    fn jail_alive(name: &str) -> bool {
+        jaild::ffi::jail_id_by_name(name).is_some()
+    }
+
+    /// `line` with `fd` attached (SCM_RIGHTS).
+    fn send_with_fd(c: &UnixStream, line: &str, fd: i32) -> std::io::Result<()> {
+        let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut _, iov_len: line.len() };
+        let mut cbuf = [0u64; 4];
+        // SAFETY: a zeroed msghdr is valid; every pointer outlives the call;
+        // the CMSG macros work on our own buffer.
+        unsafe {
+            let mut m: libc::msghdr = std::mem::zeroed();
+            m.msg_iov = &mut iov;
+            m.msg_iovlen = 1;
+            m.msg_control = cbuf.as_mut_ptr().cast();
+            m.msg_controllen = libc::CMSG_SPACE(4) as _;
+            let h = libc::CMSG_FIRSTHDR(&m);
+            (*h).cmsg_level = libc::SOL_SOCKET;
+            (*h).cmsg_type = libc::SCM_RIGHTS;
+            (*h).cmsg_len = libc::CMSG_LEN(4) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(h) as *mut i32, fd);
+            if libc::sendmsg(c.as_raw_fd(), &m, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn unmount_force(dir: &Path) {
+        if let Ok(c) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
+            // SAFETY: a valid NUL-terminated path.
+            unsafe { libc::unmount(c.as_ptr(), libc::MNT_FORCE) };
+        }
+    }
 
     /// The media service's view of the daemon, for its connection threads.
     struct MediaHost {
@@ -351,9 +452,24 @@ mod run {
         }
 
         fn eject(&self, part: &str) -> (u8, String) {
+            self.ask(Req::Eject(part.to_string()))
+        }
+
+        fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
+            self.ask(Req::Grant(g.clone()))
+        }
+
+        fn revoke(&self, jail: &str) -> (u8, String) {
+            self.ask(Req::Revoke(jail.to_string()))
+        }
+    }
+
+    impl MediaHost {
+        /// Hand `r` to the daemon's loop and wait for its answer.
+        fn ask(&self, r: Req) -> (u8, String) {
             use std::io::Write;
             let (rtx, rrx) = mpsc::channel();
-            if self.tx.lock().unwrap().send((part.to_string(), rtx)).is_err() {
+            if self.tx.lock().unwrap().send((r, rtx)).is_err() {
                 return (mstatus::FAILED, "dispensatord is shutting down".into());
             }
             let _ = self.wake.lock().unwrap().write_all(&[1]);
@@ -386,6 +502,9 @@ mod run {
             ejected_now: Vec::new(),
             settling: Vec::new(),
             devices: None,
+            controls: BTreeMap::new(),
+            grants: Vec::new(),
+            next_grant: 0,
         };
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
@@ -598,9 +717,104 @@ mod run {
                     reqs.push(r);
                 }
             }
-            for (part, reply) in reqs {
-                let _ = reply.send(self.eject(&part));
+            for (r, reply) in reqs {
+                let a = match r {
+                    Req::Eject(part) => self.eject(&part),
+                    Req::Grant(g) => self.grant(&g),
+                    Req::Revoke(jail) => {
+                        let n = self.end_grants(|g| g.jail == jail);
+                        (mstatus::OK, format!("{n} grants into {jail} ended"))
+                    }
+                };
+                let _ = reply.send(a);
             }
+        }
+
+        /// Put a folder of a served stick into an app's jail (§4.8): a new
+        /// FUSE mount of the stick's own server, rooted there, owned by the
+        /// app, nullfs'd in by jaild.
+        fn grant(&mut self, g: &atrium_media::Grant) -> (u8, String) {
+            use std::io::BufRead;
+            if !matches!(self.session, Session::Active { .. }) {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            }
+            let Some(ctl) = self.controls.get(&g.part) else { return (mstatus::NOT_FOUND, format!("{} has no server taking grants", g.part)) };
+            if !jail_alive(&g.jail) {
+                return (mstatus::NOT_FOUND, format!("no jail {}", g.jail));
+            }
+            let dest = format!("/media/{}", g.part);
+            if self.grants.iter().any(|x| x.jail == g.jail && x.dest == dest) {
+                return (mstatus::BUSY, format!("{} already has {dest}", g.jail));
+            }
+            let read_only = g.read_only || self.media.driver_of(&g.part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
+            let top = Path::new("/media/.grants");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::create_dir_all(top);
+                let _ = std::fs::set_permissions(top, std::fs::Permissions::from_mode(0o711));
+            }
+            self.next_grant += 1;
+            let dir = top.join(self.next_grant.to_string());
+            let _ = std::fs::create_dir(&dir);
+            let fail = |dir: &Path, m: String| {
+                unmount_force(dir);
+                let _ = std::fs::remove_dir(dir);
+                eprintln!("atrium-dispensatord: grant {} {} -> {}: {m}", g.part, g.path, g.jail);
+                (mstatus::FAILED, m)
+            };
+            let fuse = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/fuse") {
+                Ok(f) => f,
+                Err(e) => return fail(&dir, format!("/dev/fuse: {e}")),
+            };
+            if let Err(e) = jaild::ffi::fusefs_mount(&dir.to_string_lossy(), fuse.as_raw_fd(), read_only, &format!("capsa-grant:{}", g.part)) {
+                return fail(&dir, format!("mount fusefs: {e}"));
+            }
+            let line = format!("mount {} {} {} {}\n", g.uid, g.gid, u8::from(read_only), g.path);
+            if let Err(e) = send_with_fd(ctl, &line, fuse.as_raw_fd()) {
+                return fail(&dir, format!("the server: {e}"));
+            }
+            drop(fuse);
+            let mut reply = String::new();
+            let read = ctl.try_clone().and_then(|c| {
+                c.set_read_timeout(Some(Duration::from_secs(10)))?;
+                std::io::BufReader::new(c).read_line(&mut reply)
+            });
+            match read {
+                Ok(_) if reply.trim_end() == "ok" => {}
+                Ok(_) => return fail(&dir, reply.trim_end().trim_start_matches("error ").to_string()),
+                Err(e) => return fail(&dir, format!("the server: {e}")),
+            }
+            let attach = Request::AttachMount(jaild::protocol::AttachMountRequest {
+                jail_name: g.jail.clone(),
+                source: dir.to_string_lossy().into_owned(),
+                dest: dest.clone(),
+                mount_kind: MountKind::RwNullfs,
+                size_mb: None,
+            });
+            match Client::connect(&self.jaild).and_then(|mut c| c.send(&attach)) {
+                Ok((Response::Ok, _)) => {}
+                Ok((other, _)) => return fail(&dir, format!("jaild: {other:?}")),
+                Err(e) => return fail(&dir, format!("jaild: {e}")),
+            }
+            eprintln!("atrium-dispensatord: grant {}{} -> {} at {dest} (uid {}{})", g.part, g.path, g.jail, g.uid, if read_only { ", ro" } else { "" });
+            self.grants.push(GrantRec { part: g.part.clone(), jail: g.jail.clone(), dir, dest: dest.clone() });
+            (mstatus::OK, dest)
+        }
+
+        /// End the grants `f` picks: out of the jail, then the mount.
+        fn end_grants(&mut self, f: impl Fn(&GrantRec) -> bool) -> usize {
+            let (gone, keep): (Vec<GrantRec>, Vec<GrantRec>) = std::mem::take(&mut self.grants).into_iter().partition(|g| f(g));
+            self.grants = keep;
+            for g in &gone {
+                if jail_alive(&g.jail) {
+                    let d = Request::DetachMount(jaild::protocol::DetachMountRequest { jail_name: g.jail.clone(), dest: g.dest.clone(), force: true });
+                    let _ = Client::connect(&self.jaild).and_then(|mut c| c.send(&d));
+                }
+                unmount_force(&g.dir);
+                let _ = std::fs::remove_dir(&g.dir);
+                eprintln!("atrium-dispensatord: grant {} -> {} ended", g.part, g.jail);
+            }
+            gone.len()
         }
 
         fn mountpoint(&self, device: &str) -> Option<String> {
@@ -626,6 +840,7 @@ mod run {
                     }
                 }
             }
+            self.end_grants(|g| g.part == device);
             let (_, acts) = self.media.eject(device, &self.session);
             self.act(acts);
             self.ejected_now.push(device.to_string());
@@ -668,6 +883,8 @@ mod run {
                 }
                 if last.elapsed() >= reshow {
                     last = Instant::now();
+                    // A grant lasts as long as its app's jail (one shot).
+                    self.end_grants(|g| !jail_alive(&g.jail));
                     self.follow_session();
                     self.publish();
                     self.publish_devices();
@@ -777,6 +994,7 @@ mod run {
                     device: device.clone(),
                     mountpoint: mountpoint.clone(),
                     read_only: *read_only,
+                    control: p.argv.windows(2).any(|w| w == ["--control-fd", "5"]),
                 }),
             }
         }
@@ -825,7 +1043,23 @@ mod run {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            let sent = Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::CreateJail(Self::request(&p))));
+            // A stick's server takes grants on fd 5, a socket to us (§4.8).
+            let req = Self::request(&p);
+            let sent = if req.fuse.as_ref().is_some_and(|f| f.control) {
+                match UnixStream::pair() {
+                    Ok((ours, theirs)) => {
+                        use std::os::fd::AsFd;
+                        let r = Client::connect(&self.jaild).and_then(|mut c| c.send_with_fds(&Request::CreateJail(req), &[theirs.as_fd()], 1));
+                        if matches!(r, Ok((Response::JailCreated(_), _))) {
+                            self.controls.insert(device.to_string(), ours);
+                        }
+                        r.map(|(resp, fds)| (resp, fds.first().copied()))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::CreateJail(req)))
+            };
             match sent {
                 Ok((Response::JailCreated(r), fd)) => {
                     eprintln!(
@@ -848,6 +1082,8 @@ mod run {
             let Some((name, path)) = stop_names(d, vars) else { return };
             let mounts = d.mounts_ro.clone();
             let had = self.drivers.remove(&(driver.to_string(), device.to_string())).is_some();
+            self.end_grants(|g| g.part == device);
+            self.controls.remove(device);
             let rm = Request::RemoveJail { jid: None, name: Some(name.clone()) };
             let _ = Client::connect(&self.jaild).and_then(|mut c| c.send(&rm));
             Self::unmount_all(&path, &mounts);

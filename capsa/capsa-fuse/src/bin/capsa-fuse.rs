@@ -3,6 +3,7 @@
 //! ```text
 //! atrium-capsa-fuse --dev-fd N --fuse-fd M [--uid U --gid G] [--ro]
 //! atrium-capsa-fuse --dev PATH --fuse-fd M ...
+//!     [--control-fd N]    grants arrive on N, a Unix socket (§4.8)
 //! ```
 //!
 //! In Atrium jaild opens the partition and `/dev/fuse`, mounts fusefs on
@@ -17,7 +18,9 @@ use std::process::ExitCode;
 
 use capsa_fat::exfat::ExVolume;
 use capsa_fat::{Aligned, BlockDev, Error, Volume};
-use capsa_fuse::{serve, Options};
+use capsa_fuse::server::serve_with;
+use capsa_fuse::Options;
+use std::os::unix::net::UnixStream;
 
 fn usage() -> ExitCode {
     eprintln!("usage: atrium-capsa-fuse (--dev PATH | --dev-fd N) --fuse-fd N [--uid U] [--gid G] [--ro] [--umask OCTAL]");
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
     let mut dev: Option<File> = None;
     let mut fuse: Option<File> = None;
     let mut opts = Options::default();
+    let mut control: Option<UnixStream> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || it.next();
@@ -73,6 +77,11 @@ fn main() -> ExitCode {
                 None => return usage(),
             },
             "--ro" => opts.read_only = true,
+            // SAFETY: as above; jaild checked it is a socket.
+            "--control-fd" => match fd(val()) {
+                Some(n) => control = Some(unsafe { UnixStream::from_raw_fd(n) }),
+                None => return usage(),
+            },
             // Octal, e.g. 077: the volume is the owner's alone.
             "--umask" => match val().and_then(|s| u32::from_str_radix(&s, 8).ok()).filter(|m| *m <= 0o777) {
                 Some(m) => opts.umask = m,
@@ -101,7 +110,7 @@ fn main() -> ExitCode {
     if capsa_fuse::tessera::is_tessera(&mut dev) {
         // Read-only until Tessera's encryption can vouch for a disk.
         let r = match capsa_fuse::tessera::TesseraVolume::open(dev) {
-            Ok(v) => serve(v, fuse, Options { read_only: true, ..opts }),
+            Ok(v) => serve_with(v, fuse, Options { read_only: true, ..opts }, control),
             Err(e) => return fail(e),
         };
         return match r {
@@ -114,12 +123,12 @@ fn main() -> ExitCode {
     }
     let r = if &head[3..11] == b"EXFAT   " {
         match ExVolume::open(dev) {
-            Ok(v) => serve(v, fuse, opts),
+            Ok(v) => serve_with(v, fuse, opts, control),
             Err(e) => return fail(e),
         }
     } else {
         match Volume::open(dev) {
-            Ok(v) => serve(v, fuse, opts),
+            Ok(v) => serve_with(v, fuse, opts, control),
             Err(e) => return fail(e),
         }
     };

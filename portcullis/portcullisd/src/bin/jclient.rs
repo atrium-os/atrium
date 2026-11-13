@@ -223,5 +223,5 @@ fn env_fuse() -> Option<FuseServe> {
     let mut it = v.split(':');
     let device = it.next()?.to_string();
     let mountpoint = it.next()?.to_string();
-    Some(FuseServe { device, mountpoint, read_only: it.next() == Some("ro") })
+    Some(FuseServe { device, mountpoint, read_only: it.next() == Some("ro"), control: false })
 }

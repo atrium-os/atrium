@@ -1,8 +1,19 @@
 //! The request loop: one request read from `/dev/fuse`, one reply written,
 //! single-threaded (removable media is slow; the kernel queues).
+//!
+//! One volume can be served on several mounts (device-assignment.md §4.8):
+//! the session's own, and a grant for an app, rooted at a folder and owned
+//! by the app's uid. dispensatord adds a grant by passing an already
+//! mounted `/dev/fuse` descriptor over the control socket; every mount
+//! reads and writes the same open volume, so the stick has one writer.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::rc::Rc;
 
 use capsa_fat::Error;
 
@@ -34,6 +45,78 @@ impl Default for Options {
     }
 }
 
+/// One volume behind several mounts: each mount's state holds a handle.
+pub struct Shared<B>(Rc<RefCell<B>>);
+
+impl<B> Clone for Shared<B> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<B: Backend> Backend for Shared<B> {
+    type Dir = B::Dir;
+    type Node = B::Node;
+    type Key = B::Key;
+    fn root(&self) -> B::Dir {
+        self.0.borrow().root()
+    }
+    fn key(n: &B::Node) -> B::Key {
+        B::key(n)
+    }
+    fn name(n: &B::Node) -> &str {
+        B::name(n)
+    }
+    fn attr(n: &B::Node) -> Attr {
+        B::attr(n)
+    }
+    fn as_dir(&self, n: &B::Node) -> capsa_fat::Result<B::Dir> {
+        self.0.borrow().as_dir(n)
+    }
+    fn list(&mut self, d: B::Dir) -> capsa_fat::Result<Vec<B::Node>> {
+        self.0.borrow_mut().list(d)
+    }
+    fn lookup(&mut self, d: B::Dir, name: &str) -> capsa_fat::Result<B::Node> {
+        self.0.borrow_mut().lookup(d, name)
+    }
+    fn refresh(&mut self, k: B::Key) -> capsa_fat::Result<B::Node> {
+        self.0.borrow_mut().refresh(k)
+    }
+    fn read(&mut self, n: &B::Node, off: u64, buf: &mut [u8]) -> capsa_fat::Result<usize> {
+        self.0.borrow_mut().read(n, off, buf)
+    }
+    fn statfs(&mut self) -> capsa_fat::Result<(u32, u64, u64)> {
+        self.0.borrow_mut().statfs()
+    }
+    fn writable(&self) -> bool {
+        self.0.borrow().writable()
+    }
+    fn create(&mut self, d: B::Dir, name: &str, dir: bool, now: i64) -> capsa_fat::Result<B::Node> {
+        self.0.borrow_mut().create(d, name, dir, now)
+    }
+    fn write(&mut self, n: &mut B::Node, off: u64, data: &[u8], now: i64) -> capsa_fat::Result<usize> {
+        self.0.borrow_mut().write(n, off, data, now)
+    }
+    fn truncate(&mut self, n: &mut B::Node, len: u64, now: i64) -> capsa_fat::Result<()> {
+        self.0.borrow_mut().truncate(n, len, now)
+    }
+    fn set_mtime(&mut self, n: &mut B::Node, t: i64) -> capsa_fat::Result<()> {
+        self.0.borrow_mut().set_mtime(n, t)
+    }
+    fn unlink(&mut self, n: &B::Node) -> capsa_fat::Result<()> {
+        self.0.borrow_mut().unlink(n)
+    }
+    fn rmdir(&mut self, n: &B::Node) -> capsa_fat::Result<()> {
+        self.0.borrow_mut().rmdir(n)
+    }
+    fn rename(&mut self, n: &B::Node, to: B::Dir, name: &str, now: i64) -> capsa_fat::Result<B::Node> {
+        self.0.borrow_mut().rename(n, to, name, now)
+    }
+    fn sync(&mut self) -> capsa_fat::Result<()> {
+        self.0.borrow_mut().sync()
+    }
+}
+
 struct NodeInfo<K> {
     /// `None` for the root.
     key: Option<K>,
@@ -49,6 +132,9 @@ struct State<B: Backend> {
     by_key: HashMap<B::Key, u64>,
     next: u64,
     cluster: u32,
+    /// Keys this mount removed (`None`) or moved (`Some(new)`), for the
+    /// volume's other mounts to follow.
+    moved: Vec<(B::Key, Option<B::Key>)>,
 }
 
 enum Target<N> {
@@ -130,10 +216,27 @@ impl<B: Backend> State<B> {
     }
 
     fn kill(&mut self, k: B::Key) {
+        self.moved.push((k, None));
+        self.follow_kill(k);
+    }
+
+    fn follow_kill(&mut self, k: B::Key) {
         if let Some(id) = self.by_key.remove(&k) {
             if let Some(i) = self.nodes.get_mut(&id) {
                 i.dead = true;
             }
+        }
+    }
+
+    fn follow_move(&mut self, ok: B::Key, nk: B::Key) {
+        if ok == nk {
+            return;
+        }
+        if let Some(id) = self.by_key.remove(&ok) {
+            if let Some(i) = self.nodes.get_mut(&id) {
+                i.key = Some(nk);
+            }
+            self.by_key.insert(nk, id);
         }
     }
 
@@ -223,6 +326,15 @@ impl<B: Backend> State<B> {
             proto::INTERRUPT => return None,
             proto::LOOKUP => (|| {
                 let (name, _) = cstr(b).ok_or(libc::EINVAL)?;
+                // A grant's root has no parent here: `..` is itself, as in
+                // a chroot (the kernel crosses the mount itself anyway).
+                if r.nodeid == 1 && (name == "." || name == "..") {
+                    let a = self.attr_of(1)?;
+                    if let Some(i) = self.nodes.get_mut(&1) {
+                        i.lookups += 1;
+                    }
+                    return Ok(proto::entry_out(&a, self.opts.valid_secs));
+                }
                 let d = self.dir(r.nodeid)?;
                 let n = self.fs.lookup(d, name).map_err(e)?;
                 Ok(self.entry(&n))
@@ -348,12 +460,8 @@ impl<B: Backend> State<B> {
                 }
                 // The renamed node keeps its id under its new key.
                 let (ok, nk) = (B::key(&n), B::key(&m));
-                if let Some(id) = self.by_key.remove(&ok) {
-                    if let Some(i) = self.nodes.get_mut(&id) {
-                        i.key = Some(nk);
-                    }
-                    self.by_key.insert(nk, id);
-                }
+                self.moved.push((ok, Some(nk)));
+                self.follow_move(ok, nk);
                 self.fs.sync().map_err(e)?;
                 Ok(Vec::new())
             })(),
@@ -416,47 +524,208 @@ fn init_reply(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Serve `fs` on `dev` (an open `/dev/fuse` that is already mounted) until
 /// the kernel unmounts it. Returns why it stopped.
-pub fn serve<B: Backend, F: Read + Write>(fs: B, mut dev: F, opts: Options) -> std::io::Result<()> {
-    let mut st = State { fs, opts, nodes: HashMap::new(), by_key: HashMap::new(), next: 1, cluster: 4096 };
-    st.nodes.insert(1, NodeInfo { key: None, lookups: 1, dead: false });
-    st.cluster = st.fs.statfs().map(|s| s.0).unwrap_or(4096);
-    let mut buf = vec![0u8; BUF];
-    let mut started = false;
-    loop {
-        let n = match dev.read(&mut buf) {
-            Ok(0) => return Ok(()),
+pub fn serve<B: Backend, F: Read + Write + AsRawFd + 'static>(fs: B, dev: F, opts: Options) -> std::io::Result<()> {
+    serve_with(fs, dev, opts, None)
+}
+
+trait Dev: Read + Write + AsRawFd {}
+impl<T: Read + Write + AsRawFd> Dev for T {}
+
+struct Mount<B: Backend> {
+    st: State<Shared<B>>,
+    dev: Box<dyn Dev>,
+    started: bool,
+}
+
+impl<B: Backend> Mount<B> {
+    fn new(fs: Shared<B>, dev: Box<dyn Dev>, opts: Options, root: Option<B::Key>) -> Self {
+        let cluster = fs.0.borrow_mut().statfs().map(|s| s.0).unwrap_or(4096);
+        let mut st = State { fs, opts, nodes: HashMap::new(), by_key: HashMap::new(), next: 1, cluster, moved: Vec::new() };
+        st.nodes.insert(1, NodeInfo { key: root, lookups: 1, dead: false });
+        if let Some(k) = root {
+            st.by_key.insert(k, 1);
+        }
+        Self { st, dev, started: false }
+    }
+
+    /// One request. `Ok(false)`: this mount is over (unmounted).
+    fn step(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
+        let n = match self.dev.read(buf) {
+            Ok(0) => return Ok(false),
             Ok(n) => n,
             Err(e) => match e.raw_os_error() {
-                Some(libc::ENODEV) => return Ok(()), // unmounted
-                Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => continue,
+                Some(libc::ENODEV) => return Ok(false), // unmounted
+                Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => return Ok(true),
                 _ => return Err(e),
             },
         };
-        let Some(r) = proto::parse(&buf[..n]) else { continue };
+        let Some(r) = proto::parse(&buf[..n]) else { return Ok(true) };
         let out = if r.opcode == proto::INIT {
-            started = true;
+            self.started = true;
             match init_reply(r.body) {
                 Some(b) => proto::reply(r.unique, 0, &b),
                 None => proto::reply(r.unique, libc::EPROTO, &[]),
             }
-        } else if !started {
+        } else if !self.started {
             proto::reply(r.unique, libc::EIO, &[])
         } else {
-            match st.handle(&r) {
-                None => continue,
+            match self.st.handle(&r) {
+                None => return Ok(true),
                 Some(Ok(b)) => proto::reply(r.unique, 0, &b),
                 Some(Err(e)) => proto::reply(r.unique, e, &[]),
             }
         };
         let destroy = r.opcode == proto::DESTROY;
-        if let Err(e) = dev.write_all(&out) {
+        if let Err(e) = self.dev.write_all(&out) {
             // The request was interrupted and is gone: not our problem.
             if e.raw_os_error() != Some(libc::ENOENT) {
                 return Err(e);
             }
         }
-        if destroy {
-            return Ok(());
+        Ok(!destroy)
+    }
+}
+
+/// Most grant mounts one server serves at once.
+pub const MAX_GRANTS: usize = 64;
+
+/// A grant request from the control socket: `mount UID GID RO PATH`, with
+/// the mounted `/dev/fuse` descriptor attached (SCM_RIGHTS).
+fn recv_grant(c: &UnixStream) -> std::io::Result<Option<(String, Option<File>)>> {
+    let mut data = [0u8; 4096];
+    let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+    // Room for one descriptor (and stray extras, which are closed).
+    let mut cbuf = [0u64; 16];
+    // SAFETY: a zeroed msghdr is valid; every pointer set below outlives
+    // the call.
+    let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+    m.msg_iov = &mut iov;
+    m.msg_iovlen = 1;
+    m.msg_control = cbuf.as_mut_ptr().cast();
+    m.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+    // SAFETY: m describes buffers we own.
+    let n = unsafe { libc::recvmsg(c.as_raw_fd(), &mut m, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut fds: Vec<File> = Vec::new();
+    // SAFETY: walking the control buffer the kernel filled, with its macros.
+    unsafe {
+        let mut h = libc::CMSG_FIRSTHDR(&m);
+        while !h.is_null() {
+            if (*h).cmsg_level == libc::SOL_SOCKET && (*h).cmsg_type == libc::SCM_RIGHTS {
+                let p = libc::CMSG_DATA(h) as *const RawFd;
+                let count = ((*h).cmsg_len as usize - (p as usize - h as usize)) / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    fds.push(File::from_raw_fd(std::ptr::read_unaligned(p.add(i))));
+                }
+            }
+            h = libc::CMSG_NXTHDR(&m, h);
         }
     }
+    if n == 0 {
+        return Ok(None);
+    }
+    let line = String::from_utf8_lossy(&data[..n as usize]).trim_end_matches('\n').to_string();
+    let fd = if fds.len() == 1 { fds.pop() } else { None };
+    Ok(Some((line, fd)))
+}
+
+/// `PATH` from the volume's root, one name at a time: a directory's key.
+fn resolve<B: Backend>(fs: &mut Shared<B>, path: &str) -> std::result::Result<Option<B::Key>, String> {
+    let mut dir = fs.root();
+    let mut key = None;
+    for name in path.split('/').filter(|n| !n.is_empty()) {
+        if name == "." || name == ".." {
+            return Err("no . or .. in a grant's path".into());
+        }
+        let n = fs.lookup(dir, name).map_err(|e| format!("{name}: {e}"))?;
+        dir = fs.as_dir(&n).map_err(|_| format!("{name} is not a folder"))?;
+        key = Some(B::key(&n));
+    }
+    Ok(key)
+}
+
+/// [`serve`], plus grants arriving on `control` (device-assignment.md
+/// §4.8). The main mount ending ends everything; a grant's ending ends
+/// only it.
+pub fn serve_with<B: Backend, F: Read + Write + AsRawFd + 'static>(fs: B, dev: F, opts: Options, mut control: Option<UnixStream>) -> std::io::Result<()> {
+    let fs = Shared(Rc::new(RefCell::new(fs)));
+    let base = opts.clone();
+    let mut mounts: Vec<Mount<B>> = vec![Mount::new(fs.clone(), Box::new(dev), opts, None)];
+    let mut buf = vec![0u8; BUF];
+    loop {
+        let mut p: Vec<libc::pollfd> = mounts.iter().map(|m| libc::pollfd { fd: m.dev.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+        p.push(libc::pollfd { fd: control.as_ref().map_or(-1, |c| c.as_raw_fd()), events: libc::POLLIN, revents: 0 });
+        // SAFETY: p is a valid array of pollfds (a negative fd is ignored).
+        let r = unsafe { libc::poll(p.as_mut_ptr(), p.len() as _, -1) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        let mut over = Vec::new();
+        for (i, pf) in p.iter().enumerate().take(mounts.len()) {
+            if pf.revents == 0 {
+                continue;
+            }
+            let res = mounts[i].step(&mut buf);
+            // What one mount removed or moved, the others see the same way.
+            let moved = std::mem::take(&mut mounts[i].st.moved);
+            for (j, m) in mounts.iter_mut().enumerate() {
+                if j != i {
+                    for &(k, nk) in &moved {
+                        match nk {
+                            None => m.st.follow_kill(k),
+                            Some(nk) => m.st.follow_move(k, nk),
+                        }
+                    }
+                }
+            }
+            match res {
+                Ok(true) => {}
+                Ok(false) if i == 0 => return Ok(()),
+                Ok(false) => over.push(i),
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => over.push(i),
+            }
+        }
+        for i in over.into_iter().rev() {
+            mounts.remove(i);
+        }
+        if p.last().is_some_and(|c| c.revents != 0) {
+            let Some(c) = control.as_ref() else { continue };
+            match recv_grant(c) {
+                Ok(Some((line, fd))) => {
+                    let reply = match grant(&fs, &base, &line, fd, mounts.len()) {
+                        Ok(m) => {
+                            mounts.push(m);
+                            "ok\n".to_string()
+                        }
+                        Err(e) => format!("error {e}\n"),
+                    };
+                    let _ = (&*c).write_all(reply.as_bytes());
+                }
+                // dispensatord went: no more grants, the mounts go on.
+                Ok(None) | Err(_) => control = None,
+            }
+        }
+    }
+}
+
+fn grant<B: Backend>(fs: &Shared<B>, base: &Options, line: &str, fd: Option<File>, have: usize) -> std::result::Result<Mount<B>, String> {
+    let mut w = line.splitn(5, ' ');
+    let (Some("mount"), Some(uid), Some(gid), Some(ro), Some(path)) = (w.next(), w.next(), w.next(), w.next(), w.next()) else {
+        return Err("expected: mount UID GID RO PATH".into());
+    };
+    let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) else { return Err("bad uid or gid".into()) };
+    let fd = fd.ok_or("no /dev/fuse descriptor with the request")?;
+    if have > MAX_GRANTS {
+        return Err("too many grants".into());
+    }
+    let root = resolve(&mut fs.clone(), path)?;
+    let opts = Options { uid, gid, read_only: base.read_only || ro == "1", valid_secs: base.valid_secs, umask: 0o077 };
+    Ok(Mount::new(fs.clone(), Box::new(fd), opts, root))
 }

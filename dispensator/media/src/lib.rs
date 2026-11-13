@@ -8,13 +8,17 @@
 //! |---|---|---|
 //! | `LIST` 0x00 | empty | `u8 status`, then postcard `Vec<Volume>` |
 //! | `EJECT` 0x01 | postcard [`Eject`] | `u8 status`, then postcard `String` (a message to show) |
+//! | `GRANT` 0x02 | postcard [`Grant`] | `u8 status`, then postcard `String` (where it is in the jail, or why not) |
+//! | `REVOKE` 0x03 | postcard `String` (the jail) | `u8 status`, then postcard `String` |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
 //! the daemon decides who that is ([`server::Host::allowed`]) and checks it
 //! again on every request and event, so a subscriber is dropped when the
 //! session changes. The files themselves never go over Aqueduct: they stay a
-//! FUSE mount that the file manager's jail is given.
+//! FUSE mount. `GRANT` puts a folder of a served stick (or all of it) into an
+//! app's jail for as long as that jail runs (§4.8); only root may ask (the
+//! picker and the file manager's launch go through portcullisd).
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +27,8 @@ pub use aqueduct::classes::CLASS_MEDIA as CLASS;
 pub mod op {
     pub const LIST: u16 = 0x00;
     pub const EJECT: u16 = 0x01;
+    pub const GRANT: u16 = 0x02;
+    pub const REVOKE: u16 = 0x03;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -55,6 +61,18 @@ pub struct Eject {
     pub part: String,
 }
 
+/// Put `path` (`/` for the whole stick) of `part` into `jail`, owned there
+/// by `uid`:`gid` (the app's). It lands at `/media/<part>` in the jail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub part: String,
+    pub path: String,
+    pub jail: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Added(Volume),
@@ -85,6 +103,10 @@ pub mod server {
         /// Eject `part`: `(status, message)`. Runs on the connection's
         /// thread; the daemon hands it to its own loop and waits.
         fn eject(&self, part: &str) -> (u8, String);
+        /// Carry out a grant (the caller is root: checked here).
+        fn grant(&self, g: &Grant) -> (u8, String);
+        /// End every grant into `jail`.
+        fn revoke(&self, jail: &str) -> (u8, String);
     }
 
     pub struct Shared {
@@ -153,6 +175,22 @@ pub mod server {
         }
     }
 
+    /// Grants are root's alone: portcullisd, for the picker and the file
+    /// manager. Not the session's user, whose own mount has it all already.
+    pub(crate) fn grant_checked(shared: &Shared, uid: u32, g: &Grant) -> (u8, String) {
+        if uid != 0 {
+            return (status::NOT_ALLOWED, "only root may grant".into());
+        }
+        let ok = |s: &str, max: usize| !s.is_empty() && s.len() <= max && !s.contains('\n') && !s.contains('\0');
+        if !ok(&g.part, 32) || !ok(&g.jail, 255) || !ok(&g.path, 1024) || !g.path.starts_with('/') || g.path.split('/').any(|c| c == "..") || g.uid == 0 {
+            return (status::MALFORMED, "malformed grant".into());
+        }
+        if !shared.state.lock().unwrap().volumes.iter().any(|v| v.part == g.part) {
+            return (status::NOT_FOUND, format!("{} is not mounted", g.part));
+        }
+        shared.host.grant(g)
+    }
+
     fn send_ev(conn: &mut Connection, ev: &Event) -> io::Result<()> {
         let p = postcard::to_stdvec(ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         conn.send_message(CLASS, op::EV, flag::ASYNC_EVENT, &p)
@@ -179,6 +217,21 @@ pub mod server {
                         _ => (status::MALFORMED, "malformed".into()),
                     };
                     conn.send_message(CLASS, op::EJECT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
+                op::GRANT => {
+                    let (st, msg) = match postcard::from_bytes::<Grant>(&m.payload) {
+                        Ok(g) => grant_checked(&shared, uid, &g),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::GRANT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
+                op::REVOKE => {
+                    let (st, msg) = match postcard::from_bytes::<String>(&m.payload) {
+                        Ok(_) if uid != 0 => (status::NOT_ALLOWED, "only root may revoke".into()),
+                        Ok(j) if !j.is_empty() && j.len() <= 255 => shared.host.revoke(&j),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::REVOKE, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
@@ -253,6 +306,30 @@ pub mod client {
         }
     }
 
+    fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
+        let r = (|| {
+            let mut c = Connection::connect(sock)?;
+            let p = call(&mut c, o, &postcard::to_stdvec(v).unwrap_or_default())?;
+            let (&st, rest) = p.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty reply"))?;
+            Ok::<_, io::Error>((st, postcard::from_bytes::<String>(rest).unwrap_or_default()))
+        })();
+        match r {
+            Ok((status::OK, m)) => Ok(m),
+            Ok((st, m)) => Err((st, m)),
+            Err(e) => Err((status::FAILED, e.to_string())),
+        }
+    }
+
+    /// Grant (root only): where it is in the jail.
+    pub fn grant(sock: &Path, g: &Grant) -> Result<String, (u8, String)> {
+        status_call(sock, op::GRANT, g)
+    }
+
+    /// End every grant into `jail` (root only).
+    pub fn revoke(sock: &Path, jail: &str) -> Result<String, (u8, String)> {
+        status_call(sock, op::REVOKE, &jail.to_string())
+    }
+
     /// Subscribe: an `Added` per volume served now, then every change, until
     /// the daemon drops the stream (the session changed) or the socket closes.
     pub struct Events(Connection);
@@ -296,6 +373,12 @@ mod tests {
         }
         fn eject(&self, part: &str) -> (u8, String) {
             if part == "da1s1" { (status::BUSY, "busy".into()) } else { (status::OK, format!("{part} ejected")) }
+        }
+        fn grant(&self, g: &Grant) -> (u8, String) {
+            (status::OK, format!("/media/{}", g.part))
+        }
+        fn revoke(&self, j: &str) -> (u8, String) {
+            (status::OK, j.into())
         }
     }
 
@@ -360,5 +443,24 @@ mod tests {
         assert_eq!(s.list(5).unwrap().len(), 1);
         assert!(s.list(6).is_none());
         assert_eq!(s.eject(6, "a").0, status::NOT_ALLOWED);
+    }
+
+    #[test]
+    fn grants_are_roots_and_checked() {
+        let s = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(5)))));
+        s.update(vec![vol("da0s1")], &[]);
+        let g = Grant { part: "da0s1".into(), path: "/Photos".into(), jail: "atrium-app-1".into(), uid: 50001, gid: 50001, read_only: false };
+        assert_eq!(server::grant_checked(&s, 0, &g), (status::OK, "/media/da0s1".into()));
+        assert_eq!(server::grant_checked(&s, 5, &g).0, status::NOT_ALLOWED, "not even the session's user");
+        for bad in [
+            Grant { path: "Photos".into(), ..g.clone() },
+            Grant { path: "/a/../b".into(), ..g.clone() },
+            Grant { path: "/a\nmount 0 0 0 /".into(), ..g.clone() },
+            Grant { uid: 0, ..g.clone() },
+            Grant { jail: String::new(), ..g.clone() },
+        ] {
+            assert_eq!(server::grant_checked(&s, 0, &bad).0, status::MALFORMED, "{bad:?}");
+        }
+        assert_eq!(server::grant_checked(&s, 0, &Grant { part: "da9s1".into(), ..g.clone() }).0, status::NOT_FOUND);
     }
 }

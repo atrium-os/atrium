@@ -62,7 +62,7 @@ V 'usbconfig list >/dev/null 2>&1' || { echo "the VM has no USB controller (QEMU
 
 echo "== cross-build"
 CROSS_RUSTFLAGS=$(cd "$ROOT" && ARCH=amd64 sh -c '. ./scripts/cloud-vm.sh >/dev/null; printf %s "$CROSS_RUSTFLAGS"' sh env)
-( cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE -p jaild ) || { echo "jaild build failed"; exit 1; }
+( cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE -p jaild -p portcullisd --bin atrium-jaild --bin atrium-portcullisd-jclient ) || { echo "jaild build failed"; exit 1; }
 ( cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TRIPLE --bins ) || { echo "dispensator build failed"; exit 1; }
 # The Tessera core (Tessera sticks, read-only) for the guest, from core/Makefile's SRCS.
 CORE="$ROOT/atrium-tessera/core"; COREOUT="$CORE/build-cross-$TRIPLE"; SYSROOT="$VMDIR/sysroot"
@@ -105,6 +105,7 @@ V 'rm -rf /root/am && mkdir -p /root/am/scripts /root/am/capsa/etc/devices.d'
 scp -q $K -P 2222 "$ROOT/portcullis/target/$TRIPLE/release/atrium-jaild" \
   "$ROOT/dispensator/target/$TRIPLE/release/atrium-dispensatord" \
   "$ROOT/capsa/target/$TRIPLE/release/atrium-capsa-fuse" \
+  "$ROOT/portcullis/target/$TRIPLE/release/atrium-portcullisd-jclient" \
   "$ROOT/etc/atrium.devfs.rules" root@localhost:/root/am/
 scp -q $K -P 2222 "$ROOT/scripts/capsa-service.sh" root@localhost:/root/am/scripts/
 scp -q $K -P 2222 "$ROOT/capsa/etc/devices.d/50-capsa.toml" root@localhost:/root/am/capsa/etc/devices.d/
@@ -124,6 +125,7 @@ cp $P.automount-bak $P
 sed -i '' 's/^allowed_ids = \[\(.*\)\]/allowed_ids = [\1, 31]/' $P
 sed -i '' 's/^allowed_system_uids = \[/allowed_system_uids = [ 65031,/' $P
 sed -i '' 's/^allowed_system_gids = \[/allowed_system_gids = [ 65031,/' $P
+grep -q '"/media/.grants/\*"' $P || sed -i '' 's|^rw_patterns = \[|rw_patterns = [ "/media/.grants/*",|' $P
 cat >> $P <<'EOP'
 
 [[devfs_rulesets.pinned]]
@@ -136,7 +138,7 @@ fuse_devices      = ["da#p#", "da#s#", "da#"]
 fuse_mount_prefix = "/media"
 EOP
 grep -q 'sysfil.profiles.fuse-server' $P || printf '\n[sysfil.profiles.fuse-server]\ninclude = ["base"]\nioctls  = ["0x40046480", "0x40086481"]\n' >> $P
-for u in alice:1011 bob:1012; do id ${u%:*} >/dev/null 2>&1 || pw useradd ${u%:*} -u ${u#*:} -m -s /bin/sh; done
+for u in alice:1011 bob:1012 grantapp:50601 grantapp2:50602; do id ${u%:*} >/dev/null 2>&1 || pw useradd ${u%:*} -u ${u#*:} -m -s /bin/sh; done
 install -d -m 0755 /atrium/sockets/ostiarius
 : > /atrium/sockets/ostiarius/active-session; : > /atrium/sockets/ostiarius/session-locked
 service atrium-jaild start >/dev/null 2>&1; sleep 2
@@ -188,10 +190,34 @@ else
   bad "not mounted for alice ($(V "tail -4 /var/log/atrium/dispensatord.log | tr '\n' ';'"))"
 fi
 
+echo "== an app given a folder, one shot (§4.8)"
+JC=/root/am/atrium-portcullisd-jclient; JS=/var/run/atrium/jaild.sock
+JA=app-grant-a-$RUN; JB=app-grant-b-$RUN; RA=/var/lib/atrium/jails/$JA; RB=/var/lib/atrium/jails/$JB
+V "mkdir -p $RA $RB; $JC $JS create $JA $RA >/dev/null; $JC $JS create $JB $RB >/dev/null"
+V "su -m alice -c 'mkdir -p $M/Docs && echo for the app > $M/Docs/note.txt'"
+out=$(V "su -m alice -c '$DD --grant $PART /Docs --jail $JA --uid 50601' 2>&1")
+echo "$out" | grep -q "status 2" && ok "the session's user may not grant ($out)" || bad "alice granted: '$out'"
+out=$(V "$DD --grant $PART /Docs --jail $JA --uid 50601 2>&1")
+[ "$out" = "ok /media/$PART" ] && ok "root grants /Docs into $JA ($out)" || bad "grant: '$out' ($(V "grep grant /var/log/atrium/dispensatord.log | tail -2 | tr '\n' ';'"))"
+G=$RA/media/$PART
+[ "$(V "stat -f '%u %Lp' $G")" = "50601 700" ] && ok "in the jail it is the app's (uid 50601, 0700)" || bad "grant root is '$(V "stat -f '%u %Lp' $G")'"
+[ "$(V "ls $G | tr '\n' ' '")" = "note.txt " ] && ok "only the folder: note.txt, not the stick" || bad "the grant shows '$(V "ls $G | tr '\n' ' '")'"
+[ "$(V "su -m grantapp -c 'cat $G/note.txt'")" = "for the app" ] && ok "the app reads it" || bad "the app cannot read note.txt"
+V "su -m grantapp -c 'echo from the app > $G/reply.txt'" && [ "$(V "su -m alice -c 'cat $M/Docs/reply.txt'")" = "from the app" ] && ok "its write lands on the stick; alice sees it" || bad "the app's write"
+V "su -m alice -c 'cat $G/note.txt' >/dev/null 2>&1" && bad "alice reads the app's grant" || ok "nobody else reads the app's grant (alice refused)"
+out=$(V "$DD --grant $PART / --jail $JB --uid 50602 --ro 2>&1")
+[ "$out" = "ok /media/$PART" ] && ok "the whole stick, read-only, into $JB" || bad "whole grant: '$out'"
+[ "$(V "su -m grantapp2 -c 'cat $RB/media/$PART/hello.txt'")" = "on the stick" ] && ok "$JB reads the stick" || bad "$JB cannot read hello.txt"
+V "su -m grantapp2 -c 'echo x > $RB/media/$PART/x.txt' 2>/dev/null" && bad "$JB wrote on a read-only grant" || ok "and cannot write"
+V "$JC $JS remove $JA >/dev/null"; sleep 5
+V "mount -p | grep -q '$RA/media'" && bad "$JA's grant outlived its jail" || ok "$JA gone: its grant ended"
+[ "$(V "ls /media/.grants | wc -l | tr -d ' '")" = "1" ] && ok "one grant left ($JB's)" || bad "grants left: '$(V "ls /media/.grants | tr '\n' ' '")'"
 echo "== lock and unlock"
 lock alice
 mounted && bad "still mounted while locked" || ok "locked: unmounted"
 V "jls -n name | grep -q 'name=atrium-capsa-$PART'" && bad "jail still up while locked" || ok "and the server's jail is gone"
+[ "$(V "ls /media/.grants 2>/dev/null | wc -l | tr -d ' '")" = "0" ] && ok "locking ended $JB's grant" || bad "grants while locked: '$(V "ls /media/.grants | tr '\n' ' '")'"
+V "$JC $JS remove $JB >/dev/null"
 V "tail -1 /tmp/mw.$RUN | grep -qx end" && ok "locking ends the subscription" || bad "subscriber while locked: '$(V "tr '\n' ';' < /tmp/mw.$RUN")'"
 lock ""
 mounted && [ "$(V "su -m alice -c 'cat $M/alice.txt'")" = "from alice" ] && ok "unlocked: back, with alice's file" || bad "not back after unlock"
