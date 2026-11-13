@@ -522,6 +522,7 @@ si_uq_evict_task(void *arg, int pending __unused)
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
 			continue;
+		amd_gmc12_l2_note(c->gt, "evict task: start");
 		err = amd_mes12_uq_evict(hw);
 		if (err != 0) {
 			si_recover(c, "a lost user queue that will not stop",
@@ -597,6 +598,7 @@ si_iv_batch_end(struct amd_si_client *c)
 			fault = true;
 		} else if ((c->b_fault_vmids & 0xff00u) != 0) {
 			si_uq_faulted(c, c->b_fault_vmids & 0xff00u, flog);
+			amd_gmc12_l2_note(c->gt, "IH: queue marked lost");
 		} else if (flog)
 			device_printf(sc->dev, "si: VM fault on VMID %u at "
 			    "%#jx, not the running submit's VMID %u\n",

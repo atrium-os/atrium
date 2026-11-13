@@ -50,6 +50,8 @@ MTX_SYSINIT(gmc12_inv, &gmc12_inv_mtx, "gmc12 inv", MTX_DEF);
 static volatile sbintime_t gmc12_flush_t0, gmc12_flush_t1;
 static volatile u_int gmc12_flush_vmid;
 #define GC12_GCVM_L2_STATUS	0x15c7
+#define GC12_CP_CPF_STATUS	0x0e27
+static volatile sbintime_t gmc12_fault_t;
 
 static void
 flush_mark(u_int vmid, bool start)
@@ -1080,6 +1082,8 @@ amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status, uint64_t *addr)
 	*status = hr(&h, h.g->fault_status);
 	*addr = ((uint64_t)(hr(&h, h.g->fault_addr_hi) & 0xf) << 32 |
 	    hr(&h, h.g->fault_addr_lo)) << PAGE_SHIFT;
+	if (*status != 0 && h.g->gc)
+		gmc12_fault_t = sbinuptime();
 	if (*status != 0 && h.g->gc) {
 		sbintime_t now = sbinuptime(), t0 = gmc12_flush_t0,
 		    t1 = gmc12_flush_t1;
@@ -1100,6 +1104,25 @@ amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status, uint64_t *addr)
 	hrmw(&h, h.g->fault_cntl, 0, FAULT_CNTL_CLEAR);
 	hrmw(&h, h.g->fault_cntl, FAULT_CNTL_CLEAR, 0);
 	return (*status != 0);
+}
+
+/*
+ * Run 880c3ce7: L2_BUSY was clear when test 15's fault was taken and set
+ * by the time of the wave kill. Bracket the steps in between: the L2 and
+ * CPF state and the time since the last GFXHUB fault was taken.
+ */
+void
+amd_gmc12_l2_note(struct amd_gart *gt, const char *when)
+{
+	struct hub h;
+	sbintime_t t = gmc12_fault_t;
+
+	if (!hub_open(gt->sc, true, &h))
+		return;
+	device_printf(gt->sc->dev, "gmc: %s: GCVM_L2_STATUS %#x, "
+	    "CP_CPF_STATUS %#x, %jd us after the fault\n", when,
+	    hr(&h, GC12_GCVM_L2_STATUS), hr(&h, GC12_CP_CPF_STATUS),
+	    (intmax_t)(t == 0 ? -1 : sbttous(sbinuptime() - t)));
 }
 
 /* gfxhub_v12_0_print_l2_protection_fault_status, one line. */

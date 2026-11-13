@@ -3097,7 +3097,9 @@ amd_mes12_uq_evict(struct amd_uq *q)
 
 	if (q->added && !uq2_done(q)) {
 		amd_mes12_uq_report(q, "destroy: work in flight");
+		amd_gmc12_l2_note(m->gt, "evict: after the queue report");
 		if (uq2_hqd_find(m, q->db, &vmid) && vmid >= 8) {
+			amd_gmc12_l2_note(m->gt, "evict: after the HQD lookup");
 			cp_snap(m, "before the wave kill");
 			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);
 			cp_snap(m, "right after the wave kill");

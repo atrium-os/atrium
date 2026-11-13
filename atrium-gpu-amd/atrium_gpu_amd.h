@@ -896,6 +896,7 @@ void	amd_gmc12_ctx_report(struct amd_gart *gt, u_int vmid,
 	    const char *when);
 bool	amd_gmc12_fault_take(struct amd_gart *gt, uint32_t *status,
 	    uint64_t *addr);
+void	amd_gmc12_l2_note(struct amd_gart *gt, const char *when);
 void	amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st,
 	    const char *when);
 u_int	amd_gmc12_fault_vmid(uint32_t status);
