@@ -214,6 +214,24 @@ are public ISA and register documents; for Wi-Fi there is nothing else.
 | 3a | MediaTek MT7921/MT7922/MT7925 | AMD laptops (RZ608/RZ616), USB MT7921AU dongles | PCIe and USB | ISC reference (`mt76`); the USB variant can be passed into the dev VM (§6) |
 | 3b | Realtek RTL8852BE/CE, RTL8922AE | budget laptops, mini PCs | PCIe | `rtw89` BSD-3 option |
 
+### 5.1 Hardware available (Shankar, 2026-11-13)
+
+Shankar can get a USB Wi-Fi module and plans to buy a Minisforum AI X1 Pro.
+Reviews list its Wi-Fi card as a **MediaTek MT7925** (Wi-Fi 7, PCIe, M.2,
+connac3 firmware); to be confirmed by PCI ID when it arrives. That reverses
+the order above: MediaTek goes first.
+
+- **USB dongle: MT7921AU** (Wi-Fi 6E, connac2), e.g. Alfa AWUS036AXML or
+  Netgear A8000. Passes into the arm64 QEMU VM on the Mac by USB
+  passthrough, so the driver can be developed before any bare-metal box.
+- **MT7921 and MT7925 share most of the host interface** (`mt76`'s common
+  `mt792x` code, ISC): MCU message framing, firmware patch + RAM load, WFDMA
+  rings on PCIe, the same USB transport style. One `aura_mt79` module covers
+  both, with the bus (USB/PCIe) and the connac2/connac3 differences as layers.
+- **AI X1 Pro:** x86_64, MT7925 on PCIe; runs Atrium bare metal for the
+  throughput and soak gates. Its M.2 card can later be swapped for an Intel
+  BE200 to bring up `aura_intel` on the same box.
+
 Older Intel (7260–9560) stays out unless someone needs it: `iwm` covers them
 in FreeBSD and that hardware is going away.
 
@@ -248,10 +266,10 @@ in FreeBSD and that hardware is going away.
 | W0 | `aura-proto`, `aura_wlan` skeleton, kpi bindings (bus_dma, MSI-X, firmware, mbuf, ifnet), `aura_sim` + hwsim bridge | `wlan0` appears in the VM and passes Ethernet frames to the sim |
 | W1 | `aurad`: scan, open + WPA2-PSK + PMF, Arca credentials, jail, atrium-net glue, DHCP | VM joins hwsim `hostapd` WPA2 and gets an address |
 | W2 | `aurad`: WPA3-SAE (H2E + hunting-and-pecking), transition mode, roaming, MAC randomization, regdb | sim gate (§6.2) green |
-| W3 | `aura_intel` transport: gen2 rings, firmware load (ucode TLV + pnvm), alive, NVM, UMAC scan | real AX210 scans and reports BSSs to `aurad` |
-| W4 | `aura_intel` station: sta/mac contexts, TX/RX, HW crypto, firmware rate control (TLC), BA sessions, PS, LAR | real AP joined at HE rates, iperf target met |
+| W3 | `aura_mt79` USB transport: MCU messages, patch + RAM firmware load, hardware scan | MT7921AU in the Mac VM scans and reports BSSs to `aurad` |
+| W4 | `aura_mt79` station: BSS/STA records, TX/RX, HW crypto, firmware rate control, BA sessions, PS, country/regulatory; then the PCIe (WFDMA) bus layer and MT7925 on the AI X1 Pro | real AP joined at HE/EHT rates, iperf target met on the AI X1 Pro |
 | W5 | suspend/resume, rfkill, firmware crash recovery (reload + rejoin), 24 h soak | soak green |
-| W6 | second family (BE200 or MediaTek/Realtek per hardware) | same gates |
+| W6 | second family: `aura_intel` (BE200 swapped into the AI X1 Pro, or AX210) | same gates |
 | W7 | Enterprise: EAP-TLS, PEAP-MSCHAPv2, EAP-TTLS; certificates through Arca | interop with hostapd's EAP server |
 
 W0–W2 need no Wi-Fi hardware at all.
@@ -290,9 +308,9 @@ later addition; the split in §3.1 allows it (hostapd's role would move into
 4. **Reference rule:** permissive-licensed driver code and public standards
    allowed, notices kept; GPL-only code and firmware disassembly never.
    *Recommend yes* (§4).
-5. **First family Intel AX200/AX201/AX210/AX211, BE200 second.** *Recommend
-   yes if an Intel test machine exists*; otherwise MediaTek MT7921AU first
-   because it is testable over USB passthrough in the Mac VM (§6.4).
+5. **First family MediaTek** (revised 2026-11-13 after Shankar's hardware
+   answer, §5.1): MT7921AU over USB in the Mac VM, then MT7925 over PCIe in
+   the Minisforum AI X1 Pro; Intel AX2xx/BE200 second. *Recommend yes.*
 6. **Own Rust supplicant inside `aurad`**, WPA2/WPA3-Personal + PMF in v1,
    Enterprise in W7. *Recommend yes.*
 7. **Machine-wide networks in Arca's machine store** (new kind
