@@ -417,8 +417,8 @@ mes_report(struct mes *m, const char *when)
 #define GCVM_L2_STATUS		S0(0x15c7)	/* L2_BUSY, CONTEXT_DOMAIN_BUSY[16:1] */
 
 /* MES pipe 0's program counter (GRBM-selected). */
-static uint32_t
-mes_pc0(struct mes *m) __unused
+static __unused uint32_t
+mes_pc0(struct mes *m)
 {
 	uint32_t v;
 
