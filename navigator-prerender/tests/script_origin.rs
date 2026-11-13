@@ -103,3 +103,21 @@ fn a_data_script_is_not_a_network_refusal() {
     assert!(f.asked.is_empty());
     assert!(c.blocked_hosts.is_empty(), "{:?}", c.blocked_hosts);
 }
+
+/// ★ A tracking pixel (declared at most 1 × 1) is never fetched or hinted,
+/// whatever its host; a real image, even a hidden one, still is.
+#[test]
+fn a_pixel_is_never_fetched() {
+    let mut f = Recording::default();
+    let html = r#"<html><body>
+        <img src="https://px.example/a.gif" width="1" height="1">
+        <img src="https://px.example/b.gif" width="0" height="0">
+        <img src="https://cdn.example/slide2.jpg" style="display: none">
+        <img src="https://news.example/photo.png">
+      </body></html>"#;
+    let _ = convert_with(html, Some("https://news.example/p.html"), &mut BoaEngine::default(), &mut f);
+    assert!(touched(&f, "px.example").is_empty(), "{:?} {:?}", f.asked, f.hinted);
+    for real in ["photo.png", "slide2.jpg"] {
+        assert!(f.asked.iter().chain(&f.hinted).any(|u| u.ends_with(real)), "{real}: {:?}", f.asked);
+    }
+}

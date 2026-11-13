@@ -547,7 +547,7 @@ fn convert_impl(
 /// http(s) only, each once, at most 512.
 fn header_hints(dom: &dom::Dom, base: Option<&str>) -> Vec<String> {
     let mut seen = HashSet::new();
-    dom.by_tag_anywhere("img").into_iter().filter(|&h| !subresource::declares_size(dom, h))
+    dom.by_tag_anywhere("img").into_iter().filter(|&h| !subresource::declares_size(dom, h) && !subresource::invisible_img(dom, h))
         .filter_map(|h| dom.attr(h, "src").and_then(|v| resolve(base, v)))
         .filter(|u| (u.starts_with("https://") || u.starts_with("http://")) && u.len() <= serve::MAX_URL && !u.contains(['\n', '\r']))
         .filter(|u| seen.insert(u.clone())).take(512).collect()
@@ -572,7 +572,8 @@ fn hints_in_order(dom: &dom::Dom, base: Option<&str>, tier1_first: bool, scripte
     };
     let sheets = attr_urls("link", "href", &|h| dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace()
         .any(|x| x.eq_ignore_ascii_case("stylesheet"))));
-    let images = attr_urls("img", "src", &|_| true);
+    // A pixel is never fetched, so never hinted either.
+    let images = attr_urls("img", "src", &|h| !subresource::invisible_img(dom, h));
     // ★ Only scripts the gate would fetch are hinted: a hint for a
     // cross-origin script would have fetchd's prefetcher fetch it anyway.
     let origin = base.and_then(|b| url::Url::parse(b).ok()).map(|u| u.origin());
