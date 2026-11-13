@@ -1134,3 +1134,17 @@ work (self-test, scrub).
   first stuck queue sat on pipe 1 (tried) and the second on pipe 0 (skipped, mode 1).
   On gpusim both suites are ALL OK. Box artifacts: pci 4ed2ead4…, gpu d3d29df1…,
   display 3d9cea12…, si-client-test unchanged (5801b269…), xfer b542f672.
+- **2026-11-13 10:24, amdgpu-exact pipe reset on the box (4e443a80): it never ran.**
+  si-client-test 71/71. The ih_rb_base and cp_mes_cntl writes were refused, each
+  register was unchanged, and each uid was locked out. Both refusals forced a re-init,
+  and both re-inits passed.
+  - The first stuck queue (me1 pipe 1 queue 2) shared its pipe with another active
+    HQD, so the pipe reset was skipped. The second was on pipe 0 with the kernel queue,
+    skipped again.
+  - The MES-level attempt failed as at 09:26.
+  - The card idled at detach (8 W).
+  Host-key note: Atrium's ssh host key (ED25519 SHA256:govgi7…) is now saved on the
+  Mac as alias r9700-atrium. Ubuntu keeps lCcTAANW… under r9700.
+  Conclusion: MES places user queues on pipe 0 and on shared pipes, so even a working
+  pipe reset would cover only some refusals. Reset + per-uid lockout stays the
+  defence. Logs: claude/project-thread-33aauq 5fd4e4ac.
