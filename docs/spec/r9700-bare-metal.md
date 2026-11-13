@@ -909,3 +909,12 @@ work (self-test, scrub).
   `mes_v12_0_reset_compute_pipe_mmio`. It holds the queue's MEC pipe in reset, forces
   every HQD on it inactive, releases the pipe, then retries REMOVE_QUEUE. Every queue on
   that pipe is lost (EIO), not the whole card.
+- **2026-11-13 05:28, stage 5f on the box (a652163f): si-client-test 64/64; suite ALL OK;
+  isolation again stopped after Part A step 6.** The CPG fault ladder ran in this order:
+  dequeue reset (still active), REMOVE_QUEUE refused (…0301…), MES RESET refused
+  (…0800…), REMOVE refused (…0303…), MEC pipe reset. The pipe reset **made the HQD
+  inactive** ("not mapped"), but REMOVE_QUEUE was still refused (…0303…), so the driver
+  did a mode 1 reset. After it, 4 scrubs failed with ENXIO and those pages were kept
+  back. Next: reset the pipe first, as soon as the dequeue reset fails and before MES
+  is asked anything, so MES never sees the refused REMOVE and RESET; MES RESET becomes
+  the last rung.

@@ -2825,8 +2825,15 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			    us);
 		}
 	}
-	if (q->added && !uq2_done(q))
-		(void)uq2_hqd_reset(q);
+	/*
+	 * A queue whose HQD a dequeue reset cannot stop (a CP-side fault,
+	 * client CPG: box runs a0597b2d..a652163f) gets its MEC pipe reset
+	 * BEFORE MES is asked to remove it. Run a652163f: asked first, MES
+	 * refused REMOVE_QUEUE and its RESET, and after that still refused
+	 * REMOVE once the pipe reset had made the HQD inactive.
+	 */
+	if (q->added && !uq2_done(q) && !uq2_hqd_reset(q))
+		(void)uq2_pipe_reset(q);
 	if (q->added) {
 		err = uq_remove_raw(m, q->gva, q->db);
 		if (err != 0 && uq2_hqd_reset(q)) {
@@ -2834,25 +2841,25 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			    "(%d); HQD reset, trying once more\n", q->slot, err);
 			err = uq_remove_raw(m, q->gva, q->db);
 		}
-		if (err != 0) {
-			/* Still refused: MES's own queue reset, then once
-			 * more. Only if that fails too does the caller reset
-			 * the GPU. */
-			int rerr = uq_reset_raw(m, q->gva, q->db);
-
-			(void)uq2_hqd_reset(q);
-			err = uq_remove_raw(m, q->gva, q->db);
-			device_printf(m->sc->dev, "uq%u: after MES RESET (%d): "
-			    "REMOVE_QUEUE %s\n", q->slot, rerr, err == 0 ?
-			    "ok" : "still refused");
-		}
-		if (err != 0 && uq2_pipe_reset(q)) {
+		if (err != 0 && uq2_hqd_find(m, q->db, &vmid) &&
+		    uq2_pipe_reset(q)) {
 			/* The pipe's other queues went with it: the caller
 			 * loses them (amd_mes12_pipe_resets moved). */
 			err = uq_remove_raw(m, q->gva, q->db);
 			device_printf(m->sc->dev, "uq%u: after MEC pipe reset: "
 			    "REMOVE_QUEUE %s\n", q->slot, err == 0 ? "ok" :
 			    "still refused");
+		}
+		if (err != 0) {
+			/* Still refused: MES's own queue reset, then once
+			 * more. Only if that fails too does the caller reset
+			 * the GPU. */
+			int rerr = uq_reset_raw(m, q->gva, q->db);
+
+			err = uq_remove_raw(m, q->gva, q->db);
+			device_printf(m->sc->dev, "uq%u: after MES RESET (%d): "
+			    "REMOVE_QUEUE %s\n", q->slot, rerr, err == 0 ?
+			    "ok" : "still refused");
 		}
 		if (err != 0 || uq2_hqd_find(m, q->db, &vmid)) {
 			amd_mes12_uq_report(q, "REMOVE_QUEUE failed");
