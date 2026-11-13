@@ -382,6 +382,12 @@ pub unsafe extern "C" fn amd_rs_ctl_ioctl(
     _td: *mut thread,
 ) -> c_int {
     let dev = unsafe { Dev::from_cdev(dev) };
+    // The node is root 0600, but an open fd can be passed on: every call checks the caller's
+    // privilege, so a ctl fd handed to an unprivileged process carries nothing (ABI 2.3 §4.1).
+    let priv_err = unsafe { sys::amd_rs_priv_driver() };
+    if priv_err != 0 {
+        return priv_err;
+    }
     // SAFETY: the kernel's argument buffer for this command.
     let mut data = unsafe { IoctlData::from_raw(cmd, data) };
     match cmd {

@@ -1429,12 +1429,39 @@ attest(void)
 	    "gpusim; shared engine queues");
 }
 
+/* The card was reset and every client lost: a fresh VM_CREATE fails ENXIO. */
+static int
+dev_lost(void)
+{
+	struct atrium_gpu_vm_create v;
+	int fd, lost;
+
+	fd = open(GPU, O_RDWR);
+	if (fd < 0)
+		return (errno == ENXIO);
+	memset(&v, 0, sizeof(v));
+	lost = ioctl(fd, ATRIUM_GPU_IOC_VM_CREATE, &v) != 0 && errno == ENXIO;
+	if (!lost)
+		close((int)v.out_fd);
+	close(fd);
+	return (lost);
+}
+
 int
 main(int argc, char **argv)
 {
 	signal(SIGPIPE, SIG_IGN);
 	detect_si();
-#define RUN(f)		do { f(); qreap(); } while (0)
+#define RUN(f)		do {						\
+	f();								\
+	qreap();							\
+	if (dev_lost()) {						\
+		printf("device lost (ENXIO): stopping, the rest would "	\
+		    "only cascade\n");					\
+		printf("%d FAILURES\n", failures + 1);			\
+		return (1);						\
+	}								\
+} while (0)
 #define GPUSIM(f, why)	do {						\
 	if (g_si)							\
 		printf(#f " SKIP: gpusim only (%s)\n", why);		\

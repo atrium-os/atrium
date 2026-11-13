@@ -478,7 +478,7 @@ struct atrium_gpu_backend_ops {
 	void	(*bo_free)(struct atrium_amd_bo *bo);
 	/* Map / unmap one page of a BO into a VM at a GPU-VA (amd: a GPUVM PTE). */
 	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
-		    vm_paddr_t phys, int vram, int writable);
+		    vm_paddr_t phys, int vram, u_int prot);	/* AMD_VM_WRITE|EXEC */
 	void	(*unmap_page)(struct atrium_amd_vm *vm, uint64_t va);
 	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell,
 	 * under the queue's lock; EBUSY if another client owns the queue or
@@ -695,6 +695,7 @@ struct atrium_amd_reset_hooks {
 #define ATRIUM_AMD_HANG_MS	5000	/* default watchdog limit (sysctl hang_ms) */
 #define ATRIUM_AMD_VRAM_LIMIT_PCT 75	/* default per-uid VRAM cap (kmod audit G2) */
 #define ATRIUM_AMD_SYS_LIMIT_PCT 50	/* default per-uid System BO cap */
+#define ATRIUM_AMD_QUEUE_LIMIT	32	/* default per-uid live queue fds (ABI §4.2) */
 
 struct atrium_amd_client;	/* one open of the client node (rs/ioctl.rs) */
 
@@ -1100,6 +1101,8 @@ struct atrium_amd_softc {
 	int		 hang_ms;	/* no progress this long = hung */
 	int		 vram_limit_pct; /* per-uid VRAM cap, % of VRAM (rs/quota.rs) */
 	int		 sys_limit_pct;	/* per-uid System BO cap, % of RAM */
+	int		 queue_limit;	/* per-uid live queue fds (rs/quota.rs) */
+	int		 gpu_wx;	/* 1: X only where bound EXEC (silicon PTEs) */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
 	struct atrium_amd_vram vram;	/* device VRAM allocator (base, vram.c) */
 	struct amd_clear_engine clear;	/* VRAM clear engine (gpu, clear.c) */
@@ -1177,7 +1180,7 @@ int	 amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
 /* vm.c — the backend's GPUVM: VMIDs, page tables, PTEs. The VM fd object is
  * the front-end's (rs/vm.rs). */
 int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys,
-	    int vram, int writable);
+	    int vram, u_int prot);
 void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
 /* amd backend hardware setup/teardown of a VM's GPUVM (the front-end owns the
  * struct + fd; these own the VMID + page tables + PT base). */

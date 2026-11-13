@@ -149,6 +149,40 @@ type3(uint32_t opcode, uint32_t body_dwords)
 	    (opcode << 8));
 }
 
+/*
+ * RELEASE_MEM: write the 64-bit `value` to `va` at end of pipe. gpusim's
+ * model takes 6 body dwords and raises the EOP interrupt the syncobj
+ * waits for. gfx12 silicon takes 7 (the last is the interrupt context id;
+ * a short packet at the end of an IB wedges the CP fetching past it) and
+ * needs no interrupt here: the kernel ends every blob with its own EOP.
+ * Returns dwords.
+ */
+static int
+emit_eop(uint32_t *r, uint64_t va, uint64_t value)
+{
+	if (!g_si) {
+		r[0] = type3(IT_RELEASE_MEM, 6);
+		r[1] = (5u << 8);
+		r[2] = (2u << 29) | (2u << 24);
+		r[3] = (uint32_t)(va & 0xffffffff);
+		r[4] = (uint32_t)(va >> 32);
+		r[5] = (uint32_t)(value & 0xffffffff);
+		r[6] = (uint32_t)(value >> 32);
+		return (7);
+	}
+	r[0] = type3(IT_RELEASE_MEM, 7);
+	/* CACHE_FLUSH_AND_INV_TS_EVENT, index 5, GCR writeback (as the
+	 * kernel's and si_client_test's own RELEASE_MEMs). */
+	r[1] = 1u << 22 | 1u << 21 | 3u << 25 | 5u << 8 | 0x14u;
+	r[2] = 2u << 29;		/* DATA_SEL 64 bits, INT_SEL none */
+	r[3] = (uint32_t)(va & 0xffffffff);
+	r[4] = (uint32_t)(va >> 32);
+	r[5] = (uint32_t)(value & 0xffffffff);
+	r[6] = (uint32_t)(value >> 32);
+	r[7] = 0;			/* INT_CTXID */
+	return (8);
+}
+
 static int
 vm_create(int fd)
 {
@@ -158,6 +192,23 @@ vm_create(int fd)
 	if (ioctl(fd, ATRIUM_GPU_IOC_VM_CREATE, &v) != 0)
 		return (-1);
 	return ((int)v.out_fd);
+}
+
+/*
+ * After a test: is the device gone (the card was reset, every client lost)?
+ * A fresh VM_CREATE then fails ENXIO; any later test would only cascade.
+ */
+static int
+dev_lost(int fd)
+{
+	int v;
+
+	v = vm_create(fd);
+	if (v >= 0) {
+		close(v);
+		return (0);
+	}
+	return (errno == ENXIO);
 }
 
 /* Allocate a BO and bind it into `vm` at an auto VA — the common path. */
@@ -406,8 +457,9 @@ test_bo_fd(int fd, int vm)
 static int
 test_gfx_fence(int fd, int vm)
 {
-	uint32_t ring_h, fence_h, ring[9];
+	uint32_t ring_h, fence_h, ring[10];
 	uint64_t ring_va, fence_va, fence = 0;
+	int n;
 
 	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
@@ -416,16 +468,10 @@ test_gfx_fence(int fd, int vm)
 	}
 	ring[0] = type3(IT_NOP, 1);
 	ring[1] = 0;
-	ring[2] = type3(IT_RELEASE_MEM, 6);
-	ring[3] = (5u << 8);
-	ring[4] = (2u << 29) | (2u << 24);
-	ring[5] = (uint32_t)(fence_va & 0xffffffff);
-	ring[6] = (uint32_t)(fence_va >> 32);
-	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
-	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	n = 2 + emit_eop(ring + 2, fence_va, FENCE_MAGIC);
 
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit_va(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX) != 0 ||
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0 ||
 	    bo_read(fd, fence_h, &fence, sizeof(fence)) != 0) {
 		printf("gfx: ioctl failed\n");
 		return (1);
@@ -545,9 +591,9 @@ static int
 test_irq(int fd, int vm)
 {
 	struct atrium_gpu_irqs q0, q1;
-	uint32_t ring_h, fence_h, ring[9];
+	uint32_t ring_h, fence_h, ring[10];
 	uint64_t ring_va, fence_va;
-	int i;
+	int i, n;
 
 	if (ioctl(fd, ATRIUM_GPU_IOC_GET_IRQS, &q0) != 0) {
 		printf("irq: GET_IRQS failed\n");
@@ -564,15 +610,9 @@ test_irq(int fd, int vm)
 	}
 	ring[0] = type3(IT_NOP, 1);
 	ring[1] = 0;
-	ring[2] = type3(IT_RELEASE_MEM, 6);
-	ring[3] = (5u << 8);
-	ring[4] = (2u << 29) | (2u << 24);
-	ring[5] = (uint32_t)(fence_va & 0xffffffff);
-	ring[6] = (uint32_t)(fence_va >> 32);
-	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
-	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	n = 2 + emit_eop(ring + 2, fence_va, FENCE_MAGIC);
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit_va(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX) != 0) {
+	    submit_va(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX) != 0) {
 		printf("irq: submit failed\n");
 		return (1);
 	}
@@ -601,7 +641,7 @@ test_syncobj(int fd, int vm)
 	struct atrium_gpu_syncobj_wait wt;
 	struct timespec ts = { 2, 0 };
 	struct kevent kev;
-	uint32_t ring_h, fence_h, ring[9];
+	uint32_t ring_h, fence_h, ring[10];
 	uint64_t ring_va, fence_va;
 	int so_fd, kq, n;
 
@@ -626,15 +666,9 @@ test_syncobj(int fd, int vm)
 	}
 	ring[0] = type3(IT_NOP, 1);
 	ring[1] = 0;
-	ring[2] = type3(IT_RELEASE_MEM, 6);
-	ring[3] = (5u << 8);
-	ring[4] = (2u << 29) | (2u << 24);
-	ring[5] = (uint32_t)(fence_va & 0xffffffff);
-	ring[6] = (uint32_t)(fence_va >> 32);
-	ring[7] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
-	ring[8] = (uint32_t)(FENCE_MAGIC >> 32);
+	n = 2 + emit_eop(ring + 2, fence_va, FENCE_MAGIC);
 	if (bo_write(fd, ring_h, ring, sizeof(ring)) != 0 ||
-	    submit_so(fd, vm, ring_va, 9, ATRIUM_GPU_ENGINE_GFX, so_fd, 1) != 0) {
+	    submit_so(fd, vm, ring_va, n, ATRIUM_GPU_ENGINE_GFX, so_fd, 1) != 0) {
 		printf("syncobj: submit failed\n");
 		return (1);
 	}
@@ -987,9 +1021,9 @@ test_cross_queue(int fd, int vm)
 	struct atrium_gpu_syncobj_op q;
 	struct atrium_gpu_syncobj_wait wt;
 	uint32_t addr_h, fence_h, ringa_h, ringb_h;
-	uint32_t ringa[14], ringb[6], zero = 0;
+	uint32_t ringa[15], ringb[6], zero = 0;
 	uint64_t addr_va, fence_va, ringa_va, ringb_va, fb = 0;
-	int so_fd;
+	int so_fd, na;
 
 	memset(&cr, 0, sizeof(cr));
 	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &cr) != 0) {
@@ -1018,13 +1052,7 @@ test_cross_queue(int fd, int vm)
 	ringa[4] = 1;					/* reference */
 	ringa[5] = 0xffffffff;				/* mask */
 	ringa[6] = 0x10;
-	ringa[7] = type3(IT_RELEASE_MEM, 6);
-	ringa[8] = (5u << 8);
-	ringa[9] = (2u << 29) | (2u << 24);
-	ringa[10] = (uint32_t)(fence_va & 0xffffffff);
-	ringa[11] = (uint32_t)(fence_va >> 32);
-	ringa[12] = (uint32_t)(FENCE_MAGIC & 0xffffffff);
-	ringa[13] = (uint32_t)(FENCE_MAGIC >> 32);
+	na = 7 + emit_eop(ringa + 7, fence_va, FENCE_MAGIC);
 
 	/* Ring B (gfx): WRITE_DATA(addr) = 1 — unblocks A. */
 	ringb[0] = type3(IT_WRITE_DATA, 5);
@@ -1041,7 +1069,7 @@ test_cross_queue(int fd, int vm)
 	}
 
 	/* Submit A first; its ring parks on the WAIT (addr is still 0). */
-	if (submit_so(fd, vm, ringa_va, 14, ATRIUM_GPU_ENGINE_COMPUTE, so_fd,
+	if (submit_so(fd, vm, ringa_va, na, ATRIUM_GPU_ENGINE_COMPUTE, so_fd,
 	    1) != 0) {
 		printf("cross_queue: submit A failed\n");
 		return (1);
@@ -2270,7 +2298,16 @@ main(void)
 		    "missing\n");
 		return (1);
 	}
-#define RUN(t)		do { rc |= (t); qreap(); } while (0)
+#define RUN(t)		do {						\
+	rc |= (t);							\
+	qreap();							\
+	if (dev_lost(fd)) {						\
+		printf("device lost (ENXIO): stopping, the rest would "	\
+		    "only cascade\n");					\
+		printf("FAILURES\n");					\
+		return (1);						\
+	}								\
+} while (0)
 #define GPUSIM(name, t)	do {						\
 	if (g_si)							\
 		printf("%s SKIP: gpusim only\n", name);			\

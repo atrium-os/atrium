@@ -830,3 +830,23 @@ work (self-test, scrub).
   its own EOP, so they wait on one there. Runner: `gpu-stage-run.sh
   <pci>,<gpu>,<si test>,<suite>,<iso> 5f` runs si-client-test, then
   `/root/atrium-gpu-test` and `/root/test-gpu-isolation`.
+- **2026-11-13, stage 5f on the box (a0597b2d): si-client-test 60/60; both suites
+  FAILED.** `atrium_gpu_test`'s gfx test wrote gpusim's 6-dword RELEASE_MEM; gfx12's
+  has 7 body dwords (the last is INT_CTXID). The short packet at the end of the IB
+  wedged the CP (rptr 0, GPU busy), MES refused REMOVE_QUEUE, and the driver fell back
+  to a mode 1 reset. Every later call failed ENXIO, so both suites cascaded into
+  failures. Findings: (1) a client's malformed packet can force a whole-GPU reset
+  (hostile-PM4 gap); (2) after the reset the device stays lost until reattach, and the
+  reset path leaks bus resources at detach; (3) an unrouted EOP with context 0x4000020
+  was logged.
+- **2026-11-13, fixes for the next 5f run (gpusim: suite ALL OK, isolation ALL OK).**
+  The suites emit the real gfx12 RELEASE_MEM on silicon (`emit_eop`); other
+  silicon-path packets (WRITE_DATA, WAIT_REG_MEM, DMA_DATA, the si_ops shaders) were
+  checked. Both suites stop at the first device loss (a fresh VM_CREATE fails ENXIO)
+  instead of cascading. Also settled from the GPU security review: every ctl-node ioctl
+  checks PRIV_DRIVER; a per-uid cap on live queues (`isolation.queue_limit`, 32,
+  EDQUOT); GPU W^X: `BIND_EXEC` (needs `READONLY`) and `isolation.gpu_wx`. With it set,
+  only EXEC-bound pages are executable on silicon, and a user queue's writeback and EOP
+  pages lose X. The default stays 0 until the box shows which fetches need X.
+  si-client-test 13 sets it, runs code and IB bound EXEC, checks that a jump into a
+  read-write data BO faults (EIO), and probes an IB without X (informational).

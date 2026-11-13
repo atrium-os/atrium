@@ -69,8 +69,9 @@ impl Dev {
     }
 
     /// Write one page's PTE in `vm`. The VA lies in the VM's window (the arena handed it out).
-    pub fn map_page(self, vm: *mut sys::atrium_amd_vm, va: u64, phys: u64, vram: bool, writable: bool) -> Result<()> {
-        check(unsafe { (self.ops().map_page.unwrap())(vm, va, phys as _, vram as c_int, writable as c_int) })
+    /// `prot`: AMD_VM_WRITE and/or AMD_VM_EXEC (read is implied).
+    pub fn map_page(self, vm: *mut sys::atrium_amd_vm, va: u64, phys: u64, vram: bool, prot: u32) -> Result<()> {
+        check(unsafe { (self.ops().map_page.unwrap())(vm, va, phys as _, vram as c_int, prot as _) })
     }
 
     pub fn unmap_page(self, vm: *mut sys::atrium_amd_vm, va: u64) {
@@ -364,6 +365,11 @@ impl Dev {
     /// The per-uid cap in bytes, for VRAM or for System BOs.
     pub fn quota_limit(self, vram: bool) -> u64 {
         unsafe { sys::amd_rs_quota_limit(self.0, vram as c_int) }
+    }
+
+    /// The per-uid cap on live queue fds.
+    pub fn queue_limit(self) -> u64 {
+        unsafe { sys::amd_rs_queue_limit(self.0) }
     }
 
     pub fn quota_refused(self) {

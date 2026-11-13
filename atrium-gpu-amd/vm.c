@@ -116,7 +116,7 @@ amd_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
  */
 int
 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
-    int writable)
+    u_int prot)
 {
 	struct atrium_amd_softc *sc = vm->sc;
 	uint64_t pte;
@@ -134,7 +134,7 @@ amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
 	pte = ((uint64_t)phys & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
 	if (vram)
 		pte |= ATRIUM_AMD_PTE_VRAM;
-	if (writable)
+	if (prot & AMD_VM_WRITE)	/* gpusim's PTE has no execute bit */
 		pte |= ATRIUM_AMD_PTE_WRITE;
 	mtx_lock(&sc->lock);
 	pt[pt_i] = pte;

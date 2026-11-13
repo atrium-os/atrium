@@ -52,6 +52,11 @@
  *  12 real ops   (5e) gpusim's SIM_COMPUTE_KERNEL ops COPY, INC and FILL as
  *                real shaders (si_ops.h, oracle-built): each on its own
  *                code page, 64 elements, from a System and a VRAM source.
+ *  13 W^X        with isolation.gpu_wx = 1: BIND_EXEC without READONLY is
+ *                refused; code and IB bound EXEC run on a queue whose
+ *                writeback and EOP pages have no X; the shader copied into a
+ *                read-write data BO faults (EIO) and the VM runs on; an IB
+ *                without X is probed (informational).
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1149,6 +1154,126 @@ out:
 	run_clean(a, "12 real ops: write_42 runs on after");
 }
 
+/*
+ * 13: GPU W^X (ABI 2.3 §5.4) with isolation.gpu_wx = 1, restored after.
+ * Only pages bound EXEC (which needs READONLY) are executable; the queue's
+ * writeback and EOP pages lose X too. Whether the CP fetches an IB as an
+ * execute access is not known yet: that probe is informational.
+ */
+#define WX_SYSCTL	"dev.atrium_gpu_amd.0.isolation.gpu_wx"
+
+static int
+wx_set(int v, int *old)
+{
+	size_t len = sizeof(*old);
+
+	return (sysctlbyname(WX_SYSCTL, old, &len, &v, sizeof(v)));
+}
+
+static void
+wx(void)
+{
+	struct job j;
+	uint64_t va, data_va, ib2_va, code_va;
+	uint32_t first;
+	int old = 0, tmp, bo, data, ib2, r, n, ms;
+
+	if (wx_set(1, &old) != 0) {
+		check(0, "13 W^X", "set %s: %s", WX_SYSCTL, strerror(errno));
+		return;
+	}
+	job_init(&j);
+	data = ib2 = -1;
+
+	/* a: EXEC without READONLY is refused. */
+	j.vm = vm_create();
+	bo = bo_alloc(4096, 0);
+	r = j.vm >= 0 && bo >= 0 &&
+	    vm_bind(j.vm, bo, ATRIUM_GPU_BIND_EXEC, &va) != 0 ? errno : 0;
+	check(r == EINVAL, "13 W^X: BIND_EXEC without READONLY is refused",
+	    "%s", r == 0 ? "accepted" : strerror(r));
+	if (bo >= 0)
+		close(bo);
+
+	/* b: shader and IB bound RO|EXEC, out RW; a new queue (WB, EOP
+	 * without X) runs write_42. */
+	j.shader = bo_alloc(4096, 0);
+	j.ib = bo_alloc(4096, 0);
+	j.out = bo_alloc(4096, 0);
+	j.so = syncobj();
+	if (j.vm < 0 || j.shader < 0 || j.ib < 0 || j.out < 0 || j.so < 0 ||
+	    vm_bind(j.vm, j.shader, ATRIUM_GPU_BIND_READONLY |
+	    ATRIUM_GPU_BIND_EXEC, &j.shader_va) != 0 ||
+	    vm_bind(j.vm, j.ib, ATRIUM_GPU_BIND_READONLY |
+	    ATRIUM_GPU_BIND_EXEC, &j.ib_va) != 0 ||
+	    vm_bind(j.vm, j.out, 0, &j.out_va) != 0 ||
+	    bo_xfer(j.shader, __DECONST(void *, siw42_shader),
+	    sizeof(siw42_shader), 1) != 0 ||
+	    (j.q = queue_create(j.vm)) < 0) {
+		check(0, "13 W^X", "setup: %s", strerror(errno));
+		goto out;
+	}
+	run_clean(&j, "13 W^X: code and IB bound EXEC run, the queue's "
+	    "writeback and EOP without X");
+
+	/* c: the same shader in a read-write data BO (no X): the wave's
+	 * instruction fetch faults and the work fails. */
+	data = bo_alloc(4096, 0);
+	if (data < 0 || vm_bind(j.vm, data, 0, &data_va) != 0 ||
+	    bo_xfer(data, __DECONST(void *, siw42_shader),
+	    sizeof(siw42_shader), 1) != 0) {
+		check(0, "13 W^X", "data BO: %s", strerror(errno));
+		goto out;
+	}
+	code_va = j.shader_va;
+	j.shader_va = data_va;
+	if (poison(j.out, POISON_A) != 0 || job_submit(&j, j.out_va) != 0) {
+		check(0, "13 W^X: code in a data BO", "submit: %s",
+		    strerror(errno));
+		j.shader_va = code_va;
+		goto out;
+	}
+	j.shader_va = code_va;
+	r = job_wait(&j, 15000, &ms);
+	n = count(j.out, SIW42_OUT_VALUE, &first);
+	check(r == EIO && n == 0, "13 W^X: a jump into a read-write data BO "
+	    "faults and fails the work", "completion %s after %d ms, %d/64 "
+	    "words 42", r == 0 ? "ok" : strerror(r), ms, n);
+	if (job_renew(&j) != 0) {
+		check(0, "13 W^X: renew", "%s", strerror(errno));
+		goto out;
+	}
+	run_clean(&j, "13 W^X: the VM runs clean on a new queue after");
+
+	/* d (informational): an IB bound read-only without EXEC. */
+	ib2 = bo_alloc(4096, 0);
+	if (ib2 >= 0 && vm_bind(j.vm, ib2, ATRIUM_GPU_BIND_READONLY,
+	    &ib2_va) == 0) {
+		tmp = j.ib;
+		va = j.ib_va;
+		j.ib = ib2;
+		j.ib_va = ib2_va;
+		r = poison(j.out, POISON_A) != 0 ||
+		    job_submit(&j, j.out_va) != 0 ? errno : job_wait(&j, 15000,
+		    &ms);
+		n = count(j.out, SIW42_OUT_VALUE, &first);
+		printf("INFO: 13 W^X: an IB without X: %s, %d/64 words 42 "
+		    "(%s)\n", r == 0 ? "ok" : strerror(r), n, r == 0 ?
+		    "IB fetch needs no X" : "IB fetch is an execute access");
+		j.ib = tmp;
+		j.ib_va = va;
+	}
+out:
+	if (data >= 0)
+		close(data);
+	if (ib2 >= 0)
+		close(ib2);
+	job_close(&j);
+	if (wx_set(old, &tmp) != 0)
+		check(0, "13 W^X", "restore %s: %s", WX_SYSCTL,
+		    strerror(errno));
+}
+
 static int
 ioerr(int f, unsigned long cmd, void *arg)
 {
@@ -1431,6 +1556,9 @@ main(void)
 
 	/* 12: real-shader variants of gpusim's compute ops (5e). */
 	real_ops(&a);
+
+	/* 13: GPU W^X. */
+	wx();
 
 out:
 	job_close(&a);

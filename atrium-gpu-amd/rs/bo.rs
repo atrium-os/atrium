@@ -116,10 +116,22 @@ impl Bo {
     /// Bind into `vm` at `va` (0: the arena picks one). Takes its own reference on the VM.
     /// Returns the VA.
     pub fn bind(&self, vm: &FileRef<Vm>, va: u64, flags: u32) -> Result<u64> {
-        if flags & !(sys::ATRIUM_GPU_BIND_READONLY as u32) != 0 {
+        let ro = sys::ATRIUM_GPU_BIND_READONLY as u32;
+        let exec = sys::ATRIUM_GPU_BIND_EXEC as u32;
+        if flags & !(ro | exec) != 0 {
             return Err(EINVAL);
         }
-        let writable = flags & sys::ATRIUM_GPU_BIND_READONLY as u32 == 0;
+        // GPU W^X (ABI 2.3 §5.4): executable only if read-only.
+        if flags & exec != 0 && flags & ro == 0 {
+            return Err(EINVAL);
+        }
+        let mut prot: u32 = 0;
+        if flags & ro == 0 {
+            prot |= sys::AMD_VM_WRITE as u32;
+        }
+        if flags & exec != 0 {
+            prot |= sys::AMD_VM_EXEC as u32;
+        }
         let span = self.span();
         let mut binds = sx_xlock(&self.binds);
 
@@ -147,7 +159,7 @@ impl Bo {
         let vram = self.hw.vram != 0;
         for (i, &page) in self.pages().iter().enumerate() {
             let pva = addr + i as u64 * PAGE_SIZE;
-            if let Err(e) = dev.map_page(vm.as_c(), pva, page as u64, vram, writable) {
+            if let Err(e) = dev.map_page(vm.as_c(), pva, page as u64, vram, prot) {
                 for j in 0..i {
                     dev.unmap_page(vm.as_c(), addr + j as u64 * PAGE_SIZE);
                 }

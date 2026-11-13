@@ -35,6 +35,7 @@
  */
 
 use crate::backend::Dev;
+use crate::quota::Charge;
 use crate::syncobj::SyncObj;
 use crate::sys;
 use crate::vm::Vm;
@@ -124,6 +125,9 @@ pub struct Queue {
     sim_seq: AtomicU64,
     /// A user-mode queue's pager object; leaked with the VM if the hardware kept the queue.
     map: ManuallyDrop<Option<VmObject<UqMap>>>,
+    /// The live-queue charge against the creating uid (quota.rs); kept if the hardware kept
+    /// the queue, since its slot stays taken.
+    charge: Option<Charge>,
 }
 
 // SAFETY: the backend serialises its queue state (sc->lock, its own sx).
@@ -153,12 +157,17 @@ impl Drop for Queue {
             self.dev.uq_destroy(self.slot)
         };
         match gone {
-            // SAFETY: dropped once, here; the queue no longer runs, so neither its VM nor its
-            // pages are in use.
-            Ok(()) => unsafe {
-                ManuallyDrop::drop(&mut self.vm);
-                ManuallyDrop::drop(&mut self.map);
-            },
+            Ok(()) => {
+                // SAFETY: dropped once, here; the queue no longer runs, so neither its VM nor
+                // its pages are in use.
+                unsafe {
+                    ManuallyDrop::drop(&mut self.vm);
+                    ManuallyDrop::drop(&mut self.map);
+                }
+                if let Some(c) = self.charge.take() {
+                    self.dev.state().quotas.uncharge(c);
+                }
+            }
             // The VM and the pages stay for good (si_client.c logged why).
             Err(_) => {}
         }
@@ -198,6 +207,9 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     if gfx && (si || user) {
         return Err(EINVAL);
     }
+    // One live queue more for the calling uid (quota.rs); given back when the queue goes.
+    let charge = dev.state().quotas.charge_queue(dev)?;
+    let charged = ChargeGuard { dev, charge: Some(charge) };
     let map = if user { Some(user_map(dev)?) } else { None };
     let pages = map.as_ref().map(|m| (m.handle().ram.kva(), m.handle().ram.pa()));
     // On failure `map` drops: nothing mapped it yet, so its pages free.
@@ -223,12 +235,33 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
                 engine,
                 sim_seq: AtomicU64::new(0),
                 map: ManuallyDrop::new(map),
+                charge: charged.take(),
             },
             M_WAITOK,
         );
     let fd = kfile::install(q, (bindings::FREAD | bindings::FWRITE) as c_int)?;
     a.out_queue_fd = fd;
     Ok(())
+}
+
+/// Gives a queue charge back unless the queue took it over.
+struct ChargeGuard {
+    dev: Dev,
+    charge: Option<Charge>,
+}
+
+impl ChargeGuard {
+    fn take(mut self) -> Option<Charge> {
+        self.charge.take()
+    }
+}
+
+impl Drop for ChargeGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.charge.take() {
+            self.dev.state().quotas.uncharge(c);
+        }
+    }
 }
 
 fn check(err: c_int) -> Result<()> {

@@ -2517,16 +2517,19 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 		goto fail;
 
 	/*
-	 * The client's VM: ring read-only, writeback and EOP read-write, all
-	 * executable: the CPF fetches the ring as an execute access (box run
-	 * 2026-11-13: a ring PTE without it faulted, PERMISSION_FAULTS 0x8).
+	 * The client's VM: ring read-only and executable (the CPF fetches the
+	 * ring as an execute access; box run 2026-11-13: a ring PTE without it
+	 * faulted, PERMISSION_FAULTS 0x8). Writeback and EOP are read-write;
+	 * with isolation.gpu_wx they lose X (GPU W^X), otherwise they keep it
+	 * as before until the box shows nothing fetches them as code.
 	 */
 	q->mapped_vm = true;
 	for (i = 0; i < UQ2_PAGES; i++)
 		if ((err = amd_gmc12_vm_map(vm, va + i * PAGE_SIZE,
 		    q->pg_pa + i * PAGE_SIZE, i * PAGE_SIZE == UQ2_RING ?
 		    AMD_VM_READ | AMD_VM_EXEC :
-		    AMD_VM_READ | AMD_VM_WRITE | AMD_VM_EXEC)) != 0)
+		    AMD_VM_READ | AMD_VM_WRITE |
+		    (m->sc->gpu_wx ? 0 : AMD_VM_EXEC))) != 0)
 			goto fail;
 	if ((err = amd_gmc12_vm_flush(gt, kvmid)) != 0)
 		goto fail;

@@ -9,7 +9,10 @@
  * an allocation that would take that uid over its cap fails with EDQUOT. The
  * caps are a share of the device's VRAM and of RAM: sysctls
  * dev.atrium_gpu_amd.N.isolation.vram_limit_pct (default 75) and
- * sys_limit_pct (default 50), read at each allocation.
+ * sys_limit_pct (default 50), read at each allocation. Live queue fds are
+ * counted the same way (isolation.queue_limit, default 32, ABI §4.2): on
+ * silicon each is a MES user queue from a small device-wide table, so one
+ * uid must not hold them all.
  *
  * Why the uid and not the open: a client can open the node as often as it
  * likes, so a per-open cap is no cap. The uid is what separates the parties
@@ -31,18 +34,37 @@ struct Account {
     uid: u32,
     vram: u64,
     sys: u64,
+    queues: u64,
     next: Option<Box<Account>>,
 }
 
 /// The accounts with something charged (an account goes when it is back to zero).
 pub struct Quotas(SxLock<Option<Box<Account>>>);
 
-/// What a BO holds against its owner's account; given back by `uncharge`.
+/// What a charge is against.
+#[derive(Copy, Clone, PartialEq)]
+enum Kind {
+    Vram,
+    Sys,
+    Queue,
+}
+
+/// What a BO (or a queue) holds against its owner's account; given back by `uncharge`.
 #[derive(Copy, Clone)]
 pub struct Charge {
     uid: u32,
-    vram: bool,
+    kind: Kind,
     bytes: u64,
+}
+
+impl Account {
+    fn used(&mut self, kind: Kind) -> &mut u64 {
+        match kind {
+            Kind::Vram => &mut self.vram,
+            Kind::Sys => &mut self.sys,
+            Kind::Queue => &mut self.queues,
+        }
+    }
 }
 
 impl Quotas {
@@ -60,10 +82,19 @@ impl Quotas {
     /// Charge `bytes` of VRAM or System memory to the calling thread's uid, or EDQUOT if
     /// that would take it over its cap.
     pub fn charge(&self, dev: Dev, vram: bool, bytes: u64) -> Result<Charge> {
+        let kind = if vram { Kind::Vram } else { Kind::Sys };
+        self.charge_kind(dev, kind, bytes, dev.quota_limit(vram))
+    }
+
+    /// Charge one live queue to the calling thread's uid, or EDQUOT over its cap.
+    pub fn charge_queue(&self, dev: Dev) -> Result<Charge> {
+        self.charge_kind(dev, Kind::Queue, 1, dev.queue_limit())
+    }
+
+    fn charge_kind(&self, dev: Dev, kind: Kind, bytes: u64, limit: u64) -> Result<Charge> {
         let uid = dev.cur_ruid();
-        let limit = dev.quota_limit(vram);
         // Allocated before the lock (M_WAITOK); dropped unused if the uid has an account.
-        let mut fresh = Some(Box::new(Account { uid, vram: 0, sys: 0, next: None }, M_WAITOK));
+        let mut fresh = Some(Box::new(Account { uid, vram: 0, sys: 0, queues: 0, next: None }, M_WAITOK));
         let mut head = sx_xlock(&self.0);
         if find(&mut head, uid).is_none() {
             let mut a = fresh.take().unwrap();
@@ -71,11 +102,11 @@ impl Quotas {
             *head = Some(a);
         }
         let acct = find(&mut head, uid).unwrap();
-        let used = if vram { &mut acct.vram } else { &mut acct.sys };
+        let used = acct.used(kind);
         match used.checked_add(bytes) {
             Some(n) if n <= limit => {
                 *used = n;
-                Ok(Charge { uid, vram, bytes })
+                Ok(Charge { uid, kind, bytes })
             }
             _ => {
                 prune(&mut head);
@@ -86,11 +117,11 @@ impl Quotas {
         }
     }
 
-    /// Give a charge back (the BO's backing has been freed).
+    /// Give a charge back (the BO's backing has been freed, or the queue is gone).
     pub fn uncharge(&self, c: Charge) {
         let mut head = sx_xlock(&self.0);
         if let Some(a) = find(&mut *head, c.uid) {
-            let used = if c.vram { &mut a.vram } else { &mut a.sys };
+            let used = a.used(c.kind);
             debug_assert!(*used >= c.bytes);
             *used = used.saturating_sub(c.bytes);
         } else {
@@ -124,7 +155,7 @@ fn prune(head: &mut Option<Box<Account>>) {
     let mut cur = head.take();
     while let Some(mut a) = cur {
         cur = a.next.take();
-        if a.vram != 0 || a.sys != 0 {
+        if a.vram != 0 || a.sys != 0 || a.queues != 0 {
             a.next = keep.take();
             keep = Some(a);
         }

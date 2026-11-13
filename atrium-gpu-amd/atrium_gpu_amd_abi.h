@@ -55,6 +55,7 @@ struct atrium_gpu_cap_record {
 
 #define ATRIUM_GPU_BIND_FEAT_SPARSE	0x1u
 #define ATRIUM_GPU_BIND_FEAT_READ_ONLY	0x2u	/* VM_BIND2 + BIND_READONLY */
+#define ATRIUM_GPU_BIND_FEAT_EXEC	0x4u	/* 2.3: BIND_EXEC honoured (GPU W^X) */
 
 /*
  * ISA — which instruction set the device runs, so userspace picks its
@@ -199,6 +200,10 @@ struct atrium_gpu_vm_bind2 {
 	uint32_t	pad;		/* must be 0 */
 };
 #define ATRIUM_GPU_BIND_READONLY	0x1
+/* 2.3 (ABI v2 §5.4, GPU W^X): executable PTEs, only together with READONLY
+ * (EINVAL otherwise). Shader code is bound READONLY|EXEC; data never gets
+ * X. Silicon enforces it while isolation.gpu_wx is 1; gpusim has no X bit. */
+#define ATRIUM_GPU_BIND_EXEC		0x4
 
 /*
  * Queue fds (GPU ABI v2 §5.5, §5.7; stage 5c-2b). Layouts and numbers are

@@ -83,7 +83,7 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	c->va_align = PAGE_SIZE;
 	c->vram_bytes = sc->vram.total;
-	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
+	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC;
 	/* From GC's discovered (gpusim: modelled) version, identify.c. */
 	c->isa_family = sc->isa_family;
 	c->isa_revision = sc->isa_revision;

@@ -3,7 +3,7 @@
  *
  * si_client.c — the client node on silicon (stage 5c-2a,
  * docs/spec/r9700-bare-metal.md §4.5). The Rust front-end (rs/) is the same
- * one gpusim runs under: VM, BO and syncobj fds, SUBMIT, quotas, deferred
+ * one gpusim runs under: VM, BO, queue and syncobj fds, quotas, deferred
  * frees, the hang watchdog. This file is what it reaches on silicon:
  *
  *   VMs     each VM fd gets one of the kernel's VMIDs (1-7; MES owns 8-15)
@@ -15,13 +15,16 @@
  *           reuse by si_vram_clear: CP DMA zero-fills on the kernel queue,
  *           under VMID 0, which reaches VRAM by MC address and which no
  *           client VMID maps. The whole range starts dirty.
- *   SUBMIT  the compute engine only. The kernel compute queue (mes12.c,
- *           amd_kq: VMID 0, mapped by MES) runs the client's ring as an
- *           INDIRECT_BUFFER under the VM's VMID, then writes a sequence
- *           number to a fence in VMID 0 and raises an EOP interrupt. The
- *           client cannot write the fence (it is not in its VM), so a
- *           completion is retired only when the fence says so, never on an
- *           interrupt alone.
+ *   Queues  every queue fd is its own MES user queue in its VM (5c-2b,
+ *           AMD_UQ_SLOTS of them). Kernel mode: QUEUE_SUBMIT writes an
+ *           INDIRECT_BUFFER to the client's blob plus the kernel's own
+ *           RELEASE_MEM (EOP interrupt tagged with the queue) on a ring the
+ *           client cannot write. User mode (step 3, PRIV_DRIVER only, a
+ *           trusted renderer's own path): the client writes the ring and
+ *           rings its doorbell itself; QUEUE_SUBMIT is EOPNOTSUPP. A fault
+ *           or a hang loses only that queue. Frees wait for MES to preempt
+ *           the queues of the VM (SUSPEND + RESUME), never for a fence the
+ *           client can write. The v1 ring SUBMIT is retired.
  *   IRQs    the IH ring's consumer (ih7.c): CP EOP IVs retire signalled
  *           submits by fence; GFX UTCL2 fault IVs (client 0xa, src 0) mark
  *           the queue's current work faulted if it runs under the faulting
@@ -29,13 +32,13 @@
  *           VMID are killed (SQ_CMD) and the queue fences on (5b), or is
  *           mapped afresh if it does not.
  *
- * The front-end's queue model (rs/queue.rs) has one queue per engine and
- * reprograms it per submit; on silicon "program" only records the ring and
- * VMID, and the queue reports itself still fetching until the submit's
- * fence lands, so the front-end lets one submit run at a time and holds a
- * BO free until the work that could reach it has fenced.
+ * The front-end's shared-engine queue model (rs/queue.rs) is gpusim's. Here
+ * it only backs the retired 5c-2a kernel-queue path (si_legacy_submit,
+ * off): "program" records the ring and VMID, and the queue reports itself
+ * fetching until the submit's fence lands.
  *
- * User-mode queues (QUEUE_MAP, doorbell mmap) are 5c-2b: EOPNOTSUPP here.
+ * The v1 QUEUE_MAP (doorbell mmap of a shared engine queue) stays gpusim's:
+ * EOPNOTSUPP here.
  *
  * GfxOff: GC registers (GFXHUB contexts, fault status, SQ_CMD) read 0 and
  * drop writes while GfxOff is in effect, so every live VM holds GfxOff off
@@ -1128,12 +1131,21 @@ si_bo_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 
 static int
 si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
-    int writable)
+    u_int want)
 {
 	struct amd_si_client *c = vm->sc->si_client;
 	struct atrium_amd_vram *v = &vm->sc->vram;
-	u_int prot = AMD_VM_READ | AMD_VM_EXEC | (writable ? AMD_VM_WRITE : 0);
+	u_int prot = AMD_VM_READ | (want & (AMD_VM_WRITE | AMD_VM_EXEC));
 	int err;
+
+	/*
+	 * GPU W^X (ABI 2.3 §5.4): only pages bound EXEC (read-only shader
+	 * code) are executable. Until the box has shown which fetches need X
+	 * (IBs, a queue's writeback and EOP pages), isolation.gpu_wx = 0
+	 * keeps the old mapping, X on every page.
+	 */
+	if (atomic_load_int(&vm->sc->gpu_wx) == 0)
+		prot |= AMD_VM_EXEC;
 
 	if (vm->hw12 == NULL)
 		return (EINVAL);
@@ -1186,7 +1198,7 @@ si_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_align = PAGE_SIZE;
 	/* The device heap: the allocator's range (5d), if it is up. */
 	c->vram_bytes = sc->vram.inited ? sc->vram.total : 0;
-	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY;
+	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC;
 	c->isa_family = sc->isa_family;
 	c->isa_revision = sc->isa_revision;
 	c->isa_name = sc->isa_name;

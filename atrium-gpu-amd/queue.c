@@ -320,6 +320,27 @@ amd_iso_sysctl_pct(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* queue_limit: live queue fds one uid may hold, 1-4096. */
+static int
+amd_iso_sysctl_queue_limit(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	int v, err;
+
+	mtx_lock(&sc->lock);
+	v = sc->queue_limit;
+	mtx_unlock(&sc->lock);
+	err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (v < 1 || v > 4096)
+		return (EINVAL);
+	mtx_lock(&sc->lock);
+	sc->queue_limit = v;
+	mtx_unlock(&sc->lock);
+	return (0);
+}
+
 int
 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 {
@@ -338,6 +359,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	sc->hang_ms = ATRIUM_AMD_HANG_MS;
 	sc->vram_limit_pct = ATRIUM_AMD_VRAM_LIMIT_PCT;
 	sc->sys_limit_pct = ATRIUM_AMD_SYS_LIMIT_PCT;
+	sc->queue_limit = ATRIUM_AMD_QUEUE_LIMIT;
+	sc->gpu_wx = 0;
 	sc->hwq_inited = 1;
 
 	err = amd_dma_page_alloc(sc, &sc->null_pd);	/* zeroed: all invalid */
@@ -404,6 +427,14 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    offsetof(struct atrium_amd_softc, sys_limit_pct),
 	    amd_iso_sysctl_pct, "I",
 	    "System memory one uid's BOs may hold, in % of RAM");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "queue_limit",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    amd_iso_sysctl_queue_limit, "I",
+	    "live queue fds one uid may hold (silicon has AMD_UQ_SLOTS in all)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gpu_wx",
+	    CTLFLAG_RW, &sc->gpu_wx, 0,
+	    "GPU W^X: 1 = execute only where bound EXEC, and no X on queue "
+	    "writeback/EOP pages (silicon; applies to new mappings)");
 	return (0);
 }
 
