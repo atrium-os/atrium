@@ -165,6 +165,17 @@ safe_mode_exit(struct atrium_amd_softc *sc)
 	wr(sc, 1, GC12_RLC_SAFE_MODE, SAFE_MODE_CMD);
 }
 
+/* For mes12.c's MEC pipe reset (amdgpu holds RLC safe mode around it). */
+int
+amd_gfx12_safe_mode(struct atrium_amd_softc *sc, bool enter)
+{
+	if (!enter) {
+		safe_mode_exit(sc);
+		return (0);
+	}
+	return (safe_mode_enter(sc));
+}
+
 /*
  * gfx_v12_0_update_gfx_clock_gating for GC 12.0.0/1's cg_flags. `enable`
  * false undoes it (overrides back on, FSMs off), as amdgpu's ungate.

@@ -162,7 +162,8 @@ struct atrium_gpu_bo_xfer {
 /* Query interrupt state: how many completions the ISR has serviced. */
 struct atrium_gpu_irqs {
 	uint64_t	count;		/* out: interrupts serviced so far */
-	uint32_t	msix_enabled;	/* out: 1 = interrupt mode, 0 = poll mode */
+	uint32_t	msix_enabled;	/* out: 1 = interrupt mode (MSI-X, or MSI
+					 * on silicon), 0 = poll mode */
 	uint32_t	pad;
 };
 

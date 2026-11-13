@@ -918,3 +918,30 @@ work (self-test, scrub).
   back. Next: reset the pipe first, as soon as the dequeue reset fails and before MES
   is asked anything, so MES never sees the refused REMOVE and RESET; MES RESET becomes
   the last rung.
+- **2026-11-13 05:35, stage 5f on the box (647da1b1): si-client-test 64/64; suite ALL OK;
+  isolation ran to the end with 5 FAILs (Break 1 and four Part F checks); no mode 1
+  reset during the run.** With the pipe reset first, REMOVE_QUEUE succeeded for the
+  CPG-faulted queue, but MEC pipe 1 stayed dead afterwards: CP_CPC_BUSY_STAT 0x840,
+  and MES answered ADD_QUEUE ok for later queues on that pipe without ever mapping
+  them, so their work never ran. GC sat busy at about 61 W until detach, whose
+  designed mode 1 reset left the card cold.
+
+  **Interrupts were not in use.** The card has one MSI message and no MSI-X. A detach
+  through the reset path (04:35) never released the vector, so every later attach
+  fell back to polling the IH ring every 10 ms, quietly; the suite's irq test skipped
+  itself because it only knew MSI-X. Fixes for the next run:
+  - every detach path, including the lost-GPU one, releases the IH vector;
+  - a lost vector prints "ih: WARNING: ... polling the ring every 10 ms ... (reboot
+    to recover)", and on silicon GET_IRQS reports the IH ring's vector and count;
+  - atrium_gpu_test's irq test accepts MSI and fails on silicon in poll mode.
+  The box was rebooted at 05:44 (user's go) to get the vector back.
+
+  Pipe and CP-error fixes for the same run:
+  - after a MEC pipe reset the driver enters RLC safe mode, re-arms the pipe's start
+    PC (CP_MEC_ME1_PIPEn_PRGRM_START) and waits up to 100 ms for the PC to move,
+    logging PC and CP_CPC_BUSY_STAT before and after;
+  - CP error interrupts (bad opcode 0xb7, privileged register 0xb8, privileged
+    instruction 0xb9) are enabled per user queue and lose that queue;
+  - a stuck HQD logs its rptr/wptr and the CPC/CPF status registers;
+  - unrouted IVs log client, source, ring, VMID and src_data[0] (still unexplained:
+    EOP tags 0x04000000|doorbell from the faulting queue, and 0x18000000).

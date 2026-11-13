@@ -786,6 +786,25 @@ si_down(struct amd_si *si, bool selftest)
 	(void)smu_send(&si->link, SMU_ALLOW_GFXOFF, 0, NULL, false);
 }
 
+/* GET_IRQS on silicon: interrupts taken and whether a vector serves the IH
+ * ring (else it is polled). */
+void
+amd_si_irqs(struct atrium_amd_softc *sc, uint64_t *count, uint32_t *vec)
+{
+	struct amd_si *si = sc->si;
+
+	*count = 0;
+	*vec = 0;
+	if (si == NULL)
+		return;
+	sx_slock(&si->lock);
+	if (si->ih != NULL) {
+		*count = amd_ih7_nintr(si->ih);
+		*vec = amd_ih7_has_vector(si->ih) ? 1 : 0;
+	}
+	sx_sunlock(&si->lock);
+}
+
 static void
 si_watch(void *arg, int pending __unused)
 {
@@ -1138,9 +1157,12 @@ amd_si_detach(struct atrium_amd_softc *sc)
 		device_printf(sc->dev, "si: detach after the GPU was taken "
 		    "down (%s)\n", si->lost ? "watcher reset it" :
 		    "SMU link failed");
+	if (si->ih != NULL)
+		amd_ih7_vector_off(si->ih);	/* the vector, at least */
 	if (si->mes != NULL || si->ih != NULL)
 		device_printf(sc->dev, "si: MES/IH blocks of a card reset "
-		    "under the client node are leaked, not freed\n");
+		    "under the client node are leaked, not freed (the IH "
+		    "vector was released)\n");
 	bus_release_resource(sc->dev, SYS_RES_MEMORY, si->vram_rid, si->vram);
 	sc->si = NULL;
 	sx_destroy(&si->lock);

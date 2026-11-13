@@ -960,6 +960,7 @@ uint32_t amd_mes12_uq_fence(struct amd_uq *q);
 uint32_t amd_mes12_uq_doorbell(struct amd_uq *q);
 uint32_t amd_mes12_uq_seq(struct amd_uq *q);
 u_int	amd_mes12_uq_hqd_vmid(struct amd_uq *q);
+bool	amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue);
 void	amd_mes12_uq_free_lost(struct amd_uq *q);
 void	amd_si_lose(struct atrium_amd_softc *sc, const char *why);
 void	amd_mes12_uq_report(struct amd_uq *q, const char *when);
@@ -1222,6 +1223,10 @@ int	 amd_device_reset(struct atrium_amd_softc *sc);
  *   set_clear: the gpu module registers its clear engine (NULL on detach,
  *          which waits out a running scrub).
  */
+int	 amd_gfx12_safe_mode(struct atrium_amd_softc *sc, bool enter);
+void	 amd_ih7_vector_off(struct amd_ih7 *ih);
+bool	 amd_ih7_has_vector(struct amd_ih7 *ih);
+void	 amd_si_irqs(struct atrium_amd_softc *sc, uint64_t *count, uint32_t *vec);
 extern volatile u_int amd_mes12_pipe_resets;	/* mes12.c */
 int	 amd_vram_init(struct atrium_amd_softc *sc);
 /* Silicon: hand out [lo, hi) of `device` bytes. `dirty` = its contents are

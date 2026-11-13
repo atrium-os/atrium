@@ -600,6 +600,13 @@ test_irq(int fd, int vm)
 		return (1);
 	}
 	if (!q0.msix_enabled) {
+		/* Silicon must have its vector (MSI on the R9700): polling
+		 * there means a leaked vector, so fail loudly. */
+		if (g_si) {
+			printf("irq FAILED: silicon in poll mode (no IH "
+			    "vector; reboot to recover)\n");
+			return (1);
+		}
 		printf("irq: MSI-X unavailable — poll mode (skipped)\n");
 		return (0);
 	}
@@ -623,11 +630,11 @@ test_irq(int fd, int vm)
 		usleep(1000);
 	}
 	if (q1.count <= q0.count) {
-		printf("irq FAILED: MSI-X enabled but no delivery (count=%llu)\n",
+		printf("irq FAILED: interrupts enabled but no delivery (count=%llu)\n",
 		    (unsigned long long)q1.count);
 		return (1);
 	}
-	printf("irq OK: MSI-X delivered (count %llu -> %llu)\n",
+	printf("irq OK: interrupt delivered (count %llu -> %llu)\n",
 	    (unsigned long long)q0.count, (unsigned long long)q1.count);
 	return (0);
 }

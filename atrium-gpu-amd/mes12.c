@@ -77,8 +77,9 @@ struct mes_gen {
 	uint32_t nbif_db_aper_en, nbif_db_entry0, nbif_db_entry3;
 	/* Doorbell dword indices (amdgpu_doorbell.h NAVI10 MES_RING0/1 << 1). */
 	uint32_t db_pipe0, db_pipe1, db_aggregated;
-	/* Compute queue reset (mes_v12_0_reset_queue_mmio). */
-	uint32_t spi_compute_queue_reset;
+	/* Compute queue reset (mes_v12_0_reset_queue_mmio) and the MEC
+	 * pipe's program counter (start, current) for a pipe reset. */
+	uint32_t spi_compute_queue_reset, mec_prgrm_start, mec_instr_pntr;
 };
 
 static const struct mes_gen mes_gens[] = {
@@ -102,7 +103,7 @@ static const struct mes_gen mes_gens[] = {
 	  (0x8b * 2) << 2, (0xff * 2) << 2, 0, (0x8a * 2) << 2,
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400,
-	  S0(0x1f73) },
+	  S0(0x1f73), S1(0x2900), S1(0x2908) },
 };
 
 /* CP_MES_CNTL */
@@ -194,6 +195,9 @@ static const struct mes_gen mes_gens[] = {
 #define HDR_RESUME		0x00040071u	/* opcode 7 */
 #define HDR_RESET		0x00040081u	/* opcode 8 (MESAPI__RESET) */
 #define MEC_RS64_PIPE0_RESET	0x00010000u	/* CP_MEC_RS64_CNTL, << pipe */
+/* CP_ME1_PIPEn_INT_CNTL: PRIV_REG, OPCODE_ERROR, RESERVED_BIT_ERROR (as
+ * gfx_v12_0_set_{priv_reg,bad_op}_fault_state; si_client.c handles). */
+#define CPC_CP_ERROR_INTS	0x09800000u
 #define RST_FLAGS		4	/* bit 0 reset_queue_only */
 #define RST_GANG_CTX		8
 #define RST_DOORBELL		16
@@ -2411,6 +2415,15 @@ uq2_hqd_find(struct mes *m, uint32_t db, u_int *vmid)
 }
 
 /* The VMID MES runs the queue under now; 0 if it is not on an HQD. */
+/* Where MES has the queue now (me1 pipe, queue); false if not mapped. */
+bool
+amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue)
+{
+	u_int vmid;
+
+	return (uq2_hqd_at(q->m, q->db, &vmid, pipe, queue));
+}
+
 u_int
 amd_mes12_uq_hqd_vmid(struct amd_uq *q)
 {
@@ -2443,6 +2456,13 @@ uq2_hqd_reset(struct amd_uq *q)
 		DELAY(10);
 	wr(m, g->hqd_dequeue_req, 0);
 	idle = (rd(m, g->hqd_active) & 1) == 0;
+	if (!idle)	/* where the stuck HQD stopped, for the box log */
+		device_printf(m->sc->dev, "uq%u: stuck HQD rptr %#x wptr %#x, "
+		    "CP_CPC_STATUS %#x, CP_CPC_BUSY_STAT %#x/%#x, "
+		    "CP_CPF_STATUS %#x\n", q->slot, rd(m, g->hqd_pq_rptr),
+		    rd(m, g->hqd_pq_wptr_lo), rd(m, g->cp_cpc_status),
+		    rd(m, g->cp_cpc_busy), rd(m, g->cp_cpc_busy2),
+		    rd(m, g->cp_cpf_status));
 	grbm_select_q(m, 0, 0, 0);
 	device_printf(m->sc->dev, "uq%u: HQD me1 pipe %u queue %u (VMID %u) "
 	    "reset: %s after %u us\n", q->slot, pipe, qi, vmid,
@@ -2466,13 +2486,18 @@ uq2_pipe_reset(struct amd_uq *q)
 {
 	struct mes *m = q->m;
 	const struct mes_gen *g = m->g;
-	uint32_t d;
-	u_int vmid, pipe, qi, i;
-	bool idle;
+	uint32_t d, pc0, pc1, start, busy0, busy1;
+	u_int vmid, pipe, qi, i, us;
+	bool idle, safe;
 
 	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
 		return (true);
+	/* amdgpu holds RLC safe mode around the pipe reset. */
+	safe = amd_gfx12_safe_mode(m->sc, true) == 0;
 	grbm_select_q(m, 1, pipe, qi);
+	pc0 = rd(m, g->mec_instr_pntr);
+	start = rd(m, g->mec_prgrm_start);
+	busy0 = rd(m, g->cp_cpc_busy);
 	d = rd(m, g->cp_mec_rs64_cntl);
 	wr(m, g->cp_mec_rs64_cntl, d | (MEC_RS64_PIPE0_RESET << pipe));
 	for (i = 0; i < 8; i++) {
@@ -2481,14 +2506,32 @@ uq2_pipe_reset(struct amd_uq *q)
 		wr(m, g->hqd_dequeue_req, 0);
 	}
 	grbm_select_q(m, 1, pipe, qi);
+	/*
+	 * Re-arm the pipe's start (gfx12.c config_rs64 set it at init) before
+	 * it leaves reset. Box run 647da1b1: without it the pipe came back
+	 * busy (CP_CPC_BUSY_STAT 0x840) and MES never mapped a queue on it.
+	 */
+	wr(m, g->mec_prgrm_start, start);
 	wr(m, g->cp_mec_rs64_cntl, d & ~(MEC_RS64_PIPE0_RESET << pipe));
-	DELAY(100);
+	/* Wait for the pipe's firmware to move off its start. */
+	for (us = 0; us < 100000; us += 100) {
+		DELAY(100);
+		if (rd(m, g->mec_instr_pntr) != (start & 0x3fffffff))
+			break;
+	}
+	pc1 = rd(m, g->mec_instr_pntr);
+	busy1 = rd(m, g->cp_cpc_busy);
 	idle = (rd(m, g->hqd_active) & 1) == 0;
 	grbm_select_q(m, 0, 0, 0);
+	if (safe)
+		(void)amd_gfx12_safe_mode(m->sc, false);
 	atomic_add_int(&amd_mes12_pipe_resets, 1);
 	device_printf(m->sc->dev, "uq%u: MEC me1 pipe %u reset (VMID %u, queue "
-	    "%u): HQD %s; every queue on the pipe is lost\n", q->slot, pipe,
-	    vmid, qi, idle ? "inactive" : "STILL ACTIVE");
+	    "%u%s): HQD %s; PC %#x -> %#x (start %#x) after %u us, "
+	    "CP_CPC_BUSY_STAT %#x -> %#x; every queue on the pipe is lost\n",
+	    q->slot, pipe, vmid, qi, safe ? "" : ", no RLC safe mode",
+	    idle ? "inactive" : "STILL ACTIVE", pc0, pc1, start, us, busy0,
+	    busy1);
 	return (idle);
 }
 
@@ -2503,7 +2546,7 @@ amd_mes12_uq_ints(struct mes *m, bool on, uint32_t *saved)
 		if (on) {
 			saved[pipe] = rd(m, m->g->cpc_int_cntl);
 			wr(m, m->g->cpc_int_cntl, saved[pipe] |
-			    TIME_STAMP_INT_ENABLE);
+			    TIME_STAMP_INT_ENABLE | CPC_CP_ERROR_INTS);
 		} else
 			wr(m, m->g->cpc_int_cntl, saved[pipe]);
 	}

@@ -29,6 +29,11 @@ amd_rs_backend(struct atrium_amd_softc *sc)
 void
 amd_rs_irqs(struct atrium_amd_softc *sc, uint64_t *count, uint32_t *msix)
 {
+	if (amd_is_si(sc)) {
+		/* Silicon: the IH ring's one vector (MSI on the R9700). */
+		amd_si_irqs(sc, count, msix);
+		return;
+	}
 	*count = atomic_load_int(&sc->irq_count);
 	*msix = sc->msix_enabled;
 }

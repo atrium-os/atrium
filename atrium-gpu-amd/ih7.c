@@ -236,8 +236,11 @@ fail_msi:
 		    ih->msix_table);
 	ih->msix_table = NULL;
 fail:
-	device_printf(dev, "ih: no MSI-X or MSI vector (MSI-X %d, MSI %d); "
-	    "polling the ring\n", pci_msix_count(dev), pci_msi_count(dev));
+	device_printf(dev, "ih: WARNING: no MSI-X or MSI vector (MSI-X %d, "
+	    "MSI %d); polling the ring every 10 ms: completions are late. A "
+	    "device that exposes a vector it will not give is one an earlier "
+	    "detach leaked it from (reboot to recover)\n", pci_msix_count(dev),
+	    pci_msi_count(dev));
 	ih->kind = "polling";
 }
 
@@ -608,6 +611,20 @@ ih7_unmap_free(struct amd_ih7 *ih)
 	free(ih, M_DEVBUF);
 }
 
+/*
+ * After a card reset under the client node: the IH block's memory stays
+ * (leaked; the client's consumer may still point at it), but the vector
+ * goes back. Box runs 05:02-05:34: a detach that kept the vector left
+ * "Device leaked 1 MSI vectors", and every later attach polled.
+ */
+void
+amd_ih7_vector_off(struct amd_ih7 *ih)
+{
+	if (ih == NULL)
+		return;
+	ih7_msi_teardown(ih);
+}
+
 /* Ring off, wait, vector off (ih_v7_0_irq_disable), then unmap and free. */
 void
 amd_ih7_down(struct amd_ih7 *ih)
@@ -639,6 +656,13 @@ u_int
 amd_ih7_nintr(struct amd_ih7 *ih)
 {
 	return (ih->nintr);
+}
+
+/* True when the ring is served by a vector (MSI-X or MSI), not polled. */
+bool
+amd_ih7_has_vector(struct amd_ih7 *ih)
+{
+	return (ih != NULL && ih->msi);
 }
 
 /*

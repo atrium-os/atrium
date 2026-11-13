@@ -60,6 +60,11 @@
 #define IH_SRC_UTCL2_FAULT	0x00u
 #define IH_SRC_SQ_INTERRUPT	0xefu	/* 239: SQ interrupt message */
 #define IH_SRC_CP_EOP		0xb5u
+/* CP errors in a command stream (gfx_v12_0 bad_op/priv_reg/priv_inst irqs;
+ * GFX_11/12 SRCID 183-185); ring_id = me << 2 | pipe | queue << 4. */
+#define IH_SRC_CP_BAD_OPCODE	0xb7u
+#define IH_SRC_CP_PRIV_REG	0xb8u
+#define IH_SRC_CP_PRIV_INSTR	0xb9u
 #define SI_KCQ_DOORBELL		(0x03u << 1)	/* mes12.c KCQ_DOORBELL */
 #define SI_UQ_VA		0x200000000ull	/* above the BO window */
 #define SI_UQ_VA_STRIDE		0x10000ull
@@ -125,7 +130,10 @@ struct amd_si_client {
 		 uq_retired_poll;
 
 	/* The IV consumer's batch (interrupt thread only). */
-	u_int	 b_eop, b_fault, b_sq, b_other;
+	u_int	 b_eop, b_fault, b_sq, b_other, b_cperr;
+	uint32_t b_cperr_hqd;		/* me1 pipe * 8 + queue that erred */
+	uint32_t b_cperr_iv0;		/* the first CP error's dword 0 */
+	uint32_t b_other_iv0, b_other_iv4;	/* the first unknown IV */
 	uint32_t b_uq;			/* user queues named by an EOP */
 	uint32_t b_fault_vmids;		/* every VMID that faulted */
 	bool	 b_uq_scan;		/* an EOP named no queue: check all */
@@ -228,6 +236,43 @@ si_uq_faulted(struct amd_si_client *c, uint32_t vmids, bool log)
 			device_printf(c->sc->dev, "si: uq%u faulted (VMID %u, "
 			    "%#jx): its work fails, the queue is lost\n", i,
 			    vmid, (uintmax_t)c->b_fault_addr);
+	}
+}
+
+/*
+ * CP errors (bad opcode, privileged register or instruction) in the
+ * streams of the user queues on these me1 HQDs (bit pipe * 8 + queue):
+ * each is lost as on a fault. sc->lock held.
+ */
+static void
+si_uq_cperr(struct amd_si_client *c, uint32_t hqds, bool log)
+{
+	struct si_uq *u;
+	u_int i, pipe, q;
+
+	mtx_assert(&c->sc->lock, MA_OWNED);
+	for (i = 0; i < AMD_UQ_SLOTS && hqds != 0; i++) {
+		u = &c->uq[i];
+		if (u->hw == NULL || u->dead ||
+		    !amd_mes12_uq_hqd_where(u->hw, &pipe, &q) ||
+		    (hqds & (1u << (pipe * 8 + q))) == 0)
+			continue;
+		(void)si_uq_retire(c, i);
+		while (u->n > 0) {
+			if (u->owed[u->head].so != NULL)
+				amd_syncobj_fail(u->owed[u->head].so, EIO);
+			u->owed[u->head].so = NULL;
+			u->head = (u->head + 1) % ATRIUM_AMD_MAX_PENDING;
+			u->n--;
+		}
+		u->dead = true;
+		u->evict = true;
+		c->uq_faults++;
+		taskqueue_enqueue(taskqueue_thread, &c->uq_task);
+		if (log)
+			device_printf(c->sc->dev, "si: uq%u: CP error in its "
+			    "stream (me1 pipe %u queue %u): its work fails, the "
+			    "queue is lost\n", i, pipe, q);
 	}
 }
 
@@ -382,7 +427,7 @@ si_iv_batch_end(struct amd_si_client *c)
 	/* A fault always gets its line (address, VMID, decoded status) unless
 	 * faults themselves arrive faster than 10 a second: box runs
 	 * 05fdaebf and 955528b9 lost queues to faults with nothing logged. */
-	if (c->b_fault != 0)
+	if (c->b_fault != 0 || c->b_cperr != 0)
 		flog = ppsratecheck(&c->flog_last, &c->flog_pps, 10);
 	mtx_lock(&sc->lock);
 	for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
@@ -417,6 +462,19 @@ si_iv_batch_end(struct amd_si_client *c)
 			    c->b_fault_vmid, (uintmax_t)c->b_fault_addr,
 			    c->last_vmid);
 	}
+	if (c->b_cperr != 0) {
+		/* A bad opcode or privileged access in a client's stream:
+		 * that queue is lost, as a fault (amdgpu resets the queue). */
+		if (flog)
+			device_printf(sc->dev, "si: %u CP error IV(s) (%s, ring "
+			    "%#x): me1 HQDs %#x\n", c->b_cperr,
+			    ((c->b_cperr_iv0 >> 8) & 0xff) == IH_SRC_CP_BAD_OPCODE ?
+			    "bad opcode" : ((c->b_cperr_iv0 >> 8) & 0xff) ==
+			    IH_SRC_CP_PRIV_REG ? "privileged register" :
+			    "privileged instruction",
+			    (c->b_cperr_iv0 >> 16) & 0xff, c->b_cperr_hqd);
+		si_uq_cperr(c, c->b_cperr_hqd, flog);
+	}
 	if (c->kq != NULL && (c->b_eop != 0 || fault)) {
 		fence = amd_mes12_kq_fence(c->kq);
 		while (c->sig_n > 0 && fence_passed(fence, c->sig[c->sig_head])) {
@@ -444,14 +502,20 @@ si_iv_batch_end(struct amd_si_client *c)
 		device_printf(sc->dev, "si: %u SQ interrupt message(s)\n",
 		    c->b_sq);
 	if (c->b_other != 0 && log)
-		device_printf(sc->dev, "si: %u other IV(s)\n", c->b_other);
-	if (c->b_eop + c->b_fault + c->b_sq + c->b_other != 0)
+		device_printf(sc->dev, "si: %u other IV(s); first: client "
+		    "%#x, src %#x (%u), ring %#x, vmid %u, src_data[0] %#x\n",
+		    c->b_other, c->b_other_iv0 & 0xff,
+		    (c->b_other_iv0 >> 8) & 0xff, (c->b_other_iv0 >> 8) & 0xff,
+		    (c->b_other_iv0 >> 16) & 0xff, (c->b_other_iv0 >> 24) & 0xf,
+		    c->b_other_iv4);
+	if (c->b_eop + c->b_fault + c->b_sq + c->b_other + c->b_cperr != 0)
 		atomic_add_int(&sc->irq_count, 1);
 	if (c->b_uq_scan && log)
 		device_printf(sc->dev, "si: EOP IV with src_data[0] %#x: no "
 		    "queue of ours; checked every user queue\n",
 		    c->b_unrouted_db);
-	c->b_eop = c->b_fault = c->b_sq = c->b_other = 0;
+	c->b_eop = c->b_fault = c->b_sq = c->b_other = c->b_cperr = 0;
+	c->b_cperr_hqd = 0;
 	c->b_fault_vmid = 0;
 	c->b_uq = 0;
 	c->b_uq_scan = false;
@@ -545,8 +609,19 @@ si_iv(void *arg, const uint32_t *iv)
 		}
 	} else if (client == IH_CLIENT_GFX && src == IH_SRC_SQ_INTERRUPT)
 		c->b_sq++;
-	else
-		c->b_other++;
+	else if (client == IH_CLIENT_GRBM_CP && (src == IH_SRC_CP_BAD_OPCODE ||
+	    src == IH_SRC_CP_PRIV_REG || src == IH_SRC_CP_PRIV_INSTR)) {
+		u_int ring = (iv[0] >> 16) & 0xff;
+
+		if (c->b_cperr++ == 0)
+			c->b_cperr_iv0 = iv[0];
+		if (((ring & 0x0c) >> 2) == 1)		/* MEC1: user queues */
+			c->b_cperr_hqd |= 1u << ((ring & 3) * 8 +
+			    ((ring & 0x70) >> 4));
+	} else if (c->b_other++ == 0) {
+		c->b_other_iv0 = iv[0];
+		c->b_other_iv4 = iv[4];
+	}
 }
 
 /* ---- queue hardware for rs/queue.rs (via cp.c and queue.c) ---- */
