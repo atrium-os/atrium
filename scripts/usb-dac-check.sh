@@ -7,7 +7,9 @@
 # For each sound card snd_uaudio attached (or DAC_UNITS="1 2", pcm units):
 # make it the default unit, start lyrad (_lyra) and choragusd (_choragus) as
 # lyra-vm-check.sh does, and have lyra-play play a tone through Lyra for
-# TONE_SECS (5) at LYRA_PLAY_VOLUME (0.25). A person listens; the script
+# TONE_SECS (5) at LYRA_PLAY_VOLUME (0.25), as a RATE (48000) stream: the
+# device follows a stream that starts alone (lyra-hires.md §3), and lyrad
+# logs whether the period went out bit-perfect. A person listens; the script
 # checks what it can see:
 #   - the card is uaudio's, and lyrad opened it (sndstat shows lyrad's channel)
 #   - the samples lyrad sent held the tone for ~TONE_SECS (LYRA_DUMP)
@@ -64,7 +66,7 @@ for b in lyra/lyrad lyra/lyra-play choragus/choragusd; do
 done
 
 say "USB and sound(4)"
-v "kldload -n snd_uaudio; sysctl -q hw.snd.verbose=2 >/dev/null; sleep 2; usbconfig list; echo; cat /dev/sndstat"
+v "sysctl -q hw.snd.maxautovchans=0 >/dev/null; kldload -n snd_uaudio; sysctl -q hw.snd.verbose=2 >/dev/null; sleep 2; usbconfig list; echo; cat /dev/sndstat"
 if [ -n "${DAC_UNITS:-}" ]; then UNITS="$DAC_UNITS"; else
     UNITS=$(v 'for p in $(sysctl -N dev.pcm 2>/dev/null | sed -n "s/^dev\.pcm\.\([0-9]*\)\.%parent$/\1/p" | sort -un); do
                  case $(sysctl -n dev.pcm.$p.%parent) in uaudio*) echo $p ;; esac; done' | tr '\n' ' ')
@@ -87,6 +89,7 @@ for u in $UNITS; do
         sleep 1
         sysctl -q hw.snd.default_unit=$u >/dev/null
         sysctl -q dev.pcm.$u.bitperfect=${BITPERFECT:-1} >/dev/null 2>&1 || true
+        sysctl -q dev.pcm.$u.play.vchans=0 >/dev/null 2>&1 || true   # lyrad is the mixer (lyra-service.sh: maxautovchans=0)
         chmod 666 /dev/dsp$u
         rm -rf $T /var/db/choragus; install -d -o _choragus -g _choragus -m 0755 $T
         install -d -o _choragus -g _choragus -m 0700 /var/db/choragus
@@ -105,7 +108,7 @@ for u in $UNITS; do
     pre=$(xr)
     printf '\n  >>> LISTEN on pcm%s: a 440 Hz tone for %s s at volume %s\n' "$u" "$TONE_SECS" "$VOL"
     # Bounded: a stream with no device behind it never drains.
-    v "timeout $((TONE_SECS + 20)) su -m appa -c 'env LYRA_PLAY_FREQ=440 LYRA_PLAY_VOLUME=$VOL $BIN/lyra-play $T/audio.sock media $TONE_SECS'" \
+    v "timeout $((TONE_SECS + 20)) su -m appa -c 'env LYRA_PLAY_FREQ=440 LYRA_PLAY_RATE=${RATE:-48000} LYRA_PLAY_VOLUME=$VOL $BIN/lyra-play $T/audio.sock media $TONE_SECS'" \
         && ok "lyra-play finished" || bad "lyra-play failed"
     v "cat /dev/sndstat" | sed -n "/pcm$u:/,/^pcm/p" | head -20
     post=$(xr)
@@ -119,7 +122,7 @@ for u in $UNITS; do
     else
         bad "pcm$u: dump does not hold the tone ($frames loud frames, $dbfs dBFS)"
     fi
-    v "tail -5 $T/lyrad.log; tail -5 $T/choragusd.log"
+    v "tail -8 $T/lyrad.log; tail -5 $T/choragusd.log"
 done
 
 v "pkill -f 'daemon.*lyra-dac' ; pkill lyrad ; pkill choragusd ; true" >/dev/null 2>&1

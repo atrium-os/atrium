@@ -24,7 +24,7 @@ pub const MAX_FRAME: usize = 4096;
 
 // ── limits (lyra-v1.md §5) ───────────────────────────────────────────────────
 pub const MIN_RATE: u32 = 8_000;
-pub const MAX_RATE: u32 = 192_000;
+pub const MAX_RATE: u32 = 768_000;
 /// Channel counts a stream may have: mono, stereo, 5.1, 7.1.
 pub const CHANNELS: [u8; 4] = [1, 2, 6, 8];
 pub const MIN_BUFFER_MS: u32 = 10;
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(params().check(), Ok(()));
         for p in [
             StreamParams { rate: 7_999, ..params() },
-            StreamParams { rate: 192_001, ..params() },
+            StreamParams { rate: 768_001, ..params() },
             StreamParams { channels: 3, ..params() },
             StreamParams { channels: 0, ..params() },
             StreamParams { buffer_ms: 9, ..params() },

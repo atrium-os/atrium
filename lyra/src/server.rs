@@ -37,8 +37,15 @@ use std::sync::{mpsc, Arc, Mutex};
 
 /// The most streams lyrad mixes at once (lyra-v1.md §5).
 pub const MAX_STREAMS: usize = 64;
-/// Largest ring lyrad will make, in frames (2 s at 192 kHz, rounded up).
-pub const MAX_RING_FRAMES: u64 = 1 << 19;
+/// Largest ring lyrad will make, in frames (2 s at 768 kHz, rounded up).
+pub const MAX_RING_FRAMES: u64 = 1 << 21;
+
+/// The mix period at `rate` for a base period set at 48 kHz: the base, doubled
+/// per doubling of the rate above 48 kHz, so a period lasts about as long at
+/// 384 kHz as at 48 kHz (2.7 ms for 128 frames) and the wakeups stay as few.
+pub fn period_for(base: usize, rate: u32) -> usize {
+    base * (rate as usize).div_ceil(48_000).max(1).next_power_of_two()
+}
 /// Largest magnitude a sample may have after [`sanitize`].
 pub const SAMPLE_LIMIT: f32 = 4.0;
 
@@ -65,6 +72,8 @@ fn layout(channels: u8) -> Option<ChannelMap> {
 /// stream's rate, resamples (linear; resample once, architecture §4) and maps
 /// channels, producing exactly the frames the period needs.
 pub struct Adapter {
+    /// The stream's rate.
+    rate: u32,
     ch: usize,
     dev_ch: usize,
     /// Stream frames per device frame.
@@ -100,6 +109,7 @@ impl Adapter {
         let m = matrix(&layout(channels)?, &layout(dev_channels)?);
         let ch = channels as usize;
         Some(Adapter {
+            rate,
             ch,
             dev_ch: dev_channels as usize,
             ratio: rate as f64 / dev_rate as f64,
@@ -120,6 +130,19 @@ impl Adapter {
     /// Stream frames per device frame.
     pub fn ratio(&self) -> f64 {
         self.ratio
+    }
+
+    /// The stream's rate.
+    pub fn stream_rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Passes samples through unchanged: no resampling (ratio exactly 1, phase
+    /// 0, so every output is `carry[i]·1 + carry[i+1]·0`) and an identity
+    /// channel map.
+    pub fn is_identity(&self) -> bool {
+        self.ratio == 1.0 && self.frac == 0.0 && self.ch == self.dev_ch
+            && self.m.iter().enumerate().all(|(o, row)| row.iter().enumerate().all(|(c, &g)| g == if o == c { 1.0 } else { 0.0 }))
     }
 
     /// Forget carried frames (a flush).
@@ -235,6 +258,8 @@ pub struct Engine {
     slots: Vec<Slot>,
     rate: u32,
     period_frames: usize,
+    /// The period at 48 kHz; [`period_for`] scales it with the rate.
+    base_period: usize,
     tmp: Vec<f32>,
     /// Events for the current session, taken by [`Engine::take_events`].
     events: Vec<FromEngine>,
@@ -250,6 +275,16 @@ pub struct Engine {
     virt: Virtualizer,
     /// The virtual 7.1 bed the spatial streams mix into (period × 8).
     bed: Vec<f32>,
+    /// A device rate the run loop should reopen the built-in device at: the
+    /// rate of a stream that started while nothing else played (so it plays
+    /// untouched, see [`Engine::bit_perfect`]).
+    pub want_rate: Option<u32>,
+    /// Rates the built-in device refused; never asked for again.
+    pub refused_rates: Vec<u32>,
+    /// The last period went to the device bit for bit as one stream sent it.
+    bit_perfect: Option<u32>,
+    /// Streams sounding in the last period.
+    sounding: usize,
     /// External devices choragusd added, and the output mixed for (0: the
     /// built-in device).
     devices: Vec<ExtDevice>,
@@ -275,20 +310,30 @@ impl Engine {
             gen: 0,
             slots: Vec::new(),
             rate,
-            period_frames,
-            tmp: vec![0.0; period_frames * channels.max(BED_CHANNELS)],
+            period_frames: period_for(period_frames, rate),
+            base_period: period_frames,
+            tmp: vec![0.0; period_for(period_frames, rate) * channels.max(BED_CHANNELS)],
             events: Vec::new(),
             rate_ppm: 0,
             channels,
             balance: [Gain::new(1.0, rate as f32, 20.0), Gain::new(1.0, rate as f32, 20.0)],
             want_channels: None,
             spatial: false,
-            virt: Virtualizer::for_period(rate as f32, period_frames),
-            bed: vec![0.0; period_frames * BED_CHANNELS],
+            virt: Virtualizer::for_period(rate as f32, period_for(period_frames, rate)),
+            bed: vec![0.0; period_for(period_frames, rate) * BED_CHANNELS],
             devices: Vec::new(),
             output: 0,
             want_output: None,
+            want_rate: None,
+            refused_rates: Vec::new(),
+            bit_perfect: None,
+            sounding: 0,
         }
+    }
+
+    /// Frames per period at the current rate.
+    pub fn period_frames(&self) -> usize {
+        self.period_frames
     }
 
     /// Mix at another device rate from the next period on: every stream's
@@ -301,9 +346,22 @@ impl Engine {
         for s in &mut self.slots {
             s.adapter.set_device_rate(s.stream_rate, rate);
         }
+        self.period_frames = period_for(self.base_period, rate);
+        self.tmp.resize(self.period_frames * self.channels.max(BED_CHANNELS), 0.0);
+        self.bed.resize(self.period_frames * BED_CHANNELS, 0.0);
         // The measured HRTFs are 48 kHz; at other rates the model renders.
         self.virt = Virtualizer::for_period(rate as f32, self.period_frames);
         self.balance = [Gain::new(self.balance[0].target(), rate as f32, 20.0), Gain::new(self.balance[1].target(), rate as f32, 20.0)];
+    }
+
+    /// The stream the last period carried bit for bit, if it did.
+    pub fn bit_perfect(&self) -> Option<u32> {
+        self.bit_perfect
+    }
+
+    /// Streams sounding in the last period.
+    pub fn sounding(&self) -> usize {
+        self.sounding
     }
 
     pub fn rate(&self) -> u32 {
@@ -415,7 +473,10 @@ impl Engine {
                 if self.is_open(id) || self.slots.len() >= MAX_STREAMS {
                     return;
                 }
-                let stream_rate = (adapter.ratio() * self.rate as f64).round() as u32;
+                // Made for the configured rate; the device may be at another
+                // (it follows streams that start alone).
+                let stream_rate = adapter.stream_rate();
+                adapter.set_device_rate(stream_rate, self.rate);
                 clock.publish(&Clock { state: STATE_PAUSED, frame: 0, heard_ns: 0, rate_ppm: self.rate_ppm, flush_epoch: 0, rate: stream_rate });
                 self.slots.push(Slot {
                     id,
@@ -455,9 +516,17 @@ impl Engine {
             }
             ToEngine::Close { stream } => self.slots.retain(|s| s.id != stream),
             ToEngine::Start { stream } => {
+                // Alone: the device follows the stream's rate, so it plays
+                // without resampling (and bit for bit, if nothing else
+                // touches it). Joining others: it is resampled to theirs.
+                let alone = !self.slots.iter().any(|s| s.playing && s.id != stream);
+                let (rate, refused) = (self.rate, self.refused_rates.clone());
                 if let Some(s) = self.slot(stream) {
                     s.playing = true;
                     s.started = true;
+                    if alone && s.stream_rate != rate && !refused.contains(&s.stream_rate) {
+                        self.want_rate = Some(s.stream_rate);
+                    }
                 }
             }
             ToEngine::Pause { stream } => {
@@ -537,6 +606,20 @@ impl Engine {
         }
         let dev_rate = self.rate as f64;
         let ppm = self.rate_ppm;
+        // Bit-perfect this period: exactly one stream sounding, at the device
+        // rate and layout, at unity gain, outside virtual surround, with the
+        // balance centred. Its samples are then summed onto zeros and
+        // multiplied by exactly 1.0: unchanged.
+        let sounding: Vec<&Slot> = self.slots.iter().filter(|s| s.playing).collect();
+        let exact = match sounding.as_slice() {
+            [s] => s.adapter.is_identity()
+                && s.gain.settled() && s.gain.current() == 1.0
+                && !(virt && s.adapter.device_channels() == BED_CHANNELS)
+                && self.balance.iter().all(|b| b.settled() && b.current() == 1.0),
+            _ => false,
+        };
+        self.bit_perfect = if exact { Some(sounding[0].id) } else { None };
+        self.sounding = sounding.len();
         let drain_periods = (device_delay_frames as usize).div_ceil(self.period_frames) as u32 + 1;
         let report_every = (self.rate as usize / self.period_frames).max(1) as u32;
         for s in self.slots.iter_mut() {
@@ -1202,6 +1285,10 @@ pub fn run(cfg: Config) -> ! {
         .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
         .map(std::io::BufWriter::new);
     let mut written: u64 = 0;
+    // The built-in device's rate: the configured one until a stream that
+    // starts alone asks for its own (Engine::want_rate).
+    let mut dev_rate = cfg.rate;
+    let mut bit_perfect: Option<u32> = None;
     loop {
         if let Some(o) = engine.want_output.take() {
             if o != engine.output {
@@ -1216,9 +1303,26 @@ pub fn run(cfg: Config) -> ! {
             written = io.dumped;
             continue;
         }
-        engine.set_rate(cfg.rate);
-        let sink = match OssSink::open(cfg.rate, channels, cfg.period_frames, cfg.nfrags) {
+        if let Some(r) = engine.want_rate.take() {
+            if r != dev_rate {
+                eprintln!("lyrad: device rate {dev_rate} -> {r} Hz (a stream started alone at {r})");
+                dev_rate = r;
+            }
+        }
+        engine.set_rate(dev_rate);
+        let period = engine.period_frames() as u32;
+        // Ask for 32 bits: a bit-perfect device answers with its own depth
+        // (S16, S24 or S32), a converting one keeps 24 bits of the mix.
+        let sink = match OssSink::open_as(dev_rate, channels, period, cfg.nfrags, crate::oss::Format::S32) {
             Ok(s) => s,
+            Err(e) if dev_rate != cfg.rate && e.kind() == io::ErrorKind::InvalidInput => {
+                // The device can't run at the stream's rate: back to the
+                // configured one (the stream is resampled), and never ask again.
+                eprintln!("lyrad: the device refused {dev_rate} Hz ({e}); back to {} Hz", cfg.rate);
+                engine.refused_rates.push(dev_rate);
+                dev_rate = cfg.rate;
+                continue;
+            }
             Err(e) if channels != engine.channels() as u32 => {
                 // The device refused the new layout: back to the one it had.
                 eprintln!("lyrad: the device refused {channels} channels ({e}); staying at {}", engine.channels());
@@ -1239,10 +1343,10 @@ pub fn run(cfg: Config) -> ! {
         };
         eprintln!("lyrad: OSS device open ({} Hz, {} ch, {:?})", sink.rate_hz(), sink.channels(), sink.format());
         engine.set_channels(channels as usize);
-        mix.resize(cfg.period_frames as usize * channels as usize, 0.0);
+        mix.resize(period as usize * channels as usize, 0.0);
         out.resize(mix.len(), 0);
         let _ = ev_tx.send((engine.session(), FromEngine::Layout { channels: channels as u8 }));
-        let mut clock = DeviceClock::new(cfg.rate);
+        let mut clock = DeviceClock::new(dev_rate);
         loop {
             while let Ok(c) = rx.try_recv() {
                 engine.apply(c);
@@ -1252,6 +1356,12 @@ pub fn run(cfg: Config) -> ! {
                 break;
             }
             engine.want_output = engine.want_output.filter(|&o| o != 0);
+            if engine.want_rate.is_some_and(|r| r != dev_rate) {
+                // Reopen at the rate of the stream that started alone. Nothing
+                // else is playing, so the gap is before its first frame.
+                break;
+            }
+            engine.want_rate = None;
             if let Some(w) = engine.want_channels.take() {
                 if w as u32 != channels {
                     eprintln!("lyrad: output layout {channels} -> {w} channels; reopening the device");
@@ -1279,29 +1389,39 @@ pub fn run(cfg: Config) -> ! {
                 if let Some(w) = poslog.as_mut() {
                     use std::io::Write;
                     let _ = writeln!(w, "{now} {played} {written} {delay}");
-                    if written % (cfg.rate as u64) < cfg.period_frames as u64 {
+                    if written % (dev_rate as u64) < period as u64 {
                         let _ = w.flush();
                     }
                 }
             }
             // This period's first frame is frame `written`.
             let start = clock.heard_at(written)
-                .unwrap_or(now + (delay as i128 * 1_000_000_000 / cfg.rate as i128) as i64);
+                .unwrap_or(now + (delay as i128 * 1_000_000_000 / dev_rate as i128) as i64);
             engine.mix_at(&mut mix, delay, start);
+            // Logged while something sounds (silence is neither).
+            if engine.sounding() > 0 && engine.bit_perfect() != bit_perfect {
+                bit_perfect = engine.bit_perfect();
+                match bit_perfect {
+                    Some(id) => eprintln!("lyrad: bit-perfect: stream {id} at {dev_rate} Hz, {:?}", sink.format()),
+                    None => eprintln!("lyrad: mixing at {dev_rate} Hz, {:?}", sink.format()),
+                }
+            }
             let gen = engine.session();
             for ev in engine.take_events() {
                 let _ = ev_tx.send((gen, ev));
             }
+            // The dump stays 16-bit (the checks read it so), quantized the
+            // same way as the device's samples.
             for (o, m) in out.iter_mut().zip(&mix) {
-                *o = (m.clamp(-1.0, 1.0) * 32767.0) as i16;
+                *o = crate::oss::quantize(*m, 16) as i16;
             }
             if let Some(f) = dump.as_mut() {
                 use std::io::Write;
                 let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
                 let _ = f.write_all(bytes);
             }
-            written += cfg.period_frames as u64;
-            if let Err(e) = sink.write_i16(&out) {
+            written += period as u64;
+            if let Err(e) = sink.write_f32(&mix) {
                 eprintln!("lyrad: device write failed ({e}); reopening");
                 break;
             }
@@ -1422,6 +1542,12 @@ mod tests {
 
     fn writer() -> ClockWriter {
         clock::create().unwrap().0
+    }
+
+    /// Opened and at 0 dB, not started.
+    fn open_paused(e: &mut Engine, gen: u64, id: u32, rate: u32, ch: u8, ring: Ring) {
+        e.apply(Cmd::Open(gen, id, Box::new(Adapter::new(rate, ch, 48_000, 2).unwrap()), ring, writer()));
+        e.apply(Cmd::Msg(gen, ToEngine::SetGain { stream: id, db: 0.0 }));
     }
 
     fn open(e: &mut Engine, gen: u64, id: u32, rate: u32, ch: u8, ring: Ring) {
@@ -1563,6 +1689,106 @@ mod tests {
         let used = 30_000 - p.readable() as i64;
         assert!((used - want).abs() <= 3, "used {used} stream frames, want about {want}");
         assert!(mix.iter().all(|v| (v - 0.1).abs() < 1e-3));
+    }
+
+    #[test]
+    fn the_period_keeps_its_length_as_the_rate_rises() {
+        assert_eq!(period_for(128, 44_100), 128);
+        assert_eq!(period_for(128, 48_000), 128);
+        assert_eq!(period_for(128, 96_000), 256);
+        assert_eq!(period_for(128, 176_400), 512);
+        assert_eq!(period_for(128, 384_000), 1024);
+        assert_eq!(period_for(128, 768_000), 2048);
+    }
+
+    #[test]
+    fn a_stream_that_starts_alone_sets_the_device_rate() {
+        let (_p1, c1) = ring_pair("follow-1", 1024, 2);
+        let (_p2, c2) = ring_pair("follow-2", 1024, 2);
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        open_paused(&mut e, 1, 1, 192_000, 2, c1);
+        open_paused(&mut e, 1, 2, 44_100, 2, c2);
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        assert_eq!(e.want_rate, Some(192_000), "alone: the device follows it");
+        e.want_rate = None;
+        e.set_rate(192_000);
+        assert_eq!(e.period_frames(), 512);
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
+        assert_eq!(e.want_rate, None, "joining a playing stream: resampled instead");
+        assert_eq!(e.slots[1].adapter.ratio(), 44_100.0 / 192_000.0);
+        // A rate the device refused is not asked for again.
+        e.apply(Cmd::Msg(1, ToEngine::Pause { stream: 1 }));
+        e.apply(Cmd::Msg(1, ToEngine::Pause { stream: 2 }));
+        e.refused_rates.push(44_100);
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
+        assert_eq!(e.want_rate, None);
+    }
+
+    #[test]
+    fn a_stream_opened_while_the_device_follows_another_rate_is_converted_to_it() {
+        let (_p, c) = ring_pair("follow-open", 1024, 2);
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        e.set_rate(96_000);
+        // Made by the connection thread for the configured 48 kHz.
+        open_paused(&mut e, 1, 1, 44_100, 2, c);
+        assert_eq!(e.slots[0].adapter.ratio(), 44_100.0 / 96_000.0);
+        assert_eq!(e.slots[0].stream_rate, 44_100);
+    }
+
+    #[test]
+    fn a_lone_stream_at_the_device_rate_and_unity_gain_is_bit_perfect() {
+        // 24-bit samples at 384 kHz, as an app's f32: the mix must hold them
+        // exactly, and the output encoder then gives back the same integers.
+        let (p, c) = ring_pair("bitperfect", 1 << 14, 2);
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        e.set_rate(384_000);
+        let period = e.period_frames();
+        open_paused(&mut e, 1, 1, 384_000, 2, c);
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        let src: Vec<i32> = (0..4 * period * 2).map(|i| ((i as i64 * 2_654_435_761) % (1 << 23)) as i32 - (1 << 22)).collect();
+        p.write(&src.iter().map(|&v| v as f32 / 8_388_608.0).collect::<Vec<f32>>());
+        let mut mix = vec![0.0f32; period * 2];
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            e.mix_at(&mut mix, 0, 0);
+            assert_eq!(e.bit_perfect(), Some(1));
+            let mut bytes = Vec::new();
+            crate::oss::encode_f32(&mix, crate::oss::Format::S24, &mut bytes);
+            got.extend(bytes.chunks(3).map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8));
+        }
+        // The adapter starts from a silent left point, so the stream begins
+        // one frame in; from there, every sample is out as it came in.
+        assert_eq!(got[..2], [0, 0]);
+        assert_eq!(got[2..], src[..got.len() - 2], "every sample out as it came in");
+        // Anything that changes the samples ends it: a level below unity...
+        e.apply(Cmd::Msg(1, ToEngine::SetGain { stream: 1, db: -1.0 }));
+        e.mix_at(&mut mix, 0, 0);
+        assert_eq!(e.bit_perfect(), None);
+    }
+
+    #[test]
+    fn a_second_stream_or_resampling_ends_bit_perfect() {
+        let (p1, c1) = ring_pair("bp-two-1", 4096, 2);
+        let (p2, c2) = ring_pair("bp-two-2", 4096, 2);
+        let mut e = Engine::new(48_000, 2, 128);
+        e.apply(Cmd::Begin(1));
+        open_paused(&mut e, 1, 1, 48_000, 2, c1);
+        open_paused(&mut e, 1, 2, 44_100, 2, c2);
+        p1.write(&vec![0.25f32; 4096]);
+        p2.write(&vec![0.25f32; 4096]);
+        let mut mix = vec![0.0f32; 256];
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 1 }));
+        e.mix_at(&mut mix, 0, 0);
+        assert_eq!(e.bit_perfect(), Some(1));
+        e.apply(Cmd::Msg(1, ToEngine::Start { stream: 2 }));
+        e.mix_at(&mut mix, 0, 0);
+        assert_eq!(e.bit_perfect(), None, "two streams are a mix");
+        e.apply(Cmd::Msg(1, ToEngine::Pause { stream: 1 }));
+        e.mix_at(&mut mix, 0, 0);
+        assert_eq!(e.bit_perfect(), None, "44.1 kHz into 48 kHz is resampled");
     }
 
     #[test]

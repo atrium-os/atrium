@@ -130,7 +130,7 @@ Limen uses. Samples never cross the socket; they go through the ring.
 |---|---|---|
 | app → | `Hello` | `version: u16`, `ticket: Option<[u8; 16]>` |
 | → app | `Welcome` | `device_rate`, `device_channels`, `period_frames` |
-| app → | `Open` | `tag` (the app's number, echoed back), `role` (media, communication, notification, game, pro), `rate` (8000 to 192000), `channels` (1, 2, 6 or 8), `buffer_ms` (10 to 2000), `label: String` (at most 64 bytes, shown in the volume UI, e.g. "Video"). Samples in the ring are always interleaved f32; the client library converts i16 |
+| app → | `Open` | `tag` (the app's number, echoed back), `role` (media, communication, notification, game, pro), `rate` (8000 to 768000; [lyra-hires.md](lyra-hires.md)), `channels` (1, 2, 6 or 8), `buffer_ms` (10 to 2000), `label: String` (at most 64 bytes, shown in the volume UI, e.g. "Video"). Samples in the ring are always interleaved f32; the client library converts i16 |
 | → app | `Opened` | `tag`, `stream`, `ring_frames`, `latency_ns` (fd passed: the ring), (fd passed: the clock page) |
 | app → | `Start`, `Pause` | `stream`. A new stream is paused until `Start`, so the app can fill the ring first |
 | app → | `Flush` | `stream`: drop everything queued (a seek) |

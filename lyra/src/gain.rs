@@ -5,6 +5,10 @@
 //! its target with a one-pole smoother instead of jumping. Streaming state, runs
 //! as a node (or folded into the mix).
 
+/// How close the ramp must come before it lands on its target outright: about
+/// −140 dB of full scale, far below anything a ramp step could be heard at.
+const SNAP: f32 = 1e-7;
+
 /// A one-channel smoothed gain.
 pub struct Gain {
     current: f32,
@@ -24,10 +28,26 @@ impl Gain {
         self.target = g;
     }
 
+    /// One ramp step. A one-pole ramp in f32 stalls short of its target once
+    /// a step rounds to nothing (at 384 kHz with a 20 ms ramp, about 2e-4
+    /// below 1.0), and unity must be exactly 1.0 for a bit-perfect path: so
+    /// a step that would not move, or one within [`SNAP`], lands on the target.
+    #[inline]
+    fn step(&mut self) {
+        let d = self.target - self.current;
+        let next = self.current + d * self.coeff;
+        self.current = if d.abs() <= SNAP || next == self.current { self.target } else { next };
+    }
+
     /// One sample's gain, advancing the ramp (for per-channel use).
     pub fn next(&mut self) -> f32 {
-        self.current += (self.target - self.current) * self.coeff;
+        self.step();
         self.current
+    }
+
+    /// At its target: no ramp in progress.
+    pub fn settled(&self) -> bool {
+        self.current == self.target
     }
 
     /// Go to `g` at once, with no ramp (for a stream nothing has heard yet).
@@ -49,7 +69,7 @@ impl Gain {
     /// ramp takes as long whatever the layout.
     pub fn process_frames(&mut self, buf: &mut [f32], ch: usize) {
         for f in buf.chunks_mut(ch.max(1)) {
-            self.current += (self.target - self.current) * self.coeff;
+            self.step();
             f.iter_mut().for_each(|s| *s *= self.current);
         }
     }
@@ -57,7 +77,7 @@ impl Gain {
     /// Apply the (ramping) gain in place.
     pub fn process(&mut self, buf: &mut [f32]) {
         for s in buf.iter_mut() {
-            self.current += (self.target - self.current) * self.coeff;
+            self.step();
             *s *= self.current;
         }
     }
@@ -106,5 +126,18 @@ mod tests {
         g.process(&mut buf);
         assert!(g.current() < 1e-3, "ramped to silence");
         assert!(buf[0] > 0.5 && buf[4095] < 0.01, "smooth fade, not a cut");
+    }
+
+    #[test]
+    fn a_ramp_to_unity_lands_exactly_on_it() {
+        // Bit-perfect needs exactly 1.0, not the ulp below it a one-pole
+        // ramp in f32 can stall at.
+        let mut g = Gain::new(0.0, 384_000.0, 20.0);
+        g.set_target(1.0);
+        let mut buf = vec![0.123_456_78f32; 384_000];
+        g.process_frames(&mut buf, 2);
+        assert!(g.settled());
+        assert_eq!(g.current(), 1.0);
+        assert_eq!(*buf.last().unwrap(), 0.123_456_78);
     }
 }

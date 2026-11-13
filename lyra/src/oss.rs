@@ -94,6 +94,41 @@ impl Format {
     }
 }
 
+impl Format {
+    /// Significant bits of a sample.
+    pub fn bits(self) -> u32 {
+        match self { Format::S16 => 16, Format::S24 => 24, Format::S32 => 32 }
+    }
+}
+
+/// Quantize one mix sample (full scale ±1.0) to a `bits`-bit integer: the
+/// exact inverse of an integer source's `s / 2^(bits-1)`, so a sample that
+/// came in as a `bits`-bit (or narrower) integer goes out as the same
+/// integer, bit for bit. Rounded, then clamped to the integer range.
+#[inline]
+pub fn quantize(x: f32, bits: u32) -> i32 {
+    let scale = (1u64 << (bits - 1)) as f64;
+    let v = (x as f64 * scale).round();
+    v.clamp(-scale, scale - 1.0) as i32
+}
+
+/// Mix samples as `fmt`'s little-endian bytes, into `out` (cleared first).
+/// f32 holds 24 significant bits, so S24 and S32 carry a 24-bit source
+/// exactly; S32's low 8 bits are then zero.
+pub fn encode_f32(samples: &[f32], fmt: Format, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(samples.len() * fmt.bytes() as usize);
+    for &x in samples {
+        let x = if x.is_finite() { x } else { 0.0 };
+        let v = quantize(x, fmt.bits());
+        match fmt {
+            Format::S16 => out.extend_from_slice(&(v as i16).to_le_bytes()),
+            Format::S24 => out.extend_from_slice(&v.to_le_bytes()[..3]),
+            Format::S32 => out.extend_from_slice(&v.to_le_bytes()),
+        }
+    }
+}
+
 /// S16 samples as `fmt`'s little-endian bytes, widened exactly, into `out`
 /// (cleared first).
 pub fn encode_s16(samples: &[i16], fmt: Format, out: &mut Vec<u8>) {
@@ -124,7 +159,7 @@ pub struct OssSink {
     channels: u32,
     format: Format,
     frame_bytes: u32, // channels * format bytes
-    wide: std::cell::RefCell<Vec<u8>>, // S24/S32 staging, reused
+    wide: std::cell::RefCell<Vec<u8>>, // encode staging, reused
 }
 
 impl OssSink {
@@ -135,6 +170,13 @@ impl OssSink {
     /// what the deadline lane provides; a large buffer hides scheduling jitter at
     /// the cost of latency (why consumer stacks default high).
     pub fn open(rate_hz: u32, channels: u32, frag_frames: u32, nfrags: u32) -> io::Result<Self> {
+        Self::open_as(rate_hz, channels, frag_frames, nfrags, Format::S16)
+    }
+
+    /// As [`OssSink::open`], asking for `want`: the mix engine asks for S32,
+    /// so a bit-perfect device answers with its own depth and a converting
+    /// one keeps 24 bits of the mix. Feed it with [`OssSink::write_f32`].
+    pub fn open_as(rate_hz: u32, channels: u32, frag_frames: u32, nfrags: u32, want: Format) -> io::Result<Self> {
         let fd = unsafe { libc::open(c"/dev/dsp".as_ptr(), libc::O_WRONLY) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -155,12 +197,13 @@ impl OssSink {
         // total buffer = the latency; the device may grant fewer.
         let sz_sel = (31 - (frag_bytes.max(1)).leading_zeros()) as i32;
         sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | sz_sel)?;
-        // Ask for S16. A bit-perfect device answers with the format it has;
-        // take S24 or S32 (widened exactly), refuse anything else.
-        let got = sink.set(SNDCTL_DSP_SETFMT, AFMT_S16_NE)?;
+        // Ask for `want`. A bit-perfect device answers with the format it has;
+        // take S16, S24 or S32, refuse anything else. Without bit-perfect the
+        // kernel converts whatever it is given.
+        let got = sink.set(SNDCTL_DSP_SETFMT, want.afmt())?;
         sink.format = Format::from_afmt(got).ok_or_else(|| io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("device coerced format: asked {AFMT_S16_NE}, got {got:#x} (not S16, S24 or S32)"),
+            format!("device coerced format: asked {:#x}, got {got:#x} (not S16, S24 or S32)", want.afmt()),
         ))?;
         if sink.format != Format::S16 {
             sink.require(SNDCTL_DSP_SETFMT, sink.format.afmt(), "format")?;
@@ -217,6 +260,14 @@ impl OssSink {
             std::slice::from_raw_parts(samples.as_ptr() as *const u8, std::mem::size_of_val(samples))
         };
         self.write_bytes(bytes)
+    }
+
+    /// Write interleaved mix frames (full scale ±1.0), quantized exactly to
+    /// the device's format ([`encode_f32`]); blocks like [`OssSink::write_i16`].
+    pub fn write_f32(&self, samples: &[f32]) -> io::Result<()> {
+        let mut buf = self.wide.borrow_mut();
+        encode_f32(samples, self.format, &mut buf);
+        self.write_bytes(&buf)
     }
 
     fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
@@ -322,6 +373,44 @@ mod tests {
         assert!(w.iter().zip(src).all(|(w, s)| (w >> 8) as i16 == s));
         encode_s16(&src, Format::S16, &mut out);
         assert_eq!(out, src.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn integer_sources_come_out_bit_for_bit() {
+        // A 16- or 24-bit source, as the app's f32 (s / 2^(bits-1)), leaves
+        // as the same integer at its own depth and at every wider one.
+        let mut out = Vec::new();
+        let s16: Vec<i16> = vec![0, 1, -1, 12_345, -12_345, i16::MAX, i16::MIN];
+        let f: Vec<f32> = s16.iter().map(|&s| s as f32 / 32_768.0).collect();
+        encode_f32(&f, Format::S16, &mut out);
+        assert_eq!(out, s16.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>());
+        encode_f32(&f, Format::S32, &mut out);
+        let w: Vec<i32> = out.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert!(w.iter().zip(&s16).all(|(w, &s)| *w == (s as i32) << 16));
+        let s24: Vec<i32> = vec![0, 1, -1, 4_660_901, -4_660_901, (1 << 23) - 1, -(1 << 23)];
+        let f: Vec<f32> = s24.iter().map(|&s| s as f32 / 8_388_608.0).collect();
+        encode_f32(&f, Format::S24, &mut out);
+        let w: Vec<i32> = out.chunks(3).map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8).collect();
+        assert_eq!(w, s24);
+        encode_f32(&f, Format::S32, &mut out);
+        let w: Vec<i32> = out.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert!(w.iter().zip(&s24).all(|(w, &s)| *w == s << 8));
+        // Every 24-bit value, not just a few: f32 holds them all exactly.
+        let all: Vec<f32> = (-(1i32 << 23)..(1 << 23)).step_by(257).map(|s| s as f32 / 8_388_608.0).collect();
+        encode_f32(&all, Format::S24, &mut out);
+        let back: Vec<i32> = out.chunks(3).map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8).collect();
+        assert!(back.iter().zip((-(1i32 << 23)..(1 << 23)).step_by(257)).all(|(a, b)| *a == b));
+    }
+
+    #[test]
+    fn out_of_range_and_non_finite_samples_clamp() {
+        let mut out = Vec::new();
+        encode_f32(&[1.0, -1.0, 4.0, -4.0, f32::NAN, f32::INFINITY], Format::S16, &mut out);
+        let w: Vec<i16> = out.chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(w, vec![i16::MAX, i16::MIN, i16::MAX, i16::MIN, 0, 0]);
+        encode_f32(&[1.0, -1.0], Format::S32, &mut out);
+        let w: Vec<i32> = out.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(w, vec![i32::MAX, i32::MIN]);
     }
 
     #[test]
