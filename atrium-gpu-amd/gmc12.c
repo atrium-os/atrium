@@ -232,6 +232,21 @@ hw(struct hub *h, uint32_t dw, uint32_t v)
 	amd_mmio_write32(h->sc, h->base + (bus_size_t)dw * 4, v);
 }
 
+/*
+ * The BAR byte offset of VM context `ctx`'s PAGE_TABLE_BASE_LO on the GC hub
+ * (gc) or the MMHUB, from this IP version's table; 0 if there is none. For
+ * the hostile-PM4 test's target list (smu.c, si_protected_regs).
+ */
+bus_size_t
+amd_gmc12_ctx_base_reg(struct atrium_amd_softc *sc, bool gc, u_int ctx)
+{
+	struct hub h;
+
+	if (ctx >= NUM_CTX || !hub_open(sc, gc, &h))
+		return (0);
+	return (h.base + (bus_size_t)(h.g->ctx0_pt_base_lo + 2 * ctx) * 4);
+}
+
 static void
 hrmw(struct hub *h, uint32_t dw, uint32_t clr, uint32_t set)
 {

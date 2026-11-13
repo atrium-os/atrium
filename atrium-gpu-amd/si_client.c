@@ -546,6 +546,7 @@ si_iv_batch_end(struct amd_si_client *c)
 			    IH_SRC_CP_PRIV_REG ? "privileged register" :
 			    "privileged instruction",
 			    (c->b_cperr_iv0 >> 16) & 0xff, c->b_cperr_hqd);
+		sc->iso.cp_errors += c->b_cperr;
 		si_uq_cperr(c, c->b_cperr_hqd, flog);
 	}
 	if (c->kq != NULL && (c->b_eop != 0 || fault)) {

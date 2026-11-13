@@ -406,6 +406,9 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    "owed completions failed with EIO (queue stopped or reset)");
 	AMD_ISO_U64("quota_refused", quota_refused,
 	    "BO allocations refused: over the owner's per-uid cap");
+	AMD_ISO_U64("cp_errors", cp_errors,
+	    "CP error interrupts (bad opcode, privileged register or "
+	    "instruction) from client streams");
 	AMD_ISO_INT("deferred_now", deferred_now, "deferred BO frees pending");
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64

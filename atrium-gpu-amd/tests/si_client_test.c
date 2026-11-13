@@ -56,6 +56,17 @@
  *                READONLY is refused; code and IB bound EXEC run with data
  *                pages without X; the shader copied into a read-write data
  *                BO faults (EIO) and the VM runs on.
+ *  14 hostile    (silicon only; security model §10 item 1) client packets
+ *     PM4        aimed at registers only the kernel may touch, from the
+ *                kernel's own list (sysctl si_protected_regs, per-IP
+ *                tables): VM context 0 on both hubs, the IH ring base, MES's
+ *                pipe control (WRITE_DATA and COPY_DATA writes of the value
+ *                already there, so a write that lands changes nothing) and
+ *                the SMU argument mailbox (read only). Each runs on a fresh
+ *                VM and must be refused (its work fails, the marker after it
+ *                never lands, the register is unchanged); a read must not
+ *                return the real value; a bystander VM runs clean after
+ *                each. Stops after 2 whole-GPU re-inits (cap 3 per 10 min).
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1258,6 +1269,280 @@ ioerr(int f, unsigned long cmd, void *arg)
 	return (ioctl(f, cmd, arg) == 0 ? 0 : errno);
 }
 
+/* ---- 14: hostile PM4 (security model §10 item 1; silicon only) ---- */
+
+#define PR_SYSCTL	"dev.atrium_gpu_amd_pci.0.si_protected_regs"
+#define PR_MAX		8
+#define PR_MARK		0x600d1400u	/* written after the hostile packet */
+#define PR_REINIT_STOP	2		/* of SI_REINIT_MAX 3 per 10 min */
+
+struct preg {
+	char		name[40];
+	uint32_t	dw;		/* dword register address */
+	uint32_t	val;
+	int		w;		/* the test may write it (same value) */
+};
+
+/* The kernel's target list; the count (-1: no sysctl, not silicon) and the
+ * driver's re-init count (-1 if "lost"). */
+static int
+preg_read(struct preg *p, int *reinits)
+{
+	char buf[1024], *line, *s, mode[4];
+	size_t len = sizeof(buf) - 1;
+	unsigned long dw, v;
+	u_int ri;
+	int n = 0;
+
+	if (sysctlbyname(PR_SYSCTL, buf, &len, NULL, 0) != 0)
+		return (-1);
+	buf[len] = '\0';
+	*reinits = -1;
+	for (s = buf; (line = strsep(&s, "\n")) != NULL;) {
+		if (sscanf(line, "reinits %u", &ri) == 1) {
+			*reinits = strstr(line, "lost") != NULL ? -1 : (int)ri;
+			continue;
+		}
+		if (n < PR_MAX && p != NULL &&
+		    sscanf(line, "%39s %lx %lx %3s", p[n].name, &dw, &v,
+		    mode) == 4) {
+			p[n].dw = (uint32_t)dw;
+			p[n].val = (uint32_t)v;
+			p[n].w = mode[0] == 'w';
+			n++;
+		}
+	}
+	return (n);
+}
+
+static uint32_t
+preg_now(const char *name, int *ok)
+{
+	struct preg p[PR_MAX];
+	int i, n, ri;
+
+	*ok = 0;
+	n = preg_read(p, &ri);
+	for (i = 0; i < n; i++)
+		if (strcmp(p[i].name, name) == 0) {
+			*ok = 1;
+			return (p[i].val);
+		}
+	return (0);
+}
+
+/* WRITE_DATA of `v` to register `dw` (dst_sel 0, write confirm). */
+static u_int
+pr_write_data(uint32_t *w, uint32_t dw, uint32_t v)
+{
+	w[0] = PKT3(0x37u, 3);
+	w[1] = 1u << 20;
+	w[2] = dw;
+	w[3] = 0;
+	w[4] = v;
+	return (5);
+}
+
+/* COPY_DATA immediate `v` -> register `dw` (src_sel 5, dst_sel 0). */
+static u_int
+pr_copy_imm(uint32_t *w, uint32_t dw, uint32_t v)
+{
+	w[0] = PKT3(0x40u, 4);
+	w[1] = 5u | 0u << 8 | 1u << 20;
+	w[2] = v;
+	w[3] = 0;
+	w[4] = dw;
+	w[5] = 0;
+	return (6);
+}
+
+/* COPY_DATA register `dw` -> memory `va` (src_sel 0, dst_sel 5). */
+static u_int
+pr_copy_read(uint32_t *w, uint32_t dw, uint64_t va)
+{
+	w[0] = PKT3(0x40u, 4);
+	w[1] = 0u | 5u << 8 | 1u << 20;
+	w[2] = dw;
+	w[3] = 0;
+	w[4] = (uint32_t)va;
+	w[5] = (uint32_t)(va >> 32);
+	return (6);
+}
+
+/* WRITE_DATA of `v` to memory `va` (dst_sel 5). */
+static u_int
+pr_mark(uint32_t *w, uint64_t va, uint32_t v)
+{
+	w[0] = PKT3(0x37u, 3);
+	w[1] = 5u << 8 | 1u << 20;
+	w[2] = (uint32_t)va;
+	w[3] = (uint32_t)(va >> 32);
+	w[4] = v;
+	return (5);
+}
+
+enum pr_kind { PR_WRITE_DATA, PR_COPY_IMM, PR_READ };
+static const char *const pr_kname[] = { "WRITE_DATA", "COPY_DATA imm",
+    "COPY_DATA read" };
+
+/*
+ * One hostile job on a fresh VM: the packet, then a marker write to its own
+ * out page. What happened: *refused (the work failed and the marker never
+ * landed), *ran (completed with the marker), *cpe (CP error IVs counted),
+ * *got (out word 1 for a read). 0, or -1 if the job could not be set up.
+ */
+static int
+pr_job(enum pr_kind k, uint32_t dw, uint32_t v, int *refused, int *ran,
+    int64_t *cpe, uint32_t *got, int *err, int *ms)
+{
+	struct job j;
+	uint32_t w[16], out[2];
+	int64_t c0;
+	u_int n = 0;
+
+	*refused = *ran = 0;
+	*got = 0;
+	if (job_open(&j, "14") != 0 || poison(j.out, POISON_B) != 0) {
+		job_close(&j);
+		return (-1);
+	}
+	if (k == PR_WRITE_DATA)
+		n = pr_write_data(w, dw, v);
+	else if (k == PR_COPY_IMM)
+		n = pr_copy_imm(w, dw, v);
+	else
+		n = pr_copy_read(w, dw, j.out_va + 4);
+	n += pr_mark(w + n, j.out_va, PR_MARK);
+	c0 = iso("cp_errors");
+	if (bo_xfer(j.ib, w, n * 4, 1) != 0 ||
+	    (*err = queue_submit(j.q, j.ib_va, n, j.so, ++j.value,
+	    NULL)) != 0) {
+		job_close(&j);
+		return (-1);
+	}
+	*err = job_wait(&j, 15000, ms);
+	*cpe = iso("cp_errors") - c0;
+	if (bo_xfer(j.out, out, sizeof(out), 0) != 0)
+		out[0] = out[1] = POISON_B;
+	*ran = *err == 0 && out[0] == PR_MARK;
+	*refused = *err != 0 && out[0] != PR_MARK;
+	*got = out[1];
+	job_close(&j);
+	return (0);
+}
+
+static void
+hostile_pm4(void)
+{
+	struct preg p[PR_MAX];
+	struct job by;
+	enum pr_kind k;
+	uint32_t got, now;
+	int64_t cpe;
+	int n, i, ri0, ri, refused, ran, err, ms, ok, stopped = 0, pass;
+	char what[160];
+
+	n = preg_read(p, &ri0);
+	if (n < 0) {
+		printf("SKIP: 14 hostile PM4: no %s (not silicon)\n",
+		    PR_SYSCTL);
+		return;
+	}
+	check(n >= 5 && ri0 >= 0, "14 hostile PM4: the target list",
+	    "%d registers, re-inits so far %d", n, ri0);
+	for (i = 0; i < n; i++)
+		printf("14: target %s at dword %#x = %#x (%s)\n", p[i].name,
+		    p[i].dw, p[i].val, p[i].w ? "write same value" :
+		    "read only");
+	if (job_open(&by, "14 bystander") != 0) {
+		check(0, "14 hostile PM4", "bystander: %s", strerror(errno));
+		job_close(&by);
+		return;
+	}
+
+	/*
+	 * Writes first (the ones that matter), then reads. Each job is a
+	 * fresh VM; between jobs a bystander VM must run clean. A refusal
+	 * that costs a whole-GPU re-init is counted; at PR_REINIT_STOP the
+	 * rest are not run, so the box keeps one re-init in hand.
+	 */
+	for (k = PR_WRITE_DATA; k <= PR_READ && !stopped; k++) {
+		for (i = 0; i < n && !stopped; i++) {
+			if (k != PR_READ && !p[i].w)
+				continue;
+			if (pr_job(k, p[i].dw, p[i].val, &refused, &ran, &cpe,
+			    &got, &err, &ms) != 0) {
+				snprintf(what, sizeof(what), "14 %s %s",
+				    pr_kname[k], p[i].name);
+				check(0, what, "setup: %s", strerror(errno));
+				continue;
+			}
+			now = preg_now(p[i].name, &ok);
+			(void)preg_read(NULL, &ri);
+			printf("14: %s %s: %s after %d ms, marker %s, CP "
+			    "errors +%jd, word %#x, register now %#x, "
+			    "re-inits %d\n", pr_kname[k], p[i].name,
+			    err == 0 ? "completed" : strerror(err), ms,
+			    ran ? "written" : "not written", (intmax_t)cpe,
+			    got, now, ri);
+			snprintf(what, sizeof(what), "14 %s to %s: refused",
+			    pr_kname[k], p[i].name);
+			if (k == PR_READ) {
+				/* A leak: the real value read back. A value of
+				 * 0 cannot tell a leak from a dropped read. */
+				pass = refused || (ran && got != p[i].val);
+				snprintf(what, sizeof(what), "14 COPY_DATA "
+				    "read of %s: refused or not the real value",
+				    p[i].name);
+				if (!refused && ran && got == 0 &&
+				    p[i].val == 0)
+					printf("INFO: %s (inconclusive: the "
+					    "register is 0, so a leak cannot be "
+					    "told from a dropped read)\n", what);
+				else
+					check(pass, what, "%s, read %#x, real "
+					    "%#x", refused ? "refused" : ran ?
+					    "ran" : "neither", got, p[i].val);
+			} else {
+				/* Only a refusal proves the protection: a
+				 * same-value write that ran may have landed. */
+				pass = refused && ok && now == p[i].val;
+				check(pass, what, "%s, CP errors +%jd, "
+				    "register %#x -> %#x", refused ?
+				    "refused" : ran ? "ran, not refused "
+				    "(same value: no harm, but landing not "
+				    "ruled out)" : "neither", (intmax_t)cpe,
+				    p[i].val, now);
+			}
+			if (ri0 >= 0 && (ri < 0 || ri - ri0 >= PR_REINIT_STOP)) {
+				printf("14: %d GPU re-init(s) since the start "
+				    "of 14 (cap 3 per 10 min): the rest is "
+				    "not run\n", ri < 0 ? -1 : ri - ri0);
+				stopped = 1;
+				break;
+			}
+			if (ri != ri0) {
+				/* The bystander's VM went with the reset. */
+				job_close(&by);
+				if (job_open(&by, "14 bystander") != 0)
+					break;
+			}
+			snprintf(what, sizeof(what), "14 after %s to %s: "
+			    "another VM runs clean", pr_kname[k], p[i].name);
+			run_clean(&by, what);
+		}
+	}
+
+	(void)preg_read(NULL, &ri);
+	check(ri == ri0, "14 hostile PM4: a refused packet costs its queue, "
+	    "not a whole-GPU re-init", "re-inits %d -> %d%s", ri0, ri,
+	    stopped ? "; stopped early" : "");
+	job_close(&by);
+	if (job_open(&by, "14 after") == 0)
+		run_clean(&by, "14 hostile PM4: a new VM runs clean after");
+	job_close(&by);
+}
+
 int
 main(void)
 {
@@ -1537,6 +1822,9 @@ main(void)
 
 	/* 13: GPU W^X. */
 	wx();
+
+	/* 14: hostile PM4 (silicon only). */
+	hostile_pm4();
 
 out:
 	job_close(&a);

@@ -358,6 +358,16 @@ mes_gen_find(struct atrium_amd_softc *sc)
 	return (NULL);
 }
 
+/* The BAR byte offset of CP_MES_CNTL (hostile-PM4 targets); 0 if this GC
+ * version has no table. */
+bus_size_t
+amd_mes12_cntl_reg(struct atrium_amd_softc *sc)
+{
+	const struct mes_gen *g = mes_gen_find(sc);
+
+	return (g == NULL ? 0 : gcreg(sc, g->cp_mes_cntl));
+}
+
 static void
 mes_report(struct mes *m, const char *when)
 {

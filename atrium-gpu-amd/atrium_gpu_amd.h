@@ -712,6 +712,7 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 fences_failed;	/* completions failed with EIO */
 	uint64_t	 vm_faults;	/* VM fault interrupts */
 	uint64_t	 quota_refused;	/* BO_ALLOCs refused with EDQUOT */
+	uint64_t	 cp_errors;	/* CP error IVs: bad opcode, priv reg/instr */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
 };
@@ -964,6 +965,10 @@ bool	amd_mes12_uq_hqd_where(struct amd_uq *q, u_int *pipe, u_int *queue);
 void	amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev);
 void	amd_mes12_free_lost(struct mes *m);
 void	amd_mes12_db_release(struct atrium_amd_softc *sc);
+bus_size_t amd_mes12_cntl_reg(struct atrium_amd_softc *sc);
+bus_size_t amd_ih7_rb_base_reg(struct atrium_amd_softc *sc);
+bus_size_t amd_gmc12_ctx_base_reg(struct atrium_amd_softc *sc, bool gc,
+	    u_int ctx);
 void	amd_mes12_kq_free_lost(struct amd_kq *kq);
 /* A stuck CP queue: reset the card and bring it up again (smu.c). 0: the
  * GPU is usable again, every old queue and VM lost; else it stays lost. */

@@ -425,6 +425,17 @@ ih_gen_find(struct atrium_amd_softc *sc)
 	return (NULL);
 }
 
+/* The BAR byte offset of IH ring 0's RB_BASE (hostile-PM4 targets); 0 if
+ * this OSSSYS version has no table. */
+bus_size_t
+amd_ih7_rb_base_reg(struct atrium_amd_softc *sc)
+{
+	const struct ih_gen *g = ih_gen_find(sc);
+
+	return (g == NULL ? 0 :
+	    ((bus_size_t)sc->ip.osssys.base[0] + g->rb_base) * 4);
+}
+
 static const struct swint_gen *
 swint_gen_find(struct atrium_amd_softc *sc)
 {

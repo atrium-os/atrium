@@ -38,7 +38,10 @@
  */
 #include "atrium_gpu_amd.h"
 
+#include <sys/priv.h>
+#include <sys/sbuf.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -751,6 +754,7 @@ struct amd_si {
 	u_int gfx_holds;		/* GfxOff disallowed while > 0 (5c-2) */
 	bool client;			/* the client node is attached (5c-2) */
 	u_int reinits;			/* amd_si_reinit runs in the window */
+	u_int reinit_total;		/* amd_si_reinit runs since attach */
 	sbintime_t reinit_first;	/* when that window began */
 };
 
@@ -943,6 +947,73 @@ down:
 	return (err);
 }
 
+/*
+ * dev.atrium_gpu_amd_pci.N.si_protected_regs (root only, skipped by sysctl
+ * -a): the registers the hostile-PM4 test (si-client-test 14) aims client
+ * packets at, one per line as "name dword-address value mode", from this
+ * card's per-IP tables, then "reinits N". Mode "w": the test writes back the
+ * value read here, so a write that lands changes nothing. Only targets the
+ * kernel alone sets, once per bring-up, are "w": context 0 (the GART) on
+ * both hubs, the IH ring, MES's pipe control. Not contexts 8-15: MES may
+ * point one at a new VM between this read and the test's write. Mode "r":
+ * read only, because a write could race a live SMU message's argument. GC
+ * values are read with GfxOff held off.
+ */
+static int
+si_protected_regs_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	struct amd_si *si;
+	struct sbuf *sb;
+	struct {
+		const char	*name;
+		bus_size_t	 off;
+		bool		 w;
+	} t[5];
+	u_int i;
+	int err, held;
+
+	if ((err = priv_check(req->td, PRIV_DRIVER)) != 0)
+		return (err);
+	if ((si = sc->si) == NULL)
+		return (ENXIO);
+	t[0].name = "gc_vm_ctx0_pt_base_lo";
+	t[0].off = amd_gmc12_ctx_base_reg(sc, true, 0);
+	t[0].w = true;
+	t[1].name = "mm_vm_ctx0_pt_base_lo";
+	t[1].off = amd_gmc12_ctx_base_reg(sc, false, 0);
+	t[1].w = true;
+	t[2].name = "ih_rb_base";
+	t[2].off = amd_ih7_rb_base_reg(sc);
+	t[2].w = true;
+	t[3].name = "cp_mes_cntl";
+	t[3].off = amd_mes12_cntl_reg(sc);
+	t[3].w = true;
+	t[4].name = "smu_msg_arg";
+	t[4].off = si->link.gen != NULL ?
+	    smu_reg(sc, si->link.gen->reg_arg) : 0;
+	t[4].w = false;
+
+	held = amd_si_gfx_hold(sc) == 0;
+	sb = sbuf_new_for_sysctl(NULL, NULL, 512, req);
+	sx_xlock(&si->lock);
+	for (i = 0; held && !si->lost && i < nitems(t); i++) {
+		if (t[i].off == 0 || t[i].off + 4 > rman_get_size(sc->regs))
+			continue;
+		sbuf_printf(sb, "%s %#jx %#x %s\n", t[i].name,
+		    (uintmax_t)(t[i].off / 4), amd_mmio_read32(sc, t[i].off),
+		    t[i].w ? "w" : "r");
+	}
+	sbuf_printf(sb, "reinits %u%s\n", si->reinit_total,
+	    si->lost || !held ? " lost" : "");
+	sx_xunlock(&si->lock);
+	err = sbuf_finish(sb);
+	sbuf_delete(sb);
+	if (held)
+		amd_si_gfx_release(sc);
+	return (err);
+}
+
 int
 amd_si_attach(struct atrium_amd_softc *sc)
 {
@@ -967,6 +1038,11 @@ amd_si_attach(struct atrium_amd_softc *sc)
 	if ((err = si_up(si, true, &step)) != 0)
 		goto fail;
 	sc->si = si;
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
+	    "si_protected_regs", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_SKIP |
+	    CTLFLAG_MPSAFE, sc, 0, si_protected_regs_sysctl, "A",
+	    "registers the hostile-PM4 test aims at (root only)");
 	taskqueue_enqueue_timeout(taskqueue_thread, &si->watch,
 	    SI_WATCH_SECS * hz);
 	device_printf(sc->dev, "si: stage 5a: attached and idle (MES up, "
@@ -1146,6 +1222,7 @@ amd_si_reinit(struct atrium_amd_softc *sc)
 		return (EIO);
 	}
 	si->reinits++;
+	si->reinit_total++;
 	if (!si->lost) {
 		device_printf(sc->dev, "si: resetting the GPU for a re-init\n");
 		(void)amd_smu_mode1_reset(sc);
