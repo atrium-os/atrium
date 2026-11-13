@@ -718,3 +718,18 @@ work (self-test, scrub).
   clean, card cold. The remaining unrouted EOPs (src_data 0x20000002/3/b) are MES's own
   pipes; they should not count as misses. Next: step 3 (user mode: mmap of ring, wptr and
   doorbell from the queue fd, revocation), then step 4 (the free rule).
+- **2026-11-13, stage 5c-2b step 3 built (box run pending).** User-mode queues
+  (`USER_MODE`, root only for now): `QUEUE_MAP2` ('A',82, v2 layout plus a proposed
+  `out_fence_gpu_va`) and `fo_mmap` on the queue fd map the ring, the writeback page and
+  the queue's own doorbell page (BAR page 2 + slot; page 1 is MES's aggregated doorbells,
+  registered fictitious at MES init) through one managed pager object. Ring and writeback
+  are kpi `RamPages` (patch 0012: wired, managed, object-less pages a mgtdev pager may
+  insert); the last close revokes every mapping first, then removes the queue. Writeback
+  page: rptr report, wptr, fence, emitted; the CP's rptr is a fetch pointer (a faulted IB
+  showed it past its RELEASE_MEM), so the user-mode hang clock is fence short of emitted,
+  or rptr short of wptr, with neither moving for hang_ms. Lost queues: QUEUE_MAP2 EIO, no
+  new pages mapped; mappings already made stay until close (the queue is off the GPU, its
+  doorbell page belongs to no one else). Cleanups: MES's own EOPs (0x20xxxxxx) counted
+  apart, not as unrouted; `vm_faults` counted once per fault (it was counted in both
+  si_client.c and amd_fault_handler); the dummy-page line says whether a write landed.
+  Test 9 in si-client-test (the step-1 user-mode refusal is gone).

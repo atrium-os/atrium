@@ -71,7 +71,16 @@ void	amd_rs_q_faulted_locked(struct atrium_amd_softc *sc, uint32_t qid);
 /* C, for Rust (rs/uqueue.rs; si_client.c): client queue fds on MES user
  * queues (5c-2b). EOPNOTSUPP/0 on a backend without them. */
 int	amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
-	    uint32_t prio, int *slot);
+	    uint32_t prio, uint8_t *upg, uint64_t upa, int *slot);
+uint64_t amd_si_uq_doorbell_pa(struct atrium_amd_softc *sc, int slot);
+uint64_t amd_si_uq_fence_va(struct atrium_amd_softc *sc, int slot);
+int	amd_si_uq_alive(struct atrium_amd_softc *sc, int slot);
+
+/* C, for Rust (glue.c): the user-mode queue gate, and a queue fd's mmap. */
+int	amd_rs_priv_driver(void);
+int	amd_rs_mmap_object(vm_map_t map, vm_offset_t *addr, vm_size_t size,
+	    vm_prot_t prot, vm_prot_t cap_maxprot, int flags, vm_object_t obj,
+	    vm_ooffset_t foff, struct thread *td);
 int	amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot);
 int	amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	    uint32_t ib_dw, struct atrium_amd_syncobj *so, uint64_t value,

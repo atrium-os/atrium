@@ -71,6 +71,8 @@ struct si_uq {
 	bool	 seen_eop;		/* first routed EOP IV logged */
 	bool	 dead;			/* lost (fault, hang): work fails, EIO */
 	bool	 evict;			/* lost, still on MES: the task removes it */
+	bool	 user;			/* user mode: the client's ring (step 3) */
+	uint32_t prog_rptr;		/* user mode's hang clock: rptr at prog_tick */
 	uint32_t prog_fence;		/* hang clock: fence at prog_tick */
 	int	 prog_tick;
 	struct si_uq_owed owed[ATRIUM_AMD_MAX_PENDING];
@@ -108,7 +110,7 @@ struct amd_si_client {
 	struct callout uq_poll;
 	struct task uq_task;		/* evicts lost queues (taskqueue_thread) */
 	uint64_t uq_hangs, uq_faults;
-	uint64_t uq_eop_routed, uq_eop_unrouted, uq_retired_iv,
+	uint64_t uq_eop_routed, uq_eop_unrouted, uq_eop_mes, uq_retired_iv,
 		 uq_retired_poll;
 
 	/* The IV consumer's batch (interrupt thread only). */
@@ -166,7 +168,8 @@ si_uq_owes(struct amd_si_client *c)
 	u_int i;
 
 	for (i = 0; i < AMD_UQ_SLOTS; i++)
-		if (c->uq[i].hw != NULL && c->uq[i].n > 0)
+		if (c->uq[i].hw != NULL && (c->uq[i].n > 0 ||
+		    (c->uq[i].user && !c->uq[i].dead)))
 			return (true);
 	return (false);
 }
@@ -241,13 +244,24 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 {
 	struct atrium_amd_softc *sc = c->sc;
 	struct si_uq *u = &c->uq[slot];
-	uint32_t fence;
+	uint32_t fence, rptr;
 	int limit;
 
-	if (u->hw == NULL || u->dead || u->n == 0)
+	if (u->hw == NULL || u->dead)
 		return;
-	fence = amd_mes12_uq_fence(u->hw);
-	if (fence != u->prog_fence) {
+	if (u->user) {
+		/* Behind (wptr not fetched, fence short of what the client
+		 * emitted), and neither rptr nor fence moving. */
+		if (!amd_mes12_uq_user_busy(u->hw, &rptr, &fence) ||
+		    rptr != u->prog_rptr || fence != u->prog_fence) {
+			u->prog_rptr = rptr;
+			u->prog_fence = fence;
+			u->prog_tick = ticks;
+			return;
+		}
+	} else if (u->n == 0)
+		return;
+	else if ((fence = amd_mes12_uq_fence(u->hw)) != u->prog_fence) {
 		u->prog_fence = fence;
 		u->prog_tick = ticks;
 		return;
@@ -255,9 +269,9 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 	limit = MAX(1, (int)(((int64_t)sc->hang_ms * hz) / 1000));
 	if (ticks - u->prog_tick < limit)
 		return;
-	device_printf(sc->dev, "si: uq%u hung: fence %u, no progress for %d "
-	    "ms; its work fails, the queue is lost\n", slot, fence,
-	    sc->hang_ms);
+	device_printf(sc->dev, "si: uq%u hung%s: fence %u, no progress for "
+	    "%d ms; its work fails, the queue is lost\n", slot,
+	    u->user ? " (user mode)" : "", fence, sc->hang_ms);
 	while (u->n > 0) {
 		if (u->owed[u->head].so != NULL)
 			amd_syncobj_fail(u->owed[u->head].so, EIO);
@@ -344,7 +358,8 @@ si_iv_batch_end(struct amd_si_client *c)
 		sc->ih_fault_ring[i] = 0;
 	}
 	if (c->b_fault != 0) {
-		sc->iso.vm_faults += c->b_fault;
+		/* iso.vm_faults: counted once, by amd_fault_handler when the
+		 * fault goes to it, else below. */
 		/* Re-arm the latch (GC registers: valid while VMs hold
 		 * GfxOff off, and only a VM's work can fault here). */
 		if (c->vmids != 0 && amd_gmc12_fault_take(c->gt, &status,
@@ -383,6 +398,8 @@ si_iv_batch_end(struct amd_si_client *c)
 	/* The fault first, so the completions it covers fail (EIO). */
 	if (fault && sc->ih_handler[ATRIUM_AMD_IH_CAUSE_VM_FAULT] != NULL)
 		sc->ih_handler[ATRIUM_AMD_IH_CAUSE_VM_FAULT](sc, c->b_fault);
+	else
+		sc->iso.vm_faults += c->b_fault;
 	if (eop != 0 && sc->ih_handler[ATRIUM_AMD_IH_CAUSE_EOP] != NULL)
 		sc->ih_handler[ATRIUM_AMD_IH_CAUSE_EOP](sc, eop);
 	mtx_unlock(&sc->lock);
@@ -417,9 +434,13 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 
 	if ((ctx & 0xff000000u) == AMD_UQ_CTXID_FLAG) {
 		db = ctx & 0x00ffffffu;
-		slot = (db >> 1) - 0x10u;
-		if (db >= AMD_UQ_DOORBELL(0) && (db & 1) == 0 &&
-		    slot < AMD_UQ_SLOTS) {
+		if ((db & 0x3ffu) == 0 && db >= AMD_UQ_DOORBELL_USER(0))
+			slot = (db >> 10) - 2u;		/* user mode */
+		else if (db >= AMD_UQ_DOORBELL(0) && (db & 1) == 0)
+			slot = (db >> 1) - 0x10u;
+		else
+			slot = AMD_UQ_SLOTS;
+		if (slot < AMD_UQ_SLOTS) {
 			c->b_uq |= 1u << slot;
 			c->uq_eop_routed++;
 			if (!c->uq[slot].seen_eop) {
@@ -432,6 +453,12 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 	}
 	if (ctx == AMD_KQ_CTXID)
 		return;
+	/* MES's own scheduler EOPs (seen on silicon: 0x2000000b,
+	 * 0x20000002, 0x20000003): not a queue of ours, nothing to scan. */
+	if ((ctx & 0xff000000u) == AMD_MES_CTXID_FLAG) {
+		c->uq_eop_mes++;
+		return;
+	}
 	c->uq_eop_unrouted++;
 	c->b_uq_scan = true;
 	c->b_unrouted_db = ctx;
@@ -670,9 +697,13 @@ si_vm_flush(struct amd_si_client *c, uint16_t kvmid)
 	return (err);
 }
 
+/*
+ * `upg`/`upa`: a user-mode queue on the caller's pages (rs/uqueue.rs maps
+ * them, and the doorbell page, into the client); NULL for kernel mode.
+ */
 int
 amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
-    uint32_t prio, int *slotp)
+    uint32_t prio, uint8_t *upg, uint64_t upa, int *slotp)
 {
 	struct amd_si_client *c = sc->si_client;
 	struct amd_uq *hw;
@@ -707,14 +738,20 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		amd_mes12_uq_ints(amd_si_mes(sc), true, c->uq_int_saved);
 	/* MES priority: NORMAL (1) for every client in 5c-2b. */
 	err = amd_mes12_uq_create(amd_si_mes(sc), vm->hw12, vm->vmid, slot,
-	    SI_UQ_VA + slot * SI_UQ_VA_STRIDE, prio + 1, &hw);
+	    SI_UQ_VA + slot * SI_UQ_VA_STRIDE, prio + 1, upg, (vm_paddr_t)upa,
+	    &hw);
 	mtx_lock(&sc->lock);
 	if (err != 0) {
 		u->busy = false;
 		u->kvmid = 0;
 	} else {
 		u->hw = hw;
+		u->user = upg != NULL;
+		u->prog_tick = ticks;
 		c->uq_live++;
+		/* User mode: the hang clock runs for as long as it lives. */
+		if (u->user && !callout_pending(&c->uq_poll))
+			callout_reset(&c->uq_poll, hz / 20, si_uq_poll, c);
 	}
 	mtx_unlock(&sc->lock);
 	if (err != 0 && c->uq_live == 0)
@@ -783,10 +820,11 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 		err = 0;
 	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
-	    "routed %ju, unrouted %ju; retired by IV %ju, by poll %ju; "
-	    "queues lost to faults %ju, hangs %ju\n",
+	    "routed %ju, unrouted %ju, MES own %ju; retired by IV %ju, "
+	    "by poll %ju; queues lost to faults %ju, hangs %ju\n",
 	    slot, (uintmax_t)submits, (uintmax_t)c->uq_eop_routed,
-	    (uintmax_t)c->uq_eop_unrouted, (uintmax_t)c->uq_retired_iv,
+	    (uintmax_t)c->uq_eop_unrouted, (uintmax_t)c->uq_eop_mes,
+	    (uintmax_t)c->uq_retired_iv,
 	    (uintmax_t)c->uq_retired_poll, (uintmax_t)c->uq_faults,
 	    (uintmax_t)c->uq_hangs);
 	if (err == 0) {
@@ -819,6 +857,8 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	mtx_lock(&sc->lock);
 	if (u->hw == NULL)
 		err = ENXIO;
+	else if (u->user)
+		err = EOPNOTSUPP;		/* the client rings it itself */
 	else if (u->dead || !amd_si_usable(sc))
 		err = EIO;
 	else if (so != NULL && u->n >= ATRIUM_AMD_MAX_PENDING &&
@@ -842,6 +882,58 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	}
 	mtx_unlock(&sc->lock);
 	return (err);
+}
+
+/* A user-mode queue's fence, as a VA of its VM (QUEUE_MAP2). */
+uint64_t
+amd_si_uq_fence_va(struct atrium_amd_softc *sc, int slot)
+{
+	struct amd_si_client *c = sc->si_client;
+	uint64_t va = 0;
+
+	if (c == NULL || slot < 0 || slot >= AMD_UQ_SLOTS)
+		return (0);
+	mtx_lock(&sc->lock);
+	if (c->uq[slot].hw != NULL)
+		va = amd_mes12_uq_fence_va(c->uq[slot].hw);
+	mtx_unlock(&sc->lock);
+	return (va);
+}
+
+/* A user-mode queue's doorbell page, for its pager (rs/uqueue.rs). */
+uint64_t
+amd_si_uq_doorbell_pa(struct atrium_amd_softc *sc, int slot)
+{
+	struct amd_si_client *c = sc->si_client;
+	uint64_t pa = 0;
+
+	if (c == NULL || slot < 0 || slot >= AMD_UQ_SLOTS)
+		return (0);
+	mtx_lock(&sc->lock);
+	if (c->uq[slot].hw != NULL && c->uq[slot].user)
+		pa = amd_mes12_uq_doorbell_pa(c->uq[slot].hw);
+	mtx_unlock(&sc->lock);
+	return (pa);
+}
+
+/*
+ * 1 while the queue in `slot` runs (not lost, the card usable): its pager
+ * maps pages only then; a lost queue's next touch is SIGBUS. Called with
+ * the pager object locked (order: object, then sc->lock).
+ */
+int
+amd_si_uq_alive(struct atrium_amd_softc *sc, int slot)
+{
+	struct amd_si_client *c = sc->si_client;
+	int alive;
+
+	if (c == NULL || slot < 0 || slot >= AMD_UQ_SLOTS)
+		return (0);
+	mtx_lock(&sc->lock);
+	alive = c->uq[slot].hw != NULL && !c->uq[slot].dead &&
+	    amd_si_usable(sc);
+	mtx_unlock(&sc->lock);
+	return (alive);
 }
 
 /* A syncobj is closing: forget it in every user queue's owed list. */

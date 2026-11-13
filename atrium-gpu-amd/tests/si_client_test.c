@@ -31,6 +31,15 @@
  *                value never written): after hang_ms its completion fails
  *                with EIO, the queue refuses more work, others run on, and
  *                the VM runs clean on a new queue.
+ *   9 user mode  (step 3) a USER_MODE queue: QUEUE_MAP2's layout, mmap of
+ *                ring, writeback page and doorbell; write_42 rung from user
+ *                space twice (fence at the kernel's fence VA); refusals
+ *                (QUEUE_SUBMIT on it, QUEUE_MAP2/mmap of a kernel-mode
+ *                queue, private/exec/oversized mappings); its close takes
+ *                ring and doorbell back (SIGBUS in a child); a stuck user
+ *                ring (WAIT_REG_MEM in an IB) is lost after hang_ms
+ *                (QUEUE_MAP2: EIO) while another VM runs on; the VM then
+ *                runs clean on a kernel-mode queue.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -39,12 +48,14 @@
 #include "si_w42.h"
 
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -462,6 +473,305 @@ recv_fds(int sock, int *a, int *b)
 }
 
 /* errno of an ioctl, 0 if it succeeded. */
+/* ---- 9: user-mode queues (step 3) ---- */
+
+static int ioerr(int f, unsigned long cmd, void *arg);
+
+#define PKT3(op, n)	(3u << 30 | ((n) & 0x3fffu) << 16 | (op) << 8)
+
+struct uqm {
+	int q;
+	uint8_t *m;
+	size_t len;
+	struct atrium_gpu_queue_map2 mi;
+	uint64_t wptr;
+	uint32_t emitted;
+};
+
+static int
+uq_open(int vm, struct uqm *u)
+{
+	memset(u, 0, sizeof(*u));
+	u->m = NULL;
+	u->q = queue_create2(vm, ATRIUM_GPU_QUEUE_FAMILY_COMPUTE, 0,
+	    ATRIUM_GPU_QUEUE_FLAG_USER_MODE);
+	if (u->q < 0)
+		return (-1);
+	u->mi.struct_size = sizeof(u->mi);
+	if (ioctl(u->q, ATRIUM_GPU_IOC_QUEUE_MAP2, &u->mi) != 0)
+		return (-1);
+	u->len = u->mi.out_doorbell_offset + u->mi.out_doorbell_size;
+	u->m = mmap(NULL, u->len, PROT_READ | PROT_WRITE, MAP_SHARED, u->q, 0);
+	if (u->m == MAP_FAILED) {
+		u->m = NULL;
+		return (-1);
+	}
+	return (0);
+}
+
+static void
+uq_close(struct uqm *u)
+{
+	if (u->m != NULL)
+		munmap(u->m, u->len);
+	if (u->q >= 0)
+		close(u->q);
+	u->m = NULL;
+	u->q = -1;
+}
+
+static volatile uint8_t *
+uq_wb(struct uqm *u)
+{
+	return (u->m + u->mi.out_wptr_offset - 8);
+}
+
+/* Packets onto the ring, then emitted, wptr and the doorbell. */
+static void
+uq_ring(struct uqm *u, const uint32_t *pkt, u_int n)
+{
+	volatile uint32_t *ring = (volatile uint32_t *)(u->m +
+	    u->mi.out_ring_offset);
+	u_int i, rdw = (u_int)(u->mi.out_ring_size / 4);
+
+	for (i = 0; i < n; i++)
+		ring[(u->wptr + i) % rdw] = pkt[i];
+	u->wptr += n;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	*(volatile uint32_t *)(uq_wb(u) + 0x18) = u->emitted;
+	*(volatile uint64_t *)(uq_wb(u) + 0x08) = u->wptr;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	*(volatile uint64_t *)(u->m + u->mi.out_doorbell_offset) = u->wptr;
+}
+
+/* An IB, then a RELEASE_MEM of the next fence value (no interrupt). */
+static uint32_t
+uq_job(struct uqm *u, uint64_t ib, u_int ib_dw)
+{
+	uint64_t f = u->mi.out_fence_gpu_va;
+	uint32_t p[12];
+	u_int n = 0;
+
+	u->emitted++;
+	p[n++] = PKT3(0x3fu, 2);			/* INDIRECT_BUFFER */
+	p[n++] = (uint32_t)ib;
+	p[n++] = (uint32_t)(ib >> 32);
+	p[n++] = 1u << 23 | ib_dw;			/* valid */
+	p[n++] = PKT3(0x49u, 6);			/* RELEASE_MEM */
+	p[n++] = 1u << 22 | 1u << 21 | 3u << 25 | 5u << 8 | 0x14u;
+	p[n++] = 1u << 29;				/* 32 bits, no int */
+	p[n++] = (uint32_t)f;
+	p[n++] = (uint32_t)(f >> 32);
+	p[n++] = u->emitted;
+	p[n++] = 0;
+	p[n++] = 0;
+	uq_ring(u, p, n);
+	return (u->emitted);
+}
+
+static uint32_t
+uq_fence(struct uqm *u)
+{
+	return (*(volatile uint32_t *)(uq_wb(u) + 0x10));
+}
+
+/* 0 when the fence reaches `v` within `ms`, else ETIMEDOUT. */
+static int
+uq_wait(struct uqm *u, uint32_t v, int ms, int *took)
+{
+	struct timeval t0, t1;
+
+	gettimeofday(&t0, NULL);
+	for (;;) {
+		gettimeofday(&t1, NULL);
+		*took = (int)((t1.tv_sec - t0.tv_sec) * 1000 +
+		    (t1.tv_usec - t0.tv_usec) / 1000);
+		if ((int32_t)(uq_fence(u) - v) >= 0)
+			return (0);
+		if (*took > ms)
+			return (ETIMEDOUT);
+		usleep(1000);
+	}
+}
+
+/* A child touches `p` (write or read): 1 if it died of SIGBUS. */
+static int
+touch_sigbus(volatile uint8_t *p, int write, int *how)
+{
+	pid_t pid;
+	int st;
+
+	pid = fork();
+	if (pid < 0)
+		return (0);
+	if (pid == 0) {
+		if (write)
+			*(volatile uint64_t *)p = 1;
+		else
+			(void)*(volatile uint32_t *)p;
+		_exit(0);
+	}
+	if (waitpid(pid, &st, 0) != pid)
+		return (0);
+	*how = st;
+	return (WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+}
+
+static void
+user_mode(struct job *other)
+{
+	struct job g;
+	struct uqm u, h;
+	struct atrium_gpu_queue_map2 mi;
+	struct atrium_gpu_queue_submit qs;
+	uint32_t first, v, w[7];
+	void *p;
+	int r, n, ms, st = 0;
+
+	if (job_open(&g, "9") != 0) {
+		check(0, "9 user mode", "setup failed");
+		job_close(&g);
+		return;
+	}
+	close(g.q);
+	g.q = -1;
+	if (uq_open(g.vm, &u) != 0) {
+		check(0, "9 user mode: create, QUEUE_MAP2, mmap", "%s",
+		    strerror(errno));
+		uq_close(&u);
+		job_close(&g);
+		return;
+	}
+	check(u.mi.out_ring_offset == 0 && u.mi.out_ring_size == 4096 &&
+	    u.mi.out_wptr_offset == 0x1008 && u.mi.out_doorbell_offset ==
+	    0x2000 && u.mi.out_doorbell_size == 4096 &&
+	    u.mi.out_fence_gpu_va != 0, "9 user mode: QUEUE_MAP2 layout",
+	    "ring %#jx+%#jx, wptr %#jx, doorbell %#jx+%#jx, fence VA %#jx",
+	    (uintmax_t)u.mi.out_ring_offset, (uintmax_t)u.mi.out_ring_size,
+	    (uintmax_t)u.mi.out_wptr_offset,
+	    (uintmax_t)u.mi.out_doorbell_offset,
+	    (uintmax_t)u.mi.out_doorbell_size,
+	    (uintmax_t)u.mi.out_fence_gpu_va);
+
+	/* write_42, rung from user space, twice on the same ring. */
+	for (n = 1; n <= 2; n++) {
+		if (poison(g.out, n == 1 ? POISON_A : POISON_B) != 0 ||
+		    job_ib(&g, g.out_va) != 0) {
+			check(0, "9 user mode: job", "setup: %s",
+			    strerror(errno));
+			break;
+		}
+		v = uq_job(&u, g.ib_va, SIW42_IB_DW);
+		r = uq_wait(&u, v, 2000, &ms);
+		st = count(g.out, SIW42_OUT_VALUE, &first);
+		check(r == 0 && st == SIW42_OUT_DW, n == 1 ?
+		    "9 user mode: write_42 rung from user space" :
+		    "9 user mode: a second job on the same ring",
+		    "fence %u (want %u) after %d ms, %d/64 words 42, out[0] "
+		    "%#x, rptr report %u, wptr %ju", uq_fence(&u), v, ms, st,
+		    first, *(volatile uint32_t *)uq_wb(&u),
+		    (uintmax_t)u.wptr);
+	}
+
+	/* Refusals. */
+	memset(&qs, 0, sizeof(qs));
+	qs.struct_size = sizeof(qs);
+	qs.blob_va = g.ib_va;
+	qs.blob_size = SIW42_IB_DW * 4;
+	r = ioerr(u.q, ATRIUM_GPU_IOC_QUEUE_SUBMIT, &qs);
+	check(r == EOPNOTSUPP, "9 user mode: QUEUE_SUBMIT on it refused",
+	    "%s", r == 0 ? "accepted" : strerror(r));
+	memset(&mi, 0, sizeof(mi));
+	mi.struct_size = sizeof(mi);
+	r = other->q >= 0 ? ioerr(other->q, ATRIUM_GPU_IOC_QUEUE_MAP2, &mi) :
+	    -1;
+	check(r == EINVAL, "9 user mode: QUEUE_MAP2 of a kernel-mode queue "
+	    "refused", "%s", r == 0 ? "accepted" : strerror(r));
+	p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, other->q, 0);
+	r = p == MAP_FAILED ? errno : 0;
+	if (p != MAP_FAILED)
+		munmap(p, 4096);
+	check(r != 0, "9 user mode: mmap of a kernel-mode queue refused",
+	    "%s", r == 0 ? "mapped" : strerror(r));
+	p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, u.q, 0);
+	r = p == MAP_FAILED ? errno : 0;
+	if (p != MAP_FAILED)
+		munmap(p, 4096);
+	check(r != 0, "9 user mode: a private mapping refused", "%s",
+	    r == 0 ? "mapped" : strerror(r));
+	p = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, u.q, 0);
+	r = p == MAP_FAILED ? errno : 0;
+	if (p != MAP_FAILED)
+		munmap(p, 4096);
+	check(r != 0, "9 user mode: an executable mapping refused", "%s",
+	    r == 0 ? "mapped" : strerror(r));
+	p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, u.q,
+	    (off_t)u.len);
+	r = p == MAP_FAILED ? errno : 0;
+	if (p != MAP_FAILED)
+		munmap(p, 4096);
+	check(r != 0, "9 user mode: a mapping past the queue's pages "
+	    "refused", "%s", r == 0 ? "mapped" : strerror(r));
+
+	/* The close takes every mapping back. */
+	close(u.q);
+	u.q = -1;
+	r = touch_sigbus(u.m + u.mi.out_ring_offset, 0, &st);
+	check(r, "9 user mode: after close, the ring is gone (SIGBUS)",
+	    "child status %#x", st);
+	r = touch_sigbus(u.m + u.mi.out_doorbell_offset, 1, &st);
+	check(r, "9 user mode: after close, the doorbell is gone (SIGBUS)",
+	    "child status %#x", st);
+	uq_close(&u);
+
+	/* A stuck user ring is lost after hang_ms; others run on. */
+	if (uq_open(g.vm, &h) != 0) {
+		check(0, "9 hang: user queue", "%s", strerror(errno));
+	} else {
+		(void)poison(g.out, POISON_A);
+		w[0] = 3u << 30 | 5u << 16 | 0x3cu << 8;  /* WAIT_REG_MEM */
+		w[1] = 3u | 1u << 4;		/* equal, memory */
+		w[2] = (uint32_t)g.out_va;
+		w[3] = (uint32_t)(g.out_va >> 32);
+		w[4] = 0x12345678u;		/* never written */
+		w[5] = 0xffffffffu;
+		w[6] = 0x20u;
+		if (bo_xfer(g.ib, w, sizeof(w), 1) != 0) {
+			check(0, "9 hang", "IB: %s", strerror(errno));
+		} else {
+			struct timeval t0, t1;
+
+			(void)uq_job(&h, g.ib_va, 7);
+			gettimeofday(&t0, NULL);
+			do {
+				usleep(250000);
+				memset(&mi, 0, sizeof(mi));
+				mi.struct_size = sizeof(mi);
+				r = ioerr(h.q, ATRIUM_GPU_IOC_QUEUE_MAP2, &mi);
+				gettimeofday(&t1, NULL);
+				ms = (int)((t1.tv_sec - t0.tv_sec) * 1000 +
+				    (t1.tv_usec - t0.tv_usec) / 1000);
+			} while (r == 0 && ms < 15000);
+			check(r == EIO && ms >= 3000, "9 hang: a stuck user "
+			    "ring is lost after hang_ms (QUEUE_MAP2: EIO)",
+			    "%s after %d ms, fence %u", r == 0 ? "still alive" :
+			    strerror(r), ms, uq_fence(&h));
+			run_clean(other, "9 hang: another VM's queue runs on");
+		}
+		uq_close(&h);
+	}
+
+	/* The VM runs on, on a kernel-mode queue. */
+	g.q = queue_create(g.vm);
+	if (g.q < 0)
+		check(0, "9 user mode: kernel queue after", "%s",
+		    strerror(errno));
+	else
+		run_clean(&g, "9 user mode: the VM runs clean on a kernel-mode "
+		    "queue after");
+	job_close(&g);
+}
+
 static int
 ioerr(int f, unsigned long cmd, void *arg)
 {
@@ -636,10 +946,6 @@ main(void)
 	r = ioerr(fd, ATRIUM_GPU_IOC_SUBMIT, &s);
 	check(r == EOPNOTSUPP, "6 the 5c-2a SUBMIT on the client node is "
 	    "gone", "%s", r == 0 ? "accepted" : strerror(r));
-	r = queue_create2(a.vm, ATRIUM_GPU_QUEUE_FAMILY_COMPUTE, 0,
-	    ATRIUM_GPU_QUEUE_FLAG_USER_MODE) >= 0 ? 0 : errno;
-	check(r == EOPNOTSUPP, "6 user-mode queue refused (step 3)", "%s",
-	    r == 0 ? "accepted" : strerror(r));
 	r = queue_create2(a.vm, 1, 0, 0) >= 0 ? 0 : errno;
 	check(r == EINVAL, "6 unknown queue family refused", "%s",
 	    r == 0 ? "accepted" : strerror(r));
@@ -741,6 +1047,10 @@ main(void)
 				    "a new queue");
 		}
 	}
+
+	/* 9: user-mode queues (needs a free VM: drop 8's). */
+	job_close(&f);
+	user_mode(&a);
 
 out:
 	job_close(&a);

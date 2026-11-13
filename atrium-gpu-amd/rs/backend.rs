@@ -299,10 +299,28 @@ impl Dev {
     // --- queue fds on MES user queues (uqueue.rs; si_client.c, 5c-2b) ---
 
     /// Add a user queue running in `vm`. Returns its slot. EOPNOTSUPP on a backend without.
-    pub fn uq_create(self, vm: *mut sys::atrium_amd_vm, prio: u32) -> Result<c_int> {
+    /// `user`: a user-mode queue on these pages (ring, writeback, EOP: kernel address and
+    /// physical address of three contiguous pages that outlive the queue).
+    pub fn uq_create(self, vm: *mut sys::atrium_amd_vm, prio: u32, user: Option<(*mut u8, u64)>) -> Result<c_int> {
         let mut slot: c_int = -1;
-        check(unsafe { sys::amd_si_uq_create(self.0, vm, prio, &mut slot) })?;
+        let (pg, pa) = user.unwrap_or((core::ptr::null_mut(), 0));
+        check(unsafe { sys::amd_si_uq_create(self.0, vm, prio, pg, pa, &mut slot) })?;
         Ok(slot)
+    }
+
+    /// A user-mode queue's doorbell page (0 if none).
+    pub fn uq_doorbell_pa(self, slot: c_int) -> u64 {
+        unsafe { sys::amd_si_uq_doorbell_pa(self.0, slot) }
+    }
+
+    /// The GPU VA of a queue's fence (in its VM).
+    pub fn uq_fence_va(self, slot: c_int) -> u64 {
+        unsafe { sys::amd_si_uq_fence_va(self.0, slot) }
+    }
+
+    /// The queue runs (not lost, the card usable). Takes sc->lock.
+    pub fn uq_alive(self, slot: c_int) -> bool {
+        unsafe { sys::amd_si_uq_alive(self.0, slot) != 0 }
     }
 
     /// Take the queue off the GPU. Err: the hardware kept it, so its VM must never be freed.

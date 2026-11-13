@@ -42,6 +42,9 @@
 #include <dev/pci/pcivar.h>
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_param.h>
+#include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 
 #include "write42_ib.h"	/* stage 4e: the oracle's write_42, generated */
 
@@ -252,6 +255,7 @@ struct mes {
 	struct amd_gart *gt;
 	struct resource *dbbar;
 	int dbrid;
+	bool udb_registered;	/* user-mode doorbell pages are fictitious */
 	uint8_t *blk;		/* KVA of the GART block */
 	vm_paddr_t blk_pa;
 	uint64_t va;		/* GART address of the block */
@@ -1440,9 +1444,11 @@ vmt_variant(struct mes *m, struct disp *d, uint8_t *pg, vm_paddr_t pg_pa,
 		goto out;
 	}
 	if (gt->dummy != NULL) {
-		device_printf(sc->dev, "vm: dummy page word 0 now %#x "
-		    "(no-retry faulting writes were not seen there); zeroed\n",
-		    *(volatile uint32_t *)gt->dummy);
+		uint32_t w0 = *(volatile uint32_t *)gt->dummy;
+
+		device_printf(sc->dev, "vm: dummy page word 0 now %#x (%s); "
+		    "zeroed\n", w0, w0 == 0 ? "faulting writes did not land "
+		    "there" : "a faulting write landed there");
 		memset(gt->dummy, 0, PAGE_SIZE);
 	}
 	*gone = vmt_qclose(m, d);
@@ -2203,12 +2209,65 @@ struct amd_uq {
 	uint64_t wptr;		/* dwords emitted */
 	uint32_t seq;		/* last fence value emitted */
 	bool	 mapped_vm, added;
+	bool	 user;		/* user mode: the client writes ring and wptr
+				 * and rings its own doorbell page; pg is the
+				 * caller's (rs/uqueue.rs RamPages) */
 };
 
 static bool
 uq2_seq_passed(uint32_t fence, uint32_t seq)
 {
 	return ((int32_t)(fence - seq) >= 0);
+}
+
+/*
+ * A user-mode queue's writeback page: the CP's rptr report (+0, dwords
+ * into the ring), the client's wptr (+8), the fence its RELEASE_MEMs
+ * write (+0x10) and the last fence value it emitted (+0x18). It is busy
+ * while the CP has not fetched up to the wptr or the fence is behind what
+ * was emitted; its progress is rptr and fence. The CP's rptr runs ahead
+ * of execution (a faulted IB showed the rptr past its RELEASE_MEM), so
+ * only the fence says work is done. The client can lie about all of it,
+ * which only fools the clock on its own queue.
+ */
+#define UQ2_WB_EMITTED		0x18u
+
+static bool
+uq2_user_busy(struct amd_uq *q, uint32_t *rptr, uint32_t *fence)
+{
+	volatile uint8_t *wb = q->pg + UQ2_WB;
+	uint64_t wptr = *(volatile uint64_t *)(wb + 8);
+	uint32_t emitted = *(volatile uint32_t *)(wb + UQ2_WB_EMITTED);
+
+	*rptr = *(volatile uint32_t *)wb & (RING_DW - 1);
+	*fence = *(volatile uint32_t *)(wb + 0x10);
+	return ((uint32_t)(wptr & (RING_DW - 1)) != *rptr ||
+	    !uq2_seq_passed(*fence, emitted));
+}
+
+/* Nothing left to run: the last fence landed (kernel mode; user mode: as
+ * far as the client said it emitted, and the CP fetched it all). */
+static bool
+uq2_done(struct amd_uq *q)
+{
+	uint32_t rptr, fence;
+
+	if (q->user)
+		return (!uq2_user_busy(q, &rptr, &fence));
+	return (uq2_seq_passed(amd_mes12_uq_fence(q), q->seq));
+}
+
+bool
+amd_mes12_uq_user_busy(struct amd_uq *q, uint32_t *rptr, uint32_t *fence)
+{
+	return (uq2_user_busy(q, rptr, fence));
+}
+
+/* The GPU VA (in the client's VM) of a queue's fence. */
+uint64_t
+amd_mes12_uq_fence_va(struct amd_uq *q)
+{
+	return (q->va + UQ2_WB + 0x10);
 }
 
 /* The active MEC1 HQD (any pipe and queue) whose doorbell is `db`. */
@@ -2320,14 +2379,23 @@ uq2_free(struct amd_uq *q, u_int kvmid)
 {
 	uq2_unmap_vm(q, kvmid);
 	gart_unmap_blk(q->m->gt, q->gva, UQ_G_SIZE);
-	contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	if (!q->user)
+		contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
 	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
 	free(q, M_DEVBUF);
 }
 
+/*
+ * `upg` (UQ2_PAGES zeroed, contiguous pages at `upa`, the caller's until
+ * the queue is destroyed or freed lost) makes a user-mode queue: its
+ * doorbell is its own doorbell BAR page (AMD_UQ_DOORBELL_USER), which the
+ * client maps with ring and writeback page; the kernel never writes the
+ * ring. NULL: a kernel-mode queue on pages of its own.
+ */
 int
 amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
-    u_int slot, uint64_t va, uint32_t prio, struct amd_uq **out)
+    u_int slot, uint64_t va, uint32_t prio, uint8_t *upg, vm_paddr_t upa,
+    struct amd_uq **out)
 {
 	struct amd_gart *gt = m->gt;
 	struct amd_uq *q;
@@ -2337,20 +2405,28 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	*out = NULL;
 	if (slot >= AMD_UQ_SLOTS || (va & PAGE_MASK) != 0)
 		return (EINVAL);
+	if (upg != NULL && !m->udb_registered)
+		return (ENXIO);
 	q = malloc(sizeof(*q), M_DEVBUF, M_WAITOK | M_ZERO);
 	q->m = m;
 	q->vm = vm;
 	q->slot = slot;
-	q->db = AMD_UQ_DOORBELL(slot);
+	q->user = upg != NULL;
+	q->db = q->user ? AMD_UQ_DOORBELL_USER(slot) : AMD_UQ_DOORBELL(slot);
 	q->va = va;
 	q->gva = gt->gart_start + UQ2_GART_VA + (uint64_t)slot * UQ_G_SIZE;
 	if (q->gva + UQ_G_SIZE > gt->gart_end + 1) {
 		free(q, M_DEVBUF);
 		return (EINVAL);
 	}
-	q->pg = contigmalloc(UQ2_PAGES * PAGE_SIZE, M_DEVBUF, M_WAITOK |
-	    M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	q->pg_pa = vtophys(q->pg);
+	if (q->user) {
+		q->pg = upg;
+		q->pg_pa = upa;
+	} else {
+		q->pg = contigmalloc(UQ2_PAGES * PAGE_SIZE, M_DEVBUF,
+		    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		q->pg_pa = vtophys(q->pg);
+	}
 	q->g = contigmalloc(UQ_G_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	q->g_pa = vtophys(q->g);
@@ -2384,8 +2460,9 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	    prio)) != 0)
 		goto fail;
 	q->added = true;
-	device_printf(m->sc->dev, "uq%u: added: VM base %#jx, queue pages at "
+	device_printf(m->sc->dev, "uq%u: added%s: VM base %#jx, queue pages at "
 	    "VA %#jx (pa %#jx), MQD GART %#jx, doorbell %#x\n", slot,
+	    q->user ? " (user mode)" : "",
 	    (uintmax_t)amd_gmc12_vm_pd_addr(vm), (uintmax_t)va,
 	    (uintmax_t)q->pg_pa, (uintmax_t)(q->gva + UQ_G_MQD), q->db);
 	*out = q;
@@ -2406,6 +2483,15 @@ uint32_t
 amd_mes12_uq_doorbell(struct amd_uq *q)
 {
 	return (q->db);
+}
+
+/* A user-mode queue's doorbell page (registered fictitious); else 0. */
+vm_paddr_t
+amd_mes12_uq_doorbell_pa(struct amd_uq *q)
+{
+	if (!q->user)
+		return (0);
+	return (rman_get_start(q->m->dbbar) + (vm_paddr_t)q->db * 4);
 }
 
 uint32_t
@@ -2431,6 +2517,8 @@ amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 
 	if (!q->added)
 		return (ENXIO);
+	if (q->user)
+		return (EOPNOTSUPP);		/* the client's ring */
 	if (ib_dw == 0 || ib_dw > 0xfffffu || (ib & 3) != 0)
 		return (EINVAL);
 	/* The fence is the client's to write: a lie only makes its own
@@ -2476,10 +2564,11 @@ amd_mes12_uq_report(struct amd_uq *q, const char *when)
 	bool on;
 
 	on = uq2_hqd_find(q->m, q->db, &vmid);
-	device_printf(q->m->sc->dev, "uq%u: %s: seq %u, fence %u, wptr %ju, "
+	device_printf(q->m->sc->dev, "uq%u: %s: seq %u, fence %u, wptr %ju%s, "
 	    "rptr report %#x; HQD %s (VMID %u)\n", q->slot, when, q->seq,
-	    wb[4], (uintmax_t)q->wptr, wb[0], on ? "active" : "not mapped",
-	    vmid);
+	    wb[4], q->user ? (uintmax_t)*(volatile uint64_t *)(wb + 2) :
+	    (uintmax_t)q->wptr, q->user ? " (client's)" : "", wb[0],
+	    on ? "active" : "not mapped", vmid);
 }
 
 /*
@@ -2491,7 +2580,8 @@ amd_mes12_uq_free_lost(struct amd_uq *q)
 {
 	device_printf(q->m->sc->dev, "uq%u: freed after the GPU reset\n",
 	    q->slot);
-	contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	if (!q->user)
+		contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
 	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
 	free(q, M_DEVBUF);
 }
@@ -2511,21 +2601,20 @@ amd_mes12_uq_evict(struct amd_uq *q)
 	u_int vmid, us;
 	int err;
 
-	if (q->added && !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq)) {
+	if (q->added && !uq2_done(q)) {
 		amd_mes12_uq_report(q, "destroy: work in flight");
 		if (uq2_hqd_find(m, q->db, &vmid) && vmid >= 8) {
 			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);
-			for (us = 0; us < UQ2_KILL_WAIT_US &&
-			    !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq);
+			for (us = 0; us < UQ2_KILL_WAIT_US && !uq2_done(q);
 			    us += 100)
 				DELAY(100);
 			device_printf(m->sc->dev, "uq%u: VMID %u's waves "
 			    "killed (%d); fence %s after %u us\n", q->slot,
-			    vmid, err, uq2_seq_passed(amd_mes12_uq_fence(q),
-			    q->seq) ? "landed" : "still behind", us);
+			    vmid, err, uq2_done(q) ? "landed" : "still behind",
+			    us);
 		}
 	}
-	if (q->added && !uq2_seq_passed(amd_mes12_uq_fence(q), q->seq))
+	if (q->added && !uq2_done(q))
 		(void)uq2_hqd_reset(q);
 	if (q->added) {
 		err = uq_remove_raw(m, q->gva, q->db);
@@ -2765,6 +2854,18 @@ amd_mes12_up(struct atrium_amd_softc *sc, struct amd_gart *gt, bool kq,
 		free(m, M_DEVBUF);
 		return (ENXIO);
 	}
+	/*
+	 * The user-mode queues' doorbell pages (one BAR page each, after the
+	 * kernel's page 0 and MES's aggregated doorbells on page 1) as
+	 * fictitious pages, so a queue fd's pager (rs/uqueue.rs) can map
+	 * exactly one of them into its client and take it back.
+	 */
+	if (rman_get_size(m->dbbar) >= (bus_size_t)AMD_UQ_DOORBELL_USER(
+	    AMD_UQ_SLOTS) * 4 && vm_phys_fictitious_reg_range(
+	    rman_get_start(m->dbbar) + AMD_UQ_DOORBELL_USER(0) * 4,
+	    rman_get_start(m->dbbar) + AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) * 4,
+	    VM_MEMATTR_DEVICE) == 0)
+		m->udb_registered = true;
 	m->blk = contigmalloc(BLK_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	m->blk_pa = vtophys(m->blk);
@@ -2861,6 +2962,10 @@ mes_free(struct mes *m)
 	contigfree(m->blk, BLK_SIZE, M_DEVBUF);
 	if (m->scratch != NULL)
 		contigfree(m->scratch, 2 * MES_SCRATCH_SIZE, M_DEVBUF);
+	if (m->udb_registered)
+		vm_phys_fictitious_unreg_range(rman_get_start(m->dbbar) +
+		    AMD_UQ_DOORBELL_USER(0) * 4, rman_get_start(m->dbbar) +
+		    AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) * 4);
 	bus_release_resource(m->sc->dev, SYS_RES_MEMORY, m->dbrid, m->dbbar);
 	free(m, M_DEVBUF);
 }

@@ -914,13 +914,22 @@ uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
 void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
 #define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
 #define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
+/* A user-mode queue's doorbell: the first dword of its own doorbell BAR
+ * page (2 + slot; page 0 is the kernel's, page 1 MES's aggregated ones). */
+#define AMD_UQ_DOORBELL_USER(slot)	((2u + (slot)) << 10)
 /* RELEASE_MEM INT_CTXID, which an EOP IV carries in src_data[0]. */
 #define AMD_UQ_CTXID_FLAG	0x01000000u
 #define AMD_UQ_CTXID(db)	(AMD_UQ_CTXID_FLAG | ((db) & 0x00ffffffu))
 #define AMD_KQ_CTXID		0x02000006u
+#define AMD_MES_CTXID_FLAG	0x20000000u	/* MES's own EOPs (silicon) */
 struct amd_uq;
 int	amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
-	    u_int slot, uint64_t va, uint32_t prio, struct amd_uq **out);
+	    u_int slot, uint64_t va, uint32_t prio, uint8_t *upg,
+	    vm_paddr_t upa, struct amd_uq **out);
+vm_paddr_t amd_mes12_uq_doorbell_pa(struct amd_uq *q);
+bool	amd_mes12_uq_user_busy(struct amd_uq *q, uint32_t *rptr,
+	    uint32_t *fence);
+uint64_t amd_mes12_uq_fence_va(struct amd_uq *q);
 int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
 int	amd_mes12_uq_evict(struct amd_uq *q);
 int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,

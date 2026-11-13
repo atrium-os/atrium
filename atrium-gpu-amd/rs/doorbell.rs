@@ -25,7 +25,7 @@ use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kpi::bindings::PAGE_SIZE;
 use kpi::boxed::Box;
-use kpi::pager::{MgtDevHandle, VmObject};
+use kpi::pager::{Backing, MgtDevHandle, VmObject};
 use kpi::prelude::*;
 
 /// The pager handle of one owner's doorbell mapping.
@@ -38,12 +38,12 @@ pub struct Grant {
 }
 
 impl MgtDevHandle for Grant {
-    fn fault(&self, offset: u64, _prot: c_int) -> Option<u64> {
+    fn fault(&self, offset: u64, _prot: c_int) -> Option<Backing<'_>> {
         // One page; a revoked grant faults (SIGBUS) so the client knows.
         if self.revoked.load(Ordering::Relaxed) || offset != 0 {
             None
         } else {
-            Some(self.pa)
+            Some(Backing::Device(self.pa))
         }
     }
 }
