@@ -659,7 +659,7 @@ shipped rule); ostiarius 17 and portcullis-peer 9 on FreeBSD.
 Not yet: the session's apps see `/media` through their jails only where a
 manifest grants it (storage.md `removable_media`, not wired); a whole-disk
 (superfloppy) stick (done, §6.7); exFAT writes (done, §6.8); the lock screen as the caller of
-ostiarius `Lock`/`Unlock`. The Forum eject button came next (§6.6).
+ostiarius `Lock`/`Unlock` (done, lock-screen.md). The Forum eject button came next (§6.6).
 
 ### 6.6 As built: sticks in Forum, over Aqueduct (2026-11-13)
 
