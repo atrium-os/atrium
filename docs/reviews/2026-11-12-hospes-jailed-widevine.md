@@ -95,6 +95,20 @@ a second clone that holds upstream main deep enough to reach the fork's old base
 **Branch swap.** On Shankar's go-ahead, `atrium-os` was force-pushed to the rebased commit, and the old
 head `501a0bb0a` was kept as `atrium-os-pre-rebase-2026-11-12`.
 
+## Follow-up: boot hangs were an emulator bug (2026-11-13)
+
+After the rebase, the arm64 VM sometimes failed to boot the fork kernel: it hung on 1 boot in 2
+to 8, or panicked with "fault on nofault entry" inside `memset_mops`.
+
+- **The cause is QEMU.** Ubuntu 24.04's QEMU 8.2.2 lacks the fix for the SETM instruction
+  (FEAT_MOPS) on sizes over a page. That fix is QEMU 8.2.8, upstream `bab209af35`. Under
+  `-cpu max` the kernel uses MOPS for `memset` and page zeroing.
+- **The proof.** The same kernel booted 16 of 16 times on the atrium-os/qemu fork (10.2.92).
+- **The false lead.** A bisect first pointed at the memory-pressure module's startup hook.
+  Turning it off only shifted timing; it had no bug.
+- **The fix.** `sh scripts/build-qemu.sh` builds the fork. `cloud-vm.sh` uses that build when it
+  is present. Otherwise it falls back to `-cpu neoverse-n2`, which has no MOPS.
+
 ## The check
 
 ```

@@ -36,7 +36,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${ARCH:-aarch64}"
 case "$ARCH" in
     aarch64|arm64) ARCH=aarch64; VMDIR="${VMDIR:-$HOME/atrium-vm}"
-                   QEMU=qemu-system-aarch64; RUST_TRIPLE=aarch64-unknown-freebsd ;;
+                   QEMU=qemu-system-aarch64; RUST_TRIPLE=aarch64-unknown-freebsd
+                   FORK_QEMU="${QEMU_SRC:-$HOME/qemu-atrium}/build/qemu-system-aarch64" ;;
     amd64|x86_64)  ARCH=amd64;   VMDIR="${VMDIR:-$HOME/atrium-vm-amd64}"
                    QEMU=qemu-system-x86_64;  RUST_TRIPLE=x86_64-unknown-freebsd ;;
     *) echo "ARCH must be aarch64 or amd64" >&2; exit 2 ;;
@@ -101,7 +102,20 @@ boot() {
         else ACCEL="-accel tcg,thread=multi -cpu ${TCG_CPU:-Nehalem}"; fi
         MACH="-machine q35 $ACCEL"
     else
-        MACH="-machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth-impdef=on"
+        # ★ QEMU must have the SETM fix (QEMU 8.2.8 / 9.1.2, upstream
+        # bab209af35): FreeBSD's arm64 kernel uses FEAT_MOPS (SETP/SETM/SETE)
+        # for memset and page zeroing when the CPU has it, and the broken
+        # SETM in Ubuntu's 8.2.2 hangs or corrupts the guest intermittently
+        # (2026-11-13: rebased kernel hung 1 boot in 2-8 on 8.2.2, 16/16
+        # clean on the fork). scripts/build-qemu.sh builds the atrium-os/qemu
+        # fork, which is used automatically when present. Without it the
+        # default CPU is neoverse-n2, which has no MOPS. ARM_CPU overrides.
+        if [ -z "${QEMU_BIN:-}" ] && [ -x "$FORK_QEMU" ]; then QEMU_BIN="$FORK_QEMU"; fi
+        if [ -n "${QEMU_BIN:-}" ]; then DEF_CPU="max,pauth-impdef=on"
+        else DEF_CPU="neoverse-n2"
+            echo "  note: stock QEMU has broken MOPS; using -cpu neoverse-n2 (sh scripts/build-qemu.sh for the fork)" >&2
+        fi
+        MACH="-machine virt,gic-version=3 -accel tcg,thread=multi -cpu ${ARM_CPU:-$DEF_CPU}"
     fi
     # ICOUNT=<shift>: deterministic virtual time (one instruction = 2^shift
     # ns; idle time skipped). The guest's clock and every device, the sound
