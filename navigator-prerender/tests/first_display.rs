@@ -70,7 +70,8 @@ fn a_tier_one_conversion_hints_sheets_and_images_only() {
 fn a_scripted_conversion_hints_scripts_before_images() {
     let mut f = Hinted::default();
     navigator_prerender::convert_with(NAMES, Some("https://a.example/"), &mut navigator_prerender::boa_impl::BoaEngine::default(), &mut f);
-    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/a.js", "https://cdn.example/b.js", "https://a.example/p.png"]);
+    // ★ The cross-origin script is not hinted (legacy-web §5.4.1f).
+    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/a.js", "https://a.example/p.png"]);
 }
 
 #[test]
@@ -78,5 +79,5 @@ fn a_progressive_conversion_hints_once_for_both_in_first_display_order() {
     let mut f = Hinted::default();
     let mut eng = navigator_prerender::boa_impl::BoaEngine::default();
     navigator_prerender::convert_progressive(NAMES, Some("https://a.example/"), &mut eng, &mut f, false, &mut |_, _| {});
-    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/p.png", "https://a.example/a.js", "https://cdn.example/b.js"]);
+    assert_eq!(f.hints, vec!["https://a.example/s.css", "https://a.example/p.png", "https://a.example/a.js"]);
 }
