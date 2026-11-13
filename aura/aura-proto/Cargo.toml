@@ -1,0 +1,8 @@
+[package]
+name = "aura-proto"
+version = "0.1.0"
+description = "Aura control-channel protocol: the messages between the Wi-Fi kernel core (aura_wlan) and aura-mlme / aura-keys (wifi.md §3.2). no_std, no alloc, no unsafe, so the kernel module links the same code."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -104,9 +104,11 @@ and close to Linux's split for full-MAC chips; it is not new territory.
 
 ### 3.2 Control channel
 
-A character device per radio, `/dev/aura/ctlN`, carrying length-prefixed
+Two character devices per radio, `/dev/aura/ctlN` (for `aura-mlme`) and
+`/dev/aura/keyN` (for `aura-keys`: `SetKey`, `DelKey`, `PortAuthorized`,
+`TxEapol`, and EAPOL in; nothing else), each carrying length-prefixed
 messages of a versioned binary protocol defined once in a `no_std` crate
-(`aura-proto`) used by both sides. Requests: `Scan`, `Join`, `Auth`,
+(`aura-proto`, built: `aura/aura-proto`) used by both sides. Requests: `Scan`, `Join`, `Auth`,
 `Assoc`, `SetKey`, `DelKey`, `PortAuthorized`, `SetPowerSave`,
 `SetRegulatory`, `SetMac`, `TxMgmt`, `TxEapol`. Events: `MgmtRx`,
 `EapolRx`, `ScanDone`, `Disassociated`, `BeaconLoss`, `RfKill`,
@@ -311,7 +313,7 @@ W0–W2 need no Wi-Fi hardware at all.
 | `aura_mt79` / `aura_intel` | firmware events, RX descriptors, USB/PCIe responses (A4, A5) | kernel, Rust | DMA rings and interrupts need the kernel (no IOMMU-backed user DMA in FreeBSD). Only fixed-format structures are parsed; no IE ever. A USB user-space driver over `ugen` is possible (as Vinculum does) but costs throughput; not proposed, kept as a fallback if the kernel parser count grows |
 | `aura_wlan` | data-frame headers, A-MSDU subframes, fragments (A1, A3) | kernel, Rust | per-packet path. KRACK, FragAttacks rules live here: no key reinstall with a reset replay counter, drop non-SPP A-MSDU with an LLC/SNAP-looking DA, no mixed-key fragment reassembly, fragment cache flushed on rekey, unencrypted data dropped once the port is authorized, EAPOL accepted only from the associated BSSID |
 | `aura-mlme` (`aurad`'s parsing half) | beacons, probe responses, all IEs, auth/assoc/action frames, SAE commit/confirm framing, scan results (A1, A2) | jailed user space, Rust, fuzzed; uid `_aura`, no network, no files but state dir, capability mode after opening the cdev | the largest hostile parser; holds **no secrets** |
-| `aura-keys` (new) | EAPOL-Key frames (MIC checked before key data is parsed), SAE crypto | separate jail, uid `_aura-keys`, no network, no device node: talks only to `aura-mlme` (frames in, keys out to the kernel through it) and Arca | holds the password/PMK. Its parser is small and fixed-format, so a parser bug in `aura-mlme` does not hand over the network password. Recommend this split (decision 14) |
+| `aura-keys` (new) | EAPOL-Key frames (MIC checked before key data is parsed), SAE crypto | separate jail, uid `_aura-keys`, no network; its only device node is `/dev/aura/keyN` (keys, controlled port, EAPOL; the kernel refuses every other message there and never shows EAPOL or keys on `ctlN`); SAE frames reach it from `aura-mlme` over a socket; credentials from Arca | holds the password/PMK. Its parser is small and fixed-format, so a parser bug in `aura-mlme` does not hand over the network password. Recommend this split (decision 14) |
 | `aura-eap` (W7) | EAP, TLS server certificate chains (A2) | third jail, per join | TLS is a large parser; wpa_supplicant's EAP code has had memory bugs. Client certificate keys stay in Arca/Sigillum and sign through them |
 | `atrium-net` | no radio input; requests from Forum/apps | root, narrow | applies results only (addresses, routes) |
 | DHCP client | DHCP replies (A3) | jailed, Rust (or FreeBSD `dhclient`'s privsep child until then) | an A3 parser; network.md currently has `atrium-net` run `dhclient`. Recommend a jailed client (decision 15; belongs to the network work, noted here) |

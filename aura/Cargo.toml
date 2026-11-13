@@ -1,0 +1,13 @@
+# Aura, the Wi-Fi stack (docs/spec/wifi.md).
+#
+# Its own workspace with no path dependency outside aura/, so the user-space
+# parts build on stock FreeBSD too (spec decision 12).
+[workspace]
+resolver = "2"
+members = [
+    "aura-proto",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
