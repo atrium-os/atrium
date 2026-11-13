@@ -6,6 +6,11 @@
 //! owner and the node to grant. A device no rule matches, or one whose bus
 //! reported no collections, is given to nobody.
 //!
+//! USB interfaces (`usb` rules) come from the attach or nomatch line the
+//! kernel sends for each interface of a device under a `uhub`, which carries
+//! `ugen=`, the ids and the interface class; the device going is the `USB`
+//! `DEVICE` `DETACH` notify, since an unclaimed interface has no detach.
+//!
 //! Every line also feeds a [`Registry`], so the daemon knows every device
 //! present (for its state file) with an id that is never reused.
 
@@ -14,7 +19,7 @@ use std::collections::BTreeMap;
 use atrium_devevents::devctl::{self, Change, DevEvent, Registry};
 use atrium_devevents::hidclass::{self, Classifier, Decision, Notice};
 
-use crate::rules::{fill, Owner, Rules};
+use crate::rules::{fill, Owner, Rules, UsbInterface};
 
 /// The placeholders of one device, by name (`hidraw` -> `4`).
 pub type Vars = BTreeMap<String, String>;
@@ -23,8 +28,12 @@ pub type Vars = BTreeMap<String, String>;
 pub enum Op {
     /// Unhide `node` (relative to /dev) in `service`'s devfs mount.
     Show { service: String, node: String },
-    /// Start `driver`'s jail for `device` (`hidraw4`, `pcm1`), granting `node`.
-    StartDriver { driver: String, device: String, vars: Vars, node: String, label: String },
+    /// Start `driver`'s jail for `device` (`hidraw4`, `pcm1`, `ugen0.2:1`),
+    /// granting `nodes` (one, or every node of the rule with `all_nodes`).
+    StartDriver { driver: String, device: String, vars: Vars, nodes: Vec<String>, label: String },
+    /// Take USB interface `interface` of `ugen` (`ugen0.2`) from the kernel
+    /// driver that has it, so its rule's owner can.
+    DetachKernel { ugen: String, interface: u8 },
     /// Stop `driver`'s jail for `device`; `vars` holds its instance placeholder.
     StopDriver { driver: String, device: String, vars: Vars },
     Log(String),
@@ -43,9 +52,32 @@ pub struct Planner {
     rules: Rules,
     hid: Classifier,
     /// Keyed by the device's name: `hidrawN` for HID, the driver instance
-    /// (`pcm1`) for the `driver` class.
+    /// (`pcm1`) for the `driver` class, `ugenB.A:I` for a USB interface.
     owned: BTreeMap<String, Assignment>,
     pub registry: Registry,
+}
+
+/// A USB interface's attach or nomatch: `(ugen, bus, addr, interface, ids
+/// and class)`. `None` for anything else, or a field out of shape.
+fn usb_interface(d: &devctl::Device) -> Option<(String, u32, u32, u8, UsbInterface)> {
+    if !d.parent.starts_with("uhub") {
+        return None;
+    }
+    let f = &d.fields;
+    let ugen = f.get("ugen")?;
+    let (bus, addr) = ugen_numbers(ugen)?;
+    let interface: u8 = f.get("interface")?.parse().ok()?;
+    let byte = |k: &str| f.hex(k).and_then(|v| u8::try_from(v).ok());
+    let word = |k: &str| f.hex(k).and_then(|v| u16::try_from(v).ok());
+    let i = UsbInterface { vendor: word("vendor")?, product: word("product")?, class: byte("intclass")?, subclass: byte("intsubclass")?, protocol: byte("intprotocol")? };
+    Some((ugen.to_string(), bus, addr, interface, i))
+}
+
+/// `ugenB.A` -> `(B, A)`.
+pub fn ugen_numbers(s: &str) -> Option<(u32, u32)> {
+    let (b, a) = s.strip_prefix("ugen")?.split_once('.')?;
+    let num = |x: &str| if !x.is_empty() && x.len() <= 3 && x.bytes().all(|c| c.is_ascii_digit()) { x.parse().ok() } else { None };
+    Some((num(b)?, num(a)?))
 }
 
 fn vars(pairs: &[(&str, Option<String>)]) -> Vars {
@@ -76,23 +108,71 @@ impl Planner {
     /// (a detach names only the top of a subtree).
     fn event(&mut self, ev: &DevEvent) -> Vec<Op> {
         let mut out = Vec::new();
-        for c in self.registry.feed(ev) {
-            match c {
-                Change::Removed(d) => {
-                    if let Some(name) = d.name {
-                        if !name.starts_with("hidraw") {
-                            out.extend(self.release(&name));
-                        }
+        let mut changes = self.registry.feed(ev);
+        if let DevEvent::Notify { system, subsystem, kind, fields } = ev {
+            if (system.as_str(), subsystem.as_str(), kind.as_str()) == ("USB", "DEVICE", "DETACH") {
+                if let Some(ugen) = fields.get("ugen").filter(|u| ugen_numbers(u).is_some()) {
+                    // Its unclaimed interfaces never get a detach line.
+                    changes.extend(self.registry.forget_unclaimed(|d| d.parent.starts_with("uhub") && d.fields.get("ugen") == Some(ugen)));
+                    let prefix = format!("{ugen}:");
+                    let keys: Vec<String> = self.owned.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+                    for k in keys {
+                        out.extend(self.release(&k));
                     }
                 }
+            }
+        }
+        for c in changes {
+            match c {
+                // A kernel driver leaving a USB interface (perhaps detached
+                // for a rule's owner) is not the device going: that is the
+                // notify above, or the hub going for an unclaimed one.
+                Change::Removed(d) => match (d.name.clone(), usb_interface(&d)) {
+                    (None, Some((ugen, .., interface, _))) => out.extend(self.release(&format!("{ugen}:{interface}"))),
+                    (Some(name), _) if !name.starts_with("hidraw") => out.extend(self.release(&name)),
+                    _ => {}
+                },
                 Change::Added(d) => {
-                    if let Some(name) = d.name {
-                        out.extend(self.driver_attach(&name));
+                    let usb = usb_interface(&d).and_then(|u| self.usb_attach(d.name.as_deref(), u));
+                    match (usb, d.name) {
+                        (Some(ops), _) => out.extend(ops),
+                        (None, Some(name)) => out.extend(self.driver_attach(&name)),
+                        (None, None) => {}
                     }
                 }
             }
         }
         out
+    }
+
+    /// `None`: a kernel driver has it and no `usb` rule wants it (a
+    /// `driver` rule may, by that driver's name).
+    fn usb_attach(&mut self, kernel: Option<&str>, (ugen, bus, addr, interface, i): (String, u32, u32, u8, UsbInterface)) -> Option<Vec<Op>> {
+        let device = format!("{ugen}:{interface}");
+        let label = format!("{:04x}:{:04x} class {:02x}/{:02x}/{:02x}", i.vendor, i.product, i.class, i.subclass, i.protocol);
+        let Some((rule, owner)) = self.rules.match_usb(&i) else {
+            return kernel.is_none().then(|| vec![Op::Log(format!("{device} ({label}): no driver and no rule; shown to nobody"))]);
+        };
+        if let (Some(k), false) = (kernel, rule.detach_kernel) {
+            return Some(vec![Op::Log(format!("{device} ({label}) matches rule {} but kernel driver {k} has it (the rule has no detach_kernel)", rule.name))]);
+        }
+        let pairs = [
+            ("usb", Some(format!("{bus}-{addr}-{interface}"))),
+            ("bus", Some(bus.to_string())),
+            ("addr", Some(addr.to_string())),
+            ("interface", Some(interface.to_string())),
+        ];
+        let filled: Vec<String> = rule.nodes.iter().filter_map(|t| fill(t, &pairs)).collect();
+        let nodes = if rule.all_nodes { filled } else { filled.into_iter().take(1).collect() };
+        let a = Assignment { rule: rule.name.clone(), owner: owner.clone(), nodes, vars: vars(&pairs) };
+        let mut out = Vec::new();
+        if kernel.is_some() {
+            // Also when the owner runs already: a module devmatch loaded
+            // after the owner started has just taken the interface back.
+            out.push(Op::DetachKernel { ugen, interface });
+        }
+        out.extend(self.assign(&device, a, label, Vec::new()));
+        Some(out)
     }
 
     fn driver_attach(&mut self, name: &str) -> Vec<Op> {
@@ -165,7 +245,7 @@ impl Planner {
                 driver: driver.clone(),
                 device: device.to_string(),
                 vars: a.vars.clone(),
-                node: a.nodes[0].clone(),
+                nodes: a.nodes.clone(),
                 label,
             }),
         }
@@ -246,7 +326,7 @@ mod tests {
                     driver: "sigillum-fido".into(),
                     device: format!("hidraw{hidraw}"),
                     vars: Vars::new(),
-                    node: u2f.map_or(format!("hidraw{hidraw}"), |u| format!("u2f/{u}")),
+                    nodes: vec![u2f.map_or(format!("hidraw{hidraw}"), |u| format!("u2f/{u}"))],
                     label: format!("{vendor:04x}:{product:04x}"),
                 }),
                 hidowner::Op::StopIdentity { hidraw } => Some(Op::StopDriver { driver: "sigillum-fido".into(), device: format!("hidraw{hidraw}"), vars: Vars::new() }),
@@ -259,7 +339,7 @@ mod tests {
         ops.into_iter()
             .filter_map(|o| match o {
                 Op::Log(_) => None,
-                Op::StartDriver { driver, device, node, label, .. } => Some(Op::StartDriver { driver, device, vars: Vars::new(), node, label }),
+                Op::StartDriver { driver, device, nodes, label, .. } => Some(Op::StartDriver { driver, device, vars: Vars::new(), nodes, label }),
                 Op::StopDriver { driver, device, .. } => Some(Op::StopDriver { driver, device, vars: Vars::new() }),
                 o => Some(o),
             })
@@ -340,7 +420,7 @@ nexus0
                     driver: "sigillum-fido".into(),
                     device: "hidraw1".into(),
                     vars: [("hidbus", "1"), ("hidraw", "1"), ("u2f", "0")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-                    node: "u2f/0".into(),
+                    nodes: vec!["u2f/0".into()],
                     label: "46f4:0005".into(),
                 },
                 Op::Log("hidraw2 (0000:0000): no collections reported; shown to nobody".into()),
@@ -350,7 +430,7 @@ nexus0
         p.line("? at index=1 page=0xf1d0 usage=0x0001 on hidbus5");
         let ops = p.line("+hidraw5 at  on hidbus5");
         assert!(matches!(&ops[0], Op::Log(m) if m.contains("sigillum-fido") && m.contains("0001")), "{ops:?}");
-        assert!(matches!(&ops[1], Op::StartDriver { node, .. } if node == "hidraw5"));
+        assert!(matches!(&ops[1], Op::StartDriver { nodes, .. } if nodes == &["hidraw5"]));
         assert!(p.state().contains("hidraw1 id="));
         assert!(p.registry.len() > 10);
     }
@@ -393,5 +473,125 @@ nexus0
         // Unknown drivers and look-alike names go to nobody.
         assert!(p.line("+pcmx at  on hdaa0").is_empty());
         assert!(p.line("+vgapci0 at slot=1 on pci0").is_empty());
+    }
+
+    const USB_RULES: &str = r#"
+[[rule]]
+name          = "t-ccid"
+class         = "usb"
+usb_interface = [0x0B]
+nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
+all_nodes     = true
+owner         = "driver:t-ccid"
+
+[[rule]]
+name          = "t-bt"
+class         = "usb"
+usb_interface = [0xE0, 0x01, 0x01]
+detach_kernel = true
+nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
+all_nodes     = true
+owner         = "driver:t-bt"
+
+[[rule]]
+name          = "t-one-reader"
+class         = "usb"
+usb_ids       = ["08e6:3437"]
+usb_interface = [0x0B]
+priority      = 10
+nodes         = ["ugen{bus}.{addr}", "usb/{bus}.{addr}.0"]
+all_nodes     = true
+owner         = "driver:t-ccid"
+
+[driver.t-ccid]
+exec          = "/usr/local/bin/t-ccid"
+argv          = ["t-ccid", "--dev", "/dev/{node}", "--if", "{interface}"]
+uid           = 65050
+gid           = 65050
+jail          = "atrium-t-ccid-{usb}"
+root          = "/var/lib/atrium/jails/t-ccid-{usb}"
+devfs_ruleset = 28
+sysfil        = "device"
+
+[driver.t-bt]
+exec          = "/usr/local/bin/t-bt"
+argv          = ["t-bt", "/dev/{node}"]
+uid           = 65051
+gid           = 65051
+jail          = "atrium-t-bt-{usb}"
+root          = "/var/lib/atrium/jails/t-bt-{usb}"
+devfs_ruleset = 25
+sysfil        = "device"
+"#;
+
+    fn usb_line(kind: &str, addr: u32, ids: &str, class: &str) -> String {
+        let (v, p) = ids.split_once(':').unwrap();
+        let c: Vec<&str> = class.split('/').collect();
+        format!(
+            "{kind} at bus=0 hubaddr=1 port={addr} devaddr={addr} interface=0 ugen=ugen0.{addr} vendor=0x{v} product=0x{p} devclass=0x00 devsubclass=0x00 devproto=0x00 sernum=\"\" release=0x0100 mode=host intclass=0x{} intsubclass=0x{} intprotocol=0x{} on uhub0",
+            c[0], c[1], c[2]
+        )
+    }
+
+    #[test]
+    fn usb_interfaces() {
+        let mut r = shipped();
+        r.add_toml("u", USB_RULES).unwrap();
+        let mut p = Planner::new(r.finish().unwrap());
+        let start = |driver: &str, addr: u32, label: &str| Op::StartDriver {
+            driver: driver.into(),
+            device: format!("ugen0.{addr}:0"),
+            vars: [("usb", format!("0-{addr}-0")), ("bus", "0".into()), ("addr", addr.to_string()), ("interface", "0".into())].into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            nodes: vec![format!("ugen0.{addr}"), format!("usb/0.{addr}.0")],
+            label: label.into(),
+        };
+        // A reader no kernel driver claims: its owner starts with both nodes;
+        // devd repeating the nomatch changes nothing.
+        let reader = usb_line("?", 3, "1050:0407", "0b/00/00");
+        assert_eq!(p.line(&reader), vec![start("t-ccid", 3, "1050:0407 class 0b/00/00")]);
+        assert_eq!(p.line(&reader), vec![]);
+        // The device goes: only the notify says so for an unclaimed interface.
+        let gone = |a: u32| format!("!system=USB subsystem=DEVICE type=DETACH ugen=ugen0.{a} cdev=ugen0.{a} vendor=0x1050 product=0x0407 devclass=0x00 devsubclass=0x00 sernum=\"\" release=0x0100 mode=host port={a} parent=uhub0");
+        let stop = |d: &str, a: u32| Op::StopDriver { driver: d.into(), device: format!("ugen0.{a}:0"), vars: [("usb".to_string(), format!("0-{a}-0"))].into() };
+        assert_eq!(p.line(&gone(3)), vec![stop("t-ccid", 3)]);
+        // Plugged back at the same address: a new start, not "seen already".
+        assert_eq!(p.line(&reader), vec![start("t-ccid", 3, "1050:0407 class 0b/00/00")]);
+        // By id, the higher priority rule wins (same owner here).
+        let ops = p.line(&usb_line("?", 5, "08e6:3437", "0b/00/00"));
+        assert_eq!(ops, vec![start("t-ccid", 5, "08e6:3437 class 0b/00/00")]);
+        assert!(p.state().contains("ugen0.5:0 id=0 rule=t-one-reader owner=driver:t-ccid nodes=ugen0.5,usb/0.5.0"), "{}", p.state());
+        // Bluetooth: ng_ubt has it; the rule detaches it, then starts.
+        let bt = usb_line("+ng_ubt0", 4, "0a12:0001", "e0/01/01");
+        assert_eq!(p.line(&bt), vec![Op::DetachKernel { ugen: "ugen0.4".into(), interface: 0 }, start("t-bt", 4, "0a12:0001 class e0/01/01")]);
+        // Its detach is not the device going; a module that attaches again
+        // is detached again, the jail kept.
+        assert_eq!(p.line(&usb_line("-ng_ubt0", 4, "0a12:0001", "e0/01/01")), vec![]);
+        assert_eq!(p.line(&bt), vec![Op::DetachKernel { ugen: "ugen0.4".into(), interface: 0 }]);
+        assert_eq!(p.line(&gone(4)), vec![stop("t-bt", 4)]);
+        // Kernel-claimed with no usb rule: the kernel's, quietly; unclaimed
+        // with no rule: logged.
+        assert_eq!(p.line(&usb_line("+ukbd0", 6, "0627:0001", "03/01/01")), vec![]);
+        assert!(matches!(&p.line(&usb_line("?", 7, "dead:beef", "ff/00/00"))[..], [Op::Log(m)] if m.contains("shown to nobody")));
+        // A missing or malformed field is not a USB interface.
+        assert_eq!(p.line(&usb_line("?", 8, "1050:0407", "0b/00/00").replace("ugen=ugen0.8", "ugen=ugenx")), vec![]);
+        // A bare-ugen notify for a device never seen ends nothing.
+        assert_eq!(p.line(&gone(9)), vec![]);
+    }
+
+    #[test]
+    fn usb_at_start_from_devinfo() {
+        let mut r = Rules::default();
+        r.add_toml("u", USB_RULES).unwrap();
+        let mut p = Planner::new(r.finish().unwrap());
+        let tree = "\
+nexus0
+  pci0
+    xhci0 <XHCI>
+      usbus0
+        uhub0 <Root hub>
+          unknown pnpinfo vendor=0x1050 product=0x0407 devclass=0x00 devsubclass=0x00 devproto=0x00 sernum=\"\" release=0x0100 mode=host intclass=0x0b intsubclass=0x00 intprotocol=0x00 at bus=0 hubaddr=1 port=1 devaddr=2 interface=0 ugen=ugen0.2
+";
+        let ops = p.devinfo(tree);
+        assert!(matches!(&ops[..], [Op::StartDriver { device, nodes, .. }] if device == "ugen0.2:0" && nodes == &["ugen0.2", "usb/0.2.0"]), "{ops:?}");
     }
 }

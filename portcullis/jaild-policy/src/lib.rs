@@ -278,9 +278,9 @@ pub struct PinnedRuleset {
     /// + unit), all running `exec_path` as `uid`.
     #[serde(default)]
     pub name_prefix: bool,
-    /// Device nodes a request may name in `devfs_grant`, as patterns where
-    /// a trailing `#` stands for one or more digits (`hidraw#`). Empty: no
-    /// grants on this ruleset.
+    /// Device nodes a request may name in `devfs_grant`/`devfs_grants`, as
+    /// patterns where each `#` stands for 1 to 4 digits (`hidraw#`,
+    /// `ugen#.#`, `usb/#.#.0`). Empty: no grants on this ruleset.
     #[serde(default)]
     pub grant_nodes: Vec<String>,
 }
@@ -295,15 +295,33 @@ impl PinnedRuleset {
         }
     }
 
-    /// May a request on this ruleset show `node` (`hidraw3`)?
+    /// May a request on this ruleset show `node` (`hidraw3`, `usb/0.2.0`)?
     pub fn allows_grant(&self, node: &str) -> bool {
-        self.grant_nodes.iter().any(|pat| match pat.strip_suffix('#') {
-            Some(prefix) => node
-                .strip_prefix(prefix)
-                .is_some_and(|d| !d.is_empty() && d.len() <= 4 && d.bytes().all(|b| b.is_ascii_digit())),
-            None => node == pat,
-        })
+        self.grant_nodes.iter().any(|pat| grant_matches(pat, node))
     }
+}
+
+/// `#` in a grant pattern stands for 1 to 4 digits, everything else is
+/// literal: `hidraw#`, `u2f/#`, `ugen#.#`, `usb/#.#.0`. A `#` is never
+/// followed by a digit in a pattern, so the match is unambiguous.
+pub fn grant_matches(pat: &str, node: &str) -> bool {
+    let (mut p, mut n) = (pat.as_bytes(), node.as_bytes());
+    while let Some((&c, rest)) = p.split_first() {
+        if c == b'#' {
+            let d = n.iter().take_while(|b| b.is_ascii_digit()).count();
+            if d == 0 || d > 4 {
+                return false;
+            }
+            n = &n[d..];
+        } else {
+            match n.split_first() {
+                Some((&x, r)) if x == c => n = r,
+                _ => return false,
+            }
+        }
+        p = rest;
+    }
+    n.is_empty()
 }
 
 impl DevfsRulesets {
@@ -515,6 +533,17 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_patterns() {
+        for (pat, node) in [("hidraw#", "hidraw0"), ("hidraw#", "hidraw9999"), ("u2f/#", "u2f/3"), ("ugen#.#", "ugen0.2"), ("usb/#.#.0", "usb/12.127.0"), ("kbdmux", "kbdmux")] {
+            assert!(grant_matches(pat, node), "{pat} {node}");
+        }
+        for (pat, node) in [("hidraw#", "hidraw"), ("hidraw#", "hidraw12345"), ("hidraw#", "hidraw3a"), ("ugen#.#", "ugen0."), ("ugen#.#", "ugen0.2.1"),
+                            ("ugen#.#", "ugen.2"), ("usb/#.#.0", "usb/0.2.1"), ("usb/#.#.0", "usb/0.2.0/x"), ("usb/#.#.0", "usb/0.2"), ("kbdmux", "kbdmux0")] {
+            assert!(!grant_matches(pat, node), "{pat} {node}");
+        }
+    }
 
     fn sysfil_sample() -> SysfilPolicy {
         toml::from_str(r#"

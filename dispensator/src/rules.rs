@@ -7,7 +7,7 @@
 //! (`[service.NAME]`). All files of the directory are merged; a name defined
 //! twice is an error, so one package cannot redefine another's driver.
 //!
-//! Two device classes so far:
+//! Three device classes so far:
 //!
 //! - `hid`: a HID device (one `hidbus`) with its top-level collections'
 //!   usage pages, its `hidraw` unit and, when `u2f(4)` drives a FIDO
@@ -15,14 +15,20 @@
 //! - `driver`: a device a kernel driver attached, by driver name (`pcm`,
 //!   `atkbd`, `psm`): `driver = "pcm"` matches `pcm0`, `pcm1`... Placeholder
 //!   `{unit}`. Used for kernel class drivers whose nodes a service consumes.
+//! - `usb`: one interface of a USB device, by interface class (`usb_interface
+//!   = [class, subclass, protocol]`, a prefix) and/or `usb_ids =
+//!   ["vvvv:pppp"]`, whether or not a kernel driver took it (with
+//!   `detach_kernel`, dispensatord detaches that driver first). Placeholders
+//!   `{bus}`, `{addr}`, `{interface}`, and `{usb}` = `B-A-I` naming the
+//!   interface (jail names take no dots). Nodes are typically `ugen{bus}.{addr}`
+//!   and `usb/{bus}.{addr}.0`, with `all_nodes`: libusb opens both.
 //!
-//! More classes (USB interfaces,
-//! `pcm`, disks) come with D3 and D4.
+//! Disks come with D5b.
 //!
 //! Templates use the class's placeholders and, in a driver's argv, `{node}`
-//! (the node the rule granted). A driver's `jail` and `root` take only the
-//! class's instance placeholder (`{hidraw}` or `{unit}`), so one jail per
-//! device and a stop needs only what a detach names.
+//! (the first node the rule granted). A driver's `jail` and `root` take only
+//! the class's instance placeholder (`{hidraw}`, `{unit}` or `{usb}`), so one
+//! jail per device and a stop needs only what a detach names.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -44,6 +50,19 @@ pub struct Rule {
     /// `driver`: the kernel driver's name (devices `NAME0`, `NAME1`...).
     #[serde(default)]
     pub driver: String,
+    /// `usb`: interface class, subclass, protocol; a prefix (`[0x0B]` is
+    /// every smart-card reader).
+    #[serde(default)]
+    pub usb_interface: Vec<u8>,
+    /// `usb`: `"vvvv:pppp"` in hex; any of them. With `usb_interface` too,
+    /// both must match.
+    #[serde(default)]
+    pub usb_ids: Vec<String>,
+    /// `usb`: when a kernel driver has the interface, detach it
+    /// (`usbconfig detach_kernel_driver`) and start the owner anyway.
+    /// Without it such an interface is left to the kernel.
+    #[serde(default)]
+    pub detach_kernel: bool,
     /// Nodes to grant, in order; the first whose placeholders are all
     /// known is used, or every one with `all_nodes`.
     pub nodes: Vec<String>,
@@ -61,7 +80,7 @@ pub struct Driver {
     pub uid: u32,
     pub gid: u32,
     /// Jail name; must contain the instance placeholder of every rule class
-    /// that uses this driver (`{hidraw}` or `{unit}`), and no other.
+    /// that uses this driver (`{hidraw}`, `{unit}` or `{usb}`), and no other.
     pub jail: String,
     /// Jail root; as for `jail`.
     pub root: String,
@@ -133,17 +152,40 @@ pub fn class_vars(class: &str) -> &'static [&'static str] {
     match class {
         "hid" => &["hidraw", "hidbus", "u2f"],
         "driver" => &["unit"],
+        "usb" => &["usb", "bus", "addr", "interface"],
         _ => &[],
     }
 }
 
+/// Every placeholder of every class.
+pub const ALL_VARS: &[&str] = &["hidraw", "hidbus", "u2f", "unit", "usb", "bus", "addr", "interface"];
+
 /// The placeholder naming one device of a class (jail names, stops).
 pub fn instance_var(class: &str) -> &'static str {
-    if class == "hid" {
-        "hidraw"
-    } else {
-        "unit"
+    match class {
+        "hid" => "hidraw",
+        "usb" => "usb",
+        _ => "unit",
     }
+}
+
+/// `"vvvv:pppp"`.
+pub fn parse_usb_id(s: &str) -> Option<(u16, u16)> {
+    let (v, p) = s.split_once(':')?;
+    if v.len() != 4 || p.len() != 4 {
+        return None;
+    }
+    Some((u16::from_str_radix(v, 16).ok()?, u16::from_str_radix(p, 16).ok()?))
+}
+
+/// One USB interface as devd reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbInterface {
+    pub vendor: u16,
+    pub product: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
 }
 
 fn driver_name_ok(s: &str) -> bool {
@@ -221,7 +263,7 @@ impl Rules {
                 return Err(w("argv must have 1 to 32 entries".into()));
             }
             for a in &d.argv {
-                check_template("argv", a, &["hidraw", "hidbus", "u2f", "unit", "node"]).map_err(|e| w(e.0))?;
+                check_template("argv", a, &[ALL_VARS, &["node"]].concat()).map_err(|e| w(e.0))?;
             }
             if d.uid == 0 || d.gid == 0 {
                 return Err(w("a driver never runs as root".into()));
@@ -231,11 +273,11 @@ impl Rules {
             }
             // Which instance placeholder must appear is checked per rule
             // in finish(), once the rules naming this driver are known.
-            check_template("jail", &d.jail, &["hidraw", "unit"]).map_err(|e| w(e.0))?;
+            check_template("jail", &d.jail, &["hidraw", "unit", "usb"]).map_err(|e| w(e.0))?;
             if !d.jail.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_{}".contains(&b)) {
                 return Err(w("jail name: letters, digits, '-', '_' only".into()));
             }
-            check_abs("root", &d.root, &["hidraw", "unit"]).map_err(|e| w(e.0))?;
+            check_abs("root", &d.root, &["hidraw", "unit", "usb"]).map_err(|e| w(e.0))?;
             if !ident_ok(&d.sysfil) {
                 return Err(w("sysfil: a profile name".into()));
             }
@@ -269,11 +311,21 @@ impl Rules {
             if self.rules.len() == MAX_RULES {
                 return Err(w(format!("more than {MAX_RULES} rules")));
             }
+            let usb_fields = !r.usb_interface.is_empty() || !r.usb_ids.is_empty() || r.detach_kernel;
             match r.class.as_str() {
-                "hid" if r.driver.is_empty() => {}
-                "driver" if r.any_page.is_empty() && driver_name_ok(&r.driver) => {}
-                "hid" | "driver" => return Err(w("hid takes any_page, driver takes driver = \"NAME\"".into())),
-                c => return Err(w(format!("class {c:?}: \"hid\" or \"driver\""))),
+                "hid" if r.driver.is_empty() && !usb_fields => {}
+                "driver" if r.any_page.is_empty() && !usb_fields && driver_name_ok(&r.driver) => {}
+                "usb" if r.any_page.is_empty() && r.driver.is_empty() => {
+                    // Never "every USB device": a rule names what it drives.
+                    if r.usb_interface.is_empty() && r.usb_ids.is_empty() {
+                        return Err(w("usb takes usb_interface and/or usb_ids".into()));
+                    }
+                    if r.usb_interface.len() > 3 || r.usb_ids.len() > 32 || r.usb_ids.iter().any(|i| parse_usb_id(i).is_none()) {
+                        return Err(w("usb_interface: 1 to 3 bytes; usb_ids: up to 32 \"vvvv:pppp\"".into()));
+                    }
+                }
+                "hid" | "driver" | "usb" => return Err(w("hid takes any_page, driver takes driver = \"NAME\", usb takes usb_interface/usb_ids/detach_kernel".into())),
+                c => return Err(w(format!("class {c:?}: \"hid\", \"driver\" or \"usb\""))),
             }
             if r.nodes.is_empty() || r.nodes.len() > 8 {
                 return Err(w("nodes: 1 to 8 entries".into()));
@@ -306,9 +358,6 @@ impl Rules {
                 return err(format!("rule {}: owner {} is not defined in any file", r.name, r.owner));
             }
             if let Owner::Driver(n) = o {
-                if r.all_nodes {
-                    return err(format!("rule {}: a driver jail is granted one node; all_nodes is for services", r.name));
-                }
                 let d = &self.drivers[n];
                 let v = instance_var(&r.class);
                 for (k, t) in [("jail", &d.jail), ("root", &d.root)] {
@@ -370,6 +419,16 @@ impl Rules {
         Some((self.best(|r| r.class == "driver" && r.driver == drv)?, unit))
     }
 
+    /// The winning rule for one USB interface.
+    pub fn match_usb(&self, i: &UsbInterface) -> Option<&(Rule, Owner)> {
+        let class = [i.class, i.subclass, i.protocol];
+        self.best(|r| {
+            r.class == "usb"
+                && class.starts_with(&r.usb_interface)
+                && (r.usb_ids.is_empty() || r.usb_ids.iter().any(|x| parse_usb_id(x) == Some((i.vendor, i.product))))
+        })
+    }
+
     fn best(&self, f: impl Fn(&Rule) -> bool) -> Option<&(Rule, Owner)> {
         self.rules
             .iter()
@@ -424,6 +483,7 @@ mod tests {
             ("\"hidraw{hidraw}\"]", "\"{disk}\"]"),
             ("owner    = \"driver:sigillum-fido\"", "owner    = \"root:x\""),
             ("class    = \"hid\"", "class    = \"usb\""),
+            ("class    = \"hid\"", "class    = \"hid\"\ndetach_kernel = true"),
             ("class    = \"hid\"", "class    = \"driver\""),
             ("root          = \"/var/lib/atrium/jails/sigillum-fido-{hidraw}\"", "root          = \"/var/lib/atrium/jails/sigillum-fido-{u2f}-{hidraw}\""),
         ];
@@ -482,6 +542,26 @@ mod tests {
         assert!(r.finish().is_err(), "a {{hidraw}} jail used for a {{unit}} class");
         let mut r = Rules::default();
         r.add_toml("x", "[[rule]]\nname=\"p\"\nclass=\"driver\"\ndriver=\"pcm\"\nnodes=[\"dsp{unit}\"]\nall_nodes=true\nowner=\"driver:d\"\n[driver.d]\nexec=\"/x\"\nargv=[\"x\"]\nuid=5\ngid=5\njail=\"j-{unit}\"\nroot=\"/r/{unit}\"\ndevfs_ruleset=30\nsysfil=\"device\"\n").unwrap();
-        assert!(r.finish().is_err(), "all_nodes with a driver owner");
+        r.finish().expect("all_nodes with a driver owner: several grants");
+    }
+
+    #[test]
+    fn usb_class_checks() {
+        let rule = |extra: &str| format!("[[rule]]\nname=\"u\"\nclass=\"usb\"\n{extra}\nnodes=[\"ugen{{bus}}.{{addr}}\", \"usb/{{bus}}.{{addr}}.0\"]\nall_nodes=true\nowner=\"driver:d\"\n[driver.d]\nexec=\"/x\"\nargv=[\"x\", \"/dev/{{node}}\"]\nuid=5\ngid=5\njail=\"j-{{usb}}\"\nroot=\"/r/{{usb}}\"\ndevfs_ruleset=30\nsysfil=\"device\"\n");
+        let load = |t: &str| {
+            let mut r = Rules::default();
+            r.add_toml("x", t).and_then(|_| r.finish())
+        };
+        let r = load(&rule("usb_interface = [0x0B, 0x00]\nusb_ids = [\"1050:0407\"]")).unwrap();
+        let i = |v, p, c| UsbInterface { vendor: v, product: p, class: c, subclass: 0, protocol: 0 };
+        assert!(r.match_usb(&i(0x1050, 0x0407, 0x0B)).is_some());
+        assert!(r.match_usb(&i(0x1050, 0x0407, 0x03)).is_none(), "class must match too");
+        assert!(r.match_usb(&i(0x1050, 0x0408, 0x0B)).is_none(), "and the id");
+        for bad in ["", "usb_interface = []", "usb_ids = [\"1050-0407\"]", "usb_ids = [\"10500:407\"]", "usb_interface = [1, 2, 3, 4]", "any_page = [1]\nusb_interface = [3]", "driver = \"ukbd\"\nusb_interface = [3]"] {
+            assert!(load(&rule(bad)).is_err(), "accepted {bad:?}");
+        }
+        // A usb driver jail is per interface ({usb}), not per {unit}.
+        assert!(load(&rule("usb_interface = [0x0B]").replace("j-{usb}", "j-{unit}")).is_err());
+        assert_eq!(parse_usb_id("0a12:0001"), Some((0x0a12, 0x0001)));
     }
 }

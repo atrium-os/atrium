@@ -8,8 +8,11 @@
 //!   (`devfs -m <mount> rule apply path <node> unhide`), re-applied every
 //!   `reshow_secs` because a restarted service gets a fresh mount;
 //! - starts a driver's jail per device through jaild (`CreateJail` with
-//!   `devfs_grant` = that one node, no network, the driver's sysfil
-//!   profile), holding its procdesc; stops it when the device goes;
+//!   `devfs_grant` = that node, plus `devfs_grants` for a device that is
+//!   several, no network, the driver's sysfil profile), holding its
+//!   procdesc; stops it when the device goes;
+//! - takes a USB interface from a kernel driver when a `usb` rule with
+//!   `detach_kernel` names it (`usbconfig ... detach_kernel_driver`);
 //! - leaves everything else hidden.
 //!
 //! It never reads a device byte: the kernel classifies, jailed drivers parse.
@@ -95,7 +98,10 @@ fn main() -> ExitCode {
     };
     if a.check {
         for (r, o) in &rules.rules {
-            println!("rule {} class={} priority={} pages={:04x?} nodes={:?} owner={o:?}", r.name, r.class, r.priority, r.any_page, r.nodes);
+            println!(
+                "rule {} class={} priority={} pages={:04x?} driver={:?} usb={:02x?} ids={:?} detach_kernel={} nodes={:?} owner={o:?}",
+                r.name, r.class, r.priority, r.any_page, r.driver, r.usb_interface, r.usb_ids, r.detach_kernel, r.nodes
+            );
         }
         for (n, d) in &rules.drivers {
             println!("driver {n} exec={} uid={} ruleset={} sysfil={} jail={}", d.exec, d.uid, d.devfs_ruleset, d.sysfil, d.jail);
@@ -236,11 +242,12 @@ mod run {
             for op in ops {
                 match op {
                     Op::Show { service, node } => self.show(&service, &node),
-                    Op::StartDriver { driver, device, vars, node, label } => {
-                        let inst: Vars = vars.iter().filter(|(k, _)| matches!(k.as_str(), "hidraw" | "unit")).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    Op::StartDriver { driver, device, vars, nodes, label } => {
+                        let inst: Vars = vars.iter().filter(|(k, _)| matches!(k.as_str(), "hidraw" | "unit" | "usb")).map(|(k, v)| (k.clone(), v.clone())).collect();
                         self.stop(&driver, &device, &inst);
-                        self.start(&driver, &device, &vars, &node, &label);
+                        self.start(&driver, &device, &vars, &nodes, &label);
                     }
+                    Op::DetachKernel { ugen, interface } => Self::detach_kernel(&ugen, interface),
                     Op::StopDriver { driver, device, vars } => self.stop(&driver, &device, &vars),
                     Op::Log(m) => eprintln!("atrium-dispensatord: {m}"),
                 }
@@ -307,7 +314,8 @@ mod run {
                 hostuuid: None,
                 allow_mlock: false,
                 syscall_profile: Some(p.sysfil.clone()),
-                devfs_grant: Some(p.devfs_grant.clone()),
+                devfs_grant: p.devfs_grants.first().cloned(),
+                devfs_grants: p.devfs_grants.iter().skip(1).cloned().collect(),
             }
         }
 
@@ -325,9 +333,22 @@ mod run {
             }
         }
 
-        fn start(&mut self, driver: &str, device: &str, vars: &Vars, node: &str, label: &str) {
+        /// The planner checked `ugen` (`ugenB.A`); the interface is a number.
+        fn detach_kernel(ugen: &str, interface: u8) {
+            let out = std::process::Command::new("usbconfig")
+                .args(["-d", ugen, "-i", &interface.to_string(), "detach_kernel_driver"])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => eprintln!("atrium-dispensatord: {ugen}:{interface}: kernel driver detached"),
+                Ok(o) => eprintln!("atrium-dispensatord: {ugen}:{interface}: detach_kernel_driver: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => eprintln!("atrium-dispensatord: usbconfig: {e}"),
+            }
+        }
+
+        fn start(&mut self, driver: &str, device: &str, vars: &Vars, nodes: &[String], label: &str) {
+            let node = nodes.join(",");
             let Some(d) = self.planner.rules().drivers.get(driver) else { return };
-            let Some(p) = plan(d, vars, node) else {
+            let Some(p) = plan(d, vars, nodes) else {
                 eprintln!("atrium-dispensatord: {driver}: {device}: a template has no value");
                 return;
             };

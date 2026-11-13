@@ -324,6 +324,13 @@ pub struct CreateJailRequest {
     /// mounting devfs and before anything runs.
     #[serde(default)]
     pub devfs_grant: Option<String>,
+
+    /// More nodes of the same device, granted the same way, for a device
+    /// that is several nodes: a USB device is `ugenB.A` (a symlink) and
+    /// `usb/B.A.0` (device-assignment.md §6.3). Each must be allowed by the
+    /// pin's `grant_nodes`, and needs `devfs_grant` set; at most 7.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devfs_grants: Vec<String>,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -661,6 +668,7 @@ mod tests {
             allow_mlock: false,
             syscall_profile: None,
             devfs_grant: None,
+            devfs_grants: vec![],
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

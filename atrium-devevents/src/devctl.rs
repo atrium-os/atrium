@@ -327,6 +327,13 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.live.is_empty()
     }
+
+    /// Drop unclaimed children that `f` picks: the kernel never reports one
+    /// going (a USB device's interfaces go with the device's own notify).
+    pub fn forget_unclaimed(&mut self, f: impl Fn(&Device) -> bool) -> Vec<Change> {
+        let keys: Vec<Key> = self.live.iter().filter(|(k, d)| matches!(k, Key::Unclaimed(..)) && f(d)).map(|(k, _)| k.clone()).collect();
+        keys.into_iter().filter_map(|k| self.live.remove(&k)).map(Change::Removed).collect()
+    }
 }
 
 fn flat(f: &Fields) -> String {

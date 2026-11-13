@@ -754,19 +754,22 @@ pub fn devfs_ruleset_has_rules(id: u32) -> io::Result<bool> {
 /// Show one node in one devfs mount (`devfs -m MNT rule apply ...`): unhide
 /// it, owned by `uid`, mode 0600. Applies to that mount alone, adds no rule
 /// to any ruleset. `node` was validated against a pin's `grant_nodes`
-/// (letters then digits), so it is never a pattern.
+/// (letters, digits and dots between them), so it is never a pattern.
+/// A devfs symlink (`ugen0.2` -> `usb/0.2.0`) is only unhidden: its
+/// target is granted on its own.
 pub fn devfs_grant(mount: &str, node: &str, uid: u32) -> io::Result<()> {
-    // `name` or `dir/name` (u2f(4) keys are /dev/u2f/N), plain names only.
-    let parts: Vec<&str> = node.split('/').collect();
-    if parts.len() > 2 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric())) {
+    if !grant_name_ok(node) {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
+    let parts: Vec<&str> = node.split('/').collect();
+    let link = std::fs::symlink_metadata(format!("/dev/{node}")).is_ok_and(|m| m.file_type().is_symlink());
     let uid = uid.to_string();
     // A node in a directory needs the directory itself shown (not what
     // else is in it: the rule names the directory entry only).
     let dir: Vec<(&str, &[&str])> = if parts.len() == 2 { vec![(parts[0], &["unhide"][..])] } else { vec![] };
-    let node_actions: [(&str, &[&str]); 3] = [(node, &["unhide"][..]), (node, &["user", uid.as_str()][..]), (node, &["mode", "0600"][..])];
-    for (path, action) in dir.into_iter().chain(node_actions) {
+    let node_actions: &[(&str, &[&str])] = &[(node, &["unhide"][..]), (node, &["user", uid.as_str()][..]), (node, &["mode", "0600"][..])];
+    let node_actions = if link { &node_actions[..1] } else { node_actions };
+    for &(path, action) in dir.iter().chain(node_actions) {
         let mut args: Vec<&str> = vec!["-m", mount, "rule", "apply", "path", path];
         args.extend_from_slice(action);
         let out = std::process::Command::new("devfs").args(&args).output()?;
@@ -776,6 +779,20 @@ pub fn devfs_grant(mount: &str, node: &str, uid: u32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `name` or `dir/name` (u2f(4) keys are /dev/u2f/N, USB devices
+/// /dev/usb/B.A.E): letters, digits, and dots only between them.
+pub fn grant_name_ok(node: &str) -> bool {
+    let parts: Vec<&str> = node.split('/').collect();
+    parts.len() <= 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+                && !p.starts_with('.')
+                && !p.ends_with('.')
+                && !p.contains("..")
+        })
 }
 
 /// Unmount, ignoring errors (cleanup after a failed create).
@@ -1473,5 +1490,18 @@ mod privilege_drop_tests {
         assert_eq!(got.2, "\"\"", "empty list: allows no ioctl");
         assert_eq!(got.3, "*", "not given: unrestricted");
         assert_eq!(got.4, "unix");
+    }
+}
+
+#[cfg(test)]
+mod grant_name_tests {
+    #[test]
+    fn grant_names_are_plain() {
+        for ok in ["hidraw3", "u2f/0", "ugen0.2", "usb/0.2.0"] {
+            assert!(super::grant_name_ok(ok), "{ok}");
+        }
+        for bad in ["", "/", "a/", "/a", "a/b/c", "..", "usb/..", "usb/0..2", ".a", "a.", "u2f/*", "a b", "a\0"] {
+            assert!(!super::grant_name_ok(bad), "{bad:?}");
+        }
     }
 }

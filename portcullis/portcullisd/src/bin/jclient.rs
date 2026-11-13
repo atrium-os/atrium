@@ -70,6 +70,7 @@ fn main() -> ExitCode {
                 allow_mlock: false,
                 syscall_profile: None,
                 devfs_grant: None,
+                devfs_grants: vec![],
             })
         }
         "remove" => {
@@ -112,6 +113,7 @@ fn main() -> ExitCode {
                 allow_mlock: false,
                 syscall_profile: None,
                 devfs_grant: None,
+                devfs_grants: vec![],
             })
         }
         "attach" => {

@@ -401,7 +401,7 @@ the way Ubuntu points at NVIDIA's?).
   `{unit}`; `all_nodes = true` grants every node template (a sound card is
   `dspN` and `mixerN`). A device the registry sees removed (directly, or as
   part of a detached subtree such as `uaudio0`) is released. Driver owners
-  are refused `all_nodes` (a jail gets one node) and must name their jail
+  were refused `all_nodes` (a jail got one node; lifted in §6.3) and must name their jail
   and root by the class's instance placeholder only.
 - **Rules**: `lyra/etc/devices.d/35-lyra.toml` (`pcm` → lyrad, `dsp{unit}` +
   `mixer{unit}`); `tactus/etc/devices.d/30-tactus.toml` gains `atkbd` →
@@ -424,6 +424,52 @@ the way Ubuntu points at NVIDIA's?).
   "does not contain" checks).
 - `deploy-portcullis.sh` now passes the cross sysroot flags when it builds
   dispensatord (the Sigillum gate found the plain build failing).
+
+### 6.3 As built: D4 groundwork (2026-11-13)
+
+D4's two drivers (Vinculum's USB controller transport, B1b, and Sigillum's
+CCID driver, S3) do not exist yet. What they need from this layer does:
+
+- **A third rule class, `usb`**: one interface of a USB device, from the
+  attach (`+ng_ubt0 at ... on uhub0`) or nomatch (`? at ... on uhub0`) line
+  the kernel sends per interface, which carries `ugen=ugenB.A`, `interface=`,
+  `vendor`/`product` and `intclass`/`intsubclass`/`intprotocol`; `devinfo -v`
+  replays the same at start. A rule matches by `usb_interface = [class,
+  subclass, protocol]` (a prefix: `[0x0B]` is every smart-card reader) and/or
+  `usb_ids = ["vvvv:pppp"]`; one of them is required, so no rule takes "every
+  USB device". Placeholders `{bus}`, `{addr}`, `{interface}` and `{usb}` =
+  `B-A-I`, the instance placeholder (jail names take no dots). The device key
+  is `ugenB.A:I`.
+- **Going away**: an unclaimed interface never gets a detach line, so the
+  device's end is the `!system=USB subsystem=DEVICE type=DETACH ugen=...`
+  notify; it releases every interface of that ugen and forgets them in the
+  registry, so the same address plugged again starts afresh. A kernel driver
+  leaving an interface is not the device going.
+- **Kernel drivers**: an interface a kernel driver has stays the kernel's
+  unless the rule says `detach_kernel = true`; then dispensatord runs
+  `usbconfig -d ugenB.A -i I detach_kernel_driver` before starting the owner,
+  and again if a module devmatch loads later takes it back (the jail is
+  kept). Whole classes we always drive ourselves still belong in
+  `devmatch_blocklist` (§4.3); `detach_kernel` is for the rest. Kernel-claimed
+  interfaces no rule wants are left alone quietly; unclaimed ones are logged
+  ("shown to nobody").
+- **Several nodes per jail**: libusb on FreeBSD opens `/dev/ugenB.A`, a devfs
+  symlink to `/dev/usb/B.A.0`, and drives every endpoint through ioctls on
+  it, so a USB driver jail needs both. jaild's `CreateJail` gains
+  `devfs_grants` (up to 7 more nodes, each allowed by the pin, only with
+  `devfs_grant` set; omitted from the wire when empty, so existing requests
+  are unchanged); a symlink is only unhidden, its target gets the owner and
+  0600. Grant patterns take `#` anywhere (1 to 4 digits): `ugen#.#`,
+  `usb/#.#.0`; grant names may hold dots between digits and letters. Driver
+  owners may now use `all_nodes`; `{node}` in argv is the first node.
+- **Not shipped yet**: rule files and jaild pins for `vinculum-hci`
+  (ruleset 25) and `sigillum-ccid`; each is one `devices.d` file plus one
+  `[[devfs_rulesets.pinned]]` entry with `grant_nodes = ["ugen#.#",
+  "usb/#.#.0"]` when its driver lands. Host tests: dispensator 13 (USB
+  attach, repeat, unplug and replug at the same address, priority by id,
+  kernel detach and re-detach, malformed fields, devinfo at start),
+  jaild-policy grant patterns; jaild's validator and grant-name tests run on
+  FreeBSD (type-checked here).
 
 ## 7. Not in scope
 

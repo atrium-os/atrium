@@ -276,7 +276,16 @@ fn validate_devfs_ruleset(id: u32, policy: &Policy) -> Result<(), JaildError> {
 /// that belong to one service, e.g. the display to frescod. Only a request that
 /// IS that service may mount it: same jail name, same binary, same uid, and no
 /// child jails (a child would see the parent's devfs).
+/// Nodes in `devfs_grants`, beyond `devfs_grant`.
+pub const MAX_EXTRA_GRANTS: usize = 7;
+
 fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    if (!req.devfs_grants.is_empty() && req.devfs_grant.is_none()) || req.devfs_grants.len() > MAX_EXTRA_GRANTS {
+        return Err(JaildError::PolicyViolation {
+            rule:   "devfs_grant.extra",
+            detail: format!("devfs_grants needs devfs_grant and holds at most {MAX_EXTRA_GRANTS} nodes; got {}", req.devfs_grants.len()),
+        });
+    }
     let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else {
         if let Some(node) = &req.devfs_grant {
             return Err(JaildError::PolicyViolation {
@@ -294,7 +303,7 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
     if !pin.matches_name(&req.name) {
         return deny(format!("jail name is {:?}", req.name));
     }
-    if let Some(node) = &req.devfs_grant {
+    for node in req.devfs_grant.iter().chain(&req.devfs_grants) {
         if !pin.allows_grant(node) {
             return deny(format!("devfs_grant {node:?} is not one of {:?}", pin.grant_nodes));
         }
@@ -755,6 +764,7 @@ mod tests {
             allow_mlock: false,
             syscall_profile: None,
             devfs_grant: None,
+            devfs_grants: vec![],
         };
         validate_create(&req, &p).unwrap();
     }
@@ -782,6 +792,7 @@ mod tests {
             allow_mlock: false,
             syscall_profile: None,
             devfs_grant: None,
+            devfs_grants: vec![],
         }
     }
 
@@ -975,6 +986,7 @@ mod tests {
             allow_mlock: false,
             syscall_profile: None,
             devfs_grant: None,
+            devfs_grants: vec![],
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -999,6 +1011,7 @@ mod tests {
             allow_mlock: false,
             syscall_profile: None,
             devfs_grant: None,
+            devfs_grants: vec![],
         }
     }
 
@@ -1417,6 +1430,39 @@ mod tests {
         let mut r = frescod_req("atrium-frescod", "/usr/local/bin/atrium-frescod", 65010);
         r.devfs_grant = Some("hidraw3".into());
         assert!(refused(r), "frescod's pin grants nothing");
+    }
+
+    /// A USB device is two nodes (device-assignment.md §6.3): every one is
+    /// checked against the pin, extras need the first, and there are few.
+    #[test]
+    fn per_device_pin_grants_a_usb_device() {
+        let mut p = pinned_policy();
+        p.devfs_rulesets.allowed_ids.push(28);
+        p.devfs_rulesets.pinned.push(jaild_policy::PinnedRuleset {
+            id: 28,
+            jail_name: "atrium-x-usb-".into(),
+            exec_path: "/usr/local/bin/atrium-x-usb".into(),
+            uid: 65040,
+            leases: vec![],
+            name_prefix: true,
+            grant_nodes: vec!["ugen#.#".into(), "usb/#.#.0".into()],
+        });
+        let req = |first: Option<&str>, more: &[&str]| {
+            let mut r = frescod_req("atrium-x-usb-0-2-0", "/usr/local/bin/atrium-x-usb", 65040);
+            r.devfs_ruleset = 28;
+            r.devfs_grant = first.map(Into::into);
+            r.devfs_grants = more.iter().map(|s| s.to_string()).collect();
+            r
+        };
+        validate_devfs_pin(&req(Some("ugen0.2"), &["usb/0.2.0"]), &p).unwrap();
+        let refused = |r: CreateJailRequest| validate_devfs_pin(&r, &p).is_err();
+        assert!(refused(req(Some("ugen0.2"), &["usb/0.2.1"])), "another endpoint");
+        assert!(refused(req(Some("ugen0.2"), &["usb/0.2.0", "hidraw0"])), "a node the pin does not allow");
+        assert!(refused(req(None, &["usb/0.2.0"])), "extras without the first");
+        assert!(refused(req(Some("ugen0.2"), &["usb/0.2.0"; 8])), "too many");
+        let mut r = req(Some("ugen0.2"), &["usb/0.2.0"]);
+        r.devfs_ruleset = 21;
+        assert!(refused(r), "unpinned");
     }
 
     #[test]
