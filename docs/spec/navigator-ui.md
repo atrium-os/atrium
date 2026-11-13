@@ -1127,9 +1127,10 @@ Each step runs in the VM on headless frescod before the next.
    - **Forgetting.** Turning presence off sends `Forget { jar, url }`; an Unrecorded trail that
      closes sends `Forget { jar }`. navigatord drops that jar's pages and asks Arca to destroy the
      jar's cookie groups and their keys (arcad `W_FORGET`, arca.md §8.7). At start navigatord
-     forgets every Unrecorded jar, so a crash leaves none. The table's "in memory" for Unrecorded
-     cookies is met by destroying the keys rather than by never writing: arcad keeps them like
-     any cookie until the trail closes or navigatord restarts.
+     forgets every Unrecorded jar. Unrecorded cookies never touch disk (2026-11-13): arcad keeps
+     partitions starting `u-` in its own memory only (`arcad/src/jar.rs`, locked buffers, the same
+     limits as stored cookies), so they go when the trail closes, when the user locks, or when
+     arcad stops, and a crash leaves nothing behind.
    - Checked against the real Arca in `scripts/arca-vm-test.sh` §8, and the control in
      `scripts/navigator-live-vm.sh` (no Arca there: it says so). Not yet: the presence menu
      (account, Sign out here), the site asking (consent buttons, `SiteNeedsIt`), named personas,

@@ -38,6 +38,8 @@ pub struct State {
     tickets: crate::tickets::Tickets,
     /// The machine store (arca.md §6.4): open from boot, for services.
     machine: Option<Store>,
+    /// Unrecorded trails' cookie jars: in memory only (`crate::jar`).
+    jars: crate::jar::Jars,
     /// Unix seconds; tests move it to expire cookies.
     pub clock: fn() -> u64,
     /// Set only by [`State::handle_verified`], for the one request it runs:
@@ -118,7 +120,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, clock: system_now, verified: false })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false })
     }
 
     /// Run a request that answered `NEEDS_VERIFICATION` again, after
@@ -571,6 +573,7 @@ impl State {
                     s.lock();
                 }
                 self.handles.lock_user(&user);
+                self.jars.lock(&user);
                 ok(Vec::new())
             }
             op::V_REWRAP => {
@@ -854,6 +857,8 @@ impl State {
         if !ok_ask {
             return malformed();
         }
+        // Unrecorded jars are in memory; Personal ones in the store.
+        let mem = self.jars.forget(user, partition, prefix == 1);
         let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
         let jars: Vec<Recipient> = tri!(store.recipients())
             .into_iter()
@@ -864,7 +869,7 @@ impl State {
             })
             .map(|(_, rec)| rec)
             .collect();
-        let mut n = 0u32;
+        let mut n = (mem > 0) as u32;
         for rec in &jars {
             tri!(store.forget(&Access { persona: broker_op::WEB_PERSONA, recipient: rec }));
             n += 1;
@@ -1020,6 +1025,14 @@ impl State {
                 let Ok(rec) = Recipient::endpoint(Scheme::Https, &sc.domain, *port, partition.as_deref()) else {
                     return reply(status::DENIED);
                 };
+                // An Unrecorded trail's jar is never written (crate::jar).
+                if let Some(p) = partition.as_deref().filter(|p| crate::jar::in_memory(p)) {
+                    if !self.stores.get(&c.user).is_some_and(|s| s.state() == arca_store::LockState::Unlocked) {
+                        return reply(status::LOCKED);
+                    }
+                    tri!(self.jars.set(&c.user, p, sc, now).map_err(Error::Io));
+                    return ok(Vec::new());
+                }
                 let who = Access { persona: &c.persona, recipient: &rec };
                 let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
                 let mut sc = sc;
@@ -1098,6 +1111,16 @@ impl State {
                     _ => return reply(status::DENIED),
                 };
                 let now = (self.clock)();
+                if let Some(p) = partition.as_deref().filter(|p| crate::jar::in_memory(p)) {
+                    if !self.stores.get(&c.user).is_some_and(|s| s.state() == arca_store::LockState::Unlocked) {
+                        return reply(status::LOCKED);
+                    }
+                    let found = tri!(self.jars.matching(&c.user, p, host, path, now, ctx.as_ref()).map_err(Error::Io));
+                    if found.is_empty() {
+                        return ok(Vec::new());
+                    }
+                    return Reply { status: status::OK, body: Body::Secret(tri!(crate::cookie::header(found).map_err(Error::Io))) };
+                }
                 let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
                 let mut found = Vec::new();
                 for d in crate::cookie::candidate_domains(host) {

@@ -598,7 +598,10 @@ same-site context or a gesture, because it never holds a ticket.
     navigator-ui.md §14 step 5): `W_FORGET` (0x71, broker only) takes a partition, or a
     prefix that must be an Unrecorded jar's (`u-<16 hex>.`, or `u-` for all of them), and
     forgets every `web` group of the matching partitions with its data key
-    (`Store::forget`). `arcad/tests/cookies.rs` covers it; `scripts/arca-vm-test.sh` §8 runs
+    (`Store::forget`). Unrecorded jars themselves (partitions starting `u-`) are never
+    written: arcad holds their cookies in memory only (`arcad/src/jar.rs`, values in locked
+    buffers, same per-group and per-jar limits), needs the store unlocked to set or read them,
+    and drops them on `W_FORGET`, on lock and when it stops. `arcad/tests/cookies.rs` covers it; `scripts/arca-vm-test.sh` §8 runs
     navigatord through it.
   - ~~The Navigator's broker issuing tickets.~~ Built 2026-11-06 in `navigator-cookies`:
     a ticket per request of a cookied view, sent through the courier for its

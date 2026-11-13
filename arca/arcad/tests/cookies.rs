@@ -388,3 +388,45 @@ fn the_broker_forgets_a_jar_an_unrecorded_trails_or_all_of_them() {
     assert_ne!(forget(&mut s, &web("www.example.com", "example.com"), "u-", 1).0, status::OK);
     assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
 }
+
+/// Files under the store's directory, and whether any holds `needle`.
+fn on_disk(d: &std::path::Path, needle: &[u8]) -> (usize, bool) {
+    let mut n = 0;
+    let mut hit = false;
+    let mut stack = vec![d.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        for e in std::fs::read_dir(&p).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                n += 1;
+                let b = std::fs::read(&p).unwrap_or_default();
+                hit |= b.windows(needle.len()).any(|w| w == needle);
+            }
+        }
+    }
+    (n, hit)
+}
+
+#[test]
+fn an_unrecorded_jar_is_never_written_and_goes_when_the_user_locks() {
+    let (d, mut s) = setup();
+    let u = "u-00000000000000c3.example.com";
+    let before = on_disk(d.path(), b"unrecorded-sid");
+    jar_cookie(&mut s, "www.example.com", u, "unrecorded-sid");
+    assert_eq!(jar_has(&mut s, "www.example.com", u), "unrecorded-sid=v");
+    assert_eq!(on_disk(d.path(), b"unrecorded-sid"), before, "no file added or changed to hold it");
+    // A Personal cookie is stored as before.
+    jar_cookie(&mut s, "www.example.com", "example.com", "home");
+    assert!(on_disk(d.path(), b"home").0 > before.0);
+    // Locking ends every Unrecorded jar; the Personal one stays.
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_UNLOCK, &body(|w| { w.str("alice"); w.raw(&[1; 32]); })).status, status::OK);
+    assert_eq!(jar_has(&mut s, "www.example.com", u), "");
+    assert_eq!(jar_has(&mut s, "www.example.com", "example.com"), "home=v");
+    // Locked: an Unrecorded courier gets nothing and can set nothing.
+    let t = ticket(&mut s, "www.example.com", u, 1, "/", 1, "");
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
+    assert_ne!(get_t(&mut s, &web("www.example.com", u), "/", Some(t)).0, status::OK);
+}
