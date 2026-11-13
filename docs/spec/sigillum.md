@@ -909,7 +909,27 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
 2. **P2.** `SCard*` over `sigillum-ccid`. The CCID transport is built: descriptor, bulk
    messages, ATR, APDUs, chaining, with 15 host tests on this token's real descriptor and
    ATR.
+   **Done 2026-11-13.** `sigillum-pcsc` is the pcsc-lite API (LP64 ABI) over one reader:
+   the 12 `SCard*` calls the module imports, with auto-allocated lists, T=1 only, and the
+   card behind `sigillum-ccid`'s `Reader`. `platform.rs` stands in for libudev (a context
+   that finds no devices, logging what was asked) and libcurl (no handle,
+   `CURLE_FAILED_INIT`). The driver wire has the token records: `ListCertificates` /
+   `Certificates` and `SignDigest` / `Signed`, with fixed caps (8 certificates of 4 KiB, a
+   64-byte digest) and the three schemes of §16.5's allow-list; FIDO drivers answer them
+   `Unsupported`, and the broker refuses token records inside a FIDO ceremony.
 3. **P3.** The `sigillum-p11` host, the allow-list and the token records in sigillumd.
+   **Host done 2026-11-13.** `hospes/sigillum-p11` takes every descriptor from its parent
+   (driver socket, module, libstdc++, CCID endpoints), limits the libraries to
+   read/mmap, enters capability mode before parsing either, loads them as one set, and
+   copies only the 14 allowed entries of the module's `CK_FUNCTION_LIST`; the vendor's own
+   exports are never resolved. Received bodies are zeroed (they may hold a PIN), and APDUs
+   are never logged. `sh scripts/hospes-build.sh p11-check` runs it over
+   `hospes/fixtures/src/p11test.c`, a module that reaches its token only through PC/SC and
+   reports any call outside the allow-list to the card, against a fake CCID token
+   (`hospes/sigillum-p11-check`): certificates listed, every PIN outcome (needed, wrong,
+   final try, blocked), an ECDSA P-256 signature that verifies, the RSA `DigestInfo` and
+   PSS parameters, an unknown key, a short digest, exit on close, no forbidden call and no
+   PIN in the log: 17 of 17. Next: sigillumd's side (list, prompt for the PIN, sign).
 4. **P4.** A gate on an amd64 guest with the real token passed through from the Mac, by
    QEMU `usb-host` or by APDU forwarding (`ccid-card-passthru`). It signs a digest, and
    the signature verifies against the token's certificate. Generic PIV over the same

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["hospes-elf", "hospes-rt", "hospes-glibc", "hospes-codec-wire", "hospes-codec", "hospes-proto", "hospes-cdm", "hospes-cdm-check", "hospes-fixture-runner", "hospes-install"]
+members = ["hospes-elf", "hospes-rt", "hospes-glibc", "hospes-codec-wire", "hospes-codec", "hospes-proto", "hospes-cdm", "hospes-cdm-check", "hospes-fixture-runner", "hospes-install", "sigillum-p11", "sigillum-p11-check"]
 
 [workspace.package]
 edition = "2021"

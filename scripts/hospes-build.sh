@@ -10,6 +10,8 @@
 #   sh scripts/hospes-build.sh test RUNNER FIXDIR  # run every fixture with RUNNER (any OS)
 #   sh scripts/hospes-build.sh conform CODEC LIB STREAMDIR REF.sha  # H2 conformance (any OS)
 #   sh scripts/hospes-build.sh cdm TRIPLE          # hospes-cdm (CDM host) for TRIPLE
+#   sh scripts/hospes-build.sh p11 TRIPLE          # sigillum-p11 (token PKCS#11 host)
+#   sh scripts/hospes-build.sh p11-check           # sigillum-p11 over p11test.so (needs focal)
 #   sh scripts/hospes-build.sh test-cdm            # H3: rebuild the test CDM, its vectors and
 #                                                  #   the reference transcript (Linux)
 #   sh scripts/hospes-build.sh cdm-check-linux     # H3: hospes-cdm vs the reference host,
@@ -57,6 +59,12 @@ build_fixtures() {
         ln -sf dep.so "$out/libdep.so"
         $cc $lk -ldep -o "$out/user.so" "$src/user.c"
         rm -f "$out/libhost.so" "$out/libdep.so"
+        # S5: a PKCS#11 module that reaches its token only through PC/SC (sigillum-p11's
+        # check). x86_64 only, as the vendor module it stands in for.
+        if [ "$arch" = x86_64 ]; then
+            $cc -shared -Wall -Wextra -Wno-cast-function-type -Wl,-z,now -Wl,-z,relro -Wl,--build-id=none \
+                -Wl,--allow-shlib-undefined -o "$out/p11test.so" "$src/p11test.c"
+        fi
         # H4: a glibc-built C++ library shaped like Widevine: LLVM libc++abi linked in
         # statically, the unwinder imported from libgcc_s, old glibc symbol versions.
         clang++ --target=$arch-linux-gnu -fuse-ld=lld -O2 -fPIC -shared -nostdlib++ -std=c++17 \
@@ -205,6 +213,15 @@ run_all() {
     [ "$fails" -eq 0 ]
 }
 
+# p11_check: sigillum-p11 (x86_64) over the p11test fixture and a fake CCID token.
+LSC="$HOME/.cache/hospes-focal-libstdcxx/root/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.28"
+p11_check() {
+    [ -f "$LSC" ] || focal_libstdcxx >/dev/null
+    host=$(build_bin x86_64-unknown-linux-gnu sigillum-p11)
+    (cd "$H" && cargo build --release -p sigillum-p11-check >&2)
+    "$H/target/release/sigillum-p11-check" "$host" "$H/fixtures/bin/x86_64/p11test.so" "$LSC" >&2
+}
+
 sha() { if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else sha256 -q "$1"; fi; }
 
 conform() {
@@ -236,6 +253,8 @@ case "${1:-}" in
     runner) build_runner "$2" ;;
     codec) build_bin "$2" hospes-codec ;;
     cdm) build_bin "$2" hospes-cdm ;;
+    p11) build_bin "$2" sigillum-p11 ;;
+    p11-check) p11_check ;;
     test-cdm) build_test_cdm ;;
     cdm-check) cdm_check "$2" "$3" "$4" ;;
     cdm-check-linux)
@@ -265,6 +284,8 @@ case "${1:-}" in
         "$tmp/host" "$H/fixtures/bin/x86_64/glibc.so" >&2 || rc=1
         qemu-aarch64-static -L /usr/aarch64-linux-gnu "$tmp/host-arm64" "$H/fixtures/bin/aarch64/glibc.so" >&2 || rc=1
         rm -rf "$tmp"
+        # S5: the token host, when focal's libstdc++ is fetched.
+        if [ -f "$LSC" ]; then p11_check || rc=1; fi
         exit $rc ;;
     *) sed -n '2,8p' "$0"; exit 2 ;;
 esac

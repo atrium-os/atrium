@@ -1,0 +1,12 @@
+[package]
+name = "sigillum-p11-check"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Drives sigillum-p11 over the p11test fixture module and a fake CCID token (test tool, sigillum.md §16.5)"
+
+[dependencies]
+libc = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+sigillum-ccid = { path = "../../sigillum/sigillum-ccid", features = ["fake"] }
+sigillum-proto = { path = "../../sigillum/sigillum-proto" }

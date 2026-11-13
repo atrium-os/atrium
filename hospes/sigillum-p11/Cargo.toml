@@ -1,0 +1,18 @@
+[package]
+name = "sigillum-p11"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hosts a token vendor's PKCS#11 module under Hospes for Sigillum (sigillum.md §16.5): one token, allow-listed calls, PC/SC over our own CCID reader"
+
+[[bin]]
+name = "sigillum-p11"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+hospes-rt = { path = "../hospes-rt" }
+hospes-glibc = { path = "../hospes-glibc" }
+sigillum-ccid = { path = "../../sigillum/sigillum-ccid" }
+sigillum-pcsc = { path = "../../sigillum/sigillum-pcsc" }
+sigillum-proto = { path = "../../sigillum/sigillum-proto", default-features = false }
