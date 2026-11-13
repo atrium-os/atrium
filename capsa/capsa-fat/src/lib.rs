@@ -20,6 +20,7 @@ mod dir;
 mod fat;
 mod time;
 mod volume;
+mod write;
 
 pub use bpb::{FatType, Geometry};
 pub use dir::{Entry, Loc, ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM, ATTR_VOLUME_ID};

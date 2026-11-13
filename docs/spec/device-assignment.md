@@ -516,8 +516,23 @@ Tests: volumes made by `mkfs.fat` and `mtools` as FAT12, FAT16 and FAT32
 (long and Unicode names, nested directories, a 300-entry directory over
 several clusters, files across cluster edges read in odd-sized pieces, 8.3
 lookups, label), and 300 randomly damaged volumes walked end to end with no
-panic or hang. Next: the write path (checked with `fsck.fat`), exFAT, a
-fuzz target, then the FUSE server and jaild's outside mount.
+panic or hang.
+
+Writes: create (exact 8.3 names with NT case bits when the name is one,
+else a checksummed long name and a unique `BASE~N` alias), write at any
+offset (FAT has no holes, so a gap is zero-filled), truncate both ways,
+unlink, mkdir/rmdir (only empty), rename within and across directories
+(replacing a file or an empty directory, case-only renames in place, never
+a directory into its own subtree, `..` fixed up), mtime; directories grow
+by clusters up to the 65536-slot limit; `sync` writes every FAT copy and
+marks FSInfo's hints. Names Windows cannot round-trip (`"*/:<>?\|`,
+trailing dot or space) are refused. Tests: a scripted session on FAT12, 16
+and 32 volumes made by `mkfs.fat`, then `fsck.fat -n` must find nothing
+and `mtype` must read every file back by its long name; a volume filled to
+`NoSpace` (data and the fixed root) stays sound.
+
+Next: exFAT, a fuzz target, then the FUSE server and jaild's outside
+mount.
 
 ## 7. Not in scope
 

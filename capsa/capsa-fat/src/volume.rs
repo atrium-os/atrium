@@ -28,7 +28,7 @@ pub struct Volume<D> {
     pub(crate) dev: D,
     pub(crate) g: Geometry,
     pub(crate) fat: Table,
-    free: Option<u32>,
+    pub(crate) free: Option<u32>,
 }
 
 impl<D: BlockDev> Volume<D> {
