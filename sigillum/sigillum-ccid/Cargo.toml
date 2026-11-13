@@ -1,0 +1,8 @@
+[package]
+name = "sigillum-ccid"
+version = "0.1.0"
+description = "Sigillum's CCID transport (sigillum.md §6.2): the class descriptor, CCID bulk messages, ATRs and ISO 7816-4 APDUs, for sigillum-ccid's driver jail. Parsers only, over a Bulk trait; no USB here"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

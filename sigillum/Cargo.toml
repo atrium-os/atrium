@@ -16,9 +16,7 @@ members = [
     "sigillum-fido",
     "sigillumd",
     "sigillum-webauthn",
-    
-    
-    
+    "sigillum-ccid",
 ]
 
 [workspace.package]

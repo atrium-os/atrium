@@ -767,6 +767,10 @@ name = "sigillum-cbor"
 version = "0.1.0"
 
 [[package]]
+name = "sigillum-ccid"
+version = "0.1.0"
+
+[[package]]
 name = "sigillum-ctap"
 version = "0.1.0"
 dependencies = [
