@@ -13,12 +13,20 @@ name = "aura-fuzz"
 version = "0.0.0"
 dependencies = [
  "aura-proto",
+ "aura-wlan-core",
  "libfuzzer-sys",
 ]
 
 [[package]]
 name = "aura-proto"
 version = "0.1.0"
+
+[[package]]
+name = "aura-wlan-core"
+version = "0.1.0"
+dependencies = [
+ "aura-proto",
+]
 
 [[package]]
 name = "cc"

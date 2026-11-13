@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 aura-proto = { path = "../aura-proto" }
+aura-wlan-core = { path = "../aura-wlan-core" }
 
 # Its own workspace, like every cargo-fuzz crate.
 [workspace]
@@ -17,5 +18,11 @@ aura-proto = { path = "../aura-proto" }
 [[bin]]
 name = "proto_decode"
 path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wlan_rx"
+path = "fuzz_targets/wlan_rx.rs"
 test = false
 doc = false

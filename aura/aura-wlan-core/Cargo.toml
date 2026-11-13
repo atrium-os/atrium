@@ -1,0 +1,9 @@
+[package]
+name = "aura-wlan-core"
+version = "0.1.0"
+description = "The rules of Aura's kernel data path (wifi.md §3.1, §8.3): controlled port, 802.11 <-> Ethernet data frames, A-MSDU with the FragAttacks checks, key table with KRACK and replay rules, regulatory enforcement, and the per-radio control state machine over a Radio trait. no_std, no alloc, no unsafe; the aura_wlan kmod wraps it, the host tests drive it with a mock radio."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-proto = { path = "../aura-proto" }
