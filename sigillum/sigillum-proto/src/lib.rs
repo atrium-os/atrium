@@ -13,6 +13,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub mod client;
 pub mod driver;
 pub mod ui;
+pub mod rp;
 
 /// Write one message.
 pub fn write_msg<T: Serialize>(w: &mut impl Write, msg: &T, max: usize) -> io::Result<()> {

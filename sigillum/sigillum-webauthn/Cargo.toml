@@ -1,0 +1,24 @@
+[package]
+name = "sigillum-webauthn"
+version = "0.1.0"
+description = "The WebAuthn client for Navigator's broker (sigillum.md §9): origin to RP ID, clientDataJSON, options in, PublicKeyCredential out, through sigillumd"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sigillum-proto = { path = "../sigillum-proto" }
+sigillum-ctap = { path = "../sigillum-ctap" }
+sigillum-cbor = { path = "../sigillum-cbor" }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+base64 = "0.22"
+psl = "2"
+
+[dev-dependencies]
+sigillumd = { path = "../sigillumd" }
+sigillum-fido = { path = "../sigillum-fido" }
+sigillum-softkey = { path = "../sigillum-softkey" }
+p256 = { workspace = true }
+zeroize = { workspace = true }
+libc = "0.2"

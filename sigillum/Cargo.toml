@@ -15,6 +15,7 @@ members = [
     "sigillum-proto",
     "sigillum-fido",
     "sigillumd",
+    "sigillum-webauthn",
     
     
     

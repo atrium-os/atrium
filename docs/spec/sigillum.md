@@ -391,8 +391,10 @@ Arca is the platform authenticator (arca.md §8.4). Sigillum adds the ceremony a
 
 The page sees only WebAuthn's own errors: `NotAllowedError` for anything the user or policy
 refused or that timed out, `InvalidStateError` for "already registered" on `create`, and
-`SecurityError` for an RP ID the broker rejected. The detail goes to the sheet and the audit
-line.
+`SecurityError` for an RP ID the broker rejected or an origin that isn't a secure context.
+Malformed options are `TypeError`, and a `pubKeyCredParams` without ES256 is
+`NotSupportedError`, both before anything is asked. The detail goes to the sheet and the
+audit line.
 
 ## 10. Certificates on smartcards and tokens
 
@@ -713,6 +715,36 @@ otherwise passes the blobs on without reading them.
   for a YubiKey on the Mac VM.
 - **Not yet:** Capsicum in `sigillumd` itself (it reads the launch registry per connection; a
   pre-opened directory fd comes later), `allow.mlock` for `sigillumd`.
+
+### 16.3 As built: S3 (in progress)
+
+- **S3a (2026-11-13): `sigillum-webauthn`**, the WebAuthn client the Navigator broker links.
+  The Navigator broker and its JS runtime aren't built yet, so this is the library they
+  will call: options in WebAuthn L3's JSON forms (`PublicKeyCredentialCreationOptionsJSON`,
+  `...RequestOptionsJSON`), the origin the broker knows, a `RegistrationResponseJSON` or
+  `AuthenticationResponseJSON` out.
+  - `origin`: the RP ID is the host or a registrable suffix of it, never a public suffix
+    (the `psl` list; unknown TLDs count as suffixes; `localhost` has no parent), and only
+    on a secure origin (`https`, or `http` on `localhost`/`*.localhost`).
+  - `client_data`: `clientDataJSON` in the limited serialization's fixed order (type,
+    challenge, origin, crossOrigin, topOrigin), so an RP may verify it by template.
+  - `options`: every field bounded (challenge ≤ 1024 B, user handle 1–64 B, ≤ 64
+    credential ids of ≤ 1023 B, display strings cut to 64 B on a char boundary, options
+    JSON ≤ 64/128 KiB); unknown enum values ignored, as the spec says.
+  - `client`: the reply is checked a third time (RP ID hash, UP, UV when required, the
+    attested credential is the one named, the attestation object carries the same
+    authenticator data, an asserted credential is in the allow list, a discoverable one
+    names its user). A reply for another ceremony, or any failed check, is
+    `NotAllowedError`. `publicKey` is the SPKI DER of the ES256 key. A `Canceller` sends
+    `Cancel` from another thread for the page's `AbortSignal`.
+  - Gate (host, `cargo test -p sigillum-webauthn`, 11 tests): options JSON through the real
+    `sigillumd` on sockets, the real driver loop over the soft key and a scripted sheet, to
+    a relying-party verifier that checks `clientDataJSON`, the RP ID hash, flags, the zeroed
+    AAGUID, the SPKI against the attested COSE key and the ES256 signature. Registration,
+    sign-in with an allow list and discoverably (user handle returned), `excludeCredentials`
+    → `InvalidStateError`, a foreign RP ID → `SecurityError` without reaching `sigillumd`,
+    five tampered replies → `NotAllowedError`, abort → `NotAllowedError` well before the
+    timeout.
 
 ## 17. Decisions, with recommendations
 
