@@ -872,6 +872,7 @@ dependencies = [
 name = "portcullis-jail"
 version = "0.1.0"
 dependencies = [
+ "jaild-policy",
  "portcullis-identity",
  "portcullis-toml",
  "thiserror 1.0.69",

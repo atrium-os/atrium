@@ -1,0 +1,27 @@
+[package]
+name        = "sigillum-ui"
+version     = "0.1.0"
+edition     = "2021"
+license     = "BSD-2-Clause"
+publish     = false
+description = "Sigillum's trusted sheets (docs/spec/sigillum.md §7.2, §7.3): who asks and for what, the device choice spent as a frescod IDENTITY press, PINs and passcodes typed into its own window. Runs as _sigillum-ui; talks only to sigillumd and frescod."
+
+[lib]
+name = "sigillum_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sigillum-ui"
+path = "src/bin/sigillum-ui.rs"
+
+[dependencies]
+sigillum-proto  = { path = "../sigillum-proto" }
+fresco-client   = { path = "../../fresco-client" }
+fresco-protocol = { path = "../../fresco-protocol" }
+aqueduct        = { path = "../../aqueduct" }
+pergola         = { path = "../../pergola" }
+postcard        = { version = "1", features = ["use-std"] }
+zeroize         = "1"
+libc            = "0.2"
+
+[workspace]

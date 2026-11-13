@@ -77,6 +77,9 @@ fn fits(e: &Entry, p: u8) -> bool {
         // Arca's chip: a click, or Enter on the picked account.
         (kind::BUTTON, purpose::FILL) => true,
         (kind::KEY, purpose::FILL) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
+        // Sigillum's sheet: the same, in the sheet's own window.
+        (kind::BUTTON, purpose::IDENTITY) => true,
+        (kind::KEY, purpose::IDENTITY) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -103,8 +106,9 @@ impl Table {
 
     /// Spend `token` for `presenter_uid` on `purpose`; `focused(window)`
     /// says whether that window still has focus.
-    /// For `FILL`, `visible(window, minted)` says whether that credential
-    /// slot was fully visible and still before the press (arca-autofill.md §4).
+    /// For `FILL` and `IDENTITY`, `visible(window, minted)` says whether that
+    /// credential slot or sheet was fully visible and still before the press
+    /// (arca-autofill.md §4, sigillum.md §7.2).
     pub fn consume(&mut self, now: u64, token: &Token, presenter_uid: u32, purpose: u8, focused: impl Fn(u32) -> bool, visible: impl Fn(u32, u64) -> bool) -> ConsumeResult {
         let Some(e) = self.live.get(token).copied() else { return refused(refusal::UNKNOWN) };
         if now.saturating_sub(e.minted_ns) >= LIFETIME_NS {
@@ -121,7 +125,7 @@ impl Table {
         }
         // Visibility first: a slot under a cover is OBSCURED whichever
         // window took focus.
-        if purpose == purpose::FILL && !visible(e.window_id, e.minted_ns) {
+        if matches!(purpose, purpose::FILL | purpose::IDENTITY) && !visible(e.window_id, e.minted_ns) {
             return refused(refusal::OBSCURED);
         }
         // A drop lands on whatever window is under the pointer, focused
@@ -330,7 +334,18 @@ pub fn consumers() -> Vec<u32> {
     if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
         return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
     }
-    ["_tabula", "_share", "_praeco", "_arca-ui"].iter().filter_map(|n| uid_of(n)).collect()
+    ["_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui"].iter().filter_map(|n| uid_of(n)).collect()
+}
+
+/// The uids whose top-level windows are trusted sheets, watched for
+/// `IDENTITY` presses like credential slots: `FRESCOD_SHEET_UIDS` (comma
+/// separated), else the user `_sigillum-ui`. Read once.
+pub fn sheet_uids() -> &'static [u32] {
+    static UIDS: OnceLock<Vec<u32>> = OnceLock::new();
+    UIDS.get_or_init(|| match std::env::var("FRESCOD_SHEET_UIDS") {
+        Ok(s) => s.split(',').filter_map(|u| u.trim().parse().ok()).collect(),
+        Err(_) => uid_of("_sigillum-ui").into_iter().collect(),
+    })
 }
 
 fn uid_of(name: &str) -> Option<u32> {
@@ -547,6 +562,19 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::FILL, YES, |_, _| true)), 0);
         let typed = t.mint(key(0x04, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::FILL, YES, |_, _| true)), refusal::WRONG_KIND);
+    }
+
+    #[test]
+    fn an_identity_press_is_a_click_or_enter_on_a_sheet_seen_whole() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::IDENTITY, YES, NOVIS)), refusal::OBSCURED);
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::IDENTITY, YES, |_, _| true)), refusal::WRONG_UID);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::IDENTITY, YES, |_, _| true)), 0);
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::IDENTITY, |_| false, |_, _| true)), refusal::NOT_FOCUSED);
+        let typed = t.mint(key(0x1e, 0, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::IDENTITY, YES, |_, _| true)), refusal::WRONG_KIND, "a PIN digit authorises nothing");
     }
 
     #[test]

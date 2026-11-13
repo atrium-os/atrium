@@ -2195,6 +2195,11 @@ pub mod activation {
         /// Enter, in the slot, which frescod must have seen whole,
         /// uncovered and still for `credential::STILL_NS` before the press.
         pub const FILL: u8 = 7;
+        /// Sigillum's trusted sheet (sigillum.md §7.2): a click, or Enter,
+        /// in a sheet window of `_sigillum-ui`'s, which frescod must have
+        /// seen whole, uncovered and still for `credential::STILL_NS`
+        /// before the press, as for `FILL`.
+        pub const IDENTITY: u8 = 8;
     }
 
     /// What minted a token.

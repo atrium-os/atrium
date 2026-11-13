@@ -384,6 +384,20 @@ fn one_ceremony_at_a_time_and_cancel() {
 }
 
 #[test]
+fn cancel_on_the_sheet_needs_no_token() {
+    let mut r = Rig::new(SoftKey::new(None));
+    r.request(&web_broker(), register("example.com", Uv::Discouraged));
+    let key = r.sheets.last().unwrap().0;
+    // A device choice without a valid press does nothing...
+    assert!(matches!(&r.broker.press(key, Choice::Device(DEV), false)[..], [Action::Audit(_)]));
+    assert!(r.replies.is_empty());
+    // ...but Escape (no token) still cancels.
+    let a = r.broker.press(key, Choice::Cancel, false);
+    r.run(a);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 1, reason: Refusal::NotAllowed });
+}
+
+#[test]
 fn verify_user_is_for_arca_and_ostiarius_only() {
     let mut r = Rig::new(SoftKey::new(None));
     let v = |purpose| Request::VerifyUser(VerifyUser { ceremony: 3, user: "shankar".into(), purpose, min_strength: Strength::BiometricSecure });

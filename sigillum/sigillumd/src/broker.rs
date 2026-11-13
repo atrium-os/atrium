@@ -271,10 +271,12 @@ impl Broker {
     /// covered, moved or faded, or the press was synthetic.
     pub fn press(&mut self, key: Key, choice: Choice, activation_ok: bool) -> Vec<Action> {
         let Some(c) = self.ceremonies.get(&key) else { return Vec::new() };
-        if !activation_ok {
+        // Cancelling needs no proof of a press: it only ever ends a
+        // ceremony, and Escape carries no token.
+        if !activation_ok && choice != Choice::Cancel {
             return vec![Action::Audit(format!("press refused key={key}: no valid activation"))];
         }
-        if c.state != State::AwaitingPress {
+        if c.state != State::AwaitingPress && choice != Choice::Cancel {
             return Vec::new();
         }
         match (choice, &c.kind) {

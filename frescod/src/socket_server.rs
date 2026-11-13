@@ -362,6 +362,11 @@ fn window_uid(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Option<u32> {
 }
 
 /// The uid of the app that owns `window_id`.
+/// The peer uid a client id was given to, if known (no compositor lock).
+pub fn client_uid(owner: u32) -> Option<u32> {
+    u8::try_from(owner).ok().and_then(|o| CLIENT_UID.lock().unwrap()[o as usize])
+}
+
 pub fn window_owner_uid(window_id: u32, comp: &Mutex<Compositor>) -> Option<u32> {
     let id = u16::try_from(window_id).ok()?;
     let c = comp.lock().unwrap();

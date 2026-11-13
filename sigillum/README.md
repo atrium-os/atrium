@@ -13,6 +13,7 @@ uids and the launch registry), in `sigillumd` only, as in arcad.
 | `sigillum-softkey` | a CTAP 2.1 authenticator in memory, with misbehaviour knobs; tests only | tests |
 | `sigillum-proto` | the wires of spec §14: clients ↔ `sigillumd`, drivers ↔ `sigillumd`, `sigillumd` ↔ `sigillum-ui`, with caps | everywhere |
 | `sigillum-fido` | the FIDO driver: logic, socket loop and the hidraw binary (CTAP2 and U2F-only keys); attestation stripped to `none` | `sigillum-fido` jail |
+| `sigillum-ui` | the trusted sheets: who asks and for what, the device choice spent as a frescod `IDENTITY` press, PINs and passcodes typed into its own window (outside the workspace: it draws with Fresco; `cd sigillum-ui && cargo test`) | `_sigillum-ui` |
 | `sigillumd` | the broker as a pure state machine (labels, the press gate, ceremonies, byte checks of driver records, fingerprint policy) and the daemon around it (three sockets, peer uids, the launch registry) | `sigillumd` jail |
 
 ```sh

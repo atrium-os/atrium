@@ -1,11 +1,13 @@
 # Sigillum, the identity verification service (docs/spec/sigillum.md).
 #
-# Its own workspace with no path dependency outside sigillum/, like Vinculum,
-# so the device drivers and the broker's policy build and test anywhere.
-# Atrium-only seams (the launch registry, frescod's press, jails) arrive in S2
-# behind an `atrium` feature.
+# Its own workspace, so the device drivers and the broker build and test
+# anywhere. The one path dependency outside sigillum/ is portcullis-peer
+# (sigillumd's peer uids). sigillum-ui, which draws with Fresco, is outside
+# the workspace.
 [workspace]
 resolver = "2"
+# sigillum-ui draws with Fresco and has its own lock file.
+exclude = ["sigillum-ui"]
 members = [
     "sigillum-cbor",
     "sigillum-ctap",

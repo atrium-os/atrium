@@ -8,6 +8,11 @@
 //! counts only if one run covered the `STILL_NS` before the press up to
 //! the press. A slot is a window of its own above its parent, so the
 //! parent has no way to fade, blur, scale or transform it.
+//!
+//! Sigillum's sheets (sigillum.md §7.2) are watched the same way: every
+//! top-level window of a sheet uid ([`crate::activation::sheet_uids`]) must
+//! be wholly on screen, nothing composed above it overlapping it, at least
+//! the minimum size and where it was last frame, for an `IDENTITY` press.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -36,9 +41,21 @@ fn overlaps(a: [i32; 4], b: [i32; 4]) -> bool {
 /// chrome; the screen is `screen` (`[x0, y0, x1, y1]`, the strip left out).
 /// Returns the slots visible now, for the chrome to frame.
 pub fn observe_frame(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], screen: [i32; 4], now: u64) -> Vec<[i32; 4]> {
+    observe_frame_with(comp, layers, screen, now, crate::activation::sheet_uids())
+}
+
+/// [`observe_frame`] with the sheet uids given (tests).
+pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], screen: [i32; 4], now: u64, sheet_uids: &[u32]) -> Vec<[i32; 4]> {
     let slots: Vec<(u32, bool)> = {
         let c = comp.lock().unwrap();
         c.windows.iter().filter_map(|(&id, w)| {
+            if w.slot.is_none() && !sheet_uids.is_empty() {
+                let uid = crate::socket_server::client_uid(w.owner).unwrap_or(w.owner_uid);
+                if sheet_uids.contains(&uid) {
+                    let (sw, sh) = w.size;
+                    return Some((id as u32, !w.hidden && !w.embed_pending && sw >= MIN_W && sh >= MIN_H));
+                }
+            }
             let s = w.slot.filter(|s| s.kind == fresco_protocol::slot::kind::CREDENTIAL)?;
             let p = c.windows.get(&s.parent)?;
             let [x, y, rw, rh] = s.rect;
@@ -141,5 +158,38 @@ mod tests {
         observe_frame(&comp, &at(10), screen, t0 + 4000 * ms);
         observe_frame(&comp, &at(10), screen, t0 + 5000 * ms);
         assert!(!visible_for(s, t0 + 5000 * ms, t0 + 5000 * ms), "partly off the screen");
+    }
+
+    #[test]
+    fn a_sheet_window_is_watched_like_a_slot() {
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        let (app, sheet) = {
+            let mut c = comp.lock().unwrap();
+            let a = c.create(1, (800, 600));
+            let s = c.create(2, (420, 220));
+            c.windows.get_mut(&a).unwrap().owner_uid = 1001;
+            c.windows.get_mut(&s).unwrap().owner_uid = 65030;
+            (a as u32, s as u32)
+        };
+        let screen = [0, 24, 1280, 720];
+        let ms = 1_000_000u64;
+        let t0 = 5000 * ms;
+        let frame = |above: bool, t: u64| {
+            let mut l = vec![(app, [0, 30, 800, 630]), (sheet, [430, 200, 850, 420])];
+            if above {
+                l.push((app, [0, 30, 800, 630]));
+            }
+            observe_frame_with(&comp, &l, screen, t, &[65030]);
+        };
+        frame(false, t0);
+        frame(false, t0 + 600 * ms);
+        assert!(visible_for(sheet, t0 + 600 * ms, t0 + 600 * ms));
+        assert!(!visible_for(app, t0 + 600 * ms, t0 + 600 * ms), "an app window is not a sheet");
+        frame(true, t0 + 700 * ms);
+        assert!(!visible_for(sheet, t0 + 800 * ms, t0 + 800 * ms), "covered");
+        // Not a sheet uid: never watched.
+        observe_frame_with(&comp, &[(sheet, [430, 200, 850, 420])], screen, t0 + 2000 * ms, &[1]);
+        observe_frame_with(&comp, &[(sheet, [430, 200, 850, 420])], screen, t0 + 3000 * ms, &[1]);
+        assert!(!visible_for(sheet, t0 + 3000 * ms, t0 + 3000 * ms));
     }
 }
