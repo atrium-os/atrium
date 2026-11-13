@@ -60,35 +60,52 @@ struct AudioErrInfo {
 
 const AFMT_S16_NE: i32 = 0x0000_0010; // AFMT_S16_LE on little-endian (aarch64)
 const AFMT_S32_NE: i32 = 0x0000_1000; // AFMT_S32_LE on little-endian
+const AFMT_S24_NE: i32 = 0x0001_0000; // AFMT_S24_LE: packed, 3 bytes a sample
 
 /// The sample format the device took. Lyra mixes to S16; a device whose only
-/// bit-perfect format is 32-bit (USB Audio 2 DACs such as the ESS ES9281 in an
-/// EarMen Sparrow offer S32_LE alone) gets each sample widened exactly
-/// (`s << 16`): the same 16-bit word, so still bit-perfect.
+/// bit-perfect format is wider gets each sample widened exactly, the same
+/// 16-bit word in the top bits, so still bit-perfect:
+/// - S32_LE (`s << 16`): USB Audio 2 DACs such as the ESS ES9281 in an
+///   EarMen Sparrow offer it alone;
+/// - S24_LE, packed 3 bytes (`s << 8`): an AudioQuest DragonFly Red offers it
+///   alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     S16,
+    S24,
     S32,
 }
 
 impl Format {
     fn bytes(self) -> u32 {
-        match self { Format::S16 => 2, Format::S32 => 4 }
+        match self { Format::S16 => 2, Format::S24 => 3, Format::S32 => 4 }
+    }
+    fn afmt(self) -> i32 {
+        match self { Format::S16 => AFMT_S16_NE, Format::S24 => AFMT_S24_NE, Format::S32 => AFMT_S32_NE }
     }
     /// The OSS format the device granted, if Lyra can feed it.
     fn from_afmt(afmt: i32) -> Option<Self> {
         match afmt {
             AFMT_S16_NE => Some(Format::S16),
+            AFMT_S24_NE => Some(Format::S24),
             AFMT_S32_NE => Some(Format::S32),
             _ => None,
         }
     }
 }
 
-/// S16 samples widened to S32 (`s << 16`), into `out` (cleared first).
-pub fn widen_s16_to_s32(samples: &[i16], out: &mut Vec<i32>) {
+/// S16 samples as `fmt`'s little-endian bytes, widened exactly, into `out`
+/// (cleared first).
+pub fn encode_s16(samples: &[i16], fmt: Format, out: &mut Vec<u8>) {
     out.clear();
-    out.extend(samples.iter().map(|&s| (s as i32) << 16));
+    out.reserve(samples.len() * fmt.bytes() as usize);
+    for &s in samples {
+        match fmt {
+            Format::S16 => out.extend_from_slice(&s.to_le_bytes()),
+            Format::S24 => out.extend_from_slice(&((s as i32) << 8).to_le_bytes()[..3]),
+            Format::S32 => out.extend_from_slice(&((s as i32) << 16).to_le_bytes()),
+        }
+    }
 }
 
 #[repr(C)]
@@ -107,7 +124,7 @@ pub struct OssSink {
     channels: u32,
     format: Format,
     frame_bytes: u32, // channels * format bytes
-    wide: std::cell::RefCell<Vec<i32>>, // S32 staging, reused
+    wide: std::cell::RefCell<Vec<u8>>, // S24/S32 staging, reused
 }
 
 impl OssSink {
@@ -139,16 +156,17 @@ impl OssSink {
         let sz_sel = (31 - (frag_bytes.max(1)).leading_zeros()) as i32;
         sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | sz_sel)?;
         // Ask for S16. A bit-perfect device answers with the format it has;
-        // take S32 (widened exactly), refuse anything else.
+        // take S24 or S32 (widened exactly), refuse anything else.
         let got = sink.set(SNDCTL_DSP_SETFMT, AFMT_S16_NE)?;
         sink.format = Format::from_afmt(got).ok_or_else(|| io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("device coerced format: asked {AFMT_S16_NE}, got {got} (neither S16 nor S32)"),
+            format!("device coerced format: asked {AFMT_S16_NE}, got {got:#x} (not S16, S24 or S32)"),
         ))?;
-        if sink.format == Format::S32 {
-            sink.require(SNDCTL_DSP_SETFMT, AFMT_S32_NE, "format")?;
+        if sink.format != Format::S16 {
+            sink.require(SNDCTL_DSP_SETFMT, sink.format.afmt(), "format")?;
             // The fragment was sized in S16 bytes: ask again at twice the
-            // bytes, so the buffer holds the same frames (the same latency).
+            // bytes (a power of two; for S24 a little more than needed), so
+            // the buffer holds at least the same frames (the same latency).
             sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | (sz_sel + 1))?;
         }
         sink.frame_bytes = channels * sink.format.bytes();
@@ -187,16 +205,13 @@ impl OssSink {
         self.format
     }
 
-    /// Write interleaved S16 frames (widened for an S32 device); blocks until
-    /// the kernel buffer accepts them.
+    /// Write interleaved S16 frames (widened for an S24 or S32 device);
+    /// blocks until the kernel buffer accepts them.
     pub fn write_i16(&self, samples: &[i16]) -> io::Result<()> {
-        if self.format == Format::S32 {
+        if self.format != Format::S16 {
             let mut wide = self.wide.borrow_mut();
-            widen_s16_to_s32(samples, &mut wide);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(wide.as_ptr() as *const u8, std::mem::size_of_val(&wide[..]))
-            };
-            return self.write_bytes(bytes);
+            encode_s16(samples, self.format, &mut wide);
+            return self.write_bytes(&wide);
         }
         let bytes = unsafe {
             std::slice::from_raw_parts(samples.as_ptr() as *const u8, std::mem::size_of_val(samples))
@@ -291,13 +306,22 @@ mod tests {
     #[test]
     fn formats_and_widening() {
         assert_eq!(Format::from_afmt(AFMT_S16_NE), Some(Format::S16));
+        assert_eq!(Format::from_afmt(AFMT_S24_NE), Some(Format::S24));
         assert_eq!(Format::from_afmt(AFMT_S32_NE), Some(Format::S32));
         assert_eq!(Format::from_afmt(0x0000_0008), None); // AFMT_U8
+        let src = [0i16, 1, -1, i16::MAX, i16::MIN];
         let mut out = Vec::new();
-        widen_s16_to_s32(&[0, 1, -1, i16::MAX, i16::MIN], &mut out);
-        assert_eq!(out, vec![0, 0x1_0000, -0x1_0000, 0x7fff_0000, i32::MIN]);
-        // The widened word's top half is the S16 sample: still bit-perfect.
-        assert!(out.iter().zip([0i16, 1, -1, i16::MAX, i16::MIN]).all(|(w, s)| (w >> 16) as i16 == s));
+        encode_s16(&src, Format::S32, &mut out);
+        let w: Vec<i32> = out.chunks(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(w, vec![0, 0x1_0000, -0x1_0000, 0x7fff_0000, i32::MIN]);
+        encode_s16(&src, Format::S24, &mut out);
+        assert_eq!(out.len(), 15);
+        // Sign-extend each packed 24-bit word; its top 16 bits are the sample.
+        let w: Vec<i32> = out.chunks(3).map(|c| i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8).collect();
+        assert_eq!(w, vec![0, 0x100, -0x100, 0x7f_ff00, -0x80_0000]);
+        assert!(w.iter().zip(src).all(|(w, s)| (w >> 8) as i16 == s));
+        encode_s16(&src, Format::S16, &mut out);
+        assert_eq!(out, src.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>());
     }
 
     #[test]

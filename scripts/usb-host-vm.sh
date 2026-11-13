@@ -15,12 +15,20 @@
 # controller's bus; the guest sees it attach as if plugged in at boot. While the VM
 # runs, macOS cannot use the device (a DAC vanishes from Sound settings).
 #
+# !! WARNING (2026-11-13): with two full-speed DACs (DragonFly Red 21b4:0082
+# and a PCM2704C 08bb:27c4) on the UHCI companions, playing through them
+# PANICKED THE MAC: a kernel data abort in IOUSBHostFamily, panicked task
+# qemu-system-aarch64. A macOS kernel bug, reached from qemu's usb-host
+# (libusb) isochronous path as root. The high-speed Sparrow on EHCI played
+# cleanly. Do not pass full-speed isochronous devices through again without
+# the person's go-ahead.
+#
 # HCD picks the guest's host controller: ehci (default) or xhci. qemu's
 # xHCI model mangles isochronous streams from usb-host: a UAC2 DAC (EarMen
 # Sparrow) played a buzz where lyrad sent a clean 440 Hz tone, with no
 # underrun anywhere in the guest. EHCI's iTD path is the one qemu's USB
 # audio passthrough is known to work on; high-speed devices run at full
-# speed on it. ISOBUFS/ISOBSIZE (default 8/32) set usb-host's iso buffering.
+# speed on it, and full-speed ones go to its UHCI companions. ISOBUFS/ISOBSIZE (default 8/32) set usb-host's iso buffering.
 #
 # The VM's dir (VMDIR, default ~girivs/atrium-vm when run under sudo) gets
 # qemu.pid, qemu-root.out and the serial/monitor sockets, made writable for
@@ -34,7 +42,13 @@ USB=${USB:?set USB to a list of vid:pid, e.g. USB=08bb:27c4}
 HCD=${HCD:-ehci}
 ISOBUFS=${ISOBUFS:-8}; ISOBSIZE=${ISOBSIZE:-32}
 case $HCD in
-    ehci) ctl="-device usb-ehci,id=usbhc" ;;
+    # ICH9's EHCI with its three UHCI companions (qemu's plain usb-ehci takes
+    # no companions): full-speed devices (most UAC1 DACs, e.g. an AudioQuest
+    # DragonFly at 12 Mb/s) are handed to a UHCI on the same ports.
+    ehci) ctl="-device ich9-usb-ehci1,id=usbhc"
+          for c in 1:0 2:2 3:4; do
+              ctl="$ctl -device ich9-usb-uhci${c%:*},masterbus=usbhc.0,firstport=${c#*:}"
+          done ;;
     xhci) ctl="-device qemu-xhci,id=usbhc" ;;
     *) echo "HCD must be ehci or xhci" >&2; exit 1 ;;
 esac
