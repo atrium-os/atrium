@@ -346,6 +346,8 @@ the way Ubuntu points at NVIDIA's?).
 ## 7. Not in scope
 
 - New kernel drivers or hardware coverage (Wi-Fi, laptop I²C/SPI sensors).
+  Shankar 2026-11-13: Wi-Fi gets Atrium's own drivers, as the GPU does; FreeBSD's
+  linuxkpi-based `iwlwifi`/`rtw88`/`rtw89` are not used. Own spec when started.
 - User-space PCI drivers. FreeBSD has no IOMMU-backed user DMA outside bhyve;
   revisit only if a device class needs it.
 - App access to raw devices (WebUSB/WebHID-style). If ever wanted, it is a
