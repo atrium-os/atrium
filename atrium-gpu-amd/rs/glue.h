@@ -75,6 +75,7 @@ int	amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 uint64_t amd_si_uq_doorbell_pa(struct atrium_amd_softc *sc, int slot);
 uint64_t amd_si_uq_fence_va(struct atrium_amd_softc *sc, int slot);
 int	amd_si_uq_alive(struct atrium_amd_softc *sc, int slot);
+uint32_t amd_si_uq_preempt(struct atrium_amd_softc *sc, uint32_t mask);
 
 /* C, for Rust (glue.c): the user-mode queue gate, and a queue fd's mmap. */
 int	amd_rs_priv_driver(void);

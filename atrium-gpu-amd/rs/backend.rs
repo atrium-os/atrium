@@ -336,6 +336,13 @@ impl Dev {
         Ok(seqno)
     }
 
+    /// The free rule: preempt every user queue of the VMs in `mask` (kernel VMIDs) once.
+    /// Returns the VMIDs whose queues could not be (a BO of theirs waits for them to go).
+    /// Sleeps (MES round trips).
+    pub fn uq_preempt(self, mask: u32) -> u32 {
+        unsafe { sys::amd_si_uq_preempt(self.0, mask) }
+    }
+
     /// The kernel VMIDs (bit n = VMID n) whose VM has a user queue that may run.
     pub fn uq_vmids(self) -> u32 {
         unsafe { sys::amd_si_uq_vmids(self.0) }

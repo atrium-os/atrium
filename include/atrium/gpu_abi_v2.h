@@ -369,6 +369,7 @@ struct atrium_gpu_queue_map {			/* on queue_fd */
 	uint64_t out_doorbell_offset;
 	uint64_t out_doorbell_size;
 	uint64_t out_wptr_offset;
+	uint64_t out_fence_gpu_va;	/* 2.2: advisory, client-written (§5.9) */
 };
 
 /* ------------------------------------------------------------------ */

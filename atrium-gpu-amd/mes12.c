@@ -123,6 +123,7 @@ static const struct mes_gen mes_gens[] = {
 #define WB_STATUS		0x18
 #define WB_SCH_CTX		0x20
 #define WB_QUERY_FENCE		0x28
+#define WB_SUSPEND_FENCE	0x40	/* pipe 0: SUSPEND's fence (kernel's) */
 #define BLK_RES1(p)		(0x5000u + (p) * 0x1000u)
 #define BLK_SIZE		0x7000u
 /*
@@ -186,6 +187,8 @@ static const struct mes_gen mes_gens[] = {
 #define HDR_QUERY_STATUS	0x000400b1u
 #define HDR_ADD_QUEUE		0x00040021u
 #define HDR_REMOVE_QUEUE	0x00040031u
+#define HDR_SUSPEND		0x00040061u	/* opcode 6 */
+#define HDR_RESUME		0x00040071u	/* opcode 7 */
 #define HW_VMID_MMHUB		4
 #define HW_VMID_GFXHUB		8
 #define HW_COMPUTE_HQD		20	/* [8] */
@@ -256,6 +259,7 @@ struct mes {
 	struct resource *dbbar;
 	int dbrid;
 	bool udb_registered;	/* user-mode doorbell pages are fictitious */
+	uint32_t suspend_seq;	/* the free rule's SUSPEND fence values */
 	uint8_t *blk;		/* KVA of the GART block */
 	vm_paddr_t blk_pa;
 	uint64_t va;		/* GART address of the block */
@@ -2554,6 +2558,60 @@ amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 	bus_write_8(q->m->dbbar, (bus_size_t)q->db * 4, q->wptr);
 	*seq = s;
 	return (0);
+}
+
+/*
+ * The free rule (spec §4.5.1 step 4): preempt the queue's gang once,
+ * SUSPEND until MES writes the suspend fence (kernel memory, never the
+ * client's), then RESUME. Whatever the gang had in flight when its VM's
+ * PTEs were cleared and flushed has then left the GPU, so a page only
+ * those PTEs reached can be freed. mes_v12 SUSPEND (MESAPI__SUSPEND):
+ * gang context at 8, fence address 16, value 24, api_status 32; RESUME:
+ * gang context 8, api_status 16. 0: preempted and running again.
+ */
+#define SU_GANG_CTX		8
+#define SU_FENCE_ADDR		16
+#define SU_FENCE_VALUE		24
+#define SU_API_STATUS		32
+#define RS_GANG_CTX		8
+#define RS_API_STATUS		16
+#define UQ2_SUSPEND_WAIT_US	2100000
+
+int
+amd_mes12_uq_preempt(struct amd_uq *q)
+{
+	struct mes *m = q->m;
+	uint32_t pkt[API_DW], v;
+	uint8_t *b = (uint8_t *)pkt;
+	bool suspended;
+	int err, us;
+
+	if (!q->added)
+		return (0);			/* off MES: nothing in flight */
+	v = ++m->suspend_seq;
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_SUSPEND;
+	put64(b, SU_GANG_CTX, q->gva + UQ_G_GANG);
+	put64(b, SU_FENCE_ADDR, m->va + BLK_WB(0) + WB_SUSPEND_FENCE);
+	put32(b, SU_FENCE_VALUE, v);
+	if ((err = mes_api(m, 0, pkt, SU_API_STATUS,
+	    "SUSPEND (user gang)")) != 0)
+		return (err);
+	for (us = 0; us < UQ2_SUSPEND_WAIT_US &&
+	    (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) != v; us += 10)
+		DELAY(10);
+	suspended = (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) == v;
+	/* Resume whatever happened: a queue left suspended would hang. */
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = HDR_RESUME;
+	put64(b, RS_GANG_CTX, q->gva + UQ_G_GANG);
+	err = mes_api(m, 0, pkt, RS_API_STATUS, "RESUME (user gang)");
+	device_printf(m->sc->dev, "uq%u: preempted for a free: suspend fence "
+	    "%s after %d us, resume %s\n", q->slot, suspended ? "landed" :
+	    "MISSING", us, err == 0 ? "ok" : "FAILED");
+	if (!suspended)
+		return (ETIMEDOUT);
+	return (err);
 }
 
 void

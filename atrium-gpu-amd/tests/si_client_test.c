@@ -40,6 +40,11 @@
  *                ring (WAIT_REG_MEM in an IB) is lost after hang_ms
  *                (QUEUE_MAP2: EIO) while another VM runs on; the VM then
  *                runs clean on a kernel-mode queue.
+ *  10 free rule  (step 4) a BO bound in a VM with live queues is freed at its
+ *                close (one MES preemption of the VM's queues, not deferred
+ *                until they close), then the queue runs on; the same while
+ *                one of the VM's queues is stuck: freed at once or held, and
+ *                nothing deferred is left once that queue is lost.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -51,6 +56,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 
@@ -776,6 +782,114 @@ user_mode(struct job *other)
 	job_close(&g);
 }
 
+/* ---- 10: the free rule (step 4) ---- */
+
+static int64_t
+iso(const char *name)
+{
+	char n[128];
+	uint64_t v = 0;
+	int iv = 0;
+	size_t len = sizeof(v);
+
+	snprintf(n, sizeof(n), "dev.atrium_gpu_amd.0.isolation.%s", name);
+	if (sysctlbyname(n, &v, &len, NULL, 0) != 0)
+		return (-1);
+	if (len == sizeof(iv)) {
+		memcpy(&iv, &v, sizeof(iv));
+		return (iv);
+	}
+	return ((int64_t)v);
+}
+
+/* A scratch BO bound into `vm`, written, then closed. */
+static int
+bo_bind_close(int vm)
+{
+	uint32_t w[16];
+	uint64_t va;
+	int bo;
+
+	bo = bo_alloc(4096, 0);
+	if (bo < 0 || vm_bind(vm, bo, 0, &va) != 0) {
+		if (bo >= 0)
+			close(bo);
+		return (-1);
+	}
+	memset(w, 0x3c, sizeof(w));
+	(void)bo_xfer(bo, w, sizeof(w), 1);
+	close(bo);
+	return (0);
+}
+
+static void
+free_rule(struct job *a)
+{
+	struct job h;
+	int64_t d0, d1, now;
+	uint32_t w[7];
+	int r, ms, i;
+
+	/* A VM whose queue is live and idle. */
+	d0 = iso("deferred");
+	if (d0 < 0) {
+		check(0, "10 free rule", "isolation sysctls unreadable: %s",
+		    strerror(errno));
+		return;
+	}
+	if (bo_bind_close(a->vm) != 0) {
+		check(0, "10 free rule", "BO: %s", strerror(errno));
+		return;
+	}
+	d1 = iso("deferred");
+	now = iso("deferred_now");
+	check(d1 == d0 && now == 0, "10 free rule: a BO of a VM with a live "
+	    "queue is freed at its close (preempted, not deferred)",
+	    "deferred %jd -> %jd, now %jd", (intmax_t)d0, (intmax_t)d1,
+	    (intmax_t)now);
+	run_clean(a, "10 free rule: the queue runs on after the preemption");
+
+	/* The same while one of the VM's queues is stuck. */
+	if (job_open(&h, "10") != 0) {
+		check(0, "10 free rule (stuck)", "setup failed");
+		job_close(&h);
+		return;
+	}
+	(void)poison(h.out, POISON_A);
+	w[0] = 3u << 30 | 5u << 16 | 0x3cu << 8;	/* WAIT_REG_MEM */
+	w[1] = 3u | 1u << 4;
+	w[2] = (uint32_t)h.out_va;
+	w[3] = (uint32_t)(h.out_va >> 32);
+	w[4] = 0x12345678u;
+	w[5] = 0xffffffffu;
+	w[6] = 0x20u;
+	if (bo_xfer(h.ib, w, sizeof(w), 1) != 0 ||
+	    (r = queue_submit(h.q, h.ib_va, 7, h.so, ++h.value, NULL)) != 0) {
+		check(0, "10 free rule (stuck)", "submit: %s", strerror(errno));
+		job_close(&h);
+		return;
+	}
+	usleep(200000);
+	d0 = iso("deferred");
+	r = bo_bind_close(h.vm);
+	d1 = iso("deferred");
+	printf("10: BO closed under a stuck queue: %s (deferred %jd -> %jd)\n",
+	    r != 0 ? strerror(errno) : d1 == d0 ? "freed at once" : "held",
+	    (intmax_t)d0, (intmax_t)d1);
+	r = job_wait(&h, 15000, &ms);
+	check(r == EIO, "10 free rule (stuck): the stuck queue is still lost "
+	    "after hang_ms", "got %s after %d ms", r == 0 ? "success" :
+	    strerror(r), ms);
+	close(h.q);
+	h.q = -1;
+	for (i = 0; i < 100 && (now = iso("deferred_now")) != 0; i++)
+		usleep(20000);
+	check(now == 0, "10 free rule (stuck): nothing deferred is left once "
+	    "the queue is gone", "deferred_now %jd", (intmax_t)now);
+	run_clean(a, "10 free rule (stuck): another VM's queue runs on");
+	job_close(&h);
+}
+
 static int
 ioerr(int f, unsigned long cmd, void *arg)
 {
@@ -1055,6 +1169,9 @@ main(void)
 	/* 9: user-mode queues (needs a free VM: drop 8's). */
 	job_close(&f);
 	user_mode(&a);
+
+	/* 10: the free rule. */
+	free_rule(&a);
 
 out:
 	job_close(&a);

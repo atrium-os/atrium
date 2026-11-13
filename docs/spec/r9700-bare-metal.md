@@ -743,3 +743,13 @@ work (self-test, scrub).
   (counted once), hangs 2, grants 2 / live 0; unrouted EOPs 1 (src_data 0x18000000 once at
   attach, before any queue), MES own 54. Idle 7 W, detach clean, card cold. Next: step 4,
   the free rule (MES suspend/resume before freeing a BO of a VM with user queues).
+- **2026-11-13, stage 5c-2b step 4 built (box run pending): the free rule.** A BO's last
+  close clears its PTEs and flushes the VM's kernel VMID and every MES VMID (as before);
+  then each user queue of those VMs is preempted once: MES SUSPEND of its gang with a fence
+  in the kernel's MES block (never client memory), wait for it (2.1 s), RESUME. Proven VMs
+  free the BO at once; VMs whose queues could not be suspended (lost, leaked, or SUSPEND
+  without a fence) keep the old rule (the BO waits until they have no queues). Test 10.
+  Also: `out_fence_gpu_va` adopted into ABI v2 as 2.2 (advisory, client-written; never a
+  free or signal point; §5.9). RamPages follow-ups: a non-contiguous path for larger rings,
+  a review of the managed-flag change against vm_page locking and invariants, a leak
+  counter.

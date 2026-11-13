@@ -930,6 +930,7 @@ vm_paddr_t amd_mes12_uq_doorbell_pa(struct amd_uq *q);
 bool	amd_mes12_uq_user_busy(struct amd_uq *q, uint32_t *rptr,
 	    uint32_t *fence);
 uint64_t amd_mes12_uq_fence_va(struct amd_uq *q);
+int	amd_mes12_uq_preempt(struct amd_uq *q);
 int	amd_mes12_uq_destroy(struct amd_uq *q, u_int kvmid);
 int	amd_mes12_uq_evict(struct amd_uq *q);
 int	amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,

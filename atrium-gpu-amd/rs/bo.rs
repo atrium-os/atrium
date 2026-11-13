@@ -205,7 +205,13 @@ impl Drop for BoFile {
         // Work already queued under one of those VMs may still be using the pages (isolation
         // break 2): note which queues are busy now, before dropping the VM references (the
         // last one tears the VM down, which stops its queues).
-        let at = dev.busy_snapshot(&vmids[..n]);
+        let mut at = dev.busy_snapshot(&vmids[..n]);
+        // The free rule (spec §4.5.1 step 4): the PTEs are cleared and flushed; one MES
+        // preemption of each user queue of those VMs then proves nothing still uses the old
+        // translations. VMs whose queues could not be preempted keep the BO waiting.
+        if at.uq != 0 {
+            at.uq = dev.uq_preempt(at.uq);
+        }
         for b in binds.iter_mut() {
             *b = None; // drops the VM reference
         }

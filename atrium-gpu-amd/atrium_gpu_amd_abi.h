@@ -272,7 +272,7 @@ struct atrium_gpu_queue_map2 {		/* on queue_fd */
 	uint64_t	out_doorbell_offset;
 	uint64_t	out_doorbell_size;
 	uint64_t	out_wptr_offset;
-	uint64_t	out_fence_gpu_va;	/* not in v2 2.1: proposed */
+	uint64_t	out_fence_gpu_va;	/* v2 2.2 (§5.9): advisory */
 };
 
 struct atrium_gpu_syncobj_point {

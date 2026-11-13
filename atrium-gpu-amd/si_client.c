@@ -110,6 +110,7 @@ struct amd_si_client {
 	struct callout uq_poll;
 	struct task uq_task;		/* evicts lost queues (taskqueue_thread) */
 	uint64_t uq_hangs, uq_faults;
+	uint64_t uq_preempts, uq_preempt_fails;	/* the free rule */
 	uint64_t uq_eop_routed, uq_eop_unrouted, uq_eop_mes, uq_retired_iv,
 		 uq_retired_poll;
 
@@ -821,12 +822,14 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	}
 	device_printf(sc->dev, "si: uq%d closed: %ju submits; EOP IVs "
 	    "routed %ju, unrouted %ju, MES own %ju; retired by IV %ju, "
-	    "by poll %ju; queues lost to faults %ju, hangs %ju\n",
+	    "by poll %ju; queues lost to faults %ju, hangs %ju; preempted "
+	    "for frees %ju (failed %ju)\n",
 	    slot, (uintmax_t)submits, (uintmax_t)c->uq_eop_routed,
 	    (uintmax_t)c->uq_eop_unrouted, (uintmax_t)c->uq_eop_mes,
 	    (uintmax_t)c->uq_retired_iv,
 	    (uintmax_t)c->uq_retired_poll, (uintmax_t)c->uq_faults,
-	    (uintmax_t)c->uq_hangs);
+	    (uintmax_t)c->uq_hangs, (uintmax_t)c->uq_preempts,
+	    (uintmax_t)c->uq_preempt_fails);
 	if (err == 0) {
 		mtx_lock(&sc->lock);
 		u->busy = false;
@@ -882,6 +885,57 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 	}
 	mtx_unlock(&sc->lock);
 	return (err);
+}
+
+/*
+ * The free rule (spec §4.5.1 step 4): a BO of the VMs in `mask` (kernel
+ * VMIDs) lost its PTEs, flushed on every MES VMID. Preempt each of their
+ * user queues once (MES SUSPEND to a kernel fence, then RESUME), so what
+ * they had in flight is done with the old translations. Returns the VMIDs
+ * not proven that way (a queue MES would not suspend, a lost queue, a
+ * leaked one): the BO waits for their queues to go (defer.rs).
+ */
+uint32_t
+amd_si_uq_preempt(struct atrium_amd_softc *sc, uint32_t mask)
+{
+	struct amd_si_client *c = sc->si_client;
+	struct amd_uq *hw;
+	uint32_t left = 0, bit;
+	u_int i;
+	bool busy, dead;
+	int err;
+
+	if (!amd_is_si(sc) || c == NULL)
+		return (mask);
+	sx_xlock(&c->uq_sx);
+	for (i = 0; i < AMD_UQ_SLOTS; i++) {
+		mtx_lock(&sc->lock);
+		bit = c->uq[i].kvmid < 32 ? 1u << c->uq[i].kvmid : 0;
+		busy = c->uq[i].busy && (mask & bit) != 0;
+		hw = c->uq[i].hw;
+		dead = c->uq[i].dead;
+		mtx_unlock(&sc->lock);
+		if (!busy)
+			continue;
+		if (hw == NULL || dead || !amd_si_usable(sc)) {
+			left |= bit;
+			continue;
+		}
+		err = amd_mes12_uq_preempt(hw);
+		mtx_lock(&sc->lock);
+		if (err != 0) {
+			left |= bit;
+			c->uq_preempt_fails++;
+		} else
+			c->uq_preempts++;
+		mtx_unlock(&sc->lock);
+		if (err != 0)
+			device_printf(sc->dev, "si: uq%u could not be preempted "
+			    "(%d); the BO waits for its queues to close\n", i,
+			    err);
+	}
+	sx_xunlock(&c->uq_sx);
+	return (left);
 }
 
 /* A user-mode queue's fence, as a VA of its VM (QUEUE_MAP2). */
