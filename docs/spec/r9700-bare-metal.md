@@ -1017,3 +1017,16 @@ work (self-test, scrub).
   silicon a VM's page tables come from VRAM too, so A's grew by 88 KiB. Its last check
   also ran while B's VM was still open. The test now allows up to 1 MiB of page tables
   and closes B's VM before the final check (gpusim ALL OK).
+- **2026-11-13 07:30, stage 5f on the box (26fffb0b kmods, 71259704 isolation test):
+  STAGE 5f PASSED.** si-client-test 64/64; atrium_gpu_test ALL OK; test_gpu_isolation
+  ALL OK, on queue fds only, with interrupts on MSI.
+  - Step 7's CPG fault was handled by a full GPU re-init mid-run ("re-init 1 of 3:
+    PASS"); the later parts ran on the new card.
+  - Part F: +88 KiB for the 64 KiB BO with its page tables, scrubbed, B reads zero, a
+    full-device alloc and free with no ENOMEM, and in-use back to its start.
+  - Sysctls: scrub_failed 0, enomem 0, ih_overflows 0.
+  - Power: 7 W idle while attached and at detach, where the card was proven idle; the
+    vector was released.
+  Logs: branch claude/project-thread-33aauq, commit 16d37a66.
+  Open: the unrouted 0x18000000 EOP (one per IH instance); hostile-PM4 policy;
+  reset-path leaks; crash dumps need a dump device on Atrium's disk.
