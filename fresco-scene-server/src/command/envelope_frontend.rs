@@ -2730,7 +2730,7 @@ mod tests {
         // run the REAL forum-wm daemon loop against the REAL handlers.
         let wm = Wm::new(Screen {
             rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
-            bar_h: 24, dock_h: 48,
+            bar_h: 24, dock_h: 48, scale_milli: 1000,
         });
         {
             let mut conn = FrontendConn { fe: &mut f, shell: 9 };

@@ -122,43 +122,46 @@ impl FrescoConn for ClientConn {
 /// The chrome reservations (bar/dock) stay the shell's own: frescod reports the
 /// mode, not what the session has reserved from it.
 fn screen(conn: &mut Connection) -> Screen {
-    let (w, h, top) = std::env::var("FORUM_SCREEN")
+    let (w, h, top, scale) = std::env::var("FORUM_SCREEN")
         .ok()
         .and_then(|s| {
             let (a, b) = s.split_once('x')?;
             Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
         })
-        .map(|(w, h)| (w, h, 0))
+        .map(|(w, h)| (w, h, 0, 1000))
         .or_else(|| match conn.display_info() {
             Ok(d) => screen_geometry(&d),
             Err(e) => { eprintln!("forum-wm: display_info failed: {e}"); None }
         })
-        .unwrap_or((1920, 1080, 0));
-    screen_from(w, h, top)
+        .unwrap_or((1920, 1080, 0, 1000));
+    screen_from(w, h, top, scale)
 }
 
-/// frescod's reported mode → (w, h, top rows reserved), or None if no mode.
-fn screen_geometry(d: &fresco_protocol::DisplayInfoResponse) -> Option<(i32, i32, i32)> {
+/// frescod's reported mode → (w, h, top rows reserved, scale), or None if
+/// no mode.
+fn screen_geometry(d: &fresco_protocol::DisplayInfoResponse) -> Option<(i32, i32, i32, u32)> {
     if d.width == 0 || d.height == 0 {
         eprintln!("forum-wm: frescod reports no mode");
         return None;
     }
-    eprintln!("forum-wm: screen {}x{} @ {} mHz, top {} rows frescod's (from frescod)",
-              d.width, d.height, d.refresh_mhz, d.reserved_top);
+    eprintln!("forum-wm: screen {}x{} @ {} mHz, scale {}, top {} rows frescod's (from frescod)",
+              d.width, d.height, d.refresh_mhz, d.scale_milli as f32 / 1000.0, d.reserved_top);
     let top = (d.reserved_top as i32).min(d.height as i32 / 2);
-    Some((d.width as i32, d.height as i32, top))
+    Some((d.width as i32, d.height as i32, top, d.scale_milli.max(1)))
 }
 
-/// The bar's height (Pergola `theme::shell::BAR_H`).
+/// The bar's height in points (Pergola `theme::shell::BAR_H`).
 const BAR_H: i32 = 38;
 
-fn screen_from(w: i32, h: i32, top: i32) -> Screen {
+fn screen_from(w: i32, h: i32, top: i32, scale_milli: u32) -> Screen {
     /* frescod's trusted strip (F4d) covers the top `top` rows: the session's
      * screen, bar included, starts below it. */
     /* The bar's window is as tall as the bar draws (Pergola shell::BAR_H,
      * 38): at 24 its lower part was cut off, and a drop-down's anchor (a
      * bar button) fell outside the window, so frescod refused it. */
-    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: BAR_H, dock_h: 48 }
+    /* Bar and dock in points, at the monitor's scale (each monitor's own
+     * once frescod lists them: `Wm::screen_of`). */
+    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: BAR_H, dock_h: 48, scale_milli }
 }
 
 /// Tell the user (Praeco, as a system poster: praecod's
@@ -409,10 +412,10 @@ fn spawn_input_poller(core: Core) {
             // FORUM_SCREEN pins the layout to a screen the hardware isn't showing.
             if let Some(d) = display {
                 if std::env::var_os("FORUM_SCREEN").is_none() {
-                    if let Some((w, h, top)) = screen_geometry(&d) {
+                    if let Some((w, h, top, scale)) = screen_geometry(&d) {
                         let mut g = core.lock().unwrap();
                         let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
-                        match wm.set_screen(conn, screen_from(w, h, top)) {
+                        match wm.set_screen(conn, screen_from(w, h, top, scale)) {
                             Ok(Some(l)) => eprintln!(
                                 "forum-wm: display now {w}x{h} — re-laid out {} surface(s)", l.slots.len()),
                             Ok(None) => {}       // same geometry (a refresh-only switch)

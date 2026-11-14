@@ -18,20 +18,34 @@ use fresco_protocol::{
 
 /// The output region: the screen plus the chrome-reserved edges (a top bar, a
 /// bottom dock). Documents get the work area; chrome reserves the edges.
+///
+/// `rect` is in device pixels, as frescod's desktop is; the bar and dock
+/// heights are in points (what the bar and dock lay out in), turned into
+/// device pixels at the monitor's `scale_milli` (resolution-independence.md
+/// §7.2), so the bar and the work area meet exactly at any scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Screen {
     pub rect: WmRect,
     pub bar_h: i32,
     pub dock_h: i32,
+    /// Device pixels per point, thousandths.
+    pub scale_milli: u32,
 }
 
 impl Screen {
+    /// `pt` points in this screen's device pixels (rounded up, so a
+    /// reservation never comes out short of what is drawn in it).
+    pub fn px(&self, pt: i32) -> i32 {
+        (pt as i64 * self.scale_milli.max(1) as i64 + 999).div_euclid(1000) as i32
+    }
+
     pub fn work_area(&self) -> WmRect {
+        let (bar, dock) = (self.px(self.bar_h), self.px(self.dock_h));
         WmRect {
             x: self.rect.x,
-            y: self.rect.y + self.bar_h,
+            y: self.rect.y + bar,
             w: self.rect.w,
-            h: self.rect.h - self.bar_h - self.dock_h,
+            h: self.rect.h - bar - dock,
         }
     }
 }
@@ -118,15 +132,15 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
             WmRect { x: wa.x + wa.w - pw, y: wa.y, w: pw, h: wa.h }
         }
         WmRole::Dialog => {
-            let (dw, dh) = (480, 320);
+            let (dw, dh) = (screen.px(480), screen.px(320));
             WmRect { x: wa.x + (wa.w - dw) / 2, y: wa.y + (wa.h - dh) / 2, w: dw, h: dh }
         }
         WmRole::Hud | WmRole::Chrome => {
-            WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.bar_h }
+            WmRect { x: screen.rect.x, y: screen.rect.y, w: screen.rect.w, h: screen.px(screen.bar_h) }
         }
         // The default corner and aspect; `Wm` places it by the player's
         // aspect at the user's corner (`place_pip`).
-        WmRole::Pip => pip_rect(wa, (16, 9), forum_ctl::Corner::default()),
+        WmRole::Pip => pip_rect(wa, (16, 9), forum_ctl::Corner::default(), screen.scale_milli),
         // frescod's band for toasts (it clamps them there anyway).
         WmRole::Notification => {
             let top = (wa.y - screen.rect.y).max(0) as u32;
@@ -199,7 +213,9 @@ pub fn arrange_for(
 /// of the work area's width, no more than a quarter of its height, at least
 /// 160×90, `PIP_MARGIN` from the corner's edges.
 pub const PIP_MARGIN: i32 = 16;
-pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner) -> WmRect {
+pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner, scale_milli: u32) -> WmRect {
+    let k = scale_milli.max(1) as f64 / 1000.0;
+    let margin = (PIP_MARGIN as f64 * k).round() as i32;
     use forum_ctl::Corner;
     let (aw, ah) = if aspect.0 == 0 || aspect.1 == 0 { (16, 9) } else { aspect };
     let ratio = ah as f64 / aw as f64;
@@ -209,22 +225,22 @@ pub fn pip_rect(wa: WmRect, aspect: (u32, u32), corner: forum_ctl::Corner) -> Wm
         h = wa.h as f64 / 4.0;
         w = h / ratio;
     }
-    if w < 160.0 {
-        w = 160.0;
+    if w < 160.0 * k {
+        w = 160.0 * k;
         h = w * ratio;
     }
-    if h < 90.0 {
-        h = 90.0;
+    if h < 90.0 * k {
+        h = 90.0 * k;
         w = h / ratio;
     }
     let (w, h) = (w.round() as i32, h.round() as i32);
     let x = match corner {
-        Corner::TopLeft | Corner::BottomLeft => wa.x + PIP_MARGIN,
-        Corner::TopRight | Corner::BottomRight => wa.x + wa.w - PIP_MARGIN - w,
+        Corner::TopLeft | Corner::BottomLeft => wa.x + margin,
+        Corner::TopRight | Corner::BottomRight => wa.x + wa.w - margin - w,
     };
     let y = match corner {
-        Corner::TopLeft | Corner::TopRight => wa.y + PIP_MARGIN,
-        Corner::BottomLeft | Corner::BottomRight => wa.y + wa.h - PIP_MARGIN - h,
+        Corner::TopLeft | Corner::TopRight => wa.y + margin,
+        Corner::BottomLeft | Corner::BottomRight => wa.y + wa.h - margin - h,
     };
     WmRect { x, y, w, h }
 }
@@ -236,7 +252,7 @@ pub fn place_pip(layout: &mut WmDeclareLayoutPayload, screen: &Screen, active: &
     let wa = screen.work_area();
     for s in active.iter().filter(|s| s.role == WmRole::Pip) {
         let aspect = (s.rect.w.max(0) as u32, s.rect.h.max(0) as u32);
-        let slot = WmSlot { surface_id: s.surface_id, rect: pip_rect(wa, aspect, corner), layer: PIP_LAYER };
+        let slot = WmSlot { surface_id: s.surface_id, rect: pip_rect(wa, aspect, corner, screen.scale_milli), layer: PIP_LAYER };
         match layout.slots.iter_mut().find(|x| x.surface_id == s.surface_id) {
             Some(x) => *x = slot,
             None => layout.slots.push(slot),
@@ -872,6 +888,7 @@ pub mod daemon {
                 rect: WmRect { x: m.rect.x, y, w: m.rect.w, h },
                 bar_h: if primary { self.screen.bar_h } else { 0 },
                 dock_h: if primary { self.screen.dock_h } else { 0 },
+                scale_milli: m.scale_milli,
             }
         }
 
@@ -1806,8 +1823,24 @@ mod tests {
     use super::*;
 
     fn screen() -> Screen {
-        Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 }
+        Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 }
     }
+    /// The bar and dock are reserved in points (resolution-independence.md
+    /// §7.2): at 1.5 the bar's 38 pt are 57 px, and windows start below
+    /// them, so the bar is not cut off and its panels' anchors lie inside
+    /// its window.
+    #[test]
+    fn the_bar_and_dock_are_reserved_at_the_monitors_scale() {
+        let s = Screen { rect: WmRect { x: 0, y: 0, w: 3840, h: 2160 }, bar_h: 38, dock_h: 48, scale_milli: 1500 };
+        assert_eq!(rect_for(&s, WmRole::Chrome), WmRect { x: 0, y: 0, w: 3840, h: 57 });
+        assert_eq!(s.work_area(), WmRect { x: 0, y: 57, w: 3840, h: 2160 - 57 - 72 });
+        assert_eq!(rect_for(&s, WmRole::Dialog).w, 720, "a dialog's 480 pt");
+        let s1 = Screen { scale_milli: 1250, ..s };
+        assert_eq!(s1.px(38), 48, "rounded up: 47.5 px reserves 48");
+        let pip = pip_rect(WmRect { x: 0, y: 0, w: 400, h: 300 }, (16, 9), forum_ctl::Corner::TopLeft, 2000);
+        assert_eq!((pip.x, pip.y, pip.w, pip.h), (32, 32, 320, 180), "the smallest PiP and its margin in points");
+    }
+
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
         WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 } }
     }
@@ -1843,7 +1876,7 @@ mod tests {
     /// screen below it, and nothing the WM places reaches into it.
     #[test]
     fn nothing_is_placed_in_frescods_reserved_strip() {
-        let s = Screen { rect: WmRect { x: 0, y: 24, w: 1920, h: 1056 }, bar_h: 24, dock_h: 48 };
+        let s = Screen { rect: WmRect { x: 0, y: 24, w: 1920, h: 1056 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
         for role in [WmRole::Background, WmRole::Document, WmRole::Panel, WmRole::Dialog, WmRole::Chrome] {
             let r = rect_for(&s, role);
             assert!(r.y >= 24 && r.y + r.h <= 1080, "{role:?} at {r:?}");
@@ -2099,13 +2132,13 @@ mod tests {
         assert!(matches!(r, Reply::Err { .. }));
 
         // frescod's EV_DISPLAY_CHANGED → the WM adopts the screen and re-places.
-        let small = Screen { rect: WmRect { x: 0, y: 0, w: 1280, h: 720 }, bar_h: 24, dock_h: 48 };
+        let small = Screen { rect: WmRect { x: 0, y: 0, w: 1280, h: 720 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
         let l = wm.set_screen(&mut conn, small).unwrap().expect("relaid out");
         let doc = &l.slots[0];
         assert!(doc.rect.x + doc.rect.w <= 1280 && doc.rect.y + doc.rect.h <= 720, "{:?}", doc.rect);
         // The same screen again, or an unplugged (empty) one, changes nothing.
         assert!(wm.set_screen(&mut conn, small).unwrap().is_none());
-        let none = Screen { rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, bar_h: 24, dock_h: 48 };
+        let none = Screen { rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
         assert!(wm.set_screen(&mut conn, none).unwrap().is_none());
         assert_eq!(wm.screen, small);
     }
@@ -2398,7 +2431,7 @@ mod tests {
 
     fn two_monitors() -> (Wm, MockConn) {
         let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
-        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 4480, h: 1440 }, bar_h: 24, dock_h: 48 });
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 4480, h: 1440 }, bar_h: 24, dock_h: 48, scale_milli: 1000 });
         wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), mon(1, 20, 1920, 2560, 1440)]).unwrap();
         (wm, conn)
     }
@@ -2561,7 +2594,7 @@ mod tests {
     #[test]
     fn zoom_on_a_span_group_covers_the_group_and_ends_with_the_zoom() {
         let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)], ..Default::default() };
-        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 5760, h: 1080 }, bar_h: 24, dock_h: 48 });
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 5760, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 });
         let mons = vec![mon(0, 10, 0, 1920, 1080), mon(1, 11, 1920, 1920, 1080), mon(2, 12, 3840, 1920, 1080), mon(3, 13, 5760, 2560, 1440)];
         conn.outputs = mons.clone();
         wm.set_outputs(&mut conn, mons).unwrap();
@@ -2647,7 +2680,7 @@ mod tests {
     #[test]
     fn windows_stay_on_their_monitor_when_a_new_one_becomes_the_primary() {
         let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
-        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 });
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 });
         wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080)]).unwrap();
         wm.focus_new(&mut conn, 1).unwrap();
         // A second monitor arrives to the left: it is now the top-left one.
@@ -2692,13 +2725,13 @@ mod pip_tests {
     #[test]
     fn pip_sits_in_its_corner_at_a_quarter_width_and_snaps_to_the_nearest() {
         let wa = WmRect { x: 0, y: 48, w: 1920, h: 984 };
-        let r = pip_rect(wa, (16, 9), Corner::BottomRight);
+        let r = pip_rect(wa, (16, 9), Corner::BottomRight, 1000);
         assert_eq!((r.w, r.h), (437, 246), "height capped at a quarter of the work area");
         assert_eq!((r.x + r.w, r.y + r.h), (1920 - PIP_MARGIN, 48 + 984 - PIP_MARGIN));
-        let r = pip_rect(wa, (0, 0), Corner::TopLeft);
+        let r = pip_rect(wa, (0, 0), Corner::TopLeft, 1000);
         assert_eq!((r.x, r.y), (PIP_MARGIN, 48 + PIP_MARGIN), "no aspect: 16:9");
         // A small screen still gets 160×90 at least.
-        let r = pip_rect(WmRect { x: 0, y: 0, w: 400, h: 300 }, (16, 9), Corner::TopLeft);
+        let r = pip_rect(WmRect { x: 0, y: 0, w: 400, h: 300 }, (16, 9), Corner::TopLeft, 1000);
         assert!(r.w >= 160 && r.h >= 90);
         assert_eq!(nearest_corner(wa, 100, 900), Corner::BottomLeft);
         assert_eq!(nearest_corner(wa, 1800, 100), Corner::TopRight);
@@ -2709,7 +2742,7 @@ mod pip_tests {
 
     #[test]
     fn a_pip_surface_is_placed_at_the_users_corner_and_never_focused() {
-        let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 };
+        let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
         let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h } };
         let active = [surf(1, WmRole::Document, 0, 0), surf(7, WmRole::Pip, 640, 480)];
         let mut l = arrange(&screen, &active, None);

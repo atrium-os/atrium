@@ -87,11 +87,16 @@ Built in step 1a (2026-11-14); fresco-protocol's "Units" note is the reference.
 - Clients that lay out in device px themselves (Arca's UI, the lock screen, the player's
   controls, libatrium's C ABI) call `Connection::in_device_px` on each event; moving them to
   Pergola or to points is later work.
-- **Step 1b, still to do:** WM ops (`OP_WM_OUTPUTS`, arrange, move, declare layout) and the
-  desktop are still device px. A window's size is the WM's to set, so on a scale change
-  frescod keeps its buffer and the window's pt size follows the new scale; a pop-up keeps its
-  pt size. forum-wm moving to pt (floating windows keep their pt size across monitors, bar
-  and dock reservations in pt) is step 1b.
+- **Step 1b, built 2026-11-14:** the desktop and WM ops (`OP_WM_OUTPUTS`, arrange, move,
+  declare layout) stay in device px, because one desktop spans monitors of different scales
+  and the WM is a system client that frescod trusts with raw geometry. What forum-wm sizes in
+  its own units is stated in pt and converted per monitor: each `Screen` carries the monitor's
+  `scale_milli`, and the bar (38 pt) and dock (48 pt) reservations, the dialog size
+  (480 x 320 pt) and the PiP minimum and margin (160 x 90 and 16 pt) go through `Screen::px`,
+  rounding up. A window's size is the WM's to set, so on a scale change frescod keeps its
+  buffer and the window's pt size follows the new scale; a pop-up keeps its pt size. The dock
+  redraws on a live scale change. Floating windows keeping their pt size across monitors is
+  step 6.
 
 ## 4. Per-monitor scale
 
@@ -335,11 +340,12 @@ Shankar took the recommendation on each:
 1. **Units fix** (rows 4 to 7, 12). **1a, built 2026-11-14:** pt on the app connection for
    geometry and input (window, pop-up and sheet sizes and anchors, `SHEET_TOP`), scale in the
    create reply, scale changes as `EV_WINDOW_RESIZED`, Pergola in pt with one place that
-   multiplies. **1b:** forum-wm lays out the desktop in pt. Test: the Pergola showcase
+   multiplies. **1b, built 2026-11-14:** forum-wm's bar, dock, dialog and PiP sizes in pt,
+   converted at each monitor's scale; the desktop itself stays device px. Test: the Pergola showcase
    pixel-compared at 1.0, 1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit
    at every scale.
 2. **Scale policy** (rows 8 to 10): `ui_size` relative preference, TV fallback, 1/8 steps,
-   strip, cursor and forum-wm's bar and dock reservations in pt. Test: change a monitor's mode in the VM and check every window's
+   strip and cursor in pt. Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.
 3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,
    1.5 and 1.75.

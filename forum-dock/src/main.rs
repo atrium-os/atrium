@@ -122,16 +122,18 @@ impl Icons {
 struct DockView {
     apps: Vec<AppEntry>,
     icons: Icons,
-    w: f32,
-    h: f32,
+    /// The window's size in points; the loop updates it on a resize or a
+    /// scale change.
+    size: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
 }
 
 impl View for DockView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
+        let (w, h) = self.size.get();
         // Desktop wallpaper.
         ctx.push(Node::Rect {
-            rect: Rect::new(0.0, 0.0, self.w, self.h),
+            rect: Rect::new(0.0, 0.0, w, h),
             fill: palette::deep_teal(),
             radius: 0.0,
         });
@@ -139,8 +141,8 @@ impl View for DockView {
         let n = self.apps.len().max(1) as f32;
         let dock_w = PAD * 2.0 + n * TILE + (n - 1.0) * GAP;
         let dock_h = PAD * 2.0 + TILE;
-        let dock_x = (self.w - dock_w) * 0.5;
-        let dock_y = self.h - dock_h - 28.0;
+        let dock_x = (w - dock_w) * 0.5;
+        let dock_y = h - dock_h - 28.0;
 
         // Dock panel — elevated, rounded.
         ctx.add(Node::Rect {
@@ -231,7 +233,8 @@ fn render_dock() -> io::Result<()> {
     let mode = conn.appearance().map(|a| pergola::window::theme_for(&a)).unwrap_or(mode);
     let mut surface = FrescoSurface::new(conn, win);
 
-    let mut app = App::new(DockView { apps, icons: Icons::load(), w: sw, h: sh }).with_theme(mode);
+    let size = std::rc::Rc::new(std::cell::Cell::new((sw, sh)));
+    let mut app = App::new(DockView { apps, icons: Icons::load(), size: size.clone() }).with_theme(mode);
     let deltas = app.tick();
     eprintln!("forum-dock: drawing the dock ({} node deltas)", deltas.len());
     commit(&mut surface, &deltas)?;
@@ -248,6 +251,23 @@ fn render_dock() -> io::Result<()> {
         match surface.connection().wait_event(None)? {
             Some(fresco_client::Event::Appearance(a)) => {
                 app.set_theme(pergola::window::theme_for(&a));
+                let deltas = app.tick();
+                if !deltas.is_empty() {
+                    commit(&mut surface, &deltas)?;
+                    surface.present()?;
+                }
+            }
+            // A new size or scale (the WM re-laid out; the monitor's scale
+            // changed): lay out in the new points, draw at the new scale.
+            Some(fresco_client::Event::Resized { window_id, width, height, scale, .. }) if window_id == win => {
+                if scale.is_finite() && scale > 0.0 && scale != surface.scale {
+                    surface.scale = scale;
+                    app.resend_all();
+                }
+                if (width, height) != size.get() {
+                    size.set((width, height));
+                    app.invalidate();
+                }
                 let deltas = app.tick();
                 if !deltas.is_empty() {
                     commit(&mut surface, &deltas)?;
