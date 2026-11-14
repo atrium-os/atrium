@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3).
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -924,6 +924,44 @@ Gates, on the 4-core cloud machine:
 | LibreOffice, both ways | `examples/lo_check.rs`: our file of the 152 conformance formulas opens in LibreOffice 24 (headless) and is saved again by it; our reader opens LibreOffice's file, our engine recalculates, and every result is still Excel's. LibreOffice's own results agree with ours on 145; the 7 others are LibreOffice departing from Excel (`"z"<TRUE`, `TRUE=1`, `SQRT(-1)` and `LN(0)` as `#VALUE!`, `CONCATENATE` with `TRUE`, `VLOOKUP` past the range, no `XLOOKUP`). No Excel runs here; a corpus of Excel-saved files is the next differential |
 | hostile input | 3,000 mutated packages, every truncation, and 1,500 packages with mutated XML in every part (byte flips, inserted tokens, cuts): errors, no panic, no hang |
 | 1,048,576 × 20 `.xlsx` | 177 MB file, 730 MB of sheet XML: read in 3.7 s on 4 cores (13.5 s on one, before the pieces); native hand-off 0.6 s out and 0.6 s in. So about 5 s to the document on screen, the target's edge; the screen does not yet show the top rows while the rest loads. Writing it takes 12 s (one deflate stream; parallel deflate is the fix) |
+
+### 16.4 O4b as built (2026-11-14): styles and number formats
+
+- **Number formats** (`officina-grid::numfmt`): Excel's format codes as Excel shows them
+  in en-US: up to four sections with `[Color]` and `[condition]`, digit placeholders
+  (`0 # ?`), thousands separators and scaling commas, percent, scientific and
+  engineering (`##0.0E+0`), fractions (`# ?/?`, `?/8`), dates and times (`d dd ddd dddd`,
+  `m`…`mmmmm`, `yy yyyy`, `h hh`, minutes by context, seconds rounded as Excel rounds,
+  `.0`–`.000`, `AM/PM`, `A/P`, elapsed `[h] [m] [s]`), text sections (`@`), literals,
+  `\x`, `_x` padding, `*x` fill (shown once), `[$€-407]` currency, and the built-in ids
+  0–49. A code never fails to parse; unknown parts show as literals and the fidelity
+  report says so. `TEXT(value, format)` uses it.
+- **Styles** (`officina-grid::style`): a style is a number format, font (name, size,
+  bold, italic, underline, strike, colour), solid fill, horizontal and vertical
+  alignment, wrap, indent, rotation and four borders. Styles are interned per workbook;
+  each column keeps runs of style ids, so a formatted column is one run at any height.
+  Restyling is an undoable op carrying styles by value (`GridOp::Restyle`); the native
+  file has `STYLES` and `STYLE_RUNS` chunks.
+- **`.xlsx` styles**: read from `styles.xml` (custom and built-in number formats,
+  fonts, solid, patterned and gradient fills, borders, alignment, the custom indexed
+  palette, theme colours with Excel's tint) and written back (one `cellXfs` entry per
+  style; a style reaching the last row becomes the column's style). Reported: patterned
+  and gradient fills shown solid, diagonal borders, rotated and shrink-to-fit text,
+  unlocked or hidden cells, row formats on empty cells, locale-specific built-in formats.
+- **Sheets** shows values through their format (with the format's colour, `#` for a date
+  out of range), bold, font colour, fills over the grid lines, borders by width, and
+  alignment. Not yet shown: italic, underline, strike, font names and sizes, wrap and
+  vertical alignment; no style editing UI yet (the inspector comes with the toolbar
+  work).
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| number formats vs LibreOffice | `examples/numfmt_lo.rs`: 1,000 value × format pairs through `TEXT()` in LibreOffice 24: 801 agree; every other case is a known LibreOffice departure from Excel where ours is Excel's (dates before 1900-03-01, negative and past-9999 dates, seconds truncated rather than rounded, `#.##` without its trailing point, General's `1E-10`) |
+| styles vs LibreOffice | `examples/styles_lo.rs`: 32 cells with distinct styles (15 number formats, fonts, fills, 7 border lines, alignments) and a whole styled column go out with our writer, through LibreOffice's (which rewrites the styles part with its own fonts, theme and codes) and back through our reader: all 32 equal and showing the same text, the column kept, no report notes |
+| round trip | `tests/roundtrip.rs` `styles_round_trip`: whole columns, part columns past the data, unstyled cells inside a styled column, single cells: equal after write and read; a whole formatted column stays three runs |
+| 1,048,576 × 20 `.xlsx` read | 4.1 s with style runs collected (3.7 s before) |
 
 ## 17. Decisions (accepted 2026-11-14)
 
