@@ -230,7 +230,7 @@ and `libmd-dev` for `vm-automount-check.sh`.
 
 - Home folders: Scrinium's jail does not hold the user's files; giving it
   them (and the picker over them) needs Castellum/volumes work and a decision.
-- "Open with", thumbnails, search, drag and drop (Tabula), trash.
+- "Open with" ([opening-files.md](opening-files.md), proposed), thumbnails, search, drag and drop (Tabula), trash.
 - "Always allow for this app" (device-assignment.md §4.8.4), listed in Curia.
 - Activation tokens: a pick is a user gesture inside Scrinium's own window;
   dispensatord could also ask frescod for proof (tabula.md §2).
