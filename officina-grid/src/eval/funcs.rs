@@ -117,6 +117,7 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("SEARCH", 2, 3, search),
     f!("SUBSTITUTE", 3, 4, substitute),
     f!("VALUE", 1, 1, value),
+    f!("TEXT", 2, 2, text_fn),
     f!("EXACT", 2, 2, exact),
     // lookup
     f!("CHOOSE", 2, N, choose),
@@ -1100,6 +1101,25 @@ fn value(c: &Ctx, a: &[Expr]) -> Ev {
         Value::Bool(_) => e(ErrorKind::Value),
         Value::Err(k) => e(k),
     }
+}
+/// TEXT(value, format): the value as a cell with that number format shows it.
+/// Text that reads as a number is formatted as the number.
+fn text_fn(c: &Ctx, a: &[Expr]) -> Ev {
+    let x = match c.scalar(&a[0]) {
+        Value::Empty => Value::Num(0.0),
+        Value::Err(k) => return e(k),
+        Value::Str(t) => match super::parse_number(&t) {
+            Some(x) => Value::Num(x),
+            None => Value::Str(t),
+        },
+        v => v,
+    };
+    let code = tri!(text(c, &a[1]));
+    let f = crate::numfmt::NumFmt::parse(&code).format(&x);
+    if f.hashes {
+        return e(ErrorKind::Value);
+    }
+    s(f.text)
 }
 fn exact(c: &Ctx, a: &[Expr]) -> Ev {
     let x = tri!(text(c, &a[0]));

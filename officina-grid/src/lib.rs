@@ -21,6 +21,7 @@ pub mod eval;
 pub mod fast;
 pub mod formula;
 pub mod native;
+pub mod numfmt;
 pub mod ops;
 pub mod recalc;
 pub mod strings;
