@@ -1532,6 +1532,86 @@ LibreOffice's text; fields LibreOffice recalculates (document properties, formul
 errors, dates) where we keep the stored result; content controls bound to document
 properties; headers and footers (not in our body text); footnote marks.
 
+### 16.19 O5 plan (2026-11-14)
+
+O5 finishes the word processor's long tail (§7.3), then the spreadsheet's (§16), in
+steps that each end with a gate on the matching corpus files (§16.18's corpus has
+hundreds of each) and LibreOffice both ways:
+
+| step | what | gate |
+|---|---|---|
+| O5a | footnotes and endnotes: anchors in the text, numbers derived from the order, note text at the foot of the anchor's page (endnotes at the end), editing in a note bar, `.docx`/`.odt` both ways, PDF | notes on the right pages after random edits; LibreOffice both ways; corpus files with notes keep their note text |
+| O5b | comments: anchored ranges, replies, shown beside the page, both formats | LibreOffice both ways; corpus files with comments |
+| O5c | tracked changes: insertions and deletions with author and time as marks on text (and on paragraphs), shown or hidden, accept and reject, kept on round trip | LibreOffice both ways; the corpus's tracked-change files read the same as LibreOffice with changes shown |
+| O5d | sections and columns, table of contents and cross-references (fields resolved after pagination, at most three rounds, §7.4) | LibreOffice both ways; a 1,500-page TOC update gate |
+| O5e | floating pictures with wrap (square, top and bottom, behind, in front) | LibreOffice both ways; layout tests |
+| O5f | sheets: conditional formats, dynamic arrays and spill, `LET`, `LAMBDA` | Excel-result differential cases, as O1's |
+| O5g | sheets: pivot tables (model, refresh, `.xlsx`/`.ods`) | LibreOffice both ways |
+| O5h | recent files via bookmarks, once Scrinium has home folders | — |
+
+**O5a design.** A note's anchor is U+FFFC with a `note` attribute naming an entry of
+the document's note store, so the anchor is one character to the caret, find and the
+op log, like a picture. A note's text is a short list of paragraphs (text, runs,
+style) in that store; changing it is one op holding the old and new text, so undo and
+the journal cover it. Numbers are derived (footnotes 1, 2, 3 and endnotes i, ii, iii in
+document order, as Word's defaults), never stored. Pagination reserves the foot of
+the page for the notes anchored on it: a line goes on a page only if it and its notes
+fit, so the anchor and its note always share a page (a note taller than the page goes
+alone and is cut, like a table row); endnotes follow the last paragraph on pages of
+their own. Adding or removing an anchor renumbers the notes after it, so it
+repaginates to the end; changing a note's text repaginates from its anchor's page.
+
+### 16.20 O5a as built (2026-11-14): footnotes and endnotes
+
+- **Model** (`officina-text::model`). A note anchor is U+FFFC with `CharAttrs::note`
+  naming an entry of `TextDoc::notes`; a note is its kind and up to 64 paragraphs (with
+  their own block ids, so the layout cache keeps them). Ids are never reused while a
+  document is open, so undo brings an anchor back to its note. Numbers are derived:
+  `note_numbers()` counts anchors in order (footnotes 1, 2, 3; endnotes i, ii, iii),
+  cached until an op puts in or takes out an anchor. `CharAttrs::vert` adds
+  superscript and subscript (drawn at two thirds size, raised a third or lowered a
+  seventh), which the converters now read and write instead of dropping.
+- **Ops.** `TextOp::SetNote` replaces a note's text (its inverse holds the old text).
+  Inserting a note is `SetNote` then the anchor's splice, one undoable action. An op
+  that moves anchors renumbers and repaginates from its block to the end, since a
+  label's width can move lines; changing a note's text repaginates from its anchor's
+  page. The native file has a NOTES chunk (kind 7) and the journal encodes `SetNote`.
+- **Layout and pagination.** An anchor is shaped as its label, raised. A line goes on
+  a page only if it and the footnotes anchored in it fit above the foot, so a note is
+  always on its anchor's page; lines that move on take their notes with them; a line
+  alone on an empty page goes with its notes even if they overfill it (the excess is
+  cut, like a too-tall table row). Footnotes sit at the foot under a short rule, their
+  label in an 18 pt hang. Endnotes follow the last paragraph under a rule and run on
+  over as many pages as they need; those pages start at checkpoint (block count, line)
+  and are always laid out again, so they never go stale. 200 random edits (anchors in
+  and out, note text changed, typing, deleting) give the same pages as a fresh
+  pagination, with every footnote on its anchor's page.
+- **Painting** draws the rules, labels and note text, so the screen and the PDF show
+  them alike; the PDF's text layer has the labels, not U+FFFC.
+- **Editor and app.** `insert_note`, `note_at_caret`, `note_text`, `set_note_text`.
+  Insert ▸ Footnote or Endnote puts the anchor at the caret and opens a note bar (like
+  the find bar) whose field holds the note's text, its paragraphs marked ¶; Done puts
+  it in the note, Insert ▸ Edit Note opens the bar on the note beside the caret. Text
+  typed after an anchor is never part of it.
+- **Files.** `.docx`: `footnotes.xml` and `endnotes.xml` (separators skipped on read and
+  written as Word does, each part with its own relationships), the note number as
+  `w:footnoteRef`, Word's space after it dropped on read. `.odt`: `text:note` in place
+  with its citation and body. Notes inside notes, headers and footers are reported
+  dropped.
+
+Gates: the pagination and journal tests above; both formats round trip the notes
+(numbers, text, run formatting) with an empty report; LibreOffice both ways 20 of 20
+(`.docx`) and 40 of 40 (`.odt`) checks, the new ones being "footnote 1 and endnote i
+with their text" and "superscript"; the §16.18 corpus run now reads 145 notes in 60
+files, keeps all of them through our writer and reader, and is at 99.51 % of
+LibreOffice's words (anchors compared as their numbers), 912 files at 99 % both ways;
+1,514-page pagination unchanged (2.3 s).
+
+Not yet: editing a note's text on the page itself (the bar edits it as one line with ¶
+between paragraphs), note text split across pages (a footnote longer than the space
+left is cut), separator and numbering settings (restart per page, symbols), notes in
+tables' header rows repeated on each page.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

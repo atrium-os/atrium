@@ -9,6 +9,7 @@
 //! | 4 | BLOCKS | up to [`BLOCKS_PER_CHUNK`] blocks from a first index: id, style, properties, text, runs |
 //! | 5 | CHECKPOINTS | page starts (block, line) from the last pagination, for showing a reopened file at once |
 //! | 6 | IMAGE | one picture: its index, its size in pixels, its encoded bytes (one chunk each, so a reader can load them late) |
+//! | 7 | NOTES | footnotes and endnotes: id, kind, paragraphs |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -34,6 +35,7 @@ pub const ATTRS: u16 = 3;
 pub const BLOCKS: u16 = 4;
 pub const CHECKPOINTS: u16 = 5;
 pub const IMAGE: u16 = 6;
+pub const NOTES: u16 = 7;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -82,7 +84,7 @@ impl From<WireError> for LoadError {
 /// Character attributes: a mask of the fields set, then their values.
 pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     let mut m = 0u16;
-    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some()].into_iter().enumerate() {
+    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some(), a.vert.is_some(), a.note.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -114,11 +116,21 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         w.var(o.width as u64);
         w.var(o.height as u64);
     }
+    if let Some(v) = a.vert {
+        w.u8(match v {
+            VertAlign::Baseline => 0,
+            VertAlign::Super => 1,
+            VertAlign::Sub => 2,
+        });
+    }
+    if let Some(n) = a.note {
+        w.var(n as u64);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
-    if m >> 11 != 0 {
+    if m >> 13 != 0 {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -163,6 +175,17 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
             return Err(WireError::Invalid("picture frame"));
         }
         a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32 });
+    }
+    if on(11) {
+        a.vert = Some(match r.u8()? {
+            0 => VertAlign::Baseline,
+            1 => VertAlign::Super,
+            2 => VertAlign::Sub,
+            _ => return Err(WireError::Invalid("vertical alignment")),
+        });
+    }
+    if on(12) {
+        a.note = Some(r.len("note", MAX_NOTES as u64 - 1)? as NoteId);
     }
     Ok(a)
 }
@@ -342,6 +365,36 @@ fn encode_para(w: &mut Writer, p: &Para) {
     encode_runs(w, &p.runs);
 }
 
+/// A note: its kind, then its paragraphs as blocks.
+pub fn encode_note(w: &mut Writer, n: &Note) {
+    w.u8(match n.kind {
+        NoteKind::Foot => 0,
+        NoteKind::End => 1,
+    });
+    w.var(n.paras.len() as u64);
+    for p in &n.paras {
+        encode_para(w, p);
+    }
+}
+
+pub fn decode_note(r: &mut Reader, attrs: usize, styles: usize) -> Result<Note, WireError> {
+    let kind = match r.u8()? {
+        0 => NoteKind::Foot,
+        1 => NoteKind::End,
+        _ => return Err(WireError::Invalid("note kind")),
+    };
+    let k = r.count("note paragraphs", MAX_NOTE_PARAS as u64, 7)?;
+    if k == 0 {
+        return Err(WireError::Invalid("empty note"));
+    }
+    let mut paras = Vec::with_capacity(k);
+    for _ in 0..k {
+        let Block::Para(p) = decode_block(r, attrs, styles)?;
+        paras.push(p);
+    }
+    Ok(Note { kind, paras })
+}
+
 fn decode_block(r: &mut Reader, attrs: usize, styles: usize) -> Result<Block, WireError> {
     match r.u8()? {
         1 => {
@@ -469,6 +522,17 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             encode_hf(&mut w, header);
             encode_hf(&mut w, footer);
         }
+        TextOp::SetNote { id, note } => {
+            w.u8(9);
+            w.var(*id as u64);
+            match note {
+                None => w.u8(0),
+                Some(n) => {
+                    w.u8(1);
+                    encode_note(&mut w, n);
+                }
+            }
+        }
     }
     w.into_bytes()
 }
@@ -529,6 +593,15 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             let page = decode_page(&mut r)?;
             let header = decode_hf(&mut r)?;
             TextOp::SetPage { page, header, footer: decode_hf(&mut r)? }
+        }
+        9 => {
+            let id = r.len("note", MAX_NOTES as u64 - 1)? as NoteId;
+            let note = match r.u8()? {
+                0 => None,
+                1 => Some(decode_note(&mut r, attrs, styles)?),
+                _ => return Err(WireError::Invalid("note")),
+            };
+            TextOp::SetNote { id, note }
         }
         _ => return Err(WireError::Invalid("op")),
     };
@@ -613,6 +686,20 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         }
         c.add(BLOCKS, &w.into_bytes())?;
         first += chunk.len();
+    }
+
+    // The notes that have anchors.
+    let numbers = doc.note_numbers();
+    if !numbers.is_empty() {
+        let mut w = Writer::new();
+        let mut ids: Vec<NoteId> = numbers.keys().copied().collect();
+        ids.sort_unstable();
+        w.var(ids.len() as u64);
+        for id in ids {
+            w.var(id as u64);
+            encode_note(&mut w, doc.notes.get(id).expect("numbered notes exist"));
+        }
+        c.add(NOTES, &w.into_bytes())?;
     }
 
     if !checkpoints.is_empty() {
@@ -782,6 +869,23 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         let id = doc.new_id();
         doc.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
     }
+    if c.entries().iter().any(|e| e.kind == NOTES) {
+        let mut r = Reader::new(one(NOTES, "NOTES chunk")?);
+        let n = r.count("notes", MAX_NOTES as u64, 4)?;
+        for _ in 0..n {
+            let id = r.len("note", MAX_NOTES as u64 - 1)? as NoteId;
+            let note = decode_note(&mut r, attrs, styles)?;
+            for p in &note.paras {
+                if !ids.insert(p.id) || p.id >= watermark {
+                    return Err(LoadError::Bad("block id"));
+                }
+            }
+            if doc.notes.get(id).is_some() {
+                return Err(LoadError::Bad("note listed twice"));
+            }
+            doc.notes.set(id, Some(note));
+        }
+    }
     doc.raise_watermark(watermark);
 
     let mut checkpoints = Vec::new();
@@ -821,6 +925,14 @@ mod tests {
         assert_eq!(d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 }), img, "the same bytes are stored once");
         let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300 }), ..Default::default() });
         d.push_para("a \u{FFFC} b", 0, vec![(0, 0), (2, pic), (5, 0)]);
+        let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
+        d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);
+        for (b, kind, text) in [(10, NoteKind::Foot, "A footnote."), (20, NoteKind::End, "An endnote\nin two paragraphs.")] {
+            for op in d.insert_note_ops(b, 2, kind, text, 0) {
+                op.apply(&mut d);
+            }
+        }
+        d.take_changes();
         d
     }
 
@@ -835,6 +947,8 @@ mod tests {
         assert_eq!(a.id_watermark(), b.id_watermark());
         assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
         assert_eq!(a.images.iter().collect::<Vec<_>>(), b.images.iter().collect::<Vec<_>>());
+        assert_eq!(a.notes.iter().collect::<Vec<_>>(), b.notes.iter().collect::<Vec<_>>());
+        assert_eq!(a.note_numbers(), b.note_numbers());
     }
 
     #[test]
@@ -868,6 +982,8 @@ mod tests {
             TextOp::Insert { at: 9, blocks },
             TextOp::Remove { at: 12, n: 3 },
             TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End }), footer: None },
+            TextOp::SetNote { id: 5, note: Some(Note { kind: NoteKind::End, paras: vec![Para::new(d.new_id(), "note", 0)] }) },
+            TextOp::SetNote { id: 5, note: None },
             TextOp::Nop,
         ];
         for op in ops {

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::model::{Align, BlockId, CharFormat, LineSpacing, ObjectRef, Para, ParaFormat, TextDoc, OBJECT_CHAR};
+use crate::model::{Align, BlockId, CharFormat, LineSpacing, ObjectRef, Para, ParaFormat, TextDoc, VertAlign, OBJECT_CHAR};
 use crate::{twips, LU};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,48 @@ fn shape_with_objects(fonts: &dyn Fonts, text: &str, f: &CharFormat, o: &ObjectR
         from = i + ch.len_utf8();
     }
     out
+}
+
+/// Glyphs for a run in a note anchor's format: each U+FFFC shows the note's
+/// label (all its glyphs on the anchor's byte); anything else is shaped.
+fn shape_with_label(fonts: &dyn Fonts, text: &str, f: &CharFormat, label: &str) -> Vec<Glyph> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    for (i, ch) in text.char_indices().chain(std::iter::once((text.len(), '\0'))) {
+        if ch != OBJECT_CHAR && i < text.len() {
+            continue;
+        }
+        if i > from {
+            out.extend(fonts.shape(&text[from..i], f).into_iter().map(|mut g| {
+                g.cluster += from as u32;
+                g
+            }));
+        }
+        if i < text.len() {
+            out.extend(fonts.shape(label, f).into_iter().map(|mut g| {
+                g.cluster = i as u32;
+                g
+            }));
+        }
+        from = i + ch.len_utf8();
+    }
+    out
+}
+
+/// Superscript and subscript (and note anchors, raised): the size they are
+/// drawn at, and how far their baseline moves down (negative is up).
+pub fn vert_shift(f: &mut CharFormat) -> i64 {
+    let v = if f.note.is_some() { VertAlign::Super } else { f.vert };
+    if v == VertAlign::Baseline {
+        return 0;
+    }
+    let full = size_lu(f);
+    f.size = ((f.size as u32 * 2 / 3) as u16).max(2);
+    f.vert = v;
+    match v {
+        VertAlign::Super => -full / 3,
+        _ => full / 7,
+    }
 }
 
 /// What shaping and metrics come from.
@@ -213,7 +255,8 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
     let mut glyphs: Vec<Glyph> = Vec::new();
     let mut run_fmt: Vec<(u32, u16)> = Vec::new();
     for (s, e, a) in p.spans() {
-        let f = doc.styles.char_format(&cf, doc.attrs.get(a));
+        let mut f = doc.styles.char_format(&cf, doc.attrs.get(a));
+        let shift = vert_shift(&mut f);
         let fi = formats.iter().position(|x| *x == f).unwrap_or_else(|| {
             formats.push(f.clone());
             formats.len() - 1
@@ -224,14 +267,16 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         }
         let text = &p.text[s as usize..e as usize];
         // Tabs: four spaces' width for now (tab stops come with the ruler).
-        let mut g = match &f.object {
-            Some(o) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
-            None => fonts.shape(text, &f),
+        let mut g = match (&f.object, f.note) {
+            (Some(o), _) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
+            (None, Some(n)) => shape_with_label(fonts, text, &f, &doc.note_label(n)),
+            (None, None) => fonts.shape(text, &f),
         };
         let space = if text.contains('\t') { fonts.shape(" ", &f).first().map_or(0, |g| g.adv) } else { 0 };
         for x in g.iter_mut() {
             x.cluster += s;
             x.fmt = fi;
+            x.dy += shift;
             if p.text.as_bytes().get(x.cluster as usize) == Some(&b'\t') {
                 x.adv = space * 4;
             }
@@ -392,7 +437,12 @@ fn key(doc: &TextDoc, p: &Para, width: i64) -> u64 {
     width.hash(&mut h);
     for &(s, a) in &p.runs {
         s.hash(&mut h);
-        doc.attrs.get(a).hash(&mut h);
+        let at = doc.attrs.get(a);
+        at.hash(&mut h);
+        // A note anchor shows its number, which other anchors move.
+        if let Some(n) = at.note {
+            doc.note_label(n).hash(&mut h);
+        }
     }
     // Styles change rarely; their identity is part of the key through the
     // resolved paragraph format.

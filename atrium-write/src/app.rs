@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::{Align, ListKind};
+use officina_text::model::{Align, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -38,7 +38,10 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 2] = ["Find and Replace", "Spelling"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 7] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers"];
+pub const INSERT: [&str; 10] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note"];
+
+/// Paragraphs of a note as the note bar's one line shows them.
+pub const NOTE_PARA_MARK: &str = " ¶ ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
@@ -73,12 +76,16 @@ pub enum Cmd {
     SpellUse(usize),
     SpellIgnore,
     SpellAdd,
+    NoteInsert(NoteKind),
+    NoteEdit,
+    NoteDone,
+    NoteClose,
 }
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -107,6 +114,15 @@ pub struct SpellBar {
     pub message: String,
 }
 
+/// The note bar: which note's text its field holds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NoteBar {
+    pub open: bool,
+    pub id: NoteId,
+    /// "Footnote 3", "Endnote ii".
+    pub title: String,
+}
+
 /// The editor's view of the app's speller.
 pub struct AppChecker(pub Rc<RefCell<Speller>>);
 
@@ -133,6 +149,8 @@ pub struct Write {
     pub replace_text: Mutable<TextEdit>,
     pub tools_menu: Mutable<MenuState>,
     pub spell: Mutable<SpellBar>,
+    pub note: Mutable<NoteBar>,
+    pub note_text: Mutable<TextEdit>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
     pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -140,7 +158,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -181,7 +199,7 @@ impl Write {
     /// Where the pages go: under the toolbar and the find or spelling bar
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
-        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -199,6 +217,7 @@ impl Write {
             Cmd::SpellOpen => {
                 sb.open = true;
                 self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                self.note.set(NoteBar::default());
             }
             Cmd::SpellClose => {
                 self.spell.set(SpellBar::default());
@@ -244,6 +263,53 @@ impl Write {
         RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
     }
 
+    /// Runs a note command: insert a note and open the bar on it, open the bar
+    /// on the note beside the caret, or put the bar's text in the note.
+    fn note_cmd(&self, c: Cmd) {
+        let ed = self.doc.borrow().ed.clone();
+        let open_on = |id: NoteId| {
+            let e = ed.borrow();
+            let text = e.note_text(id).unwrap_or_default().replace('\n', NOTE_PARA_MARK);
+            let title = match e.doc.note_numbers().get(&id) {
+                Some(&(NoteKind::Foot, n)) => format!("Footnote {}", officina_text::model::note_label(NoteKind::Foot, n)),
+                Some(&(NoteKind::End, n)) => format!("Endnote {}", officina_text::model::note_label(NoteKind::End, n)),
+                None => "Note".into(),
+            };
+            let mut t = TextEdit::new(&text);
+            t.select_all();
+            self.note_text.set(t);
+            self.note.set(NoteBar { open: true, id, title });
+            self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+            self.spell.set(SpellBar::default());
+        };
+        match c {
+            Cmd::NoteInsert(kind) => {
+                let id = ed.borrow_mut().insert_note(kind, "");
+                if let Some(id) = id {
+                    open_on(id);
+                }
+            }
+            Cmd::NoteEdit => {
+                let id = ed.borrow().note_at_caret();
+                if let Some(id) = id {
+                    open_on(id);
+                }
+            }
+            Cmd::NoteDone => {
+                let nb = self.note.get_cloned();
+                if nb.open {
+                    let text = self.note_text.get_cloned().text().split('¶').map(str::trim).collect::<Vec<_>>().join("\n");
+                    ed.borrow_mut().set_note_text(nb.id, &text);
+                }
+                self.note.set(NoteBar::default());
+            }
+            Cmd::NoteClose => self.note.set(NoteBar::default()),
+            _ => {}
+        }
+        let (w, h) = self.size.get();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+    }
+
     /// Runs a find bar command on the editor.
     fn find_cmd(&self, c: Cmd) {
         let mut f = self.find.get_cloned();
@@ -251,6 +317,7 @@ impl Write {
             Cmd::FindOpen => {
                 f.open = true;
                 self.spell.set(SpellBar::default());
+                self.note.set(NoteBar::default());
                 // The selection, when it is on one line, is what to find.
                 let sel = self.doc.borrow().ed.borrow().selected_text();
                 if !sel.is_empty() && !sel.contains('\n') && sel.chars().count() <= 200 {
@@ -336,6 +403,13 @@ impl Write {
                     }
                     Cmd::DeleteColumn => {
                         e.delete_column();
+                    }
+                    Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::NoteDone | Cmd::NoteClose => {
+                        drop(e);
+                        drop(d);
+                        self.note_cmd(c);
+                        self.changed();
+                        return false;
                     }
                     Cmd::SpellOpen | Cmd::SpellClose | Cmd::SpellNext | Cmd::SpellUse(_) | Cmd::SpellIgnore | Cmd::SpellAdd => {
                         drop(e);
@@ -439,7 +513,12 @@ impl View for Write {
         }
         {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
-            let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| MenuItem::new(*s).enabled(!(2..=5).contains(&i) || in_table)).collect();
+            let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
+            let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| MenuItem::new(*s).enabled(match i {
+                2..=5 => in_table,
+                9 => on_note,
+                _ => true,
+            })).collect();
             let cmds = self.cmds.clone();
             MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(96.0).render(ctx);
             x += 100.0;
@@ -538,6 +617,24 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The note bar: the note's text on one line, paragraphs marked ¶.
+        let nb = self.note.get_cloned();
+        if nb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 120.0, 20.0), content: nb.title.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 12.0 - 128.0 - 160.0).max(120.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.note_text.clone()).placeholder("Note text").autofocus(true).at(140.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::NoteDone)).render(ctx);
+            Button::primary("Done").at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::NoteDone)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::NoteClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The pages.
         let cmds = self.cmds.clone();
         RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).emit(ctx);
@@ -577,6 +674,32 @@ impl View for Write {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_bar_commands() {
+        let doc = Doc::from_text("n.txt", b"Some text here.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 9), false);
+        run(Cmd::insert(7));
+        let nb = w.note.get_cloned();
+        assert!(nb.open && nb.title == "Footnote 1");
+        w.note_text.set(TextEdit::new("First paragraph ¶ second one"));
+        run(Cmd::NoteDone);
+        assert!(!w.note.get_cloned().open);
+        assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "First paragraph\nsecond one");
+        run(Cmd::insert(9));
+        assert_eq!(w.note_text.get_cloned().text(), "First paragraph ¶ second one");
+        run(Cmd::NoteClose);
+        run(Cmd::insert(8));
+        assert_eq!(w.note.get_cloned().title, "Endnote i");
+        run(Cmd::Undo);
+        run(Cmd::Undo);
+        assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "");
+    }
 
     #[test]
     fn find_bar_commands() {

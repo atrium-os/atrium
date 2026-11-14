@@ -35,6 +35,100 @@ pub struct CharAttrs {
     pub link: Option<Arc<str>>,
     /// The character (U+FFFC) is a picture drawn in line with the text.
     pub object: Option<ObjectRef>,
+    /// Raised or lowered, smaller (superscript, subscript).
+    pub vert: Option<VertAlign>,
+    /// The character (U+FFFC) anchors this note of the document's [`Notes`],
+    /// and shows the note's number.
+    pub note: Option<NoteId>,
+}
+
+/// Superscript and subscript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VertAlign {
+    #[default]
+    Baseline,
+    Super,
+    Sub,
+}
+
+/// A note of the document's [`Notes`].
+pub type NoteId = u32;
+
+/// Footnotes go at the foot of the anchor's page; endnotes after the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NoteKind {
+    #[default]
+    Foot,
+    End,
+}
+
+/// A note's text: paragraphs (with their own block ids, for the layout cache;
+/// attributes from the document's table). Never empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub kind: NoteKind,
+    pub paras: Vec<Para>,
+}
+
+/// Most paragraphs a note keeps (the rest are joined into the last).
+pub const MAX_NOTE_PARAS: usize = 64;
+/// Most notes in a document.
+pub const MAX_NOTES: usize = 1 << 20;
+
+/// The document's notes by id. An id stays taken once given (an anchor deleted
+/// and brought back by undo finds its note), so the store only grows while a
+/// document is open; files keep the notes that have anchors.
+#[derive(Debug, Clone, Default)]
+pub struct Notes {
+    list: Vec<Option<Arc<Note>>>,
+    /// (kind, number) by note id, in anchor order; rebuilt when anchors change.
+    numbers: std::cell::RefCell<Option<Arc<HashMap<NoteId, (NoteKind, u32)>>>>,
+}
+
+impl Notes {
+    pub fn get(&self, id: NoteId) -> Option<&Arc<Note>> {
+        self.list.get(id as usize).and_then(|n| n.as_ref())
+    }
+    /// Adds a note; its id.
+    pub fn add(&mut self, n: Note) -> Option<NoteId> {
+        if self.list.len() >= MAX_NOTES {
+            return None;
+        }
+        self.list.push(Some(Arc::new(n)));
+        Some((self.list.len() - 1) as NoteId)
+    }
+    /// Sets note `id` (growing the store to it); the old note.
+    pub fn set(&mut self, id: NoteId, n: Option<Note>) -> Option<Note> {
+        let i = id as usize;
+        if i >= MAX_NOTES {
+            return None;
+        }
+        if self.list.len() <= i {
+            self.list.resize(i + 1, None);
+        }
+        std::mem::replace(&mut self.list[i], n.map(Arc::new)).map(|a| (*a).clone())
+    }
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.iter().all(|n| n.is_none())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (NoteId, &Arc<Note>)> {
+        self.list.iter().enumerate().filter_map(|(i, n)| n.as_ref().map(|n| (i as NoteId, n)))
+    }
+    /// Anchors moved, came or went: numbers are recounted when next asked.
+    pub fn renumber(&self) {
+        *self.numbers.borrow_mut() = None;
+    }
+}
+
+/// A note number as shown: 1, 2, 3 for footnotes; i, ii, iii for endnotes.
+pub fn note_label(kind: NoteKind, n: u32) -> String {
+    match kind {
+        NoteKind::Foot => n.to_string(),
+        NoteKind::End => crate::lists::roman(n).to_lowercase(),
+    }
 }
 
 /// The object replacement character: one inline picture in the text.
@@ -117,6 +211,8 @@ impl CharAttrs {
             style: self.style.or(under.style),
             link: self.link.clone().or_else(|| under.link.clone()),
             object: self.object.or(under.object),
+            vert: self.vert.or(under.vert),
+            note: self.note.or(under.note),
         }
     }
 }
@@ -135,11 +231,13 @@ pub struct CharFormat {
     pub family: Arc<str>,
     pub link: Option<Arc<str>>,
     pub object: Option<ObjectRef>,
+    pub vert: VertAlign,
+    pub note: Option<NoteId>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None }
     }
 }
 
@@ -168,6 +266,12 @@ impl CharFormat {
         }
         if a.object.is_some() {
             self.object = a.object;
+        }
+        if let Some(v) = a.vert {
+            self.vert = v;
+        }
+        if a.note.is_some() {
+            self.note = a.note;
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -587,6 +691,8 @@ pub struct TextDoc {
     pub footer: Option<HeaderFooter>,
     /// The pictures placed in the text.
     pub images: Images,
+    /// Footnotes and endnotes, anchored in the text.
+    pub notes: Notes,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -625,7 +731,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d
@@ -743,6 +849,78 @@ impl TextDoc {
         let i = self.blocks.len();
         self.blocks.insert(i, Block::Para(p));
         i
+    }
+
+    /// (kind, number) of each anchored note, footnotes and endnotes each
+    /// counted from 1 in the order of their anchors.
+    pub fn note_numbers(&self) -> Arc<HashMap<NoteId, (NoteKind, u32)>> {
+        if let Some(m) = self.notes.numbers.borrow().as_ref() {
+            return m.clone();
+        }
+        let mut m = HashMap::new();
+        let (mut foot, mut end) = (0u32, 0u32);
+        if !self.notes.is_empty() {
+            for b in self.blocks.iter() {
+                let Some(p) = b.as_para() else { continue };
+                if !p.text.contains(OBJECT_CHAR) {
+                    continue;
+                }
+                for (at, ch) in p.text.char_indices() {
+                    if ch != OBJECT_CHAR {
+                        continue;
+                    }
+                    if let Some(id) = self.attrs.get(p.attr_at(at as u32)).note {
+                        if m.contains_key(&id) {
+                            continue;
+                        }
+                        let Some(n) = self.notes.get(id) else { continue };
+                        let k = match n.kind {
+                            NoteKind::Foot => {
+                                foot += 1;
+                                foot
+                            }
+                            NoteKind::End => {
+                                end += 1;
+                                end
+                            }
+                        };
+                        m.insert(id, (n.kind, k));
+                    }
+                }
+            }
+        }
+        let m = Arc::new(m);
+        *self.notes.numbers.borrow_mut() = Some(m.clone());
+        m
+    }
+
+    /// The label note `id`'s anchor shows ("" for a note with no anchor).
+    pub fn note_label(&self, id: NoteId) -> String {
+        self.note_numbers().get(&id).map(|&(k, n)| note_label(k, n)).unwrap_or_default()
+    }
+
+    /// Where note `id` is anchored: (block, byte).
+    pub fn anchor_of(&self, id: NoteId) -> Option<(usize, u32)> {
+        for (i, b) in self.blocks.iter().enumerate() {
+            let Some(p) = b.as_para() else { continue };
+            if !p.text.contains(OBJECT_CHAR) {
+                continue;
+            }
+            for (at, ch) in p.text.char_indices() {
+                if ch == OBJECT_CHAR && self.attrs.get(p.attr_at(at as u32)).note == Some(id) {
+                    return Some((i, at as u32));
+                }
+            }
+        }
+        None
+    }
+
+    /// The anchored endnotes in order.
+    pub fn endnotes(&self) -> Vec<NoteId> {
+        let m = self.note_numbers();
+        let mut v: Vec<(u32, NoteId)> = m.iter().filter(|(_, &(k, _))| k == NoteKind::End).map(|(&id, &(_, n))| (n, id)).collect();
+        v.sort_unstable();
+        v.into_iter().map(|x| x.1).collect()
     }
 
     /// All the text, paragraphs joined by '\n' (tests, word count, export).

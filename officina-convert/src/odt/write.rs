@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, CharAttrs, HeaderFooter, LineSpacing, ListKind, ParaProps, StyleKind, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Align, CharAttrs, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -59,6 +59,13 @@ fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
     if let Some(z) = a.size {
         let p = format!("{}pt", z as f64 / 2.0);
         let _ = write!(s, r#" fo:font-size="{p}" style:font-size-asian="{p}" style:font-size-complex="{p}""#);
+    }
+    if let Some(v) = a.vert {
+        let _ = write!(s, r#" style:text-position="{}""#, match v {
+            VertAlign::Super => "super 58%",
+            VertAlign::Sub => "sub 58%",
+            VertAlign::Baseline => "0% 100%",
+        });
     }
     if let Some(c) = a.color {
         let _ = write!(s, r##" fo:color="#{:06x}""##, c & 0xFF_FFFF);
@@ -146,6 +153,8 @@ struct Out<'a> {
     image_names: HashMap<u32, String>,
     tables: u32,
     frames: u32,
+    /// Writing a note's text (notes don't nest).
+    in_note: u32,
 }
 
 impl Out<'_> {
@@ -169,6 +178,7 @@ impl Out<'_> {
         let mut k = a.clone();
         k.link = None;
         k.object = None;
+        k.note = None;
         if k == CharAttrs::default() {
             return None;
         }
@@ -265,6 +275,11 @@ impl Out<'_> {
     fn para(&mut self, b: usize, out: &mut String) {
         let doc = self.doc;
         let Some(p) = doc.para(b) else { return };
+        self.para_of(p, out);
+    }
+
+    fn para_of(&mut self, p: &Para, out: &mut String) {
+        let doc = self.doc;
         let mut props = p.props.clone();
         if p.text.is_empty() {
             // An empty paragraph's formatting rides on its paragraph style.
@@ -288,6 +303,25 @@ impl Out<'_> {
                     continue;
                 }
                 Self::text(&piece[from..i], &mut inner);
+                if i < piece.len() && attrs.object.is_none() {
+                    // A note: its number and text, in place.
+                    if let (Some(id), 0) = (attrs.note, self.in_note) {
+                        if let (Some(&(kind, n)), Some(note)) = (self.doc.note_numbers().get(&id), self.doc.notes.get(id)) {
+                            let (class, pre) = if kind == NoteKind::Foot { ("footnote", "ftn") } else { ("endnote", "edn") };
+                            let label = officina_text::model::note_label(kind, n);
+                            let _ = write!(inner, r#"<text:note text:id="{pre}{n}" text:note-class="{class}"><text:note-citation>{label}</text:note-citation><text:note-body>"#);
+                            self.in_note += 1;
+                            for q in &note.paras {
+                                let mut q = q.clone();
+                                q.props.list = None;
+                                q.props.cell = None;
+                                self.para_of(&q, &mut inner);
+                            }
+                            self.in_note -= 1;
+                            inner += "</text:note-body></text:note>";
+                        }
+                    }
+                }
                 if i < piece.len() {
                     if let Some(o) = attrs.object {
                         if let Some(href) = self.image(o.image) {
@@ -435,7 +469,7 @@ fn margin(hf: &HeaderFooter, tag: &str, style: &str) -> String {
 /// The document as an `.odt`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0 };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0 };
     let mut body = String::new();
     let n = doc.blocks.len();
     let mut b = 0;

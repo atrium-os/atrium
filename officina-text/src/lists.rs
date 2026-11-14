@@ -80,7 +80,7 @@ fn alpha(mut k: u32) -> String {
     String::from_utf8(s).unwrap_or_default()
 }
 
-fn roman(mut k: u32) -> String {
+pub fn roman(mut k: u32) -> String {
     if k == 0 || k > 3999 {
         return k.to_string();
     }

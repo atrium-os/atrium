@@ -10,7 +10,9 @@
 //! default master page's header and footer (page number and count fields become
 //! `{page}` and `{pages}`).
 //!
-//! Reported, not carried: footnotes and endnotes, annotations, tracked changes,
+//! Footnotes and endnotes (`text:note`) and superscript and subscript are read.
+//!
+//! Reported, not carried: notes inside notes or headers, annotations, tracked changes,
 //! sections and columns, frames anchored to the page (kept in line), merged
 //! cells, nested tables (their text kept), fields other than page numbers (their
 //! text kept), drawings and charts, embedded objects.
@@ -18,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Align, Block, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -106,6 +108,19 @@ fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
     }
     if let Some(z) = e.attr("fo:font-size").filter(|z| !z.ends_with('%')).and_then(length) {
         a.size = Some((z / 10).clamp(2, 3276) as u16);
+    }
+    if let Some(t) = e.attr("style:text-position") {
+        let first = t.split_whitespace().next().unwrap_or("");
+        a.vert = match first {
+            "super" => Some(VertAlign::Super),
+            "sub" => Some(VertAlign::Sub),
+            _ => match first.trim_end_matches('%').parse::<f64>() {
+                Ok(v) if v > 0.0 => Some(VertAlign::Super),
+                Ok(v) if v < 0.0 => Some(VertAlign::Sub),
+                Ok(_) => Some(VertAlign::Baseline),
+                Err(_) => None,
+            },
+        };
     }
     a.color = color(e.attr("fo:color"));
     a.highlight = color(e.attr("fo:background-color"));
@@ -206,6 +221,9 @@ struct Reader<'a> {
     /// text follows the paragraph.
     boxes: Vec<El>,
     box_depth: usize,
+    /// Notes anchored in the text, read after it.
+    pending: Vec<(NoteId, NoteKind, El)>,
+    in_note: bool,
 }
 
 #[derive(Default)]
@@ -502,7 +520,22 @@ impl<'a> Reader<'a> {
                         }
                     }
                     "draw:a" => self.inline(x, p, a, at),
-                    "text:note" => self.rep.note(Kind::Dropped, "footnotes and endnotes"),
+                    "text:note" => {
+                        let kind = if x.attr("text:note-class") == Some("endnote") { NoteKind::End } else { NoteKind::Foot };
+                        match x.child("text:note-body") {
+                            Some(body) if at == Where::Body && !self.in_note => {
+                                if let Some(nid) = self.doc.notes.add(Note { kind, paras: Vec::new() }) {
+                                    let mut na = a.clone();
+                                    na.vert = None;
+                                    na.object = None;
+                                    na.note = Some(nid);
+                                    p.push(&OBJECT_CHAR.to_string(), &na);
+                                    self.pending.push((nid, kind, body.clone()));
+                                }
+                            }
+                            _ => self.rep.note(Kind::Dropped, "footnotes and endnotes in notes, headers and footers"),
+                        }
+                    }
                     "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments"),
                     "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes (shown as they stand)"),
                     "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:soft-page-break" | "text:reference-mark" | "text:reference-mark-start" | "text:reference-mark-end" | "text:alphabetical-index-mark" | "text:toc-mark" | "text:sequence-ref" => {}
@@ -586,6 +619,35 @@ impl<'a> Reader<'a> {
             self.box_content(b, cell);
         }
         self.box_depth -= 1;
+    }
+
+    /// Each note's text: read as blocks at the end, then taken out into the note.
+    fn read_notes(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return;
+        }
+        self.in_note = true;
+        for (nid, kind, body) in pending {
+            let before = self.doc.blocks.len();
+            self.box_content(&body, None);
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.cell = None;
+                    p.props.list = None;
+                    paras.push(p);
+                }
+            }
+            paras.truncate(MAX_NOTE_PARAS);
+            if paras.is_empty() {
+                let id = self.doc.new_id();
+                paras.push(officina_text::model::Para::new(id, "", 0));
+            }
+            self.doc.notes.set(nid, Some(Note { kind, paras }));
+        }
+        self.in_note = false;
+        self.doc.notes.renumber();
     }
 
     fn box_content(&mut self, b: &El, cell: Option<CellRef>) {
@@ -846,7 +908,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0 };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false };
     r.font_decls(styles.as_ref());
     r.font_decls(Some(&content));
     for s in [styles.as_ref().and_then(|s| s.child("office:styles")), styles.as_ref().and_then(|s| s.child("office:automatic-styles")), content.child("office:automatic-styles")].into_iter().flatten() {
@@ -859,6 +921,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let first_master = text.els().find(|x| x.name == "text:p" || x.name == "text:h").and_then(|p| p.attr("text:style-name")).and_then(|n| content.child("office:automatic-styles").and_then(|a| a.children("style:style").find(|s| s.attr("style:name") == Some(n)))).and_then(|s| s.attr("style:master-page-name")).map(str::to_string);
     r.page(styles.as_ref(), first_master);
     r.body(text);
+    r.read_notes();
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);
     }

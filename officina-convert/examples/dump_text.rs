@@ -8,6 +8,10 @@ fn main() {
     match r {
         Ok((d, notes)) => {
             println!("{}", d.plain_text());
+            for (id, n) in d.notes.iter() {
+                let t: Vec<&str> = n.paras.iter().map(|p| p.text.as_str()).collect();
+                println!("[{} {:?} {}] {}", d.note_label(id), n.kind, id, t.join(" / "));
+            }
             for n in notes {
                 eprintln!("note {n}");
             }

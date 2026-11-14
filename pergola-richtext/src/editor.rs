@@ -14,7 +14,7 @@ use officina_core::history::History;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, ImageData, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
@@ -359,7 +359,7 @@ impl Editor {
         let para = self.doc.para(p.block)?;
         let before = para.attr_at(p.at.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
-        let pic = base.object.take().is_some();
+        let pic = base.object.take().is_some() | base.note.take().is_some();
         let t = match self.typing.clone() {
             Some(t) => t,
             None if pic => CharAttrs::default(),
@@ -367,7 +367,57 @@ impl Editor {
         };
         let mut a = t.over(&base);
         a.object = None;
+        a.note = None;
         Some(self.doc.attrs.intern(a))
+    }
+
+    /// Puts a new footnote or endnote at the caret (over the selection) with
+    /// `text` (a paragraph a line); the caret goes after its anchor.
+    pub fn insert_note(&mut self, kind: NoteKind, text: &str) -> Option<NoteId> {
+        let (mut ops, start) = self.delete_selection_ops();
+        let base = self.typing_attr(start).unwrap_or_else(|| self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1))));
+        let base = self.doc.plain_attr(base);
+        let id = self.doc.notes.len() as NoteId;
+        // The selection's deletion runs first; the anchor goes where it began.
+        let note_ops = self.doc.insert_note_ops(start.block, 0, kind, text, base);
+        if note_ops.len() != 2 {
+            return None;
+        }
+        let mut it = note_ops.into_iter();
+        ops.insert(0, it.next().expect("the note"));
+        if let Some(TextOp::Splice { ins, .. }) = it.next() {
+            ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins });
+        }
+        self.apply(if kind == NoteKind::Foot { "Insert Footnote" } else { "Insert Endnote" }, ops, Kind::Other);
+        let p = Pos::new(start.block, start.at + OBJECT_CHAR.len_utf8() as u32);
+        self.caret = p;
+        self.anchor = p;
+        self.goal_x = None;
+        Some(id)
+    }
+
+    /// The note whose anchor is just before the caret (or just after it).
+    pub fn note_at_caret(&self) -> Option<NoteId> {
+        let p = self.doc.para(self.caret.block)?;
+        let at = self.caret.at as usize;
+        let before = p.text[..at.min(p.text.len())].char_indices().next_back().filter(|&(_, c)| c == OBJECT_CHAR).map(|(i, _)| i);
+        let after = p.text[at.min(p.text.len())..].starts_with(OBJECT_CHAR).then_some(at);
+        [before, after].into_iter().flatten().find_map(|i| self.doc.attrs.get(p.attr_at(i as u32)).note.filter(|id| self.doc.note_numbers().contains_key(id)))
+    }
+
+    /// Note `id`'s text, a paragraph a line.
+    pub fn note_text(&self, id: NoteId) -> Option<String> {
+        self.doc.notes.get(id).map(|n| n.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Sets note `id`'s text (one undoable action); false if unchanged.
+    pub fn set_note_text(&mut self, id: NoteId, text: &str) -> bool {
+        let ops = self.doc.set_note_text_ops(id, text);
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply("Edit Note", ops, Kind::Other);
+        true
     }
 
     /// Places a picture at the caret (over the selection), in line with the
@@ -1535,6 +1585,40 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn notes_insert_edit_undo_and_journal() {
+        let mut e = ed(&["one two", "three"]);
+        e.start_log();
+        e.set_caret(Pos::new(0, 3), false);
+        let id = e.insert_note(NoteKind::Foot, "A note.").unwrap();
+        assert_eq!(e.caret, Pos::new(0, 3 + OBJECT_CHAR.len_utf8() as u32));
+        assert_eq!(e.note_at_caret(), Some(id));
+        assert_eq!(e.doc.note_label(id), "1");
+        typ(&mut e, "x");
+        let p = e.doc.para(0).unwrap();
+        assert!(e.doc.attrs.get(p.attr_at(p.text.find('x').unwrap() as u32)).note.is_none(), "typed text isn't an anchor");
+        assert!(e.set_note_text(id, "Changed\nTwo lines."));
+        assert_eq!(e.note_text(id).unwrap(), "Changed\nTwo lines.");
+        while !e.paginate(Duration::from_secs(1)) {}
+        assert!(e.pages.pages()[0].notes.iter().any(|n| n.note == id));
+        // The journal replays to the same document.
+        let log = e.take_log();
+        let mut f = ed(&["one two", "three"]);
+        for l in log {
+            f.replay(l);
+        }
+        assert_eq!(texts(&f), texts(&e));
+        assert_eq!(f.note_text(id), e.note_text(id));
+        e.undo();
+        assert_eq!(e.note_text(id).unwrap(), "A note.");
+        e.undo();
+        e.undo();
+        assert_eq!(texts(&e)[0], "one two");
+        assert!(e.doc.note_numbers().is_empty());
+        e.redo();
+        assert_eq!(e.doc.note_label(id), "1");
     }
 
     #[test]

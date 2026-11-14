@@ -40,6 +40,31 @@ fn words(t: &str) -> HashMap<String, usize> {
     m
 }
 
+/// Our text with each note anchor shown as its number (as LibreOffice's text has it).
+fn labelled(d: &TextDoc) -> String {
+    let mut out = String::new();
+    for (i, b) in d.blocks.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let Some(p) = b.as_para() else { continue };
+        for (at, ch) in p.text.char_indices() {
+            match d.attrs.get(p.attr_at(at as u32)).note {
+                Some(n) if ch == '\u{FFFC}' => out.push_str(&d.note_label(n)),
+                _ => out.push(ch),
+            }
+        }
+    }
+    out
+}
+
+/// The notes' text in number order (what a round trip must keep).
+fn notes_text(d: &TextDoc) -> String {
+    let mut v: Vec<(String, String)> = d.note_numbers().iter().map(|(&id, &(k, n))| (format!("{k:?}{n:08}"), d.notes.get(id).map(|n| n.paras.iter().map(|p| p.text.clone()).collect::<Vec<_>>().join("\n")).unwrap_or_default())).collect();
+    v.sort();
+    v.into_iter().map(|x| x.1).collect::<Vec<_>>().join("\n--\n")
+}
+
 fn overlap(a: &HashMap<String, usize>, b: &HashMap<String, usize>) -> usize {
     a.iter().map(|(w, n)| (*n).min(*b.get(w).unwrap_or(&0))).sum()
 }
@@ -53,6 +78,7 @@ struct Row {
     lo_words: usize,
     roundtrip: bool,
     missing: Vec<String>,
+    notes: usize,
 }
 
 fn read(path: &Path, data: &[u8]) -> Result<(TextDoc, Vec<String>), String> {
@@ -82,7 +108,7 @@ fn main() {
             let took = t.elapsed();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let lo = std::fs::read_to_string(Path::new(txt).join(Path::new(&name).with_extension("txt"))).ok();
-            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new() };
+            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0 };
             match got {
                 Err(e) => row.ok = Err(e),
                 Ok((doc, ns)) => {
@@ -91,7 +117,9 @@ fn main() {
                         *notes.entry(what).or_default() += 1;
                     }
                     let ours = doc.plain_text();
+                    row.notes = doc.note_numbers().len();
                     if let Some(lo) = &lo {
+                        let ours = labelled(&doc);
                         let (a, b) = (words(lo), words(&ours));
                         let (na, nb) = (a.values().sum::<usize>(), b.values().sum::<usize>());
                         let o = overlap(&a, &b);
@@ -104,17 +132,18 @@ fn main() {
                     }
                     // Our writer, then our reader: the same text.
                     let odt_file = p.extension().is_some_and(|e| e == "odt");
-                    let again = std::panic::catch_unwind(|| {
+                    let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if odt_file {
-                            odt::write(&doc, Vec::new()).ok().and_then(|b| odt::read(&b).ok()).map(|(d, _)| d.plain_text())
+                            odt::write(&doc, Vec::new()).ok().and_then(|b| odt::read(&b).ok()).map(|(d, _)| d.plain_text() + &notes_text(&d))
                         } else {
-                            docx::write(&doc, Vec::new()).ok().and_then(|b| docx::read(&b).ok()).map(|(d, _)| d.plain_text())
+                            docx::write(&doc, Vec::new()).ok().and_then(|b| docx::read(&b).ok()).map(|(d, _)| d.plain_text() + &notes_text(&d))
                         }
-                    });
+                    }));
                     // Empty paragraphs aside: Word needs one after a table that ends the
                     // document or cell, and one between two tables, and our writer adds them.
                     let full = |t: &str| t.split('\n').filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
-                    row.roundtrip = matches!(again, Ok(Some(t)) if full(&t) == full(&ours));
+                    let ours_all = ours.clone() + &notes_text(&doc);
+                    row.roundtrip = matches!(again, Ok(Some(t)) if full(&t) == full(&ours_all));
                 }
             }
             rows.push(row);
@@ -134,7 +163,8 @@ fn main() {
     let slowest = rows.iter().max_by_key(|r| r.took).map(|r| format!("{} {:.0?}", r.file, r.took)).unwrap_or_default();
     println!("{n} files: {read_ok} read, {} refused, {} panics; slowest {slowest}", refused.len(), panics.len());
     println!("text against LibreOffice on {} files with text: {:.2} % of all its words; median file {:.1} %; {} files ≥ 99 % both ways", compared.len(), 100.0 * total_hit / total_lo.max(1) as f64, 100.0 * rec.get(rec.len() / 2).copied().unwrap_or(0.0), full);
-    println!("our writer then our reader keep the text of {rt} of {read_ok}");
+    println!("our writer then our reader keep the text (and notes) of {rt} of {read_ok}");
+    println!("{} notes in {} files", rows.iter().map(|r| r.notes).sum::<usize>(), rows.iter().filter(|r| r.notes > 0).count());
     for r in &panics {
         println!("PANIC {}", r.file);
     }

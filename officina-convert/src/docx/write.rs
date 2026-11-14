@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, AttrId, CharAttrs, HeaderFooter, LineSpacing, ListKind, ParaProps, StyleKind, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Align, AttrId, CharAttrs, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -70,6 +70,13 @@ fn rpr(a: &CharAttrs, styles: &[String]) -> String {
     }
     if let Some(z) = a.size {
         let _ = write!(s, r#"<w:sz w:val="{z}"/><w:szCs w:val="{z}"/>"#);
+    }
+    if let Some(v) = a.vert {
+        let _ = write!(s, r#"<w:vertAlign w:val="{}"/>"#, match v {
+            VertAlign::Super => "superscript",
+            VertAlign::Sub => "subscript",
+            VertAlign::Baseline => "baseline",
+        });
     }
     if let Some(h) = a.highlight {
         let _ = write!(s, r#"<w:shd w:val="clear" w:color="auto" w:fill="{:06X}"/>"#, h & 0xFF_FFFF);
@@ -164,6 +171,10 @@ struct Out {
     lists: HashMap<(u32, ListKind), (u32, ListKind)>,
     styles: Vec<String>,
     pic: u32,
+    /// Our note id to (kind, the id the file gives it).
+    notes: HashMap<NoteId, (NoteKind, u32)>,
+    /// Where this part's pictures go ("image" for the document's).
+    media_stem: &'static str,
 }
 
 impl Out {
@@ -179,7 +190,7 @@ impl Out {
         }
         let img = doc.images.get(i)?;
         let ext = image_ext(&img.bytes);
-        let name = format!("media/image{}.{ext}", self.media.len() + 1);
+        let name = format!("media/{}{}.{ext}", self.media_stem, self.media.len() + 1);
         self.media.push((format!("word/{name}"), img.bytes.to_vec()));
         let r = self.rel("image", name, false);
         self.image_rel.insert(i, r.clone());
@@ -196,8 +207,7 @@ impl Out {
     }
 
     /// The runs of block `b`.
-    fn runs(&mut self, doc: &TextDoc, b: usize, out: &mut String) {
-        let Some(p) = doc.para(b) else { return };
+    fn runs(&mut self, doc: &TextDoc, p: &Para, out: &mut String) {
         for (s, e, a) in p.spans() {
             if s == e {
                 continue;
@@ -222,6 +232,14 @@ impl Out {
                     '\u{2028}' | '\n' => {
                         flush(&mut text, &mut body);
                         let _ = write!(body, "<w:r>{props}<w:br/></w:r>");
+                    }
+                    OBJECT_CHAR if attrs.note.is_some() => {
+                        flush(&mut text, &mut body);
+                        let id = attrs.note.expect("checked");
+                        if let Some(&(kind, n)) = self.notes.get(&id) {
+                            let tag = if kind == NoteKind::Foot { "footnoteReference" } else { "endnoteReference" };
+                            let _ = write!(body, r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:{tag} w:id="{n}"/></w:r>"#);
+                        }
                     }
                     OBJECT_CHAR => {
                         flush(&mut text, &mut body);
@@ -253,6 +271,11 @@ impl Out {
 
     fn para(&mut self, doc: &TextDoc, b: usize, out: &mut String) {
         let Some(p) = doc.para(b) else { return };
+        self.para_of(doc, p, out, "");
+    }
+
+    /// Paragraph `p`; `lead` goes before its runs (a note's number).
+    fn para_of(&mut self, doc: &TextDoc, p: &Para, out: &mut String, lead: &str) {
         let mut pp = String::new();
         if p.style != 0 {
             if let Some(id) = self.styles.get(p.style as usize) {
@@ -277,7 +300,8 @@ impl Out {
         if !pp.is_empty() {
             let _ = write!(out, "<w:pPr>{pp}</w:pPr>");
         }
-        self.runs(doc, b, out);
+        out.push_str(lead);
+        self.runs(doc, p, out);
         out.push_str("</w:p>");
     }
 
@@ -425,7 +449,9 @@ fn numbering_part(lists: &HashMap<(u32, ListKind), (u32, ListKind)>) -> String {
 /// The document as a `.docx`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0 };
+    // Notes are numbered in the file in anchor order, each kind from 1.
+    let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image" };
     let mut body = String::new();
     let mut b = 0;
     let n = doc.blocks.len();
@@ -443,6 +469,41 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     }
     let mut sect = String::from("<w:sectPr>");
     let mut parts: Vec<(String, String)> = Vec::new();
+    // Footnotes and endnotes, each part with its own relationships.
+    let mut note_parts: Vec<(&str, String, String)> = Vec::new();
+    let mut note_media: Vec<(String, Vec<u8>)> = Vec::new();
+    for (kind, tag, part) in [(NoteKind::Foot, "footnote", "footnotes"), (NoteKind::End, "endnote", "endnotes")] {
+        let mut ours: Vec<(u32, NoteId)> = notes.iter().filter(|(_, k)| k.0 == kind).map(|(&id, k)| (k.1, id)).collect();
+        if ours.is_empty() {
+            continue;
+        }
+        ours.sort_unstable();
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" } };
+        let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
+        // Lists in notes come out as plain paragraphs (the numbering part is the body's).
+        for (n, id) in ours {
+            let Some(note) = doc.notes.get(id) else { continue };
+            let _ = write!(x, r#"<w:{tag} w:id="{n}">"#);
+            for (i, p) in note.paras.iter().enumerate() {
+                let lead = if i == 0 { format!(r#"<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:{tag}Ref/></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r>"#) } else { String::new() };
+                let mut q = p.clone();
+                q.props.list = None;
+                q.props.cell = None;
+                no.para_of(doc, &q, &mut x, &lead);
+            }
+            let _ = write!(x, "</w:{tag}>");
+        }
+        let _ = write!(x, "</w:{part}>");
+        let mut r = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
+        for (id, k, target, external) in &no.rels {
+            let mode = if *external { r#" TargetMode="External""# } else { "" };
+            let _ = write!(r, r#"<Relationship Id="{id}" Type="{REL}/{k}" Target="{}"{mode}/>"#, esc(target));
+        }
+        r += "</Relationships>";
+        note_media.extend(no.media);
+        o.rel(part, format!("{part}.xml"), false);
+        note_parts.push((part, x, r));
+    }
     for (hf, tag, kind) in [(&doc.header, "hdr", "header"), (&doc.footer, "ftr", "footer")] {
         if let Some(hf) = hf {
             let name = format!("{kind}1.xml");
@@ -459,6 +520,9 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let mut types = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="webp" ContentType="image/webp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#);
     if !o.lists.is_empty() {
         types += r#"<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#;
+    }
+    for (part, _, _) in &note_parts {
+        let _ = write!(types, r#"<Override PartName="/word/{part}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{part}+xml"/>"#);
     }
     for (name, _) in &parts {
         let kind = if name.contains("header") { "header" } else { "footer" };
@@ -483,7 +547,11 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     for (name, xml) in &parts {
         z.add(name, xml.as_bytes())?;
     }
-    for (name, bytes) in &o.media {
+    for (part, xml, r) in &note_parts {
+        z.add(&format!("word/{part}.xml"), xml.as_bytes())?;
+        z.add(&format!("word/_rels/{part}.xml.rels"), r.as_bytes())?;
+    }
+    for (name, bytes) in o.media.iter().chain(note_media.iter()) {
         z.add_stored(name, bytes)?;
     }
     z.finish()

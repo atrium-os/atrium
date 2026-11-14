@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::layout::{Fonts, LayoutCache, ParaLayout};
-use crate::model::TextDoc;
+use crate::model::{NoteId, NoteKind, TextDoc, OBJECT_CHAR};
 use crate::twips;
 use std::rc::Rc;
 
@@ -56,6 +56,23 @@ pub struct CellBox {
     pub h: i64,
 }
 
+/// Lines `lines` of paragraph `para` of note `note`, the first line's top `y`
+/// below the page's content top (the text starts [`NOTE_HANG`] in, after
+/// the label).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteSlice {
+    pub note: NoteId,
+    pub para: usize,
+    pub lines: Range<usize>,
+    pub y: i64,
+}
+
+/// Room for a note's label before its text.
+pub const NOTE_HANG: i64 = crate::pt(18);
+/// The rule above footnotes and above the endnotes: its height with the space
+/// around it.
+pub const NOTE_RULE_SPACE: i64 = crate::pt(12);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub start: Checkpoint,
@@ -64,6 +81,11 @@ pub struct Page {
     pub cells: Vec<CellBox>,
     /// Content height used.
     pub height: i64,
+    /// Footnotes at the foot and endnotes after the text.
+    pub notes: Vec<NoteSlice>,
+    /// Where the rules above the footnotes and above the endnotes go.
+    pub foot_rule: Option<i64>,
+    pub end_rule: Option<i64>,
 }
 
 impl Page {
@@ -212,7 +234,8 @@ impl Paginator {
     /// One page. Returns false once done.
     fn step(&mut self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts) -> bool {
         let Some(at) = self.cursor else { return false };
-        if at.block >= doc.blocks.len() && !self.pages.is_empty() {
+        let n_blocks = doc.blocks.len();
+        if (at.block > n_blocks || (at.block == n_blocks && self.endnote_lines(doc, cache, fonts).len() <= at.line)) && !self.pages.is_empty() {
             self.finish();
             return false;
         }
@@ -223,7 +246,9 @@ impl Paginator {
             None => self.finish(),
             Some(n) => {
                 self.cursor = Some(n);
-                if self.converge(n) {
+                // Endnote pages are always laid out again (they follow every
+                // note's text).
+                if n.block < n_blocks && self.converge(n, n_blocks) {
                     return false;
                 }
             }
@@ -238,7 +263,7 @@ impl Paginator {
     }
 
     /// If an old page started at `n` (past the edit), take it and all after it.
-    fn converge(&mut self, n: Checkpoint) -> bool {
+    fn converge(&mut self, n: Checkpoint, n_blocks: usize) -> bool {
         if self.old.is_empty() || n.block < self.settle {
             return false;
         }
@@ -253,6 +278,16 @@ impl Paginator {
                 rest.iter_mut().for_each(|p| p.shift(delta));
             }
             self.pages.append(&mut rest);
+            // The page the endnotes start on and those after it follow every
+            // note's text: they are laid out again.
+            if let Some(k) = self.pages.iter().position(|p| p.end_rule.is_some() || p.start.block >= n_blocks) {
+                let at = self.pages[k].start;
+                self.pages.truncate(k);
+                self.old.clear();
+                self.resume = None;
+                self.cursor = Some(at);
+                return false;
+            }
             if let Some(r) = self.resume.take() {
                 // The old pages stopped short of the end: carry on from there.
                 self.old.clear();
@@ -331,25 +366,162 @@ impl Paginator {
         }
     }
 
+    /// Footnotes anchored in block `b` (in `line` of it, or anywhere).
+    fn footnotes_in(&self, doc: &TextDoc, b: usize, line: Option<&crate::layout::Line>) -> Vec<NoteId> {
+        let Some(p) = doc.para(b) else { return Vec::new() };
+        let (s, e) = line.map_or((0, p.text.len()), |l| (l.start as usize, (l.end as usize).min(p.text.len())));
+        let Some(seg) = p.text.get(s..e) else { return Vec::new() };
+        if !seg.contains(OBJECT_CHAR) {
+            return Vec::new();
+        }
+        let numbers = doc.note_numbers();
+        let mut v = Vec::new();
+        for (i, ch) in seg.char_indices() {
+            if ch != OBJECT_CHAR {
+                continue;
+            }
+            if let Some(id) = doc.attrs.get(p.attr_at((s + i) as u32)).note {
+                if numbers.get(&id).is_some_and(|x| x.0 == NoteKind::Foot) && !v.contains(&id) {
+                    v.push(id);
+                }
+            }
+        }
+        v
+    }
+
+    /// The layout of paragraph `k` of note `id`.
+    pub fn note_layout(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, id: NoteId, k: usize) -> Option<Rc<ParaLayout>> {
+        let p = doc.notes.get(id)?.paras.get(k)?;
+        Some(cache.get(doc, p, (self.width - NOTE_HANG).max(crate::LU), fonts))
+    }
+
+    /// Height of note `id`'s text.
+    fn note_height(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, id: NoteId) -> i64 {
+        let k = doc.notes.get(id).map_or(0, |n| n.paras.len());
+        (0..k).filter_map(|i| self.note_layout(doc, cache, fonts, id, i)).map(|l| l.height).sum()
+    }
+
+    /// Height notes `ids` add to a page's foot (with the rule if they are the first).
+    fn notes_height(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, ids: &[NoteId], first: bool) -> i64 {
+        if ids.is_empty() {
+            return 0;
+        }
+        ids.iter().map(|&id| self.note_height(doc, cache, fonts, id)).sum::<i64>() + if first { NOTE_RULE_SPACE } else { 0 }
+    }
+
+    /// Puts footnotes `foot` (taking `foot_h`) at the foot of `page`; lines
+    /// past the foot of a page they overfill are cut.
+    fn place_footnotes(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, page: &mut Page, foot: &[NoteId], foot_h: i64) {
+        if foot.is_empty() {
+            return;
+        }
+        let h = self.height;
+        let top = (h - foot_h).max(page.height);
+        page.foot_rule = Some(top);
+        let mut y = top + NOTE_RULE_SPACE;
+        for &id in foot {
+            let k = doc.notes.get(id).map_or(0, |n| n.paras.len());
+            for para in 0..k {
+                let Some(l) = self.note_layout(doc, cache, fonts, id, para) else { continue };
+                let mut n = 0;
+                let mut yy = y;
+                while n < l.lines.len() && yy + l.lines[n].height <= h {
+                    yy += l.lines[n].height;
+                    n += 1;
+                }
+                if n > 0 {
+                    page.notes.push(NoteSlice { note: id, para, lines: 0..n, y });
+                }
+                y += l.height;
+            }
+        }
+    }
+
+    /// Every endnote line in order: (note, paragraph, line, height).
+    fn endnote_lines(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts) -> Vec<(NoteId, usize, usize, i64)> {
+        let mut v = Vec::new();
+        if doc.notes.is_empty() {
+            return v;
+        }
+        for id in doc.endnotes() {
+            let k = doc.notes.get(id).map_or(0, |n| n.paras.len());
+            for para in 0..k {
+                if let Some(l) = self.note_layout(doc, cache, fonts, id, para) {
+                    for (li, x) in l.lines.iter().enumerate() {
+                        v.push((id, para, li, x.height));
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Puts endnote lines from `from` on `page` below its text, in height `h`;
+    /// where the next page starts, if lines are left.
+    fn place_endnotes(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, page: &mut Page, from: usize, h: i64) -> Option<Checkpoint> {
+        let lines = self.endnote_lines(doc, cache, fonts);
+        if from >= lines.len() {
+            return None;
+        }
+        let empty = page.slices.is_empty();
+        let mut y = page.height;
+        if from == 0 {
+            if !empty && y + NOTE_RULE_SPACE + lines[0].3 > h {
+                return Some(Checkpoint { block: doc.blocks.len(), line: 0 });
+            }
+            page.end_rule = Some(y);
+            y += NOTE_RULE_SPACE;
+        }
+        let mut k = from;
+        while k < lines.len() && (y + lines[k].3 <= h || (k == from && empty)) {
+            let (id, para, li, lh) = lines[k];
+            match page.notes.last_mut() {
+                Some(s) if s.note == id && s.para == para && s.lines.end == li => s.lines.end = li + 1,
+                _ => page.notes.push(NoteSlice { note: id, para, lines: li..li + 1, y }),
+            }
+            y += lh;
+            k += 1;
+        }
+        page.height = y;
+        (k < lines.len()).then_some(Checkpoint { block: doc.blocks.len(), line: k })
+    }
+
     /// Lays out the page starting at `start`; returns it and where the next starts.
     fn page(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, start: Checkpoint) -> (Page, Option<Checkpoint>) {
-        let h = self.height;
+        let full_h = self.height;
         let n = doc.blocks.len();
         let mut slices: Vec<Slice> = Vec::new();
         let mut y = 0i64;
         let (mut b, mut line) = (start.block, start.line);
         let mut cells: Vec<CellBox> = Vec::new();
-        let done = |slices: Vec<Slice>, cells: Vec<CellBox>, y: i64, next: Option<Checkpoint>| (Page { start, slices, cells, height: y }, next);
+        // Footnotes anchored on this page, and the height their area takes.
+        let mut foot: Vec<NoteId> = Vec::new();
+        let mut foot_h = 0i64;
+        let has_notes = !doc.notes.is_empty();
+        let done = |slices: Vec<Slice>, cells: Vec<CellBox>, y: i64, next: Option<Checkpoint>, foot: Vec<NoteId>, foot_h: i64, cache: &mut LayoutCache| {
+            let mut page = Page { start, slices, cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None };
+            self.place_footnotes(doc, cache, fonts, &mut page, &foot, foot_h);
+            (page, next)
+        };
         loop {
+            let h = full_h - foot_h;
             if b >= n {
-                return done(slices, cells, y, None);
+                // The text has ended: endnotes, if any, follow it.
+                let mut page = Page { start, slices, cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None };
+                let next = self.place_endnotes(doc, cache, fonts, &mut page, line, h);
+                self.place_footnotes(doc, cache, fonts, &mut page, &foot, foot_h);
+                return (page, next);
             }
             if doc.cell(b).is_some() {
-                // A table row: whole, on this page if it fits.
+                // A table row: whole, on this page if it fits (with its notes).
                 let (s, c, h_row, next) = self.row(doc, cache, fonts, b, y);
-                if !slices.is_empty() && y + h_row > h {
-                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
+                let new_notes: Vec<NoteId> = if has_notes { (b..next).flat_map(|k| self.footnotes_in(doc, k, None)).filter(|id| !foot.contains(id)).collect() } else { Vec::new() };
+                let add = self.notes_height(doc, cache, fonts, &new_notes, foot.is_empty());
+                if !slices.is_empty() && y + h_row + add > h {
+                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
                 }
+                foot.extend(new_notes);
+                foot_h += add;
                 slices.extend(s);
                 cells.extend(c);
                 y += h_row;
@@ -365,11 +537,11 @@ impl Paginator {
             let top = slices.is_empty();
             if line == 0 && !top {
                 if l.format.page_break_before {
-                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
+                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
                 }
                 if let Some(need) = self.keep_need(doc, cache, fonts, b) {
                     if y + l.space_before + need > h && need <= h {
-                        return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
+                        return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
                     }
                 }
             }
@@ -381,7 +553,23 @@ impl Paginator {
             let y0 = y;
             let mut li = line;
             let mut yy = y;
-            while li < total && yy + l.lines[li].height <= h {
+            let notes_here = has_notes && doc.para(b).is_some_and(|p| p.text.contains(OBJECT_CHAR));
+            let mut room = h;
+            while li < total {
+                if notes_here {
+                    let new_notes: Vec<NoteId> = self.footnotes_in(doc, b, Some(&l.lines[li])).into_iter().filter(|id| !foot.contains(id)).collect();
+                    let add = self.notes_height(doc, cache, fonts, &new_notes, foot.is_empty());
+                    // Alone on an empty page, a line goes with its notes even if they don't fit.
+                    let alone = slices.is_empty() && li == l0;
+                    if yy + l.lines[li].height + add > room && !alone {
+                        break;
+                    }
+                    foot.extend(new_notes);
+                    foot_h += add;
+                    room = full_h - foot_h;
+                } else if yy + l.lines[li].height > room {
+                    break;
+                }
                 yy += l.lines[li].height;
                 li += 1;
             }
@@ -405,15 +593,28 @@ impl Paginator {
             }
             if cut == l0 {
                 if !top {
-                    // The paragraph starts on the next page.
-                    return done(slices, cells, y - if l0 == 0 { l.space_before } else { 0 }, Some(Checkpoint { block: b, line: l0 }));
+                    // The paragraph starts on the next page, with its notes.
+                    if notes_here {
+                        let moved: Vec<NoteId> = (l0..li).flat_map(|k| self.footnotes_in(doc, b, Some(&l.lines[k]))).collect();
+                        foot.retain(|id| !moved.contains(id));
+                        foot_h = if foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &foot, true) };
+                    }
+                    return done(slices, cells, y - if l0 == 0 { l.space_before } else { 0 }, Some(Checkpoint { block: b, line: l0 }), foot, foot_h, cache);
                 }
                 // Alone on an empty page it must break somewhere.
                 cut = li.max(l0 + 1);
             }
             let used: i64 = l.lines[l0..cut].iter().map(|x| x.height).sum();
             slices.push(Slice { block: b, lines: l0..cut, y: y0, x: 0, w: self.width });
-            return done(slices, cells, y0 + used, Some(Checkpoint { block: b, line: cut }));
+            // Notes of lines that moved to the next page go with them.
+            if notes_here && cut < li {
+                let moved: Vec<NoteId> = (cut..li).flat_map(|k| self.footnotes_in(doc, b, Some(&l.lines[k]))).collect();
+                if !moved.is_empty() {
+                    foot.retain(|id| !moved.contains(id));
+                    foot_h = if foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &foot, true) };
+                }
+            }
+            return done(slices, cells, y0 + used, Some(Checkpoint { block: b, line: cut }), foot, foot_h, cache);
         }
     }
 }
@@ -698,6 +899,117 @@ mod tests {
                 }
             }
             let _ = round;
+        }
+    }
+
+    /// Footnotes on the anchor's page, endnotes after the text, labels in
+    /// order, and repagination after random edits (anchors in, out, note text
+    /// changed) the same as from scratch.
+    #[test]
+    fn notes_go_with_their_anchors() {
+        use crate::model::{NoteKind, OBJECT_CHAR};
+        let paras: Vec<usize> = (0..40).map(|i| 1 + (i * 3) % 5).collect();
+        let mut d = doc_with(&paras, 12);
+        let notes_of = |d: &TextDoc, p: &Paginator| -> Vec<Vec<NoteId>> { p.pages().iter().map(|pg| pg.notes.iter().map(|n| n.note).collect()).collect() };
+        // A footnote in block 5 and block 30, an endnote in block 10.
+        for (b, kind, text) in [(5usize, NoteKind::Foot, "first note"), (30, NoteKind::Foot, "second note\nwith two lines"), (10, NoteKind::End, "an endnote")] {
+            for op in d.insert_note_ops(b, 0, kind, text, 0) {
+                op.apply(&mut d);
+            }
+        }
+        d.take_changes();
+        let (mut p, mut c) = all(&d);
+        assert_eq!(d.note_label(0), "1");
+        assert_eq!(d.note_label(1), "2");
+        assert_eq!(d.note_label(2), "i");
+        let pg5 = p.page_of(5, 0);
+        assert!(p.pages()[pg5].notes.iter().any(|n| n.note == 0), "{:?}", notes_of(&d, &p));
+        assert!(p.pages()[pg5].foot_rule.is_some());
+        let pg30 = p.page_of(30, 0);
+        assert_eq!(p.pages()[pg30].notes.iter().filter(|n| n.note == 1).count(), 2, "both paragraphs");
+        let last = p.pages().last().unwrap();
+        assert!(last.notes.iter().any(|n| n.note == 2) && last.end_rule.is_some(), "the endnote ends the document");
+        // The text and its notes fit the page.
+        for pg in p.pages() {
+            let body = pg.slices.iter().map(|s| s.y).max().unwrap_or(0);
+            if let Some(r) = pg.foot_rule {
+                assert!(body < r);
+            }
+        }
+        // A footnote added before the first renumbers it.
+        for op in d.insert_note_ops(1, 0, NoteKind::Foot, "earlier", 0) {
+            op.apply(&mut d);
+        }
+        let e = d.take_changes().unwrap();
+        p.edit(&d, &mut c, &FixedFonts, e);
+        assert!(p.run(&d, &mut c, &FixedFonts, usize::MAX));
+        assert_eq!((d.note_label(3), d.note_label(0)), ("1".into(), "2".into()));
+        assert_eq!(p.pages(), all(&d).0.pages());
+
+        let mut x: u64 = 0x1234_5678;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for _ in 0..200 {
+            let len = d.blocks.len();
+            let b = rnd(len as u64) as usize;
+            let ops = match rnd(5) {
+                0 => {
+                    let kind = if rnd(4) == 0 { NoteKind::End } else { NoteKind::Foot };
+                    let lines = "note text ".repeat(rnd(12) as usize + 1);
+                    d.insert_note_ops(b, 0, kind, &lines, 0)
+                }
+                1 => {
+                    // Take out a note's anchor.
+                    match d.para(b).unwrap().text.find(OBJECT_CHAR) {
+                        Some(at) => vec![TextOp::Splice { block: b as u32, at: at as u32, del: OBJECT_CHAR.len_utf8() as u32, ins: Default::default() }],
+                        None => Vec::new(),
+                    }
+                }
+                2 => {
+                    let ids: Vec<NoteId> = d.note_numbers().keys().copied().collect();
+                    if ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        let id = ids[rnd(ids.len() as u64) as usize];
+                        let t = "changed ".repeat(rnd(30) as usize + 1);
+                        d.set_note_text_ops(id, &t)
+                    }
+                }
+                3 => vec![TextOp::Splice { block: b as u32, at: 0, del: 0, ins: crate::ops::Fragment { text: "w ".repeat(rnd(40) as usize) + "v", runs: vec![(0, 0)] } }],
+                _ => {
+                    let tl = d.para(b).unwrap().text.len() as u32;
+                    let del = (rnd(30) as u32).min(tl);
+                    if d.para(b).unwrap().text.is_char_boundary(del as usize) {
+                        vec![TextOp::Splice { block: b as u32, at: 0, del, ins: Default::default() }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            d.take_changes();
+            for op in ops {
+                op.apply(&mut d);
+            }
+            if let Some(e) = d.take_changes() {
+                p.edit(&d, &mut c, &FixedFonts, e);
+            }
+            assert!(p.run(&d, &mut c, &FixedFonts, usize::MAX));
+            let fresh = all(&d).0;
+            assert_eq!(p.pages(), fresh.pages());
+            // Every anchored footnote is on its anchor's page.
+            for (&id, &(k, _)) in d.note_numbers().iter() {
+                if k != NoteKind::Foot {
+                    continue;
+                }
+                let (ab, at) = d.anchor_of(id).unwrap();
+                let l = c.get(&d, d.para(ab).unwrap(), p.width(), &FixedFonts);
+                let pg = p.page_of(ab, l.line_of(at));
+                assert!(p.pages()[pg].notes.iter().any(|n| n.note == id), "note {id} not on page {pg}");
+            }
         }
     }
 }

@@ -4,14 +4,15 @@
 //! Read: paragraphs with their styles and direct properties (alignment, indents,
 //! spacing, line spacing, keeps, page breaks, widow control, outline level),
 //! runs (bold, italic, underline, strike, size, colour, highlight and shading,
-//! font, hyperlinks), tabs and line breaks, lists (numbering.xml: bullet or
+//! font, superscript and subscript, hyperlinks), footnotes and endnotes
+//! (footnotes.xml and endnotes.xml), tabs and line breaks, lists (numbering.xml: bullet or
 //! numbered, level), tables (rows of cells of paragraphs, widths from the grid),
 //! inline pictures (their bytes and frame), paragraph and character styles with
 //! inheritance and the document defaults, page size and margins, and a header and
 //! footer (page number fields become `{page}` and `{pages}`).
 //!
 //! Reported, not carried: floating pictures (kept in line), merged cells, nested
-//! tables (their text kept), footnotes and endnotes, comments, tracked changes
+//! tables (their text kept), notes inside notes or headers, comments, tracked changes
 //! (insertions kept, deletions dropped), sections after the first, fields other than
 //! page numbers (their shown result kept), text boxes, charts, equations, embedded
 //! objects. Kept inert: macros (`.docm`, not read).
@@ -19,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Align, Block, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -169,7 +170,14 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
                 }
             }
             "w:bCs" | "w:iCs" | "w:szCs" | "w:lang" | "w:noProof" | "w:kern" | "w:rStyle" | "w:spacing" | "w:w" | "w:position" | "w:webHidden" | "w:specVanish" | "w:rtl" | "w:cs" | "w:eastAsianLayout" | "w:effect" | "w:ligatures" | "w:numForm" | "w:numSpacing" | "w:stylisticSets" | "w:cntxtAlts" | "w:snapToGrid" | "w:fitText" => {}
-            "w:vertAlign" => rep.note(Kind::Approximate, "superscript and subscript (shown as normal text)"),
+            "w:vertAlign" => {
+                a.vert = match val(p) {
+                    Some("superscript") => Some(VertAlign::Super),
+                    Some("subscript") => Some(VertAlign::Sub),
+                    Some("baseline") => Some(VertAlign::Baseline),
+                    _ => None,
+                }
+            }
             "w:caps" | "w:smallCaps" => rep.note(Kind::Approximate, "capitals and small capitals (shown as typed)"),
             "w:vanish" => rep.note(Kind::Approximate, "hidden text (shown)"),
             "w:outline" | "w:shadow" | "w:emboss" | "w:imprint" | "w:bdr" | "w:em" => rep.note(Kind::Approximate, "text effects (dropped)"),
@@ -305,6 +313,14 @@ struct Reader<'a> {
     /// Text boxes met in the paragraph being read; their paragraphs follow it.
     boxes: Vec<El>,
     box_depth: usize,
+    /// Footnotes and endnotes by their `w:id`, and the relationships of their parts.
+    foot_xml: HashMap<String, El>,
+    end_xml: HashMap<String, El>,
+    foot_rels: HashMap<String, (String, String, bool)>,
+    end_rels: HashMap<String, (String, String, bool)>,
+    /// Notes anchored in the text, read after it.
+    pending: Vec<(NoteId, NoteKind, String)>,
+    in_note: bool,
 }
 
 /// The elements named `name` among `e`'s children, looking through content
@@ -586,7 +602,22 @@ impl<'a> Reader<'a> {
                                     self.runs(b, p, link, field);
                                 }
                             }
-                            "w:footnoteReference" | "w:endnoteReference" => self.rep.note(Kind::Dropped, "footnotes and endnotes"),
+                            "w:footnoteReference" | "w:endnoteReference" => {
+                                let kind = if k.name == "w:footnoteReference" { NoteKind::Foot } else { NoteKind::End };
+                                let id = k.attr("w:id").unwrap_or("").to_string();
+                                let known = if kind == NoteKind::Foot { self.foot_xml.contains_key(&id) } else { self.end_xml.contains_key(&id) };
+                                if !known || self.in_note || field.in_margin {
+                                    self.rep.note(Kind::Dropped, "footnotes and endnotes in notes, headers and footers");
+                                } else if let Some(nid) = self.doc.notes.add(Note { kind, paras: Vec::new() }) {
+                                    let mut na = a.clone();
+                                    na.vert = None;
+                                    na.style = None;
+                                    na.object = None;
+                                    na.note = Some(nid);
+                                    p.push(&OBJECT_CHAR.to_string(), &na);
+                                    self.pending.push((nid, kind, id));
+                                }
+                            }
                             "w:commentReference" => self.rep.note(Kind::Dropped, "comments"),
                             "w:rPr" | "w:lastRenderedPageBreak" | "w:delText" => {}
                             _ => {}
@@ -670,6 +701,54 @@ impl<'a> Reader<'a> {
             self.box_depth -= 1;
         }
         k
+    }
+
+    /// The text of each note anchored in the text: read as blocks at the end of
+    /// the document, then taken out into the note.
+    fn read_notes(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return;
+        }
+        self.in_note = true;
+        let main_rels = std::mem::take(&mut self.rels);
+        for (nid, kind, id) in pending {
+            let el = if kind == NoteKind::Foot { self.foot_xml.get(&id) } else { self.end_xml.get(&id) }.cloned();
+            self.rels = if kind == NoteKind::Foot { self.foot_rels.clone() } else { self.end_rels.clone() };
+            let before = self.doc.blocks.len();
+            if let Some(el) = el {
+                let mut field = FieldState::default();
+                self.box_blocks(&el, &mut field, 0);
+            }
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.cell = None;
+                    paras.push(p);
+                }
+            }
+            // The space Word puts after the number.
+            if let Some(p) = paras.first_mut() {
+                if p.text.starts_with(' ') {
+                    p.text.remove(0);
+                    for r in p.runs.iter_mut().skip(1) {
+                        r.0 = r.0.saturating_sub(1);
+                    }
+                    p.normalize();
+                }
+            }
+            if paras.len() > MAX_NOTE_PARAS {
+                paras.truncate(MAX_NOTE_PARAS);
+            }
+            if paras.is_empty() {
+                let id = self.doc.new_id();
+                paras.push(officina_text::model::Para::new(id, "", 0));
+            }
+            self.doc.notes.set(nid, Some(Note { kind, paras }));
+        }
+        self.rels = main_rels;
+        self.in_note = false;
+        self.doc.notes.renumber();
     }
 
     /// A text box's paragraphs and tables, through content controls and the like.
@@ -952,7 +1031,26 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0 };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false };
+    for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
+        let Some(p) = find(kind) else { continue };
+        let Some(x) = part(&archive, &p)? else { continue };
+        let mut m = HashMap::new();
+        // Separators and continuation notices aren't notes.
+        for n in x.children(key).filter(|n| n.attr("w:type").is_none_or(|t| t == "normal")).take(MAX_NOTES) {
+            if let Some(id) = n.attr("w:id") {
+                m.insert(id.to_string(), n.clone());
+            }
+        }
+        let nr = rels(&archive, &p)?;
+        if kind == "footnotes" {
+            r.foot_xml = m;
+            r.foot_rels = nr;
+        } else {
+            r.end_xml = m;
+            r.end_rels = nr;
+        }
+    }
     if let Some(p) = find("settings") {
         r.even_odd = part(&archive, &p)?.is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
     }
@@ -961,17 +1059,9 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     for more in doc_xml.children("w:body").skip(1).take(16) {
         r.body(more);
     }
-    for kind in ["footnotes", "endnotes", "comments"] {
-        if find(kind).is_some() && body.find(match kind {
-            "footnotes" => "w:footnoteReference",
-            "endnotes" => "w:endnoteReference",
-            _ => "w:commentReference",
-        }).is_some() {
-            r.rep.note(Kind::Dropped, match kind {
-                "footnotes" | "endnotes" => "footnotes and endnotes",
-                _ => "comments",
-            });
-        }
+    r.read_notes();
+    if find("comments").is_some() && body.find("w:commentReference").is_some() {
+        r.rep.note(Kind::Dropped, "comments");
     }
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);

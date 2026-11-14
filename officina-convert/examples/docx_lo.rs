@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use officina_convert::docx;
-use officina_text::model::{Align, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, ObjectRef, ParaProps, TextDoc};
+use officina_text::model::{Align, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, NoteKind, ObjectRef, ParaProps, TextDoc, VertAlign};
 
 /// A small valid PNG, `w` × `h`, one colour.
 pub fn png(w: u32, h: u32) -> Vec<u8> {
@@ -72,6 +72,15 @@ pub fn sample() -> TextDoc {
     let img = d.images.add(ImageData { bytes: Arc::from(png(40, 20)), width: 40, height: 20 });
     let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720 }), ..Default::default() });
     d.push_para("See \u{FFFC} here", 0, vec![(0, 0), (4, pic), (7, 0)]);
+    let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
+    d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);
+    let k = d.push_para("A footnote and an endnote.", 0, vec![]);
+    for (at, kind, text) in [(10u32, NoteKind::Foot, "The footnote."), (25, NoteKind::End, "The endnote,\nin two paragraphs.")] {
+        for op in d.insert_note_ops(k, at, kind, text, 0) {
+            officina_core::history::Op::apply(op, &mut d);
+        }
+    }
+    d.take_changes();
     d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
     d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
     d
@@ -165,6 +174,15 @@ pub fn compare(c: &mut Checks, d: &TextDoc, back: &TextDoc) {
     }
     c.check("footer page numbers", back.footer.as_ref().map(|f| f.text.as_str()) == Some("Page {page} of {pages}") && back.footer.as_ref().map(|f| f.align) == Some(Align::Center), || format!("{:?}", back.footer));
     c.check("header", back.header.as_ref().map(|f| (f.text.as_str(), f.align)) == Some(("Report", Align::End)), || format!("{:?}", back.header));
+    // Notes: the anchors in place, numbered, with their text.
+    let notes = |d: &TextDoc| -> Vec<(String, NoteKind, String)> {
+        let Some(b) = (0..d.blocks.len()).find(|&i| d.para(i).is_some_and(|p| p.text.starts_with("A footnote"))) else { return Vec::new() };
+        let p = d.para(b).unwrap();
+        p.text.char_indices().filter(|c| c.1 == '\u{FFFC}').filter_map(|(i, _)| d.attrs.get(p.attr_at(i as u32)).note).filter_map(|id| d.notes.get(id).map(|n| (d.note_label(id), n.kind, n.paras.iter().map(|q| q.text.trim().to_string()).collect::<Vec<_>>().join("/")))).collect()
+    };
+    c.check("footnote 1 and endnote i with their text", notes(back) == notes(d) && notes(d).len() == 2, || format!("{:?} vs {:?}", notes(back), notes(d)));
+    let sup = block(back, "E = mc2").map(|b| attrs_at(back, b, 6).vert);
+    c.check("superscript", sup == Some(Some(VertAlign::Super)), || format!("{sup:?}"));
     c.check("page size and margins", back.page == d.page, || format!("{:?} vs {:?}", back.page, d.page));
 }
 

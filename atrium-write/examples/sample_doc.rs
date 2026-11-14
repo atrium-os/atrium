@@ -3,7 +3,8 @@
 //!
 //! cargo run --example sample_doc [OUT]
 
-use officina_text::model::{Align, CellRef, CharAttrs, ImageData, ListKind, ListRef, ObjectRef, ParaProps, TextDoc};
+use officina_core::history::Op;
+use officina_text::model::{Align, CellRef, CharAttrs, ImageData, ListKind, ListRef, NoteKind, ObjectRef, ParaProps, TextDoc};
 use officina_text::native;
 
 fn main() {
@@ -86,6 +87,21 @@ fn main() {
         d.push_para(&format!("Paragraph {n}. The quick brown fox jumps over the lazy dog, and a naïve café owner counts façades while the paginator keeps up with every keystroke. Shaping handles ligatures such as fi and fl, accents and marks, and characters from the fallback face like ★ and ✓."), 0, vec![]);
     }
     d.footer = Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: officina_text::model::Align::Center });
+    // A footnote on the first body paragraph and an endnote on the justified one.
+    let body = (0..d.blocks.len()).find(|&i| d.para(i).is_some_and(|p| p.text.starts_with("Text is shaped"))).unwrap();
+    let at = d.para(body).unwrap().text.find(" then laid out").unwrap() as u32;
+    for op in d.insert_note_ops(body, at, NoteKind::Foot, "IBM Plex for Latin text, with DejaVu for the characters Plex lacks.", 0) {
+        op.apply(&mut d);
+    }
+    let just = (0..d.blocks.len()).find(|&i| d.para(i).is_some_and(|p| p.text.starts_with("Justified text"))).unwrap();
+    let at = d.para(just).unwrap().text.find(" It is the usual").unwrap() as u32;
+    for op in d.insert_note_ops(just, at, NoteKind::Foot, "Hyphenation, which justified text needs to look its best, is not done yet.", 0) {
+        op.apply(&mut d);
+    }
+    let end = d.para(just).unwrap().text.len() as u32;
+    for op in d.insert_note_ops(just, end, NoteKind::End, "Endnotes are gathered after the last paragraph, numbered i, ii, iii.", 0) {
+        op.apply(&mut d);
+    }
     std::fs::write(&out, native::save_to_vec(&d, &[])).unwrap();
     println!("{out}: {} blocks", d.blocks.len());
 }

@@ -5,10 +5,10 @@
 
 use std::ops::Range;
 
-use crate::layout::{object_height, size_lu, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
+use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{Align, CharFormat, TextDoc, HEADER_FROM_EDGE};
-use crate::paginate::Page;
+use crate::model::{Align, CharFormat, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
 /// One glyph of a run.
@@ -105,7 +105,38 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         }
         let mut ly = s.y;
         for li in s.lines.clone() {
-            line(&mut out, &l, li, &p.text, left, my + ly);
+            line(&mut out, doc, &l, li, &p.text, left, my + ly);
+            ly += l.lines[li].height;
+        }
+    }
+
+    // Footnotes at the foot, endnotes after the text: a short rule above
+    // each, then each note's label in its hang and its text.
+    for y in [page.foot_rule, page.end_rule].into_iter().flatten() {
+        out.push(Item::Rect { x: mx, y: my + y + NOTE_RULE_SPACE / 2 - RULE / 2, w: (col_w / 3).max(crate::LU), h: RULE, color: 0x000000 });
+    }
+    for s in &page.notes {
+        let Some(note) = doc.notes.get(s.note) else { continue };
+        let Some(p) = note.paras.get(s.para) else { continue };
+        let l = cache.get(doc, p, (col_w - NOTE_HANG).max(crate::LU), fonts);
+        let left = mx + NOTE_HANG;
+        if s.para == 0 && s.lines.start == 0 && !l.lines.is_empty() {
+            let mut f = l.glyphs.first().map_or(&l.formats[0], |g| &l.formats[g.fmt as usize]).clone();
+            f.underline = false;
+            f.strike = false;
+            f.link = None;
+            f.object = None;
+            f.note = None;
+            f.vert = crate::model::VertAlign::Super;
+            let shift = vert_shift(&mut f);
+            runs(&mut out, fonts, &doc.note_label(s.note), &f, mx, baseline_of(&l, 0, my + s.y) + shift);
+        }
+        let mut ly = s.y;
+        for li in s.lines.clone() {
+            if li >= l.lines.len() {
+                break;
+            }
+            line(&mut out, doc, &l, li, &p.text, left, my + ly);
             ly += l.lines[li].height;
         }
     }
@@ -126,7 +157,8 @@ fn cluster_text(text: &str, start: u32, next: Option<u32>) -> &str {
     text.get(s..e.max(s)).unwrap_or("")
 }
 
-fn line(out: &mut Vec<Item>, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64) {
+#[allow(clippy::too_many_arguments)]
+fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64) {
     let line = &l.lines[li];
     let baseline = baseline_of(l, li, top);
     let bytes = text.as_bytes();
@@ -165,7 +197,11 @@ fn line(out: &mut Vec<Item>, l: &ParaLayout, li: usize, text: &str, left: i64, t
                     let next = gl[i + 1..].iter().map(|n| n.cluster).find(|&c| c > g.cluster).or(Some(line.end)).filter(|&c| c > g.cluster && c <= line.end);
                     let t = cluster_text(text, g.cluster, next);
                     let n = run.text.len() as u32;
-                    run.text.push_str(t);
+                    // A note anchor's glyphs show its label.
+                    match f.note {
+                        Some(id) if ch == OBJECT_CHAR => run.text.push_str(&doc.note_label(id)),
+                        _ => run.text.push_str(t),
+                    }
                     n..run.text.len() as u32
                 };
                 run.glyphs.push(PaintGlyph { id: g.id, x: pen - x0 + g.dx, dy: g.dy, text: range });
@@ -291,5 +327,32 @@ mod tests {
                 assert_eq!(joined, r.text);
             }
         }
+    }
+
+    #[test]
+    fn notes_paint_numbers_rules_and_text() {
+        use crate::model::NoteKind;
+        use officina_core::history::Op;
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        let k = d.push_para("Body text here", 0, vec![]);
+        for (at, kind, t) in [(4u32, NoteKind::Foot, "foot text"), (9, NoteKind::End, "end text")] {
+            for op in d.insert_note_ops(k, at, kind, t, 0) {
+                op.apply(&mut d);
+            }
+        }
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        assert_eq!(p.pages().len(), 1);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        let texts: Vec<String> = items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r.text.clone()) } else { None }).collect();
+        // The anchors show their numbers, raised and smaller; each note its number and text.
+        assert!(texts.contains(&"1".to_string()) && texts.contains(&"i".to_string()), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("foot")) && texts.iter().any(|t| t.contains("end")), "{texts:?}");
+        let small = items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None }).find(|r| r.text == "1").unwrap();
+        assert!(small.size < crate::pt(11));
+        assert!(p.pages()[0].foot_rule.is_some() && p.pages()[0].end_rule.is_some());
     }
 }

@@ -36,9 +36,14 @@ pub enum TextOp {
     Remove { at: u32, n: u32 },
     /// Sets the page setup, header and footer.
     SetPage { page: crate::model::PageSetup, header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter> },
+    /// Sets note `id`'s text (None takes the note out of the store).
+    SetNote { id: crate::model::NoteId, note: Option<crate::model::Note> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
+
+/// The size of note text, half points (10 pt).
+pub const NOTE_SIZE: u16 = 20;
 
 fn boundary(s: &str, at: u32) -> bool {
     s.is_char_boundary(at as usize)
@@ -121,15 +126,48 @@ impl TextOp {
             TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
             // Every page may change (the paginator resets on a new geometry).
             TextOp::SetPage { .. } => Edit { first: 0, last: 0, delta: 0 },
+            // Noted by `apply`, from the anchor.
+            TextOp::SetNote { .. } => return None,
         })
+    }
+
+    /// Whether the op puts in or takes out a note anchor (or may restyle one).
+    fn moves_anchors(&self, d: &TextDoc) -> bool {
+        let has = |t: &str| t.contains(crate::model::OBJECT_CHAR);
+        match self {
+            TextOp::Splice { ins, .. } => has(&ins.text),
+            TextOp::Restyle { block, .. } => d.para(*block as usize).is_some_and(|p| has(&p.text)),
+            TextOp::Insert { blocks, .. } => blocks.iter().any(|b| b.as_para().is_some_and(|p| has(&p.text))),
+            _ => false,
+        }
     }
 }
 
 impl Op<TextDoc> for TextOp {
     fn apply(self, d: &mut TextDoc) -> TextOp {
+        if let TextOp::SetNote { id, .. } = &self {
+            let id = *id;
+            let inv = self.apply_inner(d);
+            if !matches!(inv, TextOp::Nop) {
+                // The note's anchor page is laid out again (and every page
+                // after it for an endnote, which the paginator always redoes).
+                let at = d.anchor_of(id).map_or(d.blocks.len().saturating_sub(1), |a| a.0);
+                d.note(crate::model::Edit { first: at, last: at + 1, delta: 0 });
+            }
+            return inv;
+        }
+        // Anchors are counted before and after (what goes out is in the inverse).
+        let before = !d.notes.is_empty() && self.moves_anchors(d);
         let inv = self.apply_inner(d);
         if let Some(e) = inv.edit_of_inverse() {
             d.note(e);
+            if !d.notes.is_empty() && (before || inv.moves_anchors(d)) {
+                // Later notes are numbered anew; their labels' widths can move
+                // lines, so every page from here is laid out again.
+                d.notes.renumber();
+                let n = d.blocks.len();
+                d.note(crate::model::Edit { first: e.first.min(n.saturating_sub(1)), last: n, delta: 0 });
+            }
         }
         inv
     }
@@ -249,6 +287,22 @@ impl TextOp {
                 }
                 TextOp::Insert { at, blocks: out }
             }
+            TextOp::SetNote { id, note } => {
+                if let Some(n) = &note {
+                    if n.paras.is_empty() || n.paras.len() > crate::model::MAX_NOTE_PARAS || n.paras.iter().any(|p| p.runs.iter().any(|r| r.1 as usize >= d.attrs.len() || !boundary(&p.text, r.0)) || p.style as usize >= d.styles.styles.len()) {
+                        return TextOp::Nop;
+                    }
+                    for p in &n.paras {
+                        d.raise_watermark(p.id + 1);
+                    }
+                }
+                if id as usize >= crate::model::MAX_NOTES {
+                    return TextOp::Nop;
+                }
+                let old = d.notes.set(id, note);
+                d.notes.renumber();
+                TextOp::SetNote { id, note: old }
+            }
             TextOp::SetPage { page, header, footer } => {
                 let ok = |t: i32| (0..=63_360).contains(&t);
                 if !(page.width >= 1440 && page.height >= 1440 && [page.width, page.height, page.margin_top, page.margin_bottom, page.margin_start, page.margin_end].into_iter().all(ok)) || page.margin_start + page.margin_end + 720 > page.width || page.margin_top + page.margin_bottom + 720 > page.height {
@@ -266,6 +320,57 @@ impl TextOp {
 
 /// Edits built from a selection: what an editor sends.
 impl TextDoc {
+    /// A note's paragraphs from plain text (a paragraph a line), in the note
+    /// format: 10 pt, no space between paragraphs.
+    pub fn note_paras(&mut self, text: &str) -> Vec<crate::model::Para> {
+        let a = self.attrs.intern(crate::model::CharAttrs { size: Some(NOTE_SIZE), ..Default::default() });
+        let mut v = Vec::new();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let keep = lines.len().min(crate::model::MAX_NOTE_PARAS);
+        for (i, l) in lines.iter().enumerate().take(keep) {
+            // Lines past the limit join the last paragraph.
+            let t = if i + 1 == keep && lines.len() > keep { lines[i..].join(" ") } else { l.to_string() };
+            let id = self.new_id();
+            let mut p = crate::model::Para::new(id, &t, 0);
+            p.runs = vec![(0, a)];
+            p.props.space_after = Some(0);
+            p.props.space_before = Some(0);
+            v.push(p);
+        }
+        v
+    }
+
+    /// Ops that put a new note with `text` at (`block`, `at`): the note, then its
+    /// anchor (in the attributes `base` with the note set).
+    pub fn insert_note_ops(&mut self, block: usize, at: u32, kind: crate::model::NoteKind, text: &str, base: AttrId) -> Vec<TextOp> {
+        if self.para(block).is_none_or(|p| at as usize > p.text.len() || !p.text.is_char_boundary(at as usize)) || self.notes.len() >= crate::model::MAX_NOTES {
+            return Vec::new();
+        }
+        let id = self.notes.len() as crate::model::NoteId;
+        let paras = self.note_paras(text);
+        let mut a = self.attrs.get(base).clone();
+        a.object = None;
+        a.note = Some(id);
+        let anchor = self.attrs.intern(a);
+        vec![
+            TextOp::SetNote { id, note: Some(crate::model::Note { kind, paras }) },
+            TextOp::Splice { block: block as u32, at, del: 0, ins: Fragment { text: crate::model::OBJECT_CHAR.to_string(), runs: vec![(0, anchor)] } },
+        ]
+    }
+
+    /// Ops that set note `id`'s text to `text` (a paragraph a line), keeping
+    /// its kind; nothing if it is the same.
+    pub fn set_note_text_ops(&mut self, id: crate::model::NoteId, text: &str) -> Vec<TextOp> {
+        let Some(n) = self.notes.get(id) else { return Vec::new() };
+        let kind = n.kind;
+        let old: Vec<&str> = n.paras.iter().map(|p| p.text.as_str()).collect();
+        if old.join("\n") == text {
+            return Vec::new();
+        }
+        let paras = self.note_paras(text);
+        vec![TextOp::SetNote { id, note: Some(crate::model::Note { kind, paras }) }]
+    }
+
     /// Ops that delete from (`b0`, `o0`) to (`b1`, `o1`), across paragraphs.
     pub fn delete_ops(&self, b0: usize, o0: u32, b1: usize, o1: u32) -> Vec<TextOp> {
         if (b1, o1) <= (b0, o0) {

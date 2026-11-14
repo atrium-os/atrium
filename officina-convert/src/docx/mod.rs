@@ -45,6 +45,16 @@ pub(crate) mod tests {
         let img = d.images.add(ImageData { bytes: Arc::from(png), width: 40, height: 20 });
         let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720 }), ..Default::default() });
         d.push_para("See \u{FFFC} here", 0, vec![(0, 0), (4, pic), (7, 0)]);
+        let sup = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Super), ..Default::default() });
+        let sub = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Sub), ..Default::default() });
+        d.push_para("x2 and H2O", 0, vec![(0, 0), (1, sup), (2, 0), (8, sub), (9, 0)]);
+        let k = d.push_para("A footnote and an endnote.", 0, vec![]);
+        for (at, kind, text) in [(10u32, officina_text::model::NoteKind::Foot, "The footnote's text,\nin two paragraphs."), (25, officina_text::model::NoteKind::End, "The endnote.")] {
+            for op in d.insert_note_ops(k, at, kind, text, 0) {
+                officina_core::history::Op::apply(op, &mut d);
+            }
+        }
+        d.take_changes();
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
         d.page.margin_start = 1000;
@@ -64,7 +74,9 @@ pub(crate) mod tests {
                 if let Some(o) = &mut x.object {
                     o.image = 0;
                 }
-                (s, e, x)
+                // Notes are compared by number and text.
+                let note = x.note.take().map(|n| (d.note_label(n), d.notes.get(n).map(|n| n.paras.iter().map(|p| (p.text.clone(), p.spans().filter(|s| s.0 < s.1).map(|s| d.attrs.get(s.2).clone()).collect::<Vec<_>>())).collect::<Vec<_>>())));
+                (s, e, x, note)
             }).collect::<Vec<_>>();
             assert_eq!(spans(a, p), spans(b, q), "runs of {i}");
             let mut pp = p.props.clone();
