@@ -23,7 +23,8 @@
 # cloud-vm.sh env): frescod (frescod, fresco-renderer), atrium-test-client
 # (atrium-noisy). SSH_PORT (2222) and KEY pick the VM, as the other vm-*
 # checks. Under TCG (the cloud VM) the rates are slow and noisy: compare
-# the two phases only, never quote them as speeds.
+# the two phases only, never quote them as speeds, and give the hogs
+# LOADED=160 so the nodes hog reaches its limit (about 3,000 nodes/s there).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=${TARGET:-x86_64-unknown-freebsd}

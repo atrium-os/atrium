@@ -165,6 +165,7 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 - A new font size past the page limit first evicts the pages no text run draws from (their slots are freed in the renderer); only if all are in use is the run refused. `OP_TEXT_MEASURE` past it answers zeros and sends the refusal.
 - Found on the way: the scene server's CAS kept every texture blob ever sent, bound or not, so an app cycling textures grew its renderer forever. It now keeps only blobs a slot is bound to and those sent since the last upload pass.
 - `OP_BUDGET` (65,536 kernel ops per frame after culling) still drops whole nodes at pack time; this budget is the memory side, that one the per-frame raster side.
+- Noisy-neighbour gate (`scripts/fresco-noisy-neighbour.sh`, `atrium-noisy`, frescod's `FRESCOD_FRAME_STATS`): a small victim window at 60 fps, alone and then beside a hog sending a million nodes and a hog drawing 65,536 overlapping translucent full-window fills a frame. Compute renderer, cloud amd64 VM (TCG, so only the two phases are compared), 2026-11-14: 0 failed. The victim kept 92 % of its frame rate (3.69 vs 4.00 new frames/s under TCG) and its p99 gap grew 263 to 359 ms; the nodes hog was refused at node 262,145 (`used 262144 limit 262144`), told once, and stayed connected; the fills hog stayed connected; frescod ran on. Under TCG the hog needs `LOADED=160` to reach the node limit.
 
 ### F4i. A shipped frescod refuses the unsplit modes. Done (2026-11-14)
 
@@ -172,7 +173,7 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 
 - A shipped frescod (run as `_frescod`, 65010, or installed as `atrium-frescod`, which is what `40-atrium-frescod.toml` does) checks its environment first thing (`fresco_split::production::check`) and exits 78 (`EX_CONFIG`) naming every development setting it found. It never falls back to an unsplit mode by itself.
 - Development runs (`frescod` as root from the VM scripts) are unchanged.
-- Gate: `scripts/fresco-production-gate.sh` runs the policy's tests and checks that the shipped service runs `atrium-frescod` as `_frescod` with none of those variables, and that no install or launch file sets them; `... vm <frescod>` also starts it as `atrium-frescod` in the VM with each setting and expects exit 78.
+- Gate: `scripts/fresco-production-gate.sh` runs the policy's tests and checks that the shipped service runs `atrium-frescod` as `_frescod` with none of those variables, and that no install or launch file sets them; `... vm <frescod>` also starts it as `atrium-frescod` in the VM with each setting and expects exit 78. Cloud amd64 VM, 2026-11-14: PASS (8 checks).
 
 ### F4j. GPU renderer: compose never waits on a window's raster; frames far too costly are not drawn. Done (2026-11-14), needs a gpusim and an R9700 run
 

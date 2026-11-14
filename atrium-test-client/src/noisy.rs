@@ -3,7 +3,7 @@
 //!
 //! Usage: atrium-noisy SOCK MODE SECONDS
 //!
-//! - `nodes`: a window that sends a million rect nodes (10,000 per frame)
+//! - `nodes`: a window that sends a million rect nodes (40,000 per frame)
 //!   and keeps adding. Its renderer must refuse past the node budget and
 //!   tell it (`EV_BUDGET_REFUSED`), not grow until it is killed.
 //! - `fills`: a 1280x800 window of 65,536 overlapping full-window
@@ -56,7 +56,7 @@ fn main() -> std::io::Result<()> {
             let mut sent = 0u32;
             while sent < 1_000_000 && Instant::now() < end {
                 conn.scene_frame_begin()?;
-                for _ in 0..10_000 {
+                for _ in 0..40_000 {
                     sent += 1;
                     let (x, y) = ((sent % 400) as f32 * 2.0, ((sent / 400) % 300) as f32 * 2.0);
                     conn.scene_node_rect(sent, rect(x, y, 2.0, 2.0, [0.2, 0.5, 0.9, 1.0]))?;
