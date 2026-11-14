@@ -107,10 +107,14 @@ How each kind of trouble plays out. "Gate" marks what a simulated gate checks.
   Gate: tunnel scenario in aura-sim-gate W2.
 - **Long drop or leaving for good.** As above, then the address goes at 60 s. A user
   `leave` (or `forget`) drops the address at once.
-- **Low signal.** Within one network, roaming hysteresis (above). A weak network that still
-  works is kept: no automatic move to another network today. Planned with N3: move to
-  another remembered network only when the current one averages below -80 dBm for 30 s and
-  the other is above -70 dBm on two scans in a row, with the same 30 s hold-down.
+- **Low signal.** Within one network, roaming hysteresis (above). Across networks (built
+  with N3): while connected below -70 dBm aura-mlme scans every 10 s anyway and reports,
+  after each scan, the best signal per SSID it saw (`nearby ssid= rssi=`, no BSSIDs,
+  never our own BSS). atrium-net moves to another remembered auto-join network only when
+  ours has been below -80 dBm for 30 s, the other has been above -70 dBm on two scans in a
+  row, no other BSS of our own network is above -70 (then aura-mlme roams instead), and
+  30 s have passed since the last move. Highest priority wins, then the stronger signal.
+  A weak network with nothing better around is kept. A move is a `network-move` event.
 - **Flaky internet (link fine, upstream dead or lossy).** The link layer cannot see this.
   DHCP keeps running to the lease's end (renew, then rebind by broadcast at T2, then drop
   and start over). The connectivity probe (§4.2) runs on every bound interface: one whose
@@ -397,7 +401,13 @@ VM from the Aura gates cover them.
   device with no vnet set, and with IPv6 on, the stack's link-address handler
   (`nd6_grand_start`) read `V_` variables through a NULL vnet; `aura_wlan.c` now enters
   the interface's vnet around `if_setlladdr`.
-- Not yet: the cross-network low-signal move (§4.1: below -80 dBm for 30 s, another
-  remembered network above -70 dBm on two scans) needs background scans while connected;
-  real atrium-netd (NAT re-pointing); the Atrium-run probe endpoint (decided by Shankar
+- Cross-network low-signal move (§4.1): `wifi.rs` `weak_scan_done` on aura-mlme's
+  `roam-scan`/`nearby`/`roam-scan-done` lines, 6 host tests. Gate scenario `weak_move`
+  (end of `n3`, now 31 checks; alone as `aura-sim-gate.sh move`): a second AP `aura-other`
+  (`hostapd-other.conf`, channel 1) at -50 dBm; ours at -75 is kept for 90 s, at -85 the
+  move came 49 s after the drop (30 s weak plus scans) and took a lease there. W2 38/38. Found while
+  building it: after a same-network roam atrium-net never re-confirmed the lease (it now
+  treats `disconnected why=roam` as a rejoin and sends LeaseUp on `authorized`), and the
+  status line carried `link=` twice in the address grace period (now one: `lost`).
+- Not yet: real atrium-netd (NAT re-pointing); the Atrium-run probe endpoint (decided by Shankar
   2026-11-14: probing stays off until Atrium hosts one; no third-party default).

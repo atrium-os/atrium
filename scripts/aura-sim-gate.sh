@@ -530,6 +530,39 @@ $a"
     wait_st 'name=vtnet1 .*internet=no' 90 || fail "dead upstream not seen: $(st)"
     [ "$(gw)" = 10.88.0.1 ] && ok "only Ethernet left, no internet: reported (internet=no), route kept" || fail "lone interface lost its route: $(gw)"
     lanctl web-ok >/dev/null
+
+    weak_move
+}
+
+# Weak signal: move to another remembered network (spec §4.1), only when
+# ours is below -80 dBm for 30 s and the other above -70 on two scans.
+weak_move() {
+    st() { "$V" "$CTL status"; }
+    wait_st() {
+        i=0; while [ $i -lt "$2" ]; do st | grep -Eq "$1" && return 0; sleep 3; i=$((i + 3)); done; return 1
+    }
+    sh "$AP" ap hostapd-wpa2.conf hostapd-other.conf
+    other="\"aura-other\""
+    sh "$AP" signal 2437 -75 2412 -50
+    out=$("$V" "$CTL join aura-test --wait 240 --dhcp wlan0" 2>&1) || fail "join: $out"
+    # Remembered (auto-join on) once connected, so auto-join does not pick it.
+    r=$("$V" "echo '$PASS' | $CTL remember aura-other") || fail "remember aura-other: $r"
+    t0=$(date +%s)
+    while [ $(( $(date +%s) - t0 )) -lt 90 ]; do
+        st | grep -qF "ssid=$other" && fail "moved at -75 dBm: $(st)"
+        sleep 10
+    done
+    ok "at -75 dBm (weak, not bad) Wi-Fi stays on aura-test with aura-other at -50 for 90 s"
+    sh "$AP" signal 2437 -85 2412 -50
+    t1=$(date +%s)
+    wait_st "^wifi .*state=up.*ssid=\"aura-other\"" 240 || fail "no move to aura-other: $(st; "$V" "grep -Ev 'probing|probe ' /tmp/aura/net.log | tail -n 40")"
+    "$V" "grep -q 'weak signal, moving to aura-other' /tmp/aura/net.log" || fail "aura-other joined, but not by the weak-signal move: $("$V" 'tail -n 30 /tmp/aura/net.log')"
+    wait_st 'name=wlan0 .*state=bound' 120 && ok "at -85 dBm Wi-Fi moved to aura-other and took a lease there" || fail "no lease after the move: $(st)"
+    echo "    moved $(( $(date +%s) - t1 )) s after the signal dropped (at least 30 s weak + two scans, plus ssh time under TCG)"
+    sh "$AP" ssh "grep -q 'wlan1: AP-STA-CONNECTED' /tmp/hostapd.log" && ok "hostapd: associated with aura-other's BSS" || fail "hostapd aura-other"
+    sh "$AP" signal 2437 -50 2412 -50
+    leave
+    "$V" "$CTL forget aura-other" >/dev/null
 }
 
 teardown() {
@@ -553,6 +586,14 @@ w2)
     w2
     teardown
     echo "W2 gate: $pass checks passed" ;;
+move)
+    # The weak-signal move alone (also the end of n3).
+    setup hostapd-wpa2.conf
+    start_net
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember aura-test: $r"
+    weak_move
+    teardown
+    echo "weak-signal move: $pass checks passed" ;;
 n3)
     setup hostapd-wpa2.conf
     n3

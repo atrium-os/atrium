@@ -439,6 +439,22 @@ impl Station {
         self.roam_scan = false;
         // Beacons were missed while the radio was off our channel.
         self.last_beacon = self.last_beacon.max(now);
+        // What else is in range, for atrium-net's move to another remembered
+        // network on a weak signal (atrium-net.md §4.1): each network once,
+        // with its best signal, our own network's other BSSs included; no
+        // BSSIDs. Then the end of the scan.
+        let cur = self.target().map(|t| t.bss.bssid);
+        let mut best: Vec<(Vec<u8>, i8)> = Vec::new();
+        for b in self.results.iter().filter(|b| Some(b.bssid) != cur && !b.ssid.is_empty()) {
+            match best.iter_mut().find(|(s, _)| *s == b.ssid) {
+                Some(x) => x.1 = x.1.max(b.rssi),
+                None => best.push((b.ssid.clone(), b.rssi)),
+            }
+        }
+        for (ssid, rssi) in best {
+            out.push(Out::Ctl(Line::new("nearby").with_hex("ssid", &ssid).with("rssi", rssi)));
+        }
+        out.push(Out::Ctl(Line::new("event").with("what", "roam-scan-done")));
         let (Some(j), State::Up { t }) = (self.joined.clone(), &self.st) else {
             return out;
         };

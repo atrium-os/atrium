@@ -741,7 +741,13 @@ mod imp {
                             }
                         }
                         Act::Save => self.save(),
-                        Act::Event(l) => self.event(&l),
+                        Act::Event(l) => {
+                            if l.get("what") == Some("network-move") {
+                                let to = l.hex("to").map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
+                                self.log(&format!("wifi: weak signal, moving to {to} ({} dBm there)", l.get("rssi").unwrap_or("?")));
+                            }
+                            self.event(&l)
+                        }
                     }
                 }
                 queue = more;
@@ -854,9 +860,6 @@ mod imp {
                             l = l.with("dns", x.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
                         }
                         l = l.with("metered", self.metered(i) as u8);
-                        if i.wifi && self.wifi_grace.is_some() {
-                            l = l.with("link", "lost");
-                        }
                     }
                     None => l = l.with("state", "none"),
                 }
@@ -867,7 +870,9 @@ mod imp {
                     l = l.with("dns6", i.dns6.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
                 }
                 let k = self.ifs.iter().position(|x| x.name == i.name);
-                l = l.with("link", if i.link { "up" } else { "down" }).with("internet", i.inet.word());
+                // A Wi-Fi link gone but its address kept in the grace period: `lost`.
+                let lost = i.wifi && i.applied.lease.is_some() && self.wifi_grace.is_some();
+                l = l.with("link", if lost { "lost" } else if i.link { "up" } else { "down" }).with("internet", i.inet.word());
                 if let Some(p) = &i.portal {
                     l = l.with_hex("portal", p.as_bytes());
                 }

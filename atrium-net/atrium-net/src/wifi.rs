@@ -18,6 +18,18 @@ pub const REJOIN_DELAY_MS: u64 = 2_000;
 /// broken AP) is skipped by auto-join for `FAILING_HOLD_MS`.
 pub const MAX_FAILURES: u32 = 3;
 pub const FAILING_HOLD_MS: u64 = 10 * 60_000;
+/// Moving to another remembered network on a weak signal (spec §4.1): the
+/// current one below `WEAK_DBM` for `WEAK_FOR_MS`, the other above
+/// `GOOD_DBM` on `GOOD_SCANS` background scans in a row, at most one move
+/// per `MOVE_HOLD_MS`. aura-mlme scans in the background (about every 10 s)
+/// while its signal is below -70 dBm and reports each scan's networks.
+pub const WEAK_DBM: i32 = -80;
+pub const GOOD_DBM: i32 = -70;
+pub const WEAK_FOR_MS: u64 = 30_000;
+pub const GOOD_SCANS: u32 = 2;
+pub const MOVE_HOLD_MS: u64 = 30_000;
+/// No background-scan report for this long: the signal is back above -70.
+const WEAK_STALE_MS: u64 = 25_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
@@ -158,11 +170,35 @@ pub struct Wifi {
     lost_at: Option<u64>,
     /// Consecutive failed joins per network, and until when it is skipped.
     failures: Vec<(Vec<u8>, u32, u64)>,
+    /// Weak signal: below WEAK_DBM since, and the last background-scan report.
+    weak_since: Option<u64>,
+    last_weak: u64,
+    /// This background scan's networks (best signal each), and how many
+    /// scans in a row each remembered network has been above GOOD_DBM.
+    nearby: Vec<(Vec<u8>, i32)>,
+    good: Vec<(Vec<u8>, u32)>,
+    last_move: Option<u64>,
 }
 
 impl Wifi {
     pub fn new(saved: Saved) -> Wifi {
-        Wifi { saved, st: St::Idle, seen: Vec::new(), mac: None, held: false, next_scan: None, backoff: 0, connected: false, lost_at: None, failures: Vec::new() }
+        Wifi {
+            saved,
+            st: St::Idle,
+            seen: Vec::new(),
+            mac: None,
+            held: false,
+            next_scan: None,
+            backoff: 0,
+            connected: false,
+            lost_at: None,
+            failures: Vec::new(),
+            weak_since: None,
+            last_weak: 0,
+            nearby: Vec::new(),
+            good: Vec::new(),
+            last_move: None,
+        }
     }
 
     pub fn state(&self) -> &'static str {
@@ -205,7 +241,59 @@ impl Wifi {
         if was_up { vec![Act::LeaseDown] } else { vec![] }
     }
 
+    fn failing(&self, ssid: &[u8], now: u64) -> bool {
+        self.failures.iter().any(|(s, n, until)| *s == ssid && *n >= MAX_FAILURES && now < *until)
+    }
+
+    /// The end of a background scan while connected: move to another
+    /// remembered network if ours has been weak long enough and the other
+    /// has been good on enough scans in a row (spec §4.1 low signal).
+    fn weak_scan_done(&mut self, now: u64) -> Vec<Act> {
+        let St::Up { ssid: cur } = &self.st else {
+            self.nearby.clear();
+            return vec![];
+        };
+        let cur = cur.clone();
+        let nearby = std::mem::take(&mut self.nearby);
+        let best = |s: &[u8]| nearby.iter().filter(|(n, _)| n == s).map(|&(_, r)| r).max();
+        // Another BSS of our own network is good: aura-mlme roams instead.
+        let own_ok = best(&cur).is_some_and(|r| r > GOOD_DBM);
+        let mut good = Vec::new();
+        for p in self.saved.profiles.iter().filter(|p| p.auto && p.ssid != cur) {
+            if best(&p.ssid).is_some_and(|r| r > GOOD_DBM) && !self.failing(&p.ssid, now) {
+                let n = self.good.iter().find(|(s, _)| *s == p.ssid).map_or(0, |g| g.1);
+                good.push((p.ssid.clone(), n + 1));
+            }
+        }
+        self.good = good;
+        let weak_long = self.weak_since.is_some_and(|w| now >= w + WEAK_FOR_MS);
+        let held = self.last_move.is_some_and(|t| now < t + MOVE_HOLD_MS);
+        if !weak_long || own_ok || held {
+            return vec![];
+        }
+        let pick = self
+            .good
+            .iter()
+            .filter(|(_, n)| *n >= GOOD_SCANS)
+            .filter_map(|(s, _)| self.saved.get(s).map(|p| (p, best(s).unwrap_or(i32::MIN))))
+            .max_by(|a, b| a.0.prio.cmp(&b.0.prio).then(a.1.cmp(&b.1)))
+            .map(|(p, r)| (p.ssid.clone(), p.security(None), p.mac.clone(), r));
+        let Some((ssid, security, mac, rssi)) = pick else { return vec![] };
+        self.last_move = Some(now);
+        self.weak_since = None;
+        self.good.clear();
+        self.st = St::Joining { ssid: ssid.clone(), rest: Vec::new() };
+        vec![
+            Act::Event(Line::new("event").with("what", "network-move").with_hex("from", &cur).with_hex("to", &ssid).with("rssi", rssi)),
+            Act::Join { ssid, security, mac },
+        ]
+    }
+
     pub fn tick(&mut self, now: u64) -> Vec<Act> {
+        if self.weak_since.is_some() && now > self.last_weak + WEAK_STALE_MS {
+            self.weak_since = None;
+            self.good.clear();
+        }
         if !self.connected || self.held || self.st != St::Idle || !self.autos() {
             return vec![];
         }
@@ -316,6 +404,25 @@ impl Wifi {
     pub fn mlme_line(&mut self, l: &Line, now: u64) -> Vec<Act> {
         let mut a = vec![Act::Event(l.clone())];
         match (l.verb.as_str(), l.get("state")) {
+            // Background scans while connected on a weak signal.
+            ("event", _) if l.get("what") == Some("roam-scan") && matches!(self.st, St::Up { .. }) => {
+                if let Some(r) = l.num::<i32>("rssi") {
+                    self.last_weak = now;
+                    if r < WEAK_DBM {
+                        self.weak_since.get_or_insert(now);
+                    } else {
+                        self.weak_since = None;
+                    }
+                }
+            }
+            ("nearby", _) if matches!(self.st, St::Up { .. }) => {
+                if let (Some(ssid), Some(rssi)) = (l.hex("ssid"), l.num::<i32>("rssi")) {
+                    if self.nearby.len() < 64 {
+                        self.nearby.push((ssid, rssi));
+                    }
+                }
+            }
+            ("event", _) if l.get("what") == Some("roam-scan-done") => a.extend(self.weak_scan_done(now)),
             ("bss", _) if self.st == St::Scanning => {
                 if let (Some(ssid), Some(rssi)) = (l.hex("ssid"), l.num::<i32>("rssi")) {
                     self.seen.push((ssid, rssi));
@@ -327,7 +434,7 @@ impl Wifi {
                     .profiles
                     .iter()
                     .filter(|p| p.auto)
-                    .filter(|p| !self.failures.iter().any(|(s, n, until)| *s == p.ssid && *n >= MAX_FAILURES && now < *until))
+                    .filter(|p| !self.failing(&p.ssid, now))
                     .filter_map(|p| self.seen.iter().filter(|(s, _)| *s == p.ssid).map(|(_, r)| *r).max().map(|r| (p, r)))
                     .collect();
                 c.sort_by(|x, y| y.0.prio.cmp(&x.0.prio).then(y.1.cmp(&x.1)));
@@ -358,6 +465,8 @@ impl Wifi {
                     }
                     self.backoff = 0;
                     self.lost_at = None;
+                    self.weak_since = None;
+                    self.good.clear();
                     self.failures.retain(|(s, _, _)| *s != ssid);
                     self.st = St::Up { ssid };
                     // Also after a roam: atrium-lease confirms the lease.
@@ -387,6 +496,17 @@ impl Wifi {
                         self.retry_later(now);
                     }
                 }
+            }
+            // aura-mlme leaving on its way somewhere: a roam inside the same
+            // network keeps the link's lease (confirmed once authorized
+            // again); a new join leaves the network but stays Joining.
+            ("state", Some("disconnected")) if l.get("why") == Some("roam") && matches!(self.st, St::Up { .. }) => {
+                if let St::Up { ssid } = std::mem::replace(&mut self.st, St::Idle) {
+                    self.st = St::Joining { ssid, rest: Vec::new() };
+                }
+            }
+            ("state", Some("disconnected")) if l.get("why") == Some("new-join") && matches!(self.st, St::Joining { .. }) => {
+                a.push(Act::LeaseDown);
             }
             ("state", Some("disconnected")) => {
                 if matches!(self.st, St::Up { .. } | St::Joining { .. }) {
@@ -595,5 +715,133 @@ mod dropout_tests {
         let a = w.mlme_line(&line("state state=disconnected why=asked"), 5);
         assert!(a.contains(&Act::LeaseDown));
         assert!(w.tick(100_000).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod weak_signal_tests {
+    use super::*;
+
+    fn prof(s: &str, prio: i32) -> Profile {
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false }
+    }
+
+    fn line(s: &str) -> Line {
+        Line::parse(s).unwrap()
+    }
+
+    fn up(w: &mut Wifi, ssid: &str, t: u64) {
+        w.mlme_line(&Line::new("bss").with_hex("ssid", ssid.as_bytes()).with("rssi", -50), t);
+        w.mlme_line(&line("scan-done status=0 count=1"), t);
+        w.mlme_line(&line("state state=authorized bssid=02:00:00:00:00:01"), t);
+        assert_eq!(w.state(), "up");
+    }
+
+    /// One background scan: our signal, then the networks it saw.
+    fn scan(w: &mut Wifi, t: u64, ours: i32, seen: &[(&str, i32)]) -> Vec<Act> {
+        w.mlme_line(&Line::new("event").with("what", "roam-scan").with("rssi", ours), t);
+        for (s, r) in seen {
+            w.mlme_line(&Line::new("nearby").with_hex("ssid", s.as_bytes()).with("rssi", *r), t);
+        }
+        w.mlme_line(&line("event what=roam-scan-done"), t + 1)
+    }
+
+    fn moved_to(a: &[Act]) -> Option<Vec<u8>> {
+        a.iter().find_map(|x| match x {
+            Act::Join { ssid, .. } => Some(ssid.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn weak_for_30s_and_other_good_twice_moves() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0), prof("cafe", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        // Weak from 10 s; the cafe is good on every scan, but 30 s must pass.
+        for t in [10_000, 20_000, 30_000] {
+            assert_eq!(moved_to(&scan(&mut w, t, -85, &[("cafe", -60)])), None, "at {t}");
+        }
+        let a = scan(&mut w, 40_000, -85, &[("cafe", -60)]);
+        assert_eq!(moved_to(&a), Some(b"cafe".to_vec()));
+        assert!(a.iter().any(|x| matches!(x, Act::Event(l) if l.get("what") == Some("network-move"))));
+        assert_eq!(w.state(), "joining");
+        // aura-mlme leaves the old network on the way: lease down, still joining.
+        let a = w.mlme_line(&line("state state=disconnected why=new-join"), 40_100);
+        assert!(a.contains(&Act::LeaseDown));
+        assert_eq!(w.state(), "joining");
+        let a = w.mlme_line(&line("state state=authorized bssid=02:00:00:00:00:02"), 41_000);
+        assert!(a.contains(&Act::LeaseUp));
+        assert_eq!(w.ssid(), Some(&b"cafe"[..]));
+    }
+
+    #[test]
+    fn no_move_when_merely_weakish_or_other_not_good_enough() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0), prof("cafe", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        // -75 dBm: aura-mlme scans (below -70) but it is not weak enough.
+        for i in 1..10 {
+            assert_eq!(moved_to(&scan(&mut w, i * 10_000, -75, &[("cafe", -50)])), None);
+        }
+        // Weak, but the other network is only -72.
+        for i in 10..20 {
+            assert_eq!(moved_to(&scan(&mut w, i * 10_000, -85, &[("cafe", -72)])), None);
+        }
+        // Good once, then not, then good once: never two in a row.
+        for (i, r) in [(20, -60), (21, -75), (22, -60), (23, -75), (24, -60)] {
+            assert_eq!(moved_to(&scan(&mut w, i * 10_000, -85, &[("cafe", r)])), None);
+        }
+    }
+
+    #[test]
+    fn own_network_elsewhere_means_roam_not_move() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0), prof("cafe", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        for i in 1..10 {
+            assert_eq!(moved_to(&scan(&mut w, i * 10_000, -85, &[("home", -55), ("cafe", -50)])), None);
+        }
+    }
+
+    #[test]
+    fn signal_recovers_then_weak_again_restarts_the_clock() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0), prof("cafe", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        scan(&mut w, 10_000, -85, &[("cafe", -60)]);
+        scan(&mut w, 20_000, -85, &[("cafe", -60)]);
+        // No reports for a while: back above -70.
+        w.tick(60_000);
+        assert_eq!(moved_to(&scan(&mut w, 61_000, -85, &[("cafe", -60)])), None);
+        assert_eq!(moved_to(&scan(&mut w, 71_000, -85, &[("cafe", -60)])), None);
+        assert_eq!(moved_to(&scan(&mut w, 91_000, -85, &[("cafe", -60)])), Some(b"cafe".to_vec()));
+    }
+
+    #[test]
+    fn priority_then_signal_and_failing_networks_skipped() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0), prof("a", 0), prof("b", 5), prof("c", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        let seen = [("a", -40), ("b", -65), ("c", -50)];
+        let mut got = None;
+        for i in 1..6 {
+            got = got.or(moved_to(&scan(&mut w, i * 10_000, -90, &seen)));
+        }
+        assert_eq!(got, Some(b"b".to_vec()), "priority beats signal");
+    }
+
+    #[test]
+    fn roam_keeps_the_lease() {
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 0)], country: None });
+        w.mlme_up(0);
+        up(&mut w, "home", 1);
+        let a = w.mlme_line(&line("state state=disconnected why=roam"), 100);
+        assert!(!a.contains(&Act::LeaseDown), "a roam is the same link");
+        let a = w.mlme_line(&line("state state=authorized bssid=02:00:00:00:00:02"), 900);
+        assert!(a.contains(&Act::LeaseUp), "lease confirmed after the roam");
+        assert_eq!(w.state(), "up");
+        // No stray auto-join scan.
+        assert!(w.tick(10_000).is_empty());
     }
 }

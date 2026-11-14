@@ -310,7 +310,12 @@ fn roams_to_a_better_bss() {
     s.mgmt_rx(2412, -40, rx_flags::SCAN, &b2, 600);
     // Hysteresis: the first win only makes it a candidate.
     let o = s.scan_done(0, 700);
-    assert_eq!(ctl(&o)[0].get("what"), Some("roam-candidate"));
+    // What it saw, for atrium-net: our network's other BSS once, no BSSID.
+    let c = ctl(&o);
+    assert_eq!(c[0].verb, "nearby");
+    assert_eq!((c[0].hex("ssid").as_deref(), c[0].get("rssi"), c[0].get("bssid")), (Some(&b"aura-test"[..]), Some("-40"), None));
+    assert_eq!(c[1].get("what"), Some("roam-scan-done"));
+    assert_eq!(c[2].get("what"), Some("roam-candidate"));
     assert!(kernel(&o).is_empty());
     assert!(kernel(&s.tick(5_000)).is_empty(), "scans stay 10 s apart");
     for t in [5_100, 10_300] {
@@ -321,7 +326,7 @@ fn roams_to_a_better_bss() {
     s.mgmt_rx(2412, -40, rx_flags::SCAN, &b2, 10_500);
     let o = s.scan_done(0, 10_600);
     let ev = ctl(&o);
-    assert_eq!(ev[0].get("what"), Some("roam"));
+    assert!(ev.iter().any(|l| l.get("what") == Some("roam")), "{ev:?}");
     let k = kernel(&o);
     // Protected deauth to the old AP, then authentication with the new.
     assert!(matches!(k[0], Req::TxMgmt { freq: 2437, frame } if mgmt::subtype(frame) == mgmt::DEAUTH && mgmt::protected(frame)));
