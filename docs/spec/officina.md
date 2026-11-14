@@ -1408,6 +1408,52 @@ Not yet: rows split across pages and repeated header rows (§7.4 long tables), m
 cells, cell shading and border styles, column resizing by dragging, nested tables,
 automatic column widths (fixed widths now, as the spec asks for long tables).
 
+### 16.16 O3e as built (2026-11-14): `.docx` and `.odt`
+
+- **Shared**: `officina-convert::xml`, a bounded DOM over the existing pull parser (no
+  DOCTYPE, at most 2^24 elements, depth 256, 1 GiB of text), used by both readers.
+  Pictures are kept only when they decode to a size (PNG, JPEG, GIF, WebP through
+  `pixel_size`), at most 48 MB each and 65,536 per document.
+- **`.docx` reader** (`docx::read`): styles (Word's built-in names mapped to ours,
+  document defaults under Normal, basedOn chains), numbering (bullet or numbered per
+  level, one list per `numId`), runs (bold, italic, underline, strike, size, colour,
+  font, highlight), hyperlinks (external targets only), fields (PAGE and NUMPAGES in
+  headers and footers, field results elsewhere), inline pictures, tables (grid widths,
+  `gridSpan` widens a cell), page size and margins (header and footer distances
+  included), the default header and footer. First-page and even headers are reported
+  only when the document turns them on.
+- **`.docx` writer** (`docx::write`): styles under Word's ids, numbering keyed by list
+  and kind, runs, tabs and line breaks, inline pictures, tables with a grid and
+  borders, `header1`/`footer1` with PAGE and NUMPAGES fields, `sectPr`.
+- **`.odt` reader** (`odt::read`): named, automatic and default styles (Standard is
+  Normal, `Heading_20_N` is Heading N), list styles with nesting and continued
+  numbering, spans, links, spaces and tabs, page number and count fields in the
+  master page, as-character frames, tables with column widths, the first master
+  page's layout (header and footer heights added to the margins, with LibreOffice's
+  dynamic spacing inside the height).
+- **`.odt` writer** (`odt::write`): `mimetype` stored first, manifest, named styles,
+  page layout and master page with header and footer, automatic paragraph, text, list
+  and table styles, nested lists, tables, as-character pictures.
+- **What doesn't come through** is reported, never silent: footnotes, comments,
+  equations, drawings, charts and embedded objects are dropped; floating pictures,
+  text boxes, merged cells, nested tables, tracked changes, sections, columns, tab
+  stops, super/subscript, small caps and similar are kept approximately (each with
+  its own note).
+- **atrium-write** opens `.docx` and `.odt` through the sandboxed converter process
+  (`officina-convert docx|odt` writes `.owrite`) and saves both in-process; the picker
+  offers both. The status line shows the first fidelity note.
+
+Gates: round trip of a document using everything the model has, both formats, with an
+empty report; 2,000 hostile packages each, clean; LibreOffice both ways
+(`examples/docx_lo.rs`: our `.docx`, saved by LibreOffice as `.docx`, read back, 18 of
+18 checks; `examples/odt_lo.rs`: our `.odt` saved by LibreOffice as `.odt`, and our
+`.docx` saved by LibreOffice as `.odt`, 36 of 36): text, styles, run formatting, links,
+paragraph spacing and alignment, list kinds and levels, the table, the picture's size
+and pixels, header, footer with page numbers, page size and margins.
+
+Not yet: footnotes, comments, tracked changes kept as such, `.doc`, a real-world
+corpus run (§7.6 asks for one before O3 is called done).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

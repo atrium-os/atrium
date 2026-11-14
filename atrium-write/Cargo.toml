@@ -17,6 +17,7 @@ path = "src/bin/atrium_write.rs"
 [dependencies]
 navigator-image = { path = "../navigator-image" }
 officina-core = { path = "../officina-core" }
+officina-convert = { path = "../officina-convert" }
 officina-text = { path = "../officina-text" }
 pergola = { path = "../pergola" }
 pergola-richtext = { path = "../pergola-richtext" }

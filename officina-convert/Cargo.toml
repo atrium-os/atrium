@@ -17,6 +17,7 @@ path = "src/bin/officina_convert.rs"
 [dependencies]
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
+officina-text = { path = "../officina-text" }
 # Pure Rust deflate (MIT OR Zlib OR Apache-2.0); the repo already uses it via navigator-fonts.
 miniz_oxide = "0.8"
 # Streaming XML (MIT); bounded by our own limits on top.

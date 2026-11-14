@@ -65,8 +65,28 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        "docx" | "odt" => {
+            let got = if what == "docx" { officina_convert::docx::read(&input).map_err(|e| e.to_string()) } else { officina_convert::odt::read(&input).map_err(|e| e.to_string()) };
+            match got {
+                Ok((doc, loaded)) => {
+                    let out = std::io::BufWriter::new(std::io::stdout().lock());
+                    if let Err(e) = officina_text::native::save(&doc, &[], out).and_then(|mut o| o.flush()) {
+                        eprintln!("error\t{e}");
+                        std::process::exit(1);
+                    }
+                    for l in loaded.report.lines() {
+                        eprintln!("note\t{l}");
+                    }
+                    eprintln!("stats\tparagraphs {}\tpictures {}", loaded.paragraphs, loaded.pictures);
+                }
+                Err(e) => {
+                    eprintln!("error\t{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx|ods < in > out.osheet");
+            eprintln!("error\tusage: officina-convert xlsx|ods|docx|odt < in > out (.osheet or .owrite)");
             std::process::exit(2);
         }
     }
