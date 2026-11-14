@@ -143,6 +143,13 @@ fn hostile_ods_never_panics() {
         })
         .unwrap();
     }
+    wb.set_macros(officina_grid::macros::Macros {
+        family: officina_grid::macros::MacroFamily::Odf,
+        parts: vec![officina_grid::macros::MacroPart { path: "Basic/Standard/Module1.xml".into(), media_type: "text/xml".into(), data: b"<m>Sub A\nEnd Sub</m>".to_vec().into() }],
+        workbook_code: None,
+        sheet_codes: vec![],
+    })
+    .unwrap();
     let file = ods::write(&wb, Vec::new()).unwrap();
     let z = Archive::open(&file).unwrap();
     let parts: Vec<(String, Vec<u8>)> = z.entries.clone().into_iter().map(|e| (e.name.clone(), z.read(&e).unwrap())).collect();
@@ -153,7 +160,7 @@ fn hostile_ods_never_panics() {
         x ^= x << 17;
         x
     };
-    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"table:number-columns-repeated=\"99999999\" ", b"table:number-rows-repeated=\"4000000000\" ", b"office:value-type=\"date\" office:date-value=\"-9999-99-99\" ", b"office:time-value=\"PT99999999999H\" ", b"table:formula=\"of:=[.A1\" ", b"<table:table-row>", b"</table:table-row>", b"<table:table-cell>", b"style:parent-style-name=\"ce1\" ", b"\xff\xfe", b"<draw:frame svg:x=\"-1e308in\" svg:width=\"NaNin\" table:end-cell-address=\"Data.ZZZZZ99999999\">", b"</draw:frame>", b"xlink:href=\"./../content.xml\" ", b"chart:values-cell-range-address=\"Data.A1:Data.Z99\" ", b"<chart:series chart:class=\"chart:stock\">", b"<draw:object xlink:href=\"./Object 99\"/>"];
+    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"table:number-columns-repeated=\"99999999\" ", b"table:number-rows-repeated=\"4000000000\" ", b"office:value-type=\"date\" office:date-value=\"-9999-99-99\" ", b"office:time-value=\"PT99999999999H\" ", b"table:formula=\"of:=[.A1\" ", b"<table:table-row>", b"</table:table-row>", b"<table:table-cell>", b"style:parent-style-name=\"ce1\" ", b"\xff\xfe", b"<draw:frame svg:x=\"-1e308in\" svg:width=\"NaNin\" table:end-cell-address=\"Data.ZZZZZ99999999\">", b"</draw:frame>", b"xlink:href=\"./../content.xml\" ", b"chart:values-cell-range-address=\"Data.A1:Data.Z99\" ", b"<chart:series chart:class=\"chart:stock\">", b"<draw:object xlink:href=\"./Object 99\"/>", b"manifest:full-path=\"Basic/../../x\" ", b"manifest:media-type=\"a\"<b\" "];
     let n = if cfg!(debug_assertions) { 150 } else { 1500 };
     for i in 0..n {
         let mut ps = parts.clone();

@@ -12,6 +12,8 @@ pub enum Format {
     Native,
     Csv,
     Xlsx,
+    /// `.xlsm`: an `.xlsx` that may carry macros (kept inert, never run).
+    Xlsm,
     Ods,
 }
 
@@ -19,8 +21,10 @@ pub fn format_of(name: &str) -> Format {
     let n = name.to_ascii_lowercase();
     if n.ends_with(".osheet") {
         Format::Native
-    } else if n.ends_with(".xlsx") || n.ends_with(".xlsm") {
+    } else if n.ends_with(".xlsx") {
         Format::Xlsx
+    } else if n.ends_with(".xlsm") {
+        Format::Xlsm
     } else if n.ends_with(".ods") {
         Format::Ods
     } else {
@@ -88,7 +92,7 @@ pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
         return Doc::from_native(name, data).map_err(|e| format!("“{name}” isn't a sheet this app can read: {e}"));
     }
     let foreign = match format_of(name) {
-        Format::Xlsx => Some("xlsx"),
+        Format::Xlsx | Format::Xlsm => Some("xlsx"),
         Format::Ods => Some("ods"),
         _ => None,
     };

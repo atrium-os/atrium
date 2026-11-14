@@ -3,6 +3,7 @@
 
 pub(crate) mod chart;
 pub mod formula;
+pub(crate) mod macros;
 pub mod read;
 pub mod write;
 

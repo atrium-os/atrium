@@ -86,6 +86,7 @@ fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
         Format::Native => d.write_native(Vec::new()),
         Format::Csv => d.write_csv(Vec::new()),
         Format::Xlsx => officina_convert::xlsx::write(&d.wb, Vec::new()),
+        Format::Xlsm => officina_convert::xlsx::write_xlsm(&d.wb, Vec::new()),
         Format::Ods => officina_convert::ods::write(&d.wb, Vec::new()),
     }
 }
@@ -188,7 +189,20 @@ impl Run {
         match r.and_then(|_| d.saved()) {
             Ok(()) => {
                 let lost = format == Format::Csv && d.wb.groups().next().is_some();
-                d.status = if lost { format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name) } else { format!("Saved “{}”.", d.name) };
+                // Macros go back only into their own kind of file (§5.3).
+                let fam = d.wb.macros().map(|m| m.family);
+                let macros_lost = match (fam, format) {
+                    (None, _) => false,
+                    (Some(officina_grid::macros::MacroFamily::Ooxml), Format::Xlsm) | (Some(officina_grid::macros::MacroFamily::Odf), Format::Ods) | (Some(_), Format::Native) => false,
+                    _ => true,
+                };
+                d.status = if lost {
+                    format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name)
+                } else if macros_lost {
+                    format!("Saved “{}”. Its macros aren't in this file: this format can't hold them.", d.name)
+                } else {
+                    format!("Saved “{}”.", d.name)
+                };
             }
             Err(e) => d.status = format!("Couldn't save “{}”: {e}. Your changes are still here and in the autosave.", d.name),
         }
@@ -320,7 +334,7 @@ fn main() {
                         want_picker = Some(Asking::SaveAs);
                     }
                 }
-                Cmd::Undo | Cmd::Redo => {}
+                Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros => {}
             }
         }
         if let (Some(what), None) = (want_picker.take(), asking) {

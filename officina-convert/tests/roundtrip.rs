@@ -60,7 +60,7 @@ fn xlsx_round_trip() {
 
 #[test]
 fn hostile_xlsx_never_panics() {
-    let file = xlsx::write(&charted(with_table(filtered(book()))), Vec::new()).unwrap();
+    let file = xlsx::write_xlsm(&with_vba(charted(with_table(filtered(book())))), Vec::new()).unwrap();
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     // Fewer in a debug build (it is ~30x slower); release runs them all.
     let n = if cfg!(debug_assertions) { 300 } else { 3000 };
@@ -95,7 +95,7 @@ fn hostile_sheet_xml_never_panics() {
         x ^= x << 17;
         x
     };
-    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"r=\"A0\"", b"t=\"s\"", b"<v>99999999</v>", b"<row r=\"1\">", b"</row>", b"<c r=\"XFE1\">", b"si=\"7\"", b"t=\"shared\"", b"<f>", b"</f>", b"\xff\xfe", b"<c:ser>", b"</c:ser>", b"<xdr:col>99999999999</xdr:col>", b"<c:f>Data!$A$1:$C$9</c:f>", b"[#This Row]", b"<autoFilter ref=\"A1:XFD1048576\"/>"];
+    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"r=\"A0\"", b"t=\"s\"", b"<v>99999999</v>", b"<row r=\"1\">", b"</row>", b"<c r=\"XFE1\">", b"si=\"7\"", b"t=\"shared\"", b"<f>", b"</f>", b"\xff\xfe", b"<c:ser>", b"</c:ser>", b"<xdr:col>99999999999</xdr:col>", b"<c:f>Data!$A$1:$C$9</c:f>", b"[#This Row]", b"<autoFilter ref=\"A1:XFD1048576\"/>", b"codeName=\"a b\"\" ", b"Target=\"../../etc/passwd\" ", b"<sheetPr codeName=\"x\"/>"];
     let n = if cfg!(debug_assertions) { 150 } else { 1500 };
     for i in 0..n {
         let target = (next() % parts.len() as u64) as usize;
@@ -329,4 +329,76 @@ fn ods_chart_round_trip() {
         assert_eq!(b2, a2);
         assert_eq!(b.data(&back, 100), a2.data(&wb, 100));
     }
+}
+
+fn with_vba(mut wb: Workbook) -> Workbook {
+    use officina_grid::macros::*;
+    let bytes = |n: usize, k: u8| (0..n).map(|i| (i as u8).wrapping_mul(k)).collect::<Vec<u8>>();
+    wb.set_macros(Macros {
+        family: MacroFamily::Ooxml,
+        parts: vec![
+            MacroPart { path: "xl/vbaProject.bin".into(), media_type: "application/vnd.ms-office.vbaProject".into(), data: bytes(70_000, 7).into() },
+            MacroPart { path: "xl/vbaProjectSignature.bin".into(), media_type: "application/vnd.ms-office.vbaProjectSignature".into(), data: bytes(900, 13).into() },
+        ],
+        workbook_code: Some("ThisWorkbook".into()),
+        sheet_codes: vec![(0, "Sheet1".into()), (1, "Tabelle2".into())],
+    })
+    .unwrap();
+    wb
+}
+
+#[test]
+fn xlsm_keeps_macros_byte_for_byte() {
+    let wb = with_vba(book());
+    let file = xlsx::write_xlsm(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert_eq!(loaded.report.human(), vec!["inert: macros (kept as they are for saving as .xlsm; never run)".to_string()]);
+    assert_eq!(back.macros(), wb.macros());
+    // The package says it has macros, the way Excel needs.
+    let z = officina_convert::zip::Archive::open(&file).unwrap();
+    let ct = String::from_utf8(z.read_name("[Content_Types].xml").unwrap().unwrap()).unwrap();
+    assert!(ct.contains("macroEnabled.main+xml") && ct.contains("/xl/vbaProject.bin"));
+    assert!(z.read_name("xl/_rels/vbaProject.bin.rels").unwrap().is_some());
+    // Saved as .xlsx: no macros, a plain workbook.
+    let plain = xlsx::write(&wb, Vec::new()).unwrap();
+    let (p, _) = xlsx::read(&plain).unwrap();
+    assert!(p.macros().is_none());
+    let z = officina_convert::zip::Archive::open(&plain).unwrap();
+    assert!(z.entries.iter().all(|e| !e.name.contains("vba")));
+    // Through the native file and back out.
+    let n = officina_grid::native::load(&officina_grid::native::save_to_vec(&back)).unwrap();
+    assert_eq!(xlsx::read(&xlsx::write_xlsm(&n, Vec::new()).unwrap()).unwrap().0.macros(), wb.macros());
+    // Parts not directly in xl/ (or an ODF project) aren't written into an .xlsm.
+    let mut odd = book();
+    let mut m = wb.macros().unwrap().clone();
+    m.parts[1].path = "docProps/sig.bin".into();
+    odd.set_macros(m).unwrap();
+    assert!(xlsx::read(&xlsx::write_xlsm(&odd, Vec::new()).unwrap()).unwrap().0.macros().is_none());
+}
+
+#[test]
+fn ods_keeps_basic_byte_for_byte() {
+    use officina_grid::macros::*;
+    let mut wb = book();
+    let lib = |p: &str, t: &str| MacroPart { path: p.into(), media_type: "text/xml".into(), data: t.as_bytes().into() };
+    let m = Macros {
+        family: MacroFamily::Odf,
+        parts: vec![
+            lib("Basic/script-lc.xml", "<lc/>"),
+            lib("Basic/Standard/script-lb.xml", "<lb/>"),
+            lib("Basic/Standard/Module1.xml", "Sub Main\n  MsgBox \"never\"\nEnd Sub"),
+            MacroPart { path: "Scripts/python/x.py".into(), media_type: "".into(), data: b"print(1)".to_vec().into() },
+        ],
+        workbook_code: None,
+        sheet_codes: vec![],
+    };
+    wb.set_macros(m.clone()).unwrap();
+    let file = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = officina_convert::ods::read(&file).unwrap();
+    assert_eq!(back.macros(), Some(&m));
+    assert!(loaded.report.human().iter().any(|l| l.contains("macros (kept as they are")), "{:?}", loaded.report.human());
+    // An .xlsm project isn't written into an .ods, and vice versa.
+    let x = with_vba(book());
+    assert!(officina_convert::ods::read(&officina_convert::ods::write(&x, Vec::new()).unwrap()).unwrap().0.macros().is_none());
+    assert!(xlsx::read(&xlsx::write_xlsm(&wb, Vec::new()).unwrap()).unwrap().0.macros().is_none());
 }

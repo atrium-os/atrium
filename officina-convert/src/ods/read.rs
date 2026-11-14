@@ -675,9 +675,6 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             return Err(bad(format!("not an OpenDocument spreadsheet ({})", m.trim())));
         }
     }
-    if z.entries.iter().any(|e| e.name.starts_with("Basic/") || e.name.starts_with("Scripts/")) {
-        rep.note(Kind::Inert, "macros (never run; not kept in an Atrium file yet)");
-    }
     let content = z.read_name("content.xml")?.ok_or_else(|| bad("no content.xml"))?;
     let mut styles = Styles::default();
     if let Some(s) = z.read_name("styles.xml")? {
@@ -909,6 +906,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                     }
                     b"draw:frame" | b"draw:custom-shape" | b"draw:g" => rep.note(Kind::Dropped, "images and drawings"),
+                    b"script:event-listener" | b"form:button" => rep.note(Kind::Dropped, "macros bound to events and buttons (the macros are kept; nothing starts them)"),
                     b"table:named-range" | b"table:named-expression" => {
                         let a = attrs(e);
                         let src = if name == b"table:named-range" { a.get("table:cell-range-address").map(|r| format!("of:=[{r}]")) } else { a.get("table:expression").cloned() };
@@ -1187,6 +1185,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
     // Charts, once every sheet and its sizes exist.
     super::chart::read_frames(&mut wb, &z, frames, &mut rep);
+    // Macros, kept inert.
+    super::macros::read(&z, &mut wb, &mut rep)?;
     out.report.merge(rep);
     Ok((wb, out))
 }

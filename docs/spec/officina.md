@@ -238,7 +238,7 @@ and what governments ask for. The alternative is to make ODF the native format (
 | `.csv`, `.tsv` (encoding and delimiter detection) | converter (streaming, for huge files) | writer | O2 |
 | `.rtf`, `.txt`, `.md` | converter | writer | O3 |
 | pasted / dropped HTML | `navigator-normalize` in a jail, then profile → rich text | Tabula offers HTML subset | O3 |
-| `.xlsm`, `.docm`, `.pptm` | as their base format; macros reported, kept inert (§5.3) | base format only unless D7 says otherwise | O4 |
+| `.xlsm`, `.docm`, `.pptm` | as their base format; macros reported, kept inert (§5.3) | with the kept macro parts, byte for byte (D7; `.xlsm` built in O4f, §16.8) | O4 |
 | `.doc`, `.xls`, `.ppt` (binary, pre-2007) | later, converter only (§17 D8) | never | O7+ |
 | `.pdf` | not edited; opens in `atrium-pdf` | `officina-pdf` export, PDF/A-2b | O3 |
 
@@ -1086,6 +1086,43 @@ Gates, on the 4-core cloud machine:
 | drawing | `officina-draw` tests: a million-point line stays within two points per pixel column; `examples/chart_svg.rs` rendered and checked by eye |
 | live | Sheets on the cloud VM shows a combo, a pie and an area chart over the grid (screenshot checked) |
 | hostile input | the `.xlsx` and package fuzzers now run on a book with a table, a filter and charts; clean |
+
+### 16.8 O4f as built (2026-11-14): macros kept inert
+
+- **Model** (`officina-grid::macros`): a workbook may carry one set of macro parts, each
+  a package path, a media type and bytes, never parsed, plus VBA's code names for the
+  workbook and sheets (`codeName`, which the project's modules are bound to). The family
+  (OOXML or ODF) says which format they go back into. Bounded: 1,024 parts, 32 MiB a
+  part, 64 MiB in all; paths plain and relative (no `..`, no absolute, no odd
+  characters), code names letters, digits and `_`. Native chunks 11 (family, code names)
+  and 12 (one per part). `remove_macros` drops them.
+- **`.xlsm`**: the reader keeps the VBA project the workbook links to
+  (`xl/vbaProject.bin`) and its signatures (classic, agile, V3) by the project's
+  relationships, with the code names. `xlsx::write` never writes macros (Excel refuses a
+  `.xlsx` that has them); `xlsx::write_xlsm` writes them back with the macro-enabled
+  workbook type, the project relationship, its signature relationships and the code
+  names, and only parts directly in `xl/` with a known VBA media type, so a hostile
+  native file can't place a part anywhere else. The project is unchanged, so its
+  signature still holds.
+- **`.ods`**: the reader keeps the `Basic/`, `Dialogs/` and `Scripts/` folders with
+  their manifest media types; the writer writes them back with their manifest entries.
+  Bindings of macros to events and buttons in `content.xml` are not kept (reported), so
+  a saved file has its macros but nothing starts them by itself.
+- **Across formats**: macros go back only into their own family: `.xlsm` macros are not
+  written to `.ods` or `.xlsx`, Basic is not written to `.xlsm`; Sheets says so when it
+  saves.
+- **Sheets**: a file with macros shows "has macros; Atrium doesn't run them" by its name
+  and a Remove Macros button; removing them is journaled (a crash after it doesn't bring
+  them back) and takes effect at the next save. `.xlsm` files save as `.xlsm`.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| LibreOffice (`examples/macros_lo.rs`, LibreOffice 24.2) | our `.ods` with a Basic module → LibreOffice → `.ods`: the module's code is kept. Two real `.xlsm` files from Apache POI's test data: VBA project and code names kept; LibreOffice opening the original and opening our re-written `.xlsm` finds the same 5 VBA modules with the same code |
+| round trips | `tests/roundtrip.rs`: `.xlsm` parts and code names equal through write and read and through a native file; `.xlsx` gets none; parts outside `xl/` and the other family's parts are not written; `.ods` Basic and Scripts parts equal |
+| hostile input | the `.xlsx` and `.ods` fuzzers now run on packages with macros, with code-name, relationship-target and manifest-path mutations; clean |
+| app | `atrium-sheets` test: removing macros survives a crash |
 
 ## 17. Decisions (accepted 2026-11-14)
 

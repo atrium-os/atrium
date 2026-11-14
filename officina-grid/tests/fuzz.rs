@@ -111,6 +111,14 @@ fn native_reader() {
     st.borders[0].line = officina_grid::style::Line::Thick;
     wb.set_style(&officina_grid::Rect { sheet: 1, r0: 3, c0: 0, r1: 900, c1: 4 }, st);
     wb.set_style(&officina_grid::Rect { sheet: 0, r0: 0, c0: 1, r1: 10, c1: 1 }, officina_grid::style::Style::default().with_num_fmt("yyyy"));
+    use officina_grid::macros::*;
+    wb.set_macros(Macros {
+        family: MacroFamily::Ooxml,
+        parts: vec![MacroPart { path: "xl/vbaProject.bin".into(), media_type: "application/vnd.ms-office.vbaProject".into(), data: vec![9; 300].into() }],
+        workbook_code: Some("ThisWorkbook".into()),
+        sheet_codes: vec![(1, "Sheet2".into())],
+    })
+    .unwrap();
     wb.recalc();
     let good = native::save_to_vec(&wb);
     let mut g = Rng(0xfeed_beef_dead_cafe);

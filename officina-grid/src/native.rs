@@ -11,6 +11,8 @@
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
 //! | 10 | CHARTS | charts: kind, grouping, legend, titles, anchor, series ranges |
+//! | 11 | MACROS | macros kept inert: family, VBA code names (the parts follow) |
+//! | 12 | MACRO_PART | one macro part: path, media type, bytes, never parsed |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -42,6 +44,8 @@ pub const NAMES: u16 = 7;
 pub const ROWS_SHOWN: u16 = 8;
 pub const TABLES: u16 = 9;
 pub const CHARTS: u16 = 10;
+pub const MACROS: u16 = 11;
+pub const MACRO_PART: u16 = 12;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -206,6 +210,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
         c.add(CHARTS, &w.into_bytes())?;
     }
+    if let Some(m) = &wb.macros {
+        let mut w = Writer::new();
+        m.encode_head(&mut w);
+        c.add(MACROS, &w.into_bytes())?;
+        for p in &m.parts {
+            let mut w = Writer::new();
+            p.encode(&mut w);
+            c.add(MACRO_PART, &w.into_bytes())?;
+        }
+    }
     if !wb.tables.is_empty() {
         let mut w = Writer::new();
         w.var(wb.tables.len() as u64);
@@ -354,6 +368,28 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
             wb.add_chart(ch).map_err(LoadError::Bad)?;
         }
         done(&r)?;
+    }
+
+    // Macros, kept as they are.
+    let mut it = of(MACROS);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two MACROS chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let mut m = crate::macros::Macros::decode_head(&mut r)?;
+        done(&r)?;
+        for i in of(MACRO_PART) {
+            if m.parts.len() >= crate::macros::MAX_PARTS {
+                return Err(LoadError::Bad("too many macro parts"));
+            }
+            let mut r = Reader::new(c.chunk(i)?);
+            m.parts.push(crate::macros::MacroPart::decode(&mut r)?);
+            done(&r)?;
+        }
+        wb.set_macros(m).map_err(LoadError::Bad)?;
+    } else if of(MACRO_PART).next().is_some() {
+        return Err(LoadError::Bad("macro parts without MACROS"));
     }
 
     // Strings.

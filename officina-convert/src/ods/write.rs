@@ -1230,7 +1230,8 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&filters_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/></office:styles></office:document-styles>"#);
-    let mut objects = String::new();
+    let macros = super::macros::writable(wb);
+    let mut objects = super::macros::manifest_xml(&macros);
     for i in 0..wb.charts().len() {
         let n = i + 1;
         let _ = write!(objects, r#"<manifest:file-entry manifest:full-path="Object {n}/" manifest:version="1.3" manifest:media-type="application/vnd.oasis.opendocument.chart"/><manifest:file-entry manifest:full-path="Object {n}/content.xml" manifest:media-type="text/xml"/>"#);
@@ -1246,6 +1247,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     z.add("content.xml", content.as_bytes())?;
     for (i, ch) in wb.charts().iter().enumerate() {
         z.add(&format!("Object {}/content.xml", i + 1), super::chart::object_xml(wb, ch).as_bytes())?;
+    }
+    for p in &macros {
+        z.add(&p.path, &p.data)?;
     }
     z.finish()
 }

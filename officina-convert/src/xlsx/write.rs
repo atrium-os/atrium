@@ -142,7 +142,7 @@ impl Strings {
 
 const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 
-fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>> {
+fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -> io::Result<Vec<u8>> {
     let (rows, cols) = wb.extent(s);
     let name = wb.sheet_name(s);
     if rows > XLSX_ROWS || cols > XLSX_COLS {
@@ -151,6 +151,10 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
     let sh = wb.sheet(s);
     let mut o: Vec<u8> = Vec::with_capacity(1 << 16);
     let _ = write!(o, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet {NS}>"#);
+    if let Some(c) = code {
+        // Code names are letters, digits and `_` (checked by the grid).
+        let _ = write!(o, r#"<sheetPr codeName="{c}"/>"#);
+    }
     if rows > 0 && cols > 0 {
         let _ = write!(o, r#"<dimension ref="A1:{}"/>"#, a1(rows - 1, cols - 1));
     }
@@ -474,16 +478,31 @@ fn each_cell_rowmajor(wb: &Workbook, r: &Rect, extra: &[(u32, u32, u32)], f: &mu
     }
 }
 
-/// Writes `wb` as `.xlsx`.
+/// Writes `wb` as `.xlsx`; macros are not written (a `.xlsx` can't hold them).
 pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
+    write_with(wb, out, None)
+}
+
+/// Writes `wb` as `.xlsm`: as [`write`], with the macros kept from an `.xlsm`
+/// byte for byte (if the workbook has any).
+pub fn write_xlsm<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
+    write_with(wb, out, super::macros::writable(wb))
+}
+
+fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::macros::Macros>) -> io::Result<W> {
     let mut z = ZipWriter::new(out);
+    let code_of = |s: usize| macros.and_then(|m| m.sheet_codes.iter().find(|(i, _)| *i as usize == s)).map(|(_, c)| &**c);
     let n = wb.sheet_count();
     let mut strings = Strings { ids: HashMap::new(), list: Vec::new(), uses: 0 };
     let mut parts = Vec::with_capacity(n);
     for s in 0..n {
-        parts.push(sheet_xml(wb, s as u16, &mut strings)?);
+        parts.push(sheet_xml(wb, s as u16, &mut strings, code_of(s))?);
     }
-    let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#);
+    let main = if macros.is_some() { super::macros::MAIN_MACRO } else { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" };
+    let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="{MAIN}"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#).replace("{MAIN}", main);
+    if let Some(m) = macros {
+        ct.push_str(&super::macros::content_type_xml(m));
+    }
     for s in 0..n {
         ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#, s + 1));
     }
@@ -502,7 +521,11 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     z.add("[Content_Types].xml", ct.as_bytes())?;
     z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     let mut w: Vec<u8> = Vec::new();
-    let _ = write!(w, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {NS}><sheets>"#);
+    let _ = write!(w, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {NS}>"#);
+    if let Some(c) = macros.and_then(|m| m.workbook_code.as_deref()) {
+        let _ = write!(w, r#"<workbookPr codeName="{c}"/>"#);
+    }
+    w.extend_from_slice(b"<sheets>");
     for s in 0..n {
         w.extend_from_slice(b"<sheet name=\"");
         esc(&mut w, &wb.sheet_name(s as u16));
@@ -541,8 +564,15 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#, n + 1));
     r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>"#, n + 2));
+    if let Some(m) = macros {
+        let vba = m.parts.iter().find(|p| &*p.media_type == super::macros::VBA).expect("writable checked");
+        r.push_str(&format!(r#"<Relationship Id="rId{}" Type="{}" Target="{}"/>"#, n + 3, super::macros::VBA_REL, &vba.path[3..]));
+    }
     r.push_str("</Relationships>");
     z.add("xl/_rels/workbook.xml.rels", r.as_bytes())?;
+    if let Some(m) = macros {
+        super::macros::write_parts(&mut z, m)?;
+    }
     z.add("xl/styles.xml", &super::styles::write(wb))?;
     let mut sst: Vec<u8> = Vec::new();
     let _ = write!(sst, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{}" uniqueCount="{}">"#, strings.uses, strings.list.len());

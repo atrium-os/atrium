@@ -11,7 +11,7 @@
 //!
 //! Reported, not carried (O4c–O4e): merged cells, charts and
 //! drawings, defined names, tables, conditional formats, data validation, comments,
-//! hyperlinks. Kept inert: macros (`vbaProject.bin`), external links.
+//! hyperlinks. Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -915,9 +915,6 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         .unwrap_or_else(|| "xl/workbook.xml".into());
     let wb_xml = z.read_name(&wb_part)?.ok_or_else(|| bad("no workbook part"))?;
     let wb_rels = rels(&z, &wb_part)?;
-    if z.entries.iter().any(|e| e.name.to_ascii_lowercase().ends_with("vbaproject.bin")) {
-        out.report.note(Kind::Inert, "macros (never run; not kept in an Atrium file yet)");
-    }
     if wb_rels.values().any(|(t, _)| t.ends_with("/externalLink")) {
         out.report.note(Kind::Inert, "links to other workbooks (cached values kept, never refreshed)");
     }
@@ -1090,6 +1087,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
             rep.note_at(Kind::Approximate, "formula results that differ from the file's saved results", || format!("{}: {} vs {}", a1(a.row, a.col), got.display(), want.display()));
         }
     }
+    // Macros, kept inert.
+    let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
+    super::macros::read(&z, &mut wb, &wb_xml, &wb_rels, &parts, &mut rep)?;
     out.report.merge(rep);
     Ok((wb, out))
 }

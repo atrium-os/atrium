@@ -74,6 +74,8 @@ enum Record {
     ColWidth { sheet: u16, col: u32, width: f64 },
     /// The user's file now holds the document as it is here.
     Saved,
+    /// The file's macros (kept inert) are dropped; the next save writes none.
+    RemoveMacros,
 }
 
 impl Record {
@@ -97,6 +99,7 @@ impl Record {
                 w.f64(*width);
             }
             Record::Saved => w.u8(5),
+            Record::RemoveMacros => w.u8(6),
         }
         w.into_bytes()
     }
@@ -125,6 +128,7 @@ impl Record {
                 Record::ColWidth { sheet, col, width }
             }
             5 => Record::Saved,
+            6 => Record::RemoveMacros,
             _ => return Err(WireError::Invalid("record")),
         };
         if !r.is_empty() {
@@ -362,6 +366,9 @@ impl Doc {
                 self.history.redo(&mut self.wb);
             }
             Record::Saved => {}
+            Record::RemoveMacros => {
+                self.wb.remove_macros();
+            }
             Record::ColWidth { sheet, col, width } => {
                 if (sheet as usize) < self.wb.sheet_count() {
                     self.wb.sheet_mut(sheet).col_sizes.set(col, width);
@@ -479,6 +486,17 @@ impl Doc {
         self.dirty = true;
     }
 
+    /// Drops the file's macros (not undoable: the file on disk still has them until
+    /// the next save).
+    pub fn remove_macros(&mut self) {
+        if self.wb.macros().is_none() {
+            return;
+        }
+        self.journal(&Record::RemoveMacros);
+        self.replay(Record::RemoveMacros);
+        self.dirty = true;
+    }
+
     /// Writes the native file to `out`.
     pub fn write_native<W: Write>(&self, out: W) -> io::Result<W> {
         native::save(&self.wb, out)
@@ -531,6 +549,7 @@ mod tests {
             Record::Redo,
             Record::ColWidth { sheet: 0, col: 3, width: 120.5 },
             Record::Saved,
+            Record::RemoveMacros,
         ] {
             assert_eq!(Record::decode(&r.encode()).unwrap(), r);
         }
@@ -599,6 +618,26 @@ mod tests {
         assert_eq!(v(&back, 7, 2), Value::str("z"));
         back.close().unwrap();
         assert!(!dir.exists(), "a clean close leaves nothing to recover");
+    }
+
+    #[test]
+    fn removing_macros_survives_a_crash() {
+        use officina_grid::macros::*;
+        let dir = tmp("macros");
+        let mut wb = officina_grid::Workbook::new();
+        wb.add_sheet("A").unwrap();
+        wb.set_macros(Macros { family: MacroFamily::Ooxml, parts: vec![MacroPart { path: "xl/vbaProject.bin".into(), media_type: "application/vnd.ms-office.vbaProject".into(), data: vec![1, 2, 3].into() }], workbook_code: None, sheet_codes: vec![] }).unwrap();
+        let mut d = Doc::from_native("m.osheet", &native::save_to_vec(&wb)).unwrap();
+        assert!(d.wb.macros().is_some());
+        d.autosave_to(&dir).unwrap();
+        d.remove_macros();
+        assert!(d.wb.macros().is_none() && d.dirty);
+        d.autosave().unwrap().sync().unwrap();
+        drop(d);
+        let (back, rec) = recover(&dir).unwrap();
+        assert_eq!(rec.actions, 1);
+        assert!(back.wb.macros().is_none());
+        back.close().unwrap();
     }
 
     #[test]

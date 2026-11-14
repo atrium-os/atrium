@@ -33,6 +33,8 @@ pub enum Cmd {
     SaveAs,
     Undo,
     Redo,
+    /// Drop the file's macros (kept inert; never run).
+    RemoveMacros,
 }
 
 /// What the view shows besides the document.
@@ -173,11 +175,18 @@ impl View for Sheets {
             Button::secondary(label).at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(cmd)).render(ctx);
             x += wd + 8.0;
         }
-        let (name, dirty, status) = {
+        let (name, dirty, status, macros) = {
             let d = self.doc.borrow();
-            (d.name.clone(), d.dirty, d.status.clone())
+            (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some())
         };
+        if macros {
+            // The file has macros: say they don't run, and offer to drop them (§5.3).
+            let cmds = self.cmds.clone();
+            Button::secondary("Remove Macros").at(x, 8.0).width(132.0).on_click(move || cmds.lock().unwrap().push(Cmd::RemoveMacros)).render(ctx);
+            x += 140.0;
+        }
         let title = if dirty { format!("{name} (edited)") } else { name };
+        let title = if macros { format!("{title} · has macros; Atrium doesn't run them") } else { title };
         ctx.add(Node::Text { rect: Rect::new(x + 12.0, 14.0, (w - x - 24.0).max(0.0), 22.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
 
         // Formula bar: where the cursor is and what the cell holds.
@@ -232,6 +241,14 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::RemoveMacros => {
+                    let mut d = self.doc.borrow_mut();
+                    d.remove_macros();
+                    d.status = "Macros removed. The file keeps them until you save it.".into();
+                    drop(d);
+                    self.rev.set(self.rev.get().wrapping_add(1));
                     false
                 }
                 _ => true,
