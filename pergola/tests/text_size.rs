@@ -20,8 +20,14 @@ fn sizes() -> (f32, f32) {
     (h, text)
 }
 
+/// One test: the text size is one per process, and tests run in parallel.
 #[test]
-fn a_button_and_its_label_grow_with_the_text_size() {
+fn text_size() {
+    grows();
+    lint();
+}
+
+fn grows() {
     pergola::text::set_text_scale(1000);
     let (h1, t1) = sizes();
     // The tallest rect is the focus halo, 3 pt (not em) around the body.
@@ -39,4 +45,58 @@ fn a_button_and_its_label_grow_with_the_text_size() {
     assert_eq!(pergola::text::text_scale(), 1.0, "0 is 100%");
     pergola::text::set_text_scale(5000);
     assert_eq!(pergola::text::text_scale(), 2.0, "clamped to 200%");
+}
+
+/// The catalogue lint (resolution-independence.md §6.2): each widget at
+/// each text size, 85% to 200%, laid out; every label fits inside the
+/// smallest box it starts in (its control's body).
+fn lint() {
+    use pergola::reactive::Mutable;
+    use pergola::view::View;
+    use pergola::widgets::{Checkbox, Check, RadioGroup, Segmented, Tabs, Toggle};
+    let catalogue: Vec<(&str, Box<dyn Fn() -> Box<dyn View>>)> = vec![
+        ("button", Box::new(|| Box::new(Button::primary("Save the document")))),
+        ("checkbox", Box::new(|| Box::new(Checkbox::new(Mutable::new(Check::On), "Remember me")))),
+        ("toggle", Box::new(|| Box::new(Toggle::new(Mutable::new(true), "Wi-Fi")))),
+        ("radios", Box::new(|| Box::new(RadioGroup::new(Mutable::new(0), ["Day", "Week", "Month"])))),
+        ("segmented", Box::new(|| Box::new(Segmented::new(Mutable::new(0), ["Day", "Week", "Month"])))),
+        ("tabs", Box::new(|| Box::new(Tabs::new(Mutable::new(0), ["General", "Displays", "Sound"])))),
+    ];
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for t in fresco_protocol::TEXT_SIZES {
+        pergola::text::set_text_scale(t);
+        for (name, make) in &catalogue {
+            let mut app = pergola::App::new(BoxView(make()));
+            app.tick();
+            let tree = app.tree();
+            let boxes: Vec<pergola::Rect> = tree.iter().filter_map(|(_, n)| match n {
+                Node::Rect { rect, .. } | Node::Stack { rect, .. } if rect.w() > 0.0 && rect.h() > 0.0 => Some(*rect),
+                _ => None,
+            }).collect();
+            for (_, n) in tree.iter() {
+                let Node::Text { rect, content, style } = n else { continue };
+                let m = pergola::text::measure(content, style);
+                let cy = rect.y() + rect.h() / 2.0;
+                let (x0, x1, y0, y1) = (rect.x(), rect.x() + m.w, cy - m.h / 2.0, cy + m.h / 2.0);
+                let Some(b) = boxes.iter().filter(|b| b.x() <= rect.x() + 0.5 && rect.x() < b.x() + b.w() && b.y() <= cy && cy <= b.y() + b.h())
+                    .min_by(|a, b| (a.w() * a.h()).total_cmp(&(b.w() * b.h()))) else { continue };
+                checked += 1;
+                if x1 > b.x() + b.w() + 0.5 || y0 < b.y() - 0.5 || y1 > b.y() + b.h() + 0.5 || x0 < b.x() - 0.5 {
+                    bad.push(format!("{name} at {t}: {content:?} {:.1}x{:.1} at ({:.1},{:.1}) in box ({:.1},{:.1} {:.1}x{:.1})",
+                        m.w, m.h, x0, y0, b.x(), b.y(), b.w(), b.h()));
+                }
+            }
+        }
+    }
+    pergola::text::set_text_scale(1000);
+    assert!(checked > 30, "labels checked: {checked}");
+    assert!(bad.is_empty(), "clipped:\n{}", bad.join("\n"));
+}
+
+struct BoxView(Box<dyn pergola::view::View>);
+impl pergola::view::View for BoxView {
+    fn render(&self, ctx: &mut pergola::view::Ctx) {
+        self.0.render(ctx)
+    }
 }
