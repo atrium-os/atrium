@@ -1934,8 +1934,8 @@ edits, and a document compared with itself has none (`compare::tests`). Corpus
 1,832 readable ones accept to the copy and reject to the original (largest,
 15,935 paragraphs, in 49 ms). 3,000 paragraphs with scattered edits compare in
 21 ms. The sample agreement (`atrium-write/examples/compare_docs.rs`) reads as
-seven edits: four word changes, a paragraph moved and changed, bold, an inserted
-sentence.
+six edits: three word changes, a paragraph moved and changed, bold, an inserted
+sentence (seen in review mode on the cloud VM).
 
 ## 17. Decisions (accepted 2026-11-14)
 
