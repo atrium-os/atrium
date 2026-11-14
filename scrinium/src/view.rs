@@ -393,7 +393,6 @@ impl ScriniumView {
         ctx.pop();
     }
 
-    /// "Connect to server", over the window (network-shares.md §5.2).
     /// A saved server shows another key: stop. There is no "connect anyway";
     /// the way on is to forget it and connect afresh, accepting the new key.
     fn key_changed_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
@@ -430,6 +429,7 @@ impl ScriniumView {
         button(ctx, x + cw - pad - close - 8.0 - fw, by, label, Look::Ghost, true, move || with(&s, Browser::forget_changed));
     }
 
+    /// "Connect to server", over the window (network-shares.md §5.2).
     fn connect_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
         let Some(form) = &b.connect else { return };
@@ -500,17 +500,20 @@ impl ScriniumView {
                 line(ctx, 66.0, "Arca keeps it: Scrinium never sees what you type.", t.text_secondary());
                 self.cred.clone().at(lx, y + 88.0).size(inner, 36.0).render(ctx);
                 let s = self.state.clone();
-                let mark = if form.remember { "☑  Remember it in Arca" } else { "☐  Remember it in Arca" };
                 ctx.key(4001);
                 area(ctx, Rect::new(lx - 6.0, y + 136.0, 240.0, 28.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| if let Some(f) = &mut b.connect { f.remember = !f.remember }));
-                text(ctx, lx, y + 150.0, mark, type_size::SM, Weight::Regular, t.text_primary());
+                // A drawn box: the UI fonts have no ballot-box glyphs.
+                rect(ctx, lx, y + 142.0, 16.0, 16.0, t.border_strong(), 4.0);
+                // Ticked: a solid box (a hollow one read as empty).
+                rect(ctx, lx + 1.0, y + 143.0, 14.0, 14.0, if form.remember { t.accent_fg() } else { t.bg_surface() }, 3.0);
+                text(ctx, lx + 24.0, y + 150.0, "Remember it in Arca", type_size::SM, Weight::Regular, t.text_primary());
                 ctx.pop();
                 if let Some(e) = &form.error {
                     line(ctx, 184.0, e, t.danger_fg());
                 }
                 let c = cancel(ctx, self.state.clone());
                 let s = self.state.clone();
-                primary(ctx, "Connect", c, form.can_connect(), Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.connect() })));
+                primary(ctx, "Connect", c, form.can_press_connect(), Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.connect() })));
             }
             Step::Connecting(a) => {
                 title(ctx, "Connect to server");

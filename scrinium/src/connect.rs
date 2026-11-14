@@ -156,11 +156,19 @@ pub struct Form {
     pub error: Option<String>,
     pub remember: bool,
     pub want: Option<Want>,
+    /// Connect was pressed before the field's handle came. Arca's field
+    /// hands one over only when it loses focus (or on Enter or Tab), and
+    /// the press on Connect is what takes its focus, so the handle comes
+    /// just after the press: connect then, or give up after a moment.
+    pub armed: Option<std::time::Instant>,
 }
+
+/// How long a press on Connect waits for the field's handle.
+pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Default for Form {
     fn default() -> Self {
-        Form { step: Step::Address, error: None, remember: true, want: None }
+        Form { step: Step::Address, error: None, remember: true, want: None, armed: None }
     }
 }
 
@@ -207,16 +215,35 @@ impl Form {
         if let Step::Password { filled, .. } = &mut self.step {
             *filled = f;
         }
+        if f && self.armed.take().is_some() {
+            self.connect();
+        }
     }
 
     pub fn can_connect(&self) -> bool {
         matches!(self.step, Step::Password { filled: true, .. })
     }
 
+    /// Connect is offered on the password step; the field's handle may
+    /// still be on its way (see `armed`).
+    pub fn can_press_connect(&self) -> bool {
+        matches!(self.step, Step::Password { .. }) && self.armed.is_none()
+    }
+
     pub fn connect(&mut self) {
+        self.connect_at(std::time::Instant::now());
+    }
+
+    pub fn connect_at(&mut self, now: std::time::Instant) {
         if !self.can_connect() {
+            if matches!(self.step, Step::Password { .. }) {
+                self.armed = Some(now);
+                self.error = None;
+            }
             return;
         }
+        self.armed = None;
+        self.error = None;
         let Step::Password { addr, fingerprint, .. } = self.step.clone() else { return };
         self.step = Step::Connecting(addr.clone());
         self.want = Some(Want::Connect { addr, fingerprint, remember: self.remember });
@@ -228,6 +255,18 @@ impl Form {
         if matches!(self.step, Step::Connecting(_)) {
             self.error = Some(why);
             self.step = Step::Address;
+        }
+    }
+
+    /// No handle came after a press on Connect: the field was empty.
+    pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        match self.armed {
+            Some(t) if now.duration_since(t) >= ARMED_WAIT => {
+                self.armed = None;
+                self.error = Some("Type the password in Arca's field first".into());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -293,6 +332,21 @@ mod tests {
     }
 
     #[test]
+    fn a_press_before_the_handle_connects_when_it_comes() {
+        let mut f = Form::default();
+        f.submit_address("alice@nas.local:/srv");
+        f.learned(Ok("SHA256:x".into()));
+        f.take_want();
+        f.trust();
+        // The press takes the field's focus; its handle comes after.
+        f.connect();
+        assert!(f.want.is_none() && !f.can_press_connect());
+        f.field_filled(true);
+        assert!(matches!(f.take_want(), Some(Want::Connect { .. })));
+        assert!(matches!(f.step, Step::Connecting(_)) && f.armed.is_none());
+    }
+
+    #[test]
     fn the_form_goes_address_key_password_connect() {
         let mut f = Form::default();
         f.submit_address("nas.local");
@@ -304,8 +358,11 @@ mod tests {
         f.connect();
         assert!(f.want.is_none(), "no connect before the key is trusted and the field filled");
         f.trust();
-        f.connect();
+        let t0 = std::time::Instant::now();
+        f.connect_at(t0);
         assert!(f.want.is_none(), "an empty field connects nothing");
+        assert!(!f.tick(t0) && f.armed.is_some(), "the press waits a moment for the handle");
+        assert!(f.tick(t0 + super::ARMED_WAIT) && f.error.is_some() && f.armed.is_none(), "then says why");
         f.field_filled(true);
         f.remember = false;
         f.connect();

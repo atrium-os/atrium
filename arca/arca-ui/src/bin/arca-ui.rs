@@ -82,8 +82,14 @@ impl Ctx {
                 Do::Hold => match &e.parent {
                     None => e.field.refused(Notice::UnknownApp),
                     Some(p) => match self.arcad.hold(p, e.field.typed()) {
-                        Ok(h) => e.field.held(h),
-                        Err(err) => e.field.refused(if err.locked() { Notice::Locked } else { Notice::Failed }),
+                        Ok(h) => {
+                            eprintln!("arca-ui: held what was typed");
+                            e.field.held(h)
+                        }
+                        Err(err) => {
+                            eprintln!("arca-ui: hold refused: {err:?}");
+                            e.field.refused(if err.locked() { Notice::Locked } else { Notice::Failed })
+                        }
                     },
                 },
                 Do::Fill { offer, token } => self.fill(e, offer, token),
@@ -262,6 +268,7 @@ fn main() -> ExitCode {
                         vec![Do::Redraw]
                     }
                     Event::FocusChanged { gained, .. } => {
+                        eprintln!("arca-ui: focus {}", if gained { "gained" } else { "lost" });
                         e.look.hover = false;
                         e.look.ring = gained && e.pressed_at.is_none_or(|t| t.elapsed() > RING_AFTER_PRESS);
                         if gained {

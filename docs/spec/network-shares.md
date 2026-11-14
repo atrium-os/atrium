@@ -421,8 +421,21 @@ encryption. It checks:
    itself (25 s read timeout) rather than serve errors; dispensatord at
    start removes every share jail and orphaned grant an earlier run left.
    Readers on a wedged mount fail after fusefs' 30 s timeout (S0).
-   `vm-share-jail.sh` checks each of these: 47 checks, 0 failed. Still to
-   do: a VM check of the Connect sheet on screen.
+   `vm-share-jail.sh` checks each of these: 47 checks, 0 failed.
+   **The Connect sheet on screen** (`vm-scrinium-connect.sh`: frescod,
+   limend, arca-ui, arcad, dispensatord and Scrinium jailed, driven by
+   injected input against a real sshd; 18 checks, 0 failed): address, the
+   server's real key, trust, Arca's field, connect, listing, disconnect,
+   the changed-key sheet (no jail started, nothing released by Arca, Enter
+   doesn't pass it) and forget. Found and fixed on the way: Limen's poll
+   with a zero timeout was refused (EINVAL) and read as losing limend, so
+   Arca's field never came; a typed password reaches the parent only as a
+   handle (`Filled` is for Arca's chip), held when the field loses focus,
+   so a press on Connect waits up to 1.5 s for the handle its own press
+   brings, and says "Type the password in Arca's field first" if none
+   comes; dispensatord showed a share before its server answered, so the
+   file manager opened it before its grant existed: a share is now listed
+   only once ready.
 3. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
 4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.

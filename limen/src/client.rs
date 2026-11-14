@@ -69,6 +69,9 @@ impl<E: for<'a> serde::Deserialize<'a>> Wire<E> {
         if let Some(e) = self.queued.pop_front() {
             return Ok(Some(e));
         }
+        // A zero wait means "only what is there": a socket refuses a zero
+        // read timeout (EINVAL), which callers took for a lost limend.
+        let wait = wait.max(Duration::from_micros(1));
         loop {
             let Some(m) = self.conn.recv_message_or_timeout(wait)? else { return Ok(None) };
             if m.opcode_class == proto::CLASS && m.op == self.ev_op {

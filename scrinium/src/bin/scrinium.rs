@@ -129,12 +129,16 @@ impl Pane {
         if self.trace.is_some() {
             let b = self.state.get_cloned();
             let line = format!(
-                "place={} path=/{} entries=[{}] selected=[{}] notice={}",
+                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={}",
                 b.place().map_or("-", |p| p.id.as_str()),
                 b.path.join("/"),
                 b.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
                 b.selected_names().join(","),
                 b.notice.as_ref().map_or("-".to_string(), |n| n.text.clone()),
+                connect_trace(&b),
+                b.saved.iter().map(|s| s.addr.text()).collect::<Vec<_>>().join(","),
+                b.places.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(","),
+                b.unreadable.as_deref().unwrap_or("-"),
             );
             if self.trace.as_deref() != Some(&line) {
                 eprintln!("scrinium: {who}: {line}");
@@ -142,6 +146,26 @@ impl Pane {
             }
         }
         true
+    }
+}
+
+/// The Connect sheet's step, or the key-changed stop, for the trace.
+fn connect_trace(b: &scrinium::browser::Browser) -> String {
+    use scrinium::connect::Step;
+    if let Some(k) = &b.key_changed {
+        return format!("key-changed:{}", k.now);
+    }
+    let Some(f) = &b.connect else { return "-".into() };
+    let step = match &f.step {
+        Step::Address => "address".to_string(),
+        Step::Checking(_) => "checking".into(),
+        Step::Key { fingerprint, .. } => format!("key:{fingerprint}"),
+        Step::Password { filled, .. } => format!("password:{}", if f.armed.is_some() { "armed" } else if *filled { "filled" } else { "empty" }),
+        Step::Connecting(_) => "connecting".into(),
+    };
+    match &f.error {
+        Some(e) => format!("{step}({e})"),
+        None => step,
     }
 }
 
@@ -449,6 +473,10 @@ impl Network {
         let mut b = pane.state.get_cloned();
         let mut changed = false;
         let mut open = None;
+        // A press on Connect that no handle followed.
+        if let Some(f) = &mut b.connect {
+            changed |= f.tick(std::time::Instant::now());
+        }
         // What the form asks for.
         if let Some(want) = b.connect.as_mut().and_then(|f| f.take_want()) {
             changed = true;
@@ -519,14 +547,18 @@ impl Network {
                 _ => {}
             }
             loop {
-                let ev = embeds.borrow_mut().poll(Duration::from_millis(0));
+                // Not zero: a zero read timeout is refused (EINVAL), and
+                // that lost limend, so the password field never came.
+                let ev = embeds.borrow_mut().poll(Duration::from_millis(1));
                 match ev {
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.cred_embed => {
                         if let Some(m) = limen::credential::ToParent::decode(&bytes) {
                             pane.cred.apply(m);
                             let s = pane.cred_state.get_cloned();
                             if let Some(f) = &mut b.connect {
-                                f.field_filled(s.filled && s.handle.is_some());
+                                // A handle is what counts: a typed value brings only that (`Filled`
+                                // comes with a press on Arca's chip).
+                                f.field_filled(s.handle.is_some());
                                 changed = true;
                             }
                         }

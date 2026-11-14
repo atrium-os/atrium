@@ -1107,6 +1107,7 @@ mod run {
             }
             if now_ready {
                 self.sync_standing();
+                self.publish();
             }
         }
     }
@@ -1357,8 +1358,10 @@ mod run {
             }
             // A share's server answers only once it has logged in, so it is
             // never statfs'd here (that would wait on the network): its
-            // size is the file manager's to ask.
-            for (uid, r) in &self.shares {
+            // size is the file manager's to ask. Only a ready share is
+            // shown: before that the file manager has no grant of it, and
+            // opening it there would find nothing.
+            for (uid, r) in self.shares.iter().filter(|(_, r)| r.ready) {
                 vols.push(Volume {
                     part: dispensator::share::part(*uid),
                     mountpoint: dispensator::share::mountpoint(*uid),
