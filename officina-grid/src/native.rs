@@ -10,6 +10,7 @@
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
+//! | 10 | CHARTS | charts: kind, grouping, legend, titles, anchor, series ranges |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -40,6 +41,7 @@ pub const STYLE_RUNS: u16 = 6;
 pub const NAMES: u16 = 7;
 pub const ROWS_SHOWN: u16 = 8;
 pub const TABLES: u16 = 9;
+pub const CHARTS: u16 = 10;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -196,6 +198,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
         c.add(NAMES, &w.into_bytes())?;
     }
+    if !wb.charts.is_empty() {
+        let mut w = Writer::new();
+        w.var(wb.charts.len() as u64);
+        for ch in &wb.charts {
+            ch.encode(&mut w);
+        }
+        c.add(CHARTS, &w.into_bytes())?;
+    }
     if !wb.tables.is_empty() {
         let mut w = Writer::new();
         w.var(wb.tables.len() as u64);
@@ -327,6 +337,21 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         for _ in 0..k {
             let t = crate::tables::Table::decode(&mut r)?;
             wb.add_table(t).map_err(LoadError::Bad)?;
+        }
+        done(&r)?;
+    }
+
+    // Charts.
+    let mut it = of(CHARTS);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two CHARTS chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("charts", crate::charts::MAX_CHARTS as u64, 30)?;
+        for _ in 0..k {
+            let ch = crate::charts::Chart::decode(&mut r)?;
+            wb.add_chart(ch).map_err(LoadError::Bad)?;
         }
         done(&r)?;
     }

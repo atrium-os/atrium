@@ -136,6 +136,7 @@ pub struct Workbook {
     pub(crate) names: Names,
     /// Structured tables; change them with [`Workbook::add_table`] so formulas re-bind.
     pub(crate) tables: Vec<crate::tables::Table>,
+    pub(crate) charts: Vec<crate::charts::Chart>,
     pub(crate) groups: Vec<Option<Group>>,
     free_groups: Vec<GroupId>,
     pub(crate) deps: DepIndex,
@@ -163,6 +164,7 @@ impl Workbook {
             styles: StyleTable::new(),
             names: Names::default(),
             tables: Vec::new(),
+            charts: Vec::new(),
             groups: Vec::new(),
             free_groups: Vec::new(),
             deps: DepIndex::default(),

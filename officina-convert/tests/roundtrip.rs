@@ -60,7 +60,7 @@ fn xlsx_round_trip() {
 
 #[test]
 fn hostile_xlsx_never_panics() {
-    let file = xlsx::write(&book(), Vec::new()).unwrap();
+    let file = xlsx::write(&charted(with_table(filtered(book()))), Vec::new()).unwrap();
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     // Fewer in a debug build (it is ~30x slower); release runs them all.
     let n = if cfg!(debug_assertions) { 300 } else { 3000 };
@@ -85,7 +85,7 @@ fn hostile_xlsx_never_panics() {
 #[test]
 fn hostile_sheet_xml_never_panics() {
     use officina_convert::zip::{Archive, ZipWriter};
-    let file = xlsx::write(&book(), Vec::new()).unwrap();
+    let file = xlsx::write(&charted(with_table(filtered(book()))), Vec::new()).unwrap();
     let z = Archive::open(&file).unwrap();
     let parts: Vec<(String, Vec<u8>)> = z.entries.clone().into_iter().map(|e| (e.name.clone(), z.read(&e).unwrap())).collect();
     let mut x: u64 = 0xD1B5_4A32_D192_ED03;
@@ -95,7 +95,7 @@ fn hostile_sheet_xml_never_panics() {
         x ^= x << 17;
         x
     };
-    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"r=\"A0\"", b"t=\"s\"", b"<v>99999999</v>", b"<row r=\"1\">", b"</row>", b"<c r=\"XFE1\">", b"si=\"7\"", b"t=\"shared\"", b"<f>", b"</f>", b"\xff\xfe"];
+    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"r=\"A0\"", b"t=\"s\"", b"<v>99999999</v>", b"<row r=\"1\">", b"</row>", b"<c r=\"XFE1\">", b"si=\"7\"", b"t=\"shared\"", b"<f>", b"</f>", b"\xff\xfe", b"<c:ser>", b"</c:ser>", b"<xdr:col>99999999999</xdr:col>", b"<c:f>Data!$A$1:$C$9</c:f>", b"[#This Row]", b"<autoFilter ref=\"A1:XFD1048576\"/>"];
     let n = if cfg!(debug_assertions) { 150 } else { 1500 };
     for i in 0..n {
         let target = (next() % parts.len() as u64) as usize;
@@ -257,4 +257,52 @@ fn table_round_trip() {
         assert_eq!(back.formula_text(a), wb.formula_text(a), "{a:?}");
     }
     assert_eq!(back.formula_text(CellAddr::new(0, 3, 7)).unwrap(), "=[@Qty]*Data!A3");
+}
+
+fn charted(mut wb: Workbook) -> Workbook {
+    use officina_grid::addr::Rect;
+    use officina_grid::charts::*;
+    let col = |c: u32, r0: u32, r1: u32| Rect { sheet: 0, r0, c0: c, r1, c1: c };
+    let anchor = |r: u32| Anchor { sheet: 1, from: (r, 2, 0.0, 0.0), to: (r + 15, 9, 6.0, 2.5) };
+    wb.add_chart(Chart {
+        kind: ChartKind::Column,
+        grouping: Grouping::Standard,
+        title: Some(ChartText::Lit("Items & <values>".into())),
+        series: vec![
+            Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 3))), cats: Some(col(1, 0, 9)), vals: col(0, 0, 9), kind: None },
+            Series { name: Some(ChartText::Lit("Doubled".into())), cats: Some(col(1, 0, 9)), vals: col(2, 0, 9), kind: Some(ChartKind::Line) },
+        ],
+        legend: Some(LegendPos::Bottom),
+        x_title: Some("Item".into()),
+        y_title: Some("Amount".into()),
+        anchor: anchor(0),
+    })
+    .unwrap();
+    for (i, (kind, grouping)) in [(ChartKind::Bar, Grouping::Stacked), (ChartKind::Area, Grouping::Percent), (ChartKind::Scatter, Grouping::Standard), (ChartKind::Pie, Grouping::Standard), (ChartKind::Doughnut, Grouping::Standard)].into_iter().enumerate() {
+        wb.add_chart(Chart {
+            kind,
+            grouping,
+            title: Some(ChartText::Lit(format!("{kind:?}").into())),
+            series: vec![Series { name: None, cats: Some(col(0, 0, 4)), vals: col(2, 0, 4), kind: None }],
+            legend: if kind.round() { Some(LegendPos::Right) } else { None },
+            x_title: None,
+            y_title: None,
+            anchor: anchor(20 * (i as u32 + 1)),
+        })
+        .unwrap();
+    }
+    wb
+}
+
+#[test]
+fn chart_round_trip() {
+    let wb = charted(book());
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.charts().len(), wb.charts().len());
+    for (a, b) in wb.charts().iter().zip(back.charts()) {
+        assert_eq!(b, a);
+        assert_eq!(b.data(&back, 100), a.data(&wb, 100));
+    }
 }

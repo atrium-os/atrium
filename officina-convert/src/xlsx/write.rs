@@ -394,6 +394,9 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
         }
     }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
+    if wb.charts().iter().any(|c| c.anchor.sheet == s) {
+        let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
+    }
     if k > 0 {
         let _ = write!(o, r#"<tableParts count="{k}">"#);
         for j in 0..k {
@@ -484,6 +487,14 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     for s in 0..n {
         ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#, s + 1));
     }
+    for s in 0..n {
+        if wb.charts().iter().any(|c| c.anchor.sheet as usize == s) {
+            ct.push_str(&format!(r#"<Override PartName="/xl/drawings/drawing{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#, s + 1));
+        }
+    }
+    for i in 0..wb.charts().len() {
+        ct.push_str(&format!(r#"<Override PartName="/xl/charts/chart{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#, i + 1));
+    }
     for i in 0..wb.tables().len() {
         ct.push_str(&format!(r#"<Override PartName="/xl/tables/table{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#, i + 1));
     }
@@ -547,10 +558,22 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         z.add(&format!("xl/worksheets/sheet{}.xml", s + 1), &p)?;
         // Its tables, in the order its tableParts name them.
         let mine: Vec<usize> = (0..wb.tables().len()).filter(|&i| wb.tables()[i].rect.sheet as usize == s).collect();
-        if !mine.is_empty() {
+        let charts: Vec<usize> = (1..=wb.charts().len()).filter(|&i| wb.charts()[i - 1].anchor.sheet as usize == s).collect();
+        if !mine.is_empty() || !charts.is_empty() {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
+            }
+            if !charts.is_empty() {
+                // One drawing per sheet with charts, numbered by its sheet.
+                r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{}.xml"/>"#, mine.len() + 1, s + 1));
+                z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts).as_bytes())?;
+                let mut dr = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
+                for (j, i) in charts.iter().enumerate() {
+                    dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{i}.xml"/>"#, j + 1));
+                }
+                dr.push_str("</Relationships>");
+                z.add(&format!("xl/drawings/_rels/drawing{}.xml.rels", s + 1), dr.as_bytes())?;
             }
             r.push_str("</Relationships>");
             z.add(&format!("xl/worksheets/_rels/sheet{}.xml.rels", s + 1), r.as_bytes())?;
@@ -558,6 +581,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     for (i, t) in wb.tables().iter().enumerate() {
         z.add(&format!("xl/tables/table{}.xml", i + 1), &table_xml(t, i + 1))?;
+    }
+    for (i, c) in wb.charts().iter().enumerate() {
+        z.add(&format!("xl/charts/chart{}.xml", i + 1), super::chart::chart_xml(wb, c).as_bytes())?;
     }
     z.finish()
 }

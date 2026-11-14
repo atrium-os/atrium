@@ -14,6 +14,7 @@
 
 pub mod addr;
 pub mod book;
+pub mod charts;
 pub mod column;
 pub mod csv;
 pub mod deps;

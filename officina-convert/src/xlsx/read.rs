@@ -79,7 +79,7 @@ fn bad(s: impl Into<String>) -> XlsxError {
 }
 
 /// An attribute's value by local name.
-fn attr(e: &BytesStart, name: &[u8]) -> Result<Option<String>, XlsxError> {
+pub(crate) fn attr(e: &BytesStart, name: &[u8]) -> Result<Option<String>, XlsxError> {
     for a in e.attributes() {
         let a = a?;
         if a.key.local_name().as_ref() == name {
@@ -89,7 +89,7 @@ fn attr(e: &BytesStart, name: &[u8]) -> Result<Option<String>, XlsxError> {
     Ok(None)
 }
 
-fn xml(data: &[u8]) -> Reader<&[u8]> {
+pub(crate) fn xml(data: &[u8]) -> Reader<&[u8]> {
     let mut r = Reader::from_reader(data);
     r.config_mut().trim_text(false);
     r
@@ -115,7 +115,7 @@ fn resolve(base: &str, target: &str) -> String {
 }
 
 /// A part's relationships: id → (type, resolved target).
-fn rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, String)>, XlsxError> {
+pub(crate) fn rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, String)>, XlsxError> {
     let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
     let path = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
     let mut out = HashMap::new();
@@ -200,7 +200,7 @@ fn push_capped(out: &mut String, s: &str, cut: &mut bool) {
 }
 
 /// OOXML's `_xHHHH_` escapes for characters XML can't hold.
-fn decode_escapes(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn decode_escapes(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.contains("_x") {
         return s.into();
     }
@@ -565,7 +565,6 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
             b"conditionalFormatting" => seg.rep.note(Kind::Dropped, "conditional formats (O4b)"),
             b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules"),
             b"hyperlink" => seg.rep.note(Kind::Dropped, "hyperlinks"),
-            b"drawing" => seg.rep.note(Kind::Dropped, "charts, pictures and shapes (O4e)"),
             b"legacyDrawing" => seg.rep.note(Kind::Dropped, "comments"),
             b"autoFilter" => {
                 if let Some(rf) = attr(&e, b"ref")? {
@@ -1028,6 +1027,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                 table(&mut wb, i as u16, &data, &mut rep)?;
             }
         }
+    }
+
+    // Charts.
+    for (i, (_, part)) in sheets.iter().enumerate() {
+        super::chart::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
     }
 
     // Formulas, once every sheet exists (they name each other).
