@@ -5690,8 +5690,12 @@ Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in lim
 `find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
 coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
 the child's `laid out again: text 112%` and the `reading` record in trails.json; Ctrl-plus; Ctrl-H,
-typing `impl` and Enter opening Impluvium from history. Keys are injected with the press held 1 s, and
-a press in the page leaves the keyboard with the chrome (forum-wm focuses top-level surfaces only).
+typing `impl` and Enter opening Impluvium from history. Keys are injected with the press held 1 s.
+A press in the page gives the page the keys (frescod's `embed_focus`; forum-wm focuses the page's
+window): the script presses in the left margin (`inpage`, no link there at either width), then
+Ctrl-F from the page must be handed back (`a key from the page: Find`) with the find field focused,
+and Ctrl-= from the page must zoom it (`the page zoomed to 1NN%`). With the pointer in the margin,
+outside the page's scroll view, Pergola sends scroll keys to a window's only scroll view.
 The scenes `reading` and `history` in `scripts/navigator-ui-vm.sh` (`SCENES="reading history" DRIVE=0`)
 show the Aa pop-up as a real frescod pop-up window and the history view.
 

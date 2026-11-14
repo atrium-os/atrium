@@ -352,6 +352,19 @@ mod tests {
     }
 
     #[test]
+    fn keys_reach_the_only_scroll_view_unfocused_and_not_under_the_pointer() {
+        let (mut app, state) = app();
+        // The pointer outside the view (a page's margin), nothing focused.
+        app.handle_event(Event::PointerMove { at: Point::new(-50.0, -50.0) });
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: ctrl, chars: "=".into() });
+        assert!(state.get().zoom.live > 1.0, "Ctrl-= zoomed");
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::End, modifiers: Modifiers::default(), chars: String::new() });
+        run_frames(&mut app, 0.0, 400.0);
+        assert!(state.get().physics.y > 0.0, "End scrolled");
+    }
+
+    #[test]
     fn a_click_lands_on_the_row_drawn_there() {
         let (mut app, state) = app();
         let mut st = state.get();

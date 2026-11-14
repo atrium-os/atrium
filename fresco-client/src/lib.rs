@@ -718,6 +718,12 @@ impl Connection {
     /// `window-management` capability — frescod rejects the op otherwise. Sends
     /// `OP_WM_ENUMERATE` and waits for its `IS_RESPONSE` reply.
     pub fn wm_enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
+        Ok(self.wm_enumerate_all()?.surfaces)
+    }
+
+    /// [`Self::wm_enumerate`], with the windows shown in slots and their
+    /// parents (`WmEnumerateReply::embeds`).
+    pub fn wm_enumerate_all(&mut self) -> io::Result<WmEnumerateReply> {
         self.send_window_managed(control::OP_WM_ENUMERATE, &())?;
         loop {
             let m = self.recv_reply()?;
@@ -743,7 +749,7 @@ impl Connection {
                 let reply: WmEnumerateReply = decode(&m.payload)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                         format!("decode WM_ENUMERATE reply: {e}")))?;
-                return Ok(reply.surfaces);
+                return Ok(reply);
             }
             log::debug!("wm_enumerate: skipping unrelated message op={:#x}", m.op);
         }

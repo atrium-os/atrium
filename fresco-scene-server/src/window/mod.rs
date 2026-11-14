@@ -533,6 +533,12 @@ pub struct Compositor {
     pub shown:    Option<Vec<ShownLayer>>,
     pub z_order:  Vec<WindowId>,
     pub focus:    Option<WindowId>,
+    /// Which slot of the focused window has the keys (limen.md §6): set
+    /// by a press in a slot child, cleared by a press elsewhere in its
+    /// parent or by `OP_WINDOW_FOCUS_PARENT`. The window manager decides
+    /// which top-level window is focused; this only says where, inside
+    /// it, the keys go, and only while its parent is the focus.
+    pub embed_focus: Option<WindowId>,
     /// Mint each new window an embed token (frescod; a renderer's ids
     /// and tokens would mean nothing to limend).
     pub mint_embed_tokens: bool,
@@ -707,6 +713,7 @@ impl Compositor {
             shown:    None,
             z_order:  vec![0],
             focus:    Some(0),
+            embed_focus: None,
             mint_embed_tokens: false,
             cursor:   (0.0, 0.0),
             next_id:  1,
@@ -1044,15 +1051,59 @@ impl Compositor {
 
     /// Backward-compat wrapper. New callers should prefer
     /// `destroy_with_focus_shift` so they can emit FOCUS completions.
-    /// `OP_WINDOW_FOCUS_PARENT`: `by`'s embedded window `id`, focused,
-    /// gives the focus to the window it is embedded in. Refused (false)
+    /// `OP_WINDOW_FOCUS_PARENT`: `by`'s embedded window `id`, with the
+    /// keys, gives them to the window it is embedded in. Refused (false)
     /// for another client's window, one in no slot, or one without the
-    /// focus: a child gives focus away, it never takes it.
+    /// keys: a child gives focus away, it never takes it.
     pub fn focus_parent(&mut self, id: WindowId, by: ClientId) -> bool {
         let Some(w) = self.windows.get(&id) else { return false };
-        let Some(slot) = w.slot.filter(|_| w.owner == by && self.focus == Some(id)) else { return false };
+        let Some(slot) = w.slot.filter(|_| w.owner == by) else { return false };
+        if self.embed_child_focused() == Some(id) {
+            self.set_embed_focus(None);
+            return true;
+        }
+        if self.focus != Some(id) {
+            return false;
+        }
         self.set_focus_no_raise_by(Some(slot.parent), fresco_protocol::focus_cause::KEYBOARD);
         self.focus == Some(slot.parent)
+    }
+
+    /// The slot child that has the keys now: the press-chosen one, while
+    /// it is shown in a slot of the focused window.
+    pub fn embed_child_focused(&self) -> Option<WindowId> {
+        let e = self.embed_focus?;
+        (self.lock.is_none() && self.key_popup().is_none() && self.embed_in(e, self.base_keyboard_window())).then_some(e)
+    }
+
+    fn set_embed_focus(&mut self, to: Option<WindowId>) {
+        if self.embed_focus == to {
+            return;
+        }
+        let cause = fresco_protocol::focus_cause::POINTER;
+        if let Some(old) = self.embed_focus.take() {
+            if self.windows.contains_key(&old) {
+                self.emit(DisplayEvent::WindowFocusChanged { window_id: old as u32, gained: false, cause });
+            }
+        }
+        self.embed_focus = to;
+        if let Some(n) = to {
+            self.emit(DisplayEvent::WindowFocusChanged { window_id: n as u32, gained: true, cause });
+        }
+    }
+
+    /// A primary press landed on `target` (frescod's input paths): a
+    /// press in a slot child gives that child the keys within its parent
+    /// (limen.md §6); a press on a window that is no slot takes them back
+    /// to the window itself. Which top-level window is focused stays the
+    /// window manager's.
+    pub fn press_focus(&mut self, target: WindowId) {
+        let Some(w) = self.windows.get(&target) else { return };
+        if w.slot.is_some() {
+            self.set_embed_focus(Some(target));
+        } else if self.embed_focus.and_then(|e| self.windows.get(&e)).and_then(|e| e.slot).is_some_and(|s| s.parent == target) {
+            self.set_embed_focus(None);
+        }
     }
 
     pub fn destroy(&mut self, id: WindowId, by: ClientId) -> bool {
@@ -1348,6 +1399,16 @@ impl Compositor {
         if let Some(p) = self.key_popup() {
             return p as u32;
         }
+        let base = self.base_keyboard_window();
+        match self.embed_focus.filter(|&e| self.embed_in(e, base)) {
+            Some(e) => e as u32,
+            None => base as u32,
+        }
+    }
+
+    /// The window the keys go to before a slot's child is considered: the
+    /// focus, or with none the topmost window (a sheet's, while it holds it).
+    fn base_keyboard_window(&self) -> WindowId {
         let w = match self.focus.unwrap_or(0) {
             // Not a pop-up: one that grabs was taken above, a tooltip takes no keys.
             0 => self.z_order.iter().rev()
@@ -1358,9 +1419,14 @@ impl Compositor {
         // A sheet takes the keys of the window it holds (scrinium.md §4.4).
         if w != 0 && self.held(w) {
             let parent = self.windows.get(&w).and_then(|x| x.slot).map_or(w, |s| s.parent);
-            return self.key_target(parent) as u32;
+            return self.key_target(parent);
         }
-        w as u32
+        w
+    }
+
+    /// Whether `e` is shown in a slot of `parent`.
+    fn embed_in(&self, e: WindowId, parent: WindowId) -> bool {
+        self.windows.get(&e).is_some_and(|w| !w.hidden && w.slot.is_some_and(|s| s.parent == parent))
     }
 
     /// Make `child` a credential slot at `rect` in `parent` (`None`:
@@ -1466,6 +1532,9 @@ impl Compositor {
         self.z_order.retain(|&z| z != id);
         if self.focus == Some(id) {
             self.set_focus_no_raise(None);
+        }
+        if self.embed_focus == Some(id) {
+            self.embed_focus = None;
         }
     }
 
@@ -2060,6 +2129,37 @@ mod notification_tests {
         assert!(!c.focus_parent(p, 1), "a parent is in no slot");
         assert!(c.focus_parent(e, 2));
         assert_eq!(c.focus, Some(p));
+    }
+
+    #[test]
+    fn a_press_in_a_slot_gives_its_child_the_keys_inside_the_focused_parent() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (400, 300));
+        let e = c.create(2, (10, 10));
+        let other = c.create(3, (100, 100));
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([0.0, 40.0, 400.0, 260.0]), 0), Ok(()));
+        c.set_focus_no_raise(Some(p));
+        assert_eq!(c.keyboard_window(), p as u32);
+        c.press_focus(e);
+        assert_eq!(c.keyboard_window(), e as u32, "a press in the page: the page has the keys");
+        c.set_focus_no_raise(Some(other));
+        assert_eq!(c.keyboard_window(), other as u32, "the window manager moved focus away");
+        c.set_focus_no_raise(Some(p));
+        assert_eq!(c.keyboard_window(), e as u32, "and back: the page still has them");
+        c.press_focus(p);
+        assert_eq!(c.keyboard_window(), p as u32, "a press in the chrome takes them back");
+        c.press_focus(e);
+        assert!(!c.focus_parent(e, 3), "not the caller's window");
+        assert!(c.focus_parent(e, 2), "the page gives them back");
+        assert_eq!(c.keyboard_window(), p as u32);
+        assert!(!c.focus_parent(e, 2), "it has none to give now");
+        c.press_focus(e);
+        c.set_focus_no_raise(None);
+        c.raise(p);
+        assert_eq!(c.keyboard_window(), e as u32, "no focus (a pop-up went): the topmost window's page has the keys");
+        c.hide(e);
+        assert_eq!(c.keyboard_window(), p as u32, "a withdrawn page has none");
     }
 
     #[test]

@@ -270,14 +270,15 @@ UIENV=NAVIGATOR_UI_AX=1 ui https://atlas.example/wiki/Atrium ui9
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "step 7: first page: $(last)"
 P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
 W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
-inpage() { press $((PX + 300)) $((TOP + PY + 260)); }
+# The left margin: no link there in either width.
+inpage() { press $((PX + 12)) $((TOP + PY + 400)); }
 typed() { for k in "$@"; do key "$k"; done; }
-# A press in the page leaves the keyboard with the chrome (forum-wm
-# focuses top-level surfaces only), so these keys reach the UI's own map.
-# A child that has the focus hands them back (limen Key), unit-tested.
+# A press in the page gives the page the keys; Ctrl-F there is handed
+# back to the chrome with the focus, so the typing below lands in find.
 inpage
 key 0x09 0x01               # Ctrl-F
-g "grep -q 'ax  *text-input \"Find in page\" \[focused\]' $S/ui9.log" && ok "Ctrl-F opened the find bar, focused" || bad "ctrl-f: $(g "grep -v trace $S/ui9.log | tail -3")"
+g "grep -q 'a key from the page: Find' $S/ui9.log" && ok "Ctrl-F in the page was handed back to the chrome" || bad "ctrl-f from the page: $(g "grep -v trace $S/ui9.log | tail -3")"
+g "grep -q 'ax  *text-input \"Find in page\" \[focused\]' $S/ui9.log" && ok "…and opened the find bar, focused" || bad "ctrl-f: $(g "grep -v trace $S/ui9.log | tail -3")"
 typed 0x04 0x17 0x15 0x0c 0x18 0x10    # a t r i u m
 sleep 3
 g "grep -q 'navigator-page: find: [1-9][0-9]* matches' $S/limend.log" && ok "typing in the find bar found matches in the page" || bad "find: $(g "grep 'find' $S/limend.log $S/ui9.log | tail -4")"
@@ -302,11 +303,12 @@ key 0x29                    # Esc: the pop-up goes
 sleep 3
 g "grep -q '\"site\": \"atlas.example\"' $S/trails.json" && g "grep -A2 '\"site\": \"atlas.example\"' $S/trails.json | grep -q '\"text\": 72'" \
     && ok "the choice is remembered for the site in the trail store" || bad "store: $(g "grep -A6 reading $S/trails.json")"
-# Ctrl-plus: the remembered zoom steps (110%), and the page lays out at it.
+# Ctrl-plus in the page: its ScrollView zooms, and once it settles the
+# chrome remembers it.
 inpage
 key 0x2e 0x01               # Ctrl-=
 sleep 5
-g "grep -q 'reading changed: text 72 zoom 70 ' $S/ui9.log" && g "grep -q 'laid out again: .* zoom 109%' $S/limend.log" && ok "Ctrl-plus zoomed the page and the step was remembered" || bad "zoom: $(g "grep -i zoom $S/ui9.log $S/limend.log | tail -3")"
+g "grep -q 'the page zoomed to 1[01][0-9]%' $S/ui9.log" && g "grep -q 'laid out again: .* zoom 1[01][0-9]%' $S/limend.log" && ok "Ctrl-plus in the page zoomed it, and the chrome remembered it" || bad "zoom: $(g "grep -i zoom $S/ui9.log $S/limend.log | tail -3")"
 # Ctrl-H: the history view in place of the page.
 inpage
 key 0x0b 0x01               # Ctrl-H

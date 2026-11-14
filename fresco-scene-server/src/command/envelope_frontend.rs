@@ -1599,8 +1599,13 @@ impl EnvelopeFrontend {
             .collect();
         // Stable order (by surface id) so the WM sees a deterministic set.
         surfaces.sort_by_key(|s| s.surface_id);
+        let mut embeds: Vec<[u32; 2]> = comp.windows.values()
+            .filter(|w| !w.hidden)
+            .filter_map(|w| w.slot.map(|s| [w.id as u32, s.parent as u32]))
+            .collect();
+        embeds.sort();
 
-        let reply_payload = encode(&WmEnumerateReply { surfaces })
+        let reply_payload = encode(&WmEnumerateReply { surfaces, embeds })
             .map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound {
             op:      control::OP_WM_ENUMERATE,

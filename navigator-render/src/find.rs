@@ -34,7 +34,7 @@ pub fn find(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, query: 
         let mut runs: Vec<&crate::Run> = scene.runs.iter().collect();
         runs.sort_by_key(|r| (r.y, r.x));
         for r in runs {
-            matches_in(r, &q, &mut out, max);
+            matches_in(r, advance(fonts, r), &q, &mut out, max);
             if out.len() >= max {
                 break;
             }
@@ -45,8 +45,21 @@ pub fn find(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, query: 
     out
 }
 
-/// The matches of `q` (folded) in one run.
-fn matches_in(r: &crate::Run, q: &[char], out: &mut Vec<[f32; 4]>, max: usize) {
+/// The advance of a run's last glyph, in px: where the run ends past its
+/// last glyph's start, so a match at the end covers all of that glyph.
+fn advance(fonts: &FontSet, r: &crate::Run) -> f64 {
+    let size = r.size as f64 / PX;
+    let measured = (|| {
+        let f = fonts.faces.get(r.face)?;
+        let gid = r.glyphs.last()?.0;
+        let a = ttf_parser::Face::parse(&f.bytes, 0).ok()?.glyph_hor_advance(ttf_parser::GlyphId(gid))?;
+        Some(a as f64 * size / f.upem as f64)
+    })();
+    measured.unwrap_or(size * 0.55)
+}
+
+/// The matches of `q` (folded) in one run, whose last glyph advances `last` px.
+fn matches_in(r: &crate::Run, last: f64, q: &[char], out: &mut Vec<[f32; 4]>, max: usize) {
     let chars: Vec<char> = r.text.chars().collect();
     // Folding can change the length (ß, İ): only fold when it keeps it,
     // so indexes still name the run's characters.
@@ -58,7 +71,7 @@ fn matches_in(r: &crate::Run, q: &[char], out: &mut Vec<[f32; 4]>, max: usize) {
     let size = r.size as f64 / PX;
     // Where each character starts: the glyph's offset when there is one
     // glyph per character, else in proportion along the run.
-    let width = r.glyphs.last().map_or(0.0, |g| g.1 as f64 / PX) + size * 0.55;
+    let width = r.glyphs.last().map_or(0.0, |g| g.1 as f64 / PX) + last;
     let at = |i: usize| -> f64 {
         if r.glyphs.len() == n {
             if i < n { r.glyphs[i].1 as f64 / PX } else { width }

@@ -391,6 +391,10 @@ pub struct WmSurfaceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WmEnumerateReply {
     pub surfaces: Vec<WmSurfaceInfo>,
+    /// Windows shown in a slot of another (limen.md §5), as
+    /// `[child, parent]`: not the WM's to place, but a click on one is a
+    /// click on its parent for focus.
+    pub embeds: Vec<[u32; 2]>,
 }
 
 /// One placement slot in a declared layout. `layer` is front-to-back (lower =
@@ -2630,6 +2634,7 @@ mod tests {
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 },
             }],
+            embeds: vec![[7, 1]],
         };
         assert_eq!(decode::<WmEnumerateReply>(&encode(&en).unwrap()).unwrap(), en);
     }

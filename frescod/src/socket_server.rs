@@ -267,6 +267,12 @@ pub static DRAG_BEGIN: std::sync::OnceLock<DragBeginFn> = std::sync::OnceLock::n
 pub type PadClaimFn = Box<dyn Fn(u8, &fresco_protocol::PadClaim) + Send + Sync>;
 pub static PAD_CLAIM: std::sync::OnceLock<PadClaimFn> = std::sync::OnceLock::new();
 
+/// What `OP_WINDOW_FOCUS_PARENT` does in a renderer (split mode): it goes
+/// to frescod, which holds the focus (its window ids are frescod's own).
+/// Unset in frescod itself, where the frontend handles it.
+pub type FocusParentFn = Box<dyn Fn(u8, u32) + Send + Sync>;
+pub static FOCUS_PARENT: std::sync::OnceLock<FocusParentFn> = std::sync::OnceLock::new();
+
 /// Run after `OP_POPUP_GRANT` is dispatched and before its answer goes
 /// out: a renderer sends the grant on to frescod now, so it is there
 /// before the token can reach the app that claims with it.
@@ -717,6 +723,14 @@ pub fn reader_loop(
 
         /* An exclusive gamepad claim (fresco-capabilities.md §4). No reply;
          * the answer is EV_GAMEPAD_CLAIM. */
+        if msg.op == fresco_protocol::control::OP_WINDOW_FOCUS_PARENT {
+            if let Some(f) = FOCUS_PARENT.get() {
+                if let Ok(p) = fresco_protocol::decode::<fresco_protocol::WindowFocusParentPayload>(&msg.payload) {
+                    f(client_id, p.window_id);
+                }
+                continue;
+            }
+        }
         if msg.op == fresco_protocol::control::OP_PAD_CLAIM {
             if let (Ok(c), Some(f)) = (fresco_protocol::decode::<fresco_protocol::PadClaim>(&msg.payload), PAD_CLAIM.get()) {
                 f(client_id, &c);

@@ -515,8 +515,12 @@ instance is gone (system roles). The parent gets `Detached`.
 - **Pointer**: the slot is the topmost window at that point, so frescod sends the event to the
   child, in the child's coordinates. The parent never sees it.
 - **Keyboard**: focus is per window. A click in the slot focuses the child's window, so keys
-  go to the child. (Not yet: forum-wm moves focus on a click only to top-level surfaces, so
-  today a press in a slot leaves the keys with the parent; found 2026-11-14.) Tab at the end of the child's focus order and Shift-Tab at the start send
+  go to the child. Built 2026-11-14: the window manager still decides which top-level window
+  is focused, and a click in a slot focuses the window it is in (`WmEnumerateReply::embeds`
+  maps the child to its parent for forum-wm). frescod keeps which slot of that window has
+  the keys (`Compositor::embed_focus`): a primary press in a slot child gives it the keys, a
+  press on the parent itself takes them back, and they follow the parent's focus away and
+  back. The child gets `WindowFocusChanged` for it; the parent's own focus does not change. Tab at the end of the child's focus order and Shift-Tab at the start send
   `FocusOut { forward }` to limend, which tells the parent to focus its next widget. The
   child gives the parent window the focus with frescod's `OP_WINDOW_FOCUS_PARENT` (built
   2026-11-14): only for its own embedded window, only while that window has the focus, so a

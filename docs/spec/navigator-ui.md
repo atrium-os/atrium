@@ -1234,12 +1234,10 @@ Each step runs in the VM on headless frescod before the next.
      Ctrl-T, Ctrl-Shift-N) the child also gives the chrome the keyboard focus with frescod's
      new `OP_WINDOW_FOCUS_PARENT`, which works only for the caller's own embedded window
      while it has the focus.
-     - Found in the VM run: a press in the page does not give the child the keyboard today.
-       forum-wm moves focus on a click to top-level surfaces only, and an embedded child is
-       not one, so keys (arrows, Ctrl-plus in the ScrollView) stay with the chrome, which is
-       why every §9 key works there. Focusing the slot's child on a press inside it (limen.md
-       §6) is frescod and Forum work still to do; the hand-back above is ready for it and
-       unit-tested.
+     - A press in the page gives the page the keys (frescod's `embed_focus`, limen.md §6,
+       built 2026-11-14 after the first step 7 run found forum-wm only focused top-level
+       surfaces): arrows and Ctrl-plus go to its ScrollView, and the §9 shortcuts come back
+       through `Key`. A press in the chrome takes the keys back.
      - Not yet: F6 (Pergola has no function keys).
    - **Accessibility tree** (§10). `navigator_ui::ax` builds the window's tree in atrium-ax's
      roles: the rail a `tree` with each trail an item and the current one's path nested, the

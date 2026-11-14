@@ -23,3 +23,13 @@ fn matches_come_back_as_rects_in_document_order() {
     assert!(find(&doc, &fonts, &env, &Default::default(), "", 100).is_empty());
     assert!(find(&doc, &fonts, &env, &Default::default(), "zebra", 100).is_empty());
 }
+
+#[test]
+fn a_match_at_the_end_of_a_run_covers_its_last_glyph() {
+    let fonts = FontSet::load().unwrap();
+    // The same word ending a run, and inside one: the same width.
+    let doc = "<!doctype html><html><body><p>An <b>atrium</b> is open.</p><p>An <b>atrium is</b> open.</p></body></html>";
+    let m = find(doc, &fonts, &Env::default(), &Default::default(), "atrium", 10);
+    assert_eq!(m.len(), 2, "{m:?}");
+    assert!((m[0][2] - m[1][2]).abs() < 0.5, "{m:?}");
+}

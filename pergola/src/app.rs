@@ -605,8 +605,14 @@ impl<V: View> App<V> {
                         modifiers: *modifiers,
                     };
                     let under = self.pointer.and_then(|p| hit_test(&self.prev_tree, p));
-                    if !self.scroll_to(self.focused, k) {
-                        self.scroll_to(under, k);
+                    if !self.scroll_to(self.focused, k) && !self.scroll_to(under, k) {
+                        // Neither: a window with one scroll view (a
+                        // document viewer, the pointer in its margin or
+                        // outside) scrolls that one.
+                        let views: Vec<_> = self.prev_tree.iter().map(|(id, _)| id).filter(|&id| self.interactions.get(id).is_some_and(|h| h.on_scroll.is_some())).take(2).collect();
+                        if let [only] = views[..] {
+                            self.scroll_to(Some(only), k);
+                        }
                     }
                 }
             }

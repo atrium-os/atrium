@@ -61,6 +61,9 @@ impl FrescoConn for ClientConn {
     fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
         self.conn.wm_enumerate()
     }
+    fn embed_parent(&mut self, child: u32) -> io::Result<Option<u32>> {
+        Ok(self.conn.wm_enumerate_all()?.embeds.iter().find(|e| e[0] == child).map(|e| e[1]))
+    }
     fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()> {
         self.conn.wm_declare_layout(layout)
     }

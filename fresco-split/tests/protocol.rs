@@ -11,6 +11,7 @@ fn samples() -> Vec<Msg> {
         Msg::WindowCreate { window: 4, width: 200, height: 40, role: Role::Document, pos: None, title: String::new(), embed_pending: true },
         Msg::WindowDestroy { window: 3 },
         Msg::WindowTitle { window: 9, title: "x".repeat(64) },
+        Msg::FocusParent { window: 9 },
         Msg::FrameReady { window: 1, slot: 1, seq: 77 },
         Msg::Client { width: 1920, height: 1080, refresh_mhz: 60000, pixels: false },
         Msg::Client { width: 800, height: 600, refresh_mhz: 0, pixels: true },

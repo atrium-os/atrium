@@ -89,6 +89,9 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
             let pressed = next_bool(&mut it);
             if let (Some(button), Some(pressed)) = (button, pressed) {
                 let (lx, ly, target) = cursor_here(comp);
+                if pressed && button == 1 {
+                    comp.lock().unwrap().press_focus(target as u16);
+                }
                 eprintln!("frescod: inject BTN {button} {} -> window {target}", pressed as u8);
                 let _ = sink.send(DisplayEvent::InputPointerButton {
                     window_id: target, x: lx, y: ly, button, pressed, modifiers: 0, activation: injected(pressed),

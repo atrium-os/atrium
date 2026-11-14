@@ -686,6 +686,11 @@ pub mod daemon {
     /// loop pure and testable without a live frescod.
     pub trait FrescoConn {
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>>;
+        /// The window `child` is shown in a slot of, if any (limen.md §5):
+        /// a click in a page embedded in a window focuses that window.
+        fn embed_parent(&mut self, _child: u32) -> io::Result<Option<u32>> {
+            Ok(None)
+        }
         fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()>;
         fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()>;
         /// The monitor's modes + the lit one (OP_WM_DISPLAY_MODES).
@@ -1546,6 +1551,13 @@ pub mod daemon {
                 .cloned()
                 .collect();
             let resolved = arrange(&self.screen, &active, self.focus_intent).focus;
+            // A click in a slot (an embedded page) is a click on the
+            // window it is embedded in; frescod gives the slot the keys.
+            let clicked = if active.iter().any(|s| s.surface_id == clicked) {
+                clicked
+            } else {
+                conn.embed_parent(clicked)?.unwrap_or(clicked)
+            };
             match resolve_click_focus(&active, clicked, Some(resolved)) {
                 Some(id) => {
                     self.focus_intent = Some(id);
@@ -1988,8 +2000,12 @@ mod tests {
         spans: Vec<fresco_protocol::WmSpanGroupPayload>,
         pads: Vec<fresco_protocol::WmPad>,
         released: Vec<u32>,
+        embeds: Vec<[u32; 2]>,
     }
     impl FrescoConn for MockConn {
+        fn embed_parent(&mut self, child: u32) -> io::Result<Option<u32>> {
+            Ok(self.embeds.iter().find(|e| e[0] == child).map(|e| e[1]))
+        }
         fn pads(&mut self) -> io::Result<Vec<fresco_protocol::WmPad>> {
             Ok(self.pads.clone())
         }
@@ -2107,6 +2123,20 @@ mod tests {
         assert_eq!(conn.declared.as_ref().unwrap().focus, 2, "dialog focused");
         assert_eq!(layout.slots.len(), 2);
         assert_eq!(conn.rendering.len(), 2, "a rendering decision per surface");
+    }
+
+    #[test]
+    fn a_click_in_an_embedded_page_focuses_its_window() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
+            embeds: vec![[9, 1]],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.focus_click(&mut conn, 2).unwrap();
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 2);
+        assert_eq!(wm.focus_click(&mut conn, 9).unwrap(), Some(1), "surface 9 is shown in a slot of 1");
+        assert_eq!(wm.focus_click(&mut conn, 77).unwrap(), None, "an unknown window changes nothing");
     }
 
     #[test]

@@ -637,9 +637,14 @@ impl Seat {
 
     fn button(&mut self, sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, button: u8, down: bool) {
         let (target, (x, y)) = {
-            let g = comp.lock().unwrap();
+            let mut g = comp.lock().unwrap();
             let (cx, cy) = g.cursor;
-            g.pointer_target(cx, cy)
+            let hit = g.pointer_target(cx, cy);
+            // A press in a slot gives its child the keys (limen.md §6).
+            if down && button == 1 {
+                g.press_focus(hit.0);
+            }
+            hit
         };
         let _ = sink.send(DisplayEvent::InputPointerButton {
             window_id: target as u32,

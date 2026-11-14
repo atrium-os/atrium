@@ -94,6 +94,9 @@ pub enum Msg {
     WindowCreate { window: u32, width: u32, height: u32, role: Role, pos: Option<(i32, i32)>, title: String, embed_pending: bool },
     /// A client destroyed a window.
     WindowDestroy { window: u32 },
+    /// `OP_WINDOW_FOCUS_PARENT` from the client: its embedded window gives
+    /// the keys to the window it is embedded in (frescod checks it has them).
+    FocusParent { window: u32 },
     /// A window's title changed.
     WindowTitle { window: u32, title: String },
     /// `slot` (0 or 1) of `window` holds a new frame, sequence `seq`.
@@ -228,6 +231,7 @@ pub use kind::{PAD_AXIS, PAD_BUTTON, PAD_CLAIMED, PAD_DISCONNECT};
 mod kind {
     pub const WINDOW_CREATE: u32 = 1;
     pub const WINDOW_DESTROY: u32 = 2;
+    pub const FOCUS_PARENT: u32 = 16;
     pub const WINDOW_TITLE: u32 = 3;
     pub const FRAME_READY: u32 = 4;
     pub const CLIENT: u32 = 0x100;
@@ -319,6 +323,7 @@ impl Msg {
         match *self {
             Msg::WindowCreate { window, .. }
             | Msg::WindowDestroy { window }
+            | Msg::FocusParent { window }
             | Msg::WindowTitle { window, .. }
             | Msg::FrameReady { window, .. }
             | Msg::Slots { window, .. }
@@ -377,6 +382,7 @@ impl Msg {
                 r
             }
             Msg::WindowDestroy { window } => Rec::new(WINDOW_DESTROY, *window),
+            Msg::FocusParent { window } => Rec::new(FOCUS_PARENT, *window),
             Msg::WindowTitle { window, title } => {
                 let mut r = Rec::new(WINDOW_TITLE, *window);
                 r.title(title);
@@ -681,7 +687,7 @@ impl Msg {
         let (args, titled) = match k {
             WINDOW_CREATE => (6, true),
             WINDOW_TITLE => (0, true),
-            WINDOW_DESTROY | CLOSE => (0, false),
+            WINDOW_DESTROY | CLOSE | FOCUS_PARENT => (0, false),
             FRAME_READY | GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
             MAGNIFY => (4, false),
@@ -765,6 +771,7 @@ impl Msg {
                 title,
             },
             WINDOW_DESTROY => Msg::WindowDestroy { window },
+            FOCUS_PARENT => Msg::FocusParent { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
             CLIENT => Msg::Client { width: dim(r.get(2))?, height: dim(r.get(3))?, refresh_mhz: r.get(4), pixels: flag(r.get(5))? },
@@ -961,6 +968,7 @@ impl Msg {
             self,
             Msg::WindowCreate { .. }
                 | Msg::WindowDestroy { .. }
+                | Msg::FocusParent { .. }
                 | Msg::WindowTitle { .. }
                 | Msg::FrameReady { .. }
                 | Msg::DragFormat { .. }
