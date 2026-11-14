@@ -1,6 +1,7 @@
 //! officina-convert: a foreign file in, a native file out, in a sandbox.
 //!
 //!   officina-convert xlsx < book.xlsx > book.osheet 2> report
+//!   officina-convert ods < book.ods > book.osheet 2> report
 //!
 //! Reads the whole input, then (on FreeBSD) enters Capsicum capability mode, so the
 //! parser can open no file and no socket whatever the input does; CPU time and memory
@@ -47,7 +48,7 @@ fn main() {
     }
     sandbox();
     match what.as_str() {
-        "xlsx" | "xlsm" => match officina_convert::xlsx::read(&input) {
+        "xlsx" | "xlsm" | "ods" => match if what == "ods" { officina_convert::ods::read(&input).map_err(|e| e.to_string()) } else { officina_convert::xlsx::read(&input).map_err(|e| e.to_string()) } {
             Ok((wb, loaded)) => {
                 let out = std::io::BufWriter::new(std::io::stdout().lock());
                 if let Err(e) = officina_grid::native::save(&wb, out).and_then(|mut o| o.flush()) {
@@ -65,7 +66,7 @@ fn main() {
             }
         },
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx < in > out.osheet");
+            eprintln!("error\tusage: officina-convert xlsx|ods < in > out.osheet");
             std::process::exit(2);
         }
     }

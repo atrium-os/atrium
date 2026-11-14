@@ -391,9 +391,18 @@ impl<W: Write> ZipWriter<W> {
 
     /// Adds `name` with `data`, deflated (or stored when that is no smaller).
     pub fn add(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.add_with(name, data, true)
+    }
+
+    /// Adds `name` with `data` stored, never deflated (ODF's `mimetype`).
+    pub fn add_stored(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.add_with(name, data, false)
+    }
+
+    fn add_with(&mut self, name: &str, data: &[u8], deflate: bool) -> io::Result<()> {
         let crc = crc32(data);
-        let packed = miniz_oxide::deflate::compress_to_vec(data, self.level);
-        let (method, body): (u16, &[u8]) = if packed.len() < data.len() { (8, &packed) } else { (0, data) };
+        let packed = if deflate { miniz_oxide::deflate::compress_to_vec(data, self.level) } else { Vec::new() };
+        let (method, body): (u16, &[u8]) = if deflate && packed.len() < data.len() { (8, &packed) } else { (0, data) };
         let local = self.at;
         let big = data.len() as u64 >= 0xFFFF_FFFF || body.len() as u64 >= 0xFFFF_FFFF;
         let mut h = Vec::with_capacity(30 + name.len() + 20);

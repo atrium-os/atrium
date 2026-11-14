@@ -6,6 +6,7 @@
 //! and writes a native file on stdout and a fidelity report on stderr. Writers run in
 //! the document process, over our own validated model.
 
+pub mod ods;
 pub mod report;
 pub mod xlsx;
 pub mod zip;

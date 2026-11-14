@@ -86,6 +86,7 @@ fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
         Format::Native => d.write_native(Vec::new()),
         Format::Csv => d.write_csv(Vec::new()),
         Format::Xlsx => officina_convert::xlsx::write(&d.wb, Vec::new()),
+        Format::Ods => officina_convert::ods::write(&d.wb, Vec::new()),
     }
 }
 
@@ -327,7 +328,7 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
-                        Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into() },
+                        Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);

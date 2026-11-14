@@ -12,6 +12,7 @@ pub enum Format {
     Native,
     Csv,
     Xlsx,
+    Ods,
 }
 
 pub fn format_of(name: &str) -> Format {
@@ -20,6 +21,8 @@ pub fn format_of(name: &str) -> Format {
         Format::Native
     } else if n.ends_with(".xlsx") || n.ends_with(".xlsm") {
         Format::Xlsx
+    } else if n.ends_with(".ods") {
+        Format::Ods
     } else {
         Format::Csv
     }
@@ -84,8 +87,13 @@ pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
     if is_native(name) {
         return Doc::from_native(name, data).map_err(|e| format!("“{name}” isn't a sheet this app can read: {e}"));
     }
-    if format_of(name) == Format::Xlsx {
-        let (native, notes) = convert("xlsx", data).map_err(|e| format!("“{name}” couldn't be opened: {e}"))?;
+    let foreign = match format_of(name) {
+        Format::Xlsx => Some("xlsx"),
+        Format::Ods => Some("ods"),
+        _ => None,
+    };
+    if let Some(kind) = foreign {
+        let (native, notes) = convert(kind, data).map_err(|e| format!("“{name}” couldn't be opened: {e}"))?;
         let mut d = Doc::from_native(name, &native).map_err(|e| format!("“{name}”: the converter's output didn't load: {e}"))?;
         d.status = match notes.len() {
             0 => format!("Opened “{name}”."),

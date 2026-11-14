@@ -963,6 +963,39 @@ Gates, on the 4-core cloud machine:
 | round trip | `tests/roundtrip.rs` `styles_round_trip`: whole columns, part columns past the data, unstyled cells inside a styled column, single cells: equal after write and read; a whole formatted column stays three runs |
 | 1,048,576 × 20 `.xlsx` read | 4.1 s with style runs collected (3.7 s before) |
 
+### 16.5 O4c as built (2026-11-14): `.ods` in and out
+
+- **Reader** (`officina-convert::ods::read`, in the converter process; `officina-convert
+  ods`): sheets; floats, percentages, currencies, dates, times (ISO durations past a
+  day), booleans, text with its spaces, tabs and line breaks; repeated rows and cells
+  (expansion refused past 200 M cells before it happens); formulas from OpenFormula
+  (`of:=SUM([.A1:.A3])`, `;` arguments, `|` array rows, quoted sheet names, `TRUE()`,
+  error literals, `COM.MICROSOFT.*` names) recalculated with the same differential as
+  `.xlsx`; error results (`calcext:value-type="error"`); column widths, row heights;
+  cell styles with parents and the document default: ODF data styles become Excel codes
+  (number, scientific, fraction, percentage with its scaling `%`, date and time parts,
+  elapsed `[h]` from `truncate-on-overflow`, colours, `style:map` sections, LibreOffice's
+  blank-width `_x`), fonts, fills, borders by width and kind, alignment, wrap; a column's
+  default cell style is its column style. Reported: merged cells, comments, charts and
+  images, conditional formats, validation, named ranges, hidden rows and columns,
+  rotation, other formula namespaces (kept as values).
+- **Writer** (`officina-convert::ods::write`, in the document process): ODF 1.3 with
+  `mimetype` first and stored; values typed by their cell's format (date, time,
+  percentage, float), booleans with a boolean data style (LibreOffice otherwise shows 1),
+  formulas as OpenFormula with cached results, constant errors as error formulas, the
+  same style model as data styles, cell styles and column defaults (rows run to the
+  last row and through the last styled column, as LibreOffice applies column defaults
+  only to cells it has). Sheets opens and saves `.ods`.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| `.ods` vs LibreOffice, in | `examples/ods_lo.rs`: the 152 conformance formulas, the fixture and 37 styled cells written as `.xlsx`, saved by LibreOffice 24 as `.ods`, read by ours: 152/152 show Excel's result, 37/37 styled cells show the same text with the same style, whole-column style kept; no report notes besides LibreOffice's own 7 results that differ from Excel |
+| `.ods` vs LibreOffice, out | same workbook through our `.ods` writer, LibreOffice saves `.xlsx`, our reader: 152/152 Excel's results, 36/37 styled cells equal (LibreOffice turns on wrap for the cell with a line break), column style kept. LibreOffice writes our `TRUE` back as `TRUE()` and stores logical results as 1 with a boolean format |
+| round trip | `tests/ods.rs`: values, formulas (fills, other sheets, arrays, newer functions), awkward text, sizes and styles equal after our write and read |
+| hostile input | 1,500 mutated packages (XML tokens, repeats of 4 G rows, bad dates and durations) plus truncations: no panic; a repeated-value bomb refused at once |
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
