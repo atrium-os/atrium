@@ -191,6 +191,25 @@ fn width(s: &str, size: f32, weight: Weight) -> f32 {
     Node::measure_text(s, &sans(size, weight, Color::TRANSPARENT)).w
 }
 
+/// The delete strip's question in `room` pt: the name gives up its length
+/// first, then the second sentence goes. The limits are em, so at a large
+/// text size the name keeps a readable stub (not two letters) before the
+/// sentence is dropped.
+pub fn delete_question(names: &[String], room: f32) -> String {
+    if names.len() == 1 {
+        let (with_tail, bare) = ("Delete “”? It can't be brought back.", "Delete “”?");
+        let name_room = |shell: &str| (room - width(shell, type_size::SM, Weight::Medium)).min(em(220.0));
+        if name_room(with_tail) >= em(60.0) {
+            format!("Delete “{}”? It can't be brought back.", fit(&names[0], type_size::SM, Weight::Medium, name_room(with_tail)))
+        } else {
+            format!("Delete “{}”?", fit(&names[0], type_size::SM, Weight::Medium, name_room(bare).max(em(24.0))))
+        }
+    } else {
+        let q = format!("Delete {} items? They can't be brought back.", names.len());
+        if width(&q, type_size::SM, Weight::Medium) <= room { q } else { format!("Delete {} items?", names.len()) }
+    }
+}
+
 /// `s`, cut with an ellipsis to fit `max` px.
 fn fit(s: &str, size: f32, weight: Weight, max: f32) -> String {
     if max <= 0.0 {
@@ -794,19 +813,7 @@ impl ScriniumView {
             // gives up the name's length, then its second sentence.
             let tx = x0 + 14.0 + em(28.0);
             let room = (w - tx - 12.0 - button_w("Delete") - 6.0 - button_w("Cancel") - 12.0).max(0.0);
-            let fits = |q: &str| width(q, type_size::SM, Weight::Medium) <= room;
-            let q = if names.len() == 1 {
-                let (with_tail, bare) = ("Delete “”? It can't be brought back.", "Delete “”?");
-                let name_room = |shell: &str| (room - width(shell, type_size::SM, Weight::Medium)).min(220.0);
-                if name_room(with_tail) >= 60.0 {
-                    format!("Delete “{}”? It can't be brought back.", fit(&names[0], type_size::SM, Weight::Medium, name_room(with_tail)))
-                } else {
-                    format!("Delete “{}”?", fit(&names[0], type_size::SM, Weight::Medium, name_room(bare).max(24.0)))
-                }
-            } else {
-                let q = format!("Delete {} items? They can't be brought back.", names.len());
-                if fits(&q) { q } else { format!("Delete {} items?", names.len()) }
-            };
+            let q = delete_question(names, room);
             icon(ctx, x0 + 14.0, y + em(14.0), ph::WARNING, 20.0, t.danger_fg());
             text(ctx, tx, y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
             let bx = (tx + 12.0 + width(&q, type_size::SM, Weight::Medium)).min(w - 12.0 - button_w("Delete") - 6.0 - button_w("Cancel")).max(tx);
