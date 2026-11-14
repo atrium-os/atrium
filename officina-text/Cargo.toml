@@ -1,0 +1,17 @@
+[package]
+name = "officina-text"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's word-processing engine (docs/spec/officina.md §7): the document model (an indexed tree of blocks, rich text runs, named styles), undoable ops, paragraph layout cached per paragraph, and pagination with checkpoints that stops when page breaks line up again. No UI."
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+navigator-render = { path = "../navigator-render" }
+rustybuzz = "0.20"
+ttf-parser = "0.25"
+unicode-linebreak = "0.1.5"
+
+[profile.release]
+debug = 1

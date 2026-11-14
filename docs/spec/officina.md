@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4).
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4). O3a (text engine) built 2026-11-14 (§16.10).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -1157,6 +1157,63 @@ Gates: `atrium-sheets` tests (region and header, sort and undo, show only / hide
 clear, table and chart from the region, undo all of it); the grid's op test (tables and
 charts undo, redo and encode, a refused table left out); the cloud VM screenshot of
 `examples/data_demo.rs`'s sheet.
+
+### 16.10 O3 plan, and O3a as built (2026-11-14): the text engine
+
+O3 is built in steps, each with its own gate:
+
+| step | what | gate |
+|---|---|---|
+| O3a | `officina-text`: model, block tree, undoable ops, paragraph layout, pagination | the 1,500-page pagination gate below |
+| O3b | Pergola `RichTextEditor`: caret, selection, IME, typing, formatting keys, over `officina-text` | keystroke latency on a 500-page document |
+| O3c | `atrium-write`: pages as bands of pergola.md §10.4, native file and autosave journal, styles and paragraph menus | crash test; scene size on 10-, 1,500- and 5,000-page documents |
+| O3d | lists and numbering, tables, images (sizes only for layout, §7.4), headers, footers, page numbers, footnotes | numbering and float tests; image-count memory gate |
+| O3e | `.docx` and `.odt` in (converter process) and out | round trip; LibreOffice both ways; hostile packages; ECMA-376 Part 1 opened |
+| O3f | PDF export, find and replace, word count, spell check | export and find gates of §15 |
+
+**O3a, `officina-text`** (no UI):
+
+- **Model** (`model.rs`). A paragraph is UTF-8 text with attribute runs (byte start,
+  interned `CharAttrs` id), a named paragraph style and direct paragraph properties. Every
+  attribute and property is optional, so "not set" and "set to the default" stay apart
+  for the converters. Styles inherit (Normal, Heading 1–3, Title to start; depth capped
+  at 16, cycles cut) and resolve to a `ParaFormat` and `CharFormat`. Page setup is A4
+  with 2.54 cm margins. Lengths in files are twips; layout uses integer layout units
+  (64 per point), so layout is exact and the same everywhere.
+- **Block tree** (`tree.rs`). Blocks in leaves of at most 256, with a Fenwick index over
+  the leaves' block and character counts: block *i*, the block holding character *c* and
+  the character of block *i* are O(log n) plus one leaf. (Headings, captions and
+  estimated heights join the counts with O3d.)
+- **Ops** (`ops.rs`). Splice, restyle, split, join, set paragraph, insert and remove
+  blocks, each with an exact inverse, so undo, redo and the journal come from
+  `officina_core::history`; an op that doesn't fit the document becomes a no-op.
+  3,000 random edits undo back to the start byte for byte.
+- **Paragraph layout** (`layout.rs`). Shaped with rustybuzz over the pinned fonts (IBM
+  Plex, DejaVu fallback per character), broken greedily at UAX #14 opportunities with
+  trailing spaces hanging and an emergency break inside a word wider than the column;
+  alignment, justification, indents, first-line indent, and line spacing (multiple,
+  exact, at least). Layouts are cached per block by a hash of text, runs, resolved
+  formats and width, so typing relayouts one paragraph.
+- **Pagination** (`paginate.rs`). A page is a list of line slices; its start (block,
+  line) is its checkpoint. Space before is dropped at a page top; page break before;
+  widow and orphan control (two lines each side); keep together and keep with next
+  (chains up to 64, only when what they keep fits on a page); a line taller than the page
+  goes alone. An `Edit` (changed block range and block-count delta) drops the pages from
+  the one before the edit's first change (walking back over keep-with-next chains),
+  repaginates, and as soon as a new page starts at an old page's checkpoint past the edit
+  takes every later page as it was, shifted by the delta. `run(max pages)` and
+  `run_for(budget)` let the app paginate in the background; a second edit before
+  convergence repaginates on to the end instead of composing shifts. Floats, footnotes
+  and counters join the checkpoint with O3d.
+
+Gates: 17 unit tests, among them pagination rules on fixed metrics and 300 random edits
+(typing, deleting, Enter, joining, keeps, page breaks) whose incremental pages equal a
+fresh pagination each time. `examples/gate_1500.rs` (release, cloud container, real
+shaping): a generated document of 8,250 blocks and 4.7 M characters paginates to 1,514
+pages in 2.1 s (first page 2.3 ms; 30 s allowed); with layouts cached, 13 ms. Typing 40
+characters on page 757 relays 1 page per keystroke (worst 0.1 ms); Enter there relays 4
+pages; inserting a page of text on page 1 relays 553 pages in 7 ms until a break lines
+up; the result equals a fresh pagination.
 
 ## 17. Decisions (accepted 2026-11-14)
 
