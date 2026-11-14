@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 use officina_grid::addr::Rect;
 use officina_grid::eval::dates;
-use officina_grid::formula;
+use officina_grid::formula::{self, Expr};
 use officina_grid::numfmt::PALETTE;
 use officina_grid::style::{HAlign, Line, Style, StyleId, VAlign};
 use officina_grid::{ErrorKind, Value, Workbook};
@@ -998,8 +998,41 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     } else if row == 0 {
         gap(out, 1);
     }
+    out.push_str(&names_xml(wb, Some(s)));
     out.push_str("</table:table>");
     Ok(())
+}
+
+/// `table:named-expressions` for the names of one scope (a sheet's, or the
+/// workbook's): ranges as `table:named-range`, the rest as `table:named-expression`,
+/// relative to A1 of the scope's sheet.
+fn names_xml(wb: &Workbook, scope: Option<u16>) -> String {
+    let mut out = String::new();
+    let base_sheet = super::formula::sheet_a1(&wb.sheet_name(scope.unwrap_or(0)));
+    let base = format!("${}.$A$1", base_sheet.trim_start_matches('$'));
+    for d in wb.names().iter().filter(|d| d.scope == scope) {
+        let of = super::formula::to_of(&wb.name_text(d));
+        let range = matches!(*d.expr, Expr::Ref(_) | Expr::Range(_)).then(|| of.strip_prefix("of:=[").and_then(|r| r.strip_suffix(']'))).flatten().filter(|r| !r.contains('['));
+        out.push_str(if range.is_some() { r#"<table:named-range table:name=""# } else { r#"<table:named-expression table:name=""# });
+        esc(&mut out, &d.name);
+        out.push_str(r#"" table:base-cell-address=""#);
+        esc(&mut out, &base);
+        match range {
+            Some(r) => {
+                out.push_str(r#"" table:cell-range-address=""#);
+                esc(&mut out, r);
+            }
+            None => {
+                out.push_str(r#"" table:expression=""#);
+                esc(&mut out, &of);
+            }
+        }
+        out.push_str(r#""/>"#);
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("<table:named-expressions>{out}</table:named-expressions>")
 }
 
 /// Writes `wb` as `.ods`.
@@ -1064,8 +1097,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         faces.push_str(r#""/>"#);
     }
     let mut content = String::with_capacity(tables.len() + auto.len() + 1024);
-    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet>"#);
+    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="true" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
     content.push_str(&tables);
+    content.push_str(&names_xml(wb, None));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/></office:styles></office:document-styles>"#);
     let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/></manifest:manifest>"#);

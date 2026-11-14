@@ -9,6 +9,7 @@
 //! | 4 | FORMULAS | one sheet's formula groups: column, first and last row, A1 text at the first row |
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
+//! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
 //! formulas. Column chunks are independent, so a reader can load the visible part of a
@@ -34,6 +35,8 @@ pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
 pub const STYLE_RUNS: u16 = 6;
+pub const NAMES: u16 = 7;
+const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
 const ENC_NUM: u8 = 1;
@@ -179,6 +182,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             c.add(FORMULAS, &w.into_bytes())?;
         }
     }
+    if !wb.names.is_empty() {
+        let mut w = Writer::new();
+        w.var(wb.names.len() as u64);
+        for d in wb.names.iter() {
+            w.u16(d.scope.unwrap_or(GLOBAL));
+            w.str(&d.name);
+            w.str(&wb.name_text(d));
+        }
+        c.add(NAMES, &w.into_bytes())?;
+    }
     if wb.styles.len() > 1 {
         let mut w = Writer::new();
         w.var(wb.styles.len() as u64 - 1);
@@ -258,6 +271,30 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         }
     }
     done(&r)?;
+
+    // Names, before formulas (whose dependencies follow them).
+    let mut it = of(NAMES);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two NAMES chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("names", crate::names::MAX_NAMES as u64, 5)?;
+        for _ in 0..k {
+            let scope = match r.u16()? {
+                GLOBAL => None,
+                s if (s as usize) < wb.sheets.len() => Some(s),
+                _ => return Err(LoadError::Bad("a name for a sheet that does not exist")),
+            };
+            let name = r.str("name", crate::names::MAX_NAME_LEN as u64)?;
+            let src = r.str("name formula", MAX_TEXT as u64)?;
+            if wb.names.get(scope.unwrap_or(0), name).is_some_and(|d| d.scope == scope) {
+                return Err(LoadError::Bad("a name twice"));
+            }
+            wb.define_name_stored(name, scope, src).map_err(|_| LoadError::Bad("a name's formula"))?;
+        }
+        done(&r)?;
+    }
 
     // Strings.
     let mut strings: Vec<Arc<str>> = Vec::new();

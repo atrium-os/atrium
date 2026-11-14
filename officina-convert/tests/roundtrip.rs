@@ -158,3 +158,26 @@ fn styles_round_trip() {
     assert!(back.sheet(0).styles[0].runs().len() <= 3, "{:?}", back.sheet(0).styles[0].runs());
     assert!(file.len() < 200_000, "{} bytes", file.len());
 }
+
+#[test]
+fn names_round_trip() {
+    let mut wb = book();
+    wb.define_name("Items", None, "=Data!$A$1:$A$500").unwrap();
+    wb.define_name("Half", Some(1), "=0.5").unwrap();
+    wb.define_name("Twice", None, "=SUM(Items)*2").unwrap();
+    wb.define_name("_xlnm.Print_Area", Some(0), "=Data!$A$1:$D$20").unwrap();
+    wb.set_formula(CellAddr::new(1, 10, 0), "=SUM(Items)*Half").unwrap();
+    wb.set_formula(CellAddr::new(1, 11, 0), "=Twice").unwrap();
+    wb.recalc();
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.names().len(), 4);
+    for (s, r) in [(1u16, 10u32), (1, 11)] {
+        let a = CellAddr::new(s, r, 0);
+        assert_eq!(back.get(a), wb.get(a));
+        assert_eq!(back.formula_text(a), wb.formula_text(a));
+    }
+    assert_eq!(back.name_text(back.names().get(0, "_XLNM.PRINT_AREA").unwrap()), "=Data!$A$1:$D$20");
+    assert!(back.names().get(0, "Half").is_none());
+}

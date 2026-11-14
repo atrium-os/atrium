@@ -854,6 +854,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
 
     // Sheets in order.
     let mut sheets: Vec<(String, String)> = Vec::new();
+    // Defined names: (name, sheet index it is local to, formula text).
+    let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
     {
         let mut r = xml(&wb_xml);
         let mut buf = Vec::new();
@@ -874,7 +876,19 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                         }
                     }
                     b"workbookPr" => out.date1904 = attr(&e, b"date1904")?.is_some_and(|v| v == "1" || v == "true"),
-                    b"definedName" => out.report.note(Kind::Dropped, "defined names (O4d)"),
+                    b"definedName" => {
+                        let name = attr(&e, b"name")?.unwrap_or_default();
+                        let local = attr(&e, b"localSheetId")?.and_then(|v| v.parse::<u32>().ok());
+                        let mut text = String::new();
+                        let mut tb = Vec::new();
+                        if let Event::Text(t) = r.read_event_into(&mut tb)? {
+                            text = t.unescape().map(|x| x.into_owned()).unwrap_or_default();
+                        }
+                        let cut = text.len() > 8192;
+                        if names.len() < officina_grid::names::MAX_NAMES && !cut {
+                            names.push((name, local, text));
+                        }
+                    }
                     _ => {}
                 },
                 Event::Eof => break,
@@ -914,6 +928,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         },
         None => vec![0],
     };
+    // Names, before the formulas that use them.
+    for (name, local, text) in &names {
+        let scope = match local {
+            Some(i) if (*i as usize) < wb.sheet_count() => Some(*i as u16),
+            Some(_) => continue,
+            None => None,
+        };
+        if wb.define_name(name, scope, &formula_in(text)).is_err() {
+            rep.note_at(Kind::Dropped, "defined names this engine can't use", || format!("{name}: {}", text.chars().take(60).collect::<String>()));
+        }
+    }
     let mut all_f: Vec<(u16, Vec<FCell>, HashMap<u32, (u32, u32, String)>)> = Vec::new();
     for (i, (_, part)) in sheets.iter().enumerate() {
         let e = z.find(part).ok_or_else(|| bad(format!("missing {part}")))?.clone();

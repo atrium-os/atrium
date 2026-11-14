@@ -10,6 +10,7 @@
 //! interval trees (sorted by first row, a max-tree over last rows), rebuilt lazily after
 //! changes.
 
+use std::sync::Arc;
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::formula::{Coord, Expr};
 use std::collections::HashMap;
@@ -62,8 +63,17 @@ impl Footprint {
 }
 
 /// The footprints of a formula in column `col` of `sheet`, for rows `r0..=r1`.
-pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32) -> Vec<Footprint> {
+/// `names` gives a name's formula as seen from a sheet: a formula's footprints include
+/// those of the names it uses (names are relative to the using cell, as if inlined).
+pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, &str) -> Option<Arc<Expr>>) -> Vec<Footprint> {
+    let mut out = footprints_d(e, sheet, col, r0, r1, names, 0);
+    out.dedup();
+    out
+}
+
+fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, &str) -> Option<Arc<Expr>>, depth: u32) -> Vec<Footprint> {
     let mut out = Vec::new();
+    let mut named: Vec<Arc<Expr>> = Vec::new();
     let rowspan = |a: Coord, b: Coord| -> Span {
         match (a, b) {
             (Coord::Rel(x), Coord::Rel(y)) => Span::Slide { d0: x.min(y) as i64, d1: x.max(y) as i64 },
@@ -86,9 +96,16 @@ pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32) -> Vec<Footp
                 out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
             }
         }
+        Expr::Name(n) if !n.is_empty() && depth < crate::names::MAX_NAME_DEPTH => {
+            if let Some(x) = names(sheet, n) {
+                named.push(x);
+            }
+        }
         _ => {}
     });
-    out.dedup();
+    for x in named {
+        out.extend(footprints_d(&x, sheet, col, r0, r1, names, depth + 1));
+    }
     out
 }
 

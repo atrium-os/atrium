@@ -20,6 +20,7 @@ pub mod deps;
 pub mod eval;
 pub mod fast;
 pub mod formula;
+pub mod names;
 pub mod native;
 pub mod numfmt;
 pub mod ops;

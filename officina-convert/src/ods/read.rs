@@ -690,6 +690,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     r.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut sheet: Option<u16> = None;
+    // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
+    let mut names: Vec<(String, Option<u16>, String, Option<String>)> = Vec::new();
     let (mut row, mut col): (u64, u64) = (0, 0);
     let mut row_repeat = 1u32;
     let mut row_style: Option<String> = None;
@@ -860,7 +862,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                     }
                     b"draw:frame" | b"draw:custom-shape" | b"draw:g" => rep.note(Kind::Dropped, "charts, images and drawings"),
-                    b"table:named-range" | b"table:named-expression" => rep.note(Kind::Dropped, "named ranges (O4d)"),
+                    b"table:named-range" | b"table:named-expression" => {
+                        let a = attrs(e);
+                        let src = if name == b"table:named-range" { a.get("table:cell-range-address").map(|r| format!("of:=[{r}]")) } else { a.get("table:expression").cloned() };
+                        if let (Some(n), Some(src)) = (a.get("table:name"), src) {
+                            if names.len() < officina_grid::names::MAX_NAMES {
+                                names.push((n.clone(), sheet, src, a.get("table:base-cell-address").cloned()));
+                            }
+                        }
+                    }
                     b"calcext:conditional-formats" => rep.note(Kind::Dropped, "conditional formats"),
                     b"table:content-validations" => rep.note(Kind::Dropped, "data validation"),
                     b"table:database-range" => rep.note(Kind::Dropped, "database ranges and filters (O4d)"),
@@ -982,6 +992,21 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
     if wb.sheet_count() == 0 {
         return Err(bad("no tables"));
+    }
+
+    // Names, before the formulas that use them; relative parts are from the base cell.
+    for (n, scope, src, base) in names {
+        let at = base.and_then(|b| super::formula::from_of(&format!("of:=[{b}]"))).and_then(|a| {
+            let cell = a.rsplit('!').next().unwrap_or(&a).trim_start_matches('=').replace('$', "");
+            officina_grid::addr::parse_a1(&cell)
+        });
+        let (row, col) = at.unwrap_or((0, 0));
+        // LibreOffice writes a named expression's formula without its namespace.
+        let src = if src.starts_with("of:") || src.starts_with("oooc:") || src.starts_with('=') { src } else { format!("of:={src}") };
+        let ok = super::formula::from_of(&src).is_some_and(|a1| wb.define_name_at(&n, scope, &a1, row, col).is_ok());
+        if !ok {
+            rep.note_at(Kind::Dropped, "defined names this engine can't use", || format!("{n}: {}", src.chars().take(60).collect::<String>()));
+        }
     }
 
     // Formulas, once every sheet exists.

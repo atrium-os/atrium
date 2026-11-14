@@ -390,7 +390,23 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         esc(&mut w, &wb.sheet_name(s as u16));
         let _ = write!(w, r#"" sheetId="{}" r:id="rId{}"/>"#, s + 1, s + 1);
     }
-    w.extend_from_slice(b"</sheets></workbook>");
+    w.extend_from_slice(b"</sheets>");
+    if !wb.names().is_empty() {
+        w.extend_from_slice(b"<definedNames>");
+        for d in wb.names().iter() {
+            w.extend_from_slice(b"<definedName name=\"");
+            esc(&mut w, &d.name);
+            w.push(b'"');
+            if let Some(s) = d.scope {
+                let _ = write!(w, r#" localSheetId="{s}""#);
+            }
+            w.push(b'>');
+            esc(&mut w, &formula_out(&wb.name_text(d)));
+            w.extend_from_slice(b"</definedName>");
+        }
+        w.extend_from_slice(b"</definedNames>");
+    }
+    w.extend_from_slice(b"</workbook>");
     z.add("xl/workbook.xml", &w)?;
     let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
     for s in 0..n {

@@ -22,7 +22,9 @@ use officina_grid::style::{Edge, HAlign, Line, Style, VAlign};
 use officina_grid::{Value, Workbook};
 
 const COL: u32 = 25; // Z, as in tests/conformance.rs
-const SCOL: u32 = 1; // styled cells, column B of the third sheet
+const SCOL: u32 = 1;
+/// Formulas using defined names (the last on the second sheet, where `Local` is).
+const NAMED: [&str; 4] = ["=COUNTIF(Fruit,\"a*\")", "=SUM(A1:A5)*Rate", "=Doubled+1", "=Local"]; // styled cells, column B of the third sheet
 
 fn cases() -> Vec<(String, String)> {
     let src = include_str!("../../officina-grid/tests/conformance.rs");
@@ -116,6 +118,14 @@ fn fixture(cases: &[(String, String)], st: &[(Style, Value)]) -> Workbook {
     set(&mut wb, "D4", "20");
     set(&mut wb, "E1", "=1/0");
     wb.set_input(CellAddr::new(1, 0, 0), "7").unwrap();
+    // Defined names: a range, a constant, a formula, one local to a sheet.
+    wb.define_name("Fruit", None, "=S!$B$1:$B$5").unwrap();
+    wb.define_name("Rate", None, "=0.2").unwrap();
+    wb.define_name("Doubled", None, "=SUM(S!$A$1:$A$5)*2").unwrap();
+    wb.define_name("Local", Some(1), "=S!$A$3*10").unwrap();
+    for (k, f) in NAMED.iter().enumerate() {
+        wb.set_input(CellAddr::new(if k == 3 { 1 } else { 0 }, 60 + k as u32, 27), f).unwrap();
+    }
     for (i, (f, _)) in cases.iter().enumerate() {
         wb.set_input(CellAddr::new(0, 100 + i as u32, COL), f).unwrap();
     }
@@ -184,7 +194,16 @@ fn compare(what: &str, wb: &Workbook, back: &Workbook, cases: &[(String, String)
         }
     }
     kept &= back.get(CellAddr::new(1, 0, 0)) == wb.get(CellAddr::new(1, 0, 0));
-    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}", cases.len(), st.len())
+    let mut n_ok = 0;
+    for (k, f) in NAMED.iter().enumerate() {
+        let a = CellAddr::new(if k == 3 { 1 } else { 0 }, 60 + k as u32, 27);
+        if back.get(a) == wb.get(a) && back.formula_text(a).as_deref() == Some(f) {
+            n_ok += 1;
+        } else {
+            println!("  {what}: {f} shows {:?} (want {:?}), formula {:?}", back.get(a), wb.get(a), back.formula_text(a));
+        }
+    }
+    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}; {n_ok}/{} name formulas, {} names", cases.len(), st.len(), NAMED.len(), back.names().len())
 }
 
 fn main() {

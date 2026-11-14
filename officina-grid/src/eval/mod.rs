@@ -79,7 +79,13 @@ impl<'a> Ctx<'a> {
             Expr::Bool(b) => Ev::V(Value::Bool(*b)),
             Expr::Err(k) => Ev::err(*k),
             Expr::Name(n) if n.is_empty() => Ev::V(Value::Empty),
-            Expr::Name(_) => Ev::err(ErrorKind::Name),
+            Expr::Name(n) => match self.wb.names.get(self.sheet, n) {
+                Some(d) => {
+                    let x = d.expr.clone();
+                    crate::names::deeper(|| self.eval(&x)).unwrap_or(Ev::err(ErrorKind::Name))
+                }
+                None => Ev::err(ErrorKind::Name),
+            },
             Expr::Ref(r) => {
                 let sheet = r.sheet.unwrap_or(self.sheet);
                 match (r.row.resolve(self.row, MAX_ROWS), r.col.resolve(self.col, MAX_COLS)) {

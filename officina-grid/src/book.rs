@@ -8,6 +8,7 @@ use crate::eval::funcs::{self, text_key};
 use crate::eval::parse_number;
 use crate::fast::Fast;
 use crate::formula::{self, Expr, Func, ParseError};
+use crate::names::{valid_name, NameDef, Names};
 use crate::numfmt::Formatted;
 use crate::strings::StringPool;
 use crate::style::{Style, StyleId, StyleRuns, StyleTable};
@@ -127,6 +128,8 @@ pub struct Workbook {
     pub(crate) sheets: Vec<Sheet>,
     pub strings: StringPool,
     pub styles: StyleTable,
+    /// Defined names; change them with [`Workbook::define_name`] so formulas re-bind.
+    pub(crate) names: Names,
     pub(crate) groups: Vec<Option<Group>>,
     free_groups: Vec<GroupId>,
     pub(crate) deps: DepIndex,
@@ -152,6 +155,7 @@ impl Workbook {
             sheets: Vec::new(),
             strings: StringPool::new(),
             styles: StyleTable::new(),
+            names: Names::default(),
             groups: Vec::new(),
             free_groups: Vec::new(),
             deps: DepIndex::default(),
@@ -402,6 +406,88 @@ impl Workbook {
         Ok(e)
     }
 
+    /// The defined names.
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// Defines (or redefines) `name` as `src` (a formula, written as if in cell A1 of
+    /// the scope's sheet, or the first sheet), for the workbook or one sheet. Formulas
+    /// using names are re-bound and recalculate.
+    pub fn define_name(&mut self, name: &str, scope: Option<u16>, src: &str) -> Result<(), ParseError> {
+        self.define_name_at(name, scope, src, 0, 0)
+    }
+
+    /// [`Workbook::define_name`] with `src` written as if in cell (`row`, `col`): its
+    /// relative parts are offsets from there (ODF's base cell).
+    pub fn define_name_at(&mut self, name: &str, scope: Option<u16>, src: &str, row: u32, col: u32) -> Result<(), ParseError> {
+        if !valid_name(name) {
+            return Err(ParseError { at: 0, msg: format!("not a name: {name}") });
+        }
+        if scope.is_some_and(|s| s as usize >= self.sheets.len()) {
+            return Err(ParseError { at: 0, msg: "no such sheet".into() });
+        }
+        let src = if src.starts_with('=') { src.to_string() } else { format!("={src}") };
+        let e = self.parse(&src, scope.unwrap_or(0), row.min(MAX_ROWS - 1), col.min(MAX_COLS - 1))?;
+        if !self.names.set(NameDef { name: Arc::from(name), scope, expr: Arc::new(e) }) {
+            return Err(ParseError { at: 0, msg: "too many names".into() });
+        }
+        self.rebind_names();
+        Ok(())
+    }
+
+    /// Defines a name from formula text read back from a file.
+    pub fn define_name_stored(&mut self, name: &str, scope: Option<u16>, src: &str) -> Result<(), ParseError> {
+        if !valid_name(name) {
+            return Err(ParseError { at: 0, msg: format!("not a name: {name}") });
+        }
+        if scope.is_some_and(|s| s as usize >= self.sheets.len()) {
+            return Err(ParseError { at: 0, msg: "no such sheet".into() });
+        }
+        let src = if src.starts_with('=') { src.to_string() } else { format!("={src}") };
+        let e = self.parse_stored(&src, 0, 0)?;
+        if !self.names.set(NameDef { name: Arc::from(name), scope, expr: Arc::new(e) }) {
+            return Err(ParseError { at: 0, msg: "too many names".into() });
+        }
+        self.rebind_names();
+        Ok(())
+    }
+
+    pub fn remove_name(&mut self, name: &str, scope: Option<u16>) -> Option<NameDef> {
+        let d = self.names.remove(scope, name)?;
+        self.rebind_names();
+        Some(d)
+    }
+
+    /// A name's formula as text (`=Sheet1!$A$1:$A$10`).
+    pub fn name_text(&self, d: &NameDef) -> String {
+        formula::to_a1(&d.expr, 0, 0, &|s| self.sheet_name(s))
+    }
+
+    /// Re-adds every group that uses a name (its footprints follow the names) and
+    /// marks it for recalculation.
+    pub(crate) fn rebind_names(&mut self) {
+        let using: Vec<GroupId> = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(i, g)| {
+                let g = g.as_ref()?;
+                let mut named = false;
+                g.expr.walk(&mut |n| named |= matches!(n, Expr::Name(x) if !x.is_empty()));
+                named.then_some(i as GroupId)
+            })
+            .collect();
+        for g in using {
+            let (sheet, col, r0, r1, expr) = {
+                let grp = self.group(g);
+                (grp.sheet, grp.col, grp.r0, grp.r1, grp.expr.clone())
+            };
+            self.remove_group(g, false);
+            self.add_group(sheet, col, r0, r1, expr, Some((r0, r1)));
+        }
+    }
+
     /// Parses formula text read back from a file.
     pub(crate) fn parse_stored(&self, src: &str, row: u32, col: u32) -> Result<Expr, ParseError> {
         let e = formula::parse_stored(src, row, col, &|n: &str| self.sheet_id(n))?;
@@ -455,7 +541,7 @@ impl Workbook {
                 volatile |= funcs::FUNCS[*id as usize].volatile;
             }
         });
-        let fps = footprints(&expr, sheet, col, r0, r1);
+        let fps = footprints(&expr, sheet, col, r0, r1, &|s, n| self.names.get(s, n).map(|d| d.expr.clone()));
         let fast = Fast::compile(&expr, sheet, col).map(Arc::new);
         let g = Group { sheet, col, r0, r1, expr, volatile, fps, fast, dep_ids: Vec::new() };
         let id = match self.free_groups.pop() {

@@ -168,3 +168,28 @@ fn hostile_ods_never_panics() {
         let _ = ods::read(&file[..cut]);
     }
 }
+
+#[test]
+fn ods_names_round_trip() {
+    let mut wb = book();
+    wb.define_name("Items", None, "=Data!$A$1:$A$500").unwrap();
+    wb.define_name("Half", Some(1), "=0.5").unwrap();
+    wb.define_name("Twice", None, "=SUM(Items)*2").unwrap();
+    wb.define_name("Next", None, "=B1").unwrap(); // relative: the cell to the right
+    wb.set_formula(CellAddr::new(1, 10, 0), "=SUM(Items)*Half").unwrap();
+    wb.set_formula(CellAddr::new(1, 11, 0), "=Twice").unwrap();
+    wb.set_value(CellAddr::new(1, 12, 1), Value::Num(9.0));
+    wb.set_formula(CellAddr::new(1, 12, 0), "=Next").unwrap();
+    wb.recalc();
+    assert_eq!(wb.get(CellAddr::new(1, 12, 0)), Value::Num(9.0));
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.names().len(), 4);
+    for r in [10u32, 11, 12] {
+        let a = CellAddr::new(1, r, 0);
+        assert_eq!(back.get(a), wb.get(a));
+        assert_eq!(back.formula_text(a), wb.formula_text(a));
+    }
+    assert!(back.names().get(0, "Half").is_none());
+}
