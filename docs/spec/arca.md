@@ -594,6 +594,12 @@ same-site context or a gesture, because it never holds a ticket.
   - Session cookies dying with the origin's last view (§8.6): the broker has to say when
     a view closes.
   - `document.cookie` for the converter.
+  - Built 2026-11-14 for the presence menu (navigator-ui.md §6.2): `W_SIGN_OUT` (0x72,
+    broker only) ends one partition's session cookies, kept or in memory, and leaves cookies
+    with an expiry and the data key; `W_ACCOUNTS` (0x73, broker only) names the passkeys
+    (RP ID at or under the site) and web passwords Arca holds for a site, names and kinds
+    only, at most 16. The broker uses `W_SIGN_OUT` for "Sign out here"; session cookies ending
+    by themselves when the last view closes still needs the broker to say when that is.
   - "Forget this site" in the trusted UI. The broker's side is built (2026-11-13,
     navigator-ui.md §14 step 5): `W_FORGET` (0x71, broker only) takes a partition, or a
     prefix that must be an Unrecorded jar's (`u-<16 hex>.`, or `u-` for all of them), and

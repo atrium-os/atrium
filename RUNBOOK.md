@@ -5698,10 +5698,13 @@ Step 4 (parking) runs last, with `NAVIGATOR_UI_LIVE=1`: it follows a link, scrol
 goes Forward and finds it at the same offset (`navigator-page: opened at y=N` in limend.log), then
 restarts the UI and navigatord with `$D/fixtures` moved away and finds the page brought back from
 navigatord's store (`NAVIGATORD_STORE`, here `/tmp/nlive/store`; `… Store)` in navigatord2.log). The
-script prints the park and restore times at the end. Step 5's presence control is pressed last: with no
-Arca in this run, the page opens again anonymously and the UI says so.
+script prints the park and restore times at the end. Step 5's presence control is pressed last: it opens
+its menu (shot `live-7-presence-menu`), the script presses *Let this site remember me*, and with no
+Arca in this run the page opens again anonymously and the UI says so.
 
-Step 5 against the real Arca is `scripts/arca-vm-test.sh` §8 (`NAV=0` skips it; `SKIP_SUITES=1` skips
+Step 5 against the real Arca is `scripts/arca-vm-test.sh` §8 (it also runs `navctl signout` and
+`navctl accounts`: Sign out here ends the session cookie and the next page goes without it while
+the site still knows you, and Arca names no accounts for the test site; `NAV=0` skips it; `SKIP_SUITES=1` skips
 §1's suites): navigatord as the web broker (uid 50803) with `NAVIGATORD_ARCA`/`NAVIGATORD_COURIERD`,
 driven by `navctl` (navigator-control's example). The test TLS server's log decides each check: a page
 whose site knows you carries its jar's cookie, an Unrecorded trail's jar is its own and goes when the

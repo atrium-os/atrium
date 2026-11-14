@@ -400,6 +400,21 @@ impl Live {
                 Event::Handed { url, ok, why } => {
                     s.last_note = Some(if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) })
                 }
+                Event::SignedOut { url, cookies, why } => {
+                    let site = crate::trail::site(&url).to_string();
+                    eprintln!("navigator-ui: signed out of {site} here: {}", match (cookies, &why) {
+                        (Some(n), _) => format!("{n} session cookies ended"),
+                        (None, w) => format!("not done ({})", w.clone().unwrap_or_default()),
+                    });
+                    s.last_note = Some(match cookies {
+                        Some(_) => format!("signed out of {site} here"),
+                        None => format!("couldn't sign out of {site} here: {}", why.unwrap_or_default()),
+                    });
+                }
+                Event::Accounts { url, accounts, why } => {
+                    eprintln!("navigator-ui: Arca holds {} accounts for {}{}", accounts.len(), crate::trail::site(&url), why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
+                    s.accounts_answer(&url, accounts, why);
+                }
                 Event::Chrome { .. } => {}
             }
         }
@@ -541,6 +556,8 @@ impl Live {
                     send(&mut self.w, &Request::Activate { id, page, href });
                 }
                 Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
+                Out::SignOut { jar, url } => send(&mut self.w, &Request::SignOut { jar, url }),
+                Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id } => send(&mut self.w, &Request::Save { id }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
                 Out::Hand { url, how } => send(&mut self.w, &Request::Hand { url, how }),

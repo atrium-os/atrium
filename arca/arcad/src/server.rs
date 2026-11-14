@@ -170,6 +170,8 @@ impl State {
             },
             Label::WebBroker { user, .. } if op == broker_op::W_TICKET => self.broker_ticket(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_FORGET => self.broker_forget(user, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_SIGN_OUT => self.broker_sign_out(user, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_ACCOUNTS => self.broker_accounts(user, body),
             Label::WebBroker { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
@@ -887,6 +889,82 @@ impl State {
             n += 1;
         }
         ok(n.to_le_bytes().to_vec())
+    }
+
+    /// "Sign out here" (`broker_op::W_SIGN_OUT`): one partition's session
+    /// cookies go, in memory or in the store.
+    fn broker_sign_out(&mut self, user: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let Ok(partition) = r.str(caps::HOST) else { return malformed() };
+        if r.end().is_err() || Recipient::endpoint(Scheme::Https, partition, 443, Some(partition)).is_err() {
+            return malformed();
+        }
+        let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
+        if store.state() != arca_store::LockState::Unlocked {
+            return reply(status::LOCKED);
+        }
+        if crate::jar::in_memory(partition) {
+            let n = self.jars.sign_out(user, partition) as u32;
+            return ok(n.to_le_bytes().to_vec());
+        }
+        let groups: Vec<Recipient> = tri!(store.recipients())
+            .into_iter()
+            .filter(|(persona, rec)| {
+                persona == broker_op::WEB_PERSONA
+                    && matches!(rec, Recipient::Endpoint { partition: Some(p), .. } if p == partition)
+            })
+            .map(|(_, rec)| rec)
+            .collect();
+        let mut n = 0u32;
+        for rec in &groups {
+            let who = Access { persona: broker_op::WEB_PERSONA, recipient: rec };
+            for m in tri!(store.list(&who)).into_iter().filter(|m| m.kind == Kind::Cookie) {
+                // A session cookie, or one whose scope can't be read.
+                if crate::cookie::Attrs::decode(&m.scope).is_none_or(|a| a.expires.is_none()) {
+                    tri!(store.delete(&m.id, &who));
+                    n += 1;
+                }
+            }
+        }
+        ok(n.to_le_bytes().to_vec())
+    }
+
+    /// The accounts Arca holds for a site (`broker_op::W_ACCOUNTS`): names
+    /// of passkeys and web passwords, never a value.
+    fn broker_accounts(&mut self, user: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let Ok(site) = r.str(caps::HOST) else { return malformed() };
+        if r.end().is_err() || Recipient::rp_id(site).is_err() {
+            return malformed();
+        }
+        let Some(store) = self.stores.get(user) else { return reply(status::LOCKED) };
+        if store.state() != arca_store::LockState::Unlocked {
+            return reply(status::LOCKED);
+        }
+        let under = |h: &str| h == site || h.strip_suffix(site).is_some_and(|p| p.ends_with('.'));
+        let mut found: Vec<(u8, String)> = Vec::new();
+        for (persona, rec) in tri!(store.recipients()) {
+            let kind = match &rec {
+                Recipient::RpId(rp) if persona == PERSONA && under(rp) => broker_op::ACCOUNT_PASSKEY,
+                Recipient::Endpoint { scheme: Scheme::Https, host, .. } if persona == broker_op::WEB_PERSONA && under(host) => broker_op::ACCOUNT_PASSWORD,
+                _ => continue,
+            };
+            let want = if kind == broker_op::ACCOUNT_PASSKEY { Kind::P256 } else { Kind::Password };
+            for m in tri!(store.list(&Access { persona: &persona, recipient: &rec })) {
+                if m.kind == want && !found.iter().any(|(k, a)| *k == kind && *a == m.account) {
+                    found.push((kind, m.account));
+                }
+            }
+        }
+        found.sort();
+        found.truncate(broker_op::ACCOUNTS_MAX);
+        let mut w = Writer::new();
+        w.u32(found.len() as u32);
+        for (k, a) in &found {
+            w.u8(*k);
+            w.str(a);
+        }
+        ok(w.buf)
     }
 
     /// The ticket a web courier names for this request, checked against

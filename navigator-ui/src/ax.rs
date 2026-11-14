@@ -100,6 +100,7 @@ mod id {
     pub const NEW_TRAIL: u64 = 24;
     pub const HISTORY_CLEAR_ALL: u64 = 25;
     pub const HISTORY_CONFIRM: u64 = 26;
+    pub const PRESENCE_MENU: u64 = 27;
     pub const HISTORY_CLEAR_SITE: u64 = 5 << 40;
     pub const TRAIL: u64 = 1 << 40;
     pub const PAGE_ROW: u64 = 2 << 40;
@@ -189,7 +190,8 @@ pub fn tree(s: &Shell) -> Node {
         let site = trail::site(&p.url);
         bar.push(Node::new(id::TIER, "button", format!("{}: {}", tier_name(p.facts.tier), crate::ui::tier_sentence(p.facts.tier, site))).with(if s.popover { state::EXPANDED } else { 0 }));
         let knows = store.knows(site);
-        bar.push(Node::new(id::PRESENCE, "switch", format!("{site} knows you")).with(if knows { state::CHECKED } else { 0 }));
+        let words = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
+        bar.push(Node::new(id::PRESENCE, "button", words).with(if s.presence_open { state::EXPANDED } else { 0 }));
         bar.push(Node::new(id::AA, "button", "Reading controls").with(if s.reading_open { state::EXPANDED } else { 0 }));
         bar.push(Node::new(id::KEEP, "switch", "Keep this page (Ctrl-D)").with(if store.is_kept(&p.url) { state::CHECKED } else { 0 }));
     }
@@ -270,6 +272,37 @@ pub fn tree(s: &Shell) -> Node {
             Node::new(id::READING | 3 << 8, "radio-group", "Theme").value(theme),
             Node::new(id::READING | 4 << 8, "radio-group", "Width").value(if r.comfortable { "Comfortable" } else { "Full" }),
         ]));
+    }
+
+    // The presence menu (§6.2).
+    if let (Some(_), Some(p)) = (g.presence_menu, page) {
+        let site = trail::site(&p.url);
+        let m = |i: u64, role: &'static str, name: String| Node::new(id::PRESENCE_MENU | i << 8, role, name);
+        let kids = if store.knows(site) {
+            let mut v = vec![];
+            match s.accounts.as_ref().filter(|(a, _)| a == site).map(|(_, a)| a) {
+                Some(crate::shell::Accounts::Known(a)) if !a.is_empty() => {
+                    for (i, a) in a.iter().take(4).enumerate() {
+                        let kind = match a.kind {
+                            navigator_control::AccountKind::Passkey => "passkey",
+                            navigator_control::AccountKind::Password => "password",
+                        };
+                        v.push(m(10 + i as u64, "text", format!("Account in Arca: {} ({kind})", a.name)));
+                    }
+                }
+                Some(crate::shell::Accounts::Known(_)) => v.push(m(10, "text", "Arca holds no account for this site".into())),
+                Some(crate::shell::Accounts::Unknown(w)) => v.push(m(10, "text", format!("Arca can't say ({w})"))),
+                _ => v.push(m(10, "text", "Asking Arca".into())),
+            }
+            v.push(m(1, "menu-item", "Sign out here".into()));
+            v.push(m(2, "menu-item", "Forget this site".into()));
+            v
+        } else {
+            vec![m(3, "menu-item", "Let this site remember me".into())]
+        };
+        let mut n = Node::new(id::PRESENCE_MENU, "menu", format!("Whether {site} knows you")).kids(kids);
+        n.live = Some("polite");
+        top.push(n);
     }
 
     if g.status.is_some() {

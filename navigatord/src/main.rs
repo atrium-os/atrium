@@ -50,6 +50,23 @@ use navigator_cookies::{Arca as _, ArcadSocket, Broker, Fetch, Launcher, Why};
 use navigator_prerender::fetch::{FetchBudget, FetchdFetcher, Reply};
 use navigator_prerender::serve::{self, Ask, Job};
 
+/// Arca's accounts for a site as the UI is told them: known kinds, clean
+/// names, bounded.
+fn accounts_of(v: Vec<(u8, String)>) -> Vec<ctl::Account> {
+    use navigator_cookies::{ACCOUNT_PASSKEY, ACCOUNT_PASSWORD};
+    v.into_iter()
+        .filter_map(|(k, name)| {
+            let kind = match k {
+                ACCOUNT_PASSKEY => ctl::AccountKind::Passkey,
+                ACCOUNT_PASSWORD => ctl::AccountKind::Password,
+                _ => return None,
+            };
+            ctl::clean(&name, ctl::ACCOUNT_NAME_MAX).then_some(ctl::Account { kind, name })
+        })
+        .take(ctl::ACCOUNTS_MAX)
+        .collect()
+}
+
 /// Pages kept converted, most recently used last (Back is instant).
 const CACHE: usize = 16;
 /// Addresses whose page record this run knows (for link checks and the
@@ -750,6 +767,44 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                         Ok(n) => eprintln!("navigatord: forgot {part}{} ({n} cookie groups)", if prefix { "*" } else { "" }),
                         Err(e) => eprintln!("navigatord: forgetting {part}: {e}"),
                     }
+                }
+            }
+            Request::SignOut { jar, url } => {
+                let reply = |cookies: Option<u32>, why: Option<String>| send(&w, &Event::SignedOut { url: url.clone(), cookies, why });
+                let Some(part) = ctl::clean(&url, ctl::URL_MAX).then(|| navigator_cookies::partition_in(jar_id(jar), &url)).flatten() else {
+                    reply(None, Some("not an address".into()));
+                    continue;
+                };
+                let Some(c) = &cookies else {
+                    reply(None, Some("Arca isn't running here".into()));
+                    continue;
+                };
+                let r = c.lock().unwrap().arca.sign_out(&part);
+                match r {
+                    Ok(n) => {
+                        eprintln!("navigatord: signed out of {part} ({n} session cookies)");
+                        reply(Some(n), None);
+                    }
+                    Err(e) => {
+                        eprintln!("navigatord: signing out of {part}: {e}");
+                        reply(None, Some(e));
+                    }
+                }
+            }
+            Request::Accounts { url } => {
+                let reply = |accounts: Vec<ctl::Account>, why: Option<String>| send(&w, &Event::Accounts { url: url.clone(), accounts, why });
+                let Some(site) = ctl::clean(&url, ctl::URL_MAX).then(|| site_of(&url)).flatten() else {
+                    reply(vec![], Some("not an address".into()));
+                    continue;
+                };
+                let Some(c) = &cookies else {
+                    reply(vec![], Some("Arca isn't running here".into()));
+                    continue;
+                };
+                let r = c.lock().unwrap().arca.accounts(&site);
+                match r {
+                    Ok(v) => reply(accounts_of(v), None),
+                    Err(e) => reply(vec![], Some(e)),
                 }
             }
             Request::Clear { records } => {

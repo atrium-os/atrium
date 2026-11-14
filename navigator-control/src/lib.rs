@@ -75,6 +75,14 @@ pub enum Request {
     /// Forget: with `url`, its site's cookies in the jar ("Forget this
     /// site"); without, an Unrecorded trail's whole jar (the trail closed).
     Forget { jar: Jar, url: Option<String> },
+    /// "Sign out here" (§6.2): end the session cookies of `url`'s site in
+    /// the jar; cookies with an expiry, and the site knowing you, stay.
+    /// Answered by `SignedOut`.
+    SignOut { jar: Jar, url: String },
+    /// The presence menu opened on a page whose site knows you: which
+    /// accounts Arca holds for `url`'s site (names only). Answered by
+    /// `Accounts`.
+    Accounts { url: String },
     /// The UI shows a page it already has live (a page child it kept):
     /// name its origin in the strip. Only a page navigatord opened for
     /// this UI is named; anything else blanks the strip.
@@ -145,6 +153,28 @@ pub enum Event {
     NotSaved { id: u32, why: String },
     /// A hand-off was passed to its handler, or why not.
     Handed { url: String, ok: bool, why: Option<String> },
+    /// `SignOut` done: how many session cookies ended, or why not.
+    SignedOut { url: String, cookies: Option<u32>, why: Option<String> },
+    /// The accounts Arca holds for `url`'s site, at most [`ACCOUNTS_MAX`];
+    /// `why` when Arca couldn't be asked.
+    Accounts { url: String, accounts: Vec<Account>, why: Option<String> },
+}
+
+/// The most accounts an `Accounts` names, and the longest name.
+pub const ACCOUNTS_MAX: usize = 16;
+pub const ACCOUNT_NAME_MAX: usize = 128;
+
+/// An account Arca holds for a site (arcad `W_ACCOUNTS`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub kind: AccountKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountKind {
+    Passkey,
+    Password,
 }
 
 /// A persona's jar (navigator-ui.md §2.4): Personal, or one Unrecorded

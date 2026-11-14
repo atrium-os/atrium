@@ -219,7 +219,10 @@ last() { g "grep 'trace' $S/ui7.log | tail -1"; }
 g "pkill -x navigator-ui; sleep 2; true"
 ui https://atlas.example/wiki/Atrium ui7
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "presence: first page: $(last)"
-press 1110 $((TOP + 20))     # the presence control: let the site remember you
+press 1110 $((TOP + 20))     # the presence control: its menu (§6.2) hangs under it
+sleep "$GAP"
+shot live-7-presence-menu
+press 1100 $((TOP + 34 + 58 + 16))   # "Let this site remember me"
 sleep "$GAP"
 g "grep -q 'opens again: its site knows you now' $S/ui7.log" && ok "letting the site remember you opens the page again" || bad "presence: $(g "grep -v trace $S/ui7.log | tail -4")"
 g "grep -q \"can't remember you: Arca isn't running\" $S/ui7.log" && ok "…and with no Arca here it says so, and the page stays anonymous" || bad "no note: $(g "grep -v trace $S/ui7.log | tail -4")"

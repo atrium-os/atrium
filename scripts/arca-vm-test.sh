@@ -339,6 +339,16 @@ check "another Unrecorded trail shares nothing" - "$(K /v1)"
 check "the trail closed: its jar forgotten" - "$(K /u3)"
 check "Personal kept its cookie through that" sid=vm-cookie "$(K /n3)"
 check "Forget this site (Personal): gone" - "$(K /n4)"
+# Sign out here (§6.2): the session cookie ends, the site still knows you.
+N=$(wc -l < "$SRV/log")
+r=$(nav open 10 $U/s1 p 1  open 11 $U/s2 p 1  signout p $U/s2  open 12 $U/s3 p 1  accounts $U/s3  signout u:c3 $U/s3)
+echo "$r" | sed 's/^/    /'
+check "the site knowing you again: its cookie" sid=vm-cookie "$(K /s2)"
+check "Sign out here: one session cookie ended" "signedout 1" "$(echo "$r" | grep '^signedout' | head -1)"
+check "…the next page goes without it" - "$(K /s3)"
+check "…and the site still knows you" "opened 12 $U/s3 knows=true from=Fetched" "$(echo "$r" | grep '^opened 12 ')"
+check "Arca's accounts for the site, by name (none here)" "accounts 0" "$(echo "$r" | grep '^accounts' | sed 's/ *$//')"
+check "an Unrecorded jar with nothing in it: nothing to end" "signedout 0" "$(echo "$r" | grep '^signedout' | sed -n 2p)"
 # A crash leaves an Unrecorded jar (b2 has a cookie): the next navigatord
 # forgets every Unrecorded jar before it serves.
 g "pkill -x navigatord; sleep 2; true"

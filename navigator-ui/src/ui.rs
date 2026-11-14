@@ -49,6 +49,10 @@ pub mod ph {
     pub const LIGHTNING: char = '\u{e2de}';
     pub const SHIELD_CHECK: char = '\u{e40c}';
     pub const WARNING: char = '\u{e4e0}';
+    pub const SIGN_OUT: char = '\u{e42a}';
+    pub const KEY: char = '\u{e2d6}';
+    pub const PASSWORD: char = '\u{e752}';
+    pub const TRASH_SIMPLE: char = '\u{e4a8}';
 }
 
 /// The app clock for the prompt row's 500 ms rule.
@@ -299,6 +303,13 @@ impl View for ShellView {
         if let (Some(r), Some(p)) = (g.popover, page.clone()) {
             let st = self.state.clone();
             floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p));
+        }
+        if let (Some(r), Some(p)) = (g.presence_menu, &page) {
+            let (st, st2) = (self.state.clone(), self.state.clone());
+            let site = trail::site(&p.url).to_string();
+            let knows = s.store.knows(&site);
+            let accounts = s.accounts.as_ref().filter(|(a, _)| *a == site).map(|(_, a)| a.clone());
+            floating(ctx, r, g.presence, move || with(&st, |s| s.presence_open = false), move |ctx| presence_menu(ctx, r, &site, knows, accounts, &st2));
         }
         if let (Some(r), Some(p)) = (g.reading, &page) {
             let (st, st2) = (self.state.clone(), self.state.clone());
@@ -618,7 +629,7 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let (fill, hover) = if knows { (t.accent_bg(), t.accent_bg()) } else { (t.bg_surface(), t.state_hover()) };
         let edge = if knows { t.accent_mark() } else { t.border_default() };
         rect(ctx, px, 6.0, 112.0, 28.0, edge, 14.0);
-        let id = area(ctx, Rect::new(px + 1.0, 7.0, 110.0, 26.0), 13.0, fill, hover, move || with(&st2, |s| s.toggle_presence()));
+        let id = area(ctx, Rect::new(px + 1.0, 7.0, 110.0, 26.0), 13.0, fill, hover, move || with(&st2, |s| s.toggle_presence_menu()));
         if knows {
             icon(ctx, px + 9.0, 12.0, ph::USER, 16.0, t.accent_strong());
             let ts = sans(type_size::XS, Weight::Semibold, t.accent_strong());
@@ -628,13 +639,14 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             text(ctx, px + 29.0, 20.0, "Anonymous", type_size::XS, Weight::Medium, t.text_secondary());
         }
         ctx.pop();
-        ctx.tooltip(id, if knows { format!("{site} knows you · click to forget this site") } else { format!("{site} doesn't know you · click to let it remember you") });
+        ctx.tooltip(id, if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") });
     }
     let has = page.is_some();
     let st2 = st.clone();
     let aa = s.reading_open;
     icon_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| {
         s.popover = false;
+        s.presence_open = false;
         s.reading_open = !aa;
     }));
     let kept = page.is_some_and(|p| s.store.is_kept(&p.url));
@@ -869,6 +881,66 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     y += 6.0;
     let last = if f.light == Light::Green { "Green doesn't mean this site is who you think: check the name in the strip." } else { "This says what runs, not whether the site is honest." };
     wrapped(ctx, x, y, w, last, t.text_tertiary());
+}
+
+/// The presence menu (§6.2): whether the site knows you, the accounts Arca
+/// holds for it, and what you can do about it.
+fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Option<shell::Accounts>, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
+    let x = r.x() + 16.0;
+    let w = r.w() - 32.0;
+    let mut y = r.y() + 14.0;
+    let head_st = sans(type_size::SM, Weight::Semibold, t.text_primary());
+    icon(ctx, x, y, if knows { ph::USER } else { ph::EYE_SLASH }, 16.0, if knows { t.accent_strong() } else { t.text_secondary() });
+    let head = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
+    text(ctx, x + 22.0, y + 8.0, &fit(&head, &head_st, w - 22.0), type_size::SM, Weight::Semibold, t.text_primary());
+    y += 28.0;
+    // A row of the menu: a glyph and its words, the whole width pressable.
+    let row = |ctx: &mut Ctx, y: f32, g: char, label: &str, c: Color, press: Box<dyn Fn()>| {
+        let t = ctx.theme;
+        area(ctx, Rect::new(r.x() + 6.0, y, r.w() - 12.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || press());
+        icon(ctx, x, y + 8.0, g, 16.0, c);
+        text(ctx, x + 24.0, y + 16.0, label, type_size::SM, Weight::Medium, c);
+        ctx.pop();
+    };
+    if !knows {
+        text(ctx, x, y + 6.0, "Its pages open anonymously, with no cookies.", type_size::XS, Weight::Regular, t.text_secondary());
+        y += 16.0;
+        let s2 = st.clone();
+        row(ctx, y, ph::USER, "Let this site remember me", t.text_primary(), Box::new(move || with(&s2, |s| s.presence_choose(true))));
+        return;
+    }
+    text(ctx, x, y + 6.0, "ACCOUNT IN ARCA", type_size::XXS, Weight::Semibold, t.text_tertiary());
+    y += 16.0;
+    let line_st = sans(type_size::XS, Weight::Regular, t.text_secondary());
+    let mut line = |ctx: &mut Ctx, g: Option<char>, s: &str, c: Color| {
+        let dx = if let Some(g) = g {
+            icon(ctx, x, y + 2.0, g, 14.0, c);
+            20.0
+        } else { 0.0 };
+        text(ctx, x + dx, y + 10.0, &fit(s, &line_st, w - dx), type_size::XS, Weight::Regular, c);
+        y += 20.0;
+    };
+    match accounts {
+        Some(shell::Accounts::Known(v)) if !v.is_empty() => {
+            for a in v.iter().take(4) {
+                let (g, kind) = match a.kind {
+                    navigator_control::AccountKind::Passkey => (ph::KEY, "passkey"),
+                    navigator_control::AccountKind::Password => (ph::PASSWORD, "password"),
+                };
+                line(ctx, Some(g), &format!("{} · {kind}", a.name), t.text_primary());
+            }
+        }
+        Some(shell::Accounts::Known(_)) => line(ctx, None, "Arca holds no account for this site.", t.text_secondary()),
+        Some(shell::Accounts::Unknown(why)) => line(ctx, None, &format!("Arca can't say ({why})."), t.text_tertiary()),
+        Some(shell::Accounts::Asking) | None => line(ctx, None, "Asking Arca…", t.text_tertiary()),
+    }
+    y += 8.0;
+    let (s2, s3) = (st.clone(), st.clone());
+    row(ctx, y, ph::SIGN_OUT, "Sign out here", t.text_primary(), Box::new(move || with(&s2, |s| s.sign_out_here())));
+    y += 34.0;
+    row(ctx, y, ph::TRASH_SIMPLE, "Forget this site", t.danger_fg(), Box::new(move || with(&s3, |s| s.presence_choose(false))));
 }
 
 /// Words broken into lines of at most `w` px, by measurement; returns the

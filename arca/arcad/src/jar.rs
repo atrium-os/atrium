@@ -103,6 +103,15 @@ impl Jars {
         n
     }
 
+    /// "Sign out here": the session cookies (no expiry) of `user`'s jar
+    /// of exactly `partition` go; how many.
+    pub fn sign_out(&mut self, user: &str, partition: &str) -> usize {
+        let Some(jar) = self.jars.get_mut(&(user.to_string(), partition.to_string())) else { return 0 };
+        let n = jar.len();
+        jar.retain(|m| m.attrs.expires.is_some());
+        n - jar.len()
+    }
+
     /// The user locked: every Unrecorded jar of theirs goes.
     pub fn lock(&mut self, user: &str) {
         self.jars.retain(|(u, _), _| u != user);

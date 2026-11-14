@@ -1159,8 +1159,18 @@ Each step runs in the VM on headless frescod before the next.
      limits as stored cookies), so they go when the trail closes, when the user locks, or when
      arcad stops, and a crash leaves nothing behind.
    - Checked against the real Arca in `scripts/arca-vm-test.sh` §8, and the control in
-     `scripts/navigator-live-vm.sh` (no Arca there: it says so). Not yet: the presence menu
-     (account, Sign out here), the site asking (consent buttons, `SiteNeedsIt`), named personas,
+     `scripts/navigator-live-vm.sh` (no Arca there: it says so).
+   - **The presence menu** (§6.2, 2026-11-14). The control opens a pop-up menu. A site that
+     doesn't know you offers *Let this site remember me*. One that does names the accounts Arca
+     holds for it (`Accounts`: navigatord asks arcad's broker-only `W_ACCOUNTS`, which answers
+     names and kinds only, passkeys whose RP ID is the site or under it and web passwords for
+     it, at most 16), then *Sign out here* and *Forget this site*. *Sign out here* sends
+     `SignOut { jar, url }`: navigatord has arcad end the session cookies of that partition
+     (`W_SIGN_OUT`, in the store or an Unrecorded jar in memory) and the page opens again
+     fetched. Cookies with an expiry stay, and so does the site knowing you: *Forget this
+     site* is the way to drop everything. Checked in `arcad/tests/cookies.rs`, against the
+     real Arca in `scripts/arca-vm-test.sh` §8, and the menu in `scripts/navigator-live-vm.sh`.
+     Not yet: the site asking (consent buttons, `SiteNeedsIt`), named personas,
      session cookies ending with the last view, and moving a branch into its own trail with its
      jar.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,

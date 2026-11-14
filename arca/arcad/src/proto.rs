@@ -101,6 +101,21 @@ pub mod broker_op {
     /// a crash leaves none behind). Each jar's groups go with their data
     /// keys. Needs the store unlocked.
     pub const W_FORGET: u16 = 0x71;
+    /// `str partition` → `u32 cookies`. "Sign out here" (navigator-ui.md
+    /// §6.2): the session cookies (no expiry) of exactly that partition
+    /// go; cookies with an expiry stay, and so does the jar's data key.
+    /// Needs the store unlocked.
+    pub const W_SIGN_OUT: u16 = 0x72;
+    /// `str site` → `u32 n | n × (u8 kind | str account)`: the accounts
+    /// Arca holds for a site, for the presence menu (navigator-ui.md §6.2).
+    /// Kind [`ACCOUNT_PASSKEY`]: passkeys whose RP ID is the site or under
+    /// it; [`ACCOUNT_PASSWORD`]: passwords in the web persona for an https
+    /// endpoint at the site or under it. Names only, never a value; at
+    /// most [`ACCOUNTS_MAX`]. Needs the store unlocked.
+    pub const W_ACCOUNTS: u16 = 0x73;
+    pub const ACCOUNT_PASSKEY: u8 = 1;
+    pub const ACCOUNT_PASSWORD: u8 = 2;
+    pub const ACCOUNTS_MAX: usize = 16;
     /// The web couriers' persona (arca-courierd's `WEB_PERSONA`).
     pub const WEB_PERSONA: &str = "web";
     /// What an Unrecorded trail's partitions begin with (navigator-ui.md

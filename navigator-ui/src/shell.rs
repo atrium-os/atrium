@@ -108,6 +108,10 @@ pub struct Shell {
     pub reading_open: bool,
     /// Ctrl-H (§5.5): drawn where the page is, the page's slot withdrawn.
     pub history: Option<HistoryView>,
+    /// The presence menu is open (§6.2), and what Arca said about the
+    /// accounts it holds for the site it was opened on.
+    pub presence_open: bool,
+    pub accounts: Option<(String, Accounts)>,
     /// F6 put the keys on the rail (§9): Up and Down go through the
     /// trails, Enter or Escape leaves it.
     pub rail_focus: bool,
@@ -153,9 +157,40 @@ pub enum Out {
     Find { query: String, step: i8 },
     /// The current version of the page `key`, fetched again (§5.5).
     Reload { key: (u64, PageId) },
+    /// "Sign out here" (§6.2): the session cookies of the page's site in
+    /// its jar end (then the page opens again, `Reload`).
+    SignOut { jar: navigator_control::Jar, url: String },
+    /// Which accounts Arca holds for the page's site (the presence menu).
+    Accounts { url: String },
     /// History cleared (§5.5): the pages that went (their children close)
     /// and the stored versions navigatord takes out.
     Clear { keys: Vec<(u64, PageId)>, records: Vec<String> },
+}
+
+/// The accounts Arca holds for a site, as the presence menu shows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accounts {
+    /// navigatord was asked.
+    Asking,
+    Known(Vec<navigator_control::Account>),
+    /// Arca couldn't be asked, and why.
+    Unknown(String),
+}
+
+/// The presence menu's size (§6.2): a heading, the account lines, and
+/// its one or two actions.
+pub const PRESENCE_W: f32 = 300.0;
+pub fn presence_height(s: &Shell) -> f32 {
+    let knows = s.store.trail().page().is_some_and(|p| s.store.knows(crate::trail::site(&p.url)));
+    if !knows {
+        return 100.0;
+    }
+    let lines = match &s.accounts {
+        Some((_, Accounts::Known(v))) if !v.is_empty() => v.len().min(4),
+        _ => 1,
+    };
+    // Heading 28, label 16, the lines, 8, two rows, the margins.
+    14.0 + 28.0 + 16.0 + 20.0 * lines as f32 + 8.0 + 34.0 + 32.0 + 10.0
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -188,13 +223,16 @@ pub struct Geo {
     /// The Aa pop-up, and the Aa button it hangs from.
     pub reading: Option<Rect>,
     pub aa: Rect,
+    /// The presence control, and its menu while open (§6.2).
+    pub presence: Rect,
+    pub presence_menu: Option<Rect>,
     /// Space on the toolbar for the current page's media glyph.
     pub media: bool,
 }
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None, rail_focus: false, focus_page: false }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -352,7 +390,10 @@ impl Shell {
         let aa = Rect::new(w - 104.0, 6.0, 28.0, 28.0);
         let reading = (self.reading_open && self.store.trail().page().is_some())
             .then(|| Rect::new((aa.x() + aa.w() - READING_W).max(x0 + 8.0), BAR + 4.0, READING_W, READING_H));
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media }
+        let presence = Rect::new(where_.x() + where_.w() + 12.0 + if media { 32.0 } else { 0.0 }, 6.0, 112.0, 28.0);
+        let presence_menu = (self.presence_open && self.store.trail().page().is_some())
+            .then(|| Rect::new((presence.x() + presence.w() - PRESENCE_W).max(x0 + 8.0), BAR + 4.0, PRESENCE_W, presence_height(self)));
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -498,7 +539,7 @@ impl Shell {
         let g = self.geo();
         let Some(r) = g.prompt else { return false };
         let over = |o: Option<Rect>| o.is_some_and(|o| o.x() < r.x() + r.w() && r.x() < o.x() + o.w() && o.y() < r.y() + r.h() && r.y() < o.y() + o.h());
-        over(g.drop) || over(g.popover) || over(g.reading)
+        over(g.drop) || over(g.popover) || over(g.reading) || over(g.presence_menu)
     }
 
     /// Called every frame: a prompt row that moved, or is covered, starts
@@ -597,6 +638,69 @@ impl Shell {
         self.last_note = Some(if on { format!("{site} may remember you in this trail's jar") } else { format!("{site} forgotten in this trail's jar") });
     }
 
+    /// The presence control pressed: its menu opens (§6.2). On a site
+    /// that knows you, navigatord is asked which accounts Arca holds for it.
+    pub fn toggle_presence_menu(&mut self) {
+        if self.presence_open {
+            self.presence_open = false;
+            return;
+        }
+        let Some(p) = self.store.trail().page() else { return };
+        let url = p.url.clone();
+        let site = crate::trail::site(&url).to_string();
+        self.popover = false;
+        self.reading_open = false;
+        self.presence_open = true;
+        self.accounts = None;
+        if self.store.knows(&site) {
+            self.accounts = Some((site, if self.live.is_some() { Accounts::Asking } else { Accounts::Unknown("no Arca here".into()) }));
+            if self.live.is_some() {
+                self.outbox.push(Out::Accounts { url });
+            }
+        }
+    }
+
+    /// The menu's "Let this site remember me", or "Forget this site".
+    pub fn presence_choose(&mut self, remember: bool) {
+        self.presence_open = false;
+        let knows = self.store.trail().page().is_some_and(|p| self.store.knows(crate::trail::site(&p.url)));
+        if knows != remember {
+            self.toggle_presence();
+        }
+    }
+
+    /// The menu's "Sign out here" (§6.2): the session cookies of the
+    /// page's site in this trail's jar end, and the page opens again
+    /// without them. The site still knows you (cookies with an expiry
+    /// stay); "Forget this site" is for all of it.
+    pub fn sign_out_here(&mut self) {
+        self.presence_open = false;
+        let Some(p) = self.store.trail().page() else { return };
+        let url = p.url.clone();
+        let site = crate::trail::site(&url).to_string();
+        if !self.store.knows(&site) {
+            return;
+        }
+        if self.live.is_some() {
+            self.outbox.push(Out::SignOut { jar: self.store.trail().jar(), url });
+            self.reload();
+        }
+        self.last_note = Some(format!("signing out of {site} here"));
+    }
+
+    /// navigatord's answer to `Accounts`, if it is for the open menu.
+    pub fn accounts_answer(&mut self, url: &str, accounts: Vec<navigator_control::Account>, why: Option<String>) {
+        let site = crate::trail::site(url);
+        if let Some((s, a)) = &mut self.accounts {
+            if s == site && *a == Accounts::Asking {
+                *a = match why {
+                    Some(w) => Accounts::Unknown(w),
+                    None => Accounts::Known(accounts),
+                };
+            }
+        }
+    }
+
     pub fn toggle_mute(&mut self, trail: usize) {
         if let Some(t) = self.store.trails.get_mut(trail) {
             t.muted = !t.muted;
@@ -612,6 +716,7 @@ impl Shell {
     pub fn apply(&mut self, a: Action, _now: f64) {
         self.popover = false;
         self.reading_open = false;
+        self.presence_open = false;
         if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail | Action::NextRegion | Action::PrevRegion) {
             self.history = None;
         }
@@ -691,6 +796,7 @@ impl Shell {
     pub fn region_from_page(&mut self, forward: bool) {
         self.popover = false;
         self.reading_open = false;
+        self.presence_open = false;
         self.move_region(Some(Region::Page), forward);
     }
 
@@ -760,9 +866,10 @@ impl Shell {
     /// Escape closes what is on top: a pop-up, then the Where field, then
     /// the history view, then find. Returns whether it closed anything.
     pub fn escape(&mut self) -> bool {
-        if self.popover || self.reading_open {
+        if self.popover || self.reading_open || self.presence_open {
             self.popover = false;
             self.reading_open = false;
+            self.presence_open = false;
         } else if self.rail_focus {
             self.rail_focus = false;
         } else if self.editing.is_some() {
@@ -854,6 +961,7 @@ impl Shell {
         self.end_edit();
         self.popover = false;
         self.reading_open = false;
+        self.presence_open = false;
         self.history = Some(HistoryView { edit: TextEdit::new(""), selected: 0, confirm: None });
     }
 
@@ -972,6 +1080,9 @@ impl Shell {
         if self.reading_open && !inside(g.reading) && !inside(Some(g.aa)) {
             self.reading_open = false;
         }
+        if self.presence_open && !inside(g.presence_menu) && !inside(Some(g.presence)) {
+            self.presence_open = false;
+        }
     }
 }
 
@@ -1056,6 +1167,61 @@ mod tests {
         let (t, _) = s.shown_key().unwrap();
         let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
         assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
+    }
+
+    #[test]
+    fn the_presence_menu_asks_arca_and_signs_out_here() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(false);
+        s.enter("https://atlas.example/wiki/Atrium");
+        let url = "https://atlas.example/wiki/Atrium".to_string();
+        s.outbox.clear();
+        // A site that doesn't know you: the menu offers remembering only,
+        // and Arca isn't asked about accounts.
+        s.toggle_presence_menu();
+        assert!(s.presence_open && s.geo().presence_menu.is_some());
+        assert!(s.outbox.is_empty() && s.accounts.is_none());
+        s.presence_choose(true);
+        assert!(!s.presence_open && s.store.knows("atlas.example"));
+        // Now it does: opening the menu asks which accounts Arca holds.
+        s.toggle_presence_menu();
+        assert_eq!(s.outbox, vec![Out::Accounts { url: url.clone() }]);
+        assert_eq!(s.accounts, Some(("atlas.example".into(), Accounts::Asking)));
+        let a = vec![navigator_control::Account { kind: navigator_control::AccountKind::Passkey, name: "alice".into() }];
+        s.accounts_answer("https://other.example/", a.clone(), None);
+        assert_eq!(s.accounts, Some(("atlas.example".into(), Accounts::Asking)), "an answer for another site is ignored");
+        let h0 = presence_height(&s);
+        s.accounts_answer(&url, a.clone(), None);
+        assert_eq!(s.accounts, Some(("atlas.example".into(), Accounts::Known(a))));
+        assert_eq!(presence_height(&s), h0, "one account line, as the asking line");
+        // A press outside closes it; Escape too.
+        s.press_at(640.0, 600.0);
+        assert!(!s.presence_open);
+        s.toggle_presence_menu();
+        assert!(s.escape() && !s.presence_open);
+        // Sign out here: navigatord ends the session cookies, then the page
+        // opens again fetched; the site still knows you.
+        s.outbox.clear();
+        s.toggle_presence_menu();
+        s.outbox.clear();
+        s.sign_out_here();
+        let key = s.shown_key().unwrap();
+        assert_eq!(s.outbox, vec![Out::SignOut { jar: navigator_control::Jar::Personal, url: url.clone() }, Out::Reload { key }]);
+        assert!(s.store.knows("atlas.example") && !s.presence_open);
+        // Forget this site: forgotten, and navigatord told.
+        s.outbox.clear();
+        s.toggle_presence_menu();
+        s.outbox.clear();
+        s.presence_choose(false);
+        assert_eq!(s.outbox, vec![Out::Forget { jar: navigator_control::Jar::Personal, url }]);
+        assert!(!s.store.knows("atlas.example"));
+        // Without navigatord, there is no Arca to ask.
+        let mut s = shell();
+        s.toggle_presence();
+        s.toggle_presence_menu();
+        assert!(matches!(s.accounts, Some((_, Accounts::Unknown(_)))));
+        assert!(s.outbox.is_empty());
     }
 
     #[test]

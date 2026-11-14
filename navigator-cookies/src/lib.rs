@@ -162,6 +162,16 @@ pub trait Arca {
     fn forget(&mut self, _partition: &str, _prefix: bool) -> Result<u32, String> {
         Err("this Arca cannot forget".into())
     }
+    /// "Sign out here" (arcad `W_SIGN_OUT`): one partition's session
+    /// cookies end. Returns how many.
+    fn sign_out(&mut self, _partition: &str) -> Result<u32, String> {
+        Err("this Arca cannot sign out".into())
+    }
+    /// The accounts Arca holds for `site` (arcad `W_ACCOUNTS`): (kind,
+    /// name), kind `ACCOUNT_PASSKEY` or `ACCOUNT_PASSWORD`.
+    fn accounts(&mut self, _site: &str) -> Result<Vec<(u8, String)>, String> {
+        Err("this Arca cannot list accounts".into())
+    }
 }
 
 /// The couriers: one per (host, port, partition), from Arca's launcher.
@@ -188,6 +198,8 @@ pub fn partition_of(top_url: &str) -> Option<String> {
     let u = url::Url::parse(top_url).ok()?;
     Some(arcad::cookie::site(u.host_str()?))
 }
+
+pub use arcad::proto::broker_op::{ACCOUNT_PASSKEY, ACCOUNT_PASSWORD};
 
 /// An Unrecorded trail's jar prefix (navigator-ui.md §2.4): every partition
 /// of that trail begins with it, so closing the trail forgets them all.
@@ -366,6 +378,48 @@ impl Arca for ArcadSocket {
         if st != arcad::proto::status::OK { return Err(format!("arcad refused to forget (status {st})")) }
         let b: [u8; 4] = body.as_ref().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
         Ok(u32::from_le_bytes(b))
+    }
+
+    fn sign_out(&mut self, partition: &str) -> Result<u32, String> {
+        let mut w = Writer::new();
+        w.str(partition);
+        let body = self.ask(arcad::proto::broker_op::W_SIGN_OUT, &w.buf, "sign out")?;
+        let b: [u8; 4] = body.as_slice().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn accounts(&mut self, site: &str) -> Result<Vec<(u8, String)>, String> {
+        let mut w = Writer::new();
+        w.str(site);
+        let body = self.ask(arcad::proto::broker_op::W_ACCOUNTS, &w.buf, "list accounts")?;
+        let mut r = arca_store::codec::Reader::new(&body);
+        let bad = |_| "arcad: a malformed account list".to_string();
+        let n = r.u32().map_err(bad)? as usize;
+        if n > arcad::proto::broker_op::ACCOUNTS_MAX {
+            return Err("arcad: too many accounts".into());
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let k = r.u8().map_err(bad)?;
+            let a = r.str(arca_store::model::caps::ACCOUNT).map_err(bad)?;
+            out.push((k, a.to_string()));
+        }
+        r.end().map_err(bad)?;
+        Ok(out)
+    }
+}
+
+impl ArcadSocket {
+    /// One request to arcad, its OK body.
+    fn ask(&self, op: u16, body: &[u8], what: &str) -> Result<Vec<u8>, String> {
+        let mut s = UnixStream::connect(&self.path).map_err(|e| format!("arcad: {e}"))?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        arcad::proto::write_request(&mut s, op, body).map_err(|e| format!("arcad: {e}"))?;
+        let (st, b) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
+        if st != arcad::proto::status::OK {
+            return Err(format!("arcad refused to {what} (status {st})"));
+        }
+        Ok(b.as_ref().to_vec())
     }
 }
 

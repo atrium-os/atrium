@@ -5,6 +5,8 @@
 //! Each `open` waits for its answer and prints one line:
 //! `opened <id> <url> knows=<bool> from=<Source>` or `failed <id> <why>`.
 //! `forget` sends `Forget` (no answer) and waits a second.
+//! `signout <p|u:HEX> <url>` prints `signedout <n>` or `notsignedout <why>`;
+//! `accounts <url>` prints `accounts <n> [kind:name …]` or `noaccounts <why>`.
 
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -56,6 +58,33 @@ fn main() {
                 write_frame(&mut s, &Request::Forget { jar: j, url }).unwrap();
                 std::thread::sleep(Duration::from_secs(1));
                 println!("forgot");
+            }
+            "signout" => {
+                write_frame(&mut s, &Request::SignOut { jar: jar(&a[i + 1]), url: a[i + 2].clone() }).unwrap();
+                i += 3;
+                loop {
+                    match read_frame::<Event>(&mut s) {
+                        Ok(Some(Event::SignedOut { cookies: Some(n), .. })) => break println!("signedout {n}"),
+                        Ok(Some(Event::SignedOut { why, .. })) => break println!("notsignedout {}", why.unwrap_or_default()),
+                        Ok(Some(_)) => {}
+                        other => break println!("notsignedout navigatord: {other:?}"),
+                    }
+                }
+            }
+            "accounts" => {
+                write_frame(&mut s, &Request::Accounts { url: a[i + 1].clone() }).unwrap();
+                i += 2;
+                loop {
+                    match read_frame::<Event>(&mut s) {
+                        Ok(Some(Event::Accounts { why: Some(w), .. })) => break println!("noaccounts {w}"),
+                        Ok(Some(Event::Accounts { accounts, .. })) => {
+                            let names: Vec<String> = accounts.iter().map(|a| format!("{:?}:{}", a.kind, a.name)).collect();
+                            break println!("accounts {} {}", accounts.len(), names.join(" "));
+                        }
+                        Ok(Some(_)) => {}
+                        other => break println!("noaccounts navigatord: {other:?}"),
+                    }
+                }
             }
             x => panic!("navctl: {x}?"),
         }

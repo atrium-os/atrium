@@ -430,3 +430,69 @@ fn an_unrecorded_jar_is_never_written_and_goes_when_the_user_locks() {
     assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_ne!(get_t(&mut s, &web("www.example.com", u), "/", Some(t)).0, status::OK);
 }
+
+fn sign_out(s: &mut State, who: &Label, partition: &str) -> (u8, u32) {
+    let r = s.handle(who, arcad::proto::broker_op::W_SIGN_OUT, &body(|w| w.str(partition)));
+    let n = r.body.bytes().try_into().map(u32::from_le_bytes).unwrap_or(0);
+    (r.status, n)
+}
+
+#[test]
+fn signing_out_ends_one_jars_session_cookies_only() {
+    let (_d, mut s) = setup();
+    let u1 = "u-00000000000000a1.example.com";
+    for p in ["example.com", u1] {
+        let c = web("www.example.com", p);
+        let t = ticket(&mut s, "www.example.com", p, 1, "/", 1, "");
+        assert_eq!(get_t(&mut s, &c, "/", Some(t)).0, status::OK);
+        assert_eq!(set_t(&mut s, &c, "sid", "", "/", Some(t)), status::OK);
+        assert_eq!(set_t(&mut s, &c, "pref", "; Max-Age=3600", "/", Some(t)), status::OK);
+    }
+    jar_cookie(&mut s, "news.example", "news.example", "news");
+    // Personal: the session cookie goes, the one with an expiry stays.
+    assert_eq!(sign_out(&mut s, &broker(), "example.com"), (status::OK, 1));
+    assert_eq!(jar_has(&mut s, "www.example.com", "example.com"), "pref=v");
+    // An Unrecorded jar, in memory: the same.
+    assert_eq!(sign_out(&mut s, &broker(), u1), (status::OK, 1));
+    assert_eq!(jar_has(&mut s, "www.example.com", u1), "pref=v");
+    assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
+    // Only the broker, and only a partition.
+    assert_eq!(sign_out(&mut s, &broker(), "").0, status::MALFORMED);
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    assert_ne!(sign_out(&mut s, &app, "news.example").0, status::OK);
+    assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
+}
+
+fn accounts(s: &mut State, who: &Label, site: &str) -> (u8, Vec<(u8, String)>) {
+    let r = s.handle(who, arcad::proto::broker_op::W_ACCOUNTS, &body(|w| w.str(site)));
+    let mut out = vec![];
+    if r.status == status::OK {
+        let mut rd = arca_store::codec::Reader::new(r.body.bytes());
+        for _ in 0..rd.u32().unwrap() {
+            out.push((rd.u8().unwrap(), rd.str(256).unwrap().to_string()));
+        }
+        rd.end().unwrap();
+    }
+    (r.status, out)
+}
+
+#[test]
+fn the_broker_learns_the_accounts_arca_has_for_a_site_by_name_only() {
+    let (_d, mut s) = setup();
+    let sig = Label::Service("sigillumd".into());
+    let r = s.handle(&sig, arcad::proto::sigillum_op::P_CREATE, &body(|w| {
+        w.str("alice"); w.str("login.example.com"); w.bytes(b"h1"); w.str("alice@example.com"); w.str("Alice"); w.u8(1);
+    }));
+    assert_eq!(r.status, status::OK);
+    let r = s.handle(&sig, arcad::proto::sigillum_op::P_CREATE, &body(|w| {
+        w.str("alice"); w.str("notexample.com"); w.bytes(b"h2"); w.str("other"); w.str("O"); w.u8(1);
+    }));
+    assert_eq!(r.status, status::OK);
+    jar_cookie(&mut s, "www.example.com", "example.com", "sid");
+    let pk = arcad::proto::broker_op::ACCOUNT_PASSKEY;
+    assert_eq!(accounts(&mut s, &broker(), "example.com"), (status::OK, vec![(pk, "alice@example.com".into())]));
+    assert_eq!(accounts(&mut s, &broker(), "news.example"), (status::OK, vec![]));
+    assert_eq!(accounts(&mut s, &broker(), "").0, status::MALFORMED);
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    assert_ne!(accounts(&mut s, &app, "example.com").0, status::OK);
+}
