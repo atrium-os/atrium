@@ -65,7 +65,9 @@ fn app_identity(owner: &str) -> (char, &'static str) {
 }
 
 struct BarView {
-    w: f32,
+    /// The bar's width in points: the window's, which a live scale change
+    /// (or a new mode) changes, so the main loop keeps it current.
+    w: Rc<std::cell::Cell<f32>>,
     chips: Mutable<Vec<ChipData>>,
     workspace: Mutable<(String, String)>,
     time: Mutable<String>,
@@ -292,7 +294,7 @@ impl View for BarView {
         // hairline is a separate absolute rect below the fill.
         let root = ctx.push(Node::stack_filled(
             Axis::Horizontal,
-            Rect::new(0.0, 0.0, self.w, shell::BAR_H - 1.0),
+            Rect::new(0.0, 0.0, self.w.get(), shell::BAR_H - 1.0),
             16.0,
             t.bg_surface(),
             0.0,
@@ -640,7 +642,7 @@ impl View for BarView {
 
         // Bottom hairline.
         ctx.add(Node::Rect {
-            rect: Rect::new(0.0, shell::BAR_H - 1.0, self.w, 1.0),
+            rect: Rect::new(0.0, shell::BAR_H - 1.0, self.w.get(), 1.0),
             fill: t.border_default(),
             radius: 0.0,
         });
@@ -954,7 +956,7 @@ fn main() -> std::io::Result<()> {
     desc.hints = hints;
     let mut window = Window::open(&desc)?;
     // Chrome claims the top strip only.
-    let w = window.width;
+    let w = Rc::new(std::cell::Cell::new(window.width));
 
     let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (chips0, ws0) = poll_status();
@@ -999,7 +1001,7 @@ fn main() -> std::io::Result<()> {
     let view = BarView {
         now: now.clone(),
         want_media: want_media.clone(),
-        w,
+        w: w.clone(),
         chips: chips.clone(),
         workspace: workspace.clone(),
         time: time.clone(),
@@ -1029,7 +1031,17 @@ fn main() -> std::io::Result<()> {
     // Session chrome: stays up. Step with a 1s timeout — events repaint
     // immediately; the timeout refreshes clock + surface status.
     loop {
-        match window.step(&mut app, Some(Duration::from_secs(1)))? {
+        let stepped = window.step(&mut app, Some(Duration::from_secs(1)))?;
+        // A new width in points (the monitor's scale changed live, or its
+        // mode): lay the bar out across it now, not one frame late. Without
+        // this the bar kept its first width, and at 1.5 on a 1920 px screen
+        // its right half (status icons, clock) fell outside the window.
+        if window.width != w.get() {
+            w.set(window.width);
+            app.invalidate();
+            window.paint(&mut app)?;
+        }
+        match stepped {
             StepResult::Closed => return Ok(()),
             // An app's own panel opened or went (frescod's word): its icon
             // is lit while it is open.

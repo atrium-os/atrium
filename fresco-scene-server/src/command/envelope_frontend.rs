@@ -1854,11 +1854,19 @@ impl EnvelopeFrontend {
         let mut comp = self.compositor.lock().unwrap();
 
         // 1. geometry — apply each declared rect to the surface it names.
+        //    A new size is told to the window's client (EV_WINDOW_RESIZED,
+        //    in its points): the WM's sizes are the ones it lays out in.
+        //    Set silently, a client kept its old size: after a live scale
+        //    change the bar kept its old height in points and clamped its
+        //    panels' anchors to it, and an app laid out past a window the
+        //    WM had made smaller.
         for slot in &layout.slots {
-            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)).filter(|w| !w.hidden && w.slot.is_none() && w.popup.is_none()) {
-                w.pos  = (slot.rect.x as f32, slot.rect.y as f32);
-                w.size = (slot.rect.w as f32, slot.rect.h as f32);
-            }
+            let id = slot.surface_id as u16;
+            let Some(w) = comp.windows.get_mut(&id).filter(|w| !w.hidden && w.slot.is_none() && w.popup.is_none()) else {
+                continue;
+            };
+            w.pos = (slot.rect.x as f32, slot.rect.y as f32);
+            comp.resize_window(id, slot.rect.w.max(0) as u32, slot.rect.h.max(0) as u32);
         }
 
         // 2. z-order — screen at the bottom, then declared surfaces
@@ -2604,6 +2612,37 @@ mod tests {
         assert_eq!(comp.focus, Some(b as u16));
         assert!(comp.windows.get(&(b as u16)).unwrap().focus);
         assert!(!comp.windows.get(&(a as u16)).unwrap().focus);
+    }
+
+    /// The WM's new size for a window reaches its client (EV_WINDOW_RESIZED);
+    /// a layout that keeps the size says nothing. Before, the size was set
+    /// silently: after a live scale change the bar went on clamping its
+    /// panels' anchors to its old height.
+    #[test]
+    fn wm_declare_layout_tells_a_client_its_new_size() {
+        use fresco_protocol::{WmSlot, WmRect};
+        let mut f = fixture();
+        let a = make_window(&mut f, 1, 100, 100);
+        f.grant_window_management(9);
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.compositor_arc().lock().unwrap().set_event_sink(tx);
+        let layout = |h| WmDeclareLayoutPayload {
+            slots: vec![WmSlot { surface_id: a, rect: WmRect { x: 0, y: 0, w: 1920, h }, layer: 1 }],
+            focus: 0,
+            focus_cause: 0,
+        };
+        let resized = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| {
+            rx.try_iter()
+                .filter_map(|e| match e {
+                    crate::window::DisplayEvent::WindowResized { window_id, width, height } => Some((window_id, width, height)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout(57)).unwrap()), 9).unwrap();
+        assert_eq!(resized(&rx), vec![(a, 1920, 57)]);
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout(57)).unwrap()), 9).unwrap();
+        assert_eq!(resized(&rx), vec![], "the same size again is not news");
     }
 
     #[test]
