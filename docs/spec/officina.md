@@ -613,6 +613,56 @@ and grid; drag sources (Pergola accepts drops but does not start drags yet).
   width need crisp 1-device-pixel lines at fractional scales (resolution-independence.md §5).
 - Images on `Canvas` (Canvas has no image item yet).
 
+### 10.5 A huge document must not take down compositing (asked by Shankar, 2026-11-14)
+
+*"A big document: could it overwhelm the scene graph for Fresco? If it does, it brings down
+all the compositing of the entire screen."* Three layers stop it, two of which exist today;
+the third is work for the Fresco owners.
+
+**1. Officina never sends a big scene.** Only resident pages, slides or grid tiles (about
+three screens' worth, §7.4, §8.5, §9.3) are scene groups; everything else is evicted. The
+scene's size follows the window, not the document: `pergola-document` keeps about 800 nodes
+resident for a 67,000 px document wherever it is scrolled (pergola.md §10.2), and a full
+1440p sheet is about 1,500 cells. A 5,000-page document and a 5-page one send the same
+amount. This is a design rule with a gate: §15 adds "resident nodes and scene bytes per
+window stay under a fixed ceiling at any document size".
+
+**2. frescod doesn't parse or raster an app's scene (built).** In split mode, the default
+(fresco-f4-split.md F4b, F4g), every client connection gets its own jailed `fresco-renderer`
+(`_fresco-render`, rctl 512 MiB, 100 % CPU). The renderer parses that app's scene and, with
+the compute renderer (the default), rasters it; frescod receives only finished pixels for
+the window, checks the header and copies them once. So:
+
+- a scene too big or too slow costs only that app's renderer: its frame is late, and frescod
+  keeps composing the window's last good frame (the broker never blocks on a renderer,
+  F3, fuzzed);
+- a renderer that passes its memory cap is killed with its jail; that app's window goes, the
+  rest of the screen doesn't notice;
+- a frame past `fresco_compute::MAX_OPS` (65,536 ops after culling) has its excess nodes
+  dropped whole and reported to the app (`fill_drop::OP_BUDGET`), never drawn by frescod at
+  more cost.
+
+frescod's per-window compose cost is proportional to the window's pixels, not to its scene.
+
+**3. Gaps to close (Fresco owners; the cost side of scene-graph hardening H6 and H8).**
+
+- **Refuse, don't kill.** Today an app that grows its scene without bound ends when its
+  renderer hits 512 MiB, which looks to the user like a crash. Wanted: a per-client budget
+  in the renderer (nodes, scene bytes, texture and glyph-atlas bytes) that refuses the
+  message over it and tells the app, as `OP_BUDGET` does for ops, so the app can evict.
+- **GPU renderer time.** With the GPU renderer (F4e), each window's raster runs in its own
+  VM but on the GPU's shared queues, before compose. A window whose frame takes very long
+  to raster (within `MAX_OPS`, but thousands of large overlapping translucent fills) can
+  delay compose for everyone. Wanted: compose never waits on a window's raster past its
+  deadline (use the last finished surface), and a per-window raster-time budget measured on
+  the R9700, with H6's cost estimate refusing frames far over it.
+- **No unsplit fallback in production.** `FRESCOD_SPLIT=0` and the Vulkan renderer put every
+  client's scene back in one process. They are development modes; the gate should check a
+  shipped configuration refuses them.
+- **A test.** A hostile client that sends a million nodes, and one that sends 65,536
+  overlapping full-window translucent fills every frame, while a second app animates: the
+  second app's frames must stay on time (the ScrollView gates), on compute and GPU renderers.
+
 ## 11. Secrets, external data and signatures
 
 ### 11.1 Password-protected documents
@@ -695,6 +745,7 @@ Measured on the dev VM for comparison between builds, and on real hardware for n
 | PDF export of 1,500 pages with images | under 60 s on 8 cores, memory flat during export |
 | open a 1,000-slide, 2 GB deck with 1,500 photos | first slide under 1 s; memory under 500 MB |
 | presenting: next slide after the click | on screen within one frame; transitions with no missed frame at 60 Hz |
+| scene size per window | resident nodes and scene bytes under a fixed ceiling (set in O1, about 5,000 nodes) at any document size; checked on 10-, 1,500- and 5,000-page documents |
 | formula results vs Excel | 100 % of a differential corpus of real workbooks, with reasons for each listed exception |
 | round-trip `.docx` / `.xlsx` / `.odt` / `.ods` | the file reopens in Word, Excel and LibreOffice without repair prompts; visual diff of rendered pages within a set threshold |
 | converters | fuzzed (cargo-fuzz, a corpus of real and malformed files) with no panics outside the jail's handled exit, no memory growth past caps |
