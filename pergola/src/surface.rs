@@ -444,6 +444,13 @@ impl FrescoSurface {
     fn place_rect(&mut self, id: u32, group: Option<NodeId>, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
         self.edges.reset_if(self.scale);
         self.edges.drop_node(id);
+        // A dot (an icon's round join, a mark) is no border: snapped on its
+        // own, holding nothing, or it and its neighbours pull each other off.
+        if rect.w() <= NEAR && rect.h() <= NEAR {
+            let (x, w) = snap_span(rect.x(), rect.w(), self.scale);
+            let (y, h) = snap_span(rect.y(), rect.h(), self.scale);
+            return (x, y, w, h);
+        }
         let g = group.map_or(ROOT, |g| g.0);
         let (x, w) = self.edges.span(g, 0, rect.x(), rect.w());
         let (y, h) = self.edges.span(g, 1, rect.y(), rect.h());
@@ -568,19 +575,14 @@ impl Surface for FrescoSurface {
                 let (mut cx, mut cy) = ((p0.0 + p1.0) * 0.5 * k, (p0.1 + p1.1) * 0.5 * k);
                 // A horizontal or vertical rule is a whole number of device
                 // pixels wide, its edges on pixel boundaries (§5).
-                let width = if (dx == 0.0) != (dy == 0.0) {
-                    // As the rect it covers, so it lines up with the
-                    // edges near it.
-                    let (w, c) = (*width, ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5));
-                    if dy == 0.0 {
-                        let (_, y, _, h) = self.place_rect(id.0, group, crate::geom::Rect::new(p0.0.min(p1.0), c.1 - w / 2.0, dx.abs(), w));
-                        cy = y + h / 2.0;
-                        h
-                    } else {
-                        let (x, _, w, _) = self.place_rect(id.0, group, crate::geom::Rect::new(c.0 - w / 2.0, p0.1.min(p1.1), w, dy.abs()));
-                        cx = x + w / 2.0;
-                        w
-                    }
+                // Not placed from the edges near it: every path is a glyph's
+                // stroke (an icon, a check mark, a chevron), whose strokes
+                // meet end to end and would pull each other off their path.
+                let width = if dx == 0.0 || dy == 0.0 {
+                    let w = (*width * k).round().max(1.0);
+                    let snap = |c: f32| (c - w / 2.0).round() + w / 2.0;
+                    if dy == 0.0 { cy = snap(cy) } else { cx = snap(cx) }
+                    w
                 } else {
                     *width * k
                 };

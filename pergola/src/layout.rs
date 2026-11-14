@@ -262,7 +262,8 @@ fn natural_min(taffy: &mut TaffyTree<MeasureCtx>, t_root: taffy::NodeId, width: 
     st.size.width = length(width.max(w));
     taffy.set_style(t_root, st).ok()?;
     compute(taffy, t_root, Size { width: AvailableSpace::Definite(width.max(w)), height: AvailableSpace::MinContent }).ok()?;
-    let h = taffy.layout(t_root).ok()?.size.height;
+    // A scroll view's own height is its content's; it can be shorter.
+    let h = if orig.overflow.y == taffy::Overflow::Scroll { 0.0 } else { taffy.layout(t_root).ok()?.size.height };
     taffy.set_style(t_root, orig).ok()?;
     Some(crate::geom::Size::new(w.ceil(), h.ceil()))
 }
