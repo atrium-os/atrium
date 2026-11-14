@@ -297,6 +297,15 @@ impl<'a> Backend<'a> {
         matches!(self, Backend::Gpu(g) if g.rasters_pending())
     }
 
+    /// GPU renderer: submit the next slice of window rasters whose running
+    /// slice is done (§F4j). Call it every pass of the loop.
+    pub fn pump(&mut self) -> Result<()> {
+        match self {
+            Backend::Gpu(g) => g.pump(),
+            _ => Ok(()),
+        }
+    }
+
     /// GPU renderer: a window's raster finished and is not on screen yet.
     pub fn raster_landed(&self) -> bool {
         matches!(self, Backend::Gpu(g) if g.raster_landed())
@@ -677,13 +686,29 @@ pub struct GpuCompute<'a> {
     /// one engine, so a long raster holds it): the frame goes again on the
     /// next pass of the loop instead of frescod waiting for the GPU.
     retry: bool,
+    /// Pixel-ops one raster slice may take (`cost::split`), learnt from
+    /// how long full slices take, to keep each near `slice_us`.
+    slice_budget: u64,
+    slice_us: u64,
 }
 
 /// A window's raster on the GPU, not finished yet: compose keeps showing
 /// the window's last finished surface meanwhile (fresco-f4-split.md §F4j).
 struct Inflight {
-    /// `sync` reaches this when it is done.
+    /// `sync` reaches this when the slice submitted last is done.
     seq: u64,
+    /// The frame, its buffers' addresses in the window's VM, and the
+    /// slices of its raster not submitted yet (`cost::split`): one slice
+    /// goes at a time, so the window never holds the GPU for longer than
+    /// one slice (§F4j). The drawing lands once the last is done.
+    frame: Arc<fresco_compute::Frame>,
+    va: [u64; fresco_compute::binding::COUNT],
+    rest: std::collections::VecDeque<fresco_compute::cost::Slice>,
+    /// The slice running: its estimate, when it went, and whether it was
+    /// cut to the budget (only those teach the budget).
+    slice_cost: u64,
+    slice_at: std::time::Instant,
+    slice_full: bool,
     /// The tile signatures and scroll viewports of the drawing it makes.
     sig: Vec<u64>,
     scrolls: Vec<(crate::pack::Scroll, u64)>,
@@ -692,6 +717,13 @@ struct Inflight {
     started: std::time::Instant,
     /// Logged as slow already.
     slow: bool,
+}
+
+impl Inflight {
+    /// Its last slice is done: the drawing can land.
+    fn done(&self, sync: &Syncobj<'_>) -> bool {
+        self.rest.is_empty() && sync.query().is_ok_and(|d| d >= self.seq)
+    }
 }
 
 /// What a scanout buffer was last composed from: the windows, their
@@ -893,6 +925,8 @@ impl<'a> GpuCompute<'a> {
             raster_limit: std::env::var("FRESCOD_RASTER_LIMIT").ok().and_then(|v| v.parse().ok())
                 .unwrap_or(fresco_compute::cost::FAR_OVER),
             retry: false,
+            slice_budget: SLICE_START,
+            slice_us: std::env::var("FRESCOD_RASTER_SLICE_US").ok().and_then(|v| v.parse().ok()).unwrap_or(SLICE_US),
         })
     }
 
@@ -904,7 +938,41 @@ impl<'a> GpuCompute<'a> {
     /// Whether a window's raster finished since it was last looked at (a
     /// frame is due to show it).
     pub fn raster_landed(&self) -> bool {
-        self.retry || self.wins.values().any(|v| v.inflight.as_ref().is_some_and(|f| v.sync.query().is_ok_and(|d| d >= f.seq)))
+        self.retry || self.wins.values().any(|v| v.inflight.as_ref().is_some_and(|f| f.done(&v.sync)))
+    }
+
+    /// Submit the next slice of every window raster whose running slice is
+    /// done (§F4j), with no deadline: frescod's compose and other windows'
+    /// first slices, which carry the frame's, go ahead of them. Cheap when
+    /// nothing is due; frescod's loop calls it each pass.
+    pub fn pump(&mut self) -> Result<()> {
+        for (id, v) in self.wins.iter_mut() {
+            let Some(fl) = v.inflight.as_mut() else { continue };
+            if fl.rest.is_empty() || v.sync.query()? < fl.seq {
+                continue;
+            }
+            learn(&mut self.slice_budget, self.slice_us, fl);
+            let next = fl.rest.pop_front().unwrap();
+            let mut ib = self.arch.stream();
+            ib.frame_part(v.code.gpu_va(), &fl.va, &fl.frame, next.bin, &next.tiles)
+                .map_err(|e| format!("{} record: {e}", self.arch.name()))?;
+            ib.end(v.ring.gpu_va() + FENCE_OFFSET);
+            if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq + 1), 0) {
+                if !is_busy(&*e) {
+                    return Err(e);
+                }
+                log::debug!("gpu: window {id} raster slice: GPU busy, later");
+                fl.rest.push_front(next);
+                self.retry = true;
+                continue;
+            }
+            v.seq += 1;
+            fl.seq = v.seq;
+            fl.slice_full = next.cost * 2 >= self.slice_budget;
+            fl.slice_cost = next.cost;
+            fl.slice_at = std::time::Instant::now();
+        }
+        Ok(())
     }
 
     /// Apply the frame's uploads, give each window a VM and a surface of its
@@ -966,6 +1034,7 @@ impl<'a> GpuCompute<'a> {
         }
         let name = self.arch.name();
         self.retry = false;
+        self.pump()?;
 
         // FRESCOD_GPU_ISOLATION_PROBE=1 (a test): every window after the
         // first rasters to the address the first window's surface has in
@@ -984,7 +1053,7 @@ impl<'a> GpuCompute<'a> {
             let now = p.scrolls.remove(id).unwrap_or_default();
             // A raster that finished: its surface is the front now.
             if let Some(fl) = v.inflight.as_mut() {
-                if v.sync.query()? < fl.seq {
+                if !fl.done(&v.sync) {
                     // Still running: compose shows the last finished
                     // drawing; this frame's changes wait for the next.
                     let took = fl.started.elapsed();
@@ -994,6 +1063,7 @@ impl<'a> GpuCompute<'a> {
                     }
                     continue;
                 }
+                learn(&mut self.slice_budget, self.slice_us, fl);
                 land(*id, v, &mut self.version, &mut self.changes);
             }
             let sig = damage::tile_signatures(f);
@@ -1089,8 +1159,17 @@ impl<'a> GpuCompute<'a> {
                 }
                 ib.barrier();
             }
-            if !rects.is_empty() {
-                ib.frame(v.code.gpu_va(), &va, f, &rects).map_err(|e| format!("{name} record: {e}"))?;
+            // The raster in slices of about `slice_budget` (a window's
+            // whole frame when it is cheap): the first goes now, after the
+            // copy and the moves; the rest one at a time (`pump`).
+            let mut rest: std::collections::VecDeque<_> = if rects.is_empty() {
+                Default::default()
+            } else {
+                fresco_compute::cost::split(f, &rects, self.slice_budget).into()
+            };
+            let first = rest.pop_front();
+            if let Some(sl) = &first {
+                ib.frame_part(v.code.gpu_va(), &va, f, sl.bin, &sl.tiles).map_err(|e| format!("{name} record: {e}"))?;
             }
             ib.end(v.ring.gpu_va() + FENCE_OFFSET);
             v.seq += 1;
@@ -1105,7 +1184,15 @@ impl<'a> GpuCompute<'a> {
                 self.retry = true;
                 continue;
             }
-            v.inflight = Some(Inflight { seq: v.seq, sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false });
+            if !rest.is_empty() {
+                log::debug!("gpu: window {id}: raster in {} slices of ~{} pixel-ops", rest.len() + 1, self.slice_budget);
+            }
+            let slice_cost = first.as_ref().map_or(0, |s| s.cost);
+            v.inflight = Some(Inflight {
+                seq: v.seq, frame: f.clone(), va, rest,
+                slice_cost, slice_at: std::time::Instant::now(), slice_full: slice_cost * 2 >= self.slice_budget,
+                sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false,
+            });
             if probe.is_some() && n > 0 {
                 let r = v.sync.wait(v.seq, flip_wait_ms());
                 eprintln!("frescod: isolation probe: window {id} raster to {:#x} (window {} in frescod's VM): {r:?}",
@@ -1121,7 +1208,7 @@ impl<'a> GpuCompute<'a> {
             let mut all = true;
             for v in self.wins.values() {
                 if let Some(fl) = &v.inflight {
-                    all &= v.sync.query()? >= fl.seq;
+                    all &= fl.done(&v.sync);
                 }
             }
             if all || t0.elapsed() >= quick {
@@ -1130,7 +1217,8 @@ impl<'a> GpuCompute<'a> {
             std::thread::yield_now();
         }
         for (id, v) in self.wins.iter_mut() {
-            if v.inflight.as_ref().is_some_and(|fl| v.sync.query().is_ok_and(|d| d >= fl.seq)) {
+            if let Some(fl) = v.inflight.as_ref().filter(|fl| fl.done(&v.sync)) {
+                learn(&mut self.slice_budget, self.slice_us, fl);
                 land(*id, v, &mut self.version, &mut self.changes);
             }
         }
@@ -1242,6 +1330,30 @@ fn land(id: u32, v: &mut WinVm<'_>, version: &mut HashMap<u32, u64>, changes: &m
 /// A layer in the same place on screen, whichever surface it shows.
 fn same_place(a: &Layer, b: &Layer) -> bool {
     a.rect == b.rect && a.origin == b.origin && a.surface[1..] == b.surface[1..] && a.opacity == b.opacity
+}
+
+/// What a raster slice aims to take on the GPU, µs (`FRESCOD_RASTER_SLICE_US`):
+/// another window's frame or compose waits behind at most about this.
+const SLICE_US: u64 = 4000;
+/// The slice budget to start from (pixel-ops), and its bounds. It starts
+/// low: a slow GPU (gpusim) is learnt from the first full slice, a fast one
+/// grows it within a few frames.
+const SLICE_START: u64 = 1 << 20;
+const SLICE_MIN: u64 = 1 << 12;
+
+/// Learn the slice budget from a slice of `fl` that finished: one cut to
+/// the budget took `elapsed`, so the GPU does about cost / elapsed
+/// pixel-ops a µs here. Slower is believed at once; faster halfway.
+/// `elapsed` is seen late (frescod polls), so it errs short of the GPU's
+/// speed: slices come out smaller, never larger, than `slice_us`.
+fn learn(budget: &mut u64, slice_us: u64, fl: &Inflight) {
+    if !fl.slice_full || fl.slice_cost == 0 {
+        return;
+    }
+    let us = fl.slice_at.elapsed().as_micros().max(1) as u64;
+    let want = (fl.slice_cost as u128 * slice_us as u128 / us as u128).min(u64::MAX as u128) as u64;
+    let next = if want < *budget { want } else { (*budget + want) / 2 };
+    *budget = next.clamp(SLICE_MIN, fresco_compute::cost::FAR_OVER);
 }
 
 /// A window raster running longer than this is logged (once per raster).

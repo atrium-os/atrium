@@ -608,6 +608,7 @@ fn main() -> std::io::Result<()> {
         let video_due = video_at.is_some_and(|t| t <= now_ns);
         /* GPU renderer: a window's raster finished since the last frame
          * (compose showed its previous drawing meanwhile). */
+        renderer.pump().map_err(io_other)?;
         let raster_due = renderer.raster_landed();
         if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due && !raster_due {
             /* Heads that missed the newest frame get it once they land. */

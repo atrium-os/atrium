@@ -48,6 +48,20 @@ pub trait Stream {
     /// address by [`binding`] number. The frame's mask must be zero.
     fn frame(&mut self, code: u64, buffers: &[u64; binding::COUNT], f: &Frame, rects: &[[u32; 4]]) -> Result<(), Error>;
 
+    /// One part of [`Stream::frame`], so a frame's raster can be split over
+    /// several submits ([`crate::cost::split`]): bin the op workgroups
+    /// `bin` (`(first, count)`), then raster the tile rectangles `tiles`.
+    /// The mask must be zero before the first bin part, and every bin part
+    /// must have run before any raster part reads the mask.
+    fn frame_part(
+        &mut self,
+        code: u64,
+        buffers: &[u64; binding::COUNT],
+        f: &Frame,
+        bin: Option<(u32, u32)>,
+        tiles: &[[u32; 4]],
+    ) -> Result<(), Error>;
+
     /// Compose the window surfaces over the screen rects `rects` in pixels
     /// (`[x0, y0, x1, y1)`), or the whole target if `rects` is empty.
     /// `buffers` is by [`compose::binding`] number.

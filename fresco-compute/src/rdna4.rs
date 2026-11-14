@@ -67,6 +67,35 @@ impl Rdna4 {
     /// (`[tx0, ty0, tx1, ty1)`, see [`crate::damage::rects`]); the rest of
     /// the target keeps what it held. Each rectangle is one raster dispatch
     /// over its workgroups (COMPUTE_START), so the kernel is unchanged.
+    /// Part of [`Rdna4::record_tiles`]: bin only the op workgroups `bin`
+    /// (`(first, count)`; the kernel takes its op from the global id, so
+    /// a part is the same dispatch started at `first`), then raster
+    /// `rects`. See [`crate::cost::split`].
+    pub fn record_part(&self, ib: &mut Blob, a: &Addrs, f: &Frame, bin: Option<(u32, u32)>, rects: &[[u32; 4]]) -> Result<(), Error> {
+        let bind: Vec<((u32, u32), u64)> =
+            a.buffers.iter().enumerate().map(|(b, &va)| ((0, b as u32), va)).collect();
+        if let Some((first, count)) = bin.filter(|b| b.1 > 0) {
+            ib.acquire_all();
+            self.bin.record_at(ib, a.code[0], &bind, None, [first, 0, 0], [count, 1, 1])?;
+            ib.cs_partial_flush();
+        }
+        if rects.is_empty() {
+            return Ok(());
+        }
+        ib.acquire_all();
+        let per = TILE / RASTER_LOCAL;
+        let [gx, gy, _] = f.raster_groups();
+        for r in rects {
+            let (x0, y0) = (r[0] * per, r[1] * per);
+            let (x1, y1) = ((r[2] * per).min(gx), (r[3] * per).min(gy));
+            if x1 > x0 && y1 > y0 {
+                self.raster.record_at(ib, a.code[1], &bind, None, [x0, y0, 0], [x1 - x0, y1 - y0, 1])?;
+            }
+        }
+        ib.cs_partial_flush();
+        Ok(())
+    }
+
     pub fn record_tiles(&self, ib: &mut Blob, a: &Addrs, f: &Frame, rects: &[[u32; 4]]) -> Result<(), Error> {
         if rects.is_empty() {
             return Ok(());
@@ -253,6 +282,19 @@ impl crate::gpu::Stream for Rdna4Stream<'_> {
         let o = self.arch.offsets;
         let a = Addrs { code: [code + o[0], code + o[1]], buffers: *buffers };
         Ok(self.arch.k.record_tiles(&mut self.ib, &a, f, rects)?)
+    }
+
+    fn frame_part(
+        &mut self,
+        code: u64,
+        buffers: &[u64; binding::COUNT],
+        f: &Frame,
+        bin: Option<(u32, u32)>,
+        tiles: &[[u32; 4]],
+    ) -> Result<(), crate::gpu::Error> {
+        let o = self.arch.offsets;
+        let a = Addrs { code: [code + o[0], code + o[1]], buffers: *buffers };
+        Ok(self.arch.k.record_part(&mut self.ib, &a, f, bin, tiles)?)
     }
 
     fn compose(&mut self, code: u64, buffers: &[u64; crate::compose::binding::COUNT], c: &crate::compose::Compose, rects: &[[u32; 4]]) -> Result<(), crate::gpu::Error> {

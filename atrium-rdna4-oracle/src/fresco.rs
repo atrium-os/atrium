@@ -226,6 +226,22 @@ pub fn hostile(name: &str, f: &Frame) -> Option<Case> {
 }
 
 fn frame_case(name: &str, f: &Frame, init: Vec<Vec<u8>>, rects: &[[u32; 4]], guard: bool) -> Option<Case> {
+    frame_case_sliced(name, f, init, rects, guard, None)
+}
+
+/// [`frame`]'s scene rastered as frescod splits a costly frame
+/// (`fresco_compute::cost::split`, fresco-f4-split.md §F4j): bin parts by
+/// op workgroups, then raster parts by tile rows and column pieces, each
+/// part as it would be its own submit. Must equal the whole frame.
+pub fn sliced() -> Option<Case> {
+    let f = Frame::pack(&scene(), W, H, PITCH);
+    let (hx, hy) = (f.header.tiles_x, f.header.tiles_y);
+    let whole = [[0, 0, hx, hy]];
+    let budget = (fresco_compute::cost::estimate(&f, &whole) / 12).max(1);
+    frame_case_sliced("fresco_sliced", &f, f.buffers(), &whole, false, Some(budget))
+}
+
+fn frame_case_sliced(name: &str, f: &Frame, init: Vec<Vec<u8>>, rects: &[[u32; 4]], guard: bool, slice: Option<u64>) -> Option<Case> {
     use fresco_compute::rdna4::{Addrs, Rdna4};
     let k = Rdna4::new().ok()?;
     let (raster_off, code_end) = k.code_layout();
@@ -244,7 +260,14 @@ fn frame_case(name: &str, f: &Frame, init: Vec<Vec<u8>>, rects: &[[u32; 4]], gua
     let va: [u64; binding::COUNT] = std::array::from_fn(|b| base[b] + lead[b]);
     let a = Addrs { code: [CODE_VA, CODE_VA + raster_off], buffers: va };
     let mut ib = Blob::compute();
-    k.record_tiles(&mut ib, &a, &f, &rects).ok()?;
+    match slice {
+        None => k.record_tiles(&mut ib, &a, f, rects).ok()?,
+        Some(budget) => {
+            for p in fresco_compute::cost::split(f, rects, budget) {
+                k.record_part(&mut ib, &a, f, p.bin, &p.tiles).ok()?;
+            }
+        }
+    }
     ib.pad(8);
     let [bin, raster] = k.code();
     let mut code = bin;
