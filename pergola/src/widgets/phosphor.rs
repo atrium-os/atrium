@@ -4,6 +4,8 @@
 //! at `fonts/phosphor/`). Add codepoints as shell surfaces need them.
 
 pub const CODE: char = '\u{e1bc}';
+/// More (a toolbar's overflow).
+pub const DOTS_THREE: char = '\u{e1fe}';
 pub const TERMINAL_WINDOW: char = '\u{eae8}';
 pub const FILES: char = '\u{e710}';
 pub const COMPASS: char = '\u{e1c8}';

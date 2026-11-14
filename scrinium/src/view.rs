@@ -17,7 +17,7 @@ use pergola::node::Node;
 use pergola::text_edit::TextEdit;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{CredentialField, CredentialState, Glyph, ScrollState, TextField, VirtualList};
+use pergola::widgets::{CredentialField, CredentialState, Glyph, ScrollState, TextField, ToolItem, Toolbar, VirtualList};
 use pergola::{Color, Event, Key, KeyEventKind, Mutable, NodeId, TextStyle};
 
 use crate::browser::{Browser, Edit, Mode, Mods, Outcome};
@@ -67,13 +67,15 @@ pub struct ScriniumView {
     pub cred: CredentialField,
     /// What that field told the app: filled, and its handle.
     pub cred_state: Mutable<CredentialState>,
+    /// The actions row's "More" menu, where actions go that no longer fit.
+    pub more: Mutable<pergola::widgets::MenuState>,
 }
 
 impl ScriniumView {
     pub fn new(state: Mutable<Browser>, field: Mutable<TextEdit>, scroll: Mutable<ScrollState>, size: Mutable<(f32, f32)>) -> Self {
         let cred_state = Mutable::new(CredentialState::default());
         let cred = CredentialField::password(cred_state.clone());
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state }
+        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more: Mutable::new(Default::default()) }
     }
 }
 
@@ -642,22 +644,22 @@ impl ScriniumView {
         let open = b.place().is_some() && b.unreadable.is_none();
         let writable = open && !b.place().is_some_and(|p| p.read_only);
         let n = b.selected.len();
-        let mut x = x0 + 8.0;
-        let (s, f) = (self.state.clone(), self.field.clone());
-        x += button(ctx, x, ay, "New folder", Look::Ghost, writable, move || begin_edit(&s, &f, false)) + 2.0;
-        let (s, f) = (self.state.clone(), self.field.clone());
-        x += button(ctx, x, ay, "Rename", Look::Ghost, writable && n == 1, move || begin_edit(&s, &f, true)) + 2.0;
-        let s = self.state.clone();
-        x += button(ctx, x, ay, "Delete", Look::Ghost, writable && n > 0, move || with(&s, Browser::ask_delete)) + 10.0;
-        rect(ctx, x - 6.0, ay + 8.0, 1.0, 16.0, t.border_default(), 0.0);
-        let s = self.state.clone();
-        x += button(ctx, x, ay, "Copy", Look::Ghost, open && n > 0, move || with(&s, |b| b.copy(false))) + 2.0;
-        let s = self.state.clone();
-        x += button(ctx, x, ay, "Cut", Look::Ghost, writable && n > 0, move || with(&s, |b| b.copy(true))) + 2.0;
-        let s = self.state.clone();
-        button(ctx, x, ay, "Paste", Look::Ghost, writable && b.clip.is_some(), move || with(&s, Browser::paste));
+        // A toolbar: when the text grows or the window narrows, what no
+        // longer fits goes into its "More" menu (resolution-independence.md §6.3).
         let hid = if b.show_hidden { "Hide hidden files" } else { "Show hidden files" };
         let hw = width(hid, type_size::SM, Weight::Medium) + 28.0;
+        let (s1, f1, s2, f2) = (self.state.clone(), self.field.clone(), self.state.clone(), self.field.clone());
+        let (s3, s4, s5, s6) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
+        let items = vec![
+            ToolItem::new("New folder", move || begin_edit(&s1, &f1, false)).priority(2).enabled(writable),
+            ToolItem::new("Rename", move || begin_edit(&s2, &f2, true)).priority(1).enabled(writable && n == 1),
+            ToolItem::new("Delete", move || with(&s3, Browser::ask_delete)).priority(1).enabled(writable && n > 0),
+            ToolItem::new("Copy", move || with(&s4, |b| b.copy(false))).priority(3).enabled(open && n > 0),
+            ToolItem::new("Cut", move || with(&s5, |b| b.copy(true))).priority(2).enabled(writable && n > 0),
+            ToolItem::new("Paste", move || with(&s6, Browser::paste)).priority(3).enabled(writable && b.clip.is_some()),
+        ];
+        let tx = x0 + 8.0;
+        Toolbar::new(Rect::new(tx, ay, (w - hw - 16.0 - tx).max(0.0), actions_h() - 8.0), self.more.clone(), items).render(ctx);
         let s = self.state.clone();
         button(ctx, w - hw - 8.0, ay, hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
         let mut y = toolbar_h() + actions_h();

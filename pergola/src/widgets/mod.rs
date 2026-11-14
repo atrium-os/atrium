@@ -27,6 +27,7 @@ pub mod popup;
 pub mod scroll_view;
 pub mod slider;
 pub mod text_field;
+pub mod toolbar;
 pub mod virtual_list;
 
 pub use basics::{Avatar, Divider, Dot, ProgressBar};
@@ -42,4 +43,5 @@ pub use popup::{Dialog, DialogButton, Dropdown, Mark, Menu, MenuButton, MenuItem
 pub use scroll_view::{ScrollState, ScrollView};
 pub use slider::Slider;
 pub use text_field::TextField;
+pub use toolbar::{ToolItem, Toolbar};
 pub use virtual_list::VirtualList;

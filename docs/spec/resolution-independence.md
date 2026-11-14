@@ -259,7 +259,11 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   minimums (stacking them when the minimums don't fit side by side), grows a dialog about its
   centre and a panel leftwards, and gives a snapped document too wide for its half the work
   area; nothing leaves the work area.
-- Still to do: toolbar overflow menus, app-shaped `Glyphs` text.
+- **Toolbar overflow:** `pergola::widgets::Toolbar` lays out `ToolItem`s (label, priority,
+  enabled, action) in its width; when they don't fit, the lowest priorities (the later of
+  equals first) move into a "More" menu at its end, in their order, and come back when there
+  is room. Scrinium's actions row uses it. Icon-only items are not done yet.
+- Still to do: app-shaped `Glyphs` text.
 
 ### 6.4 Inline images and other inline objects
 
