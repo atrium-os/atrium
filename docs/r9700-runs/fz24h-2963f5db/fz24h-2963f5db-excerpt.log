@@ -1,0 +1,227 @@
+== fz24h 2963f5db excerpt (si-fuzz 2963f5db, kmods 2963f5db, fz:86400:0x24f00d, start 2026-11-13 21:13:07 UTC)
+== kernel log coverage: 2026-11-13 22:00 -> 2026-11-14 21:35:53, MISSING 2026-11-13 21:13-22:00 and 2026-11-14 08:00-10:00 (rotated off the box before they were pulled)
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 92 passed, 0 failed: PASS
+si-client-test rc=0
+== si-fuzz all 86400 0x24f00d
+si-fuzz: all for 86400 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 610 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+== run Fri Nov 13 21:13:07 UTC 2026 stages: fz:86400:0x24f00d kenvs: psp_bootload psp_ipfw gc_up_ok attach client
+== before
+== kldload
+== si-client-test
+== si-fuzz all 86400 0x24f00d
+si-fuzz: all for 86400 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 2, pace 610 s, generations 60 s
+si-fuzz: 2 re-init(s) before the start: waiting 610 s for the driver's window to close
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz: blob generation 4: uid 62004, seed 0x24f011
+si-fuzz: 1020 s: 214747 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 200, re-inits 5, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1080 s: 214747 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 212, re-inits 5, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1140 s: 214747 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 224, re-inits 5, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1200 s: 214747 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 236, re-inits 5, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1261 s: 214747 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 248, re-inits 5, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: ioctl generation 5: uid 61005, seed 0x24f012
+si-fuzz: blob generation 6: uid 62006, seed 0x24f013
+si-fuzz: 1321 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 256, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1381 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 268, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1441 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 280, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1501 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 292, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1561 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 304, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1621 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 316, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1681 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 328, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1741 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 340, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1801 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 352, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: 1861 s: 225578 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 364, re-inits 7, cp_errors 6, vm_faults 14, hangs 12, findings 0
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+si-fuzz: 1921 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 375, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 1981 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 387, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2041 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 399, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2101 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 411, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2161 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 423, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2221 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 435, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2281 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 447, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2341 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 459, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2401 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 471, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+si-fuzz: 2461 s: 225717 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 483, re-inits 8, cp_errors 7, vm_faults 16, hangs 13, findings 0
+== re-init lines from si-fuzz: 238
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 2, cp_errors 2, vm_faults 7, hangs 6, findings 0
+si-fuzz: 3616 s: 244149 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 706, re-inits 12, cp_errors 11, vm_faults 20, hangs 18, findings 0
+si-fuzz: 7238 s: 316884 calls, blob 27 jobs (1 ok, 14 failed, 2 clean after), canary 1406, re-inits 24, cp_errors 21, vm_faults 32, hangs 32, findings 0
+si-fuzz: 10885 s: 378971 calls, blob 46 jobs (4 ok, 25 failed, 2 clean after), canary 2109, re-inits 36, cp_errors 31, vm_faults 46, hangs 45, findings 0
+si-fuzz: 14470 s: 433218 calls, blob 56 jobs (4 ok, 30 failed, 2 clean after), canary 2807, re-inits 47, cp_errors 40, vm_faults 56, hangs 56, findings 0
+si-fuzz: 18090 s: 499308 calls, blob 70 jobs (4 ok, 38 failed, 4 clean after), canary 3509, re-inits 58, cp_errors 49, vm_faults 81, hangs 68, findings 0
+si-fuzz: 21693 s: 571547 calls, blob 79 jobs (4 ok, 44 failed, 4 clean after), canary 4214, re-inits 67, cp_errors 58, vm_faults 92, hangs 78, findings 0
+si-fuzz: 25300 s: 637836 calls, blob 89 jobs (4 ok, 50 failed, 4 clean after), canary 4920, re-inits 75, cp_errors 64, vm_faults 101, hangs 88, findings 0
+si-fuzz: 28920 s: 711039 calls, blob 98 jobs (4 ok, 56 failed, 4 clean after), canary 5628, re-inits 84, cp_errors 69, vm_faults 1025, hangs 99, findings 0
+si-fuzz: 32532 s: 774915 calls, blob 109 jobs (4 ok, 64 failed, 6 clean after), canary 6333, re-inits 92, cp_errors 73, vm_faults 1255, hangs 111, findings 0
+si-fuzz: 36149 s: 829116 calls, blob 122 jobs (5 ok, 71 failed, 7 clean after), canary 7037, re-inits 102, cp_errors 82, vm_faults 1266, hangs 123, findings 0
+si-fuzz: 39791 s: 1064196 calls, blob 134 jobs (6 ok, 77 failed, 7 clean after), canary 7744, re-inits 113, cp_errors 90, vm_faults 1280, hangs 132, findings 0
+si-fuzz: 43418 s: 1103979 calls, blob 148 jobs (7 ok, 85 failed, 8 clean after), canary 8451, re-inits 124, cp_errors 98, vm_faults 8201599, hangs 139, findings 0
+si-fuzz: 47022 s: 1151040 calls, blob 159 jobs (7 ok, 91 failed, 8 clean after), canary 9151, re-inits 134, cp_errors 104, vm_faults 8201609, hangs 153, findings 0
+si-fuzz: 50624 s: 1226752 calls, blob 169 jobs (7 ok, 98 failed, 8 clean after), canary 9855, re-inits 143, cp_errors 111, vm_faults 8201618, hangs 163, findings 0
+si-fuzz: 54237 s: 1513217 calls, blob 182 jobs (8 ok, 105 failed, 9 clean after), canary 10555, re-inits 154, cp_errors 121, vm_faults 8201630, hangs 180, findings 0
+si-fuzz: 57872 s: 1574392 calls, blob 194 jobs (8 ok, 113 failed, 9 clean after), canary 11261, re-inits 164, cp_errors 130, vm_faults 16689793, hangs 192, findings 0
+si-fuzz: 61462 s: 1612459 calls, blob 206 jobs (9 ok, 121 failed, 9 clean after), canary 11965, re-inits 173, cp_errors 137, vm_faults 16738941, hangs 203, findings 0
+si-fuzz: 65078 s: 1664872 calls, blob 220 jobs (9 ok, 130 failed, 9 clean after), canary 12663, re-inits 185, cp_errors 143, vm_faults 16738953, hangs 219, findings 0
+si-fuzz: 68710 s: 1717185 calls, blob 233 jobs (9 ok, 138 failed, 10 clean after), canary 13366, re-inits 197, cp_errors 155, vm_faults 16738966, hangs 235, findings 0
+si-fuzz: 72317 s: 1916295 calls, blob 241 jobs (9 ok, 143 failed, 10 clean after), canary 14074, re-inits 205, cp_errors 157, vm_faults 16738974, hangs 245, findings 0
+si-fuzz: 75940 s: 1985138 calls, blob 256 jobs (10 ok, 152 failed, 11 clean after), canary 14778, re-inits 216, cp_errors 168, vm_faults 16738986, hangs 257, findings 0
+si-fuzz: 79558 s: 2043880 calls, blob 269 jobs (11 ok, 160 failed, 12 clean after), canary 15482, re-inits 227, cp_errors 174, vm_faults 16745803, hangs 268, findings 0
+si-fuzz: 83182 s: 2094840 calls, blob 278 jobs (11 ok, 166 failed, 12 clean after), canary 16192, re-inits 236, cp_errors 182, vm_faults 24823295, hangs 277, findings 0
+si-fuzz: 86400 s: 2147410 calls, blob 288 jobs (11 ok, 172 failed, 12 clean after), canary 16818, re-inits 245, cp_errors 189, vm_faults 24823306, hangs 288, findings 0
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: health: a new VM runs write_42 clean
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+                          ok     EINVAL      EBADF     EFAULT     ENOTTY      EPERM     ENOMEM     ENOSPC        EIO      EBUSY EOPNOTSUPP      other
+  BO_ALLOC             35415      10723       2914          0      15438          0          0          0          0          0       1051          0
+  BO_WRITE              2296      36363       7531       2563      15660          0          0          0          0          0       1102          0
+  BO_READ               1822      36500       7481       3103      15532          0          0          0          0          0       1074          0
+  GET_IRQS             46131          0       3000          0      15556          0          0          0          0          0       1055          0
+  SYNCOBJ_CREATE       46315          0       2967          0      15476          0          0          0          0          0       1022          0
+  SYNCOBJ_SIGNAL       19887      21796       7633          0      15839          0          0          0          0          0       1039          0
+  SYNCOBJ_QUERY        19371      21695       7742          0      15772          0          0          0          0          0       1017          0
+  SYNCOBJ_WAIT          2519      21769       7825          0      15721          0          0          0          0          0       1069      16589
+  VM_CREATE             6508          0       2984          0      15538          0          0      39019          0          0       1078          0
+  VM_BIND               1246      36963      10014          0      15684          0          0          0         36         76       1020        583
+  QUEUE_MAP                0      38584      10064          0      15830          0          0          0          0          0       1174          0
+  QUERY_CAPS           14697          0       2944      25820      15401          0       5885          0          0          0        977          0
+  VM_BIND2               542      39213       9139          0      15645          0          0          0         17         26       1067        212
+  QUEUE_CREATE            51       5399       9543          0      47002         97          0          1          4          0       3664          0
+  QUEUE_MAP2               0       1058       9868          0      51126          0          0          0          0          0       3495          0
+  QUEUE_SUBMIT             5        871       9809          0      51480          0          0          0          3          0       3830          0
+  GPU_RESET                0          0       2849          0      15606      46219          0          0          0          0       1042          0
+  SCHED                    0          0       2813          0      15505      45970          0          0          0          0       1093          0
+  POWERGATE                0          0       2875          0      15605      46283          0          0          0          0       1113          0
+  old SUBMIT               0          0       2927          0      61562          0          0          0          0          0       1048          0
+si-fuzz: mmaps that succeeded 0, forks 2068, blob VM reopens 279, queue renews 159
+RESULT: PASS (0 findings, seed 0x24f00d)
+si-fuzz rc=0
+reinits 245
+== re-inits during the fuzz (2 -> 245): waiting 610 s
+== si-client-test after the fuzz
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 92 passed, 0 failed: PASS
+si-client-test rc=0
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 12125
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 2726
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 247
+dev.atrium_gpu_amd.0.isolation.cp_errors: 191
+dev.atrium_gpu_amd.0.isolation.quota_refused: 0
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 24823313
+dev.atrium_gpu_amd.0.isolation.hangs: 294
+dev.atrium_gpu_amd.0.isolation.reaped: 1206
+dev.atrium_gpu_amd.0.isolation.deferred: 1206
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 4
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 27.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 26.0C 
+detach + give-back rc=0 (try 1)
+== kernel log
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 27.0C 
+== done, log /root/runs/20261113T211307Z.log
+== kernel: client faults (excl. CPC VMID 0 reset-chain) by time/client/VMID
+Nov 13 23:32:20 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 01:50:48 gmc: client fault: fault status 0x800830: client CPF (0x4), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 02:01:13 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 02:11:41 gmc: client fault: fault status 0xa41051: client TCP (0x8), VMID 10, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 02:54:05 gmc: client fault: fault status 0xac0a70: client CPC (0x5), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x7, MAPPING_ERROR 0, RW 1, ATOMIC 1, PRT 0, UCE 0
+Nov 14 03:15:05 gmc: client fault: fault status 0xa01230: client SQC (inst) (0x9), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 03:46:58 gmc: client fault: fault status 0x800830: client CPF (0x4), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 05:21:36 gmc: client fault: fault status 0xa41a51: client SDMA0 (0xd), VMID 10, MORE_FAULTS 1, WALKER_ERROR 0, PERMatrium_gpu_amd_pci0: uq3: added: VM base 0x8019001, queue pages at VA 0x200030000 (pa 0x303ca4000), MQD GART 0x8c000, doorbell ISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 05:31:57 gmc: client fault: fault status 0xa00a30: client CPC (0x5), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 05:52:58 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 06:03:26 gmc: client fault: fault status 0xa41a51: client SDMA0 (0xd), VMID 10, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 06:24:10 gmc: client fault: fault status 0xa00a30: client CPC (0x5), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 06:45:40 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 07:49:27 gmc: client fault: fault status 0xa00a31: client CPC (0x5), VMID 10, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:24:53 gmc: client fault: fault status 0x900830: client CPF (0x4), VMID 9, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:46:10 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:46:11 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:46:12 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:46:13 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 12:46:14 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 13:39:22 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 14:10:47 gmc: client fault: fault status 0x800a11: client CPC (0x5), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x1, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 15:46:41 gmc: client fault: fault status 0x840a50: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 18:25:53 gmc: client fault: fault status 0xac0a70: client CPC (0x5), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x7, MAPPING_ERROR 0, RW 1, ATOMIC 1, PRT 0, UCE 0
+Nov 14 19:08:33 gmc: client fault: fault status 0xa00a11: client CPC (0x5), VMID 10, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x1, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 19:29:44 gmc: client fault: fault status 0x800a30: client CPC (0x5), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 20:01:35 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 20:01:36 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 20:01:37 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 20:01:38 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 20:01:39 gmc: client fault: fault status 0x801e31: client GCR (0xf), VMID 8, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 21:15:38 gmc: client fault: fault status 0xa00a30: client CPC (0x5), VMID 10, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 21:34:39 gmc: client fault: fault status 0xb41050: client TCP (0x8), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 21:34:55 gmc: client fault: fault status 0xb01280: client SQC (inst) (0x9), VMID 11, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x8, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 14 21:34:57 gmc: client fault: fault status 0xc41050: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 14 21:35:06 gmc: client fault: fault status 0xc41050: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+== kernel: VM fault batches >=100 IVs
+Nov 14 05:21:36 si: VM fault: 908 IV(s), VMIDs 0x400, first VMID 10 at 0x7000
+Nov 14 06:03:26 si: VM fault: 210 IV(s), VMIDs 0x400, first VMID 10 at 0xe00007000
+Nov 14 12:46:10 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0xd07000
+Nov 14 12:46:11 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x2b03a9000
+Nov 14 12:46:12 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x56b505000
+Nov 14 12:46:13 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x82e5d6000
+Nov 14 12:46:14 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0xaf0a8b000
+Nov 14 14:10:47 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x20a16000
+Nov 14 19:08:33 si: VM fault: 659 IV(s), VMIDs 0x400, first VMID 10 at 0x1f00001000
+Nov 14 20:01:35 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0xc71000
+Nov 14 20:01:36 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x2b077d000
+Nov 14 20:01:37 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x56d8db000
+Nov 14 20:01:38 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0x830fac000
+Nov 14 20:01:39 si: VM fault: 2047 IV(s), VMIDs 0x100, first VMID 8 at 0xaf38db000
+== last unrouted EOP
+Nov 14 21:35:42 atrium-r9700 kernel: atrium_gpu_amd_pci0: si: unrouted EOP src_data[0]: 0x18000000 x331, 0x4000028 x122, 0x4000020 x348, 0x400002c x97
