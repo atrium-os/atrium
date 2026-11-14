@@ -13,6 +13,6 @@
 pub mod editor;
 pub mod view;
 
-pub use editor::{Editor, Motion, Outcome, Pos, Spot};
+pub use editor::{Editor, Logged, Motion, Outcome, Pos, Spot};
 
 pub use view::RichTextView;

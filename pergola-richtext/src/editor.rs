@@ -82,6 +82,16 @@ pub struct Spot {
     pub h: i64,
 }
 
+/// One action as the autosave journal keeps it ([`Editor::replay`] runs it
+/// again): the ops as they were applied, whether they joined the action before
+/// them, and the attribute table entries interned for them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Logged {
+    Run { label: String, ops: Vec<TextOp>, merge: bool, attrs: Vec<CharAttrs> },
+    Undo,
+    Redo,
+}
+
 pub struct Editor {
     pub doc: TextDoc,
     pub history: History<TextOp>,
@@ -97,14 +107,54 @@ pub struct Editor {
     last: Kind,
     /// Bumped on every change to the text (for saving and redraws).
     pub revision: u64,
+    /// Actions since [`Editor::take_log`], when journaling.
+    log: Option<Vec<Logged>>,
+    attrs_logged: usize,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0 };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0 };
         e.paginate(SETTLE);
         e
+    }
+
+    /// Starts keeping a log of actions for a journal.
+    pub fn start_log(&mut self) {
+        self.log = Some(Vec::new());
+        self.attrs_logged = self.doc.attrs.len();
+    }
+
+    /// The actions since the last call.
+    pub fn take_log(&mut self) -> Vec<Logged> {
+        self.log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Runs a logged action again (recovering from the journal). Returns false
+    /// for an undo or redo with nothing to undo or redo.
+    pub fn replay(&mut self, l: Logged) -> bool {
+        self.doc.take_changes();
+        let ok = match l {
+            Logged::Run { label, ops, merge, attrs } => {
+                for a in attrs {
+                    self.doc.attrs.intern(a);
+                }
+                if merge {
+                    self.history.extend_last(&mut self.doc, &label, ops);
+                } else {
+                    self.history.run(&mut self.doc, &label, ops);
+                }
+                true
+            }
+            Logged::Undo => self.history.undo(&mut self.doc).is_some(),
+            Logged::Redo => self.history.redo(&mut self.doc).is_some(),
+        };
+        self.attrs_logged = self.doc.attrs.len();
+        self.changed();
+        let c = self.clamp(self.caret);
+        self.set_caret(c, false);
+        ok
     }
 
     pub fn fonts(&self) -> &dyn Fonts {
@@ -216,7 +266,13 @@ impl Editor {
             return;
         }
         self.doc.take_changes();
-        if kind != Kind::Other && kind == self.last {
+        let merge = kind != Kind::Other && kind == self.last;
+        if let Some(log) = &mut self.log {
+            let attrs = (self.attrs_logged..self.doc.attrs.len()).map(|i| self.doc.attrs.get(i as AttrId).clone()).collect();
+            self.attrs_logged = self.doc.attrs.len();
+            log.push(Logged::Run { label: label.to_string(), ops: ops.clone(), merge, attrs });
+        }
+        if merge {
             self.history.extend_last(&mut self.doc, label, ops);
         } else {
             self.history.run(&mut self.doc, label, ops);
@@ -360,6 +416,9 @@ impl Editor {
         if self.history.undo(&mut self.doc).is_none() {
             return false;
         }
+        if let Some(l) = &mut self.log {
+            l.push(Logged::Undo);
+        }
         self.after_history();
         true
     }
@@ -368,6 +427,9 @@ impl Editor {
         self.doc.take_changes();
         if self.history.redo(&mut self.doc).is_none() {
             return false;
+        }
+        if let Some(l) = &mut self.log {
+            l.push(Logged::Redo);
         }
         self.after_history();
         true
@@ -981,6 +1043,37 @@ mod tests {
         e.key(Key::End, NO, "", 0);
         e.key(Key::Home, SHIFT, "", 0);
         assert!(e.has_selection());
+    }
+
+    #[test]
+    fn a_logged_session_replays_to_the_same_document() {
+        let mut e = ed(&["one", "two"]);
+        let base = e.doc.clone();
+        e.start_log();
+        typ(&mut e, "abc");
+        e.key(Key::Enter, NO, "", 0);
+        e.set_caret(Pos::new(0, 0), false);
+        e.set_caret(Pos::new(1, 2), true);
+        e.key(Key::Char, CTRL, "b", 0);
+        e.key(Key::Char, CTRL, "z", 0);
+        e.key(Key::Char, CTRL, "y", 0);
+        e.set_caret(Pos::new(2, 1), false);
+        e.key(Key::Char, CTRL, "u", 0);
+        typ(&mut e, "xy");
+        e.key(Key::Backspace, NO, "", 0);
+        let log = e.take_log();
+        let mut r = Editor::new(base, Rc::new(FixedFonts));
+        for l in log {
+            r.replay(l);
+        }
+        assert_eq!(texts(&r), texts(&e));
+        let runs = |e: &Editor| e.doc.blocks.iter().map(|b| b.as_para().unwrap().runs.iter().map(|&(s, a)| (s, e.doc.attrs.get(a).clone())).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(runs(&r), runs(&e));
+        // Undo history replays too.
+        while e.undo() {}
+        while r.undo() {}
+        assert_eq!(texts(&r), texts(&e));
+        assert_eq!(texts(&r), ["one", "two"]);
     }
 
     #[test]

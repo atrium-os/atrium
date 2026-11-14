@@ -1,0 +1,31 @@
+[package]
+name = "atrium-write"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "atrium-write, Atrium's word processor (docs/spec/officina.md §7): officina-text's engine in Pergola's RichTextEditor, files through the system picker, an autosave journal for crash recovery."
+
+[lib]
+name = "atrium_write"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-write"
+path = "src/bin/atrium_write.rs"
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+officina-text = { path = "../officina-text" }
+pergola = { path = "../pergola" }
+pergola-richtext = { path = "../pergola-richtext" }
+limen = { path = "../limen" }
+libc = "0.2"
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
+
+[profile.release]
+debug = 1

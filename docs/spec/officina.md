@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4). O3a (text engine) built 2026-11-14 (§16.10); O3b (`RichTextEditor`) built 2026-11-14 (§16.11).
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4). O3a (text engine) built 2026-11-14 (§16.10); O3b (`RichTextEditor`) built 2026-11-14 (§16.11); O3c (`atrium-write`) built 2026-11-14 (§16.12).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -1263,6 +1263,42 @@ Not yet: IME composition (no composition events reach apps yet, §17 D10), bidi,
 underlines, accessibility, the flowing layout, double-click word selection and
 Shift+click (pointer events carry neither), auto-scroll while dragging past the edge,
 caret blink.
+
+### 16.12 O3c as built (2026-11-14): `atrium-write`
+
+- **Native file** (`officina-text/src/native.rs`, `.owrite`): an `officina_core`
+  container of kind Write with DOCUMENT (page setup, next block id), STYLES, ATTRS (the
+  character attribute table), BLOCKS (256 blocks a chunk, independent, so a reader can
+  load the chunks near the reading position first; v0 loads all) and CHECKPOINTS (the
+  page starts of the last finished pagination). Optional properties stay optional in
+  the file (a mask of the fields set), so "not set" and "set to the default" survive.
+  The reader is for hostile files: counts bounded by the bytes left, style and
+  attribute references checked, run starts on character boundaries and in order, block
+  ids unique and under the watermark; 3,000 damaged and cut files load or fail, none
+  panics.
+- **Autosave and recovery** (`atrium-write/src/doc.rs`), the Sheets scheme: a private
+  folder with a base file and a journal (length and CRC per record), switched by
+  generation, locked while a window owns it. A record is one editor action
+  (`pergola_richtext::Logged`): the ops as applied, whether they joined the action
+  before (a run of typing is one undo step after recovery too), and the attribute
+  entries interned for them, so the replayed table numbers them the same. After a
+  crash the document comes back as it was on screen, undo history included; a torn
+  last record is cut off.
+- **The app**: a toolbar (Open, Save, Save As, Undo, Redo, B, I, U, a Style menu with
+  Normal, Title and Heading 1–3, alignment), the pages through `RichTextEditor`, a
+  status line (page of pages, "≈" while pagination runs, paragraphs, the last
+  message). Files come from the system picker as in Sheets; `.owrite` is native,
+  anything else opens and saves as plain text (a paragraph per line, UTF-8 or
+  Windows-1252) until the converters of O3e. `scripts/write-vm.sh` runs it on a
+  headless frescod in the cloud VM; `examples/sample_doc.rs` writes the sample shown.
+
+Gates: native round trip (styles, attributes, properties, checkpoints); op encodings
+both ways; hostile files; a crash after typing, formatting, undo and redo recovers the
+same text and runs with a torn record cut off, and undo then runs back to the file as
+opened; save marks clean; text files in UTF-8 and Windows-1252. The cloud VM screenshot of the sample (`scripts/write-vm.sh`) shows the title, headings, a run of bold, italic, underline, a link, colour and highlight, and justified, centred and right-aligned paragraphs on an A4 page.
+
+Not yet: the converters (O3e), a "save changes?" prompt, Scrinium's Save As sheet,
+the jailed per-document launch, zoom and the ruler, lists, tables and images (O3d).
 
 ## 17. Decisions (accepted 2026-11-14)
 
