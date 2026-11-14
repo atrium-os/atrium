@@ -326,9 +326,9 @@ fn main() {
     }
     // SAFETY: stdin is the broker channel; nothing else here owns it.
     let broker = Arc::new(Chan::from_fd(unsafe { OwnedFd::from_raw_fd(BROKER_FD) }));
-    let (client, (sw, sh, refresh), pixels) = match broker.recv() {
-        Ok(Recv::Msg(Msg::Client { width, height, refresh_mhz, pixels }, fds)) if fds.len() == 1 => {
-            (UnixStream::from(fds.into_iter().next().unwrap()), (width, height, refresh_mhz), pixels)
+    let (client, (sw, sh, refresh), pixels, new_scale) = match broker.recv() {
+        Ok(Recv::Msg(Msg::Client { width, height, refresh_mhz, pixels, scale_milli }, fds)) if fds.len() == 1 => {
+            (UnixStream::from(fds.into_iter().next().unwrap()), (width, height, refresh_mhz), pixels, scale_milli)
         }
         _ => {
             log::warn!("fresco-renderer: the first record was not CLIENT with one fd");
@@ -356,6 +356,8 @@ fn main() {
     let comp = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
     // Pop-ups are frescod's to check, place and dismiss (fresco-popups.md §3).
     comp.lock().unwrap().popups_upstream = true;
+    // The scale its windows open at until frescod says otherwise.
+    comp.lock().unwrap().new_scale_milli = new_scale;
     let (ev_tx, ev_rx) = mpsc::channel();
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
@@ -714,7 +716,10 @@ fn from_broker(
                 comp.lock().unwrap().request_close(local as u16);
             }
             Msg::Scale { scale_milli, .. } => {
-                comp.lock().unwrap().set_window_dpi(local as u16, scale_milli as f32 / 1000.0);
+                let mut c = comp.lock().unwrap();
+                c.set_window_dpi(local as u16, scale_milli as f32 / 1000.0);
+                // The app's next window most likely opens beside this one.
+                c.new_scale_milli = scale_milli;
             }
             Msg::Input { input, .. } => {
                 let window_id = local;

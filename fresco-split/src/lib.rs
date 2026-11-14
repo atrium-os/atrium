@@ -132,7 +132,10 @@ pub enum Msg {
     /// ([`slot::write_pixels`]) instead of the packed frame, so the raster
     /// runs in the renderer's jail rather than in the broker (the compute
     /// renderer's counterpart of a GPU VM per window).
-    Client { width: u32, height: u32, refresh_mhz: u32, pixels: bool },
+    /// `scale_milli`: the scale the client's new windows open at
+    /// (resolution-independence.md §3); frescod corrects it per window
+    /// with [`Msg::Scale`].
+    Client { width: u32, height: u32, refresh_mhz: u32, pixels: bool, scale_milli: u32 },
     /// Two frame slots of `bytes` each for `window` follow as fds.
     Slots { window: u32, bytes: u32 },
     /// The broker is done with `slot`; the renderer may reuse it.
@@ -394,12 +397,13 @@ impl Msg {
                 r.put(3, *seq);
                 r
             }
-            Msg::Client { width, height, refresh_mhz, pixels } => {
+            Msg::Client { width, height, refresh_mhz, pixels, scale_milli } => {
                 let mut r = Rec::new(CLIENT, 0);
                 r.put(2, *width);
                 r.put(3, *height);
                 r.put(4, *refresh_mhz);
                 r.put(5, *pixels as u32);
+                r.put(6, *scale_milli);
                 r
             }
             Msg::Slots { window, bytes } => {
@@ -694,7 +698,7 @@ impl Msg {
             SLOTS | FRAME_DONE | SCALE => (1, false),
             FOCUS => (2, false),
             KEY => (4, false), // usage, pressed, modifiers, repeat
-            CLIENT => (4, false),
+            CLIENT => (5, false),
             BUTTON => (5, false),
             DRAG_FORMAT | DRAG_OFFER => (0, true),
             DRAG_BEGIN | DROP => (2, false),
@@ -774,7 +778,16 @@ impl Msg {
             FOCUS_PARENT => Msg::FocusParent { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
-            CLIENT => Msg::Client { width: dim(r.get(2))?, height: dim(r.get(3))?, refresh_mhz: r.get(4), pixels: flag(r.get(5))? },
+            CLIENT => Msg::Client {
+                width: dim(r.get(2))?,
+                height: dim(r.get(3))?,
+                refresh_mhz: r.get(4),
+                pixels: flag(r.get(5))?,
+                scale_milli: match r.get(6) {
+                    s @ SCALE_MIN..=SCALE_MAX => s,
+                    _ => return Err(Refused("scale out of range")),
+                },
+            },
             SLOTS => Msg::Slots { window, bytes: r.get(2) },
             FRAME_DONE => Msg::FrameDone { window, slot: slot(r.get(2))? },
             GEOMETRY => Msg::Geometry { window, width: dim(r.get(2))?, height: dim(r.get(3))? },

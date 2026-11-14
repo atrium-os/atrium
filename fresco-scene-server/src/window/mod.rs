@@ -49,8 +49,9 @@ pub enum DisplayEvent {
     /// whether to confirm; not the same as a server-initiated
     /// close (which destroys directly).
     WindowCloseRequested { window_id: u32 },
-    /// Output DPI changed (window moved to different display, etc.).
-    /// `scale_factor`: 1.0 = standard 96 DPI, 2.0 = HiDPI.
+    /// The window's scale changed (it moved to a monitor of another
+    /// density, or the monitor's scale changed): device pixels per point,
+    /// 1.0 at 110 ppi. Clients are told it as `EV_WINDOW_RESIZED`.
     WindowDpiChanged     { window_id: u32, scale_factor: f32 },
     /// A surface was created. The signal the WM reconciles on to place
     /// the newcomer (every client receives it; only the WM acts).
@@ -58,7 +59,8 @@ pub enum DisplayEvent {
     /// A surface was destroyed. The WM reconciles to reclaim its slot.
     WindowDestroyed      { window_id: u32 },
     /// The display's mode changed; every client lays out again.
-    DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32 },
+    /// `scale_milli`: the scale new windows open at.
+    DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32, scale_milli: u32 },
     /// The system appearance changed (light/dark); every client redraws.
     AppearanceChanged(fresco_protocol::AppearancePayload),
     /// The window spans several monitors (fresco-span.md): its tiles and
@@ -214,19 +216,47 @@ pub enum DragPhase {
     Leave,
 }
 
-/// Encode a `DisplayEvent` as a fresco-protocol payload. Returns
-/// `(op, payload)`; caller wraps in an aqueduct envelope with the
-/// `ASYNC_EVENT` flag and writes to the socket.
+/// Encode a `DisplayEvent` as a fresco-protocol payload, every window at
+/// scale 1.0 (a test, a client with no windows). See
+/// [`encode_event_with`].
 pub fn encode_event(ev: &DisplayEvent)
     -> Result<(u16, Vec<u8>), fresco_protocol::CodecError>
 {
+    encode_event_with(ev, &|_| None)
+}
+
+/// A window's scale (thousandths) and size in device pixels, for
+/// [`encode_event_with`].
+pub type ScaleOf<'a> = dyn Fn(u32) -> Option<(u32, (f32, f32))> + 'a;
+
+/// Encode a `DisplayEvent` for a client. Returns `(op, payload)`; the
+/// caller wraps it in an aqueduct envelope with the `ASYNC_EVENT` flag.
+///
+/// Events are in device pixels inside frescod; clients get points
+/// (resolution-independence.md §3): window sizes, pop-up places, pointer
+/// positions, scroll deltas and drag positions are divided by the
+/// window's scale, which `scale_of` gives with the window's size. A scale
+/// change (`WindowDpiChanged`) goes out as `EV_WINDOW_RESIZED`.
+pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
+    -> Result<(u16, Vec<u8>), fresco_protocol::CodecError>
+{
     use fresco_protocol::{control, encode, *};
+    let scale = |w: u32| scale_of(w).map_or(1000, |(s, _)| s);
+    let pt = |w: u32, v: f32| device_to_pt(v, scale(w));
+    let resized = |window_id: u32, size: (u32, u32), scale_milli: u32| {
+        let p = WindowResizedEvent {
+            window_id,
+            width: device_to_pt(size.0 as f32, scale_milli),
+            height: device_to_pt(size.1 as f32, scale_milli),
+            scale_milli,
+            buffer_width: size.0,
+            buffer_height: size.1,
+        };
+        Ok((control::EV_WINDOW_RESIZED, encode(&p)?))
+    };
     match ev {
         DisplayEvent::WindowResized { window_id, width, height } => {
-            let p = WindowResizedEvent {
-                window_id: *window_id, width: *width, height: *height,
-            };
-            Ok((control::EV_WINDOW_RESIZED, encode(&p)?))
+            resized(*window_id, (*width, *height), scale(*window_id))
         }
         DisplayEvent::WindowFocusChanged { window_id, gained, cause } => {
             let p = WindowFocusChangedEvent {
@@ -239,10 +269,8 @@ pub fn encode_event(ev: &DisplayEvent)
             Ok((control::EV_WINDOW_CLOSE_REQUESTED, encode(&p)?))
         }
         DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
-            let p = WindowDpiChangedEvent {
-                window_id: *window_id, scale_factor: *scale_factor,
-            };
-            Ok((control::EV_WINDOW_DPI_CHANGED, encode(&p)?))
+            let size = scale_of(*window_id).map_or((0, 0), |(_, (w, h))| (w as u32, h as u32));
+            resized(*window_id, size, (scale_factor * 1000.0).round() as u32)
         }
         DisplayEvent::WindowCreated { window_id } => {
             let p = WindowCreatedEvent { window_id: *window_id };
@@ -257,9 +285,10 @@ pub fn encode_event(ev: &DisplayEvent)
             let p = fresco_protocol::WindowSpanEvent { window_id: *window_id, tiles: tiles.clone(), hidden: hidden.clone() };
             Ok((control::EV_WINDOW_SPAN, encode(&p)?))
         }
-        DisplayEvent::DisplayChanged { width, height, refresh_mhz, reserved_top } => {
+        DisplayEvent::DisplayChanged { width, height, refresh_mhz, reserved_top, scale_milli } => {
             let p = fresco_protocol::DisplayInfoResponse {
                 width: *width, height: *height, refresh_mhz: *refresh_mhz, reserved_top: *reserved_top,
+                scale_milli: *scale_milli,
             };
             Ok((control::EV_DISPLAY_CHANGED, encode(&p)?))
         }
@@ -276,13 +305,13 @@ pub fn encode_event(ev: &DisplayEvent)
         }
         DisplayEvent::InputPointerMotion { window_id, x, y } => {
             let p = InputPointerMotionEvent {
-                window_id: *window_id, x: *x, y: *y,
+                window_id: *window_id, x: pt(*window_id, *x), y: pt(*window_id, *y),
             };
             Ok((control::EV_INPUT_POINTER_MOTION, encode(&p)?))
         }
         DisplayEvent::InputPointerButton { window_id, x, y, button, pressed, modifiers, activation } => {
             let p = InputPointerButtonEvent {
-                window_id: *window_id, x: *x, y: *y,
+                window_id: *window_id, x: pt(*window_id, *x), y: pt(*window_id, *y),
                 button: *button, pressed: *pressed, modifiers: *modifiers,
                 activation: if *activation == MINT_HERE { [0; 16] } else { *activation },
             };
@@ -290,12 +319,12 @@ pub fn encode_event(ev: &DisplayEvent)
         }
         DisplayEvent::InputPointerScroll { window_id, dx, dy, phase } => {
             let p = InputPointerScrollEvent {
-                window_id: *window_id, dx: *dx, dy: *dy, phase: *phase,
+                window_id: *window_id, dx: pt(*window_id, *dx), dy: pt(*window_id, *dy), phase: *phase,
             };
             Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
         }
         DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase } => {
-            let p = InputPointerMagnifyEvent { window_id: *window_id, x: *x, y: *y, scale: *scale, phase: *phase };
+            let p = InputPointerMagnifyEvent { window_id: *window_id, x: pt(*window_id, *x), y: pt(*window_id, *y), scale: *scale, phase: *phase };
             Ok((control::EV_INPUT_POINTER_MAGNIFY, encode(&p)?))
         }
         DisplayEvent::InputSwipe { window_id, fingers, dx, dy, phase } => {
@@ -332,11 +361,11 @@ pub fn encode_event(ev: &DisplayEvent)
                 DragPhase::Over => control::EV_DRAG_OVER,
                 DragPhase::Leave => control::EV_DRAG_LEAVE,
             };
-            let p = DragEvent { window_id: *window_id, drag_id: *drag_id, x: *x, y: *y, formats: formats.clone() };
+            let p = DragEvent { window_id: *window_id, drag_id: *drag_id, x: pt(*window_id, *x), y: pt(*window_id, *y), formats: formats.clone() };
             Ok((op, encode(&p)?))
         }
         DisplayEvent::Drop { window_id, x, y, activation } => {
-            let p = DropEvent { window_id: *window_id, x: *x, y: *y, activation: *activation };
+            let p = DropEvent { window_id: *window_id, x: pt(*window_id, *x), y: pt(*window_id, *y), activation: *activation };
             Ok((control::EV_DROP, encode(&p)?))
         }
         DisplayEvent::DragEnd { window_id, drag_id, dropped } => {
@@ -356,7 +385,12 @@ pub fn encode_event(ev: &DisplayEvent)
             Ok((control::EV_WINDOW_EMBED_TOKEN, encode(&p)?))
         }
         DisplayEvent::PopupPlaced { window_id, x, y, width, height, side } => {
-            let p = PopupPlacedEvent { window_id: *window_id, x: *x, y: *y, width: *width, height: *height, side: *side };
+            // Where it went in its parent, which it takes its scale from.
+            let w = *window_id;
+            let p = PopupPlacedEvent {
+                window_id: w, x: pt(w, *x), y: pt(w, *y),
+                width: pt(w, *width as f32), height: pt(w, *height as f32), side: *side,
+            };
             Ok((control::EV_POPUP_PLACED, encode(&p)?))
         }
         DisplayEvent::PopupDismissed { window_id, reason } => {
@@ -438,9 +472,10 @@ pub struct Window {
     /// the app, reported over `WM_ENUMERATE` so the WM can resolve it to an
     /// app-id (launch registry) for workspace assignment. 0 = unresolved.
     pub owner_uid: u32,
-    /// The scale (thousandths) its client was last told with
-    /// `EV_WINDOW_DPI_CHANGED`: 1000 until the window lands on a monitor
-    /// with another one.
+    /// Device pixels per point, thousandths (resolution-independence.md
+    /// §3): what its client was last told. A new window takes the
+    /// compositor's [`Compositor::new_scale_milli`]; then the monitor it
+    /// mostly covers decides (its parent's, for a pop-up or a slot).
     pub scale_milli: u32,
     /// A pop-up: frescod places, stacks and dismisses it.
     pub popup: Option<Popup>,
@@ -591,6 +626,9 @@ pub struct Compositor {
     /// The rows at the top of the screen only frescod draws (the trusted
     /// strip, F4d): an app's pop-up is kept below them.
     pub popup_top: f32,
+    /// The scale (thousandths) a new window opens at: the monitor new
+    /// windows land on (resolution-independence.md §3).
+    pub new_scale_milli: u32,
     /// Pop-up grants waiting for their claim; in a split renderer, those
     /// to send to frescod.
     pub popup_grants: Vec<PopupGrant>,
@@ -732,6 +770,7 @@ impl Compositor {
             last_press: None,
             popups_upstream: false,
             popup_top: 0.0,
+            new_scale_milli: 1000,
             popup_grants: Vec::new(),
             lock: None,
             lock_hidden: Vec::new(),
@@ -965,6 +1004,7 @@ impl Compositor {
         self.next_id = id.checked_add(1).unwrap_or(1);
         let mut w = Window::new(id, owner, (size.0 as f32, size.1 as f32));
         w.z = self.z_order.len() as u32;
+        w.scale_milli = self.new_scale_milli;
         if self.mint_embed_tokens {
             w.embed_token = random_token();
         }
@@ -999,11 +1039,12 @@ impl Compositor {
         true
     }
 
-    /// Update DPI scale factor for `id`. Emits `WindowDpiChanged`.
+    /// Set window `id`'s scale (device pixels per point). Emits
+    /// `WindowDpiChanged`, which its client is told as
+    /// `EV_WINDOW_RESIZED`.
     pub fn set_window_dpi(&mut self, id: WindowId, scale_factor: f32) -> bool {
-        if !self.windows.contains_key(&id) {
-            return false;
-        }
+        let Some(w) = self.windows.get_mut(&id) else { return false };
+        w.scale_milli = (scale_factor * 1000.0).round() as u32;
         self.emit(DisplayEvent::WindowDpiChanged {
             window_id: id as u32, scale_factor,
         });
@@ -1551,14 +1592,14 @@ impl Compositor {
         let rank = |id: WindowId, c: &Slot| (c.kind == fresco_protocol::slot::kind::SHEET, c.kind == fresco_protocol::slot::kind::CREDENTIAL, c.z, id);
         slots.sort_by(|a, b| rank(b.0, &b.1).cmp(&rank(a.0, &a.1)));
         for (id, c) in slots {
-            let Some((ppos, psize)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size)) else {
+            let Some((ppos, psize, pscale)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size, p.scale_milli)) else {
                 self.windows.get_mut(&id).unwrap().slot = None;
                 self.hide(id);
                 continue;
             };
             self.z_order.retain(|&w| w != id);
             let [x, y, w, h] = if c.kind == fresco_protocol::slot::kind::SHEET {
-                sheet_rect(psize, (c.rect[2], c.rect[3]))
+                sheet_rect(psize, (c.rect[2], c.rect[3]), pscale)
             } else {
                 c.rect
             };
@@ -1708,17 +1749,19 @@ impl Compositor {
     }
 }
 
-/// Where a sheet `size` goes in a parent `psize` (parent coordinates):
-/// centred across, `SHEET_TOP` down or centred if the parent is shorter
+/// Where a sheet of `size` points goes in a parent of `psize` device
+/// pixels at `scale_milli` (parent coordinates, device pixels): centred
+/// across, `SHEET_TOP` points down or centred if the parent is shorter
 /// than that leaves room for, never above the parent's top; whole pixels.
-pub fn sheet_rect(psize: (f32, f32), size: (f32, f32)) -> [f32; 4] {
-    let (w, h) = (size.0.floor().max(1.0), size.1.floor().max(1.0));
+pub fn sheet_rect(psize: (f32, f32), size: (f32, f32), scale_milli: u32) -> [f32; 4] {
+    let k = scale_milli as f32 / 1000.0;
+    let (w, h) = ((size.0 * k).floor().max(1.0), (size.1 * k).floor().max(1.0));
     let x = ((psize.0 - w) / 2.0).floor();
-    let y = SHEET_TOP.min(((psize.1 - h) / 2.0).floor()).max(0.0);
+    let y = (SHEET_TOP * k).floor().min(((psize.1 - h) / 2.0).floor()).max(0.0);
     [x, y, w, h]
 }
 
-/// How far below its parent's top edge a sheet sits.
+/// How far below its parent's top edge a sheet sits, in points.
 pub const SHEET_TOP: f32 = 48.0;
 
 /// Whether anything composed above `island` overlaps it: `layers` bottom
@@ -2009,8 +2052,43 @@ mod event_tests {
         assert_eq!(op, control::EV_WINDOW_RESIZED);
         let decoded: WindowResizedEvent = decode(&payload).expect("decode");
         assert_eq!(decoded.window_id, 7);
-        assert_eq!(decoded.width, 1280);
-        assert_eq!(decoded.height, 720);
+        assert_eq!((decoded.width, decoded.height), (1280.0, 720.0));
+        assert_eq!((decoded.scale_milli, decoded.buffer_width, decoded.buffer_height), (1000, 1280, 720));
+    }
+
+    /// Clients get points: sizes, pointer positions, scroll deltas and
+    /// pop-up places divided by the window's scale; a scale change goes
+    /// out as a resize (resolution-independence.md §3).
+    #[test]
+    fn clients_are_told_points() {
+        use fresco_protocol::{control, decode, InputPointerButtonEvent, InputPointerScrollEvent, PopupPlacedEvent, WindowResizedEvent};
+        let scale_of = |w: u32| (w == 7).then_some((1500, (1200.0, 900.0)));
+        let (op, p) = encode_event_with(&DisplayEvent::WindowResized { window_id: 7, width: 1200, height: 900 }, &scale_of).unwrap();
+        assert_eq!(op, control::EV_WINDOW_RESIZED);
+        let r: WindowResizedEvent = decode(&p).unwrap();
+        assert_eq!((r.width, r.height, r.scale_milli, r.buffer_width, r.buffer_height), (800.0, 600.0, 1500, 1200, 900));
+        let (op, p) = encode_event_with(&DisplayEvent::WindowDpiChanged { window_id: 7, scale_factor: 1.5 }, &scale_of).unwrap();
+        assert_eq!(op, control::EV_WINDOW_RESIZED, "a scale change is a resize");
+        assert_eq!(decode::<WindowResizedEvent>(&p).unwrap().width, 800.0);
+        let ev = DisplayEvent::InputPointerButton { window_id: 7, x: 300.0, y: 150.0, button: 1, pressed: true, modifiers: 0, activation: [0; 16] };
+        let b: InputPointerButtonEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
+        assert_eq!((b.x, b.y), (200.0, 100.0));
+        let ev = DisplayEvent::InputPointerScroll { window_id: 7, dx: 0.0, dy: 45.0, phase: 0 };
+        let sc: InputPointerScrollEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
+        assert_eq!(sc.dy, 30.0);
+        let ev = DisplayEvent::PopupPlaced { window_id: 7, x: 30.0, y: 60.0, width: 300, height: 450, side: 0 };
+        let pp: PopupPlacedEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
+        assert_eq!((pp.x, pp.y, pp.width, pp.height), (20.0, 40.0, 200.0, 300.0));
+        // A window it knows nothing of (none, the background): as is.
+        let ev = DisplayEvent::InputPointerButton { window_id: 0, x: 300.0, y: 150.0, button: 1, pressed: true, modifiers: 0, activation: [0; 16] };
+        let b: InputPointerButtonEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
+        assert_eq!((b.x, b.y), (300.0, 150.0));
+    }
+
+    /// A sheet's size and its gap below the parent's top are points.
+    #[test]
+    fn a_sheet_is_placed_in_points() {
+        assert_eq!(super::sheet_rect((2000.0, 1500.0), (640.0, 440.0), 1500), [520.0, 72.0, 960.0, 660.0]);
     }
 }
 
@@ -2104,7 +2182,7 @@ mod notification_tests {
         let (t, local) = c.pointer_target(pp.0 + 70.0, pp.1 + 60.0);
         assert_eq!((t, local), (s, (10.0, 12.0)));
         // A parent smaller than the sheet: it hangs past the edges, centred.
-        assert_eq!(super::sheet_rect((400.0, 300.0), (640.0, 440.0)), [-120.0, 0.0, 640.0, 440.0]);
+        assert_eq!(super::sheet_rect((400.0, 300.0), (640.0, 440.0), 1000), [-120.0, 0.0, 640.0, 440.0]);
         // Released: the parent takes input again.
         assert_eq!(c.bind_slot(s, p, kind::SHEET, None, 0), Ok(()));
         assert_eq!(c.sheet_of(p), None);

@@ -244,7 +244,8 @@ fn main() -> ExitCode {
             let e = embeds.get_mut(&id).unwrap();
             loop {
                 let ev = match e.win.poll_event() {
-                    Ok(Some(ev)) => ev,
+                    // It lays out in device pixels (resolution-independence.md §3).
+                    Ok(Some(ev)) => e.win.in_device_px(ev),
                     Ok(None) => break,
                     Err(_) => {
                         gone = true;

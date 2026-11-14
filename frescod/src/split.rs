@@ -428,7 +428,8 @@ impl Broker {
             }
         };
         let screen = self.screen();
-        ours.send(&Msg::Client { width: screen.0, height: screen.1, refresh_mhz: screen.2, pixels: self.pixels }, &[stream.as_raw_fd()])?;
+        let scale_milli = self.comp.lock().unwrap().new_scale_milli.clamp(fresco_split::SCALE_MIN, fresco_split::SCALE_MAX);
+        ours.send(&Msg::Client { width: screen.0, height: screen.1, refresh_mhz: screen.2, pixels: self.pixels, scale_milli }, &[stream.as_raw_fd()])?;
         // The broker keeps a copy of the client's socket, never read, only
         // to see the client hang up: a renderer that ignores its client's
         // hang-up must not keep its client id and windows forever.
@@ -566,7 +567,12 @@ impl Broker {
                     }
                     g
                 };
+                // The scale it opened at here, which its renderer may
+                // have guessed differently (resolution-independence.md §3).
+                let scale_milli = self.comp.lock().unwrap().windows.get(&global).map_or(1000, |w| w.scale_milli)
+                    .clamp(fresco_split::SCALE_MIN, fresco_split::SCALE_MAX);
                 r.tell(&Msg::Slots { window: local, bytes: bytes as u32 }, &[a.fd(), b.fd()])
+                    .and_then(|_| r.tell(&Msg::Scale { window: local, scale_milli }, &[]))
                     .and_then(|_| r.tell(&Msg::Geometry { window: local, width, height }, &[]))?;
                 wins.insert(local, Win { global, slots: [a, b], told: (width, height) });
                 drop(wins);

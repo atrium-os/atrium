@@ -42,7 +42,7 @@ use fresco_protocol::{
     WindowSetHintsPayload, WindowRequestClosePayload, WindowPresentPayload,
     WindowPresentDamagePayload, WindowHints,
     WindowResizedEvent, WindowFocusChangedEvent,
-    WindowCloseRequestedEvent, WindowDpiChangedEvent, WindowFillsDroppedEvent,
+    WindowCloseRequestedEvent, WindowFillsDroppedEvent,
     WindowCreatedEvent, WindowDestroyedEvent,
     InputKeyEvent, InputPointerMotionEvent,
     InputPointerButtonEvent, InputPointerScrollEvent,
@@ -67,12 +67,16 @@ pub use fresco_protocol::TextMeasureResponse as TextMetrics;
 /// inside the connection and surfaced separately.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Resized        { window_id: u32, width: u32, height: u32 },
+    /// The window's size or scale changed (resolution-independence.md
+    /// §3): lay out at `width` x `height` **points**, draw at `scale`
+    /// device pixels per point into a `buffer_width` x `buffer_height`
+    /// buffer. Pointer positions and pop-up geometry are in points too;
+    /// the scene is in device pixels.
+    Resized        { window_id: u32, width: f32, height: f32, scale: f32, buffer_width: u32, buffer_height: u32 },
     /// `cause`: what moved it (`fresco_protocol::focus_cause`): show a
     /// focus ring only for `KEYBOARD`.
     FocusChanged   { window_id: u32, gained: bool, cause: u8 },
     CloseRequested { window_id: u32 },
-    DpiChanged     { window_id: u32, scale_factor: f32 },
     /// The nodes of this window that are not drawn (each with a
     /// `fresco_protocol::fill_drop` reason): fills Fresco cannot tile, and
     /// with `OP_BUDGET` any node past the window's 65,536-op budget. Sent
@@ -95,11 +99,11 @@ pub enum Event {
     /// This window spans several monitors (fresco-span.md): each monitor's
     /// tile of it and the hidden bezel strips; no tiles = the span ended.
     Span(fresco_protocol::WindowSpanEvent),
-    /// Pop-up `window_id` landed at `x`, `y` (in its parent's pixels) at
-    /// `width` x `height`, opening to `side` after any flip
+    /// Pop-up `window_id` landed at `x`, `y` (in its parent, points) at
+    /// `width` x `height` points, opening to `side` after any flip
     /// (docs/spec/fresco-popups.md). Sent on open, on each re-place, and
     /// when the parent moves.
-    PopupPlaced { window_id: u32, x: f32, y: f32, width: u32, height: u32, side: u8 },
+    PopupPlaced { window_id: u32, x: f32, y: f32, width: f32, height: f32, side: u8 },
     /// Pop-up `window_id` is off screen (`fresco_protocol::popup_dismiss`):
     /// close the menu, then destroy the window or place it again.
     PopupDismissed { window_id: u32, reason: u8 },
@@ -121,7 +125,7 @@ pub enum Event {
         /// should ignore it.
         repeat: bool,
     },
-    /// Pointer motion in window-local logical pixels.
+    /// Pointer motion in window-local points.
     PointerMotion { window_id: u32, x: f32, y: f32 },
     /// Pointer button press/release.
     PointerButton {
@@ -133,7 +137,7 @@ pub enum Event {
         /// As for `Key`.
         activation: [u8; 16],
     },
-    /// Pointer scroll delta in logical pixels.
+    /// Pointer scroll delta in points.
     PointerScroll {
         window_id: u32,
         dx: f32,
@@ -205,6 +209,8 @@ pub struct Connection {
     /// Events that arrived while a request waited for its reply, for the
     /// next `poll_event` / `wait_event`.
     pending:        std::collections::VecDeque<Event>,
+    /// Each window's scale as last told (create reply, `Resized`).
+    scales:         std::collections::HashMap<u32, f32>,
 }
 
 /// The canonical Fresco socket location inside a Portcullis jail. Portcullis
@@ -259,6 +265,7 @@ impl Connection {
             default_window: 0,
             seq_max_id:     0,
             pending:        std::collections::VecDeque::new(),
+            scales:         std::collections::HashMap::new(),
         })
     }
 
@@ -281,7 +288,51 @@ impl Connection {
             default_window: 0,
             seq_max_id:     0,
             pending:        std::collections::VecDeque::new(),
+            scales:         std::collections::HashMap::new(),
         })
+    }
+
+    /// Window `window_id`'s scale: device pixels per point, as frescod
+    /// last said (its create reply, then `Event::Resized`); 1.0 for a
+    /// window it hasn't said for.
+    pub fn window_scale(&self, window_id: u32) -> f32 {
+        self.scales.get(&window_id).copied().unwrap_or(1.0)
+    }
+
+    /// `ev` in device pixels at its window's scale
+    /// ([`Event::in_device_px`]): for a client that lays out and draws in
+    /// device pixels itself.
+    pub fn in_device_px(&self, ev: Event) -> Event {
+        let window = match &ev {
+            Event::Resized { window_id, .. }
+            | Event::PointerMotion { window_id, .. }
+            | Event::PointerButton { window_id, .. }
+            | Event::PointerScroll { window_id, .. }
+            | Event::PointerMagnify { window_id, .. }
+            | Event::DragEnter { window_id, .. }
+            | Event::DragOver { window_id, .. }
+            | Event::Drop { window_id, .. }
+            | Event::PopupPlaced { window_id, .. } => *window_id,
+            _ => return ev,
+        };
+        let k = self.window_scale(window);
+        ev.in_device_px(k)
+    }
+
+    /// The window id in a create reply, noting the scale it opens at.
+    fn created(&mut self, op: &str, payload: &[u8]) -> io::Result<u32> {
+        let r: fresco_protocol::WindowCreateReply = decode(payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode {op} reply: {e}")))?;
+        self.scales.insert(r.window_id, r.scale_milli as f32 / 1000.0);
+        Ok(r.window_id)
+    }
+
+    /// An event on its way to the app: note a scale it carries.
+    fn note(&mut self, ev: Event) -> Event {
+        if let Event::Resized { window_id, scale, .. } = ev {
+            self.scales.insert(window_id, scale);
+        }
+        ev
     }
 
     /// Set the default target window for routable scene/slot ops.
@@ -487,6 +538,10 @@ impl Connection {
     }
 
     // ── Window management ──────────────────────────────────────────
+    //
+    // Sizes, anchors and positions here are in points; the window's scale
+    // (`window_scale`) turns them into the device pixels its scene is in
+    // (docs/spec/resolution-independence.md §3).
 
     /// Create a top-level window. Blocks until the server replies
     /// with the assigned `window_id`. Sets the new id as the
@@ -512,9 +567,7 @@ impl Connection {
                && m.op == control::OP_WINDOW_CREATE
                && m.flags & flag::IS_RESPONSE != 0
             {
-                let id: u32 = decode(&m.payload)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
-                        format!("decode WINDOW_CREATE reply: {e}")))?;
+                let id = self.created("WINDOW_CREATE", &m.payload)?;
                 self.default_window = id as u16;
                 return Ok(id);
             }
@@ -525,7 +578,7 @@ impl Connection {
     // ── Pop-ups (docs/spec/fresco-popups.md) ───────────────────────
 
     /// Open a pop-up (a menu, a drop-down list, a tooltip) of `parent`,
-    /// hanging from `anchor` (`[x, y, w, h]` in `parent`'s pixels) on
+    /// hanging from `anchor` (`[x, y, w, h]` in `parent`'s points) on
     /// `side` (`fresco_protocol::popup_side`), lined up by `align`
     /// (`popup_align`), `width` x `height` wanted. frescod places it (it
     /// may flip, slide or shrink it) and says where with
@@ -540,8 +593,7 @@ impl Connection {
         let p = fresco_protocol::PopupCreatePayload { parent, anchor, side, align, width, height, grab };
         self.send_window_managed(control::OP_POPUP_CREATE, &p)?;
         let m = self.wm_response(control::OP_POPUP_CREATE)?;
-        decode::<u32>(&m.payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode POPUP_CREATE reply: {e}")))
+        self.created("POPUP_CREATE", &m.payload)
     }
 
     /// Move or resize open pop-up `window_id`, or show it again after a
@@ -571,8 +623,7 @@ impl Connection {
         let p = fresco_protocol::PopupClaimPayload { token, width, height };
         self.send_window_managed(control::OP_POPUP_CLAIM, &p)?;
         let m = self.wm_response(control::OP_POPUP_CLAIM)?;
-        decode::<u32>(&m.payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode POPUP_CLAIM reply: {e}")))
+        self.created("POPUP_CLAIM", &m.payload)
     }
 
     // ── Video layers (docs/spec/fresco-video.md) ───────────────────
@@ -1061,7 +1112,7 @@ impl Connection {
 
     fn recv_event_inner(&mut self) -> io::Result<Event> {
         if let Some(e) = self.pending.pop_front() {
-            return Ok(e);
+            return Ok(self.note(e));
         }
         loop {
             let m: Message = self.inner.recv_message()?;
@@ -1078,7 +1129,8 @@ impl Connection {
                 log::debug!("recv_event: skipping non-event op={:#x}", m.op);
                 continue;
             }
-            return Ok(decode_event(m.op, &m.payload));
+            let ev = decode_event(m.op, &m.payload);
+            return Ok(self.note(ev));
         }
     }
 }
@@ -1208,6 +1260,35 @@ impl<'a> Drop for FrameBuilder<'a> {
     }
 }
 
+impl Event {
+    /// This event with its geometry in the window's device pixels rather
+    /// than points: for a client that draws and lays out in device pixels
+    /// itself instead of through a toolkit (resolution-independence.md
+    /// §3). `scale` is the window's (`Connection::window_scale`); a
+    /// `Resized` takes its own and reports the buffer size.
+    pub fn in_device_px(self, scale: f32) -> Event {
+        let k = scale;
+        match self {
+            Event::Resized { window_id, scale, buffer_width, buffer_height, .. } => Event::Resized {
+                window_id, width: buffer_width as f32, height: buffer_height as f32, scale, buffer_width, buffer_height,
+            },
+            Event::PointerMotion { window_id, x, y } => Event::PointerMotion { window_id, x: x * k, y: y * k },
+            Event::PointerButton { window_id, x, y, button, pressed, modifiers, activation } => {
+                Event::PointerButton { window_id, x: x * k, y: y * k, button, pressed, modifiers, activation }
+            }
+            Event::PointerScroll { window_id, dx, dy, phase } => Event::PointerScroll { window_id, dx: dx * k, dy: dy * k, phase },
+            Event::PointerMagnify { window_id, x, y, scale, phase } => Event::PointerMagnify { window_id, x: x * k, y: y * k, scale, phase },
+            Event::DragEnter { window_id, drag_id, x, y, formats } => Event::DragEnter { window_id, drag_id, x: x * k, y: y * k, formats },
+            Event::DragOver { window_id, drag_id, x, y } => Event::DragOver { window_id, drag_id, x: x * k, y: y * k },
+            Event::Drop { window_id, x, y, activation } => Event::Drop { window_id, x: x * k, y: y * k, activation },
+            Event::PopupPlaced { window_id, x, y, width, height, side } => {
+                Event::PopupPlaced { window_id, x: x * k, y: y * k, width: width * k, height: height * k, side }
+            }
+            other => other,
+        }
+    }
+}
+
 // ── event decoding ───────────────────────────────────────────────────
 
 fn is_event(m: &Message) -> bool {
@@ -1220,6 +1301,8 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         EV_WINDOW_RESIZED => match decode::<WindowResizedEvent>(payload) {
             Ok(p) => Event::Resized {
                 window_id: p.window_id, width: p.width, height: p.height,
+                scale: p.scale_milli as f32 / 1000.0,
+                buffer_width: p.buffer_width, buffer_height: p.buffer_height,
             },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
@@ -1231,12 +1314,6 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_CLOSE_REQUESTED => match decode::<WindowCloseRequestedEvent>(payload) {
             Ok(p) => Event::CloseRequested { window_id: p.window_id },
-            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
-        },
-        EV_WINDOW_DPI_CHANGED => match decode::<WindowDpiChangedEvent>(payload) {
-            Ok(p) => Event::DpiChanged {
-                window_id: p.window_id, scale_factor: p.scale_factor,
-            },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_WINDOW_FILLS_DROPPED => match decode::<WindowFillsDroppedEvent>(payload) {
@@ -1373,11 +1450,11 @@ mod tests {
     fn decode_event_dispatches_correctly() {
         use control::*;
 
-        let p = WindowResizedEvent { window_id: 7, width: 1280, height: 720 };
+        let p = WindowResizedEvent { window_id: 7, width: 640.0, height: 360.0, scale_milli: 2000, buffer_width: 1280, buffer_height: 720 };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_WINDOW_RESIZED, &bytes) {
-            Event::Resized { window_id, width, height } => {
-                assert_eq!((window_id, width, height), (7, 1280, 720));
+            Event::Resized { window_id, width, height, scale, buffer_width, buffer_height } => {
+                assert_eq!((window_id, width, height, scale, buffer_width, buffer_height), (7, 640.0, 360.0, 2.0, 1280, 720));
             }
             other => panic!("expected Resized, got {other:?}"),
         }
@@ -1387,15 +1464,6 @@ mod tests {
         match decode_event(EV_WINDOW_FOCUS_CHANGED, &bytes) {
             Event::FocusChanged { window_id: 3, gained: true, cause: 2 } => {}
             other => panic!("expected FocusChanged, got {other:?}"),
-        }
-
-        let p = WindowDpiChangedEvent { window_id: 5, scale_factor: 2.0 };
-        let bytes = encode(&p).unwrap();
-        match decode_event(EV_WINDOW_DPI_CHANGED, &bytes) {
-            Event::DpiChanged { window_id: 5, scale_factor } => {
-                assert_eq!(scale_factor, 2.0);
-            }
-            other => panic!("expected DpiChanged, got {other:?}"),
         }
 
         let p = WindowFillsDroppedEvent {

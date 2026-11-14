@@ -63,7 +63,7 @@ fn spawn_stub(socket_path: PathBuf, window_id: u32)
         let (op, flags, _payload) = read_one(&mut stream).expect("read create");
         ops2.lock().unwrap().push((op, flags));
         assert_eq!(op, OP_WINDOW_CREATE);
-        let reply = postcard::to_stdvec(&window_id).unwrap();
+        let reply = postcard::to_stdvec(&fresco_protocol::WindowCreateReply { window_id, scale_milli: 1000 }).unwrap();
         write_envelope(&mut stream, OP_WINDOW_CREATE, flag::IS_RESPONSE, &reply);
 
         // 2. Three scene-graph envelopes for the fill.

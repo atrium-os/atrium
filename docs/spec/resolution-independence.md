@@ -64,17 +64,34 @@ rows 4 to 7 of §2 by construction.
 
 ### 3.1 Wire changes
 
-- `window_create`, `Resized`, `PopupPlaced`, `WindowHints.min_size`, popup anchors and sizes:
-  pt.
-- `window_create`'s reply carries the window's `scale` and its buffer size in device px, so
-  the first frame is right (row 6).
-- `EV_WINDOW_DPI_CHANGED` becomes `EV_WINDOW_SCALE` with `{ scale, buffer_w, buffer_h }`.
-- Pointer events: pt, in the window's coordinates.
-- The scene stays in device px of the window's buffer (as now). A window's buffer size is
-  `round(size_pt * scale)`; frescod says what it chose so app and compositor agree on the
-  rounding.
-- WM ops (`OP_WM_OUTPUTS`, arrange, move, tile rects): pt. Each `WmOutput` has its mode in
-  device px and its `rect` in pt (mode / scale).
+Built in step 1a (2026-11-14); fresco-protocol's "Units" note is the reference.
+
+- **Points** on the app connection: `WindowCreatePayload` sizes, pop-up create/place/grant/
+  claim sizes and anchors, `EV_WINDOW_RESIZED`, `EV_POPUP_PLACED`, pointer positions, scroll
+  deltas, drag and drop positions.
+- **The create reply** (`WindowCreateReply`, for windows, pop-ups and claims) carries the
+  window's id and the scale it opens at, so the first frame is right (row 6). A new window
+  opens at the scale of the monitor at the desktop's origin; a pop-up at its parent's.
+- **`EV_WINDOW_DPI_CHANGED` is gone**: `EV_WINDOW_RESIZED` carries `{ width, height }` in pt,
+  `scale_milli` and `buffer_width/height` in device px, and is sent on a resize or a scale
+  change.
+- **Device px** stays for what is drawn: the scene (rects, paths, glyphs, fills, textures,
+  damage) and what is placed inside it like content (video layer rects, slot rects). A
+  window's buffer is `round(size_pt * scale)` and frescod reports the buffer it chose.
+- **`DisplayInfoResponse`** gains `scale_milli` (new windows' scale), so a full-screen app
+  asks for `mode / scale` points.
+- frescod converts at the client boundary: incoming sizes in the client-facing frontend (a
+  split renderer's own), outgoing events where they're encoded for the client, each at that
+  window's scale. Inside frescod and between broker and renderers everything stays device
+  px; a claim's size reaches frescod in pt, since only frescod knows the bar's scale.
+- Clients that lay out in device px themselves (Arca's UI, the lock screen, the player's
+  controls, libatrium's C ABI) call `Connection::in_device_px` on each event; moving them to
+  Pergola or to points is later work.
+- **Step 1b, still to do:** WM ops (`OP_WM_OUTPUTS`, arrange, move, declare layout) and the
+  desktop are still device px. A window's size is the WM's to set, so on a scale change
+  frescod keeps its buffer and the window's pt size follows the new scale; a pop-up keeps its
+  pt size. forum-wm moving to pt (floating windows keep their pt size across monitors, bar
+  and dock reservations in pt) is step 1b.
 
 ## 4. Per-monitor scale
 
@@ -315,11 +332,12 @@ Shankar took the recommendation on each:
 
 ## 12. Build order (after review)
 
-1. **Units fix** (rows 4 to 7, 12): pt on the wire for geometry and input (window, pop-up and
-   sheet sizes and anchors, `SHEET_TOP`), scale in the
-   `window_create` reply, `EV_WINDOW_SCALE`, Pergola divides input and sizes in one place,
-   forum-wm lays out the desktop in pt. Test: the Pergola showcase pixel-compared at 1.0,
-   1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit at every scale.
+1. **Units fix** (rows 4 to 7, 12). **1a, built 2026-11-14:** pt on the app connection for
+   geometry and input (window, pop-up and sheet sizes and anchors, `SHEET_TOP`), scale in the
+   create reply, scale changes as `EV_WINDOW_RESIZED`, Pergola in pt with one place that
+   multiplies. **1b:** forum-wm lays out the desktop in pt. Test: the Pergola showcase
+   pixel-compared at 1.0, 1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit
+   at every scale.
 2. **Scale policy** (rows 8 to 10): `ui_size` relative preference, TV fallback, 1/8 steps,
    strip, cursor and forum-wm's bar and dock reservations in pt. Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.

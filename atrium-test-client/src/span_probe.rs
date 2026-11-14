@@ -114,7 +114,7 @@ fn main() -> std::io::Result<()> {
         let mut retile = false;
         if let Some(ev) = conn.wait_event(Some(wait))? {
             match ev {
-                Event::Resized { window_id, width, height } if window_id == win => {
+                Event::Resized { window_id, buffer_width: width, buffer_height: height, .. } if window_id == win => {
                     eprintln!("span-probe: resized {width}x{height}");
                     (p.w, p.h) = (width.max(1), height.max(1));
                     redraw = true;

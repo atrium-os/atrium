@@ -427,7 +427,8 @@ impl EnvelopeFrontend {
     /// The scanout mode and the reserved top rows (`OP_DISPLAY_INFO`).
     pub fn display_info(&self) -> fresco_protocol::DisplayInfoResponse {
         let (width, height, refresh_mhz) = self.display_mode;
-        fresco_protocol::DisplayInfoResponse { width, height, refresh_mhz, reserved_top: self.reserved_top }
+        let scale_milli = self.compositor.lock().unwrap().new_scale_milli;
+        fresco_protocol::DisplayInfoResponse { width, height, refresh_mhz, reserved_top: self.reserved_top, scale_milli }
     }
 
     /// The monitor's modes and the lit one, for `OP_WM_DISPLAY_MODES`.
@@ -494,41 +495,89 @@ impl EnvelopeFrontend {
     }
 
     /// Tell each window the scale of the monitor it is (mostly) on, when
-    /// that differs from what it was last told (`EV_WINDOW_DPI_CHANGED`).
-    /// A window on no present monitor keeps its scale.
+    /// that differs from what it was last told (`EV_WINDOW_RESIZED`), and
+    /// set the scale new windows open at: the monitor at the desktop's
+    /// origin, where they land. A pop-up or a slot takes its parent's
+    /// scale. A window on no present monitor keeps its scale.
+    ///
+    /// A top-level window's size is the WM's to set (it lays out in device
+    /// pixels and re-lays out on the change), so its buffer stays and its
+    /// size in points follows the new scale. A pop-up's asked-for size and
+    /// anchor are scaled by the change, so it keeps its size in points
+    /// against its parent. A slot's size is its parent's to say.
     fn update_window_scales(&mut self) {
         let present: Vec<&fresco_protocol::WmOutput> =
             self.outputs.outputs.iter().filter(|o| o.present && o.mirror_of == 0).collect();
         if present.is_empty() {
             return;
         }
+        let origin = present
+            .iter()
+            .find(|o| o.rect.x <= 0 && o.rect.y <= 0 && o.rect.x + o.rect.w as i32 > 0 && o.rect.y + o.rect.h as i32 > 0)
+            .unwrap_or(&present[0]);
         let mut comp = self.compositor.lock().unwrap();
-        let mut changed: Vec<(u16, u32)> = Vec::new();
-        for (&id, w) in comp.windows.iter() {
-            if id == 0 {
-                continue;
-            }
+        comp.new_scale_milli = origin.scale_milli;
+        let on_monitor = |w: &crate::window::Window| -> Option<u32> {
             let (x, y, ww, wh) = (w.pos.0 as i64, w.pos.1 as i64, w.size.0 as i64, w.size.1 as i64);
-            let best = present
+            present
                 .iter()
                 .map(|o| {
                     let r = &o.rect;
-                    let ox = (x + ww).min(i64::from(r.x + r.w)) - x.max(i64::from(r.x));
-                    let oy = (y + wh).min(i64::from(r.y + r.h)) - y.max(i64::from(r.y));
+                    let ox = (x + ww).min(i64::from(r.x) + i64::from(r.w)) - x.max(i64::from(r.x));
+                    let oy = (y + wh).min(i64::from(r.y) + i64::from(r.h)) - y.max(i64::from(r.y));
                     (ox.max(0) * oy.max(0), o.scale_milli)
                 })
-                .max_by_key(|&(area, _)| area);
-            if let Some((area, scale)) = best {
-                if area > 0 && scale != w.scale_milli {
-                    changed.push((id, scale));
+                .max_by_key(|&(area, _)| area)
+                .filter(|&(area, _)| area > 0)
+                .map(|(_, s)| s)
+        };
+        // The window a pop-up or a slot takes its scale from.
+        let parent_of = |w: &crate::window::Window| -> Option<crate::window::WindowId> {
+            w.popup.map(|p| p.parent).filter(|&p| p != 0).or(w.slot.map(|s| s.parent))
+        };
+        let mut want: std::collections::HashMap<crate::window::WindowId, u32> = std::collections::HashMap::new();
+        let ids: Vec<crate::window::WindowId> = comp.windows.keys().copied().filter(|&id| id != 0).collect();
+        for &id in &ids {
+            // Up the chain of parents to a top-level window (bounded: a
+            // chain is at most a slot's pop-up's pop-ups deep).
+            let mut top = id;
+            for _ in 0..=fresco_protocol::POPUP_MAX_DEPTH + 2 {
+                match comp.windows.get(&top).and_then(parent_of) {
+                    Some(p) if comp.windows.contains_key(&p) => top = p,
+                    _ => break,
                 }
             }
+            let w = &comp.windows[&id];
+            let s = comp.windows.get(&top).and_then(on_monitor).unwrap_or_else(|| {
+                if top == id { w.scale_milli } else { comp.windows[&top].scale_milli }
+            });
+            if s != w.scale_milli {
+                want.insert(id, s);
+            }
         }
+        if want.is_empty() {
+            return;
+        }
+        let mut placed_again = false;
+        let mut changed: Vec<(crate::window::WindowId, u32)> = want.into_iter().collect();
+        changed.sort();
         for (id, scale) in changed {
-            if let Some(w) = comp.windows.get_mut(&id) {
-                w.scale_milli = scale;
+            let (old, popup) = {
+                let w = &comp.windows[&id];
+                (w.scale_milli, w.popup.is_some())
+            };
+            let k = scale as f32 / old.max(1) as f32;
+            if popup {
+                if let Some(p) = comp.windows.get_mut(&id).and_then(|w| w.popup.as_mut()) {
+                    p.want = (((p.want.0 as f32 * k).round() as u32).max(1), ((p.want.1 as f32 * k).round() as u32).max(1));
+                    p.anchor = p.anchor.map(|v| v * k);
+                    placed_again = true;
+                }
             }
             comp.set_window_dpi(id, scale as f32 / 1000.0);
+        }
+        if placed_again {
+            comp.place_slots();
         }
     }
 
@@ -1372,9 +1421,7 @@ impl EnvelopeFrontend {
     /// correctly without knowing the screen, and withholding that from ordinary
     /// apps is what left each of them guessing a different size.
     fn handle_display_info(&mut self) -> Result<Vec<Outbound>, DispatchError> {
-        let (width, height, refresh_mhz) = self.display_mode;
-        let payload = encode(&DisplayInfoResponse { width, height, refresh_mhz, reserved_top: self.reserved_top })
-            .map_err(|_| DispatchError::BadPayload)?;
+        let payload = encode(&self.display_info()).map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound {
             op:      control::OP_DISPLAY_INFO,
             flags:   flag::IS_RESPONSE,
@@ -1421,15 +1468,20 @@ impl EnvelopeFrontend {
         }
         let parent = u16::try_from(p.parent).map_err(|_| DispatchError::UnknownWindow)?;
         let mut comp = self.compositor.lock().unwrap();
+        // Points from the client; device pixels at the parent's scale here.
+        let scale = comp.windows.get(&parent).map_or(1000, |w| w.scale_milli);
+        let (anchor, size) = (anchor_to_device(p.anchor, scale), size_to_device((p.width, p.height), scale));
         let id = comp
-            .open_popup(self.current_client as u32, parent, p.anchor, p.side, p.align, (p.width, p.height), p.grab)
+            .open_popup(self.current_client as u32, parent, anchor, p.side, p.align, size, p.grab)
             .map_err(popup_refused)?;
         if let Some(w) = comp.windows.get_mut(&id) {
             w.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
+            w.scale_milli = scale;
         }
         drop(comp);
         self.update_window_scales();
-        let payload = encode(&(id as u32)).map_err(|_| DispatchError::BadPayload)?;
+        let payload = encode(&fresco_protocol::WindowCreateReply { window_id: id as u32, scale_milli: scale })
+            .map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound { op: control::OP_POPUP_CREATE, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
@@ -1437,9 +1489,11 @@ impl EnvelopeFrontend {
     fn handle_popup_place(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
         let p: fresco_protocol::PopupPlacePayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
         let id = u16::try_from(p.window_id).map_err(|_| DispatchError::UnknownWindow)?;
-        self.compositor.lock().unwrap()
-            .replace_popup(self.current_client as u32, id, p.anchor, p.side, p.align, (p.width, p.height))
+        let mut comp = self.compositor.lock().unwrap();
+        let scale = comp.windows.get(&id).map_or(1000, |w| w.scale_milli);
+        comp.replace_popup(self.current_client as u32, id, anchor_to_device(p.anchor, scale), p.side, p.align, size_to_device((p.width, p.height), scale))
             .map_err(popup_refused)?;
+        drop(comp);
         self.update_window_scales();
         Ok(vec![Outbound { op: control::OP_POPUP_PLACE, flags: aqueduct::envelope::flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
@@ -1453,9 +1507,11 @@ impl EnvelopeFrontend {
         }
         let parent = u16::try_from(p.parent).map_err(|_| DispatchError::UnknownWindow)?;
         let token = crate::window::random_token();
-        self.compositor.lock().unwrap()
-            .grant_popup(self.current_client as u32, parent, p.anchor, p.side, p.align, (p.width, p.height), token)
+        let mut comp = self.compositor.lock().unwrap();
+        let scale = comp.windows.get(&parent).map_or(1000, |w| w.scale_milli);
+        comp.grant_popup(self.current_client as u32, parent, anchor_to_device(p.anchor, scale), p.side, p.align, size_to_device((p.width, p.height), scale), token)
             .map_err(popup_refused)?;
+        drop(comp);
         let payload = encode(&token).map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound { op: control::OP_POPUP_GRANT, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
@@ -1468,13 +1524,18 @@ impl EnvelopeFrontend {
             return Err(DispatchError::Forbidden);
         }
         let mut comp = self.compositor.lock().unwrap();
+        // The size is in points; the compositor converts it at the scale
+        // of the window the grant hangs from (here, or in frescod for a
+        // split renderer, which doesn't know that window).
         let id = comp.claim_popup(self.current_client as u32, p.token, (p.width, p.height)).map_err(popup_refused)?;
+        let scale = comp.windows.get(&id).map_or(1000, |w| w.scale_milli);
         if let Some(w) = comp.windows.get_mut(&id) {
             w.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
         }
         drop(comp);
         self.update_window_scales();
-        let payload = encode(&(id as u32)).map_err(|_| DispatchError::BadPayload)?;
+        let payload = encode(&fresco_protocol::WindowCreateReply { window_id: id as u32, scale_milli: scale })
+            .map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound { op: control::OP_POPUP_CLAIM, flags: aqueduct::envelope::flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
@@ -1488,7 +1549,10 @@ impl EnvelopeFrontend {
             p.hints.role = None;
         }
         let mut comp = self.compositor.lock().unwrap();
-        let new_id = comp.create(self.current_client as u32, (p.width, p.height));
+        // Points from the client, device pixels here, at the scale new
+        // windows open at (resolution-independence.md §3).
+        let scale = comp.new_scale_milli;
+        let new_id = comp.create(self.current_client as u32, size_to_device((p.width, p.height), scale));
         /* Apply title + hints. Compositor's title is set via
          * `rebuild_window_title(cas)`; for M2.6 we just store the
          * literal text in Window::title and let the cutover wire the
@@ -1548,7 +1612,7 @@ impl EnvelopeFrontend {
         /* Reply with the assigned window_id. Wire encoding mirrors the
          * payload format (postcard). For a server-assigned u32 the
          * payload is just `window_id`. */
-        let reply_payload = fresco_protocol::encode(&(new_id as u32))
+        let reply_payload = fresco_protocol::encode(&fresco_protocol::WindowCreateReply { window_id: new_id as u32, scale_milli: scale })
             .map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound {
             op:      control::OP_WINDOW_CREATE,
@@ -1843,6 +1907,18 @@ impl EnvelopeFrontend {
         s.pending_damage = damage;
         Ok(Vec::new())
     }
+}
+
+/// A size in points from a client, in device pixels at `scale_milli`.
+fn size_to_device(size: (u32, u32), scale_milli: u32) -> (u32, u32) {
+    let d = |v: u32| if v == 0 { 0 } else { fresco_protocol::pt_to_device(v as f32, scale_milli) };
+    (d(size.0), d(size.1))
+}
+
+/// A rect in points from a client (a pop-up's anchor), in device pixels.
+fn anchor_to_device(a: [f32; 4], scale_milli: u32) -> [f32; 4] {
+    let k = scale_milli as f32 / 1000.0;
+    a.map(|v| v * k)
 }
 
 #[cfg(test)]
@@ -2162,7 +2238,7 @@ mod tests {
         };
         let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), client)
             .expect("create");
-        decode(&out[0].payload).unwrap()
+        decode::<fresco_protocol::WindowCreateReply>(&out[0].payload).unwrap().window_id
     }
 
     #[test]
@@ -2207,6 +2283,37 @@ mod tests {
         assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&tiny).unwrap()), 9).is_err());
         assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 1).is_err(), "WM only");
         assert_eq!(f.take_scale_requests(), vec![ok]);
+    }
+
+    /// Clients ask in points (resolution-independence.md §3): a window
+    /// opens at the scale of the monitor at the desktop's origin, its
+    /// pop-ups at its own, and the create replies say which.
+    #[test]
+    fn sizes_from_clients_are_points() {
+        use fresco_protocol::{PopupCreatePayload, WindowCreateReply, WmOutput, WmRect};
+        let mut f = fixture();
+        let out = |output, identity, x, scale_milli| WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w: 3840, h: 2160 },
+            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+        };
+        f.set_outputs(vec![out(0, 10, 0, 1500), out(1, 20, 3840, 1000)]);
+        assert_eq!(f.display_info().scale_milli, 1500);
+        let p = WindowCreatePayload { width: 800, height: 600, title: "app".into(), hints: WindowHints::default(), parent_window_id: 0 };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1).unwrap();
+        let r: WindowCreateReply = decode(&out[0].payload).unwrap();
+        assert_eq!(r.scale_milli, 1500);
+        let id = r.window_id as u16;
+        assert_eq!(f.compositor_arc().lock().unwrap().windows[&id].size, (1200.0, 900.0), "800 x 600 points at 1.5");
+        f.compositor_arc().lock().unwrap().set_focus_no_raise(Some(id));
+        let pp = PopupCreatePayload { parent: id as u32, anchor: [10.0, 20.0, 40.0, 10.0], side: 0, align: 0, width: 200, height: 100, grab: true };
+        let out = f.dispatch(&msg(control::OP_POPUP_CREATE, 0, encode(&pp).unwrap()), 1).unwrap();
+        let r: WindowCreateReply = decode(&out[0].payload).unwrap();
+        assert_eq!(r.scale_milli, 1500, "a pop-up takes its parent's scale");
+        let c = f.compositor_arc();
+        let c = c.lock().unwrap();
+        let w = &c.windows[&(r.window_id as u16)];
+        let p = w.popup.unwrap();
+        assert_eq!((p.want, p.anchor), ((300, 150), [15.0, 30.0, 60.0, 15.0]));
     }
 
     #[test]

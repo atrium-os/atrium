@@ -94,17 +94,18 @@ mod display_payload_fixtures {
         assert_eq!(bytes, vec![0x07]);
     }
 
-    /// Pin: window-resized event for (window_id=7, 1280×720) is exactly
-    /// 6 bytes (1 varint + 2 varint + 2 varint = depends on values).
-    /// 1280 = 0x80,0x0A in postcard varint; 720 = 0xD0,0x05.
+    /// Pin: window-resized event for window 7, 1280×720 points at scale
+    /// 1.0 (a 1280×720 buffer) is exactly 15 bytes.
     #[test]
     fn window_resized_event_byte_count() {
-        let e = WindowResizedEvent { window_id: 7, width: 1280, height: 720 };
+        let e = WindowResizedEvent { window_id: 7, width: 1280.0, height: 720.0, scale_milli: 1000, buffer_width: 1280, buffer_height: 720 };
         let bytes = encode(&e).expect("encode");
-        /* window_id varint(7) = 1 byte
-         * width  varint(1280) = 2 bytes
-         * height varint(720)  = 2 bytes  */
-        assert_eq!(bytes.len(), 5);
+        /* window_id varint(7)        = 1 byte
+         * width, height f32          = 4 + 4 bytes
+         * scale_milli varint(1000)   = 2 bytes
+         * buffer_width varint(1280)  = 2 bytes
+         * buffer_height varint(720)  = 2 bytes */
+        assert_eq!(bytes.len(), 15);
     }
 }
 
@@ -139,7 +140,6 @@ mod op_id_invariants {
         assert!((0x0580..=0x05FF).contains(&control::EV_WINDOW_RESIZED));
         assert!((0x0580..=0x05FF).contains(&control::EV_WINDOW_FOCUS_CHANGED));
         assert!((0x0580..=0x05FF).contains(&control::EV_WINDOW_CLOSE_REQUESTED));
-        assert!((0x0580..=0x05FF).contains(&control::EV_WINDOW_DPI_CHANGED));
     }
 
     /// atrium-core scene ops live in the documented 0x1000..=0x1FFF range.

@@ -106,7 +106,8 @@ impl Probe {
 
 fn placed(ev: &[Event], id: u32) -> Option<(f32, f32, u32, u32, u8)> {
     ev.iter().rev().find_map(|e| match *e {
-        Event::PopupPlaced { window_id, x, y, width, height, side } if window_id == id => Some((x, y, width, height, side)),
+        // Points; the probe runs at scale 1.0, so they are its pixels.
+        Event::PopupPlaced { window_id, x, y, width, height, side } if window_id == id => Some((x, y, width as u32, height as u32, side)),
         _ => None,
     })
 }

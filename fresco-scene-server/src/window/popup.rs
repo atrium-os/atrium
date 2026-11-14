@@ -223,7 +223,8 @@ impl Compositor {
     }
 
     /// `OP_POPUP_CLAIM` from client `owner`: a new window, the grabbing
-    /// pop-up `token` grants, `size` cut to the grant's. The grant is
+    /// pop-up `token` grants, `size` (points, at the scale of the window
+    /// the grant hangs from) cut to the grant's. The grant is
     /// checked again (its parent still on screen, still pressed or with
     /// its chain open). In a split renderer it is only recorded: frescod
     /// checks the token.
@@ -239,10 +240,12 @@ impl Compositor {
             return Ok(id);
         }
         let g = self.take_grant(&token)?;
-        let size = (size.0.min(g.max.0), size.1.min(g.max.1));
+        let scale = self.windows.get(&g.parent).map_or(1000, |w| w.scale_milli);
+        let size = claimed_size(size, scale, g.max);
         self.popup_ok(g.owner, g.parent, g.anchor, g.side, g.align, size, 1)?;
         let id = self.create(owner, size);
         let w = self.windows.get_mut(&id).expect("just made");
+        w.scale_milli = scale;
         w.title = String::new();
         w.popup = Some(Popup { parent: g.parent, anchor: g.anchor, side: g.side, align: g.align, want: size, grab: true, told: None, shown: 1, hosted: Some(token) });
         self.place_slots();
@@ -252,7 +255,7 @@ impl Compositor {
 
     /// frescod, for a split renderer: its window `id` (made hidden, as a
     /// pop-up to be) is the pop-up `token` grants: checked as
-    /// `OP_POPUP_CLAIM` is, then shown and placed.
+    /// `OP_POPUP_CLAIM` is (`size` in points), then shown and placed.
     pub fn attach_hosted(&mut self, owner: u32, id: WindowId, token: [u8; 16], size: (u32, u32)) -> Result<(), PopupRefused> {
         if !self.windows.get(&id).is_some_and(|w| w.owner == owner && w.popup.is_none() && w.slot.is_none()) {
             return Err(PopupRefused::UnknownWindow);
@@ -261,8 +264,12 @@ impl Compositor {
             return Err(PopupRefused::Invalid);
         }
         let g = self.take_grant(&token)?;
-        let size = (size.0.min(g.max.0), size.1.min(g.max.1));
+        let scale = self.windows.get(&g.parent).map_or(1000, |w| w.scale_milli);
+        let size = claimed_size(size, scale, g.max);
         self.popup_ok(g.owner, g.parent, g.anchor, g.side, g.align, size, 1)?;
+        if self.windows[&id].scale_milli != scale {
+            self.set_window_dpi(id, scale as f32 / 1000.0);
+        }
         if self.windows[&id].size != (size.0 as f32, size.1 as f32) {
             self.resize_window(id, size.0, size.1);
         }
@@ -492,6 +499,13 @@ impl Compositor {
 }
 
 use fresco_protocol::WmRole;
+
+/// A claimed pop-up's size: `size` points at `scale_milli`, in device
+/// pixels, cut to the grant's `max` (device pixels).
+fn claimed_size(size: (u32, u32), scale_milli: u32, max: (u32, u32)) -> (u32, u32) {
+    let d = |v: u32| fresco_protocol::pt_to_device(v as f32, scale_milli);
+    (d(size.0).min(max.0), d(size.1).min(max.1))
+}
 
 #[cfg(test)]
 mod tests {

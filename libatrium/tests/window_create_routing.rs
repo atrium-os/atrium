@@ -71,8 +71,8 @@ fn spawn_stub(socket_path: std::path::PathBuf, assigned_id: u32)
             height: decoded.height,
         });
 
-        // Reply: postcard u32 carrying the window id.
-        let reply_payload = postcard::to_stdvec(&assigned_id).unwrap();
+        // Reply: the window id and the scale it opens at.
+        let reply_payload = postcard::to_stdvec(&fresco_protocol::WindowCreateReply { window_id: assigned_id, scale_milli: 1000 }).unwrap();
         let reply_hdr = Header::new(
             CLASS_DISPLAY,
             OP_WINDOW_CREATE,

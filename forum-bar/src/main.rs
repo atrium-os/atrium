@@ -1127,9 +1127,9 @@ fn main() -> std::io::Result<()> {
         // the app through forum-wm; the app claims the pop-up with it.
         if let Some(ask) = want_drawn.get_cloned() {
             want_drawn.set(None);
-            let s = window.scale();
-            let anchor = [ask.rect.x() * s, 0.0, ask.rect.w() * s, shell::BAR_H * s];
-            let (w, h) = ((ask.width as f32 * s).round() as u32, (ask.height as f32 * s).round() as u32);
+            // Points, as the bar lays out (resolution-independence.md §3).
+            let anchor = [ask.rect.x(), 0.0, ask.rect.w(), shell::BAR_H];
+            let (w, h) = (u32::from(ask.width), u32::from(ask.height));
             let id = window.id();
             match window.connection().popup_grant(id, anchor, fresco_protocol::popup_side::BELOW, fresco_protocol::popup_align::END, w, h) {
                 Ok(token) => {

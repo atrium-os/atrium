@@ -31,7 +31,7 @@ use aqueduct::envelope::flag;
 use fresco_scene_server::command::envelope_frontend::{
     DispatchError, EnvelopeFrontend, Outbound,
 };
-use fresco_scene_server::window::{Compositor, DisplayEvent, encode_event};
+use fresco_scene_server::window::{Compositor, DisplayEvent, encode_event_with};
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -212,7 +212,10 @@ fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
 /// without its token) to those other than the window's owner.
 fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, bare: Option<DisplayEvent>) {
     let to = route(&ev, comp);
-    let wire = |ev: &DisplayEvent| match encode_event(ev) {
+    // In points, at each window's scale (resolution-independence.md §3).
+    let scale_of = |w: u32| u16::try_from(w).ok()
+        .and_then(|id| comp.lock().unwrap().windows.get(&id).map(|w| (w.scale_milli, w.size)));
+    let wire = |ev: &DisplayEvent| match encode_event_with(ev, &scale_of) {
         Ok((op, payload)) => Some(Outbound { op, flags: flag::ASYNC_EVENT, payload, fds: Vec::new() }),
         Err(e) => {
             log::debug!("encode_event failed: {e}");

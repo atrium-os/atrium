@@ -1588,10 +1588,13 @@ pub unsafe extern "C" fn atrium_window_poll_event(
     // us; we just map its typed Event onto the C-ABI AtriumWindowEvent.
     match conn.poll_event() {
         Ok(Some(ev)) => {
+            // C clients draw in device pixels: sizes are the buffer's and
+            // pointer positions are at the window's scale.
+            let ev = conn.in_device_px(ev);
             let aev = match ev {
-                fresco_client::Event::Resized { window_id, width, height } => AtriumWindowEvent {
+                fresco_client::Event::Resized { window_id, buffer_width, buffer_height, .. } => AtriumWindowEvent {
                     kind: ATRIUM_EV_WINDOW_RESIZED, _pad: 0,
-                    window_id, arg1: width, arg2: height,
+                    window_id, arg1: buffer_width, arg2: buffer_height,
                 },
                 fresco_client::Event::FocusChanged { window_id, gained, .. } => AtriumWindowEvent {
                     kind: ATRIUM_EV_WINDOW_FOCUS_CHANGED, _pad: 0,

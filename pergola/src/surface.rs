@@ -199,9 +199,12 @@ fn background_id(id: NodeId) -> u32 {
 }
 
 impl FrescoSurface {
+    /// A surface drawing into `window_id` at the scale frescod opened it
+    /// at (its create reply); `Window` follows later changes.
     pub fn new(conn: fresco_client::Connection, window_id: u32) -> Self {
+        let scale = conn.window_scale(window_id);
         Self {
-            conn, window_id, fonts: std::collections::HashMap::new(), scale: 1.0, scrolls: Default::default(),
+            conn, window_id, fonts: std::collections::HashMap::new(), scale, scrolls: Default::default(),
             atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, images: Default::default(),
             others: Default::default(),
         }

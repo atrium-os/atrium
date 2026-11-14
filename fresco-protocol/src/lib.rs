@@ -171,7 +171,7 @@ pub mod control {
     // and moving them. The desktop (DisplayInfoResponse) is their bounding box.
     pub const OP_WM_OUTPUTS:            u16 = 0x0525; // → WmOutputsReply
     pub const OP_WM_ARRANGE_OUTPUTS:    u16 = 0x0526; // WmArrangeOutputsPayload
-    // A monitor's scale (its UI size): windows on it get EV_WINDOW_DPI_CHANGED.
+    // A monitor's scale (its UI size): windows on it get EV_WINDOW_RESIZED.
     pub const OP_WM_SET_OUTPUT_SCALE:   u16 = 0x0527; // WmSetOutputScalePayload
     // Show one monitor's part of the desktop on another as well (mirroring).
     pub const OP_WM_MIRROR_OUTPUT:      u16 = 0x0528; // WmMirrorOutputPayload
@@ -196,7 +196,7 @@ pub mod control {
     pub const EV_WINDOW_RESIZED:         u16 = 0x0580;
     pub const EV_WINDOW_FOCUS_CHANGED:   u16 = 0x0581;
     pub const EV_WINDOW_CLOSE_REQUESTED: u16 = 0x0582;
-    pub const EV_WINDOW_DPI_CHANGED:     u16 = 0x0583;
+    // 0x0583 was EV_WINDOW_DPI_CHANGED: a scale change is EV_WINDOW_RESIZED now.
     /// A surface appeared / disappeared. Unlike the other window events
     /// (addressed to the surface's own client), these are the signal the
     /// window manager reconciles on — a newly-created surface needs
@@ -476,7 +476,7 @@ pub struct WmOutput {
     /// few seconds); nothing shows there meanwhile.
     pub present: bool,
     /// Its scale in thousandths (1000 = 1.0, 1500 = 1.5): what a window on
-    /// it is told by `EV_WINDOW_DPI_CHANGED`. From its pixel density
+    /// it is told by `EV_WINDOW_RESIZED`. From its pixel density
     /// (EDID physical size) unless set with `OP_WM_SET_OUTPUT_SCALE`.
     pub scale_milli: u32,
     /// `scale_milli` is the automatic one (not set by the session).
@@ -511,7 +511,7 @@ pub struct WmMirrorOutputPayload {
 /// `OP_WM_SET_OUTPUT_SCALE` — set a monitor's scale, by identity, in
 /// thousandths: 500 to 4000, or 0 for the automatic one. Kept for that
 /// monitor wherever it is plugged. `EV_DISPLAY_CHANGED` follows, and each
-/// window on it whose scale changes gets `EV_WINDOW_DPI_CHANGED`.
+/// window on it whose scale changes gets `EV_WINDOW_RESIZED`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WmSetOutputScalePayload {
     pub identity: u64,
@@ -802,6 +802,15 @@ pub struct SceneNodeClearPayload {
 }
 
 // ── Window payloads (§3.8.1) ──────────────────────────────────────────
+//
+// Units (docs/spec/resolution-independence.md §3): what a client says
+// about a window's geometry, and what it is told, is in **points**: window
+// and pop-up sizes, pop-up anchors, `EV_WINDOW_RESIZED`, `EV_POPUP_PLACED`,
+// pointer positions, scroll deltas, drag and drop positions. The scene it
+// draws (rects, paths, glyphs, fills, textures, damage, video and slot
+// rects) is in **device pixels** of the window's buffer: points times the
+// window's scale. frescod converts at the client boundary; the WM ops
+// (`OP_WM_*`) and the desktop stay in device pixels.
 
 /// `OP_WINDOW_CREATE` — request a top-level window. Server replies
 /// with the assigned `window_id` via a completion (envelope flag
@@ -884,8 +893,8 @@ pub struct PopupPlacedEvent {
     pub window_id: u32,
     pub x: f32,
     pub y: f32,
-    pub width: u32,
-    pub height: u32,
+    pub width: f32,
+    pub height: f32,
     pub side: u8,
 }
 
@@ -1170,19 +1179,53 @@ pub struct DisplayInfoResponse {
     /// Rows at the top of the screen that frescod's trusted chrome holds
     /// (0 when it draws none): anything placed there is covered.
     pub reserved_top: u32,
+    /// The scale (thousandths) a new window opens at: device pixels per
+    /// point on the monitor new windows land on. `width / scale` is the
+    /// screen in points (resolution-independence.md §3).
+    pub scale_milli: u32,
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────
 
-/// `EV_WINDOW_RESIZED` — window dimensions changed (compositor
-/// resized via WM, user dragged corner, DPI scaling shift, etc.).
-/// The client must adjust its scene-graph layout to fit and emit a
-/// new frame.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `EV_WINDOW_RESIZED` — the window's size or scale changed (the WM
+/// resized it, it moved to a monitor of another density, the monitor's
+/// scale changed). The client lays out again at `width` x `height` points
+/// and draws at `scale_milli` (resolution-independence.md §3): its scene
+/// is in device pixels of a `buffer_width` x `buffer_height` buffer, which
+/// is the point size times the scale.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowResizedEvent {
     pub window_id: u32,
-    pub width:     u32,
-    pub height:    u32,
+    /// The window's size in points.
+    pub width:     f32,
+    pub height:    f32,
+    /// Device pixels per point, thousandths (1000 = 1.0).
+    pub scale_milli: u32,
+    /// The window's buffer in device pixels.
+    pub buffer_width:  u32,
+    pub buffer_height: u32,
+}
+
+/// The reply to `OP_WINDOW_CREATE`, `OP_POPUP_CREATE` and
+/// `OP_POPUP_CLAIM`: the window's id and the scale it opens at, so the
+/// first frame is drawn at the right density. A later move or monitor
+/// change comes as `EV_WINDOW_RESIZED`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowCreateReply {
+    pub window_id: u32,
+    pub scale_milli: u32,
+}
+
+/// Device pixels for `pt` points at `scale_milli`, rounded to whole
+/// pixels, at least 1.
+pub fn pt_to_device(pt: f32, scale_milli: u32) -> u32 {
+    let v = (pt * scale_milli as f32 / 1000.0).round();
+    if v.is_finite() && v >= 1.0 { v.min(u32::MAX as f32) as u32 } else { 1 }
+}
+
+/// Points for `px` device pixels at `scale_milli` (1.0 for a scale of 0).
+pub fn device_to_pt(px: f32, scale_milli: u32) -> f32 {
+    if scale_milli == 0 { px } else { px * 1000.0 / scale_milli as f32 }
 }
 
 /// `EV_WINDOW_FOCUS_CHANGED` — focus gained or lost. Toolkits use
@@ -1265,16 +1308,6 @@ pub struct EmbedTokenEvent {
 pub struct WindowFillsDroppedEvent {
     pub window_id: u32,
     pub dropped: Vec<FillDrop>,
-}
-
-/// `EV_WINDOW_DPI_CHANGED` — output DPI changed (window moved to a
-/// different display, monitor reconfiguration, etc.). `scale_factor`
-/// is multiplicative: 1.0 = standard 96 DPI, 2.0 = HiDPI, 1.5 =
-/// fractional. Toolkit re-rasterizes glyphs / re-layouts as needed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowDpiChangedEvent {
-    pub window_id:    u32,
-    pub scale_factor: f32,
 }
 
 // ── Input event payloads (server → client, ASYNC_EVENT flag) ─────────
@@ -2474,10 +2507,10 @@ mod tests {
 
     #[test]
     fn roundtrip_window_resized_event() {
-        let e = WindowResizedEvent { window_id: 7, width: 1280, height: 720 };
+        let e = WindowResizedEvent { window_id: 7, width: 853.5, height: 480.0, scale_milli: 1500, buffer_width: 1280, buffer_height: 720 };
         let bytes = encode(&e).expect("encode");
         let back: WindowResizedEvent = decode(&bytes).expect("decode");
-        assert_eq!(back.width, 1280);
+        assert_eq!(back, e);
     }
 
     #[test]
@@ -2520,11 +2553,14 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_window_dpi_changed_event() {
-        let e = WindowDpiChangedEvent { window_id: 7, scale_factor: 2.0 };
-        let bytes = encode(&e).expect("encode");
-        let back: WindowDpiChangedEvent = decode(&bytes).expect("decode");
-        assert_eq!(back.scale_factor, 2.0);
+    fn points_and_device_pixels() {
+        assert_eq!(pt_to_device(800.0, 1500), 1200);
+        assert_eq!(pt_to_device(801.0, 1250), 1001);
+        assert_eq!(pt_to_device(0.0, 2000), 1);
+        assert_eq!(device_to_pt(1200.0, 1500), 800.0);
+        assert_eq!(device_to_pt(7.0, 0), 7.0);
+        let r = WindowCreateReply { window_id: 3, scale_milli: 2000 };
+        assert_eq!(decode::<WindowCreateReply>(&encode(&r).unwrap()).unwrap(), r);
     }
 
     /// Op-id ranges per spec §3.4 / scene_ops module doc — no overlap,
@@ -2565,7 +2601,6 @@ mod tests {
             control::EV_WINDOW_RESIZED,
             control::EV_WINDOW_FOCUS_CHANGED,
             control::EV_WINDOW_CLOSE_REQUESTED,
-            control::EV_WINDOW_DPI_CHANGED,
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
             control::EV_WINDOW_FILLS_DROPPED,

@@ -321,7 +321,7 @@ fn serve_measure_client(
             }
             op if op == control::OP_DISPLAY_INFO => {
                 let resp = DisplayInfoResponse {
-                    width: WIDTH, height: HEIGHT, refresh_mhz: 60_000, reserved_top: 0,
+                    width: WIDTH, height: HEIGHT, refresh_mhz: 60_000, reserved_top: 0, scale_milli: 1000,
                 };
                 let payload = encode(&resp).map_err(|_| io::Error::new(
                     io::ErrorKind::InvalidData, "encode DisplayInfoResponse"))?;

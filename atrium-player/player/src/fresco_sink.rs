@@ -97,6 +97,8 @@ impl FrescoSink {
             let ev = if first { self.conn.wait_event(Some(timeout.max(Duration::from_millis(1))))? } else { self.conn.poll_event()? };
             first = false;
             let Some(ev) = ev else { break };
+            // It lays out in device pixels (resolution-independence.md §3).
+            let ev = self.conn.in_device_px(ev);
             match ev {
                 Event::VideoReleased { layer, buffer, .. } if Some(layer) == self.layer => self.released.push(buffer),
                 Event::VideoPresented { layer, seq, vblank_ns, dropped, .. } if Some(layer) == self.layer => {
@@ -109,8 +111,8 @@ impl FrescoSink {
                     }
                 }
                 Event::CloseRequested { .. } => self.closed = true,
-                Event::Resized { width, height, .. } => {
-                    self.win_size = (width, height);
+                Event::Resized { buffer_width, buffer_height, .. } => {
+                    self.win_size = (buffer_width, buffer_height);
                     if let (Some(layer), Some((w, h))) = (self.layer, self.src) {
                         let rect = self.letterbox(w, h);
                         self.conn.video_layer_place(layer, Some(rect))?;

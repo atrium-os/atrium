@@ -724,8 +724,8 @@ impl<H: Host> App<H> {
 
     fn on_fresco(&mut self, ev: Event) {
         let action = match ev {
-            Event::Resized { width, height, .. } => {
-                self.controls.size = (width, height);
+            Event::Resized { buffer_width, buffer_height, .. } => {
+                self.controls.size = (buffer_width, buffer_height);
                 None
             }
             Event::PointerMotion { .. } => {

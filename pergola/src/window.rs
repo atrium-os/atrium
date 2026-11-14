@@ -96,15 +96,16 @@ pub struct Window {
 struct PopupHost<'a> {
     conn: &'a mut Connection,
     main: u32,
-    scale: f32,
-    /// The main window's size (logical px): an anchor must lie inside it.
+    /// The main window's size (points): an anchor must lie inside it.
     bounds: (f32, f32),
     destroyed: Vec<u32>,
 }
 
 impl PopupHost<'_> {
-    /// The anchor and size on the wire: device px, the anchor inside the
-    /// parent (a gap around a control at the edge is trimmed).
+    /// The anchor and size on the wire: points, as the layout has them
+    /// (frescod turns them into device pixels at the parent's scale), the
+    /// anchor inside the parent (a gap around a control at the edge is
+    /// trimmed).
     fn wire(&self, spec: &crate::popup::Spec, rect: crate::geom::Rect) -> ([f32; 4], u32, u32) {
         let a = spec.anchor;
         let (bw, bh) = self.bounds;
@@ -112,9 +113,8 @@ impl PopupHost<'_> {
         let y0 = a.y().clamp(0.0, bh);
         let x1 = (a.x() + a.w()).clamp(x0, bw);
         let y1 = (a.y() + a.h()).clamp(y0, bh);
-        let k = self.scale;
-        let size = |v: f32| ((v * k).ceil() as u32).max(1);
-        ([x0 * k, y0 * k, (x1 - x0) * k, (y1 - y0) * k], size(rect.w()), size(rect.h()))
+        let size = |v: f32| (v.ceil() as u32).max(1);
+        ([x0, y0, x1 - x0, y1 - y0], size(rect.w()), size(rect.h()))
     }
 }
 
@@ -166,6 +166,8 @@ impl Window {
     /// out Pergola text installs one itself, or gets estimates.
     pub fn open_on(mut conn: Connection, desc: &WindowDesc) -> io::Result<Self> {
 
+        // Points (resolution-independence.md §3): frescod sizes the
+        // window's buffer at the scale it opens at.
         let (w, h) = match desc.size {
             SizeSpec::Fixed(w, h) => (w, h),
             SizeSpec::FullScreen => {
@@ -174,7 +176,8 @@ impl Window {
                     log::warn!("window: display reports no mode; assuming 1280x720");
                     (1280, 720)
                 } else {
-                    (info.width, info.height)
+                    let pt = |v: u32| fresco_protocol::device_to_pt(v as f32, info.scale_milli).floor() as u32;
+                    (pt(info.width), pt(info.height))
                 }
             }
         };
@@ -235,11 +238,9 @@ impl Window {
         let deltas = app.tick();
         if !deltas.is_empty() {
             // Pop-ups open (or move, or close) before what they show is sent.
-            let scale = self.surface.scale;
             let mut host = PopupHost {
                 conn: self.surface.connection(),
                 main: self.main,
-                scale,
                 bounds: (self.width, self.height),
                 destroyed: Vec::new(),
             };
@@ -285,7 +286,8 @@ impl Window {
     /// cover, such as `popup_grant`).
     pub fn id(&self) -> u32 { self.main }
 
-    /// Window pixels per layout pixel.
+    /// Device pixels per point: the window's scale, from the monitor it
+    /// is on.
     pub fn scale(&self) -> f32 { self.surface.scale }
 
     /// Install the binder that embeds other processes' surfaces in this
@@ -295,8 +297,9 @@ impl Window {
     }
 
     /// Window lifecycle the toolkit handles itself: a resize re-lays
-    /// out; a DPI change rescales every node on the wire (layout stays
-    /// in logical pixels, the surface multiplies at emission).
+    /// out; a scale change rescales every node on the wire (layout stays
+    /// in points, the surface multiplies at emission). frescod sends
+    /// sizes and pointer positions in points already.
     fn window_event<V: View>(&mut self, ev: &fresco_client::Event, app: &mut App<V>) {
         let main = self.main;
         match *ev {
@@ -325,23 +328,22 @@ impl Window {
             }
             // A granted pop-up may land smaller than asked.
             fresco_client::Event::PopupPlaced { window_id, width, height, .. }
-                if window_id == main && (width as f32, height as f32) != (self.width, self.height) =>
+                if window_id == main && (width, height) != (self.width, self.height) =>
             {
-                self.width = width as f32;
-                self.height = height as f32;
+                self.width = width;
+                self.height = height;
                 app.invalidate();
             }
-            fresco_client::Event::Resized { window_id, width, height } if window_id == main => {
-                self.width = width as f32;
-                self.height = height as f32;
-                app.invalidate();
-            }
-            fresco_client::Event::DpiChanged { scale_factor, .. }
-                if scale_factor.is_finite() && scale_factor > 0.0
-                    && scale_factor != self.surface.scale =>
-            {
-                self.surface.scale = scale_factor;
-                app.resend_all();
+            fresco_client::Event::Resized { window_id, width, height, scale, .. } if window_id == main => {
+                if scale.is_finite() && scale > 0.0 && scale != self.surface.scale {
+                    self.surface.scale = scale;
+                    app.resend_all();
+                }
+                if (width, height) != (self.width, self.height) {
+                    self.width = width;
+                    self.height = height;
+                    app.invalidate();
+                }
             }
             _ => {}
         }

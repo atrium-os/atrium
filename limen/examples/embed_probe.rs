@@ -80,8 +80,8 @@ fn main() {
     let mut sized = false;
     let until = Instant::now() + Duration::from_secs(3);
     while Instant::now() < until && !sized {
-        if let Ok(Some(Event::Resized { width, height, .. })) = arca_win.wait_event(Some(Duration::from_millis(100))) {
-            sized = (width, height) == (240, 36);
+        if let Ok(Some(Event::Resized { buffer_width, buffer_height, .. })) = arca_win.wait_event(Some(Duration::from_millis(100))) {
+            sized = (buffer_width, buffer_height) == (240, 36);
         }
     }
     check(sized, "frescod sized Arca's window to the slot");

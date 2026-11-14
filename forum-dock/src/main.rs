@@ -56,9 +56,11 @@ fn screen_wh(conn: &mut Connection) -> (f32, f32) {
     }
     match conn.display_info() {
         Ok(d) if d.width > 0 && d.height > 0 => {
-            eprintln!("forum-dock: screen {}x{} @ {} mHz (from frescod)",
-                      d.width, d.height, d.refresh_mhz);
-            (d.width as f32, d.height as f32)
+            eprintln!("forum-dock: screen {}x{} @ {} mHz, scale {} (from frescod)",
+                      d.width, d.height, d.refresh_mhz, d.scale_milli as f32 / 1000.0);
+            // In points (resolution-independence.md §3).
+            let pt = |v: u32| fresco_protocol::device_to_pt(v as f32, d.scale_milli).floor();
+            (pt(d.width), pt(d.height))
         }
         Ok(_) => { eprintln!("forum-dock: frescod reports no mode; assuming 1280x720");
                    (1280.0, 720.0) }

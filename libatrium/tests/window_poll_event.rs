@@ -54,7 +54,7 @@ fn poll_event_decodes_close_focus_resize() {
         stream.read_exact(&mut payload).expect("read payload");
         assert_eq!(hdr.op, OP_WINDOW_CREATE);
 
-        let reply: Vec<u8> = postcard::to_stdvec(&(99u32)).unwrap();
+        let reply: Vec<u8> = postcard::to_stdvec(&fresco_protocol::WindowCreateReply { window_id: 99, scale_milli: 1000 }).unwrap();
         write_envelope(&mut stream,
                        OP_WINDOW_CREATE,
                        aqueduct::envelope::flag::IS_RESPONSE,
@@ -75,7 +75,7 @@ fn poll_event_decodes_close_focus_resize() {
 
         let p_resize = postcard::to_stdvec(
             &fresco_protocol::WindowResizedEvent {
-                window_id: 99, width: 1024, height: 768,
+                window_id: 99, width: 1024.0, height: 768.0, scale_milli: 1000, buffer_width: 1024, buffer_height: 768,
             }
         ).unwrap();
         write_envelope(&mut stream, EV_WINDOW_RESIZED, 0, &p_resize);

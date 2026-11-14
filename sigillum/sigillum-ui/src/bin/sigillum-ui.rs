@@ -185,7 +185,8 @@ fn main() -> ExitCode {
         let mut gone = false;
         loop {
             let ev = match o.win.poll_event() {
-                Ok(Some(ev)) => ev,
+                // It lays out in device pixels (resolution-independence.md §3).
+                Ok(Some(ev)) => o.win.in_device_px(ev),
                 Ok(None) => break,
                 Err(_) => {
                     gone = true;

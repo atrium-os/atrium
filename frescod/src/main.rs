@@ -564,6 +564,7 @@ fn main() -> std::io::Result<()> {
             let _ = ev_main.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
                 width: info.width, height: info.height,
                 refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
+                scale_milli: info.scale_milli,
             });
             last_gen = 0; /* repaint at once */
         }
