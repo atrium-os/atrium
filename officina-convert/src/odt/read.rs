@@ -202,6 +202,10 @@ struct Reader<'a> {
     next_table: u32,
     images: HashMap<String, u32>,
     pictures: u64,
+    /// Text boxes and shapes with text met in the paragraph being read: their
+    /// text follows the paragraph.
+    boxes: Vec<El>,
+    box_depth: usize,
 }
 
 #[derive(Default)]
@@ -481,12 +485,17 @@ impl<'a> Reader<'a> {
                             let mut b = a.clone();
                             b.object = Some(o);
                             p.push(&OBJECT_CHAR.to_string(), &b);
-                        } else if x.child("draw:text-box").is_some() {
-                            self.rep.note(Kind::Approximate, "text boxes (their text kept in line)");
-                            for q in x.find("draw:text-box").into_iter().flat_map(|t| t.els()) {
-                                if q.name == "text:p" || q.name == "text:h" {
-                                    self.inline(q, p, a, at);
+                        } else if let Some(t) = x.child("draw:text-box") {
+                            if at == Where::Margin {
+                                self.rep.note(Kind::Approximate, "text boxes (their text kept in line)");
+                                for q in t.els() {
+                                    if q.name == "text:p" || q.name == "text:h" {
+                                        self.inline(q, p, a, at);
+                                    }
                                 }
+                            } else {
+                                self.rep.note(Kind::Approximate, "text boxes (their text kept after the paragraph)");
+                                self.boxes.push(t.clone());
                             }
                         } else if x.child("draw:object").is_some() {
                             self.rep.note(Kind::Dropped, "charts and embedded objects");
@@ -497,7 +506,19 @@ impl<'a> Reader<'a> {
                     "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments"),
                     "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes (shown as they stand)"),
                     "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:soft-page-break" | "text:reference-mark" | "text:reference-mark-start" | "text:reference-mark-end" | "text:alphabetical-index-mark" | "text:toc-mark" | "text:sequence-ref" => {}
-                    "draw:custom-shape" | "draw:rect" | "draw:line" | "draw:g" | "draw:ellipse" | "draw:path" => self.rep.note(Kind::Dropped, "drawings"),
+                    "text:ruby" => {
+                        if let Some(b) = x.child("text:ruby-base") {
+                            self.inline(b, p, a, at);
+                        }
+                    }
+                    "draw:custom-shape" | "draw:rect" | "draw:line" | "draw:g" | "draw:ellipse" | "draw:path" | "draw:polygon" | "draw:circle" => {
+                        self.rep.note(Kind::Dropped, "drawings");
+                        // A shape's own text, and a group's, follow the paragraph.
+                        if at == Where::Body && (x.find("text:p").is_some() || x.find("text:h").is_some()) {
+                            self.rep.note(Kind::Approximate, "text in drawings (kept after the paragraph)");
+                            self.boxes.push(x.clone());
+                        }
+                    }
                     _ => {
                         // Fields and other inline elements: their text.
                         self.inline(x, p, a, at);
@@ -549,6 +570,43 @@ impl<'a> Reader<'a> {
                 q.props = props;
             }
         });
+        self.flush_boxes(cell);
+    }
+
+    /// The text boxes and shapes the paragraph just read held, as paragraphs
+    /// after it (in its cell, if it is in one).
+    fn flush_boxes(&mut self, cell: Option<CellRef>) {
+        if self.boxes.is_empty() || self.box_depth >= 4 {
+            self.boxes.clear();
+            return;
+        }
+        let boxes = std::mem::take(&mut self.boxes);
+        self.box_depth += 1;
+        for b in &boxes {
+            self.box_content(b, cell);
+        }
+        self.box_depth -= 1;
+    }
+
+    fn box_content(&mut self, b: &El, cell: Option<CellRef>) {
+        for x in b.els() {
+            match x.name.as_str() {
+                "text:p" | "text:h" => self.para(x, cell, None),
+                "text:list" => self.list(x, 0, None, None, cell),
+                "table:table" | "loext:table" => match cell {
+                    Some(c) => self.cell_content(&El { name: "x".into(), attrs: vec![], kids: vec![Node::El(x.clone())] }, c, 1),
+                    None => self.table(x),
+                },
+                // Groups and frames in groups: their text, in order.
+                "draw:g" | "draw:custom-shape" | "draw:rect" | "draw:ellipse" | "draw:polygon" | "draw:circle" | "draw:path" => self.box_content(x, cell),
+                "draw:frame" => {
+                    if let Some(t) = x.child("draw:text-box") {
+                        self.box_content(t, cell);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn list(&mut self, e: &El, level: u8, style: Option<String>, id: Option<u32>, cell: Option<CellRef>) {
@@ -672,11 +730,14 @@ impl<'a> Reader<'a> {
                     }
                 }
                 "text:index-title" => self.body(x),
-                "draw:frame" => {
+                "draw:frame" | "draw:custom-shape" | "draw:g" | "draw:rect" | "draw:ellipse" => {
                     let mut p = Para::default();
                     self.inline(&El { name: "x".into(), attrs: vec![], kids: vec![Node::El(x.clone())] }, &mut p, &CharAttrs::default(), Where::Body);
-                    let runs: Vec<(u32, u32)> = p.runs.into_iter().map(|(at, a)| (at, self.doc.attrs.intern(a))).collect();
-                    self.doc.push_para(&p.text, 0, runs);
+                    if !p.text.is_empty() {
+                        let runs: Vec<(u32, u32)> = p.runs.into_iter().map(|(at, a)| (at, self.doc.attrs.intern(a))).collect();
+                        self.doc.push_para(&p.text, 0, runs);
+                    }
+                    self.flush_boxes(None);
                 }
                 "text:sequence-decls" | "text:variable-decls" | "text:user-field-decls" | "office:forms" | "text:tracked-changes" | "text:soft-page-break" => {
                     if x.name == "text:tracked-changes" && !x.kids.is_empty() {
@@ -779,10 +840,13 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     }
     let content = part(&archive, "content.xml")?.ok_or_else(|| OdtError::Bad("no content.xml".into()))?;
     let styles = part(&archive, "styles.xml")?;
-    let text = content.child("office:body").and_then(|b| b.child("office:text")).ok_or_else(|| OdtError::Bad("no text body".into()))?;
+    // A text document's body; failing that, the body's one element (a damaged
+    // name, as LibreOffice reads it too) when it holds paragraphs.
+    let body = content.child("office:body").ok_or_else(|| OdtError::Bad("no text body".into()))?;
+    let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0 };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0 };
     r.font_decls(styles.as_ref());
     r.font_decls(Some(&content));
     for s in [styles.as_ref().and_then(|s| s.child("office:styles")), styles.as_ref().and_then(|s| s.child("office:automatic-styles")), content.child("office:automatic-styles")].into_iter().flatten() {

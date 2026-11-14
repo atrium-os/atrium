@@ -302,6 +302,42 @@ struct Reader<'a> {
     pictures: u64,
     /// The settings turn on separate even-page headers and footers.
     even_odd: bool,
+    /// Text boxes met in the paragraph being read; their paragraphs follow it.
+    boxes: Vec<El>,
+    box_depth: usize,
+}
+
+/// The elements named `name` among `e`'s children, looking through content
+/// controls and custom XML wrappers (rows and cells can sit in them).
+fn wrapped<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
+    for x in e.els() {
+        if x.name == name {
+            out.push(x);
+        } else if depth < 16 {
+            match x.name.as_str() {
+                "w:sdt" => {
+                    if let Some(c) = x.child("w:sdtContent") {
+                        wrapped(c, name, out, depth + 1);
+                    }
+                }
+                "w:customXml" | "w:ins" | "w:moveTo" => wrapped(x, name, out, depth + 1),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn all_of<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
+    for x in e.els() {
+        if out.len() >= 64 || depth > 64 {
+            return;
+        }
+        if x.name == name {
+            out.push(x);
+        } else {
+            all_of(x, name, out, depth + 1);
+        }
+    }
 }
 
 /// What a paragraph is being built of.
@@ -465,7 +501,27 @@ impl<'a> Reader<'a> {
                     if let Some(l) = link {
                         a.link = Some(l.clone());
                     }
+                    // Markup compatibility: the choice we read, else the fallback.
+                    let mut kids: Vec<&El> = Vec::new();
                     for k in x.els() {
+                        if k.name == "mc:AlternateContent" {
+                            let pick = k.children("mc:Choice").find(|c| c.find("w:drawing").is_some() || c.find("w:txbxContent").is_some()).or_else(|| k.child("mc:Fallback")).or_else(|| k.child("mc:Choice"));
+                            if let Some(pk) = pick {
+                                kids.extend(pk.els());
+                            }
+                        } else {
+                            kids.push(k);
+                        }
+                    }
+                    for k in kids {
+                        if matches!(k.name.as_str(), "w:drawing" | "w:pict" | "w:object") && self.box_depth < 4 {
+                            let mut b = Vec::new();
+                            all_of(k, "w:txbxContent", &mut b, 0);
+                            if !b.is_empty() {
+                                self.rep.note(Kind::Approximate, "text boxes (their text kept after the paragraph)");
+                                self.boxes.extend(b.into_iter().cloned());
+                            }
+                        }
                         match k.name.as_str() {
                             "w:fldChar" => match k.attr("w:fldCharType") {
                                 Some("begin") => {
@@ -490,7 +546,12 @@ impl<'a> Reader<'a> {
                             }
                             "w:t" | "w:delText" if k.name == "w:t" => {
                                 if field.shows_result() {
-                                    p.push(&k.text(), &a);
+                                    // Without xml:space="preserve" the ends' white space is
+                                    // layout of the XML; a line end inside is a space.
+                                    let t = k.text();
+                                    let t = if k.attr("xml:space") == Some("preserve") { t.as_str() } else { t.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\r' | '\t')) };
+                                    let t: String = t.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
+                                    p.push(&t, &a);
                                 }
                             }
                             "w:tab" | "w:ptab" => p.push("\t", &a),
@@ -514,7 +575,17 @@ impl<'a> Reader<'a> {
                                     p.push(&OBJECT_CHAR.to_string(), &pa);
                                 }
                             }
-                            "w:pict" | "w:object" => self.rep.note(Kind::Dropped, "VML pictures and embedded objects"),
+                            "w:pict" | "w:object" => {
+                                if k.find("w:txbxContent").is_none() {
+                                    self.rep.note(Kind::Dropped, "VML pictures and embedded objects");
+                                }
+                            }
+                            // Ruby inside a run (Word writes it there too): the base text.
+                            "w:ruby" => {
+                                if let Some(b) = k.child("w:rubyBase") {
+                                    self.runs(b, p, link, field);
+                                }
+                            }
                             "w:footnoteReference" | "w:endnoteReference" => self.rep.note(Kind::Dropped, "footnotes and endnotes"),
                             "w:commentReference" => self.rep.note(Kind::Dropped, "comments"),
                             "w:rPr" | "w:lastRenderedPageBreak" | "w:delText" => {}
@@ -538,8 +609,13 @@ impl<'a> Reader<'a> {
                         _ => self.runs(x, p, link, field),
                     }
                 }
-                "w:ins" | "w:smartTag" | "w:customXml" | "w:sdt" | "w:sdtContent" | "w:dir" | "w:bdo" => {
-                    if x.name == "w:ins" {
+                "w:ruby" => {
+                    if let Some(b) = x.child("w:rubyBase") {
+                        self.runs(b, p, link, field);
+                    }
+                }
+                "w:ins" | "w:moveTo" | "w:smartTag" | "w:customXml" | "w:sdt" | "w:sdtContent" | "w:dir" | "w:bdo" => {
+                    if x.name == "w:ins" || x.name == "w:moveTo" {
                         self.rep.note(Kind::Approximate, "tracked changes (insertions kept, deletions dropped)");
                     }
                     let inner = if x.name == "w:sdt" { x.child("w:sdtContent") } else { Some(x) };
@@ -581,7 +657,38 @@ impl<'a> Reader<'a> {
                 q.props = props;
             }
         });
+        // Text boxes anchored in it: their paragraphs after it.
+        let boxes = std::mem::take(&mut self.boxes);
+        if !boxes.is_empty() {
+            self.box_depth += 1;
+            for b in &boxes {
+                match cell {
+                    Some(c) => self.cell_content(b, c, 1, field),
+                    None => self.box_blocks(b, field, 0),
+                }
+            }
+            self.box_depth -= 1;
+        }
         k
+    }
+
+    /// A text box's paragraphs and tables, through content controls and the like.
+    fn box_blocks(&mut self, b: &El, field: &mut FieldState, depth: usize) {
+        for x in b.els() {
+            match x.name.as_str() {
+                "w:p" => {
+                    self.para(x, None, field);
+                }
+                "w:tbl" => self.table(x, 0, field),
+                "w:sdt" if depth < 16 => {
+                    if let Some(c) = x.child("w:sdtContent") {
+                        self.box_blocks(c, field, depth + 1);
+                    }
+                }
+                "w:customXml" | "w:ins" | "w:moveTo" if depth < 16 => self.box_blocks(x, field, depth + 1),
+                _ => {}
+            }
+        }
     }
 
     fn table(&mut self, t: &El, depth: usize, field: &mut FieldState) {
@@ -592,9 +699,13 @@ impl<'a> Reader<'a> {
         let grid: Vec<u32> = t.child("w:tblGrid").map(|g| g.children("w:gridCol").map(|c| num(c.attr("w:w")).unwrap_or(1440).clamp(1, MAX_OBJECT_TWIPS as i64) as u32).collect()).unwrap_or_default();
         let table = self.next_table;
         self.next_table += 1;
-        for (r, tr) in t.children("w:tr").enumerate() {
+        let mut rows = Vec::new();
+        wrapped(t, "w:tr", &mut rows, 0);
+        for (r, tr) in rows.into_iter().enumerate() {
             let mut col = 0usize;
-            for (c, tc) in tr.children("w:tc").enumerate() {
+            let mut cells = Vec::new();
+            wrapped(tr, "w:tc", &mut cells, 0);
+            for (c, tc) in cells.into_iter().enumerate() {
                 let pr = tc.child("w:tcPr");
                 let span = pr.and_then(|p| p.child("w:gridSpan")).and_then(|g| num(val(g))).unwrap_or(1).clamp(1, 63) as usize;
                 if span > 1 {
@@ -629,8 +740,12 @@ impl<'a> Reader<'a> {
                     self.para(x, Some(cell), field);
                 }
                 "w:tbl" if depth < 8 => {
-                    for tr in x.children("w:tr") {
-                        for inner in tr.children("w:tc") {
+                    let mut rows = Vec::new();
+                    wrapped(x, "w:tr", &mut rows, 0);
+                    for tr in rows {
+                        let mut cells = Vec::new();
+                        wrapped(tr, "w:tc", &mut cells, 0);
+                        for inner in cells {
                             self.cell_content(inner, cell, depth + 1, field);
                         }
                     }
@@ -641,6 +756,7 @@ impl<'a> Reader<'a> {
                         self.cell_content(c, cell, depth, field);
                     }
                 }
+                "w:customXml" | "w:ins" | "w:moveTo" => self.cell_content(x, cell, depth, field),
                 _ => {}
             }
         }
@@ -663,6 +779,7 @@ impl<'a> Reader<'a> {
                     }
                 }
                 "w:sectPr" => self.section(x),
+                "w:customXml" | "w:ins" | "w:moveTo" => self.body(x),
                 _ => {}
             }
         }
@@ -835,12 +952,15 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0 };
     if let Some(p) = find("settings") {
         r.even_odd = part(&archive, &p)?.is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
     }
     r.read_styles(styles.as_ref());
     r.body(body);
+    for more in doc_xml.children("w:body").skip(1).take(16) {
+        r.body(more);
+    }
     for kind in ["footnotes", "endnotes", "comments"] {
         if find(kind).is_some() && body.find(match kind {
             "footnotes" => "w:footnoteReference",

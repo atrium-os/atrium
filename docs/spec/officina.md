@@ -1451,8 +1451,8 @@ empty report; 2,000 hostile packages each, clean; LibreOffice both ways
 paragraph spacing and alignment, list kinds and levels, the table, the picture's size
 and pixels, header, footer with page numbers, page size and margins.
 
-Not yet: footnotes, comments, tracked changes kept as such, `.doc`, a real-world
-corpus run (§7.6 asks for one before O3 is called done).
+Not yet: footnotes, comments, tracked changes kept as such, `.doc`. The real-world
+corpus run is §16.18.
 
 ### 16.17 O3f as built (2026-11-14): find, word count, PDF export, spelling
 
@@ -1501,6 +1501,36 @@ Not yet: PDF/A-2b (XMP metadata and an output intent), tagged PDF and bookmarks 
 headings, export of a selection or a page range; dictionaries other than English (US)
 and choosing a language per paragraph; spelling in headers and footers; regular
 expressions in find.
+
+### 16.18 O3 real-world corpus run (2026-11-14)
+
+The run §7.6 asks for: `officina-convert/examples/corpus_text.rs` reads every `.docx`
+and `.odt` in the given folders with our reader, compares our text with LibreOffice's
+text of the same file (word counts both ways, list labels left out), and writes each
+document with our writer and reads it back. The corpus is test data kept out of the
+repository: Apache POI's `test-data/document` (130 files) and LibreOffice's
+`sw/qa/extras/odfexport/data` (134) and `sw/qa/extras/ooxmlexport/data` (1,594), most of
+them made to break readers.
+
+- 1,858 files: 1,832 read, 26 refused with a reason (encrypted, damaged ZIP, a DTD,
+  nesting past the limit, a SHA-1 encrypted `.odt`, packages with no main part), **no
+  panics**; the slowest file took 0.47 s.
+- Against LibreOffice on the 1,131 files where it gave text: 99.46 % of its words are in
+  ours, median file 100 %, 884 files at 99 % or more both ways.
+- Our writer then our reader keep the text of all 1,832.
+
+Reader gaps the run found, now fixed: content controls and custom XML around table rows
+and cells; text boxes (DrawingML, VML, `mc:AlternateContent`, groups, boxes holding
+content controls) whose text now follows the anchoring paragraph in both formats,
+as do ODF shapes with text; ruby (base text kept) in both formats; a `w:t` without
+`xml:space="preserve"` (its ends' white space dropped, line ends inside it are spaces);
+more than one `w:body`; an `.odt` whose body element has a damaged name.
+
+What is left of the difference is by choice or out of scope: tracked deletions (we show
+the document as it stands, LibreOffice's text includes deleted text); list labels in
+LibreOffice's text; fields LibreOffice recalculates (document properties, formulas with
+errors, dates) where we keep the stored result; content controls bound to document
+properties; headers and footers (not in our body text); footnote marks.
 
 ## 17. Decisions (accepted 2026-11-14)
 
