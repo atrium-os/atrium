@@ -127,6 +127,7 @@ pub struct Write {
     pub size: Rc<Cell<(f32, f32)>>,
     pub style_menu: Mutable<MenuState>,
     pub insert_menu: Mutable<MenuState>,
+    pub align_menu: Mutable<MenuState>,
     pub find: Mutable<FindBar>,
     pub find_text: Mutable<TextEdit>,
     pub replace_text: Mutable<TextEdit>,
@@ -139,7 +140,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -414,14 +415,14 @@ impl View for Write {
         button(ctx, "Open…", Cmd::Open, 72.0, 6.0);
         button(ctx, "Save", Cmd::Save, 60.0, 6.0);
         button(ctx, "Save As…", Cmd::SaveAs, 88.0, 6.0);
-        button(ctx, "PDF…", Cmd::ExportPdf, 60.0, 16.0);
+        button(ctx, "PDF…", Cmd::ExportPdf, 60.0, 10.0);
         button(ctx, "Undo", Cmd::Undo, 60.0, 6.0);
-        button(ctx, "Redo", Cmd::Redo, 60.0, 16.0);
+        button(ctx, "Redo", Cmd::Redo, 60.0, 10.0);
         button(ctx, "B", Cmd::Toggle(Toggle::Bold), 36.0, 4.0);
         button(ctx, "I", Cmd::Toggle(Toggle::Italic), 36.0, 4.0);
-        button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 16.0);
+        button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 10.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
-        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 16.0);
+        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 10.0);
         let (style_name, cur_align) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
@@ -434,7 +435,7 @@ impl View for Write {
             let items: Vec<MenuItem> = STYLES.iter().map(|s| MenuItem::new(*s).radio(*s == style_name)).collect();
             let cmds = self.cmds.clone();
             MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
-            x += 136.0;
+            x += 128.0;
         }
         {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
@@ -449,12 +450,14 @@ impl View for Write {
             MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i == 0 { Cmd::FindOpen } else { Cmd::SpellOpen })).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
-        for (label, a) in [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)] {
-            let wd = if label == "Justify" { 64.0 } else { 56.0 };
+        {
+            // Alignment, as a menu (the toolbar has no room for four buttons).
+            let all = [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)];
+            let items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == cur_align)).collect();
+            let now = all.iter().find(|(_, a)| *a == cur_align).map_or("Left", |(l, _)| l);
             let cmds = self.cmds.clone();
-            let b = if a == cur_align { Button::primary(label) } else { Button::secondary(label) };
-            b.at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(Cmd::Align(a))).render(ctx);
-            x += wd + 4.0;
+            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Align(all[i.min(3)].1))).at(x, 8.0).width(100.0).render(ctx);
+            x += 108.0;
         }
         let (name, dirty, status, ed) = {
             let d = self.doc.borrow();
@@ -496,7 +499,7 @@ impl View for Write {
             if !fb.message.is_empty() {
                 ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, (w - x - 56.0).max(0.0), 18.0), content: fb.message.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
             }
-            Button::secondary("✕").at(w - 44.0, y + 8.0).width(32.0).on_click(push(Cmd::FindClose)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::FindClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
@@ -516,7 +519,7 @@ impl View for Write {
             if !sb.word.is_empty() {
                 for (i, s) in sb.suggestions.iter().take(5).enumerate() {
                     let wd = (Node::measure_text(s, &st(type_size::MD, Weight::Regular, t.text_primary())).w + 28.0).clamp(48.0, 180.0);
-                    if x + wd > w - 300.0 {
+                    if x + wd > w - 308.0 {
                         break;
                     }
                     let b = if i == 0 { Button::primary(s.as_str()) } else { Button::secondary(s.as_str()) };
@@ -526,12 +529,12 @@ impl View for Write {
                 if !sb.message.is_empty() {
                     ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, 140.0, 18.0), content: sb.message.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
                 }
-                let bx = w - 292.0;
+                let bx = w - 300.0;
                 Button::secondary("Ignore").at(bx, y + 8.0).width(72.0).on_click(push(Cmd::SpellIgnore)).render(ctx);
                 Button::secondary("Add").at(bx + 76.0, y + 8.0).width(60.0).on_click(push(Cmd::SpellAdd)).render(ctx);
                 Button::secondary("Next").at(bx + 140.0, y + 8.0).width(64.0).on_click(push(Cmd::SpellNext)).render(ctx);
             }
-            Button::secondary("✕").at(w - 44.0, y + 8.0).width(32.0).on_click(push(Cmd::SpellClose)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::SpellClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 

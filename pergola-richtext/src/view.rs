@@ -247,7 +247,7 @@ impl RichTextView {
             let (a, b) = ed.selection();
             if a != b {
                 let mut sel = t.selection_bg();
-                sel.a = sel.a.max(0.35);
+                sel.a = 0.4;
                 for (pg, rx, ry, rw, rh) in selection_rects(&mut ed, a, b, first, last) {
                     let (px, py) = at(g.left + g.margin_x + rx as f64 * g.k, g.page_top(pg) + g.margin_y + ry as f64 * g.k);
                     ctx.add(Node::Rect { rect: Rect::new(px, py, (rw as f64 * g.k) as f32, (rh as f64 * g.k) as f32), fill: sel, radius: 0.0 });
