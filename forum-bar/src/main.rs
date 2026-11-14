@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     fn stick(p: &str) -> atrium_media::Volume {
-        atrium_media::Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 80_000_000, free_bytes: 1_900_000_000 / 100, read_only: false }
+        atrium_media::Volume { part: p.into(), label: String::new(), mountpoint: format!("/media/{p}"), size_bytes: 80_000_000, free_bytes: 1_900_000_000 / 100, read_only: false }
     }
 
     #[test]
