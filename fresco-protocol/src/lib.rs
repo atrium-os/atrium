@@ -225,6 +225,14 @@ pub mod control {
     /// `PopupHostedEvent`, to the granting client: the pop-up its grant
     /// let another client open is open, or went.
     pub const EV_POPUP_HOSTED:           u16 = 0x058d;
+    /// `BudgetRefusedEvent`, to the client: a scene, texture or text op of
+    /// its was refused because it would pass one of the client's budgets
+    /// (`budget::*`), or a frame of a window was not drawn because its
+    /// raster would take far longer than the window's budget. Sent once
+    /// when refusals start for a window and resource; again only after an
+    /// op of that resource was accepted in between. The client evicts
+    /// (clears nodes, slots, text runs at other sizes) and sends again.
+    pub const EV_BUDGET_REFUSED:         u16 = 0x058e;
     /// The display's mode changed (a mode switch, or a monitor plugged in
     /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
     /// anything laid out for the screen lays itself out again.
@@ -1283,6 +1291,48 @@ pub mod fill_drop {
     /// drawn; fewer or smaller nodes (a glyph run drawn as an image) fit.
     /// Any node kind.
     pub const OP_BUDGET: u8 = 6;
+}
+
+/// What a client's renderer holds for it, and the limit of each
+/// (`EV_BUDGET_REFUSED`). The limits are per client connection, across all
+/// its windows (docs/spec/fresco-f4-split.md §F4h). A refusal never kills
+/// the renderer: the op is not applied, the app is told, and it can evict.
+pub mod budget {
+    /// Scene nodes (every leaf and group, all windows).
+    pub const NODES: u8 = 1;
+    /// Bytes of node parameters (glyph lists, fill geometry, ...).
+    pub const SCENE_BYTES: u8 = 2;
+    /// Bytes of bound texture slots (width x height x bytes per texel).
+    pub const TEXTURE_BYTES: u8 = 3;
+    /// Glyph atlas pages (one per font and size the client shapes text in,
+    /// 1 MiB each). Pages no text run uses are evicted first.
+    pub const GLYPH_ATLAS: u8 = 4;
+    /// A window's frame would take far longer to raster on the GPU than
+    /// its per-window budget (cost estimate, `fresco_compute::cost`): it is
+    /// not drawn and the window keeps its last frame. `id` is 0.
+    pub const RASTER_TIME: u8 = 5;
+
+    /// Most nodes one client may hold. Officina keeps about 5,000 per
+    /// window resident; a 1440p spreadsheet is about 1,500 cells.
+    pub const MAX_NODES: u64 = 262_144;
+    /// Most node-parameter bytes one client may hold.
+    pub const MAX_SCENE_BYTES: u64 = 64 << 20;
+    /// Most bound texture bytes one client may hold.
+    pub const MAX_TEXTURE_BYTES: u64 = 96 << 20;
+    /// Most glyph atlas pages one client may hold.
+    pub const MAX_ATLAS_PAGES: u64 = 32;
+}
+
+/// `EV_BUDGET_REFUSED`: `resource` is a `budget::*` constant; `id` the node
+/// or slot id of the first refused op (0 for `RASTER_TIME`); `used` what the
+/// client holds now and `limit` the most it may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetRefusedEvent {
+    pub window_id: u32,
+    pub resource: u8,
+    pub id: u32,
+    pub used: u64,
+    pub limit: u64,
 }
 
 /// A node that is not drawn: any kind for `OP_BUDGET`, else a fill.
@@ -2604,6 +2654,7 @@ mod tests {
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
             control::EV_WINDOW_FILLS_DROPPED,
+            control::EV_BUDGET_REFUSED,
             control::EV_WINDOW_EMBED_TOKEN,
             control::OP_LANE_REQUEST,
             control::OP_WM_ENUMERATE,

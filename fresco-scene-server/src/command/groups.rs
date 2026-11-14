@@ -240,6 +240,7 @@ impl WindowSceneState {
         self.group_nodes.remove(&id);
         self.placements.remove(&id);
         self.node_writers.remove(&id);
+        self.node_ledger.release(id);
     }
 }
 

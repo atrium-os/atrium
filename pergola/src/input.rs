@@ -66,6 +66,9 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::PopupHosted { .. }
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
+        // Over a renderer budget: the embedder evicts (a DocumentView drops
+        // bands far from the viewport), at the loop level.
+        | fresco_client::Event::BudgetRefused { .. }
         // The window's embed token goes to limend, not to views.
         | fresco_client::Event::EmbedToken { .. }
         // Swipes go to the WM only.

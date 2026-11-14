@@ -99,6 +99,10 @@ pub struct WindowSceneState {
     /// compositor scissors to it); `None` means a whole-surface
     /// present. Consumed by the renderer/compositor each present.
     pub pending_damage: Option<DamageRect>,
+
+    /// What each node and bound slot costs, by writer (`crate::budget`).
+    pub node_ledger: crate::budget::Ledger,
+    pub slot_ledger: crate::budget::Ledger,
 }
 
 impl WindowSceneState {
@@ -338,6 +342,12 @@ pub struct EnvelopeFrontend {
     span_moved: Vec<(u64, i32, i32)>,
     /// The system appearance (`OP_APPEARANCE`, `OP_WM_SET_APPEARANCE`).
     appearance: fresco_protocol::AppearancePayload,
+
+    /// Each client's budget (`crate::budget`), and the (client, window,
+    /// resource) refusals already reported, so a client that keeps sending
+    /// past a limit is told once, until an op of that resource goes through.
+    pub limits: crate::budget::Limits,
+    refused: std::collections::HashSet<(u8, u32, u8)>,
 }
 
 impl EnvelopeFrontend {
@@ -378,7 +388,72 @@ impl EnvelopeFrontend {
             span_requests: Vec::new(),
             span_moved: Vec::new(),
             appearance: fresco_protocol::AppearancePayload::default(),
+            limits: crate::budget::Limits::default(),
+            refused: std::collections::HashSet::new(),
         }
+    }
+
+    /// What `client` holds across all windows.
+    pub fn client_use(&self, client: u8) -> crate::budget::Use {
+        let mut u = crate::budget::Use::default();
+        for s in self.per_window.values() {
+            let (n, b) = s.node_ledger.of(client);
+            u.nodes += n;
+            u.scene_bytes += b;
+            u.texture_bytes += s.slot_ledger.of(client).1;
+        }
+        u
+    }
+
+    /// Tell `client` once that ops of `resource` on `window` are refused
+    /// (`EV_BUDGET_REFUSED`); nothing if it was told and nothing of that
+    /// resource went through since.
+    fn refuse(&mut self, client: u8, window: u32, resource: u8, id: u32, used: u64, limit: u64) -> Vec<Outbound> {
+        if !self.refused.insert((client, window, resource)) {
+            return Vec::new();
+        }
+        log::warn!("client {client} window {window}: over budget {resource} ({used} of {limit}); refusing until it evicts");
+        budget_event(window, resource, id, used, limit)
+    }
+
+    /// An op of `resource` went through: the next refusal is reported.
+    fn accepted(&mut self, client: u8, window: u32, resource: u8) {
+        if !self.refused.is_empty() {
+            self.refused.remove(&(client, window, resource));
+        }
+    }
+
+    /// Whether node `id` of `window`, costing `bytes`, fits `client`'s
+    /// budget; `Err` holds the refusal to send.
+    fn admit_node(&mut self, client: u8, window: u32, id: u32, bytes: u64) -> Result<(), Vec<Outbound>> {
+        use fresco_protocol::budget;
+        let u = self.client_use(client);
+        let old = self.per_window.get(&window).and_then(|s| s.node_ledger.get(id)).filter(|(w, _)| *w == client);
+        let nodes = u.nodes + old.is_none() as u64;
+        let bytes_after = u.scene_bytes - old.map_or(0, |o| o.1) + bytes;
+        if nodes > self.limits.nodes {
+            return Err(self.refuse(client, window, budget::NODES, id, u.nodes, self.limits.nodes));
+        }
+        if bytes_after > self.limits.scene_bytes {
+            return Err(self.refuse(client, window, budget::SCENE_BYTES, id, u.scene_bytes, self.limits.scene_bytes));
+        }
+        self.accepted(client, window, budget::NODES);
+        self.accepted(client, window, budget::SCENE_BYTES);
+        Ok(())
+    }
+
+    /// Room for a glyph atlas page for (`font_id`, `size_px`): pages no
+    /// text run uses go first; `false` if the budget is still full.
+    fn atlas_room(&mut self, font_id: u32, size_px: f32) -> bool {
+        if !self.text.read().unwrap().page_needed(font_id, size_px, self.limits.atlas_pages as usize) {
+            return true;
+        }
+        let live: std::collections::HashSet<u32> = self.per_window.values()
+            .flat_map(|s| s.glyph_run_nodes.values().map(|r| r.atlas_slot_id))
+            .collect();
+        let evicted = self.text.write().unwrap().evict_unused(&live);
+        self.pending_slot_clears.extend(evicted);
+        !self.text.read().unwrap().page_needed(font_id, size_px, self.limits.atlas_pages as usize)
     }
 
     /// Tell the frontend what the display is running at, so clients can ask
@@ -643,7 +718,16 @@ impl EnvelopeFrontend {
         let sets = std::mem::take(&mut self.pending_slot_sets);
         let clears = std::mem::take(&mut self.pending_slot_clears);
         let atlas_uploads = std::mem::take(&mut self.pending_atlas_uploads);
-        let cas = self.cas.lock().unwrap();
+        let mut cas = self.cas.lock().unwrap();
+        /* The renderer keeps its own copy of every texture it was given, so
+         * the CAS keeps only blobs a slot is bound to (the budget bounds
+         * those) and blobs that came since the last drain (their SLOT_SET
+         * may not be dispatched yet). Before, every blob ever sent stayed. */
+        let bound: std::collections::HashSet<[u8; 32]> = self.per_window.values()
+            .flat_map(|s| s.slot_table.values().copied())
+            .chain(sets.iter().map(|(_, h, _)| *h))
+            .collect();
+        cas.keep_bound_and_recent(&bound);
         let mut uploads = Vec::with_capacity(sets.len() + atlas_uploads.len());
         for (slot_id, hash, kind) in sets {
             let Some(bytes) = cas.load(&hash) else {
@@ -797,6 +881,7 @@ impl EnvelopeFrontend {
     /// client disconnect).
     pub fn forget_window(&mut self, window_id: u32) {
         self.per_window.remove(&window_id);
+        self.refused.retain(|&(_, w, _)| w != window_id);
         let gone: Vec<u32> = self.video.iter().filter(|(_, l)| l.window == window_id).map(|(&id, _)| id).collect();
         for id in gone {
             self.video.remove(&id);
@@ -975,6 +1060,7 @@ impl EnvelopeFrontend {
             for id in dead_slots {
                 s.slot_table.remove(&id);
                 s.slot_writers.remove(&id);
+                s.slot_ledger.release(id);
                 self.pending_slot_clears.push(id);
             }
         }
@@ -1019,9 +1105,21 @@ impl EnvelopeFrontend {
         let p: SlotSetPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
         let writer = self.current_client;
+        let bytes = match &p.kind {
+            SlotKind::Texture(d) => crate::budget::texture_bytes(d),
+        };
+        let used = self.client_use(writer).texture_bytes;
+        let old = self.per_window.get(&win_id).and_then(|s| s.slot_ledger.get(p.slot_id))
+            .filter(|(w, _)| *w == writer).map_or(0, |o| o.1);
+        if used - old + bytes > self.limits.texture_bytes {
+            let limit = self.limits.texture_bytes;
+            return Ok(self.refuse(writer, win_id, fresco_protocol::budget::TEXTURE_BYTES, p.slot_id, used, limit));
+        }
+        self.accepted(writer, win_id, fresco_protocol::budget::TEXTURE_BYTES);
         let s = self.ensure_window_state(win_id);
         s.slot_table.insert(p.slot_id, p.hash);
         s.slot_writers.insert(p.slot_id, writer);
+        s.slot_ledger.charge(p.slot_id, writer, bytes);
         self.pending_slot_sets.push((p.slot_id, p.hash, p.kind));
         Ok(Vec::new())
     }
@@ -1033,6 +1131,7 @@ impl EnvelopeFrontend {
         if let Some(s) = self.per_window.get_mut(&win_id) {
             s.slot_table.remove(&p.slot_id);
             s.slot_writers.remove(&p.slot_id);
+            s.slot_ledger.release(p.slot_id);
         }
         self.pending_slot_clears.push(p.slot_id);
         Ok(Vec::new())
@@ -1095,6 +1194,16 @@ impl EnvelopeFrontend {
         let p: SceneNodeSetPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
         let writer = self.current_client;
+        /* A node that would pass the client's budget is not applied
+         * (crate::budget). FILL_TRANSFORM and PLACE change a node that is
+         * there already and add nothing that grows. */
+        let charged = !matches!(p.op_id, scene_ops::ATRIUM_CORE_FILL_TRANSFORM | scene_ops::ATRIUM_CORE_PLACE);
+        let bytes = crate::budget::node_bytes(p.params.len());
+        if charged {
+            if let Err(refusal) = self.admit_node(writer, win_id, p.node_id, bytes) {
+                return Ok(refusal);
+            }
+        }
         let s = self.ensure_window_state(win_id);
         /* GROUP and PLACE check the writer of the nodes they touch
          * before recording one (command::groups). */
@@ -1191,7 +1300,11 @@ impl EnvelopeFrontend {
                  * means either a future bundle that frescod doesn't
                  * have loaded, or a malformed client. Log + skip. */
                 log::debug!("SCENE_NODE_SET op_id={:#x} unhandled (no bundle loaded)", other);
+                return Ok(Vec::new());
             }
+        }
+        if charged {
+            s.node_ledger.charge(p.node_id, writer, bytes);
         }
         Ok(Vec::new())
     }
@@ -1257,6 +1370,16 @@ impl EnvelopeFrontend {
     {
         let p: TextMeasurePayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
+        /* Measuring rasters into the size's atlas page too. Over budget:
+         * an empty answer (as for an unknown font) and the refusal. */
+        if !self.atlas_room(p.font_id, p.size_px) {
+            let (used, limit) = (self.text.read().unwrap().page_count() as u64, self.limits.atlas_pages);
+            let mut out = self.refuse(self.current_client, 0, fresco_protocol::budget::GLYPH_ATLAS, 0, used, limit);
+            let payload = encode(&TextMeasureResponse { width_px: 0.0, ascent_px: 0.0, descent_px: 0.0 })
+                .map_err(|_| DispatchError::BadPayload)?;
+            out.insert(0, Outbound { op: control::OP_TEXT_MEASURE, flags: flag::IS_RESPONSE, payload, fds: Vec::new() });
+            return Ok(out);
+        }
         let resp = match self.text.write().unwrap().measure(p.font_id, p.size_px, p.weight, &p.text) {
             Some((w, a, d)) => TextMeasureResponse {
                 width_px: w, ascent_px: a, descent_px: d,
@@ -1435,6 +1558,17 @@ impl EnvelopeFrontend {
         let win_id = self.check_routable(msg)?;
         let p: TextRunInstallPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
+        let writer = self.current_client;
+        if !self.atlas_room(p.font_id, p.size_px) {
+            let (used, limit) = (self.text.read().unwrap().page_count() as u64, self.limits.atlas_pages);
+            return Ok(self.refuse(writer, win_id, fresco_protocol::budget::GLYPH_ATLAS, p.node_id, used, limit));
+        }
+        self.accepted(writer, win_id, fresco_protocol::budget::GLYPH_ATLAS);
+        /* The run's size is known once shaped; refused before shaping if
+         * even an empty run would not fit. */
+        if let Err(refusal) = self.admit_node(writer, win_id, p.node_id, crate::budget::glyph_run_bytes(p.text.chars().count())) {
+            return Ok(refusal);
+        }
 
         let (run, pending) = {
             let mut text = self.text.write().unwrap();
@@ -1446,9 +1580,10 @@ impl EnvelopeFrontend {
         if let Some(up) = pending {
             self.pending_atlas_uploads.push(up);
         }
-        let writer = self.current_client;
+        let bytes = crate::budget::glyph_run_bytes(run.glyphs.len());
         let s = self.ensure_window_state(win_id);
         s.leaf_replaces(p.node_id);
+        s.node_ledger.charge(p.node_id, writer, bytes);
         s.glyph_run_nodes.insert(p.node_id, run);
         s.rect_nodes.remove(&p.node_id);
         s.texture_nodes.remove(&p.node_id);
@@ -2057,6 +2192,106 @@ mod tests {
         assert!(f.window_state(0).unwrap().slot_table.is_empty());
     }
 
+    fn rect_msg(win: u16, id: u32) -> Message {
+        let inner = RectParams { x: 0.0, y: 0.0, w: 8.0, h: 8.0, r: 1.0, g: 0.0, b: 0.0, a: 1.0, radius: 0.0 };
+        let p = SceneNodeSetPayload { node_id: id, op_id: scene_ops::ATRIUM_CORE_RECT, params: encode(&inner).unwrap() };
+        msg(control::OP_SCENE_NODE_SET, win, encode(&p).unwrap())
+    }
+
+    fn budget_events(out: &[Outbound]) -> Vec<BudgetRefusedEvent> {
+        out.iter().filter(|o| o.op == control::EV_BUDGET_REFUSED)
+            .map(|o| decode(&o.payload).unwrap()).collect()
+    }
+
+    /// Past the node budget the op is not applied and the client is told
+    /// once; after it evicts, it can add again, and is told again if it
+    /// passes the limit again.
+    #[test]
+    fn node_budget_refuses_and_tells_once() {
+        let mut f = fixture();
+        f.limits.nodes = 3;
+        for id in 1..=3 {
+            assert!(f.dispatch(&rect_msg(0, id), 1).unwrap().is_empty());
+        }
+        let out = f.dispatch(&rect_msg(0, 4), 1).unwrap();
+        let ev = budget_events(&out);
+        assert_eq!(ev, vec![BudgetRefusedEvent { window_id: 0, resource: budget::NODES, id: 4, used: 3, limit: 3 }]);
+        assert!(!f.window_state(0).unwrap().rect_nodes.contains_key(&4), "not applied");
+        assert!(f.dispatch(&rect_msg(0, 5), 1).unwrap().is_empty(), "told once");
+        // Replacing a node it has is not a new node.
+        assert!(f.dispatch(&rect_msg(0, 2), 1).unwrap().is_empty());
+        assert_eq!(f.client_use(1).nodes, 3);
+        // It evicts, then adds.
+        let cl = SceneNodeClearPayload { node_id: 1 };
+        f.dispatch(&msg(control::OP_SCENE_NODE_CLEAR, 0, encode(&cl).unwrap()), 1).unwrap();
+        assert!(f.dispatch(&rect_msg(0, 6), 1).unwrap().is_empty());
+        assert!(f.window_state(0).unwrap().rect_nodes.contains_key(&6));
+        let out = f.dispatch(&rect_msg(0, 7), 1).unwrap();
+        assert_eq!(budget_events(&out).len(), 1, "told again after an accepted op");
+        // Another client has its own budget.
+        assert!(f.dispatch(&rect_msg(0, 100), 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scene_bytes_budget() {
+        let mut f = fixture();
+        let per = f.dispatch(&rect_msg(0, 1), 1).map(|_| f.client_use(1).scene_bytes).unwrap();
+        f.limits.scene_bytes = per * 2;
+        assert!(f.dispatch(&rect_msg(0, 2), 1).unwrap().is_empty());
+        let ev = budget_events(&f.dispatch(&rect_msg(0, 3), 1).unwrap());
+        assert_eq!(ev[0].resource, budget::SCENE_BYTES);
+        assert_eq!(f.client_use(1).scene_bytes, per * 2);
+    }
+
+    /// A group's subtree going gives its nodes back.
+    #[test]
+    fn clearing_a_group_gives_its_subtree_back() {
+        let mut f = fixture();
+        let g = GroupParams { parent: None, order: 0, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], clip: None, opacity: 1.0, flags: 0 };
+        let p = SceneNodeSetPayload { node_id: 10, op_id: scene_ops::ATRIUM_CORE_GROUP, params: encode(&g).unwrap() };
+        f.dispatch(&msg(control::OP_SCENE_NODE_SET, 0, encode(&p).unwrap()), 1).unwrap();
+        for id in 1..=4 {
+            f.dispatch(&rect_msg(0, id), 1).unwrap();
+            let pl = PlaceParams { parent: Some(10), order: id };
+            let p = SceneNodeSetPayload { node_id: id, op_id: scene_ops::ATRIUM_CORE_PLACE, params: encode(&pl).unwrap() };
+            f.dispatch(&msg(control::OP_SCENE_NODE_SET, 0, encode(&p).unwrap()), 1).unwrap();
+        }
+        assert_eq!(f.client_use(1).nodes, 5);
+        let cl = SceneNodeClearPayload { node_id: 10 };
+        f.dispatch(&msg(control::OP_SCENE_NODE_CLEAR, 0, encode(&cl).unwrap()), 1).unwrap();
+        assert_eq!(f.client_use(1), crate::budget::Use::default());
+    }
+
+    #[test]
+    fn texture_budget_and_unbound_blobs_are_dropped() {
+        let mut f = fixture();
+        f.limits.texture_bytes = 64 * 64 * 4;
+        let tex = |slot: u32, hash: [u8; 32]| SlotSetPayload { slot_id: slot, hash,
+            kind: SlotKind::Texture(TextureDesc { width: 64, height: 64, format: TextureFormat::Rgba8UnormSrgb }) };
+        let a = vec![1u8; 64 * 64 * 4];
+        let b = vec![2u8; 64 * 64 * 4];
+        let ha = f.cas.lock().unwrap().store(&a);
+        let hb = f.cas.lock().unwrap().store(&b);
+        assert!(f.dispatch(&msg(control::OP_SLOT_SET, 0, encode(&tex(1, ha)).unwrap()), 1).unwrap().is_empty());
+        let ev = budget_events(&f.dispatch(&msg(control::OP_SLOT_SET, 0, encode(&tex(2, hb)).unwrap()), 1).unwrap());
+        assert_eq!(ev[0].resource, budget::TEXTURE_BYTES);
+        assert!(!f.window_state(0).unwrap().slot_table.contains_key(&2));
+        let (up, _) = f.take_pending_uploads();
+        assert_eq!(up.len(), 1);
+        // The refused blob came since the last drain: kept once, then gone.
+        assert!(f.cas.lock().unwrap().exists(&hb));
+        f.take_pending_uploads();
+        assert!(!f.cas.lock().unwrap().exists(&hb), "never bound: dropped");
+        assert!(f.cas.lock().unwrap().exists(&ha), "bound: kept");
+        // Rebinding the same slot replaces its cost.
+        assert!(f.dispatch(&msg(control::OP_SLOT_SET, 0, encode(&tex(1, ha)).unwrap()), 1).unwrap().is_empty());
+        f.dispatch(&msg(control::OP_SLOT_CLEAR, 0, encode(&SlotClearPayload { slot_id: 1 }).unwrap()), 1).unwrap();
+        assert_eq!(f.client_use(1).texture_bytes, 0);
+        f.take_pending_uploads(); // the rebind was still pending here
+        f.take_pending_uploads();
+        assert!(!f.cas.lock().unwrap().exists(&ha), "unbound: dropped");
+    }
+
     #[test]
     fn slot_update_region_queues_texture_region_upload() {
         let mut f = fixture();
@@ -2593,6 +2828,15 @@ mod tests {
 }
 
 /// A refused pop-up request as a dispatch error.
+/// `EV_BUDGET_REFUSED` to the dispatching client.
+pub fn budget_event(window: u32, resource: u8, id: u32, used: u64, limit: u64) -> Vec<Outbound> {
+    let ev = fresco_protocol::BudgetRefusedEvent { window_id: window, resource, id, used, limit };
+    match encode(&ev) {
+        Ok(payload) => vec![Outbound { op: control::EV_BUDGET_REFUSED, flags: flag::ASYNC_EVENT, payload, fds: Vec::new() }],
+        Err(_) => Vec::new(),
+    }
+}
+
 fn popup_refused(e: crate::window::PopupRefused) -> DispatchError {
     use crate::window::PopupRefused as R;
     match e {

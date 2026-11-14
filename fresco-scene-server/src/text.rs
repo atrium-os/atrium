@@ -440,6 +440,32 @@ impl TextEngine {
         }
     }
 
+    /// Atlas pages held (one per font and size, 1 MiB each).
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether text at (`font_id`, `size_px`) needs a page that `max`
+    /// pages leave no room for (`crate::budget`).
+    pub fn page_needed(&self, font_id: u32, size_px: f32, max: usize) -> bool {
+        let key = (font_id, (size_px * 100.0) as u32);
+        !self.pages.contains_key(&key) && self.pages.len() >= max
+    }
+
+    /// Drop the pages whose slot is not in `live` (no text run draws from
+    /// them); returns their slots, for the renderer to free.
+    pub fn evict_unused(&mut self, live: &std::collections::HashSet<u32>) -> Vec<u32> {
+        let mut gone = Vec::new();
+        self.pages.retain(|_, p| {
+            let keep = live.contains(&p.slot_id);
+            if !keep {
+                gone.push(p.slot_id);
+            }
+            keep
+        });
+        gone
+    }
+
     /// Shape `text` with `font_id` at `size_px`, ensure every glyph
     /// is in the atlas, and return a fully-formed `GlyphRunParams`
     /// the caller can install into the per-window scene state.
@@ -647,3 +673,30 @@ impl Default for TextEngine {
 /// `Arc<RwLock<TextEngine>>` shared between EnvelopeFrontend and
 /// the dispatcher.
 pub type SharedTextEngine = Arc<RwLock<TextEngine>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page budget: a new size past it needs room; pages no live run
+    /// draws from are evicted and their slots returned.
+    #[test]
+    fn atlas_pages_are_budgeted_and_unused_ones_evicted() {
+        let mut t = TextEngine::new();
+        for size in 0..4u32 {
+            let id = t.next_slot_id;
+            t.next_slot_id += 1;
+            t.pages.insert((1, size * 100), AtlasPage::new(id));
+        }
+        assert_eq!(t.page_count(), 4);
+        assert!(!t.page_needed(1, 2.0, 4), "an existing size needs no page");
+        assert!(t.page_needed(1, 9.0, 4));
+        assert!(!t.page_needed(1, 9.0, 5));
+        let live: std::collections::HashSet<u32> = [SERVER_SLOT_BASE, SERVER_SLOT_BASE + 2].into();
+        let mut gone = t.evict_unused(&live);
+        gone.sort();
+        assert_eq!(gone, vec![SERVER_SLOT_BASE + 1, SERVER_SLOT_BASE + 3]);
+        assert_eq!(t.page_count(), 2);
+        assert!(!t.page_needed(1, 9.0, 4));
+    }
+}

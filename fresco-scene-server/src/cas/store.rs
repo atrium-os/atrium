@@ -117,6 +117,25 @@ impl CasStore {
         }
     }
 
+    /// Drop every blob that is not in `bound` and was not stored since the
+    /// last call, then start a new generation. Pinned blobs (ref-counted)
+    /// stay.
+    pub fn keep_bound_and_recent(&mut self, bound: &std::collections::HashSet<Hash256>) {
+        let gen = self.generation;
+        let before = self.blobs.len();
+        let mut freed_bytes = 0u64;
+        self.blobs.retain(|h, b| {
+            let keep = b.ref_count > 0 || b.last_seen >= gen || bound.contains(h);
+            if !keep {
+                freed_bytes += b.data.len() as u64;
+            }
+            keep
+        });
+        self.gc_freed_blobs += (before - self.blobs.len()) as u64;
+        self.gc_freed_bytes += freed_bytes;
+        self.generation += 1;
+    }
+
     pub fn advance_generation(&mut self) {
         self.generation += 1;
     }

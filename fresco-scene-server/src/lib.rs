@@ -13,6 +13,7 @@
 //! envelope wire is in `fresco-protocol` and dispatched through
 //! `command::envelope_frontend::EnvelopeFrontend`.
 
+pub mod budget;
 pub mod cas;
 pub mod scene;
 pub mod command;

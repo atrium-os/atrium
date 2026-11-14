@@ -83,6 +83,10 @@ pub enum Event {
     /// when that set changes, so an empty list means all of them draw
     /// again. Draw a dropped one some other way (a bitmap), or send less.
     FillsDropped   { window_id: u32, dropped: Vec<fresco_protocol::FillDrop> },
+    /// An op was refused because it would pass one of the client's
+    /// budgets (`fresco_protocol::budget`), or a frame was too costly to
+    /// raster. Evict (clear nodes or slots) and send again.
+    BudgetRefused  { window_id: u32, resource: u8, id: u32, used: u64, limit: u64 },
     /// The token that names this window to limend (limen.md §5), sent once
     /// after it is created. Hand it to limend only.
     EmbedToken     { window_id: u32, token: [u8; 16] },
@@ -1316,6 +1320,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::CloseRequested { window_id: p.window_id },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
+        control::EV_BUDGET_REFUSED => match decode::<fresco_protocol::BudgetRefusedEvent>(payload) {
+            Ok(p) => Event::BudgetRefused { window_id: p.window_id, resource: p.resource, id: p.id, used: p.used, limit: p.limit },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
         EV_WINDOW_FILLS_DROPPED => match decode::<WindowFillsDroppedEvent>(payload) {
             Ok(p) => Event::FillsDropped { window_id: p.window_id, dropped: p.dropped },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
@@ -1476,6 +1484,12 @@ mod tests {
                 assert_eq!((dropped[0].node_id, dropped[0].reason), (12, fresco_protocol::fill_drop::TILE_TOO_DENSE));
             }
             other => panic!("expected FillsDropped, got {other:?}"),
+        }
+
+        let p = fresco_protocol::BudgetRefusedEvent { window_id: 2, resource: fresco_protocol::budget::NODES, id: 9, used: 5, limit: 5 };
+        match decode_event(control::EV_BUDGET_REFUSED, &encode(&p).unwrap()) {
+            Event::BudgetRefused { window_id: 2, resource: fresco_protocol::budget::NODES, id: 9, used: 5, limit: 5 } => {}
+            other => panic!("expected BudgetRefused, got {other:?}"),
         }
     }
 

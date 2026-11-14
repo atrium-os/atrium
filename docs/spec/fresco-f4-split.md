@@ -155,6 +155,17 @@ The CPU counterpart of F4e. With the compute renderer (the default), frescod nev
 - Fixed on the way: `Tier2::seed_cache` wrote kernels where the loader no longer looked (`v4/` instead of `v4/<arch>/`, since `affaa3e`), and frescod as `_frescod` could not write the system shader cache. frescod now uses `FRESCO_COMPUTE_CACHE`, else the system cache if writable, else a private 0700 directory of its own in the temp dir.
 - Verified in the amd64 VM: frescod as `_frescod`, renderers jailed by portcullisd as `_fresco-render`, `atrium-surfaces-demo` drawn from the renderers' pixels (`frescod-f4g-pixel-mode.png`, the same picture as with frames). `fresco-split-fuzz.sh` passes in both modes (90 s each): hostile renderers write pixels of any value and size, frames where pixels belong, and bytes (`FUZZ_PIXELS=0` fuzzes the frame parser as before).
 
+### F4h. A per-client budget in the renderer: refuse, don't kill. Done (2026-11-14)
+
+Asked by Shankar (officina.md §10.5): a huge document must not take down compositing. Split mode already keeps a big scene in its own renderer; what was left is that an app growing its scene without bound ended when its renderer passed the 512 MiB cap and was killed, which looks like a crash.
+
+- The frontend (`fresco-scene-server/src/budget.rs`) counts what each client holds, across its windows: nodes, node-parameter bytes, bound texture bytes (width × height × bytes per texel) and glyph atlas pages. Each window keeps a ledger by node (and slot) id, so whatever removes a node (a clear, a group's subtree, a disconnect, the window closing) gives its share back.
+- An op that would pass a limit is not applied. The client gets `EV_BUDGET_REFUSED` (`BudgetRefusedEvent`: window, `budget::*` resource, the refused node or slot id, used, limit; `fresco_client::Event::BudgetRefused`), once per window and resource until an op of that resource goes through again, so a client stuck sending is not flooded. It evicts and sends again.
+- Limits (`fresco_protocol::budget`): 262,144 nodes, 64 MiB of node parameters, 96 MiB of textures, 32 atlas pages (1 MiB each). Officina keeps about 5,000 nodes per window; a 1440p sheet is about 1,500 cells. With the windows' pixels this stays under the cap.
+- A new font size past the page limit first evicts the pages no text run draws from (their slots are freed in the renderer); only if all are in use is the run refused. `OP_TEXT_MEASURE` past it answers zeros and sends the refusal.
+- Found on the way: the scene server's CAS kept every texture blob ever sent, bound or not, so an app cycling textures grew its renderer forever. It now keeps only blobs a slot is bound to and those sent since the last upload pass.
+- `OP_BUDGET` (65,536 kernel ops per frame after culling) still drops whole nodes at pack time; this budget is the memory side, that one the per-frame raster side.
+
 ### F4f. Secure input for passwords (waits on F5 and Navigator C0)
 
 - A password field is marked in the window's semantic tree, and the broker validates the mark (§6.4).
@@ -162,7 +173,7 @@ The CPU counterpart of F4e. With the compute renderer (the default), frescod nev
 
 ## Order
 
-F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e and F4g are done.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e, F4g and F4h are done.
 
 ## Decisions taken (recommended; say if you want otherwise)
 
