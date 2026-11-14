@@ -112,8 +112,8 @@ fn main() {
         Ok(Reply::Surfaces { surfaces, focus }) => {
             for s in surfaces {
                 let mark = if s.surface_id == focus { '*' } else { ' ' };
-                println!("{mark} {:>4} {:?} {} {}x{}+{}+{}", s.surface_id, s.role, s.owner_app,
-                         s.rect.w, s.rect.h, s.rect.x, s.rect.y);
+                println!("{mark} {:>4} {:?} {} {}x{}+{}+{} min {}x{}", s.surface_id, s.role, s.owner_app,
+                         s.rect.w, s.rect.h, s.rect.x, s.rect.y, s.min_size.0, s.min_size.1);
             }
         }
         Ok(Reply::DisplayModes { modes, current }) => {
