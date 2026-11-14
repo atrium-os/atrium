@@ -46,22 +46,29 @@ impl View for Demo {
         let t = ctx.theme;
         let s = self.shown.get_cloned();
         let (w, h) = self.size;
-        ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
+        // The whole window is pressable, so the gate can tell whether a
+        // press reached the app while the picker's sheet held it.
+        let bg = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
+        ctx.on_click(bg, || eprintln!("pick-demo: the app got a press"));
         let st = |size, weight, color| TextStyle { family: font::SANS.into(), size, weight, color };
         ctx.add(Node::Text { rect: Rect::new(24.0, 14.0, 0.0, 24.0), content: "Notes (a demo app)".into(), style: st(type_size::LG, Weight::Semibold, t.text_primary()) });
         let what = if s.asking { "Asking the system picker. Only what you pick reaches this app." } else { "What the picker handed over:" };
         ctx.add(Node::Text { rect: Rect::new(24.0, 44.0, 0.0, 20.0), content: what.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
         if s.asking {
-            // The slot: Scrinium's window goes here, above this one.
-            let r = Rect::new(24.0, 76.0, (w - 48.0).max(100.0), (h - 100.0).max(100.0));
-            let id = ctx.add(Node::Rect { rect: r, fill: t.bg_surface(), radius: 8.0 });
+            // The app's own content goes on as usual; the system places
+            // the picker's sheet over it (scrinium.md §4.4), whatever rect
+            // this slot has.
+            for (i, l) in ["Monday: call the plumber", "Groceries: rice, lentils, coriander", "Read chapter 4"].iter().enumerate() {
+                ctx.add(Node::Text { rect: Rect::new(24.0, 80.0 + i as f32 * 22.0, 0.0, 20.0), content: (*l).into(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+            }
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 1.0, 1.0), fill: Color::TRANSPARENT, radius: 0.0 });
             ctx.slot(id, PICKER_SLOT);
         } else {
             for (i, l) in s.lines.iter().enumerate() {
                 ctx.add(Node::Text { rect: Rect::new(24.0, 80.0 + i as f32 * 22.0, 0.0, 20.0), content: l.clone(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
             }
         }
-        let _ = Color::TRANSPARENT;
+        ctx.pop();
     }
 }
 

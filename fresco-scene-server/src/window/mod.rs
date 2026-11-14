@@ -1348,13 +1348,19 @@ impl Compositor {
         if let Some(p) = self.key_popup() {
             return p as u32;
         }
-        match self.focus.unwrap_or(0) {
+        let w = match self.focus.unwrap_or(0) {
             // Not a pop-up: one that grabs was taken above, a tooltip takes no keys.
             0 => self.z_order.iter().rev()
                 .find(|&&id| id != 0 && !self.is_notification(id) && self.windows.get(&id).is_some_and(|w| w.popup.is_none()))
-                .copied().unwrap_or(0) as u32,
-            f => f as u32,
+                .copied().unwrap_or(0),
+            f => f,
+        };
+        // A sheet takes the keys of the window it holds (scrinium.md §4.4).
+        if w != 0 && self.held(w) {
+            let parent = self.windows.get(&w).and_then(|x| x.slot).map_or(w, |s| s.parent);
+            return self.key_target(parent) as u32;
         }
+        w as u32
     }
 
     /// Make `child` a credential slot at `rect` in `parent` (`None`:
@@ -1398,7 +1404,9 @@ impl Compositor {
             && c.slot.is_none_or(|s| s.parent == parent)
             && c.kept_by.is_none_or(|p| p == parent)
             && !self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
-            && matches!(kind, k::PLAIN | k::CREDENTIAL | k::ISLAND)
+            && matches!(kind, k::PLAIN | k::CREDENTIAL | k::ISLAND | k::SHEET)
+            // One sheet per parent.
+            && (kind != k::SHEET || !self.windows.iter().any(|(&id, w)| id != child && w.slot.is_some_and(|s| s.parent == parent && s.kind == k::SHEET)))
             && rect.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[2] >= 1.0 && r[3] >= 1.0);
         if !ok {
             return Err(refusal::INVALID);
@@ -1471,7 +1479,7 @@ impl Compositor {
             self.windows.iter().filter_map(|(&id, w)| w.slot.map(|c| (id, c))).collect();
         /* Each goes in right above its parent, under those placed before
          * it: the topmost first. */
-        let rank = |id: WindowId, c: &Slot| (c.kind == fresco_protocol::slot::kind::CREDENTIAL, c.z, id);
+        let rank = |id: WindowId, c: &Slot| (c.kind == fresco_protocol::slot::kind::SHEET, c.kind == fresco_protocol::slot::kind::CREDENTIAL, c.z, id);
         slots.sort_by(|a, b| rank(b.0, &b.1).cmp(&rank(a.0, &a.1)));
         for (id, c) in slots {
             let Some((ppos, psize)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size)) else {
@@ -1480,8 +1488,16 @@ impl Compositor {
                 continue;
             };
             self.z_order.retain(|&w| w != id);
-            let [x, y, w, h] = c.rect;
-            let (w, h) = ((x + w).min(psize.0) - x.max(0.0), (y + h).min(psize.1) - y.max(0.0));
+            let [x, y, w, h] = if c.kind == fresco_protocol::slot::kind::SHEET {
+                sheet_rect(psize, (c.rect[2], c.rect[3]))
+            } else {
+                c.rect
+            };
+            let (w, h) = if c.kind == fresco_protocol::slot::kind::SHEET {
+                (w, h) // placed by frescod, not clipped to the parent
+            } else {
+                ((x + w).min(psize.0) - x.max(0.0), (y + h).min(psize.1) - y.max(0.0))
+            };
             let Some(at) = self.z_order.iter().position(|&w| w == c.parent).filter(|_| w >= 1.0 && h >= 1.0) else {
                 continue;
             };
@@ -1489,7 +1505,8 @@ impl Compositor {
             if self.windows[&id].size != size {
                 self.resize_window(id, size.0 as u32, size.1 as u32);
             }
-            self.windows.get_mut(&id).unwrap().pos = (ppos.0 + x.max(0.0), ppos.1 + y.max(0.0));
+            let (x, y) = if c.kind == fresco_protocol::slot::kind::SHEET { (x, y) } else { (x.max(0.0), y.max(0.0)) };
+            self.windows.get_mut(&id).unwrap().pos = (ppos.0 + x, ppos.1 + y);
             self.z_order.insert(at + 1, id);
         }
         for (i, &id) in self.z_order.iter().enumerate() {
@@ -1538,7 +1555,7 @@ impl Compositor {
     /// alone.
     pub fn pointer_target(&self, x: f32, y: f32) -> (WindowId, (f32, f32)) {
         let Some(shown) = &self.shown else {
-            let id = self.hit_test(x, y).unwrap_or(0);
+            let id = self.hit_test(x, y).filter(|&id| !self.held(id)).unwrap_or(0);
             let pos = if id == 0 { (0.0, 0.0) } else { self.windows.get(&id).map(|w| w.pos).unwrap_or((0.0, 0.0)) };
             return (id, (x - pos.0, y - pos.1));
         };
@@ -1548,6 +1565,11 @@ impl Compositor {
             let chrome = l.id == CHROME_LAYER;
             if l.id == 0 || !inside || (!chrome && !self.windows.contains_key(&l.id)) {
                 continue;
+            }
+            // A window with a sheet over it takes no pointer input, nor
+            // do its other slots.
+            if self.held(l.id) {
+                return (0, (x, y));
             }
             let local = (x - x0 as f32, y - y0 as f32);
             if let Some(a) = &l.alpha {
@@ -1565,6 +1587,35 @@ impl Compositor {
             return (l.id, local);
         }
         (0, (x, y))
+    }
+
+    /// The sheet shown over `parent`, if one is (scrinium.md §4.4).
+    pub fn sheet_of(&self, parent: WindowId) -> Option<WindowId> {
+        self.windows.iter()
+            .find(|(_, w)| w.slot.is_some_and(|s| s.parent == parent && s.kind == fresco_protocol::slot::kind::SHEET) && !w.hidden)
+            .map(|(&id, _)| id)
+            .filter(|id| self.z_order.contains(id))
+    }
+
+    /// Whether `id` is held by a sheet: it has one over it, or it is
+    /// another slot of a parent that has one.
+    pub fn held(&self, id: WindowId) -> bool {
+        if self.sheet_of(id).is_some() {
+            return true;
+        }
+        let parent = self.windows.get(&id).and_then(|w| w.slot).map(|s| s.parent);
+        parent.is_some_and(|p| self.sheet_of(p).is_some_and(|sh| sh != id))
+    }
+
+    /// Where keys for `id` go: the sheet over it while one is shown, else
+    /// `id` itself.
+    pub fn key_target(&self, id: WindowId) -> WindowId {
+        self.sheet_of(id).unwrap_or(id)
+    }
+
+    /// Whether `id` is bound as a sheet slot.
+    pub fn is_sheet(&self, id: WindowId) -> bool {
+        self.windows.get(&id).and_then(|w| w.slot).is_some_and(|s| s.kind == fresco_protocol::slot::kind::SHEET)
     }
 
     /// Whether `id` is bound as an island slot.
@@ -1587,6 +1638,19 @@ impl Compositor {
         None
     }
 }
+
+/// Where a sheet `size` goes in a parent `psize` (parent coordinates):
+/// centred across, `SHEET_TOP` down or centred if the parent is shorter
+/// than that leaves room for, never above the parent's top; whole pixels.
+pub fn sheet_rect(psize: (f32, f32), size: (f32, f32)) -> [f32; 4] {
+    let (w, h) = (size.0.floor().max(1.0), size.1.floor().max(1.0));
+    let x = ((psize.0 - w) / 2.0).floor();
+    let y = SHEET_TOP.min(((psize.1 - h) / 2.0).floor()).max(0.0);
+    [x, y, w, h]
+}
+
+/// How far below its parent's top edge a sheet sits.
+pub const SHEET_TOP: f32 = 48.0;
 
 /// Whether anything composed above `island` overlaps it: `layers` bottom
 /// to top as composed, frescod's own chrome (which frames the island)
@@ -1942,6 +2006,41 @@ mod notification_tests {
         assert!(c.z_order.contains(&e));
         assert!(c.destroy(p, 1));
         assert!(c.windows[&e].slot.is_none() && !c.z_order.contains(&e), "its parent went: released and hidden");
+    }
+
+    #[test]
+    fn a_sheet_is_placed_by_frescod_and_holds_its_parents_input() {
+        use fresco_protocol::slot::{kind, refusal};
+        let mut c = Compositor::new();
+        let p = c.create(1, (760, 540));
+        let s = c.create(2, (10, 10));
+        let s2 = c.create(2, (10, 10));
+        // The parent's rect is ignored: only the size counts.
+        assert_eq!(c.bind_slot(s, p, kind::SHEET, Some([500.0, 500.0, 640.0, 440.0]), 0), Ok(()));
+        let pp = c.windows[&p].pos;
+        assert_eq!(c.windows[&s].size, (640.0, 440.0));
+        assert_eq!(c.windows[&s].pos, (pp.0 + 60.0, pp.1 + 48.0), "centred across, near the top");
+        assert_eq!(c.sheet_of(p), Some(s));
+        assert_eq!(c.key_target(p), s, "keys for the parent go to the sheet");
+        c.set_focus_no_raise(Some(p));
+        assert_eq!(c.keyboard_window(), s as u32, "the focused parent's keys go to its sheet");
+        assert_eq!(c.bind_slot(s2, p, kind::SHEET, Some([0.0, 0.0, 10.0, 10.0]), 0), Err(refusal::INVALID), "one sheet per parent");
+        // A plain slot of the same parent stays under the sheet.
+        assert_eq!(c.bind_slot(s2, p, kind::PLAIN, Some([0.0, 0.0, 760.0, 540.0]), 9), Ok(()));
+        let z = |w| c.z_order.iter().position(|&x| x == w).unwrap();
+        assert!(z(s) > z(s2) && z(s2) > z(p));
+        // No pointer input for the parent, or its slots... the sheet gets its own.
+        let (t, _) = c.pointer_target(pp.0 + 10.0, pp.1 + 10.0);
+        assert_eq!(t, 0, "the parent and its other slots are held while the sheet is up");
+        let (t, local) = c.pointer_target(pp.0 + 70.0, pp.1 + 60.0);
+        assert_eq!((t, local), (s, (10.0, 12.0)));
+        // A parent smaller than the sheet: it hangs past the edges, centred.
+        assert_eq!(super::sheet_rect((400.0, 300.0), (640.0, 440.0)), [-120.0, 0.0, 640.0, 440.0]);
+        // Released: the parent takes input again.
+        assert_eq!(c.bind_slot(s, p, kind::SHEET, None, 0), Ok(()));
+        assert_eq!(c.sheet_of(p), None);
+        assert_eq!(c.key_target(p), p);
+        assert_eq!(c.keyboard_window(), p as u32);
     }
 
     #[test]

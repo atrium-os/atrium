@@ -2111,6 +2111,14 @@ pub mod slot {
         /// draw over. While anything composed above it overlaps it, the
         /// island takes no pointer input and its frame is dashed.
         pub const ISLAND: u8 = 2;
+        /// A system dialog over its parent (scrinium.md §4.4), the file
+        /// picker's: frescod ignores the rect's x and y and places it,
+        /// `w` x `h`, centred on the parent and near its top, unclipped
+        /// (it may hang past a small parent's edges). While it is shown the
+        /// parent is dimmed and gets no pointer input, keys for the parent
+        /// go to the sheet, and frescod frames it with a tag naming its app
+        /// that the parent can't draw over. One per parent.
+        pub const SHEET: u8 = 3;
     }
 
     pub mod refusal {

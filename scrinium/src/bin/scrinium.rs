@@ -157,7 +157,7 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
     let who = format!("picker {embed}");
     let desc = WindowDesc {
         hints: fresco_protocol::WindowHints { embed_pending: true, ..Default::default() },
-        ..WindowDesc::new("Choose", SizeSpec::Fixed(640, 420))
+        ..WindowDesc::new("Choose", SizeSpec::Fixed(640, 440))
     };
     let win = match fresco_client::Connection::connect(&fresco).and_then(|c| Window::open_on(c, &desc)) {
         Ok(w) => w,

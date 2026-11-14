@@ -47,10 +47,18 @@ impl Frescod {
 
 impl Compositor for Frescod {
     fn bind(&mut self, parent: WindowToken, child: WindowToken, kind: SlotKind, rect: Option<[f32; 4]>, z: u8) -> Result<(u32, u32), u8> {
+        let kind_of = kind;
         let kind = match kind {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
             SlotKind::Island => slot::kind::ISLAND,
+            SlotKind::Sheet { .. } => slot::kind::SHEET,
+        };
+        // A sheet's size is the role's, never the parent's (frescod
+        // places it).
+        let rect = match kind_of {
+            SlotKind::Sheet { w, h } => rect.map(|_| [0.0, 0.0, w as f32, h as f32]),
+            _ => rect,
         };
         match self.ask(&SlotBind { parent, child, kind, rect, z, keep_shown: false }) {
             Ok(SlotBindResult::Ok { parent_uid, child_uid }) => Ok((parent_uid, child_uid)),

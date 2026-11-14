@@ -334,6 +334,72 @@ pub fn slot_frames(slots: &[[i32; 4]], islands: &[Island]) -> Option<WindowFrame
     })
 }
 
+/// A sheet as composed (scrinium.md §4.4): its screen rect and the app
+/// it is, by the launch registry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sheet {
+    pub rect: [i32; 4],
+    pub app: String,
+}
+
+impl Sheet {
+    /// What its tag says, in the characters the chrome font draws.
+    pub fn tag(&self) -> String {
+        format!("system: {}", self.app)
+    }
+}
+
+/// A sheet's frame: the focus ring's blue, which no window may draw over.
+const SHEET_COLOR: [f32; 4] = RING_COLOR;
+/// The dim laid over a sheet's parent, under the sheet.
+const DIM_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.38];
+
+/// The layer that dims a sheet's parent: its own id (`dim_id`), the
+/// parent's screen rect, laid just under the sheet so neither the sheet
+/// nor anything above the parent is dimmed. It takes no input; the
+/// compositor holds the parent's anyway.
+pub fn dim_layer(id: u32, [x0, y0, x1, y1]: [i32; 4]) -> WindowFrame {
+    WindowFrame {
+        id,
+        pos: (x0 as f32, y0 as f32),
+        size: ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32),
+        rects: vec![rect(0, 0, x1 - x0, y1 - y0, DIM_COLOR)],
+        ..Default::default()
+    }
+}
+
+/// The dim layer's id for the sheet `sheet`: outside the windows' u16
+/// ids and far above the video layers' (`video::FIRST_ID` up).
+pub fn dim_id(sheet: u32) -> u32 {
+    0xfffe_0000 | (sheet & 0xffff)
+}
+
+/// A frame of `RING` just outside each sheet and its tag in a pill above
+/// its top left corner (below its bottom when there is no room above
+/// `top`), added to the chrome layer `c`.
+pub fn sheet_frames(c: &mut WindowFrame, sheets: &[Sheet], top: i32) {
+    let (mut right, mut bottom) = (c.size.0 as i32, c.size.1 as i32);
+    for sh in sheets {
+        let [x0, y0, x1, y1] = sh.rect;
+        let (w, h) = (x1 - x0, y1 - y0);
+        c.rects.push(rect(x0 - RING, y0 - RING, w + 2 * RING, RING, SHEET_COLOR));
+        c.rects.push(rect(x0 - RING, y1, w + 2 * RING, RING, SHEET_COLOR));
+        c.rects.push(rect(x0 - RING, y0, RING, h, SHEET_COLOR));
+        c.rects.push(rect(x1, y0, RING, h, SHEET_COLOR));
+        let tag = sh.tag();
+        let tw = text_width(&tag) + 2 * PAD + 6;
+        let above = y0 - RING - LABEL_H;
+        let y = if above >= top { above } else { y1 + RING };
+        let mut pill = rect(x0 - RING, y, tw, LABEL_H, SHEET_COLOR);
+        pill.radius = 3.0;
+        c.rects.push(pill);
+        text(&mut c.rects, &tag, x0 - RING + PAD + 3, y + (LABEL_H - glyphs::LINE) / 2, tw - 2 * PAD);
+        right = right.max(x1 + RING).max(x0 + tw);
+        bottom = bottom.max(y1 + RING).max(y + LABEL_H);
+    }
+    c.size = (right.max(1) as u32, bottom.max(1) as u32);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +479,31 @@ mod tests {
         let pill = high.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).unwrap();
         assert_eq!(pill.position[1] as i32, 101);
         assert!(super::slot_frames(&[], &[clear]).is_some(), "direct mode frames islands too");
+    }
+
+    #[test]
+    fn a_sheet_is_framed_and_tagged_above_and_its_parent_dimmed() {
+        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into() };
+        assert_eq!(sh.tag(), "system: org.atrium.scrinium");
+        let mut c = build(1280, None, |_| None, &[], &[], &[], &[], &[]);
+        let before = c.rects.len();
+        sheet_frames(&mut c, &[sh.clone()], STRIP_H);
+        let added = &c.rects[before..];
+        assert_eq!(added.iter().filter(|n| n.color == SHEET_COLOR && n.radius == 0.0).count(), 4, "four sides");
+        // No frame pixel inside the sheet.
+        assert!(added.iter().filter(|n| n.radius == 0.0 && n.color == SHEET_COLOR).all(|n| {
+            let (x0, y0, x1, y1) = (n.position[0] as i32, n.position[1] as i32, (n.position[0] + n.size[0]) as i32, (n.position[1] + n.size[1]) as i32);
+            x1 <= 160 || x0 >= 800 || y1 <= 200 || y0 >= 640
+        }));
+        let pill = added.iter().find(|n| n.radius > 0.0).expect("a tag");
+        assert_eq!(pill.position[1] as i32, 200 - RING - LABEL_H, "above the sheet");
+        // No room above: below it.
+        let mut c = build(1280, None, |_| None, &[], &[], &[], &[], &[]);
+        sheet_frames(&mut c, &[Sheet { rect: [10, 30, 300, 200], ..sh }], STRIP_H);
+        assert!(c.rects.iter().any(|n| n.radius > 0.0 && n.color == SHEET_COLOR && n.position[1] as i32 == 200 + RING));
+        let d = dim_layer(dim_id(7), [0, 24, 760, 564]);
+        assert_eq!((d.pos, d.size), ((0.0, 24.0), (760, 540)));
+        assert!(d.rects[0].color[3] > 0.0 && d.rects[0].color[3] < 1.0, "see-through");
+        assert!(dim_id(1) > u16::MAX as u32 && dim_id(1) != CHROME_ID, "never a window's id, nor the chrome's");
     }
 }

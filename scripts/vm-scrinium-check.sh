@@ -185,13 +185,17 @@ sleep 10
 V "grep -q 'providing picker' /tmp/sc/picker.log" && ok "Scrinium provides the picker" || bad "provider: $(V 'tail -3 /tmp/sc/picker.log /tmp/sc/limend.log | tr "\n" ";"')"
 V "daemon -f -o /tmp/sc/demo.log jexec -u grantapp $JN env FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock PICK_EXT=txt /bin/scrinium-pick-demo"
 sleep $WAIT
-V "grep -q 'the picker is in its slot' /tmp/sc/demo.log" && ok "the picker's window is in the app's slot" || bad "slot: $(V 'tail -3 /tmp/sc/demo.log /tmp/sc/picker.log | tr "\n" ";"')"
+V "grep -q 'the picker is in its slot' /tmp/sc/demo.log" && ok "the picker's sheet is over the app" || bad "slot: $(V 'tail -3 /tmp/sc/demo.log /tmp/sc/picker.log | tr "\n" ";"')"
 shot 4 scrinium-picker
-# The app's window is at 0,0; its slot at 24,76 (712 x 440). In the picker:
-# rows from y 120, 30 each; the list from x 176; Open at the bottom right.
-press 300 271                       # hello.txt (Docs, Photos, hello.txt)
+# The app's window is at 0,0, 760 x 540. frescod puts the 640 x 440 sheet
+# at 60,48 whatever slot the app drew. In the picker: rows from y 135, 30
+# each; the list from x 176; Open at the bottom right.
+press 20 300                        # the app, beside the sheet
+press 380 520                       # the app, below the sheet
+V "grep -q 'the app got a press' /tmp/sc/demo.log" && bad "a press reached the app under its sheet" || ok "the app got no press while the sheet was up"
+press 336 243                       # hello.txt (Docs, Photos, hello.txt)
 shot 4 scrinium-picker-selected
-press 688 486                       # Open
+press 652 458                       # Open
 sleep 10
 V "grep -q 'pick-demo: file hello.txt 21 hello from the stick' /tmp/sc/demo.log" && ok "the app read hello.txt through the descriptor" || bad "file pick: $(V 'tail -4 /tmp/sc/demo.log /tmp/sc/picker.log | tr "\n" ";"')"
 V "grep -q 'could write to a read-only pick' /tmp/sc/demo.log" && bad "the app wrote to a read-only pick" || ok "and could not write to it"
@@ -202,7 +206,7 @@ V "pkill -f scrinium-pick-demo"; sleep 3
 echo "== the picker: one file, to change"
 V "daemon -f -o /tmp/sc/demo2.log jexec -u grantapp $JN env FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock PICK_EXT=txt PICK_WRITE=1 /bin/scrinium-pick-demo"
 sleep $WAIT
-press 300 271; press 688 486; sleep 10
+press 336 243; press 652 458; sleep 10
 V "grep -q 'wrote to hello.txt: ok' /tmp/sc/demo2.log" && [ "$(V "su -m alice -c 'tail -1 $M/hello.txt'")" = "added by the app" ] && ok "a writable pick takes the app's line; alice sees it" || bad "write pick: $(V 'tail -3 /tmp/sc/demo2.log | tr "\n" ";"')"
 V "pkill -f scrinium-pick-demo"; sleep 3
 
@@ -210,14 +214,23 @@ echo "== the picker: a folder"
 V "daemon -f -o /tmp/sc/demo3.log jexec -u grantapp $JN env FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock PICK_KIND=folder PICK_WRITE=1 /bin/scrinium-pick-demo"
 sleep $WAIT
 shot 2 scrinium-picker-folder
-press 300 211                       # Docs
-press 655 486                       # Choose folder
+press 336 183                       # Docs
+press 619 458                       # Choose folder
 sleep 15
 V "grep -q 'pick-demo: folder /media/$PART note.txt,plan.md,trips' /tmp/sc/demo3.log" && ok "Docs mounted in the app's jail at /media/$PART" || bad "folder pick: $(V 'tail -4 /tmp/sc/demo3.log /tmp/sc/picker.log | tr "\n" ";"')"
 [ "$(V "stat -f '%u %Lp' $RN/media/$PART 2>&1")" = "50601 700" ] && ok "the app's own (50601, 0700)" || bad "grant root: '$(V "stat -f '%u %Lp' $RN/media/$PART 2>&1")'"
 V "su -m alice -c 'cat $M/Docs/from-the-app.txt'" | grep -q "the app wrote this" && ok "the app wrote into it; alice sees the file" || bad "folder write: $(V 'grep wrote /tmp/sc/demo3.log')"
 V "test -d $RN/media/$PART && ! ls $RN/media/$PART | grep -q hello.txt" && ok "only Docs: not the stick's other files" || bad "the app sees more than Docs, or nothing"
 shot 6 scrinium-folder-picked
+
+echo "== the picker: keys go to the sheet, Escape cancels"
+V "pkill -f scrinium-pick-demo"; sleep 3
+V "daemon -f -o /tmp/sc/demo4.log jexec -u grantapp $JN env FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock PICK_EXT=txt /bin/scrinium-pick-demo"
+sleep $WAIT
+key 0x29                            # Escape
+sleep 4
+V "grep -q 'pick-demo: cancelled' /tmp/sc/demo4.log" && ok "Escape reached the sheet, not the app: cancelled" || bad "escape: $(V 'tail -3 /tmp/sc/demo4.log /tmp/sc/frescod.log | tr "\n" ";"')"
+shot 4 scrinium-cancelled
 
 echo "== the app's jail goes: its grant ends"
 V "pkill -f scrinium-pick-demo; umount $RN/tmp/sc; $JC $JS remove $JN >/dev/null"; sleep 6
@@ -227,6 +240,6 @@ echo "== clean up"
 V "pkill -f scrinium; pkill -x limend; pkill -x frescod; umount $RF/sock; umount $RF/tmp/sc; $JC $JS remove $JF >/dev/null"
 V "sed -i '' '/ org.atrium.scrinium\$/d; / org.test.notes\$/d' $REG; rm -rf $APPS/org.atrium.scrinium $APPS/org.test.notes"
 mon "device_del scs$RUN" >/dev/null; sleep 4
-for f in frescod limend scrinium picker demo demo2 demo3; do get /tmp/sc/$f.log "$OUT/$f.log" 2>/dev/null; done
+for f in frescod limend scrinium picker demo demo2 demo3 demo4; do get /tmp/sc/$f.log "$OUT/$f.log" 2>/dev/null; done
 echo "scrinium: $fails failed"
 exit $fails

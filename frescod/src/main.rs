@@ -1422,6 +1422,30 @@ fn render_one_frame(
         let (sw, sh) = render_backend::surface_size(w);
         (w.id, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
     }).collect();
+    /* Sheets (scrinium.md §4.4): the parent dimmed by a layer just under
+     * the sheet (after the hit-test rects: the compositor holds the
+     * parent's input itself), and framed and tagged in the chrome below. */
+    let sheets: Vec<chrome::Sheet> = {
+        let c = comp.lock().unwrap();
+        let found: Vec<(u32, u32, u32)> = rects.iter().filter_map(|&(id, _)| {
+            let w = u16::try_from(id).ok()?;
+            if !c.is_sheet(w) {
+                return None;
+            }
+            let win = c.windows.get(&w)?;
+            Some((id, win.slot?.parent as u32, win.owner_uid))
+        }).collect();
+        drop(c);
+        let mut out = Vec::new();
+        for (sheet, parent, uid) in found {
+            let (Some(&(_, sr)), Some(&(_, pr))) = (rects.iter().find(|(l, _)| *l == sheet), rects.iter().find(|(l, _)| *l == parent)) else { continue };
+            if let Some(at) = windows.iter().position(|w| w.id == sheet) {
+                windows.insert(at, chrome::dim_layer(chrome::dim_id(sheet), pr));
+            }
+            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid) });
+        }
+        out
+    };
     /* Credential slots (arca-autofill.md §4): what this frame shows of
      * each, before frescod's own chrome goes on top. */
     let slots = credential::observe_frame(comp, &rects, [0, top as i32, screen_w as i32, screen_h as i32], activation::now_ns());
@@ -1468,11 +1492,15 @@ fn render_one_frame(
         let origin = |id: u16| b.origin(id).or_else(|| focus_parent.filter(|_| focus.map(|f| f as u16) == Some(id)).and_then(|p| b.origin(p)));
         let islands: Vec<chrome::Island> = island_ids.iter().filter_map(|&id| island_at(id, u16::try_from(id).ok().and_then(|w| b.origin(w)))).collect();
         let mut c = chrome::build(screen_w, focus, origin, &rects, &slots, &covers, &hosted, &islands);
-        c.size.1 = c.size.1.min(screen_h);
+        chrome::sheet_frames(&mut c, &sheets, chrome::STRIP_H);
+        c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
-    } else if let Some(mut c) = chrome::slot_frames(&slots, &island_ids.iter().filter_map(|&id| island_at(id, None)).collect::<Vec<_>>()) {
-        /* Direct mode: no strip, but slots still get their frame. */
+    } else if let Some(mut c) = chrome::slot_frames(&slots, &island_ids.iter().filter_map(|&id| island_at(id, None)).collect::<Vec<_>>())
+        .or_else(|| (!sheets.is_empty()).then(|| crate::pack::WindowFrame { id: chrome::CHROME_ID, pos: (0.0, 0.0), size: (1, 1), ..Default::default() }))
+    {
+        /* Direct mode: no strip, but slots and sheets still get their frame. */
+        chrome::sheet_frames(&mut c, &sheets, 0);
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);

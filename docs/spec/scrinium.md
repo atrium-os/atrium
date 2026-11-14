@@ -8,9 +8,10 @@ configuration). Gate: `scripts/vm-scrinium-check.sh` on the cloud amd64 VM.
    restricted capability `removable-files` and so has every stick, whole and
    read-write, for as long as it runs ([device-assignment.md](device-assignment.md) §4.8, §6.11).
 2. **The system file picker.** The provider of Limen's `picker` role
-   ([limen.md](limen.md) §2.3). An app asks for a file or a folder; Scrinium's
-   window is drawn in a slot of the app's window but in Scrinium's own
-   process and jail, and only what the user picks reaches the app.
+   ([limen.md](limen.md) §2.3). An app asks for a file or a folder;
+   Scrinium's window comes up as a sheet over the app's window (§4.4), in
+   Scrinium's own process and jail, and only what the user picks reaches
+   the app.
 
 ## 1. Short answer
 
@@ -84,9 +85,10 @@ held in three places, each checked by someone else:
   manifest holds `removable-files`, and `PICKED` only to one holding
   `file-picker`; both are restricted capabilities that portcullisd installs
   only with policy approval.
-- An app sees only its slot. Scrinium's window is its own surface, bound into
-  the slot by frescod (limen.md §5); the app cannot read its pixels or send
-  it input.
+- An app sees none of the picker. Scrinium's window is its own surface,
+  placed over the app by frescod as a sheet (§4.4, limen.md §5.1); the app
+  cannot read its pixels, send it input, move it, shrink it or draw over
+  its frame.
 
 ## 4. The picker
 
@@ -150,9 +152,28 @@ in the app's jail, a second pick from it is refused `BUSY` ("already has
 CLI for tests: `atrium-dispensatord --picked PART PATH APP_UID`
 (`PICKED_RO=1` for read-only).
 
-### 4.4 The picker window
+### 4.4 The picker window: a sheet
 
-Title (the app's, or "Choose a file" / "Choose a folder"), a line saying for
+Shankar 2026-11-14: modal to the app that asked, not to the system. The
+picker is a Limen slot of kind `sheet` (limen.md §5.1):
+
+- **The system places it.** 640 x 440, centred across the app's window and
+  48 px below its top; the app's slot rect is ignored, so the app can't
+  shrink or hide it. It moves with the app's window and has no title bar of
+  its own; it can't be dragged. A window smaller than the sheet has it
+  hanging past its edges, still centred on it.
+- **Modal to that app only.** While it is up, frescod dims the app's window
+  (a translucent layer under the sheet), gives the app and its other slots
+  no pointer input, and sends keys meant for the app to the sheet. Every
+  other app and the desktop work as usual.
+- **A frame the app can't draw.** frescod's chrome draws a 2 px frame round
+  the sheet in the focus ring's blue and a tag above it, `system:
+  org.atrium.scrinium` (the chrome's font has lowercase only). A fake
+  picker drawn by an app gets nothing, since the app still can't reach the
+  stick, but the frame is what says this one is real.
+- Escape or Cancel closes it.
+
+Inside it: title (the app's, or "Choose a file" / "Choose a folder"), a line saying for
 which app and whether it may change what it gets, the sidebar of sticks, Up
 and crumbs, the list filtered to the extensions (folders always shown), and
 Cancel plus Open / Choose folder. Escape cancels.
@@ -183,6 +204,9 @@ descriptor and not writable, a writable pick whose line lands on the stick, a
 folder pick mounted in the app's jail as only that folder (50601, 0700) that
 the app writes into, and the grant ending with the app's jail. Screenshots
 land in `scratch/scrinium/`. **0 failed** 2026-11-14 (TCG, about 20 minutes).
+The sheet (§4.4) adds: two presses on the app beside and below the sheet
+reach nothing, the picks are made at the sheet's frescod-chosen place, and
+Escape typed with the app focused reaches the sheet and cancels.
 
 Setting it up needs: `/usr/bin/env` in the test jails (the script copies
 it), and frescod started with `FRESCOD_SLOT_UIDS=0` so that limend, run as

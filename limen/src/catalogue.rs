@@ -11,6 +11,11 @@ pub enum SlotKind {
     /// Live code in a page (navigator-ui.md §6.3): frescod's frame and
     /// origin tag, no input while anything overlaps it.
     Island,
+    /// A system dialog over the parent (scrinium.md §4.4): frescod places
+    /// it, `w` x `h`, centred near the parent's top whatever rect the
+    /// parent asked for, dims the parent and keeps its input from it, and
+    /// frames it with a tag the parent can't draw over.
+    Sheet { w: u16, h: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +53,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
-    Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Plain, takes_fd: false, returns_fd: true },
+    Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Sheet { w: 640, h: 440 }, takes_fd: false, returns_fd: true },
     Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },

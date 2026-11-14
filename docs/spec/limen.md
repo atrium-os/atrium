@@ -444,6 +444,15 @@ The slot op takes a **kind**:
 - `island` (2026-11-14): pinned, plus frescod's frame and an origin tag (`live code:
   <origin>`), and no pointer input while anything composed above overlaps it; the frame is
   then dashed (navigator-ui.md §6.3, §14 step 6). Role `web-island`.
+- `sheet` (3, 2026-11-14): a system dialog over the parent ([scrinium.md](scrinium.md) §4.4),
+  role `picker`. The catalogue gives the role its size (`SlotKind::Sheet { w, h }`, the
+  picker 640 x 440) and limend sends that, never the parent's rect; frescod ignores x and y
+  and places it centred across the parent, `SHEET_TOP` (48 px) down or centred in a shorter
+  parent, unclipped (it hangs past a parent smaller than it). While it is shown the parent and
+  its other slots get no pointer input, keys for any of them go to the sheet, a translucent
+  layer just under the sheet dims the parent, and frescod's chrome frames the sheet in the
+  focus ring's blue with a tag `system: <app id>` above it. One sheet per parent. It moves
+  with the parent and can't be dragged on its own.
 
 Only limend may bind slots. The op has its own allowlist (`_limen`) instead of the whole
 window-management socket. `OP_WM_CREDENTIAL_SLOT` stays as the test stand-in until the general
@@ -466,7 +475,7 @@ renderer's, not frescod's, so windows are named by an **embed token** instead of
   `FRESCOD_SLOT_UIDS`, default `_limen`), `UNKNOWN_WINDOW` (2), or `INVALID` (3: the same window
   twice, a parent that is itself a slot, a child that hosts slots, a notification, a child
   already in another parent, a bad kind or rect).
-- `slot::kind::PLAIN` (0), `CREDENTIAL` (1) and `ISLAND` (2). Only `CREDENTIAL` gets the visibility record,
+- `slot::kind::PLAIN` (0), `CREDENTIAL` (1), `ISLAND` (2) and `SHEET` (3). Only `CREDENTIAL` gets the visibility record,
   `FILL` and the frame.
 - `WindowHints.embed_pending` keeps a window off screen (not composed, hit or focused, and not
   listed to the WM) until it is bound. A child of either kind goes off screen again when it is
