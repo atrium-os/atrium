@@ -44,6 +44,8 @@ pub struct StyleRegion {
 pub enum GridOp {
     Replace(Region),
     Restyle(StyleRegion),
+    /// Several edits as one (a sort moves values and styles together). Not nested.
+    Batch(Vec<GridOp>),
 }
 
 impl GridOp {
@@ -115,6 +117,14 @@ impl GridOp {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         let r = match self {
+            GridOp::Batch(ops) => {
+                w.u8(3);
+                w.var(ops.len() as u64);
+                for op in ops {
+                    w.bytes(&op.encode());
+                }
+                return w.into_bytes();
+            }
             GridOp::Replace(r) => r,
             GridOp::Restyle(s) => {
                 w.u8(2);
@@ -158,6 +168,21 @@ impl GridOp {
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(b);
         let kind = r.u8()?;
+        if kind == 3 {
+            let n = r.count("ops", 1 << 16, 1)?;
+            let mut ops = Vec::with_capacity(n);
+            for _ in 0..n {
+                let b = r.bytes("op", b.len() as u64)?;
+                if b.first() == Some(&3) {
+                    return Err(WireError::Invalid("nested batch"));
+                }
+                ops.push(GridOp::decode(b)?);
+            }
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Batch(ops));
+        }
         if kind != 1 && kind != 2 {
             return Err(WireError::Invalid("op kind"));
         }
@@ -215,6 +240,12 @@ impl Op<Workbook> for GridOp {
         match self {
             GridOp::Replace(region) => GridOp::Replace(wb.replace(region)),
             GridOp::Restyle(region) => GridOp::Restyle(wb.replace_styles(region)),
+            GridOp::Batch(ops) => {
+                // The inverse undoes them in reverse order.
+                let mut inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(wb)).collect();
+                inv.reverse();
+                GridOp::Batch(inv)
+            }
         }
     }
 }
