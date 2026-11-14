@@ -57,6 +57,7 @@ struct Args {
     password_fd: Option<i32>,
     arca: Option<String>,
     as_uid: Option<u32>,
+    control_fd: Option<i32>,
     opts: Options,
 }
 
@@ -77,6 +78,8 @@ fn args() -> Option<Args> {
             "--learn" => a.learn = true,
             "--fuse-fd" => a.fuse_fd = Some(fd(it.next())?),
             "--mnt" => a.mnt = Some(it.next()?),
+            // Grants of folders arrive here (device-assignment.md §4.8), as for a stick.
+            "--control-fd" => a.control_fd = Some(fd(it.next())?),
             // Any descriptor, stdin included: it is read once and closed.
             "--password-fd" => a.password_fd = Some(it.next()?.parse::<i32>().ok().filter(|&n| n >= 0)?),
             "--arca" => a.arca = Some(it.next()?),
@@ -237,7 +240,9 @@ fn main() -> ExitCode {
         Err(e) => return fail("sftp", e),
     };
     let fs = match SftpFs::new(s, &a.root, !a.opts.read_only) {
-        Ok(f) => f,
+        // A server that stops answering (25 s per read) or a dropped
+        // connection ends the share rather than leaving one that fails.
+        Ok(f) => f.exit_on_loss(),
         Err(e) => return fail("share root", e),
     };
     let fuse = match (a.fuse_fd, &a.mnt) {
@@ -257,7 +262,9 @@ fn main() -> ExitCode {
     if unsafe { libc::cap_enter() } != 0 {
         return fail("cap_enter", std::io::Error::last_os_error());
     }
-    match serve_with(fs, fuse, a.opts, None) {
+    // SAFETY: jaild handed us this socket as `control_fd`; owned once, here.
+    let control = a.control_fd.map(|n| unsafe { std::os::unix::net::UnixStream::from_raw_fd(n) });
+    match serve_with(fs, fuse, a.opts, control) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail("/dev/fuse", e),
     }

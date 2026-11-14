@@ -354,7 +354,15 @@ enum Job {
     /// The share's part, and the item to forget at disconnect (not remembered).
     Connected(Result<String, String>, Option<scrinium::shares::Saved>),
     Saved(Vec<scrinium::shares::Saved>),
+    /// A saved server asked for its key again, before connecting.
+    Rechecked(scrinium::shares::Saved, Result<String, String>),
+    /// A share's size and free space (its server answers over the network,
+    /// so it is asked off the window's thread).
+    Space(String, Option<(u64, u64)>),
 }
+
+/// How often a share's free space is asked again.
+const SHARE_SPACE_EVERY: Duration = Duration::from_secs(30);
 
 /// "Connect to server" and the saved shares, for the manager's window.
 struct Network {
@@ -367,6 +375,9 @@ struct Network {
     rx: Receiver<Job>,
     /// Shares connected without "remember": their item goes at disconnect.
     forget: HashMap<String, scrinium::shares::Saved>,
+    /// Shares' (size, free) by part, and when each was asked.
+    space: HashMap<String, (u64, u64)>,
+    asked: HashMap<String, std::time::Instant>,
 }
 
 impl Network {
@@ -382,7 +393,7 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new() };
         n.refresh_saved();
         n
     }
@@ -465,9 +476,24 @@ impl Network {
         if let Some(i) = b.want_reconnect.take() {
             changed = true;
             if let Some(s) = b.saved.get(i).cloned() {
-                b.notice = Some(scrinium::browser::Notice { text: format!("Connecting to {}…", s.addr.host), error: false });
-                self.connect_job(s.addr, s.key, None);
+                // Ask the server who it is first: a changed key stops here,
+                // on its own sheet (the share server's pin would also stop
+                // it, but only after the share seemed to connect).
+                b.notice = Some(scrinium::browser::Notice { text: format!("Asking {} who it is…", s.addr.host), error: false });
+                let (media, tx) = (self.media.clone(), self.tx.clone());
+                std::thread::spawn(move || {
+                    let r = atrium_media::client::learn(&media, &atrium_media::Learn { host: s.addr.host.clone(), port: s.addr.port }).map_err(|(_, m)| m);
+                    let _ = tx.send(Job::Rechecked(s, r));
+                });
             }
+        }
+        if let Some(s) = b.want_forget.take() {
+            changed = true;
+            match scrinium::shares::forget(&self.arca, &s) {
+                Ok(()) => b.notice = Some(scrinium::browser::Notice { text: format!("Forgot {}", s.addr.host), error: false }),
+                Err(e) => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't forget {}: {e}", s.addr.host), error: true }),
+            }
+            self.refresh_saved();
         }
         // Arca's field: asked for when the form gets to the password, let go after.
         let wants_field = matches!(b.connect.as_ref().map(|f| &f.step), Some(Step::Password { .. }));
@@ -516,6 +542,18 @@ impl Network {
                 }
             }
         }
+        // Shares' sizes: asked now and then, each on its own thread.
+        for p in b.places.iter().filter(|p| p.network) {
+            if self.asked.get(&p.id).is_some_and(|t| t.elapsed() < SHARE_SPACE_EVERY) {
+                continue;
+            }
+            self.asked.insert(p.id.clone(), std::time::Instant::now());
+            let (id, root, tx) = (p.id.clone(), p.root.clone(), self.tx.clone());
+            std::thread::spawn(move || {
+                let r = scrinium::places::statvfs(&root).map(|(size, free, _)| (size, free));
+                let _ = tx.send(Job::Space(id, r));
+            });
+        }
         // What came back.
         while let Ok(j) = self.rx.try_recv() {
             changed = true;
@@ -539,6 +577,34 @@ impl Network {
                     None => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't connect: {e}"), error: true }),
                 },
                 Job::Saved(l) => b.saved = l,
+                Job::Space(part, r) => match r {
+                    Some(sf) => {
+                        self.space.insert(part, sf);
+                    }
+                    None => {
+                        self.space.remove(&part);
+                    }
+                },
+                Job::Rechecked(s, Ok(fp)) => match scrinium::connect::recheck(&s.key, &fp) {
+                    scrinium::connect::Recheck::Same => {
+                        b.notice = Some(scrinium::browser::Notice { text: format!("Connecting to {}…", s.addr.host), error: false });
+                        self.connect_job(s.addr, s.key, None);
+                    }
+                    scrinium::connect::Recheck::Changed { now } => {
+                        eprintln!("scrinium: {} shows another key ({now}): stopped", s.addr.host);
+                        b.notice = None;
+                        b.key_changed = Some(scrinium::browser::KeyChanged { saved: s, now });
+                    }
+                    scrinium::connect::Recheck::Odd => b.notice = Some(scrinium::browser::Notice { text: format!("{} gave no key", s.addr.host), error: true }),
+                },
+                Job::Rechecked(s, Err(e)) => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't reach {}: {e}", s.addr.host), error: true }),
+            }
+        }
+        for p in b.places.iter_mut().filter(|p| p.network) {
+            let (size, free) = self.space.get(&p.id).copied().unwrap_or((0, 0));
+            if (p.size, p.free) != (size, free) {
+                (p.size, p.free) = (size, free);
+                changed = true;
             }
         }
         if changed {

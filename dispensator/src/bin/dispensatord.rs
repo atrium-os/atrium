@@ -487,6 +487,8 @@ mod run {
         key: (String, u16, String, String),
         session_user: String,
         _pd: Option<OwnedFd>,
+        /// Its server has logged in and answers: grants may go to it.
+        ready: bool,
     }
 
     /// A grant: a FUSE mount at `dir` (the stick's server, rooted at the
@@ -592,10 +594,53 @@ mod run {
         Ok(())
     }
 
+    /// Forced, and by the file system's id rather than its path: a lookup
+    /// would ask a wedged FUSE server for its root and hold this daemon
+    /// (jaild::ffi::unmount_at).
     fn unmount_force(dir: &Path) {
-        if let Ok(c) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
-            // SAFETY: a valid NUL-terminated path.
-            unsafe { libc::unmount(c.as_ptr(), libc::MNT_FORCE) };
+        let _ = jaild::ffi::unmount_at(&dir.to_string_lossy(), libc::MNT_FORCE);
+    }
+
+    /// What a statfs of a FUSE mount found, asked off this thread.
+    enum Probe {
+        Answered(u64, u64),
+        /// No answer in time: the server is stopped, wedged or waiting on
+        /// the network. Nothing here waits on it.
+        Silent,
+        NotMounted,
+    }
+
+    /// How long the daemon waits for a FUSE server to answer a statfs.
+    const PROBE_WAIT: Duration = Duration::from_secs(2);
+
+    /// statfs `mnt` if fusefs is mounted there, on a thread of its own, for
+    /// at most PROBE_WAIT. One probe per mount at a time: while one is still
+    /// waiting (a wedged server), the next is Silent at once, so threads
+    /// never pile up behind one server.
+    fn probe(mnt: &str) -> Probe {
+        static WAITING: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+        let waiting = WAITING.get_or_init(Default::default);
+        if jaild::ffi::fsid_of(mnt).is_none() {
+            return Probe::NotMounted;
+        }
+        if !waiting.lock().unwrap().insert(mnt.to_string()) {
+            return Probe::Silent;
+        }
+        let (tx, rx) = mpsc::channel();
+        let m = mnt.to_string();
+        let spawned = std::thread::Builder::new().name("statfs".into()).spawn(move || {
+            let r = fuse_space(&m);
+            WAITING.get().map(|w| w.lock().unwrap().remove(&m));
+            let _ = tx.send(r);
+        });
+        if spawned.is_err() {
+            waiting.lock().unwrap().remove(mnt);
+            return Probe::Silent;
+        }
+        match rx.recv_timeout(PROBE_WAIT) {
+            Ok(Some((size, free))) => Probe::Answered(size, free),
+            Ok(None) => Probe::NotMounted,
+            Err(_) => Probe::Silent,
         }
     }
 
@@ -875,7 +920,7 @@ mod run {
     impl Agent {
         /// Labels a previous run left live: none of their servers runs now.
         fn retire_stale_shares(&mut self) {
-            let Ok(t) = std::fs::read_to_string(dispensator::share::REGISTRY) else { return };
+            let t = std::fs::read_to_string(dispensator::share::REGISTRY).unwrap_or_default();
             let mut live = std::collections::BTreeSet::new();
             for l in t.lines() {
                 let mut f = l.split_ascii_whitespace();
@@ -886,10 +931,38 @@ mod run {
                     live.insert(uid);
                 }
             }
-            for uid in live {
-                let _ = append_registry(&dispensator::share::retired_line(uid));
+            for uid in &live {
+                let _ = append_registry(&dispensator::share::retired_line(*uid));
+            }
+            // And every share jail still standing, labelled or not (a
+            // registry cleared at boot, a daemon killed mid-connect).
+            let standing = (dispensator::share::UID_FIRST..=dispensator::share::UID_LAST).filter(|u| jail_alive(&dispensator::share::jail_name(*u)));
+            let all: std::collections::BTreeSet<u32> = live.into_iter().chain(standing).collect();
+            for uid in all {
                 remove_share_jail(&self.jaild, uid);
                 unmount_force(Path::new(&dispensator::share::mountpoint(uid)));
+            }
+        }
+
+        /// Grants a previous run left (it was killed): their nullfs in apps'
+        /// jails, then the FUSE mounts under /media/.grants. Nothing serves
+        /// them any more, so none is looked up, only unmounted by id.
+        fn sweep_orphan_grants(&mut self) {
+            const TOP: &str = "/media/.grants/";
+            let table = jaild::ffi::mount_table();
+            for m in table.iter().rev().filter(|m| m.from.starts_with(TOP)) {
+                // <JAIL_ROOT>/<jail>/<dest>: tell jaild, so its record goes too.
+                let jailed = m.on.strip_prefix(dispensator::share::JAIL_ROOT).and_then(|r| r.strip_prefix('/')).and_then(|r| r.split_once('/'));
+                if let Some((jail, dest)) = jailed {
+                    let d = Request::DetachMount(jaild::protocol::DetachMountRequest { jail_name: jail.into(), dest: format!("/{dest}"), force: true });
+                    let _ = Client::connect(&self.jaild).and_then(|mut c| c.send(&d));
+                }
+                let _ = jaild::ffi::unmount_at(&m.on, libc::MNT_FORCE);
+            }
+            for m in table.iter().rev().filter(|m| m.on.starts_with(TOP)) {
+                let _ = jaild::ffi::unmount_at(&m.on, libc::MNT_FORCE);
+                let _ = std::fs::remove_dir(&m.on);
+                eprintln!("atrium-dispensatord: an earlier run's grant {} ended", m.on);
             }
         }
 
@@ -908,7 +981,7 @@ mod run {
                 return (mstatus::FAILED, format!("share registry: {e}"));
             }
             let mnt = sr::mountpoint(uid);
-            let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: false };
+            let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: true };
             let req = match share_request(uid, addr, sh.port, sr::argv(&sh, addr, suid, sgid, read_only), Some(fuse)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -916,14 +989,31 @@ mod run {
                     return (mstatus::FAILED, e);
                 }
             };
-            match Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::CreateJail(req))) {
+            // Its folders are granted as a stick's are: on a control socket.
+            let (ours, theirs) = match UnixStream::pair() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = append_registry(&sr::retired_line(uid));
+                    return (mstatus::FAILED, format!("socketpair: {e}"));
+                }
+            };
+            let sent = {
+                use std::os::fd::AsFd;
+                Client::connect(&self.jaild).and_then(|mut c| c.send_with_fds(&Request::CreateJail(req), &[theirs.as_fd()], 1)).map(|(r, fds)| (r, fds.first().copied()))
+            };
+            drop(theirs);
+            match sent {
                 Ok((Response::JailCreated(r), fd)) => {
                     eprintln!("atrium-dispensatord: share {} -> {} (jid {}, pid {})", sr::part(uid), sr::jail_name(uid), r.jid, r.pid);
+                    self.controls.insert(sr::part(uid), ours);
                     // SAFETY: jaild just passed us this procdesc; held, it keeps the jail.
                     let pd = fd.map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
                     let label = format!("{}@{}:{}", sh.user, sh.host, sh.path);
-                    self.shares.insert(uid, ShareRun { label, read_only, key, session_user: user, _pd: pd });
+                    self.shares.insert(uid, ShareRun { label, read_only, key, session_user: user, _pd: pd, ready: false });
                     self.publish();
+                    // The file manager's standing grant takes it once its
+                    // server answers (reap_shares), not now: a grant waits on
+                    // the server, which is still logging in.
                     (mstatus::OK, sr::part(uid))
                 }
                 other => {
@@ -942,13 +1032,18 @@ mod run {
                 return (mstatus::NOT_FOUND, format!("{part} is not connected"));
             }
             let mnt = dispensator::share::mountpoint(uid);
-            if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
-                // SAFETY: a valid NUL-terminated path.
-                if unsafe { libc::unmount(c.as_ptr(), 0) } != 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EBUSY) {
-                        return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
-                    }
+            // A server that doesn't answer would hold the unmount (FUSE_DESTROY
+            // waits for it): end it first, nothing of it is left to save.
+            if matches!(probe(&mnt), Probe::Silent) {
+                eprintln!("atrium-dispensatord: {part}: its server doesn't answer: ended");
+                self.stop_share(uid);
+                self.ejected_now.push(part.clone());
+                self.publish();
+                return (mstatus::OK, format!("{part} disconnected (its server wasn't answering)"));
+            }
+            if let Err(e) = jaild::ffi::unmount_at(&mnt, 0) {
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
                 }
             }
             self.stop_share(uid);
@@ -961,9 +1056,20 @@ mod run {
             if self.shares.remove(&uid).is_none() {
                 return;
             }
+            let part = dispensator::share::part(uid);
             let name = dispensator::share::jail_name(uid);
-            remove_share_jail(&self.jaild, uid);
-            unmount_force(Path::new(&dispensator::share::mountpoint(uid)));
+            let mnt = dispensator::share::mountpoint(uid);
+            // A live server hears its grants end first (FUSE_DESTROY); one
+            // that doesn't answer is ended first, so no unmount waits on it.
+            if matches!(probe(&mnt), Probe::Silent) {
+                remove_share_jail(&self.jaild, uid);
+                self.end_grants(|g| g.part == part);
+            } else {
+                self.end_grants(|g| g.part == part);
+                remove_share_jail(&self.jaild, uid);
+            }
+            self.controls.remove(&part);
+            unmount_force(Path::new(&mnt));
             let _ = append_registry(&dispensator::share::retired_line(uid));
             eprintln!("atrium-dispensatord: {name} removed");
         }
@@ -971,13 +1077,36 @@ mod run {
         /// A share server that exited (wrong password, server gone, a
         /// changed host key) takes its share with it.
         fn reap_shares(&mut self) {
-            let dead: Vec<u32> = self.shares.keys().copied().filter(|u| !jail_alive(&dispensator::share::jail_name(*u))).collect();
+            // Gone: its process exited (the procdesc says so at once, even if
+            // the jail lingers) or its jail is gone.
+            let exited = |r: &ShareRun| {
+                r._pd.as_ref().is_some_and(|pd| {
+                    let mut p = libc::pollfd { fd: pd.as_raw_fd(), events: libc::POLLHUP, revents: 0 };
+                    // SAFETY: one valid pollfd, no wait.
+                    (unsafe { libc::poll(&mut p, 1, 0) }) > 0 && p.revents & libc::POLLHUP != 0
+                })
+            };
+            let dead: Vec<u32> = self.shares.iter().filter(|(u, r)| exited(r) || !jail_alive(&dispensator::share::jail_name(**u))).map(|(u, _)| *u).collect();
             for uid in &dead {
                 eprintln!("atrium-dispensatord: {} ended", dispensator::share::part(*uid));
                 self.stop_share(*uid);
             }
             if !dead.is_empty() {
                 self.publish();
+            }
+            // Servers that have logged in since: now they take grants.
+            let waiting: Vec<u32> = self.shares.iter().filter(|(_, r)| !r.ready).map(|(u, _)| *u).collect();
+            let mut now_ready = false;
+            for uid in waiting {
+                if let Probe::Answered(..) = probe(&dispensator::share::mountpoint(uid)) {
+                    if let Some(r) = self.shares.get_mut(&uid) {
+                        r.ready = true;
+                        now_ready = true;
+                    }
+                }
+            }
+            if now_ready {
+                self.sync_standing();
             }
         }
     }
@@ -1014,6 +1143,7 @@ mod run {
             shares: BTreeMap::new(),
         };
         a.retire_stale_shares();
+        a.sweep_orphan_grants();
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
         if wants_media {
@@ -1215,7 +1345,13 @@ mod run {
             for part in parts {
                 let Some(mnt) = self.mountpoint(&part) else { continue };
                 // A server that exited (not FAT, say) leaves no live mount.
-                let Some((size_bytes, free_bytes)) = fuse_space(&mnt) else { continue };
+                // A server that doesn't answer leaves its size unknown (0),
+                // and never holds this loop.
+                let (size_bytes, free_bytes) = match probe(&mnt) {
+                    Probe::Answered(size, free) => (size, free),
+                    Probe::Silent => (0, 0),
+                    Probe::NotMounted => continue,
+                };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
                 vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new() });
             }
@@ -1270,6 +1406,9 @@ mod run {
             if !matches!(self.session, Session::Active { .. }) {
                 return (mstatus::NOT_ALLOWED, "no unlocked session".into());
             }
+            if dispensator::share::uid_of_part(&g.part).and_then(|u| self.shares.get(&u)).is_some_and(|r| !r.ready) {
+                return (mstatus::BUSY, format!("{} is still connecting", g.part));
+            }
             let Some(ctl) = self.controls.get(&g.part) else { return (mstatus::NOT_FOUND, format!("{} has no server taking grants", g.part)) };
             if !jail_alive(&g.jail) {
                 return (mstatus::NOT_FOUND, format!("no jail {}", g.jail));
@@ -1278,7 +1417,9 @@ mod run {
             if self.grants.iter().any(|x| x.jail == g.jail && x.dest == dest) {
                 return (mstatus::BUSY, format!("{} already has {dest}", g.jail));
             }
-            let read_only = g.read_only || self.media.driver_of(&g.part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
+            let read_only = g.read_only
+                || self.media.driver_of(&g.part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only)
+                || dispensator::share::uid_of_part(&g.part).and_then(|u| self.shares.get(&u)).is_some_and(|r| r.read_only);
             let top = Path::new("/media/.grants");
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1364,7 +1505,7 @@ mod run {
                 return 0;
             }
             let mut made = 0;
-            let parts: Vec<String> = self.controls.keys().cloned().collect();
+            let parts: Vec<String> = self.controls.keys().filter(|p| !dispensator::share::uid_of_part(p).and_then(|u| self.shares.get(&u)).is_some_and(|r| !r.ready)).cloned().collect();
             for s in self.standing.clone() {
                 for part in &parts {
                     let dest = format!("/media/{part}");
@@ -1410,16 +1551,17 @@ mod run {
                 return self.disconnect_share(uid);
             }
             let Some(mnt) = self.mountpoint(device) else { return (mstatus::NOT_FOUND, format!("{device} is not mounted")) };
-            if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
-                // SAFETY: a valid NUL-terminated path.
-                if unsafe { libc::unmount(c.as_ptr(), 0) } != 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EBUSY) {
-                        return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
-                    }
-                    if e.raw_os_error() != Some(libc::EINVAL) {
-                        return (mstatus::FAILED, format!("unmount {mnt}: {e}"));
-                    }
+            // A stick's server that doesn't answer would hold the unmount:
+            // refuse, rather than wait on it (unplugging ends it for good).
+            if matches!(probe(&mnt), Probe::Silent) {
+                return (mstatus::FAILED, format!("{device}'s server isn't answering: unplug the stick"));
+            }
+            if let Err(e) = jaild::ffi::unmount_at(&mnt, 0) {
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
+                }
+                if e.raw_os_error() != Some(libc::EINVAL) {
+                    return (mstatus::FAILED, format!("unmount {mnt}: {e}"));
                 }
             }
             self.end_grants(|g| g.part == device);
@@ -1589,11 +1731,8 @@ mod run {
         fn unmount_all(path: &str, mounts: &[String]) {
             for m in mounts {
                 let target = Path::new(path).join(m.trim_start_matches('/'));
-                if let Ok(c) = std::ffi::CString::new(target.to_string_lossy().as_bytes()) {
-                    // SAFETY: a valid NUL-terminated path; failure (not
-                    // mounted) is expected and ignored.
-                    unsafe { libc::unmount(c.as_ptr(), 0) };
-                }
+                // Failure (not mounted) is expected and ignored.
+                let _ = jaild::ffi::unmount_at(&target.to_string_lossy(), 0);
             }
         }
 

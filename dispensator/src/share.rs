@@ -168,6 +168,9 @@ pub fn argv(s: &Share, addr: Ipv4Addr, session_uid: u32, session_gid: u32, read_
         "--pin".into(), s.fingerprint.clone(),
         "--root".into(), s.path.clone(),
         "--fuse-fd".into(), "3".into(),
+        // jaild's control socket, next after /dev/fuse (no device before
+        // it): grants of the share's folders (§4.8).
+        "--control-fd".into(), "4".into(),
         "--arca".into(), ARCA_SOCKET.into(),
         "--uid".into(), session_uid.to_string(),
         "--gid".into(), session_gid.to_string(),

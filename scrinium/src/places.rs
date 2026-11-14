@@ -146,7 +146,8 @@ pub fn scan(media: &Path) -> Vec<Place> {
     out
 }
 
-fn statvfs(p: &Path) -> Option<(u64, u64, bool)> {
+/// (size, free, read-only) of the file system at `p`.
+pub fn statvfs(p: &Path) -> Option<(u64, u64, bool)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     // SAFETY: statvfs into a zeroed struct we own, with a NUL-terminated path.

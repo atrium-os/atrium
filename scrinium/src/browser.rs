@@ -109,6 +109,18 @@ pub struct Browser {
     /// The sidebar asked to connect this saved share (an index into
     /// `saved`): the app does it.
     pub want_reconnect: Option<usize>,
+    /// A saved server now shows another key: the hard-stop sheet.
+    pub key_changed: Option<KeyChanged>,
+    /// The key-changed sheet asked to forget that server: the app does it.
+    pub want_forget: Option<crate::shares::Saved>,
+}
+
+/// A saved server whose key isn't the one the user accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChanged {
+    pub saved: crate::shares::Saved,
+    /// The fingerprint it shows now.
+    pub now: String,
 }
 
 impl Browser {
@@ -135,6 +147,8 @@ impl Browser {
             connect: None,
             saved: Vec::new(),
             want_reconnect: None,
+            key_changed: None,
+            want_forget: None,
         }
     }
 
@@ -535,8 +549,21 @@ impl Browser {
         self.connect = None;
     }
 
+    pub fn close_key_changed(&mut self) {
+        self.key_changed = None;
+    }
+
+    /// Forget the server whose key changed. Connecting to it again is a new
+    /// "Connect to server", with the new key shown to accept: never a way
+    /// around the stop.
+    pub fn forget_changed(&mut self) {
+        if let Some(k) = self.key_changed.take() {
+            self.want_forget = Some(k.saved);
+        }
+    }
+
     pub fn reconnect(&mut self, i: usize) {
-        if i < self.saved.len() {
+        if i < self.saved.len() && self.key_changed.is_none() {
             self.want_reconnect = Some(i);
         }
     }

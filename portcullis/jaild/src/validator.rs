@@ -169,7 +169,8 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
         && exec.gid == uid
         && exec.path == c.exec_path
         && match &req.fuse {
-            Some(f) => !exec.stdio && f.device.is_empty() && !f.control && f.mountpoint == c.mountpoint(uid),
+            // Serving: its own mount, and grants of folders on the control socket.
+            Some(f) => !exec.stdio && f.device.is_empty() && f.mountpoint == c.mountpoint(uid),
             None => exec.stdio,
         }
         && req.devfs_grant.is_none()
@@ -993,6 +994,11 @@ mod tests {
         let ok = share("system-share-63001", &root("system-share-63001"), exe, 63001, "/media/share-63001");
         assert!(is_share_server(&ok, &p));
         validate_create(&ok, &p).expect("a share server jail");
+        // With a control socket, for grants of its folders (§4.8).
+        let mut ctl = ok.clone();
+        ctl.fuse.as_mut().unwrap().control = true;
+        assert!(is_share_server(&ctl, &p));
+        validate_create(&ctl, &p).expect("a share server taking grants");
         let mut stdio = ok.clone();
         stdio.exec.as_mut().unwrap().stdio = true;
         let mut dev = ok.clone();

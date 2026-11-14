@@ -113,6 +113,12 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
         }
         return false;
     }
+    if b.key_changed.is_some() {
+        if *key == Key::Escape {
+            with(state, Browser::close_key_changed);
+        }
+        return true;
+    }
     if b.edit.is_some() || b.confirm_delete.is_some() {
         if *key == Key::Escape {
             with(state, |b| {
@@ -289,6 +295,9 @@ impl View for ScriniumView {
                 if b.connect.is_some() {
                     self.connect_sheet(ctx, &b, w, h);
                 }
+                if b.key_changed.is_some() {
+                    self.key_changed_sheet(ctx, &b, w, h);
+                }
             }
             Mode::Picker { .. } => self.picker(ctx, &b, w, h),
         }
@@ -330,7 +339,8 @@ impl ScriniumView {
             let room = sw - 16.0 - 44.0 - if p.stick && manager { 30.0 } else { 0.0 };
             text(ctx, 44.0, y + 15.0, &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
             let sub = if p.network {
-                if p.read_only { "Server · read-only".into() } else { "Server".into() }
+                let free = if p.size > 0 { format!("Server · {} free", fs::size_text(p.free)) } else { "Server".into() };
+                if p.read_only { format!("{free} · read-only") } else { free }
             } else if p.stick {
                 let free = if p.size > 0 { format!("{} free", fs::size_text(p.free)) } else { "USB stick".into() };
                 if p.read_only { format!("{free} · read-only") } else { free }
@@ -381,6 +391,42 @@ impl ScriniumView {
     }
 
     /// "Connect to server", over the window (network-shares.md §5.2).
+    /// A saved server shows another key: stop. There is no "connect anyway";
+    /// the way on is to forget it and connect afresh, accepting the new key.
+    fn key_changed_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
+        let t = ctx.theme;
+        let Some(k) = &b.key_changed else { return };
+        ctx.key(4100);
+        area(ctx, Rect::new(0.0, 0.0, w, h), 0.0, Color::rgba(0.0, 0.0, 0.0, 0.33), Color::rgba(0.0, 0.0, 0.0, 0.33), || {});
+        ctx.pop();
+        let (cw, ch) = (520.0_f32, 300.0_f32);
+        let (x, y) = (((w - cw) / 2.0).max(8.0), ((h - ch) / 2.0).max(8.0));
+        rect(ctx, x - 1.0, y - 1.0, cw + 2.0, ch + 2.0, t.danger_fg(), 11.0);
+        rect(ctx, x, y, cw, ch, t.bg_surface(), 10.0);
+        let pad = 24.0;
+        let (lx, inner) = (x + pad, cw - 2.0 * pad);
+        let line = |ctx: &mut Ctx, row: f32, s: &str, c: Color| text(ctx, lx, y + row, &fit(s, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, c);
+        icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.danger_fg());
+        text(ctx, lx + 28.0, y + 32.0, &fit(&format!("{} isn't the server you saved", k.saved.addr.host), type_size::LG, Weight::Semibold, inner - 28.0), type_size::LG, Weight::Semibold, t.text_primary());
+        line(ctx, 66.0, "It shows a different key from the one you accepted, so Scrinium won't connect", t.text_secondary());
+        line(ctx, 86.0, "and Arca won't give it your password. Someone may be pretending to be it.", t.text_secondary());
+        line(ctx, 114.0, "You accepted", t.text_tertiary());
+        rect(ctx, lx, y + 122.0, inner, 30.0, t.bg_canvas(), 6.0);
+        text(ctx, lx + 10.0, y + 137.0, &fit(&crate::connect::fingerprint(&k.saved.key), type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
+        line(ctx, 170.0, "It shows now", t.text_tertiary());
+        rect(ctx, lx, y + 178.0, inner, 30.0, t.bg_canvas(), 6.0);
+        text(ctx, lx + 10.0, y + 193.0, &fit(&k.now, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.danger_fg());
+        line(ctx, 226.0, "If its owner says the key really changed, forget it and connect to it again.", t.text_tertiary());
+        let by = y + ch - 32.0 - pad;
+        let close = width("Close", type_size::SM, Weight::Medium) + 28.0;
+        let s = self.state.clone();
+        button(ctx, x + cw - pad - close, by, "Close", Look::Primary, true, move || with(&s, Browser::close_key_changed));
+        let label = "Forget this server";
+        let fw = width(label, type_size::SM, Weight::Medium) + 28.0;
+        let s = self.state.clone();
+        button(ctx, x + cw - pad - close - 8.0 - fw, by, label, Look::Ghost, true, move || with(&s, Browser::forget_changed));
+    }
+
     fn connect_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
         let Some(form) = &b.connect else { return };

@@ -402,9 +402,27 @@ encryption. It checks:
    (address, the key to accept, Arca's password field) and saved servers
    in the sidebar. Gates on the cloud amd64 VM: `vm-share-sftp.sh` (Arca
    and the server, 19 checks) and `vm-share-jail.sh` (the jailed path
-   through dispensatord and jaild, 27 checks), both 0 failed. Still to do:
-   the hard-stop sheet when a saved share's key changes, folder grants of
-   a share to apps, share sizes, a VM check of the Connect sheet itself.
+   through dispensatord and jaild), both 0 failed. Then, the same day:
+   a saved server is asked for its key before connecting, and a changed
+   key stops on its own sheet (no "connect anyway": Close, or forget the
+   server and connect afresh, accepting the new key); a share's folders
+   are granted as a stick's are (the file manager's standing grant,
+   picked folders, read-only), once its server answers; Scrinium asks a
+   share's free space off its window thread every 30 s.
+   **Hangs and stuck jails** (Shankar 2026-11-14): nothing that serves a
+   desktop waits on a FUSE server. jaild and dispensatord unmount by
+   file-system id from the mount table (MNT_BYFSID), never by path, since
+   a path lookup asks the mount for its root and a wedged server holds
+   that; dispensatord's statfs of a mount runs on a side thread for at
+   most 2 s, one at a time per mount; a share whose server doesn't answer
+   is ended before it is unmounted (FUSE_DESTROY would wait on it), a
+   stick's eject is refused instead; a share server's exit is seen at once
+   on its process descriptor; a server whose SSH peer goes silent ends
+   itself (25 s read timeout) rather than serve errors; dispensatord at
+   start removes every share jail and orphaned grant an earlier run left.
+   Readers on a wedged mount fail after fusefs' 30 s timeout (S0).
+   `vm-share-jail.sh` checks each of these: 47 checks, 0 failed. Still to
+   do: a VM check of the Connect sheet on screen.
 3. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
 4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.

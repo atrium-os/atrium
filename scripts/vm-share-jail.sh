@@ -24,8 +24,17 @@
 #   - the file manager saves the password in Arca, then connects: a jail
 #     system-share-63000 serves /media/share-63000 to alice, as uid 63000;
 #   - alice reads and writes through it; bob cannot list it;
-#   - the share is in alice's media list; eject ends it, the jail goes and
+#   - the file manager's jail (standing grant, attach-all) gets the share
+#     as it gets a stick; an app's jail gets one folder of it, read-only
+#     when asked; the share's free space reads;
+#   - the share is in alice's media list; eject ends it and its grants, the jail goes and
 #     the registry label is retired;
+#   - hangs (network-shares.md §4.4): a share server that is stopped
+#     (SIGSTOP) holds nobody: dispensatord answers at once and the share
+#     disconnects; a server killed outright is reaped with its mounts and
+#     grants; a server whose SSH peer stops answering ends itself (25 s
+#     read timeout) and is reaped; dispensatord killed with a share up
+#     leaves no jail or mount once it starts again;
 #   - connected again, locking the screen ends it.
 #
 # Ends "share-jail: N failed".
@@ -63,7 +72,7 @@ EOC
 /usr/sbin/sshd -f $SD/sshd_config || exit 1
 
 echo "=== cross-build"
-(cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p jaild --bin atrium-jaild) || exit 1
+(cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p jaild -p portcullisd --bin atrium-jaild --bin atrium-portcullisd-jclient) || exit 1
 (cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin atrium-dispensatord) || exit 1
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || exit 1
 (cd "$ROOT/capsa" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p capsa-share) || exit 1
@@ -73,7 +82,8 @@ B=/var/tmp/sharejail-bin
 V "pkill -f $B/; pkill -f atrium-share-sftp; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 for b in "$ROOT/portcullis/target/$TARGET/release/atrium-jaild" "$ROOT/dispensator/target/$TARGET/release/atrium-dispensatord" \
          "$ROOT/arca/arcad/target/$TARGET/release/arcad" "$ROOT/arca/arcad/target/$TARGET/release/arca-probe" \
-         "$ROOT/capsa/target/$TARGET/release/atrium-share-sftp" "$ROOT/etc/jaild.policy.toml"; do
+         "$ROOT/capsa/target/$TARGET/release/atrium-share-sftp" "$ROOT/etc/jaild.policy.toml" \
+         "$ROOT/portcullis/target/$TARGET/release/atrium-portcullisd-jclient"; do
     scp $K -P 2222 -q "$b" root@localhost:$B/ || exit 1
 done
 scp $K -P 2222 -q "$ROOT/scripts/jaild-policy-merge.sh" root@localhost:$B/ || exit 1
@@ -87,7 +97,7 @@ install -m 0755 $B/atrium-jaild /usr/local/bin/atrium-jaild
 install -m 0755 $B/atrium-dispensatord /usr/local/bin/atrium-dispensatord
 install -m 0755 $B/atrium-share-sftp /usr/local/bin/atrium-share-sftp
 : > /var/run/atrium/share-registry
-for m in \$(mount -p | awk '\$2 ~ /jails\/system-share-|\/media\/share-/ {print \$2}' | sort -r); do umount -f \$m; done
+for m in \$(mount -p | awk '\$2 ~ /jails\/system-share-|\/media\/share-|\/media\/.grants\// {print \$2}' | sort -r); do umount -f \$m; done
 service atrium-jaild start >/dev/null 2>&1; sleep 2
 : > /var/log/atrium/dispensatord.log
 service atrium-dispensatord start >/dev/null 2>&1; sleep 3
@@ -141,7 +151,21 @@ hold() { as sg-ui "hold alice $PUB $1 $2" | sed -n 's/^status=0 body=//p'; }
 H=$(hold org.test.files sh4re-Test-pw)
 ID=$(as grantfm "share-save $H $HOST $SPORT $SHAREPATH $KEY sharetest" | sed -n 's/^status=0 body=//p')
 check "the file manager saves the password in Arca" 32 "${#ID}"
-su sharetest -c "echo from-server > $SHAREPATH/hello.txt"
+su sharetest -c "echo from-server > $SHAREPATH/hello.txt; mkdir -p $SHAREPATH/Docs; echo for-the-app > $SHAREPATH/Docs/note.txt"
+# The file manager's own jail, with its standing grant (as vm-automount-check.sh).
+JC=$B/atrium-portcullisd-jclient; JS=/var/run/atrium/jaild.sock
+JF=app-files-sj$$; RF=/var/lib/atrium/jails/$JF
+JA=app-share-a$$; RA=/var/lib/atrium/jails/$JA
+JB=app-share-b$$; RB=/var/lib/atrium/jails/$JB
+V 'sh -s' <<EOS
+mkdir -p $RF/bin $RF/sock $RA $RB
+$JC $JS create $JF $RF >/dev/null; $JC $JS create $JA $RA >/dev/null; $JC $JS create $JB $RB >/dev/null
+cp $DD $RF/bin/dd
+for l in \$(ldd -f '%p\n' $DD | grep '^/') /libexec/ld-elf.so.1; do mkdir -p $RF\$(dirname \$l); cp \$l $RF\$l; done
+mount_nullfs -o ro /atrium/sockets/removable-media $RF/sock
+EOS
+out=$(V "jexec -u grantfm $JF /bin/dd --media-socket /sock/removable-media.sock --attach-all" 2>&1)
+case "$out" in "ok "*) ok "the file manager's jail has its standing grant ($out)" ;; *) bad "attach-all: $out" ;; esac
 out=$(V "su -m alice -c '$DD --connect $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
 case "$out" in *"status 2"*) ok "alice is not the file manager: no connecting" ;; *) bad "alice's connect: $out" ;; esac
 out=$(V "su -m grantfm -c '$DD --connect $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
@@ -158,6 +182,23 @@ check "the server runs as 63000 in it" 63000 "$(V "ps -J $JID -o uid= | head -1"
 check "its jail has its own vnet" new "$(V "jls -j $JID vnet" | tr -d ' ')"
 check "Arca filled it once" 1 "$(V "grep -c 'share:sftp:$HOST:$SPORT@alice op=0x00a9.*status=0' $G/db/audit.log" | tr -d ' ')"
 V "su -m alice -c '$DD --media'" | grep -q "^share-63000 $M" && ok "alice's media list has it" || bad "media list: $(V "su -m alice -c '$DD --media'" | tr '\n' ';')"
+
+echo "=== the share's folders, granted"
+F=$RF/media/share-63000
+i=0; while [ $i -lt 10 ] && ! V "test -e $F/hello.txt"; do sleep 1; i=$((i+1)); done
+check "the file manager's jail has the share, as a stick" from-server "$(V "su -m grantfm -c 'cat $F/hello.txt'" 2>&1)"
+check "its own (50603, 0700)" "50603 700" "$(V "stat -f '%u %Lp' $F")"
+check "and the share's free space reads" 1 "$(V "df -k $F | awk 'NR==2 {print (\$2 > 0)}'")"
+out=$(V "$DD --grant share-63000 /Docs --jail $JA --uid 50601" 2>&1)
+check "a folder of the share into an app's jail" "ok /media/share-63000" "$out"
+check "the app reads it" for-the-app "$(V "su -m grantapp -c 'cat $RA/media/share-63000/note.txt'" 2>&1)"
+V "su -m grantapp -c 'echo from-the-app > $RA/media/share-63000/reply.txt'"
+check "its write lands on the server" from-the-app "$(cat $SHAREPATH/Docs/reply.txt 2>&1)"
+V "test -e $RA/media/share-63000/hello.txt" && bad "the app sees above its folder" || ok "only that folder"
+V "su -m alice -c 'ls $RA/media/share-63000' >/dev/null 2>&1" && bad "alice reads the app's grant" || ok "nobody else reads the app's grant"
+out=$(V "$DD --grant share-63000 /Docs --jail $JB --uid 50602 --ro" 2>&1)
+check "read-only into another app" "ok /media/share-63000" "$out"
+V "su -m grantapp2 -c 'echo x > $RB/media/share-63000/x.txt'" 2>/dev/null && bad "wrote on a read-only grant" || ok "and it can't write"
 out=$(V "su -m bob -c '$DD --eject share-63000'" 2>&1)
 case "$out" in error*) ok "bob may not eject it" ;; *) bad "bob's eject: $out" ;; esac
 out=$(V "su -m alice -c '$DD --eject share-63000'" 2>&1)
@@ -165,8 +206,49 @@ case "$out" in "ok "*) ok "alice disconnects it ($out)" ;; *) bad "eject: $out" 
 sleep 3
 V "jls -n name | grep -q system-share-63000" && bad "the jail stayed" || ok "its jail is gone"
 V "mount -p | grep -q ' $M '" && bad "still mounted" || ok "unmounted"
+check "its grants ended with it" 0 "$(V "mount -p | grep -c '/media/share-63000'" | tr -d ' ')"
 check "its Arca label is retired" "63000 retired" "$(V "tail -1 /var/run/atrium/share-registry")"
 check "and the retired uid gets nothing from Arca" "status=5 body=" "$(V "su -m sj-share -c '$P $S share-items $KEY'" 2>&1)"
+
+echo "=== hangs and stuck jails"
+fm_connect() {
+    out=$(V "su -m grantfm -c '$DD --connect $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
+    i=0; while [ $i -lt 40 ] && ! V "test -e $F/hello.txt"; do sleep 1; i=$((i+1)); done
+    echo "$out"
+}
+share_pid() { V "pgrep -f '^/usr/local/bin/atrium-share-sftp --host'" | head -1; }
+gone() { # what: no share jail, no share or grant mount, label retired
+    i=0; while [ $i -lt ${1:-20} ] && V "jls -n name | grep -q system-share- || mount -p | grep -q 'share-6300'"; do sleep 1; i=$((i+1)); done
+    ! V "jls -n name | grep -q system-share- || mount -p | grep -q 'share-6300'"
+}
+out=$(fm_connect)
+case "$out" in "ok share-"*) ok "connected ($out), in the file manager's jail" ;; *) bad "connect: $out" ;; esac
+SP=$(share_pid)
+V "kill -STOP $SP"
+V "su -m alice -c 'ls $M' >/dev/null 2>&1 &"   # a reader now waits on it (until fusefs' 30 s timeout)
+sleep 2
+t0=$(date +%s); out=$(V "su -m alice -c '$DD --media'" 2>&1); t=$(( $(date +%s) - t0 ))
+[ $t -le 8 ] && echo "$out" | grep -q '^ok' && ok "a stopped server: dispensatord answers at once (${t}s)" || bad "media list took ${t}s: $out"
+t0=$(date +%s); out=$(V "su -m alice -c '$DD --eject share-63000'" 2>&1); t=$(( $(date +%s) - t0 ))
+case "$out" in *"wasn't answering"*) [ $t -le 20 ] && ok "and it disconnects in ${t}s ($out)" || bad "disconnect took ${t}s" ;; *) bad "disconnect of a stopped server: $out (${t}s)" ;; esac
+gone && ok "its jail, mount and grants are gone" || bad "left: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
+
+out=$(fm_connect)
+SP=$(share_pid)
+V "kill -9 $SP"
+gone 20 && ok "a killed server is reaped with its mounts and grants" || bad "after kill -9: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
+check "its label retired" "63000 retired" "$(V "tail -1 /var/run/atrium/share-registry")"
+
+out=$(fm_connect)
+pkill -STOP -f 'sshd: sharetest' 2>/dev/null
+V "su -m alice -c 'cat $M/hello.txt' >/dev/null 2>&1 &"
+gone 120 && ok "a server whose peer went silent ends itself and is reaped" || bad "a silent peer: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
+pkill -CONT -f 'sshd: sharetest' 2>/dev/null; pkill -f 'sshd: sharetest' 2>/dev/null
+
+out=$(fm_connect)
+V "pkill -9 -f 'atrium-dispensatord --rules'; sleep 1; service atrium-dispensatord start >/dev/null 2>&1"
+gone 30 && ok "dispensatord killed with a share up: once it restarts no jail or mount is left" || bad "after a restart: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
+V "printf '%s\n' alice > $SEAT"; sleep 4
 
 echo "=== the screen locks"
 out=$(V "su -m grantfm -c '$DD --connect $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
@@ -175,7 +257,8 @@ V "printf '%s\n' alice > $LOCK"; sleep 8
 V "jls -n name | grep -q system-share-" && bad "a share jail outlived the lock" || ok "locked: the share ended"
 V ": > $LOCK"; sleep 4
 check "no mounts left in share jails" 0 "$(V "mount -p | grep -c /jails/system-share-" | tr -d ' ')"
-rm -f $SHAREPATH/j.txt; V "pkill -f $B/arcad; true"; kill "$(cat $SD/sshd.pid)" 2>/dev/null
+V "umount -f $RF/sock; for j in $JF $JA $JB; do $JC $JS remove \$j >/dev/null; done; true"
+rm -rf $SHAREPATH/j.txt $SHAREPATH/Docs; V "pkill -f $B/arcad; true"; kill "$(cat $SD/sshd.pid)" 2>/dev/null
 
 echo "share-jail: $fails failed"
 [ $fails = 0 ]

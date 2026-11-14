@@ -108,6 +108,25 @@ pub fn key_of(fp: &str) -> Option<[u8; 32]> {
     out.try_into().ok()
 }
 
+/// A saved server, asked again before connecting (§5.1, the table in §5):
+/// is it still the key the user accepted?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recheck {
+    Same,
+    /// A different key: a hard stop, never a click-through.
+    Changed { now: String },
+    /// The answer wasn't a fingerprint at all.
+    Odd,
+}
+
+pub fn recheck(saved: &[u8; 32], learned: &str) -> Recheck {
+    match key_of(learned) {
+        Some(k) if &k == saved => Recheck::Same,
+        Some(_) => Recheck::Changed { now: learned.to_string() },
+        None => Recheck::Odd,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// Typing the address.
@@ -262,6 +281,15 @@ mod tests {
         assert_eq!(fingerprint(&key), fp);
         assert_eq!(key_of(fp), Some(key));
         assert_eq!(key_of("SHA256:short"), None);
+    }
+
+    #[test]
+    fn a_saved_server_is_rechecked() {
+        let k = [7u8; 32];
+        assert_eq!(recheck(&k, &fingerprint(&k)), Recheck::Same);
+        let other = fingerprint(&[8u8; 32]);
+        assert_eq!(recheck(&k, &other), Recheck::Changed { now: other.clone() });
+        assert_eq!(recheck(&k, "no key"), Recheck::Odd);
     }
 
     #[test]

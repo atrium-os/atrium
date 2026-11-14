@@ -36,6 +36,9 @@ pub struct SftpFs<S: Read + Write> {
     wr: Option<(u64, Vec<u8>)>,
     /// The connection failed: every operation fails from here on.
     dead: bool,
+    /// Leave instead: the share then ends for good, and whoever started
+    /// the server sees it go (dispensatord reaps it and unmounts).
+    exit_on_loss: bool,
 }
 
 fn map(e: sftp::Error) -> Error {
@@ -57,7 +60,7 @@ impl<S: Read + Write> SftpFs<S> {
         }
         let mut ids = HashMap::new();
         ids.insert(root.clone(), 1);
-        Ok(SftpFs { s, paths: vec![None, Some(root)], ids, writable, rd: None, wr: None, dead: false })
+        Ok(SftpFs { s, paths: vec![None, Some(root)], ids, writable, rd: None, wr: None, dead: false, exit_on_loss: false })
     }
 
     fn path(&self, id: u64) -> Result<&str> {
@@ -82,6 +85,13 @@ impl<S: Read + Write> SftpFs<S> {
         Ok(if dp.ends_with('/') { format!("{dp}{name}") } else { format!("{dp}/{name}") })
     }
 
+    /// A lost connection ends the process (exit status 4) instead of
+    /// leaving a share that fails every request.
+    pub fn exit_on_loss(mut self) -> Self {
+        self.exit_on_loss = true;
+        self
+    }
+
     fn live(&self) -> Result<()> {
         if self.dead {
             Err(Error::Io("the connection to the server is gone".into()))
@@ -92,8 +102,12 @@ impl<S: Read + Write> SftpFs<S> {
 
     /// Turns a connection-level failure into a dead share.
     fn chk<T>(&mut self, r: std::result::Result<T, sftp::Error>) -> Result<T> {
-        if let Err(sftp::Error::Ssh(_) | sftp::Error::Protocol(_)) = &r {
+        if let Err(e @ (sftp::Error::Ssh(_) | sftp::Error::Protocol(_))) = &r {
             self.dead = true;
+            if self.exit_on_loss {
+                eprintln!("atrium-share-sftp: the connection is gone ({e}): ending the share");
+                std::process::exit(4);
+            }
         }
         r.map_err(map)
     }

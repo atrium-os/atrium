@@ -76,14 +76,7 @@ pub fn serve(
             info!("jaild: reconcile orphan runtime mount jail={} dest={} (host {})",
                 m.jail_name, m.dest, m.host_dest);
             // Best-effort unmount; EINVAL = already gone, fine.
-            let c = match std::ffi::CString::new(m.host_dest.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            #[allow(unsafe_code)]
-            let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
-            if rc < 0 {
-                let e = std::io::Error::last_os_error();
+            if let Err(e) = ffi::unmount_at(&m.host_dest, 0) {
                 if e.raw_os_error() != Some(libc::EINVAL) {
                     warn!("jaild: orphan unmount {}: {e}", m.host_dest);
                 }
@@ -223,7 +216,9 @@ fn dispatch(
         Request::CreateJail(r) if r.exec.as_ref().is_some_and(|e| e.stdio));
     /* ★ And a FUSE server's control socket (FuseServe::control, device-
      * assignment.md §4.8): exactly one descriptor, and it must be a socket,
-     * which the server gets as fd 5. Nothing else rides along. */
+     * which the server gets after its FUSE descriptors: fd 5 behind a
+     * device and /dev/fuse, fd 4 behind /dev/fuse alone (a share server).
+     * Nothing else rides along. */
     let fuse_control = !wants_stdio && matches!(&req,
         Request::CreateJail(r) if r.fuse.as_ref().is_some_and(|f| f.control));
     let mut fds = fds;
@@ -567,15 +562,8 @@ fn handle_attach_mount(
                 rolling back the mount");
         state.runtime_mounts.retain(|m|
             !(m.jail_name == req.jail_name && m.dest == req.dest));
-        let c = std::ffi::CString::new(host_dest_str.clone()).ok();
-        if let Some(c) = c {
-            // SAFETY: c is a valid CStr; we just successfully mounted on it.
-            #[allow(unsafe_code)]
-            let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
-            if rc < 0 {
-                warn!("jaild: rollback unmount {host_dest_str}: {}",
-                    std::io::Error::last_os_error());
-            }
+        if let Err(e) = ffi::unmount_at(&host_dest_str, 0) {
+            warn!("jaild: rollback unmount {host_dest_str}: {e}");
         }
         return Response::SyscallFailed {
             name:  "state_save".into(),
@@ -621,15 +609,12 @@ fn handle_detach_mount(
     }
 
     let flags = if req.force { libc::MNT_FORCE } else { 0 };
-    /* SAFETY: c is a valid CStr; flags well-defined. */
-    let c = match std::ffi::CString::new(host_dest.as_str()) {
-        Ok(c) => c,
-        Err(_) => return Response::Error { detail: "NUL in host_dest".into() },
-    };
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::unmount(c.as_ptr(), flags) };
-    if rc < 0 {
-        let e = std::io::Error::last_os_error();
+    if host_dest.contains('\0') {
+        return Response::Error { detail: "NUL in host_dest".into() };
+    }
+    /* By the file system's id, not the path: a lookup would ask a wedged
+     * FUSE server for its root and hold jaild (ffi::unmount_at). */
+    if let Err(e) = ffi::unmount_at(&host_dest, flags) {
         // EINVAL = "not a mount" → fold to Ok (already gone).
         if e.raw_os_error() != Some(libc::EINVAL) {
             warn!("jaild: DetachMount unmount {host_dest}: {e}");
@@ -724,11 +709,8 @@ fn handle_remove(
     if let Some(p) = jail_path.as_deref() {
         if p != "/" && !p.is_empty() {
             let devdir = format!("{}/dev", p.trim_end_matches('/'));
-            if let Ok(c) = std::ffi::CString::new(devdir.as_str()) {
-                #[allow(unsafe_code)]
-                let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
-                if rc < 0 {
-                    let e = std::io::Error::last_os_error();
+            {
+                if let Err(e) = ffi::unmount_at(&devdir, 0) {
                     if e.raw_os_error() != Some(libc::EINVAL) {
                         warn!("jaild: RemoveJail devfs unmount {devdir}: {e}");
                     }
@@ -783,11 +765,8 @@ fn handle_remove(
             .collect();
         for m in &to_drop {
             // Best-effort unmount.
-            if let Ok(c) = std::ffi::CString::new(m.host_dest.as_str()) {
-                #[allow(unsafe_code)]
-                let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
-                if rc < 0 {
-                    let e = std::io::Error::last_os_error();
+            {
+                if let Err(e) = ffi::unmount_at(&m.host_dest, 0) {
                     if e.raw_os_error() != Some(libc::EINVAL) {
                         warn!("jaild: RemoveJail runtime-mount unmount {}: {e}",
                             m.host_dest);

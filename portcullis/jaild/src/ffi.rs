@@ -883,11 +883,85 @@ pub fn kld_ensure(_name: &str) -> io::Result<()> {
 /// Forced unmount, ignoring errors: a FUSE mount whose server is gone would
 /// otherwise refuse a plain unmount while anything holds it open.
 pub fn unmount_force_quiet(path: &str) {
-    if let Ok(c) = CString::new(path) {
+    let _ = unmount_at(path, libc::MNT_FORCE);
+}
+
+/// Unmount what is mounted on `path` (the top mount there), found in the
+/// mount table and named by its file-system id, never by looking `path` up.
+/// A lookup crosses the mount and asks the file system for its root: a FUSE
+/// server that is stopped, wedged or never answered FUSE_INIT holds that
+/// lookup, and with it the daemon asking (network-shares.md §4.4). Not
+/// mounted is EINVAL, as unmount(2) by path says it.
+pub fn unmount_at(path: &str, flags: libc::c_int) -> io::Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        let Some(id) = fsid_of(path) else { return Err(io::Error::from_raw_os_error(libc::EINVAL)) };
+        let c = CString::new(format!("FSID:{}:{}", id[0], id[1])).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: c is a valid NUL-terminated fsid string.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::unmount(c.as_ptr(), flags | libc::MNT_BYFSID) };
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let c = CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: c is a valid NUL-terminated path.
         #[allow(unsafe_code)]
-        let _ = unsafe { libc::unmount(c.as_ptr(), libc::MNT_FORCE) };
+        let r = unsafe { libc::unmount(c.as_ptr(), flags) };
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
+}
+
+/// One entry of the kernel's mount table.
+#[derive(Debug, Clone)]
+pub struct MountEntry {
+    pub from: String,
+    pub on: String,
+    pub fstype: String,
+    pub fsid: [i32; 2],
+}
+
+/// The kernel's mount table as it stands, in mount order (MNT_NOWAIT: no
+/// file system is asked anything, so a wedged one can't hold the caller).
+#[cfg(target_os = "freebsd")]
+pub fn mount_table() -> Vec<MountEntry> {
+    #[allow(unsafe_code)]
+    // SAFETY: a null buffer only counts.
+    let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut v: Vec<libc::statfs> = Vec::with_capacity(n as usize + 16);
+    #[allow(unsafe_code)]
+    // SAFETY: the buffer has room for capacity() entries.
+    let got = unsafe { libc::getfsstat(v.as_mut_ptr(), (v.capacity() * std::mem::size_of::<libc::statfs>()) as libc::c_long, libc::MNT_NOWAIT) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: the kernel filled `got` entries.
+    unsafe { v.set_len(got as usize) };
+    #[allow(unsafe_code)]
+    let text = |b: &[libc::c_char]| -> String {
+        // SAFETY: the kernel NUL-terminates these names.
+        unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }.to_string_lossy().into_owned()
+    };
+    v.iter().map(|st| MountEntry {
+        from: text(&st.f_mntfromname),
+        on: text(&st.f_mntonname),
+        fstype: text(&st.f_fstypename),
+        #[allow(unsafe_code)]
+        // SAFETY: fsid_t is two i32s.
+        fsid: unsafe { std::mem::transmute_copy::<libc::fsid_t, [i32; 2]>(&st.f_fsid) },
+    }).collect()
+}
+
+/// The id of the top file system mounted on `path` (mount_table).
+#[cfg(target_os = "freebsd")]
+pub fn fsid_of(path: &str) -> Option<[i32; 2]> {
+    let want = path.trim_end_matches('/');
+    let want = if want.is_empty() { "/" } else { want };
+    mount_table().into_iter().rev().find(|m| m.on == want).map(|m| m.fsid)
 }
 
 /// Put `fds` at 3, 4, … in the calling (child) process, without CLOEXEC, so
@@ -923,11 +997,7 @@ pub fn is_socket(fd: &impl std::os::fd::AsRawFd) -> bool {
 
 /// Unmount, ignoring errors (cleanup after a failed create).
 pub fn unmount_quiet(path: &str) {
-    if let Ok(c) = CString::new(path) {
-        // SAFETY: c is a valid NUL-terminated path.
-        #[allow(unsafe_code)]
-        let _ = unsafe { libc::unmount(c.as_ptr(), 0) };
-    }
+    let _ = unmount_at(path, 0);
 }
 
 /// Set a string sysctl (root only; jaild runs as root on the host).
