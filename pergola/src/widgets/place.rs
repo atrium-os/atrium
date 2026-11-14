@@ -38,7 +38,14 @@ impl Button {
     /// Its width: as given, or the label with `sm` padding each side
     /// (em-based: it grows with the text size).
     pub fn natural_width(&self) -> f32 {
-        if self.rect.w() > 0.0 { self.rect.w() } else { text_w(&self.label, type_size::MD, Weight::Medium) + 2.0 * size::em(space::SM) }
+        if self.rect.w() > 0.0 {
+            self.rect.w()
+        } else if self.icon.is_some() {
+            // Square, as tall as the button.
+            size::button_height()
+        } else {
+            text_w(&self.label, type_size::MD, Weight::Medium) + 2.0 * size::em(space::SM)
+        }
     }
 }
 

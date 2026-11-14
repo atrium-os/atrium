@@ -293,6 +293,10 @@ impl View for ScriniumView {
         rect(ctx, 0.0, 0.0, w, h, t.bg_canvas(), 0.0);
         match &b.mode {
             Mode::Manager => {
+                // Laid out by hand, so the minimum is stated: the places,
+                // a name and a size column, a few rows (em: it grows with
+                // the text size).
+                ctx.min_size(pergola::geom::Size::new(side_w() + em(360.0), em(360.0)));
                 self.manager(ctx, &b, w, h);
                 if b.connect.is_some() {
                     self.connect_sheet(ctx, &b, w, h);

@@ -467,6 +467,8 @@ pub struct NodeTree {
     /// The stack whose natural minimum is the window's minimum size
     /// (`Ctx::min_size_from`); none: the window gives no minimum.
     min_root: Option<NodeId>,
+    /// A minimum the app states outright (`Ctx::min_size`), in points.
+    min_size: Option<crate::geom::Size>,
     /// Stacks that are text with inline objects ([`crate::flow`]).
     flows: HashMap<NodeId, crate::flow::Shared>,
 }
@@ -482,6 +484,9 @@ impl NodeTree {
     /// The stack whose natural minimum is the window's ([`crate::view::Ctx::min_size_from`]).
     pub fn min_root(&self) -> Option<NodeId> { self.min_root }
     pub fn set_min_root(&mut self, id: NodeId) { self.min_root = Some(id); }
+    /// The minimum the app stated ([`crate::view::Ctx::min_size`]).
+    pub fn min_size(&self) -> Option<crate::geom::Size> { self.min_size }
+    pub fn set_min_size(&mut self, s: crate::geom::Size) { self.min_size = Some(s); }
 
     /// Lay the stack `id` out as `flow`: text and inline objects broken
     /// into lines together ([`crate::flow`]).

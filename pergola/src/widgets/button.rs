@@ -42,6 +42,10 @@ pub struct Button {
     pub rect: Rect,
     /// Shown after a hover (an icon-only button names itself here).
     pub tooltip: Option<String>,
+    /// Drawn instead of the label, from `font::ICONS`, 1 em of the label's
+    /// size so it grows with the text (an icon-only button). The label
+    /// still names it: its tooltip, and its entry in an overflow menu.
+    pub icon: Option<char>,
 }
 
 impl Button {
@@ -52,6 +56,7 @@ impl Button {
             on_click: None,
             rect: Rect::new(0.0, 0.0, 0.0, size::button_height()),
             tooltip: None,
+            icon: None,
         }
     }
 
@@ -65,6 +70,16 @@ impl Button {
 
     pub fn ghost(label: impl Into<String>) -> Self {
         Self { variant: Variant::Ghost, ..Self::primary(label) }
+    }
+
+    /// Draw `ch` (an icon in `font::ICONS`) instead of the label; the
+    /// label becomes its tooltip unless it has one.
+    pub fn icon(mut self, ch: char) -> Self {
+        self.icon = Some(ch);
+        if self.tooltip.is_none() {
+            self.tooltip = Some(self.label.clone());
+        }
+        self
     }
 
     pub fn tooltip(mut self, t: impl Into<String>) -> Self {
@@ -181,10 +196,14 @@ impl View for Button {
         // Label centered on the rect — phase 5 places it at a
         // hardcoded vertical center; full text metrics-aware
         // placement comes when fresco-text shaping lands (phase 4.5).
-        let label_size = Node::measure_text(&self.label, &TextStyle {
-            family: font::SANS.into(),
+        let (content, family, weight) = match self.icon {
+            Some(ch) => (ch.to_string(), font::ICONS, Weight::Regular),
+            None => (self.label.clone(), font::SANS, Weight::Medium),
+        };
+        let label_size = Node::measure_text(&content, &TextStyle {
+            family: family.into(),
             size: type_size::MD,
-            weight: Weight::Medium,
+            weight,
             color: label_color,
         });
         let label_rect = Rect::new(
@@ -195,11 +214,11 @@ impl View for Button {
         );
         ctx.tree.insert(Some(bg_id), Node::Text {
             rect: label_rect,
-            content: self.label.clone(),
+            content,
             style: TextStyle {
-                family: font::SANS.into(),
+                family: family.into(),
                 size: type_size::MD,
-                weight: Weight::Medium,
+                weight,
                 color: label_color,
             },
         });

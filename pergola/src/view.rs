@@ -185,6 +185,14 @@ impl<'a> Ctx<'a> {
         self.tree.set_min_root(id);
     }
 
+    /// The window's minimum size, stated outright in points: for a layout
+    /// placed by hand, which [`Ctx::min_size_from`] cannot measure. Give it
+    /// in em (`theme::size::em`) so it grows with the text size; it is sent
+    /// again when the text size changes (resolution-independence.md §6.3).
+    pub fn min_size(&mut self, size: crate::geom::Size) {
+        self.tree.set_min_size(size);
+    }
+
     /// Keep a scroll view's place across a reflow (resolution-independence.md
     /// §6.3): when its content lays out again with its position unchanged
     /// (a text size or width change), `handler` gets the position that

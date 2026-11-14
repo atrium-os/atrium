@@ -20,16 +20,25 @@ pub struct ToolItem {
     /// Higher stays in the row longer; equal ones leave from the end.
     pub priority: i32,
     pub enabled: bool,
+    /// Shown as this icon in the row (the label is its tooltip, and its
+    /// entry when it moves into "More").
+    pub icon: Option<char>,
     action: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl ToolItem {
     /// `action` as a [`Button`]'s click.
     pub fn new(label: impl Into<String>, action: impl Fn() + Send + Sync + 'static) -> Self {
-        Self { label: label.into(), priority: 0, enabled: true, action: Arc::new(action) }
+        Self { label: label.into(), priority: 0, enabled: true, icon: None, action: Arc::new(action) }
     }
     pub fn priority(mut self, p: i32) -> Self {
         self.priority = p;
+        self
+    }
+    /// An icon-only action: `ch` from `font::ICONS` in the row, named by
+    /// its label.
+    pub fn icon(mut self, ch: char) -> Self {
+        self.icon = Some(ch);
         self
     }
     pub fn enabled(mut self, on: bool) -> Self {
@@ -87,7 +96,14 @@ impl View for Toolbar {
         let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::toolbar() };
         let bh = size::button_height().min(h);
         let y = self.rect.y() + (h - bh) / 2.0;
-        let widths: Vec<f32> = self.items.iter().map(|i| Button::ghost(i.label.clone()).natural_width()).collect();
+        let button = |i: &ToolItem| {
+            let b = Button::ghost(i.label.clone());
+            match i.icon {
+                Some(ch) => b.icon(ch),
+                None => b,
+            }
+        };
+        let widths: Vec<f32> = self.items.iter().map(|i| button(i).natural_width()).collect();
         let priorities: Vec<i32> = self.items.iter().map(|i| i.priority).collect();
         let shown = fit(&widths, &priorities, self.rect.w(), Self::gap(), Self::more_w());
         let mut x = self.rect.x();
@@ -95,7 +111,7 @@ impl View for Toolbar {
             if !on {
                 continue;
             }
-            let mut b = Button::ghost(item.label.clone()).at(x, y).width(*w);
+            let mut b = button(item).at(x, y).width(*w);
             b.rect.size.h = bh;
             if item.enabled {
                 let a = item.action.clone();
@@ -188,5 +204,18 @@ mod tests {
             assert!(t.contains(&l.to_string()), "{l} in the row: {t:?}");
         }
         assert!(!t.contains(&crate::widgets::phosphor::DOTS_THREE.to_string()));
+    }
+
+    /// An icon-only action is a square in the row, drawn as its icon; in
+    /// "More" it is listed by its label.
+    #[test]
+    fn an_icon_action_is_its_icon_in_the_row_and_its_label_in_more() {
+        let ch = crate::widgets::phosphor::DOTS_THREE;
+        let item = ToolItem::new("Share", || {}).icon(ch);
+        let b = Button::ghost("Share").icon(ch);
+        assert_eq!(b.natural_width(), size::button_height(), "square");
+        assert_eq!(b.tooltip.as_deref(), Some("Share"), "named by its tooltip");
+        assert!(b.natural_width() < Button::ghost("Share").natural_width());
+        assert_eq!(item.icon, Some(ch));
     }
 }

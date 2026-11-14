@@ -267,7 +267,8 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
 - **Toolbar overflow:** `pergola::widgets::Toolbar` lays out `ToolItem`s (label, priority,
   enabled, action) in its width; when they don't fit, the lowest priorities (the later of
   equals first) move into a "More" menu at its end, in their order, and come back when there
-  is room. Scrinium's actions row uses it. Icon-only items are not done yet.
+  is room. Scrinium's actions row uses it. Icon-only items: `ToolItem::icon(ch)` / `Button::icon(ch)` draw the icon in a square button (label as tooltip, and as the entry in More).
+- **Stated minimums:** an app laid out by hand states its minimum in em with `Ctx::min_size(Size)` (preferred over `min_size_from`); Scrinium's manager does (sidebar + 360 em-pt by 360).
 - **App-shaped `Glyphs` text is document content**, not UI: a document view
   (`pergola-document`) and Officina's `pergola-richtext` follow their own zoom (whose default
   can start from the text size), as §6.1 says for content. So `Node::Glyphs` does not follow
