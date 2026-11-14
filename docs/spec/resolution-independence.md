@@ -218,6 +218,30 @@ Fraction, baseline }`) used by both widgets and DocumentView.
   density monitor keeps its physical size, clamped to fit.
 - Popups take their parent window's scale, even when they hang over another monitor.
 
+### 7.1 Dialogs, pop-ups and sheets
+
+Everything that hangs from a window is placed relative to it, in pt, and drawn at the
+parent's scale, so it keeps its size and its place against the parent on any monitor.
+
+- **In-window dialogs** (Pergola `Dialog`, a scrim over the window): part of the window's
+  own layout, so they scale with it. Their size comes from their content (em-based, §6.2),
+  capped to the window less a pt margin; past that the body scrolls, the buttons stay.
+- **Pop-ups** (menus, dropdowns, the bar's panels; fresco-popups.md): anchor, size and the
+  flip/shift at monitor edges are in pt, worked out against the parent's monitor in pt. A
+  pop-up takes its parent's scale even when it hangs over another monitor.
+- **Sheets** (the Scrinium picker and other Limen `sheet` slots; limen.md §5.1): today
+  the catalogue size (picker 640 x 440) and `SHEET_TOP` (48) are device px, so a sheet
+  would shrink on a HiDPI monitor and sit too close to the top. They become pt. The sheet's
+  process is told the parent's scale like any embedded surface (§9) and renders at it.
+  Its size is the larger of the catalogue size and the sheet's own natural minimum (so at
+  text size 150% a picker grows rather than clipping), capped to the parent's monitor in pt.
+  It stays centred across the parent and hangs past a smaller parent, as now.
+- **Modality is unchanged**: dimming, input routing and the focus-ring frame follow the
+  sheet's rect, which frescod converts with the parent's scale. The frame and its
+  `system:` tag are frescod chrome and scale per §8.
+- **Moving the parent to another monitor** moves its pop-ups and sheets with it; they switch
+  scale with the parent on release (§7), in one frame, never one before the other.
+
 ## 8. frescod's own drawing
 
 The origin strip, the cursor, Arca's ring, the lock screen, focus outlines drawn by frescod
@@ -265,7 +289,8 @@ Shankar took the recommendation on each:
 
 ## 12. Build order (after review)
 
-1. **Units fix** (rows 4 to 7, 12): pt on the wire for geometry and input, scale in the
+1. **Units fix** (rows 4 to 7, 12): pt on the wire for geometry and input (window, pop-up and
+   sheet sizes and anchors, `SHEET_TOP`), scale in the
    `window_create` reply, `EV_WINDOW_SCALE`, Pergola divides input and sizes in one place,
    forum-wm lays out the desktop in pt. Test: the Pergola showcase pixel-compared at 1.0,
    1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit at every scale.
