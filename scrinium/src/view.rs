@@ -37,17 +37,20 @@ pub mod ph {
     pub const GLOBE: char = '\u{e288}';
 }
 
-pub const SIDE_W: f32 = 208.0;
-pub const PICK_SIDE_W: f32 = 176.0;
-pub const TOOLBAR_H: f32 = 48.0;
-pub const ACTIONS_H: f32 = 40.0;
-pub const STRIP_H: f32 = 48.0;
-pub const HEADER_H: f32 = 28.0;
-pub const STATUS_H: f32 = 28.0;
-pub const ROW_H: f32 = 30.0;
-pub const PLACE_H: f32 = 44.0;
-pub const PICK_TITLE_H: f32 = 52.0;
-pub const PICK_FOOT_H: f32 = 60.0;
+// Layout sizes at 100% text; each grows with the system text size
+// (resolution-independence.md §6.2), so rows and bars fit their labels.
+fn em(pt: f32) -> f32 { pergola::theme::size::em(pt) }
+pub fn side_w() -> f32 { em(208.0) }
+pub fn pick_side_w() -> f32 { em(176.0) }
+pub fn toolbar_h() -> f32 { em(48.0) }
+pub fn actions_h() -> f32 { em(40.0) }
+pub fn strip_h() -> f32 { em(48.0) }
+pub fn header_h() -> f32 { em(28.0) }
+pub fn status_h() -> f32 { em(28.0) }
+pub fn row_h() -> f32 { em(30.0) }
+pub fn place_h() -> f32 { em(44.0) }
+pub fn pick_title_h() -> f32 { em(52.0) }
+pub fn pick_foot_h() -> f32 { em(60.0) }
 
 pub struct ScriniumView {
     pub state: Mutable<Browser>,
@@ -317,11 +320,11 @@ impl ScriniumView {
             return;
         }
         for (i, p) in b.places.iter().enumerate() {
-            let y = top + 38.0 + i as f32 * (PLACE_H + 2.0);
+            let y = top + 38.0 + i as f32 * (place_h() + 2.0);
             let on = b.at == Some(i);
             let s = self.state.clone();
             ctx.key(1000 + i as u64);
-            area(ctx, Rect::new(8.0, y, sw - 16.0, PLACE_H), 6.0, if on { t.selection_idle() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&s, |b| b.open_place(i)));
+            area(ctx, Rect::new(8.0, y, sw - 16.0, place_h()), 6.0, if on { t.selection_idle() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&s, |b| b.open_place(i)));
             let g = if p.network { ph::GLOBE } else if p.stick { ph::USB } else { ph::FOLDER };
             icon(ctx, 16.0, y + 7.0, g, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
             let room = sw - 16.0 - 44.0 - if p.stick && manager { 30.0 } else { 0.0 };
@@ -357,7 +360,7 @@ impl ScriniumView {
             .collect();
         let foot = h - 48.0;
         let mut y = foot - saved.len() as f32 * 32.0;
-        if !saved.is_empty() && y > top + 38.0 + b.places.len() as f32 * (PLACE_H + 2.0) + 24.0 {
+        if !saved.is_empty() && y > top + 38.0 + b.places.len() as f32 * (place_h() + 2.0) + 24.0 {
             text(ctx, 16.0, y - 12.0, "Servers", type_size::XS, Weight::Semibold, t.text_tertiary());
             for (i, label) in saved {
                 let s = self.state.clone();
@@ -511,10 +514,10 @@ impl ScriniumView {
         let (mod_w, size_w, kind_w) = if wide { (140.0, 90.0, 100.0) } else { (0.0, 84.0, 0.0) };
         let size_x = lw - mod_w - size_w - 12.0;
         let kind_x = size_x - kind_w;
-        rect(ctx, x0, y0, lw, HEADER_H, t.bg_canvas(), 0.0);
-        rect(ctx, x0, y0 + HEADER_H - 1.0, lw, 1.0, t.border_default(), 0.0);
+        rect(ctx, x0, y0, lw, header_h(), t.bg_canvas(), 0.0);
+        rect(ctx, x0, y0 + header_h() - 1.0, lw, 1.0, t.border_default(), 0.0);
         let head = |ctx: &mut Ctx, x: f32, s: &str| {
-            text(ctx, x0 + x, y0 + HEADER_H / 2.0, s, type_size::XS, Weight::Semibold, t.text_tertiary());
+            text(ctx, x0 + x, y0 + header_h() / 2.0, s, type_size::XS, Weight::Semibold, t.text_tertiary());
         };
         head(ctx, 44.0, "Name");
         if wide {
@@ -524,7 +527,7 @@ impl ScriniumView {
         } else {
             head(ctx, size_x + size_w - 30.0, "Size");
         }
-        let top = y0 + HEADER_H;
+        let top = y0 + header_h();
         let lh = (y1 - top).max(0.0);
         if b.entries.is_empty() {
             let msg = match (&b.unreadable, b.place()) {
@@ -541,31 +544,31 @@ impl ScriniumView {
         let selected = b.selected.clone();
         let handlers: Vec<_> = (0..entries.len()).map(|i| std::rc::Rc::new(self.press_handler(i))).collect();
         let picking_files = b.picker().map(|f| f.kind == Kind::File);
-        VirtualList::new(self.scroll.clone(), Rect::new(x0, top, lw, lh), entries.len(), ROW_H, move |i, ctx| {
+        VirtualList::new(self.scroll.clone(), Rect::new(x0, top, lw, lh), entries.len(), row_h(), move |i, ctx| {
             let t = ctx.theme;
             let e = &entries[i];
             let sel = selected.binary_search(&i).is_ok();
-            let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, lw, ROW_H), 0.0));
+            let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, lw, row_h()), 0.0));
             ctx.set_flex(row, FlexStyle { free: true, ..FlexStyle::default() });
             let h = handlers[i].clone();
-            area(ctx, Rect::new(6.0, 1.0, lw - 12.0, ROW_H - 2.0), 5.0, if sel { t.selection_bg() } else { Color::TRANSPARENT }, if sel { t.selection_bg() } else { t.state_hover() }, move || h());
+            area(ctx, Rect::new(6.0, 1.0, lw - 12.0, row_h() - 2.0), 5.0, if sel { t.selection_bg() } else { Color::TRANSPARENT }, if sel { t.selection_bg() } else { t.state_hover() }, move || h());
             // In a file picker folders are for going into: dimmer.
             let dim = picking_files == Some(true) && e.dir;
             let fg = if e.link { t.text_tertiary() } else { t.text_primary() };
             icon(ctx, 16.0, 7.0, file_icon(&e.name, e.dir, e.link), 16.0, if e.dir { t.accent_fg() } else { t.text_secondary() });
             let name_w = if kind_w > 0.0 { kind_x - 52.0 } else { size_x - 52.0 };
-            text(ctx, 44.0, ROW_H / 2.0, &fit(&e.name, type_size::SM, Weight::Regular, name_w), type_size::SM, Weight::Regular, if dim { t.text_secondary() } else { fg });
+            text(ctx, 44.0, row_h() / 2.0, &fit(&e.name, type_size::SM, Weight::Regular, name_w), type_size::SM, Weight::Regular, if dim { t.text_secondary() } else { fg });
             if kind_w > 0.0 {
-                text(ctx, kind_x, ROW_H / 2.0, fs::kind_of(&e.name, e.dir), type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, kind_x, row_h() / 2.0, fs::kind_of(&e.name, e.dir), type_size::SM, Weight::Regular, t.text_secondary());
             }
             if !e.dir {
                 let s = fs::size_text(e.size);
                 let sw = width(&s, type_size::SM, Weight::Regular);
-                text(ctx, size_x + size_w - sw, ROW_H / 2.0, &s, type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, size_x + size_w - sw, row_h() / 2.0, &s, type_size::SM, Weight::Regular, t.text_secondary());
             }
             if mod_w > 0.0 {
                 if let Some(m) = e.modified {
-                    text(ctx, lw - mod_w, ROW_H / 2.0, &fs::time_text(m), type_size::SM, Weight::Regular, t.text_secondary());
+                    text(ctx, lw - mod_w, row_h() / 2.0, &fs::time_text(m), type_size::SM, Weight::Regular, t.text_secondary());
                 }
             }
             ctx.pop();
@@ -578,18 +581,18 @@ impl ScriniumView {
 
     fn manager(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
-        self.sidebar(ctx, b, 0.0, SIDE_W, h);
-        let x0 = SIDE_W;
+        self.sidebar(ctx, b, 0.0, side_w(), h);
+        let x0 = side_w();
         // Toolbar: back, up, the path.
-        rect(ctx, x0, TOOLBAR_H - 1.0, w - x0, 1.0, t.border_default(), 0.0);
+        rect(ctx, x0, toolbar_h() - 1.0, w - x0, 1.0, t.border_default(), 0.0);
         let s = self.state.clone();
         icon_button(ctx, x0 + 10.0, 10.0, ph::ARROW_LEFT, b.can_go_back(), "Back (Alt-Left)", move || with(&s, Browser::go_back));
         let s = self.state.clone();
         icon_button(ctx, x0 + 42.0, 10.0, ph::ARROW_UP, !b.path.is_empty(), "Up (Backspace)", move || with(&s, Browser::up));
-        self.crumbs(ctx, b, x0 + 84.0, TOOLBAR_H / 2.0, w - 16.0);
+        self.crumbs(ctx, b, x0 + 84.0, toolbar_h() / 2.0, w - 16.0);
 
         // What can be done here.
-        let ay = TOOLBAR_H + 4.0;
+        let ay = toolbar_h() + 4.0;
         let open = b.place().is_some() && b.unreadable.is_none();
         let writable = open && !b.place().is_some_and(|p| p.read_only);
         let n = b.selected.len();
@@ -611,17 +614,17 @@ impl ScriniumView {
         let hw = width(hid, type_size::SM, Weight::Medium) + 28.0;
         let s = self.state.clone();
         button(ctx, w - hw - 8.0, ay, hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
-        let mut y = TOOLBAR_H + ACTIONS_H;
+        let mut y = toolbar_h() + actions_h();
         rect(ctx, x0, y - 1.0, w - x0, 1.0, t.border_default(), 0.0);
 
         // A name being typed, or a question.
         if let Some(edit) = &b.edit {
-            rect(ctx, x0, y, w - x0, STRIP_H, t.accent_bg(), 0.0);
+            rect(ctx, x0, y, w - x0, strip_h(), t.accent_bg(), 0.0);
             let label = match edit {
                 Edit::NewFolder => "New folder:".to_string(),
                 Edit::Rename(n) => format!("Rename “{}” to:", fit(n, type_size::SM, Weight::Medium, 160.0)),
             };
-            text(ctx, x0 + 16.0, y + STRIP_H / 2.0, &label, type_size::SM, Weight::Medium, t.text_primary());
+            text(ctx, x0 + 16.0, y + strip_h() / 2.0, &label, type_size::SM, Weight::Medium, t.text_primary());
             let fx = x0 + 24.0 + width(&label, type_size::SM, Weight::Medium);
             let fw = (w - fx - 200.0).clamp(120.0, 320.0);
             let s = self.state.clone();
@@ -640,29 +643,29 @@ impl ScriniumView {
             });
             let s = self.state.clone();
             button(ctx, bx + bw + 6.0, y + 8.0, "Cancel", Look::Ghost, true, move || with(&s, Browser::cancel_edit));
-            y += STRIP_H;
+            y += strip_h();
         } else if let Some(names) = &b.confirm_delete {
-            rect(ctx, x0, y, w - x0, STRIP_H, t.accent_bg(), 0.0);
+            rect(ctx, x0, y, w - x0, strip_h(), t.accent_bg(), 0.0);
             let q = if names.len() == 1 {
                 format!("Delete “{}”? It can't be brought back.", fit(&names[0], type_size::SM, Weight::Medium, 220.0))
             } else {
                 format!("Delete {} items? They can't be brought back.", names.len())
             };
             icon(ctx, x0 + 14.0, y + 14.0, ph::WARNING, 20.0, t.danger_fg());
-            text(ctx, x0 + 42.0, y + STRIP_H / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
+            text(ctx, x0 + 42.0, y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
             let bx = x0 + 54.0 + width(&q, type_size::SM, Weight::Medium);
             let s = self.state.clone();
             let bw = button(ctx, bx, y + 8.0, "Delete", Look::Danger, true, move || with(&s, Browser::delete_confirmed));
             let s = self.state.clone();
             button(ctx, bx + bw + 6.0, y + 8.0, "Cancel", Look::Ghost, true, move || with(&s, |b| b.confirm_delete = None));
-            y += STRIP_H;
+            y += strip_h();
         }
 
-        self.list(ctx, b, x0, w, y, h - STATUS_H, w - x0 > 620.0);
+        self.list(ctx, b, x0, w, y, h - status_h(), w - x0 > 620.0);
 
         // The status line.
-        let sy = h - STATUS_H;
-        rect(ctx, x0, sy, w - x0, STATUS_H, t.bg_surface(), 0.0);
+        let sy = h - status_h();
+        rect(ctx, x0, sy, w - x0, status_h(), t.bg_surface(), 0.0);
         rect(ctx, x0, sy, w - x0, 1.0, t.border_default(), 0.0);
         let (msg, color) = match &b.notice {
             Some(n) => (n.text.clone(), if n.error { t.danger_fg() } else { t.text_secondary() }),
@@ -675,11 +678,11 @@ impl ScriniumView {
                 (s, t.text_secondary())
             }
         };
-        text(ctx, x0 + 16.0, sy + STATUS_H / 2.0, &fit(&msg, type_size::XS, Weight::Regular, w - x0 - 220.0), type_size::XS, Weight::Regular, color);
+        text(ctx, x0 + 16.0, sy + status_h() / 2.0, &fit(&msg, type_size::XS, Weight::Regular, w - x0 - 220.0), type_size::XS, Weight::Regular, color);
         if let Some(p) = b.place().filter(|p| p.stick && p.size > 0) {
             let r = format!("{} free of {}{}", fs::size_text(p.free), fs::size_text(p.size), if p.read_only { " · read-only" } else { "" });
             let rw = width(&r, type_size::XS, Weight::Regular);
-            text(ctx, w - rw - 16.0, sy + STATUS_H / 2.0, &r, type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, w - rw - 16.0, sy + status_h() / 2.0, &r, type_size::XS, Weight::Regular, t.text_tertiary());
         }
     }
 
@@ -687,8 +690,8 @@ impl ScriniumView {
         let t = ctx.theme;
         let Mode::Picker { filter, app } = &b.mode else { return };
         // The heading: what is asked, and for whom.
-        rect(ctx, 0.0, 0.0, w, PICK_TITLE_H, t.bg_surface(), 0.0);
-        rect(ctx, 0.0, PICK_TITLE_H - 1.0, w, 1.0, t.border_default(), 0.0);
+        rect(ctx, 0.0, 0.0, w, pick_title_h(), t.bg_surface(), 0.0);
+        rect(ctx, 0.0, pick_title_h() - 1.0, w, 1.0, t.border_default(), 0.0);
         let title = if !filter.title.is_empty() {
             filter.title.clone()
         } else {
@@ -703,11 +706,11 @@ impl ScriniumView {
         let who = if filter.write { format!("for {app}, which may change it") } else { format!("for {app}, to read") };
         text(ctx, 46.0, 37.0, &fit(&who, type_size::XS, Weight::Regular, w - 70.0), type_size::XS, Weight::Regular, t.text_tertiary());
 
-        let foot = h - PICK_FOOT_H;
-        self.sidebar(ctx, b, PICK_TITLE_H, PICK_SIDE_W, foot);
-        let x0 = PICK_SIDE_W;
+        let foot = h - pick_foot_h();
+        self.sidebar(ctx, b, pick_title_h(), pick_side_w(), foot);
+        let x0 = pick_side_w();
         // The path row.
-        let py = PICK_TITLE_H;
+        let py = pick_title_h();
         let s = self.state.clone();
         icon_button(ctx, x0 + 8.0, py + 6.0, ph::ARROW_UP, !b.path.is_empty(), "Up", move || with(&s, Browser::up));
         self.crumbs(ctx, b, x0 + 46.0, py + 20.0, w - 12.0);
@@ -715,7 +718,7 @@ impl ScriniumView {
         self.list(ctx, b, x0, w, py + 40.0, foot, false);
 
         // The answer.
-        rect(ctx, 0.0, foot, w, PICK_FOOT_H, t.bg_surface(), 0.0);
+        rect(ctx, 0.0, foot, w, pick_foot_h(), t.bg_surface(), 0.0);
         rect(ctx, 0.0, foot, w, 1.0, t.border_default(), 0.0);
         let pick = b.pick();
         let go = match filter.kind {
@@ -738,7 +741,7 @@ impl ScriniumView {
             (_, Err(e), _) => (e.clone(), t.text_tertiary()),
             (_, Ok(Outcome::Cancelled), _) => (String::new(), t.text_tertiary()),
         };
-        text(ctx, 16.0, foot + PICK_FOOT_H / 2.0, &fit(&msg, type_size::SM, Weight::Regular, w - 56.0 - gw - cw), type_size::SM, Weight::Regular, color);
+        text(ctx, 16.0, foot + pick_foot_h() / 2.0, &fit(&msg, type_size::SM, Weight::Regular, w - 56.0 - gw - cw), type_size::SM, Weight::Regular, color);
     }
 }
 

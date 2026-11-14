@@ -6,7 +6,7 @@
 //!
 //! Visual language reference: §3 spacing, §5 radius (`SM`), §6
 //! motion (spring-snappy on press in a future phase), §8 density
-//! (`size::BUTTON_HEIGHT_DEFAULT`).
+//! (`size::button_height()`).
 //!
 //! Three variants: `primary` (filled accent), `secondary` (border +
 //! neutral fill), `ghost` (text-only). Constructors below; defaults
@@ -38,7 +38,7 @@ pub struct Button {
     pub variant: Variant,
     pub on_click: Option<ClickCallback>,
     /// Outer rect — width is fixed (caller chooses); height defaults
-    /// to `size::BUTTON_HEIGHT_DEFAULT` if `rect.size.h == 0.0`.
+    /// to `size::button_height()` if `rect.size.h == 0.0`.
     pub rect: Rect,
     /// Shown after a hover (an icon-only button names itself here).
     pub tooltip: Option<String>,

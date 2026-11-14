@@ -5,7 +5,7 @@
 //! scene holds a few screens of rows. Rows are keyed by index, so a row
 //! keeps its node ids as the window moves over it.
 //!
-//! Rows have one fixed height (`size::LIST_ROW_DEFAULT` or `_DENSE`).
+//! Rows have one fixed height (`size::list_row()` or `list_row_dense()`, which follow the text size).
 //! Variable heights wait for the band sources `DocumentView` brings.
 
 use std::rc::Rc;

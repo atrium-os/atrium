@@ -35,6 +35,10 @@ pub const RADIO_ROW_GAP: f32 = space::XS;
 
 pub type Changed<T> = Rc<dyn Fn(T)>;
 
+/// A size above at the system text size: a box grows with its label
+/// (resolution-independence.md §6.2).
+fn em(pt: f32) -> f32 { size::em(pt) }
+
 fn inflate(r: Rect, d: f32) -> Rect {
     Rect::new(r.x() - d, r.y() - d, r.w() + 2.0 * d, r.h() + 2.0 * d)
 }
@@ -124,16 +128,16 @@ fn box_and_label(ctx: &mut Ctx, x: f32, y: f32, label: &str, round: bool, enable
     let t = ctx.theme;
     let color = if enabled { t.text_primary() } else { t.text_disabled() };
     let ls = Node::measure_text(label, &label_style(color, type_size::MD));
-    let h = BOX.max(ls.h);
-    let hit = Rect::new(x, y, BOX + LABEL_GAP + ls.w, h);
-    let bx = Rect::new(x, y + (h - BOX) / 2.0, BOX, BOX);
-    let rad = if round { BOX / 2.0 } else { radius::XS };
+    let h = em(BOX).max(ls.h);
+    let hit = Rect::new(x, y, em(BOX) + LABEL_GAP + ls.w, h);
+    let bx = Rect::new(x, y + (h - em(BOX)) / 2.0, em(BOX), em(BOX));
+    let rad = if round { em(BOX) / 2.0 } else { radius::XS };
     let ring = focus_ring(ctx, bx, rad);
     // The hit target: transparent, the whole box and label.
     let target = ctx.add(Node::Rect { rect: hit, fill: Color::TRANSPARENT, radius: 0.0 });
     let edge = ctx.tree.insert(Some(target), Node::Rect { rect: bx, fill: t.border_control(), radius: rad });
     ctx.tree.insert(Some(target), Node::Text {
-        rect: Rect::new(x + BOX + LABEL_GAP, y + (h - ls.h) / 2.0, ls.w, ls.h),
+        rect: Rect::new(x + em(BOX) + LABEL_GAP, y + (h - ls.h) / 2.0, ls.w, ls.h),
         content: label.into(),
         style: label_style(color, type_size::MD),
     });
@@ -167,9 +171,10 @@ impl View for Checkbox {
             Check::Mixed => (Color::TRANSPARENT, mark),
             Check::Off => (Color::TRANSPARENT, Color::TRANSPARENT),
         };
-        ctx.tree.insert(Some(edge), Node::Path { p0: (cx + 4.0, cy + 8.3), p1: (cx + 6.7, cy + 11.0), width: 1.6, color: check });
-        ctx.tree.insert(Some(edge), Node::Path { p0: (cx + 6.7, cy + 11.0), p1: (cx + 12.0, cy + 5.0), width: 1.6, color: check });
-        ctx.tree.insert(Some(edge), Node::Rect { rect: Rect::new(cx + 4.0, cy + 7.0, 8.0, 2.0), fill: bar, radius: 1.0 });
+        let u = em(1.0);
+        ctx.tree.insert(Some(edge), Node::Path { p0: (cx + 4.0 * u, cy + 8.3 * u), p1: (cx + 6.7 * u, cy + 11.0 * u), width: 1.6 * u, color: check });
+        ctx.tree.insert(Some(edge), Node::Path { p0: (cx + 6.7 * u, cy + 11.0 * u), p1: (cx + 12.0 * u, cy + 5.0 * u), width: 1.6 * u, color: check });
+        ctx.tree.insert(Some(edge), Node::Rect { rect: Rect::new(cx + 4.0 * u, cy + 7.0 * u, 8.0 * u, 2.0 * u), fill: bar, radius: u });
         if ctx.is_focus_visible(target) {
             light_ring(ctx, ring);
         }
@@ -234,11 +239,11 @@ impl View for Toggle {
         let on = self.value.get();
         let color = if self.enabled { t.text_primary() } else { t.text_disabled() };
         let ls = Node::measure_text(&self.label, &label_style(color, type_size::MD));
-        let h = TOGGLE_H.max(ls.h);
-        let track = Rect::new(self.x, self.y + (h - TOGGLE_H) / 2.0, TOGGLE_W, TOGGLE_H);
-        let ring = focus_ring(ctx, track, TOGGLE_H / 2.0);
+        let h = em(TOGGLE_H).max(ls.h);
+        let track = Rect::new(self.x, self.y + (h - em(TOGGLE_H)) / 2.0, em(TOGGLE_W), em(TOGGLE_H));
+        let ring = focus_ring(ctx, track, em(TOGGLE_H) / 2.0);
         let target = ctx.add(Node::Rect {
-            rect: Rect::new(self.x, self.y, TOGGLE_W + LABEL_GAP + ls.w, h),
+            rect: Rect::new(self.x, self.y, em(TOGGLE_W) + LABEL_GAP + ls.w, h),
             fill: Color::TRANSPARENT,
             radius: 0.0,
         });
@@ -254,13 +259,13 @@ impl View for Toggle {
                 (t.border_control(), if hovered { t.state_hover().over(base) } else { base }, t.border_control())
             }
         };
-        let e = ctx.tree.insert(Some(target), Node::Rect { rect: track, fill: edge, radius: TOGGLE_H / 2.0 });
-        ctx.tree.insert(Some(e), Node::Rect { rect: inflate(track, -stroke::DEFAULT), fill: inside, radius: TOGGLE_H / 2.0 - stroke::DEFAULT });
-        let inset = (TOGGLE_H - TOGGLE_THUMB) / 2.0;
-        let tx = if on { track.x() + TOGGLE_W - inset - TOGGLE_THUMB } else { track.x() + inset };
-        ctx.tree.insert(Some(e), Node::Rect { rect: Rect::new(tx, track.y() + inset, TOGGLE_THUMB, TOGGLE_THUMB), fill: thumb, radius: TOGGLE_THUMB / 2.0 });
+        let e = ctx.tree.insert(Some(target), Node::Rect { rect: track, fill: edge, radius: em(TOGGLE_H) / 2.0 });
+        ctx.tree.insert(Some(e), Node::Rect { rect: inflate(track, -stroke::DEFAULT), fill: inside, radius: em(TOGGLE_H) / 2.0 - stroke::DEFAULT });
+        let inset = (em(TOGGLE_H) - em(TOGGLE_THUMB)) / 2.0;
+        let tx = if on { track.x() + em(TOGGLE_W) - inset - em(TOGGLE_THUMB) } else { track.x() + inset };
+        ctx.tree.insert(Some(e), Node::Rect { rect: Rect::new(tx, track.y() + inset, em(TOGGLE_THUMB), em(TOGGLE_THUMB)), fill: thumb, radius: em(TOGGLE_THUMB) / 2.0 });
         ctx.tree.insert(Some(target), Node::Text {
-            rect: Rect::new(self.x + TOGGLE_W + LABEL_GAP, self.y + (h - ls.h) / 2.0, ls.w, ls.h),
+            rect: Rect::new(self.x + em(TOGGLE_W) + LABEL_GAP, self.y + (h - ls.h) / 2.0, ls.w, ls.h),
             content: self.label.clone(),
             style: label_style(color, type_size::MD),
         });
@@ -350,7 +355,7 @@ impl View for RadioGroup {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         let chosen = self.value.get();
-        let row_h = BOX.max(Node::measure_text("Mg", &label_style(t.text_primary(), type_size::MD)).h);
+        let row_h = em(BOX).max(Node::measure_text("Mg", &label_style(t.text_primary(), type_size::MD)).h);
         let total = Rect::new(self.x, self.y, 0.0, self.labels.len() as f32 * (row_h + RADIO_ROW_GAP));
         let group = ctx.add(Node::Rect { rect: total, fill: Color::TRANSPARENT, radius: 0.0 });
         let visible = ctx.is_focus_visible(group);
@@ -364,12 +369,12 @@ impl View for RadioGroup {
             if on {
                 set_fill(ctx, edge, fill);
             }
-            ctx.tree.insert(Some(edge), Node::Rect { rect: inflate(bx, -stroke::DEFAULT), fill, radius: BOX / 2.0 - stroke::DEFAULT });
-            let c = (BOX - RADIO_DOT) / 2.0;
+            ctx.tree.insert(Some(edge), Node::Rect { rect: inflate(bx, -stroke::DEFAULT), fill, radius: em(BOX) / 2.0 - stroke::DEFAULT });
+            let c = (em(BOX) - em(RADIO_DOT)) / 2.0;
             ctx.tree.insert(Some(edge), Node::Rect {
-                rect: Rect::new(bx.x() + c, bx.y() + c, RADIO_DOT, RADIO_DOT),
+                rect: Rect::new(bx.x() + c, bx.y() + c, em(RADIO_DOT), em(RADIO_DOT)),
                 fill: if on { t.text_on_accent() } else { Color::TRANSPARENT },
-                radius: RADIO_DOT / 2.0,
+                radius: em(RADIO_DOT) / 2.0,
             });
             // The ring sits on the chosen radio while the group has it.
             if visible && on {
@@ -595,7 +600,7 @@ mod tests {
         let v = Mutable::with_dirty(0usize, d.clone());
         let mut app = App::new_with_flag(One(RadioGroup::new(v.clone(), ["Daily", "Weekly", "Never"]).at(0.0, 0.0)), d);
         app.tick();
-        let row = BOX.max(Node::measure_text("Mg", &label_style(Color::TRANSPARENT, type_size::MD)).h) + RADIO_ROW_GAP;
+        let row = em(BOX).max(Node::measure_text("Mg", &label_style(Color::TRANSPARENT, type_size::MD)).h) + RADIO_ROW_GAP;
         click(&mut app, 8.0, row * 2.0 + 8.0);
         assert_eq!(v.get(), 2);
         // The group is one Tab stop; arrows move the choice and wrap.

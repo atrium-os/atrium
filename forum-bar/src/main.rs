@@ -556,7 +556,9 @@ impl View for BarView {
             // A Fixed output (line out to an amplifier) keeps the mix at 100%:
             // the slider is off and says where the volume is.
             let fixed_now = a.fixed();
-            let size = pergola::geom::Size::new(260.0, 2.0 * PANEL_PADDING + 28.0 + 36.0 + 36.0 + if fixed_now { 20.0 } else { 0.0 } + if rows > 0.0 { 24.0 + rows * 28.0 } else { 0.0 });
+            // Em-based, so it grows with the text size (resolution-independence.md §7.2).
+            let em = pergola::theme::size::em;
+            let size = pergola::geom::Size::new(em(260.0), 2.0 * PANEL_PADDING + em(28.0 + 36.0 + 36.0) + if fixed_now { em(20.0) } else { 0.0 } + if rows > 0.0 { em(24.0 + rows * 28.0) } else { 0.0 });
             let (level, muted, output, fixed) = (self.vol_level.clone(), self.vol_muted.clone(), self.vol_output.clone(), self.vol_fixed.clone());
             let current = a.current;
             let want = self.want_audio.clone();
@@ -570,26 +572,26 @@ impl View for BarView {
                     .on_change(move |m| w1.set(Some(AudioAction::Mute(m))))
                     .render(ctx);
                 Slider::new(level.clone(), 0.0, 1.0)
-                    .at(inner.x(), inner.y() + 36.0)
+                    .at(inner.x(), inner.y() + em(36.0))
                     .width(inner.w())
                     .enabled(enabled && !fixed_now)
                     .on_change(move |v| w2.set(Some(AudioAction::Master(v as f32))))
                     .render(ctx);
-                let mut y = inner.y() + 36.0 + 36.0;
+                let mut y = inner.y() + em(36.0 + 36.0);
                 if fixed_now {
-                    Label::new("Fixed at 100%: use your amplifier").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y - 8.0).emit(ctx);
-                    y += 20.0;
+                    Label::new("Fixed at 100%: use your amplifier").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y - em(8.0)).emit(ctx);
+                    y += em(20.0);
                 }
                 Toggle::new(fixed.clone(), "Fixed volume (line out)")
                     .at(inner.x(), y)
                     .on_change(move |on| w4.set(Some(AudioAction::Fixed(current, on))))
                     .render(ctx);
-                y += 36.0;
+                y += em(36.0);
                 if !names.is_empty() {
                     Label::new("Output").size(type_size::XS).color(t.text_tertiary()).at(inner.x(), y).emit(ctx);
                     let ids = ids.clone();
                     RadioGroup::new(output.clone(), names.clone())
-                        .at(inner.x(), y + 24.0)
+                        .at(inner.x(), y + em(24.0))
                         .on_change(move |i| {
                             if let Some(&id) = ids.get(i) {
                                 w3.set(Some(AudioAction::Output(id)));

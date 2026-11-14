@@ -18,6 +18,9 @@ use crate::Color;
 pub const TRACK_H: f32 = 4.0;
 pub const THUMB: f32 = 16.0;
 
+/// A size above at the system text size (resolution-independence.md §6.2).
+fn em(pt: f32) -> f32 { crate::theme::size::em(pt) }
+
 pub struct Slider {
     /// The value, in `min..=max`.
     pub value: Mutable<f64>,
@@ -32,7 +35,7 @@ pub struct Slider {
 
 impl Slider {
     pub fn new(value: Mutable<f64>, min: f64, max: f64) -> Self {
-        Self { value, min, max, step: 0.0, rect: Rect::new(0.0, 0.0, 180.0, THUMB), enabled: true, on_change: None }
+        Self { value, min, max, step: 0.0, rect: Rect::new(0.0, 0.0, 180.0, em(THUMB)), enabled: true, on_change: None }
     }
     pub fn step(mut self, s: f64) -> Self {
         self.step = s.max(0.0);
@@ -71,27 +74,27 @@ pub fn snap(v: f64, min: f64, max: f64, step: f64) -> f64 {
 impl View for Slider {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
-        let r = Rect::new(self.rect.x(), self.rect.y(), self.rect.w(), THUMB);
+        let r = Rect::new(self.rect.x(), self.rect.y(), self.rect.w(), em(THUMB));
         let span = (self.max - self.min).abs().max(f64::EPSILON);
         let frac = ((self.value.get() - self.min.min(self.max)) / span).clamp(0.0, 1.0) as f32;
         // The thumb's centre travels THUMB/2 in from each end.
-        let travel = (r.w() - THUMB).max(0.0);
-        let cx = r.x() + THUMB / 2.0 + frac * travel;
-        let ty = r.y() + (THUMB - TRACK_H) / 2.0;
+        let travel = (r.w() - em(THUMB)).max(0.0);
+        let cx = r.x() + em(THUMB) / 2.0 + frac * travel;
+        let ty = r.y() + (em(THUMB) - em(TRACK_H)) / 2.0;
 
-        let thumb = Rect::new(cx - THUMB / 2.0, r.y(), THUMB, THUMB);
+        let thumb = Rect::new(cx - em(THUMB) / 2.0, r.y(), em(THUMB), em(THUMB));
         // Focus ring around the thumb (§14.1), under everything.
-        let halo = ctx.add(Node::Rect { rect: grow(thumb, 3.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 3.0 });
-        let ring = ctx.add(Node::Rect { rect: grow(thumb, 1.0), fill: Color::TRANSPARENT, radius: THUMB / 2.0 + 1.0 });
+        let halo = ctx.add(Node::Rect { rect: grow(thumb, 3.0), fill: Color::TRANSPARENT, radius: em(THUMB) / 2.0 + 3.0 });
+        let ring = ctx.add(Node::Rect { rect: grow(thumb, 1.0), fill: Color::TRANSPARENT, radius: em(THUMB) / 2.0 + 1.0 });
         let target = ctx.add(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 0.0 });
         let (track, filled, edge) = if self.enabled {
             (t.border_strong(), t.accent_mark(), t.border_control())
         } else {
             (t.border_default(), t.border_strong(), t.border_default())
         };
-        ctx.tree.insert(Some(target), Node::Rect { rect: Rect::new(r.x(), ty, r.w(), TRACK_H), fill: track, radius: TRACK_H / 2.0 });
-        ctx.tree.insert(Some(target), Node::Rect { rect: Rect::new(r.x(), ty, cx - r.x(), TRACK_H), fill: filled, radius: TRACK_H / 2.0 });
-        let e = ctx.tree.insert(Some(target), Node::Rect { rect: thumb, fill: edge, radius: THUMB / 2.0 });
+        ctx.tree.insert(Some(target), Node::Rect { rect: Rect::new(r.x(), ty, r.w(), em(TRACK_H)), fill: track, radius: em(TRACK_H) / 2.0 });
+        ctx.tree.insert(Some(target), Node::Rect { rect: Rect::new(r.x(), ty, cx - r.x(), em(TRACK_H)), fill: filled, radius: em(TRACK_H) / 2.0 });
+        let e = ctx.tree.insert(Some(target), Node::Rect { rect: thumb, fill: edge, radius: em(THUMB) / 2.0 });
         let body = if ctx.is_pressed(target) && self.enabled {
             t.state_pressed().over(t.bg_elevated())
         } else if ctx.is_hovered(target) && self.enabled {
@@ -99,7 +102,7 @@ impl View for Slider {
         } else {
             t.bg_elevated()
         };
-        ctx.tree.insert(Some(e), Node::Rect { rect: grow(thumb, -stroke::DEFAULT), fill: body, radius: THUMB / 2.0 - stroke::DEFAULT });
+        ctx.tree.insert(Some(e), Node::Rect { rect: grow(thumb, -stroke::DEFAULT), fill: body, radius: em(THUMB) / 2.0 - stroke::DEFAULT });
         if ctx.is_focus_visible(target) {
             for (id, c) in [(halo, t.accent_bg()), (ring, t.focus_ring())] {
                 if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
@@ -125,7 +128,7 @@ impl View for Slider {
             }
         };
         let s = set.clone();
-        let (x0, w) = (r.x() + THUMB / 2.0, travel);
+        let (x0, w) = (r.x() + em(THUMB) / 2.0, travel);
         ctx.on_drag(target, move |_: DragPhase, p: Point| {
             let f = if w > 0.0 { ((p.x - x0) / w).clamp(0.0, 1.0) } else { 0.0 } as f64;
             s(min + f * (max - min));
