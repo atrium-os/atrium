@@ -89,3 +89,27 @@ fn a_fill_past_the_cap_is_reported_as_its_index() {
     assert_eq!(f.header.op_count as usize, cap);
     assert_eq!(dropped, vec![(Node::Fill(0), drop::OP_BUDGET), (Node::Fill(1), drop::OP_BUDGET)]);
 }
+
+#[test]
+fn many_large_fills_stop_at_the_block_budget() {
+    // Full-target squares (1280x800): each block is a tile entry per tile,
+    // so 65,536 of them would be about 19 GB; the frame keeps to
+    // MAX_FRAME_BLOCK_WORDS and drops (without preparing) the rest.
+    let (w, h) = (1280u32, 800u32);
+    let sq = fill::Fill {
+        verbs: vec![fill::VERB_MOVE, fill::VERB_LINE, fill::VERB_LINE, fill::VERB_LINE, fill::VERB_CLOSE],
+        points: vec![[0.0, 0.0], [w as f32, 0.0], [w as f32, h as f32], [0.0, h as f32]],
+        transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        clip: None,
+        gradient: None,
+        ..fuzz::fills()[0].clone()
+    };
+    let n = 2000;
+    let scene = Scene { fills: vec![sq; n], ..Default::default() };
+    let (f, dropped) = Frame::pack_report(&scene, w, h, w);
+    let kept = n - dropped.len();
+    assert!(kept > 0 && !dropped.is_empty(), "kept {kept}");
+    assert!(dropped.iter().all(|&(_, why)| why == drop::FRAME_BUDGET));
+    assert!(f.texels.len() <= fill::MAX_FRAME_BLOCK_WORDS + 1, "{} words", f.texels.len());
+    assert!(f.validate(f.target_words()).is_ok());
+}

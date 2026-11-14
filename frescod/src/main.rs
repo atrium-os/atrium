@@ -910,7 +910,18 @@ fn present_head(
     deadline_ns: u32,
     enc: &hdr::Encoder,
 ) -> std::io::Result<()> {
-    let (back, next) = upload_head(h, renderer, desktop, desktop_w, deadline_ns, enc)?;
+    let (back, next) = match upload_head(h, renderer, desktop, desktop_w, deadline_ns, enc) {
+        Ok(x) => x,
+        /* GPU renderer: the GPU was busy (a long raster on a shared
+         * engine). Nothing was drawn into the buffer: no flip, the screen
+         * keeps its frame, and the renderer asks for another pass. */
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            h.dirty.forget();
+            h.stale = true;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let mut c = OutputCommit::flip(h.output, Some(h.scan.buffer(back)), true);
     c.format = h.format();
     c.in_fence = Some((&h.copy_done, next));
@@ -948,7 +959,7 @@ fn upload_head(
     match renderer {
         Some(r) => {
             r.present(&h.scan, back, desktop, lacks, deadline_ns, (&h.copy_done, next), h.hdr_on.then_some(enc))
-                .map_err(io_other)?
+                .map_err(|e| if render_backend::is_busy(&*e) { std::io::Error::from_raw_os_error(libc::EBUSY) } else { io_other(e) })?
         }
         None => {
             outputs::crop_fit(desktop, desktop_w, &h.vp, &mut h.staging, h.mode.width, h.mode.height);

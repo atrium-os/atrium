@@ -673,6 +673,10 @@ pub struct GpuCompute<'a> {
     /// The raster cost ceiling (`FRESCOD_RASTER_LIMIT` pixel-ops, for
     /// measuring on hardware; default `cost::FAR_OVER`).
     raster_limit: u64,
+    /// A submit found the GPU busy (EBUSY: on gpusim every VM's work shares
+    /// one engine, so a long raster holds it): the frame goes again on the
+    /// next pass of the loop instead of frescod waiting for the GPU.
+    retry: bool,
 }
 
 /// A window's raster on the GPU, not finished yet: compose keeps showing
@@ -834,6 +838,12 @@ fn place(stage: &mut Vec<u8>, bytes: &[u8]) -> u64 {
 }
 
 /// Write `ib` into `ring` and submit it in `vm`, signalling `signal`.
+/// Whether `e` is the driver's EBUSY (the GPU did not take the work in
+/// time).
+pub fn is_busy(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()) == Some(libc::EBUSY)
+}
+
 fn run<'a>(vm: &Vm<'a>, ring: &Bo<'a>, ib: &dyn fresco_compute::gpu::Stream, signal: (&Syncobj<'_>, u64), deadline_ns: u32) -> Result<()> {
     let bytes = ib.bytes();
     if bytes.len() as u64 > FENCE_OFFSET {
@@ -882,6 +892,7 @@ impl<'a> GpuCompute<'a> {
             refusals: Vec::new(),
             raster_limit: std::env::var("FRESCOD_RASTER_LIMIT").ok().and_then(|v| v.parse().ok())
                 .unwrap_or(fresco_compute::cost::FAR_OVER),
+            retry: false,
         })
     }
 
@@ -893,7 +904,7 @@ impl<'a> GpuCompute<'a> {
     /// Whether a window's raster finished since it was last looked at (a
     /// frame is due to show it).
     pub fn raster_landed(&self) -> bool {
-        self.wins.values().any(|v| v.inflight.as_ref().is_some_and(|f| v.sync.query().is_ok_and(|d| d >= f.seq)))
+        self.retry || self.wins.values().any(|v| v.inflight.as_ref().is_some_and(|f| v.sync.query().is_ok_and(|d| d >= f.seq)))
     }
 
     /// Apply the frame's uploads, give each window a VM and a surface of its
@@ -954,6 +965,7 @@ impl<'a> GpuCompute<'a> {
             return Err("scanout buffer smaller than the screen".into());
         }
         let name = self.arch.name();
+        self.retry = false;
 
         // FRESCOD_GPU_ISOLATION_PROBE=1 (a test): every window after the
         // first rasters to the address the first window's surface has in
@@ -1082,7 +1094,17 @@ impl<'a> GpuCompute<'a> {
             }
             ib.end(v.ring.gpu_va() + FENCE_OFFSET);
             v.seq += 1;
-            run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns)?;
+            if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns) {
+                // The GPU is busy with other work: this window keeps its last
+                // drawing and rasters on a later pass; frescod goes on.
+                v.seq -= 1;
+                if !is_busy(&*e) {
+                    return Err(e);
+                }
+                log::debug!("gpu: window {id} raster: GPU busy, later");
+                self.retry = true;
+                continue;
+            }
             v.inflight = Some(Inflight { seq: v.seq, sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false });
             if probe.is_some() && n > 0 {
                 let r = v.sync.wait(v.seq, flip_wait_ms());
@@ -1185,18 +1207,16 @@ impl<'a> GpuCompute<'a> {
         // End of pipe: the fence, then the interrupt that signals `signal`.
         ib.end(self.ring.gpu_va() + FENCE_OFFSET);
         if let Err(e) = run(self.vm, &self.ring, &*ib, signal, deadline_ns) {
-            // EBUSY: a window's work kept the queue past the driver's wait.
-            // Wait for every window's work, then try once more.
-            let busy = e.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()) == Some(libc::EBUSY);
-            if !busy {
-                return Err(e);
+            // EBUSY: a window's work kept the GPU past the driver's wait.
+            // Compose never waits on a window's raster (§F4j): this buffer
+            // was not drawn, the screen keeps what it shows, and the frame
+            // goes again on the loop's next pass. The caller skips the flip.
+            self.composed.remove(&target.gpu_va());
+            self.last_target = None;
+            if is_busy(&*e) {
+                self.retry = true;
             }
-            for v in self.wins.values() {
-                if v.seq > 0 {
-                    v.sync.wait(v.seq, flip_wait_ms())?;
-                }
-            }
-            run(self.vm, &self.ring, &*ib, signal, deadline_ns)?;
+            return Err(e);
         }
         Ok(())
     }

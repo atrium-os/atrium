@@ -449,11 +449,18 @@ fn kind_ops(
     }
     // Filled paths: each one's tiled block in `texels` (see `fill`).
     let mut fills = Vec::with_capacity(scene.fills.len());
-    let (mut lines_total, mut indices_total) = (0usize, 0usize);
+    let (mut lines_total, mut indices_total, mut words_total) = (0usize, 0usize, 0usize);
     if let Some(c) = cache.as_deref_mut() {
         c.begin();
     }
     for (k, fl) in scene.fills.iter().enumerate() {
+        // Past the block budget, later fills are not even prepared: their
+        // blocks would only be thrown away (and kept in the cache).
+        if words_total >= fill::MAX_FRAME_BLOCK_WORDS {
+            dropped.push((Node::Fill(k), fill::drop::FRAME_BUDGET));
+            fills.push(None);
+            continue;
+        }
         let r = match cache.as_deref_mut() {
             Some(c) => c.get(fl, width, height),
             None => std::sync::Arc::new(fill::prepare(fl, width, height)),
@@ -470,13 +477,17 @@ fn kind_ops(
                 continue;
             }
         };
-        if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS || indices_total + p.indices > fill::MAX_FRAME_INDICES {
+        if lines_total + p.lines > fill::MAX_FRAME_SEGMENTS
+            || indices_total + p.indices > fill::MAX_FRAME_INDICES
+            || words_total + p.block.len() > fill::MAX_FRAME_BLOCK_WORDS
+        {
             dropped.push((Node::Fill(k), fill::drop::FRAME_BUDGET));
             fills.push(None);
             continue;
         }
         lines_total += p.lines;
         indices_total += p.indices;
+        words_total += p.block.len();
         let base = texels.len();
         fills.push(Some(Op {
             p0: p.clip,

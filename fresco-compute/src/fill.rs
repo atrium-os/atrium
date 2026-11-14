@@ -36,8 +36,8 @@
 //! the transform, which carries scroll and zoom). A path that flattens to
 //! more than [`MAX_PATH_SEGMENTS`] lines, puts more than
 //! [`MAX_TILE_SEGMENTS`] lines in one tile, or would take the frame past
-//! [`MAX_FRAME_SEGMENTS`] lines or [`MAX_FRAME_INDICES`] list entries is
-//! dropped (not drawn); a path wholly outside the target or its clip is
+//! [`MAX_FRAME_SEGMENTS`] lines, [`MAX_FRAME_INDICES`] list entries or
+//! [`MAX_FRAME_BLOCK_WORDS`] block words is dropped (not drawn); a path wholly outside the target or its clip is
 //! culled. The kernel re-checks every index it reads from the block, so a
 //! hostile renderer's block only draws wrong pixels, in bounded work.
 //!
@@ -81,6 +81,13 @@ pub const MAX_FRAME_SEGMENTS: usize = 512 * 1024;
 pub const MAX_TILE_SEGMENTS: u32 = 4096;
 /// Most list entries (line, tile) per frame.
 pub const MAX_FRAME_INDICES: usize = 4 << 20;
+/// Most block words (tile entries, lines, lists, stops) all fills of a
+/// frame may take: 16 MiB. A block holds [`ENTRY_WORDS`] per tile of the
+/// fill's box whatever its lines, so without this a client sending many
+/// large fills (65,536 full-window ones: about 19 GB at 1280x800) ran its
+/// renderer out of memory before any other budget applied. A full 1440p
+/// fill is about 1 MiB of block.
+pub const MAX_FRAME_BLOCK_WORDS: usize = 4 << 20;
 /// Flattening tolerance, target pixels.
 pub const TOLERANCE: f32 = 0.25;
 /// Most lines one curve flattens to.
