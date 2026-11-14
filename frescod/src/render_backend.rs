@@ -719,6 +719,8 @@ struct Inflight {
     slice_cost: u64,
     slice_at: std::time::Instant,
     slice_full: bool,
+    /// The budget `rest` was last cut to.
+    cut: u64,
     /// `fg_submits` once this slice went.
     slice_fg: u64,
     /// The tile signatures and scroll viewports of the drawing it makes.
@@ -984,9 +986,13 @@ impl<'a> GpuCompute<'a> {
             // The rest was cut with the budget of its frame's submit: if the
             // budget has since shrunk (a slow GPU learnt), cut it again, or
             // its slices would each hold the GPU far past `slice_us`.
-            if fl.rest.front().is_some_and(|n| n.bin.is_none() && n.cost > 2 * self.slice_budget) {
+            // Only when the budget has at least halved since the last cut: a
+            // single tile is never cut, so a slice can stay over the budget,
+            // and cutting again is O(ops x tiles) on frescod's loop.
+            if self.slice_budget * 2 <= fl.cut && fl.rest.iter().all(|s| s.bin.is_none()) {
                 let tiles: Vec<[u32; 4]> = fl.rest.iter().flat_map(|s| s.tiles.iter().copied()).collect();
-                if fl.rest.iter().all(|s| s.bin.is_none()) {
+                fl.cut = self.slice_budget;
+                {
                     fl.rest = fresco_compute::cost::split_raster(&fl.frame, &tiles, self.slice_budget).into();
                     log::debug!("gpu: window {id}: rest cut again into {} slices of ~{} pixel-ops", fl.rest.len(), self.slice_budget);
                 }
@@ -1233,7 +1239,7 @@ impl<'a> GpuCompute<'a> {
             let slice_cost = first.as_ref().map_or(0, |s| s.cost);
             v.inflight = Some(Inflight {
                 seq: v.seq, frame: f.clone(), va, rest,
-                slice_cost, slice_at: std::time::Instant::now(), slice_full: slice_cost * 2 >= self.slice_budget,
+                slice_cost, slice_at: std::time::Instant::now(), slice_full: slice_cost * 2 >= self.slice_budget, cut: self.slice_budget,
                 slice_fg: self.fg_submits,
                 sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false,
             });
