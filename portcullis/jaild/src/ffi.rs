@@ -801,10 +801,17 @@ pub fn grant_name_ok(node: &str) -> bool {
 /// before the daemon answers FUSE_INIT, and file access waits for it.
 /// `allow_other` because the mount is jaild's (root) and the readers are the
 /// user's apps; `default_permissions` so the kernel checks the modes the
-/// server reports (device-assignment.md §6.4).
+/// server reports (device-assignment.md §6.4). `nosuid` and `noexec`: nothing
+/// a FUSE server serves runs here or gains privilege. `timeout=` pins how
+/// long the kernel waits for any one answer before it fails the call with
+/// `ETIMEDOUT`, so a server that stops answering (a compromised one
+/// included) can't hold apps in the kernel (network-shares.md §4.4).
+/// How long fusefs waits for a FUSE server's answer to one request.
+pub const FUSE_ANSWER_TIMEOUT_SECS: u32 = 30;
+
 #[cfg(target_os = "freebsd")]
 pub fn fusefs_mount(target: &str, fuse_fd: i32, read_only: bool, fsname: &str) -> io::Result<()> {
-    let opts: [(&str, Option<String>); 7] = [
+    let opts: [(&str, Option<String>); 8] = [
         ("fstype", Some("fusefs".into())),
         ("fspath", Some(target.into())),
         ("from", Some("/dev/fuse".into())),
@@ -812,6 +819,9 @@ pub fn fusefs_mount(target: &str, fuse_fd: i32, read_only: bool, fsname: &str) -
         ("fsname", Some(fsname.into())),
         ("allow_other", None),
         ("default_permissions", None),
+        // fusefs reads it as "timeout=" (vfs_scanopt); its own default is
+        // 60 s, clamped to 0..=600.
+        ("timeout=", Some(FUSE_ANSWER_TIMEOUT_SECS.to_string())),
     ];
     let mut strs: Vec<CString> = Vec::new();
     for (k, v) in &opts {
@@ -832,7 +842,7 @@ pub fn fusefs_mount(target: &str, fuse_fd: i32, read_only: bool, fsname: &str) -
             None => iov.push(libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }),
         }
     }
-    let flags = if read_only { libc::MNT_RDONLY } else { 0 } | libc::MNT_NOSUID;
+    let flags = if read_only { libc::MNT_RDONLY } else { 0 } | libc::MNT_NOSUID | libc::MNT_NOEXEC;
     // SAFETY: each non-null iov_base points into a CString in `strs`, which
     // outlives nmount.
     #[allow(unsafe_code)]

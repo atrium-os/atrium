@@ -140,12 +140,21 @@ remote attacker can reach, and the kernel work is there:
    change, invalidations at bad times, replies out of order). Bugs are
    fixed in the fork; fusefs can also be narrowed to the FUSE features our
    servers use.
-2. **Mount options** set by jaild (today `nosuid`, `allow_other`,
-   `default_permissions`, `portcullis/jaild/src/ffi.rs`), adding for shares
-   and sticks: `noexec`; `daemon_timeout`, so a server that stops answering
-   (a compromised one included, whose own deadlines can't be trusted) gives
-   apps an error instead of holding them in the kernel; `intr`, so a stuck
-   process can be killed.
+2. **Mount options** set by jaild, done 2026-11-14 for every FUSE mount
+   (sticks today): `nosuid` and `noexec` (nothing served runs here or gains
+   privilege), plus `allow_other` and `default_permissions` as before; and
+   an explicit answer timeout, `timeout=30` (jaild
+   `FUSE_ANSWER_TIMEOUT_SECS`; fusefs reads the key `timeout=` and defaults
+   to 60 s, at most 600). Every request the kernel sends waits at most that
+   long and then fails with `ETIMEDOUT`, so a server that stops answering
+   (a compromised one included) can't hold apps in the kernel; the session
+   is not marked dead and recovers when the server answers again. `intr` is
+   left off: fusefs only honours it for servers that implement
+   `FUSE_INTERRUPT`, ours don't, and `SIGKILL` already ends a waiting
+   process. Gate `vm-automount-check.sh`: the flags, a script on the stick
+   that won't run, a stopped Capsa server making `ls` fail after two 30 s
+   waits (DTrace on `fdisp_wait_answ` shows `timeout=30`) and working again
+   once resumed.
 3. **A sysfil profile** for share servers: `networked` minus what a FUSE
    server doesn't need; log-only first, like the others (jail-sysfil.md).
 4. **Kernel memory a server can pin** (queued requests, buffers) that racct
@@ -346,8 +355,9 @@ encryption. It checks:
 
 ## 10. Build order once accepted
 
-1. **S0 kernel side** (§4.4): the mount options, the fusefs fuzzer under
-   KASAN and the share-server sysfil profile, before any network code.
+1. **S0 kernel side** (§4.4): the mount options (done 2026-11-14), the
+   fusefs fuzzer under KASAN and the share-server sysfil profile, before
+   any network code.
 2. **S1 SFTP:** share-volume source in dispensatord, the jail/vnet/pf
    setup, `atrium-share-sftp` with Arca host-key pinning and signing,
    Scrinium's Connect form with the arca-ui slot, the gate's SFTP part.

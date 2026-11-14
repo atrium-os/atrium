@@ -872,6 +872,11 @@ unclaimed device, QEMU's fw_cfg (`acpi0:\_SB_.PCI0.FWCF`).
 Not yet: Curia itself (its Devices page reads this), and the Opifex
 catalog lookup for a `nobody` device (§4.7, point 2).
 
+**Mount options (2026-11-14).** jaild's fusefs mounts are `nosuid,noexec`
+with an explicit 30 s answer timeout (`timeout=30`): a stick server that
+stops answering fails each request with `ETIMEDOUT` instead of holding the
+caller ([network-shares.md](network-shares.md) §4.4).
+
 ### 6.11 As built: grants, a stick's folder in an app's jail (2026-11-14)
 
 The mount side of §4.8:

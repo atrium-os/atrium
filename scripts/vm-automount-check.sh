@@ -176,6 +176,28 @@ if mounted; then
   [ "$(V "stat -f '%Su %Lp' $M")" = "alice 700" ] && ok "alice's alone (0700)" || bad "root dir is '$(V "stat -f '%Su %Lp' $M")'"
   [ "$(V "su -m alice -c 'cat $M/hello.txt'")" = "on the stick" ] && ok "alice reads the file on the stick" || bad "alice cannot read hello.txt"
   V "su -m alice -c 'echo from alice > $M/alice.txt'" && ok "alice writes" || bad "alice cannot write"
+  # network-shares.md §4.4: nothing on a FUSE mount runs or gains privilege.
+  opts=$(V "mount -p | tr -s '\t' ' ' | grep ' $M fusefs' | cut -d' ' -f4")
+  echo ",$opts," | grep -q ',noexec,' && echo ",$opts," | grep -q ',nosuid,' && ok "mounted nosuid,noexec ($opts)" || bad "mount options: '$opts'"
+  V "su -m alice -c 'printf \"#!/bin/sh\necho ran\n\" > $M/run.sh; chmod +x $M/run.sh; $M/run.sh'" 2>/dev/null | grep -q ran && bad "a script on the stick ran" || ok "a script on the stick does not run"
+  V "su -m alice -c 'rm -f $M/run.sh'"
+  # A server that stops answering: each request fails after the answer
+  # timeout (jaild's FUSE_ANSWER_TIMEOUT_SECS, 30 s; fusefs's own default is
+  # 60) instead of holding alice. ls makes two requests in a row, so about
+  # 60 s (DTrace on fdisp_wait_answ shows timeout=30 per wait).
+  sp=$(V "jls -j atrium-capsa-$PART jid 2>/dev/null | xargs -I{} pgrep -j {} atrium-capsa-fuse | head -1")
+  if [ -n "$sp" ]; then
+    V "kill -STOP $sp"
+    t0=$(date +%s)
+    out=$(V "su -m alice -c 'ls $M/'" 2>&1)
+    t=$(( $(date +%s) - t0 ))
+    V "kill -CONT $sp"
+    [ $t -ge 25 ] && [ $t -le 75 ] && echo "$out" | grep -qi 'timed out' && ok "a stopped server: ls fails after ${t}s ($(echo "$out" | head -1))" || bad "stopped server: ${t}s, '$out'"
+    sleep 2
+    [ "$(V "su -m alice -c 'cat $M/hello.txt'")" = "on the stick" ] && ok "and works again once it answers" || bad "after the stop: no hello.txt"
+  else
+    bad "no atrium-capsa-fuse in atrium-capsa-$PART"
+  fi
   V "su -m bob -c 'ls $M' >/dev/null 2>&1" && bad "bob can list alice's stick" || ok "bob cannot list it"
   V "jls -n name | grep -q 'name=atrium-capsa-$PART'" && ok "served from jail atrium-capsa-$PART" || bad "no jail atrium-capsa-$PART"
   sleep 3
