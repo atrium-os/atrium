@@ -1,7 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** proposal, 2026-11-14 (§7.4 very large documents and §9.3 very large decks added the same day). Scope only, nothing built. The decisions in §17 are
-Shankar's to make; each has a recommendation.
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). Scope only, nothing built; O1 is next.
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -771,9 +770,9 @@ The spreadsheet goes first: it carries the hardest engine work (scale, recalc), 
 only the simplest text (one-line cells), and the grid widget it forces is useful to other
 apps at once.
 
-## 17. Decisions for Shankar
+## 17. Decisions (accepted 2026-11-14)
 
-Each with a recommendation.
+Shankar agreed to all of them as recommended, 2026-11-14.
 
 1. **Suite shape: three apps over shared crates, one jailed process per document.**
    *Recommend yes.* The alternative, one process per app holding many documents with a

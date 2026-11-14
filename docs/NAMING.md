@@ -45,6 +45,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **Peer broker** | **Concursus** | a coming-together | symmetric device-to-device channel broker; STUN/TURN-equivalent + signaling + typed role messages |
 | **Name resolver** | **Nomenclator** | the Roman servant who whispered names to his master | resolves `atrium-doc://` / `atrium-app://` names through publisher manifests to content hashes |
 | **IDE (reference dev environment)** | **Artifex** | skilled artisan / maker — "one who makes," paired with Opifex (the maker of packages) | reference Insula IDE — native Pergola app, Limen-extension model, LSP/DAP host, Stoa-embedded terminal; flagship demonstrator of the no-Electron pitch (§10.9 of insula spec) |
+| **Office suite engine** *(accepted 2026-11-14)* | **Officina** | workshop | shared crates (document core, rich text, grid and formulas, drawing, converters, PDF) behind the plain-named apps `atrium-write`, `atrium-sheets`, `atrium-slides`. See `docs/spec/officina.md` |
 
 ## Foundation apps
 
