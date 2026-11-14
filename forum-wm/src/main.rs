@@ -203,6 +203,9 @@ fn main() -> io::Result<()> {
     // and how the session last left them (arrangement per set, scales).
     let store = forum_wm::displays::default_path();
     wm.displays = forum_wm::displays::load(&store);
+    // The dock reports its height once, at its start: keep the space it
+    // last reported until it says again (it may be up already).
+    wm.screen.dock_h = wm.displays.dock_pt as i32;
     wm.display_store = Some(store);
     match io_conn.conn.wm_outputs() {
         Ok(r) => {

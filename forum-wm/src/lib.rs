@@ -427,6 +427,10 @@ pub mod displays {
         pub spans: HashMap<Vec<u64>, Vec<forum_ctl::SpanGroupInfo>>,
         /// Apps whose zoom stays on one monitor.
         pub no_span: std::collections::BTreeSet<String>,
+        /// The dock's reported height in points (`Intent::ReserveBottom`),
+        /// so a restarted WM keeps the dock's space before the dock (which
+        /// reports once, at its start) says it again. 0: none reported.
+        pub dock_pt: u32,
     }
 
     /// The set a list of monitors makes, as `sets` keys it: every monitor
@@ -537,6 +541,9 @@ pub mod displays {
             for a in &self.no_span {
                 lines.push(format!("nospan {a}"));
             }
+            if self.dock_pt != 0 {
+                lines.push(format!("dock {}", self.dock_pt));
+            }
             let mut t = String::from("# forum-wm: where each set of monitors sat, monitor UI sizes, span groups\n");
             for l in lines {
                 t.push_str(&l);
@@ -566,6 +573,11 @@ pub mod displays {
                             if members.len() >= 2 {
                                 m.spans.entry(key).or_default().push(forum_ctl::SpanGroupInfo { members, gap, gap_mm });
                             }
+                        }
+                    }
+                    Some(&"dock") if w.len() == 2 => {
+                        if let Ok(pt) = w[1].parse::<u32>() {
+                            m.dock_pt = pt.min(forum_ctl::MAX_RESERVE_PT);
                         }
                     }
                     Some(&"nospan") if w.len() == 2 => {
@@ -1189,6 +1201,10 @@ pub mod daemon {
         /// re-lay out. Clamped to `forum_ctl::MAX_RESERVE_PT`.
         pub fn set_dock_reserve(&mut self, conn: &mut impl FrescoConn, pt: u32) -> io::Result<()> {
             let pt = pt.min(forum_ctl::MAX_RESERVE_PT) as i32;
+            if self.displays.dock_pt != pt as u32 {
+                self.displays.dock_pt = pt as u32;
+                self.save_displays();
+            }
             if pt == self.screen.dock_h {
                 return Ok(());
             }
@@ -2753,6 +2769,10 @@ mod tests {
         assert_eq!(wm.screen.work_area().h, 1080 - 38 - 120, "a new mode keeps the dock's height");
         handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 5000 });
         assert_eq!(wm.screen.dock_h, forum_ctl::MAX_RESERVE_PT as i32);
+        // Remembered, so a restarted WM keeps the dock's space.
+        handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 120 });
+        let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
+        assert_eq!(m.dock_pt, 120);
     }
 
     #[test]
