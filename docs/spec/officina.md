@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2).
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -879,6 +879,51 @@ Gates, on the 4-core cloud machine:
 Not in O2: a "save changes?" prompt, the jailed one-process-per-document launch (§3; the
 app runs as a plain Limen client for now), multiple sheets in the UI, row insert and
 delete, fill handle, find, number formats (O4), visible-first recalculation.
+
+### 16.3 O4a as built (2026-11-14): `.xlsx` in and out
+
+O4 is built in steps: **O4a** `.xlsx` values, formulas and sizes (this section); O4b
+styles and number formats; O4c `.ods`; O4d sort, filter, tables and defined names; O4e
+charts.
+
+- **`officina-convert`** (new crate; deps `miniz_oxide` and `quick-xml`, both permissive,
+  pure Rust):
+  - a ZIP reader for hostile archives (bounded entries and names, every offset checked,
+    an entry inflates to at most its declared size and 4 GiB, the archive to 16 GiB,
+    a declared ratio over 1000:1 refused, CRC checked, ZIP64 read, encryption refused)
+    and a writer (ZIP64 when needed);
+  - the `.xlsx` reader: sheets, shared and inline strings (rich runs flattened,
+    `_xHHHH_` escapes), numbers, booleans, errors, formulas (plain, shared fills as one
+    formula group, array formulas in their first cell, `_xlfn.` prefixes dropped),
+    column widths and row heights, the 1904 flag. A sheet part is inflated on one
+    thread, cut at row ends into 8 MB pieces and parsed on every core, then merged in
+    order;
+  - the `.xlsx` writer: one part per sheet, shared strings, a fill as one shared
+    formula with its cached results, `_xlfn.` for newer functions, sizes, and Excel's
+    view of our extra errors (a cycle writes 0, as Excel shows it; over a limit
+    `#NUM!`). A sheet past 1,048,576 × 16,384 is refused by name;
+  - the fidelity report (§5.2): notes counted, with examples: approximate, inert,
+    dropped. On open, every formula's result is recalculated and compared with the
+    file's cached result; differences go in the report (a differential against
+    whatever wrote the file);
+  - the **converter process** `officina-convert xlsx`: the file on stdin, the native
+    file on stdout, notes on stderr. It reads its input, caps CPU (60 s) and address
+    space (8 GiB), and on FreeBSD enters Capsicum capability mode before parsing a byte
+    (checked in the VM with `truss`: `cap_enter() = 0`, then its worker threads). The
+    throwaway jail (portcullis one-shot) is the next wall to add around it.
+- **`atrium-sheets`** opens `.xlsx` and `.xlsm` through the converter process (the
+  parser never runs in the document's process) and saves `.xlsx` with the writer, in
+  process, as §5.2 says. The status line shows the report's first note; all go to the
+  document's `notes`.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| round trip | values, text with markup characters and escapes, booleans, errors, a 500-row fill (back as one group), formulas over other sheets and newer functions, sizes: everything equal after write and read; the reader's differential finds 0 differences (`tests/roundtrip.rs`) |
+| LibreOffice, both ways | `examples/lo_check.rs`: our file of the 152 conformance formulas opens in LibreOffice 24 (headless) and is saved again by it; our reader opens LibreOffice's file, our engine recalculates, and every result is still Excel's. LibreOffice's own results agree with ours on 145; the 7 others are LibreOffice departing from Excel (`"z"<TRUE`, `TRUE=1`, `SQRT(-1)` and `LN(0)` as `#VALUE!`, `CONCATENATE` with `TRUE`, `VLOOKUP` past the range, no `XLOOKUP`). No Excel runs here; a corpus of Excel-saved files is the next differential |
+| hostile input | 3,000 mutated packages, every truncation, and 1,500 packages with mutated XML in every part (byte flips, inserted tokens, cuts): errors, no panic, no hang |
+| 1,048,576 × 20 `.xlsx` | 177 MB file, 730 MB of sheet XML: read in 3.7 s on 4 cores (13.5 s on one, before the pieces); native hand-off 0.6 s out and 0.6 s in. So about 5 s to the document on screen, the target's edge; the screen does not yet show the top rows while the rest loads. Writing it takes 12 s (one deflate stream; parallel deflate is the fix) |
 
 ## 17. Decisions (accepted 2026-11-14)
 

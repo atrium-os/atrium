@@ -1,0 +1,8 @@
+//! `.xlsx` (SpreadsheetML): [`read`] for the converter process, [`write`] for the
+//! document process.
+
+pub mod read;
+pub mod write;
+
+pub use read::{read, Loaded, XlsxError};
+pub use write::write;

@@ -1,0 +1,27 @@
+[package]
+name = "officina-convert"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's converters for foreign formats (docs/spec/officina.md §5.2): a bounded ZIP reader and writer, .xlsx in and out. The reader runs in a sandboxed converter process (`officina-convert`); the writer runs in the document process over our own model."
+
+[lib]
+name = "officina_convert"
+path = "src/lib.rs"
+
+[[bin]]
+name = "officina-convert"
+path = "src/bin/officina_convert.rs"
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+officina-grid = { path = "../officina-grid" }
+# Pure Rust deflate (MIT OR Zlib OR Apache-2.0); the repo already uses it via navigator-fonts.
+miniz_oxide = "0.8"
+# Streaming XML (MIT); bounded by our own limits on top.
+quick-xml = "0.37"
+libc = "0.2"
+
+[profile.release]
+debug = 1

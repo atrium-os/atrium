@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use atrium_sheets::app::{Cmd, Sheets, Ui, PICKER_SLOT};
 use atrium_sheets::bench::{self, Frame, Pattern, Report};
 use atrium_sheets::doc::{self, Doc};
+use atrium_sheets::files::{format_of, load, stem_of, Format};
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
@@ -45,9 +46,9 @@ const SYNC_EVERY: Duration = Duration::from_secs(2);
 /// Where the user's file is, for Save.
 enum Target {
     /// A picked file, open read-write.
-    Picked { file: File, native: bool },
+    Picked { file: File, format: Format },
     /// A path (development, or written by Save As).
-    Path { path: PathBuf, native: bool },
+    Path { path: PathBuf, format: Format },
 }
 
 /// What the picker is up for.
@@ -70,27 +71,6 @@ fn new_autosave_dir(root: &Path) -> PathBuf {
     root.join(format!("{}-{n}", std::process::id()))
 }
 
-fn is_native(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".osheet")
-}
-
-/// A document from a file's bytes, by its name's extension.
-fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
-    if is_native(name) {
-        return Doc::from_native(name, data).map_err(|e| format!("“{name}” isn't a sheet this app can read: {e}"));
-    }
-    let (mut d, st) = Doc::from_csv(name, data).map_err(|e| format!("“{name}” couldn't be read as CSV: {e:?}"))?;
-    let mut notes = vec![format!("Opened “{name}”: {} rows × {} columns", st.rows, st.cols)];
-    if st.latin {
-        notes.push("read as Windows-1252 (not UTF-8)".into());
-    }
-    if st.cut > 0 {
-        notes.push(format!("{} over-long cells cut", st.cut));
-    }
-    d.status = notes.join("; ") + ".";
-    Ok(d)
-}
-
 fn read_all(f: &mut File) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     f.seek(SeekFrom::Start(0))?;
@@ -101,11 +81,11 @@ fn read_all(f: &mut File) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn encode(d: &Doc, native: bool) -> io::Result<Vec<u8>> {
-    if native {
-        d.write_native(Vec::new())
-    } else {
-        d.write_csv(Vec::new())
+fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
+    match format {
+        Format::Native => d.write_native(Vec::new()),
+        Format::Csv => d.write_csv(Vec::new()),
+        Format::Xlsx => officina_convert::xlsx::write(&d.wb, Vec::new()),
     }
 }
 
@@ -150,12 +130,6 @@ fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "every name is taken"))
 }
 
-fn stem_of(name: &str) -> &str {
-    match name.rfind('.') {
-        Some(i) if i > 0 => &name[..i],
-        _ => name,
-    }
-}
 
 struct Run {
     sheets: Sheets,
@@ -196,12 +170,12 @@ impl Run {
 
     fn save(&mut self) -> bool {
         let Some(t) = self.target.as_mut() else { return false };
-        let native = match t {
-            Target::Picked { native, .. } | Target::Path { native, .. } => *native,
+        let format = match t {
+            Target::Picked { format, .. } | Target::Path { format, .. } => *format,
         };
         let r = {
             let d = self.sheets.doc.borrow();
-            encode(&d, native).and_then(|bytes| match t {
+            encode(&d, format).and_then(|bytes| match t {
                 Target::Picked { file, .. } => write_over(file, &bytes),
                 Target::Path { path, .. } => {
                     let mut f = OpenOptions::new().write(true).open(&*path)?;
@@ -212,7 +186,7 @@ impl Run {
         let mut d = self.sheets.doc.borrow_mut();
         match r.and_then(|_| d.saved()) {
             Ok(()) => {
-                let lost = !native && d.wb.groups().next().is_some();
+                let lost = format == Format::Csv && d.wb.groups().next().is_some();
                 d.status = if lost { format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name) } else { format!("Saved “{}”.", d.name) };
             }
             Err(e) => d.status = format!("Couldn't save “{}”: {e}. Your changes are still here and in the autosave.", d.name),
@@ -225,7 +199,7 @@ impl Run {
     fn save_into(&mut self, dir: &Path) {
         let (stem, bytes) = {
             let d = self.sheets.doc.borrow();
-            (stem_of(&d.name).to_string(), encode(&d, true))
+            (stem_of(&d.name).to_string(), encode(&d, Format::Native))
         };
         let r = bytes.and_then(|b| write_new(dir, &stem, &b));
         match r {
@@ -237,7 +211,7 @@ impl Run {
                     let _ = d.saved();
                     d.status = format!("Saved as “{name}”.");
                 }
-                self.target = Some(Target::Path { path, native: true });
+                self.target = Some(Target::Path { path, format: Format::Native });
                 self.sheets.changed();
             }
             Err(e) => self.set_status(format!("Couldn't save there: {e}.")),
@@ -249,11 +223,11 @@ impl Run {
         let mut f = File::from(fd);
         match read_all(&mut f).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
             Ok(mut d) => {
-                let native = is_native(&name);
+                let format = format_of(&name);
                 if !write {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
                 }
-                self.show(d, write.then_some(Target::Picked { file: f, native }));
+                self.show(d, write.then_some(Target::Picked { file: f, format }));
             }
             Err(e) => self.set_status(e),
         }
@@ -284,7 +258,7 @@ fn main() {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
             match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, &data)) {
-                Ok(d) => first = Some((d, Some(Target::Path { path: p, native: is_native(&name) }))),
+                Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
                 Err(e) => eprintln!("atrium-sheets: {e}"),
             }
         }
@@ -353,7 +327,7 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
-                        Asking::Open => Filter { kind: Kind::File, extensions: ["csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into() },
+                        Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);

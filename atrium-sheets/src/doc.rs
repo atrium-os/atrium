@@ -299,6 +299,9 @@ pub struct Doc {
     pub status: String,
     /// The separator CSV saves with: the one the file was read with.
     pub csv_sep: u8,
+    /// The fidelity report of the import that made this document (docs/spec/officina.md
+    /// §5.2), one line per note.
+    pub notes: Vec<String>,
 }
 
 impl Doc {
@@ -309,7 +312,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',' }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.

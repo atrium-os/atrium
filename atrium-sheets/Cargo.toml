@@ -21,6 +21,7 @@ path = "examples/scroll_cost.rs"
 [dependencies]
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
+officina-convert = { path = "../officina-convert" }
 pergola = { path = "../pergola" }
 limen = { path = "../limen" }
 fresco-protocol = { path = "../fresco-protocol" }
