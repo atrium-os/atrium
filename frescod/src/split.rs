@@ -702,6 +702,12 @@ impl Broker {
                     log::debug!("frescod: client {}: window {local} has no keys to give", r.client_id);
                 }
             }
+            Msg::FocusEmbed { .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("focus from an unknown window")?;
+                if !self.comp.lock().unwrap().focus_embed(global, r.client_id as u32) {
+                    log::debug!("frescod: client {}: window {local} has no keys to hand on", r.client_id);
+                }
+            }
             Msg::PadClaim { device, claim, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global as u32).ok_or("pad claim for unknown window")?;
                 crate::tactus_client::claim(r.client_id, global, device, claim);

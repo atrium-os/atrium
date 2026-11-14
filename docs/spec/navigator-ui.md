@@ -1277,7 +1277,14 @@ Each step runs in the VM on headless frescod before the next.
        built 2026-11-14 after the first step 7 run found forum-wm only focused top-level
        surfaces): arrows and Ctrl-plus go to its ScrollView, and the §9 shortcuts come back
        through `Key`. A press in the chrome takes the keys back.
-     - Not yet: F6 (Pergola has no function keys).
+     - F6 and Shift-F6 (2026-11-14) move the keys round rail, toolbar and page. On the rail
+       the current trail gets a focus ring and Up/Down go through the trails (Enter or Esc
+       leaves); the toolbar is the Where field; the page gets them through frescod's new
+       `OP_WINDOW_FOCUS_EMBED` (a window with the keys hands them to the window in its
+       topmost slot; only its owner, only while it has them; split mode sends it on as
+       `Msg::FocusEmbed`). The page hands F6 back (limen `ChromeKey::F6`) and gives the
+       chrome the focus, which moves on to the rail. The page is skipped while none is shown
+       or history is up. Pergola gained function keys (`Key::F(n)`).
    - **Accessibility tree** (§10). `navigator_ui::ax` builds the window's tree in atrium-ax's
      roles: the rail a `tree` with each trail an item and the current one's path nested, the
      toolbar a `toolbar` (the Where field a `combo-box`, presence and Keep `switch`es), the

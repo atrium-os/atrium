@@ -14,6 +14,7 @@ fn samples() -> Vec<Msg> {
         Msg::FocusParent { window: 9 },
         Msg::WindowMinSize { window: 9, width: 320, height: 0 },
         Msg::WindowMinSize { window: 9, width: 8192, height: 8192 },
+        Msg::FocusEmbed { window: 9 },
         Msg::FrameReady { window: 1, slot: 1, seq: 77 },
         Msg::Client { width: 1920, height: 1080, refresh_mhz: 60000, pixels: false, scale_milli: 1000 },
         Msg::Client { width: 800, height: 600, refresh_mhz: 0, pixels: true, scale_milli: 1500 },

@@ -275,6 +275,8 @@ pub static PAD_CLAIM: std::sync::OnceLock<PadClaimFn> = std::sync::OnceLock::new
 /// Unset in frescod itself, where the frontend handles it.
 pub type FocusParentFn = Box<dyn Fn(u8, u32) + Send + Sync>;
 pub static FOCUS_PARENT: std::sync::OnceLock<FocusParentFn> = std::sync::OnceLock::new();
+/// The same for `OP_WINDOW_FOCUS_EMBED`.
+pub static FOCUS_EMBED: std::sync::OnceLock<FocusParentFn> = std::sync::OnceLock::new();
 
 /// Run after `OP_POPUP_GRANT` is dispatched and before its answer goes
 /// out: a renderer sends the grant on to frescod now, so it is there
@@ -729,8 +731,13 @@ pub fn reader_loop(
 
         /* An exclusive gamepad claim (fresco-capabilities.md §4). No reply;
          * the answer is EV_GAMEPAD_CLAIM. */
-        if msg.op == fresco_protocol::control::OP_WINDOW_FOCUS_PARENT {
-            if let Some(f) = FOCUS_PARENT.get() {
+        let focus_hook = match msg.op {
+            fresco_protocol::control::OP_WINDOW_FOCUS_PARENT => FOCUS_PARENT.get(),
+            fresco_protocol::control::OP_WINDOW_FOCUS_EMBED => FOCUS_EMBED.get(),
+            _ => None,
+        };
+        if matches!(msg.op, fresco_protocol::control::OP_WINDOW_FOCUS_PARENT | fresco_protocol::control::OP_WINDOW_FOCUS_EMBED) {
+            if let Some(f) = focus_hook {
                 if let Ok(p) = fresco_protocol::decode::<fresco_protocol::WindowFocusParentPayload>(&msg.payload) {
                     f(client_id, p.window_id);
                 }

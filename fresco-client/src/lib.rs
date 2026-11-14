@@ -768,6 +768,13 @@ impl Connection {
             &fresco_protocol::WindowFocusParentPayload { window_id })
     }
 
+    /// A window with the keys gives them to the window shown in its
+    /// topmost slot (`OP_WINDOW_FOCUS_EMBED`; the Navigator's F6).
+    pub fn window_focus_embed(&mut self, window_id: u32) -> io::Result<()> {
+        self.send_window_managed(control::OP_WINDOW_FOCUS_EMBED,
+            &fresco_protocol::WindowFocusParentPayload { window_id })
+    }
+
     pub fn window_request_close(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_REQUEST_CLOSE,
             &WindowRequestClosePayload { window_id })

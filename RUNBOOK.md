@@ -5726,7 +5726,7 @@ in the VM (61/61).
 Step 7 runs last (ui9.log, with `NAVIGATOR_UI_AX=1` so the accessibility tree is logged as `ax` lines):
 the page's image comes with its ticket (`navigator-page: 1 images with the page` in limend.log);
 Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in limend.log, the UI's
-`find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
+`find: N matches, at K`), Enter to the next match, Esc; F6 four times (HID 0x3f: the rail with the Trails tree `[focused]`, the toolbar, `F6: the page has the keys`, then from the page `a key from the page: NextRegion` back to the rail) and Esc; the Aa pop-up pressed at its scene
 coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
 the child's `laid out again: text 112%` and the `reading` record in trails.json; Ctrl-plus; Ctrl-H,
 typing `impl` and Enter opening Impluvium from history (ui9 runs with `NAVIGATOR_UI_IDLE_S=60`,

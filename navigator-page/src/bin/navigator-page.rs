@@ -404,7 +404,8 @@ impl Run {
                     out.send(k);
                     // Find, the Where field, history, a new trail: what
                     // comes next is typed in the chrome.
-                    return m.ctrl && !m.alt && matches!(chars.to_ascii_lowercase().as_str(), "f" | "l" | "h" | "t" | "n");
+                    // F6: the keys leave the page for the chrome's next part.
+                    return key == pergola::Key::F(6) || (m.ctrl && !m.alt && matches!(chars.to_ascii_lowercase().as_str(), "f" | "l" | "h" | "t" | "n"));
                 }
             }
             Some(Event::PointerDown { at }) => {
@@ -426,6 +427,7 @@ fn chrome_key(key: pergola::Key, m: pergola::Modifiers, chars: &str) -> Option<T
     use pergola::Key;
     let k = match key {
         Key::Escape => ChromeKey::Escape,
+        Key::F(6) => ChromeKey::F6,
         Key::Tab if m.ctrl => ChromeKey::Tab,
         Key::Left if m.alt => ChromeKey::Left,
         Key::Right if m.alt => ChromeKey::Right,

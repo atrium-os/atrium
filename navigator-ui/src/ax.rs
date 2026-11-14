@@ -171,7 +171,8 @@ pub fn tree(s: &Shell) -> Node {
         }
         trails.push(item);
     }
-    top.push(Node::new(id::RAIL, "tree", "Trails").kids(trails));
+    let rail = Node::new(id::RAIL, "tree", "Trails").kids(trails);
+    top.push(if s.rail_focus { rail.with(state::FOCUSED) } else { rail });
 
     // The toolbar.
     let mut bar = vec![

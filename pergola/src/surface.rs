@@ -258,7 +258,9 @@ impl Edges {
             [(edge_key(0.0), 0.0), (edge_key(len), dev)]
         });
         let reach = edge_key(NEAR);
-        let held = self.groups.get(&group).map(|g| g[axis as usize].range(key - reach..=key + reach));
+        // Saturating: an edge far off (a huge or infinite extent) saturates
+        // its key at i32::MAX, and `key + reach` would wrap below `key - reach`.
+        let held = self.groups.get(&group).map(|g| g[axis as usize].range(key.saturating_sub(reach)..=key.saturating_add(reach)));
         let all = own.iter().flatten().copied().chain(held.into_iter().flatten().map(|(&b, &(dev, _))| (b, dev)));
         // The same point, else outside the span first (a box's own
         // border), then inside.
@@ -268,11 +270,11 @@ impl Edges {
                 return dev;
             }
             // In whole 1/64 pt, so a 1 pt inset is exactly 1 pt.
-            let dist = (key - b).abs() as f32 / 64.0;
+            let dist = (key as i64 - b as i64).abs() as f32 / 64.0;
             if dist > NEAR {
                 continue;
             }
-            let outside = (key - b) as f32 * toward > 0.0;
+            let outside = (key as i64 - b as i64) as f32 * toward > 0.0;
             let rank = dist + if outside { 0.0 } else { NEAR };
             if best.map_or(true, |(r, _)| rank < r) {
                 let px = (dist * k).round().max(1.0);
@@ -672,6 +674,17 @@ impl Surface for FrescoSurface {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_edge_far_off_saturates_instead_of_panicking() {
+        // A tall page (or an infinite clip) puts an edge past i32 in 1/64 pt.
+        let mut e = super::Edges::default();
+        e.reset_if(1.5);
+        e.hold(1, super::ROOT, &[(1, 1.0e30, -1.0)]);
+        let _ = e.place(super::ROOT, 1, f32::MAX, 1.0);
+        let _ = e.place(super::ROOT, 1, f32::INFINITY, -1.0);
+        let _ = e.place(super::ROOT, 1, -1.0e30, 1.0);
+    }
+
     use super::snap_span;
 
     /// Drawn edges fall on device pixels at fractional scales, 1 pt lines

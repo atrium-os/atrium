@@ -1149,6 +1149,30 @@ impl Compositor {
         self.focus == Some(slot.parent)
     }
 
+    /// `OP_WINDOW_FOCUS_EMBED`: `by`'s window `parent`, with the keys,
+    /// gives them to the child shown in its topmost slot (a sheet's
+    /// parent never: the sheet holds them). Refused for another client's
+    /// window, one without the keys, or one with no child shown.
+    pub fn focus_embed(&mut self, parent: WindowId, by: ClientId) -> bool {
+        let Some(w) = self.windows.get(&parent) else { return false };
+        if w.owner != by || w.slot.is_some() || self.base_keyboard_window() != parent || self.key_popup().is_some() || self.lock.is_some() {
+            return false;
+        }
+        let child = self
+            .windows
+            .iter()
+            .filter(|(_, c)| !c.hidden && c.slot.is_some_and(|s| s.parent == parent))
+            .max_by_key(|(&id, c)| (c.slot.map_or(0, |s| s.z), id))
+            .map(|(&id, _)| id);
+        match child {
+            Some(c) => {
+                self.set_embed_focus(Some(c));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The slot child that has the keys now: the press-chosen one, while
     /// it is shown in a slot of the focused window.
     pub fn embed_child_focused(&self) -> Option<WindowId> {
@@ -2288,6 +2312,16 @@ mod notification_tests {
         assert_eq!(c.keyboard_window(), e as u32, "no focus (a pop-up went): the topmost window's page has the keys");
         c.hide(e);
         assert_eq!(c.keyboard_window(), p as u32, "a withdrawn page has none");
+        assert!(!c.focus_embed(p, 1), "nothing shown to give them to");
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([0.0, 40.0, 400.0, 260.0]), 0), Ok(()));
+        c.set_focus_no_raise(Some(p));
+        c.press_focus(p);
+        assert!(!c.focus_embed(p, 3), "not the caller's window");
+        assert!(!c.focus_embed(e, 2), "a child has no slot of its own");
+        assert!(c.focus_embed(p, 1), "F6: the chrome gives the page the keys");
+        assert_eq!(c.keyboard_window(), e as u32);
+        c.set_focus_no_raise(Some(other));
+        assert!(!c.focus_embed(p, 1), "a window without the keys can't hand them on");
     }
 
     #[test]

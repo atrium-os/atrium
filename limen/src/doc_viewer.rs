@@ -130,6 +130,9 @@ pub enum ChromeKey {
     Left,
     Right,
     Escape,
+    /// F6 (Shift-F6): the next (previous) part of the chrome has the keys
+    /// (navigator-ui.md §9).
+    F6,
 }
 
 /// The longest `chars` in `Key` (one character).
@@ -194,7 +197,7 @@ impl ToParent {
             ToParent::Zoomed { zoom_64 } => (Reading::ZOOM_MIN..=Reading::ZOOM_MAX).contains(zoom_64),
             ToParent::Key { key, chars, ctrl, alt, .. } => {
                 clean_text(chars, KEY_CHARS_MAX) && chars.chars().count() <= 1 && (*key != ChromeKey::Char || !chars.is_empty())
-                    && (*key == ChromeKey::Escape || *ctrl || *alt)
+                    && (matches!(key, ChromeKey::Escape | ChromeKey::F6) || *ctrl || *alt)
             }
         };
         ok.then_some(m)

@@ -412,6 +412,16 @@ fn main() {
             }
         }));
     }
+    // And handing them to what a window embeds (F6): frescod too.
+    {
+        let (broker, comp) = (broker.clone(), comp.clone());
+        let _ = socket_server::FOCUS_EMBED.set(Box::new(move |_, window| {
+            let known = u16::try_from(window).is_ok_and(|id| id != 0 && comp.lock().unwrap().windows.contains_key(&id));
+            if known {
+                send(&broker, &Msg::FocusEmbed { window });
+            }
+        }));
+    }
     // A gamepad claim goes to frescod, which holds the pads and decides.
     {
         let (broker, comp) = (broker.clone(), comp.clone());

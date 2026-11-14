@@ -161,9 +161,27 @@ fn decode_key(hid: u16, mods: &Modifiers) -> (Key, String) {
         0x4D => (Key::End,       String::new()),
         0x4B => (Key::PageUp,    String::new()),
         0x4E => (Key::PageDown,  String::new()),
+        0x3A..=0x45 => (Key::F((hid - 0x3A + 1) as u8), String::new()),
         // Anything else: use Char with empty content — the Down event
         // still reaches handlers that want to react to non-printable
         // keys, but TextField won't append anything.
         _ => (Key::Char, String::new()),
+    }
+}
+
+#[cfg(test)]
+mod function_key_tests {
+    use super::*;
+
+    #[test]
+    fn function_keys_decode_by_number_and_modifiers_are_the_hid_byte() {
+        let none = decode_modifiers(0);
+        assert_eq!(decode_key(0x3A, &none).0, Key::F(1));
+        assert_eq!(decode_key(0x3F, &none).0, Key::F(6));
+        assert_eq!(decode_key(0x45, &none).0, Key::F(12));
+        let m = decode_modifiers(0x10);
+        assert!(m.ctrl && !m.shift, "right Ctrl");
+        let m = decode_modifiers(0x02);
+        assert!(m.shift && !m.ctrl, "left Shift");
     }
 }

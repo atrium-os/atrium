@@ -491,7 +491,10 @@ impl Live {
                         let ev = crate::keys::from_child(key, &chars, ctrl, shift, alt);
                         if let Some(a) = crate::keys::action(&ev) {
                             eprintln!("navigator-ui: a key from the page: {a:?}");
-                            s.apply(a, crate::ui::now_ms());
+                            match a {
+                                crate::keys::Action::NextRegion | crate::keys::Action::PrevRegion => s.region_from_page(a == crate::keys::Action::NextRegion),
+                                _ => s.apply(a, crate::ui::now_ms()),
+                            }
                             changed = true;
                         } else if key == limen::doc_viewer::ChromeKey::Escape {
                             changed |= s.escape();

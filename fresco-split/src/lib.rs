@@ -100,6 +100,9 @@ pub enum Msg {
     /// `OP_WINDOW_FOCUS_PARENT` from the client: its embedded window gives
     /// the keys to the window it is embedded in (frescod checks it has them).
     FocusParent { window: u32 },
+    /// `OP_WINDOW_FOCUS_EMBED` from the client: its window gives the keys
+    /// to the window in its topmost slot (frescod checks it has them).
+    FocusEmbed { window: u32 },
     /// A window's title changed.
     WindowTitle { window: u32, title: String },
     /// A window's minimum size, points (`WindowHints.min_size`; 0 = none),
@@ -251,6 +254,7 @@ mod kind {
     pub const WINDOW_DESTROY: u32 = 2;
     pub const FOCUS_PARENT: u32 = 16;
     pub const WINDOW_MIN_SIZE: u32 = 17;
+    pub const FOCUS_EMBED: u32 = 18;
     pub const WINDOW_TITLE: u32 = 3;
     pub const FRAME_READY: u32 = 4;
     pub const CLIENT: u32 = 0x100;
@@ -344,6 +348,7 @@ impl Msg {
             Msg::WindowCreate { window, .. }
             | Msg::WindowDestroy { window }
             | Msg::FocusParent { window }
+            | Msg::FocusEmbed { window }
             | Msg::WindowTitle { window, .. }
             | Msg::WindowMinSize { window, .. }
             | Msg::FrameReady { window, .. }
@@ -411,6 +416,7 @@ impl Msg {
                 r.put(3, *height);
                 r
             }
+            Msg::FocusEmbed { window } => Rec::new(FOCUS_EMBED, *window),
             Msg::WindowTitle { window, title } => {
                 let mut r = Rec::new(WINDOW_TITLE, *window);
                 r.title(title);
@@ -723,7 +729,7 @@ impl Msg {
         let (args, titled) = match k {
             WINDOW_CREATE => (6, true),
             WINDOW_TITLE => (0, true),
-            WINDOW_DESTROY | CLOSE | FOCUS_PARENT => (0, false),
+            WINDOW_DESTROY | CLOSE | FOCUS_PARENT | FOCUS_EMBED => (0, false),
             WINDOW_MIN_SIZE => (2, false),
             FRAME_READY | GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
@@ -813,6 +819,7 @@ impl Msg {
                 let side = |v: u32| if v <= MAX_MIN_SIZE_PT { Ok(v) } else { Err(Refused("minimum size out of range")) };
                 Msg::WindowMinSize { window, width: side(r.get(2))?, height: side(r.get(3))? }
             }
+            FOCUS_EMBED => Msg::FocusEmbed { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
             CLIENT => Msg::Client {
@@ -1021,6 +1028,7 @@ impl Msg {
             Msg::WindowCreate { .. }
                 | Msg::WindowDestroy { .. }
                 | Msg::FocusParent { .. }
+                | Msg::FocusEmbed { .. }
                 | Msg::WindowTitle { .. }
                 | Msg::WindowMinSize { .. }
                 | Msg::FrameReady { .. }

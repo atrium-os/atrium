@@ -108,6 +108,20 @@ pub struct Shell {
     pub reading_open: bool,
     /// Ctrl-H (§5.5): drawn where the page is, the page's slot withdrawn.
     pub history: Option<HistoryView>,
+    /// F6 put the keys on the rail (§9): Up and Down go through the
+    /// trails, Enter or Escape leaves it.
+    pub rail_focus: bool,
+    /// F6 asked for the page to have the keys: the main loop hands them
+    /// over (frescod `OP_WINDOW_FOCUS_EMBED`) and clears it.
+    pub focus_page: bool,
+}
+
+/// What F6 moves the keys between (§9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Rail,
+    Toolbar,
+    Page,
 }
 
 /// The live page's state, as navigatord and the page child reported it.
@@ -180,7 +194,7 @@ pub struct Geo {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -598,7 +612,7 @@ impl Shell {
     pub fn apply(&mut self, a: Action, _now: f64) {
         self.popover = false;
         self.reading_open = false;
-        if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail) {
+        if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail | Action::NextRegion | Action::PrevRegion) {
             self.history = None;
         }
         match a {
@@ -649,6 +663,16 @@ impl Shell {
                 }
             }
             Action::Reload => self.reload(),
+            Action::NextRegion | Action::PrevRegion => {
+                let from = if self.editing.is_some() {
+                    Some(Region::Toolbar)
+                } else if self.rail_focus {
+                    Some(Region::Rail)
+                } else {
+                    None
+                };
+                self.move_region(from, a == Action::NextRegion);
+            }
             Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
                 let mut r = self.store.reading();
                 r.zoom_64 = match a {
@@ -661,6 +685,76 @@ impl Shell {
         }
     }
 
+    // -- F6 (§9) -------------------------------------------------------------
+
+    /// F6 from the page (handed back by the child): the region after it.
+    pub fn region_from_page(&mut self, forward: bool) {
+        self.popover = false;
+        self.reading_open = false;
+        self.move_region(Some(Region::Page), forward);
+    }
+
+    /// The keys go from `from` (`None`: the chrome, nothing in it focused,
+    /// counts as before the rail) to the next region round rail, toolbar,
+    /// page; the page only while one is shown (not Start, a stop page or
+    /// the history view).
+    fn move_region(&mut self, from: Option<Region>, forward: bool) {
+        const ORDER: [Region; 3] = [Region::Rail, Region::Toolbar, Region::Page];
+        let page = self.live_page_shown() && self.history.is_none();
+        let at = match from {
+            Some(r) => ORDER.iter().position(|&x| x == r).unwrap(),
+            None if forward => 2,
+            None => 0,
+        };
+        let mut i = at;
+        let to = loop {
+            i = if forward { (i + 1) % 3 } else { (i + 2) % 3 };
+            if ORDER[i] != Region::Page || page {
+                break ORDER[i];
+            }
+        };
+        self.rail_focus = to == Region::Rail;
+        match to {
+            Region::Toolbar => {
+                if self.editing.is_none() {
+                    self.begin_edit();
+                }
+            }
+            Region::Rail => self.end_edit(),
+            Region::Page => {
+                self.end_edit();
+                self.focus_page = true;
+            }
+        }
+        self.last_note = Some(format!("F6: the keys are in the {}", match to { Region::Rail => "rail", Region::Toolbar => "toolbar", Region::Page => "page" }));
+    }
+
+    /// A page the person can give the keys to is on screen.
+    fn live_page_shown(&self) -> bool {
+        self.store.trail().page().is_some() && !matches!(self.live, Some(LivePage::Failed { .. }) | Some(LivePage::File { .. }))
+    }
+
+    /// A key while the rail has the keys: Up and Down go through the
+    /// trails in the rail's order, Enter or Escape leaves the rail.
+    pub fn rail_key(&mut self, key: Key) -> bool {
+        match key {
+            Key::Up | Key::Down => {
+                let order = self.store.rail_order();
+                let at = order.iter().position(|&i| i == self.store.current).unwrap_or(0);
+                let to = if key == Key::Down { (at + 1).min(order.len().saturating_sub(1)) } else { at.saturating_sub(1) };
+                if let Some(&i) = order.get(to) {
+                    // Not `show_trail`: a trail on Start would take the
+                    // keys into its Where field.
+                    self.popover = false;
+                    self.store.select(i);
+                }
+            }
+            Key::Enter | Key::Escape => self.rail_focus = false,
+            _ => return false,
+        }
+        true
+    }
+
     // -- Escape ------------------------------------------------------------
 
     /// Escape closes what is on top: a pop-up, then the Where field, then
@@ -669,6 +763,8 @@ impl Shell {
         if self.popover || self.reading_open {
             self.popover = false;
             self.reading_open = false;
+        } else if self.rail_focus {
+            self.rail_focus = false;
         } else if self.editing.is_some() {
             self.end_edit();
         } else if let Some(h) = &mut self.history {
@@ -864,6 +960,7 @@ impl Shell {
     /// A press anywhere: it closes the field and the popover when it
     /// lands outside them (the press itself still goes on to what it hit).
     pub fn press_at(&mut self, x: f32, y: f32) {
+        self.rail_focus = false;
         let g = self.geo();
         let inside = |r: Option<Rect>| r.is_some_and(|r| x >= r.x() && x < r.x() + r.w() && y >= r.y() && y < r.y() + r.h());
         if self.editing.is_some() && !inside(Some(g.where_)) && !inside(g.drop) {
@@ -1128,6 +1225,37 @@ mod tests {
         let open = s.store.trails.iter().filter(|t| !t.unrecorded && t.current.is_some()).count();
         assert_eq!(s.history_rows().len(), open, "each open trail keeps its page");
         assert!(s.store.earlier.is_empty());
+    }
+
+    #[test]
+    fn f6_goes_round_rail_toolbar_and_page() {
+        let mut s = shell();
+        assert!(s.store.trail().page().is_some());
+        s.apply(Action::NextRegion, 0.0);
+        assert!(s.rail_focus && s.editing.is_none(), "from nothing focused: the rail");
+        let before = s.store.current;
+        assert!(s.rail_key(Key::Down));
+        assert!(s.rail_focus, "Down moves through the trails and keeps the rail");
+        assert_ne!(s.store.current, before);
+        s.rail_key(Key::Up);
+        assert_eq!(s.store.current, before);
+        s.apply(Action::NextRegion, 0.0);
+        assert!(!s.rail_focus && s.editing.is_some(), "then the toolbar's Where field");
+        s.apply(Action::NextRegion, 0.0);
+        assert!(s.editing.is_none() && s.focus_page, "then the page");
+        s.focus_page = false;
+        s.region_from_page(true);
+        assert!(s.rail_focus, "F6 handed back by the page: the rail");
+        s.apply(Action::PrevRegion, 0.0);
+        assert!(s.focus_page && !s.rail_focus, "Shift-F6 from the rail: the page");
+        s.focus_page = false;
+        // No page to give the keys to: the history view, or Start.
+        s.apply(Action::History, 0.0);
+        s.region_from_page(false);
+        assert!(s.editing.is_some());
+        s.apply(Action::NextRegion, 0.0);
+        assert!(s.rail_focus && !s.focus_page, "the page is skipped while history is up");
+        assert!(s.escape() && !s.rail_focus);
     }
 
     #[test]

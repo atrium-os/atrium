@@ -291,6 +291,19 @@ g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q ', at 2' && ok "En
 shot live-10-find
 key 0x29                    # Esc
 g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q 'find: 0 matches' && ok "Esc closed find and cleared the mark" || bad "esc: $(g "grep 'find:' $S/ui9.log | tail -2")"
+# F6 (§9): rail, toolbar, page, and from the page (handed back) the rail.
+key 0x3f                    # F6
+g "grep -q 'F6: the keys are in the rail' $S/ui9.log" && g "grep -q 'ax  *tree \"Trails\" \[focused\]' $S/ui9.log" \
+    && ok "F6 put the keys on the rail" || bad "f6 rail: $(g "grep -v trace $S/ui9.log | tail -3")"
+key 0x3f
+g "grep -q 'F6: the keys are in the toolbar' $S/ui9.log" && ok "…F6 again, the toolbar's Where field" || bad "f6 toolbar: $(g "grep -v trace $S/ui9.log | tail -3")"
+key 0x3f
+g "grep -q 'F6: the page has the keys' $S/ui9.log" && ok "…F6 again, the page (frescod handed it the keys)" || bad "f6 page: $(g "grep -v trace $S/ui9.log | tail -3")"
+N6=$(g "grep -c 'F6: the keys are in the rail' $S/ui9.log")
+key 0x3f
+g "grep -q 'a key from the page: NextRegion' $S/ui9.log" && [ "$(g "grep -c 'F6: the keys are in the rail' $S/ui9.log")" -gt "$N6" ] \
+    && ok "…and F6 in the page went round to the rail" || bad "f6 from the page: $(g "grep -v trace $S/ui9.log | tail -3")"
+key 0x29                    # Esc: the rail lets go
 # Aa: the pop-up hangs under its button, above the page's window.
 press $((W - 90)) $((TOP + 20))
 sleep "$GAP"

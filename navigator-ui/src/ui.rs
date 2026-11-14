@@ -383,6 +383,11 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let current = i == s.store.current;
         let st2 = st.clone();
         let fill = if current { t.bg_elevated() } else { Color::TRANSPARENT };
+        if current && s.rail_focus {
+            // F6 put the keys here (§9): a focus ring on the trail.
+            rect(ctx, 6.0, y - 2.0, w - 12.0, 36.0, t.accent_mark(), 8.0);
+            rect(ctx, 8.0, y, w - 16.0, 32.0, t.bg_surface(), 6.0);
+        }
         area(ctx, Rect::new(8.0, y, w - 16.0, 32.0), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
         if current {
             rect(ctx, 8.0, y + 8.0, 2.0, 16.0, t.accent_mark(), 1.0);

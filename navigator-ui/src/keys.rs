@@ -31,14 +31,20 @@ pub enum Action {
     ZoomReset,
     /// Ctrl-R: the current version of the page, fetched again (§5.5).
     Reload,
+    /// F6, Shift-F6: the keys go to the next (previous) of rail, toolbar
+    /// and page (§9).
+    NextRegion,
+    PrevRegion,
 }
 
-/// The action a key press asks for, if it is one of §9's. Not yet: F6
-/// (Pergola has no function keys yet). Escape is the shell's: it closes
-/// whatever is on top.
+/// The action a key press asks for, if it is one of §9's. Escape is the
+/// shell's: it closes whatever is on top.
 pub fn action(ev: &Event) -> Option<Action> {
     let Event::Key { kind: KeyEventKind::Down, key, modifiers: m, chars } = ev else { return None };
     let c = chars.to_ascii_lowercase();
+    if *key == Key::F(6) && !m.ctrl && !m.alt {
+        return Some(if m.shift { Action::PrevRegion } else { Action::NextRegion });
+    }
     if m.alt && !m.ctrl {
         return match key {
             Key::Left => Some(Action::Back),
@@ -85,6 +91,7 @@ pub fn from_child(key: limen::doc_viewer::ChromeKey, chars: &str, ctrl: bool, sh
         C::Left => Key::Left,
         C::Right => Key::Right,
         C::Escape => Key::Escape,
+        C::F6 => Key::F(6),
     };
     Event::Key { kind: KeyEventKind::Down, key, modifiers: pergola::Modifiers { ctrl, shift, alt, meta: false }, chars: chars.into() }
 }
@@ -108,6 +115,9 @@ mod tests {
         assert_eq!(action(&k(Key::Char, "3", true, false, false)), Some(Action::Nth(3)));
         assert_eq!(action(&k(Key::Char, "9", true, false, false)), Some(Action::Nth(9)));
         assert_eq!(action(&k(Key::Char, "0", true, false, false)), Some(Action::ZoomReset));
+        assert_eq!(action(&k(Key::F(6), "", false, false, false)), Some(Action::NextRegion));
+        assert_eq!(action(&k(Key::F(6), "", false, true, false)), Some(Action::PrevRegion));
+        assert_eq!(action(&from_child(limen::doc_viewer::ChromeKey::F6, "", false, false, false)), Some(Action::NextRegion));
         assert_eq!(action(&k(Key::Char, "+", true, true, false)), Some(Action::ZoomIn));
         assert_eq!(action(&k(Key::Char, "f", true, false, false)), Some(Action::Find));
         assert_eq!(action(&k(Key::Char, "H", true, false, false)), Some(Action::History));

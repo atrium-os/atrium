@@ -190,8 +190,17 @@ fn main() -> std::io::Result<()> {
                     changed = true;
                 }
             }
-            if changed {
+            // F6 to the page: frescod hands it the keys, if this window has them.
+            let to_page = std::mem::take(&mut s.focus_page);
+            if changed || to_page {
                 state.set(s);
+            }
+            if to_page {
+                let id = window.id();
+                match window.connection().window_focus_embed(id) {
+                    Ok(()) => eprintln!("navigator-ui: F6: the page has the keys"),
+                    Err(e) => eprintln!("navigator-ui: frescod: {e}"),
+                }
             }
         }
         if let Some(sv) = &mut saver {
@@ -292,6 +301,8 @@ fn event(raw: &fresco_client::Event, main: u32, state: &Mutable<Shell>) {
             } else if !kind.pressed() {
             } else if s.editing.is_some() {
                 s.edit_key(*key, *modifiers, chars, now);
+            } else if s.rail_focus {
+                s.rail_key(*key);
             } else if *key == pergola::Key::Escape {
                 s.escape();
             } else if s.history.is_some() {

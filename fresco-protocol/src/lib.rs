@@ -141,6 +141,12 @@ pub mod control {
     /// reply. Only while that child has the focus; it can give focus
     /// away, never take it.
     pub const OP_WINDOW_FOCUS_PARENT:   u16 = 0x050b;
+    /// The other way (the Navigator's F6, limen.md §6): a window with the
+    /// keys gives them to the window shown in its topmost slot:
+    /// `WindowFocusParentPayload` naming the parent, no reply. Only the
+    /// parent's owner, only while it has the keys: it can hand them to
+    /// what it embeds, never take them from another app.
+    pub const OP_WINDOW_FOCUS_EMBED:    u16 = 0x050c;
 
     /// Deadline-lane sponsorship request (scheduler federation §1.1,
     /// Laminar phase J): the client asks frescod — the vblank deadline

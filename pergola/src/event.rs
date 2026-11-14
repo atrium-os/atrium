@@ -104,6 +104,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// A function key, F1 to F12, by its number.
+    F(u8),
 }
 
 /// Topmost-node hit test. Walks the tree depth-first; returns the
