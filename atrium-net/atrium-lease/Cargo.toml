@@ -1,0 +1,10 @@
+[package]
+name = "atrium-lease"
+version = "0.1.0"
+description = "Jailed per-interface DHCPv4 client and router-advertisement reader (docs/spec/atrium-net.md §3, §5)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+net-proto = { path = "../net-proto" }
+aura-ipc = { path = "../../aura/aura-ipc" }

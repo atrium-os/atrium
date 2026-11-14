@@ -1,0 +1,9 @@
+[package]
+name = "net-proto"
+version = "0.1.0"
+description = "What atrium-lease may propose to atrium-net, and the checks atrium-net applies before touching the host (docs/spec/atrium-net.md §5.2)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-ipc = { path = "../../aura/aura-ipc" }

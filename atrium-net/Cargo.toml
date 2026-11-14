@@ -1,0 +1,11 @@
+# atrium-net, the host's network configuration daemon (docs/spec/atrium-net.md).
+[workspace]
+resolver = "2"
+members = [
+    "net-proto",
+    "atrium-lease",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
