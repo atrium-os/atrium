@@ -16,6 +16,8 @@ use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
 use officina_spell::{Dictionary, Speller};
 use officina_text::find::Query;
+use officina_text::merge::{MergeError, Take};
+use officina_text::track::EditKind;
 use officina_text::track::Resolve;
 use pergola_richtext::{Checker, Editor};
 use pergola::text_edit::TextEdit;
@@ -36,7 +38,7 @@ pub const FIND_H: f32 = 48.0;
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
 /// The Tools menu, in order.
-pub const TOOLS: [&str; 5] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…"];
+pub const TOOLS: [&str; 6] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 12] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment"];
@@ -102,6 +104,10 @@ pub enum Cmd {
     ReviewRejectAll,
     /// Compare with another version (the app asks for the file).
     CompareWith,
+    /// Merge another reviewed copy in (the app asks for the file).
+    MergeWith,
+    /// Settle the picked conflict.
+    ReviewTake(Take),
 }
 
 impl Cmd {
@@ -476,6 +482,32 @@ impl Write {
         self.changed();
     }
 
+    /// Merges `other` (another reviewed copy, named `name`) into the
+    /// document: its changes come in under their authors, conflicts wait in
+    /// review.
+    pub fn merge_with(&self, other: &Doc, name: &str) {
+        let ed = self.doc.borrow().ed.clone();
+        let theirs = other.ed.borrow().doc.clone();
+        let who = name.rsplit_once('.').map_or(name, |(s, _)| s).to_string();
+        let r = ed.borrow_mut().merge_with(&theirs, &who);
+        self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+        self.spell.set(SpellBar::default());
+        self.note.set(NoteBar::default());
+        self.comment.set(CommentBar::default());
+        let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+        let msg = match r {
+            Err(MergeError::NotSameOriginal) => format!("“{name}” isn't a copy of this document's original."),
+            Err(MergeError::HasConflicts) => format!("“{name}” has conflicts of its own: settle them there first."),
+            Ok(m) if m.applied == 0 && m.conflicts == 0 => format!("Nothing new in “{name}”."),
+            Ok(m) if m.conflicts == 0 => format!("Merged “{name}”: {} added.", plural(m.applied, "change", "changes")),
+            Ok(m) => format!("Merged “{name}”: {} added, {} to settle.", plural(m.applied, "change", "changes"), plural(m.conflicts, "conflict", "conflicts")),
+        };
+        self.doc.borrow_mut().status = msg;
+        let (w, h) = self.size.get();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+        self.changed();
+    }
+
     /// Runs a find bar command on the editor.
     fn find_cmd(&self, c: Cmd) {
         let mut f = self.find.get_cloned();
@@ -574,9 +606,12 @@ impl Write {
                         return false;
                     }
                     Cmd::ReviewClose => e.review = false,
-                    Cmd::ReviewPrevious | Cmd::ReviewNext | Cmd::ReviewAccept | Cmd::ReviewReject | Cmd::ReviewAcceptAll | Cmd::ReviewRejectAll => {
+                    Cmd::ReviewPrevious | Cmd::ReviewNext | Cmd::ReviewAccept | Cmd::ReviewReject | Cmd::ReviewAcceptAll | Cmd::ReviewRejectAll | Cmd::ReviewTake(_) => {
                         let at = e.review_at;
                         match c {
+                            Cmd::ReviewTake(how) => {
+                                e.review_take(how);
+                            }
                             Cmd::ReviewPrevious => e.review_select(at.saturating_sub(1)),
                             Cmd::ReviewNext => e.review_select(at + 1),
                             Cmd::ReviewAccept => {
@@ -760,7 +795,7 @@ impl View for Write {
                 _ => MenuItem::new(*s),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith][i.min(4)])).at(x, 8.0).width(88.0).render(ctx);
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith][i.min(5)])).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
         {
@@ -908,17 +943,42 @@ impl View for Write {
                 move || cmds.lock().unwrap().push(c)
             };
             let line = match &picked {
+                Some(p) if matches!(p.kind, EditKind::Conflict(_)) => format!("Conflict · edit {} of {} · {}", edits.iter().position(|x| x == p).map_or(0, |i| i + 1), edits.len(), p.summary),
                 Some(p) => format!("Edit {} of {} · {author} · {}", edits.iter().position(|x| x == p).map_or(0, |i| i + 1), edits.len(), p.summary),
                 None => "No changes to review".to_string(),
             };
-            let bx = w - 540.0;
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, (bx - 24.0).max(0.0), 20.0), content: line, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let conflict = picked.as_ref().is_some_and(|p| matches!(p.kind, EditKind::Conflict(_)));
+            // A conflict's three choices take more room than accept and reject.
+            let extra = if conflict { 200.0 } else { 0.0 };
+            let bx = w - 540.0 - extra;
+            // As much of the line as fits before the buttons.
+            let style = st(type_size::MD, Weight::Semibold, t.text_primary());
+            let room = (bx - 24.0).max(0.0);
+            let mut line = line;
+            if Node::measure_text(&line, &style).w > room {
+                let mut chars: Vec<char> = line.chars().collect();
+                while !chars.is_empty() && Node::measure_text(&format!("{}…", chars.iter().collect::<String>()), &style).w > room {
+                    chars.truncate(chars.len().saturating_sub(4.max(chars.len() / 16)));
+                }
+                line = format!("{}…", chars.iter().collect::<String>().trim_end());
+            }
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, room, 20.0), content: line, style });
             Button::secondary("‹").at(bx, y + 8.0).width(32.0).on_click(push(Cmd::ReviewPrevious)).render(ctx);
             Button::secondary("›").at(bx + 36.0, y + 8.0).width(32.0).on_click(push(Cmd::ReviewNext)).render(ctx);
-            Button::primary("Accept").at(bx + 76.0, y + 8.0).width(72.0).on_click(push(Cmd::ReviewAccept)).render(ctx);
-            Button::secondary("Reject").at(bx + 152.0, y + 8.0).width(68.0).on_click(push(Cmd::ReviewReject)).render(ctx);
-            Button::secondary("Accept All").at(bx + 228.0, y + 8.0).width(96.0).on_click(push(Cmd::ReviewAcceptAll)).render(ctx);
-            Button::secondary("Reject All").at(bx + 328.0, y + 8.0).width(92.0).on_click(push(Cmd::ReviewRejectAll)).render(ctx);
+            if conflict {
+                // A conflict: whose version stays.
+                let (mine, theirs) = picked.as_ref().map(|p| p.summary.split(" · ").map(|x| x.split(':').next().unwrap_or("").to_string()).collect::<Vec<_>>()).map(|v| (v.first().cloned().unwrap_or_default(), v.get(1).cloned().unwrap_or_default())).unwrap_or_default();
+                let short = |s: &str| if s.chars().count() > 10 { s.chars().take(9).chain(std::iter::once('…')).collect() } else { s.to_string() };
+                let bx2 = bx;
+                Button::primary(&format!("Keep {}", short(&mine))).at(bx2 + 76.0, y + 8.0).width(118.0).on_click(push(Cmd::ReviewTake(Take::Mine))).render(ctx);
+                Button::secondary(&format!("Take {}", short(&theirs))).at(bx2 + 198.0, y + 8.0).width(118.0).on_click(push(Cmd::ReviewTake(Take::Theirs))).render(ctx);
+                Button::secondary("Keep Both").at(bx2 + 320.0, y + 8.0).width(92.0).on_click(push(Cmd::ReviewTake(Take::Both))).render(ctx);
+            } else {
+                Button::primary("Accept").at(bx + 76.0, y + 8.0).width(72.0).on_click(push(Cmd::ReviewAccept)).render(ctx);
+                Button::secondary("Reject").at(bx + 152.0, y + 8.0).width(68.0).on_click(push(Cmd::ReviewReject)).render(ctx);
+            }
+            Button::secondary("Accept All").at(bx + extra + 228.0, y + 8.0).width(96.0).on_click(push(Cmd::ReviewAcceptAll)).render(ctx);
+            Button::secondary("Reject All").at(bx + extra + 328.0, y + 8.0).width(92.0).on_click(push(Cmd::ReviewRejectAll)).render(ctx);
             Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ReviewClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
@@ -1082,6 +1142,35 @@ mod tests {
         // The Tools menu asks for the file.
         w.cmds.lock().unwrap().push(Cmd::CompareWith);
         assert_eq!(w.take_cmds(), vec![Cmd::CompareWith]);
+    }
+
+    #[test]
+    fn merge_a_reviewed_copy_and_settle_its_conflict() {
+        let doc = Doc::from_text("ann.txt", b"Pay within thirty days.\nDeliver in two weeks.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let text = || w.doc.borrow().ed.borrow().doc.visible_text();
+        // Ann's copy: her edit tracked against the original.
+        w.compare_with(&Doc::from_text("original.txt", b"Pay within sixty days.\nDeliver in two weeks.").unwrap(), "original.txt");
+        let ben = Doc::from_text("ben.txt", b"Pay within ninety days.\nDeliver in five weeks.").unwrap();
+        w.merge_with(&ben, "ben.txt");
+        assert_eq!(w.doc.borrow().status, "Merged “ben.txt”: 1 change added, 1 conflict to settle.");
+        assert_eq!(text(), vec!["Pay within thirty days.", "Deliver in five weeks."]);
+        run(Cmd::ReviewTake(Take::Theirs));
+        assert_eq!(text(), vec!["Pay within ninety days.", "Deliver in five weeks."]);
+        run(Cmd::Undo);
+        run(Cmd::ReviewTake(Take::Both));
+        assert_eq!(text(), vec!["Pay within thirty ninety days.", "Deliver in five weeks."]);
+        // Not a copy of the same original.
+        let x = Doc::from_text("x.txt", b"Something else.").unwrap();
+        x.ed.borrow_mut().compare_with(&Doc::from_text("y.txt", b"Something old.").unwrap().ed.borrow().doc);
+        w.merge_with(&x, "x.txt");
+        assert!(w.doc.borrow().status.contains("isn't a copy"), "{}", w.doc.borrow().status);
+        w.cmds.lock().unwrap().push(Cmd::MergeWith);
+        assert_eq!(w.take_cmds(), vec![Cmd::MergeWith]);
     }
 
     #[test]

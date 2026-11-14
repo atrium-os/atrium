@@ -95,6 +95,9 @@ struct Row {
     /// rejecting gives it back (None: not compared).
     compare_ok: Option<bool>,
     compare_took: Duration,
+    merge_ok: Option<bool>,
+    merge_safe: bool,
+    merge_took: Duration,
 }
 
 /// A copy of `d` (its tracked changes accepted) edited: the second paragraph
@@ -155,7 +158,7 @@ fn main() {
             let took = t.elapsed();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let lo = std::fs::read_to_string(Path::new(txt).join(Path::new(&name).with_extension("txt"))).ok();
-            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0, edits: 0, edits_kept: true, compare_ok: None, compare_took: Duration::ZERO };
+            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0, edits: 0, edits_kept: true, compare_ok: None, compare_took: Duration::ZERO, merge_ok: None, merge_safe: false, merge_took: Duration::ZERO };
             match got {
                 Err(e) => row.ok = Err(e),
                 Ok((doc, ns)) => {
@@ -219,6 +222,60 @@ fn main() {
                         }));
                         row.compare_took = t.elapsed();
                         row.compare_ok = Some(res.unwrap_or(false));
+                        // Merge: two copies, each amending its own paragraphs.
+                        let t = Instant::now();
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut plain = doc.clone();
+                            let ops = plain.resolve_ops(officina_text::track::Resolve::Accept, |_| true);
+                            for op in ops {
+                                officina_core::history::Op::apply(op, &mut plain);
+                            }
+                            let amend = |k: usize, word: &str| {
+                                let mut x = plain.clone();
+                                for b in (0..x.blocks.len()).rev().filter(|b| b % 6 == k) {
+                                    let Some(p) = x.para(b) else { continue };
+                                    let at = p.text.len() as u32;
+                                    let a = p.attr_at(at.saturating_sub(1));
+                                    let a = x.plain_attr(a);
+                                    let op = officina_text::ops::TextOp::Splice { block: b as u32, at, del: 0, ins: officina_text::ops::Fragment { text: format!(" {word}"), runs: vec![(0, a)] } };
+                                    officina_core::history::Op::apply(op, &mut x);
+                                }
+                                x
+                            };
+                            let (ta, tb) = (amend(1, "annx"), amend(4, "benx"));
+                            let a = plain.compare(&ta, "Ann", "");
+                            let Ok((m, mg)) = a.merged(&tb, "Ben", "") else { return (false, false) };
+                            let both: Vec<String> = plain.visible_text().iter().enumerate().map(|(b, t)| match b % 6 {
+                                1 => format!("{t} annx"),
+                                4 => format!("{t} benx"),
+                                _ => t.clone(),
+                            }).collect();
+                            let res = |how| {
+                                let mut x = m.clone();
+                                let ops = x.resolve_ops(how, |_| true);
+                                for op in ops {
+                                    officina_core::history::Op::apply(op, &mut x);
+                                }
+                                x.visible_text()
+                            };
+                            let count = |v: &[String], w: &str| v.iter().map(|t| t.matches(w).count()).sum::<usize>();
+                            let acc = res(officina_text::track::Resolve::Accept);
+                            // Safe: rejects to the original, every amendment there once
+                            // (counting both versions of each conflict).
+                            let mut kept = m.clone();
+                            for c in m.conflicts().into_iter().rev() {
+                                let ops = kept.take_ops(c.id, officina_text::merge::Take::Both);
+                                for op in ops {
+                                    officina_core::history::Op::apply(op, &mut kept);
+                                }
+                            }
+                            let all = kept.resolved_all(officina_text::track::Resolve::Accept).visible_text();
+                            let safe = res(officina_text::track::Resolve::Reject) == plain.visible_text() && count(&all, "annx") == count(&both, "annx") && count(&all, "benx") == count(&both, "benx");
+                            (safe, mg.conflicts == 0 && m.visible_text() == both && acc == both && safe)
+                        }));
+                        row.merge_took = t.elapsed();
+                        row.merge_safe = res.as_ref().is_ok_and(|r| r.0);
+                        row.merge_ok = Some(res.is_ok_and(|r| r.1));
                     }
                     if row.edits > 0 {
                         let back = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -261,6 +318,15 @@ fn main() {
     let cmp: Vec<&Row> = rows.iter().filter(|r| r.compare_ok.is_some()).collect();
     let slow = cmp.iter().max_by_key(|r| r.compare_took).map(|r| format!("{} {:.0?}", r.file, r.compare_took)).unwrap_or_default();
     println!("compared with an edited copy: {} of {} accept to the copy and reject to the original; slowest {slow}", cmp.iter().filter(|r| r.compare_ok == Some(true)).count(), cmp.len());
+    let mrg: Vec<&Row> = rows.iter().filter(|r| r.merge_ok.is_some()).collect();
+    let slow = mrg.iter().max_by_key(|r| r.merge_took).map(|r| format!("{} {:.0?}", r.file, r.merge_took)).unwrap_or_default();
+    println!("merged two copies amending different paragraphs: {} of {} read exactly as both; {} of {} reject to the original with every amendment there once (in the text or a conflict); slowest {slow}", mrg.iter().filter(|r| r.merge_ok == Some(true)).count(), mrg.len(), mrg.iter().filter(|r| r.merge_safe).count(), mrg.len());
+    for r in mrg.iter().filter(|r| !r.merge_safe).take(10) {
+        println!("  merge unsafe: {}", r.file);
+    }
+    for r in mrg.iter().filter(|r| r.merge_ok == Some(false)).take(3) {
+        println!("  merge differs: {}", r.file);
+    }
     for r in cmp.iter().filter(|r| r.compare_ok == Some(false)).take(10) {
         println!("compare FAIL {}", r.file);
     }

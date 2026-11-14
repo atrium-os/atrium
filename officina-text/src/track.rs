@@ -420,6 +420,7 @@ impl TextDoc {
     /// does.
     pub fn resolve_range_ops(&mut self, how: Resolve, pick: impl Fn(RevId) -> bool, from: (usize, u32), to: (usize, u32)) -> Vec<TextOp> {
         let mut ops = Vec::new();
+        let mut dropped = std::collections::HashSet::new();
         let n = self.blocks.len();
         let inside = |b: usize, s: u32, e: u32| from <= (b, s) && (b, e) <= to;
         for b in (from.0..n.min(to.0.saturating_add(1))).rev() {
@@ -438,6 +439,17 @@ impl TextDoc {
                     continue;
                 }
                 let x = self.attrs.get(a).clone();
+                if let Some(c) = x.conflict {
+                    // A conflict stays until someone picks, unless the other
+                    // version itself is rejected.
+                    if how == Resolve::Reject && self.conflicts.get(c).is_some_and(|alt| pick(alt.rev)) {
+                        ops.push(TextOp::Splice { block: b as u32, at: s, del: e - s, ins: Fragment::default() });
+                        if dropped.insert(c) {
+                            ops.push(TextOp::SetConflict { id: c, alt: None });
+                        }
+                    }
+                    continue;
+                }
                 if let Some(t) = x.deleted {
                     let Some(d) = self.deletions.get(t).cloned() else { continue };
                     if !pick(d.rev) {
@@ -488,7 +500,7 @@ impl TextDoc {
 
     /// Ops that put deletion `d` back where its tombstone (`at`, `len` bytes)
     /// is in paragraph `b`, splitting paragraphs at its breaks.
-    fn restore_ops(&self, b: usize, at: u32, len: u32, pieces: &[DelPiece], ops: &mut Vec<TextOp>) {
+    pub(crate) fn restore_ops(&self, b: usize, at: u32, len: u32, pieces: &[DelPiece], ops: &mut Vec<TextOp>) {
         let frag = |p: &DelPiece| Fragment { text: p.text.clone(), runs: if p.text.is_empty() { Vec::new() } else { p.runs.clone() } };
         ops.push(TextOp::Splice { block: b as u32, at, del: len, ins: frag(&pieces[0]) });
         let mut block = b as u32;
@@ -508,7 +520,7 @@ impl TextDoc {
     /// deletion puts back. Picked tombstones inside are put back (rejecting) or
     /// left out (accepting), picked insertions dropped or kept, picked breaks
     /// dropped or kept, picked formatting undone or kept.
-    fn resolve_pieces(&mut self, pieces: &[DelPiece], how: Resolve, pick: &impl Fn(RevId) -> bool, depth: usize) -> Vec<DelPiece> {
+    pub(crate) fn resolve_pieces(&mut self, pieces: &[DelPiece], how: Resolve, pick: &impl Fn(RevId) -> bool, depth: usize) -> Vec<DelPiece> {
         let mut out = vec![DelPiece::default()];
         let push = |out: &mut Vec<DelPiece>, text: &str, a: AttrId| {
             let last = out.last_mut().expect("one piece at least");
@@ -541,6 +553,12 @@ impl TextDoc {
                 }
                 let text = &q.text[qs as usize..qe as usize];
                 let x = self.attrs.get(qa).clone();
+                if let Some(c) = x.conflict {
+                    if !(how == Resolve::Reject && self.conflicts.get(c).is_some_and(|alt| pick(alt.rev))) {
+                        push(&mut out, text, qa);
+                    }
+                    continue;
+                }
                 if let Some(t) = x.deleted {
                     match self.deletions.get(t).cloned() {
                         Some(d) if pick(d.rev) && depth < 64 => {
@@ -594,7 +612,8 @@ impl TextDoc {
     }
 
     /// The proposed text with tracked marks taken off (what accepting everything
-    /// shows), for comparisons: each paragraph's text without tombstones.
+    /// shows), for comparisons: each paragraph's text without tombstones (or
+    /// conflict markers).
     pub fn visible_text(&self) -> Vec<String> {
         self.blocks
             .iter()
@@ -602,7 +621,7 @@ impl TextDoc {
             .map(|p| {
                 let mut t = String::new();
                 for (s, e, a) in p.spans() {
-                    if s < e && self.attrs.get(a).deleted.is_none() {
+                    if s < e && self.attrs.get(a).deleted.is_none() && self.attrs.get(a).conflict.is_none() {
                         t.push_str(&p.text[s as usize..e as usize]);
                     }
                 }
@@ -625,6 +644,9 @@ pub enum EditKind {
     Break,
     /// Formatting changed (one entry for all the places of one change).
     Format,
+    /// Two copies changed the same words differently (a merge): this one's
+    /// version reads, the other's waits in the conflict until someone picks.
+    Conflict(crate::model::ConflictId),
 }
 
 /// An edit: tracked changes grouped the way people think of them. Never
@@ -939,8 +961,64 @@ impl TextDoc {
             };
             out.push(Edit { kind: EditKind::Format, rev, ranges, old: String::new(), new: String::new(), minor: false, summary });
         }
+        // A conflict is one entry: the edits inside it are its first version.
+        let cs = self.conflicts();
+        if !cs.is_empty() {
+            let mark = OBJECT_CHAR.len_utf8() as u32;
+            out.retain(|e| !cs.iter().any(|c| c.start <= e.ranges[0].0 && e.ranges[0].1 <= (c.end.0, c.end.1 + mark)));
+            for c in cs {
+                out.push(self.conflict_edit(c));
+            }
+        }
         out.sort_by_key(|e| e.ranges[0].0);
         out
+    }
+
+    /// The lane entry of a conflict: "Ann: “thirty” · Ben: “ninety”".
+    fn conflict_edit(&self, c: crate::merge::ConflictAt) -> Edit {
+        let mark = OBJECT_CHAR.len_utf8() as u32;
+        let (from, to) = ((c.start.0, c.start.1 + mark), c.end);
+        let mut mine: Option<RevId> = None;
+        let mut old = String::new();
+        for b in from.0..=to.0 {
+            let Some(p) = self.para(b) else { break };
+            if b > from.0 {
+                old.push('\n');
+            }
+            let (s0, e0) = (if b == from.0 { from.1 } else { 0 }, if b == to.0 { to.1 } else { p.text.len() as u32 });
+            for (s, e, a) in p.spans() {
+                let (s, e) = (s.max(s0), e.min(e0));
+                if s >= e {
+                    continue;
+                }
+                let x = self.attrs.get(a);
+                if mine.is_none() {
+                    mine = x.rev.or(x.fmt.map(|f| f.rev)).or_else(|| x.deleted.and_then(|t| self.deletions.get(t)).map(|d| d.rev));
+                }
+                if x.deleted.is_none() && x.conflict.is_none() {
+                    old.push_str(&p.text[s as usize..e as usize]);
+                }
+            }
+        }
+        let mut new = String::new();
+        if let Some(alt) = self.conflicts.get(c.id) {
+            for (k, q) in alt.pieces.iter().enumerate() {
+                if k > 0 {
+                    new.push('\n');
+                }
+                for (i, &(s, a)) in q.runs.iter().enumerate() {
+                    let e = q.runs.get(i + 1).map_or(q.text.len() as u32, |r| r.0);
+                    if s < e && self.attrs.get(a).deleted.is_none() {
+                        new.push_str(&q.text[s as usize..e as usize]);
+                    }
+                }
+            }
+        }
+        let who = |r: Option<RevId>, or: &str| r.and_then(|r| self.revisions.get(r)).map_or(or.to_string(), |v| v.author.to_string());
+        let (a, b) = differing_words(&old, &new);
+        let show = |t: &str| if t.trim().is_empty() { "(nothing)".to_string() } else { quote(t) };
+        let summary = format!("{}: {} · {}: {}", who(mine, "this copy"), show(a), who(Some(c.rev), "the other copy"), show(b));
+        Edit { kind: EditKind::Conflict(c.id), rev: c.rev, ranges: vec![(c.start, (c.end.0, c.end.1 + mark))], old, new, minor: false, summary }
     }
 
     /// Edits by change set, sets in order.
@@ -958,7 +1036,11 @@ impl TextDoc {
     }
 
     /// Ops that accept or reject one edit (each of its places).
+    /// A conflict: accepting takes the other version, rejecting keeps this one.
     pub fn resolve_edit_ops(&mut self, how: Resolve, e: &Edit) -> Vec<TextOp> {
+        if let EditKind::Conflict(id) = e.kind {
+            return self.take_ops(id, if how == Resolve::Accept { crate::merge::Take::Theirs } else { crate::merge::Take::Mine });
+        }
         let mut ranges = e.ranges.clone();
         // Last place first, so earlier ones keep their positions.
         ranges.sort_by(|a, b| b.0.cmp(&a.0));

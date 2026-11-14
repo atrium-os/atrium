@@ -205,6 +205,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unsettled_conflicts_save_as_this_copys_version() {
+        let mk = |t: &str| {
+            let mut d = TextDoc::new();
+            d.blocks.remove(0);
+            d.push_para(t, 0, vec![]);
+            d
+        };
+        let o = mk("Pay within sixty days.");
+        let a = o.compare(&mk("Pay within thirty days."), "Ann", "2026-11-15T10:00:00Z");
+        let (m, mg) = a.merged(&mk("Pay within ninety days."), "Ben", "2026-11-15T10:00:00Z").unwrap();
+        assert_eq!(mg.conflicts, 1);
+        for bytes in [super::write(&m, Vec::new()).unwrap(), crate::odt::write(&m, Vec::new()).unwrap()] {
+            let r = super::read(&bytes).map(|x| x.0).or_else(|_| crate::odt::read(&bytes).map(|x| x.0)).unwrap();
+            assert_eq!(r.visible_text(), vec!["Pay within thirty days."]);
+            assert!(!r.visible_text()[0].contains('\u{FFFC}'));
+            assert_eq!(r.edits().len(), 1);
+        }
+    }
+
+    #[test]
     fn hostile_packages_fail_cleanly() {
         let bytes = super::write(&sample(), Vec::new()).unwrap();
         let mut x: u64 = 0x5eed;

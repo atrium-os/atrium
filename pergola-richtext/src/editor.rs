@@ -428,12 +428,12 @@ impl Editor {
         let para = self.doc.para(p.block)?;
         // Tombstones (tracked deletions) before the caret don't format typing.
         let mut k = p.at;
-        while k >= 3 && para.text[..k as usize].ends_with(OBJECT_CHAR) && self.doc.attrs.get(para.attr_at(k - 3)).deleted.is_some() {
+        while k >= 3 && para.text[..k as usize].ends_with(OBJECT_CHAR) && { let x = self.doc.attrs.get(para.attr_at(k - 3)); x.deleted.is_some() || x.conflict.is_some() } {
             k -= 3;
         }
         let before = para.attr_at(k.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
-        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.deleted.take().is_some() | (k != p.at);
+        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.deleted.take().is_some() | base.conflict.take().is_some() | (k != p.at);
         // Tracking marks are the typing's own, never inherited.
         pic |= base.rev.take().is_some() | base.fmt.take().is_some();
         // Typing inside commented text stays in the comment; at its end it doesn't.
@@ -455,6 +455,7 @@ impl Editor {
         a.object = None;
         a.note = None;
         a.deleted = None;
+        a.conflict = None;
         a.rev = None;
         a.fmt = None;
         Some(self.doc.attrs.intern(a))
@@ -615,6 +616,41 @@ impl Editor {
         self.review = n > 0;
         self.review_select(0);
         Some(n)
+    }
+
+    /// Merges `other`, another reviewed copy of this document's original
+    /// (one undoable step): its changes come in under their own authors,
+    /// places both changed differently become conflicts, and review opens on
+    /// the first conflict, or the first edit. `name` stands for the other's
+    /// author when its edits weren't tracked.
+    pub fn merge_with(&mut self, other: &officina_text::model::TextDoc, name: &str) -> Result<officina_text::merge::Merge, officina_text::merge::MergeError> {
+        let now = self.now.to_string();
+        let mut mg = self.doc.merge_ops(other, name, &now)?;
+        let ops = std::mem::take(&mut mg.ops);
+        if !ops.is_empty() {
+            self.apply("Merge", ops, Kind::Other);
+            self.clamp_caret();
+        }
+        let e = self.edits();
+        let first = e.iter().position(|e| matches!(e.kind, officina_text::track::EditKind::Conflict(_))).unwrap_or(0);
+        self.review = !e.is_empty();
+        self.review_select(first);
+        Ok(mg)
+    }
+
+    /// Settles the selected conflict; the next edit is selected.
+    pub fn review_take(&mut self, how: officina_text::merge::Take) -> bool {
+        let Some(e) = self.review_edit() else { return false };
+        let officina_text::track::EditKind::Conflict(id) = e.kind else { return false };
+        let ops = self.doc.take_ops(id, how);
+        if ops.is_empty() {
+            return false;
+        }
+        let at = self.review_at;
+        self.apply("Settle Conflict", ops, Kind::Other);
+        self.clamp_caret();
+        self.review_select(at);
+        true
     }
 
     /// The document's edits (cached until the next change).
@@ -1517,9 +1553,9 @@ impl Editor {
         Pos::new(p.block, g as u32)
     }
 
-    /// Whether a tombstone (a tracked deletion) is at `p`.
+    /// Whether a tombstone (a tracked deletion) or a conflict marker is at `p`.
     pub fn tomb_at(&self, p: Pos) -> bool {
-        self.doc.para(p.block).is_some_and(|q| q.text[p.at.min(q.text.len() as u32) as usize..].starts_with(OBJECT_CHAR) && self.doc.attrs.get(q.attr_at(p.at)).deleted.is_some())
+        self.doc.para(p.block).is_some_and(|q| q.text[p.at.min(q.text.len() as u32) as usize..].starts_with(OBJECT_CHAR) && { let x = self.doc.attrs.get(q.attr_at(p.at)); x.deleted.is_some() || x.conflict.is_some() })
     }
 
     fn grapheme_right(&self, p: Pos) -> Pos {
@@ -1974,6 +2010,43 @@ pub(crate) mod tests {
         assert_eq!(r.edits().len(), e.edits().len());
         e.undo();
         assert!(e.edits().is_empty());
+    }
+
+    #[test]
+    fn merge_brings_in_the_other_copy_and_settles_conflicts() {
+        let original = ed(&["Pay within sixty days.", "Deliver in two weeks.", "Warranty of twelve months."]).doc;
+        let mut e = ed(&["Pay within thirty days.", "Deliver in two weeks.", "Warranty of twelve months."]);
+        e.author = "Ann".into();
+        assert!(e.compare_with(&original).is_some());
+        let theirs = ed(&["Pay within ninety days.", "Deliver in five weeks.", "Warranty of twelve months."]).doc;
+        e.start_log();
+        let start = e.doc.clone();
+        let mg = e.merge_with(&theirs, "Ben").unwrap();
+        assert_eq!((mg.applied, mg.conflicts), (1, 1));
+        assert_eq!(e.doc.visible_text(), vec!["Pay within thirty days.", "Deliver in five weeks.", "Warranty of twelve months."]);
+        // Review opens on the conflict.
+        assert!(e.review);
+        assert!(matches!(e.review_edit().unwrap().kind, officina_text::track::EditKind::Conflict(_)));
+        assert!(e.review_take(officina_text::merge::Take::Theirs));
+        assert_eq!(e.doc.visible_text()[0], "Pay within ninety days.");
+        assert!(e.doc.conflicts().is_empty());
+        // The journal replays it.
+        let log = e.take_log();
+        let mut r = Editor::new(start, Rc::new(FixedFonts));
+        for l in log {
+            r.replay(l);
+        }
+        assert_eq!(r.doc.visible_text(), e.doc.visible_text());
+        assert_eq!(r.edits().len(), e.edits().len());
+        // Undo takes back the pick, then the merge.
+        e.undo();
+        assert_eq!(e.doc.conflicts().len(), 1);
+        e.undo();
+        assert_eq!(e.doc.visible_text()[1], "Deliver in two weeks.");
+        // Merging into the original itself: the copy is compared with it.
+        let mut o = Editor::new(original, Rc::new(FixedFonts));
+        let mg = o.merge_with(&theirs, "Ben").unwrap();
+        assert_eq!((mg.applied, mg.conflicts), (2, 0));
     }
 
     #[test]

@@ -46,6 +46,7 @@ enum Target {
 enum Asking {
     Open,
     Compare,
+    Merge,
     SaveAs,
     Picture,
     ExportPdf,
@@ -182,8 +183,11 @@ impl Run {
         let mut d = self.write.doc.borrow_mut();
         match r.and_then(|_| d.saved()) {
             Ok(()) => {
+                let open = d.ed.borrow().doc.conflicts().len();
                 d.status = if format == Format::Text {
                     format!("Saved “{}” as plain text: formatting is not kept in a text file.", d.name)
+                } else if open > 0 && format != Format::Native {
+                    format!("Saved “{}” with this copy's version of {open} unsettled conflict{}: settle them first to keep the other version in this format.", d.name, if open == 1 { "" } else { "s" })
                 } else {
                     format!("Saved “{}”.", d.name)
                 };
@@ -355,6 +359,15 @@ fn main() {
             q.push(Cmd::ReviewOpen);
             q.extend(std::iter::repeat_n(Cmd::ReviewNext, n));
         }
+        Some(f) if f.starts_with("merge:") => {
+            // BAR=merge:PATH merges another reviewed copy at PATH into the document.
+            let p = std::path::Path::new(&f[6..]);
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match fs::read(p).map_err(|e| e.to_string()).and_then(|data| load(&name, &data)) {
+                Ok(other) => run.write.merge_with(&other, &name),
+                Err(e) => run.set_status(e),
+            }
+        }
         Some(f) if f.starts_with("compare:") => {
             // BAR=compare:PATH compares an earlier version at PATH with the document.
             let p = std::path::Path::new(&f[8..]);
@@ -400,6 +413,7 @@ fn main() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::CompareWith => want_picker = Some(Asking::Compare),
+                Cmd::MergeWith => want_picker = Some(Asking::Merge),
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::ExportPdf => want_picker = Some(Asking::ExportPdf),
@@ -418,6 +432,7 @@ fn main() {
                     let filter = match what {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a document".into() },
                         Asking::Compare => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with an earlier version", stem_of(&name)) },
+                        Asking::Merge => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Merge a reviewed copy into “{}”", stem_of(&name)) },
                         Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
                         Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)) },
@@ -443,6 +458,12 @@ fn main() {
                     let fd = e.borrow_mut().take_fd();
                     match (ToParent::decode(&bytes), fd) {
                         (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
+                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Merge) => {
+                            match read_all(&mut File::from(fd)).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
+                                Ok(other) => run.write.merge_with(&other, &name),
+                                Err(e) => run.set_status(e),
+                            }
+                        }
                         (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Compare) => {
                             match read_all(&mut File::from(fd)).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
                                 Ok(older) => run.write.compare_with(&older, &name),

@@ -17,6 +17,7 @@ pub mod compare;
 pub mod find;
 pub mod layout;
 pub mod lists;
+pub mod merge;
 pub mod model;
 pub mod native;
 pub mod ops;

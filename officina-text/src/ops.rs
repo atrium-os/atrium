@@ -44,6 +44,8 @@ pub enum TextOp {
     SetRevision { id: crate::model::RevId, rev: Option<crate::model::Revision> },
     /// Sets deletion `id`, what a tombstone holds (None takes it out).
     SetDeletion { id: crate::model::DelId, del: Option<crate::model::Deletion> },
+    /// Sets merge conflict `id`, the other version it holds (None takes it out).
+    SetConflict { id: crate::model::ConflictId, alt: Option<crate::model::Deletion> },
     /// Turns tracking on or off.
     SetTracking { on: bool },
     /// Nothing (what an op that didn't fit becomes).
@@ -55,6 +57,12 @@ pub const NOTE_SIZE: u16 = 20;
 
 fn boundary(s: &str, at: u32) -> bool {
     s.is_char_boundary(at as usize)
+}
+
+/// Whether a deletion (or a conflict's other version) is well formed here.
+fn deletion_ok(d: &TextDoc, x: &crate::model::Deletion) -> bool {
+    let bytes: usize = x.pieces.iter().map(|p| p.text.len()).sum();
+    !(x.pieces.is_empty() || bytes > crate::model::MAX_DELETION_TEXT || x.pieces.iter().enumerate().any(|(i, p)| (i > 0) != p.para.is_some() || p.runs.iter().any(|r| r.1 as usize >= d.attrs.len() || !boundary(&p.text, r.0)) || p.para.as_ref().is_some_and(|q| q.1 as usize >= d.styles.styles.len())))
 }
 
 impl TextDoc {
@@ -139,7 +147,7 @@ impl TextOp {
             // Comments change no layout; the editor redraws on every action.
             TextOp::SetComment { .. } | TextOp::SetRevision { .. } | TextOp::SetTracking { .. } => return None,
             // A tombstone takes no room; its text is drawn only in review.
-            TextOp::SetDeletion { .. } => return None,
+            TextOp::SetDeletion { .. } | TextOp::SetConflict { .. } => return None,
         })
     }
 
@@ -328,6 +336,16 @@ impl TextOp {
                 }
                 let old = d.revisions.set(id, rev);
                 TextOp::SetRevision { id, rev: old }
+            }
+            TextOp::SetConflict { id, alt } => {
+                if id as usize >= crate::model::MAX_CONFLICTS || alt.as_ref().is_some_and(|x| !deletion_ok(d, x)) {
+                    return TextOp::Nop;
+                }
+                for p in alt.iter().flat_map(|x| x.pieces.iter()).filter_map(|p| p.para.as_ref()) {
+                    d.raise_watermark(p.0 + 1);
+                }
+                let old = d.conflicts.set(id, alt);
+                TextOp::SetConflict { id, alt: old }
             }
             TextOp::SetDeletion { id, del } => {
                 if id as usize >= crate::model::MAX_DELETIONS {

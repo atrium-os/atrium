@@ -52,6 +52,122 @@ pub fn diff<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Hunk> {
     if suf > 0 {
         out.push(Hunk::Equal(a.len() - suf, b.len() - suf, suf));
     }
+    compact(a, b, out)
+}
+
+/// Slides a pure insertion or deletion over a run of equal items to join
+/// the change beside it, where the items allow (deleting the third of five
+/// empty paragraphs is the same as deleting the first): an edited paragraph
+/// next to empty ones then reads as one change, not an insertion here and a
+/// deletion further on.
+fn compact<T: PartialEq>(a: &[T], b: &[T], mut h: Vec<Hunk>) -> Vec<Hunk> {
+    let mut k = 0;
+    while k < h.len() {
+        let Hunk::Change(i0, i1, j0, j1) = h[k] else {
+            k += 1;
+            continue;
+        };
+        let del = j0 == j1 && i0 < i1;
+        let ins = i0 == i1 && j0 < j1;
+        if !(del || ins) {
+            // A change that deletes and inserts next to a pure insertion (or
+            // deletion) over equal items: some of its deletions (or
+            // insertions) may belong with that one, each paragraph then one
+            // edit.
+            if k >= 2 {
+                if let (Hunk::Equal(_, _, l), Hunk::Change(p0, p1, q0, q1)) = (h[k - 1], h[k - 2]) {
+                    let m = (q1 - q0).min(i1 - i0);
+                    if p0 == p1 && m > 0 && (1..=l).all(|s| a[i0 - s] == a[i0 + m - s]) {
+                        h[k - 2] = Hunk::Change(p0, p1 + m, q0, q1);
+                        h[k - 1] = Hunk::Equal(p1 + m, q1, l);
+                        h[k] = Hunk::Change(i0 + m, i1, j0, j1);
+                        k += 1;
+                        continue;
+                    }
+                    let m = (p1 - p0).min(j1 - j0);
+                    if q0 == q1 && m > 0 && (1..=l).all(|s| b[j0 - s] == b[j0 + m - s]) {
+                        h[k - 2] = Hunk::Change(p0, p1, q0, q1 + m);
+                        h[k - 1] = Hunk::Equal(p1, q1 + m, l);
+                        h[k] = Hunk::Change(i0, i1, j0 + m, j1);
+                        k += 1;
+                        continue;
+                    }
+                }
+            }
+            if k + 2 < h.len() {
+                if let (Hunk::Equal(_, _, l), Hunk::Change(p0, p1, q0, q1)) = (h[k + 1], h[k + 2]) {
+                    // Deletions beyond its insertions, before a pure insertion.
+                    let m = (q1 - q0).min((i1 - i0).saturating_sub(j1 - j0));
+                    if p0 == p1 && m > 0 && (0..l).all(|s| a[i1 - m + s] == a[i1 + s]) {
+                        h[k] = Hunk::Change(i0, i1 - m, j0, j1);
+                        h[k + 1] = Hunk::Equal(i1 - m, j1, l);
+                        h[k + 2] = Hunk::Change(p0 - m, p1, q0, q1);
+                        k += 1;
+                        continue;
+                    }
+                    let m = (p1 - p0).min((j1 - j0).saturating_sub(i1 - i0));
+                    if q0 == q1 && m > 0 && (0..l).all(|s| b[j1 - m + s] == b[j1 + s]) {
+                        h[k] = Hunk::Change(i0, i1, j0, j1 - m);
+                        h[k + 1] = Hunk::Equal(i1, j1 - m, l);
+                        h[k + 2] = Hunk::Change(p0, p1, q0 - m, q1);
+                        k += 1;
+                        continue;
+                    }
+                }
+            }
+            k += 1;
+            continue;
+        }
+        let same = |x: usize, y: usize| if del { a[x] == a[y] } else { b[x] == b[y] };
+        let (s0, s1) = if del { (i0, i1) } else { (j0, j1) };
+        // Up, to the change before.
+        if k >= 2 {
+            if let (Hunk::Equal(_, _, l), Hunk::Change(p0, p1, q0, q1)) = (h[k - 1], h[k - 2]) {
+                if (1..=l).all(|s| same(s0 - s, s1 - s)) {
+                    let n = s1 - s0;
+                    h[k - 2] = if del { Hunk::Change(p0, p1 + n, q0, q1) } else { Hunk::Change(p0, p1, q0, q1 + n) };
+                    h[k - 1] = if del { Hunk::Equal(p1 + n, q1, l) } else { Hunk::Equal(p1, q1 + n, l) };
+                    h.remove(k);
+                    continue;
+                }
+            }
+        }
+        // Down, to the change after.
+        if k + 2 < h.len() {
+            if let (Hunk::Equal(_, _, l), Hunk::Change(p0, p1, q0, q1)) = (h[k + 1], h[k + 2]) {
+                if (0..l).all(|s| same(s0 + s, s1 + s)) {
+                    let n = s1 - s0;
+                    h[k] = Hunk::Equal(i0, j0, l);
+                    h[k + 2] = if del { Hunk::Change(p0 - n, p1, q0, q1) } else { Hunk::Change(p0, p1, q0 - n, q1) };
+                    h.remove(k + 1);
+                    // h[k] is now an Equal next to the one before it, maybe.
+                    if k > 0 {
+                        if let (Hunk::Equal(x, y, l0), Hunk::Equal(_, _, l1)) = (h[k - 1], h[k]) {
+                            h[k - 1] = Hunk::Equal(x, y, l0 + l1);
+                            h.remove(k);
+                            continue;
+                        }
+                    }
+                    k += 1;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+    // Neighbours of one kind join.
+    let mut out: Vec<Hunk> = Vec::with_capacity(h.len());
+    for x in h {
+        match (out.last_mut(), x) {
+            (Some(Hunk::Equal(_, _, l)), Hunk::Equal(_, _, n)) => *l += n,
+            (Some(Hunk::Change(_, i1, _, j1)), Hunk::Change(_, x1, _, y1)) => {
+                *i1 = x1;
+                *j1 = y1;
+            }
+            (_, Hunk::Equal(_, _, 0)) => {}
+            _ => out.push(x),
+        }
+    }
     out
 }
 
@@ -277,13 +393,14 @@ impl Src {
 }
 
 /// The formatting of attributes, what a formatting change is about.
-fn looks(a: &CharAttrs) -> CharAttrs {
+pub(crate) fn looks(a: &CharAttrs) -> CharAttrs {
     let mut x = a.clone();
     x.comments = None;
     x.note = None;
     x.rev = None;
     x.deleted = None;
     x.fmt = None;
+    x.conflict = None;
     if let Some(o) = &mut x.object {
         o.image = 0;
     }
@@ -576,6 +693,8 @@ impl TextDoc {
                         o.edit_para(&sa[i + k], &sb[j + k]);
                     }
                 }
+                // One paragraph for one: it was edited, however much.
+                Hunk::Change(i0, i1, j0, j1) if i1 == i0 + 1 && j1 == j0 + 1 => o.edit_para(&sa[i0], &sb[j0]),
                 Hunk::Change(i0, i1, j0, j1) => {
                     // Pair edited paragraphs in order, each with the most alike ahead.
                     let mut j = j0;
@@ -943,6 +1062,20 @@ mod tests {
         assert_eq!(c.visible_text(), b.visible_text());
         eprintln!("3,000 paragraphs, {} edits, compared in {took:?}", c.edits().len());
         assert!(took < std::time::Duration::from_secs(if cfg!(debug_assertions) { 30 } else { 3 }));
+    }
+
+    #[test]
+    fn changes_next_to_equal_items_slide_together() {
+        let a = ["1", "", "", "", "", "", "2"];
+        let b = ["1", "x", "", "", "", "", "2"];
+        assert_eq!(diff(&a, &b), vec![Hunk::Equal(0, 0, 1), Hunk::Change(1, 2, 1, 2), Hunk::Equal(2, 2, 5)]);
+        let b = ["1", "", "", "", "", "x", "2"];
+        assert_eq!(diff(&a, &b), vec![Hunk::Equal(0, 0, 5), Hunk::Change(5, 6, 5, 6), Hunk::Equal(6, 6, 1)]);
+        // Two of a run edited: each is one change.
+        let a = ["1", "", "", "", "", "", "", "", "2"];
+        let b = ["1", "", "x", "", "", "", "y", "", "2"];
+        let ones = diff(&a, &b).into_iter().filter(|h| matches!(h, Hunk::Change(i0, i1, j0, j1) if i1 - i0 == 1 && j1 - j0 == 1)).count();
+        assert_eq!(ones, 2, "{:?}", diff(&a, &b));
     }
 
     #[test]

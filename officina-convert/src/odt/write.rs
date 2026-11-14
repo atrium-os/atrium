@@ -623,6 +623,10 @@ fn margin(hf: &HeaderFooter, tag: &str, style: &str) -> String {
 
 /// The document as an `.odt`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
+    // Unsettled merge conflicts: ODF has none, this copy's version goes.
+    if !doc.conflicts.is_empty() {
+        return write(&doc.without_conflicts(), out);
+    }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
     let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None };
     // Comments: each anchored one's start and end; its replies right after its start.

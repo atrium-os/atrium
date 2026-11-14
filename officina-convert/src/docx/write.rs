@@ -525,6 +525,10 @@ fn numbering_part(lists: &HashMap<(u32, ListKind), (u32, ListKind)>) -> String {
 
 /// The document as a `.docx`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
+    // Unsettled merge conflicts: Word has none, this copy's version goes.
+    if !doc.conflicts.is_empty() {
+        return write(&doc.without_conflicts(), out);
+    }
     // Tracked deletions are written inline: put their text back, marked.
     let ex = (!doc.deletions.is_empty()).then(|| doc.expanded());
     let (doc, del_breaks) = match &ex {

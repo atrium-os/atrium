@@ -50,6 +50,10 @@ pub struct CharAttrs {
     /// Tracked: the formatting was changed under a revision; `old` is what the
     /// text had (an earlier entry of the attribute table).
     pub fmt: Option<FmtChange>,
+    /// Merge: the character (U+FFFC) is one end of this conflict of the
+    /// document's [`Conflicts`] (the first marker starts it, the second ends
+    /// it); it takes no room on the page.
+    pub conflict: Option<ConflictId>,
 }
 
 /// A formatting change: its revision and the attributes before it.
@@ -61,6 +65,8 @@ pub struct FmtChange {
 
 /// A revision of the document's [`Revisions`].
 pub type RevId = u32;
+/// A merge conflict of the document's [`Conflicts`].
+pub type ConflictId = u32;
 /// A deletion of the document's [`Deletions`].
 pub type DelId = u32;
 
@@ -159,6 +165,11 @@ impl<T: Clone> Store<T> {
 
 pub type Revisions = Store<Revision>;
 pub type Deletions = Store<Deletion>;
+/// Merge conflicts: each holds the other copy's version of the text between
+/// its two markers (as tracked text, under that copy's revisions), kept until
+/// someone picks.
+pub type Conflicts = Store<Deletion>;
+pub const MAX_CONFLICTS: usize = 1 << 16;
 
 /// A comment of the document's [`Comments`].
 pub type CommentId = u32;
@@ -419,6 +430,7 @@ impl CharAttrs {
             rev: self.rev.or(under.rev),
             deleted: self.deleted.or(under.deleted),
             fmt: self.fmt.or(under.fmt),
+            conflict: self.conflict.or(under.conflict),
         }
     }
 }
@@ -444,11 +456,12 @@ pub struct CharFormat {
     pub rev: Option<RevId>,
     pub deleted: Option<DelId>,
     pub fmt: Option<FmtChange>,
+    pub conflict: Option<ConflictId>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None }
     }
 }
 
@@ -495,6 +508,9 @@ impl CharFormat {
         }
         if a.fmt.is_some() {
             self.fmt = a.fmt;
+        }
+        if a.conflict.is_some() {
+            self.conflict = a.conflict;
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -924,6 +940,8 @@ pub struct TextDoc {
     /// Tracked changes: who made them, and what deletions took out.
     pub revisions: Revisions,
     pub deletions: Deletions,
+    /// Merge conflicts not yet settled.
+    pub conflicts: Conflicts,
     /// Edits are tracked (a setting the file keeps).
     pub tracking: bool,
     next_id: BlockId,
@@ -964,7 +982,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), tracking: false, next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

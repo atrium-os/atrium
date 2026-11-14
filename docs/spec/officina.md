@@ -1937,6 +1937,64 @@ edits, and a document compared with itself has none (`compare::tests`). Corpus
 six edits: three word changes, a paragraph moved and changed, bold, an inserted
 sentence (seen in review mode on the cloud VM).
 
+### 16.27 O5c5 as built (2026-11-15): merging reviewed copies
+
+- **Reading a copy against its original** (`officina-text::merge`). A document
+  is walked into pieces, each with where it is in the document and in the
+  original (everything rejected): kept text, kept paragraph breaks, and changes
+  (insertions and inserted breaks take no room in the original, a tombstone the
+  room of what rejecting it puts back). Touching changes are one group.
+- **Merging** (`merge_ops(other)`). The original is this document with
+  everything rejected; a copy with tracked changes must reject to the same text,
+  a copy without is first compared with it (and refused if it shares under 30 %
+  of its words, once the original has 20). Groups of both copies are sorted by
+  their place in the original; groups that overlap or touch form a cluster. A
+  cluster of only the other's changes is copied in over the original text there
+  with its tracked marks, under its own revisions (authors, dates and change
+  sets kept; a revision both copies carry is shared), with its deletions,
+  pictures, notes and comments; comments the other put on text it kept are
+  added to the same text here. A cluster where both made the same change is
+  kept once. Any other cluster is a **conflict**: this copy's version stays,
+  between two zero-width markers (U+FFFC with `conflict`), and the other
+  version, with its marks, is kept whole in `TextDoc::conflicts` (a deletion's
+  encoding; the CONFLICTS chunk in the native file, `SetConflict` op in the
+  journal). Everything is ordinary undoable ops, built last place first.
+- **Settling** (`take_ops`). Keep mine drops the markers; Take theirs puts the
+  other version (with its tracked changes) in place of what is between them;
+  Keep both inserts the other version as it reads after this one, as its
+  author's insertion. Reject all with the other's revision picked drops its
+  conflicts too; accept all leaves them to settle. Edits show a conflict as one
+  entry, "Ann: “fourteen” · Ben: “twenty-one”", with the edits inside it hidden.
+- **Diff alignment.** Compare now slides a pure insertion or deletion over
+  equal neighbours to join the change beside it, and moves the surplus of a
+  mixed change likewise, so an edited paragraph among empty ones is one edit;
+  a one-for-one changed paragraph is always an edited paragraph.
+- **Write.** Tools › **Merge with…** picks the copy; the status says how many
+  changes came in and how many conflicts wait, and review opens on the first
+  conflict. A conflict's review bar has **Keep Ann**, **Take Ben**, **Keep Both**;
+  on the page the other version waits in an amber label. Saving `.docx` or
+  `.odt` with conflicts left keeps this copy's version (the status says so); the
+  native file keeps them.
+- **Not yet:** paragraph style changes of the other copy on text both kept;
+  merging copies whose original was edited in between (three-way with a
+  separate base); conflicts inside notes, headers and footers.
+
+Gates (`merge::tests`): 10,000 random pairs of copies editing separate
+paragraphs, or separate words of one paragraph (words, paragraphs added and
+removed, bold): the merge has no conflicts and accept all equals applying both,
+reject all the original, the other copy untracked merges the same, the other
+order reads the same, the native file keeps it, and undo returns the copy;
+10,000 random pairs changing the same word differently: always a conflict,
+reading as this copy, rejecting to the original, Take theirs giving theirs and
+Keep mine giving mine. Editor and app tests replay the journal and undo.
+Corpus (1,832 readable files), two copies amending every sixth paragraph
+offset by three: all 1,832 reject to the original with every amendment present
+once, in the text or a conflict, and 1,742 read exactly as both; the other 90
+have long runs of identical or empty table cells, where the place of an edit
+is ambiguous, and there the merge shows a conflict instead of guessing. The
+largest (15,935 paragraphs) takes 10 s for both compares, the merge and the
+checks; most take milliseconds.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

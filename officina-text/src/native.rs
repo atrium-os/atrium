@@ -13,6 +13,7 @@
 //! | 8 | COMMENTS | comments: id, author, initials, date, text, the comment answered, resolved |
 //! | 9 | REVISIONS | whether edits are tracked; revisions: id, author, date, change set, its name |
 //! | 10 | DELETIONS | tracked deletions a tombstone holds: id, revision, pieces (paragraph, text, runs) |
+//! | 11 | CONFLICTS | merge conflicts: id, then the other version as a deletion's encoding |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -28,7 +29,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Comment, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Comment, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -42,6 +43,7 @@ pub const NOTES: u16 = 7;
 pub const COMMENTS: u16 = 8;
 pub const REVISIONS: u16 = 9;
 pub const DELETIONS: u16 = 10;
+pub const CONFLICTS: u16 = 11;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -96,7 +98,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         }
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -156,12 +158,15 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         w.var(f.rev as u64);
         w.var(f.old as u64);
     }
+    if let Some(c) = a.conflict {
+        w.var(c as u64);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 2 != 0 || (m >> 15 != 0 && ext == 0) {
+    if ext >> 3 != 0 || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -239,6 +244,9 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         let rev = r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId;
         let old = r.len("attribute", MAX_ATTRS)? as AttrId;
         a.fmt = Some(FmtChange { rev, old });
+    }
+    if ext & 4 != 0 {
+        a.conflict = Some(r.len("conflict", MAX_CONFLICTS as u64 - 1)? as ConflictId);
     }
     Ok(a)
 }
@@ -698,6 +706,17 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             w.u8(13);
             w.u8(*on as u8);
         }
+        TextOp::SetConflict { id, alt } => {
+            w.u8(14);
+            w.var(*id as u64);
+            match alt {
+                None => w.u8(0),
+                Some(v) => {
+                    w.u8(1);
+                    encode_deletion(&mut w, v);
+                }
+            }
+        }
         TextOp::SetNote { id, note } => {
             w.u8(9);
             w.var(*id as u64);
@@ -805,6 +824,15 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("deletion")),
             };
             TextOp::SetDeletion { id, del }
+        }
+        14 => {
+            let id = r.len("conflict", MAX_CONFLICTS as u64 - 1)? as ConflictId;
+            let alt = match r.u8()? {
+                0 => None,
+                1 => Some(decode_deletion(&mut r, attrs, styles)?),
+                _ => return Err(WireError::Invalid("conflict")),
+            };
+            TextOp::SetConflict { id, alt }
         }
         13 => TextOp::SetTracking {
             on: match r.u8()? {
@@ -943,6 +971,16 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
             encode_deletion(&mut w, doc.deletions.get(id).expect("live deletions exist"));
         }
         c.add(DELETIONS, &w.into_bytes())?;
+    }
+    let cons = doc.live_conflicts();
+    if !cons.is_empty() {
+        let mut w = Writer::new();
+        w.var(cons.len() as u64);
+        for id in cons {
+            w.var(id as u64);
+            encode_deletion(&mut w, doc.conflicts.get(id).expect("live conflicts exist"));
+        }
+        c.add(CONFLICTS, &w.into_bytes())?;
     }
 
     if !checkpoints.is_empty() {
@@ -1175,6 +1213,21 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
                 watermark = watermark.max(p.0 + 1);
             }
             doc.deletions.set(id, Some(d));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == CONFLICTS) {
+        let mut r = Reader::new(one(CONFLICTS, "CONFLICTS chunk")?);
+        let n = r.count("conflicts", MAX_CONFLICTS as u64, 3)?;
+        for _ in 0..n {
+            let id = r.len("conflict", MAX_CONFLICTS as u64 - 1)? as ConflictId;
+            let d = decode_deletion(&mut r, attrs, styles)?;
+            if doc.conflicts.get(id).is_some() {
+                return Err(LoadError::Bad("conflict listed twice"));
+            }
+            for p in d.pieces.iter().filter_map(|p| p.para.as_ref()) {
+                watermark = watermark.max(p.0 + 1);
+            }
+            doc.conflicts.set(id, Some(d));
         }
     }
     doc.raise_watermark(watermark);

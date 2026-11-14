@@ -294,6 +294,14 @@ impl RichTextView {
                             if w == 0 {
                                 ctx.add(Node::Rect { rect: Rect::new(q(rx - 1.0), q(ry), 2.0, rh), fill: Color::from_srgb8(0xc0, 0x26, 0x26), radius: 0.0 });
                                 let old = e.old.trim();
+                                let other;
+                                let old = if let EditKind::Conflict(_) = e.kind {
+                                    // A conflict shows the other version where it waits.
+                                    other = format!("or: {}", e.new.trim());
+                                    other.as_str()
+                                } else {
+                                    old
+                                };
                                 let text = if e.kind == EditKind::Move {
                                     "moved from here".to_string()
                                 } else if old.chars().count() > 60 {
@@ -305,7 +313,11 @@ impl RichTextView {
                                     labels.push((rx, ry, text));
                                 }
                             } else {
-                                let fill = if e.kind == EditKind::Format { Color::rgba(0.2, 0.45, 0.95, 0.18) } else { Color::rgba(0.1, 0.65, 0.3, 0.2) };
+                                let fill = match e.kind {
+                                    EditKind::Format => Color::rgba(0.2, 0.45, 0.95, 0.18),
+                                    EditKind::Conflict(_) => Color::rgba(0.95, 0.6, 0.1, 0.25),
+                                    _ => Color::rgba(0.1, 0.65, 0.3, 0.2),
+                                };
                                 ctx.add(Node::Rect { rect: Rect::new(q(rx), q(ry), (w as f64 * g.k).max(1.0) as f32, rh), fill, radius: 0.0 });
                             }
                         }
@@ -313,13 +325,19 @@ impl RichTextView {
                     }
                 }
                 // What a deletion took away, struck through, over its place.
+                // A conflict's other version, in amber, not struck.
                 for (lx, ly, text) in labels {
-                    let style = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: pergola::theme::Weight::Regular, color: Color::from_srgb8(0x99, 0x1b, 0x1b) };
+                    let alt = text.starts_with("or: ");
+                    let ink = if alt { Color::from_srgb8(0x8a, 0x4b, 0x08) } else { Color::from_srgb8(0x99, 0x1b, 0x1b) };
+                    let style = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: pergola::theme::Weight::Regular, color: ink };
                     let tw = Node::measure_text(&text, &style).w + 12.0;
                     let (bx, by) = (q(lx - 6.0), q(ly - 20.0));
-                    ctx.add(Node::Rect { rect: Rect::new(bx, by, tw, 18.0), fill: Color::rgba(1.0, 0.93, 0.93, 1.0), radius: 4.0 });
+                    let back = if alt { Color::rgba(1.0, 0.95, 0.85, 1.0) } else { Color::rgba(1.0, 0.93, 0.93, 1.0) };
+                    ctx.add(Node::Rect { rect: Rect::new(bx, by, tw, 18.0), fill: back, radius: 4.0 });
                     ctx.add(Node::Text { rect: Rect::new(bx + 6.0, by + 1.0, tw - 8.0, 16.0), content: text, style });
-                    ctx.add(Node::Rect { rect: Rect::new(bx + 6.0, by + 9.0, tw - 12.0, 1.0), fill: Color::from_srgb8(0x99, 0x1b, 0x1b), radius: 0.0 });
+                    if !alt {
+                        ctx.add(Node::Rect { rect: Rect::new(bx + 6.0, by + 9.0, tw - 12.0, 1.0), fill: ink, radius: 0.0 });
+                    }
                 }
                 // Comment balloons in the space right of the page, each at its
                 // text's first line on this page, pushed down so none overlap.
@@ -544,6 +562,7 @@ impl RichTextView {
                 EditKind::Move => "Move",
                 EditKind::Break => "Paragraph",
                 EditKind::Format => "Formatting",
+                EditKind::Conflict(_) => "Conflict",
             };
             let meta = if e.minor { format!("{a} · {kind} · minor") } else { format!("{a} · {kind}") };
             ctx.add(Node::Text { rect: Rect::new(lx + 20.0, y + 3.0, LANE_W - 36.0, 16.0), content: meta, style: text(t.text_secondary(), pergola::theme::Weight::Regular, xs) });
