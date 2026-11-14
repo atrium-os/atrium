@@ -15,6 +15,7 @@ use officina_grid::addr::Rect;
 use officina_grid::eval::dates;
 use officina_grid::formula::{self, Expr};
 use officina_grid::numfmt::PALETTE;
+use officina_grid::filter::Cond;
 use officina_grid::style::{HAlign, Line, Style, StyleId, VAlign};
 use officina_grid::{ErrorKind, Value, Workbook};
 
@@ -921,20 +922,45 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     let mut k = 0; // into cells
     let mut hi = 0; // into heights
     let fill_to = tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1);
-    let gap = |out: &mut String, n: u32| {
-        if n == 0 {
-            return;
-        }
-        let _ = write!(out, r#"<table:table-row table:style-name="ro{def_row}""#);
-        if n > 1 {
-            let _ = write!(out, r#" table:number-rows-repeated="{n}""#);
-        }
-        // Cells through the last styled column: LibreOffice gives a column's default
-        // style only to cells the row has.
-        if fill_to > 1 {
-            let _ = write!(out, r#"><table:table-cell table:number-columns-repeated="{fill_to}"/></table:table-row>"#);
+    // Hidden rows: "filter" inside the auto-filter's range (LibreOffice shows them
+    // again when the filter is cleared), "collapse" elsewhere.
+    let frange = sh.filter.as_ref().map(|f| (f.rect.r0, f.rect.r1));
+    let vis = |r: u32| -> &'static str {
+        if !sh.row_hidden(r) {
+            ""
+        } else if frange.is_some_and(|(a, b)| a <= r && r <= b) {
+            r#" table:visibility="filter""#
         } else {
-            out.push_str("><table:table-cell/></table:table-row>");
+            r#" table:visibility="collapse""#
+        }
+    };
+    // Empty rows `start .. start + n`, split where hidden ranges begin and end.
+    let gap = |out: &mut String, start: u32, n: u32| {
+        let end = start as u64 + n as u64;
+        let mut r = start as u64;
+        while r < end {
+            // The run of rows that share `r`'s visibility.
+            let v = vis(r as u32);
+            let k = sh.hidden.partition_point(|h| (h.1 as u64) < r);
+            let next = match sh.hidden.get(k) {
+                Some(&(a, b)) if (a as u64) <= r => b as u64 + 1,
+                Some(&(a, _)) => a as u64,
+                None => end,
+            }
+            .min(end);
+            let m = next - r;
+            let _ = write!(out, r#"<table:table-row table:style-name="ro{def_row}"{v}"#);
+            if m > 1 {
+                let _ = write!(out, r#" table:number-rows-repeated="{m}""#);
+            }
+            // Cells through the last styled column: LibreOffice gives a column's
+            // default style only to cells the row has.
+            if fill_to > 1 {
+                let _ = write!(out, r#"><table:table-cell table:number-columns-repeated="{fill_to}"/></table:table-row>"#);
+            } else {
+                out.push_str("><table:table-cell/></table:table-row>");
+            }
+            r = next;
         }
     };
     loop {
@@ -946,7 +972,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             (None, Some(b)) => b,
             (None, None) => break,
         };
-        gap(out, r - row);
+        gap(out, row, r - row);
         let mut rs = def_row;
         while hi < heights.len() && heights[hi].0 <= r {
             if heights[hi].0 == r {
@@ -954,7 +980,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             }
             hi += 1;
         }
-        let _ = write!(out, r#"<table:table-row table:style-name="ro{rs}">"#);
+        let _ = write!(out, r#"<table:table-row table:style-name="ro{rs}"{}>"#, vis(r));
         let mut col = 0u32;
         let mut any = false;
         while k < cells.len() && cells[k].0 == r {
@@ -991,16 +1017,86 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         out.push_str("</table:table-row>");
         row = r + 1;
     }
+    let hid_end = sh.hidden.last().map_or(0, |h| h.1 + 1).min(ODS_ROWS);
     if tails.iter().any(|&t| t != 0) {
         // LibreOffice applies a column's default style only to rows the table has:
         // run the table to its last row.
-        gap(out, ODS_ROWS - row);
+        gap(out, row, ODS_ROWS - row);
+    } else if hid_end > row {
+        gap(out, row, hid_end - row);
     } else if row == 0 {
-        gap(out, 1);
+        gap(out, 0, 1);
     }
     out.push_str(&names_xml(wb, Some(s)));
     out.push_str("</table:table>");
     Ok(())
+}
+
+/// `table:database-ranges` holding each sheet's auto-filter, as LibreOffice writes
+/// them: columns joined by and; a column's values as one condition with set items.
+fn filters_xml(wb: &Workbook) -> String {
+    let mut out = String::new();
+    for s in 0..wb.sheet_count() as u16 {
+        let Some(f) = &wb.sheet(s).filter else { continue };
+        let sh = super::formula::sheet_a1(&wb.sheet_name(s));
+        let addr = format!("{sh}.{}{}:{sh}.{}{}", officina_grid::addr::col_name(f.rect.c0), f.rect.r0 + 1, officina_grid::addr::col_name(f.rect.c1), f.rect.r1 + 1);
+        let _ = write!(out, r#"<table:database-range table:name="__Anonymous_Sheet_DB__{s}" table:target-range-address=""#);
+        esc(&mut out, &addr);
+        out.push_str(r#"" table:display-filter-buttons="true">"#);
+        if !f.conds.is_empty() {
+            out.push_str("<table:filter><table:filter-and>");
+            for (c, cond) in &f.conds {
+                let field = c - f.rect.c0;
+                match cond {
+                    Cond::Values(v) => {
+                        let first = v.first().cloned().unwrap_or_default();
+                        let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
+                        esc(&mut out, &first);
+                        out.push_str(r#"" table:operator="=""#);
+                        if v.len() > 1 {
+                            out.push('>');
+                            for x in v {
+                                out.push_str(r#"<table:filter-set-item table:value=""#);
+                                esc(&mut out, x);
+                                out.push_str(r#""/>"#);
+                            }
+                            out.push_str("</table:filter-condition>");
+                        } else {
+                            out.push_str("/>");
+                        }
+                    }
+                    Cond::Compare(cs, and) => {
+                        let or = !and && cs.len() > 1;
+                        if or {
+                            out.push_str("<table:filter-or>");
+                        }
+                        for (op, x) in cs {
+                            let op = if op == "<>" { "!=" } else { op.as_str() };
+                            // Typed only where untyped would read as text: LibreOffice
+                            // drops the value of a typed order test.
+                            let ty = if matches!(op, "=" | "!=") { r#" table:data-type="number""# } else { "" };
+                            let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{}"{ty}/>"#, num(*x), esc_attr(op));
+                        }
+                        if or {
+                            out.push_str("</table:filter-or>");
+                        }
+                    }
+                }
+            }
+            out.push_str("</table:filter-and></table:filter>");
+        }
+        out.push_str("</table:database-range>");
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("<table:database-ranges>{out}</table:database-ranges>")
+}
+
+fn esc_attr(s: &str) -> String {
+    let mut o = String::new();
+    esc(&mut o, s);
+    o
 }
 
 /// `table:named-expressions` for the names of one scope (a sheet's, or the
@@ -1100,6 +1196,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="true" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
     content.push_str(&tables);
     content.push_str(&names_xml(wb, None));
+    content.push_str(&filters_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/></office:styles></office:document-styles>"#);
     let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/></manifest:manifest>"#);

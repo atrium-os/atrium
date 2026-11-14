@@ -9,6 +9,7 @@
 //! | 4 | FORMULAS | one sheet's formula groups: column, first and last row, A1 text at the first row |
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
+//! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -36,6 +37,7 @@ pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
 pub const STYLE_RUNS: u16 = 6;
 pub const NAMES: u16 = 7;
+pub const ROWS_SHOWN: u16 = 8;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -191,6 +193,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.str(&wb.name_text(d));
         }
         c.add(NAMES, &w.into_bytes())?;
+    }
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        if sh.hidden.is_empty() && sh.filter.is_none() {
+            continue;
+        }
+        let mut w = Writer::new();
+        wb.filter_state(si as u16).encode(&mut w);
+        c.add(ROWS_SHOWN, &w.into_bytes())?;
     }
     if wb.styles.len() > 1 {
         let mut w = Writer::new();
@@ -476,6 +486,21 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
             sh.styles[col] = crate::style::StyleRuns::from_runs(runs);
         }
         done(&r)?;
+    }
+
+    for i in of(ROWS_SHOWN) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let st = crate::filter::FilterState::decode(&mut r)?;
+        done(&r)?;
+        let s = st.sheet as usize;
+        if s >= wb.sheets.len() {
+            return Err(LoadError::Bad("rows of a sheet that does not exist"));
+        }
+        if !wb.sheets[s].hidden.is_empty() || wb.sheets[s].filter.is_some() {
+            return Err(LoadError::Bad("a sheet's rows twice"));
+        }
+        wb.sheets[s].hidden = st.hidden;
+        wb.sheets[s].filter = st.filter;
     }
 
     // Stored results are current; only volatile formulas need a recalculation, and

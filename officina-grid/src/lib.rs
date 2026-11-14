@@ -19,6 +19,7 @@ pub mod csv;
 pub mod deps;
 pub mod eval;
 pub mod fast;
+pub mod filter;
 pub mod formula;
 pub mod names;
 pub mod native;

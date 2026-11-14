@@ -193,3 +193,26 @@ fn ods_names_round_trip() {
     }
     assert!(back.names().get(0, "Half").is_none());
 }
+
+#[test]
+fn ods_filter_round_trip() {
+    use officina_grid::filter::{merge, AutoFilter, Cond};
+    let mut wb = book();
+    let f = AutoFilter {
+        rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 20, c1: 1 },
+        conds: vec![
+            (0, Cond::Compare(vec![(">".into(), 3.0), ("<".into(), 20.0)], true)),
+            (1, Cond::Values(vec!["item 3".into(), "ITEM 5".into(), "item 9".into()])),
+        ],
+    };
+    let mut st = wb.filtered(0, Some(f));
+    st.hidden.push((100, 102));
+    st.hidden = merge(st.hidden);
+    wb.replace_filter(st);
+    let want = wb.filter_state(0);
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.filter_state(0), want);
+    assert_eq!(back.filter_state(1).filter, None);
+}

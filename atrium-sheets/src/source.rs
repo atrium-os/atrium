@@ -20,11 +20,32 @@ pub const MIN_COLS: u32 = 16384;
 /// The sheet on screen.
 pub struct SheetSource {
     pub doc: Rc<RefCell<Doc>>,
+    /// Row sizes with hidden rows zero high, while the sheet hides any, keyed by what
+    /// they were built from.
+    view: RefCell<Option<(ViewKey, officina_grid::column::Sizes)>>,
 }
+
+type ViewKey = (u16, usize, usize, usize, usize, u64);
 
 impl SheetSource {
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc }
+        Self { doc, view: RefCell::new(None) }
+    }
+
+    /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
+    fn rows_view<T>(&self, f: impl FnOnce(&officina_grid::column::Sizes) -> T) -> T {
+        let d = self.doc.borrow();
+        let sh = d.wb.sheet(d.sheet);
+        if sh.hidden.is_empty() {
+            return f(&sh.row_sizes);
+        }
+        let o = sh.row_sizes.overrides();
+        let key = (d.sheet, sh.hidden.as_ptr() as usize, sh.hidden.len(), o.as_ptr() as usize, o.len(), sh.row_sizes.default.to_bits());
+        let mut v = self.view.borrow_mut();
+        if v.as_ref().is_none_or(|(k, _)| *k != key) {
+            *v = Some((key, sh.view_row_sizes()));
+        }
+        f(&v.as_ref().unwrap().1)
     }
     fn used(&self) -> (u32, u32) {
         let d = self.doc.borrow();
@@ -99,12 +120,11 @@ impl GridSource for SheetSource {
         MIN_COLS.max(c.saturating_add(26)).min(MAX_COLS)
     }
     fn row_top(&self, r: u32) -> f64 {
-        let d = self.doc.borrow();
-        d.wb.sheet(d.sheet).row_sizes.offset(r)
+        self.rows_view(|s| s.offset(r))
     }
     fn row_at(&self, y: f64) -> u32 {
-        let d = self.doc.borrow();
-        d.wb.sheet(d.sheet).row_sizes.index_at(y.max(0.0)).min(self.rows() - 1)
+        let rows = self.rows();
+        self.rows_view(|s| s.index_at(y.max(0.0))).min(rows - 1)
     }
     fn col_left(&self, c: u32) -> f64 {
         let d = self.doc.borrow();

@@ -33,11 +33,15 @@ pub struct Sheet {
     pub(crate) rows_used: u32,
     /// Per column: its cells' styles.
     pub styles: Vec<StyleRuns>,
+    /// Hidden rows, as sorted, disjoint ranges (a filter's and by hand).
+    pub hidden: Vec<(u32, u32)>,
+    /// The auto-filter, if the sheet has one.
+    pub filter: Option<crate::filter::AutoFilter>,
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new() }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)

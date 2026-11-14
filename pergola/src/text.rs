@@ -150,6 +150,38 @@ pub fn measure(content: &str, style: &TextStyle) -> Size {
     Size::new(w, h)
 }
 
+/// The width of `content` as the sum of its characters' widths, each measured once
+/// per font and cached. Ignores kerning (a fraction of a pixel in UI text), so a view
+/// with many distinct strings, like a spreadsheet's numbers, costs no round trip to
+/// the compositor after the first few characters.
+pub fn measure_chars(content: &str, style: &TextStyle) -> f32 {
+    thread_local! {
+        static CHARS: std::cell::RefCell<HashMap<(String, u32, u16, char), f32>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let (size, weight) = ((style.size * 100.0) as u32, style.weight as u16);
+    CHARS.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded: a few fonts × the characters text uses.
+        if m.len() > 65_536 {
+            m.clear();
+        }
+        let mut w = 0.0;
+        for ch in content.chars() {
+            let k = (style.family.clone(), size, weight, ch);
+            w += match m.get(&k) {
+                Some(&x) => x,
+                None => {
+                    let mut b = [0u8; 4];
+                    let x = measure(ch.encode_utf8(&mut b), style).w;
+                    m.insert(k, x);
+                    x
+                }
+            };
+        }
+        w
+    })
+}
+
 /// Wire-backed measurer: its own `fresco_client::Connection`, a
 /// font-id cache, and a result cache. Shell text is a small, highly
 /// repetitive set of strings (chips, seams, clock), so the cache is
@@ -250,6 +282,26 @@ mod tests {
         install_measurer(Box::new(Fixed(99.5)));
         let s = measure("abcd", &style());
         assert!((s.w - 99.5).abs() < 1e-4);
+        clear_measurer();
+
+        // Character widths: a thousand distinct numbers ask the measurer once per
+        // distinct character, not once per string (each ask is a round trip).
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl MeasureText for Counting {
+            fn measure_width(&mut self, _: &str, _: f32, _: u16, s: &str) -> Option<f32> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(s.chars().count() as f32 * 7.0)
+            }
+        }
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        install_measurer(Box::new(Counting(n.clone())));
+        let mut st = style();
+        st.size = 13.5; // a size no other test has cached
+        for i in 0..1000 {
+            let t = format!("{}", i * 7919);
+            assert_eq!(measure_chars(&t, &st), t.len() as f32 * 7.0);
+        }
+        assert!(n.load(std::sync::atomic::Ordering::Relaxed) <= 10, "{} asks", n.load(std::sync::atomic::Ordering::Relaxed));
         clear_measurer();
     }
 }

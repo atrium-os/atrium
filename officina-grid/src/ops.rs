@@ -44,6 +44,8 @@ pub struct StyleRegion {
 pub enum GridOp {
     Replace(Region),
     Restyle(StyleRegion),
+    /// A sheet's filter and hidden rows, swapped in whole.
+    Filter(crate::filter::FilterState),
     /// Several edits as one (a sort moves values and styles together). Not nested.
     Batch(Vec<GridOp>),
 }
@@ -117,6 +119,11 @@ impl GridOp {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         let r = match self {
+            GridOp::Filter(f) => {
+                w.u8(4);
+                f.encode(&mut w);
+                return w.into_bytes();
+            }
             GridOp::Batch(ops) => {
                 w.u8(3);
                 w.var(ops.len() as u64);
@@ -168,6 +175,13 @@ impl GridOp {
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(b);
         let kind = r.u8()?;
+        if kind == 4 {
+            let f = crate::filter::FilterState::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Filter(f));
+        }
         if kind == 3 {
             let n = r.count("ops", 1 << 16, 1)?;
             let mut ops = Vec::with_capacity(n);
@@ -240,6 +254,7 @@ impl Op<Workbook> for GridOp {
         match self {
             GridOp::Replace(region) => GridOp::Replace(wb.replace(region)),
             GridOp::Restyle(region) => GridOp::Restyle(wb.replace_styles(region)),
+            GridOp::Filter(f) => GridOp::Filter(wb.replace_filter(f)),
             GridOp::Batch(ops) => {
                 // The inverse undoes them in reverse order.
                 let mut inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(wb)).collect();

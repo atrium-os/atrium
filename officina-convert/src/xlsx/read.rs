@@ -19,6 +19,7 @@ use std::sync::Arc;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use officina_grid::filter::{AutoFilter, Cond};
 use officina_grid::addr::{a1, parse_a1, CellAddr, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
 use officina_grid::formula::{self, Expr};
@@ -343,6 +344,10 @@ struct Seg {
     rep: Report,
     first_row: Option<u32>,
     last_row: Option<u32>,
+    /// Rows with `hidden="1"`.
+    hidden: Vec<u32>,
+    /// `<autoFilter ref>` and its columns' conditions.
+    filter: Option<(String, Vec<(u32, Cond)>)>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -357,6 +362,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
     let (mut row, mut col): (i64, i64) = (-1, -1);
     let mut vtext: Vec<u8> = Vec::new();
     let mut vbuf: Vec<u8> = Vec::new();
+    let mut fcol: Option<u32> = None;
     loop {
         buf.clear();
         let ev = r.read_event_into(&mut buf)?;
@@ -414,6 +420,9 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                     if let Some(h) = attr(&e, b"ht")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v < 410.0) {
                         seg.heights.push((row as u32, (h * 96.0 / 72.0).round().max(2.0)));
                     }
+                }
+                if attr(&e, b"hidden")?.is_some_and(|v| v == "1" || v == "true") {
+                    seg.hidden.push(row as u32);
                 }
                 let _ = empty;
             }
@@ -558,7 +567,53 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
             b"drawing" => seg.rep.note(Kind::Dropped, "charts, pictures and shapes (O4e)"),
             b"legacyDrawing" => seg.rep.note(Kind::Dropped, "comments"),
             b"tablePart" => seg.rep.note(Kind::Approximate, "tables kept as plain cells (O4d)"),
-            b"autoFilter" => seg.rep.note(Kind::Dropped, "filters (O4d)"),
+            b"autoFilter" => {
+                if let Some(rf) = attr(&e, b"ref")? {
+                    seg.filter = Some((rf, Vec::new()));
+                }
+            }
+            b"filterColumn" => {
+                fcol = attr(&e, b"colId")?.and_then(|v| v.parse::<u32>().ok());
+                if attr(&e, b"hiddenButton")?.is_some_and(|v| v == "1") {
+                    seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
+                }
+            }
+            b"filter" | b"filters" | b"customFilters" | b"customFilter" => {
+                let Some((_, conds)) = seg.filter.as_mut() else { continue };
+                let Some(c) = fcol else { continue };
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"filters" => {
+                        let blank = attr(&e, b"blank")?.is_some_and(|v| v == "1" || v == "true");
+                        conds.push((c, Cond::Values(if blank { vec![String::new()] } else { Vec::new() })));
+                    }
+                    b"filter" => {
+                        if let (Some((cc, Cond::Values(v))), Some(val)) = (conds.last_mut(), attr(&e, b"val")?) {
+                            if *cc == c && v.len() < 1 << 20 {
+                                v.push(val);
+                            }
+                        }
+                    }
+                    b"customFilters" => conds.push((c, Cond::Compare(Vec::new(), attr(&e, b"and")?.is_some_and(|v| v == "1" || v == "true")))),
+                    _ => {
+                        let op = match attr(&e, b"operator")?.as_deref() {
+                            None | Some("equal") => "=",
+                            Some("notEqual") => "<>",
+                            Some("lessThan") => "<",
+                            Some("lessThanOrEqual") => "<=",
+                            Some("greaterThan") => ">",
+                            Some("greaterThanOrEqual") => ">=",
+                            Some(_) => "",
+                        };
+                        let val = attr(&e, b"val")?.and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite());
+                        match (conds.last_mut(), val) {
+                            (Some((cc, Cond::Compare(v, _))), Some(x)) if *cc == c && !op.is_empty() && v.len() < 2 => v.push((op.to_string(), x)),
+                            _ => seg.rep.note(Kind::Approximate, "text and wildcard custom filters (rows stay as the file hid them)"),
+                        }
+                    }
+                }
+            }
+            b"dynamicFilter" | b"top10" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, top-10, colour and icon filters (rows stay as the file hid them)"),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => seg.rep.note(Kind::Dropped, "frozen panes"),
             _ => {}
         }
@@ -641,6 +696,8 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut last_row: Option<u32> = None;
         let mut widths = Vec::new();
         let mut heights = Vec::new();
+        let mut hidden: Vec<u32> = Vec::new();
+        let mut filter = None;
         let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
         let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
         let (mut dw, mut dh) = (None, None);
@@ -677,6 +734,8 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 shared.extend(seg.shared);
                 widths.extend(seg.widths);
                 heights.extend(seg.heights);
+                hidden.extend(seg.hidden);
+                filter = seg.filter.or(filter);
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
                 out.cells += seg.cells;
@@ -717,6 +776,18 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         }
         if !heights.is_empty() {
             sh.row_sizes = Sizes::from_overrides(sh.row_sizes.default, heights);
+        }
+        // Hidden rows as the file hid them; the filter kept with its conditions (the
+        // file's rows are what Excel last computed, so they are not recomputed).
+        sh.hidden = officina_grid::filter::merge(hidden.into_iter().map(|r| (r, r)).collect());
+        if let Some((rf, mut conds)) = filter {
+            if let Some((r0, c0, r1, c1)) = parse_ref(&rf) {
+                conds.retain_mut(|(c, cond)| {
+                    *c += c0;
+                    *c <= c1 && !matches!(cond, Cond::Compare(v, _) if v.is_empty())
+                });
+                sh.filter = Some(AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
+            }
         }
         // Styles: a column's own style under its cells' runs.
         let mut id = |xf: u32| -> StyleId {
@@ -1045,4 +1116,12 @@ mod tests {
         assert_eq!(resolve("", "xl/workbook.xml"), "xl/workbook.xml");
         assert_eq!(resolve("xl/workbook.xml", "/xl/s.xml"), "xl/s.xml");
     }
+}
+
+/// `A1:D10` (or one cell) as (r0, c0, r1, c1).
+pub(crate) fn parse_ref(s: &str) -> Option<(u32, u32, u32, u32)> {
+    let s = s.replace('$', "");
+    let (a, b) = s.split_once(':').unwrap_or((&s, &s));
+    let ((r0, c0), (r1, c1)) = (parse_a1(a)?, parse_a1(b)?);
+    Some((r0.min(r1), c0.min(c1), r0.max(r1), c0.max(c1)))
 }

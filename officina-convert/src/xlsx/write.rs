@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
 use officina_grid::formula;
+use officina_grid::filter::Cond;
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::xlsx::read::MDW;
@@ -210,7 +211,25 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
         o.extend_from_slice(b"</cols>");
     }
     o.extend_from_slice(b"<sheetData>");
-    let heights = sh.row_sizes.overrides();
+    // Rows with attributes: their height, hidden.
+    let mut meta: BTreeMap<u32, (Option<f64>, bool)> = BTreeMap::new();
+    for &(r, px) in sh.row_sizes.overrides() {
+        meta.entry(r).or_insert((None, false)).0 = Some(px);
+    }
+    for &(a, b) in &sh.hidden {
+        for r in a..=b.min(XLSX_ROWS - 1) {
+            meta.entry(r).or_insert((None, false)).1 = true;
+        }
+    }
+    let heights: Vec<(u32, (Option<f64>, bool))> = meta.into_iter().collect();
+    let row_attrs = |o: &mut Vec<u8>, m: &(Option<f64>, bool)| {
+        if let Some(px) = m.0 {
+            let _ = write!(o, r#" ht="{}" customHeight="1""#, px * 72.0 / 96.0);
+        }
+        if m.1 {
+            o.extend_from_slice(br#" hidden="1""#);
+        }
+    };
     let mut hi = 0;
     let mut cur_row: Option<u32> = None;
     // Shared-formula ids: one per fill longer than a cell.
@@ -225,17 +244,18 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
             o.extend_from_slice(b"</row>");
         }
         while *hi < heights.len() && heights[*hi].0 < r {
-            // A sized row with no cells.
-            let (hr, px) = heights[*hi];
-            let _ = write!(o, r#"<row r="{}" ht="{}" customHeight="1"/>"#, hr + 1, px * 72.0 / 96.0);
+            // A sized or hidden row with no cells.
+            let _ = write!(o, r#"<row r="{}""#, heights[*hi].0 + 1);
+            row_attrs(o, &heights[*hi].1);
+            o.extend_from_slice(b"/>");
             *hi += 1;
         }
+        let _ = write!(o, r#"<row r="{}""#, r + 1);
         if *hi < heights.len() && heights[*hi].0 == r {
-            let _ = write!(o, r#"<row r="{}" ht="{}" customHeight="1">"#, r + 1, heights[*hi].1 * 72.0 / 96.0);
+            row_attrs(o, &heights[*hi].1);
             *hi += 1;
-        } else {
-            let _ = write!(o, r#"<row r="{}">"#, r + 1);
         }
+        o.push(b'>');
         *cur = Some(r);
     };
     if (rows > 0 && cols > 0) || !extra.is_empty() {
@@ -323,13 +343,57 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
         o.extend_from_slice(b"</row>");
     }
     while hi < heights.len() {
-        let (hr, px) = heights[hi];
+        let (hr, m) = heights[hi];
         if hr < XLSX_ROWS {
-            let _ = write!(o, r#"<row r="{}" ht="{}" customHeight="1"/>"#, hr + 1, px * 72.0 / 96.0);
+            let _ = write!(o, r#"<row r="{}""#, hr + 1);
+            row_attrs(&mut o, &m);
+            o.extend_from_slice(b"/>");
         }
         hi += 1;
     }
-    o.extend_from_slice(b"</sheetData></worksheet>");
+    o.extend_from_slice(b"</sheetData>");
+    if let Some(f) = &sh.filter {
+        if f.rect.r1 < XLSX_ROWS && f.rect.c1 < XLSX_COLS {
+            let _ = write!(o, r#"<autoFilter ref="{}:{}""#, a1(f.rect.r0, f.rect.c0), a1(f.rect.r1, f.rect.c1));
+            if f.conds.is_empty() {
+                o.extend_from_slice(b"/>");
+            } else {
+                o.push(b'>');
+                for (c, cond) in &f.conds {
+                    let _ = write!(o, r#"<filterColumn colId="{}">"#, c - f.rect.c0);
+                    match cond {
+                        Cond::Values(v) => {
+                            o.extend_from_slice(if v.iter().any(|x| x.is_empty()) { br#"<filters blank="1">"# as &[u8] } else { b"<filters>" });
+                            for x in v.iter().filter(|x| !x.is_empty()) {
+                                o.extend_from_slice(b"<filter val=\"");
+                                esc(&mut o, x);
+                                o.extend_from_slice(b"\"/>");
+                            }
+                            o.extend_from_slice(b"</filters>");
+                        }
+                        Cond::Compare(cs, and) => {
+                            o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
+                            for (op, x) in cs {
+                                let name = match op.as_str() {
+                                    "<>" => "notEqual",
+                                    "<" => "lessThan",
+                                    "<=" => "lessThanOrEqual",
+                                    ">" => "greaterThan",
+                                    ">=" => "greaterThanOrEqual",
+                                    _ => "equal",
+                                };
+                                let _ = write!(o, r#"<customFilter operator="{name}" val="{x}"/>"#);
+                            }
+                            o.extend_from_slice(b"</customFilters>");
+                        }
+                    }
+                    o.extend_from_slice(b"</filterColumn>");
+                }
+                o.extend_from_slice(b"</autoFilter>");
+            }
+        }
+    }
+    o.extend_from_slice(b"</worksheet>");
     Ok(o)
 }
 
@@ -391,9 +455,18 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         let _ = write!(w, r#"" sheetId="{}" r:id="rId{}"/>"#, s + 1, s + 1);
     }
     w.extend_from_slice(b"</sheets>");
-    if !wb.names().is_empty() {
+    let filtered: Vec<u16> = (0..n as u16).filter(|&s| wb.sheet(s).filter.is_some()).collect();
+    if !wb.names().is_empty() || !filtered.is_empty() {
         w.extend_from_slice(b"<definedNames>");
-        for d in wb.names().iter() {
+        // Excel's name for each auto-filter's range.
+        for &s in &filtered {
+            let f = wb.sheet(s).filter.as_ref().unwrap();
+            let _ = write!(w, r#"<definedName name="_xlnm._FilterDatabase" localSheetId="{s}" hidden="1">"#);
+            let sheet = crate::ods::formula::sheet_a1(&wb.sheet_name(s));
+            esc(&mut w, &format!("{sheet}!${}${}:${}${}", officina_grid::addr::col_name(f.rect.c0), f.rect.r0 + 1, officina_grid::addr::col_name(f.rect.c1), f.rect.r1 + 1));
+            w.extend_from_slice(b"</definedName>");
+        }
+        for d in wb.names().iter().filter(|d| !d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase")) {
             w.extend_from_slice(b"<definedName name=\"");
             esc(&mut w, &d.name);
             w.push(b'"');

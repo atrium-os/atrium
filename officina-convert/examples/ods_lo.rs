@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use officina_grid::addr::{CellAddr, Rect};
+use officina_grid::filter::{AutoFilter, Cond};
 use officina_grid::style::{Edge, HAlign, Line, Style, VAlign};
 use officina_grid::{Value, Workbook};
 
@@ -129,6 +130,20 @@ fn fixture(cases: &[(String, String)], st: &[(Style, Value)]) -> Workbook {
     for (i, (f, _)) in cases.iter().enumerate() {
         wb.set_input(CellAddr::new(0, 100 + i as u32, COL), f).unwrap();
     }
+    // An auto-filter on the second sheet (C10:D16): fruit in a list, count over 3;
+    // and rows 30-31 hidden by hand.
+    for (r, (f, n)) in [("Fruit", 0.0), ("apple", 3.0), ("Pear", 10.0), ("apple", 7.0), ("fig", 1.0), ("pear", 4.0), ("kiwi", 9.0)].iter().enumerate() {
+        wb.set_input(CellAddr::new(1, 9 + r as u32, 2), f).unwrap();
+        if r > 0 {
+            wb.set_value(CellAddr::new(1, 9 + r as u32, 3), Value::Num(*n));
+        } else {
+            wb.set_input(CellAddr::new(1, 9, 3), "Count").unwrap();
+        }
+    }
+    wb.sheet_mut(1).hidden = vec![(29, 30)];
+    let f = AutoFilter { rect: Rect { sheet: 1, r0: 9, c0: 2, r1: 15, c1: 3 }, conds: vec![(2, Cond::Values(vec!["pear".into(), "apple".into()])), (3, Cond::Compare(vec![(">".into(), 3.0)], true))] };
+    let fst = wb.filtered(1, Some(f));
+    wb.replace_filter(fst);
     for (i, (s, v)) in st.iter().enumerate() {
         let a = CellAddr::new(2, i as u32, SCOL);
         wb.set_value(a, v.clone());
@@ -194,6 +209,14 @@ fn compare(what: &str, wb: &Workbook, back: &Workbook, cases: &[(String, String)
         }
     }
     kept &= back.get(CellAddr::new(1, 0, 0)) == wb.get(CellAddr::new(1, 0, 0));
+    let rows_ok = back.sheet(1).hidden == wb.sheet(1).hidden;
+    if !rows_ok {
+        println!("  {what}: hidden rows {:?} → {:?}", wb.sheet(1).hidden, back.sheet(1).hidden);
+    }
+    let filter_ok = back.sheet(1).filter == wb.sheet(1).filter;
+    if !filter_ok {
+        println!("  {what}: filter {:?}\n      → {:?}", wb.sheet(1).filter, back.sheet(1).filter);
+    }
     let mut n_ok = 0;
     for (k, f) in NAMED.iter().enumerate() {
         let a = CellAddr::new(if k == 3 { 1 } else { 0 }, 60 + k as u32, 27);
@@ -203,7 +226,7 @@ fn compare(what: &str, wb: &Workbook, back: &Workbook, cases: &[(String, String)
             println!("  {what}: {f} shows {:?} (want {:?}), formula {:?}", back.get(a), wb.get(a), back.formula_text(a));
         }
     }
-    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}; {n_ok}/{} name formulas, {} names", cases.len(), st.len(), NAMED.len(), back.names().len())
+    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}; {n_ok}/{} name formulas, {} names; hidden rows kept {rows_ok}, filter kept {filter_ok}", cases.len(), st.len(), NAMED.len(), back.names().len())
 }
 
 fn main() {

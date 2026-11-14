@@ -353,6 +353,10 @@ impl GridView {
                         }
                         for row in r0..=r1 {
                             let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
+                            if yb <= yt {
+                                // A hidden row (filtered out): nothing to draw.
+                                continue;
+                            }
                             for col in c0..=c1 {
                                 let Some(cv) = src.cell(row, col) else { continue };
                                 let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
@@ -527,7 +531,7 @@ impl GridView {
                     }
                     let label = src.col_label(c);
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
-                    let lw = crate::text::measure(&label, &st).w;
+                    let lw = crate::text::measure_chars(&label, &st);
                     if lw <= w {
                         ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
                     }
@@ -602,6 +606,9 @@ impl GridView {
                 ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
                 for row in r0..=r1 {
                     let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
+                    if yb <= yt {
+                        continue;
+                    }
                     let cy = q(rh_rect.y() as f64 + (yt - by));
                     let h = (yb - yt) as f32;
                     ctx.key(row as u64 + 1);
@@ -613,7 +620,8 @@ impl GridView {
                     }
                     let label = src.row_label(row);
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
-                    let lw = crate::text::measure(&label, &st).w;
+                    // By character widths: every row number is a new string.
+                    let lw = crate::text::measure_chars(&label, &st);
                     ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
                     ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
                     ctx.pop();
@@ -693,8 +701,9 @@ fn ring(ctx: &mut Ctx, r: Rect, c: Color) {
     ctx.add(Node::Rect { rect: Rect::new(r.x() + r.w() - k, r.y(), k, r.h()), fill: c, radius: 0.0 });
 }
 
-/// The text a cell shows in `avail` px and its width: whole when it
-/// fits; a number too wide becomes `#`s (a cut number would lie); other
+/// The text a cell shows in `avail` px and its width (by cached character widths:
+/// a sheet of distinct numbers must not ask the compositor for each one): whole when
+/// it fits; a number too wide becomes `#`s (a cut number would lie); other
 /// text is cut with an ellipsis.
 fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
     let est = cv.text.chars().count() as f32 * style.size * 0.6;
@@ -702,7 +711,7 @@ fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
         // Clearly fits and left-aligned: no need to measure.
         return (cv.text.clone(), est);
     } else {
-        crate::text::measure(&cv.text, style).w
+        crate::text::measure_chars(&cv.text, style)
     };
     if w <= avail {
         return (cv.text.clone(), w);
@@ -711,7 +720,7 @@ fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
         return (String::new(), 0.0);
     }
     if cv.numeric {
-        let one = crate::text::measure("#", style).w.max(1.0);
+        let one = crate::text::measure_chars("#", style).max(1.0);
         let n = (avail / one).floor().max(1.0) as usize;
         let s = "#".repeat(n);
         return (s, n as f32 * one);
@@ -721,7 +730,7 @@ fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
     let mut n = ((avail / w) * chars.len() as f32) as usize;
     loop {
         let s: String = chars[..n.min(chars.len())].iter().collect::<String>() + "…";
-        let sw = crate::text::measure(&s, style).w;
+        let sw = crate::text::measure_chars(&s, style);
         if sw <= avail || n == 0 {
             return if n == 0 { (String::new(), 0.0) } else { (s, sw) };
         }

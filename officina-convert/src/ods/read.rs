@@ -21,6 +21,7 @@ use officina_grid::column::Sizes;
 use officina_grid::eval::dates;
 use officina_grid::strings::MAX_TEXT;
 use officina_grid::style::{Edge, HAlign, Line, Style, StyleId, StyleRuns, VAlign};
+use officina_grid::filter::Cond;
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::report::{Kind, Report};
@@ -690,6 +691,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     r.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut sheet: Option<u16> = None;
+    // Hidden rows of the sheet being read; an auto-filter being read (target range,
+    // conditions by field) and the filters read.
+    let mut hidden_rows: Vec<(u32, u32)> = Vec::new();
+    let mut db: Option<(String, Vec<(u32, Cond)>)> = None;
+    let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
+    let mut filter_and = true;
+    let mut in_set = false;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
     let mut names: Vec<(String, Option<u16>, String, Option<String>)> = Vec::new();
     let (mut row, mut col): (u64, u64) = (0, 0);
@@ -795,8 +803,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 }
                             }
                         }
-                        if a.get("table:visibility").is_some_and(|v| v != "visible") {
-                            rep.note(Kind::Approximate, "hidden rows shown");
+                        if a.get("table:visibility").is_some_and(|v| v != "visible") && row < MAX_ROWS as u64 {
+                            hidden_rows.push((row as u32, (row + row_repeat as u64 - 1).min(MAX_ROWS as u64 - 1) as u32));
                         }
                         col = 0;
                         row_cells.clear();
@@ -873,7 +881,65 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     }
                     b"calcext:conditional-formats" => rep.note(Kind::Dropped, "conditional formats"),
                     b"table:content-validations" => rep.note(Kind::Dropped, "data validation"),
-                    b"table:database-range" => rep.note(Kind::Dropped, "database ranges and filters (O4d)"),
+                    b"table:database-range" => {
+                        let a = attrs(e);
+                        db = None;
+                        if a.get("table:display-filter-buttons").is_some_and(|v| v == "true") {
+                            if let Some(t) = a.get("table:target-range-address") {
+                                db = Some((t.clone(), Vec::new()));
+                            }
+                        } else {
+                            rep.note(Kind::Dropped, "database ranges");
+                        }
+                    }
+                    b"table:filter-and" => filter_and = true,
+                    b"table:filter-or" => filter_and = false,
+                    b"table:filter-condition" | b"table:filter-set-item" => {
+                        let a = attrs(e);
+                        let Some((_, conds)) = db.as_mut() else { continue };
+                        if name == b"table:filter-set-item" {
+                            if let (Some((_, Cond::Values(v))), Some(x)) = (conds.last_mut(), a.get("table:value")) {
+                                // The condition's own value repeats the first item.
+                                if !std::mem::replace(&mut in_set, true) {
+                                    v.clear();
+                                }
+                                if v.len() < 1 << 20 {
+                                    v.push(x.clone());
+                                }
+                            }
+                            continue;
+                        }
+                        in_set = false;
+                        let Some(field) = a.get("table:field-number").and_then(|v| v.parse::<u32>().ok()) else { continue };
+                        let op = a.get("table:operator").map(String::as_str).unwrap_or("=");
+                        let value = a.get("table:value").cloned().unwrap_or_default();
+                        // LibreOffice leaves the type out of its numeric tests: an order
+                        // test on a number is numeric unless the file says text.
+                        let number = match a.get("table:data-type").map(String::as_str) {
+                            Some(t) => t == "number",
+                            None => !matches!(op, "=" | "!=") && value.parse::<f64>().is_ok(),
+                        };
+                        let cmp = ["=", "!=", "<", "<=", ">", ">="].contains(&op);
+                        match (number, cmp, value.parse::<f64>()) {
+                            (true, true, Ok(x)) if x.is_finite() => {
+                                let op = if op == "!=" { "<>" } else { op }.to_string();
+                                match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Compare(..))) {
+                                    Some((_, Cond::Compare(v, _))) if v.len() < 2 => v.push((op, x)),
+                                    Some(_) => rep.note(Kind::Approximate, "filters with more than two tests on a column (rows stay as the file hid them)"),
+                                    None => conds.push((field, Cond::Compare(vec![(op, x)], filter_and))),
+                                }
+                            }
+                            (false, _, _) if op == "=" => match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Values(_))) {
+                                Some((_, Cond::Values(v))) => {
+                                    if !value.is_empty() || empty {
+                                        v.push(value);
+                                    }
+                                }
+                                _ => conds.push((field, Cond::Values(if empty || !value.is_empty() { vec![value] } else { Vec::new() }))),
+                            },
+                            _ => rep.note(Kind::Approximate, "text, pattern and top-N filters (rows stay as the file hid them)"),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -893,6 +959,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     continue;
                 }
                 match name {
+                    b"table:database-range" => filters.extend(db.take()),
                     b"text:p" | b"text:h" => in_p = false,
                     b"table:table-cell" | b"table:covered-table-cell" => {
                         if let Some(c) = cell.take() {
@@ -981,6 +1048,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:table" => {
                         if let Some(s) = sheet.take() {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
+                            wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
                         }
                     }
                     _ => {}
@@ -992,6 +1060,21 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
     if wb.sheet_count() == 0 {
         return Err(bad("no tables"));
+    }
+
+    // Auto-filters: their range names the sheet.
+    for (target, mut conds) in filters {
+        let Some(a1) = super::formula::from_of(&format!("of:=[{}]", target.replace(':', ":"))) else { continue };
+        let (sh, rf) = match a1.trim_start_matches('=').rsplit_once('!') {
+            Some((sh, rf)) => (sh.trim_matches('\'').replace("''", "'"), rf.to_string()),
+            None => continue,
+        };
+        let (Some(s), Some((r0, c0, r1, c1))) = (wb.sheet_id(&sh), crate::xlsx::read::parse_ref(&rf)) else { continue };
+        conds.retain_mut(|(c, _)| {
+            *c += c0;
+            *c <= c1
+        });
+        wb.sheet_mut(s).filter = Some(officina_grid::filter::AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
     }
 
     // Names, before the formulas that use them; relative parts are from the base cell.

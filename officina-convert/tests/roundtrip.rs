@@ -181,3 +181,36 @@ fn names_round_trip() {
     assert_eq!(back.name_text(back.names().get(0, "_XLNM.PRINT_AREA").unwrap()), "=Data!$A$1:$D$20");
     assert!(back.names().get(0, "Half").is_none());
 }
+
+fn filtered(mut wb: Workbook) -> Workbook {
+    use officina_grid::addr::Rect;
+    use officina_grid::filter::{AutoFilter, Cond};
+    let f = AutoFilter {
+        rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 20, c1: 1 },
+        conds: vec![
+            (0, Cond::Compare(vec![(">".into(), 3.0), ("<".into(), 20.0)], true)),
+            (1, Cond::Values(vec!["item 3".into(), "ITEM 5".into(), "item 9".into()])),
+        ],
+    };
+    let mut st = wb.filtered(0, Some(f));
+    st.hidden.push((100, 102)); // hidden by hand, outside the filter
+    st.hidden = officina_grid::filter::merge(st.hidden);
+    wb.replace_filter(st);
+    wb
+}
+
+#[test]
+fn filter_round_trip() {
+    let wb = filtered(book());
+    let want = wb.filter_state(0);
+    assert_eq!(want.hidden.iter().map(|(a, b)| b - a + 1).sum::<u32>(), 20 - 3 + 3);
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.filter_state(0), want);
+    assert_eq!(back.filter_state(1).filter, None);
+    // The hidden _FilterDatabase name Excel wants comes and goes with the filter.
+    assert!(back.names().get(0, "_xlnm._FilterDatabase").is_some());
+    let again = xlsx::write(&back, Vec::new()).unwrap();
+    assert_eq!(xlsx::read(&again).unwrap().0.names().len(), back.names().len());
+}
