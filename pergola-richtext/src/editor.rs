@@ -13,7 +13,7 @@ use std::time::Duration;
 use officina_core::history::History;
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Align, AttrId, CharAttrs, CharFormat, ListKind, ListRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL};
+use officina_text::model::{Align, AttrId, CharAttrs, CharFormat, ImageData, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
@@ -88,7 +88,7 @@ pub struct Spot {
 /// them, and the attribute table entries interned for them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Logged {
-    Run { label: String, ops: Vec<TextOp>, merge: bool, attrs: Vec<CharAttrs> },
+    Run { label: String, ops: Vec<TextOp>, merge: bool, attrs: Vec<CharAttrs>, images: Vec<(u32, ImageData)> },
     Undo,
     Redo,
 }
@@ -111,13 +111,14 @@ pub struct Editor {
     /// Actions since [`Editor::take_log`], when journaling.
     log: Option<Vec<Logged>>,
     attrs_logged: usize,
+    images_logged: usize,
     numbering: Option<(u64, Rc<Numbering>)>,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, numbering: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None };
         e.paginate(SETTLE);
         e
     }
@@ -126,6 +127,7 @@ impl Editor {
     pub fn start_log(&mut self) {
         self.log = Some(Vec::new());
         self.attrs_logged = self.doc.attrs.len();
+        self.images_logged = self.doc.images.len();
     }
 
     /// The actions since the last call.
@@ -138,7 +140,10 @@ impl Editor {
     pub fn replay(&mut self, l: Logged) -> bool {
         self.doc.take_changes();
         let ok = match l {
-            Logged::Run { label, ops, merge, attrs } => {
+            Logged::Run { label, ops, merge, attrs, images } => {
+                for (_, img) in images {
+                    self.doc.images.add(img);
+                }
                 for a in attrs {
                     self.doc.attrs.intern(a);
                 }
@@ -153,6 +158,7 @@ impl Editor {
             Logged::Redo => self.history.redo(&mut self.doc).is_some(),
         };
         self.attrs_logged = self.doc.attrs.len();
+        self.images_logged = self.doc.images.len();
         self.changed();
         let c = self.clamp(self.caret);
         self.set_caret(c, false);
@@ -272,7 +278,9 @@ impl Editor {
         if let Some(log) = &mut self.log {
             let attrs = (self.attrs_logged..self.doc.attrs.len()).map(|i| self.doc.attrs.get(i as AttrId).clone()).collect();
             self.attrs_logged = self.doc.attrs.len();
-            log.push(Logged::Run { label: label.to_string(), ops: ops.clone(), merge, attrs });
+            let images = (self.images_logged..self.doc.images.len()).filter_map(|i| self.doc.images.get(i as u32).map(|d| (i as u32, (**d).clone()))).collect();
+            self.images_logged = self.doc.images.len();
+            log.push(Logged::Run { label: label.to_string(), ops: ops.clone(), merge, attrs, images });
         }
         if merge {
             self.history.extend_last(&mut self.doc, label, ops);
@@ -305,18 +313,64 @@ impl Editor {
 
     /// The attributes typed text gets at `p`: those before it, with any
     /// pending formatting over them.
+    /// Text typed next to a picture takes its formatting, not the picture.
     fn typing_attr(&mut self, p: Pos) -> Option<AttrId> {
-        let t = self.typing.clone()?;
         let para = self.doc.para(p.block)?;
         let before = para.attr_at(p.at.saturating_sub(1));
-        let base = self.doc.attrs.get(before).clone();
-        Some(self.doc.attrs.intern(t.over(&base)))
+        let mut base = self.doc.attrs.get(before).clone();
+        let pic = base.object.take().is_some();
+        let t = match self.typing.clone() {
+            Some(t) => t,
+            None if pic => CharAttrs::default(),
+            None => return None,
+        };
+        let mut a = t.over(&base);
+        a.object = None;
+        Some(self.doc.attrs.intern(a))
+    }
+
+    /// Places a picture at the caret (over the selection), in line with the
+    /// text: its frame is its pixel size at 96 dpi, shrunk to fit the column
+    /// and the page.
+    pub fn insert_image(&mut self, img: ImageData) -> bool {
+        if img.width == 0 || img.height == 0 || img.bytes.is_empty() {
+            return false;
+        }
+        let (px_w, px_h) = (img.width as i64, img.height as i64);
+        let mut w = px_w * 15;
+        let mut h = px_h * 15;
+        let fit_w = (self.pages.width() * 20 / officina_text::LU).min(MAX_OBJECT_TWIPS as i64).max(20);
+        let fit_h = (self.pages.content_height() * 20 / officina_text::LU * 9 / 10).min(MAX_OBJECT_TWIPS as i64).max(20);
+        if w > fit_w {
+            h = h * fit_w / w;
+            w = fit_w;
+        }
+        if h > fit_h {
+            w = w * fit_h / h;
+            h = fit_h;
+        }
+        let image = self.doc.images.add(img);
+        let (mut ops, start) = self.delete_selection_ops();
+        let mut a = self.typing_attr(start).map(|a| self.doc.attrs.get(a).clone()).unwrap_or_else(|| {
+            let before = self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1)));
+            self.doc.attrs.get(before).clone()
+        });
+        a.object = Some(ObjectRef { image, width: w.max(1) as u32, height: h.max(1) as u32 });
+        let attr = self.doc.attrs.intern(a);
+        let ins = Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] };
+        ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins });
+        self.apply("Insert Picture", ops, Kind::Other);
+        let p = Pos::new(start.block, start.at + OBJECT_CHAR.len_utf8() as u32);
+        self.caret = p;
+        self.anchor = p;
+        self.goal_x = None;
+        true
     }
 
     /// Types `s` over the selection. Newlines start paragraphs; other control
     /// characters are dropped (a tab and a line break, U+2028, stay).
     pub fn insert(&mut self, s: &str) -> bool {
-        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t').collect();
+        let s: String = s.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && c != OBJECT_CHAR).collect();
         if s.is_empty() {
             return false;
         }
@@ -1007,7 +1061,7 @@ pub enum Toggle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use officina_text::layout::FixedFonts;
     use pergola::event::{Key, Modifiers};
@@ -1170,6 +1224,61 @@ mod tests {
         assert_eq!(e.pages.pages().len(), a4);
         e.undo();
         assert!(e.doc.footer.is_none());
+    }
+
+    /// A w x h PNG, one colour.
+    pub(crate) fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut wr = enc.write_header().unwrap();
+            wr.write_image_data(&[200, 40, 40, 255].repeat((w * h) as usize)).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn a_picture_goes_in_line_and_typing_beside_it_is_text() {
+        let mut e = ed(&["ab"]);
+        e.start_log();
+        e.set_caret(Pos::new(0, 1), false);
+        let bytes = png(300, 150);
+        let (_, w, h) = navigator_image::image::natural_size(&bytes).unwrap();
+        assert_eq!((w, h), (300, 150));
+        assert!(e.insert_image(ImageData { bytes: bytes.clone().into(), width: w, height: h }));
+        assert_eq!(texts(&e), ["a\u{FFFC}b"]);
+        let p = e.doc.para(0).unwrap();
+        let o = e.doc.attrs.get(p.attr_at(1)).object.expect("a picture");
+        assert_eq!((o.width, o.height), (300 * 15, 150 * 15), "96 dpi");
+        typ(&mut e, "x");
+        let p = e.doc.para(0).unwrap();
+        assert!(e.doc.attrs.get(p.attr_at(4)).object.is_none(), "typed text isn't a picture");
+        // Pasted object characters are dropped.
+        e.insert("\u{FFFC}");
+        assert_eq!(texts(&e), ["a\u{FFFC}xb"]);
+        // The same picture again is stored once; a huge one fits the column.
+        e.insert_image(ImageData { bytes: bytes.into(), width: w, height: h });
+        e.insert_image(ImageData { bytes: png(4000, 1000).into(), width: 4000, height: 1000 });
+        assert_eq!(e.doc.images.len(), 2);
+        let p = e.doc.para(0).unwrap();
+        let big = e.doc.attrs.get(p.attr_at(p.text.len() as u32 - 2)).object.unwrap();
+        assert!(big.width as i64 <= e.pages.width() * 20 / officina_text::LU);
+        // The journal replays to the same document, pictures included.
+        let log = e.take_log();
+        let mut r = ed(&["ab"]);
+        for l in log {
+            r.replay(l);
+        }
+        assert_eq!(texts(&r), texts(&e));
+        assert_eq!(r.doc.images.len(), 2);
+        while !e.paginate(Duration::from_secs(1)) {}
+        e.undo();
+        e.undo();
+        e.undo();
+        e.undo();
+        assert_eq!(texts(&e), ["ab"]);
     }
 
     #[test]

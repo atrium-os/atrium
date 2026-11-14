@@ -8,6 +8,7 @@
 //! | 3 | ATTRS | the character attribute table after the default (id 0), in id order |
 //! | 4 | BLOCKS | up to [`BLOCKS_PER_CHUNK`] blocks from a first index: id, style, properties, text, runs |
 //! | 5 | CHECKPOINTS | page starts (block, line) from the last pagination, for showing a reopened file at once |
+//! | 6 | IMAGE | one picture: its index, its size in pixels, its encoded bytes (one chunk each, so a reader can load them late) |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Align, AttrId, HeaderFooter, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Align, AttrId, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -32,6 +33,12 @@ pub const STYLES: u16 = 2;
 pub const ATTRS: u16 = 3;
 pub const BLOCKS: u16 = 4;
 pub const CHECKPOINTS: u16 = 5;
+pub const IMAGE: u16 = 6;
+
+/// Largest picture side recorded, pixels.
+pub const MAX_IMAGE_PX: u64 = 1 << 16;
+/// Largest encoded picture.
+pub const MAX_IMAGE_BYTES: u64 = 48 << 20;
 
 pub const BLOCKS_PER_CHUNK: usize = 256;
 /// Most blocks a document may have.
@@ -75,7 +82,7 @@ impl From<WireError> for LoadError {
 /// Character attributes: a mask of the fields set, then their values.
 pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     let mut m = 0u16;
-    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some()].into_iter().enumerate() {
+    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -102,11 +109,16 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     if let Some(l) = &a.link {
         w.str(l);
     }
+    if let Some(o) = &a.object {
+        w.var(o.image as u64);
+        w.var(o.width as u64);
+        w.var(o.height as u64);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
-    if m >> 10 != 0 {
+    if m >> 11 != 0 {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -142,6 +154,15 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     }
     if on(9) {
         a.link = Some(Arc::from(r.str("link", 8192)?));
+    }
+    if on(10) {
+        let image = r.var()?;
+        let (w, h) = (r.var()?, r.var()?);
+        let side = 1..=MAX_OBJECT_TWIPS as u64;
+        if image > u32::MAX as u64 || !side.contains(&w) || !side.contains(&h) {
+            return Err(WireError::Invalid("picture frame"));
+        }
+        a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32 });
     }
     Ok(a)
 }
@@ -549,6 +570,12 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
     }
     c.add(STYLES, &w.into_bytes())?;
 
+    for (i, img) in doc.images.iter().enumerate() {
+        let mut w = Writer::new();
+        encode_image(&mut w, i as u32, img);
+        c.add(IMAGE, &w.into_bytes())?;
+    }
+
     let mut w = Writer::new();
     let n = doc.attrs.len();
     w.var(n as u64 - 1);
@@ -586,6 +613,31 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
 
 pub fn save_to_vec(doc: &TextDoc, checkpoints: &[Checkpoint]) -> Vec<u8> {
     save(doc, checkpoints, Vec::new()).expect("writing to a Vec does not fail")
+}
+
+/// One picture as the IMAGE chunk and the journal hold it: index, pixel size, bytes.
+pub fn encode_image(w: &mut Writer, i: u32, img: &ImageData) {
+    w.var(i as u64);
+    w.var(img.width as u64);
+    w.var(img.height as u64);
+    w.bytes(&img.bytes);
+}
+
+fn decode_image(data: &[u8]) -> Result<(u64, ImageData), LoadError> {
+    let mut r = Reader::new(data);
+    let (i, img) = decode_image_record(&mut r)?;
+    Ok((i as u64, img))
+}
+
+/// A picture from a journal record ([`encode_image`]).
+pub fn decode_image_record(r: &mut Reader) -> Result<(u32, ImageData), WireError> {
+    let i = r.var()?;
+    let (w, h) = (r.var()?, r.var()?);
+    let bytes = r.bytes("picture", MAX_IMAGE_BYTES)?;
+    if i > u32::MAX as u64 || !(1..=MAX_IMAGE_PX).contains(&w) || !(1..=MAX_IMAGE_PX).contains(&h) || bytes.is_empty() {
+        return Err(WireError::Invalid("picture"));
+    }
+    Ok((i as u32, ImageData { bytes: Arc::from(bytes), width: w as u32, height: h as u32 }))
 }
 
 // ---------- load ----------
@@ -655,10 +707,26 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
     }
     doc.styles = StyleSheet { styles, ..StyleSheet::default() };
 
+    let mut images: Vec<(u64, ImageData)> = Vec::new();
+    for (i, e) in c.entries().iter().enumerate() {
+        if e.kind == IMAGE {
+            images.push(decode_image(c.chunk(i)?)?);
+        }
+    }
+    images.sort_by_key(|x| x.0);
+    for (k, (i, img)) in images.into_iter().enumerate() {
+        if i != k as u64 || doc.images.add(img) != k as u32 {
+            return Err(LoadError::Bad("pictures missing, repeated or out of order"));
+        }
+    }
+
     let mut r = Reader::new(one(ATTRS, "ATTRS chunk")?);
     let n = r.count("attributes", MAX_ATTRS, 2)?;
     for i in 0..n {
         let a = decode_attrs(&mut r)?;
+        if a.object.is_some_and(|o| o.image as usize >= doc.images.len()) {
+            return Err(LoadError::Bad("picture reference"));
+        }
         if doc.attrs.intern(a) as usize != i + 1 {
             return Err(LoadError::Bad("attribute listed twice"));
         }
@@ -732,6 +800,10 @@ mod tests {
         d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
         d.page.margin_start = 1000;
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
+        let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });
+        assert_eq!(d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 }), img, "the same bytes are stored once");
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300 }), ..Default::default() });
+        d.push_para("a \u{FFFC} b", 0, vec![(0, 0), (2, pic), (5, 0)]);
         d
     }
 
@@ -745,6 +817,14 @@ mod tests {
         }
         assert_eq!(a.id_watermark(), b.id_watermark());
         assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
+        assert_eq!(a.images.iter().collect::<Vec<_>>(), b.images.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_picture_reference_past_the_pictures_is_refused() {
+        let mut d = TextDoc::new();
+        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 600, height: 300 }), ..Default::default() });
+        assert!(matches!(load(&save_to_vec(&d, &[])), Err(LoadError::Bad("picture reference"))));
     }
 
     #[test]

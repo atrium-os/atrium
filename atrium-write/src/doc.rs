@@ -75,7 +75,7 @@ enum Record {
 fn encode(r: &Record) -> Vec<u8> {
     let mut w = Writer::new();
     match r {
-        Record::Action(Logged::Run { label, ops, merge, attrs }) => {
+        Record::Action(Logged::Run { label, ops, merge, attrs, images }) => {
             w.u8(1);
             w.str(label);
             w.u8(*merge as u8);
@@ -86,6 +86,13 @@ fn encode(r: &Record) -> Vec<u8> {
             w.var(ops.len() as u64);
             for op in ops {
                 w.bytes(&native::encode_op(op));
+            }
+            // Pictures last, so records written before them still read.
+            if !images.is_empty() {
+                w.var(images.len() as u64);
+                for (i, img) in images {
+                    native::encode_image(&mut w, *i, img);
+                }
             }
         }
         Record::Action(Logged::Undo) => w.u8(2),
@@ -116,7 +123,14 @@ fn decode(b: &[u8], attrs: usize, styles: usize) -> Result<Record, WireError> {
             for _ in 0..k {
                 ops.push(native::decode_op(r.bytes("op", 64 << 20)?, attrs + n, styles)?);
             }
-            Record::Action(Logged::Run { label, ops, merge, attrs: new })
+            let mut images = Vec::new();
+            if !r.is_empty() {
+                let n = r.count("pictures", 1 << 16, 4)?;
+                for _ in 0..n {
+                    images.push(native::decode_image_record(&mut r)?);
+                }
+            }
+            Record::Action(Logged::Run { label, ops, merge, attrs: new, images })
         }
         2 => Record::Action(Logged::Undo),
         3 => Record::Action(Logged::Redo),
@@ -400,6 +414,19 @@ mod tests {
         let p = std::env::temp_dir().join(format!("atrium-write-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn a_journal_record_carries_its_pictures() {
+        let img = officina_text::model::ImageData { bytes: std::sync::Arc::from(&b"\x89PNG...."[..]), width: 3, height: 2 };
+        let rec = Record::Action(Logged::Run { label: "Insert Picture".into(), ops: vec![], merge: false, attrs: vec![], images: vec![(0, img.clone())] });
+        match decode(&encode(&rec), 1, 1).unwrap() {
+            Record::Action(Logged::Run { images, .. }) => assert_eq!(images, vec![(0, img)]),
+            _ => panic!("not a run"),
+        }
+        // A record from before pictures still reads.
+        let old = Record::Action(Logged::Run { label: "Typing".into(), ops: vec![], merge: true, attrs: vec![], images: vec![] });
+        assert!(matches!(decode(&encode(&old), 1, 1), Ok(Record::Action(Logged::Run { .. }))));
     }
 
     const NO: Modifiers = Modifiers { shift: false, ctrl: false, alt: false, meta: false };

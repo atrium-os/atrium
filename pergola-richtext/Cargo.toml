@@ -11,7 +11,11 @@ pergola = { path = "../pergola" }
 pergola-document = { path = "../pergola-document" }
 officina-core = { path = "../officina-core" }
 officina-text = { path = "../officina-text" }
+navigator-image = { path = "../navigator-image" }
 unicode-segmentation = "1"
+
+[dev-dependencies]
+png = "0.17"
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch.

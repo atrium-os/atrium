@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use officina_text::layout::{size_lu, ParaLayout};
+use officina_text::layout::{object_height, size_lu, ParaLayout, OBJECT_FACE};
 use officina_text::twips;
 use pergola::event::{Event, KeyEventKind};
 use pergola::geom::{Point, Rect};
@@ -174,7 +174,7 @@ impl RichTextView {
                     }
                     let mut ly = s.y;
                     for li in s.lines.clone() {
-                        draw_line(ctx, faces, &l, li, &text, cx, cy + ly as f64 * g.k, g.k);
+                        draw_line(ctx, faces, &ed.doc.images, &l, li, &text, cx, cy + ly as f64 * g.k, g.k);
                         ly += l.lines[li].height;
                     }
                 }
@@ -345,7 +345,8 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
 /// Draws line `li` of a paragraph with its top at window y `top`, content
 /// left at `left`.
 #[allow(clippy::too_many_arguments)]
-fn draw_line(ctx: &mut Ctx, faces: Option<&Faces>, l: &ParaLayout, li: usize, text: &str, left: f64, top: f64, k: f64) {
+#[allow(clippy::too_many_arguments)]
+fn draw_line(ctx: &mut Ctx, faces: Option<&Faces>, images: &officina_text::model::Images, l: &ParaLayout, li: usize, text: &str, left: f64, top: f64, k: f64) {
     let line = &l.lines[li];
     let natural = line.ascent + line.descent;
     let baseline = top + (line.ascent + (line.height - natural).max(0) / 2) as f64 * k;
@@ -356,9 +357,28 @@ fn draw_line(ctx: &mut Ctx, faces: Option<&Faces>, l: &ParaLayout, li: usize, te
     while i < gl.len() {
         let (face, fmt) = (gl[i].face, gl[i].fmt);
         let f = &l.formats[fmt as usize];
+        if face == OBJECT_FACE {
+            // A picture, on the baseline; a placeholder until it decodes.
+            let g = gl[i];
+            if let Some(o) = &f.object {
+                let (w, h) = (g.adv as f64 * k, object_height(o, g.adv) as f64 * k);
+                let rect = Rect::new(q(left + pen as f64 * k), q(baseline - h), w as f32, h as f32);
+                match images.get(o.image).and_then(|d| crate::pictures::picture(d, w * 2.0, h * 2.0)) {
+                    Some(image) => {
+                        ctx.add(Node::Image { rect, image });
+                    }
+                    None => {
+                        ctx.add(Node::Rect { rect, fill: Color::rgba(0.85, 0.86, 0.88, 1.0), radius: 0.0 });
+                    }
+                }
+            }
+            pen += g.adv;
+            i += 1;
+            continue;
+        }
         let x0 = pen;
         let mut run: Vec<PGlyph> = Vec::new();
-        while i < gl.len() && gl[i].face == face && gl[i].fmt == fmt {
+        while i < gl.len() && gl[i].face == face && gl[i].fmt == fmt && gl[i].face != OBJECT_FACE {
             let g = gl[i];
             let ch = text[g.cluster as usize..].chars().next().unwrap_or(' ');
             if !ch.is_control() && ch != '\u{2028}' && ch != '\t' {
@@ -498,6 +518,31 @@ mod tests {
 
     fn added(d: &[NodeDelta]) -> usize {
         d.iter().filter(|d| matches!(d, NodeDelta::Added { .. })).count()
+    }
+
+    #[test]
+    fn pictures_decode_once_and_only_near_the_view() {
+        use officina_text::model::ImageData;
+        let (mut app, ed, scroll) = host(3000);
+        {
+            let mut e = ed.borrow_mut();
+            // A picture on the first page and one far down.
+            for b in [0usize, 2900] {
+                e.set_caret(Pos::new(b, 0), false);
+                e.insert_image(ImageData { bytes: crate::editor::tests::png(64, 32).into(), width: 64, height: 32 });
+            }
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let before = crate::pictures::decodes();
+        let d = app.tick();
+        let images = |d: &[NodeDelta]| d.iter().filter(|x| matches!(x, NodeDelta::Added { node: Node::Image { .. }, .. })).count();
+        assert_eq!(images(&d), 1, "only the picture near the view");
+        assert_eq!(crate::pictures::decodes() - before, 1, "the same bytes decode once");
+        let mut st = scroll.get();
+        st.physics.set_position(40.0);
+        scroll.set(st);
+        app.tick();
+        assert_eq!(crate::pictures::decodes() - before, 1, "scrolling reuses the decode");
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub enum Cmd {
     Style(usize),
     List(ListKind),
     PageNumbers,
+    InsertPicture,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,6 +116,19 @@ impl Write {
         out
     }
 
+    /// Places a picture from its encoded bytes at the caret.
+    pub fn insert_picture(&self, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > navigator_image::image::MAX_ENCODED_IMAGE_BYTES {
+            return Err("it is over 16 MB".into());
+        }
+        let (_, w, h) = navigator_image::image::natural_size(&bytes).map_err(|k| format!("not a picture this app can show ({k})"))?;
+        let d = self.doc.borrow();
+        d.ed.borrow_mut().insert_image(officina_text::model::ImageData { bytes: bytes.into(), width: w, height: h });
+        drop(d);
+        self.sync();
+        Ok(())
+    }
+
     /// Journals the editor's actions; marks the document edited.
     pub fn sync(&self) {
         if self.doc.borrow_mut().sync_log() {
@@ -148,7 +162,8 @@ impl View for Write {
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 16.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
         button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 4.0);
-        button(ctx, "Page #", Cmd::PageNumbers, 68.0, 16.0);
+        button(ctx, "Page #", Cmd::PageNumbers, 68.0, 4.0);
+        button(ctx, "Picture…", Cmd::InsertPicture, 76.0, 16.0);
         let (style_name, cur_align) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();

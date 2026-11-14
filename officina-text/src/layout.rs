@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::model::{Align, BlockId, CharFormat, LineSpacing, Para, ParaFormat, TextDoc};
+use crate::model::{Align, BlockId, CharFormat, LineSpacing, ObjectRef, Para, ParaFormat, TextDoc, OBJECT_CHAR};
 use crate::{twips, LU};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,50 @@ pub struct Glyph {
     pub cluster: u32,
     /// Index into [`ParaLayout::formats`].
     pub fmt: u16,
+}
+
+/// The face of a glyph that stands for an inline picture (its `id` is 0; the
+/// picture is the format's `object`).
+pub const OBJECT_FACE: u16 = u16::MAX;
+
+/// A picture's laid-out size in layout units: its frame, scaled down to fit a
+/// column `full` wide.
+pub fn object_size(o: &ObjectRef, full: i64) -> (i64, i64) {
+    let (w, h) = (twips(o.width.max(1) as i64), twips(o.height.max(1) as i64));
+    if w > full && full > 0 {
+        (full, (h * full / w).max(1))
+    } else {
+        (w, h)
+    }
+}
+
+/// A laid-out picture's height from its glyph's advance.
+pub fn object_height(o: &ObjectRef, adv: i64) -> i64 {
+    (twips(o.height.max(1) as i64) * adv / twips(o.width.max(1) as i64)).max(1)
+}
+
+/// Glyphs for `text` in format `f`, whose `object` is `o`: each U+FFFC is the
+/// picture, as one glyph as wide as its frame; anything else is shaped.
+fn shape_with_objects(fonts: &dyn Fonts, text: &str, f: &CharFormat, o: &ObjectRef, full: i64) -> Vec<Glyph> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    let (w, _) = object_size(o, full);
+    for (i, ch) in text.char_indices().chain(std::iter::once((text.len(), '\0'))) {
+        if ch != OBJECT_CHAR && i < text.len() {
+            continue;
+        }
+        if i > from {
+            out.extend(fonts.shape(&text[from..i], f).into_iter().map(|mut g| {
+                g.cluster += from as u32;
+                g
+            }));
+        }
+        if i < text.len() {
+            out.push(Glyph { face: OBJECT_FACE, id: 0, adv: w, dx: 0, dy: 0, cluster: i as u32, fmt: 0 });
+        }
+        from = i + ch.len_utf8();
+    }
+    out
 }
 
 /// What shaping and metrics come from.
@@ -164,6 +208,7 @@ fn opportunities(text: &str) -> Vec<(u32, bool)> {
 /// Lays out `p` (of `doc`) in a column `width` layout units wide.
 pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> ParaLayout {
     let (pf, cf) = doc.styles.para_format(p.style, &p.props);
+    let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
     let mut formats: Vec<CharFormat> = Vec::new();
     let mut glyphs: Vec<Glyph> = Vec::new();
     let mut run_fmt: Vec<(u32, u16)> = Vec::new();
@@ -179,7 +224,10 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         }
         let text = &p.text[s as usize..e as usize];
         // Tabs: four spaces' width for now (tab stops come with the ruler).
-        let mut g = fonts.shape(text, &f);
+        let mut g = match &f.object {
+            Some(o) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
+            None => fonts.shape(text, &f),
+        };
         let space = if text.contains('\t') { fonts.shape(" ", &f).first().map_or(0, |g| g.adv) } else { 0 };
         for x in g.iter_mut() {
             x.cluster += s;
@@ -216,7 +264,6 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         }
         (cum[e as usize] - cum[start as usize], e)
     };
-    let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
     // A list item's hang holds its label; its text starts at the indent.
     let first_line = if pf.list.is_some() { pf.first_line.max(0) } else { pf.first_line };
     let avail = |first: bool| (full - if first { twips(first_line as i64) } else { 0 }).max(LU);
@@ -292,6 +339,16 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
             asc = asc.max(a);
             desc = desc.max(d);
             nat = nat.max(h);
+        }
+        // Pictures sit on the baseline and make the line as tall as they are.
+        for g in glyphs[g0..gi].iter().filter(|g| g.face == OBJECT_FACE) {
+            if let Some(o) = &formats[g.fmt as usize].object {
+                let h = object_height(o, g.adv);
+                if h > asc {
+                    nat += h - asc;
+                    asc = h;
+                }
+            }
         }
         let height = match pf.line_spacing {
             LineSpacing::Multiple(m) => nat * m.clamp(25, 1000) as i64 / 100,
@@ -397,6 +454,29 @@ mod tests {
         let mut d = TextDoc::new();
         d.blocks.update(0, |b| b.as_para_mut().unwrap().text = text.to_string());
         d
+    }
+
+    #[test]
+    fn a_picture_is_one_glyph_on_the_baseline_and_fits_the_column() {
+        use crate::model::ObjectRef;
+        let mut d = doc("ab\u{FFFC}cd");
+        let o = ObjectRef { image: 0, width: 2880, height: 1440 };
+        let pic = d.attrs.intern(CharAttrs { object: Some(o), ..Default::default() });
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, 0), (2, pic), (5, 0)]);
+        // A column 1 inch wide: the 2 x 1 inch frame scales to 1 x 0.5.
+        let w = twips(1440);
+        let l = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        let g: Vec<&Glyph> = l.glyphs.iter().filter(|g| g.face == OBJECT_FACE).collect();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].adv, w);
+        assert_eq!(object_height(&o, g[0].adv), twips(720));
+        let line = &l.lines[l.line_of(2)];
+        assert_eq!(line.ascent, twips(720), "the picture stands on the baseline");
+        assert!(line.height >= twips(720) + line.descent);
+        // Only U+FFFC is a picture, even in a run that names one.
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, pic)]);
+        let l = layout_para(&d, d.para(0).unwrap(), w, &FixedFonts);
+        assert_eq!(l.glyphs.iter().filter(|g| g.face == OBJECT_FACE).count(), 1);
     }
 
     #[test]

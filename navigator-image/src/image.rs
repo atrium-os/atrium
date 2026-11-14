@@ -204,6 +204,25 @@ pub fn sniff(b: &[u8]) -> Result<Format, &'static str> {
     Err("unknown")
 }
 
+/// A raster image's natural size from its header alone, nothing decoded (for
+/// laying out by size before any pixels exist). SVG has no natural pixel size.
+pub fn natural_size(b: &[u8]) -> Result<(Format, u32, u32), &'static str> {
+    let format = sniff(b)?;
+    let be32 = |i: usize| b.get(i..i + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+    let le16 = |i: usize| b.get(i..i + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u32);
+    let size = match format {
+        Format::Png => (b.get(12..16) == Some(b"IHDR")).then(|| be32(16).zip(be32(20))).flatten(),
+        Format::Jpeg => jpeg_frame_size(b),
+        Format::Gif => le16(6).zip(le16(8)),
+        Format::Webp => webp_size(b),
+        Format::Svg => return Err("svg"),
+    };
+    match size {
+        Some((w, h)) if w > 0 && h > 0 => Ok((format, w, h)),
+        _ => Err("no size in the header"),
+    }
+}
+
 /// The address an image is requested by: `blake3:` and 64 lowercase hex.
 pub fn address_hex(address: &str) -> Option<&str> {
     let hex = address.strip_prefix("blake3:")?;

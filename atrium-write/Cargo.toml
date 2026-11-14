@@ -15,6 +15,7 @@ name = "atrium-write"
 path = "src/bin/atrium_write.rs"
 
 [dependencies]
+navigator-image = { path = "../navigator-image" }
 officina-core = { path = "../officina-core" }
 officina-text = { path = "../officina-text" }
 pergola = { path = "../pergola" }
@@ -29,3 +30,6 @@ pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
 debug = 1
+
+[dev-dependencies]
+png = "0.17"

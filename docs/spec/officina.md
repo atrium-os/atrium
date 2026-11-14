@@ -1334,6 +1334,44 @@ footer.
 Not yet: tables, images, section-level headers (first page, odd and even), header
 editing beyond page numbers, list restart and start-at.
 
+### 16.14 O3d part 2 as built (2026-11-14): pictures
+
+- **Model** (`officina-text`): a picture is the character U+FFFC with a character
+  attribute `object: ObjectRef { image, width, height }` (its frame in twips), so it
+  flows in line with the text, is typed over, selected, copied, deleted and undone like
+  any character, and every existing op serves it. The bytes live once per document in
+  `TextDoc.images` (append-only while open, the same bytes stored once), with their
+  pixel size read from the header when added (`navigator_image::image::natural_size`,
+  nothing decoded).
+- **Layout**: each U+FFFC in an object run is one glyph (`OBJECT_FACE`) as wide as the
+  frame, scaled down to fit the column; the picture stands on the baseline and the line
+  grows to hold it. Layout reads only the frame, so paginating any number of pictures
+  decodes none (§7.4). Other characters in such a run are shaped as text.
+- **Native file**: chunk 6 IMAGE, one per picture (index, pixel size, bytes, at most
+  48 MB), so a reader can load them late; attribute mask bit 10 is the object. The
+  reader refuses gaps, repeats, frames over 22 in and references past the pictures.
+- **Editor**: `insert_image` places a picture at the caret at 96 dpi, shrunk to the
+  column and 90 % of the page height; text typed beside a picture takes its formatting
+  but never the picture; typed or pasted U+FFFC is dropped. The journal records the
+  pictures an action added (at the end of the record, so older records still read).
+- **Drawing** (`pergola-richtext/src/pictures.rs`): a picture is decoded the first time
+  a page showing it is drawn, at about twice its drawn size and never above its natural
+  size, by the Navigator's decoders (PNG, JPEG, GIF, WebP) with their header ceilings;
+  pixels stay in a 256 MB least-recently-used cache keyed by the bytes and size; a
+  picture that won't decode draws a grey frame. Pages never move either way.
+- **atrium-write**: "Picture…" asks the picker for a PNG, JPEG, GIF or WebP (read
+  only, at most 16 MB) and inserts it at the caret.
+
+Gates: a picture's glyph, scale to the column and line height; native round trip with
+a picture stored once; a reference past the pictures refused; insert, type beside,
+paste U+FFFC, a huge picture fitted, journal replay, undo; only the picture near the
+view is decoded, once, and scrolling reuses it; journal records with and without
+pictures.
+
+Not yet: decoding off the UI thread (a large JPEG decodes in the frame that first
+shows it), resizing a picture by dragging its handles, floating pictures with wrap
+(O5), pictures dropped from the store when unused (they go on saving until reopened).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

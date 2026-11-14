@@ -33,6 +33,73 @@ pub struct CharAttrs {
     /// A named character style under the direct formatting.
     pub style: Option<StyleId>,
     pub link: Option<Arc<str>>,
+    /// The character (U+FFFC) is a picture drawn in line with the text.
+    pub object: Option<ObjectRef>,
+}
+
+/// The object replacement character: one inline picture in the text.
+pub const OBJECT_CHAR: char = '\u{FFFC}';
+
+/// An inline picture: an image of the document's [`Images`] and the frame it is
+/// drawn in, in twips. Layout needs only the frame; the pixels are decoded when
+/// a page showing it is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectRef {
+    pub image: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Largest picture frame side, twips (22 in).
+pub const MAX_OBJECT_TWIPS: u32 = 31680;
+
+/// An image's encoded bytes (PNG, JPEG, GIF or WebP, as given) and its size in
+/// pixels, as read from its header when it was added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub bytes: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The pictures a document uses, each stored once however often it is placed.
+/// Append-only while the document is open (undo keeps indices valid).
+#[derive(Debug, Clone, Default)]
+pub struct Images {
+    list: Vec<Arc<ImageData>>,
+    by_hash: HashMap<u64, Vec<u32>>,
+}
+
+impl Images {
+    fn hash(b: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish()
+    }
+    /// Adds an image (or finds the same bytes already here); returns its index.
+    pub fn add(&mut self, img: ImageData) -> u32 {
+        let h = Self::hash(&img.bytes);
+        if let Some(&i) = self.by_hash.get(&h).and_then(|v| v.iter().find(|&&i| self.list[i as usize].bytes == img.bytes)) {
+            return i;
+        }
+        let i = self.list.len() as u32;
+        self.list.push(Arc::new(img));
+        self.by_hash.entry(h).or_default().push(i);
+        i
+    }
+    pub fn get(&self, i: u32) -> Option<&Arc<ImageData>> {
+        self.list.get(i as usize)
+    }
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<ImageData>> {
+        self.list.iter()
+    }
 }
 
 impl CharAttrs {
@@ -49,6 +116,7 @@ impl CharAttrs {
             family: self.family.clone().or_else(|| under.family.clone()),
             style: self.style.or(under.style),
             link: self.link.clone().or_else(|| under.link.clone()),
+            object: self.object.or(under.object),
         }
     }
 }
@@ -66,11 +134,12 @@ pub struct CharFormat {
     pub highlight: Option<u32>,
     pub family: Arc<str>,
     pub link: Option<Arc<str>>,
+    pub object: Option<ObjectRef>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None }
     }
 }
 
@@ -96,6 +165,9 @@ impl CharFormat {
         }
         if a.highlight.is_some() {
             self.highlight = a.highlight;
+        }
+        if a.object.is_some() {
+            self.object = a.object;
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -492,6 +564,8 @@ pub struct TextDoc {
     /// Text in the top and bottom margins of every page.
     pub header: Option<HeaderFooter>,
     pub footer: Option<HeaderFooter>,
+    /// The pictures placed in the text.
+    pub images: Images,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -530,7 +604,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

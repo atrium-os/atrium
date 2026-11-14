@@ -3,7 +3,7 @@
 //!
 //! cargo run --example sample_doc [OUT]
 
-use officina_text::model::{Align, CharAttrs, ListKind, ListRef, ParaProps, TextDoc};
+use officina_text::model::{Align, CharAttrs, ImageData, ListKind, ListRef, ObjectRef, ParaProps, TextDoc};
 use officina_text::native;
 
 fn main() {
@@ -37,6 +37,25 @@ fn main() {
     let k = d.push_para("A centred line.", 0, vec![]);
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.align = Some(Align::Center));
     let k = d.push_para("And one set to the right.", 0, vec![]);
+    // A picture in line with the text: a 640 x 160 gradient, drawn 4 x 1 inch.
+    let png = {
+        let (w, h) = (640u32, 160u32);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&[(40 + x * 180 / w) as u8, (90 + y * 120 / h) as u8, (200 - x * 120 / w) as u8, 255]);
+            }
+        }
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&px).unwrap();
+        out
+    };
+    let img = d.images.add(ImageData { bytes: png.into(), width: 640, height: 160 });
+    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 5760, height: 1440 }), ..Default::default() });
+    d.push_para("A picture: \u{FFFC} sits on the baseline.", 0, vec![(0, 0), (11, pic), (14, 0)]);
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.align = Some(Align::End));
     let item = |d: &mut TextDoc, t: &str, id, kind, level| {
         let i = d.push_para(t, 0, vec![]);
