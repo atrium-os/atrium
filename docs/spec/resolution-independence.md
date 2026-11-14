@@ -91,11 +91,11 @@ Built in step 1a (2026-11-14); fresco-protocol's "Units" note is the reference.
   declare layout) stay in device px, because one desktop spans monitors of different scales
   and the WM is a system client that frescod trusts with raw geometry. What forum-wm sizes in
   its own units is stated in pt and converted per monitor: each `Screen` carries the monitor's
-  `scale_milli`, and the bar (38 pt) and dock (48 pt) reservations, the dialog size
+  `scale_milli`, and the bar (38 pt) and dock reservations, the dialog size
   (480 x 320 pt) and the PiP minimum and margin (160 x 90 and 16 pt) go through `Screen::px`,
   rounding up. A window's size is the WM's to set, so on a scale change frescod keeps its
   buffer and the window's pt size follows the new scale; a pop-up keeps its pt size. The dock
-  redraws on a live scale change. Floating windows keeping their pt size across monitors is
+  redraws on a live scale change, and reports how tall it draws (§7.2). Floating windows keeping their pt size across monitors is
   step 6.
 
 ## 4. Per-monitor scale
@@ -270,10 +270,10 @@ parent's scale, so it keeps its size and its place against the parent on any mon
   its status icons are in pt and draw at the monitor's scale. Its icons are vector (Phosphor,
   and apps' vector status icons), flattened at the device size, so they stay crisp at 1.25
   or 2.0 with no 1x/2x assets.
-- **The space it reserves** is the gap today: forum-wm hard-codes `BAR_H = 38` and the dock's
-  48 as device px, so at scale 1.5 the bar draws 57 px tall while windows are laid out 38 px
-  down, under it. The reservations become pt, the same constants Pergola uses, times the
-  monitor's scale, so the bar and the work area always meet exactly. With text size above
+- **The space it reserves** is in pt (step 1b): forum-wm's `BAR_H = 38`, the same constant
+  Pergola uses, times the monitor's scale, so the bar and the work area always meet exactly.
+  Before 1b it was 38 device px, and at scale 1.5 the bar drew 57 px tall over windows laid
+  out 38 px down. With text size above
   100% the bar's height is em-based (§6.2) and the WM reserves the bar's reported height.
 - **A bar on each monitor** (where Forum shows one) draws at that monitor's scale, so on a
   mixed setup each bar is the same physical height.
@@ -284,8 +284,12 @@ parent's scale, so it keeps its size and its place against the parent on any mon
   between bar and panel (`HOSTED_LABEL_GAP`) becomes pt too.
 - **The dock** (forum-dock) is a Pergola app too, started with the session: its tiles
   (`TILE`, 60) and its Lucide icons are vector and in pt, so they follow the scale like the
-  bar. Its reservation is forum-wm's hard-coded 48 device px today and becomes the dock's
-  reported height in pt, as for the bar. It has no panels yet; when it gets them (a tile's
+  bar. It reports how tall it draws from the bottom of the screen (panel plus margin,
+  120 pt today) to forum-wm with `Intent::ReserveBottom { pt }` on the forum-ctl socket,
+  which only session components reach; forum-wm keeps that many pt free at the bottom of
+  the main monitor at its scale, keeps it across mode changes, clamps it to 240 pt, and
+  reserves nothing while no dock has reported (built 2026-11-14; before, forum-wm reserved
+  a fixed 48 and full-size windows covered most of the dock). It has no panels yet; when it gets them (a tile's
   menu, a stack of a folder), they are its pop-ups (§7.1). App icons that arrive as bitmaps
   (an app's manifest icon) follow §6.4: declared density, chosen for the device size.
 - **The trusted strip** above everything is frescod's (§8), 24 pt.

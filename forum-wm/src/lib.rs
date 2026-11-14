@@ -1175,6 +1175,19 @@ pub mod daemon {
         }
 
         /// Move the PiP window to `corner` and lay out again.
+        /// The dock reported how tall it draws (`Intent::ReserveBottom`, in
+        /// points): keep that much free at the bottom of the main monitor and
+        /// re-lay out. Clamped to `forum_ctl::MAX_RESERVE_PT`.
+        pub fn set_dock_reserve(&mut self, conn: &mut impl FrescoConn, pt: u32) -> io::Result<()> {
+            let pt = pt.min(forum_ctl::MAX_RESERVE_PT) as i32;
+            if pt == self.screen.dock_h {
+                return Ok(());
+            }
+            self.screen.dock_h = pt;
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces).map(|_| ())
+        }
+
         pub fn set_pip_corner(&mut self, conn: &mut impl FrescoConn, corner: forum_ctl::Corner) -> io::Result<()> {
             self.pip_corner = corner;
             let surfaces = conn.enumerate()?;
@@ -1536,6 +1549,9 @@ pub mod daemon {
         pub fn set_screen(&mut self, conn: &mut impl FrescoConn, screen: Screen)
             -> io::Result<Option<WmDeclareLayoutPayload>>
         {
+            // The dock's reservation is the dock's word (`set_dock_reserve`),
+            // not the mode's: a new mode keeps it.
+            let screen = Screen { dock_h: self.screen.dock_h, ..screen };
             if screen.rect.w <= 0 || screen.rect.h <= 0 || screen == self.screen {
                 return Ok(None);
             }
@@ -1753,6 +1769,10 @@ pub mod control {
                 let (groups, spanning) = wm.span_groups();
                 Reply::SpanGroups { groups, spanning, no_span: wm.displays.no_span.iter().cloned().collect() }
             }
+            Intent::ReserveBottom { pt } => match wm.set_dock_reserve(conn, pt) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::PipCorner { corner } => match wm.set_pip_corner(conn, corner) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -2705,6 +2725,23 @@ mod tests {
         assert_eq!(conn.released, [1]);
         let Reply::Pads { pads } = handle_intent(&mut wm, &mut conn, Intent::ListPads) else { panic!() };
         assert_eq!(pads[0].held_by_app, "");
+    }
+
+    /// The dock says how tall it draws (resolution-independence.md §7.2):
+    /// a maximized document ends above it at the monitor's scale, a new
+    /// mode keeps the reservation, and an oversized ask is clamped.
+    #[test]
+    fn the_dock_reports_its_own_height() {
+        let s = Screen { rect: WmRect { x: 0, y: 0, w: 3840, h: 2160 }, bar_h: 38, dock_h: 0, scale_milli: 1500 };
+        let mut wm = Wm::new(s);
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document)], ..Default::default() };
+        assert_eq!(wm.screen.work_area().h, 2160 - 57, "no dock yet: nothing kept free");
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 120 }), Reply::Ack);
+        assert_eq!(wm.screen.work_area().h, 2160 - 57 - 180, "120 pt at 1.5");
+        wm.set_screen(&mut conn, Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 38, dock_h: 0, scale_milli: 1000 }).unwrap();
+        assert_eq!(wm.screen.work_area().h, 1080 - 38 - 120, "a new mode keeps the dock's height");
+        handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 5000 });
+        assert_eq!(wm.screen.dock_h, forum_ctl::MAX_RESERVE_PT as i32);
     }
 
     #[test]

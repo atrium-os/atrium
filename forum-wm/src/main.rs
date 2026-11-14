@@ -161,7 +161,7 @@ fn screen_from(w: i32, h: i32, top: i32, scale_milli: u32) -> Screen {
      * bar button) fell outside the window, so frescod refused it. */
     /* Bar and dock in points, at the monitor's scale (each monitor's own
      * once frescod lists them: `Wm::screen_of`). */
-    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: BAR_H, dock_h: 48, scale_milli }
+    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: BAR_H, dock_h: 0, scale_milli }
 }
 
 /// Tell the user (Praeco, as a system poster: praecod's

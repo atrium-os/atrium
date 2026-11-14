@@ -72,6 +72,11 @@ fn screen_wh(conn: &mut Connection) -> (f32, f32) {
 const TILE: f32 = 60.0;
 const GAP: f32 = 16.0;
 const PAD: f32 = 16.0;
+/// The gap between the dock panel and the bottom of the screen.
+const MARGIN: f32 = 28.0;
+/// How tall the dock draws from the bottom of the screen, in points: what
+/// it asks forum-wm to keep free of windows (`Intent::ReserveBottom`).
+const RESERVE_PT: u32 = (PAD * 2.0 + TILE + MARGIN) as u32;
 
 // Lucide vector icons (ISC), embedded + parsed once into polylines. Drawn as stroked
 // segments — resolution-independent, like everything in the vector scene graph.
@@ -142,7 +147,7 @@ impl View for DockView {
         let dock_w = PAD * 2.0 + n * TILE + (n - 1.0) * GAP;
         let dock_h = PAD * 2.0 + TILE;
         let dock_x = (w - dock_w) * 0.5;
-        let dock_y = h - dock_h - 28.0;
+        let dock_y = h - dock_h - MARGIN;
 
         // Dock panel — elevated, rounded.
         ctx.add(Node::Rect {
@@ -232,6 +237,12 @@ fn render_dock() -> io::Result<()> {
     // frescod has none to give.
     let mode = conn.appearance().map(|a| pergola::window::theme_for(&a)).unwrap_or(mode);
     let mut surface = FrescoSurface::new(conn, win);
+    // Tell the WM how tall the dock draws, so a maximized window ends above
+    // it (resolution-independence.md §7.2). Best effort: without forum-wm
+    // (a bare dev session) there is nothing to tell.
+    if let Err(e) = reserve_bottom(RESERVE_PT) {
+        eprintln!("forum-dock: could not reserve {RESERVE_PT} pt for the dock: {e}");
+    }
 
     let size = std::rc::Rc::new(std::cell::Cell::new((sw, sh)));
     let mut app = App::new(DockView { apps, icons: Icons::load(), size: size.clone() }).with_theme(mode);
@@ -398,6 +409,21 @@ fn launch(app_id: &str) -> io::Result<()> {
             eprintln!("forum-dock: unexpected post-launch reply: {other:?}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Ask forum-wm to keep `pt` points free at the bottom of the screen.
+fn reserve_bottom(pt: u32) -> io::Result<()> {
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(forum_ctl::default_socket_path())?;
+    let req = forum_ctl::encode(&forum_ctl::Intent::ReserveBottom { pt })
+        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
+    forum_ctl::write_frame(&mut s, &req)?;
+    match forum_ctl::decode::<forum_ctl::Reply>(&forum_ctl::read_frame(&mut s)?) {
+        Ok(forum_ctl::Reply::Ack) => Ok(()),
+        Ok(forum_ctl::Reply::Err { message }) => Err(io::Error::other(message)),
+        Ok(other) => Err(io::Error::other(format!("{other:?}"))),
+        Err(e) => Err(io::Error::other(format!("decode: {e}"))),
     }
 }
 

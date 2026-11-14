@@ -108,6 +108,12 @@ pub enum Intent {
     /// "Move the picture-in-picture window to this corner" (a drag on it
     /// ends as this; atrium-player-pip-keys.md §3.2). Remembered.
     PipCorner { corner: Corner },
+    /// "Keep `pt` points free at the bottom of the main monitor": the dock
+    /// says how tall it draws, so no window covers it
+    /// (resolution-independence.md §7.2). In points, so it holds at every
+    /// scale; at most [`MAX_RESERVE_PT`]. 0 gives the space back. Only a
+    /// session component reaches this socket (`forum-control`).
+    ReserveBottom { pt: u32 },
     /// "Which gamepads are there, and which app holds each?" — the
     /// controller menu (fresco-capabilities.md §4). Read-only.
     ListPads,
@@ -128,6 +134,10 @@ pub enum Intent {
     /// claims the pop-up with it (forum-status-items.md §4).
     StatusOpenPanel { app_id: String, token: [u8; 16] },
 }
+
+/// The most a [`Intent::ReserveBottom`] may keep free, in points: a dock
+/// that asks for more is clamped, so it cannot take the screen from apps.
+pub const MAX_RESERVE_PT: u32 = 240;
 
 // ── status items (docs/spec/forum-status-items.md) ──────────────────────────
 

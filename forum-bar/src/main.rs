@@ -1232,7 +1232,7 @@ mod tests {
         let (chips, ws) = poll_status();
         let (time, date) = clock_now();
         BarView {
-            w: 1280.0,
+            w: Rc::new(std::cell::Cell::new(1280.0)),
             chips: Mutable::new(chips),
             workspace: Mutable::new(ws),
             time: Mutable::new(time),
