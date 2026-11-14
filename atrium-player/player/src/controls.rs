@@ -215,10 +215,11 @@ impl Controls {
         None
     }
 
-    /// A key press, by HID usage, with Fresco's modifier bits (bit 0 Shift).
+    /// A key press, by HID usage, with Fresco's modifier byte (HID: Shift
+    /// is 0x02 or 0x20).
     pub fn key(&mut self, hid_usage: u16, modifiers: u8) -> Option<Action> {
         self.poke();
-        if modifiers & 1 != 0 {
+        if modifiers & 0x22 != 0 {
             return match hid_usage {
                 0x11 => Some(Action::PageAction(limen::media_player::media_action::NEXT_TRACK)), // N
                 0x13 => Some(Action::PageAction(limen::media_player::media_action::PREVIOUS_TRACK)), // P
@@ -390,8 +391,8 @@ mod tests {
         assert_eq!(c.key(0x26, 0), Some(Action::Seek(0.9)), "9");
         assert_eq!(c.key(0x10, 0), Some(Action::ToggleMute));
         assert_eq!(c.key(0x04, 0), None, "a");
-        assert_eq!(c.key(0x11, 1), Some(Action::PageAction(1)), "shift-N");
-        assert_eq!(c.key(0x0E, 1), None, "shift-K");
+        assert_eq!(c.key(0x11, 0x02), Some(Action::PageAction(1)), "shift-N");
+        assert_eq!(c.key(0x0E, 0x02), None, "shift-K");
         assert_eq!(c.key(0x0C, 0), Some(Action::TogglePip), "i");
         // The PiP button takes the bar's right end, and the track gives way.
         let (_, x1, _) = c.track();

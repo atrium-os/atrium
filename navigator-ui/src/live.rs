@@ -40,6 +40,9 @@ use crate::trail::PageId;
 /// jail with its own layout; the broker's own bound is 16 sessions
 /// (backend §4.4a), and the UI stays well inside it.
 pub const BUDGET: usize = 6;
+/// A live page not looked at for this long is parked: well inside the
+/// broker's 30-minute idle timeout (backend §4.4b).
+pub const IDLE_S: u64 = 20 * 60;
 /// How long a child has to answer `Park` before it is closed anyway (the
 /// page then comes back from the top).
 const PARK_WAIT: Duration = Duration::from_secs(3);
@@ -93,6 +96,8 @@ pub struct Live {
     /// Pages to open as their current version, not the stored one
     /// (Reload, "Fetch the current version").
     fresh: HashSet<Key>,
+    /// A page not looked at for this long is parked (`NAVIGATOR_UI_IDLE_S`).
+    idle: Duration,
 }
 
 fn send(w: &mut UnixStream, r: &Request) {
@@ -144,6 +149,7 @@ impl Live {
                 }
             }
         });
+        let idle = Duration::from_secs(std::env::var("NAVIGATOR_UI_IDLE_S").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(IDLE_S));
         let budget = std::env::var("NAVIGATOR_UI_LIVE").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(BUDGET);
         Ok((
             Live {
@@ -161,6 +167,7 @@ impl Live {
                 jars: HashSet::new(),
                 history: false,
                 fresh: HashSet::new(),
+                idle,
             },
             fd,
         ))
@@ -263,27 +270,35 @@ impl Live {
     }
 
     /// Park the least recently seen pages past the budget.
+    /// Park the least recently seen pages past the budget, and any page
+    /// not looked at for `idle` (§4.4: an idle expiry is a park, never a
+    /// loss: the UI parks a page well before a broker's idle timeout).
+    /// Never the page on screen or its parent.
     fn park(&mut self, s: &Shell) {
         let parent = self.shown.and_then(|(t, p)| (s.store.trail().id == t).then(|| s.store.trail().pages.get(p).and_then(|q| q.parent)).flatten().map(|q| (t, q)));
+        let (shown, idle) = (self.shown, self.idle);
+        let parkable = move |c: &Child| c.parking.is_none() && Some(c.key) != shown && Some(c.key) != parent;
         while self.live() > self.budget {
-            let pick = self
-                .children
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.parking.is_none() && Some(c.key) != self.shown && Some(c.key) != parent)
-                .min_by_key(|(_, c)| c.seen)
-                .map(|(i, _)| i);
+            let pick = self.children.iter().enumerate().filter(|(_, c)| parkable(c)).min_by_key(|(_, c)| c.seen).map(|(i, _)| i);
             let Some(i) = pick else { break };
-            let live = self.live();
-            let c = &mut self.children[i];
-            c.parking = Some(Instant::now());
-            eprintln!("navigator-ui: parking {} ({live} live, budget {})", c.url, self.budget);
-            if self.children[i].attached {
-                let embed = self.children[i].embed;
-                self.to_child(embed, &ToChild::Park);
-            } else {
-                self.close(i);
-            }
+            let why = format!("{} live, budget {}", self.live(), self.budget);
+            self.park_one(i, &why);
+        }
+        while let Some(i) = self.children.iter().position(|c| parkable(c) && c.seen.elapsed() > idle) {
+            let why = format!("not looked at for {} s", self.children[i].seen.elapsed().as_secs());
+            self.park_one(i, &why);
+        }
+    }
+
+    fn park_one(&mut self, i: usize, why: &str) {
+        let c = &mut self.children[i];
+        c.parking = Some(Instant::now());
+        eprintln!("navigator-ui: parking {} ({why})", c.url);
+        if self.children[i].attached {
+            let embed = self.children[i].embed;
+            self.to_child(embed, &ToChild::Park);
+        } else {
+            self.close(i);
         }
     }
 
@@ -540,7 +555,7 @@ impl Live {
                     while let Some(i) = self.children.iter().position(|c| keys.contains(&c.key) && Some(c.key) != self.shown) {
                         self.close(i);
                     }
-                    eprintln!("navigator-ui: history cleared: {} pages of open trails, {} stored versions to take out", keys.len(), records.len());
+                    eprintln!("navigator-ui: history cleared: {} pages, {} stored versions to take out", keys.len(), records.len());
                     for chunk in records.chunks(navigator_control::CLEAR_MAX) {
                         send(&mut self.w, &Request::Clear { records: chunk.to_vec() });
                     }

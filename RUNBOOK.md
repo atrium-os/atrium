@@ -1815,7 +1815,7 @@ Four-app multi-window demo: `atrium-edit-socket` + `atrium-term-socket` + `atriu
 
 **D1 step 2(c.16) (native keyboard + pointer via /dev/hidraw*)** — DONE (2026-04-29). Both readers open the kernel's hidraw cdev directly; no AT-scancode translation, no Linux-shape evdev. Identification is by HID report descriptor (`HIDIOCGRDESC` ioctl):
 
-- `input_reader` finds the first hidraw whose descriptor starts with USAGE_PAGE(Generic Desktop) ; USAGE(Keyboard) (`05 01 09 06`). Reads 8-byte USB HID Keyboard boot reports. Bytes are *already in the wire format we want* — bytes 2..7 carry HID Usage Page 0x07 codes verbatim. Press/release derived by diffing successive reports' key sets; modifier byte at offset 0 maps to the wire's 3-bit shift/ctrl/alt bitmap.
+- `input_reader` finds the first hidraw whose descriptor starts with USAGE_PAGE(Generic Desktop) ; USAGE(Keyboard) (`05 01 09 06`). Reads 8-byte USB HID Keyboard boot reports. Bytes are *already in the wire format we want* — bytes 2..7 carry HID Usage Page 0x07 codes verbatim. Press/release derived by diffing successive reports' key sets; the modifier byte at offset 0 goes on the wire as it is (HID: Ctrl 0x11, Shift 0x22, Alt 0x44, Gui 0x88; fresco-protocol `InputKeyEvent`).
 - `pointer_reader` finds the first hidraw whose descriptor starts with `05 01 09 02` (Mouse). Hardcodes the QEMU usb-tablet's 6-byte report layout (1 byte buttons + 2× 16-bit absolute axes + signed wheel). HID button bits map to Usage Page 0x09 numbers (1=primary, 2=secondary, 3=middle); Linux `BTN_*` doesn't appear anywhere.
 
 Tried first: `/dev/kbd0` `KDSKBMODE(K_RAW)`. On modern hidbus FreeBSD `/dev/kbd0` is the `kbdmux(4)` multiplexer view and rejects `K_RAW` (`ENOTTY`); the underlying physical keyboard `/dev/kbd1` is held exclusively by kbdmux. Hidraw works in parallel — no driver detach, no exclusive-claim juggling.
@@ -5714,7 +5714,8 @@ Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in lim
 `find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
 coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
 the child's `laid out again: text 112%` and the `reading` record in trails.json; Ctrl-plus; Ctrl-H,
-typing `impl` and Enter opening Impluvium from history, which shows the stored-version prompt
+typing `impl` and Enter opening Impluvium from history (ui9 runs with `NAVIGATOR_UI_IDLE_S=60`,
+so Atrium, not looked at since, is then parked as idle: `parking … (not looked at for N s)`), which shows the stored-version prompt
 (`prompt=stored`); its primary answer, Fetch the current version, must make navigatord fetch it
 again (another `opened … Fetched` line). Then Ctrl-H and Clear all… (pressed at the history
 column's right, computed from the trace's `page=` and `w=`), the `alert` in the ax lines, Enter:

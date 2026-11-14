@@ -267,7 +267,8 @@ g "pkill -x navigator-ui; sleep 2; true"
 
 echo "=== reading, find, history, keys, accessibility (step 7)"
 last() { g "grep 'trace' $S/ui9.log | tail -1"; }
-UIENV=NAVIGATOR_UI_AX=1 ui https://atlas.example/wiki/Atrium ui9
+# NAVIGATOR_UI_IDLE_S: a page not looked at for a minute is parked (§4.4).
+UIENV="NAVIGATOR_UI_AX=1 NAVIGATOR_UI_IDLE_S=60" ui https://atlas.example/wiki/Atrium ui9
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "step 7: first page: $(last)"
 P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
 W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
@@ -332,6 +333,11 @@ g "grep -q 'fetching the current version of https://atlas.example/wiki/Impluvium
 # Clearing history: it asks first, then the trail store and navigatord's
 # store lose the pages, and each open trail keeps the page it is on. The
 # trail on screen is put away first, so its pages are cleared whole.
+# Atrium, in another trail, has not been looked at since history opened
+# Impluvium: idle, it is parked (never the page on screen).
+i=0; until g "grep -q 'parking https://atlas.example/wiki/Atrium (not looked at for' $S/ui9.log" || [ $i -ge 120 ]; do sleep 5; i=$((i+5)); done
+g "grep -q 'parking https://atlas.example/wiki/Atrium (not looked at for' $S/ui9.log" && g "grep -q 'parked https://atlas.example/wiki/Atrium at y=' $S/ui9.log" \
+    && ok "a page not looked at for a minute was parked" || bad "idle: $(g "grep -E 'parking|parked' $S/ui9.log | tail -3")"
 key 0x1a 0x01               # Ctrl-W
 key 0x0b 0x01               # Ctrl-H
 P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}

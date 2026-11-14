@@ -1127,10 +1127,13 @@ Each step runs in the VM on headless frescod before the next.
      opened, and checks links on a page that has left its cache against the store.
    - VM, TCG (`scripts/navigator-live-vm.sh`, 25/25): a swap 9 ms; a park 68 ms; a parked page back
      to laid out, at its scroll offset, 2.7 s from the cache and 3.4 s from the store after a
-     restart of the UI and navigatord with the fixtures gone. Nearly all of that is a new child
+     restart of the UI and navigatord with the fixtures gone. *2026-11-14:* idle expiry is a
+     park: a live page not looked at for 20 minutes (`NAVIGATOR_UI_IDLE_S`), well inside the
+     broker's 30-minute timeout, is parked like one past the budget, never the page on screen
+     or its parent. Nearly all of that is a new child
      under TCG; the Mac (HVF) and R9700 measurements, and the budget set from them, are open.
    - Not yet: broker sessions (replayed and live-code pages) parked with the backend's
-     `Save`/`Restore`, which waits for navigatord to host sessions; idle expiry as a park; the rail
+     `Save`/`Restore`, which waits for navigatord to host sessions; the rail
      saying why a page can't be parked; fading in a restore.
 5. **Presence and personas.** The cookie action, Arca partitions, Unrecorded.
    *Built 2026-11-13:*

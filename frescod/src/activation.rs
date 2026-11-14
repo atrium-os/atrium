@@ -26,9 +26,10 @@ const HID_X: u16 = 0x1b;
 const HID_ENTER: u16 = 0x28;
 const HID_INSERT: u16 = 0x49;
 const HID_KP_ENTER: u16 = 0x58;
-const MOD_SHIFT: u8 = 1 << 0;
-const MOD_CTRL: u8 = 1 << 1;
-const MOD_ALT: u8 = 1 << 2;
+/// The HID modifier byte (either hand), as the wire carries it.
+const MOD_CTRL: u8 = 0x01 | 0x10;
+const MOD_SHIFT: u8 = 0x02 | 0x20;
+const MOD_ALT: u8 = 0x04 | 0x40;
 
 /// At most this many live tokens: input rate bounds it far lower; past
 /// it the oldest go (a flood of synthetic presses cannot grow it).

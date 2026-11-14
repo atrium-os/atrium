@@ -83,8 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Event::Key { hid_usage, pressed, modifiers, window_id, .. })
                     if window_id == win =>
                 {
-                    keymap.shift = modifiers & 0x01 != 0;
-                    keymap.ctrl  = modifiers & 0x02 != 0;
+                    // The HID modifier byte (fresco-protocol InputKeyEvent).
+                    keymap.shift = modifiers & 0x22 != 0;
+                    keymap.ctrl  = modifiers & 0x11 != 0;
                     if let Some(action) = keymap.handle(hid_usage, pressed) {
                         if apply(&mut buf, action, &mut alive)? {
                             dirty = true;

@@ -139,8 +139,8 @@ pub enum Out {
     Find { query: String, step: i8 },
     /// The current version of the page `key`, fetched again (§5.5).
     Reload { key: (u64, PageId) },
-    /// History cleared (§5.5): the open trails' pages that went (their
-    /// children close) and the stored versions navigatord takes out.
+    /// History cleared (§5.5): the pages that went (their children close)
+    /// and the stored versions navigatord takes out.
     Clear { keys: Vec<(u64, PageId)>, records: Vec<String> },
 }
 

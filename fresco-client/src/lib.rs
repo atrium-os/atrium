@@ -1506,13 +1506,13 @@ mod tests {
 
         let p = InputKeyEvent {
             window_id: 4, hid_usage: 0x04, /* 'a' */
-            pressed: true, modifiers: 0x01, /* shift */
+            pressed: true, modifiers: 0x02, /* left shift (HID) */
             activation: [7; 16],
             repeat: false,
         };
         let bytes = encode(&p).unwrap();
         match decode_event(EV_INPUT_KEY, &bytes) {
-            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x01, activation: [7, ..], repeat: false } => {}
+            Event::Key { window_id: 4, hid_usage: 0x04, pressed: true, modifiers: 0x02, activation: [7, ..], repeat: false } => {}
             other => panic!("expected Key, got {other:?}"),
         }
 

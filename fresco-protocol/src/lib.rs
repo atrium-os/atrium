@@ -1427,10 +1427,10 @@ pub struct WindowFillsDroppedEvent {
 ///
 /// `hid_usage` is a USB HID Usage Page 0x07 code (Keyboard/Keypad) —
 /// the same byte the keyboard hardware emits, no Linux-keycode
-/// translation. `modifiers` is a 3-bit bitmap: bit 0 = Shift,
-/// bit 1 = Ctrl, bit 2 = Alt. (Gui/Meta is intentionally dropped at
-/// the wire layer; toolkits that care can read raw HID via a future
-/// vendor channel.)
+/// translation. `modifiers` is the HID modifier byte too: left Ctrl
+/// 0x01, Shift 0x02, Alt 0x04, Gui 0x08, and the right-hand keys the
+/// same bits shifted up by 4 (so Ctrl is `m & 0x11`, Shift `m & 0x22`).
+/// Pointer events carry the same byte.
 ///
 /// `window_id == 0` indicates "no window had focus" — the server
 /// broadcasts the event to all clients in that case so headless test

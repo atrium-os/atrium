@@ -108,7 +108,7 @@ impl Clear {
 pub struct Cleared {
     /// How many page records left the trail store.
     pub pages: usize,
-    /// Pages of open trails that went (their page children close).
+    /// Pages that went (any page child of theirs closes).
     pub keys: Vec<(u64, PageId)>,
     /// The stored versions navigatord is told to take out: those no page
     /// left names, and not a kept page's.
@@ -140,9 +140,7 @@ pub fn clear(store: &mut TrailStore, what: &Clear, now_s: u64) -> Cleared {
                 saved.push((a, url));
             }
             out.pages += 1;
-            if open {
-                out.keys.push((t.id, i));
-            }
+            out.keys.push((t.id, i));
         }
     }
     store.earlier.retain(|e| !e.trail.is_empty());
@@ -227,7 +225,7 @@ mod tests {
         assert_eq!(count(&s, &Clear::Day(older.clone()), now), 2);
         let c = clear(&mut s, &Clear::Day(older), now);
         assert_eq!(c.pages, 2);
-        assert_eq!(c.keys.len(), 1, "one of an open trail's pages");
+        assert_eq!(c.keys.len(), 2, "an open trail's page and the put-away one's");
         assert_eq!(c.records, vec!["0".repeat(64), "c".repeat(64)]);
         assert!(s.earlier.is_empty(), "the trail put away had nothing left");
         let first = s.trails.iter().find(|t| !t.unrecorded).unwrap();

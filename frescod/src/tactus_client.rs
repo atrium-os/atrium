@@ -338,19 +338,14 @@ fn wire_phase(p: Phase) -> u8 {
     }
 }
 
-/// The HID modifier byte to the wire's bits (shift 1, ctrl 2, alt 4).
+/// The wire's modifier byte is the HID one, as the keyboard sends it
+/// (fresco-protocol `InputKeyEvent::modifiers`): left Ctrl 0x01, Shift
+/// 0x02, Alt 0x04, Gui 0x08, the right-hand keys the same bits << 4.
+/// Every client decodes it that way (Pergola, forum-wm, Arca's and
+/// Sigillum's sheets, Scrinium); it once went out as shift 1, ctrl 2,
+/// alt 4, which turned a real Ctrl into Shift and dropped Gui.
 fn wire_mods(hid: u8) -> u8 {
-    let mut out = 0u8;
-    if hid & 0b0010_0010 != 0 {
-        out |= 0x01;
-    }
-    if hid & 0b0001_0001 != 0 {
-        out |= 0x02;
-    }
-    if hid & 0b0100_0100 != 0 {
-        out |= 0x04;
-    }
-    out
+    hid
 }
 
 impl Seat {
