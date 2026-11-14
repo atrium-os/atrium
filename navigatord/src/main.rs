@@ -179,6 +179,10 @@ struct Page {
     /// verified them (content address, encoded bytes), within
     /// `ctl::images_ok`. Never decoded here: the page child does that.
     images: Arc<Vec<(String, Vec<u8>)>>,
+    /// What each of its consent controls wrote when the converter pressed
+    /// it (`atrium-consent:<n>`, legacy-web §5.4.1e), kept for the reader's
+    /// own press. Memory only: a page from the store has none.
+    consents: Arc<Vec<Vec<String>>>,
 }
 
 /// What the store holds for a page besides its recording: which address
@@ -267,7 +271,7 @@ impl State {
         if !ctl::images_ok(&lens) {
             return Err("the record's images are out of bounds".into());
         }
-        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images) })
+        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images), consents: Default::default() })
     }
 
     /// The page at `url` this UI may act on: the cache, else the store.
@@ -295,7 +299,7 @@ impl State {
         self.cache.push(p.clone());
         if asked != p.url {
             // A redirect: the asked address finds it too.
-            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx, images: p.images.clone() }));
+            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx, images: p.images.clone(), consents: p.consents.clone() }));
         }
         while self.cache.len() > CACHE {
             self.cache.remove(0);
@@ -556,6 +560,7 @@ enum Got {
 fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Got, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
+    let jar = cookies.as_ref().map(|(c, v)| (c.clone(), *v));
     if let Some((cookies, view)) = cookies {
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
         up = Upstream::Cookied { cookies, view, host, navigated: false, plain: Box::new(up) };
@@ -579,8 +584,21 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
     if let Some((what, ext)) = files::kind(&doc) {
         return Ok(Got::File { url: base, what, ext, body: doc });
     }
+    // ★ A cookied view's scripts start with its script-readable cookies
+    // (legacy-web §5.4.1e step 6); what they write stays in the converter.
+    let script_cookies = match jar {
+        Some((c, view)) => match c.lock().unwrap().script_cookies(view, &base) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("navigatord: no document.cookie for {base}: {e:?}");
+                Some(String::new())
+            }
+        },
+        None => None,
+    };
     let job = Job {
         base: Some(base.clone()),
+        cookies: script_cookies,
         net: true,
         emit: true,
         blobs: true,
@@ -673,7 +691,69 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         return Err("the recording is over its bound".into());
     }
     let insecure = base.starts_with("http:");
-    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images) }))
+    let consents = consents_of(&o.report);
+    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images), consents: Arc::new(consents) }))
+}
+
+/// The converter's `CW <n> <line>` report lines: what each consent control
+/// wrote, bounded as the converter bounds them.
+fn consents_of(report: &str) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![];
+    for l in report.lines() {
+        let mut f = l.splitn(3, '\t');
+        let (Some("CW"), Some(n), Some(line)) = (f.next(), f.next(), f.next()) else { continue };
+        let Ok(n) = n.parse::<usize>() else { continue };
+        if n >= CONSENTS_MAX || n > out.len() || line.len() > 4096 || line.chars().any(char::is_control) {
+            continue;
+        }
+        if n == out.len() {
+            out.push(vec![]);
+        }
+        if out[n].len() < 16 {
+            out[n].push(line.to_string());
+        }
+    }
+    out
+}
+
+/// The most consent controls a page keeps (the converter's own bound).
+const CONSENTS_MAX: usize = 4;
+/// A consent control's mark in a recording (the converter's).
+const CONSENT_SCHEME: &str = "atrium-consent:";
+
+/// The reader pressed a consent control (navigator-ui.md §6.2, legacy-web
+/// §5.4.1e): what the converter saw it write goes to Arca in the jar, as
+/// the page's own script cookies. Only this press writes; the converter's
+/// own press of it never left the converter.
+fn consent(page: &Page, href: &str, jar: Jar, cookies: Option<&Cookies>) -> LinkAction {
+    let blocked = |why: &str| LinkAction::Blocked { why: why.into() };
+    let Some(n) = href.strip_prefix(CONSENT_SCHEME).and_then(|n| n.parse::<usize>().ok()) else { return blocked("not a consent control") };
+    if !page.recording.windows(href.len()).any(|w| w == href.as_bytes()) {
+        return blocked("the page does not carry this control");
+    }
+    let Some(lines) = page.consents.get(n) else { return blocked("this page's answer is no longer held here; reload it and press again") };
+    let Some(c) = cookies else { return blocked("Arca isn't running here") };
+    let Ok(u) = url::Url::parse(&page.url) else { return blocked("not an address") };
+    let (Some(host), Some(part)) = (u.host_str().map(str::to_ascii_lowercase), navigator_cookies::partition_in(jar_id(jar), &page.url)) else {
+        return blocked("not an address");
+    };
+    if u.scheme() != "https" {
+        return blocked("only an https page may keep cookies");
+    }
+    let port = u.port_or_known_default().unwrap_or(443);
+    let path = if u.path().is_empty() { "/" } else { u.path() };
+    let mut kept = 0;
+    for l in lines.iter() {
+        match c.lock().unwrap().arca.script_set_cookie(&host, port, &part, path, l) {
+            Ok(()) => kept += 1,
+            Err(e) => eprintln!("navigatord: {part}: a consent's cookie not kept: {e}"),
+        }
+    }
+    eprintln!("navigatord: consent {n} pressed on {}: {kept} of {} cookies kept in {part}", page.url, lines.len());
+    if kept == 0 {
+        return blocked("Arca kept none of its cookies");
+    }
+    LinkAction::Consented { url: page.url.clone() }
 }
 
 /// The document's `<title>` from the recording's JSON text, bounded.
@@ -1014,10 +1094,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 });
             }
-            Request::Activate { id, page, href } => {
+            Request::Activate { id, page, href, jar } => {
                 let p = state.lock().unwrap().page(&page);
                 let action = match p {
                     None => LinkAction::Blocked { why: "that page is not open".into() },
+                    Some(p) if href.starts_with(CONSENT_SCHEME) => consent(&p, &href, jar, cookies.as_ref()),
                     Some(p) => activate(&p, &href, &cfg.schemes),
                 };
                 if let LinkAction::Handoff { url, .. } = &action {
@@ -1194,7 +1275,7 @@ mod tests {
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
-        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default() }
+        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default(), consents: Default::default() }
     }
 
     #[test]
@@ -1226,6 +1307,18 @@ mod tests {
         assert_eq!(fixture(&d, "https://atlas.example/../etc/passwd"), None);
         assert_eq!(fixture(&d, "file:///etc/passwd"), None);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_consent_controls_writes_are_read_strictly() {
+        let r = "Y\tReplayed\tx\nCW\t0\tconsent=yes; Path=/\nCW\t0\tb=1\nCW\t2\tskipped=1\nCW\t1\tc=2\nCW\tx\tbad=1\nCW\t9\tbig=1\n";
+        assert_eq!(consents_of(r), vec![vec!["consent=yes; Path=/".to_string(), "b=1".into()], vec!["c=2".into()]]);
+        let p = Page { consents: Arc::new(consents_of(r)), ..page("https://a.example/", "<a href=\"atrium-consent:0\">Accept</a>") };
+        let no = |a: LinkAction| matches!(a, LinkAction::Blocked { .. });
+        // Not carried, not held, or no Arca: refused before anything is written.
+        assert!(no(consent(&p, "atrium-consent:1", Jar::Personal, None)));
+        assert!(no(consent(&p, "atrium-consent:x", Jar::Personal, None)));
+        assert!(no(consent(&p, "atrium-consent:0", Jar::Personal, None)));
     }
 
     #[test]

@@ -227,6 +227,10 @@ pub struct RunReport {
     pub page_blocked: u32,
     pub blocked_hosts: Vec<(String, u32)>,
     pub beacons_suppressed: u32,
+    /// A consent wall's controls (legacy-web §5.4.1e): what pressing each
+    /// wrote to `document.cookie`, in the order the document marks them
+    /// `atrium-consent:<n>`.
+    pub consents: Vec<Vec<String>>,
 }
 
 pub trait ScriptEngine {

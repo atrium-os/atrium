@@ -5709,7 +5709,10 @@ Step 5 against the real Arca is `scripts/arca-vm-test.sh` §8 (it also runs `nav
 the site still knows you, and Arca names no accounts for the test site; then a page whose stand-in
 chain (`ck.chain` beside the fixture) is a failed cookie check opens with `knows=true` and the
 note "this site needs to know you to show this page", while a plain 404 stays a failure; then `navctl endsession` ends the site's session cookie
-(the next page goes without it); `NAV=0` skips it; `SKIP_SUITES=1` skips
+(the next page goes without it); then a consent wall fixture (`wall`) opens anonymously,
+`navctl activate <id> <page> atrium-consent:0 <jar>` answers `Consented`, a control the
+page does not carry is `Blocked`, and the site's next page in that jar carries
+`consent=yes`; `NAV=0` skips it; `SKIP_SUITES=1` skips
 §1's suites): navigatord as the web broker (uid 50803) with `NAVIGATORD_ARCA`/`NAVIGATORD_COURIERD`,
 driven by `navctl` (navigator-control's example). The test TLS server's log decides each check: a page
 whose site knows you carries its jar's cookie, an Unrecorded trail's jar is its own and goes when the

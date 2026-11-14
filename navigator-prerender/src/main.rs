@@ -101,6 +101,11 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     let _ = writeln!(o, "P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
     for (k, n) in c.blocked_hosts.iter() { let _ = writeln!(o, "B\t{n}\t{k}"); }
+    // A consent control's writes (legacy-web §5.4.1e), for the parent to
+    // keep until the reader presses it: `CW <n> <what it wrote>`.
+    for (i, ws) in c.consents.iter().enumerate() {
+        for w in ws { let _ = writeln!(o, "CW\t{i}\t{w}"); }
+    }
     let _ = writeln!(o, "V\t{:?}", c.verdict);
     // The PROXIMATE CAUSE of the first failure: the last recorded event
     // before the throw. A symptom bucket like "null or undefined" is useless
@@ -893,7 +898,24 @@ fn convert_in_child(
     // ★ An unreadable file is an EMPTY document, counted, not a skip — as
     // the child did before it lost the filesystem.
     let doc = fs::read(file).unwrap_or_default();
+    // ★ A cookied view's scripts start with its script-readable cookies
+    // (legacy-web §5.4.1e step 6), from the partition its broker uses.
+    let script_cookies = match (&d.cookied, net) {
+        (Some((arcad, _)), true) => {
+            use navigator_cookies::Arca;
+            let u = url::Url::parse(base).ok().filter(|u| u.scheme() == "https");
+            match (u.as_ref().and_then(|u| u.host_str()), navigator_cookies::partition_of(base)) {
+                (Some(h), Some(p)) => Some(navigator_cookies::ArcadSocket { path: arcad.into() }
+                    .script_cookies(&h.to_ascii_lowercase(), u.as_ref().and_then(|u| u.port_or_known_default()).unwrap_or(443),
+                                    &p, u.as_ref().map(|u| u.path()).filter(|p| !p.is_empty()).unwrap_or("/"))
+                    .unwrap_or_default()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let job = Job {
+        cookies: script_cookies,
         base: (!base.is_empty()).then(|| base.to_string()),
         net, explore: d.explore, same_site: d.same_site, protect: d.protect,
         emit: d.emit_dir.is_some(), blobs: d.blob_dir.is_some(), require_confined: d.require,
@@ -1219,6 +1241,7 @@ fn serve() -> ! {
         layout_fetcher: relay.clone().map(|f| Box::new(f) as Box<dyn Fetcher>),
         nominal_geometry: nominal_geometry(),
         no_scroll_sweep: std::env::var("PRERENDER_SCROLL").ok().as_deref() == Some("0"),
+        cookies: job.cookies.clone(),
         ..Default::default()
     };
     let c = if job.scripts && job.progressive {

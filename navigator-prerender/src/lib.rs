@@ -111,6 +111,8 @@ pub struct Conversion {
     pub page_blocked: u32,
     pub blocked_hosts: Vec<(String, u32)>,
     pub beacons_suppressed: u32,
+    /// What pressing each consent control writes (`atrium-consent:<n>`).
+    pub consents: Vec<Vec<String>>,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -321,6 +323,7 @@ fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::S
             b
         },
         beacons_suppressed: rep.beacons_suppressed,
+        consents: rep.consents,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,

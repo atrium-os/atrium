@@ -92,8 +92,9 @@ pub enum Request {
     /// this UI is named; anything else blanks the strip.
     Show { url: String },
     /// What activating `href` in the page at `page` does. Answered by
-    /// `Link` with the same `id`.
-    Activate { id: u32, page: String, href: String },
+    /// `Link` with the same `id`. `jar`: the persona's jar the page is in,
+    /// where a consent control's press keeps its cookies (§6.2).
+    Activate { id: u32, page: String, href: String, jar: Jar },
     /// The UI shows no page (Start, a stop page): no origin in the strip.
     Blank,
     /// The person pressed Save on a file an `Open` turned out to be
@@ -132,6 +133,11 @@ pub enum LinkAction {
     InDocument { fragment: String },
     Handoff { url: String, scheme: String },
     Blocked { why: String },
+    /// A consent wall's control (`atrium-consent:<n>`, legacy-web
+    /// §5.4.1e): the reader's press kept what it writes in the page's
+    /// jar, so the site now knows you there; the UI opens `url` again
+    /// with the site knowing you.
+    Consented { url: String },
 }
 
 /// navigatord → UI.

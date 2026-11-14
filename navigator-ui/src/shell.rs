@@ -155,7 +155,9 @@ pub enum LivePage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Out {
     /// A link pressed in the page (the href as the page spells it).
-    Activate { page: String, href: String, beside: bool },
+    /// `jar`: the trail's, where a consent control's press keeps its
+    /// cookies (§6.2).
+    Activate { page: String, href: String, beside: bool, jar: navigator_control::Jar },
     /// The person told a site to forget them in a jar (§6.2).
     Forget { jar: navigator_control::Jar, url: String },
     /// Save, or drop, the file navigatord holds under that `Open` (§6.4).
@@ -286,7 +288,7 @@ impl Shell {
     /// A link pressed in the live page: navigatord decides what it does.
     pub fn link_pressed(&mut self, href: &str) {
         if let Some(page) = self.shown_url() {
-            self.outbox.push(Out::Activate { page, href: href.into(), beside: self.mods.ctrl });
+            self.outbox.push(Out::Activate { page, href: href.into(), beside: self.mods.ctrl, jar: self.store.trail().jar() });
         }
     }
 
@@ -702,6 +704,20 @@ impl Shell {
             self.reload();
         }
         self.last_note = Some(format!("signing out of {site} here"));
+    }
+
+    /// The reader pressed a consent wall's control (§6.2, legacy-web
+    /// §5.4.1e) and Arca kept its answer in this trail's jar: the site
+    /// knows you here now, and the page opens again with its cookies.
+    pub fn consented(&mut self, url: &str) {
+        let Some(p) = self.store.trail().page() else { return };
+        let site = crate::trail::site(url).to_string();
+        if crate::trail::site(&p.url) != site {
+            return;
+        }
+        self.store.set_knows(&site, true);
+        self.reload();
+        self.last_note = Some(format!("{site} keeps your answer in this trail's jar"));
     }
 
     /// navigatord's answer to `Accounts`, if it is for the open menu.
@@ -1222,7 +1238,7 @@ mod tests {
         assert_eq!(p.saved.as_deref(), Some(saved.as_str()), "the version navigatord keeps, for parking");
         // A press in the page goes to navigatord; its answer moves the trail.
         s.link_pressed("/wiki/Impluvium");
-        assert_eq!(s.outbox, vec![Out::Activate { page: "https://atlas.example/wiki/Atrium".into(), href: "/wiki/Impluvium".into(), beside: false }]);
+        assert_eq!(s.outbox, vec![Out::Activate { page: "https://atlas.example/wiki/Atrium".into(), href: "/wiki/Impluvium".into(), beside: false, jar: navigator_control::Jar::Personal }]);
         s.follow_link("https://atlas.example/wiki/Impluvium", false);
         assert_eq!(s.store.trail().pages.len(), 2);
         s.apply(Action::Back, 0.0);
@@ -1245,6 +1261,26 @@ mod tests {
         let (t, _) = s.shown_key().unwrap();
         let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
         assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
+    }
+
+    #[test]
+    fn a_consent_press_lets_the_site_know_you_and_reopens() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(true);
+        s.enter("https://news.example/a");
+        s.outbox.clear();
+        s.link_pressed("atrium-consent:0");
+        let jar = s.store.trail().jar();
+        assert!(matches!(jar, navigator_control::Jar::Unrecorded(_)));
+        assert_eq!(s.outbox, vec![Out::Activate { page: "https://news.example/a".into(), href: "atrium-consent:0".into(), beside: false, jar }]);
+        s.outbox.clear();
+        // An answer for another site changes nothing.
+        s.consented("https://other.example/");
+        assert!(s.outbox.is_empty() && !s.store.knows("news.example"));
+        s.consented("https://news.example/a");
+        assert!(s.store.knows("news.example"));
+        assert!(matches!(s.outbox.as_slice(), [Out::Reload { .. }]), "{:?}", s.outbox);
     }
 
     #[test]

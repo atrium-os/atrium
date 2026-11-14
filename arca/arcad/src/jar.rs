@@ -71,6 +71,14 @@ impl Jars {
         Ok(())
     }
 
+    /// Whether the jar holds an `HttpOnly` cookie `sc` would replace: a
+    /// script may not (RFC 6265bis §5.7 step 21).
+    pub fn http_only_named(&self, user: &str, partition: &str, sc: &SetCookie) -> bool {
+        self.jars.get(&(user.into(), partition.into())).is_some_and(|jar| jar.iter().any(|m| {
+            m.attrs.http_only && m.domain == sc.domain && m.name == sc.name && m.attrs.path == sc.attrs.path && m.attrs.host_only == sc.attrs.host_only
+        }))
+    }
+
     /// The jar's cookies for a request to `host` at `path`: (name, value,
     /// path length, created), as [`cookie::header`] takes them.
     pub fn matching(&mut self, user: &str, partition: &str, host: &str, path: &str, now: u64, ctx: Option<&Ticket>) -> io::Result<Vec<(String, LockedBuf, usize, u64)>> {
@@ -80,6 +88,24 @@ impl Jars {
         for d in cookie::candidate_domains(host) {
             for m in jar.iter().filter(|m| m.domain == d) {
                 if cookie::applies(&d, &m.attrs, host, path, now) && ctx.is_none_or(|t| cookie::same_site_allows(&m.attrs, t)) {
+                    let mut v = LockedBuf::zeroed(m.value.len())?;
+                    v.as_mut().copy_from_slice(m.value.as_ref());
+                    out.push((m.name.clone(), v, m.attrs.path.len(), m.attrs.created));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `matching` for a script: no ticket (it is the page's own origin) and
+    /// no `HttpOnly` cookie.
+    pub fn script_matching(&mut self, user: &str, partition: &str, host: &str, path: &str, now: u64) -> io::Result<Vec<(String, LockedBuf, usize, u64)>> {
+        let Some(jar) = self.jars.get_mut(&(user.to_string(), partition.to_string())) else { return Ok(vec![]) };
+        jar.retain(|m| m.attrs.expires.is_none_or(|e| e > now));
+        let mut out = vec![];
+        for d in cookie::candidate_domains(host) {
+            for m in jar.iter().filter(|m| m.domain == d && !m.attrs.http_only) {
+                if cookie::applies(&d, &m.attrs, host, path, now) {
                     let mut v = LockedBuf::zeroed(m.value.len())?;
                     v.as_mut().copy_from_slice(m.value.as_ref());
                     out.push((m.name.clone(), v, m.attrs.path.len(), m.attrs.created));

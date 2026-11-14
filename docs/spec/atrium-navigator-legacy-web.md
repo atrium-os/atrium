@@ -630,10 +630,42 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   cookied view's navigation (`Broker::fetch` with `Fetch::navigation`) is its caller's.
   The Navigator has no live open-a-URL path in the broker yet.
 - *Step 5, credentialed conversions:* keyed by URL plus a jar version, and kept private.
-- *Step 6, `document.cookie`.*
-- *Step 7, the reader-facing UI:* the cookied mark, and "forget this site".
+- *Step 7, the reader-facing UI:* the cookied mark, and "forget this site". (Built since
+  in the Navigator UI, navigator-ui.md §6.2.)
 - *Refinement 2:* telling a banner, which should be a local transition, from a wall.
   Today the reader's action is explicit.
+
+**Built 2026-11-14: step 6, `document.cookie`, and the reader's consent press.**
+- *Script cookies.* A cookied conversion's job header carries `cookies=<n=v; ...>`
+  (strict, no control characters, at most 8 KiB): the document's non-`HttpOnly` cookies
+  from its partition, which navigatord asks Arca for with `W_SCRIPT_COOKIES` (0x74, broker
+  only). The converter's `document.cookie` starts from them and its writes go to a scratch
+  jar in the converter (deleted by `Max-Age=0` or a past `Expires`, at most 50), so nothing
+  a conversion's script writes leaves it. An anonymous conversion's `document.cookie` is
+  `""`, its writes dropped, and `navigator.cookieEnabled` is false; a cookied one's is true.
+- *Finding the control.* After the page settles, the converter presses up to 8 controls
+  (`button`, `a`, `input` button or submit, `role=button`) whose text, at most 40
+  characters, says a consent word (accept, agree, allow, consent, continue, OK, got it,
+  yes, understood, proceed). Each press is a probe: the document and the scratch jar are
+  put back after it. A press that wrote `document.cookie` makes the control a consent
+  control: at most 4, each turned into `<a href="atrium-consent:<n>">` keeping its text,
+  with what it wrote reported as `CW <n> <line>` (at most 16 lines, 4 KiB each, no
+  control characters).
+- *The reader's press.* navigatord keeps a page's consents in memory with the page (a page
+  from the store has none: "reload it and press again"). A press of
+  `atrium-consent:<n>` that the recording carries writes each line to Arca with
+  `W_SCRIPT_SET_COOKIE` (0x75, broker only) in the trail's jar: parsed as a `Set-Cookie`
+  for the document's host and path, never `HttpOnly`, never replacing an `HttpOnly`
+  cookie, never another site's. The UI is told `Consented`, lets the site know you in
+  that jar and opens the page again, so the wall's content comes from the site with the
+  answer.
+- *Checked:* `navigator-prerender` tests/cookies.rs (4), arcad
+  `a_taken_transitions_script_cookie_is_kept` and `a_scripts_cookies_leave_out_httponly_ones`,
+  navigatord and navigator-ui unit tests, and `scripts/arca-vm-test.sh` §8 against the
+  real Arca (the site's next page carries the answer).
+- *Not yet:* inline `onclick="..."` attribute handlers are not run by the converter, so a
+  wall wired only that way is not found; a wall built inside an iframe (normalized
+  documents have none) is not either.
 - *Session cookies dying with the view* (Arca §8.6).
 - *The EU-vantage measurement.*
 

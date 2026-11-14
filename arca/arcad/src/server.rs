@@ -103,6 +103,16 @@ macro_rules! tri {
     };
 }
 
+/// [`tri`] in a function that answers `Result<_, Reply>`.
+macro_rules! tri_r {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return Err(map_err(e)),
+        }
+    };
+}
+
 fn malformed() -> Reply {
     reply(status::MALFORMED)
 }
@@ -172,6 +182,8 @@ impl State {
             Label::WebBroker { user, .. } if op == broker_op::W_FORGET => self.broker_forget(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_SIGN_OUT => self.broker_sign_out(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_ACCOUNTS => self.broker_accounts(user, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_SCRIPT_COOKIES => self.broker_script_cookies(user, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_SCRIPT_SET_COOKIE => self.broker_script_set_cookie(user, body),
             Label::WebBroker { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
@@ -929,6 +941,166 @@ impl State {
         ok(n.to_le_bytes().to_vec())
     }
 
+    /// A cookied view's `document.cookie` (`broker_op::W_SCRIPT_COOKIES`):
+    /// what a request there would carry, without the `HttpOnly` cookies.
+    fn broker_script_cookies(&mut self, user: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let ep = crate::proto::read_endpoint(&mut r)?;
+            let partition = r.str(caps::HOST)?;
+            let path = r.str(1024)?;
+            r.end()?;
+            Ok::<_, Error>((ep, partition, path))
+        })();
+        let Ok((ep, partition, path)) = parsed else { return malformed() };
+        let Recipient::Endpoint { host, port, .. } = ep else { return malformed() };
+        if !path.starts_with('/') || Recipient::endpoint(Scheme::Https, &host, port, Some(partition)).is_err() {
+            return malformed();
+        }
+        if !self.stores.get(user).is_some_and(|s| s.state() == LockState::Unlocked) {
+            return reply(status::LOCKED);
+        }
+        let now = (self.clock)();
+        let found = if crate::jar::in_memory(partition) {
+            tri!(self.jars.script_matching(user, partition, &host, path, now).map_err(Error::Io))
+        } else {
+            let Some(store) = self.stores.get_mut(user) else { return reply(status::LOCKED) };
+            let mut found = Vec::new();
+            for d in crate::cookie::candidate_domains(&host) {
+                let Ok(rec) = Recipient::endpoint(Scheme::Https, &d, port, Some(partition)) else { continue };
+                let who = Access { persona: broker_op::WEB_PERSONA, recipient: &rec };
+                for m in tri!(store.list(&who)).into_iter().filter(|m| m.kind == Kind::Cookie) {
+                    let Some(a) = crate::cookie::Attrs::decode(&m.scope) else { continue };
+                    if !a.http_only && crate::cookie::applies(&d, &a, &host, path, now) {
+                        let (_, v) = tri!(store.release(&m.id, &who, None));
+                        found.push((m.account, v, a.path.len(), a.created));
+                    }
+                }
+            }
+            found
+        };
+        if found.is_empty() {
+            return ok(Vec::new());
+        }
+        Reply { status: status::OK, body: Body::Secret(tri!(crate::cookie::header(found).map_err(Error::Io))) }
+    }
+
+    /// A cookie a page's script wrote, kept because the reader took the
+    /// transition that wrote it (`broker_op::W_SCRIPT_SET_COOKIE`).
+    fn broker_script_set_cookie(&mut self, user: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let ep = crate::proto::read_endpoint(&mut r)?;
+            let partition = r.str(caps::HOST)?;
+            let path = r.str(PATH_MAX)?;
+            let line = r.str(COOKIE_NAME_MAX + COOKIE_VALUE_MAX + COOKIE_ATTRS_MAX + 2)?;
+            r.end()?;
+            Ok::<_, Error>((ep, partition.to_string(), path.to_string(), line.to_string()))
+        })();
+        let Ok((ep, partition, path, line)) = parsed else { return malformed() };
+        let Recipient::Endpoint { host, port, .. } = ep else { return malformed() };
+        if !path.starts_with('/') || Recipient::endpoint(Scheme::Https, &host, port, Some(&partition)).is_err() {
+            return malformed();
+        }
+        if !self.stores.get(user).is_some_and(|s| s.state() == LockState::Unlocked) {
+            return reply(status::LOCKED);
+        }
+        // `document.cookie = "n=v; attrs"`: as a Set-Cookie header's value.
+        let (pair, attrs) = line.split_once(';').unwrap_or((&line, ""));
+        let Some((name, value)) = pair.split_once('=') else { return reply(status::DENIED) };
+        let now = (self.clock)();
+        let Ok(sc) = crate::cookie::parse(name.trim(), value.trim().as_bytes(), attrs.as_bytes(), &host, &path, now) else {
+            return reply(status::DENIED);
+        };
+        match self.put_cookie(user, broker_op::WEB_PERSONA, port, Some(&partition), sc, now, true) {
+            Ok(_) => ok(Vec::new()),
+            Err(r) => r,
+        }
+    }
+
+    /// Keep one cookie a web courier (or, `script`, a page's
+    /// `document.cookie`) set, by Arca's rules: one per (name, domain,
+    /// path, host-only), expired ones gone, the group's oldest out when
+    /// full. An Unrecorded partition's go to memory. A script's never
+    /// carries or replaces an `HttpOnly` one.
+    #[allow(clippy::too_many_arguments)]
+    fn put_cookie(&mut self, user: &str, persona: &str, port: u16, partition: Option<&str>,
+                  sc: crate::cookie::SetCookie, now: u64, script: bool) -> Result<Option<ItemId>, Reply> {
+        if script && sc.attrs.http_only {
+            return Err(reply(status::DENIED));
+        }
+        let Ok(rec) = Recipient::endpoint(Scheme::Https, &sc.domain, port, partition) else {
+            return Err(reply(status::DENIED));
+        };
+        // An Unrecorded trail's jar is never written (crate::jar).
+        if let Some(p) = partition.filter(|p| crate::jar::in_memory(p)) {
+            if !self.stores.get(user).is_some_and(|s| s.state() == arca_store::LockState::Unlocked) {
+                return Err(reply(status::LOCKED));
+            }
+            if script && self.jars.http_only_named(user, p, &sc) {
+                return Err(reply(status::DENIED));
+            }
+            tri_r!(self.jars.set(user, p, sc, now).map_err(Error::Io));
+            return Ok(None);
+        }
+        let who = Access { persona, recipient: &rec };
+        let Some(store) = self.stores.get_mut(user) else { return Err(reply(status::LOCKED)) };
+        let mut sc = sc;
+        let mut cookies: Vec<(ItemId, Option<crate::cookie::Attrs>, String)> = tri_r!(store.list(&who))
+            .into_iter()
+            .filter(|m| m.kind == Kind::Cookie)
+            .map(|m| (m.id, crate::cookie::Attrs::decode(&m.scope), m.account))
+            .collect();
+        // One cookie per (name, domain, path, host-only): a new one
+        // replaces it, keeping its creation time; an expired one
+        // deletes it. An unreadable scope is dropped.
+        let same = |a: &Option<crate::cookie::Attrs>, n: &str| {
+            a.as_ref().is_none_or(|a| n == sc.name && a.path == sc.attrs.path && a.host_only == sc.attrs.host_only)
+        };
+        // ★ A script never replaces an HttpOnly cookie (RFC 6265bis
+        // §5.7 step 21).
+        if script && cookies.iter().any(|(_, a, n)| a.as_ref().is_some_and(|a| a.http_only) && same(a, n)) {
+            return Err(reply(status::DENIED));
+        }
+        for (id, a, n) in &cookies {
+            if same(a, n) {
+                if let Some(a) = a {
+                    sc.attrs.created = a.created;
+                }
+                tri_r!(store.delete(id, &who));
+            }
+        }
+        cookies.retain(|(_, a, n)| !same(a, n));
+        if sc.expired(now) {
+            return Ok(None);
+        }
+        // Expired ones go; then, if the group is full, the oldest.
+        let mut live: Vec<(ItemId, u64)> = Vec::new();
+        for (id, a, _) in &cookies {
+            match a {
+                Some(a) if a.expires.is_none_or(|e| e > now) => live.push((*id, a.created)),
+                _ => tri_r!(store.delete(id, &who)),
+            }
+        }
+        live.sort_by_key(|c| c.1);
+        let excess = (live.len() + 1).saturating_sub(crate::cookie::PER_GROUP);
+        for (id, _) in live.iter().take(excess) {
+            tri_r!(store.delete(id, &who));
+        }
+        let scope = sc.attrs.encode();
+        let m = tri_r!(store.add(NewItem {
+            persona,
+            recipient: rec.clone(),
+            class: Class::AfterFirstUnlock,
+            kind: Kind::Cookie,
+            provenance: Provenance::ServerSet,
+            account: &sc.name,
+            scope: &scope,
+            value: &sc.value,
+        }));
+        Ok(Some(m.id))
+    }
+
     /// The accounts Arca holds for a site (`broker_op::W_ACCOUNTS`): names
     /// of passkeys and web passwords, never a value.
     fn broker_accounts(&mut self, user: &str, body: &[u8]) -> Reply {
@@ -1112,69 +1284,14 @@ impl State {
                     // Ignored, as a browser ignores it; the courier drops the header either way.
                     Err(_) => return reply(status::DENIED),
                 };
-                let Ok(rec) = Recipient::endpoint(Scheme::Https, &sc.domain, *port, partition.as_deref()) else {
-                    return reply(status::DENIED);
-                };
-                // An Unrecorded trail's jar is never written (crate::jar).
-                if let Some(p) = partition.as_deref().filter(|p| crate::jar::in_memory(p)) {
-                    if !self.stores.get(&c.user).is_some_and(|s| s.state() == arca_store::LockState::Unlocked) {
-                        return reply(status::LOCKED);
+                let (user, persona, port, partition) = (c.user.clone(), c.persona.clone(), *port, partition.clone());
+                match self.put_cookie(&user, &persona, port, partition.as_deref(), sc, now, false) {
+                    Ok(id) => {
+                        *item = id;
+                        ok(Vec::new())
                     }
-                    tri!(self.jars.set(&c.user, p, sc, now).map_err(Error::Io));
-                    return ok(Vec::new());
+                    Err(r) => r,
                 }
-                let who = Access { persona: &c.persona, recipient: &rec };
-                let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
-                let mut sc = sc;
-                let mut cookies: Vec<(ItemId, Option<crate::cookie::Attrs>, String)> = tri!(store.list(&who))
-                    .into_iter()
-                    .filter(|m| m.kind == Kind::Cookie)
-                    .map(|m| (m.id, crate::cookie::Attrs::decode(&m.scope), m.account))
-                    .collect();
-                // One cookie per (name, domain, path, host-only): a new one
-                // replaces it, keeping its creation time; an expired one
-                // deletes it. An unreadable scope is dropped.
-                let same = |a: &Option<crate::cookie::Attrs>, n: &str| {
-                    a.as_ref().is_none_or(|a| n == sc.name && a.path == sc.attrs.path && a.host_only == sc.attrs.host_only)
-                };
-                for (id, a, n) in &cookies {
-                    if same(a, n) {
-                        if let Some(a) = a {
-                            sc.attrs.created = a.created;
-                        }
-                        tri!(store.delete(id, &who));
-                    }
-                }
-                cookies.retain(|(_, a, n)| !same(a, n));
-                if sc.expired(now) {
-                    return ok(Vec::new());
-                }
-                // Expired ones go; then, if the group is full, the oldest.
-                let mut live: Vec<(ItemId, u64)> = Vec::new();
-                for (id, a, _) in &cookies {
-                    match a {
-                        Some(a) if a.expires.is_none_or(|e| e > now) => live.push((*id, a.created)),
-                        _ => tri!(store.delete(id, &who)),
-                    }
-                }
-                live.sort_by_key(|c| c.1);
-                let excess = (live.len() + 1).saturating_sub(crate::cookie::PER_GROUP);
-                for (id, _) in live.iter().take(excess) {
-                    tri!(store.delete(id, &who));
-                }
-                let scope = sc.attrs.encode();
-                let m = tri!(store.add(NewItem {
-                    persona: &c.persona,
-                    recipient: rec.clone(),
-                    class: Class::AfterFirstUnlock,
-                    kind: Kind::Cookie,
-                    provenance: Provenance::ServerSet,
-                    account: &sc.name,
-                    scope: &scope,
-                    value: &sc.value,
-                }));
-                *item = Some(m.id);
-                ok(Vec::new())
             }
             courier_op::COOKIES => {
                 let Ok(path) = r.str(PATH_MAX) else { return malformed() };

@@ -496,3 +496,80 @@ fn the_broker_learns_the_accounts_arca_has_for_a_site_by_name_only() {
     let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
     assert_ne!(accounts(&mut s, &app, "example.com").0, status::OK);
 }
+
+fn script_cookies(s: &mut State, who: &Label, host: &str, partition: &str, path: &str) -> (u8, String) {
+    let r = s.handle(who, arcad::proto::broker_op::W_SCRIPT_COOKIES, &body(|w| {
+        arcad::proto::write_endpoint(w, host, 443);
+        w.str(partition);
+        w.str(path);
+    }));
+    (r.status, String::from_utf8(r.body.bytes().to_vec()).unwrap())
+}
+
+/// `document.cookie` for a cookied view's converter: what a request would
+/// carry, never an HttpOnly cookie, in the store and in an Unrecorded jar.
+#[test]
+fn a_scripts_cookies_leave_out_httponly_ones() {
+    let (_d, mut s) = setup();
+    for p in ["example.com", "u-00000000000000a1.example.com"] {
+        let c = web("www.example.com", p);
+        let t = ticket(&mut s, "www.example.com", p, 1, "/", 1, "");
+        assert_eq!(get_t(&mut s, &c, "/", Some(t)).0, status::OK);
+        assert_eq!(set_t(&mut s, &c, "sid", "; HttpOnly", "/", Some(t)), status::OK);
+        assert_eq!(set_t(&mut s, &c, "consent", "; Max-Age=3600", "/", Some(t)), status::OK);
+        assert_eq!(set_t(&mut s, &c, "deep", "; Path=/a", "/", Some(t)), status::OK);
+        assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/"), (status::OK, "consent=v".into()), "{p}");
+        assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/a/b"), (status::OK, "deep=v; consent=v".into()), "{p}");
+    }
+    assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", "news.example", "/").1, "");
+    assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", "example.com", "x").0, status::MALFORMED);
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    assert_ne!(script_cookies(&mut s, &app, "www.example.com", "example.com", "/").0, status::OK);
+    assert_ne!(script_cookies(&mut s, &web("www.example.com", "example.com"), "www.example.com", "example.com", "/").0, status::OK);
+}
+
+fn script_set(s: &mut State, host: &str, partition: &str, path: &str, line: &str) -> u8 {
+    s.handle(&broker(), arcad::proto::broker_op::W_SCRIPT_SET_COOKIE, &body(|w| {
+        arcad::proto::write_endpoint(w, host, 443);
+        w.str(partition);
+        w.str(path);
+        w.str(line);
+    })).status
+}
+
+/// The reader's accept press keeps what the page's script wrote, by a
+/// Set-Cookie's rules, but never as HttpOnly and never over an HttpOnly
+/// cookie (legacy-web §5.4.1e); a request then carries it.
+#[test]
+fn a_taken_transitions_script_cookie_is_kept() {
+    let (_d, mut s) = setup();
+    for p in ["example.com", "u-00000000000000a1.example.com"] {
+        let c = web("www.example.com", p);
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/news/a", "consent=yes; Path=/; Max-Age=3600"), status::OK, "{p}");
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/news/a", "here=1"), status::OK, "{p}");
+        assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/news/b").1, "here=1; consent=yes", "{p}");
+        assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/").1, "consent=yes", "{p}");
+        // What a request carries: the courier is told it.
+        let t = ticket(&mut s, "www.example.com", p, 1, "/", 1, "");
+        let (st, header) = get_t(&mut s, &c, "/", Some(t));
+        assert_eq!((st, header.as_str()), (status::OK, "consent=yes"), "{p}");
+        // Never HttpOnly, never over an HttpOnly one, never another site's.
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/", "x=1; HttpOnly"), status::DENIED, "{p}");
+        let t = ticket(&mut s, "www.example.com", p, 1, "/", 1, "");
+        assert_eq!(get_t(&mut s, &c, "/", Some(t)).0, status::OK);
+        assert_eq!(set_t(&mut s, &c, "sid", "; HttpOnly", "/", Some(t)), status::OK);
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/", "sid=forged"), status::DENIED, "{p}");
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/", "y=1; Domain=other.example"), status::DENIED, "{p}");
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/", "no-equals"), status::DENIED, "{p}");
+        // Deleted by the script's own Max-Age=0.
+        assert_eq!(script_set(&mut s, "www.example.com", p, "/news/a", "here=; Max-Age=0"), status::OK, "{p}");
+        assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/news/b").1, "consent=yes", "{p}");
+    }
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    assert_ne!(s.handle(&app, arcad::proto::broker_op::W_SCRIPT_SET_COOKIE, &body(|w| {
+        arcad::proto::write_endpoint(w, "www.example.com", 443);
+        w.str("example.com");
+        w.str("/");
+        w.str("a=1");
+    })).status, status::OK);
+}

@@ -601,6 +601,11 @@ same-site context or a gesture, because it never holds a ticket.
     (RP ID at or under the site) and web passwords Arca holds for a site, names and kinds
     only, at most 16. The broker uses `W_SIGN_OUT` for "Sign out here", and for session cookies
     ending when a site's last page in a jar goes (navigator-ui.md §14 step 5).
+  - Built 2026-11-14 for consent walls (legacy-web §5.4.1e step 6): `W_SCRIPT_COOKIES`
+    (0x74, broker only) gives a cookied conversion its document's non-`HttpOnly` cookies as
+    `n=v; ...`, kept or in memory; `W_SCRIPT_SET_COOKIE` (0x75, broker only) keeps a line a
+    page's script wrote, only for the reader's own press of a consent control: a
+    `Set-Cookie`'s rules, never `HttpOnly`, never over an `HttpOnly` cookie.
   - "Forget this site" in the trusted UI. The broker's side is built (2026-11-13,
     navigator-ui.md §14 step 5): `W_FORGET` (0x71, broker only) takes a partition, or a
     prefix that must be an Unrecorded jar's (`u-<16 hex>.`, or `u-` for all of them), and

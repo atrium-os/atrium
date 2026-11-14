@@ -8,7 +8,8 @@
 //! `signout <p|u:HEX> <url>` prints `signedout <n>` or `notsignedout <why>`;
 //! `endsession <p|u:HEX> <url>` sends `EndSession` (no answer), waits a
 //! second and prints `ended`;
-//! `accounts <url>` prints `accounts <n> [kind:name …]` or `noaccounts <why>`.
+//! `accounts <url>` prints `accounts <n> [kind:name …]` or `noaccounts <why>`;
+//! `activate <id> <page> <href> <p|u:HEX>` prints `link <id> <action>`.
 
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -91,6 +92,18 @@ fn main() {
                         }
                         Ok(Some(_)) => {}
                         other => break println!("noaccounts navigatord: {other:?}"),
+                    }
+                }
+            }
+            "activate" => {
+                let id = a[i + 1].parse().unwrap();
+                write_frame(&mut s, &Request::Activate { id, page: a[i + 2].clone(), href: a[i + 3].clone(), jar: jar(&a[i + 4]) }).unwrap();
+                i += 5;
+                loop {
+                    match read_frame::<Event>(&mut s) {
+                        Ok(Some(Event::Link { id: got, action })) if got == id => break println!("link {id} {action:?}"),
+                        Ok(Some(_)) => {}
+                        other => break println!("link {id} navigatord: {other:?}"),
                     }
                 }
             }

@@ -113,6 +113,21 @@ pub mod broker_op {
     /// endpoint at the site or under it. Names only, never a value; at
     /// most [`ACCOUNTS_MAX`]. Needs the store unlocked.
     pub const W_ACCOUNTS: u16 = 0x73;
+    /// `endpoint | str partition | str path` → the `document.cookie`
+    /// string (`n=v; n2=v2`, as a `Cookie` header orders them) of the
+    /// cookies a request to that host and path in that partition would
+    /// carry, leaving out every `HttpOnly` one (arca.md §8.1, decision 4:
+    /// script-readable cookies are the page's own by the web's contract).
+    /// For a cookied view's converter. Needs the store unlocked.
+    pub const W_SCRIPT_COOKIES: u16 = 0x74;
+    /// `endpoint | str partition | str path | str line` → empty: keep a
+    /// cookie a page's script wrote (`document.cookie = line`, at the
+    /// document `path`) in the partition, by the rules a `Set-Cookie` has,
+    /// except that it can neither be `HttpOnly` nor replace one. Only the
+    /// writes of a transition the reader took come here (the accept or
+    /// continue press of a consent wall, legacy-web §5.4.1e), never
+    /// exploration's. Needs the store unlocked.
+    pub const W_SCRIPT_SET_COOKIE: u16 = 0x75;
     pub const ACCOUNT_PASSKEY: u8 = 1;
     pub const ACCOUNT_PASSWORD: u8 = 2;
     pub const ACCOUNTS_MAX: usize = 16;

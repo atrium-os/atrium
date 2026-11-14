@@ -3075,6 +3075,9 @@ struct ProbeResult {
     at: Vec<Handle>,
     counters: (u32, u32, u32, u32, i64, i64),
     selectors: Vec<String>,
+    /// What it wrote to `document.cookie`, as written (the jar is put back
+    /// after: a probe is an observation).
+    cookie_writes: Vec<String>,
 }
 
 fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult {
@@ -3101,6 +3104,7 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
         .ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
     let nav0 = nav_count(ctx);
     let hosts0 = PAGE_BLOCKED.with(|b| b.borrow().1.clone());
+    let jar0 = ctx.eval(Source::from_bytes(b"__cookieWrites.length = 0; __cookieState()")).ok();
     let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
     let mut effects = vec![];
     let mut at = vec![];
@@ -3139,6 +3143,14 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
         });
     }
     let selectors = PROBE_SELECTORS.with(|s| s.borrow_mut().take()).unwrap_or_default();
+    let cookie_writes: Vec<String> = ctx.eval(Source::from_bytes(b"__cookieWrites.join('\\n')")).ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+    if let Some(j) = jar0 {
+        if let Ok(f) = ctx.eval(Source::from_bytes(b"(function (s) { __cookieState(s); })")) {
+            if let Some(c) = f.as_callable() { let _ = c.call(&JsValue::undefined(), &[j], ctx); }
+        }
+    }
     // Restore. The probe is an observation, not an edit.
     DOM.with(|d| *d.borrow_mut() = before);
     GEO.with(|g| g.borrow_mut().snap = geo_before.clone());
@@ -3158,7 +3170,7 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
     let nav = nav_count(ctx).saturating_sub(nav0);
     let hosts = PAGE_BLOCKED.with(|b| b.borrow().1.iter()
         .filter(|(k, n)| hosts0.get(*k) != Some(*n)).map(|(k, _)| k.clone()).collect());
-    ProbeResult { transition, nav, hosts, at, counters, selectors }
+    ProbeResult { transition, nav, hosts, at, counters, selectors, cookie_writes }
 }
 
 fn credit(c: &mut crate::engine::Interactive, r: &ProbeResult) {
@@ -3178,6 +3190,80 @@ struct Example {
     gesture: Gesture,
     recorded: Option<(usize, Vec<Handle>)>,
     net: (u32, u32, u32),
+}
+
+/// The words a consent or interstitial wall's control says (legacy-web
+/// §5.4.1e case 2), lower case.
+const CONSENT_WORDS: &[&str] = &["accept", "agree", "allow", "consent", "continue", "ok", "okay", "got it", "yes", "understood", "understand", "proceed"];
+/// The most controls a conversion presses looking for one, and the most
+/// it marks.
+const CONSENT_PROBES: usize = 8;
+pub const CONSENTS_MAX: usize = 4;
+
+/// ★ A consent wall's control (legacy-web §5.4.1e): an element the reader
+/// could press, saying one of [`CONSENT_WORDS`], whose press writes
+/// `document.cookie`. Each is pressed once, as a probe (the document and
+/// the jar are put back), and the ones that wrote are returned with what
+/// they wrote. Only the reader's own press of one ever reaches Arca.
+fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<String>)> {
+    let cands: Vec<Handle> = DOM.with(|d| {
+        let d = d.borrow();
+        let mut v = vec![];
+        for h in 0..d.nodes.len() as Handle {
+            if v.len() >= CONSENT_PROBES { break }
+            let Some(tag) = d.tag(h) else { continue };
+            let tag = tag.to_ascii_lowercase();
+            let pressable = match tag.as_str() {
+                "button" | "a" => true,
+                "input" => matches!(d.attr(h, "type").map(str::to_ascii_lowercase).as_deref(), Some("button" | "submit")),
+                _ => d.attr(h, "role") == Some("button") || d.attr(h, "onclick").is_some(),
+            };
+            if !pressable || !d.connected(h) { continue }
+            let text = if tag == "input" { d.attr(h, "value").unwrap_or("").to_string() } else { d.visible_text(h) };
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            if text.is_empty() || text.len() > 40 { continue }
+            let words: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            let says = CONSENT_WORDS.iter().any(|c| if c.contains(' ') { text.contains(c) } else { words.contains(c) });
+            if says { v.push(h) }
+        }
+        v
+    });
+    let mut out = vec![];
+    for h in cands {
+        let p = Probe { target: h, gesture: Gesture::Click, key: 0, root: None, discover: None };
+        let r = run_probe(ctx, &p, parser_nodes);
+        if !r.cookie_writes.is_empty() && out.len() < CONSENTS_MAX {
+            out.push((h, r.cookie_writes));
+        }
+    }
+    out
+}
+
+/// The scheme a consent control's mark uses: `atrium-consent:<n>`, the
+/// n-th of the conversion's consents. navigatord takes a press of it as
+/// the reader's own (navigator-ui.md §6.2).
+pub const CONSENT_SCHEME: &str = "atrium-consent:";
+
+/// Make each consent control a link the page child can press: an `a`
+/// with `href="atrium-consent:<n>"`, keeping its text.
+fn mark_consents(found: &[(Handle, Vec<String>)]) {
+    DOM.with(|d| {
+        let mut d = d.borrow_mut();
+        for (i, (h, _)) in found.iter().enumerate() {
+            let h = *h;
+            let is_input = d.tag(h).is_some_and(|t| t.eq_ignore_ascii_case("input"));
+            if is_input {
+                let label = d.attr(h, "value").unwrap_or("Continue").to_string();
+                let t = d.create(Kind::Text(label));
+                d.append(h, t);
+            }
+            if let Some(n) = d.get_mut(h) {
+                n.kind = Kind::Element("a".into());
+                n.attrs.retain(|(k, _)| !matches!(k.as_str(), "type" | "value" | "onclick" | "disabled" | "href"));
+            }
+            d.set_attr(h, "href", &format!("{CONSENT_SCHEME}{i}"));
+        }
+    });
 }
 
 fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize))
@@ -4257,6 +4343,12 @@ pub struct BoaEngine {
     pub module_root: Option<std::path::PathBuf>,
     /// The document's own URL.
     pub base_url: Option<String>,
+    /// ★ A cookied view's `document.cookie` (legacy-web §5.4.1e step 6,
+    /// arca.md §8.1 decision 4): the origin's script-readable cookies as
+    /// Arca gave them. `None`: an anonymous conversion, "no cookies".
+    /// Writes go to a scratch copy inside this run and are dropped: only
+    /// the transition the reader takes reaches Arca, never exploration.
+    pub cookies: Option<String>,
     /// ★ Where a LAYOUT reads the document's stylesheets and image sizes
     /// (legacy-web §5.4.5.6e): the converter's own fetcher, never the
     /// page's — wired to the same caches (or fetchd) the recording's
@@ -4515,9 +4607,46 @@ const GLOBALS: &str = r#"
 
   // Same reasoning: "there are no cookies" rather than a cookie jar. Writes
   // are accepted and dropped so a script that sets one does not throw.
+  // ★ A cookied view (legacy-web §5.4.1e step 6) starts from the origin's
+  // script-readable cookies, and its writes go to this run's scratch copy
+  // only: nothing a conversion's script sets leaves the converter.
   try {
+    var jar = null;
+    if (typeof globalThis.__doc_cookies === 'string') {
+      jar = [];
+      globalThis.__doc_cookies.split('; ').forEach(function (p) {
+        var i = p.indexOf('=');
+        if (i > 0) jar.push([p.slice(0, i), p.slice(i + 1)]);
+      });
+    }
+    // What the page wrote, for the probe that asks (a consent control's
+    // press, legacy-web §5.4.1e), and the jar's state, put back after it.
+    globalThis.__cookieWrites = [];
+    globalThis.__cookieState = function (s) {
+      if (s === undefined) return JSON.stringify(jar);
+      jar = JSON.parse(s);
+    };
     Object.defineProperty(document, 'cookie', {
-      get: function () { return ''; }, set: function () {}, configurable: true
+      get: function () {
+        return jar ? jar.map(function (c) { return c[0] + '=' + c[1]; }).join('; ') : '';
+      },
+      set: function (v) {
+        var line = String(v);
+        if (__cookieWrites.length < 16 && line.length <= 4096 && !/[\x00-\x1f\x7f]/.test(line)) __cookieWrites.push(line);
+        if (!jar) return;
+        var parts = line.split(';');
+        var nv = parts[0], i = nv.indexOf('=');
+        if (i <= 0) return;
+        var name = nv.slice(0, i).trim(), value = nv.slice(i + 1).trim();
+        var gone = parts.slice(1).some(function (a) {
+          var kv = a.trim().toLowerCase();
+          return /^max-age=\s*(-|0+$)/.test(kv) ||
+                 (kv.indexOf('expires=') === 0 && Date.parse(a.trim().slice(8)) < Date.now());
+        });
+        jar = jar.filter(function (c) { return c[0] !== name; });
+        if (!gone && jar.length < 50) jar.push([name, value]);
+      },
+      configurable: true
     });
   } catch (e) {}
 
@@ -5750,7 +5879,8 @@ const GLOBALS: &str = r#"
   globalThis.navigator = {
     sendBeacon: function () { globalThis.__beacons++; return true; },
     userAgent: 'atrium-navigator-prerender/0.1',
-    language: 'en', languages: ['en'], onLine: true, cookieEnabled: false
+    language: 'en', languages: ['en'], onLine: true,
+    cookieEnabled: typeof globalThis.__doc_cookies === 'string'
   };
 })();
 "#;
@@ -6044,7 +6174,7 @@ impl BoaEngine {
         LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
-        let mut rep = RunReport { transitions: vec![], templates: vec![], interactive_found: 0, coverage: vec![],
+        let mut rep = RunReport { transitions: vec![], consents: vec![], templates: vec![], interactive_found: 0, coverage: vec![],
             explore_stats: Default::default(),
             scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
@@ -6083,6 +6213,9 @@ impl BoaEngine {
 
         let _ = ctx.register_global_property(js_string!("__doc_url"),
             js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
+        if let Some(c) = &self.cookies {
+            let _ = ctx.register_global_property(js_string!("__doc_cookies"), js_string!(c.clone()), Attribute::all());
+        }
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
             rep.errors.push(format!("bootstrap: {e}"));
         }
@@ -6232,6 +6365,14 @@ impl BoaEngine {
         // exploration (which is reverted, probe by probe) only adds a table
         // of what its elements do. The readable artifact is taken here
         // (§5.4.5.7), so exploration is off the reader's critical path.
+        // ★ A consent wall's control, found by pressing it (and put back),
+        // is marked in the document the reader sees.
+        {
+            let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
+            let found = find_consents(&mut ctx, parser_nodes);
+            mark_consents(&found);
+            rep.consents = found.into_iter().map(|(_, w)| w).collect();
+        }
         if let Some(cb) = settled {
             DOM.with(|d| cb(&d.borrow(), &rep));
         }

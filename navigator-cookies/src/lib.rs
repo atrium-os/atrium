@@ -169,6 +169,18 @@ pub trait Arca {
     }
     /// The accounts Arca holds for `site` (arcad `W_ACCOUNTS`): (kind,
     /// name), kind `ACCOUNT_PASSKEY` or `ACCOUNT_PASSWORD`.
+    /// A cookied view's `document.cookie` (arcad `W_SCRIPT_COOKIES`):
+    /// what a request to `host:port` `path` would carry from `partition`,
+    /// without its `HttpOnly` cookies, as `n=v; ...`.
+    fn script_cookies(&mut self, _host: &str, _port: u16, _partition: &str, _path: &str) -> Result<String, String> {
+        Err("not supported".into())
+    }
+    /// Keep what a page's script wrote (`document.cookie = line` at
+    /// `path`), for the reader's press of a consent control (arcad
+    /// `W_SCRIPT_SET_COOKIE`).
+    fn script_set_cookie(&mut self, _host: &str, _port: u16, _partition: &str, _path: &str, _line: &str) -> Result<(), String> {
+        Err("not supported".into())
+    }
     fn accounts(&mut self, _site: &str) -> Result<Vec<(u8, String)>, String> {
         Err("this Arca cannot list accounts".into())
     }
@@ -260,6 +272,20 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     pub fn cookied(&self, view: ViewId) -> Option<Why> { self.views.get(&view).and_then(|v| v.cookied) }
 
     pub fn partition(&self, view: ViewId) -> Option<&str> { self.views.get(&view).map(|v| v.partition.as_str()) }
+
+    /// ★ What a cookied view's page scripts start with as
+    /// `document.cookie` (legacy-web §5.4.1e step 6), for the document at
+    /// `url`: its non-`HttpOnly` cookies from the view's partition. A view
+    /// that is not cookied has none, and Arca is not asked.
+    pub fn script_cookies(&mut self, view: ViewId, url: &str) -> Result<Option<String>, Refused> {
+        let Some(View { partition, cookied: Some(_) }) = self.views.get(&view).cloned() else { return Ok(None) };
+        let url = url::Url::parse(url).map_err(|e| Refused::Malformed(e.to_string()))?;
+        if url.scheme() != "https" { return Ok(None) }
+        let host = url.host_str().ok_or_else(|| Refused::Malformed("no host".into()))?.to_ascii_lowercase();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let path = if url.path().is_empty() { "/" } else { url.path() };
+        self.arca.script_cookies(&host, port, &partition, path).map(Some).map_err(Refused::Ticket)
+    }
 
     /// ★ One request of a view. A view that is not cookied gets
     /// [`Refused::NotCookied`] before anything is asked of Arca: the caller
@@ -386,6 +412,24 @@ impl Arca for ArcadSocket {
         let body = self.ask(arcad::proto::broker_op::W_SIGN_OUT, &w.buf, "sign out")?;
         let b: [u8; 4] = body.as_slice().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
         Ok(u32::from_le_bytes(b))
+    }
+
+    fn script_cookies(&mut self, host: &str, port: u16, partition: &str, path: &str) -> Result<String, String> {
+        let mut w = Writer::new();
+        arcad::proto::write_endpoint(&mut w, host, port);
+        w.str(partition);
+        w.str(path);
+        let body = self.ask(arcad::proto::broker_op::W_SCRIPT_COOKIES, &w.buf, "read a page's cookies")?;
+        String::from_utf8(body).map_err(|_| "arcad: cookies that are not UTF-8".to_string())
+    }
+
+    fn script_set_cookie(&mut self, host: &str, port: u16, partition: &str, path: &str, line: &str) -> Result<(), String> {
+        let mut w = Writer::new();
+        arcad::proto::write_endpoint(&mut w, host, port);
+        w.str(partition);
+        w.str(path);
+        w.str(line);
+        self.ask(arcad::proto::broker_op::W_SCRIPT_SET_COOKIE, &w.buf, "keep a page's cookie").map(|_| ())
     }
 
     fn accounts(&mut self, site: &str) -> Result<Vec<(u8, String)>, String> {

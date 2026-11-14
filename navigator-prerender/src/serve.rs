@@ -81,15 +81,23 @@ pub struct Job {
     /// Run the page's scripts. Off: the tier-1 conversion alone (parse,
     /// subresources, serialize), the first-display artifact (§5.4.5.7).
     pub scripts: bool,
+    /// ★ A cookied conversion's script-readable cookies (legacy-web
+    /// §5.4.1e step 6), as `n=v; ...`: what `document.cookie` starts as.
+    /// None: no jar, `document.cookie` is empty and writes go nowhere.
+    /// Writes never leave the child either way.
+    pub cookies: Option<String>,
     pub len: usize,
 }
 
 impl Default for Job {
     fn default() -> Self {
         Job { base: None, net: false, explore: false, same_site: false, protect: false, emit: false,
-              blobs: false, require_confined: false, deadline_s: 30, mem_mb: 4096, progressive: false, scripts: true, len: 0 }
+              blobs: false, require_confined: false, deadline_s: 30, mem_mb: 4096, progressive: false, scripts: true, cookies: None, len: 0 }
     }
 }
+
+/// The most script-readable cookies one conversion starts with.
+pub const MAX_COOKIES: usize = 8192;
 
 fn b(v: bool) -> &'static str { if v { "1" } else { "0" } }
 
@@ -97,8 +105,14 @@ impl Job {
     pub fn header(&self) -> Result<String, String> {
         let base = self.base.as_deref().unwrap_or("");
         if base.contains(['\t', '\n', '\r']) { return Err(format!("base URL with a control character: {base:?}")) }
+        let cookies = match &self.cookies {
+            Some(c) if c.chars().any(char::is_control) => return Err("cookies with a control character".into()),
+            Some(c) if c.len() > MAX_COOKIES => return Err(format!("{} bytes of cookies is over the {MAX_COOKIES} limit", c.len())),
+            Some(c) => format!("\tcookies={c}"),
+            None => String::new(),
+        };
         Ok(format!("{MAGIC}\tbase={base}\tnet={}\texplore={}\tsame_site={}\tprotect={}\temit={}\tblobs={}\
-                    \trequire_confined={}\tdeadline={}\tmem_mb={}\tprogressive={}\tscripts={}\tlen={}\n",
+                    \trequire_confined={}\tdeadline={}\tmem_mb={}\tprogressive={}\tscripts={}{cookies}\tlen={}\n",
             b(self.net), b(self.explore), b(self.same_site), b(self.protect), b(self.emit), b(self.blobs),
             b(self.require_confined), self.deadline_s, self.mem_mb, b(self.progressive), b(self.scripts), self.len))
     }
@@ -127,6 +141,8 @@ impl Job {
                 "scripts" => j.scripts = flag(v)?,
                 "progressive" => j.progressive = flag(v)?,
                 "mem_mb" => j.mem_mb = v.parse().map_err(|_| format!("bad mem_mb {v:?}"))?,
+                "cookies" if v.len() <= MAX_COOKIES && !v.chars().any(char::is_control) => j.cookies = Some(v.to_string()),
+                "cookies" => return Err("bad cookies".into()),
                 "len" => { j.len = v.parse().map_err(|_| format!("bad len {v:?}"))?; have_len = true }
                 _ => return Err(format!("unknown field {k:?}")),
             }

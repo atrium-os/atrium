@@ -368,6 +368,20 @@ echo "$r" | sed 's/^/    /'
 check "a session: the cookie on the next page" sid=vm-cookie "$(K /e2)"
 check "the site's last page went: its session cookie ended" - "$(K /e3)"
 check "…and navigatord said so" yes "$(g "grep -q 'the last page of api.example went: 1 session cookies ended' $N8/navd1.log && echo yes || echo no")"
+# A consent wall (legacy-web §5.4.1e): the converter finds the control
+# whose press writes a cookie and marks it; the reader's press (here
+# navctl's) keeps that cookie in the trail's jar, and the site's next page
+# carries it. Exploration's own press of it never reached Arca.
+g "printf '%s' '<html><head><title>Wall</title></head><body><div id=w><p>We use cookies.</p><button id=y>Accept all</button><button id=m>More options</button></div><script>document.getElementById(\"y\").addEventListener(\"click\", function () { document.cookie = \"consent=yes; Path=/; Max-Age=3600\"; document.getElementById(\"w\").hidden = true; });</script></body></html>' > $N8/fix/api.example/wall && chown arcabroker $N8/fix/api.example/wall"
+N=$(wc -l < "$SRV/log")
+r=$(nav open 18 $U/wall u:f6 0  open 19 $U/w1 u:f6 1  activate 20 $U/wall atrium-consent:0 u:f6  activate 21 $U/wall atrium-consent:3 u:f6  open 22 $U/w2 u:f6 1)
+echo "$r" | sed 's/^/    /'
+check "a consent wall: opened anonymously" "opened 18 $U/wall knows=false from=Fetched" "$(echo "$r" | grep '^opened 18 ')"
+check "…the converter's own press reached no jar" - "$(K /w1)"
+check "the reader's press: its answer kept" "link 20 Consented { url: \"$U/wall\" }" "$(echo "$r" | grep '^link 20 ')"
+check "…a control the page does not carry is refused" yes "$(echo "$r" | grep -q '^link 21 Blocked' && echo yes || echo no)"
+check "…and the site's next page carries the answer" yes "$(K /w2 | grep -q 'consent=yes' && echo yes || echo no)"
+check "…navigatord said so" yes "$(g "grep -q 'consent 0 pressed on $U/wall: 1 of 1 cookies kept in u-00000000000000f6.api.example' $N8/navd1.log && echo yes || echo no")"
 # A crash leaves an Unrecorded jar (b2 has a cookie): the next navigatord
 # forgets every Unrecorded jar before it serves.
 g "pkill -x navigatord; sleep 2; true"

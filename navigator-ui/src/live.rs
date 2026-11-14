@@ -370,6 +370,10 @@ impl Live {
                         }
                         LinkAction::Handoff { url, scheme } => s.handoff(&url, &scheme, crate::ui::now_ms()),
                         LinkAction::Blocked { why } => s.last_note = Some(format!("link refused: {why}")),
+                        LinkAction::Consented { url } => {
+                            eprintln!("navigator-ui: the reader's answer on {url} is kept; it opens again with the site knowing you");
+                            s.consented(&url);
+                        }
                     }
                 }
                 Event::File { id, url, name, size, origin, kind } => {
@@ -561,10 +565,10 @@ impl Live {
         changed |= !s.outbox.is_empty();
         for o in std::mem::take(&mut s.outbox) {
             match o {
-                Out::Activate { page, href, beside } => {
+                Out::Activate { page, href, beside, jar } => {
                     let id = self.id();
                     self.activations.insert(id, beside);
-                    send(&mut self.w, &Request::Activate { id, page, href });
+                    send(&mut self.w, &Request::Activate { id, page, href, jar });
                 }
                 Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
                 Out::Moved { keys } => {
