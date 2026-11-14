@@ -4,7 +4,8 @@
 use super::{Compositor, DisplayEvent, Popup, PopupGrant, PopupRefused, WindowId};
 
 /// The gap frescod leaves between the bar and a panel an app hangs from
-/// it by a grant, where frescod's label naming the app goes.
+/// it by a grant, where frescod's label naming the app goes; points, at
+/// the bar's scale.
 pub const HOSTED_LABEL_GAP: f32 = 24.0;
 
 /// The most grants waiting at once (one a bar window; a few bars).
@@ -372,12 +373,14 @@ impl Compositor {
                 continue;
             };
             let ppos = parent.pos;
+            // The label's gap is in points, at the parent's scale.
+            let label_gap = HOSTED_LABEL_GAP * parent.scale_milli.max(1) as f32 / 1000.0;
             let mut a = [ppos.0 + p.anchor[0], ppos.1 + p.anchor[1], p.anchor[2], p.anchor[3]];
             if p.hosted.is_some() {
                 // Room between the bar and the app's panel for frescod's
                 // label naming the app (forum-status-items.md §4).
-                a[1] -= HOSTED_LABEL_GAP;
-                a[3] += 2.0 * HOSTED_LABEL_GAP;
+                a[1] -= label_gap;
+                a[3] += 2.0 * label_gap;
             }
             let ([x, y, w, h], side) = place(a, p.side, p.align, p.want, self.bounds_at(a[0] + a[2] / 2.0, a[1] + a[3] / 2.0, self.popup_trusted(id)));
             let size = (w as u32, h as u32);

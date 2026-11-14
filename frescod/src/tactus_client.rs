@@ -493,7 +493,10 @@ impl Seat {
                 let (w, h) = screen();
                 let mut g = comp.lock().unwrap();
                 let (x, y) = g.cursor;
-                self.moved(sink, &mut g, (x + dx).clamp(0.0, w - 1.0), (y + dy).clamp(0.0, h - 1.0));
+                // Motion is in points: as far across a 2.0 monitor as a
+                // 1.0 one for the same hand movement.
+                let k = g.scale_at(x, y) as f32 / 1000.0;
+                self.moved(sink, &mut g, (x + dx * k).clamp(0.0, w - 1.0), (y + dy * k).clamp(0.0, h - 1.0));
             }
             Message::Absolute { x, y, .. } => {
                 let (w, h) = screen();
@@ -507,7 +510,7 @@ impl Seat {
                     g.pointer_target(x, y)
                 };
                 // HID: positive is away from the user; the wire's positive
-                // dy scrolls content down. 8 px per detent, as before.
+                // dy scrolls content down. 8 pt per detent, at any scale.
                 let v = value_120 as f32 / 120.0 * 8.0;
                 let (dx, dy) = match axis {
                     Axis::Vertical => (0.0, -v),

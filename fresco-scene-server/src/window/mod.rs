@@ -321,10 +321,11 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
             };
             Ok((control::EV_INPUT_POINTER_BUTTON, encode(&p)?))
         }
+        // Scroll amounts are points already (a wheel detent is 8 pt, a
+        // touchpad's travel is the fingers'), not device pixels: a 2.0
+        // monitor scrolls as far per detent as a 1.0 one.
         DisplayEvent::InputPointerScroll { window_id, dx, dy, phase } => {
-            let p = InputPointerScrollEvent {
-                window_id: *window_id, dx: pt(*window_id, *dx), dy: pt(*window_id, *dy), phase: *phase,
-            };
+            let p = InputPointerScrollEvent { window_id: *window_id, dx: *dx, dy: *dy, phase: *phase };
             Ok((control::EV_INPUT_POINTER_SCROLL, encode(&p)?))
         }
         DisplayEvent::InputPointerMagnify { window_id, x, y, scale, phase } => {
@@ -637,6 +638,9 @@ pub struct Compositor {
     /// The scale (thousandths) a new window opens at: the monitor new
     /// windows land on (resolution-independence.md §3).
     pub new_scale_milli: u32,
+    /// Each monitor's part of the desktop (x0, y0, x1, y1, device px) and
+    /// its scale, for [`Compositor::scale_at`].
+    pub output_scales: Vec<([f32; 4], u32)>,
     /// Pop-up grants waiting for their claim; in a split renderer, those
     /// to send to frescod.
     pub popup_grants: Vec<PopupGrant>,
@@ -779,6 +783,7 @@ impl Compositor {
             popups_upstream: false,
             popup_top: 0.0,
             new_scale_milli: 1000,
+            output_scales: Vec::new(),
             popup_grants: Vec::new(),
             lock: None,
             lock_hidden: Vec::new(),
@@ -1050,6 +1055,17 @@ impl Compositor {
     /// Set window `id`'s scale (device pixels per point). Emits
     /// `WindowDpiChanged`, which its client is told as
     /// `EV_WINDOW_RESIZED`.
+    /// The scale (thousandths) of the monitor under desktop point (x, y):
+    /// pointer motion is in points, so it is turned into device pixels at
+    /// this scale (resolution-independence.md §8). Off every monitor, the
+    /// scale new windows open at.
+    pub fn scale_at(&self, x: f32, y: f32) -> u32 {
+        self.output_scales
+            .iter()
+            .find(|(r, _)| x >= r[0] && x < r[2] && y >= r[1] && y < r[3])
+            .map_or(self.new_scale_milli, |&(_, s)| s)
+    }
+
     pub fn set_window_dpi(&mut self, id: WindowId, scale_factor: f32) -> bool {
         let Some(w) = self.windows.get_mut(&id) else { return false };
         w.scale_milli = (scale_factor * 1000.0).round() as u32;
@@ -2083,7 +2099,7 @@ mod event_tests {
         assert_eq!((b.x, b.y), (200.0, 100.0));
         let ev = DisplayEvent::InputPointerScroll { window_id: 7, dx: 0.0, dy: 45.0, phase: 0 };
         let sc: InputPointerScrollEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
-        assert_eq!(sc.dy, 30.0);
+        assert_eq!(sc.dy, 45.0, "scroll amounts are points at the source");
         let ev = DisplayEvent::PopupPlaced { window_id: 7, x: 30.0, y: 60.0, width: 300, height: 450, side: 0 };
         let pp: PopupPlacedEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
         assert_eq!((pp.x, pp.y, pp.width, pp.height), (20.0, 40.0, 200.0, 300.0));

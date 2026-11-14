@@ -310,6 +310,10 @@ pub struct EnvelopeFrontend {
     /// scene server has no display of its own to ask. Zero until set, which is
     /// what a headless/test frontend reports.
     display_mode: (u32, u32, u32),
+    /// frescod's strip at the top of the screen, in points (0: none); in
+    /// device pixels, at the scale of the monitor at the desktop's origin,
+    /// it is `reserved_top` (resolution-independence.md §8).
+    strip_pt: u32,
     reserved_top: u32,
     /// Who may open notification surfaces; `None`: anyone (a renderer's
     /// frontend, which only forwards). Default: no one.
@@ -376,6 +380,7 @@ impl EnvelopeFrontend {
             video: HashMap::new(),
             next_video_layer: 1,
             display_mode: (0, 0, 0),
+            strip_pt: 0,
             reserved_top: 0,
             notification_uids: Some(Vec::new()),
             chrome_may: Some(Box::new(|_| false)),
@@ -475,7 +480,16 @@ impl EnvelopeFrontend {
         self.reserved_top
     }
 
-    pub fn set_reserved_top(&mut self, rows: u32) {
+    /// frescod draws a strip `pt` points tall at the top of the screen:
+    /// the top rows no window or app pop-up gets, at the current scale.
+    pub fn set_strip_pt(&mut self, pt: u32) {
+        self.strip_pt = pt;
+        let scale = self.compositor.lock().unwrap().new_scale_milli;
+        self.update_reserved_top(scale);
+    }
+
+    fn update_reserved_top(&mut self, scale_milli: u32) {
+        let rows = if self.strip_pt == 0 { 0 } else { fresco_protocol::pt_to_device(self.strip_pt as f32, scale_milli) };
         self.reserved_top = rows;
         self.compositor.lock().unwrap().popup_top = rows as f32;
     }
@@ -590,8 +604,19 @@ impl EnvelopeFrontend {
             .iter()
             .find(|o| o.rect.x <= 0 && o.rect.y <= 0 && o.rect.x + o.rect.w as i32 > 0 && o.rect.y + o.rect.h as i32 > 0)
             .unwrap_or(&present[0]);
+        // The strip is in points too: its rows follow the origin's scale.
+        let rows = if self.strip_pt == 0 { 0 } else { fresco_protocol::pt_to_device(self.strip_pt as f32, origin.scale_milli) };
+        self.reserved_top = rows;
         let mut comp = self.compositor.lock().unwrap();
         comp.new_scale_milli = origin.scale_milli;
+        comp.popup_top = rows as f32;
+        comp.output_scales = present
+            .iter()
+            .map(|o| {
+                let r = &o.rect;
+                ([r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32], o.scale_milli)
+            })
+            .collect();
         let on_monitor = |w: &crate::window::Window| -> Option<u32> {
             let (x, y, ww, wh) = (w.pos.0 as i64, w.pos.1 as i64, w.size.0 as i64, w.size.1 as i64);
             present
@@ -2481,6 +2506,28 @@ mod tests {
         let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), client)
             .expect("create");
         decode::<fresco_protocol::WindowCreateReply>(&out[0].payload).unwrap().window_id
+    }
+
+    /// frescod's strip is in points (resolution-independence.md §8): its
+    /// rows, which no window or app pop-up gets, follow the scale of the
+    /// monitor at the desktop's origin, and pointer motion is turned into
+    /// pixels at the scale of the monitor under it.
+    #[test]
+    fn the_strip_and_the_pointer_follow_the_scale() {
+        use fresco_protocol::{WmOutput, WmRect};
+        let mut f = fixture();
+        f.set_strip_pt(24);
+        assert_eq!(f.reserved_top(), 24);
+        let out = |output, identity, x, scale_milli| WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
+            refresh_mhz: 60000, present: true, scale_milli, auto_scale_milli: scale_milli, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+        };
+        f.set_outputs(vec![out(0, 10, 0, 2000), out(1, 20, 1920, 1000)]);
+        assert_eq!((f.reserved_top(), f.display_info().reserved_top), (48, 48));
+        let comp = f.compositor_arc();
+        let c = comp.lock().unwrap();
+        assert_eq!(c.popup_top, 48.0);
+        assert_eq!((c.scale_at(100.0, 100.0), c.scale_at(2000.0, 100.0), c.scale_at(5000.0, 0.0)), (2000, 1000, 2000));
     }
 
     #[test]

@@ -308,6 +308,19 @@ The origin strip, the cursor, Arca's ring, the lock screen, focus outlines drawn
 and frescod-side text all use the scale of the monitor they're drawn on: `STRIP_H` becomes
 24 pt. The cursor is vector or provided at 1x/2x/3x and picked per monitor.
 
+**Built in step 2b (2026-11-14).** The strip is `STRIP_PT = 24` and frescod's chrome (the
+strip, its origin text, the focus ring, the labels over bar-hosted panels, island, sheet and
+credential-slot frames) is drawn through `chrome::Px` at the scale of the monitor at the
+desktop's origin. The chrome's font is rasterized at build time for quarter steps from 1.0
+to 4.0, and the largest table not above the scale is used, so text is never a 14 px bitmap
+blown up. `reserved_top` (the strip's rows, sent in `OP_DISPLAY_INFO` and
+`EV_DISPLAY_CHANGED`) and the pop-up ceiling follow the scale, and the gap left for the label
+over a bar-hosted panel (`HOSTED_LABEL_GAP`) is pt at the bar's scale. Input is in pt at the
+source: relative pointer motion moves the cursor `dx x scale` device px of the monitor under
+it, a wheel detent scrolls 8 pt and touchpad scrolling is finger travel in pt, so scroll
+amounts reach apps unconverted. frescod draws no cursor image today (the pointer is the
+hardware's or the host's); when it does, it follows this rule.
+
 ## 9. Embedded and non-Pergola surfaces
 
 - **Limen slots** (embedded jailed surfaces, e.g. Navigator pages): the parent places the slot
@@ -357,8 +370,8 @@ Shankar took the recommendation on each:
    pixel-compared at 1.0, 1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit
    at every scale.
 2. **Scale policy** (rows 8 to 10). **2a, built 2026-11-14:** `ui_size` relative
-   preference, TV fallback, 1/8 steps, laptop panels at Smaller (§4.2). **2b:** frescod's
-   strip and cursor in pt. Test: change a monitor's mode in the VM and check every window's
+   preference, TV fallback, 1/8 steps, laptop panels at Smaller (§4.2). **2b, built 2026-11-14:**
+   frescod's strip, chrome and input amounts in pt (§8). Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.
 3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,
    1.5 and 1.75.
