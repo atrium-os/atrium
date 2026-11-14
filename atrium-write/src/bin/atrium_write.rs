@@ -45,6 +45,7 @@ enum Target {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Asking {
     Open,
+    Compare,
     SaveAs,
     Picture,
     ExportPdf,
@@ -354,6 +355,15 @@ fn main() {
             q.push(Cmd::ReviewOpen);
             q.extend(std::iter::repeat_n(Cmd::ReviewNext, n));
         }
+        Some(f) if f.starts_with("compare:") => {
+            // BAR=compare:PATH compares an earlier version at PATH with the document.
+            let p = std::path::Path::new(&f[8..]);
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match fs::read(p).map_err(|e| e.to_string()).and_then(|data| load(&name, &data)) {
+                Ok(older) => run.write.compare_with(&older, &name),
+                Err(e) => run.set_status(e),
+            }
+        }
         Some("comment") => run.write.cmds.lock().unwrap().push(Cmd::CommentOpen(0)),
         Some(f) if f.starts_with("find:") => {
             run.write.find_text.set(pergola::text_edit::TextEdit::new(&f[5..]));
@@ -389,6 +399,7 @@ fn main() {
         for c in run.write.take_cmds() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::CompareWith => want_picker = Some(Asking::Compare),
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::ExportPdf => want_picker = Some(Asking::ExportPdf),
@@ -406,6 +417,7 @@ fn main() {
                     let name = run.write.doc.borrow().name.clone();
                     let filter = match what {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a document".into() },
+                        Asking::Compare => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with an earlier version", stem_of(&name)) },
                         Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
                         Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)) },
@@ -431,6 +443,12 @@ fn main() {
                     let fd = e.borrow_mut().take_fd();
                     match (ToParent::decode(&bytes), fd) {
                         (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
+                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Compare) => {
+                            match read_all(&mut File::from(fd)).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
+                                Ok(older) => run.write.compare_with(&older, &name),
+                                Err(e) => run.set_status(e),
+                            }
+                        }
                         (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Picture) => {
                             let r = read_all(&mut File::from(fd)).map_err(|e| e.to_string()).and_then(|b| run.write.insert_picture(b));
                             if let Err(e) = r {

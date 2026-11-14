@@ -1897,6 +1897,46 @@ insertion, bold, an inserted and a deleted break by two people keep every change
 0 panics, 343 tracked edits read in 78 files, our writer then reader keep every
 edit of all 78; text recall against LibreOffice 99.51 %.
 
+### 16.26 O5c4 as built (2026-11-15): compare two versions
+
+- **Engine** (`officina-text::compare`). `diff()` is Myers over any sequence,
+  after taking off the common start and end; past 2,048 differences the middle
+  is one change (bounded time and memory). `TextDoc::compare(other)` accepts both
+  documents' own changes first, diffs paragraphs by text, and inside each changed
+  stretch pairs paragraphs that share at least half their words (looking 64
+  ahead), so an edited paragraph is one paragraph with word changes, not a
+  delete and an insert. Paired and kept paragraphs are diffed by words (a lone
+  space between two changes joins them); runs that read the same but look
+  different become formatting changes. The result is the second document with
+  the differences as tracked changes by one revision ("Compare", the author
+  given): accept all gives the second, reject all gives the first.
+- **Moves.** A move is found where edits are grouped (§16.24), so compared and
+  hand-tracked documents read alike: a deleted paragraph and an inserted one by
+  one author with the same text is "moved", and one sharing at least 60 % of its
+  words (20 characters or more) is "moved and changed it". An insertion of several
+  paragraphs holding the moved one is split so the move is found inside it.
+- **Commands.** `compare_ops(original)` turns the open document into the
+  comparison as ordinary undoable ops (revision, deletions, tombstones,
+  formatting, paragraph marks), so Undo takes it back and the journal replays it;
+  it refuses a document that already has tracked changes. Write's Tools menu has
+  **Compare with…**: pick the earlier version, and the document opens in review
+  mode on the first edit, the status line saying how many edits there are.
+- **Not yet:** a side-by-side view (review mode's lane covers reading the
+  edits); comparing notes, headers, footers and table structure (their text is
+  compared as paragraphs); compare of documents that already carry changes
+  (accept or reject them first).
+
+Gates: 10,000 random pairs (edits, splits, joins, moves, formatting, empty
+documents): accept all gives the second exactly, reject all the first, the native
+file round trip keeps both, `compare_ops` undoes to the start and gives the same
+edits, and a document compared with itself has none (`compare::tests`). Corpus
+(1,858 files): each document compared with an edited copy of itself, 1,832 of
+1,832 readable ones accept to the copy and reject to the original (largest,
+15,935 paragraphs, in 49 ms). 3,000 paragraphs with scattered edits compare in
+21 ms. The sample agreement (`atrium-write/examples/compare_docs.rs`) reads as
+seven edits: four word changes, a paragraph moved and changed, bold, an inserted
+sentence.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -36,7 +36,7 @@ pub const FIND_H: f32 = 48.0;
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
 /// The Tools menu, in order.
-pub const TOOLS: [&str; 4] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes"];
+pub const TOOLS: [&str; 5] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 12] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment"];
@@ -100,6 +100,8 @@ pub enum Cmd {
     ReviewReject,
     ReviewAcceptAll,
     ReviewRejectAll,
+    /// Compare with another version (the app asks for the file).
+    CompareWith,
 }
 
 impl Cmd {
@@ -452,6 +454,28 @@ impl Write {
         RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
     }
 
+    /// Compares `original` (an earlier version, named `name`) with the
+    /// document: what differs becomes tracked changes, shown in review.
+    pub fn compare_with(&self, original: &Doc, name: &str) {
+        let ed = self.doc.borrow().ed.clone();
+        let orig = original.ed.borrow().doc.clone();
+        let n = ed.borrow_mut().compare_with(&orig);
+        self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+        self.spell.set(SpellBar::default());
+        self.note.set(NoteBar::default());
+        self.comment.set(CommentBar::default());
+        let msg = match n {
+            None => "This document has tracked changes: accept or reject them before comparing.".to_string(),
+            Some(0) => format!("No differences from “{name}”."),
+            Some(1) => format!("Compared with “{name}”: 1 edit."),
+            Some(n) => format!("Compared with “{name}”: {n} edits."),
+        };
+        self.doc.borrow_mut().status = msg;
+        let (w, h) = self.size.get();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+        self.changed();
+    }
+
     /// Runs a find bar command on the editor.
     fn find_cmd(&self, c: Cmd) {
         let mut f = self.find.get_cloned();
@@ -732,10 +756,11 @@ impl View for Write {
             let tracking = self.doc.borrow().ed.borrow().doc.tracking;
             let items: Vec<MenuItem> = TOOLS.iter().enumerate().map(|(i, s)| match i {
                 2 => MenuItem::new(*s).checked(tracking).separated(),
+                4 => MenuItem::new(*s).separated(),
                 _ => MenuItem::new(*s),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen][i.min(3)])).at(x, 8.0).width(88.0).render(ctx);
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith][i.min(4)])).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
         {
@@ -1033,6 +1058,30 @@ mod tests {
         assert!(!w.doc.borrow().ed.borrow().review);
         run(Cmd::TrackToggle);
         assert!(!w.doc.borrow().ed.borrow().doc.tracking);
+    }
+
+    #[test]
+    fn compare_with_an_earlier_version() {
+        let doc = Doc::from_text("new.txt", b"The slow brown fox.\nIt leaps over the dog.\nA new line.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let text = || w.doc.borrow().ed.borrow().doc.visible_text();
+        let older = Doc::from_text("old.txt", b"The quick brown fox.\nIt jumps over the dog.").unwrap();
+        w.compare_with(&older, "old.txt");
+        assert_eq!(w.doc.borrow().status, "Compared with “old.txt”: 3 edits.");
+        assert!(w.doc.borrow().ed.borrow().review);
+        assert_eq!(text(), vec!["The slow brown fox.", "It leaps over the dog.", "A new line."]);
+        run(Cmd::ReviewRejectAll);
+        assert_eq!(text(), vec!["The quick brown fox.", "It jumps over the dog."]);
+        run(Cmd::Undo);
+        run(Cmd::Undo);
+        assert!(w.doc.borrow().ed.borrow_mut().edits().is_empty());
+        // The Tools menu asks for the file.
+        w.cmds.lock().unwrap().push(Cmd::CompareWith);
+        assert_eq!(w.take_cmds(), vec![Cmd::CompareWith]);
     }
 
     #[test]

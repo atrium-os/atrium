@@ -91,6 +91,41 @@ struct Row {
     /// Tracked edits read, and whether our writer and reader keep them.
     edits: usize,
     edits_kept: bool,
+    /// Compared with an edited copy of itself: accepting gives the copy,
+    /// rejecting gives it back (None: not compared).
+    compare_ok: Option<bool>,
+    compare_took: Duration,
+}
+
+/// A copy of `d` (its tracked changes accepted) edited: the second paragraph
+/// gone, the last moved to the front, a word added to every fifth.
+fn edited_copy(d: &TextDoc) -> TextDoc {
+    let mut x = d.compare(d, "x", "");
+    let ops = x.resolve_ops(officina_text::track::Resolve::Accept, |_| true);
+    for op in ops {
+        officina_core::history::Op::apply(op, &mut x);
+    }
+    let texts = x.visible_text();
+    let mut paras: Vec<String> = texts.into_iter().filter(|t| !t.contains('\u{FFFC}')).collect();
+    if paras.len() > 2 {
+        paras.remove(1);
+        let last = paras.pop().unwrap();
+        paras.insert(0, last);
+    }
+    for (i, p) in paras.iter_mut().enumerate() {
+        if i % 5 == 4 {
+            p.push_str(" amended");
+        }
+    }
+    let mut y = TextDoc::new();
+    y.blocks.remove(0);
+    if paras.is_empty() {
+        paras.push(String::new());
+    }
+    for p in &paras {
+        y.push_para(p, 0, vec![]);
+    }
+    y
 }
 
 fn read(path: &Path, data: &[u8]) -> Result<(TextDoc, Vec<String>), String> {
@@ -120,7 +155,7 @@ fn main() {
             let took = t.elapsed();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let lo = std::fs::read_to_string(Path::new(txt).join(Path::new(&name).with_extension("txt"))).ok();
-            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0, edits: 0, edits_kept: true };
+            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0, edits: 0, edits_kept: true, compare_ok: None, compare_took: Duration::ZERO };
             match got {
                 Err(e) => row.ok = Err(e),
                 Ok((doc, ns)) => {
@@ -160,6 +195,31 @@ fn main() {
                     let full = |t: &str| t.split('\n').filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
                     let ours_all = ours.clone() + &notes_text(&doc);
                     row.roundtrip = matches!(again, Ok(Some(t)) if full(&t) == full(&ours_all));
+                    // Compare with an edited copy.
+                    {
+                        let t = Instant::now();
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut plain = doc.clone();
+                            // Pictures and notes stay out of the copy: plain text against plain text.
+                            let ops = plain.resolve_ops(officina_text::track::Resolve::Accept, |_| true);
+                            for op in ops {
+                                officina_core::history::Op::apply(op, &mut plain);
+                            }
+                            let b = edited_copy(&plain);
+                            let c = plain.compare(&b, "Compare", "");
+                            let res = |how| {
+                                let mut x = c.clone();
+                                let ops = x.resolve_ops(how, |_| true);
+                                for op in ops {
+                                    officina_core::history::Op::apply(op, &mut x);
+                                }
+                                x.visible_text()
+                            };
+                            c.visible_text() == b.visible_text() && res(officina_text::track::Resolve::Accept) == b.visible_text() && res(officina_text::track::Resolve::Reject) == plain.visible_text()
+                        }));
+                        row.compare_took = t.elapsed();
+                        row.compare_ok = Some(res.unwrap_or(false));
+                    }
                     if row.edits > 0 {
                         let back = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if odt_file {
@@ -198,6 +258,12 @@ fn main() {
     println!("our writer then our reader keep the text (and notes) of {rt} of {read_ok}");
     println!("{} notes in {} files", rows.iter().map(|r| r.notes).sum::<usize>(), rows.iter().filter(|r| r.notes > 0).count());
     println!("{} comments in {} files", rows.iter().map(|r| r.comments).sum::<usize>(), rows.iter().filter(|r| r.comments > 0).count());
+    let cmp: Vec<&Row> = rows.iter().filter(|r| r.compare_ok.is_some()).collect();
+    let slow = cmp.iter().max_by_key(|r| r.compare_took).map(|r| format!("{} {:.0?}", r.file, r.compare_took)).unwrap_or_default();
+    println!("compared with an edited copy: {} of {} accept to the copy and reject to the original; slowest {slow}", cmp.iter().filter(|r| r.compare_ok == Some(true)).count(), cmp.len());
+    for r in cmp.iter().filter(|r| r.compare_ok == Some(false)).take(10) {
+        println!("compare FAIL {}", r.file);
+    }
     let tracked: Vec<&Row> = rows.iter().filter(|r| r.edits > 0).collect();
     println!("{} tracked edits in {} files; our writer then our reader keep them all in {} of those files", tracked.iter().map(|r| r.edits).sum::<usize>(), tracked.len(), tracked.iter().filter(|r| r.edits_kept).count());
     for r in &panics {

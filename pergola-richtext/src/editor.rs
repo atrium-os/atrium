@@ -601,6 +601,22 @@ impl Editor {
         true
     }
 
+    /// Compares `original` with this document: the text stays, and what
+    /// differs becomes tracked changes as `author` (one undoable step), shown
+    /// in review from the first. The number of edits; none when the document
+    /// has tracked changes of its own.
+    pub fn compare_with(&mut self, original: &officina_text::model::TextDoc) -> Option<usize> {
+        let now = if self.now.is_empty() { "".to_string() } else { self.now.to_string() };
+        let author = self.author.clone();
+        let ops = self.doc.compare_ops(original, &author, &now)?;
+        self.apply("Compare", ops, Kind::Other);
+        self.clamp_caret();
+        let n = self.edits().len();
+        self.review = n > 0;
+        self.review_select(0);
+        Some(n)
+    }
+
     /// The document's edits (cached until the next change).
     pub fn edits(&mut self) -> Rc<Vec<Edit>> {
         if let Some((r, e)) = &self.edits_cache {
@@ -1935,6 +1951,29 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn compare_marks_what_changed_and_undoes() {
+        let original = ed(&["The quick brown fox", "jumps over", "the dog"]).doc;
+        let mut e = ed(&["The slow brown fox", "the dog", "jumps over"]);
+        e.start_log();
+        e.author = "Cy".into();
+        let n = e.compare_with(&original).unwrap();
+        assert!(n >= 2, "{n}");
+        assert!(e.review);
+        assert_eq!(texts(&e).len(), 3);
+        assert_eq!(e.doc.visible_text(), vec!["The slow brown fox", "the dog", "jumps over"]);
+        assert!(e.edits().iter().any(|x| x.summary == "“quick” → “slow”"), "{:?}", e.edits());
+        // The journal replays it.
+        let log = e.take_log();
+        let mut r = ed(&["The slow brown fox", "the dog", "jumps over"]);
+        for l in log {
+            r.replay(l);
+        }
+        assert_eq!(r.edits().len(), e.edits().len());
+        e.undo();
+        assert!(e.edits().is_empty());
     }
 
     #[test]

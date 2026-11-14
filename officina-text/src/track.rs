@@ -792,6 +792,35 @@ impl TextDoc {
         (old, new)
     }
 
+    /// The edit a group of touching changes makes.
+    fn group_edit(&self, rev: RevId, from: (usize, u32), to: (usize, u32), ins: bool, del: bool, brk: bool) -> Edit {
+        // Whole words around it, in its paragraphs.
+        let wf = (from.0, self.word_edge(from.0, from.1, false));
+        let wt = (to.0, self.word_edge(to.0, to.1, true));
+        let (old, new) = self.old_new(wf, wt, rev);
+        let kind = match (ins || brk, del) {
+            (true, true) => EditKind::Replace,
+            (false, true) => EditKind::Delete,
+            (true, false) if !ins => EditKind::Break,
+            _ => EditKind::Insert,
+        };
+        let changed = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+        let minor = changed(&old) == changed(&new) && kind != EditKind::Break;
+        let (o, n) = self.old_new(from, to, rev);
+        let summary = match kind {
+            EditKind::Insert => format!("inserted {}", quote(&n)),
+            EditKind::Delete => format!("deleted {}", quote(&o)),
+            EditKind::Replace if !old.contains('\n') && !new.contains('\n') => {
+                let (a, b) = differing_words(&old, &new);
+                format!("{} → {}", quote(a), quote(b))
+            }
+            EditKind::Replace => format!("replaced {} with {}", quote(&o), quote(&n)),
+            EditKind::Break => "new paragraph".into(),
+            _ => String::new(),
+        };
+        Edit { kind, rev, ranges: vec![(from, to)], old, new, minor, summary }
+    }
+
     /// The tracked changes grouped into edits, in document order (formatting
     /// edits after the text ones they share a place with).
     pub fn edits(&self) -> Vec<Edit> {
@@ -806,7 +835,9 @@ impl TextDoc {
             }
             let (ins, del, brk) = (c.kind == ChangeKind::Insert, matches!(c.kind, ChangeKind::Delete(_)), c.kind == ChangeKind::InsertBreak);
             let touches = |g: &(RevId, (usize, u32), (usize, u32), bool, bool, bool)| {
-                g.0 == c.rev && (g.2 == c.from || (brk && c.from.0 == g.2 .0 + 1 && self.para(g.2 .0).is_some_and(|p| p.text.len() as u32 == g.2 .1)))
+                // A new paragraph after text deleted is its own edit (paragraphs
+                // deleted, then others inserted: two edits, or a move).
+                g.0 == c.rev && (g.2 == c.from || (brk && !(g.4 && !g.3 && !g.5) && c.from.0 == g.2 .0 + 1 && self.para(g.2 .0).is_some_and(|p| p.text.len() as u32 == g.2 .1)))
             };
             match groups.last_mut() {
                 Some(g) if touches(g) => {
@@ -818,34 +849,7 @@ impl TextDoc {
                 _ => groups.push((c.rev, c.from, c.to, ins, del, brk)),
             }
         }
-        let mut out: Vec<Edit> = Vec::new();
-        for (rev, from, to, ins, del, brk) in groups {
-            // Whole words around it, in its paragraphs.
-            let wf = (from.0, self.word_edge(from.0, from.1, false));
-            let wt = (to.0, self.word_edge(to.0, to.1, true));
-            let (old, new) = self.old_new(wf, wt, rev);
-            let kind = match (ins || brk, del) {
-                (true, true) => EditKind::Replace,
-                (false, true) => EditKind::Delete,
-                (true, false) if !ins => EditKind::Break,
-                _ => EditKind::Insert,
-            };
-            let changed = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
-            let minor = changed(&old) == changed(&new) && kind != EditKind::Break;
-            let (o, n) = self.old_new(from, to, rev);
-            let summary = match kind {
-                EditKind::Insert => format!("inserted {}", quote(&n)),
-                EditKind::Delete => format!("deleted {}", quote(&o)),
-                EditKind::Replace if !old.contains('\n') && !new.contains('\n') => {
-                    let (a, b) = differing_words(&old, &new);
-                    format!("{} → {}", quote(a), quote(b))
-                }
-                EditKind::Replace => format!("replaced {} with {}", quote(&o), quote(&n)),
-                EditKind::Break => "new paragraph".into(),
-                _ => String::new(),
-            };
-            out.push(Edit { kind, rev, ranges: vec![(from, to)], old, new, minor, summary });
-        }
+        let mut out: Vec<Edit> = groups.into_iter().map(|(rev, from, to, ins, del, brk)| self.group_edit(rev, from, to, ins, del, brk)).collect();
         // Moves: a deletion and an insertion of the same text by one author.
         let author = |r: RevId| self.revisions.get(r).map(|v| v.author.clone());
         let mut k = 0;
@@ -854,11 +858,50 @@ impl TextDoc {
                 let (o, _) = self.old_new(out[k].ranges[0].0, out[k].ranges[0].1, out[k].rev);
                 let t = o.trim().to_string();
                 if t.chars().count() >= 8 {
-                    if let Some(j) = out.iter().position(|e| e.kind == EditKind::Insert && author(e.rev) == author(out[k].rev) && self.old_new(e.ranges[0].0, e.ranges[0].1, e.rev).1.trim() == t) {
+                    // An insertion of several paragraphs, one of them this text:
+                    // that paragraph is an edit of its own.
+                    let a = author(out[k].rev);
+                    let holder = out.iter().position(|e| e.kind == EditKind::Insert && author(e.rev) == a && e.ranges[0].0 .0 < e.ranges[0].1 .0 && self.old_new(e.ranges[0].0, e.ranges[0].1, e.rev).1.split('\n').any(|l| l.trim() == t));
+                    if let Some(h) = holder {
+                        let (rev, (from, to)) = (out[h].rev, out[h].ranges[0]);
+                        let len = |b: usize| self.para(b).map_or(0, |p| p.text.len() as u32);
+                        let q = (from.0..=to.0).find(|&q| {
+                            let (s, e) = (if q == from.0 { from.1 } else { 0 }, if q == to.0 { to.1 } else { len(q) });
+                            self.old_new((q, s), (q, e), rev).1.trim() == t
+                        });
+                        if let Some(q) = q {
+                            let mut parts = Vec::new();
+                            if q > from.0 {
+                                parts.push((from, (q - 1, len(q - 1))));
+                            }
+                            parts.push(((q, if q == from.0 { from.1 } else { 0 }), (q, if q == to.0 { to.1 } else { len(q) })));
+                            if q < to.0 {
+                                parts.push(((q + 1, 0), to));
+                            }
+                            let made: Vec<Edit> = parts.into_iter().map(|(f, e)| self.group_edit(rev, f, e, true, false, f.0 != e.0 || self.para(f.0).is_some_and(|p| p.props.rev.is_some()))).collect();
+                            out.splice(h..h + 1, made.clone());
+                            if h < k {
+                                k += made.len() - 1;
+                            }
+                        }
+                    }
+                    let same = out.iter().position(|e| e.kind == EditKind::Insert && author(e.rev) == author(out[k].rev) && self.old_new(e.ranges[0].0, e.ranges[0].1, e.rev).1.trim() == t);
+                    // Else a paragraph moved and edited: mostly the same words.
+                    let alike = || {
+                        (t.chars().count() >= 20 && o.starts_with('\n'))
+                            .then(|| {
+                                out.iter().position(|e| {
+                                    let n = self.old_new(e.ranges[0].0, e.ranges[0].1, e.rev).1;
+                                    e.kind == EditKind::Insert && author(e.rev) == author(out[k].rev) && n.trim().chars().count() >= 20 && !n.trim().contains('\n') && crate::compare::similarity(&t, n.trim()) >= 0.6
+                                })
+                            })
+                            .flatten()
+                    };
+                    if let Some((j, edited)) = same.map(|j| (j, false)).or_else(|| alike().map(|j| (j, true))) {
                         let to = out[j].ranges[0];
                         out[k].kind = EditKind::Move;
                         out[k].ranges.push(to);
-                        out[k].summary = format!("moved {}", quote(&t));
+                        out[k].summary = if edited { format!("moved {} and changed it", quote(&t)) } else { format!("moved {}", quote(&t)) };
                         out[k].minor = false;
                         out.remove(j);
                         if j < k {
