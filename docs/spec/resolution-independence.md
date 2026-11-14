@@ -480,7 +480,7 @@ reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descript
 in place of `src`, kept under the `src` the document names it by, and its natural size is
 its pixels over its density, so it takes the room its 1x `src` would and a 2x screen gets
 2x pixels. Nothing about the reader leaks; the cost is larger image downloads, bounded by
-the existing image ceilings. (Chosen by Shankar 2026-11-14.) `<picture>` sources are not read yet.
+the existing image ceilings. (Chosen by Shankar 2026-11-14.) A `<picture>`'s first `<source>` that applies at the conversion viewport (media holds, type decodable) is picked the same way.
 
 ## 11. Decisions (accepted 2026-11-14)
 

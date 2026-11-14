@@ -176,10 +176,45 @@ pub fn pick(cands: &[Candidate], sizes: Option<&str>) -> Option<(String, f32)> {
     best.map(|(c, d)| (c.url.clone(), d))
 }
 
+/// Image types the renderer decodes, as a `<source type>` names them.
+fn decodable(t: &str) -> bool {
+    matches!(t.trim().to_ascii_lowercase().as_str(), "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/svg+xml")
+}
+
+/// In a `<picture>`, the first `<source>` before `h` that applies at the
+/// conversion viewport (its `media` holds, its `type`, if any, is one we
+/// decode) and has candidates, picked as an `<img>`'s are.
+fn from_picture(dom: &Dom, h: Handle) -> Option<(String, f32)> {
+    let mut sources = Vec::new();
+    let mut at = h;
+    while let Some(p) = dom.previous_sibling(at) {
+        at = p;
+        if dom.tag(p) == Some("source") {
+            sources.push(p);
+        }
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    for s in sources.into_iter().rev() {
+        if dom.attr(s, "media").is_some_and(|m| !holds(m)) || dom.attr(s, "type").is_some_and(|t| !decodable(t)) {
+            continue;
+        }
+        let cands = dom.attr(s, "srcset").map(parse).unwrap_or_default();
+        if let Some(p) = pick(&cands, dom.attr(s, "sizes")) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// What to fetch for the `<img>` `h`: a `srcset` candidate picked for
 /// [`DENSITY`] (also from a `<picture>`'s plain `<source>`), with its
 /// density; else `None`, and its `src` is fetched at 1x.
 pub fn for_img(dom: &Dom, h: Handle) -> Option<(String, f32)> {
+    if let Some(picked) = from_picture(dom, h) {
+        return Some(picked);
+    }
     let sizes = dom.attr(h, "sizes");
     let mut cands = dom.attr(h, "srcset").map(parse).unwrap_or_default();
     if cands.is_empty() {

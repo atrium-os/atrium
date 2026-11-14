@@ -182,3 +182,20 @@ fn a_srcset_image_is_fetched_at_two_x_for_everyone_and_sized_in_css_px() {
     assert_eq!(out.images[0].src, "/one.svg", "keyed as the document names it");
     assert_eq!((out.images[0].natural.width, out.images[0].natural.height), (Some(64), Some(32)), "128 px at 2x is 64 CSS px");
 }
+
+/// A `<picture>`'s first source that applies (a type we decode, a media
+/// that holds at the conversion viewport) gives the candidates, at 2x.
+#[test]
+fn a_picture_source_is_picked_at_two_x_too() {
+    let dom = navigator_dom::parse(r#"<html><body><picture>
+        <source type="image/avif" srcset="/a.avif 2x">
+        <source media="(max-width: 600px)" srcset="/narrow.svg 2x">
+        <source srcset="/wide1.svg 1x, /wide2.svg 2x">
+        <img src="/fallback.svg"></picture></body></html>"#);
+    let mut f = MapFetcher::default();
+    f.0.insert("https://example.com/wide2.svg".into(), r#"<svg width="200" height="100"></svg>"#.into());
+    let out = collect(&dom, Some("https://example.com/"), &mut f);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(out.images[0].src, "/fallback.svg");
+    assert_eq!((out.images[0].natural.width, out.images[0].natural.height), (Some(100), Some(50)));
+}
