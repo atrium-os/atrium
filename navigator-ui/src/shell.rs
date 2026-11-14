@@ -49,7 +49,7 @@ pub const HIST_CONFIRM: f32 = 56.0;
 /// The history view's Clear all button: its x and width, for a column at
 /// `x` that is `col` wide (left of the close button).
 pub fn history_clear_all(x: f32, col: f32) -> (f32, f32) {
-    (x + col - 36.0 - 84.0, 84.0)
+    (x + col - em(36.0) - em(84.0), em(84.0))
 }
 
 /// The page slot's key (pergola::slot): where Limen binds the page.
@@ -193,14 +193,14 @@ pub const PRESENCE_W: f32 = 300.0;
 pub fn presence_height(s: &Shell) -> f32 {
     let knows = s.store.trail().page().is_some_and(|p| s.store.knows(crate::trail::site(&p.url)));
     if !knows {
-        return 100.0;
+        return em(100.0);
     }
     let lines = match &s.accounts {
         Some((_, Accounts::Known(v))) if !v.is_empty() => v.len().min(4),
         _ => 1,
     };
     // Heading 28, label 16, the lines, 8, two rows, the margins.
-    14.0 + 28.0 + 16.0 + 20.0 * lines as f32 + 8.0 + 34.0 + 32.0 + 10.0
+    em(14.0 + 28.0 + 16.0 + 20.0 * lines as f32 + 8.0 + 34.0 + 32.0 + 10.0)
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -358,7 +358,7 @@ impl Shell {
     }
 
     pub fn rail_w(&self) -> f32 {
-        if self.rail_collapsed || self.w < RAIL_AUTO_NARROW { RAIL_NARROW } else { RAIL }
+        if self.rail_collapsed || self.w < em(RAIL_AUTO_NARROW) { em(RAIL_NARROW) } else { em(RAIL) }
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
@@ -379,16 +379,16 @@ impl Shell {
         let mut y = bar() + 1.0;
         let page = self.store.trail().page();
         let find = (self.find.is_some() && page.is_some() && self.history.is_none()).then(|| {
-            let r = Rect::new(x0, y, w - x0, FIND);
-            y += FIND;
+            let r = Rect::new(x0, y, w - x0, em(FIND));
+            y += em(FIND);
             r
         });
         let prompt = page.filter(|_| self.history.is_none()).and_then(|p| p.asked.as_ref()).map(|_| {
-            let r = Rect::new(x0, y, w - x0, PROMPT);
-            y += PROMPT;
+            let r = Rect::new(x0, y, w - x0, em(PROMPT));
+            y += em(PROMPT);
             r
         });
-        let status = (self.status_bar && page.is_some()).then(|| Rect::new(x0, h - STATUS, w - x0, STATUS));
+        let status = (self.status_bar && page.is_some()).then(|| Rect::new(x0, h - em(STATUS), w - x0, em(STATUS)));
         let bottom = status.map_or(h, |s| s.y());
         let page = Rect::new(x0, y, w - x0, (bottom - y).max(0.0));
         let drop = self.editing.as_ref().and_then(|_| {
@@ -396,13 +396,13 @@ impl Shell {
             (!v.is_empty()).then(|| Rect::new(where_.x(), bar() + 1.0 + 3.0, where_.w(), drop_height(&v)))
         });
         let popover = (self.popover && self.store.trail().page().is_some())
-            .then(|| Rect::new(where_.x(), bar() + 4.0, POPOVER_W.min(w - where_.x() - 8.0), popover_height(self)));
+            .then(|| Rect::new(where_.x(), bar() + 4.0, em(POPOVER_W).min(w - where_.x() - 8.0), popover_height(self)));
         let aa = Rect::new(w - em(104.0), em(6.0), em(28.0), em(28.0));
         let reading = (self.reading_open && self.store.trail().page().is_some())
             .then(|| Rect::new((aa.x() + aa.w() - em(READING_W)).max(x0 + 8.0), bar() + 4.0, em(READING_W), em(READING_H)));
         let presence = Rect::new(where_.x() + where_.w() + em(12.0) + if media { em(32.0) } else { 0.0 }, em(6.0), em(112.0), em(28.0));
         let presence_menu = (self.presence_open && self.store.trail().page().is_some())
-            .then(|| Rect::new((presence.x() + presence.w() - PRESENCE_W).max(x0 + 8.0), bar() + 4.0, PRESENCE_W, presence_height(self)));
+            .then(|| Rect::new((presence.x() + presence.w() - em(PRESENCE_W)).max(x0 + 8.0), bar() + 4.0, em(PRESENCE_W), presence_height(self)));
         Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu }
     }
 
@@ -1104,7 +1104,7 @@ pub fn chip_rect(g: &Geo) -> Rect {
 
 /// The suggestion list's height for these rows (§5.3).
 pub fn drop_height(v: &[Suggestion]) -> f32 {
-    let mut h = 8.0;
+    let mut h = em(8.0);
     let mut last: Option<u8> = None;
     for s in v {
         let group = match s.source {
@@ -1113,18 +1113,18 @@ pub fn drop_height(v: &[Suggestion]) -> f32 {
             Source::Search => 2,
         };
         if last != Some(group) {
-            h += if group == 2 { 9.0 } else { DROP_LABEL };
+            h += em(if group == 2 { 9.0 } else { DROP_LABEL });
         }
         last = Some(group);
-        h += DROP_ROW;
+        h += em(DROP_ROW);
     }
-    h + 6.0
+    h + em(6.0)
 }
 
 /// The popover's height: two sections and the reasons (§6.5).
 pub fn popover_height(s: &Shell) -> f32 {
     let reasons = s.store.trail().page().map_or(0, |p| p.facts.reasons.len() + p.facts.live_parts.len());
-    176.0 + 20.0 * reasons as f32
+    em(176.0 + 20.0 * reasons as f32)
 }
 
 #[cfg(test)]

@@ -191,28 +191,15 @@ fn area(ctx: &mut Ctx, r: Rect, radius: f32, fill: Color, hover: Color, on: impl
     id
 }
 
-/// A 28 px ghost icon button (visual language §14: overlay on hover).
+/// A 28 pt ghost icon button at the text size (visual language §14:
+/// overlay on hover; resolution-independence.md §6.2).
 fn icon_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, color: Color, tip: &str, on: impl Fn() + 'static) {
-    let t = ctx.theme;
-    let r = Rect::new(x, y, 28.0, 28.0);
-    let id = if enabled {
-        area(ctx, r, 6.0, Color::TRANSPARENT, t.state_hover(), on)
-    } else {
-        ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 6.0 })
-    };
-    icon(ctx, x + 4.0, y + 4.0, g, 20.0, if enabled { color } else { t.text_disabled() });
-    ctx.pop();
-    ctx.tooltip(id, tip.to_string());
-}
-
-/// [`icon_button`] at the text size: a toolbar's (resolution-independence.md §6.2).
-fn tool_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, color: Color, tip: &str, on: impl Fn() + 'static) {
     let t = ctx.theme;
     let r = Rect::new(x, y, em(28.0), em(28.0));
     let id = if enabled {
-        area(ctx, r, 6.0, Color::TRANSPARENT, t.state_hover(), on)
+        area(ctx, r, em(6.0), Color::TRANSPARENT, t.state_hover(), on)
     } else {
-        ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 6.0 })
+        ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: em(6.0) })
     };
     icon(ctx, x + em(4.0), y + em(4.0), g, em(20.0), if enabled { color } else { t.text_disabled() });
     ctx.pop();
@@ -221,7 +208,7 @@ fn tool_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, color: Col
 
 /// Texts in one row on a shared baseline, laid out by Pergola.
 fn inline(ctx: &mut Ctx, x: f32, cy: f32, gap: f32, runs: &[(String, TextStyle)]) {
-    let y = cy - 0.5 * runs.first().map(|r| r.1.size).unwrap_or(13.0);
+    let y = cy - 0.5 * em(runs.first().map(|r| r.1.size).unwrap_or(13.0));
     let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x, y, 0.0, 0.0), gap));
     ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
     for (s, st) in runs {
@@ -236,10 +223,10 @@ fn monogram(ctx: &mut Ctx, x: f32, y: f32, url: &str, strong: bool) {
     let t = ctx.theme;
     let site = trail::site(url);
     let letter: String = site.chars().next().map_or("·".into(), |c| c.to_uppercase().collect());
-    rect(ctx, x, y, 20.0, 20.0, if strong { t.text_primary() } else { t.border_strong() }, 4.0);
+    rect(ctx, x, y, em(20.0), em(20.0), if strong { t.text_primary() } else { t.border_strong() }, em(4.0));
     let st = sans(type_size::XS, Weight::Semibold, if strong { t.bg_canvas() } else { t.text_primary() });
     let lw = width(&letter, &st);
-    text(ctx, x + (20.0 - lw) / 2.0, y + 10.0, &letter, type_size::XS, Weight::Semibold, if strong { t.bg_canvas() } else { t.text_primary() });
+    text(ctx, x + (em(20.0) - lw) / 2.0, y + em(10.0), &letter, type_size::XS, Weight::Semibold, if strong { t.bg_canvas() } else { t.text_primary() });
 }
 
 fn light_glyph(l: Light) -> char {
@@ -305,7 +292,7 @@ impl View for ShellView {
         if let (Some(r), Some(f)) = (g.find, &s.find) {
             find_bar(ctx, r, f, &self.state);
         }
-        if g.rail > shell::RAIL_NARROW {
+        if g.rail > em(shell::RAIL_NARROW) {
             rail(ctx, &s, &g, &self.state);
         } else {
             rail_narrow(ctx, &s, &g, &self.state);
@@ -358,52 +345,52 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     // Persona (for new trails) and New trail.
     {
         let st2 = st.clone();
-        rect(ctx, 12.0, 6.0, 122.0, 28.0, t.border_control(), 6.0);
-        area(ctx, Rect::new(13.0, 7.0, 120.0, 26.0), 5.0, t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
+        rect(ctx, em(12.0), em(6.0), em(122.0), em(28.0), t.border_control(), em(6.0));
+        area(ctx, Rect::new(em(13.0), em(7.0), em(120.0), em(26.0)), em(5.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
             s.store.persona = match s.store.persona {
                 trail::Persona::Personal => trail::Persona::Unrecorded,
                 trail::Persona::Unrecorded => trail::Persona::Personal,
             };
         }));
         let unrec = s.store.persona == trail::Persona::Unrecorded;
-        icon(ctx, 20.0, 12.0, if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, 16.0, t.text_secondary());
-        text(ctx, 42.0, 20.0, s.store.persona.name(), type_size::SM, Weight::Medium, t.text_primary());
-        icon(ctx, 116.0, 13.0, ph::CARET_DOWN, 12.0, t.text_secondary());
+        icon(ctx, em(20.0), em(12.0), if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, em(16.0), t.text_secondary());
+        text(ctx, em(42.0), em(20.0), s.store.persona.name(), type_size::SM, Weight::Medium, t.text_primary());
+        icon(ctx, em(116.0), em(13.0), ph::CARET_DOWN, em(12.0), t.text_secondary());
         ctx.pop();
     }
     {
         let st2 = st.clone();
-        let id = area(ctx, Rect::new(146.0, 6.0, 68.0, 28.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.new_trail(false)));
-        icon(ctx, 154.0, 12.0, ph::PLUS, 16.0, t.text_primary());
-        text(ctx, 174.0, 20.0, "Trail", type_size::SM, Weight::Medium, t.text_primary());
+        let id = area(ctx, Rect::new(em(146.0), em(6.0), em(68.0), em(28.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.new_trail(false)));
+        icon(ctx, em(154.0), em(12.0), ph::PLUS, em(16.0), t.text_primary());
+        text(ctx, em(174.0), em(20.0), "Trail", type_size::SM, Weight::Medium, t.text_primary());
         ctx.pop();
         ctx.tooltip(id, "New trail (Ctrl-T)");
     }
     let st2 = st.clone();
-    icon_button(ctx, 216.0, 6.0, ph::SIDEBAR_SIMPLE, true, t.text_secondary(), "Collapse the rail (Ctrl-B)", move || with(&st2, |s| s.rail_collapsed = true));
+    icon_button(ctx, em(216.0), em(6.0), ph::SIDEBAR_SIMPLE, true, t.text_secondary(), "Collapse the rail (Ctrl-B)", move || with(&st2, |s| s.rail_collapsed = true));
 
-    let bottom = g.h - 8.0;
-    let mut y = 44.0;
+    let bottom = g.h - em(8.0);
+    let mut y = em(44.0);
 
     // "Playing" (§8a.2): another trail making sound.
     if let Some(pi) = s.store.rail_order().into_iter().find(|i| *i != s.store.current && s.store.trails[*i].row_media() == Some(RowMedia::Sound)) {
         let pt = &s.store.trails[pi];
         label(ctx, y, "PLAYING");
-        y += 18.0;
+        y += em(18.0);
         let st2 = st.clone();
-        area(ctx, Rect::new(8.0, y, w - 16.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.show_trail(pi)));
-        monogram(ctx, 18.0, y + 6.0, pt.page().map_or("", |p| &p.url), false);
+        area(ctx, Rect::new(em(8.0), y, w - em(16.0), em(32.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.show_trail(pi)));
+        monogram(ctx, em(18.0), y + em(6.0), pt.page().map_or("", |p| &p.url), false);
         let ts = sans(type_size::SM, Weight::Regular, t.text_primary());
-        text(ctx, 46.0, y + 16.0, &fit(pt.title(), &ts, 160.0), type_size::SM, Weight::Regular, t.text_primary());
+        text(ctx, em(46.0), y + em(16.0), &fit(pt.title(), &ts, em(160.0)), type_size::SM, Weight::Regular, t.text_primary());
         ctx.pop();
-        media_button(ctx, 212.0, y + 4.0, pt, pi, st);
-        y += 40.0;
+        media_button(ctx, em(212.0), y + em(4.0), pt, pi, st);
+        y += em(40.0);
     }
 
     label(ctx, y, "TODAY");
-    y += 18.0;
+    y += em(18.0);
     for i in s.store.rail_order() {
-        if y + 32.0 > bottom {
+        if y + em(32.0) > bottom {
             break;
         }
         let tr = &s.store.trails[i];
@@ -412,21 +399,21 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let fill = if current { t.bg_elevated() } else { Color::TRANSPARENT };
         if current && s.rail_focus {
             // F6 put the keys here (§9): a focus ring on the trail.
-            rect(ctx, 6.0, y - 2.0, w - 12.0, 36.0, t.accent_mark(), 8.0);
-            rect(ctx, 8.0, y, w - 16.0, 32.0, t.bg_surface(), 6.0);
+            rect(ctx, em(8.0) - 2.0, y - 2.0, w - em(16.0) + 4.0, em(32.0) + 4.0, t.accent_mark(), em(6.0) + 2.0);
+            rect(ctx, em(8.0), y, w - em(16.0), em(32.0), t.bg_surface(), em(6.0));
         }
-        area(ctx, Rect::new(8.0, y, w - 16.0, 32.0), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
+        area(ctx, Rect::new(em(8.0), y, w - em(16.0), em(32.0)), em(6.0), fill, t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
         if current {
-            rect(ctx, 8.0, y + 8.0, 2.0, 16.0, t.accent_mark(), 1.0);
+            rect(ctx, em(8.0), y + em(8.0), 2.0, em(16.0), t.accent_mark(), 1.0);
         }
         let url = tr.page().map_or("", |p| p.url.as_str());
         if tr.page().is_some() {
-            monogram(ctx, 18.0, y + 6.0, url, current);
+            monogram(ctx, em(18.0), y + em(6.0), url, current);
         } else {
-            icon(ctx, 20.0, y + 8.0, ph::PLUS, 16.0, t.text_tertiary());
+            icon(ctx, em(20.0), y + em(8.0), ph::PLUS, em(16.0), t.text_tertiary());
         }
         // State glyphs on the right, right to left.
-        let mut gx = 212.0;
+        let mut gx = em(212.0);
         let mut glyphs: Vec<(char, Color)> = vec![];
         if tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
             glyphs.push((ph::LIGHTNING, t.warning_fg()));
@@ -439,25 +426,25 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         }
         let media = tr.row_media();
         if media.is_some() {
-            gx -= 26.0;
+            gx -= em(26.0);
         }
         for (gch, c) in &glyphs {
-            icon(ctx, gx + 4.0, y + 8.0, *gch, 16.0, *c);
-            gx -= 20.0;
+            icon(ctx, gx + em(4.0), y + em(8.0), *gch, em(16.0), *c);
+            gx -= em(20.0);
         }
         if tr.has_unseen() && !current {
-            rect(ctx, gx + 10.0, y + 13.0, 6.0, 6.0, t.text_tertiary(), 3.0);
-            gx -= 12.0;
+            rect(ctx, gx + em(10.0), y + em(13.0), em(6.0), em(6.0), t.text_tertiary(), em(3.0));
+            gx -= em(12.0);
         }
-        let w_title = gx + 20.0 - 46.0;
+        let w_title = gx + em(20.0) - em(46.0);
         let (wt, ct) = if current { (Weight::Semibold, t.text_primary()) } else { (Weight::Regular, t.text_primary()) };
         let title = fit(tr.title(), &sans(type_size::SM, wt, ct), w_title);
-        text(ctx, 46.0, y + 16.0, &title, type_size::SM, wt, if tr.page().is_none() { t.text_secondary() } else { ct });
+        text(ctx, em(46.0), y + em(16.0), &title, type_size::SM, wt, if tr.page().is_none() { t.text_secondary() } else { ct });
         ctx.pop();
         if media.is_some() {
-            media_button(ctx, 212.0, y + 4.0, tr, i, st);
+            media_button(ctx, em(212.0), y + em(4.0), tr, i, st);
         }
-        y += 34.0;
+        y += em(34.0);
         if current && tr.page().is_some() {
             y = path_rows(ctx, s, y, bottom, st);
         }
@@ -465,35 +452,35 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
 
     // Earlier: trails put away, by day (§4.5).
     let now_s = crate::clock::now_s();
-    if !s.store.earlier.is_empty() && y + 60.0 < bottom {
-        y += 8.0;
+    if !s.store.earlier.is_empty() && y + em(60.0) < bottom {
+        y += em(8.0);
         label(ctx, y, "EARLIER");
-        y += 18.0;
+        y += em(18.0);
         for (i, e) in s.store.earlier.iter().enumerate() {
-            if y + 32.0 > bottom {
+            if y + em(32.0) > bottom {
                 break;
             }
             let st2 = st.clone();
-            let id = area(ctx, Rect::new(8.0, y, w - 16.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+            let id = area(ctx, Rect::new(em(8.0), y, w - em(16.0), em(32.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
                 s.store.bring_back(i);
             }));
-            monogram(ctx, 18.0, y + 6.0, e.trail.page().map_or("", |p| &p.url), false);
+            monogram(ctx, em(18.0), y + em(6.0), e.trail.page().map_or("", |p| &p.url), false);
             let ts = sans(type_size::SM, Weight::Regular, t.text_secondary());
-            text(ctx, 46.0, y + 16.0, &fit(e.trail.title(), &ts, 150.0), type_size::SM, Weight::Regular, t.text_secondary());
+            text(ctx, em(46.0), y + em(16.0), &fit(e.trail.title(), &ts, em(150.0)), type_size::SM, Weight::Regular, t.text_secondary());
             let ds = sans(type_size::XXS, Weight::Regular, t.text_tertiary());
             let day = crate::clock::day_label(e.at_s, now_s);
-            text(ctx, 228.0 - width(&day, &ds), y + 16.0, &day, type_size::XXS, Weight::Regular, t.text_tertiary());
+            text(ctx, em(228.0) - width(&day, &ds), y + em(16.0), &day, type_size::XXS, Weight::Regular, t.text_tertiary());
             ctx.pop();
             ctx.tooltip(id, format!("Put away {} · click to bring it back", crate::clock::when_label(e.at_s, now_s)));
-            y += 32.0;
+            y += em(32.0);
         }
     }
 }
 
 fn label(ctx: &mut Ctx, y: f32, s: &str) {
     let t = ctx.theme;
-    text(ctx, 16.0, y + 6.0, s, type_size::XXS, Weight::Semibold, t.text_tertiary());
+    text(ctx, em(16.0), y + em(6.0), s, type_size::XXS, Weight::Semibold, t.text_tertiary());
 }
 
 /// The media glyph: a click mutes or unmutes the trail without switching
@@ -502,8 +489,8 @@ fn media_button(ctx: &mut Ctx, x: f32, y: f32, tr: &trail::Trail, i: usize, st: 
     let t = ctx.theme;
     let Some(m) = tr.row_media() else { return };
     let st2 = st.clone();
-    let id = area(ctx, Rect::new(x, y, 24.0, 24.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.toggle_mute(i)));
-    icon(ctx, x + 4.0, y + 4.0, media_glyph(m), 16.0, t.text_secondary());
+    let id = area(ctx, Rect::new(x, y, em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.toggle_mute(i)));
+    icon(ctx, x + em(4.0), y + em(4.0), media_glyph(m), em(16.0), t.text_secondary());
     ctx.pop();
     ctx.tooltip(id, if m == RowMedia::Muted { "Unmute this trail" } else { "Mute this trail (Ctrl-M)" });
 }
@@ -514,11 +501,11 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
     let tr = s.store.trail();
     let r = tr.path_rows();
     let top = y;
-    let rows: Vec<(usize, f32)> = r.path.iter().map(|p| (*p, 0.0)).chain(r.branches.iter().map(|b| (*b, 14.0))).collect();
+    let rows: Vec<(usize, f32)> = r.path.iter().map(|p| (*p, 0.0)).chain(r.branches.iter().map(|b| (*b, em(14.0)))).collect();
     let mut first_branch_y = None;
     let mut last_y = y;
     for (k, (pi, indent)) in rows.iter().enumerate() {
-        if y + 26.0 > bottom {
+        if y + em(26.0) > bottom {
             break;
         }
         if k == r.path.len() {
@@ -526,47 +513,47 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
         }
         let p = &tr.pages[*pi];
         let current = tr.current == Some(*pi);
-        let x = 46.0 + indent;
+        let x = em(46.0) + indent;
         let pi = *pi;
         let st2 = st.clone();
-        area(ctx, Rect::new(x - 6.0, y, 228.0 - x + 6.0, 26.0), 4.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+        area(ctx, Rect::new(x - em(6.0), y, em(228.0) - x + em(6.0), em(26.0)), em(4.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
             s.end_edit();
             s.store.trail_mut().go(pi);
         }));
-        rect(ctx, x - 10.0, y + 13.0, 8.0, 1.0, t.border_strong(), 0.0);
-        let max = 214.0 - x - 4.0;
+        rect(ctx, x - em(10.0), y + em(13.0), em(8.0), 1.0, t.border_strong(), 0.0);
+        let max = em(214.0) - x - em(4.0);
         if let Some(q) = &p.search {
-            icon(ctx, x, y + 6.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
+            icon(ctx, x, y + em(6.0), ph::MAGNIFYING_GLASS, em(14.0), t.text_tertiary());
             let label = format!("Search: {q}");
             let ts = sans(type_size::XS, Weight::Regular, t.text_secondary());
-            text(ctx, x + 18.0, y + 13.0, &fit(&label, &ts, max - 18.0), type_size::XS, Weight::Regular, t.text_secondary());
+            text(ctx, x + em(18.0), y + em(13.0), &fit(&label, &ts, max - em(18.0)), type_size::XS, Weight::Regular, t.text_secondary());
         } else {
             let (wt, c) = if current { (Weight::Semibold, t.text_primary()) } else { (Weight::Regular, t.text_secondary()) };
-            text(ctx, x, y + 13.0, &fit(&p.title, &sans(type_size::XS, wt, c), max), type_size::XS, wt, c);
+            text(ctx, x, y + em(13.0), &fit(&p.title, &sans(type_size::XS, wt, c), max), type_size::XS, wt, c);
         }
         if current {
-            rect(ctx, 220.0, y + 10.0, 6.0, 6.0, t.accent_mark(), 3.0);
+            rect(ctx, em(220.0), y + em(10.0), em(6.0), em(6.0), t.accent_mark(), em(3.0));
         } else if !p.seen {
-            rect(ctx, 220.0, y + 10.0, 6.0, 6.0, t.text_tertiary(), 3.0);
+            rect(ctx, em(220.0), y + em(10.0), em(6.0), em(6.0), t.text_tertiary(), em(3.0));
         }
         ctx.pop();
         last_y = y;
-        y += 26.0;
+        y += em(26.0);
     }
     // The tree's lines: the path's spine, and the branches' own.
-    let spine_end = first_branch_y.map_or(last_y, |b| b - 26.0);
+    let spine_end = first_branch_y.map_or(last_y, |b| b - em(26.0));
     if spine_end > top {
-        rect(ctx, 36.0, top + 2.0, 1.0, spine_end - top + 11.0, t.border_strong(), 0.0);
+        rect(ctx, em(36.0), top + 2.0, 1.0, spine_end - top + em(11.0), t.border_strong(), 0.0);
     }
     if let Some(b) = first_branch_y {
-        rect(ctx, 50.0, b - 6.0, 1.0, last_y - b + 19.0, t.border_strong(), 0.0);
+        rect(ctx, em(50.0), b - em(6.0), 1.0, last_y - b + em(19.0), t.border_strong(), 0.0);
     }
-    if r.folded > 0 && y + 22.0 < bottom {
+    if r.folded > 0 && y + em(22.0) < bottom {
         let more = if r.folded == 1 { "1 more branch".to_string() } else { format!("{} more branches", r.folded) };
-        text(ctx, 60.0, y + 9.0, &more, type_size::XXS, Weight::Medium, t.text_tertiary());
-        y += 22.0;
+        text(ctx, em(60.0), y + em(9.0), &more, type_size::XXS, Weight::Medium, t.text_tertiary());
+        y += em(22.0);
     }
-    y + 4.0
+    y + em(4.0)
 }
 
 /// The rail collapsed to monograms (Ctrl-B), the dock rail's width.
@@ -576,34 +563,34 @@ fn rail_narrow(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     rect(ctx, 0.0, 0.0, w, g.h, t.bg_surface(), 0.0);
     rect(ctx, w, 0.0, 1.0, g.h, t.border_default(), 0.0);
     let st2 = st.clone();
-    icon_button(ctx, 14.0, 6.0, ph::SIDEBAR_SIMPLE, true, t.text_secondary(), "Expand the rail (Ctrl-B)", move || with(&st2, |s| s.rail_collapsed = false));
+    icon_button(ctx, em(14.0), em(6.0), ph::SIDEBAR_SIMPLE, true, t.text_secondary(), "Expand the rail (Ctrl-B)", move || with(&st2, |s| s.rail_collapsed = false));
     let st2 = st.clone();
-    icon_button(ctx, 14.0, 44.0, ph::PLUS, true, t.text_primary(), "New trail (Ctrl-T)", move || with(&st2, |s| s.new_trail(false)));
-    let mut y = 84.0;
+    icon_button(ctx, em(14.0), em(44.0), ph::PLUS, true, t.text_primary(), "New trail (Ctrl-T)", move || with(&st2, |s| s.new_trail(false)));
+    let mut y = em(84.0);
     for i in s.store.rail_order() {
-        if y + 36.0 > g.h {
+        if y + em(36.0) > g.h {
             break;
         }
         let tr = &s.store.trails[i];
         let current = i == s.store.current;
         let st2 = st.clone();
-        let id = area(ctx, Rect::new(8.0, y, 40.0, 32.0), 6.0, if current { t.bg_elevated() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
+        let id = area(ctx, Rect::new(em(8.0), y, em(40.0), em(32.0)), em(6.0), if current { t.bg_elevated() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
         if current {
-            rect(ctx, 8.0, y + 8.0, 2.0, 16.0, t.accent_mark(), 1.0);
+            rect(ctx, em(8.0), y + em(8.0), 2.0, em(16.0), t.accent_mark(), 1.0);
         }
         match tr.page() {
-            Some(p) => monogram(ctx, 18.0, y + 6.0, &p.url, current),
+            Some(p) => monogram(ctx, em(18.0), y + em(6.0), &p.url, current),
             None => {
-                icon(ctx, 20.0, y + 8.0, ph::MAGNIFYING_GLASS, 16.0, t.text_tertiary());
+                icon(ctx, em(20.0), y + em(8.0), ph::MAGNIFYING_GLASS, em(16.0), t.text_tertiary());
             }
         }
         if tr.row_media().is_some() || tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
             let c = if tr.row_media().is_some() { t.accent_mark() } else { t.warning_fg() };
-            rect(ctx, 40.0, y + 4.0, 6.0, 6.0, c, 3.0);
+            rect(ctx, em(40.0), y + em(4.0), em(6.0), em(6.0), c, em(3.0));
         }
         ctx.pop();
         ctx.tooltip(id, tr.title().to_string());
-        y += 36.0;
+        y += em(36.0);
     }
 }
 
@@ -617,11 +604,11 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let tr = s.store.trail();
     let page = tr.page();
     let st2 = st.clone();
-    tool_button(ctx, x0 + em(9.0), em(6.0), ph::ARROW_LEFT, tr.can_back(), t.text_primary(), "Back (Alt-Left)", move || with(&st2, |s| s.apply(crate::keys::Action::Back, now_ms())));
+    icon_button(ctx, x0 + em(9.0), em(6.0), ph::ARROW_LEFT, tr.can_back(), t.text_primary(), "Back (Alt-Left)", move || with(&st2, |s| s.apply(crate::keys::Action::Back, now_ms())));
     let st2 = st.clone();
-    tool_button(ctx, x0 + em(41.0), em(6.0), ph::ARROW_RIGHT, tr.can_forward(), t.text_secondary(), "Forward (Alt-Right)", move || with(&st2, |s| s.apply(crate::keys::Action::Forward, now_ms())));
+    icon_button(ctx, x0 + em(41.0), em(6.0), ph::ARROW_RIGHT, tr.can_forward(), t.text_secondary(), "Forward (Alt-Right)", move || with(&st2, |s| s.apply(crate::keys::Action::Forward, now_ms())));
     let st2 = st.clone();
-    tool_button(ctx, x0 + em(73.0), em(6.0), ph::ARROW_CLOCKWISE, page.is_some(), t.text_secondary(), "Reload: the current version of this page (Ctrl-R)", move || with(&st2, |s| s.reload()));
+    icon_button(ctx, x0 + em(73.0), em(6.0), ph::ARROW_CLOCKWISE, page.is_some(), t.text_secondary(), "Reload: the current version of this page (Ctrl-R)", move || with(&st2, |s| s.reload()));
 
     let f = g.where_;
     match &s.editing {
@@ -630,13 +617,12 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     }
 
     // Media (when this page plays), presence, then Aa, Keep, More.
-    let mut px = f.x() + f.w() + em(12.0);
+    let px = f.x() + f.w() + em(12.0);
     if g.media {
         let m = tr.row_media().unwrap_or(RowMedia::Sound);
         let i = s.store.current;
         let st2 = st.clone();
-        tool_button(ctx, px - 2.0, em(6.0), media_glyph(m), true, t.text_secondary(), "Mute this trail (Ctrl-M)", move || with(&st2, |s| s.toggle_mute(i)));
-        px += em(32.0);
+        icon_button(ctx, px - 2.0, em(6.0), media_glyph(m), true, t.text_secondary(), "Mute this trail (Ctrl-M)", move || with(&st2, |s| s.toggle_mute(i)));
     }
     if let Some(p) = page {
         let site = trail::site(&p.url).to_string();
@@ -664,15 +650,15 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let has = page.is_some();
     let st2 = st.clone();
     let aa = s.reading_open;
-    tool_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| {
+    icon_button(ctx, g.aa.x(), g.aa.y(), ph::TEXT_AA, has, if aa { t.accent_fg() } else { t.text_secondary() }, "Reading controls", move || with(&st2, |s| {
         s.popover = false;
         s.presence_open = false;
         s.reading_open = !aa;
     }));
     let kept = page.is_some_and(|p| s.store.is_kept(&p.url));
     let st2 = st.clone();
-    tool_button(ctx, g.w - em(72.0), em(6.0), ph::STAR, has, if kept { t.accent_fg() } else { t.text_secondary() }, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" }, move || with(&st2, |s| s.store.toggle_keep()));
-    tool_button(ctx, g.w - em(40.0), em(6.0), ph::DOTS_THREE, true, t.text_secondary(), "More", || {});
+    icon_button(ctx, g.w - em(72.0), em(6.0), ph::STAR, has, if kept { t.accent_fg() } else { t.text_secondary() }, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" }, move || with(&st2, |s| s.store.toggle_keep()));
+    icon_button(ctx, g.w - em(40.0), em(6.0), ph::DOTS_THREE, true, t.text_secondary(), "More", || {});
 }
 
 /// The Where field at rest (§5.3): the tier chip with its light, the
@@ -813,9 +799,9 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
     let t = ctx.theme;
     let v = s.suggestions();
     let sel = s.editing.as_ref().and_then(|e| e.selected);
-    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let body = |c: Color, w: Weight| sans(type_size::SM, w, c);
-    let mut y = r.y() + 8.0;
+    let mut y = r.y() + em(8.0);
     let mut last: Option<u8> = None;
     for (i, sg) in v.iter().enumerate() {
         let group = match sg.source {
@@ -825,45 +811,45 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
         };
         if last != Some(group) {
             if group == 2 {
-                rect(ctx, r.x() + 1.0, y + 3.0, r.w() - 2.0, 1.0, t.border_default(), 0.0);
-                y += 9.0;
+                rect(ctx, r.x() + 1.0, y + em(3.0), r.w() - 2.0, 1.0, t.border_default(), 0.0);
+                y += em(9.0);
             } else {
-                text(ctx, r.x() + 14.0, y + 10.0, if group == 0 { "OPEN TRAILS" } else { "KEPT AND HISTORY" }, type_size::XXS, Weight::Semibold, t.text_tertiary());
-                y += DROP_LABEL;
+                text(ctx, r.x() + em(14.0), y + em(10.0), if group == 0 { "OPEN TRAILS" } else { "KEPT AND HISTORY" }, type_size::XXS, Weight::Semibold, t.text_tertiary());
+                y += em(DROP_LABEL);
             }
         }
         last = Some(group);
         let st2 = st.clone();
         let sg2 = sg.clone();
         let fill = if sel == Some(i) { t.state_hover() } else { Color::TRANSPARENT };
-        area(ctx, Rect::new(r.x() + 6.0, y, r.w() - 12.0, DROP_ROW), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.take_suggestion(&sg2, now_ms())));
-        let cy = y + DROP_ROW / 2.0;
-        let room = r.w() - 60.0;
+        area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(DROP_ROW)), em(6.0), fill, t.state_hover(), move || with(&st2, |s| s.take_suggestion(&sg2, now_ms())));
+        let cy = y + em(DROP_ROW) / 2.0;
+        let room = r.w() - em(60.0);
         match &sg.source {
             Source::Open { trail_title, .. } => {
-                monogram(ctx, r.x() + 14.0, y + 5.0, &sg.url, true);
+                monogram(ctx, r.x() + em(14.0), y + em(5.0), &sg.url, true);
                 let a = fit(&sg.title, &body(t.text_primary(), Weight::Medium), room * 0.45);
                 let b = fit(&format!("in trail “{trail_title}”"), &body(t.text_tertiary(), Weight::Regular), room * 0.4);
-                inline(ctx, r.x() + 44.0, cy, 10.0, &[(a, body(t.text_primary(), Weight::Medium)), (b, body(t.text_tertiary(), Weight::Regular))]);
+                inline(ctx, r.x() + em(44.0), cy, em(10.0), &[(a, body(t.text_primary(), Weight::Medium)), (b, body(t.text_tertiary(), Weight::Regular))]);
                 let ss = sans(type_size::XS, Weight::Medium, t.accent_fg());
-                text(ctx, r.x() + r.w() - 18.0 - width("Switch to", &ss), cy, "Switch to", type_size::XS, Weight::Medium, t.accent_fg());
+                text(ctx, r.x() + r.w() - em(18.0) - width("Switch to", &ss), cy, "Switch to", type_size::XS, Weight::Medium, t.accent_fg());
             }
             Source::Kept | Source::History => {
                 let g = if sg.source == Source::Kept { ph::BOOKMARK } else { ph::CLOCK };
-                icon(ctx, r.x() + 16.0, y + 7.0, g, 16.0, t.text_tertiary());
+                icon(ctx, r.x() + em(16.0), y + em(7.0), g, em(16.0), t.text_tertiary());
                 let addr = sg.url.split_once("://").map_or(sg.url.as_str(), |(_, r)| r);
                 let a = fit(&sg.title, &body(t.text_primary(), Weight::Regular), room * 0.5);
                 let b = fit(addr, &body(t.text_tertiary(), Weight::Regular), room * 0.45);
-                inline(ctx, r.x() + 44.0, cy, 10.0, &[(a, body(t.text_primary(), Weight::Regular)), (b, body(t.text_tertiary(), Weight::Regular))]);
+                inline(ctx, r.x() + em(44.0), cy, em(10.0), &[(a, body(t.text_primary(), Weight::Regular)), (b, body(t.text_tertiary(), Weight::Regular))]);
             }
             Source::Search => {
-                icon(ctx, r.x() + 16.0, y + 7.0, ph::MAGNIFYING_GLASS, 16.0, t.text_tertiary());
+                icon(ctx, r.x() + em(16.0), y + em(7.0), ph::MAGNIFYING_GLASS, em(16.0), t.text_tertiary());
                 let a = fit(&format!("Search for “{}”", sg.title), &body(t.text_primary(), Weight::Regular), room * 0.55);
-                inline(ctx, r.x() + 44.0, cy, 6.0, &[(a, body(t.text_primary(), Weight::Regular)), ("· sent only when you press Enter".into(), body(t.text_tertiary(), Weight::Regular))]);
+                inline(ctx, r.x() + em(44.0), cy, em(6.0), &[(a, body(t.text_primary(), Weight::Regular)), ("· sent only when you press Enter".into(), body(t.text_tertiary(), Weight::Regular))]);
             }
         }
         ctx.pop();
-        y += DROP_ROW;
+        y += em(DROP_ROW);
     }
 }
 
@@ -871,27 +857,27 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 /// and the line that says what green does not mean.
 fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     let t = ctx.theme;
-    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let f = &p.facts;
     let site = trail::site(&p.url);
-    let x = r.x() + 16.0;
-    let w = r.w() - 32.0;
-    let mut y = r.y() + 14.0;
-    icon(ctx, x, y, light_glyph(f.light), 16.0, light_color(ctx, f.light));
+    let x = r.x() + em(16.0);
+    let w = r.w() - em(32.0);
+    let mut y = r.y() + em(14.0);
+    icon(ctx, x, y, light_glyph(f.light), em(16.0), light_color(ctx, f.light));
     let head = match f.light {
         Light::Green => "Nothing to worry about that we can see",
         Light::Amber => "Something is weaker than usual",
         Light::Red => "This page is unsafe",
     };
-    text(ctx, x + 22.0, y + 8.0, head, type_size::SM, Weight::Semibold, t.text_primary());
-    y += 28.0;
-    text(ctx, x, y + 6.0, "CONNECTION", type_size::XXS, Weight::Semibold, t.text_tertiary());
-    y += 16.0;
+    text(ctx, x + em(22.0), y + em(8.0), head, type_size::SM, Weight::Semibold, t.text_primary());
+    y += em(28.0);
+    text(ctx, x, y + em(6.0), "CONNECTION", type_size::XXS, Weight::Semibold, t.text_tertiary());
+    y += em(16.0);
     let conn = if f.insecure { "Not private. Anyone on this network can read or change this page.".to_string() } else { format!("{} to {site}.", f.connection) };
     y = wrapped(ctx, x, y, w, &conn, t.text_secondary());
-    y += 6.0;
-    text(ctx, x, y + 6.0, "WHAT RUNS", type_size::XXS, Weight::Semibold, t.text_tertiary());
-    y += 16.0;
+    y += em(6.0);
+    text(ctx, x, y + em(6.0), "WHAT RUNS", type_size::XXS, Weight::Semibold, t.text_tertiary());
+    y += em(16.0);
     y = wrapped(ctx, x, y, w, &tier_sentence(f.tier, site), t.text_secondary());
     for o in &f.live_parts {
         y = wrapped(ctx, x, y, w, &format!("1 part of this page runs live code: {o}."), t.warning_fg());
@@ -899,7 +885,7 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     for reason in &f.reasons {
         y = wrapped(ctx, x, y, w, reason, if f.light == Light::Red { t.danger_fg() } else { t.warning_fg() });
     }
-    y += 6.0;
+    y += em(6.0);
     let last = if f.light == Light::Green { "Green doesn't mean this site is who you think: check the name in the strip." } else { "This says what runs, not whether the site is honest." };
     wrapped(ctx, x, y, w, last, t.text_tertiary());
 }
@@ -908,40 +894,40 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
 /// holds for it, and what you can do about it.
 fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Option<shell::Accounts>, st: &Mutable<Shell>) {
     let t = ctx.theme;
-    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), 8.0);
-    let x = r.x() + 16.0;
-    let w = r.w() - 32.0;
-    let mut y = r.y() + 14.0;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
+    let x = r.x() + em(16.0);
+    let w = r.w() - em(32.0);
+    let mut y = r.y() + em(14.0);
     let head_st = sans(type_size::SM, Weight::Semibold, t.text_primary());
-    icon(ctx, x, y, if knows { ph::USER } else { ph::EYE_SLASH }, 16.0, if knows { t.accent_strong() } else { t.text_secondary() });
+    icon(ctx, x, y, if knows { ph::USER } else { ph::EYE_SLASH }, em(16.0), if knows { t.accent_strong() } else { t.text_secondary() });
     let head = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
-    text(ctx, x + 22.0, y + 8.0, &fit(&head, &head_st, w - 22.0), type_size::SM, Weight::Semibold, t.text_primary());
-    y += 28.0;
+    text(ctx, x + em(22.0), y + em(8.0), &fit(&head, &head_st, w - em(22.0)), type_size::SM, Weight::Semibold, t.text_primary());
+    y += em(28.0);
     // A row of the menu: a glyph and its words, the whole width pressable.
     let row = |ctx: &mut Ctx, y: f32, g: char, label: &str, c: Color, press: Box<dyn Fn()>| {
         let t = ctx.theme;
-        area(ctx, Rect::new(r.x() + 6.0, y, r.w() - 12.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || press());
-        icon(ctx, x, y + 8.0, g, 16.0, c);
-        text(ctx, x + 24.0, y + 16.0, label, type_size::SM, Weight::Medium, c);
+        area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(32.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || press());
+        icon(ctx, x, y + em(8.0), g, em(16.0), c);
+        text(ctx, x + em(24.0), y + em(16.0), label, type_size::SM, Weight::Medium, c);
         ctx.pop();
     };
     if !knows {
-        text(ctx, x, y + 6.0, "Its pages open anonymously, with no cookies.", type_size::XS, Weight::Regular, t.text_secondary());
-        y += 16.0;
+        text(ctx, x, y + em(6.0), "Its pages open anonymously, with no cookies.", type_size::XS, Weight::Regular, t.text_secondary());
+        y += em(16.0);
         let s2 = st.clone();
         row(ctx, y, ph::USER, "Let this site remember me", t.text_primary(), Box::new(move || with(&s2, |s| s.presence_choose(true))));
         return;
     }
-    text(ctx, x, y + 6.0, "ACCOUNT IN ARCA", type_size::XXS, Weight::Semibold, t.text_tertiary());
-    y += 16.0;
+    text(ctx, x, y + em(6.0), "ACCOUNT IN ARCA", type_size::XXS, Weight::Semibold, t.text_tertiary());
+    y += em(16.0);
     let line_st = sans(type_size::XS, Weight::Regular, t.text_secondary());
     let mut line = |ctx: &mut Ctx, g: Option<char>, s: &str, c: Color| {
         let dx = if let Some(g) = g {
-            icon(ctx, x, y + 2.0, g, 14.0, c);
-            20.0
+            icon(ctx, x, y + 2.0, g, em(14.0), c);
+            em(20.0)
         } else { 0.0 };
-        text(ctx, x + dx, y + 10.0, &fit(s, &line_st, w - dx), type_size::XS, Weight::Regular, c);
-        y += 20.0;
+        text(ctx, x + dx, y + em(10.0), &fit(s, &line_st, w - dx), type_size::XS, Weight::Regular, c);
+        y += em(20.0);
     };
     match accounts {
         Some(shell::Accounts::Known(v)) if !v.is_empty() => {
@@ -957,10 +943,10 @@ fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Opti
         Some(shell::Accounts::Unknown(why)) => line(ctx, None, &format!("Arca can't say ({why})."), t.text_tertiary()),
         Some(shell::Accounts::Asking) | None => line(ctx, None, "Asking Arca…", t.text_tertiary()),
     }
-    y += 8.0;
+    y += em(8.0);
     let (s2, s3) = (st.clone(), st.clone());
     row(ctx, y, ph::SIGN_OUT, "Sign out here", t.text_primary(), Box::new(move || with(&s2, |s| s.sign_out_here())));
-    y += 34.0;
+    y += em(34.0);
     row(ctx, y, ph::TRASH_SIMPLE, "Forget this site", t.danger_fg(), Box::new(move || with(&s3, |s| s.presence_choose(false))));
 }
 
@@ -972,16 +958,16 @@ fn wrapped(ctx: &mut Ctx, x: f32, mut y: f32, w: f32, s: &str, c: Color) -> f32 
     for word in s.split(' ') {
         let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
         if width(&cand, &st) > w && !line.is_empty() {
-            text(ctx, x, y + 8.0, &line, type_size::XS, Weight::Regular, c);
-            y += 16.0;
+            text(ctx, x, y + em(8.0), &line, type_size::XS, Weight::Regular, c);
+            y += em(16.0);
             line = word.to_string();
         } else {
             line = cand;
         }
     }
     if !line.is_empty() {
-        text(ctx, x, y + 8.0, &line, type_size::XS, Weight::Regular, c);
-        y += 16.0;
+        text(ctx, x, y + em(8.0), &line, type_size::XS, Weight::Regular, c);
+        y += em(16.0);
     }
     y
 }
@@ -992,8 +978,8 @@ fn wrapped(ctx: &mut Ctx, x: f32, mut y: f32, w: f32, s: &str, c: Color) -> f32 
 fn small_button(ctx: &mut Ctx, r: Rect, g: Option<char>, label: &str, on: bool, tip: &str, press: impl Fn() + 'static) {
     let t = ctx.theme;
     let (edge, fill, fg) = if on { (t.accent_mark(), t.accent_bg(), t.accent_strong()) } else { (t.border_control(), t.bg_surface(), t.text_primary()) };
-    rect(ctx, r.x(), r.y(), r.w(), r.h(), edge, 6.0);
-    let id = area(ctx, Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), 5.0, fill, t.state_hover(), press);
+    rect(ctx, r.x(), r.y(), r.w(), r.h(), edge, em(6.0));
+    let id = area(ctx, Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), em(5.0), fill, t.state_hover(), press);
     match g {
         Some(g) => {
             icon(ctx, r.x() + (r.w() - em(16.0)) / 2.0, r.y() + (r.h() - em(16.0)) / 2.0, g, em(16.0), fg);
@@ -1071,9 +1057,9 @@ fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, st: &Mutable<Shell>) {
     let t = ctx.theme;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_surface(), 0.0);
     rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
-    let fw = 320.0f32.min(r.w() - 220.0).max(120.0);
-    text_field(ctx, Rect::new(r.x() + 12.0, r.y() + 6.0, fw, 28.0), &f.edit, "Find in page");
-    let x = r.x() + 24.0 + fw;
+    let fw = em(320.0).min(r.w() - em(220.0)).max(em(120.0));
+    text_field(ctx, Rect::new(r.x() + em(12.0), r.y() + em(6.0), fw, em(28.0)), &f.edit, "Find in page");
+    let x = r.x() + em(24.0) + fw;
     let what = if f.edit.text().is_empty() {
         String::new()
     } else if !f.answered {
@@ -1086,13 +1072,13 @@ fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, st: &Mutable<Shell>) {
         format!("{} of {}", f.current, f.count)
     };
     let c = if f.answered && f.count == 0 && !f.edit.text().is_empty() { t.danger_fg() } else { t.text_secondary() };
-    text(ctx, x, r.y() + 20.0, &what, type_size::XS, Weight::Medium, c);
+    text(ctx, x, r.y() + em(20.0), &what, type_size::XS, Weight::Medium, c);
     let has = f.count > 0;
     let (a, b, c2) = (st.clone(), st.clone(), st.clone());
     let enter = |up: bool| pergola::Modifiers { shift: up, ..Default::default() };
-    icon_button(ctx, x + 96.0, r.y() + 6.0, ph::CARET_UP, has, t.text_secondary(), "Previous match (Shift-Enter)", move || with(&a, |s| { s.find_key(pergola::Key::Enter, enter(true), ""); }));
-    icon_button(ctx, x + 126.0, r.y() + 6.0, ph::CARET_DOWN, has, t.text_secondary(), "Next match (Enter)", move || with(&b, |s| { s.find_key(pergola::Key::Enter, enter(false), ""); }));
-    icon_button(ctx, r.x() + r.w() - 40.0, r.y() + 6.0, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&c2, |s| s.close_find()));
+    icon_button(ctx, x + em(96.0), r.y() + em(6.0), ph::CARET_UP, has, t.text_secondary(), "Previous match (Shift-Enter)", move || with(&a, |s| { s.find_key(pergola::Key::Enter, enter(true), ""); }));
+    icon_button(ctx, x + em(126.0), r.y() + em(6.0), ph::CARET_DOWN, has, t.text_secondary(), "Next match (Enter)", move || with(&b, |s| { s.find_key(pergola::Key::Enter, enter(false), ""); }));
+    icon_button(ctx, r.x() + r.w() - em(40.0), r.y() + em(6.0), ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&c2, |s| s.close_find()));
 }
 
 // -- the history view (§5.5) ---------------------------------------------------------
@@ -1104,36 +1090,36 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let r = g.page;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_canvas(), 0.0);
     let Some(h) = &s.history else { return };
-    let col = 720.0f32.min(r.w() - 64.0);
-    let x = r.x() + ((r.w() - col) / 2.0).max(32.0);
-    let mut y = r.y() + 24.0;
-    text(ctx, x, y + 12.0, "History", type_size::XL, Weight::Semibold, t.text_primary());
+    let col = em(720.0).min(r.w() - em(64.0));
+    let x = r.x() + ((r.w() - col) / 2.0).max(em(32.0));
+    let mut y = r.y() + em(24.0);
+    text(ctx, x, y + em(12.0), "History", type_size::XL, Weight::Semibold, t.text_primary());
     let st2 = st.clone();
-    icon_button(ctx, x + col - 28.0, y, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&st2, |s| s.history = None));
+    icon_button(ctx, x + col - em(28.0), y, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&st2, |s| s.history = None));
     let st2 = st.clone();
     let (cx, cw) = shell::history_clear_all(x, col);
-    small_button(ctx, Rect::new(cx, y + 1.0, cw, 26.0), None, "Clear all…", false, "Clear all history", move || with(&st2, |s| s.ask_clear(Clear::All)));
-    y += 40.0;
-    text_field(ctx, Rect::new(x, y, col, 32.0), &h.edit, "Filter by title or address");
-    y += 48.0;
+    small_button(ctx, Rect::new(cx, y + 1.0, cw, em(26.0)), None, "Clear all…", false, "Clear all history", move || with(&st2, |s| s.ask_clear(Clear::All)));
+    y += em(40.0);
+    text_field(ctx, Rect::new(x, y, col, em(32.0)), &h.edit, "Filter by title or address");
+    y += em(48.0);
     if let Some((what, n)) = &h.confirm {
         // It can't be undone: it says what it takes, and asks.
-        boxed(ctx, x - 8.0, y, col + 16.0, shell::HIST_CONFIRM - 12.0, t.border_default(), t.bg_elevated(), 8.0);
-        text(ctx, x + 4.0, y + 22.0, &fit(&clear_question(what, *n), &sans(type_size::SM, Weight::Medium, t.text_primary()), col - 180.0), type_size::SM, Weight::Medium, t.text_primary());
+        boxed(ctx, x - em(8.0), y, col + em(16.0), em(shell::HIST_CONFIRM) - em(12.0), t.border_default(), t.bg_elevated(), em(8.0));
+        text(ctx, x + em(4.0), y + em(22.0), &fit(&clear_question(what, *n), &sans(type_size::SM, Weight::Medium, t.text_primary()), col - em(180.0)), type_size::SM, Weight::Medium, t.text_primary());
         let st2 = st.clone();
-        small_button(ctx, Rect::new(x + col - 160.0, y + 8.0, 72.0, 28.0), None, "Cancel", false, "", move || with(&st2, |s| {
+        small_button(ctx, Rect::new(x + col - em(160.0), y + em(8.0), em(72.0), em(28.0)), None, "Cancel", false, "", move || with(&st2, |s| {
             if let Some(h) = &mut s.history {
                 h.confirm = None;
             }
         }));
         let st2 = st.clone();
-        small_button(ctx, Rect::new(x + col - 80.0, y + 8.0, 80.0, 28.0), None, "Clear", true, "", move || with(&st2, |s| s.confirm_clear()));
-        y += shell::HIST_CONFIRM;
+        small_button(ctx, Rect::new(x + col - em(80.0), y + em(8.0), em(80.0), em(28.0)), None, "Clear", true, "", move || with(&st2, |s| s.confirm_clear()));
+        y += em(shell::HIST_CONFIRM);
     }
     let rows = s.history_rows();
     if rows.is_empty() {
         let msg = if h.edit.text().is_empty() { "Nothing yet. Pages you open in recorded trails are listed here." } else { "No page matches." };
-        text(ctx, x, y + 10.0, msg, type_size::SM, Weight::Regular, t.text_secondary());
+        text(ctx, x, y + em(10.0), msg, type_size::SM, Weight::Regular, t.text_secondary());
         return;
     }
     let now = crate::clock::now_s();
@@ -1143,26 +1129,26 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     for (i, row) in rows.iter().enumerate() {
         let d = crate::history::day_of(row.at_s, now);
         if d != day {
-            if y + HIST_DAY + shell::HIST_ROW > r.y() + r.h() {
+            if y + em(HIST_DAY) + em(shell::HIST_ROW) > r.y() + r.h() {
                 break;
             }
-            text(ctx, x, y + 16.0, &d.to_uppercase(), type_size::XXS, Weight::Semibold, t.text_tertiary());
+            text(ctx, x, y + em(16.0), &d.to_uppercase(), type_size::XXS, Weight::Semibold, t.text_tertiary());
             let st2 = st.clone();
             let d2 = d.clone();
-            small_button(ctx, Rect::new(x + col - shell::HIST_DAY_CLEAR_W, y + 3.0, shell::HIST_DAY_CLEAR_W, 22.0), None, "Clear day", false, &format!("Clear {d}"), move || with(&st2, |s| s.ask_clear(Clear::Day(d2.clone()))));
-            y += shell::HIST_DAY;
+            small_button(ctx, Rect::new(x + col - em(shell::HIST_DAY_CLEAR_W), y + em(3.0), em(shell::HIST_DAY_CLEAR_W), em(22.0)), None, "Clear day", false, &format!("Clear {d}"), move || with(&st2, |s| s.ask_clear(Clear::Day(d2.clone()))));
+            y += em(shell::HIST_DAY);
             day = d;
         }
-        if y + shell::HIST_ROW > r.y() + r.h() {
+        if y + em(shell::HIST_ROW) > r.y() + r.h() {
             break;
         }
         let st2 = st.clone();
         let row2 = row.clone();
         let fill = if i == h.selected { t.state_hover() } else { Color::TRANSPARENT };
-        area(ctx, Rect::new(x - 8.0, y, col + 16.0, shell::HIST_ROW), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.open_history_row(&row2, now_ms())));
-        monogram(ctx, x, y + 7.0, &row.url, false);
-        text(ctx, x + 30.0, y + 17.0, &fit(&row.title, &ts, col * 0.45), type_size::SM, Weight::Medium, t.text_primary());
-        let ux = x + 40.0 + col * 0.45;
+        area(ctx, Rect::new(x - em(8.0), y, col + em(16.0), em(shell::HIST_ROW)), em(6.0), fill, t.state_hover(), move || with(&st2, |s| s.open_history_row(&row2, now_ms())));
+        monogram(ctx, x, y + em(7.0), &row.url, false);
+        text(ctx, x + em(30.0), y + em(17.0), &fit(&row.title, &ts, col * 0.45), type_size::SM, Weight::Medium, t.text_primary());
+        let ux = x + em(40.0) + col * 0.45;
         let when = if row.at_s == 0 { String::new() } else { crate::clock::when_label(row.at_s, now).rsplit(' ').next().unwrap_or("").to_string() };
         let label = match row.place {
             crate::history::Place::Open(_) => when,
@@ -1171,13 +1157,13 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let ls = sans(type_size::XS, Weight::Regular, t.text_tertiary());
         let lw = width(&label, &ls);
         // The address up to the time label and the clear button.
-        ctx.add(Node::Text { rect: Rect::new(ux, y + 9.0, 0.0, 16.0), content: fit(&row.url, &us, (col - (ux - x) - lw - 36.0 - 16.0).max(40.0)), style: us.clone() });
-        text(ctx, x + col - lw - 36.0, y + 17.0, &label, type_size::XS, Weight::Regular, t.text_tertiary());
+        ctx.add(Node::Text { rect: Rect::new(ux, y + em(9.0), 0.0, em(16.0)), content: fit(&row.url, &us, (col - (ux - x) - lw - em(36.0) - em(16.0)).max(em(40.0))), style: us.clone() });
+        text(ctx, x + col - lw - em(36.0), y + em(17.0), &label, type_size::XS, Weight::Regular, t.text_tertiary());
         ctx.pop();
         let st2 = st.clone();
         let site = trail::site(&row.url).to_string();
-        icon_button(ctx, x + col - 28.0, y + 3.0, ph::TRASH_SIMPLE, true, t.text_tertiary(), &format!("Clear everything from {site}"), move || with(&st2, |s| s.ask_clear(Clear::Site(site.clone()))));
-        y += shell::HIST_ROW;
+        icon_button(ctx, x + col - em(28.0), y + em(3.0), ph::TRASH_SIMPLE, true, t.text_tertiary(), &format!("Clear everything from {site}"), move || with(&st2, |s| s.ask_clear(Clear::Site(site.clone()))));
+        y += em(shell::HIST_ROW);
     }
 }
 
@@ -1231,13 +1217,13 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             ("wants to play sound".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
     };
-    icon(ctx, r.x() + 16.0, r.y() + 12.0, g, 20.0, t.text_secondary());
-    inline(ctx, r.x() + 46.0, r.y() + 22.0, 6.0, &runs);
+    icon(ctx, r.x() + em(16.0), r.y() + em(12.0), g, em(20.0), t.text_secondary());
+    inline(ctx, r.x() + em(46.0), r.y() + em(22.0), em(6.0), &runs);
     let answers = p.answers();
     let bs = sans(type_size::SM, Weight::Semibold, t.text_primary());
-    let mut x = r.x() + r.w() - 16.0;
+    let mut x = r.x() + r.w() - em(16.0);
     for (i, a) in answers.iter().enumerate().rev() {
-        let w = width(a, &bs) + 24.0;
+        let w = width(a, &bs) + em(24.0);
         x -= w;
         let primary = i == answers.len() - 1;
         let ghost = i == 0 && answers.len() > 2;
@@ -1248,16 +1234,16 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
         } else {
             (t.border_control(), t.bg_surface(), t.state_hover(), t.text_primary())
         };
-        rect(ctx, x, r.y() + 6.0, w, 32.0, edge, 6.0);
+        rect(ctx, x, r.y() + em(6.0), w, em(32.0), edge, em(6.0));
         let st2 = st.clone();
-        area(ctx, Rect::new(x + 1.0, r.y() + 7.0, w - 2.0, 30.0), 5.0, fill, hover, move || with(&st2, |s| {
+        area(ctx, Rect::new(x + 1.0, r.y() + em(7.0), w - 2.0, em(30.0)), em(5.0), fill, hover, move || with(&st2, |s| {
             if !s.answer(i, now_ms()) {
                 eprintln!("navigator-ui: a press within 500 ms of the prompt appearing doesn't count");
             }
         }));
-        text(ctx, x + 12.0, r.y() + 22.0, a, type_size::SM, Weight::Semibold, fg);
+        text(ctx, x + em(12.0), r.y() + em(22.0), a, type_size::SM, Weight::Semibold, fg);
         ctx.pop();
-        x -= 8.0;
+        x -= em(8.0);
     }
 }
 
@@ -1279,9 +1265,9 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
         if shown {
             ctx.slot(slot, PAGE_SLOT);
         }
-        let col = 640.0f32.min(r.w() - 64.0);
-        let x = r.x() + ((r.w() - col) / 2.0).max(32.0);
-        let y = r.y() + 48.0;
+        let col = em(640.0).min(r.w() - em(64.0));
+        let x = r.x() + ((r.w() - col) / 2.0).max(em(32.0));
+        let y = r.y() + em(48.0);
         let ns = sans(type_size::SM, Weight::Regular, t.text_secondary());
         match live {
             crate::shell::LivePage::Loading(u) => {
@@ -1289,11 +1275,11 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
             }
             crate::shell::LivePage::Failed { url, why } => {
                 text(ctx, x, y, &fit(&format!("{} could not be opened", crate::trail::host(url)), &ns, col), type_size::LG, Weight::Semibold, t.text_primary());
-                text(ctx, x, y + 28.0, &fit(why, &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, x, y + em(28.0), &fit(why, &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
             }
             crate::shell::LivePage::File { url, name } => {
                 text(ctx, x, y, &fit(name, &ns, col), type_size::LG, Weight::Semibold, t.text_primary());
-                text(ctx, x, y + 28.0, &fit(&format!("A file from {}, not a page. Save it from the row above.", crate::trail::host(url)), &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, x, y + em(28.0), &fit(&format!("A file from {}, not a page. Save it from the row above.", crate::trail::host(url)), &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
             }
             crate::shell::LivePage::Shown(_) => {}
         }
@@ -1302,50 +1288,50 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
     }
     let slot = ctx.push(Node::Rect { rect: r, fill: t.bg_canvas(), radius: 0.0 });
     ctx.slot(slot, PAGE_SLOT);
-    let col = 640.0f32.min(r.w() - 64.0);
-    let x = r.x() + ((r.w() - col) / 2.0).max(32.0);
-    let mut y = r.y() + 36.0;
+    let col = em(640.0).min(r.w() - em(64.0));
+    let x = r.x() + ((r.w() - col) / 2.0).max(em(32.0));
+    let mut y = r.y() + em(36.0);
     let (_, links) = fake::lookup(&p.url);
     if let Some(q) = &p.search {
-        text(ctx, x, y + 14.0, &format!("Results for “{q}”"), type_size::XXL, Weight::Semibold, t.text_primary());
+        text(ctx, x, y + em(14.0), &format!("Results for “{q}”"), type_size::XXL, Weight::Semibold, t.text_primary());
     } else {
         let hs = sans(type_size::XXL, Weight::Semibold, t.text_primary());
-        text(ctx, x, y + 14.0, &fit(&p.title, &hs, col), type_size::XXL, Weight::Semibold, t.text_primary());
+        text(ctx, x, y + em(14.0), &fit(&p.title, &hs, col), type_size::XXL, Weight::Semibold, t.text_primary());
     }
-    y += 40.0;
+    y += em(40.0);
     let ms = TextStyle { family: font::MONO.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() };
-    ctx.add(Node::Text { rect: Rect::new(x, y, 0.0, 16.0), content: fit(&p.url, &ms, col), style: ms.clone() });
-    y += 28.0;
+    ctx.add(Node::Text { rect: Rect::new(x, y, 0.0, em(16.0)), content: fit(&p.url, &ms, col), style: ms.clone() });
+    y += em(28.0);
     // What this area is.
-    boxed(ctx, x, y, col, 56.0, t.border_default(), t.bg_surface(), 8.0);
-    text(ctx, x + 14.0, y + 18.0, "Page slot", type_size::XS, Weight::Semibold, t.text_secondary());
+    boxed(ctx, x, y, col, em(56.0), t.border_default(), t.bg_surface(), em(8.0));
+    text(ctx, x + em(14.0), y + em(18.0), "Page slot", type_size::XS, Weight::Semibold, t.text_secondary());
     let note = "The page's own surface goes here, drawn by its jailed renderer (Limen, build step 2).";
     let ns = sans(type_size::XS, Weight::Regular, t.text_tertiary());
-    text(ctx, x + 14.0, y + 38.0, &fit(note, &ns, col - 28.0), type_size::XS, Weight::Regular, t.text_tertiary());
-    y += 76.0;
+    text(ctx, x + em(14.0), y + em(38.0), &fit(note, &ns, col - em(28.0)), type_size::XS, Weight::Regular, t.text_tertiary());
+    y += em(76.0);
     let mut hovered = None;
     if !links.is_empty() {
-        text(ctx, x, y + 6.0, "STAND-IN LINKS · click to follow, Ctrl-click to open beside", type_size::XXS, Weight::Semibold, t.text_tertiary());
-        y += 18.0;
+        text(ctx, x, y + em(6.0), "STAND-IN LINKS · click to follow, Ctrl-click to open beside", type_size::XXS, Weight::Semibold, t.text_tertiary());
+        y += em(18.0);
         for l in links {
-            if y + 30.0 > r.y() + r.h() {
+            if y + em(30.0) > r.y() + r.h() {
                 break;
             }
             let st2 = st.clone();
             let l2 = l.clone();
-            let id = area(ctx, Rect::new(x - 8.0, y, col + 16.0, 30.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.activate(&l2, now_ms())));
+            let id = area(ctx, Rect::new(x - em(8.0), y, col + em(16.0), em(30.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.activate(&l2, now_ms())));
             if ctx.is_hovered(id) {
                 hovered = Some(l.url.clone());
             }
             if l.download.is_some() {
-                icon(ctx, x, y + 7.0, ph::DOWNLOAD, 16.0, t.accent_fg());
+                icon(ctx, x, y + em(7.0), ph::DOWNLOAD, em(16.0), t.accent_fg());
             } else {
-                icon(ctx, x, y + 7.0, ph::ARROW_RIGHT, 16.0, t.accent_fg());
+                icon(ctx, x, y + em(7.0), ph::ARROW_RIGHT, em(16.0), t.accent_fg());
             }
             let ls = sans(type_size::SM, Weight::Medium, t.accent_fg());
-            text(ctx, x + 24.0, y + 15.0, &fit(&l.title, &ls, col - 24.0), type_size::SM, Weight::Medium, t.accent_fg());
+            text(ctx, x + em(24.0), y + em(15.0), &fit(&l.title, &ls, col - em(24.0)), type_size::SM, Weight::Medium, t.accent_fg());
             ctx.pop();
-            y += 30.0;
+            y += em(30.0);
         }
     }
     ctx.pop();
@@ -1359,69 +1345,69 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let r = g.page;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_canvas(), 0.0);
     let x = g.where_.x();
-    let mut y = r.y() + 32.0;
+    let mut y = r.y() + em(32.0);
     // Leave room for the suggestions when they are open.
     if let Some(d) = g.drop {
-        y = d.y() + d.h() + 28.0;
+        y = d.y() + d.h() + em(28.0);
     }
     if s.store.trail().unrecorded {
-        icon(ctx, x, y, ph::EYE_SLASH, 16.0, t.text_secondary());
-        text(ctx, x + 24.0, y + 8.0, "Unrecorded: nothing in this trail is written down, and its cookies go when it closes.", type_size::SM, Weight::Regular, t.text_secondary());
-        y += 36.0;
+        icon(ctx, x, y, ph::EYE_SLASH, em(16.0), t.text_secondary());
+        text(ctx, x + em(24.0), y + em(8.0), "Unrecorded: nothing in this trail is written down, and its cookies go when it closes.", type_size::SM, Weight::Regular, t.text_secondary());
+        y += em(36.0);
     }
     if !s.store.kept.is_empty() {
-        text(ctx, x, y + 8.0, "Kept", type_size::SM, Weight::Semibold, t.text_secondary());
-        y += 26.0;
+        text(ctx, x, y + em(8.0), "Kept", type_size::SM, Weight::Semibold, t.text_secondary());
+        y += em(26.0);
         let mut cx = x;
         for k in &s.store.kept {
-            if cx + 176.0 > r.x() + r.w() - 16.0 {
+            if cx + em(176.0) > r.x() + r.w() - em(16.0) {
                 break;
             }
             let st2 = st.clone();
             let url = k.url.clone();
-            rect(ctx, cx, y, 176.0, 64.0, t.border_default(), 8.0);
-            area(ctx, Rect::new(cx + 1.0, y + 1.0, 174.0, 62.0), 7.0, t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
+            rect(ctx, cx, y, em(176.0), em(64.0), t.border_default(), em(8.0));
+            area(ctx, Rect::new(cx + 1.0, y + 1.0, em(174.0), em(62.0)), em(7.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
                 s.store.follow(fake::spec(&url));
             }));
-            monogram(ctx, cx + 14.0, y + 14.0, &k.url, false);
+            monogram(ctx, cx + em(14.0), y + em(14.0), &k.url, false);
             let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
-            text(ctx, cx + 44.0, y + 24.0, &fit(&k.title, &ts, 100.0), type_size::SM, Weight::Medium, t.text_primary());
+            text(ctx, cx + em(44.0), y + em(24.0), &fit(&k.title, &ts, em(100.0)), type_size::SM, Weight::Medium, t.text_primary());
             let ds = sans(type_size::XS, Weight::Regular, t.text_tertiary());
-            text(ctx, cx + 44.0, y + 44.0, &fit(trail::host(&k.url), &ds, 120.0), type_size::XS, Weight::Regular, t.text_tertiary());
-            icon(ctx, cx + 152.0, y + 8.0, ph::STAR, 12.0, t.text_tertiary());
+            text(ctx, cx + em(44.0), y + em(44.0), &fit(trail::host(&k.url), &ds, em(120.0)), type_size::XS, Weight::Regular, t.text_tertiary());
+            icon(ctx, cx + em(152.0), y + em(8.0), ph::STAR, em(12.0), t.text_tertiary());
             ctx.pop();
-            cx += 188.0;
+            cx += em(188.0);
         }
-        y += 96.0;
+        y += em(96.0);
     }
     if !s.store.earlier.is_empty() {
-        text(ctx, x, y + 8.0, "Put away", type_size::SM, Weight::Semibold, t.text_secondary());
-        y += 26.0;
+        text(ctx, x, y + em(8.0), "Put away", type_size::SM, Weight::Semibold, t.text_secondary());
+        y += em(26.0);
         for (i, e) in s.store.earlier.iter().enumerate() {
-            if y + 30.0 > r.y() + r.h() {
+            if y + em(30.0) > r.y() + r.h() {
                 break;
             }
             let st2 = st.clone();
-            area(ctx, Rect::new(x - 8.0, y, 420.0, 30.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+            area(ctx, Rect::new(x - em(8.0), y, em(420.0), em(30.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
                 // Bring it back in place of this empty trail on Start.
                 s.store.put_away(crate::clock::now_s());
                 s.store.bring_back(i);
             }));
-            monogram(ctx, x, y + 5.0, e.trail.page().map_or("", |p| &p.url), false);
-            text(ctx, x + 30.0, y + 15.0, e.trail.title(), type_size::SM, Weight::Regular, t.text_primary());
-            text(ctx, x + 320.0, y + 15.0, &crate::clock::when_label(e.at_s, crate::clock::now_s()), type_size::XS, Weight::Regular, t.text_tertiary());
+            monogram(ctx, x, y + em(5.0), e.trail.page().map_or("", |p| &p.url), false);
+            text(ctx, x + em(30.0), y + em(15.0), e.trail.title(), type_size::SM, Weight::Regular, t.text_primary());
+            text(ctx, x + em(320.0), y + em(15.0), &crate::clock::when_label(e.at_s, crate::clock::now_s()), type_size::XS, Weight::Regular, t.text_tertiary());
             ctx.pop();
             // Forget: its records go now (§4.5).
             let st3 = st.clone();
-            let fid = area(ctx, Rect::new(x + 432.0, y + 3.0, 24.0, 24.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
+            let fid = area(ctx, Rect::new(x + em(432.0), y + em(3.0), em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
                 s.store.forget(i);
             }));
-            icon(ctx, x + 436.0, y + 7.0, ph::X, 16.0, t.text_tertiary());
+            icon(ctx, x + em(436.0), y + em(7.0), ph::X, em(16.0), t.text_tertiary());
             ctx.pop();
             ctx.tooltip(fid, "Forget this trail");
-            y += 30.0;
+            y += em(30.0);
         }
     }
 }
@@ -1432,27 +1418,27 @@ fn stop_page(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) {
     let t = ctx.theme;
     let r = g.page;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_canvas(), 0.0);
-    let col = 520.0f32.min(r.w() - 64.0);
+    let col = em(520.0).min(r.w() - em(64.0));
     let x = r.x() + (r.w() - col) / 2.0;
-    let mut y = r.y() + (r.h() * 0.22).max(40.0);
-    icon(ctx, x, y, ph::PROHIBIT, 32.0, t.danger_fg());
-    y += 52.0;
+    let mut y = r.y() + (r.h() * 0.22).max(em(40.0));
+    icon(ctx, x, y, ph::PROHIBIT, em(32.0), t.danger_fg());
+    y += em(52.0);
     text(ctx, x, y, "This page was stopped", type_size::XL, Weight::Semibold, t.text_primary());
-    y += 30.0;
+    y += em(30.0);
     let ms = TextStyle { family: font::MONO.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_secondary() };
-    ctx.add(Node::Text { rect: Rect::new(x, y - 9.0, 0.0, 18.0), content: trail::host(&p.url).into(), style: ms });
-    y += 22.0;
+    ctx.add(Node::Text { rect: Rect::new(x, y - em(9.0), 0.0, em(18.0)), content: trail::host(&p.url).into(), style: ms });
+    y += em(22.0);
     for reason in &p.facts.reasons {
         y = wrapped(ctx, x, y, col, reason, t.text_secondary());
     }
-    y = wrapped(ctx, x, y + 4.0, col, "Nothing from it was shown, and nothing you type can reach it.", t.text_tertiary());
-    y += 16.0;
+    y = wrapped(ctx, x, y + em(4.0), col, "Nothing from it was shown, and nothing you type can reach it.", t.text_tertiary());
+    y += em(16.0);
     let bs = sans(type_size::SM, Weight::Semibold, t.text_on_accent());
-    let w = width("Go back", &bs) + 24.0;
+    let w = width("Go back", &bs) + em(24.0);
     let st2 = st.clone();
-    rect(ctx, x, y, w, 32.0, t.accent_fill(), 6.0);
-    area(ctx, Rect::new(x + 1.0, y + 1.0, w - 2.0, 30.0), 5.0, t.accent_fill(), t.accent_fill_hover(), move || with(&st2, |s| s.leave_stopped()));
-    text(ctx, x + 12.0, y + 16.0, "Go back", type_size::SM, Weight::Semibold, t.text_on_accent());
+    rect(ctx, x, y, w, em(32.0), t.accent_fill(), em(6.0));
+    area(ctx, Rect::new(x + 1.0, y + 1.0, w - 2.0, em(30.0)), em(5.0), t.accent_fill(), t.accent_fill_hover(), move || with(&st2, |s| s.leave_stopped()));
+    text(ctx, x + em(12.0), y + em(16.0), "Go back", type_size::SM, Weight::Semibold, t.text_on_accent());
     ctx.pop();
 }
 
@@ -1470,11 +1456,11 @@ fn status_bar(ctx: &mut Ctx, s: &Shell, r: Rect, link: Option<String>) {
     let f = fake::spec(&url).facts;
     let cur_site = s.store.trail().page().map(|p| trail::site(&p.url).to_string()).unwrap_or_default();
     let site = trail::site(&url);
-    icon(ctx, r.x() + 12.0, r.y() + 5.0, light_glyph(f.light), 14.0, light_color(ctx, f.light));
-    let cy = r.y() + 12.5;
+    icon(ctx, r.x() + em(12.0), r.y() + em(5.0), light_glyph(f.light), em(14.0), light_color(ctx, f.light));
+    let cy = r.y() + em(12.5);
     let scheme = if url.starts_with("http://") { "http://" } else { "https://" };
     let (before, domain, after) = trail::split_address(&url);
-    inline(ctx, r.x() + 32.0, cy, 0.0, &[
+    inline(ctx, r.x() + em(32.0), cy, 0.0, &[
         (scheme.into(), st(t.text_tertiary(), Weight::Regular)),
         (before.into(), st(t.text_tertiary(), Weight::Regular)),
         (domain.into(), st(t.text_primary(), Weight::Semibold)),
@@ -1488,7 +1474,7 @@ fn status_bar(ctx: &mut Ctx, s: &Shell, r: Rect, link: Option<String>) {
         }
     };
     let addr_w = width(&format!("{scheme}{before}{domain}{after}"), &st(t.text_primary(), Weight::Semibold));
-    let fx = r.x() + 32.0 + addr_w.max(260.0) + 24.0;
+    let fx = r.x() + em(32.0) + addr_w.max(em(260.0)) + em(24.0);
     let fs = st(c, Weight::Medium);
-    text(ctx, fx, cy, &fit(&facts, &fs, r.x() + r.w() - fx - 12.0), type_size::XS, Weight::Medium, c);
+    text(ctx, fx, cy, &fit(&facts, &fs, r.x() + r.w() - fx - em(12.0)), type_size::XS, Weight::Medium, c);
 }

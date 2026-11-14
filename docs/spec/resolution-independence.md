@@ -479,8 +479,11 @@ scrolled so that word sits where it did (the same document px showed text from f
 up; found in the live check).
 The Navigator's toolbar row (its height `shell::bar()`, the Where field, tier chip, presence
 pill, toolbar buttons) and the Aa pop-up are sized in em, so they grow with the text size
-(the check found the pills and the Aa value label crowded at 150%). The rail, history and
-the other pop-ups are still fixed points. Page images: profile §3.11 admits no fetch that varies with the reader's screen,
+(the check found the pills and the Aa value label crowded at 150%). So is the rest of its
+chrome: the rail (wide and collapsed, and the window width below which it collapses), the
+find bar, prompt row and status bar, the tier popover, presence menu and suggestion list,
+the history view, and Start and the stop page; one `icon_button` at the text size serves
+them all (`navigator-ui/tests/text_size.rs` checks the geometry at 1.5x). Page images: profile §3.11 admits no fetch that varies with the reader's screen,
 so the converter picks an `<img>`'s `srcset` candidate for one fixed density, 2x, for every
 reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descriptors over
 `sizes` at the 1280 px conversion viewport (px/vw/em lengths, min/max-width conditions; else
