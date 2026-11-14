@@ -148,6 +148,17 @@ snaps at emission, not in layout:
 - **Icons** are vector (Phosphor), flattened at the device size (as now in `icon.rs`).
 - frescod never resamples a window's buffer except in §7's straddle case and in mirroring.
 
+**Built in step 3 (2026-11-14)**, all in `FrescoSurface` (pergola/src/surface.rs), so no
+widget changes: `snap_span` rounds a rect's start and end to device pixels, and a span of
+2 pt or less (a hairline, a border, a divider) is `max(1, round(w x scale))` pixels wherever
+it lands; group and scroll origins, scroll clips and backdrops are whole pixels, so what a
+group holds keeps its snapped edges; horizontal and vertical stroked paths are a whole number
+of pixels wide with their edges on pixel boundaries; images snap like rects;
+`text::wire_top_device` puts each text run's baseline on a device pixel (x stays
+fractional). Radii, diagonal strokes and filled paths are not snapped. Edges move by at most
+half a pixel and sizes by at most one, at 1.0 too, where layout gives fractional positions
+(centred content).
+
 ## 6. Text size and relative sizing of widgets
 
 This is the core of Shankar's second point: widgets must keep their proportions, and must
@@ -373,7 +384,7 @@ Shankar took the recommendation on each:
    preference, TV fallback, 1/8 steps, laptop panels at Smaller (§4.2). **2b, built 2026-11-14:**
    frescod's strip, chrome and input amounts in pt (§8). Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.
-3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,
+3. **Crispness** (§5): emission snapping (built 2026-11-14). Test: hairlines are solid device pixels at 1.25,
    1.5 and 1.75.
 4. **Text size** (§6.1, 6.2, 6.3): system setting broadcast like appearance, em-based tokens,
    overflow menus, min-size hints, anchor-kept scroll. Test: the catalogue lint.

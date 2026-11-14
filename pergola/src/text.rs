@@ -44,6 +44,18 @@ pub fn clear_measurer() {
 /// instead leaves IBM Plex about 0.18 em low, since its ascender (1.025
 /// em) is far taller than its descender (0.275 em). Icon fonts are drawn
 /// in a centred em square already and keep the plain top.
+/// [`wire_top`] in device pixels at scale `k`, with the baseline on a
+/// device pixel (resolution-independence.md §5): text sits on the same
+/// pixel row as a rule drawn at its baseline, at any fractional scale.
+pub fn wire_top_device(rect: crate::geom::Rect, style: &TextStyle, k: f32) -> f32 {
+    let asc = match style.family.as_str() {
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 1.025,
+        _ => return (rect.y() * k).round(),
+    };
+    let baseline = (wire_top(rect, style) + asc * style.size) * k;
+    baseline.round() - asc * style.size * k
+}
+
 pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
     // (ascender, cap height) in em, read from the shipped faces.
     let (asc, cap) = match style.family.as_str() {
@@ -188,6 +200,23 @@ mod tests {
             size: 13.0,
             weight: Weight::Regular,
             color: crate::color::Color::TRANSPARENT,
+        }
+    }
+
+    /// At a fractional scale the baseline lands on a device pixel
+    /// (resolution-independence.md §5), within half a pixel of exact.
+    #[test]
+    fn the_baseline_is_on_a_device_pixel() {
+        let st = TextStyle { family: crate::theme::font::SANS.into(), ..style() };
+        for k in [1.0f32, 1.25, 1.375, 1.5, 1.75, 2.0] {
+            for y in [0.0f32, 3.3, 17.7, 101.1] {
+                let r = crate::geom::Rect::new(5.0, y, 100.0, 22.0);
+                let top = wire_top_device(r, &st, k);
+                let base = top + 1.025 * st.size * k;
+                assert!((base - base.round()).abs() < 1e-3, "baseline {base} at {k}");
+                let exact = (wire_top(r, &st) + 1.025 * st.size) * k;
+                assert!((base - exact).abs() <= 0.5 + 1e-3);
+            }
         }
     }
 

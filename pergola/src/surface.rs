@@ -193,6 +193,24 @@ pub const IMAGE_SLOT_BIT: u32 = 0x4000_0000;
 /// The window's glyph atlas texture slot.
 pub const ATLAS_SLOT: u32 = 0x00A7_1A50;
 
+/// A span (`x`, `w` in points) in device pixels at scale `k`, snapped so
+/// its drawn edges fall on device pixels (resolution-independence.md §5):
+/// layout keeps exact points; only what is drawn is snapped. A thin span
+/// (a hairline, a 1 pt border or divider) keeps a whole number of pixels,
+/// `max(1, round(w x k))`, wherever it lands, so every 1 pt line of a view
+/// is equally wide; a wider one runs from its rounded start to its
+/// rounded end, so neighbours still meet without a gap or an overlap.
+pub fn snap_span(x: f32, w: f32, k: f32) -> (f32, f32) {
+    let x0 = (x * k).round();
+    if w <= 0.0 {
+        return (x0, 0.0);
+    }
+    if w <= 2.0 {
+        return (x0, (w * k).round().max(1.0));
+    }
+    (x0, (((x + w) * k).round() - x0).max(1.0))
+}
+
 /// The wire id of a filled Stack's background rect.
 fn background_id(id: NodeId) -> u32 {
     id.0 | crate::node::DERIVED_BIT
@@ -294,8 +312,10 @@ impl FrescoSurface {
 
     fn rect_params(&self, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
         let k = self.scale;
+        let (x, w) = snap_span(rect.x(), rect.w(), k);
+        let (y, h) = snap_span(rect.y(), rect.h(), k);
         fresco_protocol::RectParams {
-            x: rect.x() * k, y: rect.y() * k, w: rect.w() * k, h: rect.h() * k,
+            x, y, w, h,
             r: fill.r, g: fill.g, b: fill.b, a: fill.a,
             radius: radius * k,
         }
@@ -315,13 +335,15 @@ impl FrescoSurface {
             parent: group.map(|g| g.0),
             order,
             transform: GroupParams::IDENTITY,
-            clip: Some([rect.x() * k, rect.y() * k, (rect.x() + rect.w()) * k, (rect.y() + rect.h()) * k]),
+            clip: Some([(rect.x() * k).round(), (rect.y() * k).round(), ((rect.x() + rect.w()) * k).round(), ((rect.y() + rect.h()) * k).round()]),
             opacity: 1.0,
             flags: group_flags::SCROLL,
         };
-        outer.transform[4] = rect.x() * k;
-        outer.transform[5] = rect.y() * k;
-        let back = backdrop.map(|c| [0.0, 0.0, rect.w() * k, rect.h() * k, c.r, c.g, c.b, c.a, 0.0]);
+        // Whole device pixels, so what the group holds keeps its snapped
+        // edges (resolution-independence.md §5).
+        outer.transform[4] = (rect.x() * k).round();
+        outer.transform[5] = (rect.y() * k).round();
+        let back = backdrop.map(|c| [0.0, 0.0, (rect.w() * k).round(), (rect.h() * k).round(), c.r, c.g, c.b, c.a, 0.0]);
         let (old_outer, old_back) = match self.scrolls.get(&id.0) {
             Some(&(o, b)) => (Some(o), Some(b)),
             None => (None, None),
@@ -386,9 +408,10 @@ impl Surface for FrescoSurface {
                 // this id in the group's device coordinates.
                 let font_id = self.font_id(&style.family)?;
                 let color = [style.color.r, style.color.g, style.color.b, style.color.a];
+                // The baseline on a device pixel; x stays fractional.
                 self.conn.text_run_install(
                     id.0, font_id, style.size * k,
-                    rect.x() * k, crate::text::wire_top(*rect, style) * k,
+                    rect.x() * k, crate::text::wire_top_device(*rect, style, k),
                     color,
                     content.clone(),
                     style.weight as u16,
@@ -398,11 +421,22 @@ impl Surface for FrescoSurface {
                 // A stroked segment → the rotated-quad path op (cx,cy,length,angle).
                 let dx = p1.0 - p0.0;
                 let dy = p1.1 - p0.1;
+                let (mut cx, mut cy) = ((p0.0 + p1.0) * 0.5 * k, (p0.1 + p1.1) * 0.5 * k);
+                // A horizontal or vertical rule is a whole number of device
+                // pixels wide, its edges on pixel boundaries (§5).
+                let width = if dx == 0.0 || dy == 0.0 {
+                    let w = (*width * k).round().max(1.0);
+                    let snap = |c: f32| (c - w / 2.0).round() + w / 2.0;
+                    if dy == 0.0 { cy = snap(cy) } else { cx = snap(cx) }
+                    w
+                } else {
+                    *width * k
+                };
                 let params = fresco_protocol::PathParams {
-                    cx: (p0.0 + p1.0) * 0.5 * k,
-                    cy: (p0.1 + p1.1) * 0.5 * k,
+                    cx,
+                    cy,
                     length: (dx * dx + dy * dy).sqrt() * k,
-                    width: *width * k,
+                    width,
                     angle: dy.atan2(dx),
                     r: color.r, g: color.g, b: color.b, a: color.a,
                 };
@@ -420,7 +454,9 @@ impl Surface for FrescoSurface {
                     self.conn.slot_set_texture(slot, hash, d.width, d.height, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
                 }
                 let r = *rect;
-                self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x: r.x() * k, y: r.y() * k, w: r.w() * k, h: r.h() * k, slot_id: slot })?;
+                let (x, w) = snap_span(r.x(), r.w(), k);
+                let (y, h) = snap_span(r.y(), r.h(), k);
+                self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x, y, w, h, slot_id: slot })?;
             }
             Node::Glyphs { origin, face, size, color, glyphs } => {
                 let params = self.glyph_run(*origin, face, *size, *color, glyphs)?;
@@ -447,8 +483,9 @@ impl Surface for FrescoSurface {
             opacity: 1.0,
             flags: 0,
         };
-        g.transform[4] = rect.x() * k;
-        g.transform[5] = rect.y() * k;
+        // Whole device pixels, so its contents keep their snapped edges.
+        g.transform[4] = (rect.x() * k).round();
+        g.transform[5] = (rect.y() * k).round();
         self.conn.scene_group(id.0, g)?;
         let bg = background_id(id);
         match fill {
@@ -469,5 +506,33 @@ impl Surface for FrescoSurface {
 
     fn present(&mut self) -> io::Result<()> {
         self.conn.window_present(self.window_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snap_span;
+
+    /// Drawn edges fall on device pixels at fractional scales, 1 pt lines
+    /// are all as wide wherever they land, and neighbours meet
+    /// (resolution-independence.md §5).
+    #[test]
+    fn edges_snap_to_device_pixels() {
+        for k in [1.25f32, 1.375, 1.5, 1.75] {
+            let line = (k.round()).max(1.0);
+            for x in [0.0f32, 0.3, 7.0, 10.5, 33.3, 101.9] {
+                let (x0, w) = snap_span(x, 1.0, k);
+                assert_eq!(x0.fract(), 0.0);
+                assert_eq!(w, line, "a 1 pt line at {k} is {line} px wherever it is");
+                let (a0, aw) = snap_span(x, 40.0, k);
+                let (b0, _) = snap_span(x + 40.0, 40.0, k);
+                assert_eq!((a0.fract(), aw.fract()), (0.0, 0.0));
+                assert_eq!(a0 + aw, b0, "neighbours meet at {k}");
+                assert!((aw - 40.0 * k).abs() <= 1.0, "the size stays within a pixel");
+            }
+        }
+        assert_eq!(snap_span(10.0, 0.0, 1.5), (15.0, 0.0));
+        assert_eq!(snap_span(0.0, 0.5, 1.25), (0.0, 1.0), "a hairline is at least a pixel");
+        assert_eq!(snap_span(3.0, 50.0, 1.0), (3.0, 50.0), "1.0 is unchanged");
     }
 }
