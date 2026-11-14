@@ -175,6 +175,15 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).on_frame = Some(Box::new(handler));
     }
 
+    /// Keep a scroll view's place across a reflow (resolution-independence.md
+    /// §6.3): when its content lays out again with its position unchanged
+    /// (a text size or width change), `handler` gets the position that
+    /// keeps the first visible text where it was, and the node; it
+    /// returns nothing of use (the bool is ignored).
+    pub fn on_reflow<F: Fn(f64, &Node) -> bool + 'static>(&mut self, id: NodeId, handler: F) {
+        self.interactions.entry(id).on_reflow = Some(Box::new(handler));
+    }
+
     /// Whether [`Ctx::popup`] opens a window (the app runs in a `Window`);
     /// otherwise a menu draws as an overlay.
     pub fn popups_enabled(&self) -> bool { self.state.popups }

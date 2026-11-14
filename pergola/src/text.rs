@@ -288,8 +288,11 @@ mod tests {
         // distinct character, not once per string (each ask is a round trip).
         struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl MeasureText for Counting {
-            fn measure_width(&mut self, _: &str, _: f32, _: u16, s: &str) -> Option<f32> {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            fn measure_width(&mut self, _: &str, size: f32, _: u16, s: &str) -> Option<f32> {
+                // Only this test's size: other tests measure meanwhile.
+                if size == 13.5 * text_scale() {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Some(s.chars().count() as f32 * 7.0)
             }
         }

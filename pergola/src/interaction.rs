@@ -71,6 +71,9 @@ pub struct Handlers {
     pub on_scroll: Option<ScrollHandler>,
     /// A per-frame step (a fling, an eased jump, a zoom settling).
     pub on_frame: Option<FrameHandler>,
+    /// A scroll view's content reflowed (text size, width): the position
+    /// that keeps the reader's place, and the node as laid out.
+    pub on_reflow: Option<FrameHandler>,
     /// A drop from another window landed on this node (tabula.md §4).
     pub on_drop: Option<ClickHandler>,
     /// A press on this node, then every move until release, goes here (a

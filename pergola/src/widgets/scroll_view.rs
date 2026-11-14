@@ -289,6 +289,16 @@ impl<V: View> ScrollView<V> {
             s.set(st);
         });
         let s = self.state.clone();
+        ctx.on_reflow(id, move |y, node| {
+            let mut st = s.get();
+            st.fit(node);
+            st.physics.set_position(y);
+            if st != s.get() {
+                s.set(st);
+            }
+            false
+        });
+        let s = self.state.clone();
         ctx.on_frame(id, move |t, node| {
             let mut st = s.get();
             let more = st.frame(t, node);
@@ -305,6 +315,122 @@ impl<V: View> View for ScrollView<V> {
     fn render(&self, ctx: &mut Ctx) {
         self.emit(ctx);
     }
+}
+
+/// Where a scroll view's reader is: the text (a paragraph, a label) nearest
+/// the top of what it shows, and how far into it the top is (resolution-independence.md §6.3).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Anchor {
+    scroll: NodeId,
+    offset: f32,
+    leaf: NodeId,
+    /// The leaf's words ([`words`]), so another node that took its id is
+    /// not mistaken for it.
+    text: Option<String>,
+    /// How far the top is into the leaf: a fraction of its height when the
+    /// top is inside it, else points above it (negative).
+    within: f32,
+    inside: bool,
+}
+
+/// A text leaf's words, or a wrapped paragraph's (a stack of its lines,
+/// `layout::break_lines`): letters and digits only, so the same text
+/// broken at other places is the same; `None` for anything else.
+fn words(tree: &crate::node::NodeTree, id: NodeId) -> Option<String> {
+    let keep = |t: &str| t.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    match tree.get(id)? {
+        Node::Text { content, .. } => Some(keep(content)),
+        Node::Stack { .. } => {
+            let kids = tree.children_of(id);
+            let mut out = String::new();
+            for &k in kids {
+                match tree.get(k) {
+                    Some(Node::Text { content, .. }) if tree.children_of(k).is_empty() => out += &keep(content),
+                    _ => return None,
+                }
+            }
+            (!kids.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The anchors of the scroll views among `ids` in `tree`.
+pub(crate) fn anchors(tree: &crate::node::NodeTree, ids: impl Iterator<Item = NodeId>) -> Vec<Anchor> {
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(Node::Scroll { rect, offset, .. }) = tree.get(id) else { continue };
+        let (top, origin) = (*offset, rect.y());
+        // Leaves below the top's line, text first: a background or hit
+        // rect as tall as the content does not move when text reflows.
+        let mut best: Option<(bool, f32, NodeId)> = None;
+        let mut stack: Vec<NodeId> = tree.children_of(id).iter().rev().copied().collect();
+        while let Some(n) = stack.pop() {
+            let kids = tree.children_of(n);
+            let para = !kids.is_empty() && words(tree, n).is_some();
+            if !kids.is_empty() && !para {
+                stack.extend(kids.iter().rev().copied());
+                continue;
+            }
+            let Some(node) = tree.get(n) else { continue };
+            let r = node.rect();
+            let (y, h) = (r.y() - origin, r.h());
+            if h <= 0.0 || y + h <= top {
+                continue;
+            }
+            let text = para || matches!(node, Node::Text { .. } | Node::Glyphs { .. } | Node::Image { .. });
+            let better = match best {
+                None => true,
+                Some((bt, by, _)) => (text && !bt) || (text == bt && y < by),
+            };
+            if better {
+                best = Some((text, y, n));
+            }
+        }
+        let Some((_, y, leaf)) = best else { continue };
+        let node = tree.get(leaf).unwrap();
+        let h = node.rect().h();
+        let inside = top >= y;
+        out.push(Anchor {
+            scroll: id,
+            offset: top,
+            leaf,
+            text: words(tree, leaf),
+            within: if inside { (top - y) / h } else { top - y },
+            inside,
+        });
+    }
+    out
+}
+
+/// Move each anchored scroll view in `tree` whose position did not change
+/// but whose anchor did, so the anchor is where it was on screen; the
+/// views moved and their new positions.
+pub(crate) fn reanchor(tree: &mut crate::node::NodeTree, anchors: &[Anchor]) -> Vec<(NodeId, f64)> {
+    let mut out = Vec::new();
+    for a in anchors {
+        let Some(Node::Scroll { rect, offset, zoom, content_h, .. }) = tree.get(a.scroll) else { continue };
+        if *offset != a.offset {
+            continue;
+        }
+        if a.text.is_some() && words(tree, a.leaf) != a.text {
+            continue;
+        }
+        let Some(leaf) = tree.get(a.leaf) else { continue };
+        let r = leaf.rect();
+        let y = r.y() - rect.y();
+        let top = if a.inside { y + a.within * r.h() } else { y + a.within };
+        let max = (content_h - rect.h() / zoom.max(1e-3)).max(0.0);
+        let top = top.clamp(0.0, max);
+        if (top - a.offset).abs() < 0.5 {
+            continue;
+        }
+        if let Some(Node::Scroll { offset, .. }) = tree.get_mut(a.scroll) {
+            *offset = top;
+        }
+        out.push((a.scroll, top as f64));
+    }
+    out
 }
 
 /// Where the point `p` (window px) falls in the content of the scroll
@@ -350,6 +476,70 @@ mod tests {
         let mut app = App::new_with_flag(Doc { state: state.clone() }, dirty);
         app.tick();
         (app, state)
+    }
+
+    /// Paragraphs in a view whose width the test changes.
+    struct Prose {
+        state: Mutable<ScrollState>,
+        width: Mutable<f32>,
+    }
+
+    impl View for Prose {
+        fn render(&self, ctx: &mut Ctx) {
+            let w = self.width.get();
+            let body = crate::view::Draw(move |ctx: &mut Ctx| {
+                let col = ctx.push(Node::vstack(Rect::new(0.0, 0.0, w, 0.0), 8.0));
+                ctx.set_flex(col, crate::layout::FlexStyle { align: crate::Align::Stretch, ..Default::default() });
+                for i in 0..40 {
+                    let text = format!("Paragraph {i}: ") + &"words that wrap again when the view gets narrower or the text bigger ".repeat(4);
+                    ctx.paragraph(text, crate::node::TextStyle { family: crate::theme::font::SANS.into(), size: 14.0, weight: crate::theme::Weight::Regular, color: Color::rgba(0.0, 0.0, 0.0, 1.0) });
+                }
+                ctx.pop();
+            });
+            ScrollView::new(self.state.clone(), Rect::new(0.0, 0.0, w, 300.0), body).emit(ctx);
+        }
+    }
+
+    fn scroll_node(app: &App<Prose>) -> (NodeId, f32) {
+        app.tree().iter().find_map(|(id, n)| match n { Node::Scroll { offset, .. } => Some((id, *offset)), _ => None }).unwrap()
+    }
+
+    /// A reflow keeps the reader's place: the text at the top of the view
+    /// before a width change is at the same place on screen after it,
+    /// though everything above it got taller (resolution-independence.md §6.3).
+    #[test]
+    fn a_reflow_keeps_the_readers_place() {
+        let dirty = Arc::new(AtomicBool::new(true));
+        let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+        let width = Mutable::with_dirty(420.0f32, dirty.clone());
+        let mut app = App::new_with_flag(Prose { state: state.clone(), width: width.clone() }, dirty);
+        app.tick();
+        let mut st = state.get();
+        let (id, _) = scroll_node(&app);
+        st.fit(app.tree().get(id).unwrap());
+        st.physics.set_position(1500.0);
+        state.set(st);
+        app.tick();
+        let a = anchors(app.tree(), std::iter::once(id)).pop().expect("an anchor");
+        let leaf = app.tree().get(a.leaf).unwrap().rect();
+        let before = leaf.y() - 1500.0;
+        let frac = (1500.0 - leaf.y()) / leaf.h();
+        width.set(260.0);
+        app.tick();
+        app.tick();
+        let (_, off) = scroll_node(&app);
+        let leaf2 = app.tree().get(a.leaf).unwrap().rect();
+        assert!(leaf2.y() > leaf.y() + 200.0, "what is above it rewrapped taller");
+        assert!(off > 1700.0, "the position followed the text down: {off}");
+        let after = leaf2.y() + frac * leaf2.h() - off;
+        assert!((after - (before + frac * leaf.h())).abs() < 1.0, "the same place in the text is at the top: {after}");
+        assert_eq!(state.get().physics.y as f32, off, "the state agrees with what was drawn");
+        // A scroll by the reader is not undone.
+        let mut st = state.get();
+        st.physics.set_position(100.0);
+        state.set(st);
+        app.tick();
+        assert_eq!(scroll_node(&app).1, 100.0);
     }
 
     fn run_frames(app: &mut App<Doc>, from: f64, ms: f64) -> Vec<Vec<NodeDelta>> {

@@ -240,10 +240,17 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   forum-wm with `Intent::ReserveTop { pt }` at start and on each change, and forum-wm gives
   the bar that height (24 to 96 pt), remembers it (`bar` in forum-displays.state) and keeps
   it across mode changes and restarts.
-- Still pt and to be moved: widgets' inner paddings, virtual list rows, app-shaped `Glyphs`
-  text.
-  The overflow menus, min-size hints, anchor-kept scroll and the catalogue lint (§6.2, §6.3)
-  are next.
+- **More em-based sizes (2026-11-14):** button and menu paddings, the menu's widest,
+  checkbox, radio and toggle parts and the check mark, the slider, the bar's volume panel and
+  Scrinium's rows, bars and sidebars. Document content (Officina's grid, a page) keeps its own
+  sizes and follows its zoom, not the text size.
+- **Anchor-kept scroll:** before each render `App` notes, per scroll view, the paragraph or
+  label nearest the top and how far into it the top is; after layout, if the view's position
+  did not change but that text moved (a text size or width change), the position moves with
+  it and the view's state is told (`Ctx::on_reflow`). A wrapped paragraph is matched by its
+  words, so it is found again however it rewraps; a reader's own scroll is never undone.
+- Still to do: toolbar overflow menus, min-size hints to the WM (a protocol op to update
+  `WindowHints.min_size` after creation, forum-wm honouring it), app-shaped `Glyphs` text.
 
 ### 6.4 Inline images and other inline objects
 

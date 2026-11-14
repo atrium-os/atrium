@@ -283,7 +283,17 @@ impl<V: View> App<V> {
             tip: self.tip,
             popups: self.popups,
         };
-        let (next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
+        // Where each scroll view's reader is, to keep it across a reflow.
+        let anchors = crate::widgets::scroll_view::anchors(
+            &self.prev_tree,
+            self.interactions.by_node.iter().filter(|(_, h)| h.on_reflow.is_some()).map(|(id, _)| *id),
+        );
+        let (mut next, interactions) = render_continuing(&self.view, self.theme, state, &mut self.prev_tree);
+        for (id, y) in crate::widgets::scroll_view::reanchor(&mut next, &anchors) {
+            if let (Some(cb), Some(node)) = (interactions.get(id).and_then(|h| h.on_reflow.as_ref()), next.get(id)) {
+                cb(y, node);
+            }
+        }
         // The render pass laid it out (`Ctx::flush_overlays`).
         let deltas = if std::mem::take(&mut self.resend) {
             diff(&NodeTree::new(), &next)
