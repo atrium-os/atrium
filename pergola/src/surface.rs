@@ -174,6 +174,8 @@ pub struct FrescoSurface {
     atlas_seen: Option<u64>,
     /// Images bound to texture slots, by image id.
     images: std::collections::HashSet<u32>,
+    /// Where this window's drawn edges went.
+    edges: Edges,
     /// The other windows' slot and scroll state (pop-ups,
     /// [`FrescoSurface::select`]): slots are per window.
     others: std::collections::HashMap<u32, WindowState>,
@@ -185,6 +187,7 @@ struct WindowState {
     scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
     atlas_seen: Option<u64>,
     images: std::collections::HashSet<u32>,
+    edges: Edges,
 }
 
 /// Image texture slots: this bit plus the image's id.
@@ -211,6 +214,129 @@ pub fn snap_span(x: f32, w: f32, k: f32) -> (f32, f32) {
     (x0, (((x + w) * k).round() - x0).max(1.0))
 }
 
+/// Where drawn edges went, per group, so an edge 2 pt or less from one
+/// already placed is placed from it: a box inset by a 1 pt border, a
+/// divider at a box's edge or a child group inside its parent then keeps
+/// its border `max(1, round(d x k))` pixels wide on every side, which
+/// snapping each edge on its own cannot do at a scale like 1.5
+/// (resolution-independence.md §5).
+#[derive(Default)]
+struct Edges {
+    /// The scale these were placed at; a new one starts over.
+    k: f32,
+    /// Per group (`ROOT` for the window), per axis, a placed edge in points
+    /// (in 1/64 pt) to its device position and how many nodes hold it.
+    groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, (f32, u32)>; 2]>,
+    /// The edges each node holds, to let go when it changes or goes.
+    nodes: std::collections::HashMap<u32, (u32, Vec<(u8, i32)>)>,
+    /// Each group's own box: points `w`, `h`, pixels `dw`, `dh`.
+    bounds: std::collections::HashMap<u32, [f32; 4]>,
+}
+
+const ROOT: u32 = u32::MAX;
+/// How far a related edge may be, in points: a border or a divider.
+const NEAR: f32 = 2.0;
+
+fn edge_key(e: f32) -> i32 { (e * 64.0).round() as i32 }
+
+impl Edges {
+    fn reset_if(&mut self, k: f32) {
+        if self.k != k {
+            *self = Edges { k, ..Default::default() };
+        }
+    }
+
+    /// The device position of edge `e` on `axis` in `group`. `toward` is
+    /// the side the span lies on (+1 a start edge, -1 an end edge): an edge
+    /// is placed from one at the same point, else from the nearest placed
+    /// edge outside the span within [`NEAR`], else rounded.
+    fn place(&self, group: u32, axis: u8, e: f32, toward: f32) -> f32 {
+        let k = self.k;
+        let key = edge_key(e);
+        let own = self.bounds.get(&group).map(|&[w, h, dw, dh]| {
+            let (len, dev) = if axis == 0 { (w, dw) } else { (h, dh) };
+            [(edge_key(0.0), 0.0), (edge_key(len), dev)]
+        });
+        let reach = edge_key(NEAR);
+        let held = self.groups.get(&group).map(|g| g[axis as usize].range(key - reach..=key + reach));
+        let all = own.iter().flatten().copied().chain(held.into_iter().flatten().map(|(&b, &(dev, _))| (b, dev)));
+        // The same point, else outside the span first (a box's own
+        // border), then inside.
+        let mut best: Option<(f32, f32)> = None;
+        for (b, dev) in all {
+            if b == key {
+                return dev;
+            }
+            // In whole 1/64 pt, so a 1 pt inset is exactly 1 pt.
+            let dist = (key - b).abs() as f32 / 64.0;
+            if dist > NEAR {
+                continue;
+            }
+            let outside = (key - b) as f32 * toward > 0.0;
+            let rank = dist + if outside { 0.0 } else { NEAR };
+            if best.map_or(true, |(r, _)| rank < r) {
+                let px = (dist * k).round().max(1.0);
+                best = Some((rank, if key > b { dev + px } else { dev - px }));
+            }
+        }
+        best.map_or((e * k).round(), |(_, d)| d)
+    }
+
+    /// A span (`x`, `w` in points) on `axis` in `group`, in device pixels,
+    /// like [`snap_span`] but placed from the edges near it.
+    fn span(&self, group: u32, axis: u8, x: f32, w: f32) -> (f32, f32) {
+        let x0 = self.place(group, axis, x, 1.0);
+        if w <= 0.0 {
+            return (x0, 0.0);
+        }
+        if w <= NEAR {
+            return (x0, (w * self.k).round().max(1.0));
+        }
+        let x1 = self.place(group, axis, x + w, -1.0);
+        (x0, (x1 - x0).max(1.0))
+    }
+
+    /// Note a node's placed edges, (axis, points, device) each.
+    fn hold(&mut self, node: u32, group: u32, edges: &[(u8, f32, f32)]) {
+        self.drop_node(node);
+        let g = self.groups.entry(group).or_default();
+        let mut keys = Vec::with_capacity(edges.len());
+        for &(axis, e, dev) in edges {
+            let key = edge_key(e);
+            g[axis as usize].entry(key).or_insert((dev, 0)).1 += 1;
+            keys.push((axis, key));
+        }
+        self.nodes.insert(node, (group, keys));
+    }
+
+    /// A group's own box, `w` x `h` points drawn `dw` x `dh` pixels: its
+    /// contents are placed from these edges.
+    fn bounds(&mut self, group: u32, w: f32, h: f32, dw: f32, dh: f32) {
+        self.bounds.insert(group, [w, h, dw, dh]);
+    }
+
+    fn drop_node(&mut self, node: u32) {
+        let Some((group, keys)) = self.nodes.remove(&node) else { return };
+        if let Some(g) = self.groups.get_mut(&group) {
+            for (axis, key) in keys {
+                let m = &mut g[axis as usize];
+                match m.get_mut(&key) {
+                    Some(v) if v.1 > 1 => v.1 -= 1,
+                    Some(_) => { m.remove(&key); }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// `node` is gone, and with it what it held and, if a group, its box.
+    fn forget(&mut self, node: u32) {
+        self.drop_node(node);
+        self.groups.remove(&node);
+        self.bounds.remove(&node);
+    }
+}
+
 /// The wire id of a filled Stack's background rect.
 fn background_id(id: NodeId) -> u32 {
     id.0 | crate::node::DERIVED_BIT
@@ -224,6 +350,7 @@ impl FrescoSurface {
         Self {
             conn, window_id, fonts: std::collections::HashMap::new(), scale, scrolls: Default::default(),
             atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, images: Default::default(),
+            edges: Default::default(),
             others: Default::default(),
         }
     }
@@ -237,12 +364,14 @@ impl FrescoSurface {
             scrolls: std::mem::take(&mut self.scrolls),
             atlas_seen: self.atlas_seen,
             images: std::mem::take(&mut self.images),
+            edges: std::mem::take(&mut self.edges),
         };
         self.others.insert(self.window_id, mine);
         let w = self.others.remove(&window).unwrap_or_default();
         self.scrolls = w.scrolls;
         self.atlas_seen = w.atlas_seen;
         self.images = w.images;
+        self.edges = w.edges;
         self.window_id = window;
         self.conn.set_default_window(window as u16);
     }
@@ -310,10 +439,24 @@ impl FrescoSurface {
         })
     }
 
-    fn rect_params(&self, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
+    /// `rect` (points, in `group`) in device pixels, its edges placed
+    /// from those near it, and held by `id` for what comes after.
+    fn place_rect(&mut self, id: u32, group: Option<NodeId>, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
+        self.edges.reset_if(self.scale);
+        self.edges.drop_node(id);
+        let g = group.map_or(ROOT, |g| g.0);
+        let (x, w) = self.edges.span(g, 0, rect.x(), rect.w());
+        let (y, h) = self.edges.span(g, 1, rect.y(), rect.h());
+        self.edges.hold(id, g, &[
+            (0, rect.x(), x), (0, rect.x() + rect.w(), x + w),
+            (1, rect.y(), y), (1, rect.y() + rect.h(), y + h),
+        ]);
+        (x, y, w, h)
+    }
+
+    fn rect_params(&mut self, id: u32, group: Option<NodeId>, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
         let k = self.scale;
-        let (x, w) = snap_span(rect.x(), rect.w(), k);
-        let (y, h) = snap_span(rect.y(), rect.h(), k);
+        let (x, y, w, h) = self.place_rect(id, group, rect);
         fresco_protocol::RectParams {
             x, y, w, h,
             r: fill.r, g: fill.g, b: fill.b, a: fill.a,
@@ -331,19 +474,20 @@ impl FrescoSurface {
         let Node::Scroll { rect, offset, offset_x, zoom, stretch, backdrop, .. } = node else { unreachable!() };
         use fresco_protocol::{group_flags, GroupParams};
         let k = self.scale;
+        let (x, y, w, h) = self.place_rect(id.0, group, *rect);
         let mut outer = GroupParams {
             parent: group.map(|g| g.0),
             order,
             transform: GroupParams::IDENTITY,
-            clip: Some([(rect.x() * k).round(), (rect.y() * k).round(), ((rect.x() + rect.w()) * k).round(), ((rect.y() + rect.h()) * k).round()]),
+            clip: Some([x, y, x + w, y + h]),
             opacity: 1.0,
             flags: group_flags::SCROLL,
         };
         // Whole device pixels, so what the group holds keeps its snapped
         // edges (resolution-independence.md §5).
-        outer.transform[4] = (rect.x() * k).round();
-        outer.transform[5] = (rect.y() * k).round();
-        let back = backdrop.map(|c| [0.0, 0.0, (rect.w() * k).round(), (rect.h() * k).round(), c.r, c.g, c.b, c.a, 0.0]);
+        outer.transform[4] = x;
+        outer.transform[5] = y;
+        let back = backdrop.map(|c| [0.0, 0.0, w, h, c.r, c.g, c.b, c.a, 0.0]);
         let (old_outer, old_back) = match self.scrolls.get(&id.0) {
             Some(&(o, b)) => (Some(o), Some(b)),
             None => (None, None),
@@ -399,7 +543,7 @@ impl Surface for FrescoSurface {
         let k = self.scale;
         match node {
             Node::Rect { rect, fill, radius } => {
-                let params = self.rect_params(*rect, *fill, *radius);
+                let params = self.rect_params(id.0, group, *rect, *fill, *radius);
                 self.conn.scene_node_rect(id.0, params)?;
             }
             Node::Text { rect, content, style } => {
@@ -424,11 +568,19 @@ impl Surface for FrescoSurface {
                 let (mut cx, mut cy) = ((p0.0 + p1.0) * 0.5 * k, (p0.1 + p1.1) * 0.5 * k);
                 // A horizontal or vertical rule is a whole number of device
                 // pixels wide, its edges on pixel boundaries (§5).
-                let width = if dx == 0.0 || dy == 0.0 {
-                    let w = (*width * k).round().max(1.0);
-                    let snap = |c: f32| (c - w / 2.0).round() + w / 2.0;
-                    if dy == 0.0 { cy = snap(cy) } else { cx = snap(cx) }
-                    w
+                let width = if (dx == 0.0) != (dy == 0.0) {
+                    // As the rect it covers, so it lines up with the
+                    // edges near it.
+                    let (w, c) = (*width, ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5));
+                    if dy == 0.0 {
+                        let (_, y, _, h) = self.place_rect(id.0, group, crate::geom::Rect::new(p0.0.min(p1.0), c.1 - w / 2.0, dx.abs(), w));
+                        cy = y + h / 2.0;
+                        h
+                    } else {
+                        let (x, _, w, _) = self.place_rect(id.0, group, crate::geom::Rect::new(c.0 - w / 2.0, p0.1.min(p1.1), w, dy.abs()));
+                        cx = x + w / 2.0;
+                        w
+                    }
                 } else {
                     *width * k
                 };
@@ -453,9 +605,7 @@ impl Surface for FrescoSurface {
                     let hash = self.conn.upload_blob(&d.rgba)?;
                     self.conn.slot_set_texture(slot, hash, d.width, d.height, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
                 }
-                let r = *rect;
-                let (x, w) = snap_span(r.x(), r.w(), k);
-                let (y, h) = snap_span(r.y(), r.h(), k);
+                let (x, y, w, h) = self.place_rect(id.0, group, *rect);
                 self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x, y, w, h, slot_id: slot })?;
             }
             Node::Glyphs { origin, face, size, color, glyphs } => {
@@ -483,15 +633,21 @@ impl Surface for FrescoSurface {
             opacity: 1.0,
             flags: 0,
         };
-        // Whole device pixels, so its contents keep their snapped edges.
-        g.transform[4] = (rect.x() * k).round();
-        g.transform[5] = (rect.y() * k).round();
+        // Whole device pixels, placed from the edges near it, so its
+        // contents keep their snapped edges and an inset keeps its border.
+        let (x, y, w, h) = self.place_rect(id.0, group, *rect);
+        self.edges.bounds(id.0, rect.w(), rect.h(), w, h);
+        g.transform[4] = x;
+        g.transform[5] = y;
         self.conn.scene_group(id.0, g)?;
         let bg = background_id(id);
         match fill {
             Some(f) => {
-                let local = crate::geom::Rect::new(0.0, 0.0, rect.w(), rect.h());
-                let params = self.rect_params(local, *f, *radius);
+                let params = fresco_protocol::RectParams {
+                    x: 0.0, y: 0.0, w, h,
+                    r: f.r, g: f.g, b: f.b, a: f.a,
+                    radius: radius * k,
+                };
                 self.conn.scene_node_rect(bg, params)?;
                 self.conn.scene_place(bg, Some(id.0), 0)
             }
@@ -501,6 +657,7 @@ impl Surface for FrescoSurface {
 
     fn clear_node(&mut self, id: NodeId) -> io::Result<()> {
         self.scrolls.remove(&id.0);
+        self.edges.forget(id.0);
         self.conn.scene_node_clear(id.0)
     }
 
@@ -534,5 +691,53 @@ mod tests {
         assert_eq!(snap_span(10.0, 0.0, 1.5), (15.0, 0.0));
         assert_eq!(snap_span(0.0, 0.5, 1.25), (0.0, 1.0), "a hairline is at least a pixel");
         assert_eq!(snap_span(3.0, 50.0, 1.0), (3.0, 50.0), "1.0 is unchanged");
+    }
+
+    /// A box inset by a 1 pt border inside another, as siblings or as a
+    /// group in a group, has its border equally wide on all four sides at
+    /// every scale, and a divider at a box's edge sits inside it.
+    #[test]
+    fn borders_are_even_on_every_side() {
+        use super::{Edges, ROOT};
+        for k in [1.0f32, 1.25, 1.375, 1.5, 1.75, 2.0, 2.25] {
+            let line = (1.0 * k).round().max(1.0);
+            for x in [0.0f32, 0.3, 7.0, 10.5, 33.3, 101.9, 250.25] {
+                for w in [20.0f32, 33.5, 100.0, 141.7] {
+                    let mut e = Edges::default();
+                    e.reset_if(k);
+                    // Siblings: the edge rect, then the body inset by 1 pt.
+                    let (ox, ow) = e.span(ROOT, 0, x, w);
+                    e.hold(1, ROOT, &[(0, x, ox), (0, x + w, ox + ow)]);
+                    let (ix, iw) = e.span(ROOT, 0, x + 1.0, w - 2.0);
+                    e.hold(2, ROOT, &[(0, x + 1.0, ix), (0, x + w - 1.0, ix + iw)]);
+                    assert_eq!(ix - ox, line, "near border at {k}, x {x}, w {w}");
+                    assert_eq!(ox + ow - (ix + iw), line, "far border at {k}, x {x}, w {w}");
+                    // A group: its box is its contents' frame.
+                    e.bounds(7, w, w, ow, ow);
+                    let (cx, cw) = e.span(7, 0, 1.0, w - 2.0);
+                    assert_eq!((cx, ow - (cx + cw)), (line, line), "child inset at {k}, w {w}");
+                    // A 1 pt divider at the bottom of the group.
+                    let (dy, dh) = e.span(7, 1, w - 1.0, 1.0);
+                    assert_eq!((dy + dh, dh), (ow, line), "divider at the bottom at {k}, w {w}");
+                    // Something unrelated is rounded as before.
+                    assert_eq!(e.span(7, 0, w / 2.0 - 0.3, 3.0 + w / 4.0).0, ((w / 2.0 - 0.3) * k).round());
+                }
+            }
+        }
+    }
+
+    /// A node that moves lets go of where it was.
+    #[test]
+    fn a_moved_node_lets_go_of_its_old_edges() {
+        use super::{Edges, ROOT};
+        let mut e = Edges::default();
+        e.reset_if(1.5);
+        e.hold(1, ROOT, &[(0, 10.0, 15.0)]);
+        assert_eq!(e.span(ROOT, 0, 11.0, 1.0).0, 17.0, "placed from 10");
+        e.drop_node(1);
+        assert_eq!(e.span(ROOT, 0, 11.0, 1.0).0, (11.0f32 * 1.5).round());
+        e.hold(1, ROOT, &[(0, 10.0, 15.0)]);
+        e.forget(1);
+        assert!(e.groups[&ROOT][0].is_empty());
     }
 }

@@ -160,10 +160,15 @@ half a pixel and sizes by at most one, at 1.0 too, where layout gives fractional
 (centred content).
 
 Live check (Mac VM, 2026-11-14): at 1.25 every 1 pt border is a solid 1 px. At 1.5 a
-bordered box's far edge (bottom, sometimes right) is 1 px where the near edge is 2, because
-a border is an outer rect plus a body inset by 1 pt and the two snap independently. The fix
-is to snap a body against its parent's already-snapped edges, which means `Surface::set_node`
-learns the parent rect. Open.
+bordered box's far edge came out 1 px where the near edge was 2, because a border is an
+outer rect plus a body inset by 1 pt and each edge was snapped on its own; no rounding of
+single edges can make every 1 pt step 2 px at 1.5. Fixed (2026-11-14): `FrescoSurface` keeps,
+per group, where each drawn edge went, and places an edge 2 pt or less from one already
+placed from that one (`max(1, round(d x k))` pixels away), preferring the edge outside the
+span; a group's own box (0 and its size) counts as placed edges for what it holds. So a
+border inset, a child group's inset and a divider at a box's edge are equally wide on all
+sides at every scale, and neighbours that share an edge still meet. Unrelated edges round
+as before. Not yet re-checked live.
 
 ## 6. Text size and relative sizing of widgets
 
