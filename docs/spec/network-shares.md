@@ -1,0 +1,326 @@
+# Network shares: SMB, SFTP, WebDAV and NFS in Scrinium
+
+**Status:** proposal 2026-11-14 (Shankar asked whether the file manager mounts
+network shares and, if it belongs there, for a security audit of doing it
+properly with the credentials). Nothing here is built. Decisions are in §9.
+**Scope:** connecting to a file server on the LAN or the internet, showing it
+in Scrinium next to the sticks, handing its files and folders to apps through
+the picker, and where the passwords and keys live.
+
+## 1. Short answer
+
+- **Today Scrinium has no network mounts.** The kernel can't do them either:
+  `std.atrium` removes the NFS client, krpc and kgssapi, and `smbfs` can't be
+  loaded (kernel-hardening.md §2). That stays.
+- **It belongs in Scrinium as a place, not as code inside Scrinium.** The user
+  adds a server in Scrinium and sees it in the sidebar; the protocol, the
+  network and the password are handled by pieces Scrinium can't reach.
+- **Each share is served by its own jailed user-space FUSE server**, the
+  same shape as a stick's Capsa server (device-assignment.md §6.4): Rust,
+  one share per process, Capsicum, a sysfil profile, a vnet whose pf lets it
+  reach that one server and nothing else. The server's bytes are hostile
+  input, and the worst a server exploit gets is that one share's own
+  credential.
+- **Passwords and keys stay in Arca.** The user types them into Arca's own
+  credential sheet, never into Scrinium. Arca releases a password to a share
+  server only after that server has proved who it is (an SSH host key, a TLS
+  certificate, Kerberos), the courier rule of arca.md §5. An SSH key never
+  leaves Arca at all: Arca signs.
+- **Everything after the mount is what sticks already have:** a 0700 mount
+  for the session's user, Scrinium's standing grant, the picker handing an
+  app one file or one folder (scrinium.md §4), gone on lock and on
+  disconnect.
+- **The weak spot is SMB with a password and no Kerberos:** NTLM can't
+  authenticate the server, so anyone who can pose as it on the LAN can try
+  to crack the password offline. SMB 3.1.1 with encryption and a strict
+  dialect floor limits what they get, and the UI says so (§5.3).
+
+Order to build, by how well each protocol can be secured: **SFTP**, then
+**WebDAV over HTTPS**, then **SMB 3.1.1**. **NFS** only as NFSv4 with
+Kerberos (`krb5p`), later, or not at all.
+
+## 2. What is at stake
+
+| Asset | Where it is | Who must not get it |
+|---|---|---|
+| A share's password or token | Arca, class while-unlocked | every app, Scrinium, every other share's server, a server posing as this one |
+| An SSH private key | Arca, use-not-read | everyone; only signatures leave Arca |
+| The files on the share | the server; in flight; in the mount | apps the user did not pick them for; other users of the machine; the LAN |
+| The user's identity and machine name | the user's head and the machine | LAN observers, servers that don't need it |
+| The machine itself | kernel, other jails | a hostile server sending crafted replies |
+
+## 3. Threats
+
+| Attacker | Wants | What stops it (section) |
+|---|---|---|
+| **Hostile or compromised server** | code execution on the client from crafted replies; the user's other credentials | parsing only in that share's jail, Rust, fuzzed, bounded allocations (§4.1); it is only ever given its own credential (§5.1); FUSE is the only way its data reaches the kernel, already used for sticks |
+| **LAN attacker** (same Wi-Fi, café, hotel) | pose as the server to get the password; read or change files in flight; downgrade the protocol | server identity checked before any credential is released (§5.1); pinned SSH host keys, TLS, SMB 3.1.1 pre-auth integrity and encryption, no SMB1/2.x, no guest fallback (§5.3); pf pins the server's address (§4.3) |
+| **Spoofed discovery** | the user picks "NAS" that is really the attacker | discovery lists names only, and a name never inherits a saved credential; the identity check is what counts (§6.4) |
+| **Malicious app** | the share's password; files it wasn't given; to make the system connect somewhere and leak a hash | apps never see credentials or the mount, only picked items (§6.2); no app or document can start a connection: only the user in Scrinium can (§6.3) |
+| **Malicious link or document** (`smb://evil/x`, `\\evil\x`, a `.desktop`-style shortcut) | the classic NTLM hash leak: make the client authenticate to the attacker | there is no URL handler that connects with credentials; a link can at most open Scrinium's "Connect to server" form filled in, and a server never gets a credential saved for another (§6.3) |
+| **Compromised Scrinium** | passwords; other users' shares | it never holds a password (§5.2); it sees the files of mounted shares, as it sees sticks |
+| **Compromised share server** | other shares, other credentials, the user's files | it has one share's credential and network reach to one host; no filesystem but its own `/dev/fuse` (§4.1) |
+| **Someone at the locked or stolen machine** | saved passwords; cached files | credentials are while-unlocked and Arca's keys are evicted at lock; shares are unmounted at lock; nothing is cached on disk (§7) |
+| **A server that hangs or lies** | freeze apps; exhaust memory or disk | every FUSE reply has a deadline and becomes `EIO`, never a hang in the kernel; sizes and names are checked (§4.2) |
+
+Out of scope: a server the user really trusts doing bad things with the files
+the user gave it, and an attacker who already has root on this machine.
+
+## 4. The share server
+
+### 4.1 Shape
+
+One process per mounted share: `atrium-share-sftp`, `atrium-share-dav`,
+`atrium-share-smb` (names to be decided). It is started by the mount manager
+(§6.1) through jaild, like a Capsa server, and holds:
+
+- an already-mounted `/dev/fuse` descriptor (jaild's `fuse` request mounts
+  fusefs from outside the jail, device-assignment.md §6.4), so the server
+  can't choose where it is mounted or with what options;
+- one socket to Arca, through which it can ask only for the items whose
+  recipient is this share (§5.1);
+- a network: its own vnet (`Routed`), with a pf anchor passing only the
+  server's address and port, as Arca's courier jails do (arca.md §5.4).
+
+No other files, no `/dev` beyond the fuse fd, Capsicum after setup, a
+`networked` sysfil profile, racct limits on memory and descriptors. It runs as
+its own uid from a fixed range, not as the user.
+
+### 4.2 What it checks in the server's replies
+
+Everything from the network is hostile:
+
+- **Protocol parsing** in Rust with no `unsafe` beyond the FUSE and socket
+  calls, every length bounded before it is allocated, every parser a fuzz
+  target (SSH/SFTP packets, HTTP and PROPFIND XML, SMB2 headers, NTLM
+  messages, NFS XDR).
+- **Names.** Refused or hidden: `/` or NUL inside a name, `.` and `..`,
+  names over 255 bytes, invalid UTF-8 (shown escaped later, as on sticks),
+  control characters. Two names that differ only by Unicode normalisation or
+  case on a case-insensitive server: the second is hidden, so one name
+  never means two files.
+- **Symlinks on the server** are not followed by the server and are shown as
+  links Scrinium won't open (as on sticks, scrinium.md §2.2). Mounts are
+  `nosuid,noexec` with no device nodes, so nothing on a share can become
+  setuid or a device here.
+- **Sizes and counts.** A directory listing is capped (entries and bytes);
+  a read returns at most what was asked; a file whose size changes under a
+  read is reported as such, not trusted.
+- **Time.** Every request to the server has a deadline (connect, first byte,
+  idle). When it passes, the FUSE reply is `EIO` (or `ETIMEDOUT`), so an app
+  reading a file on a dead server gets an error instead of a process stuck
+  in the kernel. The mount stays, marked disconnected in Scrinium, and
+  reconnects on the next access.
+
+### 4.3 The network
+
+- The address is resolved once, through the system resolver, and the share
+  server's pf anchor is set to that address alone before the server starts
+  (no DNS rebinding: the name can't later point at something else).
+- LAN addresses are allowed for a share because the user typed or picked
+  that server: adding a share is the private-network grant nuntius.md §4
+  describes, scoped to one address and port. The cloud metadata address is
+  never allowed.
+- Nothing listens. The client announces nothing on mDNS.
+- What the client tells a server is the minimum: SSH client banner
+  `SSH-2.0-Atrium`, SMB workstation name empty (NTLM allows it), no domain
+  unless the user gave one, WebDAV `User-Agent: Atrium`.
+
+## 5. Credentials
+
+### 5.1 The rule: identity first, then the secret
+
+Each saved share is an Arca item whose **recipient** is the share:
+`(protocol, host, port, share or path, server identity)`. The server
+identity is:
+
+| protocol | identity | first connection |
+|---|---|---|
+| SFTP | the SSH host key (Ed25519 or ECDSA preferred; RSA ≥ 3072 with SHA-2; no DSA, no SHA-1) | shown as a fingerprint for the user to accept, then pinned in the item. A changed key later is a hard stop with its own sheet, never a click-through |
+| WebDAV | the TLS certificate for the host name, through the system trust store (docs/TLS.md); optionally pinned | a certificate that doesn't validate is refused; a self-signed NAS can be pinned by fingerprint, shown as such |
+| SMB with Kerberos | the service ticket for `cifs/host` | via the user's realm, later |
+| SMB with a password | **none that a password protocol can prove** (§5.3) | the host's address and the server's GUID are recorded and a change is shown, but that is a hint, not proof |
+| NFSv4 with `krb5p` | the service ticket for `nfs/host` | via the realm, later |
+
+The share server connects, completes the handshake up to the point where
+the server's identity is known, and **only then** asks Arca for its item.
+Arca releases it only if the identity the server reports matches the item's
+recipient. Arca knows which share server is asking from its uid (one uid per
+running share, registered by the mount manager the way couriers are,
+arca.md §5.3), so a share server can never ask for another share's item.
+
+- **Passwords** go to the share server for the one login, are wiped after
+  it, and are fetched again on a reconnect.
+- **SSH keys** never leave Arca: the share server asks Arca to sign the
+  SSH authentication challenge (Arca's `arca_sign`, the ssh-agent model of
+  arca.md §9), bound to that share's recipient.
+- **Tokens** (WebDAV services with OAuth, later) are courier-attached like
+  any HTTP bearer item.
+
+### 5.2 Entering a password
+
+Scrinium's "Connect to server" form takes the address and the user name. The
+password field is not Scrinium's: it is a Limen `credential` slot filled by
+`arca-ui` (arca-autofill.md), so the text the user types goes to Arca and
+Scrinium only learns "saved" or "wrong password". "Remember" is Arca's
+choice to keep the item; without it the item lives until the share is
+disconnected.
+
+A password is offered for a share only to the recipient it was saved for.
+Saving the same password for two servers is two items, each bound to its
+own.
+
+### 5.3 SMB without Kerberos, honestly
+
+Home NAS boxes and Windows shares almost always use NTLMv2 with a password.
+NTLMv2 proves the client to the server, never the server to the client. So a
+LAN attacker who can answer for the server's address gets an NTLMv2
+response, which is an offline-crackable function of the password, and can
+try to relay it to another server.
+
+What the share server does about it:
+
+- **SMB 3.1.1 only**, with the pre-authentication integrity hash
+  (SHA-512): an attacker in the middle can't change the negotiation, so no
+  downgrade to an older dialect, an unsigned session or a weaker cipher.
+- **Encryption required** (AES-128-GCM or AES-256-GCM); a server that won't
+  encrypt is refused, with a sheet that says why. Signing alone is not
+  enough because it leaves the files readable on the wire.
+- **No SMB1, no 2.x, no guest or anonymous fallback**, no plaintext or LM
+  or NTLMv1, ever.
+- **No credentials to a server the user didn't add**, and the server is
+  pinned by address at mount (§4.3), so an attacker has to win the address
+  on the LAN, not just a name.
+- **The UI says what this protects.** The first time a password-only SMB
+  share is added, Scrinium shows one line: someone on this network could
+  try to guess this password; use one you use nowhere else. Kerberos,
+  when there is a realm, removes this.
+
+What it can't fix: an attacker on the LAN who takes the server's address
+gets one NTLMv2 response per connection to crack. That is the protocol, and
+macOS, Windows and Linux clients have the same exposure.
+
+### 5.4 NFS
+
+NFS with `AUTH_SYS` (the default nearly everywhere) has no authentication:
+the client states a uid and the server believes it. Any process that can
+send packets from an allowed address can be anyone. There's nothing a client
+can do to make that safe. Recommendation: no NFS in the first versions; if
+it comes, NFSv4.1 with `krb5p` only, through a user-space client in the same
+jail shape (the kernel's stays removed).
+
+## 6. How it fits Atrium
+
+### 6.1 Who mounts
+
+The **mount manager** is the piece that today serves sticks: dispensatord's
+media side (device-assignment.md §6.5, §6.11). A share becomes another
+volume next to sticks, so the session mount (0700 at `/media/<name>`),
+Scrinium's standing grant, the picker's file descriptors and folder grants,
+eject (here: disconnect), lock and logout all work unchanged.
+
+What changes in dispensatord is small and has no network code in it: it
+gains a "share" volume source with `CONNECT {protocol, host, port, path,
+user}` and `DISCONNECT`, it starts the share server through jaild with a
+mounted `/dev/fuse` and the vnet of §4.1, and registers its uid with Arca.
+dispensatord never parses a byte from the network and never holds a
+credential. Alternative: a separate daemon for shares; it would duplicate
+the grant code, so not recommended (§9, D3).
+
+`CONNECT` is accepted from the session's user's file manager only
+(`removable-files` holder, or a new capability `network-shares`; D4), with an
+unlocked session, like `ATTACH_ALL`.
+
+### 6.2 Apps
+
+Apps never see a share's mount or its credential. An app gets a file or a
+folder from a share exactly as from a stick: the user picks it in the
+picker, the file comes as a descriptor (scrinium.md §4.2) and the folder as
+a grant mount in the app's jail (§4.3). A folder grant on a share is the
+same FUSE server serving a second mount rooted at that folder, owned by the
+app's uid.
+
+### 6.3 Who may start a connection
+
+Only the user, in Scrinium's "Connect to server" form or by opening a saved
+share in its sidebar. Nothing else can make the system connect to a file
+server:
+
+- no `smb://`, `sftp://` or `\\host\share` handler that mounts or
+  authenticates; a link to one opens the form with the address filled in,
+  and the user still presses Connect;
+- no connection at login unless the user ticked "connect at login" for
+  that share (D8), and then only to the pinned identity;
+- an app can't ask for a share to be mounted, only for the picker.
+
+This is what closes the SMB hash-leak class of attack (a document or page
+that makes the client authenticate to the attacker's host).
+
+### 6.4 Discovery
+
+Browsing the LAN for servers (mDNS/DNS-SD `_smb._tcp`, `_sftp-ssh._tcp`,
+`_webdavs._tcp`) is untrusted input and a privacy question. Not in the first
+version: the user types the address. When it comes, it runs in its own
+small jail, shows names and addresses only, and a discovered name never
+inherits a saved credential: adding it is a new share with its own identity
+check.
+
+## 7. At rest, lock, and the end of a session
+
+- **No disk cache** in the first version: reads go to the server. If a
+  cache comes later it is in the session's encrypted area and dropped at
+  logout.
+- **Lock:** shares are unmounted like sticks, and Arca evicts the
+  while-unlocked keys. Unlocking remounts the shares that were mounted,
+  through the same identity-first login (D7).
+- **Logout, user switch:** unmounted; the share servers' jails are removed.
+- **Disconnect** (Scrinium's eject button on a share) ends the share
+  server, its grants and its session with the server.
+- Files open from a share when it goes get `EIO`, as on an unplugged stick.
+
+## 8. What the gate must show
+
+A VM gate in the style of `vm-scrinium-check.sh`, with servers on the host:
+OpenSSH sftp-server, a WebDAV server over TLS, Samba with SMB 3.1.1
+encryption. It checks:
+
+- the password reaches Arca only through arca-ui, and Scrinium's log and
+  memory never hold it;
+- a server with a changed SSH host key, a bad certificate, or an SMB server
+  that refuses encryption or offers only SMB2: refused before any
+  credential leaves Arca (Arca logs no release);
+- a share server can't fetch another share's item (asks, is refused);
+- the share server's jail can reach the server's address and port only
+  (a connect elsewhere fails);
+- a fuzzed or stalling server: `EIO` within the deadline, no hang, the
+  server process bounded;
+- the picker hands a file and a folder from a share to an app, as for a
+  stick; lock unmounts; unlock remounts with a fresh login.
+
+## 9. Decisions, with recommendations
+
+| # | Decision | Recommendation |
+|---|---|---|
+| D1 | Kernel clients (smbfs, NFS) or user-space? | User-space, one jailed FUSE server per share; kernel clients stay removed |
+| D2 | Which protocols, in what order | SFTP, then WebDAV over HTTPS, then SMB 3.1.1; NFS not now (NFSv4.1 `krb5p` only, if ever) |
+| D3 | Who mounts | dispensatord's media side, as another volume source (no network code in it); not a new daemon |
+| D4 | Which app may connect shares | the file manager, via a new restricted capability `network-shares` (separate from `removable-files`, so a stick-only file manager can't reach the network) |
+| D5 | Credentials | Arca items bound to protocol, host, port, path and server identity; released only after the identity check; SSH keys sign inside Arca and never leave |
+| D6 | Password entry | arca-ui in a Limen credential slot inside Scrinium's form; Scrinium never sees it |
+| D7 | Lock | unmount at lock, remount at unlock (like sticks) |
+| D8 | Connect at login | off by default; per share opt-in, to the pinned identity only |
+| D9 | SMB floor | 3.1.1 only, encryption required, no NTLMv1/LM/guest; Kerberos later; the one-line warning for password-only shares |
+| D10 | Links (`smb://`, `\\host`) | open the Connect form filled in; never mount or authenticate on their own |
+| D11 | Discovery | not in the first version; later in its own jail, names only |
+| D12 | Disk cache | none in the first version |
+| D13 | Protocol code | own Rust clients for SMB and WebDAV; for SSH, an existing pure-Rust SSH crate audited and fuzzed, or our own transport if review finds it wanting |
+
+## 10. Build order once accepted
+
+1. **S1 SFTP:** share-volume source in dispensatord, the jail/vnet/pf
+   setup, `atrium-share-sftp` with Arca host-key pinning and signing,
+   Scrinium's Connect form with the arca-ui slot, the gate's SFTP part.
+2. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
+3. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
+   exists.
+4. **S4** disconnected-state UI, reconnect, "connect at login".
