@@ -35,9 +35,10 @@ fn frame(r: &mut Rect, to: Rect) {
 }
 
 impl Button {
-    /// Its width: as given, or the label with `sm` padding each side.
+    /// Its width: as given, or the label with `sm` padding each side
+    /// (em-based: it grows with the text size).
     pub fn natural_width(&self) -> f32 {
-        if self.rect.w() > 0.0 { self.rect.w() } else { text_w(&self.label, type_size::MD, Weight::Medium) + 2.0 * space::SM }
+        if self.rect.w() > 0.0 { self.rect.w() } else { text_w(&self.label, type_size::MD, Weight::Medium) + 2.0 * size::em(space::SM) }
     }
 }
 

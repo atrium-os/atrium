@@ -186,7 +186,9 @@ impl Menu {
                 l + k
             })
             .fold(0.0, f32::max);
-        (2.0 * MENU_INSET + 2.0 * space::SM + gutter + widest).ceil().min(MENU_MAX_W)
+        // Paddings and the widest a menu may be are em-based: at a large
+        // text size a menu grows rather than cutting its labels.
+        (2.0 * MENU_INSET + 2.0 * size::em(space::SM) + gutter + widest).ceil().min(size::em(MENU_MAX_W))
     }
 
     /// The menu's height for its items.
