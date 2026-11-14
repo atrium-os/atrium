@@ -107,9 +107,15 @@ pub struct SeriesData {
 }
 
 /// The cells of a one-row-or-column range, in order, at most `max`.
-fn cells(r: &Rect, max: usize) -> Vec<CellAddr> {
+/// The cells of `r` in rows the sheet shows (as Excel charts do: rows a filter or
+/// the user hid are left out), at most `max`.
+fn cells(wb: &Workbook, r: &Rect, max: usize) -> Vec<CellAddr> {
     let mut out = Vec::new();
+    let sh = wb.sheet(r.sheet);
     for row in r.r0..=r.r1 {
+        if sh.row_hidden(row) {
+            continue;
+        }
         for col in r.c0..=r.c1 {
             if out.len() >= max {
                 return out;
@@ -142,11 +148,11 @@ impl Chart {
             .enumerate()
             .map(|(i, s)| {
                 let vals: Vec<Option<f64>> = if ok_rect(wb, &s.vals) {
-                    cells(&s.vals, max).into_iter().map(|a| if let Value::Num(x) = wb.get(a) { Some(x) } else { None }).collect()
+                    cells(wb, &s.vals, max).into_iter().map(|a| if let Value::Num(x) = wb.get(a) { Some(x) } else { None }).collect()
                 } else {
                     Vec::new()
                 };
-                let cat_cells = s.cats.filter(|r| ok_rect(wb, r)).map(|r| cells(&r, max)).unwrap_or_default();
+                let cat_cells = s.cats.filter(|r| ok_rect(wb, r)).map(|r| cells(wb, &r, max)).unwrap_or_default();
                 let cats: Vec<String> = cat_cells.iter().map(|a| wb.formatted(*a).text).collect();
                 let kind = s.kind.unwrap_or(self.kind);
                 let xs = if kind == ChartKind::Scatter { cat_cells.iter().map(|a| if let Value::Num(x) = wb.get(*a) { Some(x) } else { None }).collect() } else { Vec::new() };
@@ -161,6 +167,12 @@ impl Chart {
     pub fn data_version(&self, wb: &Workbook) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Hidden rows leave the chart: their state is part of its data.
+        let mut sheets: Vec<u16> = self.series.iter().map(|s| s.vals.sheet).filter(|&s| (s as usize) < wb.sheet_count()).collect();
+        sheets.dedup();
+        for s in sheets {
+            wb.sheet(s).hidden.hash(&mut h);
+        }
         let mut col = |sheet: u16, c: u32| {
             if (sheet as usize) < wb.sheet_count() {
                 (sheet, c, wb.sheet(sheet).cols.get(c as usize).map_or(0, |c| c.generation)).hash(&mut h);
@@ -175,6 +187,7 @@ impl Chart {
         }
         for s in &self.series {
             for r in [Some(s.vals), s.cats].into_iter().flatten() {
+
                 for c in r.c0..=r.c1.min(r.c0 + 4096) {
                     col(r.sheet, c);
                 }
@@ -419,6 +432,16 @@ mod tests {
         assert_eq!(d[1].name, "Series2");
         assert_eq!(d[1].vals, [None, None, None]);
         assert_eq!(d[1].kind, ChartKind::Line);
+        // A hidden row (by a filter or by hand) drops out of the chart, and the
+        // version changes so a drawing is redone.
+        let v = c.data_version(&wb);
+        let row = c.series[0].vals.r0 + 1;
+        wb.sheet_mut(c.series[0].vals.sheet).hidden = vec![(row, row)];
+        assert_ne!(c.data_version(&wb), v);
+        let d = c.data(&wb, 1000);
+        assert_eq!(d[0].cats, ["Jan", "Mar"]);
+        assert_eq!(d[0].vals, [Some(3.0), Some(-1.0)]);
+        wb.sheet_mut(c.series[0].vals.sheet).hidden.clear();
         let mut w = Writer::new();
         c.encode(&mut w);
         let b = w.into_bytes();

@@ -1151,7 +1151,7 @@ The O4d/O4e engine features, usable in `atrium-sheets` (`src/data.rs`):
 
 Not yet: picking several values from a list (the menu works on the cursor's value),
 number conditions in the UI, totals rows, chart editing (titles, kinds, ranges),
-moving and sizing charts with the pointer; charts still show rows a filter hides.
+moving and sizing charts with the pointer. Charts leave out rows a filter (or the user) hides, as Excel's do.
 
 Gates: `atrium-sheets` tests (region and header, sort and undo, show only / hide /
 clear, table and chart from the region, undo all of it); the grid's op test (tables and
