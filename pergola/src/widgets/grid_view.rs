@@ -325,7 +325,7 @@ impl GridView {
             let page = ctx.push(Node::vstack(local, 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             // Window position of content point (px, py).
-            let at = |px: f64, py: f64| (body.x() + (px - bx) as f32, body.y() + (py - by) as f32);
+            let at = |px: f64, py: f64| (q(body.x() as f64 + (px - bx)), q(body.y() as f64 + (py - by)));
             if tiles_r.0 <= tiles_r.1 && tiles_c.0 <= tiles_c.1 {
                 for tr in tiles_r.0..=tiles_r.1 {
                     for tc in tiles_c.0..=tiles_c.1 {
@@ -361,11 +361,11 @@ impl GridView {
                                 let (shown, w) = fit_text(&cv, cw - 2.0 * PAD, &style);
                                 let tx0 = match cv.align {
                                     CellAlign::Left => cx + PAD,
-                                    CellAlign::Center => cx + (cw - w) / 2.0,
-                                    CellAlign::Right => cx + cw - PAD - w,
+                                    CellAlign::Center => cx + q(((cw - w) / 2.0) as f64),
+                                    CellAlign::Right => cx + q((cw - PAD - w) as f64),
                                 };
                                 let lh = TEXT_SIZE * 1.3;
-                                ctx.add(Node::Text { rect: Rect::new(tx0, cy + ((ch - lh) / 2.0).max(0.0), w, lh), content: shown, style });
+                                ctx.add(Node::Text { rect: Rect::new(tx0, cy + q(((ch - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
                             }
                         }
                         ctx.pop();
@@ -489,9 +489,17 @@ impl GridView {
             let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 3.0 * REBASE)) as f32, HEADER_H), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             if cols > 0 && tiles_c.0 <= tiles_c.1 {
-                for c in tiles_c.0 * TILE_COLS..=((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 {
+              for tc in tiles_c.0..=tiles_c.1 {
+                // One group per tile of columns, so a new base moves the
+                // group and sends nothing inside it.
+                let (c0, c1) = (tc * TILE_COLS, ((tc + 1) * TILE_COLS).min(cols) - 1);
+                let gx = q(ch_rect.x() as f64 + (src.col_left(c0) - bx));
+                ctx.key(1 << 40 | tc as u64);
+                let grp = ctx.push(Node::vstack(Rect::new(gx, ch_rect.y(), (src.col_left(c1 + 1) - src.col_left(c0)) as f32, HEADER_H), 0.0));
+                ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
+                for c in c0..=c1 {
                     let (xl, xr) = (src.col_left(c), src.col_left(c + 1));
-                    let cx = ch_rect.x() + (xl - bx) as f32;
+                    let cx = q(ch_rect.x() as f64 + (xl - bx));
                     let w = (xr - xl) as f32;
                     ctx.key(c as u64 + 1);
                     let on = c >= sel.c0 && c <= sel.c1;
@@ -504,11 +512,13 @@ impl GridView {
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                     let lw = crate::text::measure(&label, &st).w;
                     if lw <= w {
-                        ctx.add(Node::Text { rect: Rect::new(cx + (w - lw) / 2.0, ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
+                        ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
                     }
                     ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
                     ctx.pop();
                 }
+                ctx.pop();
+              }
             }
             ctx.pop();
         }
@@ -567,9 +577,15 @@ impl GridView {
             let page = ctx.push(Node::vstack(Rect::new(rh_rect.x(), rh_rect.y(), header_w, ((ext[1] - by).clamp(0.0, 3.0 * REBASE)) as f32), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             if rows > 0 && tiles_r.0 <= tiles_r.1 {
-                for row in tiles_r.0 * TILE_ROWS..=((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1 {
+              for tr in tiles_r.0..=tiles_r.1 {
+                let (r0, r1) = (tr * TILE_ROWS, ((tr + 1) * TILE_ROWS).min(rows) - 1);
+                let gy = q(rh_rect.y() as f64 + (src.row_top(r0) - by));
+                ctx.key(1 << 40 | tr as u64);
+                let grp = ctx.push(Node::vstack(Rect::new(rh_rect.x(), gy, header_w, (src.row_top(r1 + 1) - src.row_top(r0)) as f32), 0.0));
+                ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
+                for row in r0..=r1 {
                     let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
-                    let cy = rh_rect.y() + (yt - by) as f32;
+                    let cy = q(rh_rect.y() as f64 + (yt - by));
                     let h = (yb - yt) as f32;
                     ctx.key(row as u64 + 1);
                     let on = row >= sel.r0 && row <= sel.r1;
@@ -581,10 +597,12 @@ impl GridView {
                     let label = src.row_label(row);
                     let st = if on { hstyle_on.clone() } else { hstyle.clone() };
                     let lw = crate::text::measure(&label, &st).w;
-                    ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + header_w - PAD - 2.0 - lw, cy + ((h - 15.0) / 2.0).max(0.0), lw, 15.0), content: label, style: st });
+                    ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
                     ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
                     ctx.pop();
                 }
+                ctx.pop();
+              }
             }
             ctx.pop();
         }
@@ -641,6 +659,15 @@ impl View for GridView {
 }
 
 /// A 2 px ring inside `r`.
+/// A position snapped to 1/64 px. Sums and differences of such values
+/// below 2^17 are exact in `f32`, so a cell's place inside its tile (what
+/// goes on the wire, [`Node::to_group`]) is the same wherever the tile is:
+/// moving the base moves only the tiles' groups, and nothing in them is
+/// sent again.
+fn q(v: f64) -> f32 {
+    ((v * 64.0).round() / 64.0) as f32
+}
+
 fn ring(ctx: &mut Ctx, r: Rect, c: Color) {
     let k = 2.0;
     ctx.add(Node::Rect { rect: Rect::new(r.x(), r.y(), r.w(), k), fill: c, radius: 0.0 });
@@ -1027,6 +1054,32 @@ mod tests {
         }
         assert!(scroll.get().physics.y > 2000.0, "flung to {}", scroll.get().physics.y);
         assert!(most < 4000, "at most {most} nodes resident");
+    }
+
+    #[test]
+    fn crossing_a_rebase_moves_tiles_without_resending_them() {
+        let (mut app, _, scroll, _, _) = host(1_000_000, 100);
+        app.tick();
+        let mut st = scroll.get();
+        st.physics.set_position(REBASE - 100.0);
+        scroll.set(st);
+        app.tick();
+        let mut st = scroll.get();
+        st.physics.set_position(REBASE + 100.0);
+        scroll.set(st);
+        let d = app.tick();
+        let mut kinds = std::collections::BTreeMap::new();
+        for x in &d {
+            let k = match x {
+                NodeDelta::Added { node, .. } => format!("add {:?}", std::mem::discriminant(node)),
+                NodeDelta::Changed { node, .. } => format!("chg {}", match node { Node::Stack { .. } => "stack", Node::Scroll { .. } => "scroll", Node::Text { .. } => "text", Node::Rect { .. } => "rect", _ => "other" }),
+                NodeDelta::Removed { .. } => "rm".into(),
+            };
+            *kinds.entry(k).or_insert(0) += 1;
+        }
+        // Only the viewports and the tiles' groups: nothing inside a tile.
+        assert!(d.iter().all(|x| matches!(x, NodeDelta::Changed { node: Node::Stack { .. } | Node::Scroll { .. }, .. })), "{kinds:?}");
+        assert!(d.len() < 40, "{kinds:?}");
     }
 
     #[test]

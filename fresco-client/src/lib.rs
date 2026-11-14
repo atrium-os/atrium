@@ -444,14 +444,20 @@ impl Connection {
 
     // ── Frame boundaries ───────────────────────────────────────────
 
+    /// Opens a frame. Until `scene_frame_end` the frame's messages are
+    /// buffered and go out together (a write per 256 KiB, not one per
+    /// node: a page of new cells is ~2,000 messages).
     pub fn scene_frame_begin(&mut self) -> io::Result<()> {
+        self.inner.cork();
         self.send_routable(control::OP_SCENE_FRAME_BEGIN,
             &SceneFrameBeginPayload::default())
     }
 
     pub fn scene_frame_end(&mut self) -> io::Result<()> {
-        self.send_routable(control::OP_SCENE_FRAME_END,
-            &SceneFrameEndPayload::default())
+        let r = self.send_routable(control::OP_SCENE_FRAME_END,
+            &SceneFrameEndPayload::default());
+        let f = self.inner.uncork();
+        r.and(f)
     }
 
     // ── Scene nodes ────────────────────────────────────────────────
@@ -1074,6 +1080,7 @@ impl Connection {
     /// equivalent here — both make `recv` return EAGAIN when no data
     /// is ready.
     pub fn poll_event(&mut self) -> io::Result<Option<Event>> {
+        self.inner.flush()?;
         self.inner.set_nonblocking(true)?;
         let result = self.recv_event_inner();
         self.inner.set_nonblocking(false)?;

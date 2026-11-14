@@ -99,6 +99,9 @@ pub struct Connection {
     /// Service messages that arrived while an upload waited for its ACK
     /// (events from a busy peer): delivered next, in order.
     held: VecDeque<(Header, Vec<u8>)>,
+    /// While corked, `send_message` only buffers: a frame of many small
+    /// messages goes out in a few writes instead of one per message.
+    corked: bool,
 }
 
 #[derive(Debug)]
@@ -122,7 +125,7 @@ impl Connection {
 
     pub fn wrap(s: UnixStream) -> io::Result<Self> {
         let rd = s.try_clone()?;
-        let wr = BufWriter::new(s);
+        let wr = BufWriter::with_capacity(256 * 1024, s);
         Ok(Self {
             rd, wr,
             inbuf: Vec::new(),
@@ -133,6 +136,7 @@ impl Connection {
             incoming_uploads:  HashMap::new(),
             infds: VecDeque::new(),
             held: VecDeque::new(),
+            corked: false,
         })
     }
 
@@ -160,6 +164,28 @@ impl Connection {
         }
         let h = Header::new(opcode_class, op, flags, payload.len() as u32);
         envelope::write_message(&mut self.wr, h, payload)?;
+        if self.corked {
+            return Ok(());
+        }
+        self.wr.flush()
+    }
+
+    /// Buffer what is sent until [`Connection::uncork`] (or a read, which
+    /// sends what is buffered first, so a request never waits on its own
+    /// reply).
+    pub fn cork(&mut self) {
+        self.corked = true;
+    }
+
+    /// Send everything buffered, and send each message at once again.
+    pub fn uncork(&mut self) -> io::Result<()> {
+        self.corked = false;
+        self.wr.flush()
+    }
+
+    /// Send what is buffered now. Call it before making the socket
+    /// non-blocking (the write side shares the descriptor's mode).
+    pub fn flush(&mut self) -> io::Result<()> {
         self.wr.flush()
     }
 
@@ -198,6 +224,9 @@ impl Connection {
 
     /// Read from the socket into `chunk`, queueing any fds that came along.
     fn read_chunk(&mut self, chunk: &mut [u8]) -> io::Result<usize> {
+        if !self.wr.buffer().is_empty() {
+            self.wr.flush()?;
+        }
         let (n, fds) = recv_with_fds(&self.rd, chunk)?;
         for fd in fds {
             if self.infds.len() < MAX_QUEUED_FDS {
