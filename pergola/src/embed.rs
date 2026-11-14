@@ -104,6 +104,12 @@ impl Embeds {
         Ok(ev)
     }
 
+    /// The descriptor that came with the last [`ParentEvent::MessageFd`]
+    /// polled (the picker's file, limen.md §2.3).
+    pub fn take_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.parent.take_fd()
+    }
+
     /// The `Window`'s slot binder for these embeds.
     pub fn binder(this: &Rc<RefCell<Self>>) -> Box<dyn SlotBinder> {
         Box::new(Binder(this.clone()))

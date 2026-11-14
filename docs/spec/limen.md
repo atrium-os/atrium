@@ -103,8 +103,8 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 ### 2.0 System roles and user roles
 
 - **System roles** have exactly one provider, a system service named in limend's catalogue.
-  The user never picks it, and no app can register for it. `credential` is Arca and
-  `sign-in` is Vestibulum.
+  The user never picks it, and no app can register for it. `credential` is Arca,
+  `sign-in` is Vestibulum and `picker` is Scrinium ([scrinium.md](scrinium.md)).
 - **User roles** are provided by installed apps that declare them (§3), and the user picks a
   default.
 
@@ -113,7 +113,7 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `credential` | system | Arca | `credential` | as long as the form |
 | `sign-in` | system | Vestibulum | `credential` | one sign-in |
 | `doc-viewer` | user | default: the Navigator's document worker | `plain` | as long as the parent wants |
-| `picker` | user | default: Scrinium | `plain` | one pick |
+| `picker` | system | Scrinium (`org.atrium.scrinium`) | `plain` | one pick |
 | `share-target` | user | the app the user chose in the share sheet | `plain` | one share |
 | `media-player` | user | default media app | `plain` | as long as the parent wants |
 | `payment` | user | the user's payment app | `credential` | one payment |
@@ -263,15 +263,27 @@ all of them.
 ### 2.3 `picker`
 
 One-shot powerbox ([insula.md](insula.md) §5.2): the user picks items in the child's UI, and
-only those items reach the parent.
+only those items reach the parent. A system role since 2026-11-14: the picker decides what
+an app gets, so no app may register to be it. Built: [scrinium.md](scrinium.md) §4; types
+`limen::picker`.
 
 | direction | message | payload |
 |---|---|---|
-| parent → child | `Open` | `filter: { kind, mime, multiple }` |
-| child → parent | `Picked` | `items: Vec<Item>`; a file comes as a descriptor that limend passes with the message |
+| parent → child | `Open` | `filter: { kind: File \| Folder, extensions, multiple, write, title }` |
+| child → parent | `File` | `name, size, write`; sent with `EMIT_FD`, the open file in the same frame |
+| child → parent | `Folder` | `at` (`/media/<part>` in the parent's jail), `name, read_only`; the folder was mounted there by dispensatord's `PICKED` |
+| child → parent | `Done` | `files: u32` |
 | child → parent | `Cancelled` | none |
+| child → parent | `Failed` | `why` (at most 200 bytes) |
 
-The embed detaches on `Picked` or `Cancelled`.
+The parent detaches on `Done` or `Cancelled`.
+
+**A file back by descriptor.** `EMIT_FD` (0x15) is `EMIT` with one descriptor, for a role
+whose catalogue row says `returns_fd` (today `picker` alone), and only once the embed is
+attached. limend `fstat`s it and refuses anything but a regular file opened `O_RDONLY` or
+`O_RDWR` (`BAD_FD`), narrows it with Capsicum (read, seek, fstat; plus write, ftruncate,
+fsync for `O_RDWR`) and hands it to the parent as `ParentEvent::MessageFd` in the same
+frame (`Parent::take_fd`). Any other role: `MALFORMED`.
 
 ### 2.4 `share-target`
 

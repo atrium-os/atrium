@@ -337,9 +337,12 @@ that wants to open a file on it should be able to, with one-shot permission.
    modes), from the same open volume, so the stick never has two writers.
    jaild attaches it into the app's jail as a nullfs runtime mount, which it
    removes with the jail.
-6. **Who may grant.** dispensatord's grant op takes root only (portcullisd,
-   and the picker through it). The picker and Scrinium themselves are
-   Scrinium's work; the mount side is built (§6.11).
+6. **Who may grant.** dispensatord's grant op takes root only (portcullisd).
+   The picker does not go through it: as built (§6.11,
+   [scrinium.md](scrinium.md) §4), Scrinium opens a picked file from its own
+   standing grant and hands it over Limen (`EMIT_FD`), and asks for a picked
+   folder with `PICKED`, which only an app holding the restricted capability
+   `file-picker` may call.
 
 ## 5. How existing work maps onto it
 
@@ -913,8 +916,14 @@ The mount side of §4.8:
   the reply carries the open file as its one descriptor, which portcullisd
   passes on to the app over Aqueduct. CLI `--open PART PATH [--write]`
   prints the file as read through the descriptor.
-- **Not yet:** the picker and the file manager themselves, which are
-  Scrinium's.
+- **The picker's folders** (`PICKED`, op 6): `{part, path, app_uid,
+  read_only}` from the session's picker, an app whose manifest holds the
+  restricted capability `file-picker`, for another app of the same user;
+  dispensatord finds that app's one jail and makes the same grant as
+  `GRANT`. CLI `--picked PART PATH APP_UID` (`PICKED_RO=1`). The file
+  manager (`removable-files` or `file-picker`) may also list sticks and
+  eject them. The picker and file manager themselves: Scrinium
+  ([scrinium.md](scrinium.md)), gate `vm-scrinium-check.sh`.
 
 Tests: capsa-fuse `grants` (a real FUSE mount on Linux: refusals, only the
 folder, owner and mode, `..`, writes seen by the session, the session's

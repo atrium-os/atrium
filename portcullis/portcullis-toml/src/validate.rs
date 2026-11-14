@@ -203,6 +203,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.removable-files = true: restricted to the file manager (every USB stick, \
              read-write, while it runs); requires explicit policy approval"));
     }
+    if c.file_picker == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.file-picker = true: restricted to the system file picker (puts what the \
+             user picks into other apps' jails); requires explicit policy approval"));
+    }
     if c.media_control == Some(true) {
         r.warnings.push(format!(
             "{ctx}.media-control = true: restricted to now-playing and the media keys \

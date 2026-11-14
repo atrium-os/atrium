@@ -15,6 +15,8 @@ const OTHER: u32 = 1002;
 const ARCA_UID: u32 = 900;
 const VIEWER_UID: u32 = 1500;
 const PLAYER_UID: u32 = 1600;
+const SCRINIUM_UID: u32 = 1700;
+const W_PICKER: WindowToken = [7; 16];
 const W_APP: WindowToken = [1; 16];
 const W_OTHER: WindowToken = [2; 16];
 const W_ARCA: WindowToken = [3; 16];
@@ -60,7 +62,7 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert!(["org.example.viewer", "org.example.player", "org.example.picker"].contains(&app), "{app}");
+        assert!(["org.example.viewer", "org.example.player", "org.example.map"].contains(&app), "{app}");
         self.0.send((embed, ch)).unwrap();
         Ok(if app == "org.example.player" { PLAYER_UID } else { VIEWER_UID })
     }
@@ -83,6 +85,7 @@ impl World {
             g.0.insert(W_OTHER, OTHER);
             g.0.insert(W_ARCA, ARCA_UID);
             g.0.insert(W_VIEWER, VIEWER_UID);
+            g.0.insert(W_PICKER, SCRINIUM_UID);
         }
         let (tx, rx) = mpsc::channel();
         let ended = Arc::new(Mutex::new(Vec::new()));
@@ -90,12 +93,13 @@ impl World {
             APP => Some(("ana".into(), "org.example.mail".into())),
             OTHER => Some(("ana".into(), "org.example.other".into())),
             ARCA_UID => Some(("ana".into(), catalogue::ARCA.into())),
+            SCRINIUM_UID => Some(("ana".into(), catalogue::SCRINIUM.into())),
             _ => None,
         });
         let defaults = Box::new(|_: &str, role: &str| match role {
             "doc-viewer" => Some("org.example.viewer".to_string()),
             "media-player" => Some("org.example.player".to_string()),
-            "picker" => Some("org.example.picker".to_string()),
+            "map" => Some("org.example.map".to_string()),
             _ => None,
         });
         let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone())), resolve, defaults);
@@ -398,8 +402,8 @@ fn a_player_gets_a_read_only_file_or_pipe_with_a_message_and_nothing_else() {
     assert!(player.take_fd().is_none());
 
     // A role that takes no descriptor, and someone else's embed.
-    let v = app.request("picker", W_APP).unwrap();
-    let _picker = w.spawned();
+    let v = app.request("map", W_APP).unwrap();
+    let _map = w.spawned();
     assert_eq!(refused(app.send_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
     let mut other = w.parent(OTHER);
     assert_eq!(refused(other.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::NOT_YOURS);
@@ -485,4 +489,70 @@ fn one_pip_at_a_time_and_none_outlives_its_embed() {
     app.detach(b).unwrap();
     assert!(matches!(next_c(&mut pb), ChildEvent::Pip { on: true, .. }));
     drop(pb);
+}
+
+#[test]
+fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsFd;
+    let w = World::new();
+    // Only Scrinium may provide it; with none, no picker.
+    let mut app = w.parent(APP);
+    assert_eq!(refused(app.request("picker", W_APP)), refusal::NO_PROVIDER);
+    assert!(matches!(provider(w.connect(APP), "picker"), Err(Error::Refused(r)) if r == refusal::NOT_PROVIDER));
+    let mut picker = provider(w.connect(SCRINIUM_UID), "picker").unwrap();
+
+    let e = app.request("picker", W_APP).unwrap();
+    assert_eq!(next_c(&mut picker), ChildEvent::Attach { embed: e, role: "picker".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    let ask = limen::picker::ToChild::Open(limen::picker::Filter::file());
+    app.send(e, ask.encode()).unwrap();
+    assert!(matches!(next_c(&mut picker), ChildEvent::Message { .. }));
+
+    let path = std::env::temp_dir().join(format!("limen-pick-{}", std::process::id()));
+    std::fs::write(&path, b"picked bytes").unwrap();
+    let ro = std::fs::File::open(&path).unwrap();
+    let file = limen::picker::ToParent::File { name: "notes.txt".into(), size: 12, write: false };
+    // Not before the user could see it: the slot must be attached.
+    assert_eq!(refused(picker.emit_fd(e, file.encode(), ro.as_fd())), refusal::NOT_ATTACHED);
+    picker.ready(e, W_PICKER).unwrap();
+    app.place(e, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: e });
+
+    picker.emit_fd(e, file.encode(), ro.as_fd()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::MessageFd { embed: e, bytes: file.encode() });
+    let mut got = std::fs::File::from(app.take_fd().expect("the picked file"));
+    let mut s = String::new();
+    got.read_to_string(&mut s).unwrap();
+    assert_eq!(s, "picked bytes");
+    got.rewind().unwrap();
+    assert!(got.write_all(b"x").is_err(), "read-only stays read-only");
+
+    // Read-write: the app may change it.
+    let rw = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    picker.emit_fd(e, limen::picker::ToParent::File { name: "notes.txt".into(), size: 12, write: true }.encode(), rw.as_fd()).unwrap();
+    assert!(matches!(next_p(&mut app), ParentEvent::MessageFd { .. }));
+    let mut got = std::fs::File::from(app.take_fd().unwrap());
+    got.write_all(b"changed").unwrap();
+    drop(got);
+    assert!(std::fs::read_to_string(&path).unwrap().starts_with("changed"));
+
+    // Nothing but a regular file: not a directory, a socket or a pipe.
+    let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+    assert_eq!(refused(picker.emit_fd(e, file.encode(), dir.as_fd())), refusal::BAD_FD);
+    let (sock, _peer) = UnixStream::pair().unwrap();
+    assert_eq!(refused(picker.emit_fd(e, file.encode(), sock.as_fd())), refusal::BAD_FD);
+    let (r, _w) = std::io::pipe().unwrap();
+    assert_eq!(refused(picker.emit_fd(e, file.encode(), r.as_fd())), refusal::BAD_FD);
+    // A plain message carries none.
+    picker.emit(e, limen::picker::ToParent::Done { files: 2 }.encode()).unwrap();
+    assert!(matches!(next_p(&mut app), ParentEvent::Message { .. }));
+    assert!(app.take_fd().is_none());
+
+    // Another role's child can't hand one back, and a parent can't send one
+    // to the picker.
+    let v = app.request("doc-viewer", W_APP).unwrap();
+    let (_, mut viewer) = w.spawned();
+    assert_eq!(refused(viewer.emit_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
+    assert_eq!(refused(app.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
+    let _ = std::fs::remove_file(&path);
 }

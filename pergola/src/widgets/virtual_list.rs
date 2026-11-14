@@ -30,15 +30,23 @@ pub struct VirtualList {
     pub row_h: f32,
     row: RowFn,
     key: Option<u64>,
+    backdrop: Option<Color>,
 }
 
 impl VirtualList {
     pub fn new(state: Mutable<ScrollState>, rect: Rect, count: usize, row_h: f32, row: impl Fn(usize, &mut Ctx) + 'static) -> Self {
-        Self { state, rect, count, row_h, row: Rc::new(row), key: None }
+        Self { state, rect, count, row_h, row: Rc::new(row), key: None, backdrop: None }
     }
 
     pub fn key(mut self, k: u64) -> Self {
         self.key = Some(k);
+        self
+    }
+
+    /// The opaque colour under the rows (the scroll view's backdrop;
+    /// default the theme's `bg_window`).
+    pub fn backdrop(mut self, c: Color) -> Self {
+        self.backdrop = Some(c);
         self
     }
 
@@ -76,6 +84,9 @@ impl VirtualList {
         let mut v = ScrollView::new(self.state.clone(), self.rect, content);
         if let Some(k) = self.key {
             v = v.key(k);
+        }
+        if let Some(c) = self.backdrop {
+            v = v.backdrop(c);
         }
         v.emit(ctx)
     }

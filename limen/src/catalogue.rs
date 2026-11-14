@@ -29,6 +29,10 @@ pub struct Role {
     /// The parent may pass one descriptor with a message (limen.md §2.2):
     /// a read-only file or pipe, checked and narrowed by limend.
     pub takes_fd: bool,
+    /// The child may pass one descriptor back with a message (`EMIT_FD`):
+    /// a regular file, read-only or read-write, checked and narrowed by
+    /// limend. The picker's picked file (limen.md §2.3).
+    pub returns_fd: bool,
 }
 
 pub const ARCA: &str = "org.atrium.arca";
@@ -36,18 +40,21 @@ pub const VESTIBULUM: &str = "org.atrium.vestibulum";
 /// The Navigator's engine jail host (legacy-web tier 4): a page's live
 /// islands.
 pub const NAVIGATOR_ENGINE: &str = "org.atrium.navigator.engine";
+/// Scrinium, the file manager, which also serves the system picker
+/// (scrinium.md §4): it holds the user's sticks and hands out one pick.
+pub const SCRINIUM: &str = "org.atrium.scrinium";
 
 pub const ROLES: &[Role] = &[
-    Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false },
-    Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false },
-    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },
-    Role { name: "picker", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
-    Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
-    Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true },
-    Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false },
-    Role { name: "web-island", provider: Provider::System(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false },
-    Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
-    Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false },
+    Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
+    Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
+    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
+    Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Plain, takes_fd: false, returns_fd: true },
+    Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
+    Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
+    Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
+    Role { name: "web-island", provider: Provider::System(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
+    Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
+    Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
 ];
 
 /// Roles whose children may play sound as their parent (lyra-v1.md §4):

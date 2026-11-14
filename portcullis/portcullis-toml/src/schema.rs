@@ -162,6 +162,12 @@ pub struct Capabilities {
     /// asks the system picker for one file or folder.
     #[serde(rename = "removable-files")]
     pub removable_files: Option<bool>,
+    /// The system file picker (scrinium.md §4): serve Limen's `picker` role
+    /// and ask dispensatord, over `removable-media/`, to put the folder the
+    /// user picked into the jail of the app it picked for. It reads nothing
+    /// by itself (that is `removable-files`). Restricted to Scrinium.
+    #[serde(rename = "file-picker")]
+    pub file_picker: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -382,6 +388,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         session_lock:     ovr.session_lock.or(base.session_lock),
         device_list:      ovr.device_list.or(base.device_list),
         removable_files:  ovr.removable_files.or(base.removable_files),
+        file_picker:      ovr.file_picker.or(base.file_picker),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

@@ -12,6 +12,7 @@
 //! | `REVOKE` 0x03 | postcard `String` (the jail) | `u8 status`, then postcard `String` |
 //! | `ATTACH_ALL` 0x04 | empty | `u8 status`, then postcard `String`: the file manager asks for every stick, now and as they come, in its own jail |
 //! | `OPEN` 0x05 | postcard [`Open`] | `u8 status`, then postcard `String`; with `OK`, the open file as the message's one descriptor |
+//! | `PICKED` 0x06 | postcard [`Picked`] | `u8 status`, then postcard `String` (where it is in the app's jail, or why not): the system picker puts the folder the user picked into the app's jail |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -33,6 +34,7 @@ pub mod op {
     pub const REVOKE: u16 = 0x03;
     pub const ATTACH_ALL: u16 = 0x04;
     pub const OPEN: u16 = 0x05;
+    pub const PICKED: u16 = 0x06;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -86,6 +88,18 @@ pub struct Open {
     pub write: bool,
 }
 
+/// The system picker (Scrinium, capability `file-picker`) asks for the
+/// folder the user picked to go into the jail of the app it was picking for
+/// (scrinium.md §4.3). The daemon finds that app's jail and gid itself from
+/// `app_uid`, and refuses unless both are apps of the session's user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Picked {
+    pub part: String,
+    pub path: String,
+    pub app_uid: u32,
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Added(Volume),
@@ -126,6 +140,11 @@ pub mod server {
         /// Open `o.path` of the volume mounted at `mountpoint` (the caller is
         /// root and the path has no `..`: both checked here).
         fn open(&self, mountpoint: &str, o: &Open) -> Result<std::fs::File, (u8, String)>;
+        /// `uid` (the picker, from its jail) asks for a picked folder to go
+        /// into `p.app_uid`'s jail; the daemon checks who both are. The
+        /// request itself is checked here (part served, path absolute, no
+        /// `..`).
+        fn picked(&self, uid: u32, p: &Picked) -> (u8, String);
     }
 
     pub struct Shared {
@@ -210,6 +229,17 @@ pub mod server {
         shared.host.grant(g)
     }
 
+    pub(crate) fn picked_checked(shared: &Shared, uid: u32, p: &Picked) -> (u8, String) {
+        let ok = |s: &str, max: usize| !s.is_empty() && s.len() <= max && !s.contains('\n') && !s.contains('\0');
+        if !ok(&p.part, 32) || !ok(&p.path, 1024) || !p.path.starts_with('/') || p.path.split('/').any(|c| c == "..") || p.app_uid == 0 || uid == 0 {
+            return (status::MALFORMED, "malformed pick".into());
+        }
+        if !shared.state.lock().unwrap().volumes.iter().any(|v| v.part == p.part) {
+            return (status::NOT_FOUND, format!("{} is not mounted", p.part));
+        }
+        shared.host.picked(uid, p)
+    }
+
     fn send_ev(conn: &mut Connection, ev: &Event) -> io::Result<()> {
         let p = postcard::to_stdvec(ev).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         conn.send_message(CLASS, op::EV, flag::ASYNC_EVENT, &p)
@@ -278,6 +308,13 @@ pub mod server {
                         }
                         Err((st, msg)) => conn.send_message(CLASS, op::OPEN, flag::IS_RESPONSE, &enc(st, &msg))?,
                     }
+                }
+                op::PICKED => {
+                    let (st, msg) = match postcard::from_bytes::<Picked>(&m.payload) {
+                        Ok(p) => picked_checked(&shared, uid, &p),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::PICKED, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
@@ -381,6 +418,12 @@ pub mod client {
         status_call(sock, op::ATTACH_ALL, &())
     }
 
+    /// The picker asks for the picked folder in the app's jail: where it is
+    /// there.
+    pub fn picked(sock: &Path, p: &Picked) -> Result<String, (u8, String)> {
+        status_call(sock, op::PICKED, p)
+    }
+
     /// Open a file of a stick (root only): the open file.
     pub fn open(sock: &Path, o: &Open) -> Result<std::fs::File, (u8, String)> {
         let r = (|| {
@@ -453,6 +496,9 @@ mod tests {
         }
         fn open(&self, mnt: &str, o: &Open) -> Result<std::fs::File, (u8, String)> {
             std::fs::File::open(format!("{mnt}{}", o.path)).map_err(|e| (status::FAILED, e.to_string()))
+        }
+        fn picked(&self, uid: u32, p: &Picked) -> (u8, String) {
+            if uid == 7 { (status::OK, format!("/media/{}", p.part)) } else { (status::NOT_ALLOWED, "not the picker".into()) }
         }
     }
 
@@ -536,6 +582,26 @@ mod tests {
             assert_eq!(server::grant_checked(&s, 0, &bad).0, status::MALFORMED, "{bad:?}");
         }
         assert_eq!(server::grant_checked(&s, 0, &Grant { part: "da9s1".into(), ..g.clone() }).0, status::NOT_FOUND);
+    }
+
+    #[test]
+    fn picks_are_checked_before_the_daemon_sees_them() {
+        let s = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(5)))));
+        s.update(vec![vol("da0s1")], &[]);
+        let p = Picked { part: "da0s1".into(), path: "/Photos".into(), app_uid: 50001, read_only: true };
+        assert_eq!(server::picked_checked(&s, 7, &p), (status::OK, "/media/da0s1".into()));
+        assert_eq!(server::picked_checked(&s, 5, &p).0, status::NOT_ALLOWED, "the daemon decides who the picker is");
+        for bad in [
+            Picked { path: "Photos".into(), ..p.clone() },
+            Picked { path: "/a/../..".into(), ..p.clone() },
+            Picked { path: "/a\0".into(), ..p.clone() },
+            Picked { app_uid: 0, ..p.clone() },
+            Picked { part: String::new(), ..p.clone() },
+        ] {
+            assert_eq!(server::picked_checked(&s, 7, &bad).0, status::MALFORMED, "{bad:?}");
+        }
+        assert_eq!(server::picked_checked(&s, 0, &p).0, status::MALFORMED, "root grants with GRANT");
+        assert_eq!(server::picked_checked(&s, 7, &Picked { part: "da9s1".into(), ..p.clone() }).0, status::NOT_FOUND);
     }
 
     /// OPEN hands over a descriptor, for root alone, never above the stick.

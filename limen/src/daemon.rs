@@ -146,6 +146,12 @@ impl State {
         }
     }
     fn to_parent(&self, e: &Embed, ev: ParentEvent) { self.push(e.parent, op::EV_PARENT, &ev) }
+    /// A message with a descriptor for the parent (a picked file).
+    fn to_parent_fd(&self, e: &Embed, ev: ParentEvent, fd: OwnedFd) {
+        if let Some(tx) = self.conns.get(&e.parent) {
+            let _ = tx.send((op::EV_PARENT, postcard::to_stdvec(&ev).expect("encodes"), Some(fd)));
+        }
+    }
     fn to_child(&self, e: &Embed, ev: ChildEvent) { self.push(e.child, op::EV_CHILD, &ev) }
 }
 
@@ -220,13 +226,14 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Ar
             if m.opcode_class != proto::CLASS {
                 continue;
             }
-            // A SEND_FD's descriptor came with the message's first byte, so
-            // it is queued by now; only that op takes one.
-            let fd = if m.op == op::SEND_FD { conn.take_fds(1).and_then(|mut v| v.pop()) } else { None };
+            // A SEND_FD's (or EMIT_FD's) descriptor came with the message's
+            // first byte, so it is queued by now; only those ops take one.
+            let takes = m.op == op::SEND_FD || m.op == op::EMIT_FD;
+            let fd = if takes { conn.take_fds(1).and_then(|mut v| v.pop()) } else { None };
             // Descriptors sent with anything else are closed, so none waits
             // to be taken for a later message. (Clients wait for each reply,
             // so a later message's descriptor can't be queued yet.)
-            if m.op != op::SEND_FD {
+            if !takes {
                 while conn.take_fds(1).is_some() {}
             }
             let reply = handle(&shared, id, uid, m.op, &m.payload, fd);
@@ -281,7 +288,12 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 let r: proto::Ready = de(payload)?;
                 as_child(shared, conn, r.embed, |e| e.child_window = Some(r.window))
             }
-            op::EMIT => emit(shared, conn, de(payload)?),
+            op::EMIT => emit(shared, conn, de(payload)?, None),
+            op::EMIT_FD => {
+                let m: proto::Emit = de(payload)?;
+                let fd = fd.ok_or(Reply::Refused { reason: refusal::MALFORMED })?;
+                emit(shared, conn, m, Some(fd))
+            }
             op::PIP => pip(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
@@ -470,13 +482,29 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     Ok(Reply::Ok)
 }
 
-fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit) -> Result<Reply, Reply> {
+/// A child's message for its parent, and on a role that returns one (the
+/// picker), a regular file. Every refusal closes the descriptor.
+fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>) -> Result<Reply, Reply> {
     let mut st = shared.state.lock().unwrap();
     let Some(e) = st.embeds.get_mut(&m.embed).filter(|e| e.child == conn) else {
         return Err(Reply::Refused { reason: refusal::NOT_YOURS });
     };
     if m.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
+    }
+    if fd.is_some() && !e.role.returns_fd {
+        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    }
+    // Only once the child's window is in the slot: a pick is something the
+    // user did there.
+    if fd.is_some() && !e.attached {
+        return Err(Reply::Refused { reason: refusal::NOT_ATTACHED });
+    }
+    if let Some(f) = fd.as_ref() {
+        match crate::fdpass::check_returned(f) {
+            Ok(w) if crate::fdpass::narrow_returned(f, w).is_ok() => {}
+            _ => return Err(Reply::Refused { reason: refusal::BAD_FD }),
+        }
     }
     let (ok, first_drop) = e.to_parent.take(Instant::now());
     let e = &st.embeds[&m.embed];
@@ -486,7 +514,10 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit) -> Result<Reply, Rep
         }
         return Err(Reply::Refused { reason: refusal::RATE });
     }
-    st.to_parent(e, ParentEvent::Message { embed: m.embed, bytes: m.bytes });
+    match fd {
+        Some(fd) => st.to_parent_fd(e, ParentEvent::MessageFd { embed: m.embed, bytes: m.bytes }, fd),
+        None => st.to_parent(e, ParentEvent::Message { embed: m.embed, bytes: m.bytes }),
+    }
     Ok(Reply::Ok)
 }
 

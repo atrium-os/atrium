@@ -129,6 +129,13 @@ fn args() -> Result<Args, String> {
             "--ro" => a.grant_ro = true,
             "--revoke" => a.media_cmd = Some(format!("revoke {}", val()?)),
             "--attach-all" => a.media_cmd = Some("attach-all".into()),
+            // The picker's request (scrinium.md §4.3): PART PATH APP_UID.
+            "--picked" => {
+                let part = val()?;
+                let path = it.next().ok_or("--picked needs PART PATH APP_UID")?;
+                let uid = it.next().ok_or("--picked needs PART PATH APP_UID")?;
+                a.media_cmd = Some(format!("picked {part} {uid} {path}"));
+            }
             "--open" => {
                 let part = val()?;
                 let path = it.next().ok_or("--open needs PART PATH")?;
@@ -285,6 +292,24 @@ fn print_devices(ds: &[atrium_devices::Device]) {
 fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
     if cmd == "attach-all" {
         return match atrium_media::client::attach_all(sock) {
+            Ok(m) => {
+                println!("ok {m}");
+                ExitCode::SUCCESS
+            }
+            Err((st, m)) => {
+                println!("error {m} (status {st})");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(rest) = cmd.strip_prefix("picked ") {
+        let mut f = rest.splitn(3, ' ');
+        let (Some(part), Some(uid), Some(path)) = (f.next(), f.next().and_then(|u| u.parse().ok()), f.next()) else {
+            println!("error malformed");
+            return ExitCode::FAILURE;
+        };
+        let p = atrium_media::Picked { part: part.into(), path: path.into(), app_uid: uid, read_only: std::env::var_os("PICKED_RO").is_some() };
+        return match atrium_media::client::picked(sock, &p) {
             Ok(m) => {
                 println!("ok {m}");
                 ExitCode::SUCCESS
@@ -469,16 +494,21 @@ mod run {
         }
     }
 
-    /// Does the installed manifest of `app_id` ask for `removable-files`?
-    /// (portcullisd granted it at install: a restricted capability is
-    /// installed only with policy approval.)
-    fn has_removable_files(apps_dir: &str, app_id: &str) -> bool {
+    /// Does the installed manifest of `app_id` ask for the capability `cap`
+    /// (`removable-files`, `file-picker`)? (portcullisd granted it at
+    /// install: a restricted capability is installed only with policy
+    /// approval.)
+    fn has_cap(apps_dir: &str, app_id: &str, cap: &str) -> bool {
         if app_id.is_empty() || app_id.contains('/') || app_id.starts_with('.') {
             return false;
         }
         let Ok(t) = std::fs::read_to_string(Path::new(apps_dir).join(app_id).join("atrium.toml")) else { return false };
         let Ok(v) = t.parse::<toml::Table>() else { return false };
-        v.get("capabilities").and_then(|c| c.get("removable-files")).and_then(|b| b.as_bool()) == Some(true)
+        v.get("capabilities").and_then(|c| c.get(cap)).and_then(|b| b.as_bool()) == Some(true)
+    }
+
+    fn has_removable_files(apps_dir: &str, app_id: &str) -> bool {
+        has_cap(apps_dir, app_id, "removable-files")
     }
 
     type EjectReq = (Req, mpsc::Sender<(u8, String)>);
@@ -551,8 +581,11 @@ mod run {
     }
 
     impl mserver::Host for MediaHost {
+        /// The session's user and components, and the file manager (an app
+        /// of that user holding `removable-files`): it lists the sticks it
+        /// holds, hears them come and go, and ejects them (scrinium.md §3).
         fn allowed(&self, uid: u32) -> bool {
-            session_allowed(&self.session, &self.registry, uid)
+            session_allowed(&self.session, &self.registry, uid) || self.file_manager(uid).is_some()
         }
 
         fn eject(&self, part: &str) -> (u8, String) {
@@ -584,6 +617,28 @@ mod run {
             self.ask(Req::AttachAll(Standing { jail, uid, gid, user }))
         }
 
+        /// The system picker (an app of the session's user holding
+        /// `file-picker`) puts the folder the user picked into the jail of
+        /// the app it picked for: also an app of that user, in exactly one
+        /// jail, not a session component. The grant is the one root makes
+        /// (§4.8), at `/media/<part>` in that jail.
+        fn picked(&self, uid: u32, p: &atrium_media::Picked) -> (u8, String) {
+            let Session::Active { user, .. } = self.session.lock().unwrap().clone() else { return (mstatus::NOT_ALLOWED, "no unlocked session".into()) };
+            let Ok(reg) = portcullis_peer::AppRegistry::load(&self.registry) else { return (mstatus::NOT_ALLOWED, "not an app".into()) };
+            let Some((owner, app)) = reg.resolve(uid) else { return (mstatus::NOT_ALLOWED, "not an app".into()) };
+            if owner != user || !has_cap(&self.apps_dir, app, "file-picker") {
+                return (mstatus::NOT_ALLOWED, format!("{app} is not the session's picker"));
+            }
+            let Some((towner, target)) = reg.resolve(p.app_uid) else { return (mstatus::NOT_FOUND, format!("uid {} is not an app", p.app_uid)) };
+            if towner != user || reg.is_session(p.app_uid) {
+                return (mstatus::NOT_ALLOWED, format!("{target} is not an app of the session's user"));
+            }
+            let Some(jail) = jail_of_uid(p.app_uid) else { return (mstatus::NOT_FOUND, format!("{target} runs in no one jail")) };
+            let gid = primary_gid(p.app_uid).unwrap_or(p.app_uid);
+            eprintln!("atrium-dispensatord: {app} picked {}{} for {target}{}", p.part, p.path, if p.read_only { " (read-only)" } else { "" });
+            self.ask(Req::Grant(atrium_media::Grant { part: p.part.clone(), path: p.path.clone(), jail, uid: p.app_uid, gid, read_only: p.read_only }))
+        }
+
         /// Root's own open, on the session's mount: no link followed, no
         /// directory, nothing above the stick (no `..`, checked before).
         fn open(&self, mountpoint: &str, o: &atrium_media::Open) -> Result<std::fs::File, (u8, String)> {
@@ -608,6 +663,15 @@ mod run {
     }
 
     impl MediaHost {
+        /// `uid`'s app id, when it is an app of the session's user holding
+        /// `removable-files` (the file manager).
+        fn file_manager(&self, uid: u32) -> Option<String> {
+            let Session::Active { user, .. } = self.session.lock().unwrap().clone() else { return None };
+            let reg = portcullis_peer::AppRegistry::load(&self.registry).ok()?;
+            let (owner, app) = reg.resolve(uid)?;
+            (owner == user && has_removable_files(&self.apps_dir, app)).then(|| app.to_string())
+        }
+
         /// Hand `r` to the daemon's loop and wait for its answer.
         fn ask(&self, r: Req) -> (u8, String) {
             use std::io::Write;

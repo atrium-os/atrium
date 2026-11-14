@@ -1,0 +1,30 @@
+[package]
+name = "scrinium"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Scrinium, Atrium's file manager and system file picker (docs/spec/scrinium.md): browses the USB sticks it holds (removable-files) and other places, and serves Limen's picker role, handing an app one picked file as a descriptor or one picked folder as a grant into its jail."
+
+[lib]
+name = "scrinium"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scrinium"
+path = "src/bin/scrinium.rs"
+
+# An app that asks for a pick: the other end of the picker, for the VM gate
+# and as the example of how an app uses it.
+[[bin]]
+name = "scrinium-pick-demo"
+path = "src/bin/pick_demo.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+limen = { path = "../limen" }
+atrium-media = { path = "../dispensator/media" }
+libc = "0.2"
+log = "0.4"

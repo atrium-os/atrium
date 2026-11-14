@@ -81,7 +81,7 @@ impl<E: for<'a> serde::Deserialize<'a>> Wire<E> {
 }
 
 /// The parent's end: one connection to limend for all of a window's embeds.
-pub struct Parent(Wire<ParentEvent>);
+pub struct Parent(Wire<ParentEvent>, VecDeque<std::os::fd::OwnedFd>);
 
 impl Parent {
     /// `LIMEN_SOCKET`, else [`DEFAULT_SOCKET`].
@@ -95,7 +95,7 @@ impl Parent {
     }
 
     pub fn wrap(conn: Connection) -> Self {
-        Parent(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_PARENT })
+        Parent(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_PARENT }, VecDeque::new())
     }
 
     /// Ask for a `role` embed in the window `window` names (its frescod
@@ -144,7 +144,19 @@ impl Parent {
     }
 
     pub fn poll(&mut self, wait: Duration) -> Result<Option<ParentEvent>, Error> {
-        self.0.poll(wait)
+        let ev = self.0.poll(wait)?;
+        if matches!(ev, Some(ParentEvent::MessageFd { .. })) {
+            if let Some(fd) = self.0.conn.take_fds(1).and_then(|mut v| v.pop()) {
+                self.1.push_back(fd);
+            }
+        }
+        Ok(ev)
+    }
+
+    /// The descriptor of the last [`ParentEvent::MessageFd`] polled (a
+    /// picked file).
+    pub fn take_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.1.pop_front()
     }
 }
 
@@ -200,6 +212,18 @@ impl Child {
 
     pub fn emit(&mut self, embed: EmbedId, bytes: Vec<u8>) -> Result<(), Error> {
         self.0.ok(op::EMIT, &proto::Emit { embed, bytes })
+    }
+
+    /// A role message with one descriptor, for a role that returns one (the
+    /// picker's file): a regular file, read-only or read-write. limend
+    /// narrows it to what that mode allows and refuses anything else with
+    /// `BAD_FD`, or before the slot is attached with `NOT_ATTACHED`.
+    pub fn emit_fd(&mut self, embed: EmbedId, bytes: Vec<u8>, fd: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
+        use std::os::fd::AsRawFd;
+        match self.0.call_fds(op::EMIT_FD, &proto::Emit { embed, bytes }, &[fd.as_raw_fd()])? {
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            _ => Ok(()),
+        }
     }
 
     /// Ask for picture-in-picture (`on`) or to go back into the slot.

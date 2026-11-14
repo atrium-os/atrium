@@ -29,6 +29,9 @@ pub mod op {
     /// [`Pip`](super::Pip): the child's window into or out of
     /// picture-in-picture.
     pub const PIP: u16 = 0x14;
+    /// [`Emit`](super::Emit) with one descriptor in the same frame, for a
+    /// role that returns one (catalogue `returns_fd`: the picker's file).
+    pub const EMIT_FD: u16 = 0x15;
     // events
     pub const EV_PARENT: u16 = 0x80;
     pub const EV_CHILD: u16 = 0x81;
@@ -131,6 +134,11 @@ pub enum ParentEvent {
     /// placeholder in the slot) or came back. From limend, so the parent
     /// can trust it. No `Suspended` comes while in PiP.
     Pip { embed: EmbedId, on: bool },
+    /// A message with one descriptor (a role that returns one: the
+    /// picker's file), a regular file narrowed by limend to what its open
+    /// mode allows: take it with
+    /// [`Parent::take_fd`](crate::client::Parent::take_fd).
+    MessageFd { embed: EmbedId, bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
