@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use officina_text::layout::{object_height, size_lu, ParaLayout, OBJECT_FACE};
+use officina_text::paint::{paint_page, Item};
 use officina_text::twips;
 use pergola::event::{Event, KeyEventKind};
 use pergola::geom::{Point, Rect};
@@ -167,53 +167,40 @@ impl RichTextView {
                 ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
                 ctx.add(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, g.page_w as f32 + 2.0, g.page_h as f32 + 2.0), fill: t.border_default(), radius: 0.0 });
                 ctx.add(Node::Rect { rect: Rect::new(px, py, g.page_w as f32, g.page_h as f32), fill: paper, radius: 0.0 });
-                let (cx, cy) = (px as f64 + g.margin_x, py as f64 + g.margin_y);
-                let page = ed.pages.pages()[i].clone();
                 let numbering = ed.numbering();
-                // Header and footer, in the margins.
                 let pages_text = if ed.pages.done() { known.to_string() } else { format!("{est}") };
-                for (hf, top) in [(&ed.doc.header, true), (&ed.doc.footer, false)] {
-                    let Some(hf) = hf else { continue };
-                    let text = hf.resolve(i + 1, &pages_text);
-                    let from = twips(officina_text::model::HEADER_FROM_EDGE as i64) as f64 * g.k;
-                    let fmt = officina_text::model::CharFormat { size: 18, color: 0x555555, ..Default::default() };
-                    let size = size_lu(&fmt) as f64 * g.k;
-                    let baseline = if top { py as f64 + from + size * 0.8 } else { py as f64 + g.page_h - from };
-                    let width = g.page_w - 2.0 * g.margin_x;
-                    draw_text(ctx, faces, ed.fonts(), &text, &fmt, hf.align, px as f64 + g.margin_x, width, baseline, g.k);
-                }
-                // Table cell borders.
-                let rule = Color::rgba(0.55, 0.57, 0.6, 1.0);
-                // Each cell draws its top and left rule; the right and bottom ones
-                // only where no cell continues, so shared edges are drawn once.
-                for c in &page.cells {
-                    let (x, y, w, h) = (cx + c.x as f64 * g.k, cy + c.y as f64 * g.k, c.w as f64 * g.k, c.h as f64 * g.k);
-                    let right = !page.cells.iter().any(|d| d.y == c.y && d.x == c.x + c.w);
-                    let below = !page.cells.iter().any(|d| d.y == c.y + c.h && d.x < c.x + c.w && d.x + d.w > c.x);
-                    let mut rules = vec![(x, y, w, 1.0), (x, y, 1.0, h)];
-                    if right {
-                        rules.push((x + w, y, 1.0, h + 1.0));
-                    }
-                    if below {
-                        rules.push((x, y + h, w + 1.0, 1.0));
-                    }
-                    for (rx, ry, rw, rh) in rules {
-                        ctx.add(Node::Rect { rect: Rect::new(q(rx), q(ry), rw.max(1.0) as f32, rh.max(1.0) as f32), fill: rule, radius: 0.0 });
-                    }
-                }
-                for s in &page.slices {
-                    let l = ed.layout(s.block);
-                    let text = ed.doc.para(s.block).map(|p| p.text.clone()).unwrap_or_default();
-                    let cx = cx + s.x as f64 * g.k;
-                    if s.lines.start == 0 {
-                        if let Some(label) = numbering.label(s.block) {
-                            draw_label(ctx, faces, &l, &label, ed.fonts(), cx, cy + s.y as f64 * g.k, g.k);
+                let col_w = ed.pages.width();
+                let items = {
+                    let e = &mut *ed;
+                    let fonts = e.fonts_rc();
+                    paint_page(&e.doc, e.pages.pages(), i, col_w, &mut e.cache, &*fonts, &numbering, &pages_text)
+                };
+                let (ox, oy) = (px as f64, py as f64);
+                for it in items {
+                    match it {
+                        Item::Rect { x, y, w, h, color } => {
+                            ctx.add(Node::Rect { rect: Rect::new(q(ox + x as f64 * g.k), q(oy + y as f64 * g.k), (w as f64 * g.k).max(1.0) as f32, (h as f64 * g.k).max(1.0) as f32), fill: rgb(color), radius: 0.0 });
                         }
-                    }
-                    let mut ly = s.y;
-                    for li in s.lines.clone() {
-                        draw_line(ctx, faces, &ed.doc.images, &l, li, &text, cx, cy + ly as f64 * g.k, g.k);
-                        ly += l.lines[li].height;
+                        Item::Glyphs(r) => {
+                            if let Some(face) = faces.and_then(|fs| fs.get(r.face as usize)) {
+                                let run: Vec<PGlyph> = r.glyphs.iter().map(|gl| PGlyph { id: gl.id, dx: (gl.x as f64 * g.k) as f32, dy: (gl.dy as f64 * g.k) as f32 }).collect();
+                                ctx.add(Node::Glyphs { origin: Point::new(q(ox + r.x as f64 * g.k), q(oy + r.y as f64 * g.k)), face: face.clone(), size: (r.size as f64 * g.k) as f32, color: rgb(r.color), glyphs: Arc::from(run) });
+                            }
+                        }
+                        Item::Image { image, x, y, w, h } => {
+                            let (w, h) = (w as f64 * g.k, h as f64 * g.k);
+                            let rect = Rect::new(q(ox + x as f64 * g.k), q(oy + y as f64 * g.k), w as f32, h as f32);
+                            // A placeholder until it decodes.
+                            match ed.doc.images.get(image).and_then(|d| crate::pictures::picture(d, w * 2.0, h * 2.0)) {
+                                Some(image) => {
+                                    ctx.add(Node::Image { rect, image });
+                                }
+                                None => {
+                                    ctx.add(Node::Rect { rect, fill: Color::rgba(0.85, 0.86, 0.88, 1.0), radius: 0.0 });
+                                }
+                            }
+                        }
+                        Item::Link { .. } => {}
                     }
                 }
                 ctx.pop();
@@ -387,136 +374,6 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
     out
 }
 
-/// Draws line `li` of a paragraph with its top at window y `top`, content
-/// left at `left`.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn draw_line(ctx: &mut Ctx, faces: Option<&Faces>, images: &officina_text::model::Images, l: &ParaLayout, li: usize, text: &str, left: f64, top: f64, k: f64) {
-    let line = &l.lines[li];
-    let natural = line.ascent + line.descent;
-    let baseline = top + (line.ascent + (line.height - natural).max(0) / 2) as f64 * k;
-    let bytes = text.as_bytes();
-    let gl = &l.glyphs[line.glyphs.clone()];
-    let mut pen = line.x;
-    let mut i = 0;
-    while i < gl.len() {
-        let (face, fmt) = (gl[i].face, gl[i].fmt);
-        let f = &l.formats[fmt as usize];
-        if face == OBJECT_FACE {
-            // A picture, on the baseline; a placeholder until it decodes.
-            let g = gl[i];
-            if let Some(o) = &f.object {
-                let (w, h) = (g.adv as f64 * k, object_height(o, g.adv) as f64 * k);
-                let rect = Rect::new(q(left + pen as f64 * k), q(baseline - h), w as f32, h as f32);
-                match images.get(o.image).and_then(|d| crate::pictures::picture(d, w * 2.0, h * 2.0)) {
-                    Some(image) => {
-                        ctx.add(Node::Image { rect, image });
-                    }
-                    None => {
-                        ctx.add(Node::Rect { rect, fill: Color::rgba(0.85, 0.86, 0.88, 1.0), radius: 0.0 });
-                    }
-                }
-            }
-            pen += g.adv;
-            i += 1;
-            continue;
-        }
-        let x0 = pen;
-        let mut run: Vec<PGlyph> = Vec::new();
-        while i < gl.len() && gl[i].face == face && gl[i].fmt == fmt && gl[i].face != OBJECT_FACE {
-            let g = gl[i];
-            let ch = text[g.cluster as usize..].chars().next().unwrap_or(' ');
-            if !ch.is_control() && ch != '\u{2028}' && ch != '\t' {
-                run.push(PGlyph { id: g.id, dx: ((pen - x0 + g.dx) as f64 * k) as f32, dy: (g.dy as f64 * k) as f32 });
-            }
-            pen += g.adv;
-            if line.space_extra != 0 && bytes.get(g.cluster as usize) == Some(&b' ') {
-                pen += line.space_extra;
-            }
-            i += 1;
-        }
-        let (rx, rw) = (left + x0 as f64 * k, (pen - x0) as f64 * k);
-        let size = size_lu(f) as f64 * k;
-        if let Some(h) = f.highlight {
-            ctx.add(Node::Rect { rect: Rect::new(rx as f32, top as f32, rw as f32, (line.height as f64 * k) as f32), fill: rgb(h), radius: 0.0 });
-        }
-        let color = rgb(f.color);
-        if let (Some(fs), false) = (faces, run.is_empty()) {
-            if let Some(face) = fs.get(face as usize) {
-                ctx.add(Node::Glyphs { origin: Point::new(q(rx), q(baseline)), face: face.clone(), size: size as f32, color, glyphs: Arc::from(run) });
-            }
-        }
-        let thick = (size / 14.0).max(1.0) as f32;
-        if f.underline || f.link.is_some() {
-            ctx.add(Node::Rect { rect: Rect::new(rx as f32, (baseline + size * 0.12) as f32, rw as f32, thick), fill: color, radius: 0.0 });
-        }
-        if f.strike {
-            ctx.add(Node::Rect { rect: Rect::new(rx as f32, (baseline - size * 0.28) as f32, rw as f32, thick), fill: color, radius: 0.0 });
-        }
-    }
-}
-
-/// A list item's label in its hang, on the first line's baseline, in the
-/// format the item's text starts with.
-#[allow(clippy::too_many_arguments)]
-fn draw_label(ctx: &mut Ctx, faces: Option<&Faces>, l: &ParaLayout, label: &str, fonts: &dyn officina_text::layout::Fonts, left: f64, top: f64, k: f64) {
-    let Some(line) = l.lines.first() else { return };
-    let f = l.glyphs.first().map_or(&l.formats[0], |g| &l.formats[g.fmt as usize]);
-    let mut f = f.clone();
-    f.underline = false;
-    f.strike = false;
-    f.link = None;
-    let glyphs = fonts.shape(label, &f);
-    let natural = line.ascent + line.descent;
-    let baseline = top + (line.ascent + (line.height - natural).max(0) / 2) as f64 * k;
-    let x0 = twips((l.format.indent_start + l.format.first_line) as i64) as f64;
-    let size = (size_lu(&f) as f64 * k) as f32;
-    let mut pen = 0i64;
-    let mut i = 0;
-    while i < glyphs.len() {
-        let face = glyphs[i].face;
-        let start = pen;
-        let mut run = Vec::new();
-        while i < glyphs.len() && glyphs[i].face == face {
-            run.push(PGlyph { id: glyphs[i].id, dx: ((pen - start + glyphs[i].dx) as f64 * k) as f32, dy: (glyphs[i].dy as f64 * k) as f32 });
-            pen += glyphs[i].adv;
-            i += 1;
-        }
-        if let Some(fc) = faces.and_then(|fs| fs.get(face as usize)) {
-            ctx.add(Node::Glyphs { origin: Point::new(q(left + (x0 + start as f64) * k), q(baseline)), face: fc.clone(), size, color: rgb(f.color), glyphs: Arc::from(run) });
-        }
-    }
-}
-
-/// One line of text in `fmt`, aligned in a box `width` wide from `left`.
-#[allow(clippy::too_many_arguments)]
-fn draw_text(ctx: &mut Ctx, faces: Option<&Faces>, fonts: &dyn officina_text::layout::Fonts, text: &str, fmt: &officina_text::model::CharFormat, align: officina_text::model::Align, left: f64, width: f64, baseline: f64, k: f64) {
-    use officina_text::model::Align;
-    let glyphs = fonts.shape(text, fmt);
-    let w = glyphs.iter().map(|g| g.adv).sum::<i64>() as f64 * k;
-    let x0 = match align {
-        Align::Center => left + (width - w) / 2.0,
-        Align::End => left + width - w,
-        _ => left,
-    };
-    let size = (size_lu(fmt) as f64 * k) as f32;
-    let mut pen = 0i64;
-    let mut i = 0;
-    while i < glyphs.len() {
-        let face = glyphs[i].face;
-        let start = pen;
-        let mut run = Vec::new();
-        while i < glyphs.len() && glyphs[i].face == face {
-            run.push(PGlyph { id: glyphs[i].id, dx: ((pen - start + glyphs[i].dx) as f64 * k) as f32, dy: (glyphs[i].dy as f64 * k) as f32 });
-            pen += glyphs[i].adv;
-            i += 1;
-        }
-        if let Some(fc) = faces.and_then(|fs| fs.get(face as usize)) {
-            ctx.add(Node::Glyphs { origin: Point::new(q(x0 + start as f64 * k), q(baseline)), face: fc.clone(), size, color: rgb(fmt.color), glyphs: Arc::from(run) });
-        }
-    }
-}
-
 fn rgb(c: u32) -> Color {
     Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
@@ -541,7 +398,7 @@ mod tests {
     }
     impl View for Host {
         fn render(&self, ctx: &mut Ctx) {
-            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7 }.emit(ctx);
+            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7, on_find: None }.emit(ctx);
         }
     }
 

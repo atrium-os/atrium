@@ -124,6 +124,7 @@ dependencies = [
  "navigator-image",
  "officina-convert",
  "officina-core",
+ "officina-pdf",
  "officina-text",
  "pergola",
  "pergola-richtext",
@@ -1093,6 +1094,15 @@ name = "officina-grid"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+]
+
+[[package]]
+name = "officina-pdf"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "navigator-image",
+ "officina-text",
 ]
 
 [[package]]

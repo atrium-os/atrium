@@ -40,6 +40,7 @@ pub enum Cmd {
     Open,
     Save,
     SaveAs,
+    ExportPdf,
     Undo,
     Redo,
     Toggle(Toggle),
@@ -294,7 +295,8 @@ impl View for Write {
         };
         button(ctx, "Open…", Cmd::Open, 72.0, 6.0);
         button(ctx, "Save", Cmd::Save, 60.0, 6.0);
-        button(ctx, "Save As…", Cmd::SaveAs, 88.0, 16.0);
+        button(ctx, "Save As…", Cmd::SaveAs, 88.0, 6.0);
+        button(ctx, "PDF…", Cmd::ExportPdf, 60.0, 16.0);
         button(ctx, "Undo", Cmd::Undo, 60.0, 6.0);
         button(ctx, "Redo", Cmd::Redo, 60.0, 16.0);
         button(ctx, "B", Cmd::Toggle(Toggle::Bold), 36.0, 4.0);

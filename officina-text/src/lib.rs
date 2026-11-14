@@ -20,6 +20,7 @@ pub mod model;
 pub mod native;
 pub mod ops;
 pub mod paginate;
+pub mod paint;
 pub mod tree;
 
 /// Layout units per point.

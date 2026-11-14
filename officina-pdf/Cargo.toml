@@ -1,0 +1,18 @@
+[package]
+name = "officina-pdf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "PDF export for Officina (docs/spec/officina.md §7.4, §14): pages from officina-text's painter, streamed page by page, fonts embedded as TrueType subsets, each picture once, links as annotations."
+
+[dependencies]
+officina-text = { path = "../officina-text" }
+navigator-image = { path = "../navigator-image" }
+miniz_oxide = "0.8"
+
+[profile.release]
+debug = 1
+
+[dev-dependencies]
+png = "0.17"

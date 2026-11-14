@@ -19,6 +19,7 @@ navigator-image = { path = "../navigator-image" }
 officina-core = { path = "../officina-core" }
 officina-convert = { path = "../officina-convert" }
 officina-text = { path = "../officina-text" }
+officina-pdf = { path = "../officina-pdf" }
 pergola = { path = "../pergola" }
 pergola-richtext = { path = "../pergola-richtext" }
 limen = { path = "../limen" }

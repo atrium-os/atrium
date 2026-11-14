@@ -171,6 +171,10 @@ impl Editor {
         ok
     }
 
+    pub fn fonts_rc(&self) -> Rc<dyn Fonts> {
+        self.fonts.clone()
+    }
+
     pub fn fonts(&self) -> &dyn Fonts {
         &*self.fonts
     }

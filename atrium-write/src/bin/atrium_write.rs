@@ -46,6 +46,7 @@ enum Asking {
     Open,
     SaveAs,
     Picture,
+    ExportPdf,
 }
 
 fn state_root() -> PathBuf {
@@ -83,17 +84,26 @@ fn write_over(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 /// Writes `bytes` to `dir/name` through a temp file and a rename; never replaces a
 /// file already there (`name 2.owrite` and so on instead). Returns the path.
 fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    place_new(dir, stem, "owrite", |f| f.write_all(bytes))
+}
+
+/// A new file `STEM.EXT` (or `STEM N.EXT`) in `dir`, written by `fill` to a
+/// hidden temporary first, so nothing half-written or existing is replaced.
+fn place_new(dir: &Path, stem: &str, ext: &str, fill: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<PathBuf> {
     let stem: String = stem.chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
     let stem = stem.trim_start_matches('.');
     let stem = if stem.is_empty() { "Document" } else { stem };
     let tmp = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
     {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        if let Err(e) = fill(&mut f).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     for n in 1..1000 {
-        let name = if n == 1 { format!("{stem}.owrite") } else { format!("{stem} {n}.owrite") };
+        let name = if n == 1 { format!("{stem}.{ext}") } else { format!("{stem} {n}.{ext}") };
         let path = dir.join(&name);
         // A hard link fails when the name is taken, so nothing is replaced.
         match fs::hard_link(&tmp, &path) {
@@ -117,6 +127,8 @@ struct Run {
     write: Write,
     target: Option<Target>,
     root: PathBuf,
+    /// A PDF export running in the background: its latest word.
+    export: Option<std::sync::Arc<std::sync::Mutex<(String, bool)>>>,
 }
 
 impl Run {
@@ -203,6 +215,62 @@ impl Run {
         }
     }
 
+    /// Exports the document as it is now to `STEM.pdf` in `dir`, in the
+    /// background; the status line follows it.
+    fn export_pdf(&mut self, dir: &Path) {
+        if self.export.is_some() {
+            self.set_status("A PDF export is already running.");
+            return;
+        }
+        let (doc, stem, title) = {
+            let d = self.write.doc.borrow();
+            let e = d.ed.borrow();
+            (e.doc.clone(), stem_of(&d.name).to_string(), stem_of(&d.name).to_string())
+        };
+        let word = std::sync::Arc::new(std::sync::Mutex::new((format!("Exporting “{stem}.pdf”…"), false)));
+        self.export = Some(word.clone());
+        let dir = dir.to_path_buf();
+        let spawned = std::thread::Builder::new().name("pdf-export".into()).spawn(move || {
+            let r = officina_text::layout::PinnedFonts::new().map_err(|e| io::Error::other(e)).and_then(|fonts| {
+                let mut stats = None;
+                let path = place_new(&dir, &stem, "pdf", |f| {
+                    let w = io::BufWriter::new(f);
+                    let mut tick = Instant::now();
+                    let (w, s) = officina_pdf::export(&doc, &fonts, &fonts, &officina_pdf::Info { title }, w, &mut |done, total| {
+                        if tick.elapsed() >= Duration::from_millis(250) {
+                            tick = Instant::now();
+                            word.lock().unwrap().0 = format!("Exporting PDF: page {done} of {total}…");
+                        }
+                    })?;
+                    w.into_inner().map_err(|e| e.into_error())?;
+                    stats = Some(s);
+                    Ok(())
+                })?;
+                Ok((path, stats.unwrap_or_default()))
+            });
+            *word.lock().unwrap() = match r {
+                Ok((path, s)) => (format!("Exported “{}” ({} pages).", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), s.pages), true),
+                Err(e) => (format!("Couldn't export the PDF: {e}."), true),
+            };
+        });
+        if let Err(e) = spawned {
+            self.export = None;
+            self.set_status(format!("Couldn't start the export: {e}."));
+        }
+    }
+
+    /// Shows how the export is going; forgets it once it ends.
+    fn poll_export(&mut self) {
+        let Some(w) = &self.export else { return };
+        let (msg, done) = w.lock().unwrap().clone();
+        if self.write.doc.borrow().status != msg {
+            self.set_status(msg);
+        }
+        if done {
+            self.export = None;
+        }
+    }
+
     /// A picked file arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
@@ -272,7 +340,7 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
-    let mut run = Run { write, target: None, root: root.clone() };
+    let mut run = Run { write, target: None, root: root.clone(), export: None };
     run.show(doc, target);
     let size = run.write.size.clone();
     let mut app = App::new_with_flag(run.write.clone(), dirty);
@@ -296,6 +364,7 @@ fn main() {
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
+                Cmd::ExportPdf => want_picker = Some(Asking::ExportPdf),
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
@@ -312,6 +381,7 @@ fn main() {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a document".into() },
                         Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
+                        Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)) },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
@@ -344,9 +414,11 @@ fn main() {
                     }
                 }
                 Ok(Some(ParentEvent::Message { bytes, .. })) => match ToParent::decode(&bytes) {
-                    Some(ToParent::Folder { at, read_only, name }) if asking == Some(Asking::SaveAs) => {
+                    Some(ToParent::Folder { at, read_only, name }) if matches!(asking, Some(Asking::SaveAs | Asking::ExportPdf)) => {
                         if read_only {
                             run.set_status(format!("“{name}” is read-only; choose another folder."));
+                        } else if asking == Some(Asking::ExportPdf) {
+                            run.export_pdf(Path::new(&at));
                         } else {
                             run.save_into(Path::new(&at));
                         }
@@ -373,6 +445,7 @@ fn main() {
                 run.write.ui.set(Ui { asking: false });
             }
         }
+        run.poll_export();
         if last_sync.elapsed() >= SYNC_EVERY {
             last_sync = Instant::now();
             let mut d = run.write.doc.borrow_mut();
