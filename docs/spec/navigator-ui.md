@@ -103,6 +103,7 @@ A live page is these processes, each in its own jail:
 | part | jail | holds | per |
 |---|---|---|---|
 | document worker | zero capabilities (backend §4.7) | the page's document and its in-page history | page |
+| page view | Limen doc-viewer child (`org.atrium.navigator.page`), as `_navpage`; one capability, `navigator-page`: navigatord's ticket socket, where a one-shot random ticket is traded for the page's recording (decided 2026-11-14: the only way for it to get its page, and the socket does nothing else); no network, no graphics socket, no host files | the page's recording and its layout | live page |
 | page renderer | frescod split-mode renderer, no GPU fd, its own GPU VM (threat model §2.5.2) | the page's scene buffer | page window |
 | converter | one-shot, rlimits (backend §4.7d) | the page's bytes while converting | conversion |
 | fetcher | Nuntius; anonymous fetches shared per conversion, cookied ones through Arca's courier for one (persona, origin) | network, nothing else | request or (persona, origin) |
@@ -1074,8 +1075,10 @@ Each step runs in the VM on headless frescod before the next.
      fetched by navigator-fetchd in a fetcher jail (`network = "full"`) and converted by
      prerender in a one-shot converter jail with no capabilities, over a hermetic network that
      serves the fixtures by name. The UI runs as navigatord's user, since navigatord opens the
-     UI's frescod connection and limend checks the slot's parent by owner. Open: images and
-     anchors in the child; the renderer jail in the same run.
+     UI's frescod connection and limend checks the slot's parent by owner. frescod runs as
+     `_frescod` and each window's renderer (the UI's, each page's) is a portcullisd jail as
+     `_fresco-render` (`scripts/fresco-renderer-bundle.sh`); 25/25. Open: images and anchors
+     in the child.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.
    *Built 2026-11-13:*
    - The tree, open beside, put away and Earlier were built in step 1. Earlier now carries the

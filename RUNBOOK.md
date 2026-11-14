@@ -5720,7 +5720,9 @@ It deploys the portcullis stack (deploy-portcullis.sh, which merges `etc/jaild.p
 allows rctl in jaild, starts portcullisd on `/atrium/sockets/portcullis/portcullis.sock`, and
 installs three signed bundles: `org.atrium.navigator.page` (`scripts/navigator-page-bundle.sh`:
 the `navigator-page` capability, system grant, worker rule `_limen` → `_navpage` 65035),
-`org.atrium.navigator.converter` (prerender, no capabilities) and `org.atrium.navigator.fetcher`
+`org.atrium.fresco.renderer` (`scripts/fresco-renderer-bundle.sh`; frescod runs as `_frescod`
+with `FRESCOD_ACTIVATION_SOCK` in the run dir, and each window's renderer is a jail as
+`_fresco-render`), `org.atrium.navigator.converter` (prerender, no capabilities) and `org.atrium.navigator.fetcher`
 (navigator-fetchd, `network = "full"`, its trust store plus the fixture CA). limend runs as
 `_limen` with a run registry naming navtest's uid as `org.atrium.navigator`; navigatord runs as
 navtest with `NAVIGATORD_CONVERTER`/`NAVIGATORD_FETCHD` set to `portcullis exec --daemon`, and
@@ -5729,7 +5731,8 @@ the UI runs as navtest too (navigatord opens its frescod connection, so its wind
 Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
 mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` only; its network
 is a vnet of its own with lo0 only; portcullisd logs converter and fetcher jails and the worker
-rule; a link follows into a new page jail; two live pages are two jails; no jail is left after
+rule; the UI's and the pages' renderers run in jails as 65011, none outside one, none left after
+frescod; a link follows into a new page jail; two live pages are two jails; no jail is left after
 the UI exits. jaild needed two policy entries for it: `/atrium/sockets/navigator-page` in
 `rw_paths` and 65035 in the allowed system uids and gids. Logs and frames in the out dir
 (default `scratch/navigator-confined`).
