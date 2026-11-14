@@ -1181,6 +1181,14 @@ Each step runs in the VM on headless frescod before the next.
      control and the rail's person glyph show it. Without Arca the failure says the site needs
      to know you. Checked against the real Arca in `scripts/arca-vm-test.sh` §8 (a stand-in
      chain beside a fixture, `<page>.chain`).
+   - **Session cookies end with the site's last page** (arca.md §8.6, 2026-11-14). The UI keeps
+     the set of (jar, site) pairs where the site knows you and has a page in an open trail
+     (`TrailStore::open_sessions`). When a pair leaves it (its trails put away, its pages
+     cleared) while the site still knows you, the UI sends `EndSession { jar, url }` and
+     navigatord has arcad end that partition's session cookies (`W_SIGN_OUT`). A closed
+     Unrecorded trail's jar is forgotten whole instead. Trails restored at start keep their
+     sessions, as a browser that reopens its tabs does. Checked against the real Arca in
+     `scripts/arca-vm-test.sh` §8 (`navctl endsession`).
      Not yet: consent buttons pressed in a page, named personas,
      session cookies ending with the last view, and moving a branch into its own trail with its
      jar.

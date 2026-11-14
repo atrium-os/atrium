@@ -797,6 +797,32 @@ impl TrailStore {
         }
     }
 
+    /// The sites that know you and have a page in an open trail, by jar:
+    /// their sessions (Arca §8.6). When one leaves this set while the site
+    /// still knows you, its session cookies end.
+    pub fn open_sessions(&self) -> BTreeSet<(navigator_control::Jar, String)> {
+        let mut v = BTreeSet::new();
+        for t in &self.trails {
+            let jar = Self::jar_of(t);
+            for p in t.pages.iter().filter(|p| !p.url.is_empty()) {
+                let st = site(&p.url);
+                if self.known.contains(&(jar.clone(), st.to_string())) {
+                    v.insert((t.jar(), st.to_string()));
+                }
+            }
+        }
+        v
+    }
+
+    /// Whether `site` knows you in `jar` (any trail of it).
+    pub fn knows_in(&self, jar: navigator_control::Jar, site: &str) -> bool {
+        let j = match jar {
+            navigator_control::Jar::Personal => "personal".to_string(),
+            navigator_control::Jar::Unrecorded(j) => format!("unrecorded-{j:016x}"),
+        };
+        self.known.contains(&(j, site.to_string()))
+    }
+
     /// Whether `site` knows you in trail `index`'s jar (the rail's person glyph).
     pub fn trail_knows(&self, index: usize, site: &str) -> bool {
         self.known.contains(&(Self::jar_of(&self.trails[index]), site.to_string()))
@@ -1052,6 +1078,10 @@ mod tests {
 mod asked_tests {
     use super::*;
 
+    fn spec(url: &str) -> PageSpec {
+        PageSpec { url: url.into(), title: url.into(), search: None, facts: Facts::green(""), media: Media::None }
+    }
+
     /// A site that asked to know you (§6.2) knows you in that trail's jar
     /// only: another Unrecorded trail's jar is apart.
     #[test]
@@ -1065,5 +1095,23 @@ mod asked_tests {
         s.unknow(ta, "https://sd.example/");
         assert!(!s.trail_knows(a, "sd.example"));
         let _ = tb;
+    }
+
+    /// A site's session is open while a page of it is in an open trail and
+    /// it knows you there; putting the trail away ends it.
+    #[test]
+    fn a_session_lasts_while_a_page_of_the_site_is_in_an_open_trail() {
+        use navigator_control::Jar;
+        let mut s = TrailStore::empty();
+        s.new_trail(false);
+        s.trail_mut().follow(spec("https://www.sd.example/a"));
+        s.trail_mut().follow(spec("https://news.example/b"));
+        assert!(s.open_sessions().is_empty(), "nobody knows you yet");
+        s.set_knows("sd.example", true);
+        assert_eq!(s.open_sessions().into_iter().collect::<Vec<_>>(), vec![(Jar::Personal, "sd.example".to_string())]);
+        assert!(s.knows_in(Jar::Personal, "sd.example") && !s.knows_in(Jar::Personal, "news.example"));
+        s.put_away(0);
+        assert!(s.open_sessions().is_empty());
+        assert!(s.knows_in(Jar::Personal, "sd.example"), "it still knows you: only the session ends");
     }
 }

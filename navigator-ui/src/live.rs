@@ -91,6 +91,9 @@ pub struct Live {
     /// The Unrecorded jars of open trails: one that goes (its trail
     /// closed) is forgotten in navigatord and Arca.
     jars: HashSet<u64>,
+    /// The sites that know you with a page in an open trail, by jar
+    /// (`TrailStore::open_sessions`), as of the last tick.
+    sessions: std::collections::BTreeSet<(Jar, String)>,
     /// The history view is open, the page's slot withdrawn.
     history: bool,
     /// Pages to open as their current version, not the stored one
@@ -165,6 +168,7 @@ impl Live {
                 dark: false,
                 budget,
                 jars: HashSet::new(),
+                sessions: Default::default(),
                 history: false,
                 fresh: HashSet::new(),
                 idle,
@@ -600,6 +604,18 @@ impl Live {
             eprintln!("navigator-ui: an Unrecorded trail closed; forgetting its jar");
             send(&mut self.w, &Request::Forget { jar: Jar::Unrecorded(j), url: None });
         }
+        // A site's last page in a jar went, and it still knows you there:
+        // its session cookies end (Arca §8.6). A closed Unrecorded trail's
+        // jar was forgotten whole just above.
+        let sessions = s.store.open_sessions();
+        for (jar, site) in self.sessions.difference(&sessions) {
+            let gone = matches!(jar, Jar::Unrecorded(j) if !jars.contains(j));
+            if !gone && s.store.knows_in(*jar, site) {
+                eprintln!("navigator-ui: the last page of {site} in its jar went; ending its session");
+                send(&mut self.w, &Request::EndSession { jar: *jar, url: format!("https://{site}/") });
+            }
+        }
+        self.sessions = sessions;
         self.jars = jars;
         // Pages whose site the person let remember them, or forgot, since
         // they opened: closed, to open again as asked.

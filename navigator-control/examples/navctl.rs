@@ -6,6 +6,8 @@
 //! `opened <id> <url> knows=<bool> from=<Source>` or `failed <id> <why>`.
 //! `forget` sends `Forget` (no answer) and waits a second.
 //! `signout <p|u:HEX> <url>` prints `signedout <n>` or `notsignedout <why>`;
+//! `endsession <p|u:HEX> <url>` sends `EndSession` (no answer), waits a
+//! second and prints `ended`;
 //! `accounts <url>` prints `accounts <n> [kind:name …]` or `noaccounts <why>`.
 
 use std::os::unix::net::UnixStream;
@@ -70,6 +72,12 @@ fn main() {
                         other => break println!("notsignedout navigatord: {other:?}"),
                     }
                 }
+            }
+            "endsession" => {
+                write_frame(&mut s, &Request::EndSession { jar: jar(&a[i + 1]), url: a[i + 2].clone() }).unwrap();
+                i += 3;
+                std::thread::sleep(Duration::from_secs(1));
+                println!("ended");
             }
             "accounts" => {
                 write_frame(&mut s, &Request::Accounts { url: a[i + 1].clone() }).unwrap();

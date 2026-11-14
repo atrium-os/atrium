@@ -848,6 +848,15 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
+            Request::EndSession { jar, url } => {
+                let Some(part) = ctl::clean(&url, ctl::URL_MAX).then(|| navigator_cookies::partition_in(jar_id(jar), &url)).flatten() else { continue };
+                let Some(c) = &cookies else { continue };
+                let r = c.lock().unwrap().arca.sign_out(&part);
+                match r {
+                    Ok(n) => eprintln!("navigatord: the last page of {part} went: {n} session cookies ended"),
+                    Err(e) => eprintln!("navigatord: ending the session of {part}: {e}"),
+                }
+            }
             Request::Accounts { url } => {
                 let reply = |accounts: Vec<ctl::Account>, why: Option<String>| send(&w, &Event::Accounts { url: url.clone(), accounts, why });
                 let Some(site) = ctl::clean(&url, ctl::URL_MAX).then(|| site_of(&url)).flatten() else {

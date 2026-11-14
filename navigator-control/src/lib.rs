@@ -79,6 +79,10 @@ pub enum Request {
     /// the jar; cookies with an expiry, and the site knowing you, stay.
     /// Answered by `SignedOut`.
     SignOut { jar: Jar, url: String },
+    /// The site's last page in the jar went (its trails put away, its pages
+    /// cleared) while it still knows you: its session cookies end (Arca
+    /// §8.6), as a browser's do when it closes. No answer.
+    EndSession { jar: Jar, url: String },
     /// The presence menu opened on a page whose site knows you: which
     /// accounts Arca holds for `url`'s site (names only). Answered by
     /// `Accounts`.
@@ -181,7 +185,7 @@ pub enum AccountKind {
 
 /// A persona's jar (navigator-ui.md §2.4): Personal, or one Unrecorded
 /// trail's own throwaway jar, named by a random id the UI picks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Jar {
     Personal,
     Unrecorded(u64),

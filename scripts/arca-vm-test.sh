@@ -360,6 +360,14 @@ check "a failed cookie check: the page opened with the site knowing you, and say
     "opened 13 $U/ck knows=true from=Fetched note=this site needs to know you to show this page" "$(echo "$r" | grep '^opened 13 ')"
 check "…through Arca, in that trail's jar (empty at first)" - "$(K /ck)"
 check "an error that is not a cookie check stays an error" "failed 14 the site answered 404" "$(echo "$r" | grep '^failed 14 ')"
+# The site's last page went (Arca §8.6): its session cookies end, and it
+# still knows you.
+N=$(wc -l < "$SRV/log")
+r=$(nav open 15 $U/e1 p 1  open 16 $U/e2 p 1  endsession p $U/  open 17 $U/e3 p 1)
+echo "$r" | sed 's/^/    /'
+check "a session: the cookie on the next page" sid=vm-cookie "$(K /e2)"
+check "the site's last page went: its session cookie ended" - "$(K /e3)"
+check "…and navigatord said so" yes "$(g "grep -q 'the last page of api.example went: 1 session cookies ended' $N8/navd1.log && echo yes || echo no")"
 # A crash leaves an Unrecorded jar (b2 has a cookie): the next navigatord
 # forgets every Unrecorded jar before it serves.
 g "pkill -x navigatord; sleep 2; true"
