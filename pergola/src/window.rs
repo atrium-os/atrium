@@ -90,6 +90,18 @@ pub struct Window {
     popups: crate::popup::Popups,
     /// The main window is a granted pop-up ([`WindowDesc::hosted`]).
     hosted: bool,
+    /// Where the last [`Window::paint`] spent its time.
+    pub last_paint: PaintTiming,
+}
+
+/// The parts of one [`Window::paint`], in milliseconds: rendering and diffing the
+/// tree, sending the frame (writes block while frescod is behind), and how many
+/// deltas went out.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaintTiming {
+    pub build_ms: f64,
+    pub send_ms: f64,
+    pub deltas: usize,
 }
 
 /// Opens pop-ups for [`crate::popup::Popups`] on the window's connection.
@@ -205,6 +217,7 @@ impl Window {
             width: w as f32,
             height: h as f32,
             binder: None,
+            last_paint: PaintTiming::default(),
             embed_token: None,
             appearance,
             follow_appearance: true,
@@ -234,8 +247,11 @@ impl Window {
             app.set_theme(t);
         }
         app.set_popups(true);
+        let t0 = std::time::Instant::now();
         app.frame();
         let deltas = app.tick();
+        let t1 = std::time::Instant::now();
+        self.last_paint = PaintTiming { build_ms: (t1 - t0).as_secs_f64() * 1e3, send_ms: 0.0, deltas: deltas.len() };
         if !deltas.is_empty() {
             // Pop-ups open (or move, or close) before what they show is sent.
             let mut host = PopupHost {
@@ -262,6 +278,7 @@ impl Window {
                 self.surface.present()?;
             }
             self.surface.select(self.main);
+            self.last_paint.send_ms = t1.elapsed().as_secs_f64() * 1e3;
         }
         // After the present, so a slot never sits over a frame that does
         // not yet show the space for it.

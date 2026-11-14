@@ -5,7 +5,7 @@
 //! `.xlsx`'s limits (1,048,576 rows, 16,384 columns) is refused with its name: the
 //! format can't hold it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use crate::zip::ZipWriter;
 
 pub const XLSX_ROWS: u32 = 1 << 20;
 pub const XLSX_COLS: u32 = 1 << 14;
+/// Styled empty cells written as cells of their own, per sheet, at most.
+const MAX_EXTRA: usize = 4_000_000;
 
 /// Functions newer than Excel 2007 carry a prefix in files.
 const FUTURE: &[&str] = &[
@@ -154,13 +156,56 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
     let dw = sh.col_sizes.default / MDW;
     let dh = sh.row_sizes.default * 72.0 / 96.0;
     let _ = write!(o, r#"<sheetFormatPr defaultRowHeight="{dh}" defaultColWidth="{dw}" customHeight="1"/>"#);
-    let over = sh.col_sizes.overrides();
-    if !over.is_empty() {
-        o.extend_from_slice(b"<cols>");
-        for &(c, px) in over {
-            if c < XLSX_COLS {
-                let _ = write!(o, r#"<col min="{0}" max="{0}" width="{1}" customWidth="1"/>"#, c + 1, px / MDW);
+    // Styles: a run to the last row is the column's style (it covers the empty
+    // cells below); other styled empty cells are written as cells of their own.
+    let last = XLSX_ROWS - 1;
+    let mut col_style: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut extra: Vec<(u32, u32, u32)> = Vec::new();
+    for (c, runs) in sh.styles.iter().enumerate().take(XLSX_COLS as usize) {
+        let c = c as u32;
+        let tail = runs.get(last);
+        if tail != 0 {
+            col_style.insert(c, tail);
+        }
+        for (a, b, id) in runs.spans(0, last) {
+            if id == tail {
+                continue;
             }
+            // Cells whose style differs from the column's: empty ones need writing
+            // (style 0 included, under a styled column).
+            if b - a > MAX_EXTRA as u32 || extra.len() > MAX_EXTRA {
+                continue;
+            }
+            for r in a..=b {
+                if wb.value(s, r, c).is_empty() && wb.group_at(s, r, c).is_none() {
+                    extra.push((r, c, id));
+                }
+            }
+        }
+    }
+    extra.sort_unstable();
+    let over = sh.col_sizes.overrides();
+    if !over.is_empty() || !col_style.is_empty() {
+        let mut cols: BTreeMap<u32, (Option<f64>, u32)> = BTreeMap::new();
+        for &(c, px) in over {
+            cols.entry(c).or_insert((None, 0)).0 = Some(px);
+        }
+        for (&c, &id) in &col_style {
+            cols.entry(c).or_insert((None, 0)).1 = id;
+        }
+        o.extend_from_slice(b"<cols>");
+        for (c, (px, id)) in cols {
+            if c >= XLSX_COLS {
+                continue;
+            }
+            let _ = write!(o, r#"<col min="{0}" max="{0}" width="{1}""#, c + 1, px.unwrap_or(sh.col_sizes.default) / MDW);
+            if px.is_some() {
+                o.extend_from_slice(br#" customWidth="1""#);
+            }
+            if id != 0 {
+                let _ = write!(o, r#" style="{id}""#);
+            }
+            o.extend_from_slice(b"/>");
         }
         o.extend_from_slice(b"</cols>");
     }
@@ -193,11 +238,13 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
         }
         *cur = Some(r);
     };
-    if rows > 0 && cols > 0 {
+    if (rows > 0 && cols > 0) || !extra.is_empty() {
         // Formula cells whose value is empty are still written.
         let mut each = |r: u32, c: u32, v: Value| {
             let g = wb.group_at(s, r, c);
-            if v.is_empty() && g.is_none() {
+            let xf = sh.style_id(r, c);
+            let styled = xf != col_style.get(&c).copied().unwrap_or(0);
+            if v.is_empty() && g.is_none() && !styled {
                 return;
             }
             // Errors Excel doesn't have: a cycle shows 0 there (with a warning), a
@@ -216,7 +263,11 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
                 Value::Bool(_) => r#" t="b""#,
                 Value::Err(_) => r#" t="e""#,
             };
-            let _ = write!(o, r#"<c r="{at}"{t}>"#);
+            if xf != 0 || styled {
+                let _ = write!(o, r#"<c r="{at}" s="{xf}"{t}>"#);
+            } else {
+                let _ = write!(o, r#"<c r="{at}"{t}>"#);
+            }
             if let Some(g) = g {
                 let grp = wb.group(g);
                 if grp.r0 == grp.r1 {
@@ -265,7 +316,8 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
             }
             o.extend_from_slice(b"</c>");
         };
-        each_cell_rowmajor(wb, &rect, &mut each);
+        let ext = Rect { r1: rect.r1.max(extra.last().map_or(0, |e| e.0)), c1: rect.c1.max(extra.iter().map(|e| e.1).max().unwrap_or(0)), ..rect };
+        each_cell_rowmajor(wb, &ext, &extra, &mut each);
     }
     if cur_row.is_some() {
         o.extend_from_slice(b"</row>");
@@ -283,9 +335,9 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
 
 /// Every cell in row-major order, formula cells included even when their value is
 /// empty: values come from `each_rowmajor`, formula cells it skipped are added.
-fn each_cell_rowmajor(wb: &Workbook, r: &Rect, f: &mut dyn FnMut(u32, u32, Value)) {
-    // Formula cells by row, for the ones with empty values.
-    let mut empty_f: Vec<(u32, u32)> = Vec::new();
+fn each_cell_rowmajor(wb: &Workbook, r: &Rect, extra: &[(u32, u32, u32)], f: &mut dyn FnMut(u32, u32, Value)) {
+    // Formula cells by row, for the ones with empty values, and styled empty cells.
+    let mut empty_f: Vec<(u32, u32)> = extra.iter().map(|e| (e.0, e.1)).collect();
     for (_, g) in wb.groups() {
         if g.sheet != r.sheet {
             continue;
@@ -297,10 +349,14 @@ fn each_cell_rowmajor(wb: &Workbook, r: &Rect, f: &mut dyn FnMut(u32, u32, Value
         }
     }
     empty_f.sort_unstable();
+    empty_f.dedup();
     let mut k = 0;
     wb.each_rowmajor(r, &mut |row, col, v| {
         while k < empty_f.len() && empty_f[k] < (row, col) {
             f(empty_f[k].0, empty_f[k].1, Value::Empty);
+            k += 1;
+        }
+        if k < empty_f.len() && empty_f[k] == (row, col) {
             k += 1;
         }
         f(row, col, v);
@@ -344,8 +400,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>"#, n + 2));
     r.push_str("</Relationships>");
     z.add("xl/_rels/workbook.xml.rels", r.as_bytes())?;
-    // The least styles part Excel opens without repair.
-    z.add("xl/styles.xml", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#)?;
+    z.add("xl/styles.xml", &super::styles::write(wb))?;
     let mut sst: Vec<u8> = Vec::new();
     let _ = write!(sst, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{}" uniqueCount="{}">"#, strings.uses, strings.list.len());
     for s in &strings.list {

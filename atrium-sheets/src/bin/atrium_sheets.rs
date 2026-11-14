@@ -446,6 +446,7 @@ fn bench_main(a: &[String]) -> i32 {
         let mut events = bench::script(p, secs, at).into_iter().peekable();
         let start = Instant::now();
         let mut frames = Vec::new();
+        let mut parts: Vec<pergola::PaintTiming> = Vec::new();
         let mut moving = Vec::new();
         let n = (secs * hz) as usize;
         // One entry per vsync of wall-clock time: vsyncs that went by while a frame
@@ -485,11 +486,33 @@ fn bench_main(a: &[String]) -> i32 {
                     return 1;
                 }
                 frames.push(Frame { start: now, cost: t.elapsed().as_secs_f64() * 1e3 });
+                parts.push(win.last_paint);
             }
         }
         let r = Report::new(&frames, period, &moving);
         all_pass &= r.passes(period);
         println!("atrium-sheets bench {} rows {rows} hz {hz}: {}", p.name(), r.line(period));
+        // Where the time went: building the frame, or sending it (a write waits
+        // while frescod is behind).
+        let pct = |mut v: Vec<f64>, q: f64| {
+            v.sort_by(f64::total_cmp);
+            v.get(((v.len() as f64 - 1.0) * q).round().max(0.0) as usize).copied().unwrap_or(0.0)
+        };
+        let slow: Vec<&pergola::PaintTiming> = frames.iter().zip(&parts).filter(|(f, _)| f.cost > 2.0 * period).map(|(_, p)| p).collect();
+        let mean = |f: &dyn Fn(&pergola::PaintTiming) -> f64| if slow.is_empty() { 0.0 } else { slow.iter().map(|p| f(p)).sum::<f64>() / slow.len() as f64 };
+        println!(
+            "  parts: build p50 {:.2} p99 {:.2} ms; send p50 {:.2} p99 {:.2} ms; deltas p50 {:.0} p99 {:.0}; {} slow frames (>2 periods): build {:.1} ms, send {:.1} ms, {:.0} deltas on average",
+            pct(parts.iter().map(|p| p.build_ms).collect(), 0.5),
+            pct(parts.iter().map(|p| p.build_ms).collect(), 0.99),
+            pct(parts.iter().map(|p| p.send_ms).collect(), 0.5),
+            pct(parts.iter().map(|p| p.send_ms).collect(), 0.99),
+            pct(parts.iter().map(|p| p.deltas as f64).collect(), 0.5),
+            pct(parts.iter().map(|p| p.deltas as f64).collect(), 0.99),
+            slow.len(),
+            mean(&|p| p.build_ms),
+            mean(&|p| p.send_ms),
+            mean(&|p| p.deltas as f64),
+        );
         // Let a fling settle, then back to the top for the next pattern.
         let settle = Instant::now();
         while app.wants_frame() && settle.elapsed() < Duration::from_secs(10) {

@@ -124,3 +124,37 @@ fn hostile_sheet_xml_never_panics() {
         let _ = xlsx::read(&w.finish().unwrap());
     }
 }
+
+#[test]
+fn styles_round_trip() {
+    use officina_grid::addr::Rect;
+    use officina_grid::style::{Edge, HAlign, Line, Style};
+    let mut wb = book();
+    let mut money = Style::default().with_num_fmt("\"$\"#,##0.00");
+    money.font.bold = true;
+    money.fill = Some(0xE2EFDA);
+    money.borders[3] = Edge { line: Line::Medium, color: Some(0x375623) };
+    let date = Style::default().with_num_fmt("yyyy-mm-dd");
+    let mut centred = Style::default();
+    centred.h_align = HAlign::Center;
+    centred.font.italic = true;
+    // A whole column, part of one (past the data), one cell, and a column style with
+    // unstyled cells inside it.
+    wb.set_style(&Rect { sheet: 0, r0: 0, c0: 0, r1: 1_048_575, c1: 0 }, money.clone());
+    wb.set_style(&Rect { sheet: 0, r0: 10, c0: 0, r1: 12, c1: 0 }, Style::default());
+    wb.set_style(&Rect { sheet: 0, r0: 0, c0: 5, r1: 799, c1: 5 }, date.clone());
+    wb.set_style(&Rect { sheet: 1, r0: 2, c0: 0, r1: 2, c1: 0 }, centred.clone());
+    wb.set_value(CellAddr::new(0, 3, 5), Value::Num(46340.0));
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    for (s, r, c) in [(0u16, 0u32, 0u32), (0, 9, 0), (0, 10, 0), (0, 12, 0), (0, 13, 0), (0, 600, 0), (0, 1_048_575, 0), (0, 3, 5), (0, 799, 5), (0, 800, 5), (1, 2, 0), (1, 3, 0), (0, 5, 1)] {
+        let a = CellAddr::new(s, r, c);
+        assert_eq!(back.style(a), wb.style(a), "style at {s} {r},{c}");
+    }
+    assert_eq!(back.formatted(CellAddr::new(0, 3, 5)).text, "2026-11-14");
+    assert_eq!(back.formatted(CellAddr::new(0, 4, 0)).text, "$6.00");
+    // A whole formatted column stays a few runs, and the file small.
+    assert!(back.sheet(0).styles[0].runs().len() <= 3, "{:?}", back.sheet(0).styles[0].runs());
+    assert!(file.len() < 200_000, "{} bytes", file.len());
+}

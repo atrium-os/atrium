@@ -7,7 +7,9 @@
 //! value until recalculation; the converter compares the two (a differential against
 //! whatever wrote the file, Excel included) and reports differences.
 //!
-//! Reported, not carried (O4b–O4e): styles and number formats, merged cells, charts and
+//! Styles and number formats come from `xl/styles.xml` ([`super::styles`]).
+//!
+//! Reported, not carried (O4c–O4e): merged cells, charts and
 //! drawings, defined names, tables, conditional formats, data validation, comments,
 //! hyperlinks. Kept inert: macros (`vbaProject.bin`), external links.
 
@@ -21,6 +23,7 @@ use officina_grid::addr::{a1, parse_a1, CellAddr, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
 use officina_grid::formula::{self, Expr};
 use officina_grid::strings::MAX_TEXT;
+use officina_grid::style::{StyleId, StyleRuns};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::report::{Kind, Report};
@@ -331,7 +334,11 @@ struct Seg {
     heights: Vec<(u32, f64)>,
     default_w: Option<f64>,
     default_h: Option<f64>,
-    styled: u64,
+    /// Per column: runs of cells' `cellXfs` index, (first row, last row, xf).
+    sruns: Vec<Vec<(u32, u32, u32)>>,
+    /// `<col style>`: (first column, last column, xf), 0-based.
+    col_styles: Vec<(u32, u32, u32)>,
+    row_styled: u64,
     cells: u64,
     rep: Report,
     first_row: Option<u32>,
@@ -371,6 +378,9 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                 if hidden {
                     seg.rep.note(Kind::Approximate, "hidden columns shown narrow");
                 }
+                if let Some(xf) = attr(&e, b"style")?.and_then(|v| v.parse::<u32>().ok()).filter(|&x| x != 0) {
+                    seg.col_styles.push((min.clamp(1, MAX_COLS) - 1, max.clamp(1, MAX_COLS) - 1, xf));
+                }
                 if let Some(w) = w {
                     let px = (w * MDW).round().max(2.0);
                     let (min, max) = (min.clamp(1, MAX_COLS), max.clamp(1, MAX_COLS));
@@ -397,6 +407,9 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                 col = -1;
                 seg.first_row.get_or_insert(rr as u32);
                 seg.last_row = Some(rr as u32);
+                if attr(&e, b"customFormat")?.is_some_and(|v| v == "1" || v == "true") && attr(&e, b"s")?.is_some_and(|v| v != "0") {
+                    seg.row_styled += 1;
+                }
                 if attr(&e, b"customHeight")?.is_some_and(|v| v == "1" || v == "true") {
                     if let Some(h) = attr(&e, b"ht")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v < 410.0) {
                         seg.heights.push((row as u32, (h * 96.0 / 72.0).round().max(2.0)));
@@ -406,13 +419,13 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
             }
             b"c" => {
                 // One pass over the attributes, no allocation unless escaped.
-                let (mut r_at, mut t_at, mut styled) = (None::<std::borrow::Cow<[u8]>>, None::<std::borrow::Cow<[u8]>>, false);
+                let (mut r_at, mut t_at, mut xf) = (None::<std::borrow::Cow<[u8]>>, None::<std::borrow::Cow<[u8]>>, 0u32);
                 for a in e.attributes().with_checks(false) {
                     let a = a?;
                     match a.key.local_name().as_ref() {
                         b"r" => r_at = Some(a.value),
                         b"t" => t_at = Some(a.value),
-                        b"s" => styled = a.value.as_ref() != b"0",
+                        b"s" => xf = std::str::from_utf8(&a.value).ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         _ => {}
                     }
                 }
@@ -432,8 +445,15 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                     None | Some(b"n") => None,
                     Some(x) => Some(String::from_utf8_lossy(x).into_owned()),
                 };
-                if styled {
-                    seg.styled += 1;
+                // Runs of one style down a column (style 0 too: it ends a run).
+                let ci = cc as usize;
+                if seg.sruns.len() <= ci {
+                    seg.sruns.resize_with(ci + 1, Vec::new);
+                }
+                let col_runs = &mut seg.sruns[ci];
+                match col_runs.last_mut() {
+                    Some(l) if l.2 == xf && l.1 + 1 == rr => l.1 = rr,
+                    _ => col_runs.push((rr, rr, xf)),
                 }
                 if empty {
                     continue;
@@ -552,7 +572,8 @@ const PIECE: usize = 8 << 20;
 
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>) -> Result<(), XlsxError> {
+#[allow(clippy::too_many_arguments)]
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -620,6 +641,8 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut last_row: Option<u32> = None;
         let mut widths = Vec::new();
         let mut heights = Vec::new();
+        let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
+        let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
         let (mut dw, mut dh) = (None, None);
         let mut failed = None;
         for (i, seg) in seg_rx {
@@ -657,9 +680,24 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
                 out.cells += seg.cells;
-                if seg.styled > 0 {
-                    out.report.note_n(Kind::Approximate, "cells with styles and number formats shown as General (dates show as serial numbers until O4b)", seg.styled);
+                if seg.row_styled > 0 {
+                    out.report.note_n(Kind::Approximate, "row formats on empty cells not kept (cells keep their own)", seg.row_styled);
                 }
+                if sruns.len() < seg.sruns.len() {
+                    sruns.resize_with(seg.sruns.len(), Vec::new);
+                }
+                for (c, runs) in seg.sruns.into_iter().enumerate() {
+                    let dst = &mut sruns[c];
+                    let mut it = runs.into_iter().peekable();
+                    if let (Some(l), Some(f)) = (dst.last_mut(), it.peek()) {
+                        if l.2 == f.2 && l.1 + 1 == f.0 {
+                            l.1 = f.1;
+                            it.next();
+                        }
+                    }
+                    dst.extend(it);
+                }
+                col_styles.extend(seg.col_styles);
                 rep.merge(seg.rep);
             }
         }
@@ -680,6 +718,53 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         if !heights.is_empty() {
             sh.row_sizes = Sizes::from_overrides(sh.row_sizes.default, heights);
         }
+        // Styles: a column's own style under its cells' runs.
+        let mut id = |xf: u32| -> StyleId {
+            match xf_ids.get(xf as usize) {
+                Some(&i) => i,
+                None => {
+                    rep.note(Kind::Approximate, "cells naming a style the file does not have, shown unstyled");
+                    0
+                }
+            }
+        };
+        let mut base: Vec<StyleId> = Vec::new();
+        for (c0, c1, xf) in col_styles {
+            let i = id(xf);
+            if i != 0 && base.len() <= c1 as usize {
+                base.resize(c1 as usize + 1, 0);
+            }
+            if i != 0 {
+                for b in &mut base[c0 as usize..=c1 as usize] {
+                    *b = i;
+                }
+            }
+        }
+        let ncols = sruns.len().max(base.len());
+        let mut cols: Vec<StyleRuns> = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let b = base.get(c).copied().unwrap_or(0);
+            let mut v: Vec<(u32, StyleId)> = Vec::new();
+            let mut at = 0u32;
+            if b != 0 {
+                v.push((0, b));
+            }
+            for &(r0, r1, xf) in sruns.get(c).map(Vec::as_slice).unwrap_or(&[]) {
+                if r0 > at && b != 0 {
+                    v.push((at, b));
+                }
+                v.push((r0, id(xf)));
+                at = r1 + 1;
+            }
+            if (at as u64) < MAX_ROWS as u64 && at > 0 {
+                v.push((at, b));
+            }
+            cols.push(StyleRuns::from_runs(v));
+        }
+        while cols.last().is_some_and(|c| c.is_empty()) {
+            cols.pop();
+        }
+        wb.sheet_mut(s).styles = cols;
         Ok(())
     })
 }
@@ -816,12 +901,25 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         wb.add_sheet(&n).map_err(bad)?;
     }
     let mut rep = Report::default();
+    // Styles, before the cells that name them.
+    let theme = wb_rels.values().find(|(t, _)| t.ends_with("/theme")).map(|(_, p)| p.clone());
+    let theme = match theme {
+        Some(p) => super::styles::theme_colors(&z.read_name(&p)?.unwrap_or_default()),
+        None => super::styles::theme_colors(b""),
+    };
+    let xf_ids: Vec<StyleId> = match wb_rels.values().find(|(t, _)| t.ends_with("/styles")).map(|(_, p)| p.clone()) {
+        Some(p) => match z.read_name(&p)? {
+            Some(x) => super::styles::read(&x, &theme, &mut rep).into_iter().map(|st| wb.styles.intern(st)).collect(),
+            None => vec![0],
+        },
+        None => vec![0],
+    };
     let mut all_f: Vec<(u16, Vec<FCell>, HashMap<u32, (u32, u32, String)>)> = Vec::new();
     for (i, (_, part)) in sheets.iter().enumerate() {
         let e = z.find(part).ok_or_else(|| bad(format!("missing {part}")))?.clone();
         let mut fcells = Vec::new();
         let mut shared = HashMap::new();
-        sheet(&mut wb, i as u16, &z, &e, &sst, &mut out, &mut rep, &mut fcells, &mut shared)?;
+        sheet(&mut wb, i as u16, &z, &e, &sst, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared)?;
         all_f.push((i as u16, fcells, shared));
     }
 

@@ -2,6 +2,7 @@
 //! document process.
 
 pub mod read;
+pub mod styles;
 pub mod write;
 
 pub use read::{read, Loaded, XlsxError};

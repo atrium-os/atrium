@@ -59,4 +59,4 @@ pub use reactive::Mutable;
 pub use surface::{commit, FrescoSurface, LogSurface, Surface};
 pub use view::{render, Ctx, Draw, InteractionState, View};
 pub use widgets::{Avatar, Button, Chip, Divider, Dot, Glyph, Label, ListRow, ProgressBar, ScrollState, ScrollView, TextField};
-pub use window::{Flow, SizeSpec, StepResult, Window, WindowDesc};
+pub use window::{Flow, PaintTiming, SizeSpec, StepResult, Window, WindowDesc};
