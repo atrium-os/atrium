@@ -1,10 +1,11 @@
 #!/bin/sh
-# atrium-net's N0 gate (docs/spec/atrium-net.md §10): the FreeBSD VM's second
-# NIC (vtnet1) on a fake LAN (atrium-net/sim/lan.py: router, DHCP, DNS) that
-# can turn hostile.
+# atrium-net's N0 + N2 gate (docs/spec/atrium-net.md §10): the FreeBSD VM's
+# second NIC (vtnet1) on a fake LAN (atrium-net/sim/lan.py: router, DHCP, DNS,
+# IPv6 RAs) that can turn hostile.
 #
-#   sh scripts/atrium-net-gate.sh vm     boot the VM with the LAN NIC
-#   sh scripts/atrium-net-gate.sh n0     build, install, run the checks
+#   sh scripts/atrium-net-gate.sh vm     boot the VM with the LAN NIC (and the
+#                                        Aura gates' port, so one VM serves both)
+#   sh scripts/atrium-net-gate.sh n0     build, install, run the checks (IPv4, IPv6)
 #
 # vtnet0 (slirp, ssh) is left alone except for its default route, which
 # atrium-net takes over during the run and which is put back at the end.
@@ -22,6 +23,10 @@ ok() { echo "ok   $1"; pass=$((pass + 1)); }
 cleanup() {
     "$V" 'pkill -f "atrium-net -v"; sleep 1
         for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
+        # RAs off before deleting SLAAC addresses (kernel race, spec §5.3).
+        ifconfig vtnet1 inet6 -accept_rtadv
+        for a in $(ifconfig vtnet1 inet6 | awk "/inet6 fd77:/{print \$2}"); do ifconfig vtnet1 inet6 $a -alias; done
+        ifconfig vtnet1 inet6 ifdisabled
         g=$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n "$g" ] && { route -q change default $g || route -q add default $g; }
         [ -f /tmp/atrium-net/resolv.conf.saved ] && cp /tmp/atrium-net/resolv.conf.saved /etc/resolv.conf
         true' || true
@@ -53,7 +58,7 @@ wait_addr() {
 
 case "${1:-}" in
 vm)
-    QEMU_EXTRA="$LANDEV" sh "$ROOT/scripts/cloud-vm.sh" up
+    QEMU_EXTRA="$LANDEV" NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
     ;;
 n0)
     CROSS_RUSTFLAGS=$(set -- env; . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
@@ -99,6 +104,46 @@ n0)
     a=$("$V" 'drill gate.atrium.test @127.0.0.1 | awk "/^gate.atrium.test/{print \$5}"')
     [ "$a" = 10.88.0.77 ] && ok "name resolved through unbound: gate.atrium.test = $a" || fail "resolve: $a"
 
+    # IPv6 (N2): kernel SLAAC from the LAN's RA, asked for by a router
+    # solicitation; DNS servers from the RA's RDNSS through atrium-lease.
+    v6() { "$V" 'ifconfig vtnet1 inet6' | awk '/inet6 fd77:/{print $2, ($0 ~ /temporary/) ? "temporary" : "stable"}'; }
+    i=0; while [ $i -lt 90 ] && ! v6 | grep -q temporary; do sleep 3; i=$((i + 3)); done
+    a6=$(v6); echo "$a6" | sed 's/^/    /'
+    [ "$(stat rs)" -ge 1 ] && ok "router solicitation sent ($(stat rs)); the LAN answered with an RA" || fail "no router solicitation"
+    st=$(echo "$a6" | awk '$2=="stable"{print $1; exit}')
+    [ -n "$st" ] && ok "SLAAC address on fd77:0:0:88::/64: $st" || fail "no stable IPv6 address"
+    # RFC 7217: not EUI-64 (02:4e:00:00:00:01 would give ...:4e:ff:fe00:1).
+    case "$st" in *ff:fe*) fail "EUI-64 interface ID: $st" ;; *) ok "interface ID is stable-private (RFC 7217), not the MAC" ;; esac
+    echo "$a6" | grep -q temporary && ok "temporary address (RFC 8981): $(echo "$a6" | awk '$2=="temporary"{print $1; exit}')" || fail "no temporary address"
+    # vtnet0 (QEMU's slirp) has its own RA router, which may win the default.
+    "$V" 'ndp -rn' | grep -q '^fe80::1%vtnet1 ' && ok "fe80::1 on vtnet1 is a default router (from the RA)" || fail "default routers: $("$V" 'ndp -rn')"
+    "$V" 'ping6 -c 2 -t 10 fd77:0:0:88::1' >/dev/null && ok "ping6 the LAN's router" || fail "ping6"
+    src=$("$V" 'ping6 -c 1 -t 10 fd77:0:0:88::1 | head -1' | sed -n 's/^PING6*([^)]*) \([^ ]*\) --> .*/\1/p')
+    echo "$a6" | grep -q "^$src temporary" && ok "outgoing traffic uses the temporary address" || echo "    note: source '$src'"
+    i=0; while [ $i -lt 30 ]; do fw=$("$V" 'local-unbound-control list_forwards 2>&1 | grep "^\. " || true'); echo "$fw" | grep -q fd77:0:0:88::53 && break; sleep 3; i=$((i + 3)); done
+    echo "$fw" | grep -q fd77:0:0:88::53 && ok "unbound forwards to the RA's DNS servers too ($fw)" || fail "IPv6 forwarders: $fw"
+    echo "$fw" | grep -q 'fe80::1' && ok "link-local DNS server forwarded with its interface" || fail "link-local forwarder: $fw"
+    a=$("$V" 'drill -6 gate.atrium.test AAAA @fd77:0:0:88::53 | awk "/^gate.atrium.test/{print \$5}"')
+    [ "$a" = fd77:0:0:88::77 ] && ok "DNS over IPv6 to the RA's server: AAAA $a" || fail "DNS over IPv6: $a"
+    a=$("$V" 'drill gate.atrium.test AAAA @127.0.0.1 | awk "/^gate.atrium.test/{print \$5}"')
+    [ "$a" = fd77:0:0:88::77 ] && ok "AAAA through unbound: $a" || fail "AAAA through unbound: $a"
+    # A rogue router's bad RAs: nothing bad reaches unbound, the good servers stay.
+    lanctl hostile6 >/dev/null
+    bad=""
+    i=0
+    while [ $i -lt 120 ] && [ "$(stat hostile6_sent)" -lt 24 ]; do
+        fw=$("$V" 'local-unbound-control list_forwards 2>&1 | grep "^\. " || true')
+        for b in ' ::1 ' ff02:: ::ffff 2002: fd66:; do case " $fw " in *"$b"*) bad="$bad $b" ;; esac; done
+        sleep 3; i=$((i + 3))
+    done
+    lanctl good6 >/dev/null
+    n=$(stat hostile6_sent)
+    [ "$n" -ge 12 ] || fail "rogue router only sent $n RAs"
+    [ -z "$bad" ] && ok "$n hostile RAs (12 kinds, cycled): no bad DNS server reached unbound" || fail "hostile RA applied:$bad"
+    sv=$("$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock")
+    echo "$sv" | grep -q 'dns6=fd77:0:0:88::53,fe80::1' && ok "the LAN's IPv6 DNS servers kept through the rogue RAs" || fail "dns6 after rogue RAs: $sv"
+    "$V" 'pgrep -x atrium-lease >/dev/null && pgrep -x atrium-net >/dev/null' && ok "atrium-net and atrium-lease still running" || fail "a process died on hostile RAs"
+
     # The parser's sandbox: its own uid, only its socket (fds 0-3).
     p=$("$V" 'pgrep -x atrium-lease')
     u=$("$V" "ps -o user= -p $p")
@@ -142,7 +187,7 @@ n0)
     lanctl good >/dev/null
     wait_addr 10.88.0.50 120 && ok "back on a good server: bound again" || fail "no recovery"
 
-    echo "atrium-net N0 gate: $pass checks passed"
+    echo "atrium-net N0+N2 gate: $pass checks passed"
     ;;
 *)
     echo "usage: $0 vm|n0" >&2

@@ -150,11 +150,33 @@ on its previous good state.
 
 ### 5.3 IPv6
 
-Kernel SLAAC (`accept_rtadv`) with stable-private interface IDs (RFC 7217, keyed by the
-same machine secret as the per-app MACs) and temporary addresses (RFC 8981) preferred
-for outgoing connections. atrium-lease reads RAs only for RDNSS/DNSSL (RFC 8106) and
-proposes them; the kernel handles prefixes and routes. DHCPv6 (stateful) later, if a
-network needs it.
+Kernel SLAAC (`accept_rtadv`) with stable-private interface IDs (RFC 7217) and
+temporary addresses (RFC 8981) preferred for outgoing connections. atrium-lease reads
+RAs only for RDNSS (RFC 8106) and proposes the servers; the kernel handles prefixes and
+routes. DHCPv6 (stateful) later, if a network needs it.
+
+As built (N2):
+- atrium-net sets `use_stableaddr`, `use_tempaddr`, `prefer_tempaddr` and per interface
+  `accept_rtadv auto_linklocal stableaddr -ifdisabled`, and sends three router
+  solicitations (from `::`, 4 s apart) when a link comes up, so the address does not
+  wait for the router's periodic RA. The solicitation is built by atrium-net; nothing in
+  it comes from the lease process.
+- FreeBSD keys RFC 7217 on `kern.hostuuid` (readable by local users, not a secret, but
+  never sent). Atrium's installer should give each install a random hostuuid rather
+  than the SMBIOS UUID; until then a local user can predict our stable addresses on a
+  known prefix, which only matters for addresses they could look up anyway.
+- The bpf filter passes ICMPv6 type 134 with hop limit 255 and no extension headers.
+  atrium-lease checks the rest (link-local source, code, checksum, option lengths), keeps
+  at most three servers per RA, drops unusable ones (loopback, multicast, IPv4-mapped,
+  6to4, Teredo, site-local) and caps lifetimes at 3 h; atrium-net checks the list again
+  (`check_dns6`) and gives unbound DHCP's servers and the RA's together, link-local ones
+  as `fe80::1%<ifindex>`.
+- DNSSL (search domains) is not read: nothing uses search domains.
+- Leaving a Wi-Fi network removes its SLAAC addresses at once (the kernel would keep
+  them until their lifetimes end).
+- Not defended: a rogue router on the link can still announce prefixes, routes and
+  usable-looking DNS servers (the kernel and RFC 8106 accept them). RA guard is the
+  network's job; on Wi-Fi the network's key already bounds who can send.
 
 ## 6. DNS
 
@@ -283,3 +305,22 @@ VM from the Aura gates cover them.
   43 `ANDROID_METERED` and the profile's `metered` flag reported as `metered=1`.
 - Not yet: unbound's `forward.conf` rewrite, the lease-process spawner, the cross-network
   low-signal move (N3), connectivity probe (N3).
+
+### 10.3 N2 as built (2026-11-14)
+
+- IPv6 as in §5.3: kernel SLAAC with stable-private and temporary addresses, router
+  solicitations from atrium-net, RDNSS read by atrium-lease (`ra.rs`, host-tested with a
+  20 000-round mutating fuzz and the gate LAN's own RA) and checked again by atrium-net
+  (`check_dns6`) before unbound gets DHCP's and the RA's servers together.
+- Gate: `scripts/atrium-net-gate.sh n0` now 28 checks, IPv4 and IPv6, including 25 RAs
+  from a rogue router (12 kinds) with no bad server reaching unbound.
+- Found while testing: a FreeBSD kernel race. Deleting a SLAAC address while RAs for its
+  prefix arrive can free the prefix that a newly made address still points to
+  (`in6_purgeifaddr` checks `ndpr_addrcnt` without the ND6 lock while `prelist_update`
+  increments it); the next RA or NA walks the freed prefix and the kernel panics in
+  `pfxlist_onlink_check`. `lan.py flap6` plus address deletions in a loop reproduce it
+  in about 15 s. atrium-net turns RA processing off on the interface while it deletes
+  addresses, which closes its own window; the kernel fix (address-prefix linkage under
+  the ND6 write lock, a prefix reference held across the purge) is for the fork.
+- Not yet: DHCPv6, the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
+  wired), RA MTU beyond what the kernel applies.

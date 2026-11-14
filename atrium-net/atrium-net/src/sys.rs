@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 const IOC_OUT: u64 = 0x4000_0000;
@@ -21,6 +21,16 @@ const SIOCGIFFLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 17, IFREQ);
 const SIOCDIFADDR: u64 = ioc(IOC_IN, b'i', 25, IFREQ);
 const SIOCAIFADDR: u64 = ioc(IOC_IN, b'i', 43, 68);
 const SIOCSIFMTU: u64 = ioc(IOC_IN, b'i', 52, IFREQ);
+const IN6_IFREQ: usize = 288;
+const IN6_NDIREQ: usize = 72;
+const SIOCDIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 25, IN6_IFREQ);
+const SIOCGIFINFO_IN6: u64 = ioc(IOC_IN | IOC_OUT, b'i', 108, IN6_NDIREQ);
+const SIOCSIFINFO_FLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 87, IN6_NDIREQ);
+const ND6_IFF_PERFORMNUD: u32 = 0x1;
+const ND6_IFF_ACCEPT_RTADV: u32 = 0x2;
+const ND6_IFF_IFDISABLED: u32 = 0x8;
+const ND6_IFF_AUTO_LINKLOCAL: u32 = 0x20;
+const ND6_IFF_STABLEADDR: u32 = 0x800;
 const BIOCGBLEN: u64 = ioc(IOC_OUT, b'B', 102, 4);
 const BIOCSETF: u64 = ioc(IOC_IN, b'B', 103, 16);
 const BIOCSETIF: u64 = ioc(IOC_IN, b'B', 108, IFREQ);
@@ -60,8 +70,9 @@ unsafe fn ioctl(fd: RawFd, req: u64, arg: *mut u8) -> libc::c_int {
 }
 
 pub struct Ifc {
-    /// An AF_INET datagram socket for interface ioctls.
+    /// AF_INET and AF_INET6 datagram sockets for interface ioctls.
     s: OwnedFd,
+    s6: OwnedFd,
 }
 
 impl Ifc {
@@ -70,7 +81,56 @@ impl Ifc {
         if fd < 0 {
             return err("socket");
         }
-        Ok(Ifc { s: unsafe { OwnedFd::from_raw_fd(fd) } })
+        let s = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return err("socket6");
+        }
+        Ok(Ifc { s, s6: unsafe { OwnedFd::from_raw_fd(fd) } })
+    }
+
+    /// IPv6 on: kernel SLAAC from RAs with stable-private interface IDs
+    /// (RFC 7217), a link-local address, NUD (docs/spec/atrium-net.md §5.3).
+    pub fn enable_inet6(&self, name: &str) -> io::Result<()> {
+        self.nd6_flags(name, ND6_IFF_ACCEPT_RTADV | ND6_IFF_AUTO_LINKLOCAL | ND6_IFF_STABLEADDR | ND6_IFF_PERFORMNUD, ND6_IFF_IFDISABLED)
+    }
+
+    /// RA processing on or off. Off while we delete SLAAC addresses: the
+    /// kernel races an address deletion against an RA re-creating it and can
+    /// free the prefix the new address points to (spec §5.3, kernel panic).
+    pub fn accept_rtadv(&self, name: &str, on: bool) -> io::Result<()> {
+        if on {
+            self.nd6_flags(name, ND6_IFF_ACCEPT_RTADV, 0)
+        } else {
+            self.nd6_flags(name, 0, ND6_IFF_ACCEPT_RTADV)
+        }
+    }
+
+    fn nd6_flags(&self, name: &str, set: u32, clear: u32) -> io::Result<()> {
+        let mut r = [0u8; IN6_NDIREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCGIFINFO_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCGIFINFO_IN6");
+        }
+        let f = (u32::from_ne_bytes(r[36..40].try_into().unwrap()) | set) & !clear;
+        r[36..40].copy_from_slice(&f.to_ne_bytes());
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCSIFINFO_FLAGS, r.as_mut_ptr()) } != 0 {
+            return err("SIOCSIFINFO_FLAGS");
+        }
+        Ok(())
+    }
+
+    /// Remove an IPv6 address (SLAAC addresses of a network we left).
+    pub fn del_addr6(&self, name: &str, a: Ipv6Addr) -> io::Result<()> {
+        let mut r = [0u8; IN6_IFREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        r[16] = 28;
+        r[17] = libc::AF_INET6 as u8;
+        r[24..40].copy_from_slice(&a.octets());
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCDIFADDR_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCDIFADDR_IN6");
+        }
+        Ok(())
     }
 
     pub fn up(&self, name: &str) -> io::Result<()> {
@@ -124,6 +184,7 @@ pub struct IfInfo {
     pub index: u16,
     pub mac: Option<[u8; 6]>,
     pub v4: Vec<(Ipv4Addr, u8)>,
+    pub v6: Vec<Ipv6Addr>,
 }
 
 pub fn interfaces() -> io::Result<Vec<IfInfo>> {
@@ -141,7 +202,7 @@ pub fn interfaces() -> io::Result<Vec<IfInfo>> {
         }
         let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
         let idx = out.iter().position(|i| i.name == name).unwrap_or_else(|| {
-            out.push(IfInfo { name: name.clone(), index: 0, mac: None, v4: Vec::new() });
+            out.push(IfInfo { name: name.clone(), index: 0, mac: None, v4: Vec::new(), v6: Vec::new() });
             out.len() - 1
         });
         let sa = ifa.ifa_addr as *const u8;
@@ -163,6 +224,15 @@ pub fn interfaces() -> io::Result<Vec<IfInfo>> {
                 u32::from_be_bytes([m[4], m[5], m[6], m[7]]).leading_ones() as u8
             };
             out[idx].v4.push((addr, prefix));
+        } else if fam == libc::AF_INET6 {
+            let a = unsafe { std::slice::from_raw_parts(sa, 28) };
+            let mut o: [u8; 16] = a[8..24].try_into().unwrap();
+            // KAME keeps the scope in the second word of link-local addresses.
+            if o[0] == 0xfe && o[1] & 0xc0 == 0x80 {
+                o[2] = 0;
+                o[3] = 0;
+            }
+            out[idx].v6.push(Ipv6Addr::from(o));
         }
     }
     unsafe { libc::freeifaddrs(head) };
@@ -258,21 +328,29 @@ struct BpfInsn {
     k: u32,
 }
 
-/// IPv4, UDP, not a fragment, source port 67, destination port 68.
-const DHCP_FILTER: [(u16, u8, u8, u32); 13] = [
-    (0x28, 0, 0, 12),
-    (0x15, 0, 10, 0x0800),
-    (0x30, 0, 0, 23),
-    (0x15, 0, 8, 17),
-    (0x28, 0, 0, 20),
-    (0x45, 6, 0, 0x1fff),
-    (0xb1, 0, 0, 14),
-    (0x48, 0, 0, 14),
-    (0x15, 0, 3, 67),
-    (0x48, 0, 0, 16),
-    (0x15, 0, 1, 68),
-    (0x06, 0, 0, 1514),
-    (0x06, 0, 0, 0),
+/// DHCP replies (IPv4, UDP, not a fragment, 67 -> 68) and IPv6 router
+/// advertisements (ICMPv6 134, hop limit 255, no extension headers).
+const RX_FILTER: [(u16, u8, u8, u32); 20] = [
+    (0x28, 0, 0, 12),       // 0  ldh [12]
+    (0x15, 0, 9, 0x0800),   // 1  jeq IPv4 ? 2 : 11
+    (0x30, 0, 0, 23),       // 2  ldb [23]
+    (0x15, 0, 15, 17),      // 3  jeq UDP ? 4 : drop
+    (0x28, 0, 0, 20),       // 4  ldh [20]
+    (0x45, 13, 0, 0x1fff),  // 5  fragment ? drop : 6
+    (0xb1, 0, 0, 14),       // 6  ldx 4*([14]&0xf)
+    (0x48, 0, 0, 14),       // 7  ldh [x+14]
+    (0x15, 0, 10, 67),      // 8  jeq 67 ? 9 : drop
+    (0x48, 0, 0, 16),       // 9  ldh [x+16]
+    (0x15, 7, 8, 68),       // 10 jeq 68 ? take : drop
+    (0x15, 0, 7, 0x86dd),   // 11 jeq IPv6 ? 12 : drop
+    (0x30, 0, 0, 20),       // 12 ldb [20] next header
+    (0x15, 0, 5, 58),       // 13 jeq ICMPv6 ? 14 : drop
+    (0x30, 0, 0, 21),       // 14 ldb [21] hop limit
+    (0x15, 0, 3, 255),      // 15 jeq 255 ? 16 : drop
+    (0x30, 0, 0, 54),       // 16 ldb [54] ICMPv6 type
+    (0x15, 0, 1, 134),      // 17 jeq RA ? take : drop
+    (0x06, 0, 0, 1514),     // 18 take
+    (0x06, 0, 0, 0),        // 19 drop
 ];
 
 pub struct Bpf {
@@ -292,7 +370,7 @@ impl Bpf {
         let mut zero: u32 = 0;
         let mut blen: u32 = 0;
         let mut ir = ifreq(ifname);
-        let insns: Vec<BpfInsn> = DHCP_FILTER.iter().map(|&(code, jt, jf, k)| BpfInsn { code, jt, jf, k }).collect();
+        let insns: Vec<BpfInsn> = RX_FILTER.iter().map(|&(code, jt, jf, k)| BpfInsn { code, jt, jf, k }).collect();
         #[repr(C)]
         struct Prog {
             len: u32,
@@ -470,6 +548,16 @@ impl Unbound {
         s.take(65536).read_to_end(&mut out)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
+}
+
+/// Set an integer sysctl (before capability mode).
+pub fn sysctl_int(name: &str, v: i32) -> io::Result<()> {
+    let n = CString::new(name).map_err(|_| io::Error::other("bad sysctl name"))?;
+    let r = unsafe { libc::sysctlbyname(n.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), (&v as *const i32).cast(), 4) };
+    if r != 0 {
+        return err(name);
+    }
+    Ok(())
 }
 
 pub fn cap_enter() -> io::Result<()> {

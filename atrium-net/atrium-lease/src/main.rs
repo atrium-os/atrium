@@ -5,15 +5,17 @@
 //! neither reach the network nor open a file.
 //!
 //! atrium-net -> lease: `hello mac=M`, `mac mac=M`, `up`, `down`, `frame hex=..`,
-//!                      `refused why=..`
+//!                      `refused why=..` (frames: DHCP replies and IPv6 RAs)
 //! lease -> atrium-net: `send dest=bcast|A.B.C.D dmac=M hex=..` (a DHCP
 //!                      payload; atrium-net wraps it), `lease4 ..`,
-//!                      `lost why=..`, `state s=..`
+//!                      `lost why=..`, `state s=..`,
+//!                      `dns6 servers=A,B` (from RAs; empty when none)
 //!
 //! usage: atrium-lease [-v] [--no-sandbox] [--uid UID]
 
 use atrium_lease::client::{Client, Dest, Out};
 use atrium_lease::frame;
+use atrium_lease::ra::{self, Rdnss};
 use aura_ipc::sock::{poll_read, Conn};
 use aura_ipc::{fmt_mac, Got, Line};
 use std::os::fd::FromRawFd;
@@ -86,9 +88,12 @@ fn main() {
     let now = || t0.elapsed().as_millis() as u64;
     let mut client: Option<Client> = None;
     let mut dmac = [0xffu8; 6];
+    let mut rdnss = Rdnss::default();
+    let mut dns6: Vec<Option<Vec<std::net::Ipv6Addr>>> = Vec::new();
 
     loop {
-        let wait = match client.as_ref().and_then(|c| c.deadline()) {
+        let d = [client.as_ref().and_then(|c| c.deadline()), rdnss.deadline()].into_iter().flatten().min();
+        let wait = match d {
             Some(d) => d.saturating_sub(now()).min(60_000) as i32,
             None => 60_000,
         };
@@ -113,7 +118,10 @@ fn main() {
                         *cl = Client::new(mac, Box::new(rand));
                     }
                     ("up", Some(cl)) => outs.extend(cl.start(now())),
-                    ("down", Some(cl)) => cl.stop(),
+                    ("down", Some(cl)) => {
+                        cl.stop();
+                        dns6.push(rdnss.clear());
+                    }
                     ("refused", Some(cl)) => {
                         if verbose {
                             eprintln!("atrium-lease: atrium-net refused the lease ({})", l.get("why").unwrap_or("?"));
@@ -122,6 +130,10 @@ fn main() {
                     }
                     ("frame", Some(cl)) => {
                         let Some(f) = l.hex("hex") else { continue };
+                        if let Some(r) = ra::ra_from_frame(&f) {
+                            dns6.push(rdnss.rx(&r, now()));
+                            continue;
+                        }
                         if let Some((src_mac, _src, p)) = frame::dhcp_from_frame_mac(&f) {
                             let o = cl.rx(p, now());
                             if o.iter().any(|x| matches!(x, Out::Bound(_))) {
@@ -136,6 +148,13 @@ fn main() {
         }
         if let Some(cl) = client.as_mut() {
             outs.extend(cl.tick(now()));
+        }
+        dns6.push(rdnss.tick(now()));
+        for v in dns6.drain(..).flatten() {
+            let list: Vec<String> = v.iter().map(|a| a.to_string()).collect();
+            if c.send(&Line::new("dns6").with("servers", list.join(","))).is_err() {
+                std::process::exit(0);
+            }
         }
         for o in outs {
             let line = match o {

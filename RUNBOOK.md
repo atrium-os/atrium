@@ -5575,20 +5575,35 @@ sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` r
 
 atrium-net (docs/spec/atrium-net.md) manages the VM's second NIC, `vtnet1`, which QEMU
 connects over UDP (127.0.0.1:7801/7802) to `atrium-net/sim/lan.py`: router 10.88.0.1,
-DHCP (lease 10.88.0.50), DNS 10.88.0.53 answering `gate.atrium.test`. `vtnet0` keeps ssh.
+DHCP (lease 10.88.0.50), DNS 10.88.0.53 answering `gate.atrium.test`; on IPv6 the router
+fe80::1 sends RAs for fd77:0:0:88::/64 with RDNSS fd77:0:0:88::53 and fe80::1, and
+answers neighbor solicitations, pings and DNS (AAAA). `vtnet0` keeps ssh.
 
     sh scripts/atrium-net-gate.sh vm     # boot the VM with the LAN NIC (stock kernel is fine)
-    sh scripts/atrium-net-gate.sh n0     # host tests, cross-build, install, 14 checks
+    sh scripts/atrium-net-gate.sh n0     # host tests, cross-build, install, 28 checks (IPv4 + IPv6)
+
+`sh scripts/aura-sim-gate.sh vms` boots the same VM with the LAN NIC too, so the Aura
+and atrium-net gates share one VM (and one boot of the fork kernel).
 
 What it checks: address, default route, ping, unbound forwarders and a lookup through
-unbound, both processes in capability mode, the parser's uid and descriptors, renewal at
-T1, then a restart into a hostile LAN (`lan.py` control word `hostile` on UDP 7803)
-with no bad state applied, refusals counted, recovery. It sets up local-unbound
-(`local-unbound-setup`, a conf.d file that un-blocks `test.`) and the `_atrium-lease` user.
+unbound; IPv6: router solicitation, a stable-private (RFC 7217, not EUI-64) and a
+temporary (RFC 8981) SLAAC address, the RA's router, ping6 from the temporary address,
+the RA's DNS servers in unbound (link-local as `fe80::1%<ifindex>`), AAAA lookups, and
+25 RAs from a rogue router (12 malformed or poisoned kinds, `lan.py` control word
+`hostile6`) with no bad server reaching unbound; then both processes in capability
+mode, the parser's uid and descriptors, renewal at T1, a restart into a hostile DHCP
+server (`hostile`) with no bad state applied, refusals counted, recovery. It sets up
+local-unbound (`local-unbound-setup`, a conf.d file that un-blocks `test.`) and the
+`_atrium-lease` user.
 
 Gotchas: with resolv.conf on unbound and unbound forwarding to the LAN, sshd's reverse
 lookups stall once `lan.py` is gone, so the gate restores resolv.conf and the default
-route on exit. `LEASE_S` (default 120) sets the lease time.
+route on exit; never kill a gate run halfway (or `pkill -f` a pattern that matches your
+own shell's command line, which `lan.py` paths do). QEMU's slirp on `vtnet0` sends RAs
+too (fec0::/64), so its router may win the IPv6 default; the gate checks `ndp -r`.
+ifconfig prints fd77:0:0:88:x:x:x:x compressed as `fd77::88:...`. `LEASE_S` (default
+120) sets the lease time. `lan.py`'s `flap6` word floods RAs and router-flag-less NAs
+for kernel stress (§ spec 10.3).
 
 ### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
 

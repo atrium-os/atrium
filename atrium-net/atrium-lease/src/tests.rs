@@ -367,3 +367,127 @@ fn android_hotspot_is_metered() {
     v.splice(end..end, [43u8, 5, b'h', b'e', b'l', b'l', b'o']);
     assert!(!dhcp::parse(&v).unwrap().metered);
 }
+
+mod ra_tests {
+    use crate::ra::{ra_for_test, ra_from_frame, rdnss_opt, Rdnss, MAX_LIFE_S};
+    use net_proto::check_dns6;
+    use std::net::Ipv6Addr;
+
+    const R: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    const D1: Ipv6Addr = Ipv6Addr::new(0xfd77, 0, 0, 0, 0, 0, 0, 0x53);
+    const D2: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53);
+
+    #[test]
+    fn rdnss_read_and_expire() {
+        let f = ra_for_test(R, 1800, &rdnss_opt(600, &[D1, D2]));
+        let ra = ra_from_frame(&f).expect("valid RA");
+        assert_eq!(ra.router, R);
+        assert_eq!(ra.dns, vec![(D1, 600), (D2, 600)]);
+        let mut r = Rdnss::default();
+        assert_eq!(r.rx(&ra, 0), Some(vec![D1, D2]));
+        // The same again changes nothing.
+        assert_eq!(r.rx(&ra, 1000), None);
+        assert_eq!(r.deadline(), Some(601_000));
+        assert_eq!(r.tick(601_000), Some(vec![]));
+        // Lifetime 0 withdraws.
+        r.rx(&ra, 0);
+        let gone = ra_from_frame(&ra_for_test(R, 1800, &rdnss_opt(0, &[D1, D2]))).unwrap();
+        assert_eq!(r.rx(&gone, 10), Some(vec![]));
+        // Infinite lifetimes are capped.
+        let inf = ra_from_frame(&ra_for_test(R, 1800, &rdnss_opt(u32::MAX, &[D1]))).unwrap();
+        assert_eq!(inf.dns, vec![(D1, MAX_LIFE_S)]);
+        // A rogue router's loopback server is dropped; the good ones stay usable.
+        let mut r = Rdnss::default();
+        r.rx(&ra, 0);
+        let rogue = ra_from_frame(&ra_for_test(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x66), 0, &rdnss_opt(600, &[Ipv6Addr::LOCALHOST]))).unwrap();
+        assert_eq!(r.rx(&rogue, 5), None);
+        assert!(check_dns6(&r.tick(6).unwrap_or(vec![D1, D2])).is_ok());
+    }
+
+    #[test]
+    fn ra_validation() {
+        let good = ra_for_test(R, 1800, &rdnss_opt(600, &[D1]));
+        assert!(ra_from_frame(&good).is_some());
+        // Hop limit below 255: forwarded from off-link.
+        let mut f = good.clone();
+        f[21] = 64;
+        assert!(ra_from_frame(&f).is_none());
+        // Source not link-local.
+        assert!(ra_from_frame(&ra_for_test(D1, 1800, &rdnss_opt(600, &[D1]))).is_none());
+        // Bad checksum.
+        let mut f = good.clone();
+        let n = f.len();
+        f[n - 1] ^= 1;
+        assert!(ra_from_frame(&f).is_none());
+        // Zero-length option (would loop forever).
+        assert!(ra_from_frame(&ra_for_test(R, 1800, &[25, 0, 0, 0, 0, 0, 0, 0])).is_none());
+        // RDNSS with an even length.
+        let mut o = rdnss_opt(600, &[D1]);
+        o[1] = 2;
+        o.truncate(16);
+        assert!(ra_from_frame(&ra_for_test(R, 1800, &o)).is_none());
+        // Option running past the end.
+        let mut o = rdnss_opt(600, &[D1]);
+        o[1] = 5;
+        assert!(ra_from_frame(&ra_for_test(R, 1800, &o)).is_none());
+        // Truncated frames never panic.
+        for n in 0..good.len() {
+            let _ = ra_from_frame(&good[..n]);
+        }
+    }
+
+    #[test]
+    fn dns6_checks() {
+        assert!(check_dns6(&[D1, D2, R]).is_ok());
+        for bad in ["::1", "::", "ff02::1", "::ffff:10.0.0.1", "2002:a00:1::1", "2001:0:1::1", "fec0::1", "::10.0.0.1"] {
+            assert!(check_dns6(&[bad.parse().unwrap()]).is_err(), "{bad}");
+        }
+        assert!(check_dns6(&[D1, D1]).is_err());
+        assert!(check_dns6(&[D1, D2, R, Ipv6Addr::new(0xfd77, 0, 0, 0, 0, 0, 0, 1)]).is_err());
+    }
+
+    #[test]
+    fn ra_fuzz() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let base = ra_for_test(R, 1800, &[rdnss_opt(600, &[D1, D2]), vec![5, 1, 0, 0, 0, 0, 5, 220]].concat());
+        let mut r = Rdnss::default();
+        for i in 0..20_000u64 {
+            let mut f = base.clone();
+            for _ in 0..(next() % 6) {
+                let k = 54 + (next() as usize % (f.len() - 54));
+                f[k] = next() as u8;
+            }
+            if next() % 4 == 0 {
+                f.truncate(54 + next() as usize % (f.len() - 54));
+            }
+            // Mutated frames fail the checksum; fix it up so the option
+            // parser sees them too.
+            let m = f[54..].to_vec();
+            let refixed = ra_for_test(R, u16::from_be_bytes([m.get(6).copied().unwrap_or(0), m.get(7).copied().unwrap_or(0)]), m.get(16..).unwrap_or(&[]));
+            for g in [&f, &refixed] {
+                if let Some(ra) = ra_from_frame(g) {
+                    assert!(ra.dns.len() <= 12);
+                    if let Some(v) = r.rx(&ra, i) {
+                        assert!(v.len() <= 3);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The gate's fake LAN (atrium-net/sim/lan.py) RA, as it puts it on the wire.
+#[test]
+fn lan_py_ra_parses() {
+    let f: Vec<u8> = (0..158).map(|i| u8::from_str_radix(&"333300000001024e000000fe86dd6000000000683afffe800000000000000000000000000001ff020000000000000000000000000001860041ed400007080000000000000000030440c0000151800000384000000000fd77000000000088000000000000000005010000000005dc0101024e000000fe1905000000000258fd770000000000880000000000000053fe800000000000000000000000000001"[2 * i..2 * i + 2], 16).unwrap()).collect();
+    let ra = crate::ra::ra_from_frame(&f).expect("lan.py RA");
+    let want: Vec<std::net::Ipv6Addr> = vec!["fd77:0:0:88::53".parse().unwrap(), "fe80::1".parse().unwrap()];
+    assert_eq!(ra.dns.iter().map(|d| d.0).collect::<Vec<_>>(), want);
+    assert_eq!(ra.router_life, 1800);
+}

@@ -88,6 +88,32 @@ pub fn ordinary_unicast(a: Ipv4Addr) -> bool {
         || in_net(a, APP_NET.0, APP_NET.1))
 }
 
+/// An IPv6 DNS server from an RA is usable if it is a global (2000::/3),
+/// unique-local (fc00::/7) or link-local unicast address: not loopback,
+/// multicast, unspecified, or an IPv4 address in IPv6 clothing.
+pub fn ordinary_unicast6(a: std::net::Ipv6Addr) -> bool {
+    let s = a.segments();
+    let global = s[0] & 0xe000 == 0x2000;
+    let ula = s[0] & 0xfe00 == 0xfc00;
+    let ll = s[0] & 0xffc0 == 0xfe80 && s[1..4] == [0, 0, 0];
+    // 2002::/16 (6to4) and 2001:0::/32 (Teredo) embed IPv4 addresses.
+    let tunnel = s[0] == 0x2002 || (s[0] == 0x2001 && s[1] == 0);
+    (global && !tunnel) || ula || ll
+}
+
+/// RDNSS servers proposed by atrium-lease.
+pub fn check_dns6(d: &[std::net::Ipv6Addr]) -> Result<(), Refused> {
+    if d.len() > MAX_DNS || d.iter().any(|&a| !ordinary_unicast6(a)) {
+        return Err(Refused::Dns);
+    }
+    for (i, a) in d.iter().enumerate() {
+        if d[..i].contains(a) {
+            return Err(Refused::Dns);
+        }
+    }
+    Ok(())
+}
+
 pub fn check_v4(l: &LeaseV4, host: &HostView) -> Result<(), Refused> {
     if !(8..=30).contains(&l.prefix) {
         return Err(Refused::Prefix);

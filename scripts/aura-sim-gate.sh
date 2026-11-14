@@ -394,7 +394,7 @@ case "${1:-}" in
 vms)
     sh "$AP" up
     if ! VSSH_CONNECT_TIMEOUT=5 "$V" true 2>/dev/null; then
-        NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
+        QEMU_EXTRA="-netdev socket,id=lan,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802 -device virtio-net-pci,netdev=lan,mac=02:4e:00:00:00:01" NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
     fi
     ARCH=aarch64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-vm-check.sh" kernel ;;
 w1 | test)

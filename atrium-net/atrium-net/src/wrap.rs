@@ -94,3 +94,48 @@ pub fn frame(src_mac: &[u8; 6], dst_mac: &[u8; 6], src: Ipv4Addr, dst: Ipv4Addr,
     f.extend_from_slice(&udp);
     f
 }
+
+/// A router solicitation from the unspecified address (RFC 4861 §6.3.7:
+/// no source link-layer option then), so routers answer at once instead of
+/// at their next periodic RA. Built here; nothing in it comes from the lease
+/// process.
+pub fn rs_frame(src_mac: &[u8; 6]) -> Vec<u8> {
+    let dst = [0xff02u16, 0, 0, 0, 0, 0, 0, 2];
+    let mut f = vec![0x33, 0x33, 0, 0, 0, 2];
+    f.extend_from_slice(src_mac);
+    f.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0, 0, 8, 58, 255]);
+    f.extend_from_slice(&[0; 16]);
+    for w in dst {
+        f.extend_from_slice(&w.to_be_bytes());
+    }
+    let mut icmp = [133u8, 0, 0, 0, 0, 0, 0, 0];
+    let mut s: u32 = dst.iter().map(|&w| w as u32).sum::<u32>() + 8 + 58 + (133 << 8);
+    while s > 0xffff {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    icmp[2..4].copy_from_slice(&(!(s as u16)).to_be_bytes());
+    f.extend_from_slice(&icmp);
+    f
+}
+
+#[cfg(test)]
+mod rs_tests {
+    #[test]
+    fn rs_checksum() {
+        let f = super::rs_frame(&[2, 0, 0, 0, 0, 1]);
+        assert_eq!(f.len(), 14 + 40 + 8);
+        // Sum over the pseudo-header and message comes out as all ones.
+        let mut s: u32 = 0;
+        for c in f[22..54].chunks(2) {
+            s += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        s += 8 + 58;
+        for c in f[54..].chunks(2) {
+            s += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        while s > 0xffff {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        assert_eq!(s, 0xffff);
+    }
+}

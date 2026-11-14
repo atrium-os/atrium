@@ -25,9 +25,9 @@ mod imp {
     use atrium_net::wrap;
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
-    use net_proto::{check_v4, HostView, LeaseV4};
+    use net_proto::{check_dns6, check_v4, HostView, LeaseV4};
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -112,6 +112,11 @@ mod imp {
         refusals: u32,
         last_refusal: String,
         sends_refused: u32,
+        /// DNS servers from RAs (checked), and the router solicitations
+        /// still to send (three, 4 s apart, after the link comes up).
+        dns6: Vec<Ipv6Addr>,
+        rs_left: u8,
+        rs_at: u64,
     }
 
     struct Ctl {
@@ -138,6 +143,8 @@ mod imp {
         /// `LINK_GRACE_MS` later, so a short drop (a tunnel, a blip in the
         /// signal) does not break every open connection.
         wifi_grace: Option<u64>,
+        /// What unbound forwards to now.
+        forwarders: Vec<String>,
     }
 
     /// How long a Wi-Fi address outlives the link.
@@ -195,17 +202,8 @@ mod imp {
                         x => x,
                     },
                     Action::SetMtu(m) => self.ifc.set_mtu(ifname, *m),
-                    Action::SetDns(d) => match &self.unbound {
-                        None => Ok(()),
-                        Some(u) => {
-                            let list: Vec<String> = d.iter().map(|a| a.to_string()).collect();
-                            match u.cmd(&format!("forward {}", list.join(" "))) {
-                                Ok(s) if s.trim_end() == "ok" => Ok(()),
-                                Ok(s) => Err(io::Error::other(format!("unbound said {:?}", s.trim_end()))),
-                                Err(e) => Err(e),
-                            }
-                        }
-                    },
+                    // Merged with every interface's servers once the lease is applied.
+                    Action::SetDns(_) => Ok(()),
                 };
                 match r {
                     Ok(()) => self.log(&format!("{ifname}: {a:?}")),
@@ -213,6 +211,77 @@ mod imp {
                 }
             }
             self.refresh_host();
+            self.forward();
+        }
+
+        /// Point unbound at every interface's DNS servers: DHCP's, then the
+        /// RAs' (link-local ones with the interface index, which unbound reads
+        /// after '%'). Kept as is when nothing is known (an empty list would
+        /// leave unbound resolving from the roots).
+        fn forward(&mut self) {
+            let mut list: Vec<String> = Vec::new();
+            for i in &self.ifs {
+                if let Some(l) = &i.applied.lease {
+                    list.extend(l.dns.iter().map(|a| a.to_string()));
+                }
+            }
+            for i in &self.ifs {
+                for a in &i.dns6 {
+                    let ll = a.segments()[0] & 0xffc0 == 0xfe80;
+                    list.push(if ll { format!("{a}%{}", i.index) } else { a.to_string() });
+                }
+            }
+            let mut seen = Vec::new();
+            list.retain(|x| if seen.contains(x) { false } else { seen.push(x.clone()); true });
+            if list.is_empty() || list == self.forwarders {
+                return;
+            }
+            let Some(u) = &self.unbound else {
+                self.forwarders = list;
+                return;
+            };
+            match u.cmd(&format!("forward {}", list.join(" "))) {
+                Ok(s) if s.trim_end() == "ok" => {
+                    self.log(&format!("unbound: forward {}", list.join(" ")));
+                    self.forwarders = list;
+                }
+                Ok(s) => eprintln!("atrium-net: unbound said {:?}", s.trim_end()),
+                Err(e) => eprintln!("atrium-net: unbound: {e}"),
+            }
+        }
+
+        /// Router solicitations due, and the interfaces' IPv6 addresses.
+        fn tick6(&mut self) {
+            let now = self.now();
+            for i in &mut self.ifs {
+                if i.rs_left > 0 && now >= i.rs_at {
+                    i.rs_left -= 1;
+                    i.rs_at = now + 4000;
+                    if let Err(e) = i.bpf.write(&wrap::rs_frame(&i.mac)) {
+                        eprintln!("atrium-net: {}: router solicitation: {e}", i.name);
+                    }
+                }
+            }
+        }
+
+        /// Off a network: its SLAAC addresses go too (the kernel would keep
+        /// them until their lifetimes end, on a link that no longer has them).
+        fn drop_v6(&mut self, k: usize) {
+            let name = self.ifs[k].name.clone();
+            let _ = self.ifc.accept_rtadv(&name, false);
+            if let Ok(all) = sys::interfaces() {
+                if let Some(info) = all.iter().find(|x| x.name == name) {
+                    for a in &info.v6 {
+                        if a.segments()[0] & 0xffc0 != 0xfe80 {
+                            match self.ifc.del_addr6(&name, *a) {
+                                Ok(()) => self.log(&format!("{name}: removed {a}")),
+                                Err(e) => eprintln!("atrium-net: {name}: removing {a}: {e}"),
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = self.ifc.accept_rtadv(&name, true);
         }
 
         fn wifi_iface(&mut self) -> Option<usize> {
@@ -228,6 +297,9 @@ mod imp {
                 self.apply(&name, ia, acts);
                 let ev = Line::new("lease-lost").with("iface", &name).with("why", why);
                 self.event(&ev);
+            }
+            if self.ifs[k].wifi {
+                self.drop_v6(k);
             }
         }
 
@@ -297,6 +369,8 @@ mod imp {
                                 // nothing reaches the dead link meanwhile.
                                 if up {
                                     self.wifi_grace = None;
+                                    self.ifs[k].rs_left = 3;
+                                    self.ifs[k].rs_at = now;
                                 } else if self.wifi_grace.is_none() && self.ifs[k].applied.lease.is_some() {
                                     self.wifi_grace = Some(now + LINK_GRACE_MS);
                                     self.log("wifi: link down, keeping the address for 60 s");
@@ -418,8 +492,10 @@ mod imp {
 
         fn status(&self) -> Vec<Line> {
             let mut v = Vec::new();
+            let all = sys::interfaces().unwrap_or_default();
             for i in &self.ifs {
                 let mut l = Line::new("iface").with("name", &i.name).with("mac", fmt_mac(&i.mac));
+                let v6: Vec<String> = all.iter().filter(|x| x.name == i.name).flat_map(|x| x.v6.iter()).map(|a| a.to_string()).collect();
                 match &i.applied.lease {
                     Some(x) => {
                         l = l.with("state", "bound").with("addr", format!("{}/{}", x.addr, x.prefix));
@@ -435,6 +511,12 @@ mod imp {
                         }
                     }
                     None => l = l.with("state", "none"),
+                }
+                if !v6.is_empty() {
+                    l = l.with("inet6", v6.join(","));
+                }
+                if !i.dns6.is_empty() {
+                    l = l.with("dns6", i.dns6.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
                 }
                 l = l.with("refused", i.refusals).with("sends_refused", i.sends_refused);
                 if !i.last_refusal.is_empty() {
@@ -476,6 +558,22 @@ mod imp {
                     }
                 }
                 "lost" => self.lose(k, l.get("why").unwrap_or("?")),
+                "dns6" => {
+                    let list: Option<Vec<Ipv6Addr>> = l.get("servers").map(|s| s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect()).unwrap_or(None);
+                    match list {
+                        Some(v) if check_dns6(&v).is_ok() => {
+                            self.log(&format!("{}: IPv6 DNS {v:?}", self.ifs[k].name));
+                            self.ifs[k].dns6 = v;
+                            self.forward();
+                        }
+                        _ => {
+                            let i = &mut self.ifs[k];
+                            i.refusals += 1;
+                            i.last_refusal = "dns6".into();
+                            eprintln!("atrium-net: {}: IPv6 DNS refused: {:?}", i.name, l.get("servers"));
+                        }
+                    }
+                }
                 _ => die(&format!("{}: unexpected message from atrium-lease", self.ifs[k].name)),
             }
         }
@@ -586,13 +684,24 @@ mod imp {
             mlme: None,
             mlme_retry: 0,
             wifi_grace: None,
+            forwarders: Vec::new(),
         };
+        // Temporary addresses (RFC 8981) preferred for outgoing connections;
+        // stable-private (RFC 7217) for the rest. Before capability mode.
+        for (k, v) in [("net.inet6.ip6.use_stableaddr", 1), ("net.inet6.ip6.use_tempaddr", 1), ("net.inet6.ip6.prefer_tempaddr", 1)] {
+            if let Err(e) = sys::sysctl_int(k, v) {
+                eprintln!("atrium-net: {k}: {e}");
+            }
+        }
         net.refresh_host();
         for name in &o.ifaces {
             let info = all.iter().find(|i| &i.name == name).unwrap_or_else(|| die(&format!("no interface {name}")));
             let mac = info.mac.unwrap_or_else(|| die(&format!("{name} has no MAC")));
             let is_wifi = o.wifi.as_deref() == Some(name.as_str());
             net.ifc.up(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
+            if let Err(e) = net.ifc.enable_inet6(name) {
+                eprintln!("atrium-net: {name}: IPv6: {e}");
+            }
             let bpf = Bpf::open(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
             let (child, mut lease) = spawn_lease(&o.lease, o.verbose);
             lease.send(&Line::new("hello").with("mac", fmt_mac(&mac))).unwrap_or_else(|_| die("hello"));
@@ -616,6 +725,9 @@ mod imp {
                 refusals: 0,
                 last_refusal: String::new(),
                 sends_refused: 0,
+                dns6: Vec::new(),
+                rs_left: if is_wifi { 0 } else { 3 },
+                rs_at: 0,
             });
         }
         if let Some(d) = o.sock.parent() {
@@ -639,6 +751,7 @@ mod imp {
             let nctl = net.ctls.len();
             fds.extend(net.ctls.iter().map(|c| c.c.fd()));
             let now = net.now();
+            net.tick6();
             if net.wifi_grace.is_some_and(|g| now >= g) {
                 net.wifi_grace = None;
                 if let Some(k) = net.wifi_iface() {
@@ -652,6 +765,10 @@ mod imp {
                 for (idx, up) in net.rt.read_ifinfo() {
                     if let Some(i) = net.ifs.iter_mut().find(|i| i.index == idx && !i.wifi) {
                         let m = format!("{}: link {}", i.name, if up { "up" } else { "down" });
+                        if up {
+                            i.rs_left = 3;
+                            i.rs_at = 0;
+                        }
                         let _ = i.lease.send(&Line::new(if up { "up" } else { "down" }));
                         net.log(&m);
                     }
