@@ -99,9 +99,9 @@ How each kind of trouble plays out. "Gate" marks what a simulated gate checks.
 - **Short drop (a tunnel, a lift, a blip).** aura-mlme declares the link lost after 8 s
   without beacons (or at once on the firmware's beacon-loss report) and does not try to
   deauthenticate through a dead link. atrium-net keeps the address and routes for 60 s
-  (`status` shows `link=lost`); atrium-lease pauses. Reconnect attempts after a loss come
-  fast, at 2, 5, 10, 20, 30 and 60 s, for 10 min; after that the slow scan ladder (30 s up
-  to 5 min) applies. On reconnect atrium-lease confirms the old lease (INIT-REBOOT); the
+  (`status` shows `link=lost`); atrium-lease pauses. Reconnect scans after a loss come about
+  every 10 s for the first minute (matching the address grace), then 20, 30 and 60 s
+  apart, for 10 min; after that the slow scan ladder (30 s up to 5 min) applies. On reconnect atrium-lease confirms the old lease (INIT-REBOOT); the
   same address means nothing changes and TCP connections survive a drop of up to about a
   minute. Not back within 60 s: the address and routes go and apps see the network gone.
   Gate: tunnel scenario in aura-sim-gate W2.
@@ -264,3 +264,22 @@ VM from the Aura gates cover them.
 - Gate: `scripts/atrium-net-gate.sh vm|n0` (RUNBOOK §13.6e), 14 checks. The VM's
   second NIC is a QEMU UDP socket netdev to `atrium-net/sim/lan.py`, a simulated LAN
   with router, DHCP and DNS that can turn hostile (17 kinds of bad reply).
+
+### 10.2 N1 as built (2026-11-14)
+
+- atrium-net takes `--wifi wlan0`: it holds a connection to aura-mlme (reconnecting every
+  2 s if aura-mlme restarts), asks aura-keys to remember, prepare and forget credentials
+  (a fresh connection per call), and runs the Wi-Fi policy of §4 (`wifi.rs`, host-tested).
+  Profiles live in the state directory's `networks` file (one line per network, no
+  secret). `atrium-netctl` is the command line: `remember`, `forget`, `list`, `join`,
+  `leave`, `scan`, `wifi-status`, `country`, `status`, `watch`.
+- The Aura gates (`scripts/aura-sim-gate.sh w1|w2`) run atrium-net in place of aura-ctl +
+  dhclient. W2 adds: WPA3-only kept across a restart, auto-join with DHCP and no join
+  command, the same address confirmed after a roam, leave drops the address and holds
+  off auto-join, a 20 s tunnel (address kept, same address after) and a long drop
+  (address gone after the 60 s grace, back on rejoin). W2 38/38, W1 20/20.
+- §4.1 behaviour: beacon loss in aura-mlme (8 s), address grace 60 s, reconnect scans
+  every ~10 s in the first minute, three failures skip a network for 10 min, DHCP option
+  43 `ANDROID_METERED` and the profile's `metered` flag reported as `metered=1`.
+- Not yet: unbound's `forward.conf` rewrite, the lease-process spawner, the cross-network
+  low-signal move (N3), connectivity probe (N3).

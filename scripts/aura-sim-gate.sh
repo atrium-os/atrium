@@ -336,7 +336,11 @@ w2() {
     # drop, reconnects fast and confirms the same lease.
     "$V" "rm -f /tmp/aura/watch.log; daemon -f -o /tmp/aura/watch.log $CTL watch 400"
     sleep 2
-    sh "$AP" signal 2412 -100 2437 -100
+    # The AP VM restores the signal 20 s after the cut on its own clock: the
+    # checks below go through slow ssh and must not stretch the drop.
+    sh "$AP" signal 2412 -40 2437 -75
+    sh "$AP" blackout 20
+    t0=$(date +%s)
     i=0
     until "$V" "grep -q 'beacon-loss' /tmp/aura/watch.log"; do
         i=$((i + 1)); [ $i -lt 10 ] || { "$V" "cat /tmp/aura/watch.log"; fail "beacon loss within 30 s"; }
@@ -345,14 +349,12 @@ w2() {
     ok "tunnel: link loss noticed from missing beacons"
     "$V" "ifconfig wlan0 inet | grep -q 'inet $A2 '" && ok "tunnel: address kept while the link is gone" || fail "address dropped at once"
     "$V" "$CTL status" | grep -q '^iface name=wlan0 .*link=lost' && ok "tunnel: status says link=lost" || fail "status link=lost"
-    sleep 12
-    sh "$AP" signal 2412 -40 2437 -75
     i=0
     until "$V" "$CTL status" | grep '^iface name=wlan0 .*state=bound' | grep -qv 'link=lost'; do
-        i=$((i + 1)); [ $i -lt 30 ] || { "$V" "$CTL status; cat /tmp/aura/watch.log; tail -n 30 /tmp/aura/net.log"; fail "reconnect within 90 s of leaving the tunnel"; }
+        i=$((i + 1)); [ $i -lt 40 ] || { "$V" "$CTL status; cat /tmp/aura/watch.log; tail -n 30 /tmp/aura/net.log"; fail "reconnect after the tunnel"; }
         sleep 3
     done
-    ok "tunnel: reconnected $((i * 3)) s after the signal came back"
+    ok "tunnel: reconnected, seen $(( $(date +%s) - t0 )) s after a 20 s drop began"
     "$V" "grep -q 'lease-lost' /tmp/aura/watch.log" && fail "lease dropped during a 20 s drop" || ok "tunnel: no lease-lost event during the drop"
     "$V" "ifconfig wlan0 inet | grep -q 'inet $A2 '" && ok "tunnel: same address ($A2) after the drop" || fail "address changed after the tunnel"
     "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after the tunnel" || fail "ping after tunnel"

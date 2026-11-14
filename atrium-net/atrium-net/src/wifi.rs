@@ -8,7 +8,10 @@ use aura_ipc::{Line, MAX_LINE};
 pub const SCAN_BACKOFF_MS: [u64; 4] = [30_000, 60_000, 120_000, 300_000];
 /// Right after losing a network (a tunnel, a dropout, a hotspot asleep) it is
 /// likely to come back: look again soon, for `RECENT_LOSS_MS`.
-pub const FAST_BACKOFF_MS: [u64; 6] = [2_000, 5_000, 10_000, 20_000, 30_000, 60_000];
+/// The first minute matches atrium-net's address grace: a scan about every
+/// 10 s while the address is still held, so a short drop reconnects in time
+/// to keep open connections.
+pub const FAST_BACKOFF_MS: [u64; 10] = [2_000, 5_000, 5_000, 10_000, 10_000, 10_000, 10_000, 20_000, 30_000, 60_000];
 pub const RECENT_LOSS_MS: u64 = 10 * 60_000;
 pub const REJOIN_DELAY_MS: u64 = 2_000;
 /// A network that failed this many joins in a row (a changed password, a
@@ -526,17 +529,17 @@ mod dropout_tests {
         let a = w.mlme_line(&line("state state=disconnected why=beacon-loss"), 1000);
         assert!(a.contains(&Act::LeaseDown) && !a.contains(&Act::Drop));
         assert_eq!(w.deadline(), Some(1000 + REJOIN_DELAY_MS));
-        // Nothing in range for a while: 2, 5, 10, 20, 30, 60, 60 s ...
+        // Nothing in range for a while: every ~10 s for the first minute, then 20, 30, 60 s ...
         let mut t = w.deadline().unwrap();
         let mut gaps = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..12 {
             assert_eq!(w.tick(t), vec![Act::Mlme(line("scan"))]);
             w.mlme_line(&line("scan-done status=0 count=0"), t);
             let d = w.deadline().unwrap();
             gaps.push(d - t);
             t = d;
         }
-        assert_eq!(gaps, vec![2_000, 5_000, 10_000, 20_000, 30_000, 60_000, 60_000, 60_000]);
+        assert_eq!(gaps, vec![2_000, 5_000, 5_000, 10_000, 10_000, 10_000, 10_000, 20_000, 30_000, 60_000, 60_000, 60_000]);
         // Out of the tunnel: found, joined, lease confirmed.
         w.tick(t);
         up(&mut w, t + 1);

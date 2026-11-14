@@ -5537,7 +5537,8 @@ hwsim's wireless medium and carries every frame over UDP to `aura-air` in the Fr
 ```sh
 sh scripts/aura-sim-gate.sh vms     # both VMs up (FreeBSD with udp 7701 forwarded, Ubuntu AP VM on ssh 2223)
 sh scripts/aura-sim-gate.sh w1      # WPA2-PSK + PMF: build, hostapd + udhcpd, arcad, jailed daemons, checks
-sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens), transition mode, roaming
+sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens), transition mode, roaming,
+                                    # atrium-net auto-join, tunnel and long-drop scenarios
 sh scripts/aura-ap-vm.sh ap CONF... # AP configs from aura/sim-ap (two at most: one radio each, bridged)
 sh scripts/aura-ap-vm.sh signal 2412 -85 2437 -40   # what the FreeBSD side hears per channel
 sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there
@@ -5553,7 +5554,14 @@ sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` r
   token forced (`sae_anti_clogging_threshold=0`); transition mode picks SAE and the
   Transition Disable KDE makes a later WPA2-only BSS of the network refused; roaming
   from channel 1 to 6 when the medium fades the first BSS (`signal`), same address,
-  ping after; `aura-ctl country` sets the regulatory domain.
+  ping after; `atrium-netctl country` sets the regulatory domain. Then atrium-net's own
+  checks (spec atrium-net.md §10.2): WPA3-only kept across a restart, auto-join with
+  DHCP, leave drops the address, a 20 s tunnel (both BSSs at -100 dBm; address kept,
+  same address after) and a long drop (address gone after the 60 s grace).
+- The gates drive Wi-Fi through atrium-net (`/tmp/aura/atrium-netctl --sock
+  /tmp/aura/net.sock`, log `/tmp/aura/net.log`); aura-ctl and dhclient are no longer used.
+- Under TCG every ssh round trip takes seconds: timed scenarios (the tunnel) restore the
+  medium from a background timer on the host rather than after the checks.
 - The AP VM keeps two hwsim radios loaded between runs: unloading the module or
   `depmod` takes minutes under TCG when the FreeBSD VM is busy.
 - `MAKEOBJDIRPREFIX` is `~/obj-arm64`: a symlink to `~/obj` in a fresh container.

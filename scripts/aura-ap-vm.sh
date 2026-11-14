@@ -12,6 +12,7 @@
 #                                       each, all bridged on br0 = 10.77.0.1)
 #   sh scripts/aura-ap-vm.sh signal FREQ DBM [FREQ DBM...]
 #                                       what the FreeBSD side hears per channel
+#   sh scripts/aura-ap-vm.sh blackout SECS    # every channel out of range for SECS s (timed in the VM)
 #   sh scripts/aura-ap-vm.sh log       hostapd and medium logs
 #   sh scripts/aura-ap-vm.sh ssh CMD   run a command in the VM as root
 #   sh scripts/aura-ap-vm.sh down      power off
@@ -139,8 +140,19 @@ signal() {
     gssh "printf '$l' > /tmp/air-signal.new && mv /tmp/air-signal.new /tmp/air-signal"
 }
 
+# Every channel out of range for SECS seconds, timed inside the AP VM (an ssh
+# round trip under TCG can take most of a minute), then the old signals back.
+blackout() {
+    l=""
+    for f in 2412 2417 2422 2427 2432 2437 2442 2447 2452 2457 2462 2467 2472 2484; do l="$l$f -100\n"; done
+    gssh "cp /tmp/air-signal /tmp/air-signal.keep 2>/dev/null || : > /tmp/air-signal.keep
+        printf '$l' > /tmp/air-signal.new && mv /tmp/air-signal.new /tmp/air-signal
+        nohup sh -c 'sleep $1; cp /tmp/air-signal.keep /tmp/air-signal.new && mv /tmp/air-signal.new /tmp/air-signal' </dev/null >/dev/null 2>&1 &"
+}
+
 case "${1:-}" in
 up) up ;;
+blackout) blackout "$2" ;;
 ap) shift; ap "$@" ;;
 signal) shift; signal "$@" ;;
 log) gssh "tail -n 60 /tmp/hostapd.log; echo ---; tail -n 20 /tmp/air.log; echo ---; tail -n 20 /tmp/udhcpd.log" ;;
