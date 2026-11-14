@@ -13,7 +13,7 @@ use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::widgets::grid_view::col_name;
-use pergola::widgets::{Button, CellRange, GridAction, GridState, GridView, ScrollState};
+use pergola::widgets::{Button, CellRange, GridAction, GridState, GridView, MenuButton, MenuState, ScrollState};
 use pergola::{clipboard, Color, Mutable, TextStyle};
 
 use crate::doc::Doc;
@@ -35,6 +35,8 @@ pub enum Cmd {
     Redo,
     /// Drop the file's macros (kept inert; never run).
     RemoveMacros,
+    /// A Data menu command, on the selection.
+    Data(crate::data::DataCmd),
 }
 
 /// What the view shows besides the document.
@@ -57,13 +59,15 @@ pub struct Sheets {
     pub cmds: Arc<Mutex<Vec<Cmd>>>,
     /// The window's size in px.
     pub size: Rc<Cell<(f32, f32)>>,
+    /// The Data menu's open state.
+    pub data_menu: Mutable<MenuState>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()) }
     }
 
     /// The document changed outside the grid (opened, saved, recovered).
@@ -175,6 +179,22 @@ impl View for Sheets {
             Button::secondary(label).at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(cmd)).render(ctx);
             x += wd + 8.0;
         }
+        // The Data menu, read from the document and the selection as they are now.
+        {
+            let g = self.grid.get_cloned();
+            let entries = crate::data::menu(&self.doc.borrow(), g.selection(), g.cursor);
+            let (items, cmds_of): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+            let cmds = self.cmds.clone();
+            MenuButton::new("Data", self.data_menu.clone(), items, move |i| {
+                if let Some(Some(c)) = cmds_of.get(i) {
+                    cmds.lock().unwrap().push(Cmd::Data(*c));
+                }
+            })
+            .at(x, 8.0)
+            .width(76.0)
+            .render(ctx);
+            x += 84.0;
+        }
         let (name, dirty, status, macros) = {
             let d = self.doc.borrow();
             (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some())
@@ -241,6 +261,12 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::Data(dc) => {
+                    let g = self.grid.get_cloned();
+                    crate::data::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, dc);
+                    self.rev.set(self.rev.get().wrapping_add(1));
                     false
                 }
                 Cmd::RemoveMacros => {

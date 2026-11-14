@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod bench;
+pub mod data;
 pub mod doc;
 pub mod files;
 pub mod source;

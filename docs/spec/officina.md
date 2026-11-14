@@ -1124,6 +1124,40 @@ Gates, on the 4-core cloud machine:
 | hostile input | the `.xlsx` and `.ods` fuzzers now run on packages with macros, with code-name, relationship-target and manifest-path mutations; clean |
 | app | `atrium-sheets` test: removing macros survives a crash |
 
+### 16.9 Sheets: the Data menu (2026-11-14)
+
+The O4d/O4e engine features, usable in `atrium-sheets` (`src/data.rs`):
+
+- A **Data** menu in the toolbar (a Pergola `MenuButton`, a pop-up window placed by
+  frescod): Sort A to Z / Z to A; Filter (on or off); Show Only "value", Hide "value",
+  Clear Filter in Column, Show All Rows; Format as Table / Convert to Range; Insert
+  Column, Line or Pie Chart; Delete Chart. Items read the cursor's cell and are
+  disabled where they can't apply.
+- **What they act on**: the selection when it is more than one cell, else the table or
+  filter the cursor is in, else the current region (the block of non-empty cells
+  around the cursor bounded by empty rows and columns, found by walking its perimeter,
+  never its area). The first row is a header when it is all text over some non-text.
+  Sorting keeps the header; it is refused while a filter hides rows. Hide narrows the
+  column's value list; a column with over 10,000 values offers Show Only.
+- **Tables and charts are undoable**: `GridOp::Tables` and `GridOp::Charts` swap the
+  workbook's list in whole (journal kinds 5 and 6), so they undo, redo and survive a
+  crash like any edit. A new table is named `TableN`, columns from the header (or
+  `Column1`…); a new chart takes the first column as categories when it isn't numbers,
+  every other numeric column as a series named by its header, and sits right of the
+  data where it covers no cells.
+- **On the grid** (`GridSource::floats`): a table's outline, header tint and stripes,
+  drawn for the visible part only; a mark on each filter header cell, lit on a
+  filtered column.
+
+Not yet: picking several values from a list (the menu works on the cursor's value),
+number conditions in the UI, totals rows, chart editing (titles, kinds, ranges),
+moving and sizing charts with the pointer; charts still show rows a filter hides.
+
+Gates: `atrium-sheets` tests (region and header, sort and undo, show only / hide /
+clear, table and chart from the region, undo all of it); the grid's op test (tables and
+charts undo, redo and encode, a refused table left out); the cloud VM screenshot of
+`examples/data_demo.rs`'s sheet.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -195,6 +195,19 @@ impl Workbook {
         Ok(())
     }
 
+    /// Swaps in `ts` as the workbook's tables (each checked as [`add_table`] does;
+    /// one that doesn't fit is left out) and returns the old ones.
+    ///
+    /// [`add_table`]: Workbook::add_table
+    pub fn replace_tables(&mut self, ts: Vec<Table>) -> Vec<Table> {
+        let old = std::mem::take(&mut self.tables);
+        for t in ts {
+            let _ = self.add_table(t);
+        }
+        self.rebind_names();
+        old
+    }
+
     pub fn remove_table(&mut self, name: &str) -> Option<Table> {
         let i = self.tables.iter().position(|t| t.name.eq_ignore_ascii_case(name))?;
         let t = self.tables.remove(i);

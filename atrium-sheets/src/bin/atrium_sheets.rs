@@ -334,7 +334,7 @@ fn main() {
                         want_picker = Some(Asking::SaveAs);
                     }
                 }
-                Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros => {}
+                Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) => {}
             }
         }
         if let (Some(what), None) = (want_picker.take(), asking) {

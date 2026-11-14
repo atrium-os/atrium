@@ -48,6 +48,11 @@ pub enum GridOp {
     Filter(crate::filter::FilterState),
     /// Several edits as one (a sort moves values and styles together). Not nested.
     Batch(Vec<GridOp>),
+    /// The workbook's structured tables, swapped in whole (tables that don't fit
+    /// are left out).
+    Tables(Vec<crate::tables::Table>),
+    /// The workbook's charts, swapped in whole.
+    Charts(Vec<crate::charts::Chart>),
 }
 
 impl GridOp {
@@ -124,6 +129,22 @@ impl GridOp {
                 f.encode(&mut w);
                 return w.into_bytes();
             }
+            GridOp::Tables(ts) => {
+                w.u8(5);
+                w.var(ts.len() as u64);
+                for t in ts {
+                    t.encode(&mut w);
+                }
+                return w.into_bytes();
+            }
+            GridOp::Charts(cs) => {
+                w.u8(6);
+                w.var(cs.len() as u64);
+                for c in cs {
+                    c.encode(&mut w);
+                }
+                return w.into_bytes();
+            }
             GridOp::Batch(ops) => {
                 w.u8(3);
                 w.var(ops.len() as u64);
@@ -175,6 +196,27 @@ impl GridOp {
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(b);
         let kind = r.u8()?;
+        if kind == 5 || kind == 6 {
+            let op = if kind == 5 {
+                let n = r.count("tables", crate::tables::MAX_TABLES as u64, 8)?;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(crate::tables::Table::decode(&mut r)?);
+                }
+                GridOp::Tables(v)
+            } else {
+                let n = r.count("charts", crate::charts::MAX_CHARTS as u64, 30)?;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(crate::charts::Chart::decode(&mut r)?);
+                }
+                GridOp::Charts(v)
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(op);
+        }
         if kind == 4 {
             let f = crate::filter::FilterState::decode(&mut r)?;
             if !r.is_empty() {
@@ -255,6 +297,8 @@ impl Op<Workbook> for GridOp {
             GridOp::Replace(region) => GridOp::Replace(wb.replace(region)),
             GridOp::Restyle(region) => GridOp::Restyle(wb.replace_styles(region)),
             GridOp::Filter(f) => GridOp::Filter(wb.replace_filter(f)),
+            GridOp::Tables(ts) => GridOp::Tables(wb.replace_tables(ts)),
+            GridOp::Charts(cs) => GridOp::Charts(wb.replace_charts(cs)),
             GridOp::Batch(ops) => {
                 // The inverse undoes them in reverse order.
                 let mut inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(wb)).collect();
@@ -478,6 +522,56 @@ mod tests {
         assert_eq!(wb.groups().count(), 0);
         assert_eq!(wb.get(a("B5000")), Value::Empty);
         assert_eq!(wb.get(a("A5000")), Value::Num(4999.0));
+    }
+
+    #[test]
+    fn tables_and_charts_undo_and_encode() {
+        use crate::charts::*;
+        use crate::tables::Table;
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        for r in 0..5 {
+            wb.set_input(CellAddr::new(0, r, 0), &format!("{r}")).unwrap();
+        }
+        wb.set_input(a("A1"), "Qty").unwrap();
+        wb.set_input(a("C1"), "=SUM(T[Qty])").unwrap();
+        wb.recalc();
+        assert_eq!(wb.get(a("C1")), Value::Err(ErrorKind::Ref));
+        let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true };
+        let ch = Chart {
+            kind: ChartKind::Column,
+            grouping: Grouping::Standard,
+            title: None,
+            series: vec![Series { name: None, cats: None, vals: Rect { sheet: 0, r0: 1, c0: 0, r1: 4, c1: 0 }, kind: None }],
+            legend: None,
+            x_title: None,
+            y_title: None,
+            anchor: Anchor { sheet: 0, from: (1, 3, 0.0, 0.0), to: (10, 8, 0.0, 0.0) },
+        };
+        let ops = vec![GridOp::Tables(vec![t.clone()]), GridOp::Charts(vec![ch.clone()])];
+        for op in &ops {
+            assert_eq!(&GridOp::decode(&op.encode()).unwrap(), op);
+        }
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Format as Table", vec![ops[0].clone()]);
+        h.run(&mut wb, "Insert Chart", vec![ops[1].clone()]);
+        wb.recalc();
+        assert_eq!(wb.get(a("C1")), Value::Num(10.0), "the formula found the new table");
+        assert_eq!(wb.charts(), &[ch]);
+        h.undo(&mut wb);
+        assert!(wb.charts().is_empty());
+        h.undo(&mut wb);
+        wb.recalc();
+        assert!(wb.tables().is_empty());
+        assert_eq!(wb.get(a("C1")), Value::Err(ErrorKind::Ref));
+        h.redo(&mut wb);
+        wb.recalc();
+        assert_eq!(wb.get(a("C1")), Value::Num(10.0));
+        // A table that doesn't fit (a taken name) is left out, not applied half.
+        let mut bad = t.clone();
+        bad.name = "Qty Table".into();
+        assert!(matches!(GridOp::Tables(vec![bad]).apply(&mut wb), GridOp::Tables(old) if old.len() == 1));
+        assert!(wb.tables().is_empty());
     }
 
     #[test]

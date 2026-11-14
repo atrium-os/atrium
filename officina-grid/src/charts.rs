@@ -363,6 +363,18 @@ impl Workbook {
         Ok(self.charts.len() - 1)
     }
 
+    /// Swaps in `cs` as the workbook's charts (each checked as [`add_chart`] does)
+    /// and returns the old ones.
+    ///
+    /// [`add_chart`]: Workbook::add_chart
+    pub fn replace_charts(&mut self, cs: Vec<Chart>) -> Vec<Chart> {
+        let old = std::mem::take(&mut self.charts);
+        for c in cs {
+            let _ = self.add_chart(c);
+        }
+        old
+    }
+
     pub fn remove_chart(&mut self, i: usize) -> Option<Chart> {
         (i < self.charts.len()).then(|| self.charts.remove(i))
     }

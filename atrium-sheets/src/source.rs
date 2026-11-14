@@ -176,17 +176,108 @@ fn chart_nodes(prims: Vec<officina_draw::chart::Prim>, theme: &pergola::theme::S
     out
 }
 
+/// Float keys: charts use their index; these sit above any chart count.
+const KEY_FILTER: u64 = 1 << 61;
+const KEY_TABLE: u64 = 1 << 60;
+
+impl SheetSource {
+    /// Tables (an outline, a header tint, stripes) and the auto-filter's header marks
+    /// (a filtered column's mark is lit), for the part of the sheet in `view`.
+    fn data_marks(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
+        use pergola::shape::{Paint, PathData, Shape};
+        let d = self.doc.borrow();
+        let s = d.sheet;
+        let mut out = Vec::new();
+        let (vx0, vy0, vx1, vy1) = (view[0], view[1], view[0] + view[2], view[1] + view[3]);
+        let col_x = |c: u32| d.wb.sheet(s).col_sizes.offset(c);
+        for (i, t) in d.wb.tables().iter().enumerate() {
+            let r = t.rect;
+            if r.sheet != s {
+                continue;
+            }
+            let (x0, x1) = (col_x(r.c0), col_x(r.c1 + 1));
+            let (y0, y1) = (self.row_top(r.r0), self.row_top(r.r1 + 1));
+            if x0 > vx1 || x1 < vx0 || y0 > vy1 || y1 < vy0 {
+                continue;
+            }
+            // Only the visible part, so a million-row table costs a screenful.
+            let (fx0, fy0) = (x0.max(vx0 - 2.0), y0.max(vy0 - 2.0));
+            let (fx1, fy1) = (x1.min(vx1 + 2.0), y1.min(vy1 + 2.0));
+            let (w, h) = ((fx1 - fx0) as f32, (fy1 - fy0) as f32);
+            let at = |x: f64, y: f64, ww: f64, hh: f64, fill: Color| pergola::Node::Rect { rect: pergola::Rect::new((x - fx0) as f32, (y - fy0) as f32, ww as f32, hh as f32), fill, radius: 0.0 };
+            let mut nodes = Vec::new();
+            let accent = theme.accent_fill();
+            let first_data = r.r0 + t.header as u32;
+            if t.stripes {
+                let a = self.row_at(fy0).max(first_data);
+                let b = self.row_at(fy1).min(r.r1);
+                for row in (a..=b).filter(|row| (row - first_data) % 2 == 1) {
+                    let (ya, yb) = (self.row_top(row), self.row_top(row + 1));
+                    if yb > ya {
+                        nodes.push(at(fx0, ya, fx1 - fx0, yb - ya, accent.with_alpha(0.07)));
+                    }
+                }
+            }
+            if t.header {
+                let hb = self.row_top(r.r0 + 1);
+                nodes.push(at(fx0, y0, fx1 - fx0, hb - y0, accent.with_alpha(0.16)));
+                nodes.push(at(fx0, hb - 1.0, fx1 - fx0, 2.0, accent));
+            }
+            let edge = accent.with_alpha(0.8);
+            if y0 >= fy0 {
+                nodes.push(at(fx0, y0 - 1.0, fx1 - fx0, 2.0, edge));
+            }
+            if y1 <= fy1 {
+                nodes.push(at(fx0, y1 - 1.0, fx1 - fx0, 2.0, edge));
+            }
+            if x0 >= fx0 {
+                nodes.push(at(x0 - 1.0, fy0, 2.0, fy1 - fy0, edge));
+            }
+            if x1 <= fx1 {
+                nodes.push(at(x1 - 1.0, fy0, 2.0, fy1 - fy0, edge));
+            }
+            out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes) });
+        }
+        if let Some(f) = &d.wb.sheet(s).filter {
+            let r = f.rect;
+            let (y0, y1) = (self.row_top(r.r0), self.row_top(r.r0 + 1));
+            if y1 > y0 && y0 <= vy1 && y1 >= vy0 {
+                let a = d.wb.sheet(s).col_sizes.index_at(vx0.max(0.0)).max(r.c0);
+                let b = d.wb.sheet(s).col_sizes.index_at(vx1.max(0.0)).min(r.c1);
+                for c in a..=b {
+                    let lit = f.conds.iter().any(|(k, _)| *k == c);
+                    let size = 14.0f32.min((y1 - y0) as f32 - 2.0).max(6.0);
+                    let x = col_x(c + 1) - size as f64 - 3.0;
+                    let y = y0 + ((y1 - y0) - size as f64) / 2.0;
+                    let bg = if lit { theme.accent_fill() } else { theme.bg_surface() };
+                    let fg = if lit { theme.accent_fg() } else { theme.text_secondary() };
+                    let mut nodes = vec![
+                        pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, size, size), fill: theme.border_default(), radius: 3.0 },
+                        pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, size - 2.0, size - 2.0), fill: bg, radius: 2.0 },
+                    ];
+                    // A small down-pointing triangle.
+                    let (cx, cy, k) = (size / 2.0, size / 2.0 + 1.0, size * 0.22);
+                    let tri = PathData::new().move_to(cx - k * 1.3, cy - k * 0.7).line_to(cx + k * 1.3, cy - k * 0.7).line_to(cx, cy + k * 0.8).close();
+                    nodes.extend(Shape::new(tri).fill(Paint::Solid(fg)).fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(nodes) });
+                }
+            }
+        }
+        out
+    }
+}
+
 impl GridSource for SheetSource {
     fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
+        let mut out = self.data_marks(view, theme);
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {
-            return Vec::new();
+            return out;
         }
         let dark = theme.mode == pergola::theme::Mode::Dark;
         let mut cache = self.charts.borrow_mut();
         cache.resize(charts.len(), None);
-        let mut out = Vec::new();
         for (i, ch) in charts.iter().enumerate() {
             let a = ch.anchor;
             if a.sheet != d.sheet {
