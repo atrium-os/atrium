@@ -170,6 +170,15 @@ impl RichTextView {
                 let numbering = ed.numbering();
                 let pages_text = if ed.pages.done() { known.to_string() } else { format!("{est}") };
                 let col_w = ed.pages.width();
+                // The selection, on the paper and under the text.
+                let (a, b) = ed.selection();
+                if a != b {
+                    let sel = t.selection_bg();
+                    for (_, rx, ry, rw, rh) in selection_rects(&mut ed, a, b, i, i) {
+                        let (sx, sy) = at(g.left + g.margin_x + rx as f64 * g.k, g.page_top(i) + g.margin_y + ry as f64 * g.k);
+                        ctx.add(Node::Rect { rect: Rect::new(sx, sy, (rw as f64 * g.k) as f32, (rh as f64 * g.k) as f32), fill: sel, radius: 0.0 });
+                    }
+                }
                 let items = {
                     let e = &mut *ed;
                     let fonts = e.fonts_rc();
@@ -244,15 +253,6 @@ impl RichTextView {
             ctx.key(u64::MAX);
             let over = ctx.push(Node::vstack(local, 0.0));
             ctx.set_flex(over, FlexStyle { free: true, ..FlexStyle::default() });
-            let (a, b) = ed.selection();
-            if a != b {
-                let mut sel = t.selection_bg();
-                sel.a = 0.4;
-                for (pg, rx, ry, rw, rh) in selection_rects(&mut ed, a, b, first, last) {
-                    let (px, py) = at(g.left + g.margin_x + rx as f64 * g.k, g.page_top(pg) + g.margin_y + ry as f64 * g.k);
-                    ctx.add(Node::Rect { rect: Rect::new(px, py, (rw as f64 * g.k) as f32, (rh as f64 * g.k) as f32), fill: sel, radius: 0.0 });
-                }
-            }
             let c = ed.caret;
             let s = ed.spot(c);
             if s.page >= first && s.page <= last {
