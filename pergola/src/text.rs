@@ -37,6 +37,23 @@ pub fn clear_measurer() {
     *MEASURER.lock().unwrap() = None;
 }
 
+/// The system text size, thousandths (resolution-independence.md §6):
+/// one per process, set from the appearance frescod broadcasts.
+static TEXT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+/// The system text size as a factor: what [`TextStyle::em`] multiplies
+/// the type ramp by.
+pub fn text_scale() -> f32 {
+    TEXT_SCALE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+/// Set the system text size (thousandths; 0 is 100%), clamped to 85% to
+/// 200%. Returns whether it changed (the caller lays out again).
+pub fn set_text_scale(milli: u32) -> bool {
+    let m = if milli == 0 { 1000 } else { milli.clamp(850, 2000) };
+    TEXT_SCALE.swap(m, std::sync::atomic::Ordering::Relaxed) != m
+}
+
 /// Where frescod's text run goes (`y` on the wire is the top of the
 /// font's ascender box) so the text sits optically centred in `rect`:
 /// the band from baseline to cap height centred on the rect's middle, as
@@ -52,8 +69,8 @@ pub fn wire_top_device(rect: crate::geom::Rect, style: &TextStyle, k: f32) -> f3
         crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 1.025,
         _ => return (rect.y() * k).round(),
     };
-    let baseline = (wire_top(rect, style) + asc * style.size) * k;
-    baseline.round() - asc * style.size * k
+    let baseline = (wire_top(rect, style) + asc * style.em()) * k;
+    baseline.round() - asc * style.em() * k
 }
 
 pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
@@ -62,8 +79,8 @@ pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
         crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => (1.025, 0.698),
         _ => return rect.y(),
     };
-    let baseline = rect.y() + rect.h() / 2.0 + cap * style.size / 2.0;
-    baseline - asc * style.size
+    let baseline = rect.y() + rect.h() / 2.0 + cap * style.em() / 2.0;
+    baseline - asc * style.em()
 }
 
 /// The baseline of text optically centred in a box `h` tall, px below
@@ -74,7 +91,7 @@ pub fn baseline(h: f32, style: &TextStyle) -> f32 {
         crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 0.698,
         _ => 0.7,
     };
-    h / 2.0 + cap * style.size / 2.0
+    h / 2.0 + cap * style.em() / 2.0
 }
 
 /// Measure `content` in `style`. Shaped width when a measurer is
@@ -109,7 +126,7 @@ pub fn lines_with(content: &str, style: &TextStyle, width: f32, wrap: &crate::wr
 /// The height of one line of wrapped text in `style` (px): body
 /// leading (`line-height.body`), so lines of a paragraph breathe.
 pub fn line_height(style: &TextStyle) -> f32 {
-    (style.size * line_height::BODY).round()
+    (style.em() * line_height::BODY).round()
 }
 
 /// The size of `content` wrapped at `width`: its widest line, and its
@@ -121,14 +138,15 @@ pub fn measure_wrapped(content: &str, style: &TextStyle, width: f32, wrap: &crat
 }
 
 pub fn measure(content: &str, style: &TextStyle) -> Size {
-    let h = style.size * line_height::UI_SINGLE_LINE;
+    let size = style.em();
+    let h = size * line_height::UI_SINGLE_LINE;
     if let Some(m) = MEASURER.lock().unwrap().as_mut() {
-        if let Some(w) = m.measure_width(&style.family, style.size, style.weight as u16, content) {
+        if let Some(w) = m.measure_width(&style.family, size, style.weight as u16, content) {
             return Size::new(w, h);
         }
     }
     // Headless estimate, deliberately slightly under (see git history).
-    let w = content.chars().count() as f32 * style.size * 0.55;
+    let w = content.chars().count() as f32 * size * 0.55;
     Size::new(w, h)
 }
 
@@ -212,9 +230,9 @@ mod tests {
             for y in [0.0f32, 3.3, 17.7, 101.1] {
                 let r = crate::geom::Rect::new(5.0, y, 100.0, 22.0);
                 let top = wire_top_device(r, &st, k);
-                let base = top + 1.025 * st.size * k;
+                let base = top + 1.025 * st.em() * k;
                 assert!((base - base.round()).abs() < 1e-3, "baseline {base} at {k}");
-                let exact = (wire_top(r, &st) + 1.025 * st.size) * k;
+                let exact = (wire_top(r, &st) + 1.025 * st.em()) * k;
                 assert!((base - exact).abs() <= 0.5 + 1e-3);
             }
         }

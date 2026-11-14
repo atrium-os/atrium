@@ -192,7 +192,7 @@ impl Menu {
     /// The menu's height for its items.
     pub fn height(&self) -> f32 {
         let seps = self.items.iter().filter(|i| i.separated).count() as f32;
-        MENU_INSET * 2.0 + self.items.len() as f32 * size::MENU_ITEM + seps * (stroke::DEFAULT + 2.0 * MENU_INSET)
+        MENU_INSET * 2.0 + self.items.len() as f32 * size::menu_item() + seps * (stroke::DEFAULT + 2.0 * MENU_INSET)
     }
 
     /// The next enabled item from `from` in direction `step`, wrapping.
@@ -255,7 +255,7 @@ impl Menu {
                 ctx.tree.insert(Some(body), Node::Rect { rect: Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, stroke::DEFAULT), fill: t.border_default(), radius: 0.0 });
                 y += stroke::DEFAULT + MENU_INSET;
             }
-            let row = Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, size::MENU_ITEM);
+            let row = Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, size::menu_item());
             let hit = ctx.tree.insert(Some(body), Node::Rect { rect: row, fill: Color::TRANSPARENT, radius: radius::XS });
             let lit = item.enabled && (st.highlight == Some(i) || ctx.is_hovered(hit));
             if lit {
@@ -297,7 +297,7 @@ impl Menu {
                     sl = sl.enabled(false);
                 }
                 sl.render(ctx);
-                y += size::MENU_ITEM;
+                y += size::menu_item();
                 continue;
             }
             if let Some(k) = &item.shortcut {
@@ -316,7 +316,7 @@ impl Menu {
                     pick(i);
                 });
             }
-            y += size::MENU_ITEM;
+            y += size::menu_item();
         }
         // Presses on the body between items close nothing.
         ctx.on_click(body, || {});
@@ -384,7 +384,7 @@ impl Dropdown {
             value,
             options: options.into_iter().map(Into::into).collect(),
             menu,
-            rect: Rect::new(0.0, 0.0, 180.0, size::BUTTON_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 180.0, size::button_height()),
             attached: false,
             on_change: None,
         }
@@ -618,7 +618,7 @@ impl MenuButton {
             label: label.into(),
             items,
             menu,
-            rect: Rect::new(0.0, 0.0, 160.0, size::BUTTON_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 160.0, size::button_height()),
             attached: false,
             icon: None,
             on_pick: Rc::new(on_pick),
@@ -726,7 +726,7 @@ impl PanelButton {
         Self {
             label: label.into(),
             open,
-            rect: Rect::new(0.0, 0.0, 160.0, size::BUTTON_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 160.0, size::button_height()),
             attached: false,
             icon: None,
             size,
@@ -1017,7 +1017,7 @@ mod tests {
         click(&mut app, 20.0, 20.0);
         assert!(menu.get().open);
         // Second item: below the button (32) + gap (4) + inset (4) + one row.
-        let y = 10.0 + size::BUTTON_HEIGHT_DEFAULT + MENU_GAP + MENU_INSET + size::MENU_ITEM * 1.5;
+        let y = 10.0 + size::button_height() + MENU_GAP + MENU_INSET + size::menu_item() * 1.5;
         click(&mut app, 30.0, y);
         assert_eq!(value.get(), 1);
         click(&mut app, 20.0, 20.0);
@@ -1038,7 +1038,7 @@ mod tests {
         assert_eq!(pops.len(), 1);
         let (root, spec) = pops[0];
         // Hanging from the button, the gap inside the anchor.
-        let h = size::BUTTON_HEIGHT_DEFAULT;
+        let h = size::button_height();
         assert_eq!(spec.anchor, Rect::new(10.0, 10.0 - MENU_GAP, 180.0, h + 2.0 * MENU_GAP));
         assert_eq!((spec.side, spec.align, spec.grab), (crate::popup::Side::Below, crate::popup::Align::Start, true));
         let r = app.tree().get(root).unwrap().rect();
@@ -1046,7 +1046,7 @@ mod tests {
         // No press-catcher: frescod keeps the outside press.
         assert_eq!(app.tree().roots().count(), 4, "the dropdown's halo, ring and edge, and the pop-up");
         // Items work as before (input arrives in tree coordinates).
-        let y = r.y() + MENU_INSET + size::MENU_ITEM * 1.5;
+        let y = r.y() + MENU_INSET + size::menu_item() * 1.5;
         click(&mut app, 30.0, y);
         assert_eq!(value.get(), 1);
         assert_eq!(app.tree().popups().count(), 0);
@@ -1088,10 +1088,10 @@ mod tests {
         assert!(menu.get().open);
         assert!(lit(&app), "open: filled with the accent");
         let (root, spec) = app.tree().popups().next().map(|(id, s)| (id, *s)).unwrap();
-        let h = size::BUTTON_HEIGHT_DEFAULT;
+        let h = size::button_height();
         assert_eq!(spec.anchor, Rect::new(10.0, 0.0, 160.0, h), "no gap");
         assert_eq!(app.tree().get(root).unwrap().rect().y(), h, "it hangs from the button");
-        click(&mut app, 30.0, h + MENU_INSET + size::MENU_ITEM * 1.5);
+        click(&mut app, 30.0, h + MENU_INSET + size::menu_item() * 1.5);
         assert_eq!(picked.get(), Some(1));
         assert!(!lit(&app), "closed again");
     }

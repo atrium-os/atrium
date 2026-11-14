@@ -117,7 +117,7 @@ impl View for ReferenceScreen {
 
         // Text input with placeholder, carrying the focus ring:
         // 2px accent-bg halo, 1px focus-ring stroke, canvas fill.
-        let input_h = size::INPUT_HEIGHT_DEFAULT;
+        let input_h = size::input_height();
         let halo = 2.0;
         ctx.add(Node::Rect {
             rect: Rect::new(ix - halo - stroke::DEFAULT, cy - halo - stroke::DEFAULT,
@@ -146,7 +146,7 @@ impl View for ReferenceScreen {
         cy += input_h + space::LG;
 
         // The three button variants: primary / secondary / ghost.
-        let bh = size::BUTTON_HEIGHT_DEFAULT;
+        let bh = size::button_height();
         let bw = (iw - 2.0 * space::SM) / 3.0;
         // Primary — accent fill, text-on-accent label.
         ctx.add(Node::Rect {

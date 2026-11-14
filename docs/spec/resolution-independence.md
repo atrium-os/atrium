@@ -213,6 +213,21 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
 - **Truncation** with an ellipsis is a last resort, only where the widget says so, with the
   full text in a tooltip and in the accessibility tree.
 
+### 6.5 Built so far (step 4, 2026-11-14)
+
+- **4a, the setting:** `AppearancePayload.text_size_milli` (one of `TEXT_SIZES`, 850 to
+  2000; 0 = 100%), validated by frescod, carried to split renderers and broadcast in
+  `EV_APPEARANCE_CHANGED`. `forum-ctl text-size 130` sets it through forum-wm, which keeps the
+  scheme, remembers it (`textsize` in forum-displays.state) and restores it at start.
+- **4b, Pergola:** one text size per process (`text::text_scale`, set from the appearance;
+  a change relays out). `TextStyle.size` stays the type ramp's pt and `TextStyle::em()` is
+  what is measured, wrapped, shaped and drawn. Control heights are em-based through
+  `theme::size::{button_height, input_height, menu_item, list_row, toolbar, ...}`; the
+  constants are the 100% reference. Still pt and to be moved: widgets' inner paddings, the
+  bar's height (and the WM's reservation of it), virtual list rows, app-shaped `Glyphs` text.
+  The overflow menus, min-size hints, anchor-kept scroll and the catalogue lint (§6.2, §6.3)
+  are next.
+
 ### 6.4 Inline images and other inline objects
 
 An inline object in a line of text (an image, an icon, an emoji, a chip, an embedded control)

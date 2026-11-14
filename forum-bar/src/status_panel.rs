@@ -26,7 +26,7 @@ const GROUP_PAD: f32 = 10.0;
 const HEADING_H: f32 = 22.0;
 const LABEL_H: f32 = 18.0;
 const CONTROL_H: f32 = 24.0;
-const SEGMENTED_H: f32 = size::BUTTON_HEIGHT_DEFAULT;
+fn segmented_h() -> f32 { size::button_height() }
 const RADIO_ROW_H: f32 = 26.0;
 const SEPARATOR_H: f32 = 9.0;
 
@@ -117,13 +117,13 @@ fn layout_one(n: &StatusNode, x: f32, y: f32, w: f32, out: &mut Vec<(Rect, Piece
         StatusNode::Toggle { .. } | StatusNode::Check { .. } => control(n, x, y, w, CONTROL_H, out),
         StatusNode::Slider { label, .. } => control(n, x, y, w, if label.is_empty() { CONTROL_H } else { LABEL_H + CONTROL_H }, out),
         StatusNode::Choice { options, segmented, .. } => {
-            let h = if *segmented { SEGMENTED_H } else { options.len() as f32 * RADIO_ROW_H };
+            let h = if *segmented { segmented_h() } else { options.len() as f32 * RADIO_ROW_H };
             control(n, x, y, w, h, out)
         }
-        StatusNode::Button { .. } => control(n, x, y, w, size::BUTTON_HEIGHT_DEFAULT, out),
+        StatusNode::Button { .. } => control(n, x, y, w, size::button_height(), out),
         StatusNode::Progress { label, .. } => control(n, x, y, w, if label.is_empty() { 4.0 } else { LABEL_H + 8.0 }, out),
         StatusNode::TextField { label, .. } => {
-            control(n, x, y, w, if label.is_empty() { 0.0 } else { LABEL_H } + size::INPUT_HEIGHT_DEFAULT, out)
+            control(n, x, y, w, if label.is_empty() { 0.0 } else { LABEL_H } + size::input_height(), out)
         }
     }
 }
@@ -342,7 +342,7 @@ fn draw_control(ctx: &mut Ctx, r: Rect, n: &StatusNode, controls: &Controls, sin
         }
         (StatusNode::TextField { id, label, placeholder, value, enabled }, Some(Ctl::Text(m, _))) => {
             let dy = label_above(ctx, label);
-            let field = Rect::new(r.x(), r.y() + dy, r.w(), size::INPUT_HEIGHT_DEFAULT);
+            let field = Rect::new(r.x(), r.y() + dy, r.w(), size::input_height());
             if *enabled {
                 let (id, s) = (*id, sink.clone());
                 TextField::new(m)

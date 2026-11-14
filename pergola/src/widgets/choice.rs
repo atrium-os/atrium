@@ -393,7 +393,7 @@ pub struct Segmented {
 impl Segmented {
     pub fn new(value: Mutable<usize>, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
         let labels: Vec<String> = labels.into_iter().map(Into::into).collect();
-        Self { value, labels, rect: Rect::new(0.0, 0.0, 0.0, size::BUTTON_HEIGHT_DEFAULT), on_change: None }
+        Self { value, labels, rect: Rect::new(0.0, 0.0, 0.0, size::button_height()), on_change: None }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.rect.origin.x = x;
@@ -459,7 +459,7 @@ pub struct Tabs {
 impl Tabs {
     pub fn new(value: Mutable<usize>, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
         let labels: Vec<String> = labels.into_iter().map(Into::into).collect();
-        Self { value, labels, rect: Rect::new(0.0, 0.0, 0.0, size::BUTTON_HEIGHT_DEFAULT), on_change: None }
+        Self { value, labels, rect: Rect::new(0.0, 0.0, 0.0, size::button_height()), on_change: None }
     }
     pub fn at(mut self, x: f32, y: f32) -> Self {
         self.rect.origin.x = x;

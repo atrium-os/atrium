@@ -448,6 +448,24 @@ pub mod size {
     /// Multiplier applied to all interactive control sizes when the
     /// host reports primary input is touch.
     pub const TOUCH_SCALE: f32 = 1.25;
+
+    // Control sizes are em-based (resolution-independence.md §6.2): the
+    // constants above are their size at 100% text, and these grow with
+    // the system text size, so a control and its label grow together.
+    // Use these in widgets; the constants are the 100% reference.
+
+    /// `pt` at 100% text, at the system text size.
+    pub fn em(pt: f32) -> f32 {
+        pt * crate::text::text_scale()
+    }
+    pub fn button_height() -> f32 { em(BUTTON_HEIGHT_DEFAULT) }
+    pub fn button_height_compact() -> f32 { em(BUTTON_HEIGHT_COMPACT) }
+    pub fn button_height_large() -> f32 { em(BUTTON_HEIGHT_LARGE) }
+    pub fn input_height() -> f32 { em(INPUT_HEIGHT_DEFAULT) }
+    pub fn list_row() -> f32 { em(LIST_ROW_DEFAULT) }
+    pub fn list_row_dense() -> f32 { em(LIST_ROW_DENSE) }
+    pub fn menu_item() -> f32 { em(MENU_ITEM) }
+    pub fn toolbar() -> f32 { em(TOOLBAR) }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

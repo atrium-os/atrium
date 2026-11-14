@@ -39,6 +39,15 @@ pub struct TextStyle {
     pub color: Color,
 }
 
+impl TextStyle {
+    /// The size text is drawn and measured at: `size` (the type ramp's,
+    /// in points) times the system text size ([`crate::text::text_scale`],
+    /// resolution-independence.md §6).
+    pub fn em(&self) -> f32 {
+        self.size * crate::text::text_scale()
+    }
+}
+
 /// Per-node payload. Keep this small; structural layout sits in
 /// `NodeTree`'s parent/children indices, not duplicated per node.
 #[derive(Debug, Clone, PartialEq)]

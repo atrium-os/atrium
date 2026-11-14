@@ -99,7 +99,7 @@ impl Surface for LogSurface {
             ),
             Node::Text { rect, content, style } => println!(
                 "  set  id={:>3}  {at:<8} Text ({:>4.0},{:>4.0} {:>4.0}×{:>4.0}) {:?}px {:?}  {:?}",
-                id.0, rect.x(), rect.y(), rect.w(), rect.h(), style.size, style.weight, content,
+                id.0, rect.x(), rect.y(), rect.w(), rect.h(), style.em(), style.weight, content,
             ),
             Node::Path { p0, p1, width, .. } => println!(
                 "  set  id={:>3}  {at:<8} Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
@@ -410,7 +410,7 @@ impl Surface for FrescoSurface {
                 let color = [style.color.r, style.color.g, style.color.b, style.color.a];
                 // The baseline on a device pixel; x stays fractional.
                 self.conn.text_run_install(
-                    id.0, font_id, style.size * k,
+                    id.0, font_id, style.em() * k,
                     rect.x() * k, crate::text::wire_top_device(*rect, style, k),
                     color,
                     content.clone(),

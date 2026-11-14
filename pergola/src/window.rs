@@ -204,7 +204,10 @@ impl Window {
             None => conn.window_create(w, h, &desc.title, desc.hints.clone())?,
         };
         let appearance = match conn.appearance() {
-            Ok(a) => Some(theme_for(&a)),
+            Ok(a) => {
+                crate::text::set_text_scale(a.text_size_milli);
+                Some(theme_for(&a))
+            }
             Err(e) => {
                 log::warn!("window: no system appearance ({e}); staying light");
                 None
@@ -333,6 +336,11 @@ impl Window {
             }
             fresco_client::Event::Appearance(ref a) => {
                 self.appearance = Some(theme_for(a));
+                // The system text size: everything sized from text is laid
+                // out again (resolution-independence.md §6).
+                if crate::text::set_text_scale(a.text_size_milli) {
+                    app.invalidate();
+                }
             }
             fresco_client::Event::FocusChanged { window_id, gained: true, cause } if window_id == main => {
                 // The focus ring shows only for keyboard focus (§14.1), and

@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(embed, e);
         arca.ready(e, W_ARCA).unwrap();
         assert_eq!(embeds.borrow_mut().poll(Duration::from_secs(2)).unwrap(), Some(ParentEvent::Attached { embed: e }));
-        assert_eq!(fresco.0.lock().unwrap().last().copied().flatten(), Some([0.0, 0.0, 240.0, crate::theme::size::INPUT_HEIGHT_DEFAULT]));
+        assert_eq!(fresco.0.lock().unwrap().last().copied().flatten(), Some([0.0, 0.0, 240.0, crate::theme::size::input_height()]));
 
         arca.emit(e, ToParent::Handle { handle: [5; 16] }.encode()).unwrap();
         match embeds.borrow_mut().poll(Duration::from_secs(2)).unwrap() {

@@ -43,7 +43,7 @@ impl Button {
 
 impl Widget for Button {
     fn natural_size(&self) -> Size {
-        let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::BUTTON_HEIGHT_DEFAULT };
+        let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::button_height() };
         Size::new(self.natural_width(), h)
     }
     fn framed(mut self, r: Rect) -> Self {
@@ -57,7 +57,7 @@ impl Widget for Button {
 
 impl Widget for TextField {
     fn natural_size(&self) -> Size {
-        let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::INPUT_HEIGHT_DEFAULT };
+        let h = if self.rect.h() > 0.0 { self.rect.h() } else { size::input_height() };
         Size::new(if self.rect.w() > 0.0 { self.rect.w() } else { MIN_FIELD }, h)
     }
     /// A field with no width fills.

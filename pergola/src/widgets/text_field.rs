@@ -44,7 +44,7 @@ impl TextField {
         Self {
             state,
             placeholder: String::new(),
-            rect: Rect::new(0.0, 0.0, 0.0, size::INPUT_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 0.0, size::input_height()),
             on_submit: None,
         }
     }
@@ -108,7 +108,7 @@ impl View for TextField {
         let theme = ctx.theme;
         let edit = self.state.get_cloned();
 
-        let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::INPUT_HEIGHT_DEFAULT };
+        let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::input_height() };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.rect.size.w, h);
 
         // Node structure is the same in every state (ids stay stable):

@@ -51,7 +51,7 @@ impl CredentialField {
         Self {
             purpose,
             key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
-            rect: Rect::new(0.0, 0.0, 240.0, size::INPUT_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 240.0, size::input_height()),
             state,
             username: None,
         }

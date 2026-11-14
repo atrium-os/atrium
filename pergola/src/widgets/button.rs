@@ -50,7 +50,7 @@ impl Button {
             label: label.into(),
             variant: Variant::Primary,
             on_click: None,
-            rect: Rect::new(0.0, 0.0, 0.0, size::BUTTON_HEIGHT_DEFAULT),
+            rect: Rect::new(0.0, 0.0, 0.0, size::button_height()),
             tooltip: None,
         }
     }
@@ -93,7 +93,7 @@ impl View for Button {
     fn render(&self, ctx: &mut Ctx) {
         let theme = ctx.theme;
 
-        let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::BUTTON_HEIGHT_DEFAULT };
+        let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::button_height() };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.natural_width(), h);
 
         // Node structure is IDENTICAL in every state — state changes
