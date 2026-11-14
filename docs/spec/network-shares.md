@@ -126,6 +126,35 @@ Everything from the network is hostile:
   `SSH-2.0-Atrium`, SMB workstation name empty (NTLM allows it), no domain
   unless the user gave one, WebDAV `User-Agent: Atrium`.
 
+### 4.4 The kernel side
+
+Jails, Capsicum and sysfil confine the share server's process, but the
+server still talks to the kernel through `/dev/fuse`, and fusefs parses its
+replies. With sticks an attacker first had to break the stick server; with
+shares, whoever breaks a share server over the network can send crafted
+FUSE replies to the kernel. fusefs is therefore the one kernel boundary a
+remote attacker can reach, and the kernel work is there:
+
+1. **Fuzz fusefs from the server side** under the KASAN kernel: a hostile
+   FUSE server sending malformed replies (lengths, attributes, sizes that
+   change, invalidations at bad times, replies out of order). Bugs are
+   fixed in the fork; fusefs can also be narrowed to the FUSE features our
+   servers use.
+2. **Mount options** set by jaild (today `nosuid`, `allow_other`,
+   `default_permissions`, `portcullis/jaild/src/ffi.rs`), adding for shares
+   and sticks: `noexec`; `daemon_timeout`, so a server that stops answering
+   (a compromised one included, whose own deadlines can't be trusted) gives
+   apps an error instead of holding them in the kernel; `intr`, so a stuck
+   process can be killed.
+3. **A sysfil profile** for share servers: `networked` minus what a FUSE
+   server doesn't need; log-only first, like the others (jail-sysfil.md).
+4. **Kernel memory a server can pin** (queued requests, buffers) that racct
+   doesn't count: measured during the fuzzing, capped if it can grow.
+
+Nothing else new is reachable: the share jail's vnet and pf are the shape
+Arca's courier jails already use, and the NFS client, smbfs and kgssapi
+stay out of the kernel.
+
 ## 5. Credentials
 
 ### 5.1 The rule: identity first, then the secret
@@ -317,10 +346,12 @@ encryption. It checks:
 
 ## 10. Build order once accepted
 
-1. **S1 SFTP:** share-volume source in dispensatord, the jail/vnet/pf
+1. **S0 kernel side** (§4.4): the mount options, the fusefs fuzzer under
+   KASAN and the share-server sysfil profile, before any network code.
+2. **S1 SFTP:** share-volume source in dispensatord, the jail/vnet/pf
    setup, `atrium-share-sftp` with Arca host-key pinning and signing,
    Scrinium's Connect form with the arca-ui slot, the gate's SFTP part.
-2. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
-3. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
+3. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
+4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.
-4. **S4** disconnected-state UI, reconnect, "connect at login".
+5. **S4** disconnected-state UI, reconnect, "connect at login".
