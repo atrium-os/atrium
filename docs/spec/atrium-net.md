@@ -327,6 +327,7 @@ VM from the Aura gates cover them.
   in a fork patch (address-prefix linkage under the ND6 write lock with a prefix
   reference held across the purge; router removal after the neighbor unlock): 509 SLAAC
   addresses made and deleted under the flood with no panic or hang, 10 minutes clean, the
-  gate 28/28 on that kernel. The patch is not yet on the fork's branch.
+  gate 28/28 on that kernel. Pushed to atrium-os/freebsd-src branch `atrium-os` as
+  92ffd19c3; a private report to the FreeBSD Security Officer is drafted, not sent.
 - Not yet: DHCPv6, the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
   wired), RA MTU beyond what the kernel applies.
