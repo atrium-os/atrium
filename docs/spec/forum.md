@@ -254,7 +254,7 @@ granted to anything.
 |---|---|
 | the Applications button at the left end of the dock | the same button, Escape, Super+A |
 | Super+A (forum-wm sees the chord and tells the dock, below) | launching an app (once portcullisd accepted the launch) |
-| | a press on the view's empty space |
+| | a press on the view's empty space, or the view losing focus |
 
 The view is a `Dialog`-role window whose minimum size is the whole screen in
 points, so forum-wm's existing dialog rule (grow about the centre within the work
@@ -269,10 +269,10 @@ waiting connections). The dock asks again after each answer. One intent per
 connection still holds; this one just answers late.
 
 **Filtering.** Typing goes into the filter field (it has focus while the view is
-up). An app matches when every word typed is the start of a word of its name, or
-appears in its name, id or description; matches on the name's start come first,
-then other name matches, then the rest, each group in name order. The first match
-is selected, so typing a few letters and Enter launches it.
+up). An app matches when every word typed appears in its name, id or description.
+Matches are ranked: the name starts with what was typed; every word starts a word
+of the name; every word is in the name; the rest. Each rank is in name order. The
+first match is selected, so typing a few letters and Enter launches it.
 
 **Keyboard.** Arrows move the selection (Left/Right by one, Up/Down by a row;
 the filter field's caret is moved with the pointer, Home and End). Page Up and

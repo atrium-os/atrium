@@ -217,10 +217,16 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
     view.min = (win.width, win.height);
     let (state, query, size, actions) = (view.state.clone(), view.query.clone(), view.size.clone(), view.actions.clone());
     let mut app = App::new_with_flag(view, dirty);
+    {
+        let l = apps_view::layout(win.width, win.height);
+        eprintln!("forum-dock: Applications view open: {} app(s), {}x{} per page, {:.0}x{:.0} pt",
+                  state.get_cloned().apps.len(), l.grid.cols, l.grid.rows, win.width, win.height);
+    }
     let mut last_query = String::new();
     let mut wheel = 0.0f32;
     let mut wheel_rest = Instant::now();
     let mut had_focus = false;
+    let mut trace = String::new();
     win.paint(&mut app)?;
 
     loop {
@@ -346,9 +352,26 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
             }
         }
         if close {
+            eprintln!("forum-dock: Applications view closed");
             return Ok(());
         }
 
+        {
+            let s = state.get_cloned();
+            let m = apps::filter(&s.apps, query.get_cloned().text());
+            let line = format!(
+                "query={:?} matches={} selected={} page={} note={}",
+                query.get_cloned().text(),
+                m.len(),
+                m.get(s.selected).map_or("-", |&i| s.apps[i].id.as_str()),
+                lay.grid.page_of(s.selected),
+                s.note.as_ref().map_or("-", |n| n.text.as_str())
+            );
+            if line != trace {
+                eprintln!("forum-dock: apps: {line}");
+                trace = line;
+            }
+        }
         // Pins changed (here or in the dock).
         let fresh = {
             let s = shared.lock().unwrap();
@@ -449,6 +472,8 @@ fn render_dock() -> io::Result<()> {
     let mut app = App::new_with_flag(view, dirty);
     let mut reserved = 0u32;
     let mut last_poll = Instant::now() - RUNNING_POLL;
+    let mut apps_button = (0.0f32, 0.0f32);
+    seen = seen.wrapping_sub(1); // log the button's place at the first check
     win.paint(&mut app)?;
 
     // ★ Stay up: the dock IS the desktop background, so exiting takes the
@@ -491,6 +516,13 @@ fn render_dock() -> io::Result<()> {
         };
         if let Some((v, ds)) = fresh {
             seen = v;
+            // Where the Applications button is, for checks that press it.
+            let p = forum_dock::dock_view::panel(&ds.items(), win.width, win.height);
+            let b = (p.x() + pergola::theme::size::em(forum_dock::dock_view::PAD + forum_dock::dock_view::TILE / 2.0), p.y() + p.h() / 2.0);
+            if b != apps_button {
+                apps_button = b;
+                eprintln!("forum-dock: Applications button at {:.0},{:.0}", b.0, b.1);
+            }
             state.set(ds);
             win.paint(&mut app)?;
         }
