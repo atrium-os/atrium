@@ -35,6 +35,9 @@ pub mod ph {
     pub const WARNING: char = '\u{e4e0}';
     pub const LINK: char = '\u{e2e2}';
     pub const GLOBE: char = '\u{e288}';
+    pub const FILE: char = '\u{e230}';
+    pub const TABLE: char = '\u{e476}';
+    pub const PRESENTATION: char = '\u{e654}';
 }
 
 // Layout sizes at 100% text; each grows with the system text size
@@ -277,14 +280,25 @@ fn file_icon(name: &str, dir: bool, link: bool) -> char {
     if link {
         return ph::LINK;
     }
-    match fs::kind_of(name, dir) {
-        "Folder" => ph::FOLDER,
-        "Image" => ph::IMAGE,
-        "PDF" => ph::FILE_PDF,
-        "Audio" => ph::MUSIC_NOTE_SIMPLE,
-        "Video" => ph::FILM_STRIP,
-        "Archive" => ph::PACKAGE,
-        _ => ph::FILE_TEXT,
+    if dir {
+        return ph::FOLDER;
+    }
+    use atrium_types::Family as F;
+    match atrium_types::by_name(name) {
+        Some(t) if t.mime == "application/pdf" => ph::FILE_PDF,
+        Some(t) => match t.family {
+            F::Image => ph::IMAGE,
+            F::Audio => ph::MUSIC_NOTE_SIMPLE,
+            F::Video => ph::FILM_STRIP,
+            F::Archive | F::Bundle => ph::PACKAGE,
+            F::Program => ph::TERMINAL_WINDOW,
+            F::Link => ph::LINK,
+            F::WebPage => ph::GLOBE,
+            F::Spreadsheet => ph::TABLE,
+            F::Presentation => ph::PRESENTATION,
+            F::Text | F::Document => ph::FILE_TEXT,
+        },
+        None => ph::FILE,
     }
 }
 

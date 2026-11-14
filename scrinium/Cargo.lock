@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-types"
+version = "0.1.0"
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +655,7 @@ name = "scrinium"
 version = "0.1.0"
 dependencies = [
  "atrium-media",
+ "atrium-types",
  "fresco-client",
  "fresco-protocol",
  "libc",

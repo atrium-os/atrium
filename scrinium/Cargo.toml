@@ -26,5 +26,6 @@ fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 limen = { path = "../limen" }
 atrium-media = { path = "../dispensator/media" }
+atrium-types = { path = "../atrium-types" }
 libc = "0.2"
 log = "0.4"

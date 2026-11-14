@@ -74,7 +74,9 @@ Related: [scrinium.md](scrinium.md) (the file manager and the picker),
 
 Types are IANA media types (`audio/flac`, `application/pdf`), so they
 match what the web, mail and the converters already use. Atrium ships
-one table, `/usr/share/atrium/types.toml`, part of the signed system:
+one table, the `atrium-types` crate, compiled into Scrinium,
+portcullis-toml and portcullisd, so it is part of the signed system and
+no jail needs a file for it:
 each type with its extensions, the bytes that mark it (offset and
 magic), whether it is text, and a family (`document`, `audio`, `video`,
 `image`, `archive`, `program`, `link`, `other`) that picks the icon and
@@ -237,6 +239,15 @@ and type. D6 asks whether quick look comes in the first build.
 
 1. **T1** types table and detection in Scrinium: icons and kind column
    from it, the mismatch rule, program and link files shown as such.
+   *Built 2026-11-14:* `atrium-types` (52 types, IANA names, `marks` that
+   name a file by its bytes and `confirms` that only agree with a name,
+   e.g. any zip with `.docx`; programs by their bytes whatever the name;
+   scripts, `.jar`, packages and shortcuts by name). The Kind column and
+   icon come from the name only (reading every file's head would be a
+   network read per file on a share); a double-click reads the first
+   4 KiB off the window's thread (`O_NOFOLLOW`, regular files) and says
+   what stops it: a program, a shortcut, a name that lies ("says it is a
+   PDF document but is really a Web page"), or an unknown type.
 2. **T2** `[[opens]]` in manifests and the install screen; the defaults
    table with the system's defaults.
 3. **T3** `OpenFile` in portcullisd, the `OPEN` token purpose, the

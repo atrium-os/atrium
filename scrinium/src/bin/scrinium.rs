@@ -384,6 +384,8 @@ enum Job {
     /// so it is asked off the window's thread).
     Space(String, Option<(u64, u64)>),
     /// A share's "connect at login", as dispensatord answered.
+    /// A file to open and what its bytes say it is.
+    Typed(String, std::io::Result<atrium_types::Detected>),
     /// `true`: the user asked to change it (a failure is shown).
     AtLogin(String, Result<bool, String>, bool),
 }
@@ -610,6 +612,15 @@ impl Network {
                 let _ = tx.send(Job::AtLogin(part.0, r, part.1.is_some()));
             });
         }
+        // A file to open: its first bytes, off this thread.
+        if let Some((path, name)) = b.want_open.take() {
+            changed = true;
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let r = scrinium::fs::head(&path).map(|h| atrium_types::detect(&name, &h));
+                let _ = tx.send(Job::Typed(name, r));
+            });
+        }
         // Shares' sizes: asked now and then, each on its own thread.
         for p in b.places.iter().filter(|p| p.network) {
             let every = if self.offline.contains(&p.id) { SHARE_OFFLINE_EVERY } else { SHARE_SPACE_EVERY };
@@ -646,6 +657,7 @@ impl Network {
                     None => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't connect: {e}"), error: true }),
                 },
                 Job::Saved(l) => b.saved = l,
+                Job::Typed(name, r) => b.typed(&name, r),
                 Job::AtLogin(part, r, set) => match r {
                     Ok(on) => {
                         b.at_login.insert(part, on);

@@ -121,6 +121,9 @@ pub struct Browser {
     pub at_login: std::collections::HashMap<String, bool>,
     /// The status line asked to set it: the app does it.
     pub want_at_login: Option<(String, bool)>,
+    /// A file to open (opening-files.md §6.1): its type is read off the
+    /// window's thread (a share may be slow), then [`Browser::typed`].
+    pub want_open: Option<(PathBuf, String)>,
 }
 
 /// A saved server whose key isn't the one the user accepted.
@@ -159,6 +162,7 @@ impl Browser {
             want_forget: None,
             at_login: Default::default(),
             want_at_login: None,
+            want_open: None,
         }
     }
 
@@ -378,7 +382,22 @@ impl Browser {
                 self.select_only(i);
                 self.choose();
             }
-            Mode::Manager => self.say(format!("Opening “{}” in an app comes with default apps (Curia)", e.name), false),
+            Mode::Manager => match self.dir() {
+                Some(d) => self.want_open = Some((d.join(&e.name), e.name.clone())),
+                None => {}
+            },
+        }
+    }
+
+    /// What a file to open turned out to be (opening-files.md §4.2, §8).
+    pub fn typed(&mut self, name: &str, r: std::io::Result<atrium_types::Detected>) {
+        match r {
+            Err(e) => self.say(format!("Couldn't open “{name}”: {}", err_text(&e)), true),
+            Ok(d) => match d.question() {
+                Some(q) => self.say(format!("“{name}”: {q}"), true),
+                // Handing it to an app is the next step (§6.2).
+                None => self.say(format!("“{name}” is {}: opening it in its app comes with default apps", d.known().map_or("a file", |t| t.words)), false),
+            },
         }
     }
 
@@ -684,6 +703,36 @@ mod tests {
 
     fn names(b: &Browser) -> Vec<&str> {
         b.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_double_click_reads_what_the_file_is() {
+        let (d, p) = stick("open");
+        std::fs::write(d.join("invoice.pdf"), "<!DOCTYPE html><script>steal()</script>").unwrap();
+        std::fs::write(d.join("setup.jpg"), b"\x7fELF\x02\x01\x01").unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![p]);
+        let at = |b: &Browser, n: &str| b.entries.iter().position(|e| e.name == n).unwrap();
+        let open = |b: &mut Browser, n: &str| {
+            let i = at(b, n);
+            b.activate(i);
+            let (path, name) = b.want_open.take().expect("asked to open");
+            let r = fs::head(&path).map(|h| atrium_types::detect(&name, &h));
+            b.typed(&name, r);
+            b.notice.clone().unwrap()
+        };
+        let n = open(&mut b, "invoice.pdf");
+        assert!(n.error && n.text.contains("says it is a PDF document but is really a Web page"), "{n:?}");
+        let n = open(&mut b, "setup.jpg");
+        assert!(n.error && n.text.contains("doesn't run programs"), "{n:?}");
+        let n = open(&mut b, "hello.txt");
+        assert!(!n.error && n.text.contains("Plain text"), "{n:?}");
+        // A folder is entered, not opened.
+        let i = at(&b, "Docs");
+        b.activate(i);
+        assert!(b.want_open.is_none());
+        assert_eq!(b.path, vec!["Docs".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

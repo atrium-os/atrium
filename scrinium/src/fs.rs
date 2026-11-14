@@ -244,22 +244,28 @@ pub fn time_text(secs: u64) -> String {
 }
 
 /// What kind of file, by its name, for the icon and the Kind column.
+/// The Kind column: by the name only (opening-files.md §4). Reading every
+/// file's first bytes to list a folder would be a network read per file on
+/// a share; the bytes are read when a file is opened.
 pub fn kind_of(name: &str, dir: bool) -> &'static str {
     if dir {
         return "Folder";
     }
-    let ext = name.rsplit_once('.').map(|(s, e)| if s.is_empty() { String::new() } else { e.to_ascii_lowercase() }).unwrap_or_default();
-    match ext.as_str() {
-        "txt" | "md" | "rtf" | "log" => "Text",
-        "pdf" => "PDF",
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "svg" => "Image",
-        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" => "Audio",
-        "mp4" | "mkv" | "webm" | "mov" | "avi" => "Video",
-        "zip" | "tar" | "gz" | "xz" | "7z" | "zst" => "Archive",
-        "html" | "htm" => "Web page",
-        "" => "File",
-        _ => "Document",
+    atrium_types::words_for_name(name)
+}
+
+/// The first bytes of a file, for its type (opening-files.md §4.2): no
+/// link followed, regular files only.
+pub fn head(p: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
     }
+    let mut b = Vec::with_capacity(atrium_types::HEAD);
+    f.take(atrium_types::HEAD as u64).read_to_end(&mut b)?;
+    Ok(b)
 }
 
 #[cfg(test)]
@@ -345,7 +351,8 @@ mod tests {
         assert_eq!(size_text(16_000_000_000), "16 GB");
         assert_eq!(time_text(0), "1970-01-01 00:00");
         assert_eq!(time_text(1_794_630_600), "2026-11-14 04:30");
-        assert_eq!(kind_of("a.PDF", false), "PDF");
+        assert_eq!(kind_of("a.PDF", false), "Document");
+        assert_eq!(kind_of("setup.exe", false), "Program");
         assert_eq!(kind_of(".bashrc", false), "File");
         assert_eq!(kind_of("x", true), "Folder");
     }
