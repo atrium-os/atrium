@@ -1,6 +1,6 @@
 # Resolution and text-size independence
 
-Status: **proposal** (2026-11-14), for Shankar's review before any build.
+Status: **accepted** (2026-11-14). Shankar agreed with the recommendations in §11.
 Covers Pergola, frescod, Forum and the Navigator. No backward compatibility is kept.
 
 ## 1. The problem
@@ -252,17 +252,16 @@ Three factors multiply for page content:
 - **Inline images** in pages follow §6.4: intrinsic from declared sizes, capped to the
   column, re-picked by density. The Navigator's chrome is Pergola and follows §6 like any app.
 
-## 11. Open questions for Shankar
+## 11. Decisions (accepted 2026-11-14)
 
-1. **Reference density.** Keep 110 ppi = 1.0 for all monitors, or a separate reference for
-   laptop panels (seen closer, so about 130 ppi = 1.0)? Proposal: one reference, with laptop
-   panels detected by connector type and given UI size "Smaller" by default.
-2. **Steps.** 1/8 steps for automatic scale and the UI size list in §4.2. Finer or coarser?
-3. **Text size range.** 85% to 200% system-wide; larger needs a magnifier, not layout.
-4. **Straddling windows** resampled on the minority monitor (§7), or render twice? Proposal:
-   resample (simpler, costs nothing, only while straddling).
-5. **Per-app text size** besides the system one: proposal is no, only the system setting and
-   each app's content zoom.
+Shankar took the recommendation on each:
+
+1. **Reference density**: one reference, 110 ppi = 1.0; laptop panels (eDP) are detected by
+   connector type and start at UI size Smaller.
+2. **Steps**: 1/8 for the automatic scale; the UI size list of §4.2.
+3. **Text size range**: 85% to 200%; beyond that is a magnifier's job.
+4. **Straddling windows**: resampled on the minority monitor (§7), not rendered twice.
+5. **Per-app text size**: none; only the system setting and each app's content zoom.
 
 ## 12. Build order (after review)
 
