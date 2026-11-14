@@ -1189,9 +1189,16 @@ Each step runs in the VM on headless frescod before the next.
      Unrecorded trail's jar is forgotten whole instead. Trails restored at start keep their
      sessions, as a browser that reopens its tabs does. Checked against the real Arca in
      `scripts/arca-vm-test.sh` §8 (`navctl endsession`).
-     Not yet: consent buttons pressed in a page, named personas,
-     session cookies ending with the last view, and moving a branch into its own trail with its
-     jar.
+   - **A branch made its own trail** (§4.2, 2026-11-14): a branch row in the rail has a "Make
+     its own trail" button (arrow out of a square; a button in the accessibility tree). The
+     branch's pages leave the trail, re-indexed with the branch first, and become a new trail in
+     the same jar: an Unrecorded one shares its parent's jar until both trails close, and the
+     sites that knew you there still do. The old trail keeps tombstones (as cleared pages,
+     compacted on disk); if the page you were on moved, the branch's parent is current there and
+     the new trail is shown. Live page children follow their pages (`Out::Moved`). Dragging a
+     branch out is not built. Checked in `scripts/navigator-live-vm.sh` (Ctrl held in the chrome
+     opens a link beside, then the button).
+     Not yet: consent buttons pressed in a page, named personas.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
    app hand-off. *Built 2026-11-14*:
    - **The prompt row's rules** (§6.4), in `navigator-ui/src/shell.rs`: a press counts only once

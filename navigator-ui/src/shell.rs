@@ -170,6 +170,9 @@ pub enum Out {
     /// "Sign out here" (§6.2): the session cookies of the page's site in
     /// its jar end (then the page opens again, `Reload`).
     SignOut { jar: navigator_control::Jar, url: String },
+    /// A branch made its own trail (§4.2): the moved pages' keys, old to
+    /// new, so their live children follow them.
+    Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
     /// Which accounts Arca holds for the page's site (the presence menu).
     Accounts { url: String },
     /// History cleared (§5.5): the pages that went (their children close)
@@ -711,6 +714,18 @@ impl Shell {
                     None => Accounts::Known(accounts),
                 };
             }
+        }
+    }
+
+    /// "Make its own trail" on a branch row of the current trail (§4.2).
+    pub fn make_own_trail(&mut self, page: PageId) {
+        let Some(title) = self.store.trail().pages.get(page).map(|p| p.title.clone()) else { return };
+        match self.store.make_own_trail(self.store.current, page) {
+            Some(keys) => {
+                self.last_note = Some(format!("\u{201c}{title}\u{201d} is its own trail now"));
+                self.outbox.push(Out::Moved { keys });
+            }
+            None => self.last_note = Some("the trail's first page can't leave it".into()),
         }
     }
 

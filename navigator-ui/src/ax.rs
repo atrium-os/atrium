@@ -106,6 +106,7 @@ mod id {
     pub const PAGE_ROW: u64 = 2 << 40;
     pub const HISTORY_ROW: u64 = 3 << 40;
     pub const ANSWER: u64 = 4 << 40;
+    pub const MAKE_TRAIL: u64 = 6 << 40;
 }
 
 /// What the prompt row says, as one sentence.
@@ -162,7 +163,11 @@ pub fn tree(s: &Shell) -> Node {
                 };
                 let mut path: Vec<Node> = rows.path.iter().map(|&p| row(p, Some(p) == t.current)).collect();
                 if let Some(last) = path.last_mut() {
-                    last.children = rows.branches.iter().map(|&b| row(b, false)).collect();
+                    last.children = rows.branches.iter().map(|&b| {
+                        let mut n = row(b, false);
+                        n.children = vec![Node::new(id::MAKE_TRAIL | (t.id << 20) | b as u64, "button", "Make its own trail")];
+                        n
+                    }).collect();
                     if !last.children.is_empty() {
                         last.state |= state::EXPANDED;
                     }

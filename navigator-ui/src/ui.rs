@@ -51,6 +51,7 @@ pub mod ph {
     pub const SHIELD_CHECK: char = '\u{e40c}';
     pub const WARNING: char = '\u{e4e0}';
     pub const SIGN_OUT: char = '\u{e42a}';
+    pub const ARROW_SQUARE_OUT: char = '\u{e5de}';
     pub const KEY: char = '\u{e2d6}';
     pub const PASSWORD: char = '\u{e752}';
     pub const TRASH_SIMPLE: char = '\u{e4a8}';
@@ -523,7 +524,7 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
             s.store.trail_mut().go(pi);
         }));
         rect(ctx, x - em(10.0), y + em(13.0), em(8.0), 1.0, t.border_strong(), 0.0);
-        let max = em(214.0) - x - em(4.0);
+        let max = em(if *indent > 0.0 { 192.0 } else { 214.0 }) - x - em(4.0);
         if let Some(q) = &p.search {
             icon(ctx, x, y + em(6.0), ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
             let label = format!("Search: {q}");
@@ -539,6 +540,14 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
             rect(ctx, em(220.0), y + em(10.0), em(6.0), em(6.0), t.text_tertiary(), em(3.0));
         }
         ctx.pop();
+        // A branch (§4.2): "Make its own trail", on the row's right.
+        if *indent > 0.0 {
+            let st2 = st.clone();
+            let id = area(ctx, Rect::new(em(196.0), y + em(3.0), em(20.0), em(20.0)), em(4.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.make_own_trail(pi)));
+            icon(ctx, em(199.0), y + em(6.0), ph::ARROW_SQUARE_OUT, 14.0, t.text_tertiary());
+            ctx.pop();
+            ctx.tooltip(id, "Make its own trail");
+        }
         last_y = y;
         y += em(26.0);
     }

@@ -5717,7 +5717,9 @@ trail closes, Forget this site empties the Personal jar, and a restarted navigat
 Unrecorded jar. A `hash mismatch` ABORT is TCG's scp landing zeros:
 run it again with `BUILD=0`.
 
-Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
+Last (ui10.log, a fresh trail store `trails10.json`): Ctrl held in the chrome
+(`KEY 0xe0`) while a link in the page is pressed opens it beside as a branch, and the branch row's
+"Make its own trail" button (at 206, 62 + 135) makes it a trail of its own (`trails=2`). Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
 `NAVIGATORD_SCHEMES=mailto` and a stand-in `NAVIGATORD_OPENER` (`sh $S/opener.sh`, which appends its
 arguments to `$S/opener.log`). The script presses the fixture's PDF link, finds the download prompt with
 the trail still on its page, and presses Save. It checks `survey.pdf` is 0644 with its address in

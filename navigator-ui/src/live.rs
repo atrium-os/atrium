@@ -567,6 +567,20 @@ impl Live {
                     send(&mut self.w, &Request::Activate { id, page, href });
                 }
                 Out::Forget { jar, url } => send(&mut self.w, &Request::Forget { jar, url: Some(url) }),
+                Out::Moved { keys } => {
+                    // The pages' children follow them to their new trail.
+                    let to = |k: Key| keys.iter().find(|(o, _)| *o == k).map(|(_, n)| *n);
+                    for c in &mut self.children {
+                        if let Some(n) = to(c.key) {
+                            c.key = n;
+                        }
+                    }
+                    if let Some(n) = self.shown.and_then(to) {
+                        self.shown = Some(n);
+                    }
+                    self.fresh = self.fresh.iter().map(|&k| to(k).unwrap_or(k)).collect();
+                    eprintln!("navigator-ui: a branch of {} pages is its own trail now", keys.len());
+                }
                 Out::SignOut { jar, url } => send(&mut self.w, &Request::SignOut { jar, url }),
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id } => send(&mut self.w, &Request::Save { id }),

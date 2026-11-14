@@ -380,8 +380,26 @@ g "grep -q '\"earlier\": \[\]' $S/trails.json" \
     && ok "…nothing put away is left" || bad "trails: $(g "head -c 600 $S/trails.json")"
 g "pkill -x navigator-ui; sleep 2; true"
 
+echo "=== a branch made its own trail (§4.2)"
+# A fresh trail store: one trail, so the rail's rows are where the code puts
+# them (TODAY at 44, the trail at 62, its path from 96, 26 a row).
+last() { g "grep 'trace' $S/ui10.log | tail -1"; }
+UIENV="NAVIGATOR_TRAILS=$S/trails10.json NAVIGATOR_UI_AX=1" ui https://atlas.example/wiki/Atrium ui10
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "branch: first page: $(last)"
+inj "KEY 0xe0 1 1"; sleep 1  # Ctrl held in the chrome: the next link opens beside
+press $((PX + 50)) $((TOP + PY + 64 + 20))
+inj "KEY 0xe0 0 0"; sleep "$GAP"
+g "grep -q 'ax  *tree-item \"[^\"]*, not looked at yet\"' $S/ui10.log" && ok "Ctrl and a link opened it beside, a branch not looked at yet" || bad "beside: $(g "grep -E 'ax .*tree-item' $S/ui10.log | tail -4")"
+shot live-15-branch
+press 206 $((TOP + 122 + 13))   # the branch row's "Make its own trail"
+sleep "$GAP"
+g "grep -q 'a branch of 1 pages is its own trail now' $S/ui10.log" && last | grep -q 'trails=2 ' \
+    && ok "Make its own trail: the branch is a trail of its own" || bad "own trail: $(last); $(g "grep -v trace $S/ui10.log | tail -3")"
+shot live-16-own-trail
+g "pkill -x navigator-ui; sleep 2; true"
+
 echo "=== logs"
-for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 ui10 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

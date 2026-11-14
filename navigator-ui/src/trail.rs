@@ -468,6 +468,48 @@ impl Trail {
         p.saved.take()
     }
 
+    /// "Make its own trail" (§4.2): the branch rooted at `root` (not the
+    /// trail's root) leaves this trail. Returns its pages, re-indexed with
+    /// the root first, where its current page is among them, and the old
+    /// index of each new page. Here the branch's pages become tombstones
+    /// (as cleared ones, compacted on disk); if the current page went with
+    /// it, the branch's parent is current here.
+    pub fn split_off(&mut self, root: PageId) -> Option<(Vec<Page>, Option<PageId>, Vec<PageId>)> {
+        let parent = self.pages.get(root).filter(|p| !p.cleared())?.parent?;
+        // The subtree, depth first from the root.
+        let mut order = vec![];
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            order.push(i);
+            stack.extend(self.pages[i].children.iter().rev().copied());
+        }
+        let new_of = |old: PageId| order.iter().position(|&o| o == old);
+        let mut pages: Vec<Page> = order.iter().map(|&o| self.pages[o].clone()).collect();
+        for p in &mut pages {
+            p.parent = p.parent.and_then(new_of);
+            p.children = p.children.iter().filter_map(|&c| new_of(c)).collect();
+        }
+        pages[0].parent = None;
+        let current = self.current.and_then(new_of);
+        self.pages[parent].children.retain(|&c| c != root);
+        for &o in &order {
+            let p = &mut self.pages[o];
+            p.parent = None;
+            p.children.clear();
+            p.url.clear();
+            p.title.clear();
+            p.search = None;
+            p.seen = true;
+            p.asked = None;
+            p.prompts = Prompts::default();
+            p.saved = None;
+        }
+        if current.is_some() {
+            self.current = Some(parent);
+        }
+        Some((pages, current, order))
+    }
+
     /// Whether any page is left that is not cleared.
     pub fn is_empty(&self) -> bool {
         self.pages.iter().all(|p| p.cleared())
@@ -637,6 +679,26 @@ impl TrailStore {
         self.current
     }
 
+    /// "Make its own trail" (§4.2): the branch at `page` of trail `index`
+    /// becomes a new trail in the same jar (an Unrecorded one keeps its
+    /// jar until both trails close). The new trail is shown if the page you
+    /// were on went with it. Returns how each moved page's key changed,
+    /// (trail id, page) old to new, for the live page children.
+    pub fn make_own_trail(&mut self, index: usize, page: PageId) -> Option<Vec<((u64, PageId), (u64, PageId))>> {
+        let (pages, current, order) = self.trails.get_mut(index)?.split_off(page)?;
+        let old = &self.trails[index];
+        let (old_id, unrecorded, jar, muted) = (old.id, old.unrecorded, old.jar, old.muted);
+        let id = self.next_id;
+        self.next_id += 1;
+        let n = pages.len();
+        let t = Trail { id, pages, current: Some(current.unwrap_or(0)), unrecorded, jar, muted, active: self.tick() };
+        self.trails.push(t);
+        if current.is_some() && self.current == index {
+            self.current = self.trails.len() - 1;
+        }
+        Some((0..n).map(|i| ((old_id, order[i]), (id, i))).collect())
+    }
+
     /// Insert a ready-made trail (the stand-in store, a restored one).
     pub fn add(&mut self, mut t: Trail) -> usize {
         t.id = self.next_id;
@@ -680,7 +742,9 @@ impl TrailStore {
         if !t.unrecorded && t.current.is_some() {
             self.earlier.insert(0, PutAway { trail: t.clone(), at_s });
         }
-        if t.unrecorded {
+        // An Unrecorded trail's jar goes with the last trail in it (a
+        // branch made its own trail keeps its parent's jar).
+        if t.unrecorded && !self.trails.iter().any(|o| o.unrecorded && o.jar == t.jar) {
             let jar = Self::jar_of(&t);
             self.known.retain(|(j, _)| *j != jar);
         }
@@ -1095,6 +1159,42 @@ mod asked_tests {
         s.unknow(ta, "https://sd.example/");
         assert!(!s.trail_knows(a, "sd.example"));
         let _ = tb;
+    }
+
+    /// A branch made its own trail: the same jar, the pages re-indexed, and
+    /// what you were on goes with it; the old trail keeps the rest.
+    #[test]
+    fn a_branch_becomes_its_own_trail_in_the_same_jar() {
+        let mut s = TrailStore::empty();
+        let a = s.new_trail(true);
+        let t = s.trail_mut();
+        let root = t.follow(spec("https://a.example/"));
+        let b1 = t.open_beside(spec("https://b.example/1"));
+        t.go(b1);
+        let b2 = t.follow(spec("https://b.example/2"));
+        t.go(root);
+        let c = t.follow(spec("https://c.example/"));
+        t.go(b2);
+        let (old_id, jar) = (s.trails[a].id, s.trails[a].jar);
+        let moved = s.make_own_trail(a, b1).unwrap();
+        let nt = s.trail();
+        assert!(nt.unrecorded && nt.jar == jar && nt.id != old_id, "the same jar");
+        assert_eq!(nt.pages.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(), ["https://b.example/1", "https://b.example/2"]);
+        assert_eq!((nt.pages[0].parent, nt.pages[1].parent, nt.current), (None, Some(0), Some(1)), "shown: you were on its page");
+        assert_eq!(moved, vec![((old_id, b1), (nt.id, 0)), ((old_id, b2), (nt.id, 1))]);
+        let old = &s.trails[a];
+        assert_eq!(old.current, Some(root));
+        assert_eq!(old.pages[root].children, vec![c]);
+        assert!(old.pages[b1].cleared() && old.pages[b2].cleared());
+        // The root can't be moved out, nor a page already gone.
+        assert!(s.make_own_trail(a, root).is_none() && s.make_own_trail(a, b1).is_none());
+        // One trail of the jar closes: the jar stays known for the other.
+        let ni = s.current;
+        s.set_knows("b.example", true);
+        s.select(a);
+        s.put_away(0);
+        let ni = s.trails.iter().position(|t| t.jar == jar).unwrap_or(ni);
+        assert!(s.trail_knows(ni, "b.example"));
     }
 
     /// A site's session is open while a page of it is in an open trail and
