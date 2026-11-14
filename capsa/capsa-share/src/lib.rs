@@ -1,4 +1,5 @@
-//! Network share servers (docs/spec/network-shares.md). S1: SFTP.
+//! Network share servers (docs/spec/network-shares.md). S1: SFTP; S2:
+//! WebDAV over HTTPS (`webdav`, on the small HTTP client in `http`).
 //!
 //! `SftpFs` serves a remote folder through capsa-fuse's `Backend`: nodes
 //! are paths under the share's root, interned to stable ids so the kernel's
@@ -6,7 +7,11 @@
 //! it).
 
 pub mod arca;
+pub mod cert;
+pub mod http;
 pub mod sftp;
+pub mod tls;
+pub mod webdav;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

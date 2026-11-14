@@ -6,7 +6,7 @@
 //!
 //! arcad's wire, kept here in a few lines: a request is `u32 LE length |
 //! u16 LE op | body`, a reply `u32 LE length | u8 status | body`; strings
-//! are u32-LE-length prefixed. A share is `u8 proto (1 sftp) | str host |
+//! are u32-LE-length prefixed. A share is `u8 proto (1 sftp, 2 webdav) | str host |
 //! u16 port | str path | key[32]`.
 
 use std::io::{self, Read, Write};
@@ -41,7 +41,7 @@ fn put_str(b: &mut Vec<u8>, s: &[u8]) {
 }
 
 fn put_share(b: &mut Vec<u8>, a: &Address, key: &[u8; 32]) {
-    b.push(1);
+    b.push(a.proto.byte());
     put_str(b, a.host.as_bytes());
     b.extend_from_slice(&a.port.to_le_bytes());
     put_str(b, a.path.as_bytes());
@@ -129,9 +129,7 @@ pub fn parse_list(b: &[u8]) -> Option<Vec<Saved>> {
     let n = c.u32()?;
     let mut out = Vec::new();
     for _ in 0..n.min(4096) {
-        if c.take(1)? != [1] {
-            return None;
-        }
+        let proto = crate::connect::Proto::from_byte(c.take(1)?[0])?;
         let host = c.str()?;
         let port = c.u16()?;
         let path = c.str()?;
@@ -140,7 +138,7 @@ pub fn parse_list(b: &[u8]) -> Option<Vec<Saved>> {
         let kind = c.u16()?;
         let user = c.str()?;
         if kind == KIND_PASSWORD {
-            out.push(Saved { addr: Address { user, host, port, path }, key, item });
+            out.push(Saved { addr: Address { proto, user, host, port, path }, key, item });
         }
     }
     Some(out)
@@ -160,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_list_reply_parses() {
-        let a = Address { user: "alice".into(), host: "nas.lan".into(), port: 22, path: "/srv".into() };
+        let a = Address { proto: crate::connect::Proto::Webdav, user: "alice".into(), host: "nas.lan".into(), port: 443, path: "/dav".into() };
         let mut b = 2u32.to_le_bytes().to_vec();
         for (kind, item) in [(1u16, [7u8; 16]), (0x100, [8u8; 16])] {
             put_share(&mut b, &a, &[5; 32]);

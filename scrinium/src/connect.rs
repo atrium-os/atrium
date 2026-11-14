@@ -4,10 +4,49 @@
 //! it asks for (`want`) and reports back. Nothing here sees a password:
 //! the field is Arca's, and what Scrinium holds is a handle.
 
+/// A share's protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    Sftp,
+    /// WebDAV over HTTPS (S2).
+    Webdav,
+}
+
+impl Proto {
+    /// As Arca's wire writes it.
+    pub fn byte(self) -> u8 {
+        match self {
+            Proto::Sftp => 1,
+            Proto::Webdav => 2,
+        }
+    }
+
+    pub fn from_byte(b: u8) -> Option<Proto> {
+        match b {
+            1 => Some(Proto::Sftp),
+            2 => Some(Proto::Webdav),
+            _ => None,
+        }
+    }
+
+    pub fn media(self) -> atrium_media::ShareProto {
+        match self {
+            Proto::Sftp => atrium_media::ShareProto::Sftp,
+            Proto::Webdav => atrium_media::ShareProto::Webdav,
+        }
+    }
+}
+
+/// What a WebDAV share's identity is when the trust store vouches for its
+/// name (dispensatord's word for it); Arca pins zeros.
+pub const TRUSTED: &str = "trusted";
+
 /// Where a share is: `user@host[:port][/path]`, with or without `sftp://`,
-/// or scp-style `user@host:path`. No path is the user's home.
+/// or scp-style `user@host:path` (no path is the user's home); or
+/// `https://user@host[:port]/path` for WebDAV (no path is `/`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
+    pub proto: Proto,
     pub user: String,
     pub host: String,
     pub port: u16,
@@ -16,6 +55,10 @@ pub struct Address {
 
 impl Address {
     pub fn text(&self) -> String {
+        if self.proto == Proto::Webdav {
+            let port = if self.port == 443 { String::new() } else { format!(":{}", self.port) };
+            return format!("https://{}@{}{port}{}", self.user, self.host, self.path);
+        }
         let port = if self.port == 22 { String::new() } else { format!(":{}", self.port) };
         let path = if self.path == "." { String::new() } else if self.path.starts_with('/') { self.path.clone() } else { format!("/~/{}", self.path) };
         format!("{}@{}{port}{path}", self.user, self.host)
@@ -29,11 +72,45 @@ fn host_ok(h: &str) -> bool {
             || h.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')))
 }
 
+fn user_ok(user: &str) -> bool {
+    !user.is_empty() && user.len() <= 64 && !user.starts_with('-') && user.bytes().all(|b| b.is_ascii_graphic() && b != b':' && b != b'/')
+}
+
+/// `https://user@host[:port][/path]`.
+fn parse_webdav(rest: &str) -> Result<Address, String> {
+    let (user, rest) = rest.split_once('@').ok_or("Type it as https://name@server/folder, for example https://alice@nas.local/dav")?;
+    if !user_ok(user) {
+        return Err("That user name can't be used".into());
+    }
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("That port can't be used")?),
+        None => (hostport, 443),
+    };
+    let host = host.to_ascii_lowercase();
+    if !host_ok(&host) {
+        return Err("That server name can't be used".into());
+    }
+    if path.len() > 1024 || path.chars().any(|c| c.is_control() || c == '?' || c == '#') || path.split('/').any(|seg| seg == "..") {
+        return Err("That folder can't be used".into());
+    }
+    Ok(Address { proto: Proto::Webdav, user: user.into(), host, port, path })
+}
+
 pub fn parse_address(s: &str) -> Result<Address, String> {
     let s = s.trim();
+    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("davs://")) {
+        return parse_webdav(rest);
+    }
+    if s.starts_with("http://") || s.starts_with("dav://") {
+        return Err("Only https:// addresses: Scrinium doesn't send passwords unencrypted".into());
+    }
     let s = s.strip_prefix("sftp://").unwrap_or(s);
     let (user, rest) = s.split_once('@').ok_or("Type it as name@server, for example alice@nas.local")?;
-    if user.is_empty() || user.len() > 64 || user.starts_with('-') || !user.bytes().all(|b| b.is_ascii_graphic() && b != b':' && b != b'/') {
+    if !user_ok(user) {
         return Err("That user name can't be used".into());
     }
     // host[:port][/path] or host:path (scp style: a colon not followed by a port).
@@ -61,7 +138,7 @@ pub fn parse_address(s: &str) -> Result<Address, String> {
     if path.len() > 1024 || path.starts_with('-') || path.chars().any(|c| c.is_control()) {
         return Err("That folder can't be used".into());
     }
-    Ok(Address { user: user.into(), host, port, path })
+    Ok(Address { proto: Proto::Sftp, user: user.into(), host, port, path })
 }
 
 /// OpenSSH's fingerprint of a key digest, the way `--learn` prints it.
@@ -108,6 +185,73 @@ pub fn key_of(fp: &str) -> Option<[u8; 32]> {
     out.try_into().ok()
 }
 
+/// The key Arca pins for what the user accepted: a fingerprint's digest,
+/// or zeros for [`TRUSTED`].
+pub fn key_for(fp: &str) -> Option<[u8; 32]> {
+    if fp == TRUSTED {
+        Some([0; 32])
+    } else {
+        key_of(fp)
+    }
+}
+
+/// What dispensatord is told a saved share's identity is.
+pub fn identity_of(proto: Proto, key: &[u8; 32]) -> String {
+    if proto == Proto::Webdav && key == &[0; 32] {
+        TRUSTED.into()
+    } else {
+        fingerprint(key)
+    }
+}
+
+/// What a WebDAV server's certificate says (dispensatord's learn answer).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cert {
+    /// `None`: the trust store vouches for the name; else why not.
+    pub untrusted: Option<String>,
+    pub fingerprint: String,
+    pub subject: String,
+    pub issuer: String,
+    pub expires: String,
+}
+
+pub fn parse_cert(s: &str) -> Option<Cert> {
+    let mut lines = s.lines();
+    let first = lines.next()?.trim();
+    let untrusted = if first == "trusted" { None } else { Some(first.strip_prefix("untrusted")?.trim().to_string()) };
+    let mut c = Cert { untrusted, ..Default::default() };
+    for l in lines {
+        if key_of(l.trim()).is_some() {
+            c.fingerprint = l.trim().into();
+        } else if let Some(v) = l.strip_prefix("subject ") {
+            c.subject = v.into();
+        } else if let Some(v) = l.strip_prefix("issuer ") {
+            c.issuer = v.into();
+        } else if let Some(v) = l.strip_prefix("expires ") {
+            c.expires = v.into();
+        }
+    }
+    (!c.fingerprint.is_empty()).then_some(c)
+}
+
+/// Why a certificate isn't trusted, for people: rustls's words, shortened.
+pub fn untrusted_text(why: &str) -> String {
+    let w = why.to_ascii_lowercase();
+    // A self-signed certificate is UnknownIssuer, or CaUsedAsEndEntity when
+    // it calls itself a CA (openssl req -x509 does, and many NASes).
+    if w.contains("unknownissuer") || w.contains("unknown issuer") || w.contains("causedasendentity") {
+        "It isn't signed by an authority Atrium trusts (a self-signed server, for example).".into()
+    } else if w.contains("expired") {
+        "Its certificate has expired.".into()
+    } else if w.contains("notvalidforname") || w.contains("not valid for name") {
+        "Its certificate is for another name.".into()
+    } else if w.contains("trust store") {
+        "Atrium has no trust store to check it with.".into()
+    } else {
+        "Its certificate can't be checked.".into()
+    }
+}
+
 /// A saved server, asked again before connecting (§5.1, the table in §5):
 /// is it still the key the user accepted?
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +263,22 @@ pub enum Recheck {
     Odd,
 }
 
-pub fn recheck(saved: &[u8; 32], learned: &str) -> Recheck {
+pub fn recheck(proto: Proto, saved: &[u8; 32], learned: &str) -> Recheck {
+    if proto == Proto::Webdav {
+        let Some(c) = parse_cert(learned) else { return Recheck::Odd };
+        if saved == &[0; 32] {
+            // Saved as trusted: it must still be.
+            return match c.untrusted {
+                None => Recheck::Same,
+                Some(why) => Recheck::Changed { now: format!("{} {}", c.fingerprint, untrusted_text(&why)) },
+            };
+        }
+        return match key_of(&c.fingerprint) {
+            Some(k) if &k == saved => Recheck::Same,
+            Some(_) => Recheck::Changed { now: c.fingerprint },
+            None => Recheck::Odd,
+        };
+    }
     match key_of(learned) {
         Some(k) if &k == saved => Recheck::Same,
         Some(_) => Recheck::Changed { now: learned.to_string() },
@@ -161,6 +320,8 @@ pub struct Form {
     /// the press on Connect is what takes its focus, so the handle comes
     /// just after the press: connect then, or give up after a moment.
     pub armed: Option<std::time::Instant>,
+    /// A WebDAV server's certificate, as learned.
+    pub cert: Option<Cert>,
 }
 
 /// How long a press on Connect waits for the field's handle.
@@ -168,7 +329,7 @@ pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_millis(150
 
 impl Default for Form {
     fn default() -> Self {
-        Form { step: Step::Address, error: None, remember: true, want: None, armed: None }
+        Form { step: Step::Address, error: None, remember: true, want: None, armed: None, cert: None }
     }
 }
 
@@ -192,6 +353,24 @@ impl Form {
     pub fn learned(&mut self, r: Result<String, String>) {
         let Step::Checking(addr) = self.step.clone() else { return };
         match r {
+            Ok(learned) if addr.proto == Proto::Webdav => {
+                self.error = None;
+                match parse_cert(&learned) {
+                    // The trust store vouches for the name: no key to check.
+                    Some(c) if c.untrusted.is_none() => {
+                        self.step = Step::Password { addr, fingerprint: TRUSTED.into(), filled: false };
+                        self.cert = Some(c);
+                    }
+                    Some(c) => {
+                        self.step = Step::Key { addr, fingerprint: c.fingerprint.clone() };
+                        self.cert = Some(c);
+                    }
+                    None => {
+                        self.error = Some(format!("{} didn't show a certificate", addr.host));
+                        self.step = Step::Address;
+                    }
+                }
+            }
             Ok(fingerprint) => {
                 self.error = None;
                 self.step = Step::Key { addr, fingerprint };
@@ -280,7 +459,7 @@ mod tests {
     use super::*;
 
     fn a(user: &str, host: &str, port: u16, path: &str) -> Address {
-        Address { user: user.into(), host: host.into(), port, path: path.into() }
+        Address { proto: Proto::Sftp, user: user.into(), host: host.into(), port, path: path.into() }
     }
 
     #[test]
@@ -325,10 +504,56 @@ mod tests {
     #[test]
     fn a_saved_server_is_rechecked() {
         let k = [7u8; 32];
-        assert_eq!(recheck(&k, &fingerprint(&k)), Recheck::Same);
+        assert_eq!(recheck(Proto::Sftp, &k, &fingerprint(&k)), Recheck::Same);
         let other = fingerprint(&[8u8; 32]);
-        assert_eq!(recheck(&k, &other), Recheck::Changed { now: other.clone() });
-        assert_eq!(recheck(&k, "no key"), Recheck::Odd);
+        assert_eq!(recheck(Proto::Sftp, &k, &other), Recheck::Changed { now: other.clone() });
+        assert_eq!(recheck(Proto::Sftp, &k, "no key"), Recheck::Odd);
+        // WebDAV: a pinned key, or a name the trust store must still vouch for.
+        let pinned = format!("untrusted invalid peer certificate: UnknownIssuer\n{}\nsubject my-nas\nissuer my-nas\nexpires 261214", fingerprint(&k));
+        assert_eq!(recheck(Proto::Webdav, &k, &pinned), Recheck::Same);
+        assert!(matches!(recheck(Proto::Webdav, &[9; 32], &pinned), Recheck::Changed { .. }));
+        assert!(matches!(recheck(Proto::Webdav, &[0; 32], &pinned), Recheck::Changed { now } if now.contains("authority")));
+        let trusted = format!("trusted\n{}\nsubject nas.lan", fingerprint(&k));
+        assert_eq!(recheck(Proto::Webdav, &[0; 32], &trusted), Recheck::Same);
+        assert_eq!(recheck(Proto::Webdav, &[0; 32], "nothing"), Recheck::Odd);
+    }
+
+    #[test]
+    fn webdav_addresses() {
+        let a = parse_address("https://alice@NAS.lan/dav/My Files").unwrap();
+        assert_eq!((a.proto, a.host.as_str(), a.port, a.path.as_str()), (Proto::Webdav, "nas.lan", 443, "/dav/My Files"));
+        assert_eq!(a.text(), "https://alice@nas.lan/dav/My Files");
+        let a = parse_address("davs://alice@10.0.2.2:8444").unwrap();
+        assert_eq!((a.port, a.path.as_str()), (8444, "/"));
+        assert_eq!(a.text(), "https://alice@10.0.2.2:8444/");
+        assert!(parse_address("http://alice@nas.lan/dav").unwrap_err().contains("https"));
+        assert!(parse_address("https://nas.lan/dav").is_err(), "a name to log in with");
+        assert!(parse_address("https://alice@nas.lan/a/../b").is_err());
+        assert!(parse_address("https://alice@nas.lan/a?b").is_err());
+    }
+
+    #[test]
+    fn a_trusted_webdav_server_goes_straight_to_the_password() {
+        let mut f = Form::default();
+        f.submit_address("https://alice@nas.lan/dav");
+        f.take_want();
+        f.learned(Ok(format!("trusted\n{}\nsubject nas.lan\nissuer R11\nexpires 270101", fingerprint(&[3; 32]))));
+        assert!(matches!(&f.step, Step::Password { fingerprint, .. } if fingerprint == TRUSTED));
+        assert_eq!(f.cert.as_ref().unwrap().issuer, "R11");
+        f.field_filled(true);
+        f.connect();
+        assert!(matches!(f.take_want(), Some(Want::Connect { fingerprint, .. }) if fingerprint == TRUSTED));
+        assert_eq!(key_for(TRUSTED), Some([0; 32]));
+        assert_eq!(identity_of(Proto::Webdav, &[0; 32]), TRUSTED);
+        assert_eq!(identity_of(Proto::Sftp, &[0; 32]), fingerprint(&[0; 32]));
+        // Self-signed: its key, for the user to check.
+        let mut f = Form::default();
+        f.submit_address("https://alice@my-nas/dav");
+        f.take_want();
+        f.learned(Ok(format!("untrusted invalid peer certificate: UnknownIssuer\n{}\nsubject my-nas", fingerprint(&[4; 32]))));
+        assert!(matches!(&f.step, Step::Key { fingerprint: fp, .. } if fp == &fingerprint(&[4; 32])));
+        assert!(untrusted_text(f.cert.as_ref().unwrap().untrusted.as_deref().unwrap()).contains("authority"));
+        assert!(untrusted_text("invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))").contains("self-signed"));
     }
 
     #[test]

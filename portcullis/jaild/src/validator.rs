@@ -167,7 +167,7 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
         && (c.uid_first..=c.uid_last).contains(&uid)
         && exec.uid == uid
         && exec.gid == uid
-        && exec.path == c.exec_path
+        && c.exec_paths.contains(&exec.path)
         && match &req.fuse {
             // Serving: its own mount, and grants of folders on the control socket.
             Some(f) => !exec.stdio && f.device.is_empty() && f.mountpoint == c.mountpoint(uid),
@@ -180,9 +180,11 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
 }
 
 /// `allow.mlock` lets a jail wire memory, so it is allowlisted per jail
-/// (and given to Arca's couriers, which carry a secret per request).
+/// (and given to Arca's couriers, which carry a secret per request, and to
+/// share servers, which may hold a password for the session: WebDAV's Basic
+/// auth sends it with every request).
 fn validate_mlock(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
-    if !req.allow_mlock || policy.mlock.allow_jails.iter().any(|n| n == &req.name) || is_courier(req, policy) {
+    if !req.allow_mlock || policy.mlock.allow_jails.iter().any(|n| n == &req.name) || is_courier(req, policy) || is_share_server(req, policy) {
         return Ok(());
     }
     Err(JaildError::PolicyViolation {
@@ -994,6 +996,16 @@ mod tests {
         let ok = share("system-share-63001", &root("system-share-63001"), exe, 63001, "/media/share-63001");
         assert!(is_share_server(&ok, &p));
         validate_create(&ok, &p).expect("a share server jail");
+        let dav = share("system-share-63001", &root("system-share-63001"), "/usr/local/bin/atrium-share-webdav", 63001, "/media/share-63001");
+        assert!(is_share_server(&dav, &p), "the WebDAV server too");
+        let other = share("system-share-63001", &root("system-share-63001"), "/usr/local/bin/atrium-capsa-fuse", 63001, "/media/share-63001");
+        assert!(!is_share_server(&other, &p));
+        let mut locked = dav.clone();
+        locked.allow_mlock = true;
+        validate_create(&locked, &p).expect("a share server may lock its password in memory");
+        let mut not_share = other.clone();
+        not_share.allow_mlock = true;
+        assert!(validate_create(&not_share, &p).is_err(), "mlock for anyone else is refused");
         // With a control socket, for grants of its folders (§4.8).
         let mut ctl = ok.clone();
         ctl.fuse.as_mut().unwrap().control = true;

@@ -7,8 +7,10 @@
 //! reads the label by uid and never believes the share server about it, so
 //! a share server can only ever reach its own share's items.
 //!
-//! Registry lines: `uid user sftp host port key-hex path-hex`. The key is
-//! the SHA-256 of the server's SSH host key blob (64 hex digits); the path
+//! Registry lines: `uid user proto host port key-hex path-hex`, proto
+//! `sftp` or `webdav`. The key is the SHA-256 of the server's SSH host key
+//! blob, or of a WebDAV server's pinned public key (zeros: the trust store
+//! vouches for the host name) (64 hex digits); the path
 //! is hex so that a folder with spaces stays one field. `uid retired` ends
 //! a label, as in the courier registry (`crate::courier::lookup_with`).
 
@@ -63,13 +65,14 @@ pub fn parse_line(line: &str) -> Option<(u32, ShareLabel)> {
         return None;
     }
     let uid: u32 = f[0].parse().ok()?;
-    if !(UID_FIRST..=UID_LAST).contains(&uid) || !valid_user(f[1]) || f[2] != "sftp" {
+    if !(UID_FIRST..=UID_LAST).contains(&uid) || !valid_user(f[1]) {
         return None;
     }
+    let proto = ShareProto::from_name(f[2])?;
     let port: u16 = f[4].parse().ok()?;
     let key: [u8; 32] = unhex(f[5])?.try_into().ok()?;
     let path = String::from_utf8(unhex(f[6])?).ok()?;
-    let share = Recipient::share(ShareProto::Sftp, f[3], port, &path, key).ok()?;
+    let share = Recipient::share(proto, f[3], port, &path, key).ok()?;
     Some((uid, ShareLabel { user: f[1].into(), share }))
 }
 
@@ -80,17 +83,14 @@ pub fn lookup(path: &str, uid: u32) -> Option<ShareLabel> {
 
 /// dispensatord's side: the registry line for `uid`.
 pub fn label_line(uid: u32, l: &ShareLabel) -> Option<String> {
-    let Recipient::Share { proto: ShareProto::Sftp, host, port, path, key } = &l.share else { return None };
-    Some(format!("{uid} {} sftp {host} {port} {} {}", l.user, hex(key), hex(path.as_bytes())))
+    let Recipient::Share { proto, host, port, path, key } = &l.share else { return None };
+    Some(format!("{uid} {} {} {host} {port} {} {}", l.user, proto.name(), hex(key), hex(path.as_bytes())))
 }
 
-/// A share on the wire: `u8 proto (1 sftp) | str host | u16 port | str path
+/// A share on the wire: `u8 proto (1 sftp, 2 webdav) | str host | u16 port | str path
 /// | key[32]`.
 pub fn read_share(r: &mut Reader<'_>) -> Result<Recipient, arca_store::Error> {
-    let proto = match r.u8()? {
-        1 => ShareProto::Sftp,
-        _ => return Err(arca_store::Error::BadRecipient),
-    };
+    let proto = ShareProto::from_u8(r.u8()?).ok_or(arca_store::Error::BadRecipient)?;
     let host = r.str(caps::HOST)?;
     let port = r.u16()?;
     let path = r.str(PATH_MAX)?;
@@ -125,6 +125,9 @@ mod tests {
         assert_eq!((host.as_str(), path.as_str()), ("nas.lan", "/home/alice/My Files"));
         assert_eq!(label_line(63001, &l).unwrap(), line(63001, "/home/alice/My Files"));
         assert!(parse_line(&format!("63001 alice sftp 192.168.1.5 2222 {} 2f", "00".repeat(32))).is_some());
+        let (_, w) = parse_line(&format!("63002 alice webdav nas.lan 443 {} 2f646176", "00".repeat(32))).unwrap();
+        assert!(matches!(&w.share, Recipient::Share { proto: ShareProto::Webdav, path, .. } if path == "/dav"));
+        assert_eq!(label_line(63002, &w).unwrap(), format!("63002 alice webdav nas.lan 443 {} 2f646176", "00".repeat(32)));
         for bad in [
             line(64001, "/x"),                                                     // a courier uid
             line(62999, "/x"),                                                     // below the range

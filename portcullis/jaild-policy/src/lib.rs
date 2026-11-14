@@ -192,13 +192,15 @@ pub struct CourierPolicy {
 
 /// `[share_servers]`: dispensatord asks for one jail per mounted network
 /// share, named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
-/// running exactly `exec_path` as that uid, serving FUSE with no device at
+/// running exactly one of `exec_paths` as that uid, serving FUSE with no device at
 /// exactly `<mount_prefix>/share-<uid>` (network-shares.md §4.1, §6.1).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareServerPolicy {
     pub name_prefix:  String,
-    pub exec_path:    String,
+    /// One server per protocol (SFTP, WebDAV): a share jail runs exactly
+    /// one of these.
+    pub exec_paths:   Vec<String>,
     pub uid_first:    u32,
     pub uid_last:     u32,
     pub mount_prefix: String,

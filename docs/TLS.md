@@ -1,6 +1,6 @@
 # TLS in Atrium
 
-Last updated 2026-11-06. Atrium uses one TLS stack everywhere: **rustls 0.23** with the
+Last updated 2026-11-14. Atrium uses one TLS stack everywhere: **rustls 0.23** with the
 **`ring`** crypto provider. Nothing in the tree links OpenSSL, and new code should not
 start.
 
@@ -10,6 +10,7 @@ start.
 |---|---|---|
 | `navigator-fetch` | the Navigator's jailed fetcher (client) | `ring`, `std`, `tls12` |
 | `arca/arca-courier` | Arca's courier: the only process that sends secrets over the network (arca.md §5) | `ring`, `std`, `tls12` |
+| `capsa/capsa-share` | `atrium-share-webdav`, the WebDAV share server (network-shares.md S2): WebPKI against `/etc/ssl/cert.pem`, or a self-signed server pinned by the SHA-256 of its public key, chosen by the user in Scrinium | `ring`, `std`, `tls12` |
 | `tabellarius-relay` | relay server | `ring`, `std` |
 | `tabellarius-macos` | macOS client | `ring`, `std` |
 

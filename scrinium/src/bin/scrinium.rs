@@ -455,11 +455,12 @@ impl Network {
                 }
             }
             let c = atrium_media::Connect {
+                proto: addr.proto.media(),
                 host: addr.host.clone(),
                 port: addr.port,
                 path: addr.path.clone(),
                 user: addr.user.clone(),
-                fingerprint: scrinium::connect::fingerprint(&key),
+                fingerprint: scrinium::connect::identity_of(addr.proto, &key),
                 read_only: false,
             };
             let r = atrium_media::client::connect(&media, &c).map_err(|(_, m)| m);
@@ -484,13 +485,13 @@ impl Network {
                 Want::Learn(a) => {
                     let (media, tx) = (self.media.clone(), self.tx.clone());
                     std::thread::spawn(move || {
-                        let r = atrium_media::client::learn(&media, &atrium_media::Learn { host: a.host.clone(), port: a.port }).map_err(|(_, m)| m);
+                        let r = atrium_media::client::learn(&media, &atrium_media::Learn { proto: a.proto.media(), host: a.host.clone(), port: a.port }).map_err(|(_, m)| m);
                         let _ = tx.send(Job::Learned(r));
                     });
                 }
                 Want::Connect { addr, fingerprint, remember } => {
                     let handle = pane.cred_state.get_cloned().handle;
-                    match (handle, scrinium::connect::key_of(&fingerprint)) {
+                    match (handle, scrinium::connect::key_for(&fingerprint)) {
                         (Some(h), Some(key)) => self.connect_job(addr, key, Some((h, remember))),
                         _ => {
                             if let Some(f) = &mut b.connect {
@@ -510,7 +511,7 @@ impl Network {
                 b.notice = Some(scrinium::browser::Notice { text: format!("Asking {} who it is…", s.addr.host), error: false });
                 let (media, tx) = (self.media.clone(), self.tx.clone());
                 std::thread::spawn(move || {
-                    let r = atrium_media::client::learn(&media, &atrium_media::Learn { host: s.addr.host.clone(), port: s.addr.port }).map_err(|(_, m)| m);
+                    let r = atrium_media::client::learn(&media, &atrium_media::Learn { proto: s.addr.proto.media(), host: s.addr.host.clone(), port: s.addr.port }).map_err(|(_, m)| m);
                     let _ = tx.send(Job::Rechecked(s, r));
                 });
             }
@@ -617,7 +618,7 @@ impl Network {
                         self.space.remove(&part);
                     }
                 },
-                Job::Rechecked(s, Ok(fp)) => match scrinium::connect::recheck(&s.key, &fp) {
+                Job::Rechecked(s, Ok(fp)) => match scrinium::connect::recheck(s.addr.proto, &s.key, &fp) {
                     scrinium::connect::Recheck::Same => {
                         b.notice = Some(scrinium::browser::Notice { text: format!("Connecting to {}…", s.addr.host), error: false });
                         self.connect_job(s.addr, s.key, None);

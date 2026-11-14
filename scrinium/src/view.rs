@@ -410,11 +410,19 @@ impl ScriniumView {
         let line = |ctx: &mut Ctx, row: f32, s: &str, c: Color| text(ctx, lx, y + row, &fit(s, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, c);
         icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.danger_fg());
         text(ctx, lx + 28.0, y + 32.0, &fit(&format!("{} isn't the server you saved", k.saved.addr.host), type_size::LG, Weight::Semibold, inner - 28.0), type_size::LG, Weight::Semibold, t.text_primary());
-        line(ctx, 66.0, "It shows a different key from the one you accepted, so Scrinium won't connect", t.text_secondary());
+        // A WebDAV share saved as trusted has no key of its own: its name
+        // must still be vouched for by the trust store.
+        let by_name = k.saved.addr.proto == crate::connect::Proto::Webdav && k.saved.key == [0; 32];
+        if by_name {
+            line(ctx, 66.0, "Its certificate is no longer one Atrium trusts, so Scrinium won't connect", t.text_secondary());
+        } else {
+            line(ctx, 66.0, "It shows a different key from the one you accepted, so Scrinium won't connect", t.text_secondary());
+        }
         line(ctx, 86.0, "and Arca won't give it your password. Someone may be pretending to be it.", t.text_secondary());
         line(ctx, 114.0, "You accepted", t.text_tertiary());
         rect(ctx, lx, y + 122.0, inner, 30.0, t.bg_canvas(), 6.0);
-        text(ctx, lx + 10.0, y + 137.0, &fit(&crate::connect::fingerprint(&k.saved.key), type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
+        let accepted = if by_name { "A certificate the trust store vouches for".to_string() } else { crate::connect::fingerprint(&k.saved.key) };
+        text(ctx, lx + 10.0, y + 137.0, &fit(&accepted, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
         line(ctx, 170.0, "It shows now", t.text_tertiary());
         rect(ctx, lx, y + 178.0, inner, 30.0, t.bg_canvas(), 6.0);
         text(ctx, lx + 10.0, y + 193.0, &fit(&k.now, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.danger_fg());
@@ -459,7 +467,7 @@ impl ScriniumView {
             Step::Address => {
                 title(ctx, "Connect to server");
                 line(ctx, 66.0, "Type the server's address with your name on it, and a folder if you like:", t.text_secondary());
-                line(ctx, 88.0, "alice@nas.local   or   alice@nas.local:/srv/photos", t.text_tertiary());
+                line(ctx, 88.0, "alice@nas.local:/srv/photos  (SFTP)   or   https://alice@nas.local/dav  (WebDAV)", t.text_tertiary());
                 let fy = y + 108.0;
                 let s = self.state.clone();
                 let holder = ctx.push(Node::Rect { rect: Rect::new(lx, fy, inner, 32.0), fill: Color::TRANSPARENT, radius: 0.0 });
@@ -483,6 +491,22 @@ impl ScriniumView {
                 line(ctx, 72.0, &format!("Asking {} who it is…", a.host), t.text_secondary());
                 cancel(ctx, self.state.clone());
             }
+            Step::Key { addr, fingerprint } if addr.proto == crate::connect::Proto::Webdav => {
+                // A certificate the trust store doesn't vouch for: pinned by
+                // its key, once the user has checked it.
+                let c = form.cert.clone().unwrap_or_default();
+                icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.text_secondary());
+                text(ctx, lx + 28.0, y + 32.0, &format!("Is this really {}?", addr.host), type_size::LG, Weight::Semibold, t.text_primary());
+                line(ctx, 62.0, &crate::connect::untrusted_text(c.untrusted.as_deref().unwrap_or("")), t.text_secondary());
+                line(ctx, 82.0, &format!("Certificate for “{}”, from “{}”, until {}", c.subject, c.issuer, c.expires), t.text_tertiary());
+                line(ctx, 102.0, "If it is your own server, check its key is this one:", t.text_secondary());
+                rect(ctx, lx, y + 112.0, inner, 32.0, t.bg_canvas(), 6.0);
+                text(ctx, lx + 10.0, y + 128.0, &fit(fingerprint, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
+                line(ctx, 164.0, "Scrinium remembers it, and refuses the server if it ever changes.", t.text_tertiary());
+                let c = cancel(ctx, self.state.clone());
+                let s = self.state.clone();
+                primary(ctx, "It's the right key", c, true, Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.trust() })));
+            }
             Step::Key { addr, fingerprint } => {
                 icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.text_secondary());
                 text(ctx, lx + 28.0, y + 32.0, &format!("Is this really {}?", addr.host), type_size::LG, Weight::Semibold, t.text_primary());
@@ -495,9 +519,12 @@ impl ScriniumView {
                 let s = self.state.clone();
                 primary(ctx, "It's the right key", c, true, Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.trust() })));
             }
-            Step::Password { addr, .. } => {
+            Step::Password { addr, fingerprint, .. } => {
                 title(ctx, &format!("Password for {}@{}", addr.user, addr.host));
-                line(ctx, 66.0, "Arca keeps it: Scrinium never sees what you type.", t.text_secondary());
+                match form.cert.as_ref().filter(|_| fingerprint == crate::connect::TRUSTED) {
+                    Some(c) => line(ctx, 66.0, &format!("Its certificate checks out (from “{}”). Arca keeps the password: Scrinium never sees it.", c.issuer), t.text_secondary()),
+                    None => line(ctx, 66.0, "Arca keeps it: Scrinium never sees what you type.", t.text_secondary()),
+                };
                 self.cred.clone().at(lx, y + 88.0).size(inner, 36.0).render(ctx);
                 let s = self.state.clone();
                 ctx.key(4001);

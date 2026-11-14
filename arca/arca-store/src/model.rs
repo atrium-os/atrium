@@ -168,6 +168,36 @@ pub enum Recipient {
 #[repr(u8)]
 pub enum ShareProto {
     Sftp = 1,
+    /// WebDAV over HTTPS (S2). The key is the SHA-256 of the server's
+    /// public key (SPKI) for a pinned, self-signed server, or all zeros
+    /// for one whose certificate the trust store vouches for by name.
+    Webdav = 2,
+}
+
+impl ShareProto {
+    pub fn from_u8(b: u8) -> Option<ShareProto> {
+        match b {
+            1 => Some(ShareProto::Sftp),
+            2 => Some(ShareProto::Webdav),
+            _ => None,
+        }
+    }
+
+    /// As registry lines and logs write it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ShareProto::Sftp => "sftp",
+            ShareProto::Webdav => "webdav",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ShareProto> {
+        match s {
+            "sftp" => Some(ShareProto::Sftp),
+            "webdav" => Some(ShareProto::Webdav),
+            _ => None,
+        }
+    }
 }
 
 /// A share's host: a lowercase DNS name or an address literal (dotted IPv4,
@@ -333,10 +363,7 @@ impl Recipient {
             4 => Recipient::rp_id(r.str(caps::RP_ID)?).map_err(|_| Error::Corrupt("recipient")),
             5 => Recipient::service(r.str(64)?).map_err(|_| Error::Corrupt("recipient")),
             6 => {
-                let proto = match r.u8()? {
-                    1 => ShareProto::Sftp,
-                    _ => return Err(Error::Corrupt("share protocol")),
-                };
+                let proto = ShareProto::from_u8(r.u8()?).ok_or(Error::Corrupt("share protocol"))?;
                 let host = r.str(caps::HOST)?.to_string();
                 let port = r.u16()?;
                 let path = r.str(1024)?.to_string();

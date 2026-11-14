@@ -339,9 +339,17 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     };
+    // `https://HOST` for WebDAV, else SFTP.
+    let proto_of = |h: &str| -> (atrium_media::ShareProto, String, u16) {
+        match h.strip_prefix("https://") {
+            Some(h) => (atrium_media::ShareProto::Webdav, h.to_string(), 443),
+            None => (atrium_media::ShareProto::Sftp, h.to_string(), 22),
+        }
+    };
     if let Some(rest) = cmd.strip_prefix("learn ") {
-        let (host, port) = rest.rsplit_once(':').and_then(|(h, p)| Some((h, p.parse().ok()?))).unwrap_or((rest, 22));
-        return answer(atrium_media::client::learn(sock, &atrium_media::Learn { host: host.into(), port }));
+        let (proto, rest, default) = proto_of(rest);
+        let (host, port) = rest.rsplit_once(':').and_then(|(h, p)| Some((h.to_string(), p.parse().ok()?))).unwrap_or((rest.clone(), default));
+        return answer(atrium_media::client::learn(sock, &atrium_media::Learn { proto, host, port }));
     }
     if let Some(rest) = cmd.strip_prefix("connect ") {
         let f: Vec<&str> = rest.split(' ').collect();
@@ -353,7 +361,8 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             println!("error port");
             return ExitCode::FAILURE;
         };
-        let c = atrium_media::Connect { host: host.into(), port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false };
+        let (proto, host, _) = proto_of(host);
+        let c = atrium_media::Connect { proto, host, port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false };
         return answer(atrium_media::client::connect(sock, &c));
     }
     match cmd.split_once(' ') {
@@ -739,7 +748,7 @@ mod run {
         /// resolved here, once: the share server dials that address only.
         fn connect(&self, uid: u32, c: &atrium_media::Connect) -> (u8, String) {
             let Some(app) = self.file_manager(uid) else { return (mstatus::NOT_ALLOWED, "only the session's file manager connects shares".into()) };
-            let sh = match dispensator::share::check(&c.host, c.port, &c.path, &c.user, &c.fingerprint) {
+            let sh = match dispensator::share::check(proto_of(c.proto), &c.host, c.port, &c.path, &c.user, &c.fingerprint) {
                 Ok(s) => s,
                 Err(e) => return (mstatus::MALFORMED, e),
             };
@@ -747,7 +756,7 @@ mod run {
                 Ok(a) => a,
                 Err(e) => return (mstatus::NOT_FOUND, e),
             };
-            eprintln!("atrium-dispensatord: {app} connects sftp://{}@{}:{}{} ({addr})", sh.user, sh.host, sh.port, sh.path);
+            eprintln!("atrium-dispensatord: {app} connects {}://{}@{}:{}{} ({addr})", sh.proto.name(), sh.user, sh.host, sh.port, sh.path);
             self.ask(Req::Connect(sh, addr, c.read_only))
         }
 
@@ -765,7 +774,7 @@ mod run {
                 Ok(a) => a,
                 Err(e) => return (mstatus::NOT_FOUND, e),
             };
-            match learn_key(&self.jaild, addr, l.port) {
+            match learn_key(&self.jaild, proto_of(l.proto), &l.host, addr, l.port) {
                 Ok(fp) => (mstatus::OK, fp),
                 Err(e) => (mstatus::FAILED, e),
             }
@@ -832,14 +841,14 @@ mod run {
     /// A share server's jail: the share server binary and libraries,
     /// Arca's socket, a routed vnet that reaches `addr:port` only, the
     /// share-server system call profile, and (to serve) FUSE from jaild.
-    fn share_request(uid: u32, addr: std::net::Ipv4Addr, port: u16, argv: Vec<String>, fuse: Option<FuseServe>) -> Result<CreateJailRequest, String> {
-        use dispensator::share::{jail_name, EXEC, JAIL_ROOT};
+    fn share_request(uid: u32, proto: dispensator::share::Proto, addr: std::net::Ipv4Addr, port: u16, argv: Vec<String>, fuse: Option<FuseServe>) -> Result<CreateJailRequest, String> {
+        use dispensator::share::{jail_name, JAIL_ROOT};
         use jaild::protocol::{NetDest, NetGrants};
         let name = jail_name(uid);
         let root = format!("{JAIL_ROOT}/{name}");
         std::fs::create_dir_all(&root).map_err(|e| format!("{root}: {e}"))?;
         let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
-        let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
+        let mut mounts: Vec<MountSpec> = proto.ro_mounts().iter().map(|d| ro(d)).collect();
         mounts.push(MountSpec { source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
         let id = portcullis_identity::for_app(&format!("org.atrium.share.{uid}")).map_err(|e| format!("host identity: {e}"))?;
         let grants = NetGrants {
@@ -857,12 +866,13 @@ mod run {
             mounts,
             devfs_ruleset: 22,
             network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants) },
-            exec: Some(ExecSpec { path: EXEC.into(), argv, env: vec![], uid, gid: uid, stdio }),
+            exec: Some(ExecSpec { path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio }),
             rctl: None,
             hostname: Some(name),
             hostid: Some(id.hostid),
             hostuuid: Some(id.hostuuid.clone()),
-            allow_mlock: false,
+            // The WebDAV server locks the password it holds for the session.
+            allow_mlock: true,
             syscall_profile: Some("share-server".into()),
             devfs_grant: None,
             devfs_grants: vec![],
@@ -875,12 +885,19 @@ mod run {
     /// nothing).
     const LEARN_UID: u32 = dispensator::share::UID_LAST;
 
-    /// `--learn` in a jail: the fingerprint line from its stdout.
-    fn learn_key(jaild: &str, addr: std::net::Ipv4Addr, port: u16) -> Result<String, String> {
+    fn proto_of(p: atrium_media::ShareProto) -> dispensator::share::Proto {
+        match p {
+            atrium_media::ShareProto::Sftp => dispensator::share::Proto::Sftp,
+            atrium_media::ShareProto::Webdav => dispensator::share::Proto::Webdav,
+        }
+    }
+
+    /// `--learn` in a jail: what the server showed, from its stdout.
+    fn learn_key(jaild: &str, proto: dispensator::share::Proto, host: &str, addr: std::net::Ipv4Addr, port: u16) -> Result<String, String> {
         use std::io::Read;
         use std::os::fd::AsFd;
         remove_share_jail(jaild, LEARN_UID);
-        let req = share_request(LEARN_UID, addr, port, dispensator::share::learn_argv(addr, port), None)?;
+        let req = share_request(LEARN_UID, proto, addr, port, dispensator::share::learn_argv(proto, host, addr, port), None)?;
         let (mut rd, wr) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let null = std::fs::File::open("/dev/null").map_err(|e| e.to_string())?;
         let err = std::io::stderr();
@@ -897,7 +914,10 @@ mod run {
         let _ = rd.by_ref().take(4096).read_to_end(&mut out);
         drop(pd);
         remove_share_jail(jaild, LEARN_UID);
-        dispensator::share::parse_learned(&String::from_utf8_lossy(&out)).ok_or_else(|| "the server showed no SSH host key".into())
+        dispensator::share::parse_learned(proto, &String::from_utf8_lossy(&out)).ok_or_else(|| match proto {
+            dispensator::share::Proto::Sftp => "the server showed no SSH host key".into(),
+            dispensator::share::Proto::Webdav => "the server showed no TLS certificate".into(),
+        })
     }
 
     /// End a share jail and take down the nullfs mounts it was created with
@@ -906,7 +926,8 @@ mod run {
         let name = dispensator::share::jail_name(uid);
         let _ = Client::connect(jaild).and_then(|mut c| c.send(&Request::RemoveJail { jid: None, name: Some(name.clone()) }));
         let root = format!("{}/{name}", dispensator::share::JAIL_ROOT);
-        for d in ["/atrium/sockets/arca", "/usr/local/bin", "/usr/lib", "/libexec", "/lib", "/dev"] {
+        unmount_force(Path::new(&format!("{root}/atrium/sockets/arca")));
+        for d in dispensator::share::ALL_RO_MOUNTS.iter().rev().chain(["/dev"].iter()) {
             unmount_force(Path::new(&format!("{root}{d}")));
         }
     }
@@ -969,7 +990,7 @@ mod run {
         fn connect_share(&mut self, sh: dispensator::share::Share, addr: std::net::Ipv4Addr, read_only: bool) -> (u8, String) {
             use dispensator::share as sr;
             let Session::Active { user, uid: suid, gid: sgid } = self.session.clone() else { return (mstatus::NOT_ALLOWED, "no unlocked session".into()) };
-            let key = (sh.host.clone(), sh.port, sh.path.clone(), sh.user.clone());
+            let key = (format!("{}:{}", sh.proto.name(), sh.host), sh.port, sh.path.clone(), sh.user.clone());
             if let Some((uid, _)) = self.shares.iter().find(|(_, r)| r.key == key) {
                 return (mstatus::OK, sr::part(*uid));
             }
@@ -982,7 +1003,7 @@ mod run {
             }
             let mnt = sr::mountpoint(uid);
             let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: true };
-            let req = match share_request(uid, addr, sh.port, sr::argv(&sh, addr, suid, sgid, read_only), Some(fuse)) {
+            let req = match share_request(uid, sh.proto, addr, sh.port, sr::argv(&sh, addr, suid, sgid, read_only), Some(fuse)) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = append_registry(&sr::retired_line(uid));

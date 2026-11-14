@@ -211,7 +211,7 @@ impl State {
             Label::WebBroker { user, app_id, .. } => format!("broker:{app_id}@{user}"),
             Label::FileManager { user, app_id, .. } => format!("files:{app_id}@{user}"),
             Label::Share(sl) => match &sl.share {
-                Recipient::Share { host, port, .. } => format!("share:sftp:{host}:{port}@{}", sl.user),
+                Recipient::Share { proto, host, port, .. } => format!("share:{}:{host}:{port}@{}", proto.name(), sl.user),
                 _ => "share:?".into(),
             },
             Label::Vestibulum => "vestibulum".into(),

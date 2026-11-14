@@ -57,6 +57,10 @@ ro_paths = [
     # Atrium config (jaild policy itself, services manifests).
     "/etc/atrium",
 
+    # The system trust store (public certificates only), for the WebDAV
+    # share server (network-shares.md S2).
+    "/etc/ssl",
+
     # Per-capability service-socket directories. Each grants the
     # jail rendezvous with one Atrium service. Bootstrap derives
     # the mount from the manifest's [capabilities] block; jails
@@ -303,14 +307,15 @@ uid_last    = 64999
 # ---------------------------------------------------------------
 # Network share servers (docs/spec/network-shares.md §4.1, §6.1):
 # dispensatord asks for one jail per mounted share, named <name_prefix><uid>
-# at <instance_root_dir>/<name>, running exactly exec_path as that uid. jaild
+# at <instance_root_dir>/<name>, running exactly one of exec_paths (one per
+# protocol) as that uid. jaild
 # opens /dev/fuse and mounts fusefs at exactly <mount_prefix>/share-<uid>; the
 # server gets that descriptor (fd 3) and no device. Its uids are Arca's share
 # registry range (arcad::share).
 # ---------------------------------------------------------------
 [share_servers]
 name_prefix  = "system-share-"
-exec_path    = "/usr/local/bin/atrium-share-sftp"
+exec_paths   = ["/usr/local/bin/atrium-share-sftp", "/usr/local/bin/atrium-share-webdav"]
 uid_first    = 63000
 uid_last     = 63499
 mount_prefix = "/media"
@@ -711,6 +716,9 @@ ioctls = [
 # keepalive options, no disk ioctls and none of networked's IP options.
 [sysfil.profiles.share-server]
 include  = ["base"]
+# The WebDAV server forks a dialer before entering Capsicum (HTTP servers
+# close idle connections; capability mode can't open new ones).
+syscalls = ["fork", "wait4"]
 families = ["inet", "inet6"]
 sockopts = [
     "6:1",          # TCP_NODELAY

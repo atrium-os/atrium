@@ -148,7 +148,9 @@ fn main() -> ExitCode {
                 w.raw(&unhex(arg(3)));
             }
             let key: [u8; 32] = unhex(arg(at + 3)).try_into().unwrap_or([0; 32]);
-            let Ok(share) = arca_store::Recipient::share(arca_store::ShareProto::Sftp, arg(at), arg(at + 1).parse().unwrap_or(0), arg(at + 2), key) else {
+            // ARCA_PROBE_PROTO=webdav for a WebDAV share.
+            let proto = std::env::var("ARCA_PROBE_PROTO").ok().and_then(|p| arca_store::ShareProto::from_name(&p)).unwrap_or(arca_store::ShareProto::Sftp);
+            let Ok(share) = arca_store::Recipient::share(proto, arg(at), arg(at + 1).parse().unwrap_or(0), arg(at + 2), key) else {
                 eprintln!("bad share");
                 return ExitCode::from(2);
             };

@@ -14,7 +14,7 @@
 //! | `OPEN` 0x05 | postcard [`Open`] | `u8 status`, then postcard `String`; with `OK`, the open file as the message's one descriptor |
 //! | `PICKED` 0x06 | postcard [`Picked`] | `u8 status`, then postcard `String` (where it is in the app's jail, or why not): the system picker puts the folder the user picked into the app's jail |
 //! | `CONNECT` 0x07 | postcard [`Connect`] | `u8 status`, then postcard `String`: the share's `part` (`share-<uid>`), or why not. The file manager connects a network share it saved in Arca (network-shares.md §6.1); `EJECT` of that part disconnects |
-//! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: the server's host key fingerprint (`SHA256:...`) for the user to accept, or why not |
+//! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; or why not |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -107,22 +107,34 @@ pub struct Picked {
     pub read_only: bool,
 }
 
-/// Connect an SFTP share whose credential the file manager saved in Arca
-/// for exactly this host, port, path and pinned host key.
+/// A share's protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareProto {
+    Sftp,
+    /// WebDAV over HTTPS.
+    Webdav,
+}
+
+/// Connect a share whose credential the file manager saved in Arca for
+/// exactly this protocol, host, port, path and server identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connect {
+    pub proto: ShareProto,
     pub host: String,
     pub port: u16,
     pub path: String,
     pub user: String,
-    /// `SHA256:...`, as [`op::LEARN`] gave it and the user accepted.
+    /// `SHA256:...`, as [`op::LEARN`] gave it and the user accepted; for
+    /// WebDAV, the pinned key's, or `trusted` (the trust store vouches for
+    /// the host name).
     pub fingerprint: String,
     pub read_only: bool,
 }
 
-/// Ask a server for its host key, before anything secret is involved.
+/// Ask a server who it is, before anything secret is involved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Learn {
+    pub proto: ShareProto,
     pub host: String,
     pub port: u16,
 }

@@ -437,6 +437,42 @@ encryption. It checks:
    file manager opened it before its grant existed: a share is now listed
    only once ready.
 3. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
+   **Built 2026-11-14.** `atrium-share-webdav` (capsa-share: its own
+   HTTP/1.1 client, WebDAV over roxmltree with DTDs off and a node limit,
+   rustls with ring). Identity first: a server is either **trusted** (its
+   certificate validates for the name through `/etc/ssl/cert.pem`; Arca's
+   item is pinned to the name alone, key all zeros) or **pinned** (a
+   self-signed NAS, by the SHA-256 of its public key, shown as
+   `SHA256:…` with the certificate's subject, issuer and expiry, and why
+   it doesn't validate). An unauthenticated OPTIONS proves the identity
+   before Arca is asked; a different key, or a "trusted" server whose
+   certificate stops validating, ends the server (status 3) with nothing
+   released. `--learn` reports `trusted` or `untrusted <why>` and the
+   certificate. Basic auth sends the password with every request, so the
+   server holds it for the session in locked memory (jaild now gives
+   share servers `allow.mlock`, as it does couriers). The process that
+   parses TLS, HTTP and XML enters capability mode: a forked dialer, the
+   only part that may `connect`, hands it sockets to the one address and
+   port (so the `share-server` profile lists `fork` and `wait4`). Writes:
+   a file written in order from empty streams up as a chunked PUT on its
+   own connection; other writes are gathered in memory (at most 64 MiB a
+   file) and PUT whole on flush, release or fsync. Reads use Range; a
+   server that ignores it is cached whole for 5 s. Folders are MKCOL,
+   rename is MOVE with Overwrite, `rmdir` checks the folder is empty
+   first, quota comes from RFC 4331 properties when the server has them.
+   The share jail adds `/etc/ssl` read-only; jaild's `[share_servers]`
+   takes `exec_paths` (both servers). Arca's items carry the protocol
+   (`ShareProto::Webdav`), the audit label is `share:webdav:host:port@user`.
+   Scrinium's Connect takes `https://user@host[:port]/path` (or `davs://`;
+   plain `http://` is refused): a trusted server goes straight to Arca's
+   field, an untrusted one to the certificate sheet. Not yet: Digest
+   auth, OAuth tokens, files over 64 MiB edited other than front to back.
+   Gate `vm-share-webdav.sh` (Apache mod_dav over TLS on the host,
+   `scripts/webdav-test-server.sh`; 31 checks, 0 failed): learn both
+   ways, a trusted and a pinned share through dispensatord and jaild,
+   read, list, write, a 1 MiB stream, rename and delete, another user
+   refused, Arca filled once, eject; a wrong pin and a self-signed server
+   saved as trusted both refused with nothing from Arca.
 4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.
 5. **S4** disconnected-state UI, reconnect, "connect at login".

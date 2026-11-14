@@ -12,7 +12,18 @@ capsa-fuse = { path = "../capsa-fuse", default-features = false }
 capsa-fat = { path = "../capsa-fat" }
 libc = "0.2"
 zeroize = "1"
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [[bin]]
 name = "atrium-share-sftp"
 path = "src/bin/share-sftp.rs"
+
+[[bin]]
+name = "atrium-share-webdav"
+path = "src/bin/share-webdav.rs"
