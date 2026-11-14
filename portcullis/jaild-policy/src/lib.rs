@@ -611,7 +611,7 @@ mod tests {
         let sample = std::path::Path::new(crate_dir).parent().unwrap().parent().unwrap()
             .join("etc/jaild.policy.toml");
         let p = Policy::load(&sample).unwrap();
-        for class in ["renderer", "app", "networked", "terminal"] {
+        for class in ["renderer", "app", "networked", "terminal", "fuse-server", "share-server"] {
             let r = p.sysfil.resolve(class).unwrap_or_else(|e| panic!("{class}: {e}"));
             let sys = r.syscalls.unwrap();
             for never in ["ktrace", "ptrace", "setcred", "jail_set", "kqueuex", "procctl",
@@ -624,6 +624,11 @@ mod tests {
         let app = p.sysfil.resolve("app").unwrap();
         assert!(!app.ioctls.unwrap().contains("0x20007461"), "TIOCSCTTY outside terminal");
         assert_eq!(app.families.as_deref(), Some("unix"));
+        // A share server reaches its host and /dev/fuse, never a disk.
+        let share = p.sysfil.resolve("share-server").unwrap();
+        assert_eq!(share.families.as_deref(), Some("inet,inet6,unix"));
+        assert!(!share.ioctls.unwrap().contains("0x40086481"), "share server asks disk geometry");
+        assert!(!share.sockopts.unwrap().contains("0:4"), "share server sets IP_TTL");
     }
 
     /// Parse the shipped sample at etc/jaild.policy.toml.

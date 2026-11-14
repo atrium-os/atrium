@@ -20,3 +20,9 @@ tessera = ["dep:tessera-sys"]
 [[bin]]
 name = "atrium-capsa-fuse"
 path = "src/bin/capsa-fuse.rs"
+
+# A hostile FUSE server that fuzzes the kernel's fusefs from the server side
+# (network-shares.md §4.4). Root, FreeBSD, test machines only.
+[[bin]]
+name = "atrium-fuse-hostile"
+path = "src/bin/fuse-hostile.rs"

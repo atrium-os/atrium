@@ -1,8 +1,10 @@
 # Network shares: SMB, SFTP, WebDAV and NFS in Scrinium
 
-**Status:** proposal 2026-11-14 (Shankar asked whether the file manager mounts
-network shares and, if it belongs there, for a security audit of doing it
-properly with the credentials). Nothing here is built. Decisions are in §9.
+**Status:** accepted 2026-11-14 (Shankar: all §9 decisions as recommended).
+He asked whether the file manager mounts network shares and, if it belongs
+there, for a security audit of doing it properly with the credentials. Built
+so far: the S0 mount options, fusefs fuzzer and share-server syscall
+profile (§4.4). Decisions are in §9.
 **Scope:** connecting to a file server on the LAN or the internet, showing it
 in Scrinium next to the sticks, handing its files and folders to apps through
 the picker, and where the passwords and keys live.
@@ -139,7 +141,16 @@ remote attacker can reach, and the kernel work is there:
    FUSE server sending malformed replies (lengths, attributes, sizes that
    change, invalidations at bad times, replies out of order). Bugs are
    fixed in the fork; fusefs can also be narrowed to the FUSE features our
-   servers use.
+   servers use. Built 2026-11-14: `atrium-fuse-hostile` (capsa-fuse) and
+   `scripts/vm-fuse-fuzz.sh` (rounds of one seed each, then the VM must
+   answer, the mount must be gone and dmesg clean; a seed reproduces a
+   round). First find, on the INVARIANTS kernel: a process killed while
+   fusefs waits on a `READLINK` inside `namei()` trips the
+   `error != ERESTART` assertion and panics
+   (docs/reviews/2026-11-14-fusefs-namei-erestart.md, reproducer
+   `--repro readlink-kill`; release kernels unaffected). fusefs's own
+   "FUSE protocol violation" warnings are the kernel catching the server
+   and are expected.
 2. **Mount options** set by jaild, done 2026-11-14 for every FUSE mount
    (sticks today): `nosuid` and `noexec` (nothing served runs here or gains
    privilege), plus `allow_other` and `default_permissions` as before; and
@@ -157,6 +168,9 @@ remote attacker can reach, and the kernel work is there:
    once resumed.
 3. **A sysfil profile** for share servers: `networked` minus what a FUSE
    server doesn't need; log-only first, like the others (jail-sysfil.md).
+   Done 2026-11-14: `share-server` in etc/jaild.policy.toml, base plus
+   inet/inet6 and the TCP keepalive options, no disk ioctls and none of
+   `networked`'s IP options; learn.sh refines it once S1's server runs.
 4. **Kernel memory a server can pin** (queued requests, buffers) that racct
    doesn't count: measured during the fuzzing, capped if it can grow.
 

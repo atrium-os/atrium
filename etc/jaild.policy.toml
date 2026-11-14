@@ -690,6 +690,21 @@ ioctls = [
     "0x40086481",   # DIOCGMEDIASIZE
 ]
 
+# Network share servers (network-shares.md §4.4 item 3): one per mounted
+# share, jailed with its own vnet. They hold /dev/fuse (opened by jaild) and
+# one TCP connection to the share's host: base plus inet/inet6 and the TCP
+# keepalive options, no disk ioctls and none of networked's IP options.
+[sysfil.profiles.share-server]
+include  = ["base"]
+families = ["inet", "inet6"]
+sockopts = [
+    "6:1",          # TCP_NODELAY
+    "6:256",        # TCP_KEEPIDLE
+    "6:512",        # TCP_KEEPINTVL
+    "6:1024",       # TCP_KEEPCNT
+    "41:27",        # IPV6_V6ONLY
+]
+
 # Ordinary apps.
 [sysfil.profiles.app]
 include = ["base"]
