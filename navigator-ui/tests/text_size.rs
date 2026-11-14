@@ -69,3 +69,67 @@ fn the_rail_rows_and_pop_ups_grow_with_the_text_size() {
     assert_eq!(cw2, cw1 * 1.5, "history's Clear all");
     assert!(cx2 < cx1);
 }
+
+/// Icons are drawn at their point size times the text size, once: the
+/// renderer applies the text size to a glyph's font size, so the size
+/// handed to it stays in points (at 1.5x a 16 pt icon was drawn 2.25x,
+/// low and right of its label, in the live check).
+#[test]
+fn icons_grow_with_the_text_size_once() {
+    use navigator_ui::ui::ShellView;
+    use pergola::theme::{font, Semantic};
+    use pergola::{Mutable, Node};
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let sizes = |milli, scene| {
+        pergola::text::set_text_scale(milli);
+        let mut s = Shell::scene(scene, 1600.0, 900.0);
+        s.popover = true;
+        s.presence_open = true;
+        s.status_bar = true;
+        if scene != Scene::Start {
+            s.open_find();
+        }
+        let (tree, _) = pergola::render(&ShellView { state: Mutable::new(s) }, Semantic::LIGHT);
+        let mut v: Vec<(f32, f32)> = tree.iter().filter_map(|(_, n)| match n {
+            Node::Text { style, .. } if style.family == font::ICONS => Some((style.size, style.em())),
+            _ => None,
+        }).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    for scene in [Scene::Main, Scene::Prompt, Scene::Start, Scene::Stop] {
+        let (one, big) = (sizes(1000, scene), sizes(1500, scene));
+        pergola::text::set_text_scale(1000);
+        assert!(!big.is_empty(), "{scene:?} draws icons");
+        assert_eq!(big.iter().map(|s| s.0).collect::<Vec<_>>(), one.iter().map(|s| s.0).collect::<Vec<_>>(), "{scene:?}: the same point sizes");
+        for (pt, drawn) in big {
+            assert!(pt <= 32.0, "{scene:?}: an icon of {pt} pt is not in points");
+            assert_eq!(drawn, pt * 1.5, "{scene:?}: drawn once at the text size");
+        }
+    }
+}
+
+/// The tier popover holds all it says at every text size: its height is
+/// measured from its wrapped lines (the last one hung out of the box at
+/// 200% in the live check).
+#[test]
+fn the_tier_popover_holds_its_last_line() {
+    use navigator_ui::ui::ShellView;
+    use pergola::theme::Semantic;
+    use pergola::{Mutable, Node};
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for milli in [1000, 1500, 2000] {
+        pergola::text::set_text_scale(milli);
+        let mut s = Shell::scene(Scene::Prompt, 1920.0, 900.0);
+        s.popover = true;
+        let pop = s.geo().popover.expect("the popover");
+        let (tree, _) = pergola::render(&ShellView { state: Mutable::new(s) }, Semantic::LIGHT);
+        let last = tree.iter().filter_map(|(_, n)| match n {
+            Node::Text { rect, content, .. } if content.ends_with("the strip.") => Some(*rect),
+            _ => None,
+        }).next();
+        pergola::text::set_text_scale(1000);
+        let last = last.expect("the popover's last line is drawn");
+        assert!(last.y() + last.h() <= pop.y() + pop.h(), "{milli}: {last:?} out of {pop:?}");
+    }
+}

@@ -483,7 +483,7 @@ pill, toolbar buttons) and the Aa pop-up are sized in em, so they grow with the 
 chrome: the rail (wide and collapsed, and the window width below which it collapses), the
 find bar, prompt row and status bar, the tier popover, presence menu and suggestion list,
 the history view, and Start and the stop page; one `icon_button` at the text size serves
-them all (`navigator-ui/tests/text_size.rs` checks the geometry at 1.5x). Page images: profile §3.11 admits no fetch that varies with the reader's screen,
+them all (`navigator-ui/tests/text_size.rs` checks the geometry at 1.5x). An icon is handed to Pergola at its point size: the renderer applies the text size to a glyph as to any text, so an em-sized icon grew twice (2.25x at 150%, found in the live check). The tier popover is as tall as its wrapped lines (`shell::wrap`), not a fixed estimate. Page images: profile §3.11 admits no fetch that varies with the reader's screen,
 so the converter picks an `<img>`'s `srcset` candidate for one fixed density, 2x, for every
 reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descriptors over
 `sizes` at the 1280 px conversion viewport (px/vw/em lengths, min/max-width conditions; else

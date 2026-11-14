@@ -396,7 +396,10 @@ impl Shell {
             (!v.is_empty()).then(|| Rect::new(where_.x(), bar() + 1.0 + 3.0, where_.w(), drop_height(&v)))
         });
         let popover = (self.popover && self.store.trail().page().is_some())
-            .then(|| Rect::new(where_.x(), bar() + 4.0, em(POPOVER_W).min(w - where_.x() - 8.0), popover_height(self)));
+            .then(|| {
+                let pw = em(POPOVER_W).min(w - where_.x() - 8.0);
+                Rect::new(where_.x(), bar() + 4.0, pw, popover_height(self, pw))
+            });
         let aa = Rect::new(w - em(104.0), em(6.0), em(28.0), em(28.0));
         let reading = (self.reading_open && self.store.trail().page().is_some())
             .then(|| Rect::new((aa.x() + aa.w() - em(READING_W)).max(x0 + 8.0), bar() + 4.0, em(READING_W), em(READING_H)));
@@ -1099,7 +1102,7 @@ impl Shell {
 /// The tier chip's rect at the Where field's left end (approximate: the
 /// chip's segments are measured when drawn; this covers the widest).
 pub fn chip_rect(g: &Geo) -> Rect {
-    Rect::new(g.where_.x(), g.where_.y(), 220.0, g.where_.h())
+    Rect::new(g.where_.x(), g.where_.y(), em(220.0), g.where_.h())
 }
 
 /// The suggestion list's height for these rows (§5.3).
@@ -1122,9 +1125,59 @@ pub fn drop_height(v: &[Suggestion]) -> f32 {
 }
 
 /// The popover's height: two sections and the reasons (§6.5).
-pub fn popover_height(s: &Shell) -> f32 {
-    let reasons = s.store.trail().page().map_or(0, |p| p.facts.reasons.len() + p.facts.live_parts.len());
-    em(176.0 + 20.0 * reasons as f32)
+/// Measured from what it says, wrapped as `ui::popover` wraps it, so no
+/// line falls out of the box at any text size.
+pub fn popover_height(s: &Shell, w: f32) -> f32 {
+    let Some(p) = s.store.trail().page() else { return 0.0 };
+    let f = &p.facts;
+    let tw = w - em(32.0);
+    let lines = |t: &str| wrap(t, tw).len() as f32;
+    let site = crate::trail::site(&p.url);
+    let mut n = lines(&popover_connection(f, site)) + lines(&crate::ui::tier_sentence(f.tier, site)) + lines(popover_last(f));
+    for o in &f.live_parts {
+        n += lines(&popover_live_part(o));
+    }
+    for r in &f.reasons {
+        n += lines(r);
+    }
+    // Top 14, heading 28, two section labels 16 each, two 6 gaps, lines 16, bottom 14.
+    em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + 16.0 * n + 14.0)
+}
+
+/// The popover's connection line.
+pub fn popover_connection(f: &Facts, site: &str) -> String {
+    if f.insecure { "Not private. Anyone on this network can read or change this page.".to_string() } else { format!("{} to {site}.", f.connection) }
+}
+
+/// A live part's line in the popover.
+pub fn popover_live_part(o: &str) -> String {
+    format!("1 part of this page runs live code: {o}.")
+}
+
+/// The popover's closing line.
+pub fn popover_last(f: &Facts) -> &'static str {
+    if f.light == Light::Green { "Green doesn't mean this site is who you think: check the name in the strip." } else { "This says what runs, not whether the site is honest." }
+}
+
+/// The small body text of the pop-ups (XS sans), broken into lines no
+/// wider than `w` px at the text size.
+pub fn wrap(s: &str, w: f32) -> Vec<String> {
+    let st = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: pergola::theme::Weight::Regular, color: pergola::Color::TRANSPARENT };
+    let width = |t: &str| pergola::node::Node::measure_text(t, &st).w;
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in s.split(' ') {
+        let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if width(&cand) > w && !line.is_empty() {
+            out.push(std::mem::replace(&mut line, word.to_string()));
+        } else {
+            line = cand;
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 #[cfg(test)]

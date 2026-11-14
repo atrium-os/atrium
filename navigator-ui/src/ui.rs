@@ -201,7 +201,7 @@ fn icon_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, color: Col
     } else {
         ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: em(6.0) })
     };
-    icon(ctx, x + em(4.0), y + em(4.0), g, em(20.0), if enabled { color } else { t.text_disabled() });
+    icon(ctx, x + em(4.0), y + em(4.0), g, 20.0, if enabled { color } else { t.text_disabled() });
     ctx.pop();
     ctx.tooltip(id, tip.to_string());
 }
@@ -353,15 +353,15 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             };
         }));
         let unrec = s.store.persona == trail::Persona::Unrecorded;
-        icon(ctx, em(20.0), em(12.0), if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, em(16.0), t.text_secondary());
+        icon(ctx, em(20.0), em(12.0), if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, 16.0, t.text_secondary());
         text(ctx, em(42.0), em(20.0), s.store.persona.name(), type_size::SM, Weight::Medium, t.text_primary());
-        icon(ctx, em(116.0), em(13.0), ph::CARET_DOWN, em(12.0), t.text_secondary());
+        icon(ctx, em(116.0), em(13.0), ph::CARET_DOWN, 12.0, t.text_secondary());
         ctx.pop();
     }
     {
         let st2 = st.clone();
         let id = area(ctx, Rect::new(em(146.0), em(6.0), em(68.0), em(28.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.new_trail(false)));
-        icon(ctx, em(154.0), em(12.0), ph::PLUS, em(16.0), t.text_primary());
+        icon(ctx, em(154.0), em(12.0), ph::PLUS, 16.0, t.text_primary());
         text(ctx, em(174.0), em(20.0), "Trail", type_size::SM, Weight::Medium, t.text_primary());
         ctx.pop();
         ctx.tooltip(id, "New trail (Ctrl-T)");
@@ -410,7 +410,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         if tr.page().is_some() {
             monogram(ctx, em(18.0), y + em(6.0), url, current);
         } else {
-            icon(ctx, em(20.0), y + em(8.0), ph::PLUS, em(16.0), t.text_tertiary());
+            icon(ctx, em(20.0), y + em(8.0), ph::PLUS, 16.0, t.text_tertiary());
         }
         // State glyphs on the right, right to left.
         let mut gx = em(212.0);
@@ -429,7 +429,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             gx -= em(26.0);
         }
         for (gch, c) in &glyphs {
-            icon(ctx, gx + em(4.0), y + em(8.0), *gch, em(16.0), *c);
+            icon(ctx, gx + em(4.0), y + em(8.0), *gch, 16.0, *c);
             gx -= em(20.0);
         }
         if tr.has_unseen() && !current {
@@ -467,9 +467,11 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             }));
             monogram(ctx, em(18.0), y + em(6.0), e.trail.page().map_or("", |p| &p.url), false);
             let ts = sans(type_size::SM, Weight::Regular, t.text_secondary());
-            text(ctx, em(46.0), y + em(16.0), &fit(e.trail.title(), &ts, em(150.0)), type_size::SM, Weight::Regular, t.text_secondary());
             let ds = sans(type_size::XXS, Weight::Regular, t.text_tertiary());
             let day = crate::clock::day_label(e.at_s, now_s);
+            // The title ends a gap before the day.
+            let title_max = em(228.0) - width(&day, &ds) - em(8.0) - em(46.0);
+            text(ctx, em(46.0), y + em(16.0), &fit(e.trail.title(), &ts, title_max), type_size::SM, Weight::Regular, t.text_secondary());
             text(ctx, em(228.0) - width(&day, &ds), y + em(16.0), &day, type_size::XXS, Weight::Regular, t.text_tertiary());
             ctx.pop();
             ctx.tooltip(id, format!("Put away {} · click to bring it back", crate::clock::when_label(e.at_s, now_s)));
@@ -490,7 +492,7 @@ fn media_button(ctx: &mut Ctx, x: f32, y: f32, tr: &trail::Trail, i: usize, st: 
     let Some(m) = tr.row_media() else { return };
     let st2 = st.clone();
     let id = area(ctx, Rect::new(x, y, em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.toggle_mute(i)));
-    icon(ctx, x + em(4.0), y + em(4.0), media_glyph(m), em(16.0), t.text_secondary());
+    icon(ctx, x + em(4.0), y + em(4.0), media_glyph(m), 16.0, t.text_secondary());
     ctx.pop();
     ctx.tooltip(id, if m == RowMedia::Muted { "Unmute this trail" } else { "Mute this trail (Ctrl-M)" });
 }
@@ -523,7 +525,7 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
         rect(ctx, x - em(10.0), y + em(13.0), em(8.0), 1.0, t.border_strong(), 0.0);
         let max = em(214.0) - x - em(4.0);
         if let Some(q) = &p.search {
-            icon(ctx, x, y + em(6.0), ph::MAGNIFYING_GLASS, em(14.0), t.text_tertiary());
+            icon(ctx, x, y + em(6.0), ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
             let label = format!("Search: {q}");
             let ts = sans(type_size::XS, Weight::Regular, t.text_secondary());
             text(ctx, x + em(18.0), y + em(13.0), &fit(&label, &ts, max - em(18.0)), type_size::XS, Weight::Regular, t.text_secondary());
@@ -581,7 +583,7 @@ fn rail_narrow(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         match tr.page() {
             Some(p) => monogram(ctx, em(18.0), y + em(6.0), &p.url, current),
             None => {
-                icon(ctx, em(20.0), y + em(8.0), ph::MAGNIFYING_GLASS, em(16.0), t.text_tertiary());
+                icon(ctx, em(20.0), y + em(8.0), ph::MAGNIFYING_GLASS, 16.0, t.text_tertiary());
             }
         }
         if tr.row_media().is_some() || tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
@@ -636,11 +638,11 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let id = area(ctx, Rect::new(p.x() + 1.0, y + 1.0, p.w() - 2.0, h - 2.0), h / 2.0 - 1.0, fill, hover, move || with(&st2, |s| s.toggle_presence_menu()));
         let (gx, tx) = (p.x() + em(9.0), p.x() + em(29.0));
         if knows {
-            icon(ctx, gx, mid - em(8.0), ph::USER, em(16.0), t.accent_strong());
+            icon(ctx, gx, mid - em(8.0), ph::USER, 16.0, t.accent_strong());
             let ts = sans(type_size::XS, Weight::Semibold, t.accent_strong());
             text(ctx, tx, mid, &fit(&site, &ts, p.x() + p.w() - em(7.0) - tx), type_size::XS, Weight::Semibold, t.accent_strong());
         } else {
-            icon(ctx, gx, mid - em(8.0), ph::EYE_SLASH, em(16.0), t.text_secondary());
+            icon(ctx, gx, mid - em(8.0), ph::EYE_SLASH, 16.0, t.text_secondary());
             let ts = sans(type_size::XS, Weight::Medium, t.text_secondary());
             text(ctx, tx, mid, &fit("Anonymous", &ts, p.x() + p.w() - em(7.0) - tx), type_size::XS, Weight::Medium, t.text_secondary());
         }
@@ -669,7 +671,7 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
     let st2 = st.clone();
     area(ctx, Rect::new(f.x() + 1.0, f.y() + 1.0, f.w() - 2.0, f.h() - 2.0), 5.0, t.bg_canvas(), t.bg_canvas(), move || with(&st2, |s| s.begin_edit()));
     let Some(p) = s.store.trail().page() else {
-        icon(ctx, f.x() + em(10.0), f.y() + f.h() / 2.0 - em(7.0), ph::MAGNIFYING_GLASS, em(14.0), t.text_tertiary());
+        icon(ctx, f.x() + em(10.0), f.y() + f.h() / 2.0 - em(7.0), ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
         text(ctx, f.x() + em(30.0), f.y() + f.h() / 2.0, "Search or type an address", type_size::SM, Weight::Regular, t.text_tertiary());
         ctx.pop();
         return;
@@ -687,12 +689,12 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
     let addr_w = width(before, &body(t.text_tertiary(), Weight::Regular)) + width(domain, &body(t.text_primary(), Weight::Semibold));
     let room = end - x;
     // The title gets what the domain leaves; the domain is never cut.
-    let title_max = (room - addr_w - 40.0).max(60.0).min(room * 0.55);
+    let title_max = (room - addr_w - em(40.0)).max(em(60.0)).min(room * 0.55);
     let title = if p.search.is_some() { p.title.clone() } else { fit(&p.title, &title_st, title_max) };
-    let used: f32 = runs.iter().map(|r| width(&r.0, &r.1) + 8.0).sum::<f32>() + width(&title, &title_st) + 16.0 + addr_w;
+    let used: f32 = runs.iter().map(|r| width(&r.0, &r.1) + em(8.0)).sum::<f32>() + width(&title, &title_st) + em(16.0) + addr_w;
     runs.push((title, title_st));
     runs.push(("·".into(), body(t.text_tertiary(), Weight::Regular)));
-    let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x, f.y() + f.h() / 2.0 - em(type_size::SM) * 0.75, 0.0, 0.0), 8.0));
+    let r = ctx.push(Node::stack(Axis::Horizontal, Rect::new(x, f.y() + f.h() / 2.0 - em(type_size::SM) * 0.75, 0.0, 0.0), em(8.0)));
     ctx.set_flex(r, FlexStyle { align: Align::Baseline, ..FlexStyle::default() });
     for (sx, sst) in &runs {
         ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: sx.clone(), style: sst.clone() });
@@ -738,13 +740,13 @@ fn tier_chip(ctx: &mut Ctx, s: &Shell, x: f32, y: f32, p: &trail::Page, st: &Mut
         s.popover = !open;
         s.end_edit();
     }));
-    icon(ctx, x + em(4.0), y + (ch - em(16.0)) / 2.0, light_glyph(f.light), em(16.0), light_color(ctx, f.light));
+    icon(ctx, x + em(4.0), y + (ch - em(16.0)) / 2.0, light_glyph(f.light), 16.0, light_color(ctx, f.light));
     let mut sx = x + em(24.0);
     for (g, l, live) in &segs {
         let w = width(l, &ls) + em(36.0);
         let (edge, fill, fg) = if *live { (t.warning_fg(), t.bg_canvas(), t.warning_fg()) } else { (t.border_strong(), t.bg_surface(), t.text_secondary()) };
         boxed(ctx, sx, y, w, ch, edge, fill, ch / 2.0);
-        icon(ctx, sx + em(8.0), y + (ch - em(14.0)) / 2.0, *g, em(14.0), fg);
+        icon(ctx, sx + em(8.0), y + (ch - em(14.0)) / 2.0, *g, 14.0, fg);
         text(ctx, sx + em(26.0), y + ch / 2.0, l, type_size::XS, Weight::Semibold, fg);
         sx += w + 4.0;
     }
@@ -768,11 +770,11 @@ fn where_editing(ctx: &mut Ctx, f: Rect, e: &shell::WhereEdit) {
 /// selection and caret, or the placeholder.
 fn text_field(ctx: &mut Ctx, f: Rect, edit: &pergola::text_edit::TextEdit, placeholder: &str) {
     let t = ctx.theme;
-    boxed(ctx, f.x() - 2.0, f.y() - 2.0, f.w() + 4.0, f.h() + 4.0, t.focus_ring(), t.focus_ring(), 8.0);
-    boxed(ctx, f.x(), f.y(), f.w(), f.h(), t.border_control(), t.bg_canvas(), 6.0);
-    icon(ctx, f.x() + 10.0, f.y() + (f.h() - 14.0) / 2.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
+    boxed(ctx, f.x() - 2.0, f.y() - 2.0, f.w() + 4.0, f.h() + 4.0, t.focus_ring(), t.focus_ring(), em(8.0));
+    boxed(ctx, f.x(), f.y(), f.w(), f.h(), t.border_control(), t.bg_canvas(), em(6.0));
+    icon(ctx, f.x() + em(10.0), f.y() + (f.h() - em(14.0)) / 2.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
     let st = sans(type_size::SM, Weight::Regular, t.text_primary());
-    let tx = f.x() + 30.0;
+    let tx = f.x() + em(30.0);
     let s = edit.text();
     let cy = f.y() + f.h() / 2.0;
     let line = Node::measure_text("Mg", &st).h;
@@ -780,12 +782,12 @@ fn text_field(ctx: &mut Ctx, f: Rect, edit: &pergola::text_edit::TextEdit, place
     if !sel.is_empty() {
         let a = tx + width(&s[..sel.start], &st);
         let b = tx + width(&s[..sel.end], &st);
-        rect(ctx, a, cy - line / 2.0, (b - a).min(f.x() + f.w() - 8.0 - a), line, t.selection_bg(), 0.0);
+        rect(ctx, a, cy - line / 2.0, (b - a).min(f.x() + f.w() - em(8.0) - a), line, t.selection_bg(), 0.0);
     }
     if s.is_empty() {
         text(ctx, tx, cy, placeholder, type_size::SM, Weight::Regular, t.text_tertiary());
     } else {
-        text(ctx, tx, cy, &fit(s, &st, f.w() - 40.0), type_size::SM, Weight::Regular, t.text_primary());
+        text(ctx, tx, cy, &fit(s, &st, f.w() - em(40.0)), type_size::SM, Weight::Regular, t.text_primary());
     }
     if sel.is_empty() {
         let cx = tx + width(&s[..edit.caret()], &st);
@@ -836,14 +838,14 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
             }
             Source::Kept | Source::History => {
                 let g = if sg.source == Source::Kept { ph::BOOKMARK } else { ph::CLOCK };
-                icon(ctx, r.x() + em(16.0), y + em(7.0), g, em(16.0), t.text_tertiary());
+                icon(ctx, r.x() + em(16.0), y + em(7.0), g, 16.0, t.text_tertiary());
                 let addr = sg.url.split_once("://").map_or(sg.url.as_str(), |(_, r)| r);
                 let a = fit(&sg.title, &body(t.text_primary(), Weight::Regular), room * 0.5);
                 let b = fit(addr, &body(t.text_tertiary(), Weight::Regular), room * 0.45);
                 inline(ctx, r.x() + em(44.0), cy, em(10.0), &[(a, body(t.text_primary(), Weight::Regular)), (b, body(t.text_tertiary(), Weight::Regular))]);
             }
             Source::Search => {
-                icon(ctx, r.x() + em(16.0), y + em(7.0), ph::MAGNIFYING_GLASS, em(16.0), t.text_tertiary());
+                icon(ctx, r.x() + em(16.0), y + em(7.0), ph::MAGNIFYING_GLASS, 16.0, t.text_tertiary());
                 let a = fit(&format!("Search for “{}”", sg.title), &body(t.text_primary(), Weight::Regular), room * 0.55);
                 inline(ctx, r.x() + em(44.0), cy, em(6.0), &[(a, body(t.text_primary(), Weight::Regular)), ("· sent only when you press Enter".into(), body(t.text_tertiary(), Weight::Regular))]);
             }
@@ -863,7 +865,7 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     let x = r.x() + em(16.0);
     let w = r.w() - em(32.0);
     let mut y = r.y() + em(14.0);
-    icon(ctx, x, y, light_glyph(f.light), em(16.0), light_color(ctx, f.light));
+    icon(ctx, x, y, light_glyph(f.light), 16.0, light_color(ctx, f.light));
     let head = match f.light {
         Light::Green => "Nothing to worry about that we can see",
         Light::Amber => "Something is weaker than usual",
@@ -873,21 +875,20 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     y += em(28.0);
     text(ctx, x, y + em(6.0), "CONNECTION", type_size::XXS, Weight::Semibold, t.text_tertiary());
     y += em(16.0);
-    let conn = if f.insecure { "Not private. Anyone on this network can read or change this page.".to_string() } else { format!("{} to {site}.", f.connection) };
+    let conn = shell::popover_connection(f, site);
     y = wrapped(ctx, x, y, w, &conn, t.text_secondary());
     y += em(6.0);
     text(ctx, x, y + em(6.0), "WHAT RUNS", type_size::XXS, Weight::Semibold, t.text_tertiary());
     y += em(16.0);
     y = wrapped(ctx, x, y, w, &tier_sentence(f.tier, site), t.text_secondary());
     for o in &f.live_parts {
-        y = wrapped(ctx, x, y, w, &format!("1 part of this page runs live code: {o}."), t.warning_fg());
+        y = wrapped(ctx, x, y, w, &shell::popover_live_part(o), t.warning_fg());
     }
     for reason in &f.reasons {
         y = wrapped(ctx, x, y, w, reason, if f.light == Light::Red { t.danger_fg() } else { t.warning_fg() });
     }
     y += em(6.0);
-    let last = if f.light == Light::Green { "Green doesn't mean this site is who you think: check the name in the strip." } else { "This says what runs, not whether the site is honest." };
-    wrapped(ctx, x, y, w, last, t.text_tertiary());
+    wrapped(ctx, x, y, w, shell::popover_last(f), t.text_tertiary());
 }
 
 /// The presence menu (§6.2): whether the site knows you, the accounts Arca
@@ -899,7 +900,7 @@ fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Opti
     let w = r.w() - em(32.0);
     let mut y = r.y() + em(14.0);
     let head_st = sans(type_size::SM, Weight::Semibold, t.text_primary());
-    icon(ctx, x, y, if knows { ph::USER } else { ph::EYE_SLASH }, em(16.0), if knows { t.accent_strong() } else { t.text_secondary() });
+    icon(ctx, x, y, if knows { ph::USER } else { ph::EYE_SLASH }, 16.0, if knows { t.accent_strong() } else { t.text_secondary() });
     let head = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
     text(ctx, x + em(22.0), y + em(8.0), &fit(&head, &head_st, w - em(22.0)), type_size::SM, Weight::Semibold, t.text_primary());
     y += em(28.0);
@@ -907,7 +908,7 @@ fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Opti
     let row = |ctx: &mut Ctx, y: f32, g: char, label: &str, c: Color, press: Box<dyn Fn()>| {
         let t = ctx.theme;
         area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(32.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || press());
-        icon(ctx, x, y + em(8.0), g, em(16.0), c);
+        icon(ctx, x, y + em(8.0), g, 16.0, c);
         text(ctx, x + em(24.0), y + em(16.0), label, type_size::SM, Weight::Medium, c);
         ctx.pop();
     };
@@ -923,7 +924,7 @@ fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Opti
     let line_st = sans(type_size::XS, Weight::Regular, t.text_secondary());
     let mut line = |ctx: &mut Ctx, g: Option<char>, s: &str, c: Color| {
         let dx = if let Some(g) = g {
-            icon(ctx, x, y + 2.0, g, em(14.0), c);
+            icon(ctx, x, y + em(2.0), g, 14.0, c);
             em(20.0)
         } else { 0.0 };
         text(ctx, x + dx, y + em(10.0), &fit(s, &line_st, w - dx), type_size::XS, Weight::Regular, c);
@@ -953,19 +954,7 @@ fn presence_menu(ctx: &mut Ctx, r: Rect, site: &str, knows: bool, accounts: Opti
 /// Words broken into lines of at most `w` px, by measurement; returns the
 /// y below the last line.
 fn wrapped(ctx: &mut Ctx, x: f32, mut y: f32, w: f32, s: &str, c: Color) -> f32 {
-    let st = sans(type_size::XS, Weight::Regular, c);
-    let mut line = String::new();
-    for word in s.split(' ') {
-        let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if width(&cand, &st) > w && !line.is_empty() {
-            text(ctx, x, y + em(8.0), &line, type_size::XS, Weight::Regular, c);
-            y += em(16.0);
-            line = word.to_string();
-        } else {
-            line = cand;
-        }
-    }
-    if !line.is_empty() {
+    for line in shell::wrap(s, w) {
         text(ctx, x, y + em(8.0), &line, type_size::XS, Weight::Regular, c);
         y += em(16.0);
     }
@@ -982,7 +971,7 @@ fn small_button(ctx: &mut Ctx, r: Rect, g: Option<char>, label: &str, on: bool, 
     let id = area(ctx, Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), em(5.0), fill, t.state_hover(), press);
     match g {
         Some(g) => {
-            icon(ctx, r.x() + (r.w() - em(16.0)) / 2.0, r.y() + (r.h() - em(16.0)) / 2.0, g, em(16.0), fg);
+            icon(ctx, r.x() + (r.w() - em(16.0)) / 2.0, r.y() + (r.h() - em(16.0)) / 2.0, g, 16.0, fg);
         }
         None => {
             let st = sans(type_size::XS, Weight::Medium, fg);
@@ -1217,7 +1206,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             ("wants to play sound".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
     };
-    icon(ctx, r.x() + em(16.0), r.y() + em(12.0), g, em(20.0), t.text_secondary());
+    icon(ctx, r.x() + em(16.0), r.y() + em(12.0), g, 20.0, t.text_secondary());
     inline(ctx, r.x() + em(46.0), r.y() + em(22.0), em(6.0), &runs);
     let answers = p.answers();
     let bs = sans(type_size::SM, Weight::Semibold, t.text_primary());
@@ -1324,9 +1313,9 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
                 hovered = Some(l.url.clone());
             }
             if l.download.is_some() {
-                icon(ctx, x, y + em(7.0), ph::DOWNLOAD, em(16.0), t.accent_fg());
+                icon(ctx, x, y + em(7.0), ph::DOWNLOAD, 16.0, t.accent_fg());
             } else {
-                icon(ctx, x, y + em(7.0), ph::ARROW_RIGHT, em(16.0), t.accent_fg());
+                icon(ctx, x, y + em(7.0), ph::ARROW_RIGHT, 16.0, t.accent_fg());
             }
             let ls = sans(type_size::SM, Weight::Medium, t.accent_fg());
             text(ctx, x + em(24.0), y + em(15.0), &fit(&l.title, &ls, col - em(24.0)), type_size::SM, Weight::Medium, t.accent_fg());
@@ -1351,7 +1340,7 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         y = d.y() + d.h() + em(28.0);
     }
     if s.store.trail().unrecorded {
-        icon(ctx, x, y, ph::EYE_SLASH, em(16.0), t.text_secondary());
+        icon(ctx, x, y, ph::EYE_SLASH, 16.0, t.text_secondary());
         text(ctx, x + em(24.0), y + em(8.0), "Unrecorded: nothing in this trail is written down, and its cookies go when it closes.", type_size::SM, Weight::Regular, t.text_secondary());
         y += em(36.0);
     }
@@ -1375,7 +1364,7 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             text(ctx, cx + em(44.0), y + em(24.0), &fit(&k.title, &ts, em(100.0)), type_size::SM, Weight::Medium, t.text_primary());
             let ds = sans(type_size::XS, Weight::Regular, t.text_tertiary());
             text(ctx, cx + em(44.0), y + em(44.0), &fit(trail::host(&k.url), &ds, em(120.0)), type_size::XS, Weight::Regular, t.text_tertiary());
-            icon(ctx, cx + em(152.0), y + em(8.0), ph::STAR, em(12.0), t.text_tertiary());
+            icon(ctx, cx + em(152.0), y + em(8.0), ph::STAR, 12.0, t.text_tertiary());
             ctx.pop();
             cx += em(188.0);
         }
@@ -1404,7 +1393,7 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             let fid = area(ctx, Rect::new(x + em(432.0), y + em(3.0), em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
                 s.store.forget(i);
             }));
-            icon(ctx, x + em(436.0), y + em(7.0), ph::X, em(16.0), t.text_tertiary());
+            icon(ctx, x + em(436.0), y + em(7.0), ph::X, 16.0, t.text_tertiary());
             ctx.pop();
             ctx.tooltip(fid, "Forget this trail");
             y += em(30.0);
@@ -1421,7 +1410,7 @@ fn stop_page(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) {
     let col = em(520.0).min(r.w() - em(64.0));
     let x = r.x() + (r.w() - col) / 2.0;
     let mut y = r.y() + (r.h() * 0.22).max(em(40.0));
-    icon(ctx, x, y, ph::PROHIBIT, em(32.0), t.danger_fg());
+    icon(ctx, x, y, ph::PROHIBIT, 32.0, t.danger_fg());
     y += em(52.0);
     text(ctx, x, y, "This page was stopped", type_size::XL, Weight::Semibold, t.text_primary());
     y += em(30.0);
@@ -1456,7 +1445,7 @@ fn status_bar(ctx: &mut Ctx, s: &Shell, r: Rect, link: Option<String>) {
     let f = fake::spec(&url).facts;
     let cur_site = s.store.trail().page().map(|p| trail::site(&p.url).to_string()).unwrap_or_default();
     let site = trail::site(&url);
-    icon(ctx, r.x() + em(12.0), r.y() + em(5.0), light_glyph(f.light), em(14.0), light_color(ctx, f.light));
+    icon(ctx, r.x() + em(12.0), r.y() + em(5.0), light_glyph(f.light), 14.0, light_color(ctx, f.light));
     let cy = r.y() + em(12.5);
     let scheme = if url.starts_with("http://") { "http://" } else { "https://" };
     let (before, domain, after) = trail::split_address(&url);
