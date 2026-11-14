@@ -51,3 +51,33 @@ fn an_element_is_found_by_its_id() {
     assert_eq!(element_top(&doc, &fonts, &env, &Default::default(), "nope"), None);
     assert_eq!(element_top(&doc, &fonts, &env, &Default::default(), "a\"b"), None);
 }
+
+/// Keeping a reader's place across a text size change
+/// (resolution-independence.md §10): the word at the top of the view in one
+/// layout is found again in the other, in the same paragraph, while the
+/// same document px would show text from much further up.
+#[test]
+fn the_word_at_the_top_is_found_again_at_another_text_size() {
+    use navigator_render::find::word_at;
+    let fonts = FontSet::load().unwrap();
+    let mut doc = String::from("<!doctype html><html><body>");
+    for i in 0..60 {
+        doc.push_str(&format!("<p>Paragraph{i} says the rooms of the house have their uses and their light.</p>"));
+    }
+    doc.push_str("</body></html>");
+    let small = Env::default();
+    let big = Env { text_scale_64: 96, ..small.clone() };
+    let subs = Default::default();
+    let top = 1200.0;
+    let (word, wtop) = word_at(&doc, &fonts, &small, &subs, top).expect("a word at the top");
+    assert!(wtop >= top && wtop < top + 60.0, "{word} at {wtop}");
+    let before = find(&doc, &fonts, &small, &subs, &word, 1000);
+    let nth = before.iter().position(|m| (m[1] - wtop).abs() < 1.0).expect("it is one of its matches");
+    let after = find(&doc, &fonts, &big, &subs, &word, nth + 1);
+    let y = after[nth][1] - (wtop - top);
+    let (again, _) = word_at(&doc, &fonts, &big, &subs, y).unwrap();
+    assert_eq!(again, word, "the same word at the top");
+    assert!(y > top * 1.3, "further down the document at 150%: {y}");
+    let (same_px, _) = word_at(&doc, &fonts, &big, &subs, top).unwrap();
+    assert_ne!(same_px, word, "the same px shows other words");
+}

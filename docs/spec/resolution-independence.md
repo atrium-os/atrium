@@ -472,8 +472,11 @@ Three factors multiply for page content:
 
 **Built (step 7, 2026-11-14):** navigator-page lays pages out at the reader's per-site text
 size times the system text size (`text_64()`), for layout, the comfortable measure, find and
-in-page anchors, and lays the page out again, keeping its place, when the system text size
-changes. Page images: profile §3.11 admits no fetch that varies with the reader's screen,
+in-page anchors, and lays the page out again when the system text size changes. The reader keeps their
+place: before a reflow (text size or measure) the first word at the top of the view and
+which of its matches it is are found (`find::word_at` + `find`), and after it the view is
+scrolled so that word sits where it did (the same document px showed text from further
+up; found in the live check). Page images: profile §3.11 admits no fetch that varies with the reader's screen,
 so the converter picks an `<img>`'s `srcset` candidate for one fixed density, 2x, for every
 reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descriptors over
 `sizes` at the 1280 px conversion viewport (px/vw/em lengths, min/max-width conditions; else

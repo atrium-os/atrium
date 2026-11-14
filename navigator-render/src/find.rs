@@ -45,6 +45,36 @@ pub fn find(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, query: 
     out
 }
 
+/// The first word of the first line at or below `y` (CSS px from the
+/// document's top) in `html` laid out at `env`, and that line's top, as
+/// `find` places it: what a reader at `y` is looking at, to find again in
+/// another layout of the same page (a new text size keeps the reader on
+/// the same words, resolution-independence.md §10). Words of letters and
+/// digits only, so `find` finds it whole.
+pub fn word_at(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, y: f32) -> Option<(String, f32)> {
+    let mut b = Banded::new(html, fonts, env, subs, (env.height_px * PX) as U);
+    let mut k = 0;
+    loop {
+        if !b.ensure(k) && b.scene(k).is_none() {
+            return None;
+        }
+        let scene = b.scene(k)?;
+        let mut runs: Vec<&crate::Run> = scene.runs.iter().collect();
+        runs.sort_by_key(|r| (r.y, r.x));
+        for r in runs {
+            let top = (r.y as f64 / PX - r.size as f64 / PX * 0.85) as f32;
+            if top + 0.5 < y {
+                continue;
+            }
+            if let Some(word) = r.text.split(|c: char| !c.is_alphanumeric()).find(|w| !w.is_empty()) {
+                return Some((word.to_string(), top));
+            }
+        }
+        b.evict(k);
+        k += 1;
+    }
+}
+
 /// The advance of a run's last glyph, in px: where the run ends past its
 /// last glyph's start, so a match at the end covers all of that glyph.
 fn advance(fonts: &FontSet, r: &crate::Run) -> f64 {

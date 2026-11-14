@@ -115,7 +115,12 @@ struct Page {
 /// system's (resolution-independence.md §10), so a person who chose 130%
 /// for everything reads pages at 130% before any per-site step.
 fn text_64(r: &Reading) -> u32 {
-    (r.text_64 as f32 * pergola::text::text_scale()).round().clamp(16.0, 512.0) as u32
+    text_64_at(r, pergola::text::text_scale())
+}
+
+/// [`text_64`] at system text size `sys`.
+fn text_64_at(r: &Reading, sys: f32) -> u32 {
+    (r.text_64 as f32 * sys).round().clamp(16.0, 512.0) as u32
 }
 
 #[derive(Clone)]
@@ -259,7 +264,8 @@ impl Run {
     }
 
     /// Lay the page out again for a new size or reading, keeping its
-    /// place (the same document px from the top).
+    /// place: the word at the top of the view stays there when the text
+    /// size or measure changes; otherwise the same document px.
     fn relayout(&mut self, reading: Option<Reading>) {
         let Some(p) = self.view.page.get_cloned() else { return };
         let size = self.view.size.get();
@@ -267,6 +273,11 @@ impl Run {
         if p.size == size && p.reading == reading && p.sys == pergola::text::text_scale() {
             return;
         }
+        // What the reader is looking at, to keep in place: a new text size
+        // or measure moves every line, so the same document px would show
+        // other words (resolution-independence.md §10).
+        let reflows = text_64(&reading) != text_64_at(&p.reading, p.sys) || p.sys != pergola::text::text_scale() || measure(size.0, &reading).1 != p.lw;
+        let anchor = if reflows { self.anchor(&p) } else { None };
         if p.reading.zoom_64 != reading.zoom_64 {
             let mut st = self.view.scroll.get();
             let z = reading.zoom_64 as f64 / 64.0;
@@ -275,6 +286,9 @@ impl Run {
         }
         match lay_out(p.prepared.clone(), p.images.clone(), p.base.clone(), reading, size) {
             Ok(n) => {
+                if let Some(a) = anchor {
+                    self.restore(&n, a);
+                }
                 eprintln!("navigator-page: laid out again: text {}%, zoom {}%, {}{}", text_64(&n.reading) * 100 / 64, n.reading.zoom_64 as u32 * 100 / 64,
                     if n.reading.dark { "dark" } else { "light" }, if n.reading.comfortable { ", comfortable width" } else { "" });
                 self.view.page.set(Some(Rc::new(n)));
@@ -282,6 +296,46 @@ impl Run {
             Err(e) => eprintln!("navigator-page: layout: {e}"),
         }
         self.view.mark.set(None);
+    }
+
+    /// The layout `p` is in, for find, anchors and keeping place.
+    fn env_of(&self, p: &Page) -> navigator_style::cascade::Env {
+        let zoom = self.view.scroll.get().zoom.settled.max(0.01);
+        navigator_style::cascade::Env {
+            dark: p.reading.dark,
+            // At the system text size it was laid out at, which may have
+            // changed since.
+            text_scale_64: text_64_at(&p.reading, p.sys),
+            ..navigator_style::cascade::Env::zoomed(p.lw as f64, p.size.1 as f64, (zoom * 64.0).round() as u32)
+        }
+    }
+
+    /// The word at the top of the view in `p`: it, which of its matches it
+    /// is, and how far below the view's top it sits.
+    fn anchor(&self, p: &Page) -> Option<(String, usize, f32)> {
+        let fonts = navigator_render::fontset::FontSet::shared().ok()?;
+        let env = self.env_of(p);
+        let top = self.view.scroll.get().physics.y as f32;
+        if top <= 0.0 {
+            return None; // at the start: the start it stays
+        }
+        let (word, wtop) = navigator_render::find::word_at(&p.prepared.html, fonts, &env, &p.prepared.subs, top)?;
+        let all = navigator_render::find::find(&p.prepared.html, fonts, &env, &p.prepared.subs, &word, FOUND_MAX as usize);
+        let nth = all.iter().position(|m| (m[1] - wtop).abs() < 1.0)?;
+        Some((word, nth, wtop - top))
+    }
+
+    /// Scroll `n` so the anchor's word sits where it did.
+    fn restore(&mut self, n: &Page, (word, nth, below): (String, usize, f32)) {
+        let Ok(fonts) = navigator_render::fontset::FontSet::shared() else { return };
+        let env = self.env_of(n);
+        let all = navigator_render::find::find(&n.prepared.html, fonts, &env, &n.prepared.subs, &word, nth + 1);
+        if let Some(m) = all.get(nth) {
+            let mut st = self.view.scroll.get();
+            st.physics.y = ((m[1] - below) as f64).max(0.0);
+            self.view.scroll.set(st);
+            eprintln!("navigator-page: kept \"{word}\" #{nth} in place");
+        }
     }
 
     /// A zoom the person made here (keys, a pinch) that has settled: the
