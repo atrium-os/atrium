@@ -27,6 +27,7 @@ pub mod clipboard;
 pub mod color;
 pub mod embed;
 pub mod event;
+pub mod flow;
 pub mod geom;
 pub mod icon;
 pub mod input;

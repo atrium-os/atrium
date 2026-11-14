@@ -601,7 +601,9 @@ impl Surface for FrescoSurface {
                 self.conn.scene_node_fill(id.0, &q)?;
             }
             Node::Image { rect, image } => {
-                let d = image.data();
+                // The pixels made for the size it is drawn at, at this
+                // scale (resolution-independence.md §6.4).
+                let d = image.pick_for(rect.size, k).data();
                 let slot = IMAGE_SLOT_BIT | d.id;
                 if self.images.insert(d.id) {
                     let hash = self.conn.upload_blob(&d.rgba)?;

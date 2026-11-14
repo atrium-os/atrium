@@ -268,7 +268,10 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   enabled, action) in its width; when they don't fit, the lowest priorities (the later of
   equals first) move into a "More" menu at its end, in their order, and come back when there
   is room. Scrinium's actions row uses it. Icon-only items are not done yet.
-- Still to do: app-shaped `Glyphs` text.
+- **App-shaped `Glyphs` text is document content**, not UI: a document view
+  (`pergola-document`) and Officina's `pergola-richtext` follow their own zoom (whose default
+  can start from the text size), as §6.1 says for content. So `Node::Glyphs` does not follow
+  `text_scale`; nothing to build.
 
 ### 6.4 Inline images and other inline objects
 
@@ -300,6 +303,31 @@ Rules that make this predictable:
 
 Pergola gains an inline-object leaf in its text flow (`Inline { size: Em | Intrinsic |
 Fraction, baseline }`) used by both widgets and DocumentView.
+
+**Built (step 5, 2026-11-14):**
+
+- `pergola::flow`: a `Flow` of `Piece::Text(text, style)` and `Piece::Inline(Inline)`, broken
+  into lines together (greedy, at spaces and `\n`; a token wider than a line gets a line of
+  its own). `Inline { size, align, content }`: `InlineSize::Em(w, h)` (h at most 1 em, so the
+  line keeps its height), `Intrinsic(pt size)` (shrinks to the line, aspect kept, the line
+  grows to hold it), `Fraction(f, aspect)`; `InlineAlign::Baseline` (bottom on the baseline)
+  or `Middle` (centred on the text's middle, 0.35 em above the baseline); content an image, a
+  glyph in a family (an icon, an emoji) or a filled rounded box (a dot, a chip's body).
+  Constructors `Inline::image` (own size), `Inline::figure(image, f)` and `Inline::glyph`.
+- `Ctx::flow(Flow)` adds one to a layout like `Ctx::paragraph`: it takes the width it is
+  given and is as tall as its lines; after layout it becomes a free stack of text runs and
+  objects (`Node::Image`, `Node::Rect`, a glyph `Node::Text`), with its first baseline for
+  baseline alignment.
+- `Image` has a `density` (pixels per point, default 1; `with_density`) and the same picture
+  at other densities (`with_alternates`). `pt_size()` is pixels over density. Where it is
+  drawn, the window uploads `pick_for(rect, scale)`: the least dense candidate that fills the
+  rect pixel for pixel at the window's scale, else the densest. Drawn larger than its own size
+  (a wide figure, a zoomed document image) asks for denser pixels too. DocumentView images go
+  through the same path, so a document image source that offers alternates (step 7, `srcset`)
+  needs nothing more in Pergola.
+- Not yet: placeholders before an image arrives (the app gives the `Inline` its declared size
+  with a `Box` until then), and re-picking when only the scale changes is the window's full
+  resend on a scale change (step 6 checks it live).
 
 ## 7. Moving windows between monitors
 
@@ -446,7 +474,7 @@ Shankar took the recommendation on each:
 4. **Text size** (§6.1, 6.2, 6.3): system setting broadcast like appearance, em-based tokens,
    overflow menus, min-size hints, anchor-kept scroll. Test: the catalogue lint.
 5. **Inline objects** (§6.4) in Pergola's text flow and DocumentView, with density-aware
-   image picking.
+   image picking. **Built 2026-11-14** (§6.4 "Built").
 6. **Monitor moves** (§7): drag-time resampling and scale switch on release; chaos test
    extended with mixed-scale monitors.
 7. **Navigator** (§10): system text size into `text_scale_64`, density-picked images.

@@ -142,6 +142,13 @@ pub enum Node {
 
 /// RGBA8 (sRGB, straight alpha) pixels, named by a process-wide id so a
 /// window uploads each image once.
+///
+/// An image has a density, pixels per point (resolution-independence.md
+/// §6.4): 1 for a plain bitmap, 2 for one made for 2x displays. Its size in
+/// points is its pixels over its density, so it is the same size on every
+/// display. It may carry the same picture at other densities
+/// ([`Image::with_alternates`]); where it is drawn, the window picks the
+/// one that suits its scale ([`Image::pick`]).
 #[derive(Clone)]
 pub struct Image(std::sync::Arc<ImageData>);
 
@@ -150,6 +157,10 @@ pub struct ImageData {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Pixels per point.
+    pub density: f32,
+    /// The same picture at other densities.
+    pub alternates: Vec<Image>,
 }
 
 static NEXT_IMAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -157,9 +168,69 @@ static NEXT_IMAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 impl Image {
     pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
         assert_eq!(rgba.len(), (width * height * 4) as usize, "RGBA8 pixels");
-        Image(std::sync::Arc::new(ImageData { id: NEXT_IMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed), width, height, rgba }))
+        Image(std::sync::Arc::new(ImageData {
+            id: NEXT_IMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            width,
+            height,
+            rgba,
+            density: 1.0,
+            alternates: Vec::new(),
+        }))
     }
     pub fn data(&self) -> &ImageData { &self.0 }
+
+    fn edit(self, f: impl FnOnce(&mut ImageData)) -> Self {
+        let mut d = match std::sync::Arc::try_unwrap(self.0) {
+            Ok(d) => d,
+            Err(a) => ImageData { id: a.id, width: a.width, height: a.height, rgba: a.rgba.clone(), density: a.density, alternates: a.alternates.clone() },
+        };
+        f(&mut d);
+        // A changed image is a different image to a window that uploaded it.
+        d.id = NEXT_IMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Image(std::sync::Arc::new(d))
+    }
+
+    /// The same pixels at `density` pixels per point.
+    pub fn with_density(self, density: f32) -> Self {
+        let density = if density.is_finite() && density > 0.0 { density } else { 1.0 };
+        self.edit(|d| d.density = density)
+    }
+
+    /// The same picture at other densities, to draw where they suit the
+    /// scale better.
+    pub fn with_alternates(self, alternates: Vec<Image>) -> Self {
+        self.edit(|d| d.alternates = alternates)
+    }
+
+    /// Its size in points: its pixels over its density.
+    pub fn pt_size(&self) -> crate::geom::Size {
+        crate::geom::Size::new(self.0.width as f32 / self.0.density, self.0.height as f32 / self.0.density)
+    }
+
+    /// The candidate (itself or an alternate) to draw at `scale` device
+    /// pixels per point: the least dense at least as dense as the scale,
+    /// else the densest.
+    pub fn pick(&self, scale: f32) -> &Image {
+        let mut best = self;
+        for c in std::iter::once(self).chain(self.0.alternates.iter()) {
+            let (d, b) = (c.0.density, best.0.density);
+            let better = if b >= scale { d >= scale && d < b } else { d > b };
+            if better {
+                best = c;
+            }
+        }
+        best
+    }
+
+    /// The candidate to draw into `size` points at `scale`: as [`Image::pick`]
+    /// for the density that fills it pixel for pixel, so an image drawn
+    /// larger than its own size (a figure across a wide column, a zoomed
+    /// document) gets denser pixels too.
+    pub fn pick_for(&self, size: crate::geom::Size, scale: f32) -> &Image {
+        let pt = self.pt_size();
+        let stretch = if pt.w > 0.0 && pt.h > 0.0 { (size.w / pt.w).max(size.h / pt.h) } else { 1.0 };
+        self.pick(scale * stretch.max(0.0))
+    }
 }
 
 impl PartialEq for Image {
@@ -167,7 +238,7 @@ impl PartialEq for Image {
 }
 
 impl std::fmt::Debug for Image {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Image#{} {}×{}", self.0.id, self.0.width, self.0.height) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Image#{} {}×{}@{}x", self.0.id, self.0.width, self.0.height, self.0.density) }
 }
 
 /// The bounds of `points` under `t` (`[a, b, c, d, e, f]`).
@@ -396,6 +467,8 @@ pub struct NodeTree {
     /// The stack whose natural minimum is the window's minimum size
     /// (`Ctx::min_size_from`); none: the window gives no minimum.
     min_root: Option<NodeId>,
+    /// Stacks that are text with inline objects ([`crate::flow`]).
+    flows: HashMap<NodeId, crate::flow::Shared>,
 }
 
 impl NodeTree {
@@ -409,6 +482,11 @@ impl NodeTree {
     /// The stack whose natural minimum is the window's ([`crate::view::Ctx::min_size_from`]).
     pub fn min_root(&self) -> Option<NodeId> { self.min_root }
     pub fn set_min_root(&mut self, id: NodeId) { self.min_root = Some(id); }
+
+    /// Lay the stack `id` out as `flow`: text and inline objects broken
+    /// into lines together ([`crate::flow`]).
+    pub fn set_flow(&mut self, id: NodeId, flow: crate::flow::Shared) { self.flows.insert(id, flow); }
+    pub fn flow(&self, id: NodeId) -> Option<&crate::flow::Shared> { self.flows.get(&id) }
 
     /// Forget the keys this render did not use.
     pub fn sweep_keys(&mut self) {

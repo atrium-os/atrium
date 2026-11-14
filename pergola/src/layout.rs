@@ -198,6 +198,8 @@ struct MeasureCtx {
     style: TextStyle,
     /// Breaks into lines at the width it is given, so.
     wrap: Option<crate::wrap::Wrap>,
+    /// Text with inline objects instead ([`crate::flow`]); breaks too.
+    flow: Option<crate::flow::Shared>,
 }
 
 thread_local! {
@@ -229,8 +231,17 @@ fn compute(taffy: &mut TaffyTree<MeasureCtx>, t_root: taffy::NodeId, available: 
         t_root,
         available,
         |known, _avail, _id, ctx: Option<&mut MeasureCtx>, _style| {
+            let width_of = |a: AvailableSpace| match a {
+                AvailableSpace::Definite(w) => w,
+                AvailableSpace::MinContent => 0.0,
+                AvailableSpace::MaxContent => f32::INFINITY,
+            };
             let measured = match ctx {
-                Some(MeasureCtx { wrap: Some(w), content, style }) => {
+                Some(MeasureCtx { flow: Some(f), .. }) => {
+                    let width = known.width.unwrap_or(width_of(_avail.width));
+                    crate::flow::lay_out(f, width).size
+                }
+                Some(MeasureCtx { wrap: Some(w), content, style, .. }) => {
                     let wrap = *w;
                     let width = known.width.unwrap_or(match _avail.width {
                         AvailableSpace::Definite(w) => w,
@@ -357,6 +368,17 @@ fn break_lines(tree: &mut NodeTree, id: PNodeId) {
         break_lines(tree, c);
     }
     let fs0 = tree.style(id).copied().unwrap_or_default();
+    if let (Some(f), false) = (tree.flow(id).cloned(), fs0.free) {
+        // Text with inline objects: its runs and objects, where they sit.
+        let rect = tree.get(id).map(|n| n.rect()).unwrap_or(PRect::ZERO_SIZED);
+        let laid = crate::flow::lay_out(&f, rect.w());
+        let baseline = laid.lines.first().map(|l| l.1);
+        tree.set_style(id, FlexStyle { wrap: false, free: true, baseline, ..fs0 });
+        for p in &laid.items {
+            tree.insert(Some(id), crate::flow::node_of(p, rect.origin));
+        }
+        return;
+    }
     let wraps = fs0.wrap;
     let Some(Node::Text { rect, content, style }) = tree.get(id).cloned() else { return };
     if !wraps {
@@ -467,6 +489,13 @@ fn build(
             }
         };
         style.inset = taffy::Rect { left: side(l), top: side(t), right: side(r), bottom: side(b) };
+    }
+
+    if let (Some(f), false) = (tree.flow(id), fs.free) {
+        let r = node.rect();
+        style.size = Size { width: dim(r.size.w), height: dim(r.size.h) };
+        let ctx = MeasureCtx { content: String::new(), style: TextStyle { family: String::new(), size: 0.0, weight: crate::theme::Weight::Regular, color: crate::color::Color::TRANSPARENT }, wrap: None, flow: Some(f.clone()) };
+        return taffy.new_leaf_with_context(style, ctx).ok();
     }
 
     match node {
@@ -585,6 +614,7 @@ fn build(
                         content: content.clone(),
                         style: text_style.clone(),
                         wrap: fs.wrap.then_some(crate::wrap::Wrap { hyphens: fs.hyphens, max_lines: fs.max_lines }),
+                        flow: None,
                     },
                 )
                 .ok()

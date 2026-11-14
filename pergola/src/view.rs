@@ -344,6 +344,17 @@ impl<'a> Ctx<'a> {
         id
     }
 
+    /// Add text with inline objects (images, icons, chips) that breaks into
+    /// lines at the width layout gives it, like [`Ctx::paragraph`]; each
+    /// object sizes as it declares ([`crate::flow`],
+    /// resolution-independence.md §6.4).
+    pub fn flow(&mut self, flow: crate::flow::Flow) -> NodeId {
+        let id = self.add(Node::stack(crate::geom::Axis::Vertical, crate::geom::Rect::ZERO_SIZED, 0.0));
+        self.set_flex(id, crate::layout::FlexStyle { wrap: true, shrink: 1.0, ..crate::layout::FlexStyle::default() });
+        self.tree.set_flow(id, std::sync::Arc::new(flow));
+        id
+    }
+
     /// [`Ctx::paragraph`] with hyphenation and a line limit ("…" past it;
     /// `max_lines: 1` is a truncated label).
     pub fn paragraph_with(&mut self, content: impl Into<String>, style: crate::node::TextStyle, wrap: crate::wrap::Wrap) -> NodeId {
