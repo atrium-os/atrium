@@ -53,6 +53,7 @@ mod outputs;
 mod video;
 mod span;
 mod lock;
+mod frame_stats;
 
 use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, OutputCommit, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
@@ -81,6 +82,7 @@ fn flip_timeout_ms() -> u32 {
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
+    frame_stats::init();
 
     // A shipped frescod never runs a development mode that would put
     // clients' scenes back in this process (officina.md §10.5).
@@ -1558,6 +1560,18 @@ fn render_one_frame(
     /* A window drawn as pixels (split pixel mode) answers from them. */
     let drawn: std::collections::HashSet<u32> =
         windows.iter().filter(|w| w.pixels.is_some()).map(|w| w.id).collect();
+    {
+        let c = comp.lock().unwrap();
+        frame_stats::frame(windows.iter().filter(|w| w.id != 0).map(|w| {
+            let key = match (&w.pixels, split.and_then(|b| b.frame(w.id))) {
+                (Some(p), _) => p.gen,
+                (None, Some(f)) => Arc::as_ptr(&f) as u64,
+                (None, None) => 0,
+            };
+            let title = u16::try_from(w.id).ok().and_then(|id| c.windows.get(&id)).map(|w| w.title.clone()).unwrap_or_default();
+            (w.id, key, title)
+        }));
+    }
     renderer.render(ScreenInput { windows, uploads, clears })?;
     /* Fills packed here that did not draw: their owners hear which. */
     /* A window's frame too costly to raster on the GPU (H6): its owner is

@@ -122,3 +122,8 @@ fresco-text     = { path = "../fresco-text" }
 pergola-gamepad = { path = "../pergola-gamepad" }
 libc            = "0.2"
 png             = "0.17"
+
+# The noisy-neighbour clients (officina.md §10.5, scripts/fresco-noisy-neighbour.sh).
+[[bin]]
+name = "atrium-noisy"
+path = "src/noisy.rs"
