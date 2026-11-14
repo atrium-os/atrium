@@ -1,0 +1,18 @@
+[package]
+name = "capsa-share"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Network share servers (docs/spec/network-shares.md): an SFTP v3 client over capsa-ssh, served to the kernel through capsa-fuse. Runs jailed, one process per mounted share."
+
+[dependencies]
+capsa-ssh = { path = "../capsa-ssh" }
+capsa-fuse = { path = "../capsa-fuse", default-features = false }
+capsa-fat = { path = "../capsa-fat" }
+libc = "0.2"
+zeroize = "1"
+
+[[bin]]
+name = "atrium-share-sftp"
+path = "src/bin/share-sftp.rs"

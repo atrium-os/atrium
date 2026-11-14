@@ -1,0 +1,18 @@
+[package]
+name = "capsa-ssh"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A small SSH-2 client for the SFTP share server (network-shares.md §5.1): curve25519 key exchange with strict KEX, Ed25519/ECDSA/RSA-SHA2 host keys checked against a pin, AES-GCM, password or externally signed Ed25519 user auth, one session channel. No agent, no forwarding, no shell."
+
+[dependencies]
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+aes-gcm = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+base64 = "0.22"
