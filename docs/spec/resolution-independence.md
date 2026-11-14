@@ -159,6 +159,12 @@ fractional). Radii, diagonal strokes and filled paths are not snapped. Edges mov
 half a pixel and sizes by at most one, at 1.0 too, where layout gives fractional positions
 (centred content).
 
+Live check (Mac VM, 2026-11-14): at 1.25 every 1 pt border is a solid 1 px. At 1.5 a
+bordered box's far edge (bottom, sometimes right) is 1 px where the near edge is 2, because
+a border is an outer rect plus a body inset by 1 pt and the two snap independently. The fix
+is to snap a body against its parent's already-snapped edges, which means `Surface::set_node`
+learns the parent rect. Open.
+
 ## 6. Text size and relative sizing of widgets
 
 This is the core of Shankar's second point: widgets must keep their proportions, and must
