@@ -132,7 +132,8 @@ impl View for Toolbar {
                 a();
             }
         })
-        .at(self.rect.x() + self.rect.w() - mw, y)
+        // Square, in the middle of the row's height like the labels.
+        .at(self.rect.x() + self.rect.w() - mw, y + ((bh - mw) / 2.0).max(0.0))
         .height(bh)
         .icon(crate::widgets::phosphor::DOTS_THREE, 16.0, None)
         .render(ctx);

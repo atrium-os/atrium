@@ -25,6 +25,42 @@ fn sizes() -> (f32, f32) {
 fn text_size() {
     grows();
     lint();
+    icon_triggers();
+}
+
+/// An icon trigger's square grows with its glyph (the glyph is sized in
+/// points and drawn at the text size), and a toolbar's "More" sits in the
+/// middle of the row like the labels beside it. At 200% the square was
+/// 28 px around a 32 px glyph, and More hung at the top of the row.
+fn icon_triggers() {
+    use pergola::geom::Rect;
+    use pergola::reactive::Mutable;
+    use pergola::widgets::{phosphor, MenuButton, MenuState, ToolItem, Toolbar};
+    let dots = phosphor::DOTS_THREE.to_string();
+    let at = |milli: u32| {
+        pergola::text::set_text_scale(milli);
+        let b = MenuButton::new("More", Mutable::new(MenuState::default()), vec![], |_| {}).at(10.0, 10.0).height(200.0).icon(phosphor::DOTS_THREE, 16.0, None);
+        let (tree, _) = pergola::view::render(&b, Semantic::LIGHT);
+        let glyph = tree.iter().find_map(|(_, n)| match n { Node::Text { rect, content, .. } if *content == dots => Some(*rect), _ => None }).unwrap();
+        // The smallest rect is the button's own body (halo and ring are around it).
+        let body = tree.iter().filter_map(|(_, n)| match n { Node::Rect { rect, .. } => Some(*rect), _ => None }).min_by(|a, b| a.w().total_cmp(&b.w())).unwrap();
+        (glyph, body)
+    };
+    for milli in [1000, 1500, 2000] {
+        let (g, body) = at(milli);
+        let em = 16.0 * milli as f32 / 1000.0;
+        assert_eq!(body.w(), (em + 12.0).round(), "at {milli}: the square is em + 12");
+        assert!(g.x() >= body.x() && g.x() + g.w() <= body.x() + body.w() && g.y() >= body.y() && g.y() + g.h() <= body.y() + body.h(),
+            "at {milli}: the glyph {g:?} is inside its button {body:?}");
+    }
+    pergola::text::set_text_scale(2000);
+    let items = ["New folder", "Rename", "Delete", "Copy", "Cut", "Paste"].iter().map(|l| ToolItem::new(*l, || {})).collect();
+    let bar = Toolbar::new(Rect::new(0.0, 0.0, 400.0, 0.0), Mutable::new(MenuState::default()), items);
+    let (tree, _) = pergola::view::render(&bar, Semantic::LIGHT);
+    let mid = |want: &str| tree.iter().find_map(|(_, n)| match n { Node::Text { rect, content, .. } if content == want => Some(rect.y() + rect.h() / 2.0), _ => None });
+    let (label, more) = (mid("New folder").expect("a label in the row"), mid(&dots).expect("More is there"));
+    assert!((label - more).abs() <= 1.0, "More's glyph is level with the labels: {more} vs {label}");
+    pergola::text::set_text_scale(1000);
 }
 
 fn grows() {

@@ -49,6 +49,8 @@ pub fn header_h() -> f32 { em(28.0) }
 pub fn status_h() -> f32 { em(28.0) }
 pub fn row_h() -> f32 { em(30.0) }
 pub fn place_h() -> f32 { em(44.0) }
+/// Where a row's text starts: after its 16 px inset and its icon.
+fn text_x() -> f32 { 16.0 + em(28.0) }
 pub fn pick_title_h() -> f32 { em(52.0) }
 pub fn pick_foot_h() -> f32 { em(60.0) }
 
@@ -227,12 +229,13 @@ fn area(ctx: &mut Ctx, r: Rect, radius: f32, fill: Color, hover: Color, on: impl
     id
 }
 
-/// A 28 px ghost icon button.
+/// A 28 pt ghost icon button (its glyph grows with the text size, so the
+/// button does too).
 fn icon_button(ctx: &mut Ctx, x: f32, y: f32, g: char, enabled: bool, tip: &str, on: impl Fn() + 'static) {
     let t = ctx.theme;
-    let r = Rect::new(x, y, 28.0, 28.0);
+    let r = Rect::new(x, y, em(28.0), em(28.0));
     let id = if enabled { area(ctx, r, 6.0, Color::TRANSPARENT, t.state_hover(), on) } else { ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 6.0 }) };
-    icon(ctx, x + 4.0, y + 4.0, g, 20.0, if enabled { t.text_secondary() } else { t.text_disabled() });
+    icon(ctx, x + em(4.0), y + em(4.0), g, 20.0, if enabled { t.text_secondary() } else { t.text_disabled() });
     ctx.pop();
     ctx.tooltip(id, tip.to_string());
 }
@@ -325,25 +328,25 @@ impl ScriniumView {
         let t = ctx.theme;
         rect(ctx, 0.0, top, sw, h - top, t.bg_surface(), 0.0);
         rect(ctx, sw - 1.0, top, 1.0, h - top, t.border_default(), 0.0);
-        text(ctx, 16.0, top + 22.0, "Places", type_size::XS, Weight::Semibold, t.text_tertiary());
+        text(ctx, 16.0, top + em(22.0), "Places", type_size::XS, Weight::Semibold, t.text_tertiary());
         let manager = b.picker().is_none();
         if manager {
             self.servers(ctx, b, top, sw, h);
         }
         if b.places.is_empty() {
-            text(ctx, 16.0, top + 54.0, "Plug in a USB stick", type_size::SM, Weight::Regular, t.text_tertiary());
+            text(ctx, 16.0, top + em(54.0), "Plug in a USB stick", type_size::SM, Weight::Regular, t.text_tertiary());
             return;
         }
         for (i, p) in b.places.iter().enumerate() {
-            let y = top + 38.0 + i as f32 * (place_h() + 2.0);
+            let y = top + em(38.0) + i as f32 * (place_h() + 2.0);
             let on = b.at == Some(i);
             let s = self.state.clone();
             ctx.key(1000 + i as u64);
             area(ctx, Rect::new(8.0, y, sw - 16.0, place_h()), 6.0, if on { t.selection_idle() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&s, |b| b.open_place(i)));
             let g = if p.network { ph::GLOBE } else if p.stick { ph::USB } else { ph::FOLDER };
-            icon(ctx, 16.0, y + 7.0, g, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
-            let room = sw - 16.0 - 44.0 - if p.stick && manager { 30.0 } else { 0.0 };
-            text(ctx, 44.0, y + 15.0, &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
+            icon(ctx, 16.0, y + em(7.0), g, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
+            let room = sw - 16.0 - text_x() - if p.stick && manager { em(30.0) } else { 0.0 };
+            text(ctx, text_x(), y + em(15.0), &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
             let sub = if p.network {
                 let free = if p.offline {
                     "Reconnecting…".into()
@@ -359,11 +362,11 @@ impl ScriniumView {
             } else {
                 p.root.to_string_lossy().into_owned()
             };
-            text(ctx, 44.0, y + 31.0, &fit(&sub, type_size::XS, Weight::Regular, room), type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, text_x(), y + em(31.0), &fit(&sub, type_size::XS, Weight::Regular, room), type_size::XS, Weight::Regular, t.text_tertiary());
             ctx.pop();
             if p.stick && manager {
                 let s = self.state.clone();
-                icon_button(ctx, sw - 44.0, y + 8.0, ph::EJECT, true, if p.network { "Disconnect" } else { "Eject" }, move || with(&s, |b| b.eject(i)));
+                icon_button(ctx, sw - 16.0 - em(28.0), y + em(8.0), ph::EJECT, true, if p.network { "Disconnect" } else { "Eject" }, move || with(&s, |b| b.eject(i)));
             }
         }
     }
@@ -596,16 +599,16 @@ impl ScriniumView {
         names.extend(b.path.iter().cloned());
         // Too long: keep the last crumbs, with an ellipsis for the rest.
         let mut first = 0;
-        let total = |from: usize| names[from..].iter().map(|n| width(n, type_size::SM, Weight::Medium) + 28.0).sum::<f32>();
+        let total = |from: usize| names[from..].iter().map(|n| width(n, type_size::SM, Weight::Medium) + 10.0 + em(18.0)).sum::<f32>();
         while first + 1 < names.len() && x + total(first) > max_x {
             first += 1;
         }
         let mut cx = x;
         if first > 0 {
             text(ctx, cx, cy, "…", type_size::SM, Weight::Regular, t.text_tertiary());
-            cx += 14.0;
-            icon(ctx, cx, cy - 7.0, ph::CARET_RIGHT, 14.0, t.text_tertiary());
-            cx += 18.0;
+            cx += width("…", type_size::SM, Weight::Regular) + 4.0;
+            icon(ctx, cx, cy - em(7.0), ph::CARET_RIGHT, 14.0, t.text_tertiary());
+            cx += em(18.0);
         }
         for (d, n) in names.iter().enumerate().skip(first) {
             let last = d + 1 == names.len();
@@ -613,13 +616,13 @@ impl ScriniumView {
             let wd = width(&label, type_size::SM, Weight::Medium) + 10.0;
             let s = self.state.clone();
             ctx.key(2000 + d as u64);
-            area(ctx, Rect::new(cx - 5.0, cy - 13.0, wd, 26.0), 5.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.up_to(d)));
+            area(ctx, Rect::new(cx - 5.0, cy - em(13.0), wd, em(26.0)), 5.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.up_to(d)));
             text(ctx, cx, cy, &label, type_size::SM, if last { Weight::Semibold } else { Weight::Medium }, if last { t.text_primary() } else { t.text_secondary() });
             ctx.pop();
             cx += wd;
             if !last {
-                icon(ctx, cx, cy - 7.0, ph::CARET_RIGHT, 14.0, t.text_tertiary());
-                cx += 18.0;
+                icon(ctx, cx, cy - em(7.0), ph::CARET_RIGHT, 14.0, t.text_tertiary());
+                cx += em(18.0);
             }
         }
     }
@@ -637,7 +640,7 @@ impl ScriniumView {
         let head = |ctx: &mut Ctx, x: f32, s: &str| {
             text(ctx, x0 + x, y0 + header_h() / 2.0, s, type_size::XS, Weight::Semibold, t.text_tertiary());
         };
-        head(ctx, 44.0, "Name");
+        head(ctx, text_x(), "Name");
         if wide {
             head(ctx, kind_x, "Kind");
             head(ctx, size_x + size_w - width("Size", type_size::XS, Weight::Semibold), "Size");
@@ -673,9 +676,9 @@ impl ScriniumView {
             // In a file picker folders are for going into: dimmer.
             let dim = picking_files == Some(true) && e.dir;
             let fg = if e.link { t.text_tertiary() } else { t.text_primary() };
-            icon(ctx, 16.0, 7.0, file_icon(&e.name, e.dir, e.link), 16.0, if e.dir { t.accent_fg() } else { t.text_secondary() });
-            let name_w = if kind_w > 0.0 { kind_x - 52.0 } else { size_x - 52.0 };
-            text(ctx, 44.0, row_h() / 2.0, &fit(&e.name, type_size::SM, Weight::Regular, name_w), type_size::SM, Weight::Regular, if dim { t.text_secondary() } else { fg });
+            icon(ctx, 16.0, em(7.0), file_icon(&e.name, e.dir, e.link), 16.0, if e.dir { t.accent_fg() } else { t.text_secondary() });
+            let name_w = if kind_w > 0.0 { kind_x } else { size_x } - text_x() - 8.0;
+            text(ctx, text_x(), row_h() / 2.0, &fit(&e.name, type_size::SM, Weight::Regular, name_w), type_size::SM, Weight::Regular, if dim { t.text_secondary() } else { fg });
             if kind_w > 0.0 {
                 text(ctx, kind_x, row_h() / 2.0, fs::kind_of(&e.name, e.dir), type_size::SM, Weight::Regular, t.text_secondary());
             }
@@ -704,10 +707,10 @@ impl ScriniumView {
         // Toolbar: back, up, the path.
         rect(ctx, x0, toolbar_h() - 1.0, w - x0, 1.0, t.border_default(), 0.0);
         let s = self.state.clone();
-        icon_button(ctx, x0 + 10.0, 10.0, ph::ARROW_LEFT, b.can_go_back(), "Back (Alt-Left)", move || with(&s, Browser::go_back));
+        icon_button(ctx, x0 + 10.0, em(10.0), ph::ARROW_LEFT, b.can_go_back(), "Back (Alt-Left)", move || with(&s, Browser::go_back));
         let s = self.state.clone();
-        icon_button(ctx, x0 + 42.0, 10.0, ph::ARROW_UP, !b.path.is_empty(), "Up (Backspace)", move || with(&s, Browser::up));
-        self.crumbs(ctx, b, x0 + 84.0, toolbar_h() / 2.0, w - 16.0);
+        icon_button(ctx, x0 + 10.0 + em(32.0), em(10.0), ph::ARROW_UP, !b.path.is_empty(), "Up (Backspace)", move || with(&s, Browser::up));
+        self.crumbs(ctx, b, x0 + 20.0 + em(64.0), toolbar_h() / 2.0, w - 16.0);
 
         // What can be done here.
         let ay = toolbar_h() + 4.0;
@@ -746,8 +749,8 @@ impl ScriniumView {
             let fx = x0 + 24.0 + width(&label, type_size::SM, Weight::Medium);
             let fw = (w - fx - 200.0).clamp(120.0, 320.0);
             let s = self.state.clone();
-            let holder = ctx.push(Node::Rect { rect: Rect::new(fx, y + 8.0, fw, 32.0), fill: Color::TRANSPARENT, radius: 0.0 });
-            TextField::new(self.field.clone()).at(fx, y + 8.0).width(fw).on_submit(move |v| with(&s, |b| b.commit_edit(v))).render(ctx);
+            let holder = ctx.push(Node::Rect { rect: Rect::new(fx, y + em(8.0), fw, em(32.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+            TextField::new(self.field.clone()).at(fx, y + em(8.0)).width(fw).on_submit(move |v| with(&s, |b| b.commit_edit(v))).render(ctx);
             ctx.pop();
             if let Some(&bg) = ctx.tree.children_of(holder).get(2) {
                 ctx.autofocus(bg);
@@ -755,12 +758,12 @@ impl ScriniumView {
             let (s, f) = (self.state.clone(), self.field.clone());
             let go = if matches!(edit, Edit::NewFolder) { "Create" } else { "Rename" };
             let bx = fx + fw + 10.0;
-            let bw = button(ctx, bx, y + 8.0, go, Look::Primary, true, move || {
+            let bw = button(ctx, bx, y + em(8.0), go, Look::Primary, true, move || {
                 let v = f.get_cloned().text().to_string();
                 with(&s, |b| b.commit_edit(&v));
             });
             let s = self.state.clone();
-            button(ctx, bx + bw + 6.0, y + 8.0, "Cancel", Look::Ghost, true, move || with(&s, Browser::cancel_edit));
+            button(ctx, bx + bw + 6.0, y + em(8.0), "Cancel", Look::Ghost, true, move || with(&s, Browser::cancel_edit));
             y += strip_h();
         } else if let Some(names) = &b.confirm_delete {
             rect(ctx, x0, y, w - x0, strip_h(), t.accent_bg(), 0.0);
@@ -769,17 +772,18 @@ impl ScriniumView {
             } else {
                 format!("Delete {} items? They can't be brought back.", names.len())
             };
-            icon(ctx, x0 + 14.0, y + 14.0, ph::WARNING, 20.0, t.danger_fg());
-            text(ctx, x0 + 42.0, y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
-            let bx = x0 + 54.0 + width(&q, type_size::SM, Weight::Medium);
+            icon(ctx, x0 + 14.0, y + em(14.0), ph::WARNING, 20.0, t.danger_fg());
+            text(ctx, x0 + 14.0 + em(28.0), y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
+            let bx = x0 + 26.0 + em(28.0) + width(&q, type_size::SM, Weight::Medium);
             let s = self.state.clone();
-            let bw = button(ctx, bx, y + 8.0, "Delete", Look::Danger, true, move || with(&s, Browser::delete_confirmed));
+            let bw = button(ctx, bx, y + em(8.0), "Delete", Look::Danger, true, move || with(&s, Browser::delete_confirmed));
             let s = self.state.clone();
-            button(ctx, bx + bw + 6.0, y + 8.0, "Cancel", Look::Ghost, true, move || with(&s, |b| b.confirm_delete = None));
+            button(ctx, bx + bw + 6.0, y + em(8.0), "Cancel", Look::Ghost, true, move || with(&s, |b| b.confirm_delete = None));
             y += strip_h();
         }
 
-        self.list(ctx, b, x0, w, y, h - status_h(), w - x0 > 620.0);
+        // Room for the Kind and Modified columns (em-sized) beside a useful name.
+        self.list(ctx, b, x0, w, y, h - status_h(), w - x0 > em(620.0));
 
         // The status line.
         let sy = h - status_h();

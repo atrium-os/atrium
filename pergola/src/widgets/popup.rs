@@ -654,12 +654,15 @@ impl MenuButton {
         self
     }
     /// Show a Phosphor glyph (`size` pt, grown with the text size; `color` or `text-secondary`)
-    /// instead of the label: a square ghost button `size` + 12 wide, as
+    /// instead of the label: a square ghost button em(`size`) + 12 wide, as
     /// tall as its rect. In a row it takes its natural size.
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
         self.icon = Some(TriggerIcon { glyph, size, color, vector: None, tint: None });
-        self.rect.size.w = (size + 12.0).round();
-        self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
+        // The glyph grows with the text size where it is drawn: the
+        // square around it grows with it.
+        let g = crate::theme::size::em(size);
+        self.rect.size.w = (g + 12.0).round();
+        self.rect.size.h = self.rect.size.h.min(g + 12.0).max(g + 8.0);
         self
     }
     /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
@@ -765,8 +768,11 @@ impl PanelButton {
     /// A Phosphor glyph instead of the label (see [`MenuButton::icon`]).
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
         self.icon = Some(TriggerIcon { glyph, size, color, vector: None, tint: None });
-        self.rect.size.w = (size + 12.0).round();
-        self.rect.size.h = self.rect.size.h.min(size + 12.0).max(size + 8.0);
+        // The glyph grows with the text size where it is drawn: the
+        // square around it grows with it.
+        let g = crate::theme::size::em(size);
+        self.rect.size.w = (g + 12.0).round();
+        self.rect.size.h = self.rect.size.h.min(g + 12.0).max(g + 8.0);
         self
     }
     /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
