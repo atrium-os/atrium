@@ -1,291 +1,498 @@
 //! forum-dock — Forum's launcher, an ordinary graphics-only app.
 //!
 //! It holds `app-launch` — the grant to ASK portcullisd for the installed-app
-//! catalog and to request a launch. That is all it is: the requester. portcullisd
-//! (the TCB) still does the verify → allocate uid → register → jail dance, and the
-//! user's grants still authorize it (docs/spec/forum.md §6). The capability exists
-//! because a jailed dock can reach the daemon no other way, and because the catalog
-//! coming over that socket means the launcher never needs the app tree mounted.
+//! catalog and to request a launch — and `forum-control` (the WM intents). That
+//! is all it is: the requester. portcullisd (the TCB) still does the verify →
+//! allocate uid → register → jail dance, and the user's grants still authorize
+//! it (docs/spec/forum.md §6).
+//!
+//! It draws two windows (§6.1): the dock (the wallpaper and the row of pinned
+//! and running apps, behind everything) and, while it is up, the Applications
+//! view (every installed app, type to filter), each on a thread of its own.
 //!
 //! Usage:
-//!   forum-dock              # list installed apps
+//!   forum-dock              # the dock
+//!   forum-dock list         # list installed apps
 //!   forum-dock launch <id>  # ask the TCB to launch app <id>
 //!
-//! Apps dir: FORUM_APPS_DIR (default /var/lib/atrium/apps).
+//! Apps dir: FORUM_APPS_DIR (default /var/lib/atrium/apps). Pins: §6.1.
 
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use forum_dock::{catalog, AppEntry, APPS_DIR};
-use portcullis_ipc::{
-    read_response, round_trip, send_fds, write_request, Request, Response, PROTO_VERSION,
-    SOCKET_PATH,
-};
+use forum_dock::apps::{self, Move};
+use forum_dock::apps_view::{self, Action, AppsState, AppsView, Note};
+use forum_dock::dock_view::{reserve_pt, DockAction, DockState, DockView};
+use forum_dock::launch::{self, PreLaunch};
+use forum_dock::pins::{self, Pins};
+use forum_dock::{AppEntry, APPS_DIR};
 
-use fresco_client::Connection;
 use fresco_protocol::{WindowHints, WmRole};
-use pergola::geom::Rect;
-use pergola::theme::{palette, radius, Semantic};
-use pergola::view::{Ctx, View};
-use pergola::{commit, App, FrescoSurface, Node, Surface};
+use pergola::window::{SizeSpec, StepResult, Window, WindowDesc};
+use pergola::{App, Mutable};
 
 fn apps_dir() -> PathBuf {
     std::env::var("FORUM_APPS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(APPS_DIR))
 }
 
-/// The output geometry — ASKED, not assumed.
-///
-/// The dock fills the screen (it paints the wallpaper) and anchors its launcher
-/// to the bottom edge, so a wrong screen size does not just look off, it puts
-/// the launcher outside the display: hardcoded 1280x720 on a 640x480 scanout
-/// placed the strip at y=600, below the bottom, and the desktop came up with no
-/// visible dock at all.
-///
-/// FRESCO_SCREEN/FORUM_SCREEN still override for dev, but they cannot be the
-/// mechanism: portcullisd launches an app through jail(8), which does not carry
-/// the environment in, so a jailed dock can only be told by asking frescod.
-fn screen_wh(conn: &mut Connection) -> (f32, f32) {
-    if let Some((w, h)) = std::env::var("FORUM_SCREEN").ok().and_then(|s| {
-        let (a, b) = s.split_once('x')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-    }) {
-        eprintln!("forum-dock: screen {w}x{h} (FORUM_SCREEN override)");
-        return (w, h);
-    }
-    match conn.display_info() {
-        Ok(d) if d.width > 0 && d.height > 0 => {
-            eprintln!("forum-dock: screen {}x{} @ {} mHz, scale {} (from frescod)",
-                      d.width, d.height, d.refresh_mhz, d.scale_milli as f32 / 1000.0);
-            // In points (resolution-independence.md §3).
-            let pt = |v: u32| fresco_protocol::device_to_pt(v as f32, d.scale_milli).floor();
-            (pt(d.width), pt(d.height))
-        }
-        Ok(_) => { eprintln!("forum-dock: frescod reports no mode; assuming 1280x720");
-                   (1280.0, 720.0) }
-        Err(e) => { eprintln!("forum-dock: display_info failed ({e}); assuming 1280x720");
-                    (1280.0, 720.0) }
-    }
-}
+// ── state shared by the dock's threads ───────────────────────────────────────
 
-const TILE: f32 = 60.0;
-const GAP: f32 = 16.0;
-const PAD: f32 = 16.0;
-/// The gap between the dock panel and the bottom of the screen.
-const MARGIN: f32 = 28.0;
-/// How tall the dock draws from the bottom of the screen, in points: what
-/// it asks forum-wm to keep free of windows (`Intent::ReserveBottom`).
-const RESERVE_PT: u32 = (PAD * 2.0 + TILE + MARGIN) as u32;
-
-// Lucide vector icons (ISC), embedded + parsed once into polylines. Drawn as stroked
-// segments — resolution-independent, like everything in the vector scene graph.
-const SVG_EDITOR: &str = include_str!("../../assets/icons/lucide/editor.svg");
-const SVG_TERMINAL: &str = include_str!("../../assets/icons/lucide/terminal.svg");
-const SVG_FILES: &str = include_str!("../../assets/icons/lucide/files.svg");
-const SVG_SETTINGS: &str = include_str!("../../assets/icons/lucide/settings.svg");
-const SVG_BROWSER: &str = include_str!("../../assets/icons/lucide/browser.svg");
-
-struct Icons {
-    editor: pergola::icon::IconGeometry,
-    terminal: pergola::icon::IconGeometry,
-    files: pergola::icon::IconGeometry,
-    settings: pergola::icon::IconGeometry,
-    browser: pergola::icon::IconGeometry,
-}
-
-impl Icons {
-    fn load() -> Self {
-        use pergola::icon::parse_icon;
-        Icons {
-            editor: parse_icon(SVG_EDITOR),
-            terminal: parse_icon(SVG_TERMINAL),
-            files: parse_icon(SVG_FILES),
-            settings: parse_icon(SVG_SETTINGS),
-            browser: parse_icon(SVG_BROWSER),
-        }
-    }
-    /// Pick the app's icon: the manifest's declared `[app] icon` if present, else a
-    /// keyword match on the id/name as a fallback. (A full system would resolve the
-    /// declared name against the whole icon set / the app's bundled SVG; for now it
-    /// maps onto the embedded dock set.)
-    fn for_app(&self, app: &AppEntry) -> &pergola::icon::IconGeometry {
-        let s = app.icon.clone()
-            .unwrap_or_else(|| format!("{} {}", app.id, app.name))
-            .to_lowercase();
-        if s.contains("term") { &self.terminal }
-        else if s.contains("file") || s.contains("folder") { &self.files }
-        else if s.contains("setting") || s.contains("config") || s.contains("pref") { &self.settings }
-        else if s.contains("brows") || s.contains("web") || s.contains("net") { &self.browser }
-        else { &self.editor }
-    }
-}
-
-/// The dock: the signature teal desktop with a rounded dock panel of app tiles
-/// centred at the bottom. Each tile carries the app's Lucide vector icon. All from
-/// theme tokens.
-struct DockView {
+/// What both windows show. `version` moves on every change, so a window
+/// redraws only when something it shows changed.
+#[derive(Debug, Default)]
+struct Shared {
     apps: Vec<AppEntry>,
-    icons: Icons,
-    /// The window's size in points; the loop updates it on a resize or a
-    /// scale change.
-    size: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
+    pins: Pins,
+    running: HashSet<u32>,
+    apps_open: bool,
+    version: u64,
 }
 
-impl View for DockView {
-    fn render(&self, ctx: &mut Ctx) {
-        let t = ctx.theme;
-        let (w, h) = self.size.get();
-        // Desktop wallpaper.
-        ctx.push(Node::Rect {
-            rect: Rect::new(0.0, 0.0, w, h),
-            fill: palette::deep_teal(),
-            radius: 0.0,
-        });
+type SharedRef = Arc<Mutex<Shared>>;
 
-        let n = self.apps.len().max(1) as f32;
-        let dock_w = PAD * 2.0 + n * TILE + (n - 1.0) * GAP;
-        let dock_h = PAD * 2.0 + TILE;
-        let dock_x = (w - dock_w) * 0.5;
-        let dock_y = h - dock_h - MARGIN;
+impl Shared {
+    fn bump(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
 
-        // Dock panel — elevated, rounded.
-        ctx.add(Node::Rect {
-            rect: Rect::new(dock_x, dock_y, dock_w, dock_h),
-            fill: t.bg_elevated(),
-            radius: radius::LG,
-        });
-
-        for (i, app) in self.apps.iter().enumerate() {
-            let tx = dock_x + PAD + i as f32 * (TILE + GAP);
-            let ty = dock_y + PAD;
-            // Tile — the first app uses the accent (as if focused/running); the rest a
-            // recessed surface tone.
-            let fill = if i == 0 { t.accent_fg() } else { t.bg_surface() };
-            ctx.add(Node::Rect {
-                rect: Rect::new(tx, ty, TILE, TILE),
-                fill,
-                radius: radius::MD,
-            });
-            // The app's vector icon, centred in the tile. White on the accent tile,
-            // primary-ink on the neutral tiles.
-            let icon_color = if i == 0 {
-                pergola::color::Color::rgba(1.0, 1.0, 1.0, 1.0)
-            } else {
-                t.text_primary()
-            };
-            let icon_size = 30.0;
-            let inset = (TILE - icon_size) * 0.5;
-            pergola::icon::draw_icon(
-                ctx,
-                self.icons.for_app(app),
-                tx + inset, ty + inset, icon_size,
-                2.0,
-                icon_color,
-            );
-        }
-
-        ctx.pop();
+    fn dock_state(&self) -> DockState {
+        DockState { apps: self.apps.clone(), pins: self.pins.clone(), running: self.running.clone(), apps_open: self.apps_open }
     }
 }
 
-/// Sample apps when no real catalog is installed (so the dock renders standalone).
-fn sample_apps() -> Vec<AppEntry> {
-    [("Edit", "editor"), ("Terminal", "terminal"), ("Files", "files"),
-     ("Settings", "settings"), ("Browser", "browser")]
-        .iter()
-        .map(|(n, icon)| AppEntry {
-            id: format!("org.atrium.{}", n.to_lowercase()),
-            name: (*n).into(),
-            description: None,
-            icon: Some((*icon).into()), // as if declared in the manifest
-        })
-        .collect()
-}
-
-fn render_dock() -> io::Result<()> {
-    let mode = match std::env::var("FORUM_THEME").as_deref() {
-        Ok("dark") => Semantic::DARK,
-        _ => Semantic::LIGHT,
-    };
-    // ★ Ask the daemon first, filesystem second. A jailed dock has no app tree
-    // (deliberately), so the old filesystem-only scan came back empty and the
-    // fallback below quietly drew FAKE apps — a launcher that looks like it is
-    // working. Say what happened instead of papering over it.
-    let (mut apps, src) = forum_dock::catalog_resolved(&apps_dir());
-    match (&src, apps.is_empty()) {
+/// Fetch the catalog into `shared`. Says what happened: "nothing is
+/// installed" and "I could not see any apps" look the same on screen.
+fn refresh_catalog(shared: &SharedRef) {
+    let (all, src) = forum_dock::catalog_resolved(&apps_dir());
+    match (&src, all.is_empty()) {
         (forum_dock::CatalogSource::Unavailable, _) => eprintln!(
-            "forum-dock: NO CATALOG — portcullisd is not reachable and {} is not \
-             readable. Drawing placeholders; nothing here can launch. (A jailed \
-             dock needs the `app-launch` capability.)",
+            "forum-dock: NO CATALOG — portcullisd is not reachable and {} is not readable \
+             (a jailed dock needs the `app-launch` capability)",
             apps_dir().display()
         ),
         (_, true) => eprintln!("forum-dock: catalog from {src:?} is empty — no apps installed"),
-        (_, false) => eprintln!("forum-dock: {} app(s) from {src:?}", apps.len()),
+        (_, false) => {}
     }
-    if apps.is_empty() {
-        apps = sample_apps();
+    let listed = apps::listed(&all);
+    let mut s = shared.lock().unwrap();
+    if s.apps != listed {
+        eprintln!("forum-dock: {} app(s) from {src:?}", listed.len());
+        s.apps = listed;
+        s.bump();
     }
-    let mut conn = Connection::connect_default()?;
-    // The dock draws the full-screen wallpaper + the dock panel, so it's the
-    // back/background surface — the WM places it behind everything; the dock
-    // panel it paints in the bottom strip stays visible under documents.
-    let hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
-    let (sw, sh) = screen_wh(&mut conn);
-    let win = conn.window_create(sw as u32, sh as u32, "forum-dock", hints)?;
-    // The system appearance (visual language §15); FORUM_THEME only when
-    // frescod has none to give.
-    let mode = conn.appearance().map(|a| pergola::window::theme_for(&a)).unwrap_or(mode);
-    let mut surface = FrescoSurface::new(conn, win);
-    // Tell the WM how tall the dock draws, so a maximized window ends above
-    // it (resolution-independence.md §7.2). Best effort: without forum-wm
-    // (a bare dev session) there is nothing to tell.
-    if let Err(e) = reserve_bottom(RESERVE_PT) {
-        eprintln!("forum-dock: could not reserve {RESERVE_PT} pt for the dock: {e}");
-    }
+}
 
-    let size = std::rc::Rc::new(std::cell::Cell::new((sw, sh)));
-    let mut app = App::new(DockView { apps, icons: Icons::load(), size: size.clone() }).with_theme(mode);
-    let deltas = app.tick();
-    eprintln!("forum-dock: drawing the dock ({} node deltas)", deltas.len());
-    commit(&mut surface, &deltas)?;
-    surface.present()?;
+// ── launching ────────────────────────────────────────────────────────────────
 
-    // ★ Stay up. The dock paints the wallpaper and the launcher strip — it IS
-    // the desktop background, so exiting takes the desktop with it. It used to
-    // draw once, sleep 30s and quit. Its content is static (the catalog only
-    // changes on install/uninstall), so unlike the bar it has nothing to
-    // repaint: park instead of polling, and do no compositing at all while
-    // idle. A redraw comes from the WM re-declaring the layout, not from here.
-    // The one thing that changes it is the system appearance: redraw then.
-    loop {
-        match surface.connection().wait_event(None)? {
-            Some(fresco_client::Event::Appearance(a)) => {
-                app.set_theme(pergola::window::theme_for(&a));
-                let deltas = app.tick();
-                if !deltas.is_empty() {
-                    commit(&mut surface, &deltas)?;
-                    surface.present()?;
+/// What a launch came to, for the Applications view.
+#[derive(Debug)]
+enum Report {
+    /// Started, or its window was focused: the view's job is done.
+    Done(String),
+    /// Stays up, saying this.
+    Note(String, String),
+}
+
+/// From the dock and the key thread to the Applications view's thread.
+#[derive(Debug)]
+enum ToApps {
+    Toggle,
+    Launched(Report),
+}
+
+/// Ask portcullisd to launch `id` on a thread of its own (the request stays
+/// open while the app runs), and tell the Applications view how it went.
+fn start_launch(id: String, name: String, to_apps: Sender<ToApps>) {
+    std::thread::spawn(move || {
+        // The app gets the dock's stdio: the session's log.
+        let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
+        match launch::request(&id, stdio) {
+            PreLaunch::Started(run) => {
+                eprintln!("forum-dock: launched '{id}'");
+                let _ = to_apps.send(ToApps::Launched(Report::Done(id.clone())));
+                match run.wait() {
+                    Ok(code) => eprintln!("forum-dock: '{id}' exited (code {code:?})"),
+                    Err(e) => eprintln!("forum-dock: '{id}': {e}"),
                 }
             }
-            // A new size or scale (the WM re-laid out; the monitor's scale
-            // changed): lay out in the new points, draw at the new scale.
-            Some(fresco_client::Event::Resized { window_id, width, height, scale, .. }) if window_id == win => {
-                if scale.is_finite() && scale > 0.0 && scale != surface.scale {
-                    surface.scale = scale;
-                    app.resend_all();
+            PreLaunch::AlreadyRunning { jid, uid } => {
+                eprintln!("forum-dock: '{id}' is already running (jid {jid})");
+                match launch::focus_running(uid) {
+                    Ok(Some(sid)) => eprintln!("forum-dock: asked the WM to focus its surface {sid}"),
+                    Ok(None) => eprintln!("forum-dock: '{id}' has no window to focus"),
+                    Err(e) => eprintln!("forum-dock: could not focus '{id}': {e}"),
                 }
-                if (width, height) != size.get() {
-                    size.set((width, height));
-                    app.invalidate();
+                let _ = to_apps.send(ToApps::Launched(Report::Done(id)));
+            }
+            PreLaunch::NeedsApproval(delta) => {
+                eprintln!("forum-dock: '{id}' needs the user's approval: {}", delta.join("; "));
+                let text = format!("{name} needs your approval before it can run: {}", delta.join(", "));
+                let _ = to_apps.send(ToApps::Launched(Report::Note(id, text)));
+            }
+            PreLaunch::Failed(why) => {
+                eprintln!("forum-dock: launch of '{id}': {why}");
+                let _ = to_apps.send(ToApps::Launched(Report::Note(id, format!("{name} could not start: {why}"))));
+            }
+        }
+    });
+}
+
+fn name_of(shared: &SharedRef, id: &str) -> String {
+    shared.lock().unwrap().apps.iter().find(|a| a.id == id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string())
+}
+
+fn toggle_pin(shared: &SharedRef, id: &str) {
+    let mut s = shared.lock().unwrap();
+    let apps = s.apps.clone();
+    s.pins.toggle(&apps, id);
+    s.bump();
+    if let Some(p) = pins::path() {
+        if let Err(e) = s.pins.save(&p) {
+            eprintln!("forum-dock: could not save pins to {} ({e}); they hold until logout", p.display());
+        }
+    }
+}
+
+// ── the Applications view (§6.1) ─────────────────────────────────────────────
+
+const KEY_ENTER: u16 = 0x28;
+const KEY_ESCAPE: u16 = 0x29;
+const KEY_PAGE_UP: u16 = 0x4B;
+const KEY_PAGE_DOWN: u16 = 0x4E;
+const KEY_RIGHT: u16 = 0x4F;
+const KEY_LEFT: u16 = 0x50;
+const KEY_DOWN: u16 = 0x51;
+const KEY_UP: u16 = 0x52;
+const KEY_KP_ENTER: u16 = 0x58;
+/// How often the open view looks for launch results and Super+A.
+const APPS_POLL: Duration = Duration::from_millis(50);
+/// Wheel travel that turns a page, and the pause after a turn.
+const WHEEL_PAGE: f32 = 60.0;
+const WHEEL_REST: Duration = Duration::from_millis(350);
+
+/// The view's thread: waits closed, opens on a toggle, runs until closed.
+fn apps_thread(rx: Receiver<ToApps>, to_self: Sender<ToApps>, shared: SharedRef) {
+    loop {
+        match rx.recv() {
+            Ok(ToApps::Toggle) => {
+                if let Err(e) = run_apps_view(&rx, &to_self, &shared) {
+                    eprintln!("forum-dock: Applications view: {e}");
                 }
-                let deltas = app.tick();
-                if !deltas.is_empty() {
-                    commit(&mut surface, &deltas)?;
-                    surface.present()?;
+                let mut s = shared.lock().unwrap();
+                s.apps_open = false;
+                s.bump();
+            }
+            // A launch from the dock while the view is closed: logged already.
+            Ok(ToApps::Launched(_)) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &SharedRef) -> io::Result<()> {
+    // New installs show up each time it opens.
+    refresh_catalog(shared);
+    let mut desc = WindowDesc::new("Applications", SizeSpec::FullScreen);
+    desc.hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), ..Default::default() };
+    let mut win = Window::open(&desc)?;
+    {
+        let mut s = shared.lock().unwrap();
+        s.apps_open = true;
+        s.bump();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let (state0, mut seen) = {
+        let s = shared.lock().unwrap();
+        (AppsState { apps: s.apps.clone(), pins: s.pins.clone(), ..Default::default() }, s.version)
+    };
+    // Opened at the screen's size: that is also its minimum, so forum-wm's
+    // dialog rule gives it the whole work area (forum.md §6.1).
+    let mut view = AppsView::new(state0, (win.width, win.height), dirty.clone());
+    view.min = (win.width, win.height);
+    let (state, query, size, actions) = (view.state.clone(), view.query.clone(), view.size.clone(), view.actions.clone());
+    let mut app = App::new_with_flag(view, dirty);
+    let mut last_query = String::new();
+    let mut wheel = 0.0f32;
+    let mut wheel_rest = Instant::now();
+    let mut had_focus = false;
+    win.paint(&mut app)?;
+
+    loop {
+        let ev = match win.step(&mut app, Some(APPS_POLL))? {
+            StepResult::Closed => return Ok(()),
+            StepResult::Event(ev) => Some(ev),
+            StepResult::Timeout => None,
+        };
+        if size.get() != (win.width, win.height) {
+            size.set((win.width, win.height));
+        }
+        let lay = apps_view::layout(win.width, win.height);
+        let matches = || -> Vec<usize> {
+            let s = state.get_cloned();
+            apps::filter(&s.apps, query.get_cloned().text())
+        };
+        let select = |m: Move| {
+            let n = matches().len();
+            let mut s = state.get_cloned();
+            s.selected = apps::moved(s.selected, n, lay.grid, m);
+            state.set(s);
+        };
+        let mut close = false;
+        use fresco_client::Event as E;
+        match ev {
+            Some(E::Key { hid_usage, pressed: true, modifiers, .. }) if modifiers & 0x88 == 0 => match hid_usage {
+                KEY_ESCAPE => {
+                    if query.get_cloned().text().is_empty() {
+                        close = true;
+                    } else {
+                        query.set(pergola::text_edit::TextEdit::new(""));
+                    }
+                }
+                KEY_ENTER | KEY_KP_ENTER => {
+                    let s = state.get_cloned();
+                    if let Some(&i) = matches().get(s.selected) {
+                        actions.borrow_mut().push(Action::Launch(s.apps[i].id.clone()));
+                    }
+                }
+                KEY_LEFT => select(Move::Left),
+                KEY_RIGHT => select(Move::Right),
+                KEY_UP => select(Move::Up),
+                KEY_DOWN => select(Move::Down),
+                KEY_PAGE_UP => select(Move::PageUp),
+                KEY_PAGE_DOWN => select(Move::PageDown),
+                _ => {}
+            },
+            // Another button on a tile selects it (its pin button shows),
+            // without launching.
+            Some(E::PointerButton { pressed: true, button, x, y, .. }) if button != 1 => {
+                let n = matches().len();
+                let page = lay.grid.page_of(state.get_cloned().selected.min(n.saturating_sub(1)));
+                if let Some(i) = lay.item_at(page, n, x, y) {
+                    let mut s = state.get_cloned();
+                    s.selected = i;
+                    state.set(s);
+                }
+            }
+            Some(E::PointerScroll { dy, .. }) => {
+                if wheel_rest.elapsed() >= WHEEL_REST {
+                    wheel += dy;
+                    if wheel.abs() >= WHEEL_PAGE {
+                        select(if wheel > 0.0 { Move::PageDown } else { Move::PageUp });
+                        wheel = 0.0;
+                        wheel_rest = Instant::now();
+                    }
+                }
+            }
+            Some(E::FocusChanged { window_id, gained, .. }) if window_id == win.id() => {
+                // Gone to something else: it isn't wanted any more.
+                if gained {
+                    had_focus = true;
+                } else if had_focus {
+                    close = true;
                 }
             }
             _ => {}
+        }
+
+        // Typing: the best match is selected, and an old note goes.
+        let q = query.get_cloned().text().to_string();
+        if q != last_query {
+            last_query = q;
+            let mut s = state.get_cloned();
+            s.selected = 0;
+            s.note = None;
+            state.set(s);
+        }
+
+        for a in std::mem::take(&mut *actions.borrow_mut()) {
+            match a {
+                Action::Close => close = true,
+                Action::TogglePin(id) => toggle_pin(shared, &id),
+                Action::Launch(id) => {
+                    let mut s = state.get_cloned();
+                    if s.launching.is_none() {
+                        s.launching = Some(id.clone());
+                        s.note = None;
+                        state.set(s);
+                        start_launch(id.clone(), name_of(shared, &id), to_self.clone());
+                    }
+                }
+            }
+        }
+
+        loop {
+            match rx.try_recv() {
+                Ok(ToApps::Toggle) => close = true,
+                Ok(ToApps::Launched(Report::Done(id))) => {
+                    if state.get_cloned().launching.as_deref() == Some(id.as_str()) {
+                        close = true;
+                    }
+                }
+                Ok(ToApps::Launched(Report::Note(id, text))) => {
+                    let mut s = state.get_cloned();
+                    if s.launching.as_deref() == Some(id.as_str()) {
+                        s.launching = None;
+                    }
+                    s.note = Some(Note { text, error: true });
+                    state.set(s);
+                }
+                Err(_) => break,
+            }
+        }
+        if close {
+            return Ok(());
+        }
+
+        // Pins changed (here or in the dock).
+        let fresh = {
+            let s = shared.lock().unwrap();
+            (s.version != seen).then(|| (s.version, s.apps.clone(), s.pins.clone()))
+        };
+        if let Some((v, apps_now, pins_now)) = fresh {
+            seen = v;
+            let mut s = state.get_cloned();
+            if s.apps != apps_now || s.pins != pins_now {
+                s.apps = apps_now;
+                s.pins = pins_now;
+                state.set(s);
+            }
+        }
+        win.paint(&mut app)?;
+    }
+}
+
+/// Wait for Super+A from forum-wm and toggle the view, for as long as the
+/// dock lives. forum-wm going away is retried, slowly.
+fn key_thread(to_apps: Sender<ToApps>) {
+    let mut said = false;
+    loop {
+        match launch::wait_apps_key() {
+            Ok(()) => {
+                said = false;
+                if to_apps.send(ToApps::Toggle).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                if !said {
+                    eprintln!("forum-dock: no Super+A from forum-wm ({e}); retrying");
+                    said = true;
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+// ── the dock ─────────────────────────────────────────────────────────────────
+
+/// How often the dock looks for a change it shows (the Applications view
+/// opened or closed, a pin): a cheap version check, no drawing unless it moved.
+const DOCK_CHECK: Duration = Duration::from_millis(300);
+/// How often it asks forum-wm which apps have windows (as the bar does).
+const RUNNING_POLL: Duration = Duration::from_secs(2);
+
+fn poll_running(shared: &SharedRef) {
+    let Ok(surfaces) = launch::surfaces() else { return };
+    let running: HashSet<u32> = surfaces.iter().map(|s| s.owner_uid).filter(|&u| u != 0).collect();
+    let unknown = {
+        let mut s = shared.lock().unwrap();
+        let known: HashSet<u32> = s.apps.iter().filter_map(|a| a.uid).collect();
+        if s.running != running {
+            s.running = running.clone();
+            s.bump();
+        }
+        // A uid no app has yet: an app ran for the first time and the
+        // registry has its uid now.
+        running.iter().any(|u| !known.contains(u))
+    };
+    if unknown {
+        refresh_catalog(shared);
+    }
+}
+
+fn render_dock() -> io::Result<()> {
+    let shared: SharedRef = Arc::new(Mutex::new(Shared { pins: Pins::load(pins::path().as_deref()), ..Default::default() }));
+    refresh_catalog(&shared);
+
+    // The dock paints the full-screen wallpaper and the launcher row, so it is
+    // the background surface: the WM places it behind everything, and the row
+    // in the bottom strip it reserves stays visible.
+    let mut desc = WindowDesc::new("forum-dock", SizeSpec::FullScreen);
+    desc.hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
+    let mut win = Window::open(&desc)?;
+
+    let (to_apps, apps_rx) = channel();
+    {
+        let (shared, to_self) = (shared.clone(), to_apps.clone());
+        std::thread::Builder::new().name("forum-dock-apps".into()).spawn(move || apps_thread(apps_rx, to_self, shared))?;
+    }
+    {
+        let to_apps = to_apps.clone();
+        std::thread::Builder::new().name("forum-dock-keys".into()).spawn(move || key_thread(to_apps))?;
+    }
+
+    let dirty = Arc::new(AtomicBool::new(true));
+    let (state, mut seen) = {
+        let s = shared.lock().unwrap();
+        (Mutable::with_dirty(s.dock_state(), dirty.clone()), s.version)
+    };
+    let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
+    let actions = Default::default();
+    let view = DockView { state: state.clone(), size: size.clone(), actions: std::rc::Rc::clone(&actions) };
+    let mut app = App::new_with_flag(view, dirty);
+    let mut reserved = 0u32;
+    let mut last_poll = Instant::now() - RUNNING_POLL;
+    win.paint(&mut app)?;
+
+    // ★ Stay up: the dock IS the desktop background, so exiting takes the
+    // desktop with it.
+    loop {
+        if let StepResult::Closed = win.step(&mut app, Some(DOCK_CHECK))? {
+            return Ok(());
+        }
+        if size.get() != (win.width, win.height) {
+            size.set((win.width, win.height));
+        }
+        // Tell the WM how tall the dock draws, so a maximized window ends
+        // above it (resolution-independence.md §7.2); it grows with the text.
+        let want = reserve_pt();
+        if want != reserved {
+            match launch::reserve_bottom(want) {
+                Ok(()) => reserved = want,
+                Err(e) => {
+                    // Without forum-wm (a bare dev session) there is nobody to tell.
+                    eprintln!("forum-dock: could not reserve {want} pt for the dock: {e}");
+                    reserved = want;
+                }
+            }
+        }
+        for a in std::mem::take(&mut *actions.borrow_mut()) {
+            match a {
+                DockAction::ToggleApps => {
+                    let _ = to_apps.send(ToApps::Toggle);
+                }
+                DockAction::Launch(id) => start_launch(id.clone(), name_of(&shared, &id), to_apps.clone()),
+            }
+        }
+        if last_poll.elapsed() >= RUNNING_POLL {
+            last_poll = Instant::now();
+            poll_running(&shared);
+        }
+        let fresh = {
+            let s = shared.lock().unwrap();
+            (s.version != seen).then(|| (s.version, s.dock_state()))
+        };
+        if let Some((v, ds)) = fresh {
+            seen = v;
+            state.set(ds);
+            win.paint(&mut app)?;
         }
     }
 }
@@ -306,160 +513,48 @@ fn main() -> io::Result<()> {
             Ok(())
         }
         Some("launch") => {
-            let id = args.get(1).cloned().unwrap_or_else(|| {
+            let Some(id) = args.get(1) else {
                 eprintln!("usage: forum-dock launch <app-id>");
                 std::process::exit(2);
-            });
-            launch(&id)
+            };
+            let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
+            match launch::request(id, stdio) {
+                PreLaunch::Started(run) => match run.wait() {
+                    Ok(code) => {
+                        println!("forum-dock: '{id}' exited (code {code:?})");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("forum-dock: '{id}' {e}");
+                        std::process::exit(1);
+                    }
+                },
+                PreLaunch::AlreadyRunning { jid, uid } => {
+                    println!("forum-dock: '{id}' is already running (jid {jid})");
+                    // Ack means the WM ACCEPTED the intent, not that focus moved.
+                    match launch::focus_running(uid) {
+                        Ok(Some(sid)) => println!("forum-dock: asked the WM to focus its surface {sid}"),
+                        Ok(None) => println!("forum-dock: it has no surface to focus"),
+                        Err(e) => eprintln!("forum-dock: could not focus it: {e}"),
+                    }
+                    Ok(())
+                }
+                PreLaunch::NeedsApproval(delta) => {
+                    eprintln!("forum-dock: '{id}' needs the user's approval:");
+                    for line in delta {
+                        eprintln!("  - {line}");
+                    }
+                    std::process::exit(1);
+                }
+                PreLaunch::Failed(why) => {
+                    eprintln!("forum-dock: launch of '{id}': {why}");
+                    std::process::exit(1);
+                }
+            }
         }
         Some(other) => {
             eprintln!("forum-dock: unknown command '{other}' (try: list | launch <id>)");
             std::process::exit(2);
         }
-    }
-}
-
-/// Request a launch from portcullisd. The dock is just the requester — the daemon
-/// does the policy check, the per-app uid, the jail, the teardown. Mirrors the
-/// portcullis CLI's wire dance: Hello → Launch → ReadyForFds → hand over stdio
-/// (SCM_RIGHTS) → LaunchExit.
-fn launch(app_id: &str) -> io::Result<()> {
-    // Resolve the daemon's socket rather than hardcoding the flat path: inside a
-    // jail only the per-service directory is mounted (by `app-launch`), and the
-    // flat /atrium/sockets/portcullis.sock does not exist there at all.
-    let Some(path) = portcullis_ipc::resolve_socket_path() else {
-        eprintln!("forum-dock: portcullisd not reachable (looked for {} and {}). \
-                   A jailed dock needs the `app-launch` capability.",
-                  portcullis_ipc::SERVICE_SOCKET_PATH, SOCKET_PATH);
-        std::process::exit(1);
-    };
-    let mut s = match UnixStream::connect(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("forum-dock: portcullisd not reachable at {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION })? {
-        Response::Hello { version } if version == PROTO_VERSION => {}
-        Response::ProtoMismatch { server_version } => {
-            eprintln!("forum-dock: portcullisd speaks proto v{server_version}, dock speaks v{PROTO_VERSION}");
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("forum-dock: unexpected handshake reply: {other:?}");
-            std::process::exit(1);
-        }
-    }
-
-    write_request(&mut s, &Request::Launch { app_id: app_id.into(), bypass_policy: false })?;
-    match read_response(&mut s)? {
-        Response::ReadyForFds => {}
-        Response::LaunchNeedsApproval { delta } => {
-            eprintln!("forum-dock: '{app_id}' needs the user's approval:");
-            for line in delta { eprintln!("  - {line}"); }
-            std::process::exit(1);
-        }
-        Response::LaunchFailed { stage, message } => {
-            eprintln!("forum-dock: launch of '{app_id}' failed at {stage}: {message}");
-            std::process::exit(1);
-        }
-        /* The daemon answers this BEFORE ReadyForFds — it decides "already
-         * running" up front, without mounting anything — so the second click on
-         * a dock icon lands here, not on the post-launch path. Raise the window
-         * that exists instead of reporting a failure. */
-        Response::AlreadyRunning { jid, uid, .. } => {
-            println!("forum-dock: '{app_id}' is already running (jid {jid})");
-            match focus_running(uid) {
-                // Ack means the WM ACCEPTED the intent, not that focus moved:
-                // roles that never take focus (a panel, the background) are
-                // declined by the layout policy, which is correct. Say what we
-                // actually know.
-                Ok(Some(sid)) => println!("forum-dock: asked the WM to focus its surface {sid}"),
-                Ok(None)      => println!("forum-dock: it has no surface to focus"),
-                Err(e)        => eprintln!("forum-dock: could not focus it: {e}"),
-            }
-            return Ok(());
-        }
-        other => {
-            eprintln!("forum-dock: unexpected pre-launch reply: {other:?}");
-            std::process::exit(1);
-        }
-    }
-
-    // Hand over our stdio to the launched app (the daemon is blocked in recv_fds).
-    let stdio = [
-        io::stdin().as_raw_fd(),
-        io::stdout().as_raw_fd(),
-        io::stderr().as_raw_fd(),
-    ];
-    send_fds(&s, &stdio)?;
-
-    match read_response(&mut s)? {
-        Response::LaunchExit { code } => {
-            println!("forum-dock: '{app_id}' exited (code {code:?})");
-            Ok(())
-        }
-        Response::LaunchFailed { stage, message } => {
-            eprintln!("forum-dock: '{app_id}' failed at {stage}: {message}");
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("forum-dock: unexpected post-launch reply: {other:?}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Ask forum-wm to keep `pt` points free at the bottom of the screen.
-fn reserve_bottom(pt: u32) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
-    let mut s = UnixStream::connect(forum_ctl::default_socket_path())?;
-    let req = forum_ctl::encode(&forum_ctl::Intent::ReserveBottom { pt })
-        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
-    forum_ctl::write_frame(&mut s, &req)?;
-    match forum_ctl::decode::<forum_ctl::Reply>(&forum_ctl::read_frame(&mut s)?) {
-        Ok(forum_ctl::Reply::Ack) => Ok(()),
-        Ok(forum_ctl::Reply::Err { message }) => Err(io::Error::other(message)),
-        Ok(other) => Err(io::Error::other(format!("{other:?}"))),
-        Err(e) => Err(io::Error::other(format!("decode: {e}"))),
-    }
-}
-
-/// Ask forum-wm to focus the surface owned by `uid` — the running instance of
-/// an app we were asked to launch a second time.
-///
-/// Matching on `owner_uid` is what makes this work from inside a jail: the dock
-/// cannot read the launch registry, but every surface already carries the uid
-/// that created it, and portcullisd told us which uid to look for. Returns the
-/// focused surface id, or `None` if the app has not created a window (yet).
-fn focus_running(uid: u32) -> io::Result<Option<u32>> {
-    use std::os::unix::net::UnixStream;
-    let path = forum_ctl::default_socket_path();
-    let mut s = UnixStream::connect(&path)?;
-    let req = forum_ctl::encode(&forum_ctl::Intent::ListSurfaces)
-        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
-    forum_ctl::write_frame(&mut s, &req)?;
-    let reply: forum_ctl::Reply = forum_ctl::decode(&forum_ctl::read_frame(&mut s)?)
-        .map_err(|e| io::Error::other(format!("decode: {e}")))?;
-    let surfaces = match reply {
-        forum_ctl::Reply::Surfaces { surfaces, .. } => surfaces,
-        forum_ctl::Reply::Err { message } => return Err(io::Error::other(message)),
-        other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
-    };
-    let Some(target) = surfaces.iter().find(|s| s.owner_uid == uid) else {
-        return Ok(None);
-    };
-    /* One connection per intent — the control protocol is request/response. */
-    let mut s = UnixStream::connect(&path)?;
-    let req = forum_ctl::encode(&forum_ctl::Intent::Focus { surface_id: target.surface_id })
-        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
-    forum_ctl::write_frame(&mut s, &req)?;
-    match forum_ctl::decode::<forum_ctl::Reply>(&forum_ctl::read_frame(&mut s)?) {
-        Ok(forum_ctl::Reply::Ack)              => Ok(Some(target.surface_id)),
-        Ok(forum_ctl::Reply::Err { message })  => Err(io::Error::other(message)),
-        Ok(other)                              => Err(io::Error::other(format!("{other:?}"))),
-        Err(e)                                 => Err(io::Error::other(format!("decode: {e}"))),
     }
 }

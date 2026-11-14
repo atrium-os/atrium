@@ -450,15 +450,15 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                               portcullis_peer::DEFAULT_REGISTRY)
                           .unwrap_or_default()
                           .resolve(uid)
-                          .map(|(_user, app)| app.to_string())
+                          .map(|(user, app)| (user.to_string(), app.to_string()))
             {
-                Some(app) if launch::app_may_launch_apps(&app) => {
-                    let apps = launch::catalog();
+                Some((user, app)) if launch::app_may_launch_apps(&app) => {
+                    let apps = launch::catalog(Some(&user));
                     eprintln!("portcullisd: catalog -> {app} (uid {uid}): {} app(s)",
                               apps.len());
                     Response::CatalogList { apps }
                 }
-                Some(app) => {
+                Some((_, app)) => {
                     eprintln!("portcullisd: catalog DENIED to {app} (uid {uid}): \
                                no app-launch capability");
                     Response::Error { message:

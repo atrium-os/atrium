@@ -144,6 +144,10 @@ pub enum Intent {
     /// the bar got `token` from frescod (`OP_POPUP_GRANT`), and the app
     /// claims the pop-up with it (forum-status-items.md §4).
     StatusOpenPanel { app_id: String, token: [u8; 16] },
+    /// "Tell me when the person presses Super+A" (forum.md §6.1): the dock
+    /// opens or closes its Applications view on it. forum-wm keeps the
+    /// connection and answers `Ack` at the next press; the dock asks again.
+    WaitAppsKey,
 }
 
 /// The most a [`Intent::ReserveBottom`] may keep free, in points: a dock

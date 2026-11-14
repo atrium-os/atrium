@@ -2006,6 +2006,9 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(message) => Reply::Err { message },
             },
+            // Answered late, by the server loop (`apps_key`): it parks the
+            // connection instead of calling here.
+            Intent::WaitAppsKey => Reply::Err { message: "WaitAppsKey is answered by the forum-ctl server".into() },
             // frescod validates the mode against the monitor's list; the WM
             // re-lays out when frescod's EV_DISPLAY_CHANGED arrives, not here,
             // so a refused or failed switch leaves the layout alone.
@@ -2077,6 +2080,22 @@ mod tests {
         let mut l = arrange_snapped(&sc, &one, Some(1), &snapped);
         fit_min_sizes(&mut l, &sc, &one);
         assert_eq!(rect(&l, 1), wa);
+    }
+
+    /// The dock's Applications view (forum.md §6.1) is a dialog whose
+    /// minimum is the whole screen: it gets exactly the work area (the bar
+    /// and the dock's strip stay visible) and the focus, over a document.
+    #[test]
+    fn the_applications_view_fills_the_work_area_and_takes_focus() {
+        let sc = screen();
+        let apps = WmSurfaceInfo { min_size: (1920, 1080), ..surf(7, WmRole::Dialog) };
+        let all = [surf(1, WmRole::Background), surf(2, WmRole::Document), apps];
+        let mut l = arrange_for(&sc, &all, Some(2), false);
+        fit_min_sizes(&mut l, &sc, &all);
+        let slot = l.slots.iter().find(|s| s.surface_id == 7).unwrap();
+        assert_eq!(slot.rect, sc.work_area());
+        assert!(l.slots.iter().all(|s| s.surface_id == 7 || s.layer > slot.layer), "above everything else");
+        assert_eq!(l.focus, 7);
     }
 
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
@@ -3102,5 +3121,55 @@ mod swipe_tests {
         assert_eq!(swipe_workspace(3, 4, -200.0, 0.0), None);
         assert_eq!(swipe_workspace(1, 4, -60.0, 0.0), None);
         assert_eq!(swipe_workspace(1, 4, -200.0, 150.0), None);
+    }
+}
+
+/// Super+A for the dock's Applications view (forum.md §6.1): forum-ctl
+/// connections that asked `WaitAppsKey`, answered `Ack` at the next press.
+pub mod apps_key {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    /// At most this many waiting connections; the oldest go first (a dock
+    /// asks again after each answer, so more than a couple is a leak).
+    pub const MAX_WAITERS: usize = 4;
+
+    static WAITERS: Mutex<Vec<UnixStream>> = Mutex::new(Vec::new());
+
+    /// Keep `s` until the next press.
+    pub fn park(s: UnixStream) {
+        let mut w = WAITERS.lock().unwrap();
+        if w.len() >= MAX_WAITERS {
+            w.remove(0);
+        }
+        w.push(s);
+    }
+
+    /// The person pressed Super+A: answer every waiting connection.
+    /// Returns how many were told.
+    pub fn fire() -> usize {
+        let waiting = std::mem::take(&mut *WAITERS.lock().unwrap());
+        let Ok(bytes) = forum_ctl::encode(&forum_ctl::Reply::Ack) else { return 0 };
+        waiting.into_iter().filter_map(|mut s| forum_ctl::write_frame(&mut s, &bytes).ok()).count()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_press_answers_each_waiter_once() {
+            let (a, mut a_peer) = UnixStream::pair().unwrap();
+            let (b, mut b_peer) = UnixStream::pair().unwrap();
+            park(a);
+            park(b);
+            assert_eq!(fire(), 2);
+            for p in [&mut a_peer, &mut b_peer] {
+                let r: forum_ctl::Reply = forum_ctl::decode(&forum_ctl::read_frame(p).unwrap()).unwrap();
+                assert_eq!(r, forum_ctl::Reply::Ack);
+            }
+            // Answered and dropped: the next press tells nobody.
+            assert_eq!(fire(), 0);
+        }
     }
 }

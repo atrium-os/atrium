@@ -9,6 +9,14 @@
 
 use std::path::Path;
 
+pub mod apps;
+pub mod apps_view;
+pub mod dock_view;
+pub mod icons;
+pub mod launch;
+mod phosphor_names;
+pub mod pins;
+
 /// The conventional install root: one subdirectory per app, each with its
 /// `atrium.toml` manifest (mirrors portcullisd's launch tree).
 pub const APPS_DIR: &str = "/var/lib/atrium/apps";
@@ -21,6 +29,10 @@ pub struct AppEntry {
     pub description: Option<String>,
     /// Icon name/path the app declared in its manifest (`[app] icon = ...`).
     pub icon: Option<String>,
+    /// The uid it runs as for this person, from portcullisd (`None` until it
+    /// first ran, or when the catalog came off the filesystem): how the dock
+    /// matches windows to apps (forum.md §6.1).
+    pub uid: Option<u32>,
 }
 
 /// Parse one manifest's text into a catalog entry. `None` if it doesn't parse —
@@ -32,6 +44,7 @@ pub fn entry_from_manifest(text: &str) -> Option<AppEntry> {
         name: m.app.name,
         description: m.app.description,
         icon: m.app.icon,
+        uid: None,
     })
 }
 
@@ -92,6 +105,7 @@ pub fn catalog_from_daemon() -> Option<Vec<AppEntry>> {
                     name: a.name,
                     description: a.description,
                     icon: a.icon,
+                    uid: a.uid,
                 })
                 .collect(),
         ),

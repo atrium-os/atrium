@@ -234,6 +234,99 @@ human. The new surface arrives at Fresco; forum-wm places it by role. The dock h
 no special capability — launching is a request to the TCB, authorized by the user's
 grants, exactly like everywhere else.
 
+### 6.1 The Applications view (built 2026-11-14)
+
+Shankar (2026-11-14): apps are found in Forum, as a grid of every installed app,
+not by browsing folders in Scrinium. Opening a *file* in an app is Scrinium's
+(its file-opening spec: types, open-with, the file handed over as a descriptor);
+this section is only about starting apps.
+
+**What it is.** A full-screen grid of every app the catalog lists: each app's icon
+and name, in name order, with a filter field on top. It belongs to `forum-dock`
+(a second window of the same process), because the dock already holds the only
+two things it needs: `app-launch` (the catalog and the launch request, both over
+portcullisd's socket) and `forum-control` (the WM intents). Nothing new is
+granted to anything.
+
+**Opening and closing.**
+
+| Opens | Closes |
+|---|---|
+| the Applications button at the left end of the dock | the same button, Escape, Super+A |
+| Super+A (forum-wm sees the chord and tells the dock, below) | launching an app (once portcullisd accepted the launch) |
+| | a press on the view's empty space |
+
+The view is a `Dialog`-role window whose minimum size is the whole screen in
+points, so forum-wm's existing dialog rule (grow about the centre within the work
+area, take focus while it is up) gives it the work area: below the bar, above the
+dock's reserved strip, with the dock and its lit Applications button still
+showing. When it closes, focus goes back where forum-wm had it.
+
+**Super+A.** forum-wm sees every key. The dock asks forum-wm, over the forum-ctl
+socket, to tell it about the chord (`Intent::WaitAppsKey`); forum-wm keeps that
+connection open and answers `Ack` when Super+A is pressed (once per press, all
+waiting connections). The dock asks again after each answer. One intent per
+connection still holds; this one just answers late.
+
+**Filtering.** Typing goes into the filter field (it has focus while the view is
+up). An app matches when every word typed is the start of a word of its name, or
+appears in its name, id or description; matches on the name's start come first,
+then other name matches, then the rest, each group in name order. The first match
+is selected, so typing a few letters and Enter launches it.
+
+**Keyboard.** Arrows move the selection (Left/Right by one, Up/Down by a row;
+the filter field's caret is moved with the pointer, Home and End). Page Up and
+Page Down turn pages. Enter launches the selection. Escape clears the filter
+first, then closes.
+
+**Pages, not scrolling.** As many rows as fit the work area are shown; more apps
+go on further pages, with page dots under the grid (pressable). The wheel and
+Page Up/Down turn pages; moving the selection past the last row turns the page.
+
+**Sizes** (resolution-independence.md §6). Tiles, gaps, the field and the dots are
+`em` (they grow with the text size); the icon glyph is handed to Pergola in points
+(32 pt, `icon-xl`, visual language §9) because the renderer applies the text size to
+glyphs itself. The dock moves from Lucide to Phosphor with it: one icon family.
+
+**Icons.** `[app] icon` in the manifest names an icon from the system set (the
+Phosphor names, e.g. `"note-pencil"`, `"compass"`, plus a few short aliases:
+`files`, `settings`, `terminal`, `browser`, `editor`). An app with no icon, or a
+name not in the set, gets a tile with its name's first letter on a colour picked
+from its id. Icons shipped in the app's bundle (SVG, and bitmaps per §6.4 of
+resolution-independence.md) come later; they need the catalog to carry them.
+
+**Launching.** Exactly the dock's path: `Launch { app_id }` to portcullisd, which
+checks policy, picks the app's uid and jails it. The dock does this on a thread
+per launch (the request stays open while the app runs). The view closes when
+portcullisd answers `ReadyForFds` (started) or `AlreadyRunning` (the dock asks
+forum-wm to focus that app's window, as before). If portcullisd says the app
+needs the user's approval, or the launch failed, the view stays up and says so
+under the grid, in the daemon's words.
+
+**The dock row.** The dock now holds the Applications button, then the pinned
+apps, then any running app that is not pinned, after a divider. A running app has
+a dot under its tile. Pressing a tile launches the app or focuses its window.
+In the Applications view, each tile has a pin button on hover ("Keep in Dock" /
+"Remove from Dock").
+
+- *Running* comes from forum-wm's surface list (`ListSurfaces`, every 2 s, as the
+  bar polls it) matched by owner uid against the catalog, which now carries each
+  app's uid for the person (`CatalogEntry::uid`, from the launch registry; `None`
+  until it first ran). The catalog is fetched again when a surface with an
+  unknown uid appears and each time the view opens.
+- *Pinned* is a list of app ids, one per line, at `$FORUM_DOCK_PINS` or
+  `$HOME/.config/forum-dock/pinned`. With no file the first five apps of the
+  catalog are pinned. If the file can't be written (a session jail with no
+  writable home), pins hold until logout. *Open: a per-person settings store for
+  session components.*
+
+Forum's own components (the bar, the dock, the WM, the shelf, the overview,
+Vestibulum) are not listed: they are started by the session, not by the person
+(ids `org.atrium.forum-*` and `org.atrium.vestibulum`).
+
+Code: `forum-dock/src/{apps.rs, apps_view.rs, launch.rs, pins.rs, icons.rs}`,
+`forum-wm` (`WaitAppsKey`), `portcullis-ipc` (`CatalogEntry::uid`).
+
 ## 7. Seat / multi-session / FUS
 
 Forum is per-session (ostiarius launches one `forum-wm` + chrome per human). The

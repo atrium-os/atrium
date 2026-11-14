@@ -654,9 +654,12 @@ fn _silence(s: &str) -> String { jail_name_from_app_id(s) }
 /// manifest is unreadable or unparseable are skipped rather than reported: a
 /// broken bundle is not something a launcher can act on, and listing it would
 /// only offer the human a button that cannot work.
-pub fn catalog() -> Vec<portcullis_ipc::CatalogEntry> {
+pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    /* Each app's uid for this person, so the launcher can match windows
+     * (their owner uid) to apps (forum.md §6.1). Loaded once per catalog. */
+    let registry = user.and_then(|_| portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok());
     for e in entries.flatten() {
         let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
         let Ok(m) = Manifest::from_str(&text) else { continue };
@@ -665,6 +668,7 @@ pub fn catalog() -> Vec<portcullis_ipc::CatalogEntry> {
             name:        m.app.name.clone(),
             description: m.app.description.clone(),
             icon:        m.app.icon.clone(),
+            uid:         registry.as_ref().zip(user).and_then(|(r, u)| r.uid_for(u, &m.app.id)),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));

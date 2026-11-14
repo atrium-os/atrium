@@ -50,6 +50,9 @@ const KEY_F: u16 = 0x09;
 const KEY_RIGHT: u16 = 0x4F;
 const KEY_LEFT: u16 = 0x50;
 const KEY_UP: u16 = 0x52;
+/// Super+A opens or closes the dock's Applications view (forum.md §6.1).
+/// HID 0x04 = 'A'.
+const KEY_A: u16 = 0x04;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -364,6 +367,15 @@ fn spawn_input_poller(core: Core) {
                         // Super+S: toggle split (tiled) layout for the active workspace.
                         Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => split = true,
+                        // Super+A: the dock's Applications view. Answered right
+                        // here, without the core: only parked connections hear it.
+                        Ok(Some(Event::Key { hid_usage: KEY_A, pressed: true, repeat: false, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0 => {
+                            let told = forum_wm::apps_key::fire();
+                            if told == 0 {
+                                eprintln!("forum-wm: Super+A, but no dock is waiting for it");
+                            }
+                        }
                         // Super+F: toggle zoom (fullscreen) for the focused surface.
                         Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => zoom = true,
@@ -713,6 +725,11 @@ fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
             Some(i) => i,
             None => continue,
         };
+        // Super+A is answered late, by the input poller (forum.md §6.1).
+        if intent == forum_ctl::Intent::WaitAppsKey {
+            forum_wm::apps_key::park(s);
+            continue;
+        }
         // Carry out the intent under the core lock — serialized against the
         // input poller's focus-follows-click so the two never drive the one
         // connection at once.

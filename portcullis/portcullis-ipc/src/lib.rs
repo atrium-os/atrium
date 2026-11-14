@@ -311,6 +311,12 @@ pub struct CatalogEntry {
     pub name:        String,
     pub description: Option<String>,
     pub icon:        Option<String>,
+    /// The uid this app runs as for the asking person (the launch registry's
+    /// binding), `None` until it first ran. Surfaces carry their owner's uid,
+    /// so this is how a launcher tells which apps have windows up (forum.md
+    /// §6.1) without reading the registry, which a jailed launcher cannot.
+    #[serde(default)]
+    pub uid:         Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
