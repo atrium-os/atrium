@@ -10,6 +10,7 @@ description = "Parser and validator for atrium.toml manifests. Pure Rust + serde
 serde      = { version = "1", features = ["derive"] }
 toml       = "0.8"
 thiserror  = "1"
+atrium-types = { path = "../../atrium-types" }
 
 [dev-dependencies]
 # Golden-file tests use the standard fs APIs, no extra deps needed.

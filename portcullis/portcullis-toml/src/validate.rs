@@ -96,6 +96,32 @@ pub fn validate(m: &Manifest) -> Report {
         }
     }
 
+    /* ── [[opens]] (opening-files.md §5.1) ───────────────────── */
+
+    let mut seen = std::collections::BTreeSet::new();
+    for o in &m.opens {
+        if o.types.is_empty() {
+            r.errors.push("[[opens]].types: must name at least one type".into());
+        }
+        for t in &o.types {
+            match atrium_types::by_mime(t) {
+                None if t.ends_with("/*") => r.errors.push(format!(
+                    "[[opens]] {t:?}: no wildcards; name each type")),
+                None => r.errors.push(format!(
+                    "[[opens]] {t:?}: not a type Atrium knows (atrium-types)")),
+                Some(k) if !k.family.declarable() => r.errors.push(format!(
+                    "[[opens]] {t:?}: {} files are never opened in an app", k.family.words().to_lowercase())),
+                Some(_) => {}
+            }
+            if !seen.insert(t.as_str()) {
+                r.errors.push(format!("[[opens]] {t:?}: listed twice"));
+            }
+        }
+    }
+    if seen.len() > crate::schema::MAX_OPENS {
+        r.errors.push(format!("[[opens]]: {} types, at most {}", seen.len(), crate::schema::MAX_OPENS));
+    }
+
     /* ── [supervision] — schema enforces enum values, nothing else here ── */
 
     r

@@ -24,6 +24,8 @@
 //! network     = "none"
 //! ```
 
+pub mod opens;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;

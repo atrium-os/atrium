@@ -1,0 +1,9 @@
+# EXPECT_ERROR: not a type Atrium knows
+[app]
+id      = "org.example.player"
+name    = "Player"
+version = "0.1.0"
+entry   = "bin/player"
+
+[[opens]]
+types = ["audio/x-mine"]

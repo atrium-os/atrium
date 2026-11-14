@@ -865,8 +865,11 @@ fn handle_launch(
         let delta = d.delta;
         drop(s);
         if !delta.is_empty() {
+            // What it opens is part of what the user approves (opening-files.md §5.1).
+            let mut lines = delta.describe();
+            lines.extend(manifest.opens_lines());
             return write_response(writer, &Response::LaunchNeedsApproval {
-                delta: delta.describe(),
+                delta: lines,
             });
         }
     }

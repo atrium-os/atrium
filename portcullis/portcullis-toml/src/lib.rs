@@ -21,7 +21,7 @@ pub mod validate;
 pub use schema::{
     merge_capabilities,
     AppSection, Capabilities, FontsCap, InputCaps, InstancesPolicy, Manifest,
-    NetworkCap, PoolSection, ResourcesSection, RestartPolicy, SetupSection,
+    NetworkCap, OpenMode, OpensSection, PoolSection, ResourcesSection, RestartPolicy, SetupSection,
     SupervisionSection,
 };
 pub use validate::{validate, Report};

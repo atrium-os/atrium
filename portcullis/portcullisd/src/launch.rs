@@ -302,6 +302,7 @@ fn clone_manifest_with(
         setup:        None,           /* setup never recurses */
         resources:    None,
         supervision:  None,
+        opens:        Vec::new(),
     }
 }
 

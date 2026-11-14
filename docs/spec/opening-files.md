@@ -250,6 +250,15 @@ and type. D6 asks whether quick look comes in the first build.
    PDF document but is really a Web page"), or an unknown type.
 2. **T2** `[[opens]]` in manifests and the install screen; the defaults
    table with the system's defaults.
+   *Built 2026-11-14:* `[[opens]]` in `portcullis-toml`, checked against
+   `atrium-types` (no wildcards, only declarable types, no repeats, at
+   most 64); the approval screen in portcullisd and the CLI adds lines
+   such as "Open audio files: FLAC audio, MP3 audio" and "Open and change
+   document files: OpenDocument text". `portcullis-policy::opens` holds
+   the system defaults and the per-user table in
+   `/var/db/atrium/<user>/opens.toml` (the user's choice, then the system
+   default, else ask; a choice counts only while the app still declares
+   the type; programs, shortcuts and bundles can't be given a default).
 3. **T3** `OpenFile` in portcullisd, the `OPEN` token purpose, the
    document channel; Atrium Player and Officina receive files;
    Scrinium's double-click and Open with. Gate on the cloud VM: open a

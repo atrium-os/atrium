@@ -1,0 +1,13 @@
+# EXPECT_ERROR: listed twice
+[app]
+id      = "org.example.player"
+name    = "Player"
+version = "0.1.0"
+entry   = "bin/player"
+
+[[opens]]
+types = ["audio/flac"]
+
+[[opens]]
+types = ["audio/flac"]
+mode = "edit"

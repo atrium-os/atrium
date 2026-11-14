@@ -1,0 +1,13 @@
+# A player and editor declaring the types it opens (opening-files.md §5.1).
+[app]
+id      = "org.example.player"
+name    = "Player"
+version = "0.1.0"
+entry   = "bin/player"
+
+[[opens]]
+types = ["audio/flac", "audio/mpeg", "video/mp4"]
+
+[[opens]]
+types = ["application/vnd.oasis.opendocument.text"]
+mode = "edit"

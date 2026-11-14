@@ -27,6 +27,62 @@ pub struct Manifest {
     pub setup:        Option<SetupSection>,
     pub resources:    Option<ResourcesSection>,
     pub supervision:  Option<SupervisionSection>,
+    /// `[[opens]]`: the file types the app opens (opening-files.md §5.1).
+    /// Eligibility only: it puts the app on a type's "Open with" list and
+    /// gives it no file.
+    #[serde(default)]
+    pub opens:        Vec<OpensSection>,
+}
+
+/// One `[[opens]]` entry: media types from the system table
+/// (`atrium-types`), and whether the app changes them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpensSection {
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub mode:  OpenMode,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenMode {
+    /// Reads the file: it gets a read-only descriptor.
+    #[default]
+    View,
+    /// Changes the file in place: a read-write descriptor when the file
+    /// and its place are writable.
+    Edit,
+}
+
+/// Most types one app may declare (opening-files.md §5.1).
+pub const MAX_OPENS: usize = 64;
+
+impl Manifest {
+    /// How the app opens `mime`, if it declares it.
+    pub fn opens(&self, mime: &str) -> Option<OpenMode> {
+        self.opens.iter().find(|o| o.types.iter().any(|t| t == mime)).map(|o| o.mode)
+    }
+
+    /// For the install screen: "Opens Audio: FLAC audio, MP3 audio", one
+    /// line per mode and family, as the system table names them.
+    pub fn opens_lines(&self) -> Vec<String> {
+        let mut groups: Vec<(OpenMode, &'static str, Vec<&'static str>)> = Vec::new();
+        for o in &self.opens {
+            for t in o.types.iter().filter_map(|t| atrium_types::by_mime(t)) {
+                let fam = t.family.words();
+                match groups.iter_mut().find(|(m, f, _)| *m == o.mode && *f == fam) {
+                    Some((_, _, v)) if v.contains(&t.words) => {}
+                    Some((_, _, v)) => v.push(t.words),
+                    None => groups.push((o.mode, fam, vec![t.words])),
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(m, f, v)| format!("{} {} files: {}", if m == OpenMode::Edit { "Open and change" } else { "Open" }, f.to_lowercase(), v.join(", ")))
+            .collect()
+    }
 }
 
 /// `[bundle]` — distribution facts (atrium-bundle-format.md §4). Carried in the
@@ -587,5 +643,23 @@ input.pointer_lock = true
         let m = crate::Manifest::from_str(&GAME.replace("input.gamepad = true", "input.raw_hid = true\ninput.system_keys = true")).unwrap();
         let w = crate::validate(&m).warnings;
         assert!(w.iter().any(|w| w.contains("raw_hid")) && w.iter().any(|w| w.contains("system_keys")), "{w:?}");
+    }
+}
+
+#[cfg(test)]
+mod opens_tests {
+    use super::*;
+
+    #[test]
+    fn opens_lines_and_lookup() {
+        let m = Manifest::from_str(include_str!("../tests/accept/opens.toml")).unwrap();
+        assert_eq!(m.opens("audio/flac"), Some(OpenMode::View));
+        assert_eq!(m.opens("application/vnd.oasis.opendocument.text"), Some(OpenMode::Edit));
+        assert_eq!(m.opens("application/pdf"), None);
+        assert_eq!(m.opens_lines(), vec![
+            "Open audio files: FLAC audio, MP3 audio".to_string(),
+            "Open video files: MP4 video".to_string(),
+            "Open and change document files: OpenDocument text".to_string(),
+        ]);
     }
 }

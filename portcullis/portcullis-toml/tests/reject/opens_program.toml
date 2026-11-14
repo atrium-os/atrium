@@ -1,0 +1,9 @@
+# EXPECT_ERROR: never opened in an app
+[app]
+id      = "org.example.player"
+name    = "Player"
+version = "0.1.0"
+entry   = "bin/player"
+
+[[opens]]
+types = ["application/x-shellscript"]

@@ -1,0 +1,10 @@
+# EXPECT_ERROR: unknown variant
+[app]
+id      = "org.example.player"
+name    = "Player"
+version = "0.1.0"
+entry   = "bin/player"
+
+[[opens]]
+types = ["audio/flac"]
+mode = "run"
