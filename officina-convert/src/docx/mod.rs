@@ -54,6 +54,17 @@ pub(crate) mod tests {
                 officina_core::history::Op::apply(op, &mut d);
             }
         }
+        // Comments: one over "bold, big" with a resolved reply, one from the
+        // title into the heading (over two paragraphs, overlapping nothing).
+        let com = |author: &str, text: &str, parent, done| officina_text::model::Comment { author: author.into(), initials: author[..1].into(), date: "2026-11-14T09:30:00Z".into(), text: text.into(), parent, done };
+        let a = d.comments.next_id();
+        for op in d.add_comment_ops(2, 7, 2, 16, com("Ann", "Too much <&> at once?", None, false)) {
+            officina_core::history::Op::apply(op, &mut d);
+        }
+        officina_core::history::Op::apply(officina_text::ops::TextOp::SetComment { id: a + 1, comment: Some(com("Bo", "Fine,\nleave it.", Some(a), true)) }, &mut d);
+        for op in d.add_comment_ops(0, 4, 1, 6, com("Cy", "Shorter title.", None, false)) {
+            officina_core::history::Op::apply(op, &mut d);
+        }
         d.take_changes();
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
@@ -76,7 +87,14 @@ pub(crate) mod tests {
                 }
                 // Notes are compared by number and text.
                 let note = x.note.take().map(|n| (d.note_label(n), d.notes.get(n).map(|n| n.paras.iter().map(|p| (p.text.clone(), p.spans().filter(|s| s.0 < s.1).map(|s| d.attrs.get(s.2).clone()).collect::<Vec<_>>())).collect::<Vec<_>>())));
-                (s, e, x, note)
+                // Comments by who wrote them, their text and their thread.
+                let thread = |id| {
+                    let c = d.comments.get(id).unwrap();
+                    let replies: Vec<String> = d.comments.replies(id).into_iter().map(|r| d.comments.get(r).map(|c| format!("{}|{}|{}|{}", c.author, c.initials, c.text, c.done)).unwrap()).collect();
+                    format!("{}|{}|{}|{}|{}|{replies:?}", c.author, c.initials, c.date, c.text, c.done)
+                };
+                let comments = x.comments.take().map(|c| c.iter().map(|&id| thread(id)).collect::<std::collections::BTreeSet<_>>());
+                (s, e, x, note, comments)
             }).collect::<Vec<_>>();
             assert_eq!(spans(a, p), spans(b, q), "runs of {i}");
             let mut pp = p.props.clone();
@@ -92,6 +110,7 @@ pub(crate) mod tests {
             }
             assert_eq!(pp, qp, "props of {i}");
         }
+        assert_eq!(a.live_comments().len(), b.live_comments().len());
         assert_eq!(a.page, b.page);
         assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
         assert_eq!(a.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>(), b.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>());

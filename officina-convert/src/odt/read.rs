@@ -10,9 +10,11 @@
 //! default master page's header and footer (page number and count fields become
 //! `{page}` and `{pages}`).
 //!
-//! Footnotes and endnotes (`text:note`) and superscript and subscript are read.
+//! Footnotes and endnotes (`text:note`), superscript and subscript, and
+//! annotations as comments (ranges, replies by LibreOffice's parent name, resolved)
+//! are read.
 //!
-//! Reported, not carried: notes inside notes or headers, annotations, tracked changes,
+//! Reported, not carried: notes inside notes or headers, annotations there, tracked changes,
 //! sections and columns, frames anchored to the page (kept in line), merged
 //! cells, nested tables (their text kept), fields other than page numbers (their
 //! text kept), drawings and charts, embedded objects.
@@ -20,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, Block, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -224,6 +226,128 @@ struct Reader<'a> {
     /// Notes anchored in the text, read after it.
     pending: Vec<(NoteId, NoteKind, El)>,
     in_note: bool,
+    /// Annotations by `office:name`, for their ends and replies.
+    annotations: HashMap<String, CommentId>,
+    /// Replies and the names of what they answer.
+    reply_to: Vec<(CommentId, String)>,
+    /// The names `office:annotation-end`s carry.
+    ends: std::collections::HashSet<String>,
+    /// The comments over the text, sorted, as the paragraph being read began.
+    active: Vec<CommentId>,
+    /// Where comments start and end in the paragraph being read.
+    events: Vec<(u32, CommentId, Ev)>,
+}
+
+/// A comment range's change at a place in a paragraph.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ev {
+    Start,
+    End,
+    /// An annotation with no end: over the character before (else after) it.
+    Point,
+}
+
+/// The names of the annotation ends in `e`.
+fn annotation_ends(e: &El) -> std::collections::HashSet<String> {
+    fn walk(e: &El, out: &mut std::collections::HashSet<String>, depth: usize) {
+        for x in e.els() {
+            if x.name == "office:annotation-end" {
+                if let Some(n) = x.attr("office:name") {
+                    out.insert(n.to_string());
+                }
+            } else if depth < 64 && x.name != "office:annotation" {
+                walk(x, out, depth + 1);
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(e, &mut out, 0);
+    out
+}
+
+/// An annotation's text: a line a paragraph.
+fn annotation_text(e: &El) -> String {
+    let mut lines = Vec::new();
+    for q in e.els().filter(|q| q.name == "text:p" || q.name == "text:h" || q.name == "text:list") {
+        lines.push(q.text().split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    let mut out = lines.join("\n");
+    let mut end = out.len().min(MAX_COMMENT_TEXT);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
+}
+
+/// Puts the comments the events say over `p`'s runs: `active` over its start,
+/// left as they are over its end.
+fn apply_comments(p: &mut Para, active: &mut Vec<CommentId>, events: Vec<(u32, CommentId, Ev)>) {
+    if active.is_empty() && events.is_empty() {
+        return;
+    }
+    let len = p.text.len() as u32;
+    // Changes as (byte, id, add), points made into a start and an end.
+    let mut ch: Vec<(u32, CommentId, bool)> = Vec::new();
+    for (at, id, ev) in events {
+        match ev {
+            Ev::Start => ch.push((at, id, true)),
+            Ev::End => ch.push((at, id, false)),
+            Ev::Point => {
+                let at = at.min(len);
+                let (s, e) = if at > 0 {
+                    let s = p.text[..at as usize].char_indices().next_back().map_or(0, |(i, _)| i as u32);
+                    (s, at)
+                } else {
+                    (0, p.text.chars().next().map_or(0, |c| c.len_utf8() as u32))
+                };
+                if s < e {
+                    ch.push((s, id, true));
+                    ch.push((e, id, false));
+                }
+            }
+        }
+    }
+    ch.sort_by_key(|&(at, _, add)| (at, add));
+    // Cut the runs at each change.
+    let mut cuts: Vec<u32> = ch.iter().map(|c| c.0).filter(|&a| a > 0 && a < len).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut runs: Vec<(u32, CharAttrs)> = Vec::new();
+    for (i, (at, a)) in p.runs.iter().enumerate() {
+        let next = p.runs.get(i + 1).map_or(len, |r| r.0);
+        runs.push((*at, a.clone()));
+        for &c in cuts.iter().filter(|&&c| c > *at && c < next) {
+            runs.push((c, a.clone()));
+        }
+    }
+    let mut k = 0;
+    let mut set = active.clone();
+    for r in runs.iter_mut() {
+        while k < ch.len() && ch[k].0 <= r.0 {
+            let (_, id, add) = ch[k];
+            match (add, set.binary_search(&id)) {
+                (true, Err(i)) => set.insert(i, id),
+                (false, Ok(i)) => {
+                    set.remove(i);
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        r.1.comments = if set.is_empty() { None } else { Some(set.as_slice().into()) };
+    }
+    for &(_, id, add) in &ch[k..] {
+        match (add, set.binary_search(&id)) {
+            (true, Err(i)) => set.insert(i, id),
+            (false, Ok(i)) => {
+                set.remove(i);
+            }
+            _ => {}
+        }
+    }
+    p.runs = runs;
+    *active = set;
 }
 
 #[derive(Default)]
@@ -536,7 +660,13 @@ impl<'a> Reader<'a> {
                             _ => self.rep.note(Kind::Dropped, "footnotes and endnotes in notes, headers and footers"),
                         }
                     }
-                    "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments"),
+                    "office:annotation" if at == Where::Body && !self.in_note => self.annotation(x, p),
+                    "office:annotation-end" if at == Where::Body && !self.in_note => {
+                        if let Some(&id) = x.attr("office:name").and_then(|n| self.annotations.get(n)) {
+                            self.events.push((p.text.len() as u32, id, Ev::End));
+                        }
+                    }
+                    "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments in notes, headers and footers"),
                     "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes (shown as they stand)"),
                     "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:soft-page-break" | "text:reference-mark" | "text:reference-mark-start" | "text:reference-mark-end" | "text:alphabetical-index-mark" | "text:toc-mark" | "text:sequence-ref" => {}
                     "text:ruby" => {
@@ -557,6 +687,46 @@ impl<'a> Reader<'a> {
                         self.inline(x, p, a, at);
                     }
                 },
+            }
+        }
+    }
+
+    /// An annotation: a comment from here to its end (by name), or a reply
+    /// (LibreOffice's parent name), or a point comment.
+    fn annotation(&mut self, x: &El, p: &Para) {
+        let text_of = |n: &str| x.child(n).map(|c| c.text()).unwrap_or_default();
+        let cut = |s: String, n: usize| -> Arc<str> { Arc::from(s.trim().chars().take(n).collect::<String>().as_str()) };
+        let initials = { let i = text_of("meta:creator-initials"); if i.is_empty() { text_of("loext:sender-initials") } else { i } };
+        let c = Comment { author: cut(text_of("dc:creator"), 256), initials: cut(initials, 16), date: cut(text_of("dc:date"), 64), text: annotation_text(x), parent: None, done: x.attr("loext:resolved") == Some("true") };
+        let Some(id) = self.doc.comments.add(c) else { return };
+        if let Some(n) = x.attr("office:name") {
+            self.annotations.insert(n.to_string(), id);
+        }
+        // A reply can come before what it answers: tied up after the text.
+        let parent = x.attr("loext:parent-name");
+        if let Some(n) = parent {
+            self.reply_to.push((id, n.chars().take(256).collect()));
+        } else {
+            // A start when an end names it, else a point.
+            let ranged = x.attr("office:name").is_some_and(|n| self.ends.contains(n));
+            self.events.push((p.text.len() as u32, id, if ranged { Ev::Start } else { Ev::Point }));
+        }
+    }
+
+    /// Replies to their comments; a reply to nothing known is dropped.
+    fn tie_replies(&mut self) {
+        for (id, name) in std::mem::take(&mut self.reply_to) {
+            let parent = self.annotations.get(&name).copied().filter(|&p| p != id);
+            let Some(mut c) = self.doc.comments.get(id).map(|c| (**c).clone()) else { continue };
+            match parent {
+                Some(p) => {
+                    c.parent = Some(p);
+                    self.doc.comments.set(id, Some(c));
+                }
+                None => {
+                    self.rep.note(Kind::Dropped, "replies to comments not in the document");
+                    self.doc.comments.set(id, None);
+                }
             }
         }
     }
@@ -591,7 +761,10 @@ impl<'a> Reader<'a> {
             props.space_after = props.space_after.or(Some(0));
         }
         let mut p = Para::default();
+        let outer = std::mem::take(&mut self.events);
         self.inline(e, &mut p, &chars, Where::Body);
+        let events = std::mem::replace(&mut self.events, outer);
+        apply_comments(&mut p, &mut self.active, events);
         // Trailing collapsed space.
         let mut runs: Vec<(u32, u32)> = p.runs.into_iter().map(|(at, a)| (at, self.doc.attrs.intern(a))).collect();
         if runs.is_empty() {
@@ -908,7 +1081,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new() };
     r.font_decls(styles.as_ref());
     r.font_decls(Some(&content));
     for s in [styles.as_ref().and_then(|s| s.child("office:styles")), styles.as_ref().and_then(|s| s.child("office:automatic-styles")), content.child("office:automatic-styles")].into_iter().flatten() {
@@ -922,6 +1095,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     r.page(styles.as_ref(), first_master);
     r.body(text);
     r.read_notes();
+    r.tie_replies();
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);
     }

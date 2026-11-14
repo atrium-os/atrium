@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use officina_convert::docx;
-use officina_text::model::{Align, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, NoteKind, ObjectRef, ParaProps, TextDoc, VertAlign};
+use officina_text::model::{Align, CellRef, CharAttrs, Comment, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, NoteKind, ObjectRef, ParaProps, TextDoc, VertAlign};
 
 /// A small valid PNG, `w` × `h`, one colour.
 pub fn png(w: u32, h: u32) -> Vec<u8> {
@@ -62,7 +62,15 @@ pub fn sample() -> TextDoc {
     }
     let k = d.push_para("a bullet", 0, vec![]);
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.list = Some(Some(ListRef { id: 6, kind: ListKind::Bullet, level: 0 })));
-    d.push_para("Before the table.", 0, vec![]);
+    let k = d.push_para("Before the table.", 0, vec![]);
+    // A comment over "the table", a resolved reply to it.
+    let c = Comment { author: "Ann Author".into(), initials: "AA".into(), date: "2026-11-14T10:00:00Z".into(), text: "Is this the right table?\nCheck the widths.".into(), parent: None, done: false };
+    let root = d.comments.next_id();
+    for op in d.add_comment_ops(k, 7, k, 16, c) {
+        officina_core::history::Op::apply(op, &mut d);
+    }
+    let reply = Comment { author: "Bo Reviewer".into(), initials: "BR".into(), date: "2026-11-14T11:30:00Z".into(), text: "Yes, it is.".into(), parent: Some(root), done: true };
+    officina_core::history::Op::apply(officina_text::ops::TextOp::SetComment { id: root + 1, comment: Some(reply) }, &mut d);
     for r in 0..2u32 {
         for c in 0..3u16 {
             let k = d.push_para(&format!("r{r}c{c}"), 0, vec![]);
@@ -181,6 +189,23 @@ pub fn compare(c: &mut Checks, d: &TextDoc, back: &TextDoc) {
         p.text.char_indices().filter(|c| c.1 == '\u{FFFC}').filter_map(|(i, _)| d.attrs.get(p.attr_at(i as u32)).note).filter_map(|id| d.notes.get(id).map(|n| (d.note_label(id), n.kind, n.paras.iter().map(|q| q.text.trim().to_string()).collect::<Vec<_>>().join("/")))).collect()
     };
     c.check("footnote 1 and endnote i with their text", notes(back) == notes(d) && notes(d).len() == 2, || format!("{:?} vs {:?}", notes(back), notes(d)));
+    // Comments: what each covers, who wrote it, its text, its thread, resolved.
+    let comments = |d: &TextDoc| -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, (sb, so), (eb, eo)) in d.comment_ranges() {
+            let over = if sb == eb { d.para(sb).map(|p| p.text[so as usize..eo as usize].to_string()).unwrap_or_default() } else { "…".into() };
+            let c = d.comments.get(id).unwrap();
+            out.push(format!("“{over}” {} ({}) {:?} done={}", c.author, c.initials, c.text, c.done));
+            for r in d.comments.replies(id) {
+                let c = d.comments.get(r).unwrap();
+                out.push(format!("  reply {} {:?} done={}", c.author, c.text, c.done));
+            }
+        }
+        out
+    };
+    c.check("comment over “the table” with a resolved reply", comments(back) == comments(d), || format!("{:?}\n vs {:?}", comments(back), comments(d)));
+    let date = back.comment_ranges().first().and_then(|r| back.comments.get(r.0)).map(|c| c.date.to_string()).unwrap_or_default();
+    c.check("comment date", date.starts_with("2026-11-14T10:00:00"), || date.clone());
     let sup = block(back, "E = mc2").map(|b| attrs_at(back, b, 6).vert);
     c.check("superscript", sup == Some(Some(VertAlign::Super)), || format!("{sup:?}"));
     c.check("page size and margins", back.page == d.page, || format!("{:?} vs {:?}", back.page, d.page));

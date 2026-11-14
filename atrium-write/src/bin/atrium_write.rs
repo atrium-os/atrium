@@ -343,9 +343,10 @@ fn main() {
     write.keep_words(root.join("words"));
     let mut run = Run { write, target: None, root: root.clone(), export: None };
     run.show(doc, target);
-    // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, or find:TEXT).
+    // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, comment, or find:TEXT).
     match std::env::var("ATRIUM_WRITE_BAR").ok().as_deref() {
         Some("spell") => run.write.cmds.lock().unwrap().push(Cmd::SpellOpen),
+        Some("comment") => run.write.cmds.lock().unwrap().push(Cmd::CommentOpen(0)),
         Some(f) if f.starts_with("find:") => {
             run.write.find_text.set(pergola::text_edit::TextEdit::new(&f[5..]));
             run.write.cmds.lock().unwrap().extend([Cmd::FindOpen, Cmd::FindNext]);

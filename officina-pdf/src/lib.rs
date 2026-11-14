@@ -231,6 +231,8 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
                         let _ = writeln!(c, "0.85 0.86 0.88 rg {} {} {} {} re f", num(pt(x)), num(ph - pt(y + h)), num(pt(w)), num(pt(h)));
                     }
                 }
+                // Comments stay out of the PDF.
+                Item::Mark { .. } => {}
                 Item::Link { x, y, w, h, uri } => {
                     if uri_ok(&uri) {
                         annots.push(format!("<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] /A << /S /URI /URI {} >> >>", num(pt(x)), num(ph - pt(y + h)), num(pt(x + w)), num(ph - pt(y)), lit(&uri)));

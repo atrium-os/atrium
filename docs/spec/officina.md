@@ -1612,6 +1612,58 @@ between paragraphs), note text split across pages (a footnote longer than the sp
 left is cut), separator and numbering settings (restart per page, symbols), notes in
 tables' header rows repeated on each page.
 
+### 16.21 O5b as built (2026-11-14): comments
+
+- **Model** (`officina-text::model`). A comment is author, initials, date (ISO 8601
+  UTC), text (a paragraph a line, at most 64 KB), the comment it answers, and whether
+  it is resolved; `TextDoc::comments` holds them by id (at most 2^20; ids never
+  reused while the document is open). What a comment covers is not stored apart from
+  the text: `CharAttrs::comments` is the sorted list of comments over a run, so ranges
+  move with edits for free, overlap, cross paragraphs, and vanish with their text.
+  `comment_ranges()` derives each comment's first and last character;
+  `live_comments()` is the anchored ones and their replies, in order, which is what
+  files keep. Replies have no range: they belong to their thread.
+- **Ops.** `TextOp::SetComment` puts in, changes or takes out one comment (no layout
+  edit). Adding a comment is `SetComment` then a format pass putting its id on the
+  range; deleting one removes it and its replies from their union range in a single
+  pass, then their entries; both one undoable action. The native file has a COMMENTS
+  chunk (kind 8), attribute bit 13, and the journal encodes `SetComment`.
+- **Painting and the view.** The page painter emits a mark item over commented text
+  (the PDF ignores it); the view draws it translucent yellow, grey when resolved.
+  Balloons sit to the right of the page when the window has room: author (and
+  "resolved"), up to three lines of text, the reply count; the thread at the caret
+  gets an accent border, and clicking a balloon moves the caret to the comment and
+  opens it. Text typed at the end of a commented range is not part of it.
+- **Editor and app.** `add_comment` (selection, else the word at the caret),
+  `comment_at_caret`, `thread`, `reply_comment`, `edit_comment`, `delete_comment`.
+  Insert ▸ Comment and Edit Comment open a comment bar (like the note bar): the first
+  comment's text, with Done, Reply, Resolve or Reopen, Delete and Close. A new comment
+  left empty goes away. The author is `$USER` (else "Me") until Atrium has an account
+  name to use.
+- **Files.** `.docx`: `w:commentRangeStart`/`End` in runs, paragraphs, the body and
+  cells; `comments.xml` (text, author, initials, date); `commentsExtended.xml` for
+  threads (`w15:paraIdParent`) and resolved (`w15:done`), tied by the last paragraph's
+  `w14:paraId`. A comment with a reference and no range covers the character before
+  it. Written the same way, replies with their thread's range as Word does. `.odt`:
+  `office:annotation` and `office:annotation-end` by name, a point annotation over the
+  character before it, `dc:creator`, `dc:date`, `meta:creator-initials`,
+  `loext:resolved`, and threads by LibreOffice's `loext:parent-name` (a reply may come
+  before its parent; ties are made after the text). Comments in notes, headers and
+  footers are reported dropped.
+
+Gates: editor test (add, reply, resolve, overlap, delete with replies, undo, journal
+replay to the same document) and app test (bar commands); both formats round trip
+overlapping and cross-paragraph comments with their threads, dates and resolved state
+with an empty report; LibreOffice both ways 22 of 22 (`.docx`) and 44 of 44 (`.odt`),
+the new checks being "comment over “the table” with a resolved reply" and "comment
+date"; the §16.18 corpus reads 90 comments in 39 files (9 files still have comments
+with no place to anchor them) and our writer and reader keep all of them; text
+against LibreOffice unchanged at 99.51 %.
+
+Not yet: editing a comment on the balloon itself, rich text in comments, mentions,
+showing comments in the PDF, a comments list pane, Word's paragraph-level comment
+dates in local time (we keep what the file says).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

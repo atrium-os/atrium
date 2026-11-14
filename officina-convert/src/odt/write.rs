@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, CharAttrs, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
 
-const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.3""#;
+const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" office:version="1.3""#;
 
 /// Twips as points.
 fn pt(t: i64) -> String {
@@ -155,6 +155,16 @@ struct Out<'a> {
     frames: u32,
     /// Writing a note's text (notes don't nest).
     in_note: u32,
+    /// Comment markers by block: (byte, end?, comment id), in order; a reply
+    /// goes out after the comment it answers, with no end.
+    marks: HashMap<usize, Vec<(u32, bool, CommentId)>>,
+    /// The block being written (none in notes).
+    cur: Option<usize>,
+}
+
+/// The name an annotation goes by.
+fn annotation_name(id: CommentId) -> String {
+    format!("__Annotation__{id}")
 }
 
 impl Out<'_> {
@@ -275,7 +285,34 @@ impl Out<'_> {
     fn para(&mut self, b: usize, out: &mut String) {
         let doc = self.doc;
         let Some(p) = doc.para(b) else { return };
+        self.cur = Some(b);
         self.para_of(p, out);
+        self.cur = None;
+    }
+
+    /// An annotation's start (the comment itself) or its end.
+    fn annotation(&self, out: &mut String, end: bool, id: CommentId) {
+        let name = annotation_name(id);
+        if end {
+            let _ = write!(out, r#"<office:annotation-end office:name="{name}"/>"#);
+            return;
+        }
+        let Some(c) = self.doc.comments.get(id) else { return };
+        let parent = c.parent.map(|p| format!(r#" loext:parent-name="{}""#, annotation_name(p))).unwrap_or_default();
+        let done = if c.done { r#" loext:resolved="true""# } else { "" };
+        let _ = write!(out, r#"<office:annotation office:name="{name}"{parent}{done}><dc:creator>{}</dc:creator>"#, esc(&c.author));
+        if !c.date.is_empty() {
+            let _ = write!(out, "<dc:date>{}</dc:date>", esc(&c.date));
+        }
+        if !c.initials.is_empty() {
+            let _ = write!(out, "<meta:creator-initials>{}</meta:creator-initials>", esc(&c.initials));
+        }
+        for line in c.text.split('\n') {
+            out.push_str("<text:p>");
+            Self::text(line, out);
+            out.push_str("</text:p>");
+        }
+        out.push_str("</office:annotation>");
     }
 
     fn para_of(&mut self, p: &Para, out: &mut String) {
@@ -290,7 +327,13 @@ impl Out<'_> {
         let tag = if level.is_some() { "text:h" } else { "text:p" };
         let lvl = level.map(|l| format!(r#" text:outline-level="{l}""#)).unwrap_or_default();
         let _ = write!(out, r#"<{tag} text:style-name="{}"{lvl}>"#, esc(&st));
+        let marks = if self.in_note == 0 { self.cur.and_then(|b| self.marks.get(&b)).cloned().unwrap_or_default() } else { Vec::new() };
+        let mut m = 0;
         for (s, e, a) in p.spans() {
+            while m < marks.len() && marks[m].0 <= s {
+                self.annotation(out, marks[m].1, marks[m].2);
+                m += 1;
+            }
             if s == e {
                 continue;
             }
@@ -342,6 +385,9 @@ impl Out<'_> {
                 }
                 None => out.push_str(&inner),
             }
+        }
+        for &(_, end, id) in &marks[m..] {
+            self.annotation(out, end, id);
         }
         let _ = write!(out, "</{tag}>");
     }
@@ -469,7 +515,31 @@ fn margin(hf: &HeaderFooter, tag: &str, style: &str) -> String {
 /// The document as an `.odt`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0 };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None };
+    // Comments: each anchored one's start and end; its replies right after its start.
+    let ranges = doc.comment_ranges();
+    let live: std::collections::HashSet<CommentId> = doc.live_comments().into_iter().collect();
+    for &(id, (sb, so), (eb, eo)) in &ranges {
+        o.marks.entry(sb).or_default().push((so, false, id));
+        // The thread, in order, after the comment.
+        let mut stack = doc.comments.replies(id);
+        stack.reverse();
+        let mut seen = 0;
+        while let Some(r) = stack.pop() {
+            seen += 1;
+            if seen > 4096 || !live.contains(&r) {
+                continue;
+            }
+            o.marks.entry(sb).or_default().push((so, false, r));
+            let mut more = doc.comments.replies(r);
+            more.reverse();
+            stack.extend(more);
+        }
+        o.marks.entry(eb).or_default().push((eo, true, id));
+    }
+    for v in o.marks.values_mut() {
+        v.sort_by_key(|&(at, end, _)| (at, !end));
+    }
     let mut body = String::new();
     let n = doc.blocks.len();
     let mut b = 0;

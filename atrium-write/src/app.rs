@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::{Align, ListKind, NoteId, NoteKind};
+use officina_text::model::{Align, CommentId, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -38,7 +38,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 2] = ["Find and Replace", "Spelling"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 10] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note"];
+pub const INSERT: [&str; 12] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -80,12 +80,21 @@ pub enum Cmd {
     NoteEdit,
     NoteDone,
     NoteClose,
+    CommentAdd,
+    CommentEdit,
+    /// A balloon was clicked.
+    CommentOpen(CommentId),
+    CommentDone,
+    CommentReply,
+    CommentResolve,
+    CommentDelete,
+    CommentClose,
 }
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -123,6 +132,31 @@ pub struct NoteBar {
     pub title: String,
 }
 
+/// The comment bar: the thread it is on, and whether its field holds the
+/// first comment's text or a new reply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommentBar {
+    pub open: bool,
+    /// The thread's first comment.
+    pub id: CommentId,
+    pub replying: bool,
+    /// "Comment · Ann · 2 replies".
+    pub title: String,
+    pub done: bool,
+}
+
+/// Who the app writes comments as: `$USER` (else "Me") and its initials.
+pub fn comment_author() -> (String, String) {
+    let name = std::env::var("USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "Me".into());
+    let initials: String = name.split(|c: char| c.is_whitespace() || c == '.' || c == '_').filter_map(|w| w.chars().next()).flat_map(char::to_uppercase).take(3).collect();
+    (name, initials)
+}
+
+/// Now, as a comment date.
+pub fn comment_date() -> String {
+    officina_text::model::iso_utc(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+}
+
 /// The editor's view of the app's speller.
 pub struct AppChecker(pub Rc<RefCell<Speller>>);
 
@@ -151,6 +185,8 @@ pub struct Write {
     pub spell: Mutable<SpellBar>,
     pub note: Mutable<NoteBar>,
     pub note_text: Mutable<TextEdit>,
+    pub comment: Mutable<CommentBar>,
+    pub comment_text: Mutable<TextEdit>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
     pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -158,7 +194,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -199,7 +235,7 @@ impl Write {
     /// Where the pages go: under the toolbar and the find or spelling bar
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
-        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -218,6 +254,7 @@ impl Write {
                 sb.open = true;
                 self.find.set(FindBar { open: false, ..self.find.get_cloned() });
                 self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
             }
             Cmd::SpellClose => {
                 self.spell.set(SpellBar::default());
@@ -279,6 +316,7 @@ impl Write {
             t.select_all();
             self.note_text.set(t);
             self.note.set(NoteBar { open: true, id, title });
+            self.comment.set(CommentBar::default());
             self.find.set(FindBar { open: false, ..self.find.get_cloned() });
             self.spell.set(SpellBar::default());
         };
@@ -310,6 +348,98 @@ impl Write {
         RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
     }
 
+    /// Opens the comment bar on thread `root`: on its first comment's text,
+    /// or on a new reply.
+    fn open_comment(&self, root: CommentId, replying: bool) {
+        let ed = self.doc.borrow().ed.clone();
+        let e = ed.borrow();
+        let Some(c) = e.doc.comments.get(root).cloned() else {
+            self.comment.set(CommentBar::default());
+            return;
+        };
+        let n = e.thread(root).len() - 1;
+        let mut title = if c.author.is_empty() { "Comment".to_string() } else { format!("Comment · {}", c.author) };
+        if n > 0 {
+            title += &format!(" · {n} {}", if n == 1 { "reply" } else { "replies" });
+        }
+        let shown = if replying { String::new() } else { c.text.replace('\n', NOTE_PARA_MARK) };
+        let mut t = TextEdit::new(&shown);
+        t.select_all();
+        drop(e);
+        self.comment_text.set(t);
+        self.comment.set(CommentBar { open: true, id: root, replying, title, done: c.done });
+        self.note.set(NoteBar::default());
+        self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+        self.spell.set(SpellBar::default());
+    }
+
+    /// Runs a comment command.
+    fn comment_cmd(&self, c: Cmd) {
+        let ed = self.doc.borrow().ed.clone();
+        let cb = self.comment.get_cloned();
+        let field = || self.comment_text.get_cloned().text().split('¶').map(str::trim).collect::<Vec<_>>().join("\n");
+        match c {
+            Cmd::CommentAdd => {
+                let (name, initials) = comment_author();
+                let id = ed.borrow_mut().add_comment("", &name, &initials, &comment_date());
+                if let Some(id) = id {
+                    self.open_comment(id, false);
+                }
+            }
+            Cmd::CommentEdit => {
+                let id = ed.borrow().comment_at_caret();
+                if let Some(id) = id {
+                    self.open_comment(id, false);
+                }
+            }
+            Cmd::CommentOpen(id) => {
+                let root = ed.borrow().thread_root(id);
+                let start = ed.borrow().doc.comment_ranges().into_iter().find(|r| r.0 == root).map(|r| r.1);
+                if let Some((b, at)) = start {
+                    ed.borrow_mut().set_caret(pergola_richtext::Pos::new(b, at), false);
+                }
+                self.open_comment(root, false);
+            }
+            Cmd::CommentDone if cb.open => {
+                let text = field();
+                if cb.replying {
+                    if !text.is_empty() {
+                        let (name, initials) = comment_author();
+                        ed.borrow_mut().reply_comment(cb.id, &text, &name, &initials, &comment_date());
+                    }
+                } else if text.is_empty() && ed.borrow().thread(cb.id).len() == 1 {
+                    // A comment left empty goes away.
+                    ed.borrow_mut().delete_comment(cb.id);
+                } else {
+                    ed.borrow_mut().edit_comment(cb.id, Some(&text), None);
+                }
+                self.comment.set(CommentBar::default());
+            }
+            Cmd::CommentReply if cb.open => {
+                // Keep what was typed into the first comment, then start a reply.
+                if !cb.replying {
+                    let text = field();
+                    if !text.is_empty() {
+                        ed.borrow_mut().edit_comment(cb.id, Some(&text), None);
+                    }
+                }
+                self.open_comment(cb.id, true);
+            }
+            Cmd::CommentResolve if cb.open => {
+                ed.borrow_mut().edit_comment(cb.id, None, Some(!cb.done));
+                self.open_comment(cb.id, cb.replying);
+            }
+            Cmd::CommentDelete if cb.open => {
+                ed.borrow_mut().delete_comment(cb.id);
+                self.comment.set(CommentBar::default());
+            }
+            Cmd::CommentClose => self.comment.set(CommentBar::default()),
+            _ => {}
+        }
+        let (w, h) = self.size.get();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+    }
+
     /// Runs a find bar command on the editor.
     fn find_cmd(&self, c: Cmd) {
         let mut f = self.find.get_cloned();
@@ -318,6 +448,7 @@ impl Write {
                 f.open = true;
                 self.spell.set(SpellBar::default());
                 self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
                 // The selection, when it is on one line, is what to find.
                 let sel = self.doc.borrow().ed.borrow().selected_text();
                 if !sel.is_empty() && !sel.contains('\n') && sel.chars().count() <= 200 {
@@ -403,6 +534,13 @@ impl Write {
                     }
                     Cmd::DeleteColumn => {
                         e.delete_column();
+                    }
+                    Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::CommentDone | Cmd::CommentReply | Cmd::CommentResolve | Cmd::CommentDelete | Cmd::CommentClose => {
+                        drop(e);
+                        drop(d);
+                        self.comment_cmd(c);
+                        self.changed();
+                        return false;
                     }
                     Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::NoteDone | Cmd::NoteClose => {
                         drop(e);
@@ -635,9 +773,33 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The comment bar: the first comment's text (or a reply) on one line.
+        let cb = self.comment.get_cloned();
+        if cb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let title = if cb.replying { "Reply".to_string() } else { cb.title.clone() };
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 200.0, 20.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 220.0 - 388.0).max(120.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.comment_text.clone()).placeholder(if cb.replying { "Reply" } else { "Comment" }).autofocus(true).at(220.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::CommentDone)).render(ctx);
+            let bx = w - 380.0;
+            Button::primary("Done").at(bx, y + 8.0).width(64.0).on_click(push(Cmd::CommentDone)).render(ctx);
+            Button::secondary("Reply").at(bx + 68.0, y + 8.0).width(64.0).on_click(push(Cmd::CommentReply)).render(ctx);
+            Button::secondary(if cb.done { "Reopen" } else { "Resolve" }).at(bx + 136.0, y + 8.0).width(80.0).on_click(push(Cmd::CommentResolve)).render(ctx);
+            Button::secondary("Delete").at(bx + 220.0, y + 8.0).width(72.0).on_click(push(Cmd::CommentDelete)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::CommentClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The pages.
         let cmds = self.cmds.clone();
-        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).emit(ctx);
+        let cmds2 = self.cmds.clone();
+        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).on_comment(move |id| cmds2.lock().unwrap().push(Cmd::CommentOpen(id))).emit(ctx);
 
         // Status line: page, pages (≈ while pagination runs), and the last message.
         let sy = h - STATUS_H;
@@ -699,6 +861,56 @@ mod tests {
         run(Cmd::Undo);
         run(Cmd::Undo);
         assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "");
+    }
+
+    #[test]
+    fn comment_bar_commands() {
+        let doc = Doc::from_text("c.txt", b"Some text here.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let comments = || w.doc.borrow().ed.borrow().doc.live_comments();
+        w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 6), false);
+        run(Cmd::insert(10));
+        let cb = w.comment.get_cloned();
+        assert!(cb.open && !cb.replying);
+        // Left empty, the new comment goes away.
+        run(Cmd::CommentDone);
+        assert!(comments().is_empty());
+        run(Cmd::insert(10));
+        w.comment_text.set(TextEdit::new("Check this ¶ twice"));
+        run(Cmd::CommentReply);
+        let cb = w.comment.get_cloned();
+        assert!(cb.replying);
+        w.comment_text.set(TextEdit::new("Checked."));
+        run(Cmd::CommentDone);
+        let ids = comments();
+        assert_eq!(ids.len(), 2);
+        {
+            let d = w.doc.borrow();
+            let e = d.ed.borrow();
+            assert_eq!(e.doc.comments.get(ids[0]).unwrap().text, "Check this\ntwice");
+            assert_eq!(e.doc.comments.get(ids[1]).unwrap().parent, Some(ids[0]));
+            assert_eq!(e.doc.comment_ranges(), vec![(ids[0], (0, 5), (0, 9))]);
+        }
+        // Edit Comment opens on the thread at the caret; a balloon click on a reply opens its thread.
+        run(Cmd::CommentClose);
+        run(Cmd::insert(11));
+        assert_eq!(w.comment.get_cloned().id, ids[0]);
+        assert!(w.comment.get_cloned().title.ends_with("1 reply"));
+        run(Cmd::CommentClose);
+        run(Cmd::CommentOpen(ids[1]));
+        assert_eq!(w.comment.get_cloned().id, ids[0]);
+        run(Cmd::CommentResolve);
+        assert!(w.comment.get_cloned().done);
+        assert!(w.doc.borrow().ed.borrow().doc.comments.get(ids[0]).unwrap().done);
+        run(Cmd::CommentDelete);
+        assert!(comments().is_empty());
+        assert_eq!(w.doc.borrow().ed.borrow().doc.para(0).unwrap().text, "Some text here.");
+        run(Cmd::Undo);
+        assert_eq!(comments().len(), 2);
     }
 
     #[test]

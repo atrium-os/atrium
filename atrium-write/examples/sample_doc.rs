@@ -102,6 +102,22 @@ fn main() {
     for op in d.insert_note_ops(just, end, NoteKind::End, "Endnotes are gathered after the last paragraph, numbered i, ii, iii.", 0) {
         op.apply(&mut d);
     }
+    // Comments: one with a reply on the first body paragraph, a resolved one on
+    // the justified paragraph.
+    let com = |author: &str, initials: &str, text: &str, parent, done| officina_text::model::Comment { author: author.into(), initials: initials.into(), date: "2026-11-14T21:00:00Z".into(), text: text.into(), parent, done };
+    let p = d.para(body).unwrap().text.clone();
+    let (s, e) = (p.find("shaped").unwrap() as u32, (p.find("shaped").unwrap() + "shaped".len()) as u32);
+    let first = d.comments.next_id();
+    for op in d.add_comment_ops(body, s, body, e, com("Shankar", "SG", "Say which shaper: our own, or a port?", None, false)) {
+        op.apply(&mut d);
+    }
+    officina_text::ops::TextOp::SetComment { id: first + 1, comment: Some(com("Reviewer", "R", "Our own, in officina-text; it reads OpenType GSUB and GPOS.", Some(first), false)) }.apply(&mut d);
+    let p = d.para(just).unwrap().text.clone();
+    let s = p.find("Justified text").unwrap() as u32;
+    for op in d.add_comment_ops(just, s, just, s + "Justified text".len() as u32, com("Reviewer", "R", "Check the spacing on narrow pages.", None, true)) {
+        op.apply(&mut d);
+    }
+    d.take_changes();
     std::fs::write(&out, native::save_to_vec(&d, &[])).unwrap();
     println!("{out}: {} blocks", d.blocks.len());
 }

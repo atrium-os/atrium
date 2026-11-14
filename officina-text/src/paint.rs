@@ -46,6 +46,9 @@ pub enum Item {
     Image { image: u32, x: i64, y: i64, w: i64, h: i64 },
     /// An area that is a link.
     Link { x: i64, y: i64, w: i64, h: i64, uri: String },
+    /// Text under comments (the last one listed is the innermost): the screen
+    /// marks it, a PDF leaves it out. Comes before the text it covers.
+    Mark { x: i64, y: i64, w: i64, h: i64, comments: std::sync::Arc<[crate::model::CommentId]> },
 }
 
 /// A table rule's thickness: half a point.
@@ -217,6 +220,9 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
         let size = run.size;
         if let Some(h) = f.highlight {
             out.push(Item::Rect { x: rx, y: top, w: rw, h: line.height, color: h });
+        }
+        if let Some(c) = &f.comments {
+            out.push(Item::Mark { x: rx, y: top, w: rw, h: line.height, comments: c.clone() });
         }
         let color = f.color;
         if !run.glyphs.is_empty() {

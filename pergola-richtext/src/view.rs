@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use officina_text::model::CommentId;
 use officina_text::paint::{paint_page, Item};
 use officina_text::twips;
 use pergola::event::{Event, KeyEventKind};
@@ -58,7 +59,14 @@ impl Geom {
         let g = &ed.doc.page;
         let page_w = twips(g.width as i64) as f64 * k;
         let page_h = twips(g.height as i64) as f64 * k;
-        let left = ((rect.w() as f64 - page_w) / 2.0).max(GAP as f64);
+        // With comments, the page and the balloon column are centred together
+        // when both fit.
+        let side = BALLOON_W as f64 + 16.0;
+        let left = if !ed.doc.comments.is_empty() && rect.w() as f64 >= page_w + side + 2.0 * GAP as f64 {
+            ((rect.w() as f64 - page_w - side) / 2.0).max(GAP as f64)
+        } else {
+            ((rect.w() as f64 - page_w) / 2.0).max(GAP as f64)
+        };
         Geom { rect, k, page_w, page_h, left, margin_x: twips(g.margin_start as i64) as f64 * k, margin_y: twips(g.margin_top as i64) as f64 * k }
     }
     fn page_top(&self, i: usize) -> f64 {
@@ -81,11 +89,15 @@ pub struct RichTextView {
     pub zoom: f32,
     key: u64,
     on_find: Option<Rc<dyn Fn()>>,
+    on_comment: Option<Rc<dyn Fn(CommentId)>>,
 }
+
+/// A comment balloon's width beside the page, and the room it needs.
+pub const BALLOON_W: f32 = 200.0;
 
 impl RichTextView {
     pub fn new(editor: Rc<RefCell<Editor>>, scroll: Mutable<ScrollState>, rev: Mutable<u64>, rect: Rect) -> Self {
-        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578, on_find: None }
+        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578, on_find: None, on_comment: None }
     }
     pub fn zoom(mut self, z: f32) -> Self {
         self.zoom = z.clamp(0.25, 5.0);
@@ -98,6 +110,13 @@ impl RichTextView {
     /// Called on Ctrl+F (and Ctrl+H) in the text.
     pub fn on_find(mut self, f: impl Fn() + 'static) -> Self {
         self.on_find = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when a comment's balloon is clicked (the caret has moved to
+    /// the comment's text).
+    pub fn on_comment(mut self, f: impl Fn(CommentId) + 'static) -> Self {
+        self.on_comment = Some(Rc::new(f));
         self
     }
 
@@ -185,6 +204,7 @@ impl RichTextView {
                     paint_page(&e.doc, e.pages.pages(), i, col_w, &mut e.cache, &*fonts, &numbering, &pages_text)
                 };
                 let (ox, oy) = (px as f64, py as f64);
+                let mut balloons: Vec<(CommentId, f64)> = Vec::new();
                 for it in items {
                     match it {
                         Item::Rect { x, y, w, h, color } => {
@@ -209,7 +229,59 @@ impl RichTextView {
                                 }
                             }
                         }
+                        Item::Mark { x, y, w, h, comments } => {
+                            let done = comments.iter().all(|&c| ed.doc.comments.get(c).is_none_or(|c| c.done));
+                            let fill = if done { Color::rgba(0.55, 0.57, 0.6, 0.12) } else { Color::rgba(1.0, 0.78, 0.15, 0.32) };
+                            ctx.add(Node::Rect { rect: Rect::new(q(ox + x as f64 * g.k), q(oy + y as f64 * g.k), (w as f64 * g.k).max(1.0) as f32, (h as f64 * g.k).max(1.0) as f32), fill, radius: 0.0 });
+                            for &c in comments.iter() {
+                                let root = ed.thread_root(c);
+                                if !balloons.iter().any(|b: &(CommentId, f64)| b.0 == root) {
+                                    balloons.push((root, oy + y as f64 * g.k));
+                                }
+                            }
+                        }
                         Item::Link { .. } => {}
+                    }
+                }
+                // Comment balloons in the space right of the page, each at its
+                // text's first line on this page, pushed down so none overlap.
+                let room = r.w() as f64 - (g.left + g.page_w);
+                if !balloons.is_empty() && room >= BALLOON_W as f64 + 16.0 {
+                    let at_caret = ed.comment_at_caret();
+                    let bx = px + g.page_w as f32 + 8.0;
+                    let mut next_y = f64::MIN;
+                    let small = |c: Color, wt| pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: wt, color: c };
+                    for (id, y) in std::mem::take(&mut balloons) {
+                        let thread = ed.thread(id);
+                        let Some(first) = ed.doc.comments.get(id).cloned() else { continue };
+                        let y = y.max(next_y);
+                        let lines: Vec<String> = first.text.lines().take(3).map(|l| l.to_string()).collect();
+                        let h = 22.0 + 16.0 * lines.len().max(1) as f32 + if thread.len() > 1 { 16.0 } else { 0.0 };
+                        let rect = Rect::new(bx, q(y), BALLOON_W, h);
+                        let border = if at_caret == Some(id) { t.accent_fg() } else { t.border_default() };
+                        ctx.add(Node::Rect { rect: Rect::new(bx - 1.0, q(y) - 1.0, BALLOON_W + 2.0, h + 2.0), fill: border, radius: 6.0 });
+                        let bg = if first.done { Color::rgba(0.96, 0.96, 0.97, 1.0) } else { Color::rgba(1.0, 0.98, 0.9, 1.0) };
+                        let node = ctx.add(Node::Rect { rect, fill: bg, radius: 5.0 });
+                        let head = if first.done { format!("{} · resolved", first.author) } else { first.author.to_string() };
+                        ctx.add(Node::Text { rect: Rect::new(bx + 8.0, q(y) + 5.0, BALLOON_W - 16.0, 16.0), content: head, style: small(t.text_secondary(), pergola::theme::Weight::Semibold) });
+                        for (k, l) in lines.iter().enumerate() {
+                            ctx.add(Node::Text { rect: Rect::new(bx + 8.0, q(y) + 22.0 + 16.0 * k as f32, BALLOON_W - 16.0, 16.0), content: l.clone(), style: small(t.text_primary(), pergola::theme::Weight::Regular) });
+                        }
+                        if thread.len() > 1 {
+                            let n = thread.len() - 1;
+                            ctx.add(Node::Text { rect: Rect::new(bx + 8.0, q(y) + h - 19.0, BALLOON_W - 16.0, 16.0), content: if n == 1 { "1 reply".into() } else { format!("{n} replies") }, style: small(t.text_secondary(), pergola::theme::Weight::Regular) });
+                        }
+                        let (edc, cb) = (self.editor.clone(), self.on_comment.clone());
+                        ctx.on_click(node, move || {
+                            let start = edc.borrow().doc.comment_ranges().into_iter().find(|r| r.0 == id).map(|r| r.1);
+                            if let Some((b, at)) = start {
+                                edc.borrow_mut().set_caret(Pos::new(b, at), false);
+                            }
+                            if let Some(f) = &cb {
+                                f(id);
+                            }
+                        });
+                        next_y = y + h as f64 + 6.0;
                     }
                 }
                 // Spelling: a red dotted line under each misspelled word, but
@@ -433,7 +505,7 @@ mod tests {
     }
     impl View for Host {
         fn render(&self, ctx: &mut Ctx) {
-            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7, on_find: None }.emit(ctx);
+            RichTextView { editor: self.v.editor.clone(), scroll: self.v.scroll.clone(), rev: self.v.rev.clone(), rect: self.v.rect, zoom: 1.0, key: 7, on_find: None, on_comment: None }.emit(ctx);
         }
     }
 

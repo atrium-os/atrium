@@ -58,8 +58,13 @@ fn labelled(d: &TextDoc) -> String {
     out
 }
 
-/// The notes' text in number order (what a round trip must keep).
+/// The notes' text in number order, then the comments' (what a round trip
+/// must keep).
 fn notes_text(d: &TextDoc) -> String {
+    notes_only(d) + &d.live_comments().iter().filter_map(|&id| d.comments.get(id)).map(|c| format!("\n[{}] {}", c.author, c.text)).collect::<String>()
+}
+
+fn notes_only(d: &TextDoc) -> String {
     let mut v: Vec<(String, String)> = d.note_numbers().iter().map(|(&id, &(k, n))| (format!("{k:?}{n:08}"), d.notes.get(id).map(|n| n.paras.iter().map(|p| p.text.clone()).collect::<Vec<_>>().join("\n")).unwrap_or_default())).collect();
     v.sort();
     v.into_iter().map(|x| x.1).collect::<Vec<_>>().join("\n--\n")
@@ -79,6 +84,7 @@ struct Row {
     roundtrip: bool,
     missing: Vec<String>,
     notes: usize,
+    comments: usize,
 }
 
 fn read(path: &Path, data: &[u8]) -> Result<(TextDoc, Vec<String>), String> {
@@ -108,7 +114,7 @@ fn main() {
             let took = t.elapsed();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let lo = std::fs::read_to_string(Path::new(txt).join(Path::new(&name).with_extension("txt"))).ok();
-            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0 };
+            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0 };
             match got {
                 Err(e) => row.ok = Err(e),
                 Ok((doc, ns)) => {
@@ -118,6 +124,7 @@ fn main() {
                     }
                     let ours = doc.plain_text();
                     row.notes = doc.note_numbers().len();
+                    row.comments = doc.live_comments().len();
                     if let Some(lo) = &lo {
                         let ours = labelled(&doc);
                         let (a, b) = (words(lo), words(&ours));
@@ -165,6 +172,7 @@ fn main() {
     println!("text against LibreOffice on {} files with text: {:.2} % of all its words; median file {:.1} %; {} files ≥ 99 % both ways", compared.len(), 100.0 * total_hit / total_lo.max(1) as f64, 100.0 * rec.get(rec.len() / 2).copied().unwrap_or(0.0), full);
     println!("our writer then our reader keep the text (and notes) of {rt} of {read_ok}");
     println!("{} notes in {} files", rows.iter().map(|r| r.notes).sum::<usize>(), rows.iter().filter(|r| r.notes > 0).count());
+    println!("{} comments in {} files", rows.iter().map(|r| r.comments).sum::<usize>(), rows.iter().filter(|r| r.comments > 0).count());
     for r in &panics {
         println!("PANIC {}", r.file);
     }

@@ -5,14 +5,16 @@
 //! spacing, line spacing, keeps, page breaks, widow control, outline level),
 //! runs (bold, italic, underline, strike, size, colour, highlight and shading,
 //! font, superscript and subscript, hyperlinks), footnotes and endnotes
-//! (footnotes.xml and endnotes.xml), tabs and line breaks, lists (numbering.xml: bullet or
+//! (footnotes.xml and endnotes.xml), comments with their replies and resolved
+//! state (comments.xml, commentsExtended.xml), tabs and line breaks, lists (numbering.xml: bullet or
 //! numbered, level), tables (rows of cells of paragraphs, widths from the grid),
 //! inline pictures (their bytes and frame), paragraph and character styles with
 //! inheritance and the document defaults, page size and margins, and a header and
 //! footer (page number fields become `{page}` and `{pages}`).
 //!
 //! Reported, not carried: floating pictures (kept in line), merged cells, nested
-//! tables (their text kept), notes inside notes or headers, comments, tracked changes
+//! tables (their text kept), notes inside notes or headers, comments without a
+//! range, tracked changes
 //! (insertions kept, deletions dropped), sections after the first, fields other than
 //! page numbers (their shown result kept), text boxes, charts, equations, embedded
 //! objects. Kept inert: macros (`.docm`, not read).
@@ -20,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, Block, CellRef, CharAttrs, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -321,6 +323,49 @@ struct Reader<'a> {
     /// Notes anchored in the text, read after it.
     pending: Vec<(NoteId, NoteKind, String)>,
     in_note: bool,
+    /// Comments by their `w:id`, and (from commentsExtended.xml) the `w:id`
+    /// each answers and whether it is resolved.
+    comment_xml: HashMap<String, El>,
+    comment_parent: HashMap<String, String>,
+    comment_done: HashMap<String, bool>,
+    /// Comments met in the text: `w:id` → ours.
+    comment_ids: HashMap<String, CommentId>,
+    /// The comments over the text being read, sorted.
+    active: Vec<CommentId>,
+}
+
+/// A comment's text: a line a paragraph.
+fn comment_text(e: &El) -> String {
+    fn walk(e: &El, out: &mut String, depth: usize) {
+        for x in e.els() {
+            if out.len() > MAX_COMMENT_TEXT || depth > 32 {
+                return;
+            }
+            match x.name.as_str() {
+                "w:t" => out.push_str(&x.text()),
+                "w:tab" => out.push('\t'),
+                "w:br" | "w:cr" => out.push(' '),
+                "w:p" => {
+                    let mut line = String::new();
+                    walk(x, &mut line, depth + 1);
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&line);
+                }
+                "w:delText" | "w:instrText" | "w:del" => {}
+                _ => walk(x, out, depth + 1),
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(e, &mut out, 0);
+    let mut end = out.len().min(MAX_COMMENT_TEXT);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
 }
 
 /// The elements named `name` among `e`'s children, looking through content
@@ -517,6 +562,9 @@ impl<'a> Reader<'a> {
                     if let Some(l) = link {
                         a.link = Some(l.clone());
                     }
+                    if !self.active.is_empty() && !self.in_note && !field.in_margin {
+                        a.comments = Some(self.active.as_slice().into());
+                    }
                     // Markup compatibility: the choice we read, else the fallback.
                     let mut kids: Vec<&El> = Vec::new();
                     for k in x.els() {
@@ -618,7 +666,11 @@ impl<'a> Reader<'a> {
                                     self.pending.push((nid, kind, id));
                                 }
                             }
-                            "w:commentReference" => self.rep.note(Kind::Dropped, "comments"),
+                            "w:commentReference" if !field.in_margin => {
+                                if let Some(wid) = k.attr("w:id") {
+                                    self.point_comment(wid, p);
+                                }
+                            }
                             "w:rPr" | "w:lastRenderedPageBreak" | "w:delText" => {}
                             _ => {}
                         }
@@ -656,8 +708,87 @@ impl<'a> Reader<'a> {
                 }
                 "w:del" | "w:moveFrom" => self.rep.note(Kind::Approximate, "tracked changes (insertions kept, deletions dropped)"),
                 "m:oMath" | "m:oMathPara" => self.rep.note(Kind::Dropped, "equations"),
-                "w:commentRangeStart" | "w:commentRangeEnd" => self.rep.note(Kind::Dropped, "comments"),
+                "w:commentRangeStart" | "w:commentRangeEnd" => self.comment_mark(x),
                 _ => {}
+            }
+        }
+    }
+
+    /// A comment range's start or end: the comment joins or leaves the set
+    /// over the text. Replies get no range of their own.
+    fn comment_mark(&mut self, x: &El) {
+        if self.in_note {
+            return;
+        }
+        let Some(wid) = x.attr("w:id") else { return };
+        if x.name == "w:commentRangeEnd" {
+            if let Some(&id) = self.comment_ids.get(wid) {
+                self.active.retain(|&a| a != id);
+            }
+            return;
+        }
+        let Some(id) = self.comment_id(wid) else { return };
+        if let Err(i) = self.active.binary_search(&id) {
+            self.active.insert(i, id);
+        }
+    }
+
+    /// Our comment for `w:id` `wid` (made the first time); none for a reply.
+    fn comment_id(&mut self, wid: &str) -> Option<CommentId> {
+        if self.comment_parent.get(wid).is_some_and(|p| self.comment_xml.contains_key(p)) {
+            return None;
+        }
+        if let Some(&id) = self.comment_ids.get(wid) {
+            return Some(id);
+        }
+        let c = self.comment_xml.get(wid)?;
+        let cut = |s: Option<&str>, n: usize| -> Arc<str> { Arc::from(s.unwrap_or("").chars().take(n).collect::<String>().as_str()) };
+        let comment = Comment { author: cut(c.attr("w:author"), 256), initials: cut(c.attr("w:initials"), 16), date: cut(c.attr("w:date"), 64), text: comment_text(c), parent: None, done: self.comment_done.get(wid).copied().unwrap_or(false) };
+        let id = self.doc.comments.add(comment)?;
+        self.comment_ids.insert(wid.to_string(), id);
+        Some(id)
+    }
+
+    /// A comment with a reference and no range: over the character before it.
+    fn point_comment(&mut self, wid: &str, p: &mut Para) {
+        if self.in_note || self.comment_ids.contains_key(wid) {
+            return;
+        }
+        let Some((at, _)) = p.text.char_indices().next_back() else { return };
+        let Some(id) = self.comment_id(wid) else { return };
+        let at = at as u32;
+        let i = p.runs.iter().rposition(|r| r.0 <= at).unwrap_or(0);
+        if p.runs[i].0 < at {
+            let a = p.runs[i].1.clone();
+            p.runs.insert(i + 1, (at, a));
+        }
+        let last = p.runs.len() - 1;
+        let a = &mut p.runs[last].1;
+        let mut ids: Vec<CommentId> = a.comments.as_deref().unwrap_or(&[]).to_vec();
+        if let Err(k) = ids.binary_search(&id) {
+            ids.insert(k, id);
+        }
+        a.comments = Some(ids.into());
+    }
+
+    /// Replies to the comments read, after the text: in comments.xml's order,
+    /// so a reply follows what it answers.
+    fn read_replies(&mut self, order: &[String]) {
+        for wid in order {
+            if self.comment_ids.contains_key(wid) {
+                continue;
+            }
+            let Some(parent) = self.comment_parent.get(wid).and_then(|p| self.comment_ids.get(p)).copied() else {
+                if self.comment_xml.contains_key(wid) {
+                    self.rep.note(Kind::Dropped, "comments without a range in the text");
+                }
+                continue;
+            };
+            let Some(c) = self.comment_xml.get(wid) else { continue };
+            let cut = |s: Option<&str>, n: usize| -> Arc<str> { Arc::from(s.unwrap_or("").chars().take(n).collect::<String>().as_str()) };
+            let comment = Comment { author: cut(c.attr("w:author"), 256), initials: cut(c.attr("w:initials"), 16), date: cut(c.attr("w:date"), 64), text: comment_text(c), parent: Some(parent), done: self.comment_done.get(wid).copied().unwrap_or(false) };
+            if let Some(id) = self.doc.comments.add(comment) {
+                self.comment_ids.insert(wid.clone(), id);
             }
         }
     }
@@ -835,6 +966,7 @@ impl<'a> Reader<'a> {
                         self.cell_content(c, cell, depth, field);
                     }
                 }
+                "w:commentRangeStart" | "w:commentRangeEnd" => self.comment_mark(x),
                 "w:customXml" | "w:ins" | "w:moveTo" => self.cell_content(x, cell, depth, field),
                 _ => {}
             }
@@ -858,6 +990,7 @@ impl<'a> Reader<'a> {
                     }
                 }
                 "w:sectPr" => self.section(x),
+                "w:commentRangeStart" | "w:commentRangeEnd" => self.comment_mark(x),
                 "w:customXml" | "w:ins" | "w:moveTo" => self.body(x),
                 _ => {}
             }
@@ -1031,7 +1164,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1051,6 +1184,32 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
             r.end_rels = nr;
         }
     }
+    // Comments, and their threads and resolved state (paragraph ids tie the two).
+    let mut comment_order = Vec::new();
+    if let Some(x) = find("comments").map(|p| part(&archive, &p)).transpose()?.flatten() {
+        let mut para_of = HashMap::new();
+        for c in x.children("w:comment").take(MAX_COMMENTS) {
+            let Some(id) = c.attr("w:id") else { continue };
+            if let Some(pid) = c.children("w:p").last().and_then(|p| p.attr("w14:paraId")) {
+                para_of.insert(pid.to_string(), id.to_string());
+            }
+            comment_order.push(id.to_string());
+            r.comment_xml.insert(id.to_string(), c.clone());
+        }
+        if let Some(x) = find("commentsExtended").map(|p| part(&archive, &p)).transpose()?.flatten() {
+            for e in x.children("w15:commentEx") {
+                let Some(id) = e.attr("w15:paraId").and_then(|p| para_of.get(p)) else { continue };
+                if e.attr("w15:done") == Some("1") {
+                    r.comment_done.insert(id.clone(), true);
+                }
+                if let Some(parent) = e.attr("w15:paraIdParent").and_then(|p| para_of.get(p)) {
+                    if parent != id {
+                        r.comment_parent.insert(id.clone(), parent.clone());
+                    }
+                }
+            }
+        }
+    }
     if let Some(p) = find("settings") {
         r.even_odd = part(&archive, &p)?.is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
     }
@@ -1060,9 +1219,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
         r.body(more);
     }
     r.read_notes();
-    if find("comments").is_some() && body.find("w:commentReference").is_some() {
-        r.rep.note(Kind::Dropped, "comments");
-    }
+    r.read_replies(&comment_order);
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);
     }

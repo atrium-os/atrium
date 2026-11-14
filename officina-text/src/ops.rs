@@ -38,6 +38,8 @@ pub enum TextOp {
     SetPage { page: crate::model::PageSetup, header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter> },
     /// Sets note `id`'s text (None takes the note out of the store).
     SetNote { id: crate::model::NoteId, note: Option<crate::model::Note> },
+    /// Sets comment `id` (None takes it out of the store).
+    SetComment { id: crate::model::CommentId, comment: Option<crate::model::Comment> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -128,6 +130,8 @@ impl TextOp {
             TextOp::SetPage { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } => return None,
+            // Comments change no layout; the editor redraws on every action.
+            TextOp::SetComment { .. } => return None,
         })
     }
 
@@ -303,6 +307,13 @@ impl TextOp {
                 d.notes.renumber();
                 TextOp::SetNote { id, note: old }
             }
+            TextOp::SetComment { id, comment } => {
+                if id as usize >= crate::model::MAX_COMMENTS || comment.as_ref().is_some_and(|c| c.text.len() > crate::model::MAX_COMMENT_TEXT || c.parent == Some(id)) {
+                    return TextOp::Nop;
+                }
+                let old = d.comments.set(id, comment);
+                TextOp::SetComment { id, comment: old }
+            }
             TextOp::SetPage { page, header, footer } => {
                 let ok = |t: i32| (0..=63_360).contains(&t);
                 if !(page.width >= 1440 && page.height >= 1440 && [page.width, page.height, page.margin_top, page.margin_bottom, page.margin_start, page.margin_end].into_iter().all(ok)) || page.margin_start + page.margin_end + 720 > page.width || page.margin_top + page.margin_bottom + 720 > page.height {
@@ -356,6 +367,78 @@ impl TextDoc {
             TextOp::SetNote { id, note: Some(crate::model::Note { kind, paras }) },
             TextOp::Splice { block: block as u32, at, del: 0, ins: Fragment { text: crate::model::OBJECT_CHAR.to_string(), runs: vec![(0, anchor)] } },
         ]
+    }
+
+    /// Ops that put comment `c` on the text from (`b0`, `o0`) to (`b1`, `o1`):
+    /// the comment, then its id added to each run there.
+    pub fn add_comment_ops(&mut self, b0: usize, o0: u32, b1: usize, o1: u32, c: crate::model::Comment) -> Vec<TextOp> {
+        if (b1, o1) <= (b0, o0) || self.para(b1).is_none() || self.comments.next_id() as usize >= crate::model::MAX_COMMENTS {
+            return Vec::new();
+        }
+        let id = self.comments.next_id();
+        let mut ops = vec![TextOp::SetComment { id, comment: Some(c) }];
+        ops.extend(self.comment_mark_ops(b0, o0, b1, o1, id, true));
+        ops
+    }
+
+    /// Ops that add comment `id` to (or take it from) the runs of a range.
+    pub fn comment_mark_ops(&mut self, b0: usize, o0: u32, b1: usize, o1: u32, id: crate::model::CommentId, on: bool) -> Vec<TextOp> {
+        let mut ops = Vec::new();
+        for b in b0..=b1 {
+            let Some(p) = self.para(b) else { continue };
+            let s = if b == b0 { o0 } else { 0 };
+            let e = if b == b1 { o1 } else { p.text.len() as u32 };
+            if s >= e {
+                continue;
+            }
+            ops.extend(self.format_ops(b, s, e, |a| {
+                let mut v: Vec<crate::model::CommentId> = a.comments.as_deref().unwrap_or(&[]).to_vec();
+                v.retain(|&x| x != id);
+                if on {
+                    v.push(id);
+                    v.sort_unstable();
+                }
+                a.comments = if v.is_empty() { None } else { Some(v.into()) };
+            }));
+        }
+        ops
+    }
+
+    /// Ops that take out comment `id`, its marks on the text and its replies.
+    pub fn delete_comment_ops(&mut self, id: crate::model::CommentId) -> Vec<TextOp> {
+        let mut ids = vec![id];
+        let mut k = 0;
+        while k < ids.len() && ids.len() < crate::model::MAX_COMMENTS {
+            for r in self.comments.replies(ids[k]) {
+                if !ids.contains(&r) {
+                    ids.push(r);
+                }
+            }
+            k += 1;
+        }
+        // One pass over the text they cover, so no op undoes another's work.
+        let ranges: Vec<_> = self.comment_ranges().into_iter().filter(|r| ids.contains(&r.0)).collect();
+        let mut ops = Vec::new();
+        if let (Some(a), Some(b)) = (ranges.iter().map(|r| r.1).min(), ranges.iter().map(|r| r.2).max()) {
+            for blk in a.0..=b.0 {
+                let Some(p) = self.para(blk) else { continue };
+                let (s, e) = (if blk == a.0 { a.1 } else { 0 }, if blk == b.0 { b.1 } else { p.text.len() as u32 });
+                if s >= e {
+                    continue;
+                }
+                let gone = ids.clone();
+                ops.extend(self.format_ops(blk, s, e, move |at| {
+                    let v: Vec<crate::model::CommentId> = at.comments.as_deref().unwrap_or(&[]).iter().copied().filter(|x| !gone.contains(x)).collect();
+                    at.comments = if v.is_empty() { None } else { Some(v.into()) };
+                }));
+            }
+        }
+        for &c in ids.iter().rev() {
+            if self.comments.get(c).is_some() {
+                ops.push(TextOp::SetComment { id: c, comment: None });
+            }
+        }
+        ops
     }
 
     /// Ops that set note `id`'s text to `text` (a paragraph a line), keeping
@@ -417,6 +500,35 @@ mod tests {
 
     fn snapshot(d: &TextDoc) -> Vec<(u64, String, Vec<(u32, AttrId)>, StyleId)> {
         d.blocks.iter().map(|b| b.as_para().unwrap()).map(|p| (p.id, p.text.clone(), p.runs.clone(), p.style)).collect()
+    }
+
+    #[test]
+    fn comments_add_overlap_delete_and_undo() {
+        use crate::model::Comment;
+        let mut d = doc();
+        d.push_para("Third one here", 0, vec![]);
+        let before = snapshot(&d);
+        let mut h: History<TextOp> = History::new();
+        let c = |t: &str| Comment { author: "A".into(), text: t.into(), ..Default::default() };
+        let ops = d.add_comment_ops(0, 2, 1, 6, c("first"));
+        h.run(&mut d, "Comment", ops);
+        let ops = d.add_comment_ops(1, 0, 2, 5, c("second"));
+        h.run(&mut d, "Comment", ops);
+        h.run(&mut d, "Reply", vec![TextOp::SetComment { id: 2, comment: Some(Comment { parent: Some(0), ..c("reply") }) }]);
+        assert_eq!(d.comment_ranges(), vec![(0, (0, 2), (1, 6)), (1, (1, 0), (2, 5))]);
+        assert_eq!(d.live_comments(), vec![0, 2, 1]);
+        // Delete the first with its reply; the second's marks stay whole.
+        let ops = d.delete_comment_ops(0);
+        h.run(&mut d, "Delete Comment", ops);
+        assert_eq!(d.comment_ranges(), vec![(1, (1, 0), (2, 5))]);
+        assert!(d.comments.get(2).is_none());
+        h.undo(&mut d);
+        assert_eq!(d.live_comments(), vec![0, 2, 1]);
+        h.undo(&mut d);
+        h.undo(&mut d);
+        h.undo(&mut d);
+        assert_eq!(snapshot(&d), before);
+        assert!(d.comment_ranges().is_empty());
     }
 
     fn doc() -> TextDoc {

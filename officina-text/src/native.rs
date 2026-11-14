@@ -10,6 +10,7 @@
 //! | 5 | CHECKPOINTS | page starts (block, line) from the last pagination, for showing a reopened file at once |
 //! | 6 | IMAGE | one picture: its index, its size in pixels, its encoded bytes (one chunk each, so a reader can load them late) |
 //! | 7 | NOTES | footnotes and endnotes: id, kind, paragraphs |
+//! | 8 | COMMENTS | comments: id, author, initials, date, text, the comment answered, resolved |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -36,6 +37,7 @@ pub const BLOCKS: u16 = 4;
 pub const CHECKPOINTS: u16 = 5;
 pub const IMAGE: u16 = 6;
 pub const NOTES: u16 = 7;
+pub const COMMENTS: u16 = 8;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -84,7 +86,7 @@ impl From<WireError> for LoadError {
 /// Character attributes: a mask of the fields set, then their values.
 pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     let mut m = 0u16;
-    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some(), a.vert.is_some(), a.note.is_some()].into_iter().enumerate() {
+    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some(), a.vert.is_some(), a.note.is_some(), a.comments.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -126,11 +128,17 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     if let Some(n) = a.note {
         w.var(n as u64);
     }
+    if let Some(c) = &a.comments {
+        w.var(c.len() as u64);
+        for &id in c.iter() {
+            w.var(id as u64);
+        }
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
-    if m >> 13 != 0 {
+    if m >> 14 != 0 {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -186,6 +194,17 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     }
     if on(12) {
         a.note = Some(r.len("note", MAX_NOTES as u64 - 1)? as NoteId);
+    }
+    if on(13) {
+        let n = r.count("comments", 1 << 16, 1)?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(r.len("comment", MAX_COMMENTS as u64 - 1)? as CommentId);
+        }
+        if v.is_empty() || v.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(WireError::Invalid("comment list"));
+        }
+        a.comments = Some(v.into());
     }
     Ok(a)
 }
@@ -365,6 +384,32 @@ fn encode_para(w: &mut Writer, p: &Para) {
     encode_runs(w, &p.runs);
 }
 
+pub fn encode_comment(w: &mut Writer, c: &Comment) {
+    w.str(&c.author);
+    w.str(&c.initials);
+    w.str(&c.date);
+    w.str(&c.text);
+    w.var(c.parent.map_or(0, |p| p as u64 + 1));
+    w.u8(c.done as u8);
+}
+
+pub fn decode_comment(r: &mut Reader) -> Result<Comment, WireError> {
+    let author = Arc::from(r.str("author", MAX_NAME)?);
+    let initials = Arc::from(r.str("initials", MAX_NAME)?);
+    let date = Arc::from(r.str("date", 64)?);
+    let text = r.str("comment text", MAX_COMMENT_TEXT as u64)?.to_string();
+    let parent = match r.len("comment parent", MAX_COMMENTS as u64)? {
+        0 => None,
+        p => Some((p - 1) as CommentId),
+    };
+    let done = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(WireError::Invalid("resolved flag")),
+    };
+    Ok(Comment { author, initials, date, text, parent, done })
+}
+
 /// A note: its kind, then its paragraphs as blocks.
 pub fn encode_note(w: &mut Writer, n: &Note) {
     w.u8(match n.kind {
@@ -522,6 +567,17 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             encode_hf(&mut w, header);
             encode_hf(&mut w, footer);
         }
+        TextOp::SetComment { id, comment } => {
+            w.u8(10);
+            w.var(*id as u64);
+            match comment {
+                None => w.u8(0),
+                Some(c) => {
+                    w.u8(1);
+                    encode_comment(&mut w, c);
+                }
+            }
+        }
         TextOp::SetNote { id, note } => {
             w.u8(9);
             w.var(*id as u64);
@@ -593,6 +649,15 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             let page = decode_page(&mut r)?;
             let header = decode_hf(&mut r)?;
             TextOp::SetPage { page, header, footer: decode_hf(&mut r)? }
+        }
+        10 => {
+            let id = r.len("comment", MAX_COMMENTS as u64 - 1)? as CommentId;
+            let comment = match r.u8()? {
+                0 => None,
+                1 => Some(decode_comment(&mut r)?),
+                _ => return Err(WireError::Invalid("comment")),
+            };
+            TextOp::SetComment { id, comment }
         }
         9 => {
             let id = r.len("note", MAX_NOTES as u64 - 1)? as NoteId;
@@ -700,6 +765,17 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
             encode_note(&mut w, doc.notes.get(id).expect("numbered notes exist"));
         }
         c.add(NOTES, &w.into_bytes())?;
+    }
+
+    let live = doc.live_comments();
+    if !live.is_empty() {
+        let mut w = Writer::new();
+        w.var(live.len() as u64);
+        for id in live {
+            w.var(id as u64);
+            encode_comment(&mut w, doc.comments.get(id).expect("live comments exist"));
+        }
+        c.add(COMMENTS, &w.into_bytes())?;
     }
 
     if !checkpoints.is_empty() {
@@ -886,6 +962,18 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
             doc.notes.set(id, Some(note));
         }
     }
+    if c.entries().iter().any(|e| e.kind == COMMENTS) {
+        let mut r = Reader::new(one(COMMENTS, "COMMENTS chunk")?);
+        let n = r.count("comments", MAX_COMMENTS as u64, 6)?;
+        for _ in 0..n {
+            let id = r.len("comment", MAX_COMMENTS as u64 - 1)? as CommentId;
+            let cm = decode_comment(&mut r)?;
+            if doc.comments.get(id).is_some() || cm.parent == Some(id) {
+                return Err(LoadError::Bad("comment listed twice"));
+            }
+            doc.comments.set(id, Some(cm));
+        }
+    }
     doc.raise_watermark(watermark);
 
     let mut checkpoints = Vec::new();
@@ -932,6 +1020,14 @@ mod tests {
                 op.apply(&mut d);
             }
         }
+        let (b, e) = (30usize, 32usize);
+        let len = d.para(e).unwrap().text.len() as u32;
+        let c = Comment { author: "Ana Lima".into(), initials: "AL".into(), date: "2026-11-14T20:30:00Z".into(), text: "Check this.\nTwo lines.".into(), parent: None, done: false };
+        for op in d.add_comment_ops(b, 3, e, len, c) {
+            op.apply(&mut d);
+        }
+        let reply = Comment { author: "Bo".into(), text: "Checked.".into(), parent: Some(0), done: true, ..Default::default() };
+        TextOp::SetComment { id: 1, comment: Some(reply) }.apply(&mut d);
         d.take_changes();
         d
     }
@@ -949,6 +1045,8 @@ mod tests {
         assert_eq!(a.images.iter().collect::<Vec<_>>(), b.images.iter().collect::<Vec<_>>());
         assert_eq!(a.notes.iter().collect::<Vec<_>>(), b.notes.iter().collect::<Vec<_>>());
         assert_eq!(a.note_numbers(), b.note_numbers());
+        assert_eq!(a.comments.iter().collect::<Vec<_>>(), b.comments.iter().collect::<Vec<_>>());
+        assert_eq!(a.comment_ranges(), b.comment_ranges());
     }
 
     #[test]
@@ -964,6 +1062,8 @@ mod tests {
         let cps = vec![Checkpoint { block: 0, line: 0 }, Checkpoint { block: 40, line: 2 }];
         let bytes = save_to_vec(&d, &cps);
         let l = load(&bytes).unwrap();
+        assert_eq!(d.comment_ranges().len(), 1);
+        assert_eq!(d.live_comments(), vec![0, 1]);
         same(&d, &l.doc);
         assert_eq!(l.checkpoints, cps);
     }
@@ -984,6 +1084,8 @@ mod tests {
             TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End }), footer: None },
             TextOp::SetNote { id: 5, note: Some(Note { kind: NoteKind::End, paras: vec![Para::new(d.new_id(), "note", 0)] }) },
             TextOp::SetNote { id: 5, note: None },
+            TextOp::SetComment { id: 9, comment: Some(Comment { author: "A".into(), text: "c".into(), parent: Some(0), ..Default::default() }) },
+            TextOp::SetComment { id: 9, comment: None },
             TextOp::Nop,
         ];
         for op in ops {

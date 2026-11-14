@@ -14,7 +14,7 @@ use officina_core::history::History;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
@@ -360,15 +360,117 @@ impl Editor {
         let before = para.attr_at(p.at.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
         let pic = base.object.take().is_some() | base.note.take().is_some();
+        // Typing inside commented text stays in the comment; at its end it doesn't.
+        let after = para.attr_at(p.at);
+        let after_comments = (p.at < para.text.len() as u32).then(|| self.doc.attrs.get(after).comments.clone()).flatten();
+        let comment_change = base.comments != after_comments && base.comments.is_some();
+        if comment_change {
+            base.comments = base.comments.as_ref().and_then(|c| {
+                let v: Vec<CommentId> = c.iter().copied().filter(|x| after_comments.as_ref().is_some_and(|a| a.contains(x))).collect();
+                (!v.is_empty()).then(|| v.into())
+            });
+        }
         let t = match self.typing.clone() {
             Some(t) => t,
-            None if pic => CharAttrs::default(),
+            None if pic || comment_change => CharAttrs::default(),
             None => return None,
         };
         let mut a = t.over(&base);
         a.object = None;
         a.note = None;
         Some(self.doc.attrs.intern(a))
+    }
+
+    /// Puts a comment on the selection (or the word at the caret); its id.
+    pub fn add_comment(&mut self, text: &str, author: &str, initials: &str, date: &str) -> Option<CommentId> {
+        if !self.has_selection() {
+            self.select_word(self.caret);
+        }
+        let (a, b) = self.selection();
+        if a == b {
+            return None;
+        }
+        let c = Comment { author: author.into(), initials: initials.into(), date: date.into(), text: text.to_string(), parent: None, done: false };
+        let id = self.doc.comments.next_id();
+        let ops = self.doc.add_comment_ops(a.block, a.at, b.block, b.at, c);
+        if ops.is_empty() {
+            return None;
+        }
+        self.apply("Comment", ops, Kind::Other);
+        Some(id)
+    }
+
+    /// The comment at the caret: the innermost one over the character after it
+    /// (or before it), as the first comment of its thread.
+    pub fn comment_at_caret(&self) -> Option<CommentId> {
+        let p = self.doc.para(self.caret.block)?;
+        let at = self.caret.at;
+        let pick = |b: u32| -> Option<CommentId> { self.doc.attrs.get(p.attr_at(b)).comments.as_ref().and_then(|c| c.iter().rev().copied().find(|&id| self.doc.comments.get(id).is_some())) };
+        let id = if (at as usize) < p.text.len() { pick(at) } else { None }.or_else(|| if at > 0 { pick(at - 1) } else { None })?;
+        Some(self.thread_root(id))
+    }
+
+    /// The first comment of the thread `id` is in.
+    pub fn thread_root(&self, mut id: CommentId) -> CommentId {
+        for _ in 0..64 {
+            match self.doc.comments.get(id).and_then(|c| c.parent) {
+                Some(p) if self.doc.comments.get(p).is_some() => id = p,
+                _ => break,
+            }
+        }
+        id
+    }
+
+    /// Comment `root` and its replies, in order.
+    pub fn thread(&self, root: CommentId) -> Vec<CommentId> {
+        let mut out = vec![root];
+        let mut k = 0;
+        while k < out.len() && out.len() < 4096 {
+            for r in self.doc.comments.replies(out[k]) {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+            k += 1;
+        }
+        out
+    }
+
+    /// Answers comment `to`; the reply's id.
+    pub fn reply_comment(&mut self, to: CommentId, text: &str, author: &str, initials: &str, date: &str) -> Option<CommentId> {
+        self.doc.comments.get(to)?;
+        let id = self.doc.comments.next_id();
+        let c = Comment { author: author.into(), initials: initials.into(), date: date.into(), text: text.to_string(), parent: Some(to), done: false };
+        self.apply("Reply", vec![TextOp::SetComment { id, comment: Some(c) }], Kind::Other);
+        Some(id)
+    }
+
+    /// Changes comment `id`'s text, or marks it resolved or open again.
+    pub fn edit_comment(&mut self, id: CommentId, text: Option<&str>, done: Option<bool>) -> bool {
+        let Some(mut c) = self.doc.comments.get(id).map(|c| (**c).clone()) else { return false };
+        let before = c.clone();
+        if let Some(t) = text {
+            c.text = t.to_string();
+        }
+        if let Some(d) = done {
+            c.done = d;
+        }
+        if c == before {
+            return false;
+        }
+        let label = if done.is_some() { "Resolve Comment" } else { "Edit Comment" };
+        self.apply(label, vec![TextOp::SetComment { id, comment: Some(c) }], Kind::Other);
+        true
+    }
+
+    /// Takes out comment `id` and its replies (its text stays).
+    pub fn delete_comment(&mut self, id: CommentId) -> bool {
+        let ops = self.doc.delete_comment_ops(id);
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply("Delete Comment", ops, Kind::Other);
+        true
     }
 
     /// Puts a new footnote or endnote at the caret (over the selection) with
@@ -1585,6 +1687,50 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn comments_add_reply_resolve_delete_and_journal() {
+        let mut e = ed(&["one two three", "four"]);
+        e.start_log();
+        e.set_caret(Pos::new(0, 5), false);
+        let id = e.add_comment("On two.", "Ann", "A", "2026-11-14T00:00:00Z").unwrap();
+        assert_eq!(e.doc.comment_ranges(), vec![(id, (0, 4), (0, 7))]);
+        e.set_caret(Pos::new(0, 6), false);
+        assert_eq!(e.comment_at_caret(), Some(id));
+        // Typing at the end of the range doesn't stretch it.
+        e.set_caret(Pos::new(0, 7), false);
+        typ(&mut e, "x");
+        assert_eq!(e.doc.comment_ranges(), vec![(id, (0, 4), (0, 7))]);
+        let r = e.reply_comment(id, "Yes.", "Bo", "B", "2026-11-14T00:01:00Z").unwrap();
+        assert_eq!(e.thread_root(r), id);
+        assert_eq!(e.thread(id), vec![id, r]);
+        assert!(e.edit_comment(id, None, Some(true)));
+        assert!(!e.edit_comment(id, None, Some(true)), "no change, no edit");
+        assert!(e.edit_comment(r, Some("Yes, done."), None));
+        // A second comment overlapping the first.
+        e.set_caret(Pos::new(0, 2), false);
+        e.set_caret(Pos::new(0, 6), true);
+        let id2 = e.add_comment("Overlap.", "Ann", "A", "2026-11-14T00:02:00Z").unwrap();
+        assert_eq!(e.doc.comment_ranges().len(), 2);
+        // The journal replays to the same document.
+        let log = e.take_log();
+        let mut f = ed(&["one two three", "four"]);
+        for l in log {
+            f.replay(l);
+        }
+        assert_eq!(texts(&f), texts(&e));
+        assert_eq!(f.doc.comment_ranges(), e.doc.comment_ranges());
+        assert_eq!(f.doc.live_comments(), e.doc.live_comments());
+        assert_eq!(f.doc.comments.get(r).unwrap().text, "Yes, done.");
+        assert!(f.doc.comments.get(id).unwrap().done);
+        // Deleting a thread takes its replies, keeps the text and the other comment.
+        assert!(e.delete_comment(id));
+        assert_eq!(e.doc.live_comments(), vec![id2]);
+        assert_eq!(texts(&e)[0], "one twox three");
+        e.undo();
+        assert_eq!(e.doc.live_comments().len(), 3);
+        assert_eq!(e.doc.comment_ranges(), f.doc.comment_ranges());
     }
 
     #[test]

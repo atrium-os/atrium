@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, AttrId, CharAttrs, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -175,6 +175,19 @@ struct Out {
     notes: HashMap<NoteId, (NoteKind, u32)>,
     /// Where this part's pictures go ("image" for the document's).
     media_stem: &'static str,
+    /// Comment range markers by block: (byte, end?, comment id), in order.
+    marks: HashMap<usize, Vec<(u32, bool, CommentId)>>,
+    /// The block being written (none in notes).
+    cur: Option<usize>,
+}
+
+/// A comment range's start or its end and reference.
+fn comment_marker(out: &mut String, end: bool, id: CommentId) {
+    if end {
+        let _ = write!(out, r#"<w:commentRangeEnd w:id="{id}"/><w:r><w:commentReference w:id="{id}"/></w:r>"#);
+    } else {
+        let _ = write!(out, r#"<w:commentRangeStart w:id="{id}"/>"#);
+    }
 }
 
 impl Out {
@@ -208,7 +221,13 @@ impl Out {
 
     /// The runs of block `b`.
     fn runs(&mut self, doc: &TextDoc, p: &Para, out: &mut String) {
+        let marks = self.cur.and_then(|b| self.marks.get(&b)).cloned().unwrap_or_default();
+        let mut m = 0;
         for (s, e, a) in p.spans() {
+            while m < marks.len() && marks[m].0 <= s {
+                comment_marker(out, marks[m].1, marks[m].2);
+                m += 1;
+            }
             if s == e {
                 continue;
             }
@@ -267,11 +286,16 @@ impl Out {
                 None => out.push_str(&body),
             }
         }
+        for &(_, end, id) in &marks[m..] {
+            comment_marker(out, end, id);
+        }
     }
 
     fn para(&mut self, doc: &TextDoc, b: usize, out: &mut String) {
         let Some(p) = doc.para(b) else { return };
+        self.cur = Some(b);
         self.para_of(doc, p, out, "");
+        self.cur = None;
     }
 
     /// Paragraph `p`; `lead` goes before its runs (a note's number).
@@ -451,7 +475,34 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
     // Notes are numbered in the file in anchor order, each kind from 1.
     let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image" };
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None };
+    // Comments: a reply's range is the comment it answers.
+    let live = doc.live_comments();
+    let ranges = doc.comment_ranges();
+    let mut range_of: HashMap<CommentId, ((usize, u32), (usize, u32))> = ranges.iter().map(|&(id, s, e)| (id, (s, e))).collect();
+    for &id in &live {
+        if !range_of.contains_key(&id) {
+            let mut root = id;
+            for _ in 0..64 {
+                match doc.comments.get(root).and_then(|c| c.parent) {
+                    Some(p) => root = p,
+                    None => break,
+                }
+            }
+            if let Some(&r) = range_of.get(&root) {
+                range_of.insert(id, r);
+            }
+        }
+    }
+    for &id in &live {
+        let Some(&((sb, so), (eb, eo))) = range_of.get(&id) else { continue };
+        o.marks.entry(sb).or_default().push((so, false, id));
+        o.marks.entry(eb).or_default().push((eo, true, id));
+    }
+    for v in o.marks.values_mut() {
+        // Ends before starts at the same place: ranges don't touch.
+        v.sort_by_key(|&(at, end, _)| (at, !end));
+    }
     let mut body = String::new();
     let mut b = 0;
     let n = doc.blocks.len();
@@ -478,7 +529,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             continue;
         }
         ours.sort_unstable();
-        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" } };
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None };
         let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
         // Lists in notes come out as plain paragraphs (the numbering part is the body's).
         for (n, id) in ours {
@@ -504,6 +555,50 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         o.rel(part, format!("{part}.xml"), false);
         note_parts.push((part, x, r));
     }
+    // comments.xml, and commentsExtended.xml for threads and resolved state; a
+    // comment's last paragraph's id ties the two.
+    let mut comment_parts: Vec<(&str, &str, String)> = Vec::new();
+    if !live.is_empty() {
+        let pid = |id: CommentId| format!("{:08X}", 0x1000_0000 + (id & 0x0FFF_FFFF));
+        let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments {W_NS} xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14">"#);
+        let mut ex = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w15">"#);
+        let live_set: std::collections::HashSet<CommentId> = live.iter().copied().collect();
+        let mut other = 0x2000_0000u32;
+        for &id in &live {
+            let Some(c) = doc.comments.get(id) else { continue };
+            let _ = write!(x, r#"<w:comment w:id="{id}" w:author="{}" w:initials="{}""#, esc(&c.author), esc(&c.initials));
+            if c.date.len() >= 10 && c.date.as_bytes()[4] == b'-' {
+                let _ = write!(x, r#" w:date="{}""#, esc(&c.date));
+            }
+            x.push('>');
+            let lines: Vec<&str> = c.text.split('\n').collect();
+            for (i, line) in lines.iter().enumerate() {
+                let p = if i + 1 == lines.len() {
+                    pid(id)
+                } else {
+                    other += 1;
+                    format!("{other:08X}")
+                };
+                let _ = write!(x, r#"<w:p w14:paraId="{p}" w14:textId="77777777">"#);
+                if i == 0 {
+                    x += r#"<w:r><w:annotationRef/></w:r>"#;
+                }
+                if !line.is_empty() {
+                    let _ = write!(x, r#"<w:r><w:t xml:space="preserve">{}</w:t></w:r>"#, esc(line));
+                }
+                x += "</w:p>";
+            }
+            x += "</w:comment>";
+            let parent = c.parent.filter(|p| live_set.contains(p)).map(|p| format!(r#" w15:paraIdParent="{}""#, pid(p))).unwrap_or_default();
+            let _ = write!(ex, r#"<w15:commentEx w15:paraId="{}"{parent} w15:done="{}"/>"#, pid(id), c.done as u8);
+        }
+        x += "</w:comments>";
+        ex += "</w15:commentsEx>";
+        o.rel("comments", "comments.xml".into(), false);
+        o.rel("http://schemas.microsoft.com/office/2011/relationships/commentsExtended", "commentsExtended.xml".into(), false);
+        comment_parts.push(("comments", "comments", x));
+        comment_parts.push(("commentsExtended", "commentsExtended", ex));
+    }
     for (hf, tag, kind) in [(&doc.header, "hdr", "header"), (&doc.footer, "ftr", "footer")] {
         if let Some(hf) = hf {
             let name = format!("{kind}1.xml");
@@ -524,6 +619,9 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     for (part, _, _) in &note_parts {
         let _ = write!(types, r#"<Override PartName="/word/{part}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{part}+xml"/>"#);
     }
+    for (part, kind, _) in &comment_parts {
+        let _ = write!(types, r#"<Override PartName="/word/{part}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"/>"#);
+    }
     for (name, _) in &parts {
         let kind = if name.contains("header") { "header" } else { "footer" };
         let _ = write!(types, r#"<Override PartName="/{name}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"/>"#);
@@ -540,12 +638,16 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     }
     for (id, kind, target, external) in &o.rels {
         let mode = if *external { r#" TargetMode="External""# } else { "" };
-        let _ = write!(rels, r#"<Relationship Id="{id}" Type="{REL}/{kind}" Target="{}"{mode}/>"#, esc(target));
+        let ty = if kind.starts_with("http") { kind.clone() } else { format!("{REL}/{kind}") };
+        let _ = write!(rels, r#"<Relationship Id="{id}" Type="{ty}" Target="{}"{mode}/>"#, esc(target));
     }
     rels += "</Relationships>";
     z.add("word/_rels/document.xml.rels", rels.as_bytes())?;
     for (name, xml) in &parts {
         z.add(name, xml.as_bytes())?;
+    }
+    for (part, _, xml) in &comment_parts {
+        z.add(&format!("word/{part}.xml"), xml.as_bytes())?;
     }
     for (part, xml, r) in &note_parts {
         z.add(&format!("word/{part}.xml"), xml.as_bytes())?;

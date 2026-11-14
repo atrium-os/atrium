@@ -40,6 +40,92 @@ pub struct CharAttrs {
     /// The character (U+FFFC) anchors this note of the document's [`Notes`],
     /// and shows the note's number.
     pub note: Option<NoteId>,
+    /// The comments of the document's [`Comments`] this text is under, sorted.
+    pub comments: Option<Arc<[CommentId]>>,
+}
+
+/// A comment of the document's [`Comments`].
+pub type CommentId = u32;
+
+/// A comment: who wrote it and when, its text (a paragraph a line), and the
+/// comment it answers, if it is a reply. A reply needn't cover text of its own:
+/// it belongs where its first comment is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Comment {
+    pub author: Arc<str>,
+    pub initials: Arc<str>,
+    /// ISO 8601, as the files have it ("" when unknown).
+    pub date: Arc<str>,
+    pub text: String,
+    pub parent: Option<CommentId>,
+    /// Resolved.
+    pub done: bool,
+}
+
+/// Most comments in a document; longest comment text, bytes.
+pub const MAX_COMMENTS: usize = 1 << 20;
+pub const MAX_COMMENT_TEXT: usize = 64 << 10;
+
+/// The document's comments by id. As with notes, an id stays taken while a
+/// document is open; files keep the comments that are anchored (and their replies).
+#[derive(Debug, Clone, Default)]
+pub struct Comments {
+    list: Vec<Option<Arc<Comment>>>,
+}
+
+impl Comments {
+    pub fn get(&self, id: CommentId) -> Option<&Arc<Comment>> {
+        self.list.get(id as usize).and_then(|n| n.as_ref())
+    }
+    pub fn add(&mut self, c: Comment) -> Option<CommentId> {
+        if self.list.len() >= MAX_COMMENTS {
+            return None;
+        }
+        self.list.push(Some(Arc::new(c)));
+        Some((self.list.len() - 1) as CommentId)
+    }
+    /// Sets comment `id` (growing the store to it); the old one.
+    pub fn set(&mut self, id: CommentId, c: Option<Comment>) -> Option<Comment> {
+        let i = id as usize;
+        if i >= MAX_COMMENTS {
+            return None;
+        }
+        if self.list.len() <= i {
+            self.list.resize(i + 1, None);
+        }
+        std::mem::replace(&mut self.list[i], c.map(Arc::new)).map(|a| (*a).clone())
+    }
+    /// The id the next [`Comments::add`] gives.
+    pub fn next_id(&self) -> CommentId {
+        self.list.len() as CommentId
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.iter().all(|n| n.is_none())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (CommentId, &Arc<Comment>)> {
+        self.list.iter().enumerate().filter_map(|(i, n)| n.as_ref().map(|n| (i as CommentId, n)))
+    }
+    /// The replies to `id`, oldest first.
+    pub fn replies(&self, id: CommentId) -> Vec<CommentId> {
+        self.iter().filter(|(_, c)| c.parent == Some(id)).map(|(i, _)| i).collect()
+    }
+}
+
+/// `secs` since 1970 as ISO 8601 UTC ("2026-11-14T20:30:00Z").
+pub fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Days to civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
 /// Superscript and subscript.
@@ -213,6 +299,7 @@ impl CharAttrs {
             object: self.object.or(under.object),
             vert: self.vert.or(under.vert),
             note: self.note.or(under.note),
+            comments: self.comments.clone().or_else(|| under.comments.clone()),
         }
     }
 }
@@ -233,11 +320,12 @@ pub struct CharFormat {
     pub object: Option<ObjectRef>,
     pub vert: VertAlign,
     pub note: Option<NoteId>,
+    pub comments: Option<Arc<[CommentId]>>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None }
     }
 }
 
@@ -272,6 +360,9 @@ impl CharFormat {
         }
         if a.note.is_some() {
             self.note = a.note;
+        }
+        if a.comments.is_some() {
+            self.comments = a.comments.clone();
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -693,6 +784,8 @@ pub struct TextDoc {
     pub images: Images,
     /// Footnotes and endnotes, anchored in the text.
     pub notes: Notes,
+    /// Comments on ranges of the text.
+    pub comments: Comments,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -731,7 +824,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d
@@ -913,6 +1006,56 @@ impl TextDoc {
             }
         }
         None
+    }
+
+    /// Each anchored comment's first and last character: (block, byte) of its
+    /// start and (block, byte) of its end, in document order of starts.
+    pub fn comment_ranges(&self) -> Vec<(CommentId, (usize, u32), (usize, u32))> {
+        let mut m: HashMap<CommentId, ((usize, u32), (usize, u32))> = HashMap::new();
+        let mut order = Vec::new();
+        if self.comments.is_empty() {
+            return Vec::new();
+        }
+        for (i, b) in self.blocks.iter().enumerate() {
+            let Some(p) = b.as_para() else { continue };
+            for (s, e, a) in p.spans() {
+                if s == e {
+                    continue;
+                }
+                let Some(ids) = &self.attrs.get(a).comments else { continue };
+                for &id in ids.iter() {
+                    match m.get_mut(&id) {
+                        Some(r) => r.1 = (i, e),
+                        None => {
+                            if self.comments.get(id).is_some() {
+                                m.insert(id, ((i, s), (i, e)));
+                                order.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        order.into_iter().map(|id| (id, m[&id].0, m[&id].1)).collect()
+    }
+
+    /// The comments a file keeps: the anchored ones and replies to them, in
+    /// document order (a reply after the comment it answers).
+    pub fn live_comments(&self) -> Vec<CommentId> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (id, _, _) in self.comment_ranges() {
+            let mut stack = vec![id];
+            while let Some(c) = stack.pop() {
+                if seen.insert(c) {
+                    out.push(c);
+                    let mut r = self.comments.replies(c);
+                    r.reverse();
+                    stack.extend(r);
+                }
+            }
+        }
+        out
     }
 
     /// The anchored endnotes in order.
