@@ -738,7 +738,7 @@ impl Msg {
             VIDEO_DESTROY => (1, false),
             VIDEO_RATE => (2, false),
             VIDEO_SLOTS | VIDEO_DONE => (2, false),
-            APPEARANCE => (3, false),
+            APPEARANCE => (4, false),
             SPAN_TILE => (5, false),
             SPAN_HIDDEN => (4, false),
             SPAN_DONE => (0, false),

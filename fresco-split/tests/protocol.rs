@@ -60,6 +60,8 @@ fn samples() -> Vec<Msg> {
         Msg::PopupClaim { window: 4, token: [0xa5; 16], width: 300, height: 380 },
         Msg::PopupHosted { window: 2, token: [7; 16], open: true },
         Msg::PopupHosted { window: 2, token: [9; 16], open: false },
+        Msg::Appearance { scheme: 1, high_contrast: true, accent: 3, text_size_milli: 0 },
+        Msg::Appearance { scheme: 0, high_contrast: false, accent: 0, text_size_milli: 1500 },
     ]
 }
 
