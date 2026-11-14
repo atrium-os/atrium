@@ -363,25 +363,24 @@ extern "C" {
     fn connectat(fd: libc::c_int, s: libc::c_int, name: *const libc::sockaddr, len: libc::socklen_t) -> libc::c_int;
 }
 
-/// local-unbound's control socket, reached through a directory descriptor
-/// so it still works in capability mode.
-pub struct Unbound {
-    dir: OwnedFd,
-    name: CString,
+/// A directory descriptor, opened before capability mode, through which
+/// atrium-net reaches sockets and files by name afterwards.
+pub struct Dir {
+    fd: OwnedFd,
 }
 
-impl Unbound {
-    pub fn new(dir: &str, name: &str) -> io::Result<Unbound> {
-        let d = CString::new(dir).unwrap();
+impl Dir {
+    pub fn open(path: &str) -> io::Result<Dir> {
+        let d = CString::new(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let fd = unsafe { libc::open(d.as_ptr(), libc::O_DIRECTORY | libc::O_CLOEXEC) };
         if fd < 0 {
-            return err("unbound socket directory");
+            return err("open directory");
         }
-        Ok(Unbound { dir: unsafe { OwnedFd::from_raw_fd(fd) }, name: CString::new(name).unwrap() })
+        Ok(Dir { fd: unsafe { OwnedFd::from_raw_fd(fd) } })
     }
 
-    /// One control command; returns unbound's answer.
-    pub fn cmd(&self, c: &str) -> io::Result<String> {
+    /// Connect to the Unix socket `name` in this directory.
+    pub fn connect(&self, name: &str) -> io::Result<std::os::unix::net::UnixStream> {
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if s < 0 {
             return err("socket");
@@ -389,30 +388,86 @@ impl Unbound {
         let s = unsafe { OwnedFd::from_raw_fd(s) };
         let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         sa.sun_family = libc::AF_UNIX as _;
-        let n = self.name.as_bytes();
-        for (i, b) in n.iter().enumerate().take(sa.sun_path.len() - 1) {
+        let n = name.as_bytes();
+        if n.len() >= sa.sun_path.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        for (i, b) in n.iter().enumerate() {
             sa.sun_path[i] = *b as libc::c_char;
         }
         sa.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
-        if unsafe { connectat(self.dir.as_raw_fd(), s.as_raw_fd(), (&sa as *const libc::sockaddr_un).cast(), sa.sun_len as libc::socklen_t) } != 0 {
-            return err("connect to unbound");
+        if unsafe { connectat(self.fd.as_raw_fd(), s.as_raw_fd(), (&sa as *const libc::sockaddr_un).cast(), sa.sun_len as libc::socklen_t) } != 0 {
+            return err("connectat");
         }
-        let msg = format!("UBCT1 {c}\n");
-        if unsafe { libc::write(s.as_raw_fd(), msg.as_ptr().cast(), msg.len()) } != msg.len() as isize {
-            return err("write to unbound");
+        Ok(std::os::unix::net::UnixStream::from(s))
+    }
+
+    pub fn read(&self, name: &str, max: usize) -> io::Result<Vec<u8>> {
+        let n = CString::new(name).unwrap();
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), n.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+        if fd < 0 {
+            return err("openat");
         }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut out = Vec::new();
-        let mut b = [0u8; 512];
+        let mut b = [0u8; 4096];
         loop {
-            let n = unsafe { libc::read(s.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
-            if n <= 0 {
+            let r = unsafe { libc::read(fd.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+            if r < 0 {
+                return err("read");
+            }
+            if r == 0 {
                 break;
             }
-            out.extend_from_slice(&b[..n as usize]);
-            if out.len() > 65536 {
-                break;
+            out.extend_from_slice(&b[..r as usize]);
+            if out.len() > max {
+                return Err(io::Error::other("file too large"));
             }
         }
+        Ok(out)
+    }
+
+    /// Replace `name` atomically (write a temporary, fsync, rename), mode 0600.
+    pub fn write(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        let tmp = CString::new(format!("{name}.tmp")).unwrap();
+        let fin = CString::new(name).unwrap();
+        let d = self.fd.as_raw_fd();
+        let fd = unsafe { libc::openat(d, tmp.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return err("openat");
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let n = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        if n != data.len() as isize || unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
+            return err("write");
+        }
+        drop(fd);
+        if unsafe { libc::renameat(d, tmp.as_ptr(), d, fin.as_ptr()) } != 0 {
+            return err("renameat");
+        }
+        Ok(())
+    }
+}
+
+/// local-unbound's control socket, reached through a directory descriptor
+/// so it still works in capability mode.
+pub struct Unbound {
+    dir: Dir,
+    name: String,
+}
+
+impl Unbound {
+    pub fn new(dir: &str, name: &str) -> io::Result<Unbound> {
+        Ok(Unbound { dir: Dir::open(dir)?, name: name.to_string() })
+    }
+
+    /// One control command; returns unbound's answer.
+    pub fn cmd(&self, c: &str) -> io::Result<String> {
+        use std::io::{Read, Write};
+        let mut s = self.dir.connect(&self.name)?;
+        s.write_all(format!("UBCT1 {c}\n").as_bytes())?;
+        let mut out = Vec::new();
+        s.take(65536).read_to_end(&mut out)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 }

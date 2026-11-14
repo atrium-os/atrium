@@ -4,7 +4,7 @@
 //! Capsicum capability mode. From then on it holds one descriptor and can
 //! neither reach the network nor open a file.
 //!
-//! atrium-net -> lease: `hello mac=M`, `up`, `down`, `frame hex=..`,
+//! atrium-net -> lease: `hello mac=M`, `mac mac=M`, `up`, `down`, `frame hex=..`,
 //!                      `refused why=..`
 //! lease -> atrium-net: `send dest=bcast|A.B.C.D dmac=M hex=..` (a DHCP
 //!                      payload; atrium-net wraps it), `lease4 ..`,
@@ -105,6 +105,12 @@ fn main() {
                     ("hello", None) => {
                         let mac = l.mac("mac").unwrap_or_else(|| die("hello without mac"));
                         client = Some(Client::new(mac, Box::new(rand)));
+                    }
+                    // A new address (Wi-Fi's per-network MAC): a new client;
+                    // a lease held under the old address belongs to another network.
+                    ("mac", Some(cl)) => {
+                        let mac = l.mac("mac").unwrap_or_else(|| die("mac without mac"));
+                        *cl = Client::new(mac, Box::new(rand));
                     }
                     ("up", Some(cl)) => outs.extend(cl.start(now())),
                     ("down", Some(cl)) => cl.stop(),

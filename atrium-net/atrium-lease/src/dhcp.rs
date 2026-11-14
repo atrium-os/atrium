@@ -17,6 +17,7 @@ pub mod opt {
     pub const ROUTER: u8 = 3;
     pub const DNS: u8 = 6;
     pub const MTU: u8 = 26;
+    pub const VENDOR: u8 = 43;
     pub const REQ_ADDR: u8 = 50;
     pub const LEASE: u8 = 51;
     pub const OVERLOAD: u8 = 52;
@@ -76,6 +77,8 @@ pub struct Reply {
     pub t2: Option<u32>,
     /// Option 121 raw bytes, decoded by [`classless`].
     pub classless: Option<Vec<u8>>,
+    /// Option 43 says ANDROID_METERED: a phone sharing its mobile data.
+    pub metered: bool,
 }
 
 fn addrs(v: &[u8]) -> Option<Vec<Ipv4Addr>> {
@@ -119,6 +122,7 @@ pub fn parse(b: &[u8]) -> Option<Reply> {
         t1: None,
         t2: None,
         classless: None,
+        metered: false,
     };
     let mut kind = None;
     let mut seen = [false; 256];
@@ -153,6 +157,7 @@ pub fn parse(b: &[u8]) -> Option<Reply> {
             opt::T1 => r.t1 = Some(u32be(v)?),
             opt::T2 => r.t2 = Some(u32be(v)?),
             opt::CLASSLESS => r.classless = Some(v.to_vec()),
+            opt::VENDOR => r.metered = v.windows(15).any(|w| w == b"ANDROID_METERED"),
             opt::OVERLOAD => return None,
             _ => {}
         }
@@ -197,7 +202,7 @@ pub struct Msg {
     pub server_id: Option<Ipv4Addr>,
 }
 
-pub const PARAMS: [u8; 7] = [opt::SUBNET, opt::ROUTER, opt::DNS, opt::MTU, opt::LEASE, opt::T1, opt::T2];
+pub const PARAMS: [u8; 8] = [opt::SUBNET, opt::ROUTER, opt::DNS, opt::MTU, opt::VENDOR, opt::LEASE, opt::T1, opt::T2];
 
 pub fn build(m: &Msg) -> Vec<u8> {
     let mut b = vec![0u8; FIXED];
@@ -264,6 +269,7 @@ pub fn build_reply(r: &Reply) -> Vec<u8> {
     if let Some(v) = r.t1 { put(opt::T1, &v.to_be_bytes()); }
     if let Some(v) = r.t2 { put(opt::T2, &v.to_be_bytes()); }
     if let Some(v) = &r.classless { put(opt::CLASSLESS, v); }
+    if r.metered { put(opt::VENDOR, b"ANDROID_METERED"); }
     b.push(opt::END);
     b
 }

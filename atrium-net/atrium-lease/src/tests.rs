@@ -1,7 +1,7 @@
 use crate::client::{prefix_of, Client, Dest, Out};
 use crate::dhcp::{self, Kind, Reply};
 use crate::frame;
-use net_proto::{check_v4, HostView, Route};
+use net_proto::{check_v4, HostView, LeaseV4, Route};
 use std::net::Ipv4Addr;
 
 const MAC: [u8; 6] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
@@ -80,6 +80,7 @@ fn reply(kind: Kind, xid: u32) -> Reply {
         t1: None,
         t2: None,
         classless: None,
+        metered: false,
     }
 }
 
@@ -343,4 +344,26 @@ fn hostile_server_fuzz() {
             }
         }
     }
+}
+
+#[test]
+fn android_hotspot_is_metered() {
+    let mut c = Client::new(MAC, rng(11));
+    let out = c.start(0);
+    let (_, d) = sent(&out).remove(0);
+    let mut r = reply(Kind::Offer, d.xid);
+    r.metered = true;
+    let out = c.rx(&dhcp::build_reply(&r), 100);
+    let (_, req) = sent(&out).remove(0);
+    let mut a = reply(Kind::Ack, req.xid);
+    a.metered = true;
+    let out = c.rx(&dhcp::build_reply(&a), 200);
+    let l = out.iter().find_map(|o| match o { Out::Bound(l) => Some(l.clone()), _ => None }).expect("bound");
+    assert!(l.metered);
+    assert_eq!(LeaseV4::from_line(&l.to_line()).unwrap().metered, true);
+    // An ordinary router's vendor option is not a metered marker.
+    let mut v = dhcp::build_reply(&reply(Kind::Ack, 1));
+    let end = v.len() - 1;
+    v.splice(end..end, [43u8, 5, b'h', b'e', b'l', b'l', b'o']);
+    assert!(!dhcp::parse(&v).unwrap().metered);
 }

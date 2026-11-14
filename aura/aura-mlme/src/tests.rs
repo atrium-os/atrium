@@ -308,7 +308,18 @@ fn roams_to_a_better_bss() {
     b2[10..16].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
     b2[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
     s.mgmt_rx(2412, -40, rx_flags::SCAN, &b2, 600);
+    // Hysteresis: the first win only makes it a candidate.
     let o = s.scan_done(0, 700);
+    assert_eq!(ctl(&o)[0].get("what"), Some("roam-candidate"));
+    assert!(kernel(&o).is_empty());
+    assert!(kernel(&s.tick(5_000)).is_empty(), "scans stay 10 s apart");
+    for t in [5_100, 10_300] {
+        s.mgmt_rx(2437, -85, 0, &beacon(b"aura-test", Some(wpa2_pmf()), true, 6), t);
+    }
+    let o = s.tick(10_400);
+    assert!(matches!(kernel(&o)[..], [Req::Scan { .. }]), "{o:?}");
+    s.mgmt_rx(2412, -40, rx_flags::SCAN, &b2, 10_500);
+    let o = s.scan_done(0, 10_600);
     let ev = ctl(&o);
     assert_eq!(ev[0].get("what"), Some("roam"));
     let k = kernel(&o);
@@ -345,4 +356,22 @@ fn country_and_ap_country_element() {
     assert_eq!(*rules, aura_regdb::intersect(de, us));
     let o = s.cmd(&Line::new("leave"), 6);
     assert!(kernel(&o).iter().any(|r| matches!(r, Req::SetRegulatory { rules, .. } if rules[..] == de[..])));
+}
+
+#[test]
+fn beacon_loss_leaves() {
+    let (mut s, _) = joined(true);
+    s.keys_msg(&Line::new("authorized"), 1000);
+    for i in 0..5 {
+        s.mgmt_rx(2437, -50, 0, &beacon(b"aura-test", Some(wpa2_pmf()), true, 6), 1000 + i * 100);
+    }
+    assert!(ctl(&s.tick(5_000)).is_empty());
+    // Silence (a tunnel): gone after 8 s without a beacon.
+    let o = s.tick(1400 + 8_000);
+    let ev = ctl(&o);
+    assert_eq!(ev[0].get("state"), Some("disconnected"));
+    assert_eq!(ev[0].get("why"), Some("beacon-loss"));
+    // Not told to the AP: it cannot hear us.
+    assert!(kernel(&o).iter().all(|r| !matches!(r, Req::TxMgmt { .. })), "{o:?}");
+    assert_eq!(s.state_name(), "idle");
 }

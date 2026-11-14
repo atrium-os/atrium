@@ -86,6 +86,7 @@ mod tests {
             mtu: None,
             lease_s: 600,
             server: Ipv4Addr::new(addr[0], addr[1], addr[2], 1),
+            metered: false,
         }
     }
 

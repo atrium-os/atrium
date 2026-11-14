@@ -95,10 +95,18 @@ const SAE_KEYS_TIMEOUT_MS: u64 = 5000;
 /// and handshake with the new BSS). Scan in the background when the
 /// current BSS's beacons fall below `ROAM_RSSI`, at most every
 /// `ROAM_SCAN_EVERY_MS`; move when another BSS of the network is
-/// `ROAM_GAIN` dB better.
+/// `ROAM_GAIN` dB better on two background scans in a row (the same BSS
+/// both times), and not within `ROAM_HOLD_MS` of the last move: hysteresis,
+/// so two BSSs of similar strength do not trade places.
 const ROAM_RSSI: i32 = -70;
 const ROAM_GAIN: i32 = 8;
 const ROAM_SCAN_EVERY_MS: u64 = 10_000;
+const ROAM_HOLD_MS: u64 = 30_000;
+/// No beacon from our BSS for this long (outside our own scans): the BSS is
+/// gone (out of range, a tunnel, a hotspot switched off). Firmware with its
+/// own beacon-loss detection reports `BeaconLoss` sooner.
+const BEACON_LOSS_MS: u64 = 8_000;
+pub const REASON_INACTIVITY: u16 = 4;
 /// The RSNXE we send when using H2E: SAE hash-to-element.
 const OWN_RSNXE_H2E: [u8; 3] = [ie::RSNX, 1, ie::RSNX_SAE_H2E];
 
@@ -120,6 +128,12 @@ pub struct Station {
     rssi16: Option<i32>,
     roam_scan: bool,
     last_roam_scan: Option<u64>,
+    /// The BSS that won the last background scan (it must win twice), and
+    /// no roam scans before this time (set by a join or a roam).
+    roam_candidate: Option<Mac>,
+    roam_hold_until: u64,
+    /// When our BSS's last beacon arrived (or the association came up).
+    last_beacon: u64,
     /// The country atrium-net set ("00" until then), and whether an AP's
     /// Country element has narrowed its rules for this association.
     country: [u8; 2],
@@ -137,7 +151,7 @@ fn state_line(name: &str) -> Line {
 
 impl Station {
     pub fn new(own: Mac, rand: Box<dyn FnMut(&mut [u8])>) -> Self {
-        Station { device: own, own, mac_key: None, wpa3_only: HashSet::new(), joined: None, rssi16: None, roam_scan: false, last_roam_scan: None, country: *b"00", narrowed: false, st: State::Idle, results: Vec::new(), seq: 0, sa_query: None, rand }
+        Station { device: own, own, mac_key: None, wpa3_only: HashSet::new(), joined: None, rssi16: None, roam_scan: false, last_roam_scan: None, roam_candidate: None, roam_hold_until: 0, last_beacon: 0, country: *b"00", narrowed: false, st: State::Idle, results: Vec::new(), seq: 0, sa_query: None, rand }
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -284,6 +298,8 @@ impl Station {
                 out.push(Out::Ctl(state_line("scanning")));
                 self.joined = Some(JoinReq { ssid: ssid.clone(), want, mac });
                 self.last_roam_scan = None;
+                self.roam_candidate = None;
+                self.roam_hold_until = 0;
                 self.start_scan(Some(JoinReq { ssid, want, mac }), &mut out);
             }
             "country" => {
@@ -421,6 +437,8 @@ impl Station {
     fn roam_done(&mut self, now: u64) -> Vec<Out> {
         let mut out = Vec::new();
         self.roam_scan = false;
+        // Beacons were missed while the radio was off our channel.
+        self.last_beacon = self.last_beacon.max(now);
         let (Some(j), State::Up { t }) = (self.joined.clone(), &self.st) else {
             return out;
         };
@@ -430,8 +448,16 @@ impl Station {
             return out;
         };
         if (c.bss.rssi as i32) < cur + ROAM_GAIN {
+            self.roam_candidate = None;
             return out;
         }
+        if self.roam_candidate != Some(c.bss.bssid) {
+            self.roam_candidate = Some(c.bss.bssid);
+            out.push(Out::Ctl(Line::new("event").with("what", "roam-candidate").with("bssid", fmt_mac(&c.bss.bssid)).with("rssi", cur).with("new_rssi", c.bss.rssi)));
+            return out;
+        }
+        self.roam_candidate = None;
+        self.roam_hold_until = now + ROAM_HOLD_MS;
         out.push(Out::Ctl(Line::new("event").with("what", "roam").with("from", fmt_mac(&from)).with("to", fmt_mac(&c.bss.bssid)).with("rssi", cur).with("new_rssi", c.bss.rssi)));
         self.leave(REASON_LEAVING, true, "roam", &mut out);
         self.begin(c, now, &mut out);
@@ -495,6 +521,7 @@ impl Station {
             // Our BSS's beacons: its signal, for roaming.
             if let State::Up { t } = &self.st {
                 if sub == mgmt::BEACON && mgmt::addr2(f) == t.bss.bssid && freq == t.bss.freq {
+                    self.last_beacon = now;
                     let r = rssi as i32 * 16;
                     self.rssi16 = Some(self.rssi16.map_or(r, |a| a + (r - a) / 4));
                 }
@@ -703,6 +730,7 @@ impl Station {
                 out.push(Out::Ctl(st));
                 let ap = t.bss.country;
                 self.st = State::Up { t };
+                self.last_beacon = now;
                 self.narrow_for(ap, &mut out);
             }
             ("failed", State::Sae { .. }) => {
@@ -714,6 +742,15 @@ impl Station {
                 self.leave(REASON_4WAY_TIMEOUT, true, &why, &mut out);
             }
             _ => {}
+        }
+        out
+    }
+
+    /// The firmware lost our BSS's beacons.
+    pub fn beacon_loss(&mut self) -> Vec<Out> {
+        let mut out = Vec::new();
+        if matches!(self.st, State::Up { .. }) {
+            self.leave(REASON_INACTIVITY, false, "beacon-loss", &mut out);
         }
         out
     }
@@ -748,9 +785,16 @@ impl Station {
 
     pub fn tick(&mut self, now: u64) -> Vec<Out> {
         let mut out = Vec::new();
+        if matches!(self.st, State::Up { .. }) && !self.roam_scan && now >= self.last_beacon + BEACON_LOSS_MS {
+            self.leave(REASON_INACTIVITY, false, "beacon-loss", &mut out);
+            return out;
+        }
         if let (State::Up { .. }, Some(r), false) = (&self.st, self.rssi16, self.roam_scan) {
             let due = self.last_roam_scan.is_none_or(|l| now >= l + ROAM_SCAN_EVERY_MS);
-            if r / 16 < ROAM_RSSI && due && self.joined.is_some() {
+            if r / 16 >= ROAM_RSSI {
+                self.roam_candidate = None;
+            }
+            if r / 16 < ROAM_RSSI && due && now >= self.roam_hold_until && self.joined.is_some() {
                 self.last_roam_scan = Some(now);
                 self.roam_scan = true;
                 self.results.clear();

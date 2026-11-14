@@ -17,6 +17,8 @@ each radio's channel is learned from its own frames and a frame from the
 FreeBSD side goes to the radio on its channel. The signal the FreeBSD side
 sees per channel comes from SIGNAL_FILE ("FREQ DBM" lines, re-read when it
 changes; default -40), so a test can make one AP fade and another grow.
+At OUT_OF_RANGE dBm or below the channel is gone: frames are lost both ways
+(and reported unacknowledged), as in a tunnel or with a hotspot switched off.
 
 usage: air-hwsim.py HOST PORT
 """
@@ -55,6 +57,9 @@ TX_STAT_ACK = 4
 
 MAGIC = b"AAIR"
 SIGNAL_FILE = "/tmp/air-signal"
+
+
+OUT_OF_RANGE = -95
 
 
 class Signals:
@@ -172,7 +177,8 @@ def main():
                         rates[j] = 0xFF  # idx -1: unused
                         if j + 1 < len(rates):
                             rates[j + 1] = 0
-                st = flags if flags & TX_CTL_NO_ACK else flags | TX_STAT_ACK
+                gone = freq and sig.get(freq) <= OUT_OF_RANGE
+                st = flags if flags & TX_CTL_NO_ACK or gone else flags | TX_STAT_ACK
                 nl.send(
                     fam,
                     HWSIM_CMD_TX_INFO_FRAME,
@@ -182,6 +188,8 @@ def main():
                     + attr(A_TX_INFO, bytes(rates))
                     + attr(A_COOKIE, a.get(A_COOKIE, b"\0" * 8)),
                 )
+                if gone:
+                    continue
                 try:
                     udp.send(MAGIC + struct.pack("<HbB", freq, sig.get(freq), 0) + frame)
                     stats["up"] += 1
@@ -194,7 +202,7 @@ def main():
                 d = b""
             freq = struct.unpack_from("<H", d, 4)[0] if len(d) >= 8 else 0
             radio = radios.get(freq)
-            if len(d) >= 8 + 10 and d[:4] == MAGIC and radio is not None:
+            if len(d) >= 8 + 10 and d[:4] == MAGIC and radio is not None and sig.get(freq) > OUT_OF_RANGE:
                 # The AP hears us as well as we hear it.
                 s_dbm = sig.get(freq)
                 nl.send(

@@ -215,6 +215,7 @@ fn main() {
                     }
                     Msg::ScanDone { status } => outs.extend(sta.scan_done(status, now())),
                     Msg::Disassociated { reason, .. } => outs.extend(sta.kernel_disassociated(reason)),
+                    Msg::BeaconLoss => outs.extend(sta.beacon_loss()),
                     other => {
                         if o.verbose {
                             eprintln!("aura-mlme: kernel: {other:?}");

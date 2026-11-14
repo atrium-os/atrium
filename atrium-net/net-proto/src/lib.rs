@@ -37,6 +37,9 @@ pub struct LeaseV4 {
     pub mtu: Option<u16>,
     pub lease_s: u32,
     pub server: Ipv4Addr,
+    /// The server says the uplink is metered (Android's hotspot marker).
+    /// Advisory only: it changes no routing, it is reported to apps.
+    pub metered: bool,
 }
 
 /// What the rest of the host already uses, so a lease cannot overlap it.
@@ -159,6 +162,9 @@ impl LeaseV4 {
         if let Some(m) = self.mtu {
             l = l.with("mtu", m);
         }
+        if self.metered {
+            l = l.with("metered", 1);
+        }
         l
     }
 
@@ -191,6 +197,7 @@ impl LeaseV4 {
             mtu: match l.get("mtu") { Some(m) => Some(m.parse().ok()?), None => None },
             lease_s: l.num("secs")?,
             server: l.get("server")?.parse().ok()?,
+            metered: l.get("metered") == Some("1"),
         })
     }
 }
@@ -216,6 +223,7 @@ mod tests {
             mtu: Some(1500),
             lease_s: 3600,
             server: Ipv4Addr::new(192, 168, 1, 1),
+            metered: false,
         }
     }
 

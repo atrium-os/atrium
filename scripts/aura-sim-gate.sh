@@ -6,7 +6,8 @@
 #     medium air-hwsim.py, udhcpd on br0 (10.77.0.0/24).
 #   FreeBSD VM: aura_wlan.ko + aura_sim.ko; aura-air (the radio's firmware,
 #     test only) on UDP 7701; arcad; aura-keys and aura-mlme jailed;
-#     aura-ctl as atrium-net.
+#     atrium-net managing wlan0 (Wi-Fi profiles, DHCP through its sandboxed
+#     atrium-lease), driven by atrium-netctl.
 #
 #   sh scripts/aura-sim-gate.sh vms   boot both VMs (FreeBSD with the UDP
 #                                     forward; fork kernel via nextboot)
@@ -51,6 +52,17 @@ leave() {
     echo "$out" | grep -q 'state=disconnected' || fail "leave"
 }
 
+# atrium-net on wlan0 (state in /tmp/aura/net-state, so profiles persist
+# across its restarts within one run).
+start_net() {
+    "$V" "set -e
+        pkill -x atrium-net 2>/dev/null || true; sleep 1
+        id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
+        mkdir -p /var/empty /tmp/aura/net-state
+        daemon -f -o /tmp/aura/net.log /tmp/aura/atrium-net -v --wifi wlan0 --capsicum --no-unbound --lease /tmp/aura/atrium-lease --sock /tmp/aura/net.sock --state-dir /tmp/aura/net-state
+        sleep 2"
+}
+
 setup() {
     TARGET=arm64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-kmod.sh" >&2
     X="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
@@ -63,6 +75,11 @@ setup() {
         (cd "$ROOT/arca/arcad" && RUSTFLAGS="$X" cargo build --release --bin arcad --target "$T" >&2)
         cp "$ROOT/arca/arcad/target/$T/release/arcad" "$B/"
     fi
+    # atrium-net is the network manager here (Wi-Fi policy, DHCP through its
+    # sandboxed atrium-lease); atrium-netctl is the command line.
+    (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease --target "$T" >&2)
+    N="$ROOT/atrium-net/target/$T/release"
+    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-netctl" "$B/"
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 
@@ -145,12 +162,13 @@ setup() {
             sleep 2
             ps -o user,command -ax | grep '[a]ura-'"
     fi
-    CTL=/tmp/aura/aura-ctl
+    start_net
+    CTL="/tmp/aura/atrium-netctl --sock /tmp/aura/net.sock"
     pass=0
     ok() { echo "ok   $1"; pass=$((pass + 1)); }
     fail() {
         echo "FAIL $1"
-        "$V" "for f in /tmp/aura/air.log $KLOG $MLOG; do echo \"--- \$f\"; tail -n 40 \$f; done" || true
+        "$V" "for f in /tmp/aura/air.log $KLOG $MLOG /tmp/aura/net.log; do echo \"--- \$f\"; tail -n 40 \$f; done" || true
         sh "$AP" log || true
         exit 1
     }
@@ -171,7 +189,7 @@ w1() {
     echo "$out" | sed 's/^/    /'
     echo "$out" | grep -q 'ssid="aura-test".*security=psk-sha256' && ok "scan finds aura-test (WPA2, PMF required, PSK-SHA256)" || fail "scan result"
 
-    r=$("$V" "echo 'correct horse battery staple' | $CTL remember aura-test") || fail "remember: $r"
+    r=$("$V" "echo 'correct horse battery staple' | $CTL remember aura-test --manual") || fail "remember: $r"
     ok "credential remembered ($([ "$ARCA" = 1 ] && echo "Arca machine store" || echo "memory store"))"
 
     out=$("$V" "$CTL join aura-test --wait 180 --dhcp wlan0" 2>&1) || fail "join: $out"
@@ -207,7 +225,7 @@ w1() {
     # PMF: a forged (unprotected) deauth from the AP's address is ignored.
     sh "$AP" ssh "hostapd_cli -p /run/hostapd deauthenticate $MAC test=0 >/dev/null 2>&1; true"
     sleep 5
-    st=$("$V" "$CTL status")
+    st=$("$V" "$CTL wifi-status")
     echo "    $st"
     if "$V" "grep -q unprotected-deauth-ignored $MLOG"; then
         echo "$st" | grep -q 'state=authorized' && ok "unprotected deauth ignored (PMF), SA Query kept the link" || fail "forged deauth"
@@ -222,7 +240,7 @@ w1() {
 }
 
 w2() {
-    r=$("$V" "echo '$PASS' | $CTL remember aura-test") || fail "remember: $r"
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember: $r"
     ok "credential remembered"
 
     # 1. WPA3 only, H2E only, anti-clogging token on every commit.
@@ -232,7 +250,7 @@ w2() {
     echo "$out" | grep -q 'ssid="aura-test".*security=sae$' && ok "scan: aura-test is WPA3-SAE" || fail "scan security"
     join aura-test --dhcp wlan0
     MAC=$(mac_of "$out")
-    st=$("$V" "$CTL status"); echo "    $st"
+    st=$("$V" "$CTL wifi-status"); echo "    $st"
     echo "$st" | grep -q 'using=sae-h2e' && ok "SAE with hash-to-element" || fail "using H2E"
     "$V" "grep -q 'anti-clogging token requested' $KLOG" && ok "anti-clogging token: asked, commit sent again" || fail "token path"
     sh "$AP" ssh "grep -q 'AP-STA-CONNECTED $MAC' /tmp/hostapd.log && grep -q 'EAPOL-4WAY-HS-COMPLETED $MAC' /tmp/hostapd.log" && ok "hostapd: SAE station connected, 4-way done" || fail "hostapd SAE connect"
@@ -241,7 +259,7 @@ w2() {
     # Regulatory: our country DE; the AP's Country element (US) narrows it.
     r=$("$V" "$CTL country DE") || fail "country: $r"
     echo "    $r"
-    st=$("$V" "$CTL status"); echo "    $st"
+    st=$("$V" "$CTL wifi-status"); echo "    $st"
     echo "$st" | grep -q 'country=DE narrowed=1' && ok "country DE set; the AP's US Country element narrowed the rules" || fail "regulatory narrowing"
     "$V" 'ping -c 2 -t 20 10.77.0.1' >/dev/null && ok "still connected on channel 6 under DE and US" || fail "ping after country"
     leave
@@ -250,7 +268,7 @@ w2() {
     sh "$AP" ap hostapd-wpa3-hnp.conf
     "$V" "killall -q dhclient; true"
     join aura-test --dhcp wlan0
-    st=$("$V" "$CTL status"); echo "    $st"
+    st=$("$V" "$CTL wifi-status"); echo "    $st"
     echo "$st" | grep -q 'using=sae ' && ok "SAE with hunting-and-pecking" || fail "using H&P"
     "$V" "grep -q 'hunting-and-pecking' $KLOG" || fail "H&P in keys log"
     "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping (hunting-and-pecking)" || fail "ping (hnp)"
@@ -291,12 +309,83 @@ w2() {
     "$V" "grep -q 'what=roam ' /tmp/aura/watch.log" && ok "roamed to $BB (channel 6) when $BA faded" || fail "roam event"
     sh "$AP" ssh "grep -q 'wlan1: AP-STA-CONNECTED $MAC' /tmp/hostapd.log" && ok "hostapd: same address on the second BSS" || fail "hostapd roam"
     "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after the roam (same address, same LAN)" || fail "ping after roam"
+    A1=$("$V" "$CTL status" | sed -n 's/^iface name=wlan0 .*addr=\([0-9.]*\).*/\1/p')
     leave
-    "$V" "grep -q 'secret=\\|correct horse' $MLOG && exit 1; true" && ok "no secret in aura-mlme's log" || fail "secret leaked to mlme log"
+
+    # atrium-net (N1): what it keeps and does on its own.
+    # Transition Disable from scenario 3 survives a restart of atrium-net.
+    start_net
+    l=$("$V" "$CTL list"); echo "$l" | sed 's/^/    /'
+    echo "$l" | grep -q 'wpa3_only=1' && ok "WPA3-only flag (Transition Disable) persisted across an atrium-net restart" || fail "wpa3_only persisted"
+    # Auto-join: remembered for auto-join, nothing else asked; the best BSS of
+    # the two is joined and DHCP runs by itself.
+    sh "$AP" signal 2412 -40 2437 -75
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test") || fail "remember (auto): $r"
+    i=0
+    until "$V" "$CTL status" | grep -q '^iface name=wlan0 .*state=bound'; do
+        i=$((i + 1)); [ $i -lt 40 ] || { "$V" "$CTL status; tail -n 30 /tmp/aura/net.log"; fail "auto-join within 200 s"; }
+        sleep 5
+    done
+    st=$("$V" "$CTL status"); echo "$st" | sed 's/^/    /'
+    A2=$(echo "$st" | sed -n 's/^iface name=wlan0 .*addr=\([0-9.]*\).*/\1/p')
+    ok "auto-joined aura-test and got $A2 by DHCP without a join command"
+    [ -n "$A1" ] && [ "$A1" = "$A2" ] && ok "same address as before ($A1): the lease was confirmed, not renegotiated" || echo "    note: address $A1 then $A2"
+    "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after auto-join" || fail "ping after auto-join"
+    # Driving into a tunnel: both BSSs out of range for 20 s. aura-mlme
+    # notices the missing beacons, atrium-net keeps the address through the
+    # drop, reconnects fast and confirms the same lease.
+    "$V" "rm -f /tmp/aura/watch.log; daemon -f -o /tmp/aura/watch.log $CTL watch 400"
+    sleep 2
+    sh "$AP" signal 2412 -100 2437 -100
+    i=0
+    until "$V" "grep -q 'beacon-loss' /tmp/aura/watch.log"; do
+        i=$((i + 1)); [ $i -lt 10 ] || { "$V" "cat /tmp/aura/watch.log"; fail "beacon loss within 30 s"; }
+        sleep 3
+    done
+    ok "tunnel: link loss noticed from missing beacons"
+    "$V" "ifconfig wlan0 inet | grep -q 'inet $A2 '" && ok "tunnel: address kept while the link is gone" || fail "address dropped at once"
+    "$V" "$CTL status" | grep -q '^iface name=wlan0 .*link=lost' && ok "tunnel: status says link=lost" || fail "status link=lost"
+    sleep 12
+    sh "$AP" signal 2412 -40 2437 -75
+    i=0
+    until "$V" "$CTL status" | grep '^iface name=wlan0 .*state=bound' | grep -qv 'link=lost'; do
+        i=$((i + 1)); [ $i -lt 30 ] || { "$V" "$CTL status; cat /tmp/aura/watch.log; tail -n 30 /tmp/aura/net.log"; fail "reconnect within 90 s of leaving the tunnel"; }
+        sleep 3
+    done
+    ok "tunnel: reconnected $((i * 3)) s after the signal came back"
+    "$V" "grep -q 'lease-lost' /tmp/aura/watch.log" && fail "lease dropped during a 20 s drop" || ok "tunnel: no lease-lost event during the drop"
+    "$V" "ifconfig wlan0 inet | grep -q 'inet $A2 '" && ok "tunnel: same address ($A2) after the drop" || fail "address changed after the tunnel"
+    "$V" 'ping -c 3 -t 30 10.77.0.1' >/dev/null && ok "ping after the tunnel" || fail "ping after tunnel"
+    # A long tunnel: past the 60 s grace the address and routes go.
+    sh "$AP" signal 2412 -100 2437 -100
+    i=0
+    until "$V" "grep -q 'lease-lost.*why=link-down' /tmp/aura/watch.log"; do
+        i=$((i + 1)); [ $i -lt 30 ] || { "$V" "cat /tmp/aura/watch.log"; fail "address dropped within 90 s of a long drop"; }
+        sleep 3
+    done
+    ok "long drop: address dropped after the grace period ($((i * 3)) s)"
+    a=$("$V" "ifconfig wlan0 inet | grep -c 'inet ' || true")
+    [ "$a" = 0 ] && ok "long drop: wlan0 has no IPv4 address" || fail "address kept after the grace"
+    sh "$AP" signal 2412 -40 2437 -75
+    i=0
+    until "$V" "$CTL status" | grep -q '^iface name=wlan0 .*state=bound'; do
+        i=$((i + 1)); [ $i -lt 40 ] || { "$V" "$CTL status; tail -n 30 /tmp/aura/net.log"; fail "rejoin after a long drop"; }
+        sleep 3
+    done
+    "$V" "ifconfig wlan0 inet | grep -q 'inet $A2 '" && ok "long drop: rejoined, same address back ($A2)" || fail "address after the long drop"
+    "$V" "pkill -f 'atrium-netctl.*watch' || true"
+    # Leaving drops the address (no routes through a dead link) and holds off auto-join.
+    leave
+    sleep 3
+    a=$("$V" "ifconfig wlan0 inet | grep -c 'inet ' || true")
+    [ "$a" = 0 ] && ok "left: wlan0 has no IPv4 address" || fail "address kept after leave"
+    sleep 10
+    "$V" "$CTL status" | grep -q '^wifi state=idle' && ok "no auto-join after the user left" || fail "auto-joined after leave"
+    "$V" "grep -q 'secret=\\|correct horse' $MLOG /tmp/aura/net.log && exit 1; true" && ok "no secret in aura-mlme's or atrium-net's log" || fail "secret leaked to a log"
 }
 
 teardown() {
-    "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
+    "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
 
 case "${1:-}" in

@@ -359,8 +359,9 @@ W0–W2 need no Wi-Fi hardware at all.
   aura-keys keeps in Arca as `aura mac-key`), or `random` per join, or `device`. The
   kernel takes the address with `SetMac` and changes the ifnet's lladdr.
 - Roaming: beacon RSSI average; below -70 dBm a background scan runs at most every
-  10 s, and a BSS of the same network 8 dB better gets a fresh SAE join after a
-  protected deauth. No 802.11r (FT) or PMK caching yet.
+  10 s, and a BSS of the same network 8 dB better on two scans in a row gets a fresh
+  SAE join after a protected deauth; no further roam scan for 30 s after a move
+  (hysteresis, added 2026-11-14). No 802.11r (FT) or PMK caching yet.
 - Regulatory: `aura/aura-regdb` compiles wireless-regdb `db.txt` (2026.05.30, ISC,
   in `aura-regdb/data/`) into the binary at build time; unknown flags fail the build.
   The country is set with `aura-ctl country CC` (atrium-net later). An AP's Country

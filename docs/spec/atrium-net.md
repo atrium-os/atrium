@@ -82,11 +82,52 @@ settings UI / apps ──CLASS_NETCONF──► atrium-net (root, host stack, Ca
   networks that are present, highest priority first, then strongest. Never join open
   networks unless that profile has auto-join explicitly on (decision 17); never below
   the profile's security floor (aura-mlme enforces this too).
-- **Roaming** stays in aura-mlme (W2). `atrium-net` treats a roam inside the same
+- **No bouncing between networks.** Auto-join only chooses while not connected; a working
+  network is never left for a higher-priority one that appears (the user can switch).
+- **Roaming** stays in aura-mlme (W2), with hysteresis: the average signal must be below
+  -70 dBm, the other BSS 8 dB better on two scans in a row, and 30 s must have passed since
+  the last move (wifi.md §7.3). `atrium-net` treats a roam inside the same
   network as the same link: it keeps the lease and asks atrium-lease to confirm it
   (DHCP INIT-REBOOT) rather than starting over.
 - **Country.** The regulatory country (W2) is a setting held here and sent to aura-mlme
   at start; later it can come from the time zone as a hint, never from scan results.
+
+### 4.1 Bad links
+
+How each kind of trouble plays out. "Gate" marks what a simulated gate checks.
+
+- **Short drop (a tunnel, a lift, a blip).** aura-mlme declares the link lost after 8 s
+  without beacons (or at once on the firmware's beacon-loss report) and does not try to
+  deauthenticate through a dead link. atrium-net keeps the address and routes for 60 s
+  (`status` shows `link=lost`); atrium-lease pauses. Reconnect attempts after a loss come
+  fast, at 2, 5, 10, 20, 30 and 60 s, for 10 min; after that the slow scan ladder (30 s up
+  to 5 min) applies. On reconnect atrium-lease confirms the old lease (INIT-REBOOT); the
+  same address means nothing changes and TCP connections survive a drop of up to about a
+  minute. Not back within 60 s: the address and routes go and apps see the network gone.
+  Gate: tunnel scenario in aura-sim-gate W2.
+- **Long drop or leaving for good.** As above, then the address goes at 60 s. A user
+  `leave` (or `forget`) drops the address at once.
+- **Low signal.** Within one network, roaming hysteresis (above). A weak network that still
+  works is kept: no automatic move to another network today. Planned with N3: move to
+  another remembered network only when the current one averages below -80 dBm for 30 s and
+  the other is above -70 dBm on two scans in a row, with the same 30 s hold-down.
+- **Flaky internet (link fine, upstream dead or lossy).** The link layer cannot see this.
+  DHCP keeps running to the lease's end (renew, then rebind by broadcast at T2, then drop
+  and start over). N3 adds the connectivity probe (shared with captive-portal detection):
+  an interface whose probe fails is reported `internet=0`; when another interface has
+  internet, the default route moves to it with the same doubling hold-down as decision 9.
+  With only one interface it is reported, never torn down.
+- **A network that keeps failing** (wrong password, AP refusing us, no association).
+  Three failures in a row skip it for 10 min and emit `event what=network-failing`, so
+  auto-join tries the next network rather than hammering one. Gate: unit test.
+- **Mobile hotspots.** A sleeping or switched-off hotspot is a lost link (as above). An
+  Android hotspot marks its DHCP replies with option 43 `ANDROID_METERED`: the lease then
+  carries `metered=1`. iPhone hotspots send no marker, so a profile can be marked
+  `metered` by the user. Metered is advisory: reported in `status` and lease events for
+  apps to defer bulk work; it changes no routing (Ethernet is preferred anyway). Small
+  prefixes (an iPhone's /28) are ordinary. A hotspot restarted with a new subnet NAKs the
+  old lease and a new one is taken. Gate: metered unit test.
+- **Ethernet and Wi-Fi flapping.** Decision 9: doubling hold-down before moving back.
 
 ## 5. Addresses
 
@@ -181,6 +222,10 @@ it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
    each join); sign-in UX later. *Recommend yes.*
 9. **Ethernet preferred over Wi-Fi** when both are up (lower route metric), and Wi-Fi
    stays associated as a standby. *Recommend yes.*
+   Hysteresis (added 2026-11-14, Shankar asked): the default route moves to Wi-Fi as
+   soon as the cable's link drops, and back to Ethernet only after the cable has been up
+   with a checked lease for 5 s; each flap within 2 min doubles that wait (up to 5 min),
+   so a bad cable cannot make the route bounce.
 
 ## 10. Build order
 

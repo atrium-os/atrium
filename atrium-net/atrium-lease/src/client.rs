@@ -315,5 +315,6 @@ fn lease_from(r: &Reply, prev_server: Option<Ipv4Addr>) -> Option<LeaseV4> {
         mtu: r.mtu,
         lease_s,
         server,
+        metered: r.metered,
     })
 }
