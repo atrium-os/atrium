@@ -292,6 +292,23 @@ impl Fetcher for Remembering<'_> {
     }
 }
 
+/// What to fetch for the `<img>` `h`, and the density of what that is: a
+/// `srcset` candidate picked for every reader alike ([`crate::srcset`]),
+/// else its `src` at 1x. `None` without either.
+pub fn fetch_src(dom: &Dom, h: navigator_dom::Handle) -> Option<(String, f32)> {
+    crate::srcset::for_img(dom, h).or_else(|| dom.attr(h, "src").map(|s| (s.to_string(), 1.0)))
+}
+
+/// A natural size read from pixels `density` times denser than CSS px:
+/// the size it takes, as a browser gives a `2x` candidate.
+fn at_density(n: Natural, density: f32) -> Natural {
+    if (density - 1.0).abs() < 1e-6 || !density.is_finite() || density <= 0.0 {
+        return n;
+    }
+    let d = |v: Option<u32>| v.map(|v| ((v as f32 / density).round() as u32).max(1));
+    Natural { width: d(n.width), height: d(n.height), ratio: n.ratio }
+}
+
 type Progress<'a> = &'a mut dyn FnMut(&Subresources, &std::collections::HashSet<String>);
 
 fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode: Mode,
@@ -367,7 +384,11 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         // An image whose size the DOCUMENT already declares needs no fetch:
         // it has already arrived measured.
         let declared = |n: &str| dom.attr(h, n).and_then(|v| v.trim().parse::<u32>().ok());
-        let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
+        // ★ Keyed by its `src` (what the document and normalizer look it up
+        // by), fetched from its picked `srcset` candidate when it has one,
+        // and sized at that candidate's density.
+        let (fetch, density) = fetch_src(dom, h).unwrap_or((src.clone(), 1.0));
+        let Some(abs) = resolve(&fetch) else { out.failed.push((src, "cannot resolve".into())); continue };
         // ★ A PIXEL IS NEVER FETCHED (navigator-ui §6.6): an image that
         // declares itself at most 1 × 1, or is `hidden` itself, shows nothing a reader could see, so
         // its only effect would be telling its host a conversion happened.
@@ -389,7 +410,7 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
                 None => {
                     let _s = crate::timing::span("header");
                     match size_from_header(&abs, fetcher) {
-                        Ok(n) => { crate::timing::count("header.sized"); (n, Pending::Header) }
+                        Ok(n) => { crate::timing::count("header.sized"); (at_density(n, density), Pending::Header) }
                         Err(why) if miss_proves_failure(&why) => {
                             // Left out, as the final recording will leave it.
                             crate::timing::count(&format!("header.fails.{}", miss_kind(&why)));
@@ -410,7 +431,7 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
         // ★ For a layout, the SIZE is all that is needed: never hashed,
         // never stored.
         if layout {
-            let n = fetcher.get_bytes(&abs).ok().and_then(|b| natural_size(&b));
+            let n = fetcher.get_bytes(&abs).ok().and_then(|b| natural_size(&b)).map(|n| at_density(n, density));
             match n.or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
                 Some(natural) => out.images.push(Image { src, natural, address: String::new(), pending: None }),
                 None => out.failed.push((src, "no intrinsic size".into())),
@@ -418,7 +439,7 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
             continue;
         }
         match fetcher.get_bytes(&abs) {
-            Ok(bytes) => match natural_size(&bytes).or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
+            Ok(bytes) => match natural_size(&bytes).map(|n| at_density(n, density)).or_else(|| declared("width").zip(declared("height")).map(|(w, h)| Natural::sized(w, h))) {
                 Some(natural) => {
                     let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
                     store(&address, &bytes);

@@ -164,3 +164,21 @@ fn the_first_display_fetches_no_sprite_file() {
     let full = collect(&dom, Some("https://example.com/page"), &mut f);
     assert_eq!(full.sprites.len(), 1);
 }
+
+/// ★ `srcset` at one density for every reader (resolution-independence.md
+/// §10): the 2x candidate is fetched whatever screen reads the page, kept
+/// under the `src` the document names it by, and sized at its density, so it
+/// takes the room its 1x `src` would.
+#[test]
+fn a_srcset_image_is_fetched_at_two_x_for_everyone_and_sized_in_css_px() {
+    let dom = navigator_dom::parse(
+        r#"<html><body><img src="/one.svg" srcset="/one.svg 1x, /two.svg 2x, /three.svg 3x"></body></html>"#);
+    let mut f = MapFetcher::default();
+    // Only the 2x candidate is there: fetching another would fail.
+    f.0.insert("https://example.com/two.svg".into(), r#"<svg width="128" height="64"></svg>"#.into());
+    let out = collect(&dom, Some("https://example.com/"), &mut f);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.images[0].src, "/one.svg", "keyed as the document names it");
+    assert_eq!((out.images[0].natural.width, out.images[0].natural.height), (Some(64), Some(32)), "128 px at 2x is 64 CSS px");
+}

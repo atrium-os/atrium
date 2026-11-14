@@ -472,10 +472,16 @@ Three factors multiply for page content:
 **Built (step 7, 2026-11-14):** navigator-page lays pages out at the reader's per-site text
 size times the system text size (`text_64()`), for layout, the comfortable measure, find and
 in-page anchors, and lays the page out again, keeping its place, when the system text size
-changes. Page images: the converter fetches only `src` (it lays out at 1 dppx, and profile
-§3.11 admits no fetch that varies with the reader's screen), so on a 2x display a page image
-is 1x pixels drawn at 2x. Open: whether the converter picks a `srcset` candidate at one fixed
-density for every reader (sharp on 2x screens, nothing about the reader leaks).
+changes. Page images: profile §3.11 admits no fetch that varies with the reader's screen,
+so the converter picks an `<img>`'s `srcset` candidate for one fixed density, 2x, for every
+reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descriptors over
+`sizes` at the 1280 px conversion viewport (px/vw/em lengths, min/max-width conditions; else
+100vw); the least dense at least 2x, else the densest. The candidate is fetched (and hinted)
+in place of `src`, kept under the `src` the document names it by, and its natural size is
+its pixels over its density, so it takes the room its 1x `src` would and a 2x screen gets
+2x pixels. Nothing about the reader leaks; the cost is larger image downloads, bounded by
+the existing image ceilings. (Proposed 2026-11-14 as the recommended option; built while
+the decision is open.) `<picture>` sources are not read yet.
 
 ## 11. Decisions (accepted 2026-11-14)
 
@@ -511,3 +517,4 @@ Shankar took the recommendation on each:
    extended with mixed-scale monitors. **Built 2026-11-14** for the moves Forum has (§7
    "Built"); drag-time resampling waits for a free window drag.
 7. **Navigator** (§10): system text size into `text_scale_64`, density-picked images.
+   **Built 2026-11-14** (§10 "Built").
