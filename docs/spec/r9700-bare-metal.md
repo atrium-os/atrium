@@ -1566,3 +1566,18 @@ work (self-test, scrub).
   still unexplained. Depth caveat: the 610 s pauses after each re-init left
   only 267085 ioctl calls and 14 blob jobs in the hour. Logs:
   claude/project-thread-33aauq acb4634d.
+- **2026-11-13 21:13 to 2026-11-14 21:37, 24 h fuzz gate (2963f5db): PASS.
+  The GPU ABI §10.5 fuzz gate is met on silicon.** si-fuzz RESULT: PASS (0
+  findings): 2147410 ioctl calls, 288 blob jobs, 16818 canary runs, 243
+  re-inits during the fuzz with the cap never hit; si-client-test 92/0
+  before and after; 0 flush timeouts, 0 panics; card proven idle at detach,
+  modules unloaded. Open, not findings: (1) five fault storms (up to ~8 M
+  IVs each, ih_overflows 12125), the big ones GCR faults on VMID 8 starting
+  the moment a re-init finished, so a leftover from before the reset, not
+  live fuzzing; the driver should also mute a VMID's repeat faults until
+  its queue is gone. (2) SDMA0 faults from a user blob (05:21, 06:03) and
+  CPF faults: find the path. (3) Type 0x04 EOP IVs (doorbells 0x20, 0x28,
+  0x2c) unexplained. (4) ~280 W for a few seconds after every re-init
+  (likely the VRAM scrub). Kernel log for 21:13-22:00 and 08:00-10:00 lost
+  to newsyslog rotation (keep 5): long runs should keep more. Logs:
+  claude/project-thread-33aauq b6ce1c32 (docs/r9700-runs/fz24h-2963f5db/).
