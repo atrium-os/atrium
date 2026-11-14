@@ -118,6 +118,8 @@ struct BarView {
     net: Mutable<network::NetShown>,
     net_open: Mutable<MenuState>,
     want_net: Mutable<Option<network::NetAction>>,
+    /// The overflow menu: what the row had no room for (§ "Fitting").
+    more_open: Mutable<MenuState>,
 }
 
 /// An app's own panel to open (forum-status-items.md §4): under the icon
@@ -274,6 +276,109 @@ fn now_shown(np: &NowPlaying) -> Option<NowShown> {
     })
 }
 
+// -- fitting the row (resolution-independence.md §6.3) -----------------------
+
+/// What the bar leaves out when its row doesn't fit, first to go first:
+/// what only informs before what can be pressed, and what can be pressed
+/// moves into the overflow menu rather than going away. The clock, the
+/// workspace, the status items and the system menus always stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Shed {
+    /// "seat0 · lucius · forum-wm".
+    Session,
+    /// What is playing, in words (the note and play/pause stay).
+    NowLine,
+    /// The battery, activity and bell icons (they open nothing yet).
+    Idle,
+    /// Light/dark and Lock: into the overflow menu.
+    Actions,
+    /// The surface chips (the dock and overview reach them too).
+    Surfaces,
+    /// The word "atrium" (the mark stays).
+    BrandWord,
+    /// The date under the time.
+    Date,
+}
+
+const SHED_ORDER: [Shed; 7] = [Shed::Session, Shed::NowLine, Shed::Idle, Shed::Actions, Shed::Surfaces, Shed::BrandWord, Shed::Date];
+
+/// How many of `optional` (widths, in `SHED_ORDER`) to leave out, from
+/// the front, so the row fits `avail`: `base` is what always shows, and
+/// the overflow button (`more_w`) shows once something from `more_from`
+/// on has gone.
+fn shed_count(avail: f32, base: f32, optional: &[f32], more_from: usize, more_w: f32) -> usize {
+    let total: f32 = optional.iter().sum();
+    let mut gone = 0.0;
+    for k in 0..=optional.len() {
+        let more = if k > more_from { more_w } else { 0.0 };
+        if base + total - gone + more <= avail {
+            return k;
+        }
+        if k < optional.len() {
+            gone += optional[k];
+        }
+    }
+    optional.len()
+}
+
+fn text_w(s: &str, family: &str, size: f32, weight: Weight) -> f32 {
+    Node::measure_text(s, &pergola::TextStyle { family: family.into(), size, weight, color: Color::TRANSPARENT }).w
+}
+
+/// An icon trigger's width (the status items, the system menus, More).
+fn trigger_w() -> f32 {
+    (pergola::theme::size::em(15.0) + 12.0).round()
+}
+
+const SESSION_LINE: &str = "seat0 · lucius · forum-wm";
+
+impl BarView {
+    /// What to leave out at the bar's width and text size: the row's
+    /// pieces measured as Pergola lays them out (the root's 16 pt gaps and
+    /// 14 pt padding, each group's own gaps), lowest priority first.
+    fn shed(&self) -> Vec<Shed> {
+        use pergola::theme::font;
+        let glyph = |g: char, sz: f32| text_w(&g.to_string(), font::ICONS, sz, Weight::Regular);
+        let trig = trigger_w();
+        let (gap, row_gap) = (16.0, 14.0);
+        // Padding, the brand's mark, the divider, the spacers either side
+        // of the workspace, the right row and the clock, and a little slack.
+        let mut base = 2.0 * 14.0 + 10.0 + (gap + 1.0) + 3.0 * gap + 2.0 * gap + 8.0;
+        let (ws_name, ws_hash) = self.workspace.get_cloned();
+        base += 2.0 * 10.0 + glyph(phosphor::STACK_SIMPLE, 13.0) + 7.0 + text_w(&ws_name, font::MONO, type_size::XS, Weight::Regular)
+            + 7.0 + text_w(&format!("#{ws_hash}"), font::MONO, type_size::XS, Weight::Regular);
+        let mut now_line = 0.0;
+        if let Some(n) = self.now.get_cloned() {
+            base += gap + glyph(phosphor::MUSIC_NOTE_SIMPLE, 13.0) + if n.can_toggle { 6.0 + glyph(phosphor::PLAY, 15.0) } else { 0.0 };
+            now_line = 6.0 + text_w(&n.line, font::SANS, type_size::XS, Weight::Regular);
+        }
+        let status = self.status.get_cloned().len() as f32;
+        if status > 0.0 {
+            base += gap + status * trig + 10.0 * (status - 1.0) + gap + 1.0;
+        }
+        let menus = 2.0 + f32::from(!self.sticks.get_cloned().is_empty()) + f32::from(!self.pads.get_cloned().is_empty());
+        base += menus * trig + (menus - 1.0) * row_gap;
+        let time = text_w(&self.time.get_cloned(), font::SANS, type_size::SM, Weight::Medium);
+        let date = text_w(&self.date.get_cloned(), font::MONO, type_size::XXS, Weight::Regular);
+        base += time;
+        let chips = self.chips.get_cloned();
+        let chip_w: f32 = chips.iter().map(|c| 2.0 * 9.0 + glyph(c.glyph, 14.0) + 6.0 + 5.0).sum::<f32>() + 4.0 * (chips.len().max(1) - 1) as f32;
+        let one = |g: char| row_gap + glyph(g, 15.0);
+        let optional = [
+            gap + text_w(SESSION_LINE, font::MONO, type_size::XS, Weight::Regular),
+            now_line,
+            one(phosphor::BATTERY_CHARGING) + one(phosphor::PULSE) + one(phosphor::BELL),
+            one(phosphor::MOON) + one(phosphor::LOCK_SIMPLE),
+            gap + chip_w,
+            8.0 + text_w("atrium", font::MONO, type_size::SM, Weight::Semibold),
+            (date - time).max(0.0),
+        ];
+        let actions = SHED_ORDER.iter().position(|s| *s == Shed::Actions).unwrap_or(0);
+        let k = shed_count(self.w.get(), base, &optional, actions, row_gap + trig);
+        SHED_ORDER[..k].to_vec()
+    }
+}
+
 /// A right-row icon: Phosphor glyph, hover → accent. A no-op click
 /// handler keeps un-wired icons hover-reactive like the design.
 fn icon_glyph(ctx: &mut Ctx, glyph: char, on_click: Option<Box<dyn Fn() + 'static>>) {
@@ -293,6 +398,8 @@ fn icon_glyph(ctx: &mut Ctx, glyph: char, on_click: Option<Box<dyn Fn() + 'stati
 impl View for BarView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
+        let shed = self.shed();
+        let gone = |s: Shed| shed.contains(&s);
 
         // The bar body: full-width horizontal flex, 16px gaps, 14px
         // side padding, children vertically centered. The 1px bottom
@@ -318,26 +425,31 @@ impl View for BarView {
             fill: t.accent_fg(),
             radius: 2.0,
         });
-        Label::new("atrium")
-            .mono()
-            .size(type_size::SM)
-            .weight(Weight::Semibold)
-            .emit(ctx);
+        if !gone(Shed::BrandWord) {
+            Label::new("atrium")
+                .mono()
+                .size(type_size::SM)
+                .weight(Weight::Semibold)
+                .emit(ctx);
+        }
         ctx.pop();
 
         // Session line.
-        Label::new("seat0 · lucius · forum-wm")
-            .mono()
-            .size(type_size::XS)
-            .color(t.text_tertiary())
-            .emit(ctx);
+        if !gone(Shed::Session) {
+            Label::new(SESSION_LINE)
+                .mono()
+                .size(type_size::XS)
+                .color(t.text_tertiary())
+                .emit(ctx);
+        }
 
         Divider::vertical(16.0).emit(ctx);
 
         // Surface strip: one chip per live surface.
         let strip = ctx.push(Node::hstack(Rect::ZERO_SIZED, 4.0));
         ctx.set_flex(strip, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
-        for chip in self.chips.get_cloned() {
+        let chips = if gone(Shed::Surfaces) { Vec::new() } else { self.chips.get_cloned() };
+        for chip in chips {
             let glyph = chip.glyph;
             let tint = chip.tint;
             let dot = match chip.state {
@@ -393,7 +505,9 @@ impl View for BarView {
             let np = ctx.push(Node::hstack(Rect::ZERO_SIZED, 6.0));
             ctx.set_flex(np, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
             Glyph::new(phosphor::MUSIC_NOTE_SIMPLE).size(13.0).color(t.accent_fg()).emit(ctx);
-            Label::new(n.line.clone()).size(type_size::XS).color(t.text_secondary()).emit(ctx);
+            if !gone(Shed::NowLine) {
+                Label::new(n.line.clone()).size(type_size::XS).color(t.text_secondary()).emit(ctx);
+            }
             if n.can_toggle {
                 let want = self.want_media.clone();
                 let g = if n.playing { phosphor::PAUSE } else { phosphor::PLAY };
@@ -625,26 +739,50 @@ impl View for BarView {
             .attached();
             ctx.place(panel);
         }
-        icon_glyph(ctx, phosphor::BATTERY_CHARGING, None);
-        icon_glyph(ctx, phosphor::PULSE, None);
-        let theme_glyph = if t.mode == Mode::Dark { phosphor::SUN } else { phosphor::MOON };
-        let dark = self.want_dark.clone();
+        if !gone(Shed::Idle) {
+            icon_glyph(ctx, phosphor::BATTERY_CHARGING, None);
+            icon_glyph(ctx, phosphor::PULSE, None);
+        }
         let now_dark = t.mode == Mode::Dark;
-        icon_glyph(ctx, theme_glyph, Some(Box::new(move || dark.set(Some(!now_dark)))));
-        // Bell with the amber badge dot pinned to its top-right corner.
-        let bell = ctx.push(Node::hstack(Rect::ZERO_SIZED, 0.0));
-        ctx.set_flex(bell, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
-        icon_glyph(ctx, phosphor::BELL, None);
-        let badge = Dot::new(6.0, t.accent_fg()).emit(ctx);
-        ctx.set_flex(badge, FlexStyle {
-            absolute_inset: Some([None, Some(-1.0), Some(-2.0), None]),
-            ..FlexStyle::default()
-        });
-        ctx.pop();
+        if !gone(Shed::Actions) {
+            let theme_glyph = if now_dark { phosphor::SUN } else { phosphor::MOON };
+            let dark = self.want_dark.clone();
+            icon_glyph(ctx, theme_glyph, Some(Box::new(move || dark.set(Some(!now_dark)))));
+        }
+        if !gone(Shed::Idle) {
+            // Bell with the amber badge dot pinned to its top-right corner.
+            let bell = ctx.push(Node::hstack(Rect::ZERO_SIZED, 0.0));
+            ctx.set_flex(bell, FlexStyle { align: pergola::Align::Center, ..FlexStyle::default() });
+            icon_glyph(ctx, phosphor::BELL, None);
+            let badge = Dot::new(6.0, t.accent_fg()).emit(ctx);
+            ctx.set_flex(badge, FlexStyle {
+                absolute_inset: Some([None, Some(-1.0), Some(-2.0), None]),
+                ..FlexStyle::default()
+            });
+            ctx.pop();
+        }
         // Lock the screen (lock-screen.md §2): ostiarius locks, frescod
         // hides the session, the lock screen comes up.
-        let lock = self.want_lock.clone();
-        icon_glyph(ctx, phosphor::LOCK_SIMPLE, Some(Box::new(move || lock.set(true))));
+        if !gone(Shed::Actions) {
+            let lock = self.want_lock.clone();
+            icon_glyph(ctx, phosphor::LOCK_SIMPLE, Some(Box::new(move || lock.set(true))));
+        } else {
+            // No room (resolution-independence.md §6.3): the actions move
+            // into an overflow menu at the end of the row.
+            let (dark, lock) = (self.want_dark.clone(), self.want_lock.clone());
+            let items = vec![
+                MenuItem::new(if now_dark { "Light appearance" } else { "Dark appearance" }),
+                MenuItem::new("Lock screen"),
+            ];
+            let button = MenuButton::new("More", self.more_open.clone(), items, move |i| match i {
+                0 => dark.set(Some(!now_dark)),
+                1 => lock.set(true),
+                _ => {}
+            })
+            .icon(phosphor::DOTS_THREE, 15.0, Some(t.text_secondary()))
+            .attached();
+            ctx.place(button);
+        }
         ctx.pop();
 
         // Clock block, right-aligned text.
@@ -654,11 +792,13 @@ impl View for BarView {
             .size(type_size::SM)
             .weight(Weight::Medium)
             .emit(ctx);
-        Label::new(self.date.get_cloned())
-            .mono()
-            .size(type_size::XXS)
-            .color(t.text_tertiary())
-            .emit(ctx);
+        if !gone(Shed::Date) {
+            Label::new(self.date.get_cloned())
+                .mono()
+                .size(type_size::XXS)
+                .color(t.text_tertiary())
+                .emit(ctx);
+        }
         ctx.pop();
 
         ctx.pop(); // root
@@ -1056,6 +1196,7 @@ fn main() -> std::io::Result<()> {
         net: net.clone(),
         net_open: net_open.clone(),
         want_net: want_net.clone(),
+        more_open: Mutable::new(MenuState::default()),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -1331,6 +1472,7 @@ mod tests {
             net: Mutable::new(network::NetShown::default()),
             net_open: Mutable::new(MenuState::default()),
             want_net: Mutable::new(None),
+            more_open: Mutable::new(MenuState::default()),
         }
     }
 
@@ -1610,6 +1752,53 @@ mod tests {
             second.len(),
             second.first(),
         );
+    }
+
+    /// A narrow bar leaves out what only informs first, puts its
+    /// actions in a More menu, and never runs off its right edge: the
+    /// clock stays whole (resolution-independence.md §6.3). The same
+    /// holds at a bigger text size, where the bar is fewer points wide.
+    #[test]
+    fn a_narrow_bar_sheds_its_least_needed_pieces_and_keeps_the_clock() {
+        pergola::text::clear_measurer();
+        let texts_at = |w: f32| {
+            let view = sample_view();
+            view.w.set(w);
+            view.now.set(Some(NowShown { line: "A long song title · Some player".into(), playing: true, can_toggle: true }));
+            let time = view.time.get_cloned();
+            let (mut tree, _) = render(&view, Semantic::LIGHT);
+            let roots: Vec<_> = tree.roots().collect();
+            for r in roots {
+                pergola::layout::layout(&mut tree, r);
+            }
+            let texts: Vec<(String, Rect)> = tree.iter().filter_map(|(_, n)| match n {
+                Node::Text { content, rect, .. } => Some((content.clone(), *rect)),
+                _ => None,
+            }).collect();
+            (view.shed(), texts, time)
+        };
+        let (shed, texts, _) = texts_at(2400.0);
+        assert!(shed.is_empty(), "room for everything: {shed:?}");
+        assert!(texts.iter().any(|(c, _)| c == SESSION_LINE));
+        let mut last = 0;
+        // Every 5 pt from wide to narrow, so each step's edge is crossed.
+        for w in (0..180).map(|i| 1500.0 - 5.0 * i as f32) {
+            let (shed, texts, time) = texts_at(w);
+            assert!(shed.len() >= last, "narrower sheds no less");
+            last = shed.len();
+            let clock = texts.iter().find(|(c, _)| *c == time).expect("the clock stays");
+            assert!(clock.1.x() + clock.1.w() <= w, "at {w}: the clock ends at {:?}", clock.1);
+            for (c, r) in &texts {
+                assert!(r.x() + r.w() <= w + 0.5, "at {w}: {c:?} runs off at {r:?} ({shed:?})");
+            }
+            assert_eq!(texts.iter().any(|(c, _)| c == SESSION_LINE), !shed.contains(&Shed::Session));
+            let more = texts.iter().any(|(c, _)| *c == phosphor::DOTS_THREE.to_string());
+            assert_eq!(more, shed.contains(&Shed::Actions), "at {w}: More shows when the actions go into it");
+        }
+        assert!(last >= 4, "the narrowest bars put the actions into More: {last}");
+        assert_eq!(shed_count(100.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 0);
+        assert_eq!(shed_count(75.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 1);
+        assert_eq!(shed_count(64.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 3, "dropping the second adds More");
     }
 
     #[test]

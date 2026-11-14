@@ -216,6 +216,12 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
 - **Toolbars and button rows** that no longer fit move items into an overflow menu (lowest
   priority first) rather than clipping or shrinking text. Labels may drop to icon-only only
   where the widget declares an icon.
+  Built for Pergola's `Toolbar` (step 5) and forum-bar (2026-11-14): the bar measures its row
+  and, lowest priority first, leaves out the session line, the now-playing words, the
+  idle icons (battery, activity, bell), moves Light/Dark and Lock into a More menu, then
+  leaves out the surface chips, the word "atrium" and the date. The clock, the workspace,
+  the status items and the system menus always stay. Scrinium's rename and delete strips
+  keep their buttons at the strip's end and shorten the question instead.
 - **Min window size** is the layout's natural minimum, sent to the WM as a hint. When text
   grows, min sizes grow, and forum-wm re-tiles if a window no longer fits its tile.
 - **Scroll position** is kept by anchor (the first visible element and the offset into it),

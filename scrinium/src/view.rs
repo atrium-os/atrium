@@ -252,9 +252,14 @@ enum Look {
 }
 
 /// A text button 32 pt high (at 100% text) at (`x`, `y`); returns its width.
+/// A [`button`]'s width.
+fn button_w(label: &str) -> f32 {
+    width(label, type_size::SM, Weight::Medium) + em(28.0)
+}
+
 fn button(ctx: &mut Ctx, x: f32, y: f32, label: &str, look: Look, enabled: bool, on: impl Fn() + 'static) -> f32 {
     let t = ctx.theme;
-    let (w, h) = (width(label, type_size::SM, Weight::Medium) + em(28.0), em(32.0));
+    let (w, h) = (button_w(label), em(32.0));
     let r = Rect::new(x, y, w, h);
     let (fill, hover, fg) = match look {
         Look::Ghost => (Color::TRANSPARENT, t.state_hover(), t.text_primary()),
@@ -760,8 +765,13 @@ impl ScriniumView {
                 Edit::Rename(n) => format!("Rename “{}” to:", fit(n, type_size::SM, Weight::Medium, 160.0)),
             };
             text(ctx, x0 + 16.0, y + strip_h() / 2.0, &label, type_size::SM, Weight::Medium, t.text_primary());
+            let go = if matches!(edit, Edit::NewFolder) { "Create" } else { "Rename" };
+            // The buttons keep their room at the strip's end; the field
+            // takes what is left, at least 120 pt.
+            let buttons = 10.0 + button_w(go) + 6.0 + button_w("Cancel") + 12.0;
             let fx = x0 + 24.0 + width(&label, type_size::SM, Weight::Medium);
-            let fw = (w - fx - 200.0).clamp(120.0, 320.0);
+            let fx = fx.min(w - buttons - 120.0).max(x0 + 16.0);
+            let fw = (w - fx - buttons).clamp(120.0, 320.0);
             let s = self.state.clone();
             let holder = ctx.push(Node::Rect { rect: Rect::new(fx, y + em(8.0), fw, em(32.0)), fill: Color::TRANSPARENT, radius: 0.0 });
             TextField::new(self.field.clone()).at(fx, y + em(8.0)).width(fw).on_submit(move |v| with(&s, |b| b.commit_edit(v))).render(ctx);
@@ -770,7 +780,6 @@ impl ScriniumView {
                 ctx.autofocus(bg);
             }
             let (s, f) = (self.state.clone(), self.field.clone());
-            let go = if matches!(edit, Edit::NewFolder) { "Create" } else { "Rename" };
             let bx = fx + fw + 10.0;
             let bw = button(ctx, bx, y + em(8.0), go, Look::Primary, true, move || {
                 let v = f.get_cloned().text().to_string();
@@ -781,14 +790,26 @@ impl ScriniumView {
             y += strip_h();
         } else if let Some(names) = &b.confirm_delete {
             rect(ctx, x0, y, w - x0, strip_h(), t.accent_bg(), 0.0);
+            // The buttons keep their room at the strip's end; the question
+            // gives up the name's length, then its second sentence.
+            let tx = x0 + 14.0 + em(28.0);
+            let room = (w - tx - 12.0 - button_w("Delete") - 6.0 - button_w("Cancel") - 12.0).max(0.0);
+            let fits = |q: &str| width(q, type_size::SM, Weight::Medium) <= room;
             let q = if names.len() == 1 {
-                format!("Delete “{}”? It can't be brought back.", fit(&names[0], type_size::SM, Weight::Medium, 220.0))
+                let (with_tail, bare) = ("Delete “”? It can't be brought back.", "Delete “”?");
+                let name_room = |shell: &str| (room - width(shell, type_size::SM, Weight::Medium)).min(220.0);
+                if name_room(with_tail) >= 60.0 {
+                    format!("Delete “{}”? It can't be brought back.", fit(&names[0], type_size::SM, Weight::Medium, name_room(with_tail)))
+                } else {
+                    format!("Delete “{}”?", fit(&names[0], type_size::SM, Weight::Medium, name_room(bare).max(24.0)))
+                }
             } else {
-                format!("Delete {} items? They can't be brought back.", names.len())
+                let q = format!("Delete {} items? They can't be brought back.", names.len());
+                if fits(&q) { q } else { format!("Delete {} items?", names.len()) }
             };
             icon(ctx, x0 + 14.0, y + em(14.0), ph::WARNING, 20.0, t.danger_fg());
-            text(ctx, x0 + 14.0 + em(28.0), y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
-            let bx = x0 + 26.0 + em(28.0) + width(&q, type_size::SM, Weight::Medium);
+            text(ctx, tx, y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
+            let bx = (tx + 12.0 + width(&q, type_size::SM, Weight::Medium)).min(w - 12.0 - button_w("Delete") - 6.0 - button_w("Cancel")).max(tx);
             let s = self.state.clone();
             let bw = button(ctx, bx, y + em(8.0), "Delete", Look::Danger, true, move || with(&s, Browser::delete_confirmed));
             let s = self.state.clone();
@@ -950,6 +971,36 @@ mod tests {
         app.tick();
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t.starts_with("Delete “hello.txt”?")), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// In a narrow window the delete question gives way and both its
+    /// buttons stay inside the window.
+    #[test]
+    fn a_narrow_window_keeps_the_delete_buttons_inside() {
+        let d = std::env::temp_dir().join(format!("scrinium-view-narrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a rather long name for a quarterly report draft.txt"), "x").unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![place(&d)]);
+        for w in [960.0, 640.0, 520.0] {
+            let (mut app, state) = app_for(b.clone(), (w, 600.0));
+            with(&state, |b| {
+                b.press(0, Mods::default(), 0.0);
+                b.ask_delete();
+            });
+            app.tick();
+            let tree = app.tree();
+            let ends: Vec<(String, f32)> = tree.iter().filter_map(|(_, n)| match n {
+                Node::Text { content, rect, .. } if content == "Delete" || content == "Cancel" || content.starts_with("Delete “") => Some((content.clone(), rect.x() + rect.w())),
+                _ => None,
+            }).collect();
+            assert!(ends.iter().any(|(c, _)| c == "Cancel"), "at {w}: {ends:?}");
+            for (c, end) in &ends {
+                assert!(*end <= w, "at {w}: {c:?} ends at {end}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
