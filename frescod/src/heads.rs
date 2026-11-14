@@ -311,6 +311,17 @@ pub fn reconfigure<'a>(
                     if vrr { ", variable refresh" } else { "" },
                     if h.identity != p.identity { " (monitor changed)" } else { "" }
                 );
+                /* A mirror belongs to the monitor that was told to mirror,
+                 * not to the output: a new monitor here shows a part of its
+                 * own. If this set of monitors was left mirrored, the
+                 * caller mirrors it again through set_mirror, which also
+                 * re-modes it to its source's size. Keeping mirror_of
+                 * would show the source's place at whatever mode was
+                 * picked for the new monitor (a scaled "hybrid") and get
+                 * remembered as a mirror the user never set up. */
+                if h.identity != p.identity && h.mirror_of.take().is_some() {
+                    eprintln!("frescod: output {} stops mirroring (its monitor changed)", h.output);
+                }
                 h.identity = p.identity;
                 h.mode = m;
                 h.mode_index = p.mode_index;
