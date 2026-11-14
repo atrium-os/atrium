@@ -18,6 +18,16 @@ pub const RAIL_NARROW: f32 = 56.0;
 /// Below this window width the rail collapses by itself.
 pub const RAIL_AUTO_NARROW: f32 = 900.0;
 pub const BAR: f32 = 40.0;
+
+/// `pt` at the system text size (resolution-independence.md §6.2): the
+/// toolbar and what hangs from it grow with their text.
+pub fn em(pt: f32) -> f32 { pergola::theme::size::em(pt) }
+
+/// The toolbar's height: [`BAR`] at the text size.
+pub fn bar() -> f32 { em(BAR) }
+
+/// [`bar`] at text size `k` (for tests and layout checks).
+pub fn bar_at(k: f32) -> f32 { BAR * k }
 pub const PROMPT: f32 = 44.0;
 pub const STATUS: f32 = 24.0;
 /// The suggestion list's rows and section labels.
@@ -363,10 +373,10 @@ impl Shell {
         let rail = self.rail_w();
         let x0 = rail + 1.0;
         let media = self.store.trail().page().is_some_and(|p| p.media != crate::trail::Media::None);
-        let fx = x0 + 111.0;
-        let right = 236.0 + if media { 32.0 } else { 0.0 };
-        let where_ = Rect::new(fx, 6.0, (w - fx - right).max(160.0), 28.0);
-        let mut y = BAR + 1.0;
+        let fx = x0 + em(111.0);
+        let right = em(236.0) + if media { em(32.0) } else { 0.0 };
+        let where_ = Rect::new(fx, em(6.0), (w - fx - right).max(em(160.0)), em(28.0));
+        let mut y = bar() + 1.0;
         let page = self.store.trail().page();
         let find = (self.find.is_some() && page.is_some() && self.history.is_none()).then(|| {
             let r = Rect::new(x0, y, w - x0, FIND);
@@ -383,16 +393,16 @@ impl Shell {
         let page = Rect::new(x0, y, w - x0, (bottom - y).max(0.0));
         let drop = self.editing.as_ref().and_then(|_| {
             let v = self.suggestions();
-            (!v.is_empty()).then(|| Rect::new(where_.x(), BAR + 1.0 + 3.0, where_.w(), drop_height(&v)))
+            (!v.is_empty()).then(|| Rect::new(where_.x(), bar() + 1.0 + 3.0, where_.w(), drop_height(&v)))
         });
         let popover = (self.popover && self.store.trail().page().is_some())
-            .then(|| Rect::new(where_.x(), BAR + 4.0, POPOVER_W.min(w - where_.x() - 8.0), popover_height(self)));
-        let aa = Rect::new(w - 104.0, 6.0, 28.0, 28.0);
+            .then(|| Rect::new(where_.x(), bar() + 4.0, POPOVER_W.min(w - where_.x() - 8.0), popover_height(self)));
+        let aa = Rect::new(w - em(104.0), em(6.0), em(28.0), em(28.0));
         let reading = (self.reading_open && self.store.trail().page().is_some())
-            .then(|| Rect::new((aa.x() + aa.w() - READING_W).max(x0 + 8.0), BAR + 4.0, READING_W, READING_H));
-        let presence = Rect::new(where_.x() + where_.w() + 12.0 + if media { 32.0 } else { 0.0 }, 6.0, 112.0, 28.0);
+            .then(|| Rect::new((aa.x() + aa.w() - em(READING_W)).max(x0 + 8.0), bar() + 4.0, em(READING_W), em(READING_H)));
+        let presence = Rect::new(where_.x() + where_.w() + em(12.0) + if media { em(32.0) } else { 0.0 }, em(6.0), em(112.0), em(28.0));
         let presence_menu = (self.presence_open && self.store.trail().page().is_some())
-            .then(|| Rect::new((presence.x() + presence.w() - PRESENCE_W).max(x0 + 8.0), BAR + 4.0, PRESENCE_W, presence_height(self)));
+            .then(|| Rect::new((presence.x() + presence.w() - PRESENCE_W).max(x0 + 8.0), bar() + 4.0, PRESENCE_W, presence_height(self)));
         Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu }
     }
 
@@ -1289,7 +1299,7 @@ mod tests {
         let none = Modifiers::default();
         s.apply(Action::Find, 0.0);
         assert!(s.find.is_some() && s.geo().find.is_some());
-        assert!(s.geo().page.y() > BAR + FIND, "the bar pushes the page down");
+        assert!(s.geo().page.y() > bar() + FIND, "the bar pushes the page down");
         for c in ["a", "t"] {
             s.find_key(Key::Char, none, c);
         }
@@ -1487,7 +1497,7 @@ mod tests {
         let mut s = shell();
         let g = s.geo();
         assert_eq!(g.rail, RAIL);
-        assert_eq!(g.page.y(), BAR + 1.0);
+        assert_eq!(g.page.y(), bar() + 1.0);
         assert_eq!(g.page.y() + g.page.h(), 696.0);
         s.apply(Action::ToggleStatus, 0.0);
         s.apply(Action::ToggleRail, 0.0);

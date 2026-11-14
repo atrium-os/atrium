@@ -476,7 +476,11 @@ in-page anchors, and lays the page out again when the system text size changes. 
 place: before a reflow (text size or measure) the first word at the top of the view and
 which of its matches it is are found (`find::word_at` + `find`), and after it the view is
 scrolled so that word sits where it did (the same document px showed text from further
-up; found in the live check). Page images: profile §3.11 admits no fetch that varies with the reader's screen,
+up; found in the live check).
+The Navigator's toolbar row (its height `shell::bar()`, the Where field, tier chip, presence
+pill, toolbar buttons) and the Aa pop-up are sized in em, so they grow with the text size
+(the check found the pills and the Aa value label crowded at 150%). The rail, history and
+the other pop-ups are still fixed points. Page images: profile §3.11 admits no fetch that varies with the reader's screen,
 so the converter picks an `<img>`'s `srcset` candidate for one fixed density, 2x, for every
 reader (`navigator-prerender/src/srcset.rs`): x descriptors directly, w descriptors over
 `sizes` at the 1280 px conversion viewport (px/vw/em lengths, min/max-width conditions; else
