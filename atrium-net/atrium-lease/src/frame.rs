@@ -18,6 +18,12 @@ fn csum(b: &[u8], init: u32) -> u16 {
 
 /// (source IPv4, DHCP payload) of a frame from a DHCP server, or `None`.
 pub fn dhcp_from_frame(f: &[u8]) -> Option<(Ipv4Addr, &[u8])> {
+    dhcp_from_frame_mac(f).map(|(_, a, p)| (a, p))
+}
+
+/// Also the frame's source MAC: where a unicast renewal goes (the server,
+/// or the relay in front of it).
+pub fn dhcp_from_frame_mac(f: &[u8]) -> Option<([u8; 6], Ipv4Addr, &[u8])> {
     if f.len() < 14 + 20 + 8 || f[12..14] != [0x08, 0x00] {
         return None;
     }
@@ -56,7 +62,7 @@ pub fn dhcp_from_frame(f: &[u8]) -> Option<(Ipv4Addr, &[u8])> {
             return None;
         }
     }
-    Some((src, &udp[8..]))
+    Some((f[6..12].try_into().ok()?, src, &udp[8..]))
 }
 
 /// Build a frame for tests (and the hostile-server fuzzer).

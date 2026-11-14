@@ -7,6 +7,16 @@ name = "atrium-lease"
 version = "0.1.0"
 dependencies = [
  "aura-ipc",
+ "libc",
+ "net-proto",
+]
+
+[[package]]
+name = "atrium-net"
+version = "0.1.0"
+dependencies = [
+ "aura-ipc",
+ "libc",
  "net-proto",
 ]
 

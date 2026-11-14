@@ -1,0 +1,11 @@
+[package]
+name = "atrium-net"
+version = "0.1.0"
+description = "The host's network configuration daemon (docs/spec/atrium-net.md): applies checked proposals, parses nothing from the wire."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+net-proto = { path = "../net-proto" }
+aura-ipc = { path = "../../aura/aura-ipc" }
+libc = "0.2"

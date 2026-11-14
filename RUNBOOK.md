@@ -5563,6 +5563,25 @@ sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` r
 - Host tests include IEEE 802.11-2020 Annex J.10's SAE vectors (from hostapd's module
   tests) and the regulatory table built from `aura/aura-regdb/data/db.txt`.
 
+### 13.6e atrium-net in the cloud VM (`scripts/atrium-net-gate.sh`)
+
+atrium-net (docs/spec/atrium-net.md) manages the VM's second NIC, `vtnet1`, which QEMU
+connects over UDP (127.0.0.1:7801/7802) to `atrium-net/sim/lan.py`: router 10.88.0.1,
+DHCP (lease 10.88.0.50), DNS 10.88.0.53 answering `gate.atrium.test`. `vtnet0` keeps ssh.
+
+    sh scripts/atrium-net-gate.sh vm     # boot the VM with the LAN NIC (stock kernel is fine)
+    sh scripts/atrium-net-gate.sh n0     # host tests, cross-build, install, 14 checks
+
+What it checks: address, default route, ping, unbound forwarders and a lookup through
+unbound, both processes in capability mode, the parser's uid and descriptors, renewal at
+T1, then a restart into a hostile LAN (`lan.py` control word `hostile` on UDP 7803)
+with no bad state applied, refusals counted, recovery. It sets up local-unbound
+(`local-unbound-setup`, a conf.d file that un-blocks `test.`) and the `_atrium-lease` user.
+
+Gotchas: with resolv.conf on unbound and unbound forwarding to the LAN, sshd's reverse
+lookups stall once `lan.py` is gone, so the gate restores resolv.conf and the default
+route on exit. `LEASE_S` (default 120) sets the lease time.
+
 ### 13.6b Bluetooth (Vinculum) harness: Rootcanal + Bumble, no radio
 
 `vinculum/` is its own cargo workspace ([spec/bluetooth.md](docs/spec/bluetooth.md)).

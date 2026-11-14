@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "net-proto",
     "atrium-lease",
+    "atrium-net",
 ]
 
 [workspace.package]

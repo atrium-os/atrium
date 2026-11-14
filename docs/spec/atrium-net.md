@@ -1,6 +1,6 @@
 # atrium-net: the host's network configuration daemon
 
-**Status: proposal, 2026-11-14.** Decisions in §9 await Shankar.
+**Status: accepted 2026-11-14** (all §9 decisions as recommended).
 
 network.md §9 and service-management.md §6 name `atrium-net` as the request-driven mediator
 that owns the host's interfaces, addresses, routes, DNS and Wi-Fi association. The daemon
@@ -186,11 +186,36 @@ it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 
 | Step | What | Done when |
 |---|---|---|
-| N0 | `atrium-net` core: interface list, link events, bpf, proposal checks; `atrium-lease` DHCPv4; unbound forwarders | arm64 cloud VM gets its address from QEMU's DHCP through atrium-net, resolves a name through unbound; a fuzzed hostile DHCP server never changes host state outside §5.2 |
+| N0 | `atrium-net` core: interface list, link events, bpf, proposal checks; `atrium-lease` DHCPv4; unbound forwarders | the VM gets its address on a simulated LAN through atrium-net, resolves a name through unbound; a hostile DHCP server never changes host state outside §5.2. **Done 2026-11-14** (§10.1) |
 | N1 | Wi-Fi: profiles, auto-join, roam keeps the lease, Transition Disable persisted | `aura-sim-gate.sh w1|w2` pass with atrium-net in place of aura-ctl + dhclient; restart keeps the WPA3-only flag |
 | N2 | IPv6: SLAAC, RFC 7217 + 8981, RDNSS | AP VM runs radvd; the VM gets a temporary address, reaches the AP over v6, resolves via the RA's server |
 | N3 | Ethernet + Wi-Fi together, egress events to atrium-netd, captive detection | pulling the VM's virtio link moves the default route and NAT to wlan0 |
 | N4 | `CLASS_NETCONF`, capability checks, a `netctl` CLI, Forum status item | an app without `network_wifi` gets refused; one with it but no location grant gets no list |
 
-N0–N3 need no hardware: the cloud VM (virtio-net, QEMU user DHCP) and the AP VM from the
-Aura gates cover them.
+N0–N3 need no hardware: the cloud VM (a second virtio NIC on a simulated LAN) and the AP
+VM from the Aura gates cover them.
+
+### 10.1 N0 as built (2026-11-14)
+
+- `atrium-net/` workspace: `net-proto` (lease line format and the §5.2 checks),
+  `atrium-lease` (DHCPv4 client: RFC 2131 states incl. INIT-REBOOT, renew/rebind/expiry,
+  RFC 3442 routes, RFC 7844 option set), `atrium-net` (the daemon). Host tests cover the
+  state machine, malformed replies, hostile leases and a 20 000-round mutating-server
+  fuzz: `cd atrium-net && cargo test`.
+- atrium-lease's sandbox is Capsicum rather than a jail: it chroots to `/var/empty`, drops
+  to `_atrium-lease` (uid 65034) and calls `cap_enter` before reading anything, holding
+  only its socket. That is stricter than a jail (no files, no new network endpoints).
+- atrium-net runs in capability mode after start-up. It reaches unbound's control socket
+  with `connectat` on a directory descriptor; addresses go through `SIOCAIFADDR`, routes
+  through the routing socket. The default route is changed before it is added: with
+  multipath routing on, adding a second default just adds a path.
+- Only BOOTREQUESTs for the interface's own MAC leave through bpf, rate-limited, unicast
+  only to the applied lease's server (renewals go to the MAC the ACK came from).
+- Unbound's forwarders are set at run time (`forward`), so an unbound restart falls back
+  to `forward.conf` until the next lease; atrium-net will rewrite it in N1.
+- Known gaps: a dead atrium-lease makes atrium-net exit (respawning needs `exec`, which
+  capability mode forbids; the service manager restarts it, N1 adds a small spawner);
+  no ARP probe before using an address (DHCPDECLINE) yet; no rc/services.d manifest yet.
+- Gate: `scripts/atrium-net-gate.sh vm|n0` (RUNBOOK §13.6e), 14 checks. The VM's
+  second NIC is a QEMU UDP socket netdev to `atrium-net/sim/lan.py`, a simulated LAN
+  with router, DHCP and DNS that can turn hostile (17 kinds of bad reply).
