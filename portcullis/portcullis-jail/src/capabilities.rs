@@ -63,6 +63,10 @@ pub fn apply_all(
         // dispensatord's device list (device-assignment.md §6.10).
         apply_socket("device-list.sock", jc, opts);
     }
+    if caps.navigator_page == Some(true) {
+        // navigatord's ticket socket (navigator-ui.md §2.1), nothing else of it.
+        apply_socket("navigator-page.sock", jc, opts);
+    }
     if caps.audio_device == Some(true) {
         apply_audio_device(jc, opts);
     }

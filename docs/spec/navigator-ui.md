@@ -1062,8 +1062,20 @@ Each step runs in the VM on headless frescod before the next.
    - The UI's live mode (`NAVIGATORD_SOCKET`): `Embeds` binds the page slot; whenever the trail's
      shown page changes (Enter, a link, Back, Forward) it asks navigatord to open it.
    - Run with `scripts/navigator-live-vm.sh` (RUNBOOK §13.6d). In that run the page child and the
-     converter are not yet jailed and pages come from fixtures. Open: their bundles and worker
-     rules, the Navigator's keys while the page has the focus, images and anchors in the child.
+     converter are not jailed and pages come from fixtures, to keep the UI checks quick.
+   - *Confined, 2026-11-14* (`scripts/navigator-confined-vm.sh`, RUNBOOK §13.6e): the page child
+     is the bundle `org.atrium.navigator.page` (`scripts/navigator-page-bundle.sh`), started by
+     the real limend (as `_limen`) through portcullisd's `ExecInstance`, one jail per page, as
+     `_navpage` (65035) under a system worker rule. Its jail has its own network stack with
+     loopback only, no graphics socket and no host files; its one capability is
+     `navigator-page`, restricted, which mounts navigatord's ticket socket directory
+     (`/atrium/sockets/navigator-page/`, now the default path) and nothing else of navigatord's.
+     navigatord runs without `--unconfined-for-testing` as an unprivileged broker: each page is
+     fetched by navigator-fetchd in a fetcher jail (`network = "full"`) and converted by
+     prerender in a one-shot converter jail with no capabilities, over a hermetic network that
+     serves the fixtures by name. The UI runs as navigatord's user, since navigatord opens the
+     UI's frescod connection and limend checks the slot's parent by owner. Open: images and
+     anchors in the child; the renderer jail in the same run.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.
    *Built 2026-11-13:*
    - The tree, open beside, put away and Earlier were built in step 1. Earlier now carries the

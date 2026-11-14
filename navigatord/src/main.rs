@@ -915,7 +915,12 @@ fn main() {
         }
         Arc::new(Mutex::new(b))
     });
-    let page_path = std::env::var("NAVIGATORD_PAGE_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigator-page.sock".into());
+    // In a directory of its own: the page child's jail mounts that
+    // directory (the `navigator-page` capability) and nothing else of ours.
+    let page_path = std::env::var("NAVIGATORD_PAGE_SOCKET").unwrap_or_else(|_| "/atrium/sockets/navigator-page/navigator-page.sock".into());
+    if let Some(dir) = Path::new(&page_path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let ctl_path = std::env::var("NAVIGATORD_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigatord.sock".into());
     let pages = listen(&page_path);
     let st = state.clone();

@@ -5708,6 +5708,32 @@ to clang with `--sysroot`, which needs FreeBSD's headers in the sysroot. If `ass
 `ssh … root@localhost "tar czf - -C / usr/include" | tar xzf - -C ~/atrium-vm/sysroot`, then
 `cargo clean -p ring --release --target aarch64-unknown-freebsd` in both crates.
 
+### 13.6e Navigator confined: page, converter and fetcher jails (`scripts/navigator-confined-vm.sh`)
+
+The live stack with every part that touches a page jailed as shipped (navigator-ui.md §2.1, §14
+step 2). It boots the VM itself with the hermetic fixture network of `nuntius-vm-check.sh`
+(1.2.3.100:80/443 forwarded to a host-side server that serves `navigator-ui/fixtures` by Host,
+with a throwaway CA in `~/atrium-vm/navfix`), so `sh scripts/cloud-vm.sh down` first if the VM
+runs without it. It needs `scripts/cloud-vm.sh setup` and `kern.racct.enable=1`.
+
+It deploys the portcullis stack (deploy-portcullis.sh, which merges `etc/jaild.policy.toml`),
+allows rctl in jaild, starts portcullisd on `/atrium/sockets/portcullis/portcullis.sock`, and
+installs three signed bundles: `org.atrium.navigator.page` (`scripts/navigator-page-bundle.sh`:
+the `navigator-page` capability, system grant, worker rule `_limen` → `_navpage` 65035),
+`org.atrium.navigator.converter` (prerender, no capabilities) and `org.atrium.navigator.fetcher`
+(navigator-fetchd, `network = "full"`, its trust store plus the fixture CA). limend runs as
+`_limen` with a run registry naming navtest's uid as `org.atrium.navigator`; navigatord runs as
+navtest with `NAVIGATORD_CONVERTER`/`NAVIGATORD_FETCHD` set to `portcullis exec --daemon`, and
+the UI runs as navtest too (navigatord opens its frescod connection, so its windows are navtest's).
+
+Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
+mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` only; its network
+is a vnet of its own with lo0 only; portcullisd logs converter and fetcher jails and the worker
+rule; a link follows into a new page jail; two live pages are two jails; no jail is left after
+the UI exits. jaild needed two policy entries for it: `/atrium/sockets/navigator-page` in
+`rw_paths` and 65035 in the allowed system uids and gids. Logs and frames in the out dir
+(default `scratch/navigator-confined`).
+
 ### 13.7 Navigator corpus (on the Mac, no VM)
 
 - Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.

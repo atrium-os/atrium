@@ -33,7 +33,8 @@ use pergola::{App, Event, SizeSpec, Window, WindowDesc};
 use pergola_document::{Doc, DocumentView};
 
 /// navigatord's page socket, where a ticket is redeemed.
-const PAGE_SOCKET: &str = "/var/run/atrium/navigator-page.sock";
+/// navigatord's page socket, as the `navigator-page` capability mounts it.
+const PAGE_SOCKET: &str = "/atrium/sockets/navigator-page/navigator-page.sock";
 
 /// The comfortable measure (navigator-ui.md §7): about 70 characters of
 /// body text at 100%, in CSS px; it grows with the text size.

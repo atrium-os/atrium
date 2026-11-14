@@ -194,6 +194,7 @@ pub struct CapabilityDelta {
     pub removable_media: bool,
     pub session_lock:    bool,
     pub device_list:     bool,
+    pub navigator_page:  bool,
     pub removable_files: bool,
     pub file_picker:     bool,
     pub status_item:     bool,
@@ -240,6 +241,7 @@ impl CapabilityDelta {
             && !self.removable_media
             && !self.session_lock
             && !self.device_list
+            && !self.navigator_page
             && !self.removable_files
             && !self.file_picker
             && !self.status_item
@@ -282,6 +284,7 @@ impl CapabilityDelta {
         if self.removable_media { out.push("See the USB sticks plugged in and eject them".into()); }
         if self.session_lock    { out.push("Lock the screen".into()); }
         if self.device_list     { out.push("See every device in this machine and its hardware ids".into()); }
+        if self.navigator_page  { out.push("Fetch the Navigator's pages by ticket (the Navigator's page view)".into()); }
         if self.removable_files { out.push("Read and change every file on the USB sticks plugged in".into()); }
         if self.file_picker     { out.push("Be the file picker: give other apps the files and folders you pick".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
@@ -375,6 +378,7 @@ pub fn compute_delta(
     bool_cap!(removable_media);
     bool_cap!(session_lock);
     bool_cap!(device_list);
+    bool_cap!(navigator_page);
     bool_cap!(removable_files);
     bool_cap!(file_picker);
     bool_cap!(status_item);
@@ -573,6 +577,7 @@ mod tests {
             removable_media: None,
             session_lock: None,
             device_list: None,
+            navigator_page: None,
             removable_files: None,
             file_picker: None,
             status_item: None,

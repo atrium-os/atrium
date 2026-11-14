@@ -4,3 +4,5 @@ navigator-live
 navigator-ui
 nlive*
 nui*
+nconf*
+navigator-confined

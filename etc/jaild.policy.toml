@@ -110,6 +110,9 @@ rw_paths = [
     # aura-mlme's mlme.sock, aura-keys' keys.sock.
     "/atrium/sockets/aura",
     "/atrium/sockets/aura-keys",
+    # navigatord's ticket socket, the Navigator page jail's one capability
+    # (`navigator-page`, navigator-ui.md §2.1).
+    "/atrium/sockets/navigator-page",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",
@@ -382,6 +385,8 @@ allowed_system_uids = [
              # started by dispensatord (capsa-service.sh creates it)
     65032,   # _aura-keys: Aura's key daemon, aura-keys (wifi.md §8.3)
     65033,   # _aura: Aura's MLME daemon, aura-mlme (docs/spec/wifi.md §8.3)
+    65035,   # _navpage: the Navigator's page children, one jail per page, started
+             # by limend under the system worker rule (navigator-page-bundle.sh)
 ]
 
 [gid]
@@ -404,6 +409,7 @@ allowed_system_gids = [
     65031,   # _capsa
     65032,   # _aura-keys
     65033,   # _aura
+    65035,   # _navpage
 ]
 
 

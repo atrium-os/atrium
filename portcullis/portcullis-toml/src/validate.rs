@@ -198,6 +198,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.device-list = true: restricted to Curia's Devices page (every device \
              and its hardware ids); requires explicit policy approval"));
     }
+    if c.navigator_page == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.navigator-page = true: restricted to the Navigator's page child (redeems \
+             page tickets at navigatord); requires explicit policy approval"));
+    }
     if c.removable_files == Some(true) {
         r.warnings.push(format!(
             "{ctx}.removable-files = true: restricted to the file manager (every USB stick, \

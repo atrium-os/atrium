@@ -155,6 +155,12 @@ pub struct Capabilities {
     /// restricted.
     #[serde(rename = "device-list")]
     pub device_list: Option<bool>,
+    /// navigatord's page socket (`navigator-page/`, navigator-ui.md §2.1):
+    /// the Navigator's doc-viewer child redeems a page's one-shot ticket
+    /// there for its recording, and can do nothing else on it. Restricted
+    /// to that child's bundle.
+    #[serde(rename = "navigator-page")]
+    pub navigator_page: Option<bool>,
     /// The file manager's standing grant (device-assignment.md §4.8): every
     /// served stick, read-write, in its own jail at `/media/<part>`, for as
     /// long as the jail runs. Implies the `removable-media/` socket (it asks
@@ -387,6 +393,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         removable_media:  ovr.removable_media.or(base.removable_media),
         session_lock:     ovr.session_lock.or(base.session_lock),
         device_list:      ovr.device_list.or(base.device_list),
+        navigator_page:   ovr.navigator_page.or(base.navigator_page),
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),
         status_item:      ovr.status_item.or(base.status_item),
