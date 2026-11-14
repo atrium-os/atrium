@@ -160,29 +160,43 @@ goes the same way: the manager hands the descriptor to a new instance.
 
 Writing through a read-write descriptor in place is not crash-safe: a power cut in the
 middle leaves a torn file. And Save As needs a file that doesn't exist yet, which the
-picker can't hand out today. Proposed picker additions (Scrinium owns them):
+picker couldn't hand out. Picker additions, owned and to be built by Scrinium after its
+network-shares S1 work (agreed with the Scrinium thread, 2026-11-14; nothing in O1 needs
+them):
 
-| message | meaning |
-|---|---|
-| `Open { filter: { kind: Save, suggested_name, extensions } }` | the sheet shows a name field and folders; the user names the file |
-| `ToParent::SaveTarget { name }` + `EMIT_FD` | a descriptor to a **new temporary file in the chosen folder**, created by Scrinium, write-only |
-| parent → child `Commit { fsync: true }` | Scrinium fsyncs and renames the temporary file over the target atomically, then sends `Saved` |
-| `Abandon` | Scrinium unlinks the temporary file |
+| message | where | meaning |
+|---|---|---|
+| `Open { filter: { kind: Save, suggested_name, extensions } }` | picker sheet | the sheet (limen slot kind `sheet`) shows a name field and folders; the user names the file. If the name exists, the sheet asks to replace before going on |
+| `ToParent::SaveTarget { name, handle }` + `EMIT_FD` | picker sheet | a **write-only** descriptor to a new temporary file in the chosen folder, plus a **save handle**. The sheet then closes |
+| `Commit { fsync: true }` → `Saved` | save role | Scrinium fsyncs the temporary file, `renameat`s it over the target, fsyncs the folder |
+| `Abandon` | save role | Scrinium unlinks the temporary file |
+| plain Save of an already-picked file | save role | the same exchange with the save handle, no sheet |
 
-Plain Save of a file that came from the picker uses the same exchange without the sheet: the
-document process holds a **save handle** (an opaque token bound to its uid and the file)
-that Scrinium honours for the life of the document process. If the folder can't take a
-temporary file (a read-only stick), Save falls back to writing in place after a full backup
-to the autosave folder, and says so.
+- **Commit and Abandon don't ride the sheet**, since it closes as soon as the user picks and
+  writing a big document takes a while. They go to a windowless Scrinium role that limend
+  starts on demand, keyed by the save handle. limend binds the handle to the parent's uid,
+  app id and document process, and drops it when that process exits; Scrinium then unlinks
+  any temporary file not committed.
+- **limend's `EMIT_FD`** gains `O_WRONLY` regular files for `SaveTarget` only (today it passes
+  only `O_RDONLY` and `O_RDWR`). Scrinium makes that change.
+- **The temporary file** is created by Scrinium with `O_EXCL | O_NOFOLLOW`, mode 0600, named
+  `.<name>.save-XXXXXX` in the target folder. Scrinium sweeps stale ones in folders it opens.
+- **Fallback.** Where an atomic replace isn't possible (a read-only stick, a folder that can't
+  take a temporary file, a network share whose server lacks atomic rename, such as SFTP
+  without `posix-rename@openssh.com`, which Scrinium's SFTP server checks at connect), Save
+  writes in place after a full backup to the autosave folder, and says so.
 
 ### 4.3 Recent files and reopening
 
 Reopening a file after a restart needs a grant that outlives the process, which Atrium has
-no notion of yet (scrinium.md §8 "always allow"). Proposed: Scrinium issues a **bookmark**,
-an Arca-sealed token naming (user, app id, file identity) that only Scrinium can redeem,
-re-checking that the file still exists and the user still owns it. The launcher keeps
-bookmarks, never paths or descriptors. Needs Scrinium to hold the user's home folders
-first (scrinium.md §8). Until then, recent files work only within a session.
+no notion of yet (scrinium.md §8 "always allow"). Scrinium issues a **bookmark**, an
+Arca-sealed token naming (user, app id, file identity) that only Scrinium can redeem,
+re-checking that the file still exists and the user still owns it. File identity is
+(volume id, file id, generation), so a copied file is a different file: the bookmark says
+the original is gone rather than opening the copy. The launcher keeps bookmarks, never paths
+or descriptors. Agreed with the Scrinium thread 2026-11-14; needs Scrinium to hold the
+user's home folders first (scrinium.md §8). Until then, recent files work only within a
+session.
 
 ### 4.4 Autosave, recovery and versions
 
