@@ -147,12 +147,17 @@ fn tile_columns_fit(wa: WmRect, mins: &[i32]) -> Option<Vec<WmRect>> {
 
 /// `r` grown to at least `min` (device px), within the work area `wa`:
 /// centred on where it was for a dialog, its right edge kept for a panel.
-fn grow_to_min(r: WmRect, min: (u32, u32), wa: WmRect, keep_right: bool) -> WmRect {
-    let w = r.w.max(min.0 as i32).min(wa.w);
-    let h = r.h.max(min.1 as i32).min(wa.h);
+fn grow_to_min(r: WmRect, min: (i32, i32), wa: WmRect, keep_right: bool) -> WmRect {
+    let w = r.w.max(min.0).min(wa.w);
+    let h = r.h.max(min.1).min(wa.h);
     let x = if keep_right { r.x + r.w - w } else { r.x - (w - r.w) / 2 };
     let y = r.y - (h - r.h) / 2;
     WmRect { x: x.clamp(wa.x, wa.x + wa.w - w), y: y.clamp(wa.y, wa.y + wa.h - h), w, h }
+}
+
+/// `s`'s minimum size (points) in device pixels on `screen`.
+fn min_px(screen: &Screen, s: &WmSurfaceInfo) -> (i32, i32) {
+    (screen.px(s.min_size.0.min(i32::MAX as u32) as i32), screen.px(s.min_size.1.min(i32::MAX as u32) as i32))
 }
 
 /// Give each dialog, panel and snapped document in `layout` at least its
@@ -166,10 +171,12 @@ pub fn fit_min_sizes(layout: &mut WmDeclareLayoutPayload, screen: &Screen, surfa
         if s.min_size == (0, 0) {
             continue;
         }
+        // Points from frescod; device pixels on this monitor.
+        let min = min_px(screen, s);
         slot.rect = match s.role {
-            WmRole::Dialog => grow_to_min(slot.rect, s.min_size, wa, false),
-            WmRole::Panel => grow_to_min(slot.rect, s.min_size, wa, true),
-            WmRole::Document if slot.rect.w < s.min_size.0 as i32 && slot.rect.w < wa.w => WmRect { x: wa.x, w: wa.w, ..slot.rect },
+            WmRole::Dialog => grow_to_min(slot.rect, min, wa, false),
+            WmRole::Panel => grow_to_min(slot.rect, min, wa, true),
+            WmRole::Document if slot.rect.w < min.0 && slot.rect.w < wa.w => WmRect { x: wa.x, w: wa.w, ..slot.rect },
             _ => slot.rect,
         };
     }
@@ -260,7 +267,7 @@ pub fn arrange_for(
         doc_ids.sort_unstable();
         let mins: Vec<i32> = doc_ids
             .iter()
-            .map(|id| surfaces.iter().find(|s| s.surface_id == *id).map_or(0, |s| s.min_size.0 as i32))
+            .map(|id| surfaces.iter().find(|s| s.surface_id == *id).map_or(0, |s| min_px(screen, s).0))
             .collect();
         match tile_columns_fit(screen.work_area(), &mins) {
             Some(cols) => {
@@ -2804,6 +2811,32 @@ mod tests {
         let r = on(&mut wm, &mut conn);
         assert!(r.x < 2560 && r.w <= 2560, "back on its monitor: {r:?}");
         assert_eq!(wm.home.get(&1), Some(&20));
+    }
+
+    /// Moved to a monitor of another scale, or rescued from one, a window
+    /// keeps its size in points: a dialog its points, its minimum its
+    /// points, a document its monitor's work area (resolution-independence.md §7).
+    #[test]
+    fn a_window_keeps_its_points_on_a_monitor_of_another_scale() {
+        let dialog = WmSurfaceInfo { min_size: (600, 400), ..surf(2, WmRole::Dialog) };
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document), dialog], ..Default::default() };
+        let mut wm = Wm::new(Screen { rect: WmRect { x: 0, y: 0, w: 5760, h: 2160 }, bar_h: 24, dock_h: 48, scale_milli: 1000 });
+        let dense = fresco_protocol::WmOutput { scale_milli: 2000, ..mon(1, 20, 1920, 3840, 2160) };
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080), dense]).unwrap();
+        wm.focus_new(&mut conn, 2).unwrap();
+        let l = wm.reconcile(&mut conn).unwrap();
+        let d = slot(&l, 2).unwrap();
+        assert_eq!((d.w, d.h), (600, 400), "its minimum, at 1x");
+        wm.move_focused_to_next_monitor(&mut conn).unwrap();
+        let l = wm.reconcile(&mut conn).unwrap();
+        let d = slot(&l, 2).unwrap();
+        assert!(d.x >= 1920, "{d:?}");
+        assert_eq!((d.w, d.h), (1200, 800), "the same points at 2x");
+        // The 2x monitor leaves: rescued at 1x, the same points again.
+        wm.set_outputs(&mut conn, vec![mon(0, 10, 0, 1920, 1080)]).unwrap();
+        let d = slot(&wm.reconcile(&mut conn).unwrap(), 2).unwrap();
+        assert_eq!((d.w, d.h), (600, 400));
+        assert!(d.x + d.w <= 1920);
     }
 
     #[test]

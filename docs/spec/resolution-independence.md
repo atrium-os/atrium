@@ -344,6 +344,30 @@ Fraction, baseline }`) used by both widgets and DocumentView.
   density monitor keeps its physical size, clamped to fit.
 - Popups take their parent window's scale, even when they hang over another monitor.
 
+**Built (step 6, 2026-11-14).** Forum places every window itself (a document fills its
+monitor's work area or a column of it; a dialog, panel or PiP is sized in points), and it
+has no free window drag: a window changes monitor by "move to the next monitor"
+(`forum-ctl move-monitor`), by a monitor leaving (rescue) or coming back, or by a span. So
+what this section needs today is that those moves keep points:
+
+- frescod already gave each window its majority monitor's scale on every layout, and
+  pop-ups and slots their parent's. A layout that moves a window to a monitor of another
+  scale now sets its size and its scale under one lock (`update_window_scales_in`), so the
+  client never reads the new pixel size at the old scale (a size in points never meant,
+  and a layout pass for it). Test: `a_window_moved_to_a_denser_monitor_keeps_its_size_in_points`.
+- `WmSurfaceInfo.min_size` is in points now; forum-wm converts it at the scale of the
+  monitor it lays the window out on (`min_px`). It was device pixels at the window's old
+  scale, so a window moved from 1x to 2x got half its minimum. Test:
+  `a_window_keeps_its_points_on_a_monitor_of_another_scale` (a dialog 600 x 400 pt is 1200 x
+  800 px on the 2x monitor and 600 x 400 again when rescued to the 1x one).
+- Pergola already re-sends everything on a scale change (`App::resend_all`): text is shaped
+  at the new size and images re-picked for the new density (§6.4).
+- `scripts/vm-multimonitor-chaos.sh` gains `MIXED=1` (default): UI-size changes per
+  monitor and moves of the focused window to the next one among the plugs, swaps, mirrors
+  and arrangements.
+- Not built: drag-time resampling waits for a free window drag in Forum; a span over
+  monitors of different scales draws at its majority scale without resampling the rest.
+
 ### 7.1 Dialogs, pop-ups and sheets
 
 Everything that hangs from a window is placed relative to it, in pt, and drawn at the
@@ -476,5 +500,6 @@ Shankar took the recommendation on each:
 5. **Inline objects** (§6.4) in Pergola's text flow and DocumentView, with density-aware
    image picking. **Built 2026-11-14** (§6.4 "Built").
 6. **Monitor moves** (§7): drag-time resampling and scale switch on release; chaos test
-   extended with mixed-scale monitors.
+   extended with mixed-scale monitors. **Built 2026-11-14** for the moves Forum has (§7
+   "Built"); drag-time resampling waits for a free window drag.
 7. **Navigator** (§10): system text size into `text_scale_64`, density-picked images.

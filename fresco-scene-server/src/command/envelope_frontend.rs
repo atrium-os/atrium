@@ -595,6 +595,17 @@ impl EnvelopeFrontend {
     /// anchor are scaled by the change, so it keeps its size in points
     /// against its parent. A slot's size is its parent's to say.
     fn update_window_scales(&mut self) {
+        let arc = self.compositor.clone();
+        let mut comp = arc.lock().unwrap();
+        self.update_window_scales_in(&mut comp);
+    }
+
+    /// [`Self::update_window_scales`] under the compositor lock the caller
+    /// holds: a layout that moves a window to a monitor of another scale
+    /// sets its size and its scale in one step, so its client is never
+    /// told the new size at the old scale (a size in points that was never
+    /// meant, and a layout pass for it; resolution-independence.md §7).
+    fn update_window_scales_in(&mut self, comp: &mut Compositor) {
         let present: Vec<&fresco_protocol::WmOutput> =
             self.outputs.outputs.iter().filter(|o| o.present && o.mirror_of == 0).collect();
         if present.is_empty() {
@@ -607,7 +618,6 @@ impl EnvelopeFrontend {
         // The strip is in points too: its rows follow the origin's scale.
         let rows = if self.strip_pt == 0 { 0 } else { fresco_protocol::pt_to_device(self.strip_pt as f32, origin.scale_milli) };
         self.reserved_top = rows;
-        let mut comp = self.compositor.lock().unwrap();
         comp.new_scale_milli = origin.scale_milli;
         comp.popup_top = rows as f32;
         comp.output_scales = present
@@ -1823,7 +1833,7 @@ impl EnvelopeFrontend {
                     w: w.size.0 as i32,
                     h: w.size.1 as i32,
                 },
-                min_size: size_to_device(w.min_size, w.scale_milli),
+                min_size: w.min_size,
             })
             .collect();
         // Stable order (by surface id) so the WM sees a deterministic set.
@@ -1881,7 +1891,8 @@ impl EnvelopeFrontend {
         }
         let layout: WmDeclareLayoutPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
-        let mut comp = self.compositor.lock().unwrap();
+        let arc = self.compositor.clone();
+        let mut comp = arc.lock().unwrap();
 
         // 1. geometry — apply each declared rect to the surface it names.
         //    A new size is told to the window's client (EV_WINDOW_RESIZED,
@@ -1934,8 +1945,9 @@ impl EnvelopeFrontend {
             && comp.windows.contains_key(&(layout.focus as u16)))
             .then_some(layout.focus as u16);
         comp.set_focus_no_raise_by(new_focus, layout.focus_cause);
+        // Scales under the same lock: see `update_window_scales_in`.
+        self.update_window_scales_in(&mut comp);
         drop(comp);
-        self.update_window_scales();
 
         Ok(Vec::new()) // atomic apply; no reply
     }
@@ -2594,6 +2606,51 @@ mod tests {
         assert_eq!(f.take_ui_size_requests(), vec![ok]);
     }
 
+    /// Moved by the WM to a monitor of another scale, at its size in
+    /// points there: its client, reading the window as events arrive (as
+    /// frescod's fan-out does), only ever sees the new size at the new
+    /// scale, the same size in points (resolution-independence.md §7).
+    #[test]
+    fn a_window_moved_to_a_denser_monitor_keeps_its_size_in_points() {
+        use fresco_protocol::{WmOutput, WmRect, WmSlot};
+        let mut f = fixture();
+        let a = make_window(&mut f, 1, 100, 100);
+        let out = |output, identity, x, scale_milli| WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w: 3840, h: 2160 },
+            refresh_mhz: 60000, present: true, scale_milli, auto_scale_milli: scale_milli, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+        };
+        f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 3840, 2000)]);
+        f.grant_window_management(9);
+        let to = |x, w, h| WmDeclareLayoutPayload {
+            slots: vec![WmSlot { surface_id: a, rect: WmRect { x, y: 0, w, h }, layer: 4 }],
+            focus: a,
+            focus_cause: 0,
+        };
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&to(0, 800, 600)).unwrap()), 9).unwrap();
+        let comp = f.compositor_arc();
+        let (tx, rx) = std::sync::mpsc::channel();
+        comp.lock().unwrap().set_event_sink(tx);
+        let seen = std::thread::spawn({
+            let comp = comp.clone();
+            move || {
+                let mut seen = Vec::new();
+                while let Ok(e) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    if let crate::window::DisplayEvent::WindowResized { window_id, .. } | crate::window::DisplayEvent::WindowDpiChanged { window_id, .. } = e {
+                        let c = comp.lock().unwrap();
+                        let w = &c.windows[&(window_id as u16)];
+                        seen.push((w.scale_milli, fresco_protocol::device_to_pt(w.size.0, w.scale_milli), fresco_protocol::device_to_pt(w.size.1, w.scale_milli)));
+                    }
+                }
+                seen
+            }
+        });
+        // To the 2x monitor, twice the pixels: the same 800 x 600 pt.
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&to(4000, 1600, 1200)).unwrap()), 9).unwrap();
+        let seen = seen.join().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|s| *s == (2000, 800.0, 600.0)), "{seen:?}");
+    }
+
     /// Clients ask in points (resolution-independence.md §3): a window
     /// opens at the scale of the monitor at the desktop's origin, its
     /// pop-ups at its own, and the create replies say which.
@@ -2887,10 +2944,11 @@ mod tests {
     }
 
     /// The minimum size an app gives (points, at create and later) reaches
-    /// the WM in device pixels at the window's scale, capped, and only the
-    /// window's owner may set it (resolution-independence.md §6.3).
+    /// the WM in points whatever the window's scale (the WM converts at the
+    /// monitor it lays it out on), capped, and only the window's owner may
+    /// set it (resolution-independence.md §6.3, §7).
     #[test]
-    fn the_min_size_reaches_the_wm_in_device_pixels() {
+    fn the_min_size_reaches_the_wm_in_points() {
         let mut f = fixture();
         let p = WindowCreatePayload {
             width: 400, height: 300, title: "".into(),
@@ -2906,12 +2964,12 @@ mod tests {
             let r: WmEnumerateReply = decode(&out[0].payload).unwrap();
             r.surfaces.iter().find(|s| s.surface_id == id).unwrap().min_size
         };
-        assert_eq!(min(&mut f), (300, 150));
+        assert_eq!(min(&mut f), (200, 100));
         let set = |min| WindowSetHintsPayload { window_id: id, hints: WindowHints { min_size: min, ..Default::default() } };
         f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((320, 9999)))).unwrap()), 1).expect("set");
-        assert_eq!(min(&mut f), (480, 8192 * 3 / 2), "capped at MAX_MIN_SIZE_PT");
+        assert_eq!(min(&mut f), (320, 8192), "capped at MAX_MIN_SIZE_PT");
         f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(None)).unwrap()), 1).expect("set");
-        assert_eq!(min(&mut f), (480, 8192 * 3 / 2), "None leaves it");
+        assert_eq!(min(&mut f), (320, 8192), "None leaves it");
         assert!(f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((0, 0)))).unwrap()), 2).is_err(), "not the owner");
         f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((0, 0)))).unwrap()), 1).expect("set");
         assert_eq!(min(&mut f), (0, 0), "cleared");

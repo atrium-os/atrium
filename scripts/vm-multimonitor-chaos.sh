@@ -19,6 +19,11 @@ D=dev.atrium_gpu_amd_display.0
 C=./forum-ctl
 STEPS=${STEPS:-60}
 SEED=${SEED:-7}
+# MIXED=1 (default) adds UI-size changes on a monitor and moving the focused
+# window to the next one, so monitors run at mixed scales and windows cross
+# between them (resolution-independence.md §7). MIXED=0 is the old storm.
+MIXED=${MIXED:-1}
+ACTIONS=$([ "$MIXED" = 1 ] && echo 10 || echo 8)
 # Monitors the simulator offers on outputs 1-3 (4K and VGA left out: 4K
 # needs more VRAM than a long run leaves). Code 3 (the desktop monitor) is
 # on output 0 throughout.
@@ -75,7 +80,7 @@ check() {
 
 # The whole storm, drawn up front from one seeded stream: output, action,
 # and a coin for each step.
-awk -v s="$SEED" -v n="$STEPS" 'BEGIN{srand(s); for(i=0;i<n;i++) print int(rand()*3)+1, int(rand()*8), int(rand()*2), int(rand()*3)}' > /tmp/plan
+awk -v s="$SEED" -v n="$STEPS" -v a="$ACTIONS" 'BEGIN{srand(s); for(i=0;i<n;i++) print int(rand()*3)+1, int(rand()*a), int(rand()*2), int(rand()*4)}' > /tmp/plan
 i=0
 exec 3< /tmp/plan
 while read o a coin pick <&3; do
@@ -114,6 +119,13 @@ while read o a coin pick <&3; do
 				$C mirror $o 0 >/dev/null 2>&1; what="mirror $o 0"
 			fi
 		else what="(mirror empty $o)"; fi ;;
+	8)	# another UI size on it: a monitor of another scale than its neighbours
+		if [ "$cur" != -1 ]; then
+			set -- smaller default larger 1.5; shift $pick; f=$1
+			$C ui-size $o $f >/dev/null 2>&1; what="ui-size $o $f"
+		else what="(ui-size empty $o)"; fi ;;
+	9)	# the focused window to the next monitor (maybe of another scale)
+		$C move-monitor >/dev/null 2>&1; what="move-monitor" ;;
 	esac
 	sleep 9
 	echo "step $i: $what"

@@ -403,10 +403,12 @@ pub struct WmSurfaceInfo {
     pub owner_uid: u32,
     pub role: WmRole,
     pub rect: WmRect,
-    /// The smallest content the app can lay out in, device pixels
-    /// (`WindowHints.min_size` at the window's scale; 0 = none): the WM
-    /// gives it at least this where the screen allows
-    /// (resolution-independence.md §6.3).
+    /// The smallest content the app can lay out in, in points
+    /// (`WindowHints.min_size`, capped; 0 = none): the WM gives it at least
+    /// this, in device pixels at the scale of the monitor it lays the
+    /// window out on, where the screen allows (resolution-independence.md
+    /// §6.3, §7: a window moved to a monitor of another scale needs the
+    /// same points, not the same pixels).
     pub min_size: (u32, u32),
 }
 
