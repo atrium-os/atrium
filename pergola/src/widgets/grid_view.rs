@@ -49,8 +49,11 @@ pub const TILE_ROWS: u32 = 16;
 /// Columns in a tile.
 pub const TILE_COLS: u32 = 4;
 /// The content's base moves in steps this big (px), keeping `f32`
-/// coordinates exact.
-pub const REBASE: f64 = 1_048_576.0;
+/// coordinates exact and the viewport's translation inside the protocol's
+/// bound: a group transform may move at most ±32,768 device px
+/// (`fresco_protocol::FILL_MAX_COORD`), so 8,192 logical px leaves room for
+/// a scale of 3 and a viewport's worth of tiles past the base.
+pub const REBASE: f64 = 8192.0;
 /// The column header's height.
 pub const HEADER_H: f32 = 24.0;
 /// A press this close to a column's right edge in the header resizes it.
@@ -318,7 +321,7 @@ impl GridView {
         });
         {
             ctx.key(1);
-            let local = Rect::new(body.x(), body.y(), (ext[0] - bx).clamp(0.0, 4.0 * REBASE) as f32, (ext[1] - by).clamp(0.0, 4.0 * REBASE) as f32);
+            let local = Rect::new(body.x(), body.y(), (ext[0] - bx).clamp(0.0, 3.0 * REBASE) as f32, (ext[1] - by).clamp(0.0, 3.0 * REBASE) as f32);
             let page = ctx.push(Node::vstack(local, 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             // Window position of content point (px, py).
@@ -483,7 +486,7 @@ impl GridView {
         let colh = ctx.push(Node::Scroll { rect: ch_rect, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: (x - bx) as f32, content_w: 0.0 });
         {
             ctx.key(1);
-            let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 4.0 * REBASE)) as f32, HEADER_H), 0.0));
+            let page = ctx.push(Node::vstack(Rect::new(ch_rect.x(), ch_rect.y(), ((ext[0] - bx).clamp(0.0, 3.0 * REBASE)) as f32, HEADER_H), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             if cols > 0 && tiles_c.0 <= tiles_c.1 {
                 for c in tiles_c.0 * TILE_COLS..=((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 {
@@ -561,7 +564,7 @@ impl GridView {
         let rowh = ctx.push(Node::Scroll { rect: rh_rect, offset: (y - by) as f32, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
         {
             ctx.key(1);
-            let page = ctx.push(Node::vstack(Rect::new(rh_rect.x(), rh_rect.y(), header_w, ((ext[1] - by).clamp(0.0, 4.0 * REBASE)) as f32), 0.0));
+            let page = ctx.push(Node::vstack(Rect::new(rh_rect.x(), rh_rect.y(), header_w, ((ext[1] - by).clamp(0.0, 3.0 * REBASE)) as f32), 0.0));
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             if rows > 0 && tiles_r.0 <= tiles_r.1 {
                 for row in tiles_r.0 * TILE_ROWS..=((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1 {
@@ -980,6 +983,13 @@ mod tests {
         assert!(app.tree().iter().count() < 3000, "{} resident", app.tree().iter().count());
         let max_y = app.tree().iter().map(|(_, n)| n.rect().y().abs()).fold(0.0f32, f32::max);
         assert!(max_y < 3.0 * REBASE as f32, "coordinates stay small: {max_y}");
+        // frescod refuses a group translated past ±32,768 device px: the
+        // viewports' offsets stay well inside it at any scale up to 3.
+        for (_, n) in app.tree().iter() {
+            if let Node::Scroll { offset, offset_x, .. } = n {
+                assert!(*offset * 3.0 <= 32768.0 && *offset_x * 3.0 <= 32768.0, "offset {offset}, {offset_x}");
+            }
+        }
         // The cells there are the right ones.
         assert!(d.iter().any(|d| matches!(d, NodeDelta::Added { node: Node::Text { content, .. }, .. } if content == "here")), "the cell at row 999,999,001 sent");
         let row_label = "999999001".to_string();

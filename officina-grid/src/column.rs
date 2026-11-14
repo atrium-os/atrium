@@ -422,6 +422,15 @@ impl Sizes {
             self.prefix.push(s);
         }
     }
+    /// Sizes from a default and overrides in any order (a later duplicate wins); for
+    /// loading many at once, as [`set`](Self::set) costs O(overrides) each.
+    pub fn from_overrides(default: f64, mut over: Vec<(u32, f64)>) -> Self {
+        over.reverse();
+        over.sort_by_key(|e| e.0);
+        over.dedup_by_key(|e| e.0);
+        over.retain(|e| e.1 != default);
+        Self::from_parts(default, over)
+    }
     /// Sizes from a default and overrides sorted by index (the native format's load).
     pub(crate) fn from_parts(default: f64, over: Vec<(u32, f64)>) -> Self {
         let mut prefix = Vec::with_capacity(over.len() + 1);

@@ -835,8 +835,9 @@ bytes a cell in a mixed chunk plus the pool) and get their own measurement in O4
   (sizes by prefix sums, cells near the view only) shown as three scroll groups: the body
   (tiles of 16 rows × 4 columns, keyed, so a scroll frame changes only the three
   viewports' offsets until a tile enters), a column header that moves across only and a
-  row header that moves down only. Content coordinates rebase every 2^20 px so a sheet of
-  2^31 rows (64 billion px) stays exact in `f32`. Selection by drag, by header and by
+  row header that moves down only. Content coordinates rebase every 8,192 px, so a sheet
+  of 2^31 rows (43 billion px) stays exact in `f32` and every viewport's translation stays
+  inside frescod's ±32,768 device-px bound. Selection by drag, by header and by
   corner; column resize by its header edge; the usual spreadsheet keys (arrows, Shift, Ctrl edges,
   Page, Home/End, Tab, Enter, Escape, Delete, Ctrl+Z/Y/C/X/V/A); an in-cell editor on
   `TextEdit`; numbers that don't fit show `###`, text is cut with an ellipsis.
@@ -873,7 +874,7 @@ Gates, on the 4-core cloud machine:
 |---|---|
 | crash recovery | a child process types as fast as it can (a formula every tenth action) and is killed with SIGKILL at five different moments: each time exactly the first N actions come back in order, N at least what was last durable, torn tails cut (`tests/crash.rs`). Unit tests cover every cut point of the last record, undo across a save and a second crash after a recovery |
 | scroll, headless | atrium-sheets' own view on a 1,048,576-row × 10-column sheet (`examples/scroll_cost.rs`: the app's real work per vsync on a virtual clock; swipes at 4,000 px/s, diagonal swipes, wheel, Page Down, Ctrl+End/Home): at 60 and 120 Hz every pattern passes, frame work p99.9 1.6–4.6 ms, max 5.9 ms, 0 missed vsyncs, 0 stalls; at most 1,945 nodes resident |
-| scroll, live on frescod | `atrium-sheets --bench all 1048576 8` in a FreeBSD VM: see below |
+| scroll, live on frescod | functional, in the cloud TCG VM (`scripts/sheets-vm.sh`): the app draws on a headless frescod, and the bench drives every pattern with no protocol error. The first run found a real bug: the grid's viewports were translated up to 1 M px, past frescod's ±32,768 device-px bound on a group transform, so every scroll past about 1,600 rows was refused (`BadPayload`). The grid now rebases every 8,192 px, and `scroll_cost` checks the bound every frame. TCG frame times (60–1,400 ms) are not product numbers; the timing run is on the Mac's HVF VM, pending |
 
 Not in O2: a "save changes?" prompt, the jailed one-process-per-document launch (§3; the
 app runs as a plain Limen client for now), multiple sheets in the UI, row insert and

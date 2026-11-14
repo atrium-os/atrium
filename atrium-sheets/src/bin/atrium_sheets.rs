@@ -474,21 +474,31 @@ fn bench_main(a: &[String]) -> i32 {
         let mut frames = Vec::new();
         let mut moving = Vec::new();
         let n = (secs * hz) as usize;
-        for v in 0..n {
+        // One entry per vsync of wall-clock time: vsyncs that went by while a frame
+        // was being made count as moving (the screen was behind), so a slow frame
+        // shows up as missed vsyncs and, past 100 ms, as a stall.
+        while moving.len() < n {
+            let v = moving.len();
             let due = Duration::from_secs_f64(v as f64 * period / 1e3);
             if let Some(wait) = due.checked_sub(start.elapsed()) {
                 std::thread::sleep(wait);
             }
+            let behind = ((start.elapsed().as_secs_f64() * 1e3) / period) as usize;
+            while moving.len() < behind.min(n) {
+                moving.push(true);
+            }
+            if moving.len() >= n {
+                break;
+            }
             // Drain what frescod sent.
             while let Ok(Some(_)) = win.connection().wait_event(Some(Duration::from_micros(1))) {}
-            let now = start.elapsed().as_secs_f64() * 1e3;
+            let now = moving.len() as f64 * period;
             let mut input = false;
             while let Some((t, _)) = events.peek() {
-                if *t > now {
+                if *t > start.elapsed().as_secs_f64() * 1e3 {
                     break;
                 }
                 let (_, ev) = events.next().unwrap();
-                app.set_time(now);
                 app.handle_event(ev);
                 input = true;
             }
@@ -506,7 +516,12 @@ fn bench_main(a: &[String]) -> i32 {
         let r = Report::new(&frames, period, &moving);
         all_pass &= r.passes(period);
         println!("atrium-sheets bench {} rows {rows} hz {hz}: {}", p.name(), r.line(period));
-        // Back to the top for the next pattern.
+        // Let a fling settle, then back to the top for the next pattern.
+        let settle = Instant::now();
+        while app.wants_frame() && settle.elapsed() < Duration::from_secs(10) {
+            let _ = win.paint(&mut app);
+            std::thread::sleep(Duration::from_millis(8));
+        }
         app.handle_event(pergola::Event::Key { kind: pergola::KeyEventKind::Down, key: pergola::Key::Home, modifiers: pergola::Modifiers { ctrl: true, ..Default::default() }, chars: String::new() });
         let _ = win.paint(&mut app);
     }

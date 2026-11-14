@@ -8,6 +8,9 @@
 //! ScrollView gates (pergola.md §10): p99.9 frame time ≤ 2 periods, ≤ 1 % missed
 //! vsyncs while moving, no stall over 100 ms.
 //!
+//! Also checked: no viewport offset past what frescod accepts (a group
+//! translated at most ±32,768 device px), which a live run would refuse.
+//!
 //! Not modelled: the socket, frescod's compose (a scroll frame is a shift plus the
 //! exposed strips; fresco-compute's shift tests and the live run cover it). The live
 //! run is `atrium-sheets --bench` on frescod.
@@ -93,6 +96,7 @@ fn main() {
             let mut moving = Vec::with_capacity(n);
             let mut busy_until = 0.0f64;
             let mut most_nodes = 0;
+            let mut out_of_bounds = 0;
             let mut deltas = Vec::new();
             for v in 0..n {
                 let now = v as f64 * period;
@@ -120,11 +124,24 @@ fn main() {
                 let cost = start.elapsed().as_secs_f64() * 1e3;
                 deltas.push(d.len());
                 most_nodes = most_nodes.max(app.tree().iter().count());
+                // What frescod would refuse: a viewport translated past
+                // ±32,768 device px (at scale 2).
+                for (_, n) in app.tree().iter() {
+                    if let pergola::node::Node::Scroll { offset, offset_x, .. } = n {
+                        if offset.abs() * 2.0 > 32768.0 || offset_x.abs() * 2.0 > 32768.0 {
+                            out_of_bounds += 1;
+                        }
+                    }
+                }
                 frames.push(Frame { start: now, cost });
                 busy_until = now + cost;
             }
             base += secs * 1000.0 + 1000.0;
             let r = Report::new(&frames, period, &moving);
+            all &= out_of_bounds == 0;
+            if out_of_bounds > 0 {
+                println!("    {out_of_bounds} viewport offsets past frescod's bound");
+            }
             all &= r.passes(period);
             deltas.sort_unstable();
             let st = scroll.get();
