@@ -56,7 +56,14 @@ impl Tier2 {
         let bin = load(&cache, BIN_SPV, "bin")?;
         let raster = load(&cache, RASTER_SPV, "raster")?;
         let compose = load(&cache, crate::compose::COMPOSE_SPV, "compose")?;
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        // All CPUs but one from three up: a raster on every CPU at once
+        // leaves the clients drawing the next frame waiting for a CPU (the
+        // Officina sheets swipe bench saw ~100 ms send stalls).
+        // FRESCO_RASTER_THREADS overrides.
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let threads = std::env::var("FRESCO_RASTER_THREADS").ok().and_then(|v| v.parse().ok())
+            .unwrap_or(if cpus >= 3 { cpus - 1 } else { cpus })
+            .max(1);
         Ok(Self { _cache: cache, bin, raster, compose, threads })
     }
 
@@ -98,7 +105,7 @@ impl Tier2 {
         Ok(())
     }
 
-    /// Cap the worker threads (default: all CPUs).
+    /// Cap the worker threads (default: all CPUs but one from three up).
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
     }
