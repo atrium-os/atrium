@@ -952,7 +952,17 @@ impl<'a> GpuCompute<'a> {
                 continue;
             }
             learn(&mut self.slice_budget, self.slice_us, fl);
-            let next = fl.rest.pop_front().unwrap();
+            // The rest was cut with the budget of its frame's submit: if the
+            // budget has since shrunk (a slow GPU learnt), cut it again, or
+            // its slices would each hold the GPU far past `slice_us`.
+            if fl.rest.front().is_some_and(|n| n.bin.is_none() && n.cost > 2 * self.slice_budget) {
+                let tiles: Vec<[u32; 4]> = fl.rest.iter().flat_map(|s| s.tiles.iter().copied()).collect();
+                if fl.rest.iter().all(|s| s.bin.is_none()) {
+                    fl.rest = fresco_compute::cost::split_raster(&fl.frame, &tiles, self.slice_budget).into();
+                    log::debug!("gpu: window {id}: rest cut again into {} slices of ~{} pixel-ops", fl.rest.len(), self.slice_budget);
+                }
+            }
+            let Some(next) = fl.rest.pop_front() else { continue };
             let mut ib = self.arch.stream();
             ib.frame_part(v.code.gpu_va(), &fl.va, &fl.frame, next.bin, &next.tiles)
                 .map_err(|e| format!("{} record: {e}", self.arch.name()))?;
@@ -1338,7 +1348,7 @@ const SLICE_US: u64 = 4000;
 /// The slice budget to start from (pixel-ops), and its bounds. It starts
 /// low: a slow GPU (gpusim) is learnt from the first full slice, a fast one
 /// grows it within a few frames.
-const SLICE_START: u64 = 1 << 20;
+const SLICE_START: u64 = 1 << 14;
 const SLICE_MIN: u64 = 1 << 12;
 
 /// Learn the slice budget from a slice of `fl` that finished: one cut to

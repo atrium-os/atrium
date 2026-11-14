@@ -105,6 +105,17 @@ pub struct Slice {
 /// time, the rest of the screen's work in between, and shows the window's
 /// new drawing only once its last slice is done.
 pub fn split(f: &Frame, tiles: &[[u32; 4]], budget: u64) -> Vec<Slice> {
+    split_with(f, tiles, budget, true)
+}
+
+/// [`split`] for the raster part only (no bin slices): what is left of a
+/// frame whose bin parts have run, cut again when the budget has shrunk
+/// since it was first split (frescod learns the GPU's speed as it goes).
+pub fn split_raster(f: &Frame, tiles: &[[u32; 4]], budget: u64) -> Vec<Slice> {
+    split_with(f, tiles, budget, false)
+}
+
+fn split_with(f: &Frame, tiles: &[[u32; 4]], budget: u64, bin: bool) -> Vec<Slice> {
     let budget = budget.max(1);
     let h = &f.header;
     let t = TILE as f32;
@@ -115,7 +126,7 @@ pub fn split(f: &Frame, tiles: &[[u32; 4]], budget: u64) -> Vec<Slice> {
     }
     let mut units: Vec<(Unit, u64)> = Vec::new();
     // Bin: each workgroup of BIN_LOCAL ops, by the tiles their boxes cover.
-    let groups = h.bin_groups()[0];
+    let groups = if bin { h.bin_groups()[0] } else { 0 };
     for g in 0..groups {
         let lo = (g * crate::BIN_LOCAL) as usize;
         let hi = (lo + crate::BIN_LOCAL as usize).min(f.ops.len());
@@ -221,6 +232,24 @@ pub fn split(f: &Frame, tiles: &[[u32; 4]], budget: u64) -> Vec<Slice> {
 mod tests {
     use super::*;
     use crate::{Rect, Scene};
+
+    #[test]
+    fn the_raster_rest_splits_again_without_bins() {
+        let f = Frame::pack(&rects(200, 1024.0, 1024.0, 0.5), 1024, 1024, 1024);
+        let tiles = [[0, 0, f.header.tiles_x, f.header.tiles_y]];
+        let whole: u64 = split(&f, &tiles, FAR_OVER).iter().map(|s| s.cost).sum();
+        let s = split_raster(&f, &tiles, whole / 40);
+        assert!(s.len() >= 20, "{} slices", s.len());
+        assert!(s.iter().all(|x| x.bin.is_none() && !x.tiles.is_empty()));
+        // Every tile once.
+        let mut n = 0u64;
+        for x in &s {
+            for r in &x.tiles {
+                n += ((r[2] - r[0]) * (r[3] - r[1])) as u64;
+            }
+        }
+        assert_eq!(n, (f.header.tiles_x * f.header.tiles_y) as u64);
+    }
 
     fn all_tiles(f: &Frame) -> Vec<[u32; 4]> {
         vec![[0, 0, f.header.tiles_x, f.header.tiles_y]]
