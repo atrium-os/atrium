@@ -33,3 +33,21 @@ fn a_match_at_the_end_of_a_run_covers_its_last_glyph() {
     assert_eq!(m.len(), 2, "{m:?}");
     assert!((m[0][2] - m[1][2]).abs() < 0.5, "{m:?}");
 }
+
+#[test]
+fn an_element_is_found_by_its_id() {
+    use navigator_render::find::element_top;
+    let fonts = FontSet::load().unwrap();
+    let mut doc = String::from("<!doctype html><html><body><h1>Top</h1>");
+    for _ in 0..40 {
+        doc.push_str("<p>Filler paragraph about the rooms of the house and their uses.</p>");
+    }
+    doc.push_str("<h2 id=\"plan\">The plan</h2><p>Text <span id=\"inl\">inline</span>.</p></body></html>");
+    let env = Env::default();
+    let (y, h) = element_top(&doc, &fonts, &env, &Default::default(), "plan").expect("found");
+    assert!(y > 1000.0 && h > y, "far down: {y} of {h}");
+    let (inl, _) = element_top(&doc, &fonts, &env, &Default::default(), "inl").expect("an inline element too");
+    assert!(inl > y);
+    assert_eq!(element_top(&doc, &fonts, &env, &Default::default(), "nope"), None);
+    assert_eq!(element_top(&doc, &fonts, &env, &Default::default(), "a\"b"), None);
+}

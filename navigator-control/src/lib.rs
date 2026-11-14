@@ -27,6 +27,15 @@ pub const URL_MAX: usize = 16 * 1024;
 pub const TITLE_MAX: usize = 256;
 /// The largest recording a ticket redeems for.
 pub const RECORDING_MAX: u64 = 128 << 20;
+/// The most images a ticket redeems for with its page, and their encoded
+/// bytes in all: the converter's verified blobs, by content address.
+pub const IMAGES_MAX: usize = 256;
+pub const IMAGE_BYTES_MAX: u64 = 32 << 20;
+/// An image's content address as the recording names it: `blake3:` and
+/// 64 lowercase hex digits.
+pub fn is_image_address(a: &str) -> bool {
+    a.strip_prefix("blake3:").is_some_and(is_address)
+}
 
 pub type Ticket = [u8; 16];
 
@@ -163,6 +172,18 @@ pub struct PageHeader {
     pub base: String,
     /// The recording's length; its bytes follow the frame.
     pub len: u64,
+    /// The page's images (content address, encoded length), their bytes
+    /// following the recording's in this order. Still hostile: the child
+    /// checks each against its address and decodes it in its own jail.
+    pub images: Vec<(String, u64)>,
+}
+
+/// The images a page carries, bounded: in count, in bytes, and each named
+/// by a content address.
+pub fn images_ok(images: &[(String, u64)]) -> bool {
+    images.len() <= IMAGES_MAX
+        && images.iter().map(|(_, n)| *n).try_fold(0u64, |t, n| t.checked_add(n)).is_some_and(|t| t <= IMAGE_BYTES_MAX)
+        && images.iter().all(|(a, _)| is_image_address(a))
 }
 
 fn bad(m: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, m.into()) }
@@ -210,21 +231,55 @@ pub fn clean(s: &str, max: usize) -> bool {
     s.len() <= max && !s.chars().any(char::is_control)
 }
 
+/// What a ticket redeems for: the base address, the recording and the
+/// page's images (address, encoded bytes).
+pub struct Redeemed {
+    pub base: String,
+    pub recording: Vec<u8>,
+    pub images: Vec<(String, Vec<u8>)>,
+}
+
 /// The child's side of the page socket: redeem `ticket` for the base
-/// address and the recording, at most `RECORDING_MAX` bytes.
-pub fn redeem(path: &str, ticket: &Ticket) -> io::Result<(String, Vec<u8>)> {
+/// address, the recording (at most `RECORDING_MAX` bytes) and its images
+/// (within `images_ok`).
+pub fn redeem(path: &str, ticket: &Ticket) -> io::Result<Redeemed> {
     let mut s = UnixStream::connect(path)?;
     s.write_all(ticket)?;
-    let h: PageHeader = read_frame(&mut s)?.ok_or_else(|| bad("the ticket was refused"))?;
-    if h.len > RECORDING_MAX || !clean(&h.base, URL_MAX) {
+    read_page(&mut s)
+}
+
+/// Read what the page socket sends after a ticket.
+pub fn read_page(s: &mut impl Read) -> io::Result<Redeemed> {
+    let h: PageHeader = read_frame(s)?.ok_or_else(|| bad("the ticket was refused"))?;
+    if h.len > RECORDING_MAX || !clean(&h.base, URL_MAX) || !images_ok(&h.images) {
         return Err(bad("a header out of bounds"));
     }
-    let mut b = Vec::with_capacity(h.len as usize);
-    (&mut s).take(h.len).read_to_end(&mut b)?;
-    if b.len() as u64 != h.len {
-        return Err(bad("a short recording"));
+    let mut exact = |n: u64, what: &str| -> io::Result<Vec<u8>> {
+        let mut b = Vec::with_capacity(n as usize);
+        s.take(n).read_to_end(&mut b)?;
+        if b.len() as u64 != n {
+            return Err(bad(format!("a short {what}")));
+        }
+        Ok(b)
+    };
+    let recording = exact(h.len, "recording")?;
+    let mut images = Vec::with_capacity(h.images.len());
+    for (a, n) in h.images {
+        let b = exact(n, "image")?;
+        images.push((a, b));
     }
-    Ok((h.base, b))
+    Ok(Redeemed { base: h.base, recording, images })
+}
+
+/// The page socket's side: the header, the recording and the images.
+pub fn write_page(w: &mut impl Write, base: &str, recording: &[u8], images: &[(String, Vec<u8>)]) -> io::Result<()> {
+    let h = PageHeader { base: base.into(), len: recording.len() as u64, images: images.iter().map(|(a, b)| (a.clone(), b.len() as u64)).collect() };
+    write_frame(w, &h)?;
+    w.write_all(recording)?;
+    for (_, b) in images {
+        w.write_all(b)?;
+    }
+    Ok(())
 }
 
 /// The raw descriptor of a stream, for `send_fd`.
@@ -233,6 +288,22 @@ pub fn raw(s: &impl AsRawFd) -> RawFd { s.as_raw_fd() }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_comes_back_with_its_images_and_bounds_hold() {
+        let a = format!("blake3:{}", "ab".repeat(32));
+        let mut buf = vec![];
+        write_page(&mut buf, "https://a.example/", b"rec", &[(a.clone(), vec![1, 2, 3])]).unwrap();
+        let r = read_page(&mut buf.as_slice()).unwrap();
+        assert_eq!((r.base.as_str(), r.recording.as_slice()), ("https://a.example/", &b"rec"[..]));
+        assert_eq!(r.images, vec![(a.clone(), vec![1, 2, 3])]);
+        // Short image bytes, a bad address, too many bytes: refused.
+        assert!(read_page(&mut &buf[..buf.len() - 1]).is_err());
+        let mut bad_addr = vec![];
+        write_page(&mut bad_addr, "https://a.example/", b"rec", &[("../x".into(), vec![1])]).unwrap();
+        assert!(read_page(&mut bad_addr.as_slice()).is_err());
+        assert!(!images_ok(&[(a.clone(), IMAGE_BYTES_MAX), (a, 1)]));
+    }
 
     #[test]
     fn frames_round_trip_and_bounds_hold() {

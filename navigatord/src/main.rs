@@ -45,7 +45,7 @@ mod files;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
-use navigator_control::{self as ctl, Event, Jar, LinkAction, PageHeader, Request, Source, Ticket};
+use navigator_control::{self as ctl, Event, Jar, LinkAction, Request, Source, Ticket};
 use navigator_cookies::{Arca as _, ArcadSocket, Broker, Fetch, Launcher, Why};
 use navigator_prerender::fetch::{FetchBudget, FetchdFetcher, Reply};
 use navigator_prerender::serve::{self, Ask, Job};
@@ -158,6 +158,10 @@ struct Page {
     /// Its page record's address in the store (empty: not stored).
     saved: String,
     ctx: Ctx,
+    /// The images its recording names, as the converter fetched and
+    /// verified them (content address, encoded bytes), within
+    /// `ctl::images_ok`. Never decoded here: the page child does that.
+    images: Arc<Vec<(String, Vec<u8>)>>,
 }
 
 /// What the store holds for a page besides its recording: which address
@@ -168,6 +172,9 @@ struct Record {
     format: String,
     url: String,
     recording: String,
+    /// (content address, store address) of each image, in order.
+    #[serde(default)]
+    images: Vec<(String, String)>,
 }
 
 struct State {
@@ -194,7 +201,8 @@ impl State {
         let written = p.ctx.written();
         let store: &mut dyn Store = if written { &mut *self.store } else { self.memory.entry(p.ctx.jar).or_default() };
         let put = store.put(&p.recording).and_then(|rec| {
-            let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec };
+            let images = p.images.iter().map(|(a, b)| store.put(b).map(|s| (a.clone(), s))).collect::<Result<Vec<_>, _>>()?;
+            let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec, images };
             store.put(&serde_json::to_vec(&r).expect("encodes"))
         });
         match put {
@@ -231,7 +239,18 @@ impl State {
             return Err("the record is for another address".into());
         }
         let recording = store.get(&r.recording)?;
-        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx })
+        let mut images = vec![];
+        for (a, at) in &r.images {
+            if !ctl::is_address(at) {
+                return Err("an image's store address is malformed".into());
+            }
+            images.push((a.clone(), store.get(at)?));
+        }
+        let lens: Vec<(String, u64)> = images.iter().map(|(a, b)| (a.clone(), b.len() as u64)).collect();
+        if !ctl::images_ok(&lens) {
+            return Err("the record's images are out of bounds".into());
+        }
+        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images) })
     }
 
     /// The page at `url` this UI may act on: the cache, else the store.
@@ -259,7 +278,7 @@ impl State {
         self.cache.push(p.clone());
         if asked != p.url {
             // A redirect: the asked address finds it too.
-            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx }));
+            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx, images: p.images.clone() }));
         }
         while self.cache.len() > CACHE {
             self.cache.remove(0);
@@ -430,6 +449,7 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         base: Some(base.clone()),
         net: true,
         emit: true,
+        blobs: true,
         require_confined: !cfg.unconfined,
         deadline_s: cfg.deadline_s,
         len: doc.len(),
@@ -483,6 +503,7 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
             }
         }
     });
+    let mut images: Vec<(String, Vec<u8>)> = vec![];
     let outcome = (|| -> Result<serve::Outcome, String> {
         {
             let mut g = stdin.lock().unwrap();
@@ -491,7 +512,16 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
                 .map_err(|e| format!("could not hand the document to the converter: {e}"))?;
         }
         let mut out = std::io::BufReader::new(stdout);
-        let r = serve::drive(&mut out, &stdin, &mut |ask| budget.admit(ask.url(), |_| up.reply(ask)).to_frame(), &mut |_, _| {});
+        // Images the recording names, already checked against their
+        // addresses by the driver; kept within the page's bounds, the rest
+        // dropped (the page shows their boxes empty).
+        let r = serve::drive(&mut out, &stdin, &mut |ask| budget.admit(ask.url(), |_| up.reply(ask)).to_frame(), &mut |a, b| {
+            let total: u64 = images.iter().map(|(_, x): &(String, Vec<u8>)| x.len() as u64).sum();
+            if images.len() < ctl::IMAGES_MAX && total + b.len() as u64 <= ctl::IMAGE_BYTES_MAX
+                && ctl::is_image_address(a) && !images.iter().any(|(x, _)| x == a) {
+                images.push((a.to_string(), b.to_vec()));
+            }
+        });
         drop(stdin.lock().unwrap().take());
         r
     })();
@@ -509,7 +539,7 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         return Err("the recording is over its bound".into());
     }
     let insecure = base.starts_with("http:");
-    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx }))
+    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images) }))
 }
 
 /// The document's `<title>` from the recording's JSON text, bounded.
@@ -861,8 +891,7 @@ fn serve_page(state: Arc<Mutex<State>>, mut s: UnixStream) {
         eprintln!("navigatord: a page child brought an unknown ticket");
         return;
     };
-    let h = PageHeader { base: p.url.clone(), len: p.recording.len() as u64 };
-    if let Err(e) = ctl::write_frame(&mut s, &h).and_then(|_| s.write_all(&p.recording)) {
+    if let Err(e) = ctl::write_page(&mut s, &p.url, &p.recording, &p.images) {
         eprintln!("navigatord: page child: {e}");
     }
 }
@@ -944,7 +973,7 @@ mod tests {
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
-        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON }
+        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default() }
     }
 
     #[test]

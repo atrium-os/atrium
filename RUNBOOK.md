@@ -5694,6 +5694,7 @@ them with `cargo test --release --target aarch64-unknown-freebsd --no-run`, then
 in the VM (61/61).
 
 Step 7 runs last (ui9.log, with `NAVIGATOR_UI_AX=1` so the accessibility tree is logged as `ax` lines):
+the page's image comes with its ticket (`navigator-page: 1 images with the page` in limend.log);
 Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in limend.log, the UI's
 `find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
 coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
@@ -5741,7 +5742,11 @@ mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` onl
 is a vnet of its own with lo0 only; portcullisd logs converter and fetcher jails and the worker
 rule; the UI's and the pages' renderers run in jails as 65011, none outside one, none left after
 frescod; a link follows into a new page jail; two live pages are two jails; no jail is left after
-the UI exits. jaild needed two policy entries for it: `/atrium/sockets/navigator-page` in
+the UI exits; the page's image came with its ticket (`navigator-page: 1 images with the page`)
+and none was refused; after Back, a press on the `#plan` link scrolls the page
+(`in-page link #plan` in ui.log, `scrolled to #plan at y=` in limend.log, frame `confined-3-plan`),
+and with Impluvium parked one page jail is left. The script stops portcullisd before deploying:
+a running one holds `/usr/local/bin/portcullisd` and the copy fails (ETXTBSY). jaild needed two policy entries for it: `/atrium/sockets/navigator-page` in
 `rw_paths` and 65035 in the allowed system uids and gids. Logs and frames in the out dir
 (default `scratch/navigator-confined`).
 

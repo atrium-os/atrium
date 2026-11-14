@@ -1329,6 +1329,7 @@ dependencies = [
  "navigator-backend",
  "navigator-cookies",
  "navigator-dom",
+ "navigator-image",
  "navigator-normalize",
  "navigator-render",
  "navigator-style",
@@ -1382,6 +1383,22 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "pathfinder_simd",
  "ttf-parser",
+]
+
+[[package]]
+name = "navigator-image"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gif",
+ "image-webp",
+ "navigator-dom",
+ "navigator-svg",
+ "png 0.17.16",
+ "resvg",
+ "usvg",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -95,3 +95,21 @@ fn matches_in(r: &crate::Run, last: f64, q: &[char], out: &mut Vec<[f32; 4]>, ma
         }
     }
 }
+
+/// The top of the element whose `id` is `id` in `html` laid out at `env`,
+/// in CSS px from the document's top (an in-page link's target,
+/// navigator-ui.md §5.7), and the document's height. `None` when no
+/// laid-out element has that id.
+pub fn element_top(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources, id: &str) -> Option<(f32, f32)> {
+    // Mark the element for the geometry pass. The normalizer writes
+    // attributes double-quoted and escaped, so an id that needs escaping
+    // is not looked for (the parent only names ids the page has).
+    if id.is_empty() || id.contains(['"', '&', '<', '>']) {
+        return None;
+    }
+    let needle = format!(" id=\"{id}\"");
+    let at = html.find(&needle)? + needle.len();
+    let marked = format!("{} atrium-seek=\"1\"{}", &html[..at], &html[at..]);
+    let g = crate::html::layout_geometry(&marked, fonts, env, subs, "atrium-seek");
+    g.elements.get(&1).map(|e| ((e.y as f64 / PX) as f32, (g.height as f64 / PX) as f32))
+}

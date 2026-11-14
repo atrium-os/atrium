@@ -170,7 +170,7 @@ fn main() -> std::io::Result<()> {
     let mut saver = live.as_ref().map(|_| Saver::new(trails_path, &state.get_cloned().store));
     loop {
         match window.step(&mut app, Some(TICK))? {
-            StepResult::Event(raw) => event(&raw, &state),
+            StepResult::Event(raw) => event(&raw, window.id(), &state),
             StepResult::Closed => {
                 if let Some(sv) = &mut saver {
                     sv.save(&state.get_cloned().store, true);
@@ -268,8 +268,13 @@ impl Saver {
 /// The window's raw events the shell handles itself: its size, the
 /// keyboard map and the Where field's typing, and presses (which close
 /// the field and the popover when they land outside them).
-fn event(raw: &fresco_client::Event, state: &Mutable<Shell>) {
-    if let fresco_client::Event::Resized { width, height, .. } = raw {
+fn event(raw: &fresco_client::Event, main: u32, state: &Mutable<Shell>) {
+    if let fresco_client::Event::Resized { window_id, width, height, .. } = raw {
+        // A pop-up's window (Aa, the menu) has its own size: only the
+        // main window's is the shell's.
+        if *window_id != main {
+            return;
+        }
         let mut s = state.get_cloned();
         s.w = *width as f32;
         s.h = *height as f32;

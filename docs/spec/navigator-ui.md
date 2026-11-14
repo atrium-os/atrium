@@ -1077,8 +1077,17 @@ Each step runs in the VM on headless frescod before the next.
      serves the fixtures by name. The UI runs as navigatord's user, since navigatord opens the
      UI's frescod connection and limend checks the slot's parent by owner. frescod runs as
      `_frescod` and each window's renderer (the UI's, each page's) is a portcullisd jail as
-     `_fresco-render` (`scripts/fresco-renderer-bundle.sh`); 25/25. Open: images and anchors
-     in the child.
+     `_fresco-render` (`scripts/fresco-renderer-bundle.sh`); 25/25.
+     Images and in-page anchors in the child, 2026-11-14: navigatord asks the converter for its
+     `BLOB blake3:<hex>` frames, keeps a page's images (at most 256, 32 MiB in all, each checked
+     against its address) in the page store with the recording, and sends them after the
+     recording on the ticket socket; the child decodes them in its own jail with
+     `navigator-image` (the backend's image, SVG and resample code, split out so the page binary
+     has no TLS or network code), at most 2048×2048 each, and an image that does not decode is
+     left out and logged. A `#fragment` link is the child's alone: the chrome sends `ScrollTo`,
+     the child checks the anchor is in the recording, finds the element's top by its id
+     (`navigator_render::find::element_top`) and scrolls there, no further than the page's
+     last screen. Confined script 30/30.
 3. **Trails.** The tree, open beside, put away and Earlier, the trail store on disk.
    *Built 2026-11-13:*
    - The tree, open beside, put away and Earlier were built in step 1. Earlier now carries the

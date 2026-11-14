@@ -119,6 +119,7 @@ until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first 
 sleep "$GAP"
 g "grep -q 'page child attached' $S/ui.log" && ok "limend bound the page child into the slot" || bad "no page child: $(g "tail -5 $S/limend.log")"
 g "grep -q 'laid out \"Atrium (architecture)\"' $S/ui.log" && ok "the child redeemed its ticket and laid the page out" || bad "child: $(g "grep navigator-page $S/limend.log | tail -3")"
+g "grep -q 'navigator-page: 1 images with the page' $S/limend.log" && ok "the page's image came with its ticket" || bad "no image with the page"
 shot live-1-atrium
 # The page's top left on screen: forum-wm puts the window under the strip
 # and the bar (62), the page slot starts at the trace's page=x,y.

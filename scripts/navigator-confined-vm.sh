@@ -145,6 +145,8 @@ if [ "${BUILD:-1}" = 1 ]; then
 fi
 
 echo "=== portcullis"
+# The portcullisd this script started last time holds its binary (ETXTBSY).
+g "pkill -x portcullisd; sleep 1; true"
 sh "$ROOT/scripts/deploy-portcullis.sh" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ \+= ' | tail -2
 for b in portcullisd portcullis opifex; do
     [ "$(sha256sum "$ROOT/portcullis/target/$R/$b" | cut -d' ' -f1)" = "$(g "sha256 -q /usr/local/bin/$b" | tr -d '\r')" ] \
@@ -281,6 +283,10 @@ echo "$L" | sed 's/^/    /'
 g "grep -q '$CONV_ID' /var/log/atrium/portcullisd-navigator.log" && ok "the conversion ran in a converter jail" || bad "no converter jail was started"
 g "grep -q '$FETCH_ID' /var/log/atrium/portcullisd-navigator.log" && ok "the fetches went through a fetcher jail" || bad "no fetcher jail was started"
 g "grep -q '_limen starts $PAGE_ID as _navpage' /var/log/atrium/portcullisd-navigator.log" && ok "portcullisd applied the worker rule" || bad "no worker rule line"
+# Images: the converter's verified bytes, kept by navigatord with the page,
+# handed over with the ticket, decoded in the page's jail.
+g "grep -q 'navigator-page: 1 images with the page' $S/limend.log" && ok "the page's image came with its ticket" || bad "no image with the page: $(g "grep -h -i image $S/limend.log $S/navigatord.log | tail -3 | tr '\n' ';'")"
+g "grep -q 'an image not shown' $S/limend.log" && bad "an image was refused: $(g "grep 'an image not shown' $S/limend.log | head -2 | tr '\n' ';'")" || ok "and nothing refused decoding it"
 RP=$(g "ps -axo user,uid,jid,comm | awk '\$4==\"fresco-renderer\"'")
 echo "$RP" | sed 's/^/    /'
 [ "$(echo "$RP" | awk '$2==65011 && $3!=0' | wc -l)" -ge 2 ] && ok "the UI's and the page's windows are drawn by renderers in jails, as _fresco-render" || bad "renderers: $RP"
@@ -294,10 +300,18 @@ until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && ok "a link 
 sleep "$GAP"
 g "grep -q 'laid out \"Impluvium' $S/ui.log" && ok "the next page drew in a new jail" || bad "Impluvium: $(g "grep -h navigator-page $S/limend.log | tail -3 | tr '\n' ';'")"
 shot confined-2-impluvium
-# One jail per live page: the page shown and the page it came from (the
-# parent of the page on screen stays live even over the budget, §4.4).
+# Back to Atrium, then its in-page link (the fourth nav line, #plan):
+# navigatord says it is in the page, the UI asks the page to scroll to it.
+press 270 $((TOP + 20))     # the toolbar's Back
+until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "Back went to the parent page" || bad "back: $(last)"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 120))
+g "grep -q 'in-page link #plan' $S/ui.log" && ok "the in-page link stayed in the page" || bad "in-page: $(last)"
+g "grep -q 'scrolled to #plan at y=' $S/limend.log" && ok "the page scrolled to #plan" || bad "no scroll: $(g "grep -h -e '#plan' -e anchor $S/limend.log | tail -2 | tr '\n' ';'")"
+shot confined-3-plan
+# Back on Atrium with a budget of one, Impluvium was parked: its jail
+# ended, and one page jail is left (one per live page).
 N=$(jails)
-[ "${N:-0}" = 2 ] && ok "two live pages, two page jails" || bad "$N page jails for two live pages"
+[ "${N:-0}" = 1 ] && ok "the parked page's jail ended: one live page, one page jail" || bad "$N page jails for one live page"
 
 echo "=== end"
 g "pkill -x navigator-ui"

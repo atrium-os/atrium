@@ -327,7 +327,13 @@ impl Live {
                     let beside = self.activations.remove(&id).unwrap_or(false);
                     match action {
                         LinkAction::Navigate { url, .. } => s.follow_link(&url, beside),
-                        LinkAction::InDocument { fragment } => s.last_note = Some(format!("in-page link #{fragment} (scrolling to it comes later)")),
+                        // The page shown scrolls to it; the trail is unchanged.
+                        LinkAction::InDocument { fragment } => {
+                            if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
+                                eprintln!("navigator-ui: in-page link #{fragment}");
+                                self.to_child(c.embed, &ToChild::ScrollTo { anchor: fragment });
+                            }
+                        }
                         LinkAction::Handoff { url, scheme } => s.handoff(&url, &scheme, crate::ui::now_ms()),
                         LinkAction::Blocked { why } => s.last_note = Some(format!("link refused: {why}")),
                     }

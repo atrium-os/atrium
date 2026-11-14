@@ -24,6 +24,9 @@ fresco-protocol = { path = "../fresco-protocol" }
 navigator-normalize = { path = "../navigator-normalize" }
 navigator-render = { path = "../navigator-render" }
 navigator-style = { path = "../navigator-style" }
+# The image decoders (png, zune-jpeg, image-webp, gif; pure Rust, bounded on
+# the header before allocating): images decode here, in the page's jail.
+navigator-image = { path = "../navigator-image" }
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch.

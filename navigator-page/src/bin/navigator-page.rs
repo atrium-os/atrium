@@ -48,9 +48,56 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+/// A page's images: the encoded bytes navigatord handed over with the
+/// recording, decoded here, in the page's own jail, the first time the
+/// layout paints one, and kept. Every image is checked against its content
+/// address and bounded on its header before anything is allocated
+/// (navigator_image::image); what the page keeps decoded is charged
+/// against one budget.
+#[derive(Default)]
+struct Images {
+    encoded: std::collections::HashMap<String, Vec<u8>>,
+    decoded: RefCell<std::collections::HashMap<String, Option<pergola::node::Image>>>,
+    charged: std::cell::Cell<usize>,
+}
+
+impl Images {
+    fn new(list: Vec<(String, Vec<u8>)>) -> Self {
+        Images { encoded: list.into_iter().collect(), ..Default::default() }
+    }
+
+    fn get(&self, address: &str) -> Option<pergola::node::Image> {
+        if let Some(d) = self.decoded.borrow().get(address) {
+            return d.clone();
+        }
+        let d = self.encoded.get(address).and_then(|b| {
+            use navigator_image::image::{decode, Ceilings};
+            let left = Ceilings::default().budget.saturating_sub(self.charged.get());
+            // Never more pixels than a large screen shows at once.
+            let c = Ceilings { budget: left, target: Some((IMAGE_PX_MAX, IMAGE_PX_MAX)), ..Ceilings::default() };
+            match decode(address, b, c) {
+                Ok(px) => {
+                    self.charged.set(self.charged.get() + px.rgba.len());
+                    Some(pergola::node::Image::new(px.width, px.height, px.rgba))
+                }
+                Err(e) => {
+                    eprintln!("navigator-page: an image not shown: {e:?}");
+                    None
+                }
+            }
+        });
+        self.decoded.borrow_mut().insert(address.to_string(), d.clone());
+        d
+    }
+}
+
+/// The largest decoded image, per axis (the decoders reduce to it).
+const IMAGE_PX_MAX: u32 = 2048;
+
 /// The page as laid out, and what it was laid out from.
 struct Page {
     prepared: Rc<Prepared>,
+    images: Rc<Images>,
     base: String,
     reading: Reading,
     doc: Rc<RefCell<Doc>>,
@@ -122,10 +169,11 @@ fn measure(w: f32, r: &Reading) -> (f32, f32) {
     (((w - lw) / 2.0).floor(), lw)
 }
 
-fn lay_out(prepared: Rc<Prepared>, base: String, reading: Reading, size: (f32, f32)) -> Result<Page, String> {
+fn lay_out(prepared: Rc<Prepared>, images: Rc<Images>, base: String, reading: Reading, size: (f32, f32)) -> Result<Page, String> {
     let (x0, lw) = measure(size.0, &reading);
-    let doc = Doc::html_scaled(prepared.html.clone(), prepared.subs.clone(), lw, size.1, reading.dark, reading.text_64 as u32, |_| None)?;
-    Ok(Page { prepared, base, reading, doc: Rc::new(RefCell::new(doc)), size, x0, lw })
+    let im = images.clone();
+    let doc = Doc::html_scaled(prepared.html.clone(), prepared.subs.clone(), lw, size.1, reading.dark, reading.text_64 as u32, move |a| im.get(a))?;
+    Ok(Page { prepared, images, base, reading, doc: Rc::new(RefCell::new(doc)), size, x0, lw })
 }
 
 /// A find in progress: the query, the reading it was laid out for, the
@@ -168,7 +216,8 @@ struct Run {
 }
 
 impl Run {
-    fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, reading: Reading, scroll: f32, bytes: Result<Vec<u8>, u16>) {
+    fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, reading: Reading, scroll: f32, bytes: Result<Vec<u8>, u16>, images: Vec<(String, Vec<u8>)>) {
+        let images = Rc::new(Images::new(images));
         let prepared = match bytes.and_then(|b| prepare(kind, &b)) {
             Ok(p) => Rc::new(p),
             Err(code) => return out.send(ToParent::Error { code }),
@@ -176,7 +225,7 @@ impl Run {
         let t = Instant::now();
         self.finding = None;
         self.view.mark.set(None);
-        match lay_out(prepared.clone(), base, reading, self.view.size.get()) {
+        match lay_out(prepared.clone(), images, base, reading, self.view.size.get()) {
             Ok(p) => {
                 // A parked page comes back where it was; the scroll view
                 // clamps it to the page as laid out.
@@ -214,7 +263,7 @@ impl Run {
             (st.zoom.live, st.zoom.settled) = (z, z);
             self.view.scroll.set(st);
         }
-        match lay_out(p.prepared.clone(), p.base.clone(), reading, size) {
+        match lay_out(p.prepared.clone(), p.images.clone(), p.base.clone(), reading, size) {
             Ok(n) => {
                 eprintln!("navigator-page: laid out again: text {}%, zoom {}%, {}{}", n.reading.text_64 as u32 * 100 / 64, n.reading.zoom_64 as u32 * 100 / 64,
                     if n.reading.dark { "dark" } else { "light" }, if n.reading.comfortable { ", comfortable width" } else { "" });
@@ -287,6 +336,38 @@ impl Run {
         self.view.mark.set(Some(m));
         let rect = self.view.on_screen(m);
         out.send(ToParent::Found { count: n as u32, current: f.current as u32 + 1, rect });
+    }
+
+    /// An in-page link's target (limen.md §2.1 `ScrollTo`): the element
+    /// with that id at the top of the view. Laid out whole, as find does.
+    fn scroll_to(&mut self, anchor: &str) {
+        let Some(p) = self.view.page.get_cloned() else { return };
+        if !p.prepared.anchors.iter().any(|a| a == anchor) {
+            return eprintln!("navigator-page: no anchor {anchor:?}");
+        }
+        let st = self.view.scroll.get();
+        let zoom = st.zoom.settled.max(0.01);
+        let Ok(fonts) = navigator_render::fontset::FontSet::shared() else { return };
+        let env = navigator_style::cascade::Env {
+            dark: p.reading.dark,
+            text_scale_64: p.reading.text_64 as u32,
+            ..navigator_style::cascade::Env::zoomed(p.lw as f64, p.size.1 as f64, (zoom * 64.0).round() as u32)
+        };
+        let t = Instant::now();
+        match navigator_render::find::element_top(&p.prepared.html, fonts, &env, &p.prepared.subs, anchor) {
+            Some((y, doc_h)) => {
+                let mut st = st;
+                // At the top of the view, unless that is past the page's
+                // end: then the page's last screen, as a browser does. Set
+                // directly, as find does: the view may not know the extent
+                // that far yet.
+                let vh = p.size.1 as f64 / zoom;
+                st.physics.y = (y as f64).min(doc_h as f64 - vh).max(0.0);
+                self.view.scroll.set(st);
+                eprintln!("navigator-page: scrolled to #{anchor} at y={y:.0} ({:.0} ms)", t.elapsed().as_secs_f64() * 1e3);
+            }
+            None => eprintln!("navigator-page: #{anchor} is not laid out"),
+        }
     }
 
     /// The href under `at`, as the document spells it.
@@ -386,7 +467,7 @@ fn standalone(path: &str, kind: DocKind, dark: bool) {
     let mut run = Run { view, hover: None, finding: None };
     let bytes = std::fs::File::open(path).map_err(|_| error::NO_DOCUMENT).and_then(read_bounded);
     let base = std::env::var("NAVIGATOR_PAGE_BASE").unwrap_or_else(|_| "https://a.test/".into());
-    run.load(&mut LogOut, kind, base, Reading::plain(dark), 0.0, bytes);
+    run.load(&mut LogOut, kind, base, Reading::plain(dark), 0.0, bytes, vec![]);
     loop {
         match window.step(&mut app, Some(TICK)) {
             Ok(StepResult::Event(ev)) => {
@@ -449,7 +530,7 @@ fn embedded() {
                     }
                     Some(ToChild::SetReading { reading }) => run.relayout(Some(reading)),
                     Some(ToChild::Find { query, step }) => run.find(&mut out, &query, step),
-                    Some(ToChild::ScrollTo { .. }) => {} // anchors scroll in a later step
+                    Some(ToChild::ScrollTo { anchor }) => run.scroll_to(&anchor),
                     Some(ToChild::Load { .. }) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
                     Some(ToChild::Park) => {
                         let y = run.view.scroll.get_cloned().physics.y as f32;
@@ -460,7 +541,12 @@ fn embedded() {
                     Some(ToChild::Open { ticket, reading, scroll }) => {
                         let path = std::env::var("NAVIGATOR_PAGE_SOCKET").unwrap_or_else(|_| PAGE_SOCKET.into());
                         match navigator_control::redeem(&path, &ticket) {
-                            Ok((base, bytes)) => run.load(&mut out, DocKind::Recording, base, reading, scroll, Ok(bytes)),
+                            Ok(r) => {
+                                if !r.images.is_empty() {
+                                    eprintln!("navigator-page: {} images with the page", r.images.len());
+                                }
+                                run.load(&mut out, DocKind::Recording, r.base, reading, scroll, Ok(r.recording), r.images)
+                            }
                             Err(e) => {
                                 eprintln!("navigator-page: redeem: {e}");
                                 out.send(ToParent::Error { code: error::NO_DOCUMENT });
@@ -474,7 +560,7 @@ fn embedded() {
                     match ToChild::decode(&bytes) {
                         Some(ToChild::Load { kind, base, dark }) => {
                             let b = fd.map(std::fs::File::from).ok_or(error::NO_DOCUMENT).and_then(read_bounded);
-                            run.load(&mut out, kind, base, Reading::plain(dark), 0.0, b);
+                            run.load(&mut out, kind, base, Reading::plain(dark), 0.0, b, vec![]);
                         }
                         _ => eprintln!("navigator-page: dropped a descriptor"),
                     }
