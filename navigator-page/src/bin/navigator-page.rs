@@ -107,6 +107,15 @@ struct Page {
     /// width unless the reader asked for a comfortable one).
     x0: f32,
     lw: f32,
+    /// The system text size it was laid out at.
+    sys: f32,
+}
+
+/// The page's text size, 64 = 100%: the reader's for this site times the
+/// system's (resolution-independence.md §10), so a person who chose 130%
+/// for everything reads pages at 130% before any per-site step.
+fn text_64(r: &Reading) -> u32 {
+    (r.text_64 as f32 * pergola::text::text_scale()).round().clamp(16.0, 512.0) as u32
 }
 
 #[derive(Clone)]
@@ -165,15 +174,15 @@ fn measure(w: f32, r: &Reading) -> (f32, f32) {
     if !r.comfortable {
         return (0.0, w);
     }
-    let lw = (COMFORT_PX * r.text_64 as f32 / 64.0 * r.zoom_64 as f32 / 64.0).min(w).max(1.0);
+    let lw = (COMFORT_PX * text_64(r) as f32 / 64.0 * r.zoom_64 as f32 / 64.0).min(w).max(1.0);
     (((w - lw) / 2.0).floor(), lw)
 }
 
 fn lay_out(prepared: Rc<Prepared>, images: Rc<Images>, base: String, reading: Reading, size: (f32, f32)) -> Result<Page, String> {
     let (x0, lw) = measure(size.0, &reading);
     let im = images.clone();
-    let doc = Doc::html_scaled(prepared.html.clone(), prepared.subs.clone(), lw, size.1, reading.dark, reading.text_64 as u32, move |a| im.get(a))?;
-    Ok(Page { prepared, images, base, reading, doc: Rc::new(RefCell::new(doc)), size, x0, lw })
+    let doc = Doc::html_scaled(prepared.html.clone(), prepared.subs.clone(), lw, size.1, reading.dark, text_64(&reading), move |a| im.get(a))?;
+    Ok(Page { prepared, images, base, reading, doc: Rc::new(RefCell::new(doc)), size, x0, lw, sys: pergola::text::text_scale() })
 }
 
 /// A find in progress: the query, the reading it was laid out for, the
@@ -182,6 +191,7 @@ struct Finding {
     query: String,
     reading: Reading,
     lw: f32,
+    sys: f32,
     matches: Vec<[f32; 4]>,
     current: usize,
 }
@@ -254,7 +264,7 @@ impl Run {
         let Some(p) = self.view.page.get_cloned() else { return };
         let size = self.view.size.get();
         let reading = reading.unwrap_or(p.reading);
-        if p.size == size && p.reading == reading {
+        if p.size == size && p.reading == reading && p.sys == pergola::text::text_scale() {
             return;
         }
         if p.reading.zoom_64 != reading.zoom_64 {
@@ -265,7 +275,7 @@ impl Run {
         }
         match lay_out(p.prepared.clone(), p.images.clone(), p.base.clone(), reading, size) {
             Ok(n) => {
-                eprintln!("navigator-page: laid out again: text {}%, zoom {}%, {}{}", n.reading.text_64 as u32 * 100 / 64, n.reading.zoom_64 as u32 * 100 / 64,
+                eprintln!("navigator-page: laid out again: text {}%, zoom {}%, {}{}", text_64(&n.reading) * 100 / 64, n.reading.zoom_64 as u32 * 100 / 64,
                     if n.reading.dark { "dark" } else { "light" }, if n.reading.comfortable { ", comfortable width" } else { "" });
                 self.view.page.set(Some(Rc::new(n)));
             }
@@ -300,18 +310,18 @@ impl Run {
         }
         let st = self.view.scroll.get();
         let zoom = st.zoom.settled.max(0.01);
-        let stale = self.finding.as_ref().is_none_or(|f| f.query != query || f.reading != p.reading || f.lw != p.lw);
+        let stale = self.finding.as_ref().is_none_or(|f| f.query != query || f.reading != p.reading || f.lw != p.lw || f.sys != p.sys);
         if stale {
             let t = Instant::now();
             let Ok(fonts) = navigator_render::fontset::FontSet::shared() else { return };
             let env = navigator_style::cascade::Env {
                 dark: p.reading.dark,
-                text_scale_64: p.reading.text_64 as u32,
+                text_scale_64: text_64(&p.reading),
                 ..navigator_style::cascade::Env::zoomed(p.lw as f64, p.size.1 as f64, (zoom * 64.0).round() as u32)
             };
             let matches = navigator_render::find::find(&p.prepared.html, fonts, &env, &p.prepared.subs, query, FOUND_MAX as usize);
             eprintln!("navigator-page: find: {} matches in {:.0} ms", matches.len(), t.elapsed().as_secs_f64() * 1e3);
-            self.finding = Some(Finding { query: query.to_string(), reading: p.reading, lw: p.lw, matches, current: usize::MAX });
+            self.finding = Some(Finding { query: query.to_string(), reading: p.reading, lw: p.lw, sys: p.sys, matches, current: usize::MAX });
         }
         let f = self.finding.as_mut().unwrap();
         let n = f.matches.len();
@@ -350,7 +360,7 @@ impl Run {
         let Ok(fonts) = navigator_render::fontset::FontSet::shared() else { return };
         let env = navigator_style::cascade::Env {
             dark: p.reading.dark,
-            text_scale_64: p.reading.text_64 as u32,
+            text_scale_64: text_64(&p.reading),
             ..navigator_style::cascade::Env::zoomed(p.lw as f64, p.size.1 as f64, (zoom * 64.0).round() as u32)
         };
         let t = Instant::now();
@@ -585,6 +595,11 @@ fn embedded() {
             Ok(StepResult::Closed) => return,
             Ok(_) => {}
             Err(e) => die(format_args!("frescod: {e}")),
+        }
+        // The system text size changed (Pergola took it from frescod's
+        // appearance event): the page follows (resolution-independence.md §10).
+        if run.view.page.get_cloned().is_some_and(|p| p.sys != pergola::text::text_scale()) {
+            run.relayout(None);
         }
         run.zoom_settled(&mut out);
     }

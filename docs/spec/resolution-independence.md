@@ -469,6 +469,14 @@ Three factors multiply for page content:
 - **Inline images** in pages follow §6.4: intrinsic from declared sizes, capped to the
   column, re-picked by density. The Navigator's chrome is Pergola and follows §6 like any app.
 
+**Built (step 7, 2026-11-14):** navigator-page lays pages out at the reader's per-site text
+size times the system text size (`text_64()`), for layout, the comfortable measure, find and
+in-page anchors, and lays the page out again, keeping its place, when the system text size
+changes. Page images: the converter fetches only `src` (it lays out at 1 dppx, and profile
+§3.11 admits no fetch that varies with the reader's screen), so on a 2x display a page image
+is 1x pixels drawn at 2x. Open: whether the converter picks a `srcset` candidate at one fixed
+density for every reader (sharp on 2x screens, nothing about the reader leaks).
+
 ## 11. Decisions (accepted 2026-11-14)
 
 Shankar took the recommendation on each:
