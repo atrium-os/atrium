@@ -32,6 +32,7 @@ mod tests {
             owner_uid: 0,
             role: WmRole::Document,
             rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
+            min_size: (0, 0),
         }
     }
 

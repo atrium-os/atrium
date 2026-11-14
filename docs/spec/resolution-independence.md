@@ -249,8 +249,17 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   did not change but that text moved (a text size or width change), the position moves with
   it and the view's state is told (`Ctx::on_reflow`). A wrapped paragraph is matched by its
   words, so it is found again however it rewraps; a reader's own scroll is never undone.
-- Still to do: toolbar overflow menus, min-size hints to the WM (a protocol op to update
-  `WindowHints.min_size` after creation, forum-wm honouring it), app-shaped `Glyphs` text.
+- **Minimum window size:** Pergola measures the main root's natural minimum (taffy at
+  min-content width; the content's height at the window's width) at open and whenever the
+  text size or the width changes, and sends it in points with `OP_WINDOW_SET_HINTS`
+  (`WindowHints.min_size`, never below the app's own; at most `MAX_MIN_SIZE_PT`, 8192).
+  frescod keeps it per window (split renderers pass it as `WINDOW_MIN_SIZE`), reports it to
+  the WM in device pixels at the window's scale (`WmSurfaceInfo.min_size`) and tells it with
+  `EV_WINDOW_MIN_SIZE` (WM only). forum-wm gives split columns at least their documents'
+  minimums (stacking them when the minimums don't fit side by side), grows a dialog about its
+  centre and a panel leftwards, and gives a snapped document too wide for its half the work
+  area; nothing leaves the work area.
+- Still to do: toolbar overflow menus, app-shaped `Glyphs` text.
 
 ### 6.4 Inline images and other inline objects
 

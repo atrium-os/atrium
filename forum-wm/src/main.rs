@@ -349,6 +349,8 @@ fn spawn_input_poller(core: Core) {
                             created = Some(window_id); // a new doc opens focused
                         }
                         Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
+                        // An app's minimum size changed (its text grew): place it again.
+                        Ok(Some(Event::WindowMinSize { .. })) => surfaces_changed = true,
                         // The output changed (a mode switch or a monitor swap):
                         // keep the latest, re-lay out once below.
                         Ok(Some(Event::DisplayChanged(d))) => display = Some(d),

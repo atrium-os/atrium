@@ -105,6 +105,76 @@ fn tile_column(wa: WmRect, i: usize, n: usize) -> WmRect {
     WmRect { x, y: wa.y, w: width, h: wa.h }
 }
 
+/// Columns across the work area for documents with minimum widths `mins`
+/// (device px, 0 = none): equal where that fits them, else each at least its
+/// minimum and the rest shared out; `None` when the minimums don't fit.
+fn tile_columns_fit(wa: WmRect, mins: &[i32]) -> Option<Vec<WmRect>> {
+    let n = mins.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if mins.iter().sum::<i32>() > wa.w {
+        return None;
+    }
+    if mins.iter().all(|&m| m <= wa.w / n as i32) {
+        return Some((0..n).map(|i| tile_column(wa, i, n)).collect());
+    }
+    // Water-filling: columns whose minimum exceeds the equal share of
+    // what is left keep their minimum; the others share the rest.
+    let mut fixed = vec![false; n];
+    loop {
+        let free: Vec<usize> = (0..n).filter(|&i| !fixed[i]).collect();
+        let left = wa.w - (0..n).filter(|&i| fixed[i]).map(|i| mins[i]).sum::<i32>();
+        let share = if free.is_empty() { 0 } else { left / free.len() as i32 };
+        let more: Vec<usize> = free.iter().copied().filter(|&i| mins[i] > share).collect();
+        if more.is_empty() {
+            let mut widths: Vec<i32> = (0..n).map(|i| if fixed[i] { mins[i] } else { share }).collect();
+            // The rounding remainder to the last shared column (or the last).
+            let last = free.last().copied().unwrap_or(n - 1);
+            widths[last] += wa.w - widths.iter().sum::<i32>();
+            let mut x = wa.x;
+            return Some(widths.into_iter().map(|w| {
+                let r = WmRect { x, y: wa.y, w, h: wa.h };
+                x += w;
+                r
+            }).collect());
+        }
+        for i in more {
+            fixed[i] = true;
+        }
+    }
+}
+
+/// `r` grown to at least `min` (device px), within the work area `wa`:
+/// centred on where it was for a dialog, its right edge kept for a panel.
+fn grow_to_min(r: WmRect, min: (u32, u32), wa: WmRect, keep_right: bool) -> WmRect {
+    let w = r.w.max(min.0 as i32).min(wa.w);
+    let h = r.h.max(min.1 as i32).min(wa.h);
+    let x = if keep_right { r.x + r.w - w } else { r.x - (w - r.w) / 2 };
+    let y = r.y - (h - r.h) / 2;
+    WmRect { x: x.clamp(wa.x, wa.x + wa.w - w), y: y.clamp(wa.y, wa.y + wa.h - h), w, h }
+}
+
+/// Give each dialog, panel and snapped document in `layout` at least its
+/// minimum size where the screen allows (resolution-independence.md §6.3):
+/// a dialog grows about its centre, a panel leftwards, and a snapped
+/// document whose minimum is wider than its half takes the work area.
+pub fn fit_min_sizes(layout: &mut WmDeclareLayoutPayload, screen: &Screen, surfaces: &[WmSurfaceInfo]) {
+    let wa = screen.work_area();
+    for slot in &mut layout.slots {
+        let Some(s) = surfaces.iter().find(|s| s.surface_id == slot.surface_id) else { continue };
+        if s.min_size == (0, 0) {
+            continue;
+        }
+        slot.rect = match s.role {
+            WmRole::Dialog => grow_to_min(slot.rect, s.min_size, wa, false),
+            WmRole::Panel => grow_to_min(slot.rect, s.min_size, wa, true),
+            WmRole::Document if slot.rect.w < s.min_size.0 as i32 && slot.rect.w < wa.w => WmRect { x: wa.x, w: wa.w, ..slot.rect },
+            _ => slot.rect,
+        };
+    }
+}
+
 /// Resolve which surface holds focus: a dialog grabs it; else the caller's intent
 /// (if that surface still exists); else the topmost document; else nothing (0).
 fn resolve_focus(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>) -> u32 {
@@ -188,9 +258,19 @@ pub fn arrange_for(
             .map(|s| s.surface_id)
             .collect();
         doc_ids.sort_unstable();
-        let n = doc_ids.len();
-        for (i, id) in doc_ids.iter().enumerate() {
-            doc_rect.insert(*id, tile_column(screen.work_area(), i, n));
+        let mins: Vec<i32> = doc_ids
+            .iter()
+            .map(|id| surfaces.iter().find(|s| s.surface_id == *id).map_or(0, |s| s.min_size.0 as i32))
+            .collect();
+        match tile_columns_fit(screen.work_area(), &mins) {
+            Some(cols) => {
+                for (id, r) in doc_ids.iter().zip(cols) {
+                    doc_rect.insert(*id, r);
+                }
+            }
+            // The documents' minimums don't fit side by side: stacked
+            // instead, rather than squeezed (resolution-independence.md §6.3).
+            None => return arrange_for(screen, surfaces, focus_intent, false),
         }
     }
 
@@ -1569,6 +1649,7 @@ pub mod daemon {
             -> WmDeclareLayoutPayload
         {
             let mut l = self.layout_on_roles(screen, active, focus_intent);
+            crate::fit_min_sizes(&mut l, screen, active);
             crate::place_pip(&mut l, screen, active, self.pip_corner);
             l
         }
@@ -1953,8 +2034,46 @@ mod tests {
         assert_eq!((pip.x, pip.y, pip.w, pip.h), (32, 32, 320, 180), "the smallest PiP and its margin in points");
     }
 
+    /// Minimum sizes (resolution-independence.md §6.3): split columns give
+    /// each document at least its minimum and stack them when the minimums
+    /// don't fit; a dialog grows about its centre, a panel leftwards, a
+    /// snapped document too wide for its half takes the work area; nothing
+    /// leaves the work area.
+    #[test]
+    fn windows_get_their_minimum_size_where_the_screen_allows() {
+        let sc = screen();
+        let wa = sc.work_area();
+        let with_min = |id, role, min: (u32, u32)| WmSurfaceInfo { min_size: min, ..surf(id, role) };
+        // Three documents, one needing more than a third: it gets its minimum.
+        let docs = [with_min(1, WmRole::Document, (0, 0)), with_min(2, WmRole::Document, (wa.w as u32 / 2, 0)), with_min(3, WmRole::Document, (0, 0))];
+        let l = arrange_for(&sc, &docs, Some(1), true);
+        let rect = |l: &WmDeclareLayoutPayload, id| l.slots.iter().find(|s| s.surface_id == id).unwrap().rect;
+        assert_eq!(rect(&l, 2).w, wa.w / 2);
+        assert_eq!(rect(&l, 1).w + rect(&l, 2).w + rect(&l, 3).w, wa.w, "the columns fill the work area");
+        assert_eq!(rect(&l, 1).x + rect(&l, 1).w, rect(&l, 2).x, "and meet");
+        // Minimums wider than the screen together: stacked, each the work area.
+        let wide = [with_min(1, WmRole::Document, (wa.w as u32 * 2 / 3, 0)), with_min(2, WmRole::Document, (wa.w as u32 * 2 / 3, 0))];
+        let l = arrange_for(&sc, &wide, Some(1), true);
+        assert_eq!((rect(&l, 1), rect(&l, 2)), (wa, wa));
+        // A dialog and a panel grow, inside the work area.
+        let others = [with_min(4, WmRole::Dialog, (900, 5000)), with_min(5, WmRole::Panel, (wa.w as u32 / 2, 0))];
+        let mut l = arrange_for(&sc, &others, None, false);
+        fit_min_sizes(&mut l, &sc, &others);
+        let d = rect(&l, 4);
+        assert_eq!((d.w, d.h), (900.max(sc.px(480)), wa.h), "as tall as the work area allows");
+        assert_eq!(d.x + d.w / 2, wa.x + wa.w / 2, "centred");
+        let p = rect(&l, 5);
+        assert_eq!((p.w, p.x + p.w), (wa.w / 2, wa.x + wa.w), "a panel keeps its right edge");
+        // A snapped document too wide for its half.
+        let snapped: std::collections::HashMap<u32, Snap> = [(1, Snap::Left)].into();
+        let one = [with_min(1, WmRole::Document, (wa.w as u32 * 3 / 4, 0))];
+        let mut l = arrange_snapped(&sc, &one, Some(1), &snapped);
+        fit_min_sizes(&mut l, &sc, &one);
+        assert_eq!(rect(&l, 1), wa);
+    }
+
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
-        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 } }
+        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, min_size: (0, 0) }
     }
 
     #[test]
@@ -2382,6 +2501,7 @@ mod tests {
                 owner_uid: 1001,
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
+                min_size: (0, 0),
             }],
             ..Default::default()
         };
@@ -2513,6 +2633,7 @@ mod tests {
                 owner_uid: 1001,
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
+                min_size: (0, 0),
             }],
             ..Default::default()
         };
@@ -2904,7 +3025,7 @@ mod pip_tests {
     #[test]
     fn a_pip_surface_is_placed_at_the_users_corner_and_never_focused() {
         let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
-        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h } };
+        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h }, min_size: (0, 0) };
         let active = [surf(1, WmRole::Document, 0, 0), surf(7, WmRole::Pip, 640, 480)];
         let mut l = arrange(&screen, &active, None);
         place_pip(&mut l, &screen, &active, Corner::TopLeft);

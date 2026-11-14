@@ -477,6 +477,7 @@ dependencies = [
  "fresco-protocol",
  "futures-signals",
  "hyphenation",
+ "libc",
  "limen",
  "log",
  "postcard",

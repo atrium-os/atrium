@@ -587,6 +587,10 @@ impl Broker {
                 r.videos.lock().unwrap().retain(|&(win, _), _| win != local);
                 self.drop_window(r, w.global);
             }
+            Msg::WindowMinSize { width, height, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("minimum size of unknown window")?;
+                self.comp.lock().unwrap().set_min_size(global, (width, height));
+            }
             Msg::WindowTitle { title, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("title of unknown window")?;
                 if let Some(w) = self.comp.lock().unwrap().windows.get_mut(&global) {

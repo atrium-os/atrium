@@ -341,6 +341,8 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerMagnify { window_id, .. }
         | E::InputSwipe { window_id, .. } => window_id,
         E::DisplayChanged { .. } | E::AppearanceChanged(_) => return Route::All,
+        // A window's minimum size: the WM's business alone.
+        E::WindowMinSize { .. } => return Route::WmOnly,
         E::WindowFillsDropped { window_id, .. }
         | E::BudgetRefused { window_id, .. }
         | E::Drag { window_id, .. }

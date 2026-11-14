@@ -200,29 +200,32 @@ struct MeasureCtx {
     wrap: Option<crate::wrap::Wrap>,
 }
 
-fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
-    let mut taffy: TaffyTree<MeasureCtx> = TaffyTree::new();
+thread_local! {
+    static MIN_WANTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MINS: std::cell::RefCell<Vec<(PNodeId, crate::geom::Size)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
-    let t_root = match build(tree, root, &mut taffy, 0.0) {
-        Some(id) => id,
-        None => return,
-    };
+/// Have the next layout on this thread also find each laid-out root's
+/// natural minimum ([`take_natural_min`]).
+pub fn request_natural_min() {
+    MIN_WANTED.with(|w| w.set(true));
+    MINS.with(|m| m.borrow_mut().clear());
+}
 
-    let root_rect = tree.get(root).map(|n| n.rect()).unwrap_or(PRect::ZERO_SIZED);
-    let available = Size {
-        width: if root_rect.size.w > 0.0 {
-            AvailableSpace::Definite(root_rect.size.w)
-        } else {
-            AvailableSpace::MaxContent
-        },
-        height: if root_rect.size.h > 0.0 {
-            AvailableSpace::Definite(root_rect.size.h)
-        } else {
-            AvailableSpace::MaxContent
-        },
-    };
+/// The natural minimum the last requested layout found for `root` (once;
+/// the request ends here): the
+/// narrowest it can lay out (its widest word, control or fixed part) and
+/// how tall it is at its width. What a window tells the WM as its minimum
+/// size (resolution-independence.md §6.3); it grows with the text size.
+pub fn take_natural_min(root: PNodeId) -> Option<crate::geom::Size> {
+    MIN_WANTED.with(|w| w.set(false));
+    let all = MINS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    all.into_iter().find(|(id, _)| *id == root).map(|(_, s)| s)
+}
 
-    let result = taffy.compute_layout_with_measure(
+/// Lay out `t_root` in `available`, measuring text leaves.
+fn compute(taffy: &mut TaffyTree<MeasureCtx>, t_root: taffy::NodeId, available: Size<AvailableSpace>) -> Result<(), taffy::TaffyError> {
+    taffy.compute_layout_with_measure(
         t_root,
         available,
         |known, _avail, _id, ctx: Option<&mut MeasureCtx>, _style| {
@@ -244,7 +247,54 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
                 height: known.height.unwrap_or(measured.h),
             }
         },
-    );
+    )
+}
+
+/// `t_root`'s natural minimum: its min-content width, and its height laid
+/// out at `width` with no height given. Leaves its style as it was.
+fn natural_min(taffy: &mut TaffyTree<MeasureCtx>, t_root: taffy::NodeId, width: f32) -> Option<crate::geom::Size> {
+    let orig = taffy.style(t_root).ok()?.clone();
+    let mut st = orig.clone();
+    st.size = Size { width: auto(), height: auto() };
+    taffy.set_style(t_root, st.clone()).ok()?;
+    compute(taffy, t_root, Size { width: AvailableSpace::MinContent, height: AvailableSpace::MaxContent }).ok()?;
+    let w = taffy.layout(t_root).ok()?.size.width;
+    st.size.width = length(width.max(w));
+    taffy.set_style(t_root, st).ok()?;
+    compute(taffy, t_root, Size { width: AvailableSpace::Definite(width.max(w)), height: AvailableSpace::MinContent }).ok()?;
+    let h = taffy.layout(t_root).ok()?.size.height;
+    taffy.set_style(t_root, orig).ok()?;
+    Some(crate::geom::Size::new(w.ceil(), h.ceil()))
+}
+
+fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
+    let mut taffy: TaffyTree<MeasureCtx> = TaffyTree::new();
+
+    let t_root = match build(tree, root, &mut taffy, 0.0) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let root_rect = tree.get(root).map(|n| n.rect()).unwrap_or(PRect::ZERO_SIZED);
+    if MIN_WANTED.with(|w| w.get()) {
+        if let Some(m) = natural_min(&mut taffy, t_root, root_rect.size.w) {
+            MINS.with(|v| v.borrow_mut().push((root, m)));
+        }
+    }
+    let available = Size {
+        width: if root_rect.size.w > 0.0 {
+            AvailableSpace::Definite(root_rect.size.w)
+        } else {
+            AvailableSpace::MaxContent
+        },
+        height: if root_rect.size.h > 0.0 {
+            AvailableSpace::Definite(root_rect.size.h)
+        } else {
+            AvailableSpace::MaxContent
+        },
+    };
+
+    let result = compute(&mut taffy, t_root, available);
     if let Err(e) = result {
         log::error!("layout: taffy compute failed: {e:?}");
         return;
@@ -560,6 +610,40 @@ mod tests {
             fill: Color::rgba(1.0, 0.0, 0.0, 1.0),
             radius: radius::SM,
         }
+    }
+
+    /// The natural minimum: as narrow as the widest fixed part or word,
+    /// as tall as the content at the window's width; the layout itself is
+    /// what it would have been (resolution-independence.md §6.3).
+    #[test]
+    fn the_natural_minimum_is_the_widest_part_and_the_height_at_the_width() {
+        let style = crate::node::TextStyle { family: crate::theme::font::SANS.into(), size: 14.0, weight: crate::theme::Weight::Regular, color: palette::neutral_300() };
+        let build = || {
+            let mut tree = NodeTree::new();
+            let col = tree.insert(None, Node::vstack(Rect::new(0.0, 0.0, 600.0, 900.0), 10.0));
+            tree.set_style(col, FlexStyle { padding: 8.0, align: Align::Stretch, ..FlexStyle::default() });
+            tree.insert(Some(col), Node::Rect { rect: Rect::new(0.0, 0.0, 220.0, 30.0), fill: palette::neutral_300(), radius: 0.0 });
+            let p = tree.insert(Some(col), Node::Text { rect: Rect::ZERO_SIZED, content: "short words then Incomprehensibilities".repeat(3), style: style.clone() });
+            tree.set_style(p, FlexStyle { wrap: true, shrink: 1.0, ..FlexStyle::default() });
+            (tree, col)
+        };
+        let (mut plain, col) = build();
+        layout(&mut plain, col);
+        let (mut tree, col) = build();
+        request_natural_min();
+        layout(&mut tree, col);
+        let m = take_natural_min(col).expect("measured");
+        let word = crate::text::measure("Incomprehensibilities", &style).w;
+        assert_eq!(m.w, (220.0f32.max(word) + 16.0).ceil(), "the widest part and the padding");
+        let text_h: f32 = tree.children_of(tree.children_of(col)[1]).iter().map(|&l| tree.get(l).unwrap().rect().h()).sum();
+        assert_eq!(m.h, (8.0 + 30.0 + 10.0 + text_h + 8.0).ceil(), "the content's height at 600 wide");
+        let rects = |t: &NodeTree| t.iter().map(|(_, n)| n.rect()).collect::<Vec<_>>();
+        assert_eq!(rects(&tree), rects(&plain), "measuring did not change the layout");
+        assert_eq!(take_natural_min(col), None, "taken once");
+        // Not asked: not measured.
+        let (mut again, col) = build();
+        layout(&mut again, col);
+        assert_eq!(take_natural_min(col), None);
     }
 
     #[test]

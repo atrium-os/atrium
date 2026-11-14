@@ -95,6 +95,8 @@ pub enum Event {
     WindowCreated  { window_id: u32 },
     /// A surface was destroyed in this session.
     WindowDestroyed { window_id: u32 },
+    /// A window's minimum size changed (to the WM): place it again.
+    WindowMinSize { window_id: u32 },
     /// The display's mode changed (a switch, or a monitor plugged or
     /// swapped): the new screen. Lay out again for it.
     DisplayChanged(DisplayInfoResponse),
@@ -1355,6 +1357,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_DESTROYED => match decode::<WindowDestroyedEvent>(payload) {
             Ok(p) => Event::WindowDestroyed { window_id: p.window_id },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_WINDOW_MIN_SIZE => match decode::<fresco_protocol::WindowMinSizeEvent>(payload) {
+            Ok(p) => Event::WindowMinSize { window_id: p.window_id },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_APPEARANCE_CHANGED => match decode::<fresco_protocol::AppearancePayload>(payload) {

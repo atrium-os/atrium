@@ -214,6 +214,10 @@ pub mod control {
     /// `WindowSpanEvent`, to the window's owner: where each monitor is
     /// inside its window while it spans several (fresco-span.md §3).
     pub const EV_WINDOW_SPAN:            u16 = 0x0589;
+    /// `WindowMinSizeEvent`, to the WM: a window's minimum size changed
+    /// (`WindowHints.min_size`, resolution-independence.md §6.3), so it
+    /// enumerates again and places it to fit.
+    pub const EV_WINDOW_MIN_SIZE:        u16 = 0x058f;
     /// `AppearancePayload`, to every client: the system appearance
     /// changed (light/dark). Redraw in it.
     pub const EV_APPEARANCE_CHANGED:     u16 = 0x058a;
@@ -393,6 +397,11 @@ pub struct WmSurfaceInfo {
     pub owner_uid: u32,
     pub role: WmRole,
     pub rect: WmRect,
+    /// The smallest content the app can lay out in, device pixels
+    /// (`WindowHints.min_size` at the window's scale; 0 = none): the WM
+    /// gives it at least this where the screen allows
+    /// (resolution-independence.md §6.3).
+    pub min_size: (u32, u32),
 }
 
 /// Reply to `OP_WM_ENUMERATE` — every surface in the caller's session.
@@ -1044,7 +1053,10 @@ pub struct WindowHints {
     /// `None` = use compositor default. `Some(false)` = client-side
     /// decorations or borderless.
     pub server_decorations: Option<bool>,
-    /// Minimum content size in logical pixels. `None` = no minimum.
+    /// Minimum content size in points: the app's layout at its natural
+    /// minimum, which grows with the text size (resolution-independence.md
+    /// §6.3). `None` = no minimum at create, unchanged in
+    /// `OP_WINDOW_SET_HINTS`; `Some((0, 0))` clears it.
     pub min_size: Option<(u32, u32)>,
     /// Maximum content size. `None` = no maximum.
     pub max_size: Option<(u32, u32)>,
@@ -1321,6 +1333,16 @@ pub struct WindowCloseRequestedEvent {
 /// it (it's about other surfaces, not their own).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowCreatedEvent {
+    pub window_id: u32,
+}
+
+/// The largest minimum size (`WindowHints.min_size`) a window may give,
+/// points a side; more is taken as this.
+pub const MAX_MIN_SIZE_PT: u32 = 8192;
+
+/// `EV_WINDOW_MIN_SIZE` — `window_id`'s minimum size changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowMinSizeEvent {
     pub window_id: u32,
 }
 
@@ -2713,6 +2735,7 @@ mod tests {
             control::EV_WINDOW_CLOSE_REQUESTED,
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
+            control::EV_WINDOW_MIN_SIZE,
             control::EV_WINDOW_FILLS_DROPPED,
             control::EV_BUDGET_REFUSED,
             control::EV_WINDOW_EMBED_TOKEN,
@@ -2779,6 +2802,7 @@ mod tests {
                 owner_uid: 1001,
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 },
+                min_size: (640, 480),
             }],
             embeds: vec![[7, 1]],
         };

@@ -90,6 +90,15 @@ pub struct Window {
     popups: crate::popup::Popups,
     /// The main window is a granted pop-up ([`WindowDesc::hosted`]).
     hosted: bool,
+    /// The layout's natural minimum is to be measured at the next paint
+    /// (at open, and when the text size or the width changes) and told
+    /// to the WM (resolution-independence.md §6.3).
+    min_due: bool,
+    /// The minimum size last told, points.
+    min_sent: (u32, u32),
+    /// The app's own minimum (`WindowHints.min_size` at open): the natural
+    /// one never goes below it.
+    min_floor: (u32, u32),
     /// Where the last [`Window::paint`] spent its time.
     pub last_paint: PaintTiming,
 }
@@ -246,6 +255,9 @@ impl Window {
             main: win,
             popups: Default::default(),
             hosted: desc.hosted.is_some(),
+            min_due: desc.hosted.is_none(),
+            min_sent: desc.hints.min_size.unwrap_or((0, 0)),
+            min_floor: desc.hints.min_size.unwrap_or((0, 0)),
         })
     }
 
@@ -269,10 +281,18 @@ impl Window {
             app.set_theme(t);
         }
         app.set_popups(true);
+        let min_due = std::mem::take(&mut self.min_due);
+        if min_due {
+            crate::layout::request_natural_min();
+            app.invalidate();
+        }
         let t0 = std::time::Instant::now();
         app.frame();
         let deltas = app.tick();
         let t1 = std::time::Instant::now();
+        if min_due {
+            self.send_min_size(app);
+        }
         self.last_paint = PaintTiming { build_ms: (t1 - t0).as_secs_f64() * 1e3, deltas: deltas.len(), ..Default::default() };
         if !deltas.is_empty() {
             let (cpu0, sw0) = thread_cpu();
@@ -320,6 +340,20 @@ impl Window {
         Ok(())
     }
 
+    /// Tell the WM the layout's natural minimum, if it changed.
+    fn send_min_size<V: View>(&mut self, app: &App<V>) {
+        let Some(m) = app.tree().roots().next().and_then(crate::layout::take_natural_min) else { return };
+        let side = |v: f32, floor: u32| (v.ceil().max(0.0) as u32).max(floor).min(fresco_protocol::MAX_MIN_SIZE_PT);
+        let min = (side(m.w, self.min_floor.0), side(m.h, self.min_floor.1));
+        if min != self.min_sent {
+            self.min_sent = min;
+            let hints = WindowHints { min_size: Some(min), ..Default::default() };
+            if let Err(e) = self.surface.connection().window_set_hints(self.main, hints) {
+                log::warn!("window: minimum size not sent: {e}");
+            }
+        }
+    }
+
     /// frescod's embed token for this window: what limend names it by,
     /// for [`crate::embed::Embeds::request`] (as a parent) or
     /// `limen::client::Child::ready` (as a child). `None` until frescod
@@ -364,6 +398,7 @@ impl Window {
                 // out again (resolution-independence.md §6).
                 if crate::text::set_text_scale(a.text_size_milli) {
                     app.invalidate();
+                    self.min_due = !self.hosted;
                 }
             }
             fresco_client::Event::FocusChanged { window_id, gained: true, cause } if window_id == main => {
@@ -389,6 +424,7 @@ impl Window {
                     app.resend_all();
                 }
                 if (width, height) != (self.width, self.height) {
+                    self.min_due = !self.hosted && width != self.width;
                     self.width = width;
                     self.height = height;
                     app.invalidate();

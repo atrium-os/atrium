@@ -87,6 +87,8 @@ struct Win {
     sig: Option<u64>,
     seq: u32,
     title: String,
+    /// The minimum size last told, points.
+    min_size: (u32, u32),
     /// Pixel mode: the window as last drawn, its tiles' signatures, the
     /// drawing each slot holds (seq, 0 none), and recent frames' damage.
     px: Vec<u32>,
@@ -476,7 +478,7 @@ fn role(r: WmRole) -> Role {
 /// Tell the broker about windows the client created, retitled or
 /// destroyed since the last pass.
 fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen: (u32, u32)) {
-    let mut live: Vec<(u32, Msg, Option<(Msg, u32)>)> = {
+    let mut live: Vec<(u32, Msg, Option<(Msg, u32)>, (u32, u32))> = {
         let c = comp.lock().unwrap();
         c.windows
             .values()
@@ -509,7 +511,8 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                         grab: p.grab,
                     },
                 }, p.shown));
-                (w.id as u32, m, place)
+                let min = (w.min_size.0.min(fresco_split::MAX_MIN_SIZE_PT), w.min_size.1.min(fresco_split::MAX_MIN_SIZE_PT));
+                (w.id as u32, m, place, min)
             })
             .collect()
     };
@@ -521,7 +524,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
         s.wins.remove(&id);
         send(broker, &Msg::WindowDestroy { window: id });
     }
-    for (id, m, place) in live {
+    for (id, m, place, min) in live {
         let Msg::WindowCreate { title, .. } = &m else { unreachable!() };
         let room = s.wins.len() < MAX_WINDOWS as usize;
         match s.wins.get_mut(&id) {
@@ -541,6 +544,10 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
             }
         }
         let w = s.wins.get_mut(&id).expect("declared");
+        if w.min_size != min {
+            w.min_size = min;
+            send(broker, &Msg::WindowMinSize { window: id, width: min.0, height: min.1 });
+        }
         // Not again after frescod dismissed it (the client's window stays
         // hidden here) until the client shows it again (`shown` moves).
         if place.is_some() && place != w.popup {

@@ -102,6 +102,9 @@ pub enum Msg {
     FocusParent { window: u32 },
     /// A window's title changed.
     WindowTitle { window: u32, title: String },
+    /// A window's minimum size, points (`WindowHints.min_size`; 0 = none),
+    /// for the WM (resolution-independence.md §6.3).
+    WindowMinSize { window: u32, width: u32, height: u32 },
     /// `slot` (0 or 1) of `window` holds a new frame, sequence `seq`.
     FrameReady { window: u32, slot: u32, seq: u32 },
     /// One MIME type of the drag the next [`Msg::DragBegin`] on `window`
@@ -234,6 +237,10 @@ pub enum DragPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused(pub &'static str);
 
+/// The largest minimum size a window may give, points a side (mirrors
+/// `fresco_protocol::MAX_MIN_SIZE_PT`; this crate depends on no protocol).
+pub const MAX_MIN_SIZE_PT: u32 = 8192;
+
 /// WINDOW_CREATE's role word carries the `embed_pending` flag in this bit.
 const EMBED_PENDING_BIT: u32 = 8;
 
@@ -243,6 +250,7 @@ mod kind {
     pub const WINDOW_CREATE: u32 = 1;
     pub const WINDOW_DESTROY: u32 = 2;
     pub const FOCUS_PARENT: u32 = 16;
+    pub const WINDOW_MIN_SIZE: u32 = 17;
     pub const WINDOW_TITLE: u32 = 3;
     pub const FRAME_READY: u32 = 4;
     pub const CLIENT: u32 = 0x100;
@@ -337,6 +345,7 @@ impl Msg {
             | Msg::WindowDestroy { window }
             | Msg::FocusParent { window }
             | Msg::WindowTitle { window, .. }
+            | Msg::WindowMinSize { window, .. }
             | Msg::FrameReady { window, .. }
             | Msg::Slots { window, .. }
             | Msg::FrameDone { window, .. }
@@ -396,6 +405,12 @@ impl Msg {
             }
             Msg::WindowDestroy { window } => Rec::new(WINDOW_DESTROY, *window),
             Msg::FocusParent { window } => Rec::new(FOCUS_PARENT, *window),
+            Msg::WindowMinSize { window, width, height } => {
+                let mut r = Rec::new(WINDOW_MIN_SIZE, *window);
+                r.put(2, *width);
+                r.put(3, *height);
+                r
+            }
             Msg::WindowTitle { window, title } => {
                 let mut r = Rec::new(WINDOW_TITLE, *window);
                 r.title(title);
@@ -709,6 +724,7 @@ impl Msg {
             WINDOW_CREATE => (6, true),
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE | FOCUS_PARENT => (0, false),
+            WINDOW_MIN_SIZE => (2, false),
             FRAME_READY | GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
             MAGNIFY => (4, false),
@@ -793,6 +809,10 @@ impl Msg {
             },
             WINDOW_DESTROY => Msg::WindowDestroy { window },
             FOCUS_PARENT => Msg::FocusParent { window },
+            WINDOW_MIN_SIZE => {
+                let side = |v: u32| if v <= MAX_MIN_SIZE_PT { Ok(v) } else { Err(Refused("minimum size out of range")) };
+                Msg::WindowMinSize { window, width: side(r.get(2))?, height: side(r.get(3))? }
+            }
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
             CLIENT => Msg::Client {
@@ -1002,6 +1022,7 @@ impl Msg {
                 | Msg::WindowDestroy { .. }
                 | Msg::FocusParent { .. }
                 | Msg::WindowTitle { .. }
+                | Msg::WindowMinSize { .. }
                 | Msg::FrameReady { .. }
                 | Msg::DragFormat { .. }
                 | Msg::DragBegin { .. }

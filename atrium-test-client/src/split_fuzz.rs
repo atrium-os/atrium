@@ -177,7 +177,8 @@ fn renderer(seed: u64) {
                 }
                 Msg::WindowDestroy { window }.encode()
             }
-            63..=69 => Msg::WindowTitle { window: some_window(&mut r), title: "x".repeat(r.below(64) as usize) }.encode(),
+            63..=66 => Msg::WindowTitle { window: some_window(&mut r), title: "x".repeat(r.below(64) as usize) }.encode(),
+            67..=69 => Msg::WindowMinSize { window: some_window(&mut r), width: r.below(9000), height: r.below(9000) }.encode(),
             70..=74 => {
                 // A record only the broker sends.
                 let window = some_window(&mut r);

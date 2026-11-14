@@ -1727,6 +1727,9 @@ impl EnvelopeFrontend {
             if let Some((x, y)) = p.hints.initial_position {
                 win.pos = (x as f32, y as f32);
             }
+            if let Some((w, h)) = p.hints.min_size {
+                win.min_size = (w.min(crate::window::MAX_MIN_SIZE_PT), h.min(crate::window::MAX_MIN_SIZE_PT));
+            }
             /* Record the declared role so WM_ENUMERATE reports it and the
              * WM can place/layer by role (forum.md §2.2). `hud` is a
              * Forum-reserved layer no app may claim (overlay-safety): clamp
@@ -1819,6 +1822,7 @@ impl EnvelopeFrontend {
                     w: w.size.0 as i32,
                     h: w.size.1 as i32,
                 },
+                min_size: size_to_device(w.min_size, w.scale_milli),
             })
             .collect();
         // Stable order (by surface id) so the WM sees a deterministic set.
@@ -2000,15 +2004,17 @@ impl EnvelopeFrontend {
         let p: WindowSetHintsPayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
         let win_id = p.window_id as u16;
-        let comp = self.compositor.lock().unwrap();
+        let mut comp = self.compositor.lock().unwrap();
         let win = comp.windows.get(&win_id)
             .ok_or(DispatchError::UnknownWindow)?;
         if win.owner != self.current_client as u32 {
             return Err(DispatchError::NotOwner);
         }
-        /* Hints currently advisory; M2.6d's compositor hooks will act
-         * on them (min_size enforcement on resize, modal z-shifting). */
-        let _ = p.hints;
+        /* The minimum size goes to the WM (resolution-independence.md
+         * §6.3); the other hints are still advisory. */
+        if let Some(min) = p.hints.min_size {
+            comp.set_min_size(win_id, min);
+        }
         Ok(Vec::new())
     }
 
@@ -2865,6 +2871,37 @@ mod tests {
         let comp = f.compositor_arc().lock().unwrap();
         let win = comp.windows.get(&(new_id as u16)).expect("window exists");
         assert_eq!(win.pos, (380.0, 80.0));
+    }
+
+    /// The minimum size an app gives (points, at create and later) reaches
+    /// the WM in device pixels at the window's scale, capped, and only the
+    /// window's owner may set it (resolution-independence.md §6.3).
+    #[test]
+    fn the_min_size_reaches_the_wm_in_device_pixels() {
+        let mut f = fixture();
+        let p = WindowCreatePayload {
+            width: 400, height: 300, title: "".into(),
+            hints: WindowHints { min_size: Some((200, 100)), ..Default::default() },
+            parent_window_id: 0,
+        };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1).expect("create");
+        let id: u32 = decode(&out[0].payload).unwrap();
+        f.compositor_arc().lock().unwrap().windows.get_mut(&(id as u16)).unwrap().scale_milli = 1500;
+        f.grant_window_management(1);
+        let min = |f: &mut EnvelopeFrontend| {
+            let out = f.dispatch(&msg(control::OP_WM_ENUMERATE, 0, Vec::new()), 1).expect("enumerate");
+            let r: WmEnumerateReply = decode(&out[0].payload).unwrap();
+            r.surfaces.iter().find(|s| s.surface_id == id).unwrap().min_size
+        };
+        assert_eq!(min(&mut f), (300, 150));
+        let set = |min| WindowSetHintsPayload { window_id: id, hints: WindowHints { min_size: min, ..Default::default() } };
+        f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((320, 9999)))).unwrap()), 1).expect("set");
+        assert_eq!(min(&mut f), (480, 8192 * 3 / 2), "capped at MAX_MIN_SIZE_PT");
+        f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(None)).unwrap()), 1).expect("set");
+        assert_eq!(min(&mut f), (480, 8192 * 3 / 2), "None leaves it");
+        assert!(f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((0, 0)))).unwrap()), 2).is_err(), "not the owner");
+        f.dispatch(&msg(control::OP_WINDOW_SET_HINTS, 0, encode(&set(Some((0, 0)))).unwrap()), 1).expect("set");
+        assert_eq!(min(&mut f), (0, 0), "cleared");
     }
 
     #[test]

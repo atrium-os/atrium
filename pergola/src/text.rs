@@ -289,10 +289,12 @@ mod tests {
         struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl MeasureText for Counting {
             fn measure_width(&mut self, _: &str, size: f32, _: u16, s: &str) -> Option<f32> {
-                // Only this test's size: other tests measure meanwhile.
-                if size == 13.5 * text_scale() {
-                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Only this test's size: other tests measure meanwhile, and
+                // get the estimate as if no measurer were installed.
+                if size != 13.5 * text_scale() {
+                    return None;
                 }
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Some(s.chars().count() as f32 * 7.0)
             }
         }

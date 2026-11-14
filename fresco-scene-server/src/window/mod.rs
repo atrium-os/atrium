@@ -58,6 +58,8 @@ pub enum DisplayEvent {
     WindowCreated        { window_id: u32 },
     /// A surface was destroyed. The WM reconciles to reclaim its slot.
     WindowDestroyed      { window_id: u32 },
+    /// A window's minimum size changed: to the WM, which places it again.
+    WindowMinSize        { window_id: u32 },
     /// The display's mode changed; every client lays out again.
     /// `scale_milli`: the scale new windows open at.
     DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32, scale_milli: u32 },
@@ -284,6 +286,10 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
             let p = WindowDestroyedEvent { window_id: *window_id };
             Ok((control::EV_WINDOW_DESTROYED, encode(&p)?))
         }
+        DisplayEvent::WindowMinSize { window_id } => {
+            let p = fresco_protocol::WindowMinSizeEvent { window_id: *window_id };
+            Ok((control::EV_WINDOW_MIN_SIZE, encode(&p)?))
+        }
         DisplayEvent::AppearanceChanged(p) => Ok((control::EV_APPEARANCE_CHANGED, encode(p)?)),
         DisplayEvent::WindowSpan { window_id, tiles, hidden } => {
             let p = fresco_protocol::WindowSpanEvent { window_id: *window_id, tiles: tiles.clone(), hidden: hidden.clone() };
@@ -431,6 +437,9 @@ pub type ClientId = u32;
 ///
 /// `slots` and `scene` are `Arc<Mutex<>>` so window 0's Arcs can be
 /// shared with the renderer's read path — see `Compositor::new_with_window0`.
+/// The largest minimum size a window may ask for, points a side.
+pub use fresco_protocol::MAX_MIN_SIZE_PT;
+
 pub struct Window {
     pub id:     WindowId,
     pub owner:  ClientId,
@@ -488,6 +497,10 @@ pub struct Window {
     pub scale_milli: u32,
     /// A pop-up: frescod places, stacks and dismisses it.
     pub popup: Option<Popup>,
+    /// The smallest content the app can lay out in, points
+    /// (`WindowHints.min_size`; 0 = none), reported to the WM at the
+    /// window's scale (resolution-independence.md §6.3).
+    pub min_size: (u32, u32),
 }
 
 impl Window {
@@ -508,6 +521,7 @@ impl Window {
             embed_pending: false,
             kept_by: None,
             embed_token: [0; 16],
+            min_size: (0, 0),
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -530,6 +544,7 @@ impl Window {
             embed_pending: false,
             kept_by: None,
             embed_token: [0; 16],
+            min_size: (0, 0),
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -1168,6 +1183,17 @@ impl Compositor {
             self.set_embed_focus(Some(target));
         } else if self.embed_focus.and_then(|e| self.windows.get(&e)).and_then(|e| e.slot).is_some_and(|s| s.parent == target) {
             self.set_embed_focus(None);
+        }
+    }
+
+    /// Set `id`'s minimum size (points, each side at most
+    /// [`MAX_MIN_SIZE_PT`]; 0 = none) and tell the WM if it changed.
+    pub fn set_min_size(&mut self, id: WindowId, pt: (u32, u32)) {
+        let pt = (pt.0.min(MAX_MIN_SIZE_PT), pt.1.min(MAX_MIN_SIZE_PT));
+        let Some(w) = self.windows.get_mut(&id) else { return };
+        if w.min_size != pt {
+            w.min_size = pt;
+            self.emit(DisplayEvent::WindowMinSize { window_id: id as u32 });
         }
     }
 
