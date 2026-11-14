@@ -5714,7 +5714,12 @@ Ctrl-F and typing `atrium` (the child's `navigator-page: find: N matches` in lim
 `find: N matches, at K`), Enter to the next match, Esc; the Aa pop-up pressed at its scene
 coordinates (Text size + at 1190,152 and Comfortable at 1204,270 on the 1280-wide window), checking
 the child's `laid out again: text 112%` and the `reading` record in trails.json; Ctrl-plus; Ctrl-H,
-typing `impl` and Enter opening Impluvium from history. Keys are injected with the press held 1 s.
+typing `impl` and Enter opening Impluvium from history, which shows the stored-version prompt
+(`prompt=stored`); its primary answer, Fetch the current version, must make navigatord fetch it
+again (another `opened … Fetched` line). Then Ctrl-H and Clear all… (pressed at the history
+column's right, computed from the trace's `page=` and `w=`), the `alert` in the ax lines, Enter:
+`history: cleared N pages` in ui9.log, `navigatord: cleared N page records` and fewer objects in
+`$S/store`, and `"earlier": []` in trails.json with the page on screen kept (frame `live-14-clear`). Keys are injected with the press held 1 s.
 A press in the page gives the page the keys (frescod's `embed_focus`; forum-wm focuses the page's
 window): the script presses in the left margin (`inpage`, no link there at either width), then
 Ctrl-F from the page must be handed back (`a key from the page: Find`) with the find field focused,

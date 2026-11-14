@@ -39,6 +39,9 @@ pub fn is_image_address(a: &str) -> bool {
 
 pub type Ticket = [u8; 16];
 
+/// The most page records one `Clear` names.
+pub const CLEAR_MAX: usize = 512;
+
 /// UI → navigatord.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -60,7 +63,15 @@ pub enum Request {
     /// person let this site remember them in that jar (§6.2), so its
     /// requests carry the jar's cookies (through Arca) and its conversion
     /// is private.
-    Open { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool },
+    /// `fresh`: the current version (Reload, "Fetch the current version",
+    /// §5.5): fetched again, neither the cache nor `saved` taken.
+    Open { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
+    /// Clearing history (§5.5): take these page records out of the store,
+    /// with each recording and image no record left still names, and drop
+    /// the pages they were from the cache. Only page records navigatord
+    /// wrote are taken; anything else named is ignored. At most
+    /// [`CLEAR_MAX`] a frame: the UI sends more frames for more.
+    Clear { records: Vec<String> },
     /// Forget: with `url`, its site's cookies in the jar ("Forget this
     /// site"); without, an Unrecorded trail's whole jar (the trail closed).
     Forget { jar: Jar, url: Option<String> },
@@ -308,7 +319,11 @@ mod tests {
     #[test]
     fn frames_round_trip_and_bounds_hold() {
         let mut buf = Vec::new();
-        let m = Request::Open { id: 7, url: "https://atlas.example/".into(), saved: Some("ab".repeat(32)), jar: Jar::Unrecorded(7), knows: true };
+        let m = Request::Open { id: 7, url: "https://atlas.example/".into(), saved: Some("ab".repeat(32)), jar: Jar::Unrecorded(7), knows: true, fresh: true };
+        let clear = Request::Clear { records: vec!["ab".repeat(32); CLEAR_MAX] };
+        let mut big = vec![];
+        write_frame(&mut big, &clear).unwrap();
+        assert!(big.len() < MAX_FRAME, "a full Clear fits a frame");
         assert!(is_address(&"ab".repeat(32)) && !is_address("AB") && !is_address(&"g".repeat(64)));
         write_frame(&mut buf, &m).unwrap();
         write_frame(&mut buf, &Event::Link { id: 7, action: LinkAction::InDocument { fragment: "a".into() } }).unwrap();

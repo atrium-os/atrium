@@ -90,6 +90,9 @@ pub struct Live {
     jars: HashSet<u64>,
     /// The history view is open, the page's slot withdrawn.
     history: bool,
+    /// Pages to open as their current version, not the stored one
+    /// (Reload, "Fetch the current version").
+    fresh: HashSet<Key>,
 }
 
 fn send(w: &mut UnixStream, r: &Request) {
@@ -157,6 +160,7 @@ impl Live {
                 budget,
                 jars: HashSet::new(),
                 history: false,
+                fresh: HashSet::new(),
             },
             fd,
         ))
@@ -251,7 +255,11 @@ impl Live {
             reading,
         });
         s.live = Some(LivePage::Loading(url.clone()));
-        send(&mut self.w, &Request::Open { id, url, saved, jar, knows });
+        let fresh = self.fresh.remove(&key);
+        if fresh {
+            eprintln!("navigator-ui: fetching the current version of {url}");
+        }
+        send(&mut self.w, &Request::Open { id, url, saved, jar, knows, fresh });
     }
 
     /// Park the least recently seen pages past the budget.
@@ -518,6 +526,25 @@ impl Live {
                 Out::Save { id } => send(&mut self.w, &Request::Save { id }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
                 Out::Hand { url, how } => send(&mut self.w, &Request::Hand { url, how }),
+                Out::Reload { key } => {
+                    // Its child closes; the page opens again, fetched.
+                    if let Some(i) = self.children.iter().position(|c| c.key == key) {
+                        self.close(i);
+                    }
+                    self.fresh.insert(key);
+                    if s.shown_key() == Some(key) {
+                        self.started = false;
+                    }
+                }
+                Out::Clear { keys, records } => {
+                    while let Some(i) = self.children.iter().position(|c| keys.contains(&c.key) && Some(c.key) != self.shown) {
+                        self.close(i);
+                    }
+                    eprintln!("navigator-ui: history cleared: {} pages of open trails, {} stored versions to take out", keys.len(), records.len());
+                    for chunk in records.chunks(navigator_control::CLEAR_MAX) {
+                        send(&mut self.w, &Request::Clear { records: chunk.to_vec() });
+                    }
+                }
                 Out::Find { query, step } => {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
                         self.to_child(c.embed, &ToChild::Find { query, step });

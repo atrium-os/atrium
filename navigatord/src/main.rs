@@ -33,7 +33,7 @@
 //! (`NAVIGATORD_FIXTURES`: `<dir>/<host>/<path>`, `index.html` for a
 //! directory) instead of the network.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -285,6 +285,55 @@ impl State {
         }
     }
 
+    /// Clearing history (navigator-ui.md §5.5): the page records named go,
+    /// with each recording and image no other record in the same store
+    /// names, and their pages leave the cache. Only objects that are page
+    /// records are taken. Returns (records, objects) removed.
+    fn clear(&mut self, records: &[String]) -> (usize, usize) {
+        let mut urls = HashSet::new();
+        let mut gone = HashSet::new();
+        let (mut nr, mut no) = (0, 0);
+        let stores = std::iter::once(&mut *self.store as &mut dyn Store).chain(self.memory.values_mut().map(|m| m as &mut dyn Store));
+        for store in stores {
+            let targets: Vec<(String, Record)> = records
+                .iter()
+                .filter(|a| ctl::is_address(a))
+                .filter_map(|a| record_of(&*store, a).map(|r| (a.clone(), r)))
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let named: HashSet<&str> = targets.iter().map(|(a, _)| a.as_str()).collect();
+            // What every other record here still names stays.
+            let mut kept = HashSet::new();
+            for (a, len) in store.list().unwrap_or_default() {
+                if len <= RECORD_SCAN_MAX && !named.contains(a.as_str()) {
+                    if let Some(r) = record_of(&*store, &a) {
+                        kept.insert(r.recording);
+                        kept.extend(r.images.into_iter().map(|(_, at)| at));
+                    }
+                }
+            }
+            for (a, r) in &targets {
+                let objects = std::iter::once(&r.recording).chain(r.images.iter().map(|(_, at)| at));
+                for o in objects.filter(|o| ctl::is_address(o) && !kept.contains(*o) && !named.contains(o.as_str())) {
+                    if store.remove(o).is_ok() {
+                        no += 1;
+                    }
+                }
+                if store.remove(a).is_ok() {
+                    nr += 1;
+                }
+                urls.insert(r.url.clone());
+                gone.insert(a.clone());
+            }
+        }
+        self.cache.retain(|p| !urls.contains(&p.url) && !gone.contains(&p.saved));
+        self.tickets.retain(|_, (p, _)| !urls.contains(&p.url));
+        self.known.retain(|u, a| !urls.contains(u) && !gone.contains(a));
+        (nr, no)
+    }
+
     /// An Unrecorded jar closed, or a site was forgotten in a jar: its
     /// private pages go (`site` `None`: all of the jar's).
     fn forget(&mut self, jar: Jar, site: Option<&str>) {
@@ -305,6 +354,17 @@ impl State {
         t
     }
 }
+
+/// The page record at `a` in `store`, if that is what it holds.
+fn record_of(store: &dyn Store, a: &str) -> Option<Record> {
+    let b = store.get(a).ok()?;
+    let r: Record = serde_json::from_slice(&b).ok()?;
+    (r.format == RECORD).then_some(r)
+}
+
+/// Objects larger than this are not read as page records when clearing
+/// (a record names at most `IMAGES_MAX` images: well under it).
+const RECORD_SCAN_MAX: u64 = 256 << 10;
 
 // ---------------------------------------------------------------------------
 // Fetching and converting.
@@ -692,7 +752,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
-            Request::Open { id, url, saved, jar, knows } => {
+            Request::Clear { records } => {
+                if records.len() > ctl::CLEAR_MAX {
+                    continue;
+                }
+                let (r, o) = state.lock().unwrap().clear(&records);
+                eprintln!("navigatord: cleared {r} page records and {o} objects from the store");
+            }
+            Request::Open { id, url, saved, jar, knows, fresh } => {
                 if !ctl::clean(&url, ctl::URL_MAX) {
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
@@ -724,7 +791,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     };
                     let ctx = Ctx { jar, knows: cookied.is_some() };
                     let view = cookied.as_ref().map(|(_, v)| *v);
-                    let hit = state.lock().unwrap().cached(&url, Some(ctx));
+                    let hit = if fresh { None } else { state.lock().unwrap().cached(&url, Some(ctx)) };
+                    let saved = saved.filter(|_| !fresh);
                     let page = match hit {
                         Some(p) => Ok((p, Source::Cache)),
                         None => {
@@ -1054,5 +1122,43 @@ mod tests {
         assert!(st.tickets.remove(&t).is_none());
         assert!(st.cached("https://a.example/", Some(Ctx::ANON)).is_some());
         assert!(st.cached("https://a.example/", Some(Ctx { jar: Jar::Personal, knows: true })).is_none(), "the anonymous page is not the cookied one");
+    }
+
+    #[test]
+    fn clearing_takes_records_and_what_only_they_name() {
+        let mut st = State::default();
+        let img = |b: &[u8]| (format!("blake3:{}", navigator_backend::session::digest(b)), b.to_vec());
+        let mut a = page("https://a.example/", "x");
+        a.images = Arc::new(vec![img(b"shared"), img(b"only-a")]);
+        let a = st.stored(a);
+        // The same page seen again: another record, the same recording.
+        let mut b = page("https://b.example/", "y");
+        b.images = Arc::new(vec![img(b"shared")]);
+        let b = st.stored(b);
+        let a2 = Page { url: "https://a.example/?again".into(), ..page("https://a.example/", "x") };
+        let a2 = st.stored(a2);
+        let objects = |st: &State| st.store.list().unwrap().len();
+        let before = objects(&st);
+        st.keep(Arc::new(page("https://a.example/", "x")), "https://a.example/");
+        // A recording is not a record: naming one takes nothing.
+        let rec = navigator_backend::session::digest(&a.recording);
+        assert_eq!(st.clear(&[rec.clone(), "../x".into()]), (0, 0));
+        assert_eq!(objects(&st), before);
+        let (r, o) = st.clear(std::slice::from_ref(&a.saved));
+        assert_eq!(r, 1);
+        assert_eq!(o, 1, "only a's own image: the recording is a2's too, the shared image b's");
+        assert!(st.reopen("https://a.example/", &a.saved, Ctx::ANON).is_err());
+        assert!(st.cached("https://a.example/", None).is_none(), "out of the cache too");
+        assert!(st.reopen("https://b.example/", &b.saved, Ctx::ANON).is_ok());
+        assert!(st.reopen("https://a.example/?again", &a2.saved, Ctx::ANON).is_ok());
+        assert_eq!(st.clear(&[b.saved.clone(), a2.saved.clone()]), (2, 3), "b's recording, the shared image, a's recording");
+        assert_eq!(objects(&st), 0, "nothing left");
+        // A private page's record is in its jar's memory store.
+        let uj = Ctx { jar: Jar::Unrecorded(3), knows: false };
+        let mut up = page("https://u.example/", "u");
+        up.ctx = uj;
+        let u = st.stored(up);
+        assert_eq!(st.clear(std::slice::from_ref(&u.saved)), (1, 1));
+        assert!(st.reopen("https://u.example/", &u.saved, uj).is_err());
     }
 }

@@ -29,6 +29,8 @@ pub enum Action {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Ctrl-R: the current version of the page, fetched again (§5.5).
+    Reload,
 }
 
 /// The action a key press asks for, if it is one of §9's. Not yet: F6
@@ -64,6 +66,7 @@ pub fn action(ev: &Event) -> Option<Action> {
         ("/", _) | ("?", true) => Action::ToggleStatus,
         ("f", false) => Action::Find,
         ("h", false) => Action::History,
+        ("r", false) => Action::Reload,
         ("+" | "=", _) => Action::ZoomIn,
         ("-", false) => Action::ZoomOut,
         ("0", false) => Action::ZoomReset,

@@ -166,6 +166,9 @@ pub enum Prompt {
     /// An `atrium-app:` link (navigator.md §2.2): try it in a jail that
     /// keeps nothing, or open it.
     OpenApp { url: String, name: String },
+    /// Opened from history (§5.5): this is the version stored when it was
+    /// seen (`at_s`), offline; the current one is a press away.
+    Stored { at_s: u64 },
 }
 
 impl Prompt {
@@ -180,6 +183,7 @@ impl Prompt {
             Prompt::Handoff { scheme, .. } if scheme == "mailto" => &["Not now", "Open in Mail"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
             Prompt::OpenApp { .. } => &["Not now", "Open", "Try it"],
+            Prompt::Stored { .. } => &["Not now", "Fetch the current version"],
         }
     }
 
@@ -192,6 +196,7 @@ impl Prompt {
             Prompt::FetchAgain => "fetch-again".into(),
             Prompt::Play { origin } => format!("play {origin}"),
             Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. } => format!("hand {url}"),
+            Prompt::Stored { .. } => "stored".into(),
         }
     }
 }
@@ -249,6 +254,13 @@ pub struct Page {
     /// When it was opened (Unix s; 0: not known), for the history view's
     /// days (§5.5).
     pub at_s: u64,
+}
+
+impl Page {
+    /// Cleared from history (§5.5): an empty record kept for its index.
+    pub fn cleared(&self) -> bool {
+        self.url.is_empty()
+    }
 }
 
 /// What it takes to add a page (from the broker in step 2).
@@ -386,7 +398,7 @@ impl Trail {
 
     /// Make `id` current (a click on a path row, a suggestion).
     pub fn go(&mut self, id: PageId) -> bool {
-        if id >= self.pages.len() {
+        if self.pages.get(id).is_none_or(|p| p.cleared()) {
             return false;
         }
         self.current = Some(id);
@@ -416,6 +428,66 @@ impl Trail {
             self.pages[id].parent = None;
         }
         parent
+    }
+
+    /// Clear a page from history (§5.5): it leaves the tree, its children
+    /// hang on its parent, and its record is emptied. It keeps its index
+    /// (pages are named by index while the UI runs; the store on disk is
+    /// written without it). The current page moves to its parent, or to
+    /// any page left. Returns the record's store address.
+    pub fn clear_page(&mut self, id: PageId) -> Option<String> {
+        if self.pages.get(id).is_none_or(|p| p.cleared()) {
+            return None;
+        }
+        let parent = self.pages[id].parent;
+        let children = std::mem::take(&mut self.pages[id].children);
+        for &c in &children {
+            self.pages[c].parent = parent;
+        }
+        if let Some(p) = parent {
+            let kids = &mut self.pages[p].children;
+            match kids.iter().position(|&c| c == id) {
+                Some(at) => {
+                    kids.splice(at..=at, children);
+                }
+                None => kids.extend(children),
+            }
+        }
+        if self.current == Some(id) {
+            self.current = parent.or_else(|| self.pages.iter().enumerate().position(|(i, p)| i != id && !p.cleared()));
+        }
+        let p = &mut self.pages[id];
+        p.parent = None;
+        p.url.clear();
+        p.title.clear();
+        p.search = None;
+        p.seen = true;
+        p.asked = None;
+        p.prompts = Prompts::default();
+        p.scroll = 0.0;
+        p.saved.take()
+    }
+
+    /// Whether any page is left that is not cleared.
+    pub fn is_empty(&self) -> bool {
+        self.pages.iter().all(|p| p.cleared())
+    }
+
+    /// This trail as the store on disk keeps it: cleared pages left out,
+    /// the others renumbered.
+    pub fn compacted(&self) -> Trail {
+        let mut map = vec![None; self.pages.len()];
+        let mut t = Trail { pages: vec![], current: None, ..self.clone() };
+        for (i, p) in self.pages.iter().enumerate().filter(|(_, p)| !p.cleared()) {
+            map[i] = Some(t.pages.len());
+            t.pages.push(p.clone());
+        }
+        for p in &mut t.pages {
+            p.parent = p.parent.and_then(|q| map[q]);
+            p.children = p.children.iter().filter_map(|&c| map[c]).collect();
+        }
+        t.current = self.current.and_then(|c| map[c]);
+        t
     }
 
     /// True while a branch opened beside has not been looked at.

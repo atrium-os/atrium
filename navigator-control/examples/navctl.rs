@@ -29,7 +29,7 @@ fn main() {
         match a[i].as_str() {
             "open" => {
                 let (id, url, j, knows) = (a[i + 1].parse().unwrap(), a[i + 2].clone(), jar(&a[i + 3]), a[i + 4] == "1");
-                write_frame(&mut s, &Request::Open { id, url, saved: None, jar: j, knows }).unwrap();
+                write_frame(&mut s, &Request::Open { id, url, saved: None, jar: j, knows, fresh: false }).unwrap();
                 loop {
                     match read_frame::<Event>(&mut s) {
                         Ok(Some(Event::Opened { id: got, url, knows, from, note, .. })) if got == id => {

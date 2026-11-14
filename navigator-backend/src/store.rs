@@ -20,6 +20,11 @@ pub trait Store {
     fn put(&mut self, bytes: &[u8]) -> Result<String, String>;
     /// The bytes at an address, checked against it.
     fn get(&self, address: &str) -> Result<Vec<u8>, String>;
+    /// Take an object out (clearing history, navigator-ui.md §5.5). The
+    /// store does not know what still names it: the caller does.
+    fn remove(&mut self, address: &str) -> Result<(), String>;
+    /// Every object's address and size, in no order.
+    fn list(&self) -> Result<Vec<(String, u64)>, String>;
 }
 
 fn valid(address: &str) -> bool {
@@ -44,6 +49,13 @@ impl Store for MemoryStore {
         if !valid(address) { return Err(format!("{address:?} is not an address")) }
         let b = self.objects.get(address).cloned().ok_or_else(|| format!("no object {address}"))?;
         checked(address, b)
+    }
+    fn remove(&mut self, address: &str) -> Result<(), String> {
+        self.objects.remove(address);
+        Ok(())
+    }
+    fn list(&self) -> Result<Vec<(String, u64)>, String> {
+        Ok(self.objects.iter().map(|(a, b)| (a.clone(), b.len() as u64)).collect())
     }
 }
 
@@ -76,5 +88,25 @@ impl Store for DirStore {
         if !valid(address) { return Err(format!("{address:?} is not an address")) }
         let b = std::fs::read(self.dir.join(address)).map_err(|e| format!("no object {address}: {e}"))?;
         checked(address, b)
+    }
+    fn remove(&mut self, address: &str) -> Result<(), String> {
+        if !valid(address) { return Err(format!("{address:?} is not an address")) }
+        match std::fs::remove_file(self.dir.join(address)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{address}: {e}")),
+        }
+    }
+    fn list(&self) -> Result<Vec<(String, u64)>, String> {
+        let mut v = vec![];
+        for e in std::fs::read_dir(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))? {
+            let e = e.map_err(|e| format!("{}: {e}", self.dir.display()))?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            // Only objects: a `.x.tmp` mid-write, or anything else, is not one.
+            if valid(&name) {
+                v.push((name, e.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+        Ok(v)
     }
 }

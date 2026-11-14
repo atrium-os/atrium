@@ -320,6 +320,42 @@ key 0x28
 until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && ok "filtering and Enter opened Impluvium from history" || bad "history open: $(last)"
 g "grep -q 'ax  *tree \"Trails\"' $S/ui9.log" && g "grep -q 'ax  *embedded-content \"Impluvium' $S/ui9.log" && g "grep -q 'ax  *document \"History' $S/ui9.log" \
     && ok "the accessibility tree has the rail as a tree, the page slot, the history view" || bad "ax: $(g "grep ' ax ' $S/ui9.log | tail -12")"
+# A page from history opens as its stored version and offers the current one.
+until_trace 'prompt=stored .*url=https://atlas.example/wiki/Impluvium ' && ok "…as the version stored when it was seen, offering the current one" || bad "stored: $(last)"
+F0=$(g "cat $S/navigatord*.log | grep -c 'opened https://atlas.example/wiki/Impluvium .*Fetched'")
+sleep 1
+answer                      # Fetch the current version
+until_trace 'prompt=- .*url=https://atlas.example/wiki/Impluvium live=shown' || bad "fetch: $(last)"
+F1=$(g "cat $S/navigatord*.log | grep -c 'opened https://atlas.example/wiki/Impluvium .*Fetched'")
+g "grep -q 'fetching the current version of https://atlas.example/wiki/Impluvium' $S/ui9.log" && [ "$F1" -gt "$F0" ] \
+    && ok "Fetch the current version fetched it again (not the cache or the store)" || bad "fetch: $F0 -> $F1; $(g "grep -v trace $S/ui9.log | tail -3")"
+# Clearing history: it asks first, then the trail store and navigatord's
+# store lose the pages, and each open trail keeps the page it is on. The
+# trail on screen is put away first, so its pages are cleared whole.
+key 0x1a 0x01               # Ctrl-W
+key 0x0b 0x01               # Ctrl-H
+P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
+PW=$((W - PX)); COL=$((PW - 64)); [ "$COL" -gt 720 ] && COL=720
+X0=$((PX + (PW - COL) / 2))
+N0=$(g "ls $S/store | wc -l")
+press $((X0 + COL - 120 + 42)) $((TOP + PY + 38))    # Clear all…
+g "grep -q 'ax  *alert \"Clear all history, [0-9]* pages' $S/ui9.log" && ok "Clear all asked first, saying how many pages it takes" || bad "clear: $(g "grep -v trace $S/ui9.log | tail -3")"
+shot live-14-clear
+key 0x28                    # Enter: Clear
+sleep 3
+g "grep -q 'history: cleared [1-9][0-9]* pages from all history' $S/ui9.log" && ok "…Enter cleared them from the trail store" || bad "cleared: $(g "grep -v trace $S/ui9.log | tail -3")"
+N1=$(g "ls $S/store | wc -l")
+# A stored version still named by a page left (each trail's own page) stays:
+# the UI says how many it asked navigatord to take out.
+V=$(g "grep 'history: cleared' $S/ui9.log | tail -1" | sed -n 's/.*(\([0-9]*\) stored versions).*/\1/p')
+if [ "${V:-0}" -gt 0 ]; then
+    g "grep -q 'navigatord: cleared $V page records' $S/navigatord*.log" && [ "$N1" -lt "$N0" ] \
+        && ok "…and navigatord took their $V stored versions out of its store ($N0 -> $N1 objects)" || bad "store: $V asked, $N0 -> $N1; $(g "grep cleared $S/navigatord*.log")"
+else
+    bad "store: no stored version was only the cleared pages' ($N0 -> $N1)"
+fi
+g "grep -q '\"earlier\": \[\]' $S/trails.json" \
+    && ok "…nothing put away is left" || bad "trails: $(g "head -c 600 $S/trails.json")"
 g "pkill -x navigator-ui; sleep 2; true"
 
 echo "=== logs"

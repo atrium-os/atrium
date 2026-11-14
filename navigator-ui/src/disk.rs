@@ -135,6 +135,8 @@ fn cut(s: &str, max: usize) -> String {
 }
 
 fn trail_rec(t: &Trail) -> TrailRec {
+    // Cleared pages are not written (§5.5).
+    let t = &t.compacted();
     TrailRec {
         pages: t.pages.iter().map(|p| PageRec { url: p.url.clone(), title: cut(&p.title, MAX_TITLE), search: p.search.clone(), parent: p.parent, seen: p.seen, saved: p.saved.clone(), scroll: p.scroll, at_s: p.at_s }).collect(),
         current: t.current,

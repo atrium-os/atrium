@@ -21,6 +21,7 @@ use pergola::widgets::Glyph;
 use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use crate::fake;
+use crate::history::Clear;
 use crate::shell::{self, Geo, Shell, DROP_LABEL, DROP_ROW, HIST_DAY, PAGE_SLOT};
 use crate::trail::{self, Light, Prompt, RowMedia, Tier};
 use crate::where_field::Source;
@@ -102,6 +103,7 @@ pub fn trace(s: &mut Shell) {
                 Prompt::Play { .. } => "play",
                 Prompt::Handoff { .. } => "handoff",
                 Prompt::OpenApp { .. } => "app",
+                Prompt::Stored { .. } => "stored",
             }),
             s.rail_w(),
             t.page().map_or("-", |p| p.url.as_str()),
@@ -587,9 +589,7 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let st2 = st.clone();
     icon_button(ctx, x0 + 41.0, 6.0, ph::ARROW_RIGHT, tr.can_forward(), t.text_secondary(), "Forward (Alt-Right)", move || with(&st2, |s| s.apply(crate::keys::Action::Forward, now_ms())));
     let st2 = st.clone();
-    icon_button(ctx, x0 + 73.0, 6.0, ph::ARROW_CLOCKWISE, page.is_some(), t.text_secondary(), "Reload: a new version of this page", move || with(&st2, |s| {
-        s.last_note = Some("reload: a new version of the page comes from the broker in step 2".into());
-    }));
+    icon_button(ctx, x0 + 73.0, 6.0, ph::ARROW_CLOCKWISE, page.is_some(), t.text_secondary(), "Reload: the current version of this page (Ctrl-R)", move || with(&st2, |s| s.reload()));
 
     let f = g.where_;
     match &s.editing {
@@ -1011,9 +1011,26 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     text(ctx, x, y + 12.0, "History", type_size::XL, Weight::Semibold, t.text_primary());
     let st2 = st.clone();
     icon_button(ctx, x + col - 28.0, y, ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&st2, |s| s.history = None));
+    let st2 = st.clone();
+    let (cx, cw) = shell::history_clear_all(x, col);
+    small_button(ctx, Rect::new(cx, y + 1.0, cw, 26.0), None, "Clear all…", false, "Clear all history", move || with(&st2, |s| s.ask_clear(Clear::All)));
     y += 40.0;
     text_field(ctx, Rect::new(x, y, col, 32.0), &h.edit, "Filter by title or address");
     y += 48.0;
+    if let Some((what, n)) = &h.confirm {
+        // It can't be undone: it says what it takes, and asks.
+        boxed(ctx, x - 8.0, y, col + 16.0, shell::HIST_CONFIRM - 12.0, t.border_default(), t.bg_elevated(), 8.0);
+        text(ctx, x + 4.0, y + 22.0, &fit(&clear_question(what, *n), &sans(type_size::SM, Weight::Medium, t.text_primary()), col - 180.0), type_size::SM, Weight::Medium, t.text_primary());
+        let st2 = st.clone();
+        small_button(ctx, Rect::new(x + col - 160.0, y + 8.0, 72.0, 28.0), None, "Cancel", false, "", move || with(&st2, |s| {
+            if let Some(h) = &mut s.history {
+                h.confirm = None;
+            }
+        }));
+        let st2 = st.clone();
+        small_button(ctx, Rect::new(x + col - 80.0, y + 8.0, 80.0, 28.0), None, "Clear", true, "", move || with(&st2, |s| s.confirm_clear()));
+        y += shell::HIST_CONFIRM;
+    }
     let rows = s.history_rows();
     if rows.is_empty() {
         let msg = if h.edit.text().is_empty() { "Nothing yet. Pages you open in recorded trails are listed here." } else { "No page matches." };
@@ -1025,12 +1042,15 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
     let us = TextStyle { family: font::MONO.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() };
     for (i, row) in rows.iter().enumerate() {
-        let d = if row.at_s == 0 { "Earlier".to_string() } else { crate::clock::day_label(row.at_s, now) };
+        let d = crate::history::day_of(row.at_s, now);
         if d != day {
             if y + HIST_DAY + shell::HIST_ROW > r.y() + r.h() {
                 break;
             }
             text(ctx, x, y + 16.0, &d.to_uppercase(), type_size::XXS, Weight::Semibold, t.text_tertiary());
+            let st2 = st.clone();
+            let d2 = d.clone();
+            small_button(ctx, Rect::new(x + col - shell::HIST_DAY_CLEAR_W, y + 3.0, shell::HIST_DAY_CLEAR_W, 22.0), None, "Clear day", false, &format!("Clear {d}"), move || with(&st2, |s| s.ask_clear(Clear::Day(d2.clone()))));
             y += shell::HIST_DAY;
             day = d;
         }
@@ -1040,11 +1060,10 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         let st2 = st.clone();
         let row2 = row.clone();
         let fill = if i == h.selected { t.state_hover() } else { Color::TRANSPARENT };
-        area(ctx, Rect::new(x - 8.0, y, col + 16.0, shell::HIST_ROW), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.open_history_row(&row2)));
+        area(ctx, Rect::new(x - 8.0, y, col + 16.0, shell::HIST_ROW), 6.0, fill, t.state_hover(), move || with(&st2, |s| s.open_history_row(&row2, now_ms())));
         monogram(ctx, x, y + 7.0, &row.url, false);
         text(ctx, x + 30.0, y + 17.0, &fit(&row.title, &ts, col * 0.45), type_size::SM, Weight::Medium, t.text_primary());
         let ux = x + 40.0 + col * 0.45;
-        ctx.add(Node::Text { rect: Rect::new(ux, y + 9.0, 0.0, 16.0), content: fit(&row.url, &us, col - (ux - x) - 110.0), style: us.clone() });
         let when = if row.at_s == 0 { String::new() } else { crate::clock::when_label(row.at_s, now).rsplit(' ').next().unwrap_or("").to_string() };
         let label = match row.place {
             crate::history::Place::Open(_) => when,
@@ -1052,9 +1071,24 @@ fn history(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         };
         let ls = sans(type_size::XS, Weight::Regular, t.text_tertiary());
         let lw = width(&label, &ls);
-        text(ctx, x + col - lw, y + 17.0, &label, type_size::XS, Weight::Regular, t.text_tertiary());
+        // The address up to the time label and the clear button.
+        ctx.add(Node::Text { rect: Rect::new(ux, y + 9.0, 0.0, 16.0), content: fit(&row.url, &us, (col - (ux - x) - lw - 36.0 - 16.0).max(40.0)), style: us.clone() });
+        text(ctx, x + col - lw - 36.0, y + 17.0, &label, type_size::XS, Weight::Regular, t.text_tertiary());
         ctx.pop();
+        let st2 = st.clone();
+        let site = trail::site(&row.url).to_string();
+        icon_button(ctx, x + col - 28.0, y + 3.0, ph::TRASH_SIMPLE, true, t.text_tertiary(), &format!("Clear everything from {site}"), move || with(&st2, |s| s.ask_clear(Clear::Site(site.clone()))));
         y += shell::HIST_ROW;
+    }
+}
+
+/// What the clear confirmation asks.
+pub fn clear_question(what: &Clear, n: usize) -> String {
+    let pages = if n == 1 { "1 page".to_string() } else { format!("{n} pages") };
+    match (what, n) {
+        (_, 0) => "Nothing to clear here: the page each trail is on stays.".into(),
+        (Clear::All, _) => format!("Clear all history, {pages} with their stored versions? This can't be undone."),
+        _ => format!("Clear {pages} {}, with their stored versions? This can't be undone.", what.label()),
     }
 }
 
@@ -1088,6 +1122,11 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
         Prompt::FetchAgain => (ph::ARROW_CLOCKWISE, vec![("This page could not be restored and will be fetched again".into(), body(t.text_secondary(), Weight::Regular))]),
+        Prompt::Stored { at_s } => (ph::CLOCK, vec![
+            ("The version you saw".into(), body(t.text_secondary(), Weight::Regular)),
+            (crate::clock::when_label(*at_s, crate::clock::now_s()), body(t.text_primary(), Weight::Semibold)),
+            ("from the store, offline".into(), body(t.text_secondary(), Weight::Regular)),
+        ]),
         Prompt::Play { origin } => (ph::PLAY, vec![
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
             ("wants to play sound".into(), body(t.text_secondary(), Weight::Regular)),

@@ -1248,8 +1248,20 @@ Each step runs in the VM on headless frescod before the next.
      trails and Earlier, newest first, by day (`Page::at_s`, now in the store), once per
      address. Unrecorded trails are left out. Typing filters by title or address, Up and
      Down move, Enter or a press goes to the page in its trail, bringing an Earlier trail
-     back, so it opens as the version navigatord stored. Not yet: "Fetch the current
-     version", and clearing by day or site.
+     back, so it opens as the version navigatord stored.
+     *2026-11-14:* a page opened from history whose stored version is known shows the prompt
+     row "The version you saw <when>, from the store, offline" with **Fetch the current
+     version**, which is Reload: `Open { fresh: true }`, so navigatord takes neither its cache
+     nor the stored version and fetches again (the toolbar's Reload and Ctrl-R do the same).
+     **Clearing** is per day (a Clear day button on each day label), per site (a button on
+     each row: the registrable domain) or all (Clear all…), each behind a confirmation that
+     says how many pages it takes; Enter confirms, Esc takes it back. Cleared pages leave the
+     recorded trails, open and put away (each open trail keeps the page it is on; a put-away
+     trail left empty goes), are emptied in memory and left out of the store on disk, their
+     open page children close, and navigatord gets `Clear { records }`: it takes those page
+     records out of its store (and of the jars' memory stores), with each recording and image
+     no other record still names, and drops their pages from its cache. A kept page's stored
+     version stays. Unrecorded trails are not history and are not touched.
    - **Keyboard map** (§9). Ctrl-F, Ctrl-H and Ctrl-plus/minus/0 are added; Escape closes
      what is on top (a pop-up, the Where field, history, find). With the page focused, the
      child hands back keys it does not use as limen `Key` (Ctrl or Alt with a key, Escape),

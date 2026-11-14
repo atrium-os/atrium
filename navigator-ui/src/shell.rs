@@ -32,6 +32,15 @@ pub const READING_H: f32 = 236.0;
 /// The history view's rows and day labels (§5.5).
 pub const HIST_ROW: f32 = 34.0;
 pub const HIST_DAY: f32 = 28.0;
+/// A day label's Clear day button, and the clear confirmation's height.
+pub const HIST_DAY_CLEAR_W: f32 = 72.0;
+pub const HIST_CONFIRM: f32 = 56.0;
+
+/// The history view's Clear all button: its x and width, for a column at
+/// `x` that is `col` wide (left of the close button).
+pub fn history_clear_all(x: f32, col: f32) -> (f32, f32) {
+    (x + col - 36.0 - 84.0, 84.0)
+}
 
 /// The page slot's key (pergola::slot): where Limen binds the page.
 pub const PAGE_SLOT: u64 = 0x5041_4745; // "PAGE"
@@ -61,6 +70,9 @@ pub struct FindBar {
 pub struct HistoryView {
     pub edit: TextEdit,
     pub selected: usize,
+    /// A clear asked for and waiting for its confirmation, with how many
+    /// pages it takes (it can't be undone).
+    pub confirm: Option<(crate::history::Clear, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +137,11 @@ pub enum Out {
     Hand { url: String, how: navigator_control::Hand },
     /// Find in the page on screen (§7; limen `ToChild::Find`).
     Find { query: String, step: i8 },
+    /// The current version of the page `key`, fetched again (§5.5).
+    Reload { key: (u64, PageId) },
+    /// History cleared (§5.5): the open trails' pages that went (their
+    /// children close) and the stored versions navigatord takes out.
+    Clear { keys: Vec<(u64, PageId)>, records: Vec<String> },
 }
 
 /// A page about to be opened by navigatord: its title is its host until
@@ -523,6 +540,7 @@ impl Shell {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open })
             }
             (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try }),
+            (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
         true
@@ -630,6 +648,7 @@ impl Shell {
                     self.open_history();
                 }
             }
+            Action::Reload => self.reload(),
             Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
                 let mut r = self.store.reading();
                 r.zoom_64 = match a {
@@ -652,8 +671,10 @@ impl Shell {
             self.reading_open = false;
         } else if self.editing.is_some() {
             self.end_edit();
-        } else if self.history.is_some() {
-            self.history = None;
+        } else if let Some(h) = &mut self.history {
+            if h.confirm.take().is_none() {
+                self.history = None;
+            }
         } else if self.find.is_some() {
             self.close_find();
         } else {
@@ -737,19 +758,60 @@ impl Shell {
         self.end_edit();
         self.popover = false;
         self.reading_open = false;
-        self.history = Some(HistoryView { edit: TextEdit::new(""), selected: 0 });
+        self.history = Some(HistoryView { edit: TextEdit::new(""), selected: 0, confirm: None });
     }
 
     pub fn history_rows(&self) -> Vec<crate::history::Row> {
         self.history.as_ref().map_or_else(Vec::new, |h| crate::history::rows(&self.store, h.edit.text()))
     }
 
-    /// A row pressed (or Enter on it): its page, in its trail.
-    pub fn open_history_row(&mut self, r: &crate::history::Row) {
+    /// A row pressed (or Enter on it): its page, in its trail. It opens
+    /// as the version stored when it was seen, and the prompt row offers
+    /// the current one (§5.5).
+    pub fn open_history_row(&mut self, r: &crate::history::Row, now: f64) {
         self.history = None;
         if crate::history::open(&mut self.store, r) {
             self.last_note = Some(format!("history: opened {}", r.url));
+            if let Some(p) = self.store.trail().page().filter(|p| p.saved.is_some()) {
+                let at_s = p.at_s;
+                self.ask(Prompt::Stored { at_s }, now);
+            }
         }
+    }
+
+    /// Ask to clear history (§5.5): the confirmation shows what it takes.
+    pub fn ask_clear(&mut self, what: crate::history::Clear) {
+        let n = crate::history::count(&self.store, &what, crate::clock::now_s());
+        if let Some(h) = &mut self.history {
+            h.confirm = Some((what, n));
+        }
+    }
+
+    /// The confirmation pressed: the pages go from the trail store, their
+    /// page children close, and navigatord takes their stored versions out.
+    pub fn confirm_clear(&mut self) {
+        let Some((what, _)) = self.history.as_mut().and_then(|h| h.confirm.take()) else { return };
+        let c = crate::history::clear(&mut self.store, &what, crate::clock::now_s());
+        if let Some(h) = &mut self.history {
+            h.selected = 0;
+        }
+        self.last_note = Some(format!("history: cleared {} pages {} ({} stored versions)", c.pages, what.label(), c.records.len()));
+        if !c.keys.is_empty() || !c.records.is_empty() {
+            self.outbox.push(Out::Clear { keys: c.keys, records: c.records });
+        }
+    }
+
+    /// Reload, Ctrl-R, "Fetch the current version": the page is fetched
+    /// again; its stored version is no longer the one it opens as, and
+    /// what it was told no to may ask again (§6.4).
+    pub fn reload(&mut self) {
+        let Some(key) = self.shown_key() else { return };
+        let Some(p) = self.store.trail_mut().page_mut() else { return };
+        p.saved = None;
+        p.asked = None;
+        p.prompts = Default::default();
+        self.last_note = Some(format!("reload: {}", p.url));
+        self.outbox.push(Out::Reload { key });
     }
 
     /// A key in the history view: typing filters, Up and Down move,
@@ -757,6 +819,14 @@ impl Shell {
     pub fn history_key(&mut self, key: Key, m: Modifiers, chars: &str) -> bool {
         let n = self.history_rows().len();
         let Some(h) = &mut self.history else { return false };
+        if h.confirm.is_some() {
+            match key {
+                Key::Enter => self.confirm_clear(),
+                Key::Escape => h.confirm = None,
+                _ => {}
+            }
+            return true;
+        }
         match key {
             Key::Escape => self.history = None,
             Key::Down => h.selected = (h.selected + 1).min(n.saturating_sub(1)),
@@ -764,7 +834,7 @@ impl Shell {
             Key::Enter => {
                 let at = h.selected;
                 if let Some(r) = self.history_rows().get(at).cloned() {
-                    self.open_history_row(&r);
+                    self.open_history_row(&r, crate::ui::now_ms());
                 }
             }
             _ => match h.edit.key(key, m, chars) {
@@ -1016,6 +1086,48 @@ mod tests {
         assert!(s.history_rows().is_empty());
         s.apply(Action::History, 0.0);
         assert!(s.history.is_none(), "Ctrl-H again closes it");
+    }
+
+    #[test]
+    fn a_page_from_history_offers_its_current_version_and_history_clears_after_asking() {
+        let mut s = shell();
+        // Give every page a stored version, as navigatord would.
+        for t in s.store.trails.iter_mut().chain(s.store.earlier.iter_mut().map(|e| &mut e.trail)) {
+            for (i, p) in t.pages.iter_mut().enumerate() {
+                p.saved = Some(format!("{:0>60}{:04}", t.id % 1000, i));
+            }
+        }
+        s.apply(Action::History, 0.0);
+        let pick = s.history_rows()[1].clone();
+        s.open_history_row(&pick, 10_000.0);
+        let asked = s.store.trail().page().unwrap().asked.clone().unwrap();
+        assert!(matches!(asked.prompt, Prompt::Stored { .. }), "the stored version, and an offer");
+        assert!(s.answer(1, 10_000.0 + PROMPT_STILL_MS));
+        let key = s.shown_key().unwrap();
+        assert_eq!(s.outbox.pop(), Some(Out::Reload { key }));
+        assert!(s.store.trail().page().unwrap().saved.is_none(), "it no longer opens as the stored version");
+        assert!(s.store.trail().page().unwrap().asked.is_none());
+        // Ctrl-R does the same.
+        s.apply(Action::Reload, 0.0);
+        assert_eq!(s.outbox.pop(), Some(Out::Reload { key }));
+
+        // Clearing asks first, and Esc takes the question back, not the view.
+        s.apply(Action::History, 0.0);
+        let before = s.history_rows().len();
+        s.ask_clear(crate::history::Clear::All);
+        let n = s.history.as_ref().unwrap().confirm.as_ref().unwrap().1;
+        assert!(n > 0 && n < before + 10);
+        assert!(s.escape());
+        assert!(s.history.as_ref().is_some_and(|h| h.confirm.is_none()));
+        assert_eq!(s.history_rows().len(), before, "nothing went");
+        s.ask_clear(crate::history::Clear::All);
+        s.history_key(Key::Enter, Modifiers::default(), "");
+        let Some(Out::Clear { keys, records }) = s.outbox.pop() else { panic!("no Clear") };
+        assert!(!keys.is_empty() && !records.is_empty());
+        assert!(!records.iter().any(|r| s.store.trails.iter().any(|t| t.page().and_then(|p| p.saved.as_ref()) == Some(r))), "no open trail's page's version");
+        let open = s.store.trails.iter().filter(|t| !t.unrecorded && t.current.is_some()).count();
+        assert_eq!(s.history_rows().len(), open, "each open trail keeps its page");
+        assert!(s.store.earlier.is_empty());
     }
 
     #[test]

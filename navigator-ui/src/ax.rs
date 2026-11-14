@@ -98,6 +98,9 @@ mod id {
     pub const STATUS: u64 = 22;
     pub const START: u64 = 23;
     pub const NEW_TRAIL: u64 = 24;
+    pub const HISTORY_CLEAR_ALL: u64 = 25;
+    pub const HISTORY_CONFIRM: u64 = 26;
+    pub const HISTORY_CLEAR_SITE: u64 = 5 << 40;
     pub const TRAIL: u64 = 1 << 40;
     pub const PAGE_ROW: u64 = 2 << 40;
     pub const HISTORY_ROW: u64 = 3 << 40;
@@ -113,6 +116,7 @@ pub fn prompt_text(p: &Prompt) -> String {
         Prompt::Play { origin } => format!("{origin} wants to play sound"),
         Prompt::Handoff { url, scheme } => format!("This link is for another program ({scheme}): {url}"),
         Prompt::OpenApp { name, .. } => format!("This link opens the app {name}"),
+        Prompt::Stored { at_s } => format!("The version you saw {}, from the store, offline", crate::clock::when_label(*at_s, crate::clock::now_s())),
     }
 }
 
@@ -214,13 +218,24 @@ pub fn tree(s: &Shell) -> Node {
     if let Some(h) = &s.history {
         let rows = s.history_rows();
         let items = rows.iter().enumerate().map(|(i, r)| {
-            let n = Node::new(id::HISTORY_ROW | i as u64, "list-item", r.title.clone()).value(r.url.clone());
+            let site = crate::trail::site(&r.url);
+            let n = Node::new(id::HISTORY_ROW | i as u64, "list-item", r.title.clone())
+                .value(r.url.clone())
+                .kids(vec![Node::new(id::HISTORY_CLEAR_SITE | i as u64, "button", format!("Clear everything from {site}"))]);
             if i == h.selected { n.with(state::SELECTED) } else { n }
         });
-        top.push(Node::new(id::HISTORY, "document", "History (Ctrl-H)").kids(vec![
-            Node::new(id::HISTORY_FILTER, "text-input", "Filter by title or address").value(h.edit.text()).with(if s.editing.is_none() { state::FOCUSED } else { 0 }),
-            Node::new(id::HISTORY_LIST, "list", format!("{} pages", rows.len())).kids(items.collect()),
-        ]));
+        let mut kids = vec![
+            Node::new(id::HISTORY_FILTER, "text-input", "Filter by title or address").value(h.edit.text()).with(if s.editing.is_none() && h.confirm.is_none() { state::FOCUSED } else { 0 }),
+            Node::new(id::HISTORY_CLEAR_ALL, "button", "Clear all history"),
+        ];
+        if let Some((what, n)) = &h.confirm {
+            let mut c = Node::new(id::HISTORY_CONFIRM, "alert", crate::ui::clear_question(what, *n))
+                .kids(vec![Node::new(id::ANSWER | 100, "button", "Cancel"), Node::new(id::ANSWER | 101, "button", "Clear")]);
+            c.live = Some("assertive");
+            kids.push(c);
+        }
+        kids.push(Node::new(id::HISTORY_LIST, "list", format!("{} pages", rows.len())).kids(items.collect()));
+        top.push(Node::new(id::HISTORY, "document", "History (Ctrl-H)").kids(kids));
     }
     match page {
         None if s.history.is_none() => top.push(Node::new(id::START, "document", if tr.unrecorded { "Start, Unrecorded" } else { "Start" })),

@@ -350,6 +350,8 @@ impl Store for Tampered {
     fn get(&self, a: &str) -> Result<Vec<u8>, String> {
         if a == self.1 { Ok(self.2.clone()) } else { self.0.get(a) }
     }
+    fn remove(&mut self, a: &str) -> Result<(), String> { self.0.remove(a) }
+    fn list(&self) -> Result<Vec<(String, u64)>, String> { self.0.list() }
 }
 
 /// ★ A store that does not check its own addresses — a file replaced under
