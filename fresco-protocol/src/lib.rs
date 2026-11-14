@@ -2403,6 +2403,9 @@ pub mod activation {
         /// seen whole, uncovered and still for `credential::STILL_NS`
         /// before the press, as for `FILL`.
         pub const IDENTITY: u8 = 8;
+        /// Opening a file in its app (opening-files.md §6.2): a click, or
+        /// Enter, in the file manager's window, spent by portcullisd.
+        pub const OPEN: u8 = 9;
     }
 
     /// What minted a token.

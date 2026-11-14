@@ -133,6 +133,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-open"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-session"
 version = "0.1.0"
 dependencies = [
@@ -492,6 +499,16 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fresco-protocol"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "serde",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "generic-array"
@@ -978,8 +995,11 @@ name = "portcullisd"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-open",
+ "atrium-types",
  "atrium-volumes",
  "env_logger",
+ "fresco-protocol",
  "jaild",
  "jaild-policy",
  "libc",
@@ -997,6 +1017,7 @@ dependencies = [
  "portcullis-sig",
  "portcullis-toml",
  "portcullis-trust",
+ "postcard",
  "serde",
  "serde_json",
  "sockmux",

@@ -176,11 +176,17 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
 - It narrows the descriptor with `cap_rights_limit`: read, seek, fstat,
   and for `edit` write, ftruncate, fsync. No `fchmod`, `fchown`,
   `fexecve`, `mmap` with exec.
-- The app gets it on its **document channel**: a new instance as fd 3 with
-  `ATRIUM_OPEN=1`, followed by an `Open { name, type, write }` message on
-  that channel; a running single-instance app on the channel it already
-  has (portcullisd keeps one per running app that declares `[[opens]]`).
-  An app that declares no types has no channel.
+- The app gets it on its **document channel**: a socket portcullisd
+  serves for each app that declares `[[opens]]`, mounted into that app's
+  jail alone at `/atrium/sockets/opens/opens.sock` (the `atrium-open`
+  crate). The app connects once at start; portcullisd takes the
+  connection only from the app's own uid and sends each file there as an
+  `OPEN` message (type, `r` or `w`, name) with the descriptor. A file
+  opened before the app has connected waits (60 s at most); portcullisd
+  starts the app if it isn't running. An app that declares no types has
+  no channel. *(As built: not fd 3 and `ATRIUM_OPEN=1` as first written,
+  since jail(8) closes every descriptor above 2 and cleans the
+  environment; one channel serves new and running instances alike.)*
 - The app never learns the path, the folder, or the place. Save As goes
   through the picker (officina.md §4.2).
 
@@ -266,6 +272,36 @@ and type. D6 asks whether quick look comes in the first build.
    read-only (or edit) descriptor and can't reach the folder; a renamed
    HTML `.pdf` stops at the mismatch sheet; a script gets no Open; an app
    can't open a file or change a default by itself.
+   *Built 2026-11-14:* frescod purpose `OPEN` (a click, or Enter, in the
+   file manager's window; Forum can't grant it; root, i.e. portcullisd,
+   is a consumer); portcullis-ipc `OpenApps` and `OpenFile`, both only
+   from an app holding `removable-files` (whose jail now reaches
+   portcullisd's socket); portcullisd checks the type is declarable,
+   the app declares it (and edits it, for write), the user's policy
+   already lets the app run (no prompt on this path), spends the press
+   last, takes one descriptor (`fstat` regular, open for writing if
+   asked), narrows it (read, seek, fstat; write, ftruncate, fsync for an
+   edit), saves "Always", and hands it over on the document channel,
+   starting the app if needed. Scrinium: double-click, Enter, Open and
+   Open with… in the toolbar; the Open with sheet (apps, default first,
+   "Always open … with the app I pick"); the question sheet when the
+   name and bytes disagree, offering what the bytes show and "Open as
+   text"; programs, shortcuts and (until T5) bundles never open. Pergola
+   now runs a click's handler with its press's token (the release
+   carries none). Atrium Player and Write take files from the channel
+   (Player replaces what plays, in a window titled with the name; Write
+   opens it as a picked file, Save writing back only when given write).
+   Gate `scripts/vm-open-files.sh` on the cloud amd64 VM with a test
+   app (`atrium-open`'s `open-probe`) from a stick: the app, started by
+   portcullisd in its own jail and uid, reads a FLAC but can't write,
+   chmod, map it or learn its path (`F_KINFO` refused), sees no
+   `/media`; an ODT with Always is opened for changes and written, the
+   default saved, the next double-click goes straight to the running
+   app; an HTML `.pdf` stops at the question and opens as text,
+   read-only; a script gets no Open; the app, alice, and the file
+   manager without a real press are refused. Not yet: from a share (same
+   path as a stick, gate pending), and the Player and Write end to end
+   in the VM.
 4. **T4** quick look (D6).
 5. **T5** bundles open the installer.
 

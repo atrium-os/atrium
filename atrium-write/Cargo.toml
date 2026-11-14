@@ -24,6 +24,8 @@ officina-spell = { path = "../officina-spell" }
 pergola = { path = "../pergola" }
 pergola-richtext = { path = "../pergola-richtext" }
 limen = { path = "../limen" }
+# Files opened in Write from Scrinium (opening-files.md §6.2).
+atrium-open = { path = "../atrium-open" }
 libc = "0.2"
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its

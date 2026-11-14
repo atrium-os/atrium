@@ -38,6 +38,8 @@ hospes-proto = { path = "../../hospes/hospes-proto", features = ["std"] }
 # OpenCdm (hospes.md §3): the system's CDM, asked of portcullisd; also the
 # stand-in portcullisd in tests/system_fetcher.rs.
 portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
+# Files opened in the player from Scrinium (opening-files.md §6.2).
+atrium-open = { path = "../../atrium-open" }
 
 [features]
 # Start hospes-codec beside the worker when OpenH264 is installed (hospes.md §9).

@@ -121,9 +121,64 @@ pub struct Browser {
     pub at_login: std::collections::HashMap<String, bool>,
     /// The status line asked to set it: the app does it.
     pub want_at_login: Option<(String, bool)>,
-    /// A file to open (opening-files.md §6.1): its type is read off the
-    /// window's thread (a share may be slow), then [`Browser::typed`].
-    pub want_open: Option<(PathBuf, String)>,
+    /// A file being opened (opening-files.md §6.1): each step runs off the
+    /// window's thread (a share may be slow; portcullisd is a round trip),
+    /// and its answer comes back to [`Browser::typed`], [`Browser::apps`]
+    /// or [`Browser::handed`].
+    pub want_open: Option<OpenStep>,
+    pub open_sheet: Option<OpenSheet>,
+}
+
+/// A press's activation token (frescod's proof the user pressed).
+pub type Token = [u8; 16];
+
+/// A file being opened (opening-files.md §6): where it is, what it was
+/// decided to be, the app, and the press that asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenReq {
+    pub path: PathBuf,
+    pub name: String,
+    pub token: Token,
+    /// "Open with…": show the apps even when there is a default.
+    pub ask: bool,
+    /// The type it opens as, once decided.
+    pub mime: Option<String>,
+    /// The app it goes to, once chosen.
+    pub app: Option<String>,
+    /// Open it for changes (the app edits the type, the place is writable).
+    pub write: bool,
+    /// Make the app the default for the type.
+    pub always: bool,
+}
+
+/// An app that opens a type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    pub name: String,
+    pub edit: bool,
+    pub default: bool,
+}
+
+/// What the app's thread does next for a file being opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenStep {
+    /// Read its first bytes, for its type.
+    Type(OpenReq),
+    /// Ask which apps open its type.
+    Apps(OpenReq),
+    /// Open it and hand it to `req.app`.
+    Hand(OpenReq),
+}
+
+/// A sheet over the window while a file is being opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenSheet {
+    /// Open with: the apps that open the type.
+    Choose { req: OpenReq, words: String, apps: Vec<Choice>, always: bool },
+    /// The name and the bytes disagree, or neither says (§4.3, D3): what
+    /// it really is, and whether it can be opened as that or as text.
+    Question { req: OpenReq, says: String, actual: Option<(String, String)>, text: bool },
 }
 
 /// A saved server whose key isn't the one the user accepted.
@@ -163,6 +218,7 @@ impl Browser {
             at_login: Default::default(),
             want_at_login: None,
             want_open: None,
+            open_sheet: None,
         }
     }
 
@@ -382,22 +438,117 @@ impl Browser {
                 self.select_only(i);
                 self.choose();
             }
-            Mode::Manager => match self.dir() {
-                Some(d) => self.want_open = Some((d.join(&e.name), e.name.clone())),
-                None => {}
-            },
+            Mode::Manager => self.open_file(i, false),
         }
     }
 
-    /// What a file to open turned out to be (opening-files.md §4.2, §8).
-    pub fn typed(&mut self, name: &str, r: std::io::Result<atrium_types::Detected>) {
+    /// Open file `i` in its app (`ask`: Open with…), for the press now
+    /// being handled.
+    pub fn open_file(&mut self, i: usize, ask: bool) {
+        let Some(e) = self.entries.get(i).cloned() else { return };
+        if e.dir || e.link || !matches!(self.mode, Mode::Manager) {
+            return;
+        }
+        let Some(d) = self.dir() else { return };
+        let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+        self.open_sheet = None;
+        self.want_open = Some(OpenStep::Type(OpenReq { path: d.join(&e.name), name: e.name, token, ask, mime: None, app: None, write: false, always: false }));
+    }
+
+    /// The toolbar's Open and Open with…: the one selected file.
+    pub fn open_selected(&mut self, ask: bool) {
+        if let [i] = self.selected[..] {
+            self.open_file(i, ask);
+        }
+    }
+
+    /// What a file to open turned out to be (opening-files.md §4.2, §8):
+    /// on to its apps, or the question, or why it doesn't open. `text`:
+    /// its first bytes are text.
+    pub fn typed(&mut self, req: OpenReq, r: std::io::Result<(atrium_types::Detected, bool)>) {
+        use atrium_types::{Detected, Family};
+        let name = req.name.clone();
+        let (d, text) = match r {
+            Err(e) => return self.say(format!("Couldn't open “{name}”: {}", err_text(&e)), true),
+            Ok(v) => v,
+        };
+        match d {
+            _ if d.is_program() => self.say(format!("“{name}”: {}", d.question().unwrap_or_default()), true),
+            Detected::Known(t) if t.family == Family::Link => self.say(format!("“{name}”: {}", d.question().unwrap_or_default()), true),
+            Detected::Known(t) if t.family == Family::Bundle => self.say(format!("“{name}” is an app to install: installing from Scrinium comes later"), false),
+            Detected::Known(t) => self.want_open = Some(OpenStep::Apps(OpenReq { mime: Some(t.mime.into()), ..req })),
+            Detected::Mismatch { actual, .. } => {
+                let actual = actual.filter(|a| a.family.declarable()).map(|a| (a.mime.to_string(), a.words.to_string()));
+                let text = text && actual.as_ref().map_or(true, |(m, _)| m != "text/plain");
+                self.open_sheet = Some(OpenSheet::Question { req, says: d.question().unwrap_or_default(), actual, text });
+            }
+            Detected::Unknown { text: true } => {
+                self.open_sheet = Some(OpenSheet::Question { req, says: "Atrium doesn't know what kind of file this is, but it is text.".into(), actual: None, text: true })
+            }
+            Detected::Unknown { .. } => self.say(format!("“{name}”: {}", d.question().unwrap_or_default()), true),
+        }
+    }
+
+    /// The question sheet's "Open as …": `mime` is what the bytes show,
+    /// or `text/plain`.
+    pub fn open_as(&mut self, mime: &str) {
+        let Some(OpenSheet::Question { req, .. }) = self.open_sheet.take() else { return };
+        let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+        self.want_open = Some(OpenStep::Apps(OpenReq { mime: Some(mime.into()), token, ..req }));
+    }
+
+    /// The apps that open the file's type: straight to the default, or
+    /// the Open with sheet.
+    pub fn apps(&mut self, req: OpenReq, r: Result<Vec<Choice>, String>) {
+        let name = req.name.clone();
+        let mime = req.mime.clone().unwrap_or_default();
+        let words = atrium_types::by_mime(&mime).map_or("files of this kind", |t| t.words).to_string();
+        let apps = match r {
+            Err(e) => return self.say(format!("Couldn't open “{name}”: {e}"), true),
+            Ok(a) => a,
+        };
+        if apps.is_empty() {
+            return self.say(format!("“{name}”: no app installed opens {words}"), true);
+        }
+        match apps.iter().find(|c| c.default) {
+            Some(c) if !req.ask => {
+                let c = c.clone();
+                self.hand(req, &c);
+            }
+            _ => self.open_sheet = Some(OpenSheet::Choose { req, words, apps, always: false }),
+        }
+    }
+
+    fn hand(&mut self, req: OpenReq, c: &Choice) {
+        let writable = !self.place().is_some_and(|p| p.read_only);
+        self.say(format!("Opening “{}” in {}…", req.name, c.name), false);
+        self.want_open = Some(OpenStep::Hand(OpenReq { app: Some(c.id.clone()), write: c.edit && writable, ..req }));
+    }
+
+    /// The Open with sheet: app `i` was pressed.
+    pub fn choose_app(&mut self, i: usize) {
+        let Some(OpenSheet::Choose { req, apps, always, .. }) = self.open_sheet.take() else { return };
+        let Some(c) = apps.get(i) else { return };
+        let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+        self.hand(OpenReq { token, always, ..req }, c);
+    }
+
+    /// The Open with sheet's "Always use this app".
+    pub fn toggle_always(&mut self) {
+        if let Some(OpenSheet::Choose { always, .. }) = &mut self.open_sheet {
+            *always = !*always;
+        }
+    }
+
+    pub fn close_open_sheet(&mut self) {
+        self.open_sheet = None;
+    }
+
+    /// How the hand-over went: the app's name, or why not.
+    pub fn handed(&mut self, req: &OpenReq, r: Result<String, String>) {
         match r {
-            Err(e) => self.say(format!("Couldn't open “{name}”: {}", err_text(&e)), true),
-            Ok(d) => match d.question() {
-                Some(q) => self.say(format!("“{name}”: {q}"), true),
-                // Handing it to an app is the next step (§6.2).
-                None => self.say(format!("“{name}” is {}: opening it in its app comes with default apps", d.known().map_or("a file", |t| t.words)), false),
-            },
+            Ok(app) => self.say(format!("Opened “{}” in {app}{}", req.name, if req.always { ", which now opens these files" } else { "" }), false),
+            Err(e) => self.say(format!("Couldn't open “{}”: {e}", req.name), true),
         }
     }
 
@@ -710,28 +861,84 @@ mod tests {
         let (d, p) = stick("open");
         std::fs::write(d.join("invoice.pdf"), "<!DOCTYPE html><script>steal()</script>").unwrap();
         std::fs::write(d.join("setup.jpg"), b"\x7fELF\x02\x01\x01").unwrap();
+        std::fs::write(d.join("README"), b"plain words\n").unwrap();
         let mut b = Browser::new(Mode::Manager);
         b.set_places(vec![p]);
         let at = |b: &Browser, n: &str| b.entries.iter().position(|e| e.name == n).unwrap();
-        let open = |b: &mut Browser, n: &str| {
+        let typed = |b: &mut Browser, n: &str| {
             let i = at(b, n);
             b.activate(i);
-            let (path, name) = b.want_open.take().expect("asked to open");
-            let r = fs::head(&path).map(|h| atrium_types::detect(&name, &h));
-            b.typed(&name, r);
-            b.notice.clone().unwrap()
+            let Some(OpenStep::Type(req)) = b.want_open.take() else { panic!("asked to read its type") };
+            let r = fs::head(&req.path).map(|h| (atrium_types::detect(&req.name, &h), atrium_types::is_text(&h)));
+            b.typed(req, r);
         };
-        let n = open(&mut b, "invoice.pdf");
-        assert!(n.error && n.text.contains("says it is a PDF document but is really a Web page"), "{n:?}");
-        let n = open(&mut b, "setup.jpg");
+        // The name lies: the question, offering what it really is.
+        typed(&mut b, "invoice.pdf");
+        let Some(OpenSheet::Question { says, actual, text, .. }) = b.open_sheet.clone() else { panic!("{:?}", b.open_sheet) };
+        assert!(says.contains("says it is a PDF document but is really a Web page"), "{says}");
+        assert_eq!(actual.map(|a| a.0), Some("text/html".to_string()));
+        assert!(text);
+        b.open_as("text/plain");
+        let Some(OpenStep::Apps(req)) = b.want_open.take() else { panic!() };
+        assert_eq!(req.mime.as_deref(), Some("text/plain"));
+        // A program: never.
+        typed(&mut b, "setup.jpg");
+        let n = b.notice.clone().unwrap();
         assert!(n.error && n.text.contains("doesn't run programs"), "{n:?}");
-        let n = open(&mut b, "hello.txt");
-        assert!(!n.error && n.text.contains("Plain text"), "{n:?}");
+        assert!(b.want_open.is_none());
+        // Plain text: on to its apps.
+        typed(&mut b, "hello.txt");
+        let Some(OpenStep::Apps(req)) = b.want_open.take() else { panic!() };
+        assert_eq!(req.mime.as_deref(), Some("text/plain"));
+        // No name, but text: plain text.
+        typed(&mut b, "README");
+        let Some(OpenStep::Apps(req)) = b.want_open.take() else { panic!("{:?}", b.open_sheet) };
+        assert_eq!(req.mime.as_deref(), Some("text/plain"));
         // A folder is entered, not opened.
         let i = at(&b, "Docs");
         b.activate(i);
         assert!(b.want_open.is_none());
         assert_eq!(b.path, vec!["Docs".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_default_opens_at_once_and_open_with_asks() {
+        let (d, p) = stick("openwith");
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![p]);
+        let req = OpenReq { path: d.join("hello.txt"), name: "hello.txt".into(), token: [7; 16], ask: false, mime: Some("text/plain".into()), app: None, write: false, always: false };
+        let apps = vec![
+            Choice { id: "org.atrium.write".into(), name: "Write".into(), edit: true, default: true },
+            Choice { id: "org.test.viewer".into(), name: "Viewer".into(), edit: false, default: false },
+        ];
+        b.apps(req.clone(), Ok(apps.clone()));
+        let Some(OpenStep::Hand(h)) = b.want_open.take() else { panic!("straight to the default") };
+        assert_eq!((h.app.as_deref(), h.write, h.token), (Some("org.atrium.write"), true, [7; 16]));
+        // Open with…: the sheet, even with a default.
+        b.apps(OpenReq { ask: true, ..req.clone() }, Ok(apps.clone()));
+        assert!(b.want_open.is_none());
+        b.toggle_always();
+        b.choose_app(1);
+        let Some(OpenStep::Hand(h)) = b.want_open.take() else { panic!() };
+        assert_eq!((h.app.as_deref(), h.write, h.always), (Some("org.test.viewer"), false, true), "a viewer never gets write");
+        assert_eq!(h.token, [0; 16], "the sheet's own press (none in a test)");
+        // No default: the sheet.
+        let none: Vec<Choice> = apps.iter().cloned().map(|c| Choice { default: false, ..c }).collect();
+        b.apps(req.clone(), Ok(none));
+        assert!(matches!(b.open_sheet, Some(OpenSheet::Choose { .. })));
+        // No app at all, or an answer that says no.
+        b.apps(req.clone(), Ok(vec![]));
+        assert!(b.notice.as_ref().unwrap().text.contains("no app installed opens Plain text"));
+        b.handed(&h, Err("the press was too long ago; open it again".into()));
+        assert!(b.notice.as_ref().unwrap().error);
+        b.handed(&h, Ok("Viewer".into()));
+        assert_eq!(b.notice.as_ref().unwrap().text, "Opened “hello.txt” in Viewer, which now opens these files");
+        // A read-only place: never write.
+        b.places[0].read_only = true;
+        b.apps(req, Ok(apps));
+        let Some(OpenStep::Hand(h)) = b.want_open.take() else { panic!() };
+        assert!(!h.write);
         let _ = std::fs::remove_dir_all(&d);
     }
 

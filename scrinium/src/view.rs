@@ -20,7 +20,7 @@ use pergola::view::{Ctx, View};
 use pergola::widgets::{CredentialField, CredentialState, Glyph, ScrollState, TextField, ToolItem, Toolbar, VirtualList};
 use pergola::{Color, Event, Key, KeyEventKind, Mutable, NodeId, TextStyle};
 
-use crate::browser::{Browser, Edit, Mode, Mods, Outcome};
+use crate::browser::{Browser, Edit, Mode, Mods, OpenSheet, Outcome};
 use crate::connect::Step;
 use crate::fs;
 
@@ -123,6 +123,12 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
     if b.key_changed.is_some() {
         if *key == Key::Escape {
             with(state, Browser::close_key_changed);
+        }
+        return true;
+    }
+    if b.open_sheet.is_some() {
+        if *key == Key::Escape {
+            with(state, Browser::close_open_sheet);
         }
         return true;
     }
@@ -345,6 +351,9 @@ impl View for ScriniumView {
                 if b.key_changed.is_some() {
                     self.key_changed_sheet(ctx, &b, w, h);
                 }
+                if b.open_sheet.is_some() {
+                    self.open_sheet(ctx, &b, w, h);
+                }
             }
             Mode::Picker { .. } => self.picker(ctx, &b, w, h),
         }
@@ -488,6 +497,88 @@ impl ScriniumView {
         let fw = width(label, type_size::SM, Weight::Medium) + 28.0;
         let s = self.state.clone();
         button(ctx, x + cw - pad - close - 8.0 - fw, by, label, Look::Ghost, true, move || with(&s, Browser::forget_changed));
+    }
+
+    /// Opening a file (opening-files.md §6.1, D3): Open with, or the
+    /// question when its name and its bytes disagree.
+    fn open_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
+        let t = ctx.theme;
+        let Some(sheet) = &b.open_sheet else { return };
+        ctx.key(4200);
+        area(ctx, Rect::new(0.0, 0.0, w, h), 0.0, Color::rgba(0.0, 0.0, 0.0, 0.33), Color::rgba(0.0, 0.0, 0.0, 0.33), || {});
+        ctx.pop();
+        let pad = 24.0;
+        let row = em(44.0);
+        let (cw, ch) = match sheet {
+            OpenSheet::Choose { apps, .. } => (480.0_f32, em(150.0) + row * apps.len().min(6) as f32),
+            OpenSheet::Question { .. } => (520.0_f32, em(170.0)),
+        };
+        let (x, y) = (((w - cw) / 2.0).max(8.0), ((h - ch) / 2.0).max(8.0));
+        rect(ctx, x - 1.0, y - 1.0, cw + 2.0, ch + 2.0, t.border_strong(), 11.0);
+        rect(ctx, x, y, cw, ch, t.bg_surface(), 10.0);
+        let (lx, inner) = (x + pad, cw - 2.0 * pad);
+        let by = y + ch - em(32.0) - pad;
+        let cancel = width("Cancel", type_size::SM, Weight::Medium) + 28.0;
+        let s = self.state.clone();
+        button(ctx, x + cw - pad - cancel, by, "Cancel", Look::Ghost, true, move || with(&s, Browser::close_open_sheet));
+        match sheet {
+            OpenSheet::Choose { req, words, apps, always } => {
+                let title = format!("Open “{}” with", req.name);
+                text(ctx, lx, y + em(32.0), &fit(&title, type_size::LG, Weight::Semibold, inner), type_size::LG, Weight::Semibold, t.text_primary());
+                text(ctx, lx, y + em(56.0), &fit(&format!("Apps that open {words}"), type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_secondary());
+                let mut ry = y + em(72.0);
+                for (i, c) in apps.iter().take(6).enumerate() {
+                    let s = self.state.clone();
+                    ctx.key(4300 + i as u64);
+                    area(ctx, Rect::new(lx - 8.0, ry, inner + 16.0, row - 4.0), 6.0, t.bg_canvas(), t.state_hover(), move || with(&s, |b| b.choose_app(i)));
+                    text(ctx, lx + 4.0, ry + (row - 4.0) / 2.0, &fit(&c.name, type_size::MD, Weight::Medium, inner - 140.0), type_size::MD, Weight::Medium, t.text_primary());
+                    let tag = match (c.default, c.edit) {
+                        (true, true) => "Default · opens and changes",
+                        (true, false) => "Default · opens to view",
+                        (false, true) => "Opens and changes",
+                        (false, false) => "Opens to view",
+                    };
+                    let tw = width(tag, type_size::XS, Weight::Regular);
+                    text(ctx, lx + inner - tw, ry + (row - 4.0) / 2.0, tag, type_size::XS, Weight::Regular, t.text_tertiary());
+                    ctx.pop();
+                    ry += row;
+                }
+                // "Always", D7: Scrinium's sheet is one of the two places a
+                // default is changed.
+                let label = format!("Always open {words} with the app I pick");
+                let lw = width(&label, type_size::SM, Weight::Regular) + 22.0;
+                let s = self.state.clone();
+                let cy = by + em(16.0);
+                ctx.key(4290);
+                area(ctx, Rect::new(lx - 4.0, cy - em(14.0), lw + 8.0, em(28.0)), 4.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, Browser::toggle_always));
+                rect(ctx, lx, cy - 7.0, 14.0, 14.0, t.border_strong(), 3.0);
+                rect(ctx, lx + 1.0, cy - 6.0, 12.0, 12.0, if *always { t.accent_fg() } else { t.bg_surface() }, 2.0);
+                text(ctx, lx + 22.0, cy, &fit(&label, type_size::SM, Weight::Regular, inner - cancel - 30.0), type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+            }
+            OpenSheet::Question { req, says, actual, text: as_text } => {
+                icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.warning_fg());
+                text(ctx, lx + 28.0, y + 32.0, &fit(&format!("“{}”", req.name), type_size::LG, Weight::Semibold, inner - 28.0), type_size::LG, Weight::Semibold, t.text_primary());
+                text(ctx, lx, y + em(64.0), &fit(says, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, lx, y + em(86.0), &fit("Open it only if you know where it came from.", type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_tertiary());
+                let mut bx = x + cw - pad - cancel - 8.0;
+                if *as_text {
+                    let l = "Open as text";
+                    let bw = width(l, type_size::SM, Weight::Medium) + 28.0;
+                    bx -= bw;
+                    let s = self.state.clone();
+                    button(ctx, bx, by, l, if actual.is_some() { Look::Secondary } else { Look::Primary }, true, move || with(&s, |b| b.open_as("text/plain")));
+                    bx -= 8.0;
+                }
+                if let Some((mime, words)) = actual {
+                    let l = format!("Open as {words}");
+                    let bw = width(&l, type_size::SM, Weight::Medium) + 28.0;
+                    bx -= bw;
+                    let (s, m) = (self.state.clone(), mime.clone());
+                    button(ctx, bx, by, &l, Look::Primary, true, move || with(&s, |b| b.open_as(&m)));
+                }
+            }
+        }
     }
 
     /// "Connect to server", over the window (network-shares.md §5.2).
@@ -761,7 +852,11 @@ impl ScriniumView {
         let hw = width(hid, type_size::SM, Weight::Medium) + em(28.0);
         let (s1, f1, s2, f2) = (self.state.clone(), self.field.clone(), self.state.clone(), self.field.clone());
         let (s3, s4, s5, s6) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
+        let (s7, s8) = (self.state.clone(), self.state.clone());
+        let one_file = n == 1 && b.entries.get(b.selected[0]).is_some_and(|e| !e.dir && !e.link);
         let items = vec![
+            ToolItem::new("Open", move || with(&s7, |b| b.open_selected(false))).priority(1).enabled(open && one_file),
+            ToolItem::new("Open with…", move || with(&s8, |b| b.open_selected(true))).priority(2).enabled(open && one_file),
             ToolItem::new("New folder", move || begin_edit(&s1, &f1, false)).priority(2).enabled(writable),
             ToolItem::new("Rename", move || begin_edit(&s2, &f2, true)).priority(1).enabled(writable && n == 1),
             ToolItem::new("Delete", move || with(&s3, Browser::ask_delete)).priority(1).enabled(writable && n > 0),

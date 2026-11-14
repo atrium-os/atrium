@@ -10,10 +10,12 @@
 //!   the file manager, and folders it was given).
 //! - [`connect`]: "Connect to server", the address, key and password steps.
 //! - [`shares`]: the saved network shares, in Arca.
+//! - [`open`]: opening a file in an app through portcullisd.
 
 pub mod browser;
 pub mod connect;
 pub mod shares;
 pub mod fs;
+pub mod open;
 pub mod places;
 pub mod view;

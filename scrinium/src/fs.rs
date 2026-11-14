@@ -268,6 +268,32 @@ pub fn head(p: &Path) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
+/// The file to hand to an app (opening-files.md §6.2): no link followed,
+/// regular files only, read-write when `write` is asked and allowed, else
+/// read-only. Answers whether it is writable.
+pub fn open_for_app(p: &Path, write: bool) -> io::Result<(std::fs::File, bool)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = |w: bool| std::fs::OpenOptions::new().read(true).write(w).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p);
+    let (f, w) = match open(write) {
+        Ok(f) => (f, write),
+        Err(e) if write && matches!(e.raw_os_error(), Some(libc::EACCES | libc::EROFS | libc::EPERM)) => (open(false)?, false),
+        Err(e) => return Err(e),
+    };
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    // O_NONBLOCK only kept a FIFO put in its place from stopping us.
+    // SAFETY: F_GETFL/F_SETFL on a descriptor we own.
+    unsafe {
+        let fl = libc::fcntl(f.as_raw_fd(), libc::F_GETFL);
+        if fl >= 0 {
+            libc::fcntl(f.as_raw_fd(), libc::F_SETFL, fl & !libc::O_NONBLOCK);
+        }
+    }
+    Ok((f, w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +303,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_file_for_an_app_is_a_file_and_no_link() {
+        use std::io::Write;
+        let d = tmp("forapp");
+        std::fs::write(d.join("a.txt"), b"x").unwrap();
+        let (mut f, w) = open_for_app(&d.join("a.txt"), true).unwrap();
+        assert!(w);
+        f.write_all(b"y").unwrap();
+        let (_, w) = open_for_app(&d.join("a.txt"), false).unwrap();
+        assert!(!w);
+        std::os::unix::fs::symlink(d.join("a.txt"), d.join("l.txt")).unwrap();
+        assert!(open_for_app(&d.join("l.txt"), false).is_err(), "a link");
+        assert!(open_for_app(&d, false).is_err(), "a folder");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

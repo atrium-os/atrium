@@ -50,6 +50,15 @@ fn main() {
             _ => files.push(a),
         }
     }
+    if files.is_empty() && !headless {
+        // Started by portcullisd for a file opened in Scrinium
+        // (opening-files.md §6.2): it comes on the document channel.
+        match atrium_open::Channel::connect() {
+            Ok(Some(ch)) => return opened(ch, exit_at_end, size),
+            Ok(None) => {}
+            Err(e) => eprintln!("atrium-player: the document channel: {e}"),
+        }
+    }
     if files.is_empty() {
         usage();
     }
@@ -245,6 +254,62 @@ fn windowed(file: &str, exit_at_end: bool, size: (u32, u32)) {
         std::process::exit(1);
     }
     run(&mut app);
+}
+
+/// Files opened in the player from Scrinium: the first it was started
+/// for, waited for briefly; each later one replaces what is playing, in a
+/// window of its own titled with the file's name.
+fn opened(mut ch: atrium_open::Channel, exit_at_end: bool, size: (u32, u32)) {
+    let mut next = match ch.recv(Some(Duration::from_secs(30))) {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            eprintln!("atrium-player: started for a file, but none came");
+            std::process::exit(1)
+        }
+        Err(e) => {
+            eprintln!("atrium-player: the document channel: {e}");
+            std::process::exit(1)
+        }
+    };
+    let mut live = true;
+    loop {
+        eprintln!("atrium-player: playing “{}” ({}) opened from Scrinium", next.name, next.mime);
+        let mut conn = fresco_client::Connection::connect_default().unwrap_or_else(|e| {
+            eprintln!("atrium-player: connecting to frescod: {e}");
+            std::process::exit(1)
+        });
+        let win = conn.window_create(size.0, size.1, next.name.clone(), fresco_protocol::WindowHints::default()).unwrap_or_else(|e| {
+            eprintln!("atrium-player: window: {e}");
+            std::process::exit(1)
+        });
+        conn.set_default_window(win as u16);
+        let mut app = App::new(Standalone, conn, win, size, Options::default());
+        app.session_name = next.name.clone();
+        if let Err(e) = app.play_file(next.file, exit_at_end) {
+            eprintln!("atrium-player: starting the decode worker: {e}");
+            std::process::exit(1);
+        }
+        let mut another = None;
+        while !app.done && another.is_none() {
+            if let Err(e) = app.step() {
+                eprintln!("atrium-player: frescod: {e}");
+                std::process::exit(1);
+            }
+            if live {
+                match ch.recv(Some(Duration::ZERO)) {
+                    Ok(o) => another = o,
+                    Err(e) => {
+                        eprintln!("atrium-player: the document channel: {e}");
+                        live = false;
+                    }
+                }
+            }
+        }
+        match another {
+            Some(o) => next = o,
+            None => return,
+        }
+    }
 }
 
 /// The system fetcher (portcullisd's `OpenFetcher`), asked for `url`. ★ The

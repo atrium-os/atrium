@@ -2,7 +2,8 @@
 //!
 //!   atrium-write          a new document (or the one a crash left, restored)
 //!   atrium-write FILE     open FILE by path (development; apps get files from
-//!                         the picker)
+//!                         the picker, or from Scrinium on the document
+//!                         channel, opening-files.md §6.2)
 //!
 //! Files come from the system picker (scrinium.md §4.1): Open asks for one
 //! file, read-write; Save writes back to it. Save As asks for a folder with
@@ -364,6 +365,14 @@ fn main() {
     let mut app = App::new_with_flag(run.write.clone(), dirty);
     let _ = win.paint(&mut app);
 
+    // Files the user opens in Write from Scrinium (opening-files.md §6.2).
+    let mut channel = match atrium_open::Channel::connect() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("atrium-write: the document channel: {e}");
+            None
+        }
+    };
     let mut asking: Option<Asking> = None;
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
@@ -461,6 +470,19 @@ fn main() {
                 }
                 asking = None;
                 run.write.ui.set(Ui { asking: false });
+            }
+        }
+        if let Some(ch) = channel.as_mut() {
+            match ch.recv(Some(Duration::ZERO)) {
+                Ok(Some(o)) => {
+                    eprintln!("atrium-write: “{}” opened from Scrinium{}", o.name, if o.write { " (write)" } else { "" });
+                    run.opened(o.name, o.write, o.file.into());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("atrium-write: the document channel: {e}");
+                    channel = None;
+                }
             }
         }
         run.poll_export();

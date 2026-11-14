@@ -88,6 +88,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-open"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
 
@@ -123,6 +130,7 @@ version = "0.1.0"
 name = "atrium-write"
 version = "0.1.0"
 dependencies = [
+ "atrium-open",
  "libc",
  "limen",
  "navigator-image",

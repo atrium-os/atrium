@@ -81,6 +81,9 @@ fn fits(e: &Entry, p: u8) -> bool {
         // Sigillum's sheet: the same, in the sheet's own window.
         (kind::BUTTON, purpose::IDENTITY) => true,
         (kind::KEY, purpose::IDENTITY) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
+        // Opening a file: a double-click or Open, or Enter on the row.
+        (kind::BUTTON, purpose::OPEN) => true,
+        (kind::KEY, purpose::OPEN) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -335,7 +338,8 @@ pub fn consumers() -> Vec<u32> {
     if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
         return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
     }
-    ["_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui"].iter().filter_map(|n| uid_of(n)).collect()
+    // root: portcullisd, which spends OPEN (opening-files.md §6.2).
+    ["root", "_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui"].iter().filter_map(|n| uid_of(n)).collect()
 }
 
 /// The uids whose top-level windows are trusted sheets, watched for
@@ -576,6 +580,24 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::IDENTITY, |_| false, |_, _| true)), refusal::NOT_FOCUSED);
         let typed = t.mint(key(0x1e, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::IDENTITY, YES, |_, _| true)), refusal::WRONG_KIND, "a PIN digit authorises nothing");
+    }
+
+    #[test]
+    fn an_open_is_a_click_or_enter_in_the_file_managers_window() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::OPEN, YES, NOVIS)), refusal::WRONG_UID, "another app's press");
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::OPEN, |_| false, NOVIS)), refusal::NOT_FOCUSED);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::OPEN, YES, NOVIS)), 0);
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::OPEN, YES, NOVIS)), 0);
+        let typed = t.mint(key(0x04, 0, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::OPEN, YES, NOVIS)), refusal::WRONG_KIND, "typing opens nothing");
+        let paste = t.mint(key(HID_V, MOD_CTRL, 0));
+        assert_eq!(why(t.consume(1, &paste, 1001, purpose::OPEN, YES, NOVIS)), refusal::WRONG_KIND);
+        let forum = 900;
+        let press = t.mint(Entry { uid: forum, ..button(0) });
+        assert_eq!(granted(t.grant(1, &press, forum, 1001, purpose::OPEN)), Err(refusal::WRONG_KIND), "Forum can't grant an open");
     }
 
     #[test]

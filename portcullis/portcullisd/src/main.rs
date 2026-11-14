@@ -425,6 +425,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                                  &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare))?;
             continue;
         }
+        /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
+         * Catalog is: only the session's file manager, by its installed
+         * manifest. OpenFile also takes a descriptor, so it needs the
+         * connection itself. */
+        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. }) {
+            handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
+            continue;
+        }
         if let Request::Launch { app_id, bypass_policy } = req {
             /* `owner`, not `user`: see the inheritance note above. This is both
              * whose policy authorizes the launch and who the launched app is
@@ -915,6 +923,144 @@ fn handle_launch(
     write_response(writer, &resp)
 }
 
+/// Apps portcullisd is starting, or running, for a file opened in them,
+/// so two opens in quick succession start one instance.
+static STARTED_FOR_OPEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether `app_id` may run for `user` now without asking (the Launch
+/// gate, without its prompt: an open is not where a new grant is given).
+fn may_run_unasked(app_id: &str, user: &str, shared: &Mutex<Tenants>) -> Result<(), String> {
+    let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(app_id);
+    let text = std::fs::read_to_string(tree.join("atrium.toml")).map_err(|e| format!("{app_id}: {e}"))?;
+    manifest_trust::verify(&tree, &text)?;
+    let manifest = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{app_id}: {e}"))?;
+    let hash = hash_manifest(text.as_bytes());
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = s.get_or_load(user).map_err(|e| format!("policy for {user}: {e}"))?;
+    let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
+    let d = decide(app_id, &manifest.capabilities, &hash, &tp.policy, system.as_ref());
+    if d.delta.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} needs your approval first: open it once from Applications", manifest.app.name))
+    }
+}
+
+/// OpenApps and OpenFile (opening-files.md §6.1, §6.2). `uid` is the
+/// caller's peer uid; `owner` the human it belongs to, whose defaults and
+/// policy apply.
+fn handle_open(
+    uid:    u32,
+    owner:  &str,
+    req:    Request,
+    shared: &Mutex<Tenants>,
+    writer: &mut UnixStream,
+    reader: &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    use portcullis_ipc::OpenChoice;
+    use portcullis_policy::opens::Defaults;
+    use portcullis_toml::OpenMode;
+    use portcullisd::opens::{self, Delivery, Hub};
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: open REFUSED to uid {uid}: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    if !caller.as_deref().is_some_and(launch::app_is_file_manager) {
+        return refuse(writer, format!("cap.open.denied: only the file manager opens files in apps (caller {})",
+                                      caller.as_deref().unwrap_or("is not a launched app")));
+    }
+    let declarable = |mime: &str| atrium_types::by_mime(mime).filter(|t| t.family.declarable());
+    match req {
+        Request::OpenApps { mime } => {
+            if declarable(&mime).is_none() {
+                return refuse(writer, format!("{mime}: not a type Atrium opens in apps"));
+            }
+            let apps = launch::apps_opening(&mime);
+            let defaults = Defaults::load(&Defaults::user_path(owner)).unwrap_or_default();
+            let def = defaults.app_for(&mime, |id| apps.iter().any(|(a, _, _)| a == id));
+            let mut list: Vec<OpenChoice> = apps.into_iter()
+                .map(|(id, name, mode)| OpenChoice { default: def.as_deref() == Some(id.as_str()), id, name, edit: mode == OpenMode::Edit })
+                .collect();
+            list.sort_by_key(|c| !c.default);
+            write_response(writer, &Response::OpenApps { apps: list })
+        }
+        Request::OpenFile { app, mime, name, write, activation, always } => {
+            let Some(t) = declarable(&mime) else {
+                return refuse(writer, format!("{mime}: not a type Atrium opens in apps"));
+            };
+            if name.is_empty() || name.contains(['/', '\0']) || name.len() > atrium_open::MAX_NAME {
+                return refuse(writer, "the file's name, not a path".into());
+            }
+            let Some((mode, app_name)) = launch::app_opens(&app, &mime) else {
+                return refuse(writer, format!("{app} doesn't open {}", t.words));
+            };
+            if write && mode != OpenMode::Edit {
+                return refuse(writer, format!("{app_name} only views {}", t.words));
+            }
+            if let Err(why) = may_run_unasked(&app, owner, shared) {
+                return refuse(writer, why);
+            }
+            // Last of the checks: a refusal above doesn't spend the press.
+            if let Err(why) = opens::spend_press(&opens::activation_socket(), activation, uid) {
+                return refuse(writer, why);
+            }
+            write_response(writer, &Response::ReadyForFds)?;
+            if !reader.buffer().is_empty() {
+                return refuse(writer, "protocol violation: data buffered before the descriptor".into());
+            }
+            let mut fds = match portcullis_ipc::recv_fds(reader.get_ref(), 1) {
+                Ok(v) if v.len() == 1 => v,
+                Ok(v) => return refuse(writer, format!("expected one descriptor, got {}", v.len())),
+                Err(e) => return refuse(writer, format!("recv_fds: {e}")),
+            };
+            let fd = fds.pop().unwrap();
+            if let Err(why) = opens::check(&fd, write) {
+                return refuse(writer, format!("“{name}”: {why}"));
+            }
+            if let Err(e) = opens::narrow(&fd, write) {
+                return refuse(writer, format!("cap_rights_limit: {e}"));
+            }
+            if always {
+                let p = Defaults::user_path(owner);
+                let mut d = Defaults::load(&p).unwrap_or_default();
+                if let Err(e) = d.choose(&mime, &app).map_err(std::io::Error::other).and_then(|_| d.save(&p)) {
+                    eprintln!("portcullisd: default for {mime}: {e}");
+                } else {
+                    eprintln!("portcullisd: {owner}'s default for {mime} is now {app}");
+                }
+            }
+            let hub = Hub::global();
+            if let Err(e) = hub.listen(&app) {
+                return refuse(writer, format!("{app}'s document channel: {e}"));
+            }
+            match hub.deliver(&app, &name, &mime, write, fd) {
+                Ok(Delivery::Sent) => {}
+                Ok(Delivery::Queued) => {
+                    let mut started = STARTED_FOR_OPEN.lock().unwrap();
+                    if !started.contains(&app) && launch::running_jid(&app).is_none() {
+                        started.push(app.clone());
+                        let (a, o) = (app.clone(), owner.to_string());
+                        eprintln!("portcullisd: starting {a} for {o} to open “{name}”");
+                        thread::spawn(move || {
+                            match launch::launch_with_stdio(&a, &o, None) {
+                                Ok(out) => eprintln!("portcullisd: {a} (opened a file) exited {:?}", out.exit_code),
+                                Err(e) => eprintln!("portcullisd: {a} (opened a file) failed at {}: {}", e.stage(), e.message()),
+                            }
+                            STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &a);
+                        });
+                    }
+                }
+                Err(e) => return refuse(writer, e.to_string()),
+            }
+            eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
+            write_response(writer, &Response::Opened { app: app_name, name })
+        }
+        _ => unreachable!("routed by serve()"),
+    }
+}
+
 /// Service-manifest dir + jaild socket for the governor broker path.
 const SERVICES_DIR: &str = "/etc/atrium/services.d";
 const JAILD_SOCK:   &str = "/var/run/atrium/jaild.sock";
@@ -1352,6 +1498,10 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         | Request::TeardownSessionComponent { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
+        },
+        Request::OpenApps { .. } | Request::OpenFile { .. } => Response::Error {
+            /* Caught by serve() before reaching here (routed to handle_open). */
+            message: "internal: open verbs must go through handle_open".into(),
         },
         Request::ExecInJail { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to

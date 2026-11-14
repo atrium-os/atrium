@@ -27,5 +27,7 @@ fresco-protocol = { path = "../fresco-protocol" }
 limen = { path = "../limen" }
 atrium-media = { path = "../dispensator/media" }
 atrium-types = { path = "../atrium-types" }
+# OpenApps and OpenFile (opening-files.md §6.2).
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 libc = "0.2"
 log = "0.4"

@@ -63,6 +63,12 @@ aqueduct            = { path = "../../aqueduct" }
 # The fetcher's site-list syntax (nuntius.md §4), checked before spawn.
 nuntius             = { path = "../../nuntius", default-features = false }
 sockmux             = { path = "../sockmux" }
+# Opening files (opening-files.md §6.2): the document channel, the type
+# table, and spending the press with frescod (purpose OPEN).
+atrium-open         = { path = "../../atrium-open" }
+atrium-types        = { path = "../../atrium-types" }
+fresco-protocol     = { path = "../../fresco-protocol" }
+postcard            = { version = "1", features = ["use-std"] }
 libc                = "0.2"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"

@@ -260,6 +260,43 @@ pub enum Request {
         cols:      u16,
         rows:      u16,
     },
+
+    /// ★ The apps that open `mime`, for the file manager's Open and Open
+    /// with (docs/spec/opening-files.md §6.1). Only from the session's file
+    /// manager (its INSTALLED manifest holds `removable-files`), as for
+    /// dispensatord's CONNECT. Answer: `OpenApps`.
+    OpenApps { mime: String },
+
+    /// ★ Open a file in an app (opening-files.md §6.2). Only from the
+    /// session's file manager, and only with `activation`, a press in its
+    /// window that portcullisd spends with frescod (purpose OPEN), so a file
+    /// is opened only because the user asked. `app` must declare `mime`
+    /// (and `edit` it, for `write`); the app must be one the user's policy
+    /// already lets run. Then `ReadyForFds`, one descriptor (the file,
+    /// opened by the file manager with `O_NOFOLLOW`), and `Opened`. The app
+    /// gets it narrowed, on its document channel. `always` makes `app` the
+    /// user's default for `mime` (the Open with sheet's "Always").
+    OpenFile {
+        app:        String,
+        mime:       String,
+        /// The file's own name, for the app's title bar: never a path.
+        name:       String,
+        write:      bool,
+        activation: [u8; 16],
+        #[serde(default)]
+        always:     bool,
+    },
+}
+
+/// An app that opens a type, for the Open with sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenChoice {
+    pub id:      String,
+    pub name:    String,
+    /// It edits the type (`mode = "edit"`).
+    pub edit:    bool,
+    /// The user's default for the type (or the system's, unchosen).
+    pub default: bool,
 }
 
 /// One installed app, as the daemon is willing to describe it to a launcher.
@@ -324,6 +361,11 @@ pub enum Response {
     /// window and focus it without needing the launch registry (which a jailed
     /// launcher cannot read).
     AlreadyRunning { app_id: String, jid: i32, uid: u32 },
+
+    /// OpenApps → the apps that open the type, the default first.
+    OpenApps { apps: Vec<OpenChoice> },
+    /// OpenFile → handed to `app` (started for it, or already running).
+    Opened { app: String, name: String },
 
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable

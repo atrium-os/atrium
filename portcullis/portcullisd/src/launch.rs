@@ -266,6 +266,15 @@ pub fn launch_with_stdio(
             full_teardown(&jail_path, None);
             LaunchError::Failed("build", e.to_string())
         })?;
+    /* ★ The document channel (opening-files.md §6.2): an app that opens
+     * types gets its own directory of the channel hub, and only its own,
+     * at /atrium/sockets/opens. Made before the mount, so the source exists. */
+    let mut jc = jc;
+    if !manifest.opens.is_empty() {
+        let dir = portcullisd::opens::Hub::global().listen(app_id)
+            .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
+        jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
+    }
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
         return Err(e);
@@ -659,6 +668,47 @@ pub fn catalog() -> Vec<portcullis_ipc::CatalogEntry> {
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// `app_id`'s installed manifest, if it reads and parses.
+fn installed(app_id: &str) -> Option<Manifest> {
+    if app_id.is_empty() || app_id.contains(['/', '\0']) || app_id.starts_with('.') {
+        return None;
+    }
+    let text = fs::read_to_string(PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml")).ok()?;
+    Manifest::from_str(&text).ok()
+}
+
+/// Is `app_id` a file manager (`removable-files` in its INSTALLED
+/// manifest)? The only caller of OpenApps and OpenFile (opening-files.md
+/// §6.2), as of dispensatord's CONNECT.
+pub fn app_is_file_manager(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.removable_files == Some(true))
+}
+
+/// How `app_id` opens `mime` (its INSTALLED `[[opens]]`), and its name.
+pub fn app_opens(app_id: &str, mime: &str) -> Option<(portcullis_toml::OpenMode, String)> {
+    let m = installed(app_id)?;
+    m.opens(mime).map(|mode| (mode, if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }))
+}
+
+/// Every installed app that opens `mime`: (id, name, mode), by name.
+pub fn apps_opening(mime: &str) -> Vec<(String, String, portcullis_toml::OpenMode)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
+        let Ok(m) = Manifest::from_str(&text) else { continue };
+        // The tree's name is the id the app is launched by.
+        if e.file_name().to_str() != Some(m.app.id.as_str()) {
+            continue;
+        }
+        if let Some(mode) = m.opens(mime) {
+            out.push((m.app.id.clone(), if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }, mode));
+        }
+    }
+    out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
     out
 }
 

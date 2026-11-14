@@ -123,7 +123,9 @@ pub fn apply_all(
     // gates every verb on the caller's own installed manifest, so the mount
     // grants nothing else.
     // `protected-media` (OpenCdm) reaches it the same way.
-    if (caps.net_fetch == Some(true) || caps.protected_media == Some(true)) && caps.app_launch != Some(true) {
+    // The file manager opens files in apps through portcullisd (OpenFile,
+    // opening-files.md §6.2), which checks it by its uid on every request.
+    if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)) && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }
     Ok(())

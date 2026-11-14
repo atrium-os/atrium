@@ -13,6 +13,8 @@ pub mod cdm;
 pub mod host_mount;
 pub mod init_phase;
 pub mod jaild_client;
+/// Opening files in apps (opening-files.md §6.2).
+pub mod opens;
 /// The manifest trust gate, re-exported so existing call sites keep working.
 /// It lives in `portcullis-trust` so the CLI and `atrium-launch` share it
 /// rather than each carrying their own answer (they did).

@@ -37,6 +37,10 @@ pub struct App<V: View> {
     /// PointerUp if the up event lands on the same node. Drag
     /// detection (when up lands elsewhere) lives in a future phase.
     pending_press: Option<NodeId>,
+    /// The activation token frescod minted for that press: a click fires
+    /// on the release, which carries none, so the press's token is the
+    /// current activation while its handler runs (opening-files.md §6.2).
+    press_activation: Option<crate::clipboard::Token>,
     /// The node currently receiving keyboard input, if any. Pointer-
     /// down on a focusable node sets this; Tab / Shift-Tab cycle it
     /// through focusables in id order.
@@ -107,6 +111,7 @@ impl<V: View> App<V> {
             prev_tree: NodeTree::new(),
             interactions: Interactions::new(),
             pending_press: None,
+            press_activation: None,
             focused: None,
             focus_visible: false,
             dragging: None,
@@ -491,6 +496,7 @@ impl<V: View> App<V> {
                 // the handler. Press-tracking uses the nearest on_click ancestor;
                 // focus uses the nearest focusable ancestor.
                 self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
+                self.press_activation = crate::clipboard::current_activation();
                 self.dragging = hit.and_then(|id| self.bubble_to(id, |h| h.on_drag.is_some()));
                 if let Some(cb) = self.dragging.and_then(|d| self.interactions.get(d)).and_then(|h| h.on_drag.as_ref()) {
                     cb(crate::interaction::DragPhase::Start, *at);
@@ -519,12 +525,16 @@ impl<V: View> App<V> {
                     if pressed == up {
                         if let Some(h) = self.interactions.get(pressed) {
                             if let Some(cb) = &h.on_click {
-                                cb();
+                                match crate::clipboard::current_activation().or(self.press_activation) {
+                                    Some(t) => crate::clipboard::with_activation(Some(t), cb),
+                                    None => cb(),
+                                }
                             }
                         }
                     }
                 }
                 self.pending_press = None;
+                self.press_activation = None;
                 if self.pressed_vis.take().is_some() {
                     self.touch();
                 }
@@ -683,6 +693,29 @@ mod tests {
             let fired = self.fired.clone();
             ctx.on_click(bg, move || fired.store(true, Ordering::SeqCst));
         }
+    }
+
+    #[test]
+    fn a_click_runs_with_its_press_token() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Option<crate::clipboard::Token>>>;
+        struct Tokened(Seen);
+        impl View for Tokened {
+            fn render(&self, ctx: &mut Ctx) {
+                let bg = ctx.tree.insert(None, Node::Rect { rect: Rect::new(0.0, 0.0, 100.0, 40.0), fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0 });
+                let s = self.0.clone();
+                ctx.on_click(bg, move || *s.lock().unwrap() = crate::clipboard::current_activation());
+            }
+        }
+        let seen: Seen = Default::default();
+        let mut app = App::new(Tokened(seen.clone()));
+        app.tick();
+        let at = crate::geom::Point::new(50.0, 20.0);
+        app.handle_event_activated(Event::PointerDown { at }, Some([9; 16]));
+        app.handle_event_activated(Event::PointerUp { at }, None);
+        assert_eq!(*seen.lock().unwrap(), Some([9; 16]), "the release carries no token; the press's is used");
+        app.handle_event_activated(Event::PointerDown { at }, None);
+        app.handle_event_activated(Event::PointerUp { at }, None);
+        assert_eq!(*seen.lock().unwrap(), None, "and only that press's");
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[package]
+name = "atrium-open"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "An app's document channel (docs/spec/opening-files.md §6.2): the files the user opens in it, one descriptor each, from portcullisd."
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

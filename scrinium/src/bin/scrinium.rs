@@ -129,7 +129,7 @@ impl Pane {
         if self.trace.is_some() {
             let b = self.state.get_cloned();
             let line = format!(
-                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={}",
+                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} open={}",
                 b.place().map_or("-", |p| p.id.as_str()),
                 b.path.join("/"),
                 b.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
@@ -139,6 +139,7 @@ impl Pane {
                 b.saved.iter().map(|s| s.addr.text()).collect::<Vec<_>>().join(","),
                 b.places.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(","),
                 b.unreadable.as_deref().unwrap_or("-"),
+                open_trace(&b),
             );
             if self.trace.as_deref() != Some(&line) {
                 eprintln!("scrinium: {who}: {line}");
@@ -146,6 +147,16 @@ impl Pane {
             }
         }
         true
+    }
+}
+
+/// The open sheet, for the trace: `choose:APP,APP` or `question:MIME|text`.
+fn open_trace(b: &scrinium::browser::Browser) -> String {
+    use scrinium::browser::OpenSheet;
+    match &b.open_sheet {
+        None => "-".into(),
+        Some(OpenSheet::Choose { apps, always, .. }) => format!("choose:{}{}", apps.iter().map(|a| a.id.as_str()).collect::<Vec<_>>().join(","), if *always { ":always" } else { "" }),
+        Some(OpenSheet::Question { actual, text, .. }) => format!("question:{}{}", actual.as_ref().map_or("-", |a| a.0.as_str()), if *text { "|text" } else { "" }),
     }
 }
 
@@ -383,9 +394,13 @@ enum Job {
     /// A share's size and free space (its server answers over the network,
     /// so it is asked off the window's thread).
     Space(String, Option<(u64, u64)>),
+    /// A file to open, what its bytes say it is, and whether they are text.
+    Typed(scrinium::browser::OpenReq, std::io::Result<(atrium_types::Detected, bool)>),
+    /// The apps that open its type.
+    Apps(scrinium::browser::OpenReq, Result<Vec<scrinium::browser::Choice>, String>),
+    /// How handing it to its app went.
+    Handed(scrinium::browser::OpenReq, Result<String, String>),
     /// A share's "connect at login", as dispensatord answered.
-    /// A file to open and what its bytes say it is.
-    Typed(String, std::io::Result<atrium_types::Detected>),
     /// `true`: the user asked to change it (a failure is shown).
     AtLogin(String, Result<bool, String>, bool),
 }
@@ -612,13 +627,28 @@ impl Network {
                 let _ = tx.send(Job::AtLogin(part.0, r, part.1.is_some()));
             });
         }
-        // A file to open: its first bytes, off this thread.
-        if let Some((path, name)) = b.want_open.take() {
+        // A file being opened: each step off this thread.
+        if let Some(step) = b.want_open.take() {
+            use scrinium::browser::OpenStep;
             changed = true;
             let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let r = scrinium::fs::head(&path).map(|h| atrium_types::detect(&name, &h));
-                let _ = tx.send(Job::Typed(name, r));
+            std::thread::spawn(move || match step {
+                OpenStep::Type(req) => {
+                    let r = scrinium::fs::head(&req.path).map(|h| (atrium_types::detect(&req.name, &h), atrium_types::is_text(&h)));
+                    let _ = tx.send(Job::Typed(req, r));
+                }
+                OpenStep::Apps(req) => {
+                    let r = scrinium::open::apps(req.mime.as_deref().unwrap_or_default());
+                    let _ = tx.send(Job::Apps(req, r));
+                }
+                OpenStep::Hand(mut req) => {
+                    let r = scrinium::fs::open_for_app(&req.path, req.write).map_err(|e| scrinium::browser::err_text(&e)).and_then(|(f, w)| {
+                        req.write = w;
+                        let (app, mime) = (req.app.clone().unwrap_or_default(), req.mime.clone().unwrap_or_default());
+                        scrinium::open::open(&app, &mime, &req.name, w, req.always, req.token, &f)
+                    });
+                    let _ = tx.send(Job::Handed(req, r));
+                }
             });
         }
         // Shares' sizes: asked now and then, each on its own thread.
@@ -657,7 +687,9 @@ impl Network {
                     None => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't connect: {e}"), error: true }),
                 },
                 Job::Saved(l) => b.saved = l,
-                Job::Typed(name, r) => b.typed(&name, r),
+                Job::Typed(req, r) => b.typed(req, r),
+                Job::Apps(req, r) => b.apps(req, r),
+                Job::Handed(req, r) => b.handed(&req, r),
                 Job::AtLogin(part, r, set) => match r {
                     Ok(on) => {
                         b.at_login.insert(part, on);
