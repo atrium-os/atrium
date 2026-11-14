@@ -8,8 +8,12 @@
 //! renderer shifts what is drawn and draws only the exposed strip. The
 //! motion itself is [`crate::scroll`]'s, on the app's frame clock.
 //!
-//! What this prototype leaves out, stated: horizontal scrolling, a
-//! scrollbar, the fling blur on the wire (the renderer has no blur op
+//! Content wider than the view scrolls across too: a wheel's `dx` (or
+//! Shift + wheel), a touchpad (kept to one axis unless the gesture is
+//! diagonal) and Left/Right; both axes move the one content group, so
+//! the renderer shifts diagonally in one step.
+//!
+//! What this prototype leaves out, stated: a scrollbar, the fling blur on the wire (the renderer has no blur op
 //! yet; [`Physics::motion_blur_px`] says how much), and band sources
 //! (the [`crate::scroll::Viewport`] side is built; `DocumentView` will be
 //! its first source). Pergola-native content is laid out once at zoom 1
@@ -41,19 +45,31 @@ pub const WHEEL_ZOOM_PER_PX: f64 = 0.002;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ScrollState {
     pub physics: Physics,
+    /// The horizontal axis: still unless the content is wider than the view.
+    pub physics_x: Physics,
     pub zoom: Zoom,
     pub reduce_motion: bool,
     /// The running pinch's scale at its last step (0: no pinch).
     pub pinch_last: f64,
+    /// The content's size (width, height) at zoom 1 when the widget knows
+    /// it better than layout can: a grid of a billion rows is taller than
+    /// an `f32` holds exactly, so it scrolls in `f64` and sends nodes
+    /// near the view only (`GridView`).
+    pub extent: Option<[f64; 2]>,
+    /// Ignore zoom gestures (a grid keeps its scale).
+    pub fixed_zoom: bool,
 }
 
 impl ScrollState {
     /// Bring the bounds up to date with the node as last laid out: the
     /// content's height at zoom 1 minus what the viewport shows of it.
-    fn fit(&mut self, node: &Node) {
-        if let Node::Scroll { rect, content_h, .. } = node {
+    pub fn fit(&mut self, node: &Node) {
+        if let Node::Scroll { rect, content_h, content_w, .. } = node {
+            let [w, h] = self.extent.unwrap_or([*content_w as f64, *content_h as f64]);
             let shown = rect.h() as f64 / self.zoom.live;
-            self.physics.set_max(*content_h as f64 - shown);
+            self.physics.set_max(h - shown);
+            let across = rect.w() as f64 / self.zoom.live;
+            self.physics_x.set_max(w - across);
         }
     }
 
@@ -62,6 +78,14 @@ impl ScrollState {
     /// Apply one input at `t` ms.
     pub fn input(&mut self, kind: ScrollKind, t: f64, node: &Node) {
         self.fit(node);
+        if self.fixed_zoom {
+            match kind {
+                ScrollKind::Magnify { .. } => return,
+                ScrollKind::Wheel { modifiers, .. } if modifiers.ctrl => return,
+                ScrollKind::Key { modifiers, .. } if modifiers.ctrl => return,
+                _ => {}
+            }
+        }
         let vh = Self::viewport_h(node) / self.zoom.live;
         match kind {
             ScrollKind::Press => self.physics.stop(),
@@ -76,6 +100,7 @@ impl ScrollState {
                     self.physics.stop();
                 }
                 let focus = (at.y - node.rect().y()) as f64;
+                let focus_x = (at.x - node.rect().x()) as f64;
                 let z0 = self.zoom.live;
                 self.zoom.pinch(s / self.pinch_last, t);
                 self.pinch_last = s;
@@ -84,32 +109,50 @@ impl ScrollState {
                 if !down {
                     self.pinch_last = 0.0;
                 }
-                self.refocus(z0, focus, node);
+                self.refocus(z0, focus, focus_x, node);
             }
             ScrollKind::Wheel { at, dy, modifiers, .. } if modifiers.ctrl => {
                 let focus = at.map(|p| (p.y - node.rect().y()) as f64).unwrap_or(0.0);
+                let focus_x = at.map(|p| (p.x - node.rect().x()) as f64).unwrap_or(0.0);
                 let z0 = self.zoom.live;
                 self.zoom.pinch((-(dy as f64) * WHEEL_ZOOM_PER_PX).exp(), t);
-                self.refocus(z0, focus, node);
+                self.refocus(z0, focus, focus_x, node);
             }
             // A touchpad that says where the fingers are: they follow it,
             // fingers down catch a fling, and lifting them throws one.
-            ScrollKind::Wheel { dy, phase, .. } if phase != ScrollPhase::None => {
+            ScrollKind::Wheel { dx, dy, phase, modifiers, .. } if phase != ScrollPhase::None => {
+                let (dx, dy) = across(dx, dy, modifiers.shift);
                 if phase == ScrollPhase::Begin {
                     self.physics.stop();
+                    self.physics_x.stop();
                 }
                 if phase == ScrollPhase::End {
                     self.physics.release(t);
-                } else if dy != 0.0 {
-                    self.physics.hold(dy as f64 / self.zoom.live, t);
+                    self.physics_x.release(t);
+                } else {
+                    // A gesture mostly along one axis moves only that one,
+                    // so a vertical swipe doesn't wander sideways.
+                    let (dx, dy) = rail(dx, dy);
+                    if dy != 0.0 {
+                        self.physics.hold(dy as f64 / self.zoom.live, t);
+                    }
+                    if dx != 0.0 {
+                        self.physics_x.hold(dx as f64 / self.zoom.live, t);
+                    }
                 }
             }
-            ScrollKind::Wheel { dy, .. } => {
-                let d = dy as f64 / self.zoom.live;
-                if dy.abs() >= NOTCH_PX {
-                    self.physics.jump_by(d, t);
-                } else {
-                    self.physics.drag(d, t);
+            ScrollKind::Wheel { dx, dy, modifiers, .. } => {
+                let (dx, dy) = across(dx, dy, modifiers.shift);
+                for (p, d) in [(&mut self.physics, dy), (&mut self.physics_x, dx)] {
+                    if d == 0.0 {
+                        continue;
+                    }
+                    let v = d as f64 / self.zoom.live;
+                    if d.abs() >= NOTCH_PX {
+                        p.jump_by(v, t);
+                    } else {
+                        p.drag(v, t);
+                    }
                 }
             }
             ScrollKind::Key { key, chars, modifiers } => {
@@ -117,6 +160,8 @@ impl ScrollState {
                 match (key, chars) {
                     (Key::Up, _) => self.physics.jump_by(-LINE_PX, t),
                     (Key::Down, _) => self.physics.jump_by(LINE_PX, t),
+                    (Key::Left, _) => self.physics_x.jump_by(-LINE_PX, t),
+                    (Key::Right, _) => self.physics_x.jump_by(LINE_PX, t),
                     (Key::PageUp, _) => self.physics.jump_by(-vh * PAGE_FRACTION, t),
                     (Key::PageDown, _) => self.physics.jump_by(vh * PAGE_FRACTION, t),
                     (Key::Char, ' ') => {
@@ -131,8 +176,8 @@ impl ScrollState {
                     _ => {}
                 }
                 if self.zoom.live != z0 {
-                    // Keyboard zoom keeps the top of the viewport.
-                    self.refocus(z0, 0.0, node);
+                    // Keyboard zoom keeps the top left of the viewport.
+                    self.refocus(z0, 0.0, 0.0, node);
                 }
             }
         }
@@ -140,25 +185,50 @@ impl ScrollState {
 
     /// After the live zoom changed from `z0`: keep the content under the
     /// point `focus` px from the viewport's top where it is.
-    fn refocus(&mut self, z0: f64, focus: f64, node: &Node) {
+    fn refocus(&mut self, z0: f64, focus: f64, focus_x: f64, node: &Node) {
         let y = zoom_about(self.physics.y, focus, z0, self.zoom.live);
+        let x = zoom_about(self.physics_x.y, focus_x, z0, self.zoom.live);
         self.fit(node);
         self.physics.set_position(y);
+        self.physics_x.set_position(x);
     }
 
     /// One frame at `t` ms. Returns whether it still needs frames.
     pub fn frame(&mut self, t: f64, node: &Node) -> bool {
         self.fit(node);
         self.physics.step(t);
+        self.physics_x.step(t);
         // A settle re-renders at the new zoom (the payloads change, the
         // stretch returns to 1): the "sharpen on settle" step.
         self.zoom.step(t);
-        self.physics.is_moving() || self.zoom.is_pending()
+        self.physics.is_moving() || self.physics_x.is_moving() || self.zoom.is_pending()
     }
 }
 
-/// A vertical scroll view. `content` renders inside it, laid out in a
-/// column as wide as the view.
+/// Shift turns a wheel's vertical turn into a horizontal one (a mouse
+/// with one wheel scrolls a wide sheet across).
+fn across(dx: f32, dy: f32, shift: bool) -> (f32, f32) {
+    if shift && dx == 0.0 {
+        (dy, 0.0)
+    } else {
+        (dx, dy)
+    }
+}
+
+/// A touchpad delta mostly along one axis keeps to that axis (within
+/// about 27° of it); a diagonal one moves both.
+fn rail(dx: f32, dy: f32) -> (f32, f32) {
+    if dx.abs() <= dy.abs() * 0.5 {
+        (0.0, dy)
+    } else if dy.abs() <= dx.abs() * 0.5 {
+        (dx, 0.0)
+    } else {
+        (dx, dy)
+    }
+}
+
+/// A scroll view. `content` renders inside it, laid out in a column as
+/// wide as the view (children wider than that scroll across).
 pub struct ScrollView<V: View> {
     pub state: Mutable<ScrollState>,
     pub rect: Rect,
@@ -206,6 +276,8 @@ impl<V: View> ScrollView<V> {
             stretch: st.zoom.stretch() as f32,
             backdrop,
             content_h: 0.0,
+            offset_x: st.physics_x.y as f32,
+            content_w: 0.0,
         });
         self.content.render(ctx);
         ctx.pop();
@@ -238,16 +310,16 @@ impl<V: View> View for ScrollView<V> {
 /// Where the point `p` (window px) falls in the content of the scroll
 /// view `node`, in content px at zoom 1.
 pub fn content_point(node: &Node, p: Point) -> Option<Point> {
-    let Node::Scroll { rect, offset, zoom, stretch, .. } = node else { return None };
+    let Node::Scroll { rect, offset, offset_x, zoom, stretch, .. } = node else { return None };
     let z = zoom * stretch;
-    Some(Point::new((p.x - rect.x()) / z, (p.y - rect.y()) / z + offset))
+    Some(Point::new((p.x - rect.x()) / z + offset_x, (p.y - rect.y()) / z + offset))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::event::{Event, KeyEventKind, Modifiers};
+    use crate::event::{Event, KeyEventKind, Modifiers, ScrollPhase};
     use crate::node::NodeDelta;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -397,6 +469,85 @@ mod tests {
             NodeDelta::Changed { node: Node::Rect { rect, .. }, .. } if (rect.w() - 200.0 * z).abs() < 1e-3));
         assert!(resized, "rows sent at zoom {z}");
         assert!(!app.wants_frame());
+    }
+
+    /// A 200 × 300 view over a 900 × 2,000 sheet of rows.
+    struct Wide {
+        state: Mutable<ScrollState>,
+    }
+
+    impl View for Wide {
+        fn render(&self, ctx: &mut Ctx) {
+            let rows = crate::view::Draw(|ctx: &mut Ctx| {
+                for i in 0..50 {
+                    ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 900.0, 40.0), fill: Color::rgba(i as f32 / 50.0, 0.0, 0.0, 1.0), radius: 0.0 });
+                }
+            });
+            ScrollView::new(self.state.clone(), Rect::new(0.0, 0.0, 200.0, 300.0), rows).emit(ctx);
+        }
+    }
+
+    #[test]
+    fn wide_content_scrolls_across_and_diagonally() {
+        let dirty = Arc::new(AtomicBool::new(true));
+        let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+        let mut app = App::new_with_flag(Wide { state: state.clone() }, dirty);
+        let d = app.tick();
+        let w = d.iter().find_map(|d| match d {
+            NodeDelta::Added { node: Node::Scroll { content_w, .. }, .. } => Some(*content_w),
+            _ => None,
+        });
+        assert_eq!(w, Some(900.0), "layout measures the width");
+        // Shift + a wheel notch goes across.
+        let shift = Modifiers { shift: true, ..Default::default() };
+        app.set_time(0.0);
+        app.handle_event(Event::Scroll { at: Some(Point::new(100.0, 100.0)), dx: 0.0, dy: 40.0, modifiers: shift, phase: ScrollPhase::None });
+        let mut t = 0.0;
+        while t < 400.0 {
+            t += 1000.0 / 120.0;
+            app.set_time(t);
+            app.frame();
+            app.tick();
+        }
+        let st = state.get();
+        assert_eq!((st.physics_x.y, st.physics.y), (40.0, 0.0));
+        // A touchpad swipe mostly down stays on the vertical rail.
+        let pad = |dx, dy, phase| Event::Scroll { at: Some(Point::new(100.0, 100.0)), dx, dy, modifiers: Modifiers::default(), phase };
+        app.handle_event(pad(0.0, 0.0, ScrollPhase::Begin));
+        for i in 0..5 {
+            app.set_time(t + i as f64 * 8.0);
+            app.handle_event(pad(3.0, 20.0, ScrollPhase::Update));
+        }
+        let st = state.get();
+        assert_eq!(st.physics_x.y, 40.0, "no sideways drift");
+        assert_eq!(st.physics.y, 100.0);
+        // A diagonal one moves both, in one content transform.
+        for i in 0..5 {
+            app.set_time(t + 40.0 + i as f64 * 8.0);
+            app.handle_event(pad(10.0, 10.0, ScrollPhase::Update));
+        }
+        let d = app.tick();
+        let st = state.get();
+        assert_eq!((st.physics_x.y, st.physics.y), (90.0, 150.0));
+        assert_eq!(d.len(), 1, "one node changes: {d:?}");
+        assert!(matches!(d[0], NodeDelta::Changed { node: Node::Scroll { offset_x, offset, .. }, .. } if offset_x == 90.0 && offset == 150.0));
+        // Hits land on what is drawn there.
+        let hit = crate::event::hit_test(app.tree(), Point::new(10.0, 20.0)).unwrap();
+        assert_eq!(app.tree().get(hit).unwrap().rect().y(), 160.0);
+        // The edge clamps: 900 − 200.
+        for i in 0..40 {
+            app.set_time(t + 100.0 + i as f64 * 8.0);
+            app.handle_event(pad(100.0, 0.0, ScrollPhase::Update));
+        }
+        assert_eq!(state.get().physics_x.y, 700.0);
+    }
+
+    #[test]
+    fn narrow_content_never_scrolls_across() {
+        let (mut app, state) = app();
+        app.handle_event(Event::Scroll { at: Some(Point::new(100.0, 100.0)), dx: 50.0, dy: 0.0, modifiers: Modifiers::default(), phase: ScrollPhase::None });
+        run_frames(&mut app, 0.0, 400.0);
+        assert_eq!(state.get().physics_x.y, 0.0);
     }
 
     #[test]

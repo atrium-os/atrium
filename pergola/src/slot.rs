@@ -32,12 +32,12 @@ pub fn window_rect(tree: &NodeTree, id: NodeId) -> Option<Rect> {
     let mut r = tree.get(id)?.rect();
     let mut at = id;
     while let Some(p) = tree.parent_of(at) {
-        if let Some(Node::Scroll { rect, offset, zoom, stretch, .. }) = tree.get(p) {
+        if let Some(Node::Scroll { rect, offset, offset_x, zoom, stretch, .. }) = tree.get(p) {
             // The inverse of hit testing's mapping (event.rs).
             let z = zoom * stretch;
             let o = rect.origin;
             r = Rect {
-                origin: Point::new(o.x + (r.x() - o.x) * z, o.y + (r.y() - offset - o.y) * z),
+                origin: Point::new(o.x + (r.x() - offset_x - o.x) * z, o.y + (r.y() - offset - o.y) * z),
                 size: Size::new(r.w() * z, r.h() * z),
             };
             let inside = r.x() >= rect.x() && r.y() >= rect.y()

@@ -285,8 +285,9 @@ fn flex_subtree(tree: &mut NodeTree, root: PNodeId) {
         }
         if let Some(node) = tree.get_mut(p_id) {
             node.set_rect(PRect::new(x, y, l.size.width, l.size.height));
-            if let Node::Scroll { content_h, .. } = node {
+            if let Node::Scroll { content_h, content_w, .. } = node {
                 *content_h = l.content_size.height;
+                *content_w = l.content_size.width;
             }
         }
         let p_children: Vec<PNodeId> = tree.children_of(p_id).to_vec();

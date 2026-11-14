@@ -89,6 +89,9 @@ pub enum Node {
     /// - `stretch`: the gesture's zoom over `zoom` while a pinch runs (the
     ///   content group's scale: existing content stretched until it settles).
     /// - `content_h`: the children's height at zoom 1, written by layout.
+    /// - `offset_x`, `content_w`: the same across. Content no wider than
+    ///   the view never scrolls across (`content_w` is written by layout
+    ///   from what the children span).
     Scroll {
         rect: Rect,
         offset: f32,
@@ -96,6 +99,8 @@ pub enum Node {
         stretch: f32,
         backdrop: Option<Color>,
         content_h: f32,
+        offset_x: f32,
+        content_w: f32,
     },
     /// A single stroked line segment (a thick rotated quad at the GPU layer).
     /// Absolutely positioned — layout doesn't touch it. Vector icons are built from

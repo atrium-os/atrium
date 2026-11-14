@@ -629,7 +629,7 @@ pub const TOOLTIP_WARM_MS: f64 = 300.0;
 
 fn is_scroll_key(key: Key, chars: &str, m: &crate::event::Modifiers) -> bool {
     match key {
-        Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => true,
+        Key::Up | Key::Down | Key::Left | Key::Right | Key::PageUp | Key::PageDown | Key::Home | Key::End => true,
         Key::Char if chars == " " => true,
         Key::Char if m.ctrl => matches!(chars, "+" | "=" | "-" | "0"),
         _ => false,

@@ -15,6 +15,7 @@
 pub mod addr;
 pub mod book;
 pub mod column;
+pub mod csv;
 pub mod deps;
 pub mod eval;
 pub mod fast;

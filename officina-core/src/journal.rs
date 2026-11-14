@@ -31,6 +31,9 @@ impl<W: Write> JournalWriter<W> {
     pub fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
+    pub fn get_ref(&self) -> &W {
+        &self.out
+    }
     pub fn into_inner(self) -> W {
         self.out
     }

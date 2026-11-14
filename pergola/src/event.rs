@@ -134,10 +134,10 @@ fn hit_test_subtree(tree: &NodeTree, id: NodeId, point: Point) -> Option<NodeId>
     // Children of a scroll view are laid out unscrolled: map the point
     // into their space (undo the offset and the zoom).
     let inner = match node {
-        Node::Scroll { rect, offset, zoom, stretch, .. } => {
+        Node::Scroll { rect, offset, offset_x, zoom, stretch, .. } => {
             let z = zoom * stretch;
             Point::new(
-                rect.origin.x + (point.x - rect.origin.x) / z,
+                rect.origin.x + (point.x - rect.origin.x) / z + offset_x,
                 rect.origin.y + (point.y - rect.origin.y) / z + offset,
             )
         }

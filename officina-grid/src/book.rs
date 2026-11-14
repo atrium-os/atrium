@@ -62,6 +62,29 @@ pub enum Input {
     Formula(String),
 }
 
+impl Input {
+    /// What typing `s` into a cell means: `=...` is a formula, else a number, TRUE or
+    /// FALSE, an error value, or text (empty: nothing).
+    pub fn typed(s: &str) -> Input {
+        if s.starts_with('=') && s.len() > 1 {
+            return Input::Formula(s.to_string());
+        }
+        if s.is_empty() {
+            Input::Empty
+        } else if let Some(x) = parse_number(s) {
+            Input::Value(Value::Num(x))
+        } else if s.eq_ignore_ascii_case("TRUE") {
+            Input::Value(Value::Bool(true))
+        } else if s.eq_ignore_ascii_case("FALSE") {
+            Input::Value(Value::Bool(false))
+        } else if let Some(e) = ErrorKind::from_text(s) {
+            Input::Value(Value::Err(e))
+        } else {
+            Input::Value(Value::str(s))
+        }
+    }
+}
+
 /// Exact-match index of one column range, for MATCH / VLOOKUP / XLOOKUP.
 #[derive(Debug, Default)]
 pub struct LookupIndex {
@@ -310,24 +333,10 @@ impl Workbook {
     /// Sets a cell from what a user typed: `=...` is a formula, else a number, TRUE or
     /// FALSE, an error value, or text.
     pub fn set_input(&mut self, a: CellAddr, s: &str) -> Result<(), ParseError> {
-        if s.starts_with('=') && s.len() > 1 {
-            return self.set_formula(a, s);
+        match Input::typed(s) {
+            Input::Formula(f) => self.set_formula(a, &f),
+            i => self.set(a, &i),
         }
-        let v = if s.is_empty() {
-            Value::Empty
-        } else if let Some(x) = parse_number(s) {
-            Value::Num(x)
-        } else if s.eq_ignore_ascii_case("TRUE") {
-            Value::Bool(true)
-        } else if s.eq_ignore_ascii_case("FALSE") {
-            Value::Bool(false)
-        } else if let Some(e) = ErrorKind::from_text(s) {
-            Value::Err(e)
-        } else {
-            Value::str(s)
-        };
-        self.set_value(a, v);
-        Ok(())
     }
 
     pub fn set(&mut self, a: CellAddr, input: &Input) -> Result<(), ParseError> {

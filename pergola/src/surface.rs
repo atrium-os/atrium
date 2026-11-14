@@ -124,8 +124,8 @@ impl Surface for LogSurface {
         let r = stack.rect();
         let fill = match stack {
             Node::Stack { fill: Some(f), radius, .. } => format!(" fill=({:.2},{:.2},{:.2},{:.2}) r={radius:.0}", f.r, f.g, f.b, f.a),
-            Node::Scroll { offset, zoom, stretch, content_h, .. } => format!(
-                " SCROLL y={offset:.0} zoom={zoom:.2}×{stretch:.2} content_h={content_h:.0}"),
+            Node::Scroll { offset, offset_x, zoom, stretch, content_h, .. } => format!(
+                " SCROLL x={offset_x:.0} y={offset:.0} zoom={zoom:.2}×{stretch:.2} content_h={content_h:.0}"),
             _ => String::new(),
         };
         println!(
@@ -308,7 +308,7 @@ impl FrescoSurface {
     /// the offset and scaled by the gesture's stretch. Only what changed
     /// is sent, so a scroll frame is one `GROUP` message.
     fn set_scroll(&mut self, id: NodeId, node: &Node, group: Option<NodeId>, order: u32) -> io::Result<()> {
-        let Node::Scroll { rect, offset, zoom, stretch, backdrop, .. } = node else { unreachable!() };
+        let Node::Scroll { rect, offset, offset_x, zoom, stretch, backdrop, .. } = node else { unreachable!() };
         use fresco_protocol::{group_flags, GroupParams};
         let k = self.scale;
         let mut outer = GroupParams {
@@ -358,6 +358,7 @@ impl FrescoSurface {
         content.transform[3] = s;
         // Whole device pixels: the renderer shifts what is drawn only by a
         // whole-pixel step (fresco-scene-groups.md §4).
+        content.transform[4] = (-offset_x * zoom * s * k).round();
         content.transform[5] = (-offset * zoom * s * k).round();
         self.conn.scene_group(id.0 | crate::node::CONTENT_BIT, content)
     }

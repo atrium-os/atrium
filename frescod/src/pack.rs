@@ -1320,6 +1320,79 @@ mod group_tests {
         assert_eq!(shifted, 5, "every whole-pixel scroll smaller than the viewport shifted");
     }
 
+    /// A grid scrolls both ways at once (officina.md §10.2): the content
+    /// group's translation changes in x and y, [`shifts`] gives one
+    /// diagonal shift, and shifting then drawing what is left equals a
+    /// full draw, including across the floating button.
+    #[test]
+    fn diagonal_scrolls_shift_and_equal_full_draws() {
+        use fresco_compute::damage;
+        let build = |s: &mut WindowSceneState, o: [f32; 2]| {
+            s.set_group(200, GroupParams { parent: None, order: 0, transform: ID, clip: Some([4.0, 8.0, 60.0, 56.0]), opacity: 1.0, flags: fresco_protocol::group_flags::SCROLL }, 1).unwrap();
+            rect(s, 300, 4.0, 8.0, 56.0, 48.0, [0.9, 0.9, 0.9, 1.0]);
+            place(s, 300, Some(200), 0);
+            group(s, 201, Some(200), 1, [1.0, 0.0, 0.0, 1.0, o[0], o[1]], None);
+            // A grid of cells, wider and taller than the viewport.
+            for i in 0..120u32 {
+                let (r, c) = (i / 12, i % 12);
+                let col = [(c % 5) as f32 / 5.0, (r % 3) as f32 / 3.0, 1.0 - (i % 7) as f32 / 7.0, 1.0];
+                rect(s, i + 1, c as f32 * 11.0, r as f32 * 9.0, 10.0, 8.0, col);
+                place(s, i + 1, Some(201), i);
+            }
+            rect(s, 400, 44.0, 40.0, 10.0, 6.0, [0.1, 0.7, 0.2, 0.8]);
+            place(s, 400, None, 1);
+        };
+        let mut s = WindowSceneState::new();
+        let mut off = [2.0f32, 3.0];
+        build(&mut s, off);
+        let st = SceneState::default();
+        let w0 = grouped(&s);
+        let f0 = st.pack(&w0, W, W);
+        let mut px = reference::render(&f0);
+        let mut held = damage::tile_signatures(&f0);
+        let mut prev = keyed_scrolls(&st, &w0.scrolls);
+        let mut diagonal = 0;
+        for d in [[-5.0f32, -7.0], [9.0, 0.0], [0.0, -13.0], [-3.0, 11.0], [-0.5, -2.0], [-60.0, 4.0], [17.0, 17.0]] {
+            off = [off[0] + d[0], off[1] + d[1]];
+            build(&mut s, off);
+            let w = grouped(&s);
+            let f = st.pack(&w, W, W);
+            let sig = damage::tile_signatures(&f);
+            let now = keyed_scrolls(&st, &w.scrolls);
+            let sh = shifts(&prev, &now);
+            let whole = d.iter().all(|v| v.fract() == 0.0) && d[0].abs() < 56.0 && d[1].abs() < 48.0;
+            assert_eq!(sh.len(), whole as usize, "{d:?}");
+            if let Some(x) = sh.first() {
+                assert_eq!(x.d, [d[0] as i32, d[1] as i32]);
+                diagonal += (x.d[0] != 0 && x.d[1] != 0) as usize;
+            }
+            let out = damage::shift(&mut px, W, W, &sig, &mut held, &sh);
+            let full = reference::render(&f);
+            for r in &out.pixels {
+                for y in r[1]..r[3] {
+                    for x in r[0]..r[2] {
+                        px[(y * W + x) as usize] = full[(y * W + x) as usize];
+                    }
+                }
+            }
+            let tx = W.div_ceil(fresco_compute::TILE);
+            for (i, dirty) in damage::dirty(&sig, Some(&held)).into_iter().enumerate() {
+                if dirty {
+                    let (x0, y0) = ((i as u32 % tx) * 16, (i as u32 / tx) * 16);
+                    for y in y0..(y0 + 16).min(W) {
+                        for x in x0..(x0 + 16).min(W) {
+                            px[(y * W + x) as usize] = full[(y * W + x) as usize];
+                        }
+                    }
+                }
+            }
+            assert!(px == full, "scrolled by {d:?}: differs from a full draw");
+            held = sig;
+            prev = now;
+        }
+        assert_eq!(diagonal, 3);
+    }
+
     /// Pergola's ScrollView (c062808): the SCROLL group translated to the
     /// view's origin, clip in parent space; backdrop `id | 1 << 31` at
     /// local (0, 0, w, h), order 0; content `id | 1 << 30`, order 1, its

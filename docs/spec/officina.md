@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 is next.
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -822,6 +822,62 @@ inserting and deleting rows with reference adjustment, styles and number formats
 dynamic arrays and spills (O5), the space (intersection) operator, lazy loading of
 column chunks. The memory target is met for numbers; text-heavy sheets cost more (16
 bytes a cell in a mixed chunk plus the pool) and get their own measurement in O4.
+
+### 16.2 O2 as built (2026-11-14)
+
+- **Pergola, two-axis scrolling.** `ScrollView` scrolls across as well as down when its
+  content is wider than the view: wheel `dx`, Shift+wheel, touchpad gestures railed to one
+  axis unless clearly diagonal, Left/Right. `Node::Scroll` carries `offset_x` and
+  `content_w`; hit testing, slots and the surface's content transform use both.
+  `ScrollState.extent` (f64) lets a widget state a size an `f32` can't hold exactly, and
+  `fixed_zoom` keeps a grid's scale.
+- **Pergola `GridView`** (`pergola/src/widgets/grid_view.rs`). A `GridSource` trait
+  (sizes by prefix sums, cells near the view only) shown as three scroll groups: the body
+  (tiles of 16 rows × 4 columns, keyed, so a scroll frame changes only the three
+  viewports' offsets until a tile enters), a column header that moves across only and a
+  row header that moves down only. Content coordinates rebase every 2^20 px so a sheet of
+  2^31 rows (64 billion px) stays exact in `f32`. Selection by drag, by header and by
+  corner; column resize by its header edge; the usual spreadsheet keys (arrows, Shift, Ctrl edges,
+  Page, Home/End, Tab, Enter, Escape, Delete, Ctrl+Z/Y/C/X/V/A); an in-cell editor on
+  `TextEdit`; numbers that don't fit show `###`, text is cut with an ellipsis.
+- **frescod.** Its shift path already took any 2D move (`pack::shifts`,
+  `fresco_compute::damage`); O2 adds tests that diagonal and sideways scrolls shift and
+  equal full redraws (`pack.rs`), and the RDNA4 oracle cases `fresco_shift_diagonal` and
+  `fresco_shift_across` (CPU reference passes; the gpusim run is on the Mac).
+- **CSV** (`officina-grid/src/csv.rs`): separator detection (`,` `;` tab `|`), UTF-8 with
+  or without BOM, Windows-1252 fallback, RFC 4180 quoting; values typed as a user would
+  type them, formulas kept as text unless asked; writes General format at 15 digits with
+  CRLF and the separator it was read with.
+- **`atrium-sheets`**: the app. Toolbar (Open, Save, Save As, Undo, Redo), a formula bar
+  (address and the active cell's formula), the grid, a status line. Files come from the
+  system picker (scrinium.md §4.1): Open asks for one file read-write and Save writes
+  back to that descriptor. **Save As is interim:** until Scrinium's Save As sheet (§4.2)
+  exists it asks the picker for a folder with write access and writes `NAME.osheet`
+  there (temp file, hard link, so nothing is ever replaced; `NAME 2.osheet` and so on
+  when taken). Saving to CSV keeps values only and says so.
+- **Autosave and crash recovery** (`atrium-sheets/src/doc.rs`). Each document journals
+  every action (`officina-core` records: a run of ops, undo, redo, a column width, a
+  "saved" mark) to a private folder under `~/.local/state/atrium-sheets/autosave/`,
+  synced every 2 s. A base is written only when the document starts autosaving; a save
+  appends a mark rather than a new base, so the journal rebuilds the undo history and an
+  undo past a save, or after a recovery, replays exactly as it ran. Generations switch by
+  one rename, so a new base never meets an old journal. The folder is held with `flock`,
+  so a second window never takes a live document for a crashed one. At start the app
+  restores a document left by a crash (or by closing with unsaved changes, as there is
+  no "save changes?" prompt yet) and goes on journaling where it stopped, after cutting
+  off a torn tail.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| crash recovery | a child process types as fast as it can (a formula every tenth action) and is killed with SIGKILL at five different moments: each time exactly the first N actions come back in order, N at least what was last durable, torn tails cut (`tests/crash.rs`). Unit tests cover every cut point of the last record, undo across a save and a second crash after a recovery |
+| scroll, headless | atrium-sheets' own view on a 1,048,576-row × 10-column sheet (`examples/scroll_cost.rs`: the app's real work per vsync on a virtual clock; swipes at 4,000 px/s, diagonal swipes, wheel, Page Down, Ctrl+End/Home): at 60 and 120 Hz every pattern passes, frame work p99.9 1.6–4.6 ms, max 5.9 ms, 0 missed vsyncs, 0 stalls; at most 1,945 nodes resident |
+| scroll, live on frescod | `atrium-sheets --bench all 1048576 8` in a FreeBSD VM: see below |
+
+Not in O2: a "save changes?" prompt, the jailed one-process-per-document launch (§3; the
+app runs as a plain Limen client for now), multiple sheets in the UI, row insert and
+delete, fill handle, find, number formats (O4), visible-first recalculation.
 
 ## 17. Decisions (accepted 2026-11-14)
 

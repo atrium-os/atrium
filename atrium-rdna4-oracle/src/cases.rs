@@ -326,6 +326,9 @@ pub fn all() -> Vec<Case> {
     v.extend(crate::fresco::frame());
     v.extend(crate::fresco::damage());
     v.extend(crate::fresco::shift());
+    // A grid scrolls both ways at once (officina.md §10.2).
+    v.extend(crate::fresco::shift_by("fresco_shift_diagonal", [5, -7]));
+    v.extend(crate::fresco::shift_by("fresco_shift_across", [-9, 0]));
     v.extend(crate::fresco::isolate());
     v.extend(crate::fresco::compose());
     v.extend(spilled());

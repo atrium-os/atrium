@@ -506,7 +506,7 @@ mod tests {
     /// under whole-pixel moves), and exact without fills.
     #[test]
     fn shifted_reference_is_a_scroll() {
-        for d in [[0, -7], [0, 9], [-5, 3]] {
+        for d in [[0, -7], [0, 9], [-5, 3], [5, -7], [-9, 0]] {
             let s = scene();
             let got = shifted_reference(&s, &moved(&s, d), d);
             let want = reference::render(&Frame::pack(&moved(&s, d), W, H, PITCH));

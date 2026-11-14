@@ -1,0 +1,30 @@
+[package]
+name = "atrium-sheets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "atrium-sheets, Atrium's spreadsheet (docs/spec/officina.md §8): officina-grid's engine in a Pergola GridView, files through the system picker, an autosave journal for crash recovery."
+
+[lib]
+name = "atrium_sheets"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-sheets"
+path = "src/bin/atrium_sheets.rs"
+
+[[example]]
+name = "scroll_cost"
+path = "examples/scroll_cost.rs"
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+officina-grid = { path = "../officina-grid" }
+pergola = { path = "../pergola" }
+limen = { path = "../limen" }
+fresco-protocol = { path = "../fresco-protocol" }
+libc = "0.2"
+
+[profile.release]
+debug = 1
