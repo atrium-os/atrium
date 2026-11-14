@@ -340,8 +340,18 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
+    write.keep_words(root.join("words"));
     let mut run = Run { write, target: None, root: root.clone(), export: None };
     run.show(doc, target);
+    // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, or find:TEXT).
+    match std::env::var("ATRIUM_WRITE_BAR").ok().as_deref() {
+        Some("spell") => run.write.cmds.lock().unwrap().push(Cmd::SpellOpen),
+        Some(f) if f.starts_with("find:") => {
+            run.write.find_text.set(pergola::text_edit::TextEdit::new(&f[5..]));
+            run.write.cmds.lock().unwrap().extend([Cmd::FindOpen, Cmd::FindNext]);
+        }
+        _ => {}
+    }
     let size = run.write.size.clone();
     let mut app = App::new_with_flag(run.write.clone(), dirty);
     let _ = win.paint(&mut app);

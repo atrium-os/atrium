@@ -1454,6 +1454,54 @@ and pixels, header, footer with page numbers, page size and margins.
 Not yet: footnotes, comments, tracked changes kept as such, `.doc`, a real-world
 corpus run (§7.6 asks for one before O3 is called done).
 
+### 16.17 O3f as built (2026-11-14): find, word count, PDF export, spelling
+
+- **Find and replace** (`officina-text::find`): queries with match case and whole
+  words over paragraph text (never the laid-out pages, so it works while pagination
+  runs); find next and previous wrap round; replace all is one action (one undo);
+  `Search` finds every match a slice of paragraphs at a time. On the 1,514-page
+  document all 12,550 matches come in 10 ms and the first in microseconds, so the
+  per-chunk index §7.4 planned isn't needed yet. Replace all of 12,622 matches takes
+  21 ms, its undo 7 ms.
+- **Word count**: words (runs between spaces with a letter or digit; each ideograph a
+  word), characters with and without spaces, paragraphs; kept per paragraph through
+  edits so a keystroke recounts one paragraph. The status line shows words and
+  characters, or "N of M words" over a selection.
+- **Page painter** (`officina-text::paint`): a page as items in layout units (glyph
+  runs carrying their text, rectangles, pictures, link areas). The screen view now
+  draws from it, and so does PDF export, so the two can't drift apart.
+- **PDF export** (`officina-pdf`): streamed page by page (layouts dropped every 64
+  pages); each face embedded once as a TrueType subset that keeps glyph ids
+  (CIDFontType2, Identity-H, widths, a ToUnicode map so text copies and searches);
+  each picture once (JPEG as it is, others decoded by the bounded decoders and
+  deflated, with an SMask for alpha); links as URI annotations (http, https and
+  mailto only); title in the document information. atrium-write's **PDF…** picks a
+  folder and exports in the background with progress in the status line.
+- **Spelling** (`officina-spell`): our own reader for Hunspell-format dictionaries
+  (prefix and suffix rules with conditions and cross products, continuation classes,
+  compound rules, REP pairs with anchors, ICONV, TRY, NOSUGGEST, FORBIDDENWORD,
+  NEEDAFFIX, ONLYINCOMPOUND, KEEPCASE; long and numeric flags; bounded), the SCOWL
+  English (US) dictionary built in (permissive SCOWL/Ispell licence, kept in
+  `officina-spell/dict/README_en_US.txt`). Suggestions: replacement pairs, swaps,
+  split words, one edit, then two edits when one finds little. The editor takes a
+  checker from the app and draws a dotted red line under misspelled words on the
+  pages in view (cached per paragraph text; not the word being typed). Tools ›
+  Spelling opens a bar with the word, its suggestions, Ignore (this session), Add
+  (kept in the app's `words` file) and Next. Tools › Find and Replace (or Ctrl+F)
+  opens the find bar.
+
+Gates: find, replace and count on 1,514 pages as above; PDF export of 1,474 pages with
+100 pictures in 5.4 s with peak memory going from 22 to 31 MB, poppler reads all pages,
+the first paragraph's text and the last page's footer back; spelling: all 129,490 forms
+the dictionary's rules make check as right, 50 of 50 common misspellings caught with the
+intended word suggested for all 50 (about 60 ms a suggestion), this repository's docs
+(580,086 words) checked in 0.6 s.
+
+Not yet: PDF/A-2b (XMP metadata and an output intent), tagged PDF and bookmarks from
+headings, export of a selection or a page range; dictionaries other than English (US)
+and choosing a language per paragraph; spelling in headers and footers; regular
+expressions in find.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -96,6 +96,12 @@ pub enum Logged {
     Redo,
 }
 
+/// A spell checker the app supplies: the byte ranges of `text` it finds
+/// misspelled.
+pub trait Checker {
+    fn misspelled(&self, text: &str) -> Vec<(u32, u32)>;
+}
+
 pub struct Editor {
     pub doc: TextDoc,
     pub history: History<TextOp>,
@@ -118,12 +124,16 @@ pub struct Editor {
     numbering: Option<(u64, Rc<Numbering>)>,
     /// Word count, kept current through edits.
     pub words: WordCounter,
+    /// The spell checker, when spelling is checked.
+    pub checker: Option<Rc<dyn Checker>>,
+    /// Misspellings per paragraph, by the hash of its text.
+    spelling: std::collections::HashMap<u64, (u64, Rc<Vec<(u32, u32)>>)>,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default() };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new() };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -510,6 +520,73 @@ impl Editor {
         let t = self.selected_text();
         self.delete_selection("Cut");
         Some(t)
+    }
+
+    // ---- spelling ----
+
+    /// The misspelled words of paragraph `block` (none without a checker).
+    pub fn misspelled(&mut self, block: usize) -> Rc<Vec<(u32, u32)>> {
+        let (Some(c), Some(p)) = (self.checker.clone(), self.doc.para(block)) else { return Rc::new(Vec::new()) };
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        p.text.hash(&mut h);
+        let hash = h.finish();
+        if let Some((k, v)) = self.spelling.get(&p.id) {
+            if *k == hash {
+                return v.clone();
+            }
+        }
+        let v = Rc::new(c.misspelled(&p.text));
+        if self.spelling.len() > 200_000 {
+            self.spelling.clear();
+        }
+        self.spelling.insert(p.id, (hash, v.clone()));
+        v
+    }
+
+    /// Forgets what the checker said (after a word is added or ignored).
+    pub fn recheck(&mut self) {
+        self.spelling.clear();
+        self.revision += 1;
+    }
+
+    /// Selects the next misspelled word after the selection, wrapping round.
+    /// False when there is none.
+    pub fn next_misspelled(&mut self) -> bool {
+        if self.checker.is_none() {
+            return false;
+        }
+        let n = self.blocks();
+        let from = self.selection().1;
+        for step in 0..=n {
+            let b = (from.block + step) % n;
+            let bad = self.misspelled(b);
+            let hit = bad.iter().find(|&&(s, e)| match step {
+                0 => s >= from.at && !(s == from.at && e == from.at),
+                k if k == n => s < from.at,
+                _ => true,
+            });
+            if let Some(&(s, e)) = hit {
+                self.set_caret(Pos::new(b, s), false);
+                self.set_caret(Pos::new(b, e), true);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Replaces the selection with `with` as one action (a spelling fix).
+    pub fn replace_selection(&mut self, with: &str) -> bool {
+        let (a, b) = self.selection();
+        if a.block != b.block || a == b {
+            return false;
+        }
+        let attr = self.doc.para(a.block).map(|p| p.attr_at(a.at)).unwrap_or(0);
+        let attr = self.doc.plain_attr(attr);
+        let op = TextOp::Splice { block: a.block as u32, at: a.at, del: b.at - a.at, ins: Fragment { text: with.to_string(), runs: vec![(0, attr)] } };
+        self.apply("Correct Spelling", vec![op], Kind::Other);
+        self.set_caret(Pos::new(a.block, a.at + with.len() as u32), false);
+        true
     }
 
     // ---- find and replace ----
@@ -1451,6 +1528,34 @@ pub(crate) mod tests {
         for c in s.chars() {
             e.key(Key::Char, NO, &c.to_string(), 0);
         }
+    }
+
+    struct Teh;
+    impl Checker for Teh {
+        fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
+            text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
+        }
+    }
+
+    #[test]
+    fn spelling_next_and_fix() {
+        let mut e = ed(&["ok teh one", "fine", "teh end teh"]);
+        assert!(!e.next_misspelled());
+        e.checker = Some(Rc::new(Teh));
+        assert_eq!(*e.misspelled(0), vec![(3, 6)]);
+        assert!(e.next_misspelled());
+        assert_eq!((e.anchor, e.caret), (Pos::new(0, 3), Pos::new(0, 6)));
+        assert!(e.next_misspelled());
+        assert_eq!(e.anchor, Pos::new(2, 0));
+        assert!(e.replace_selection("the"));
+        assert_eq!(texts(&e)[2], "the end teh");
+        assert_eq!(*e.misspelled(2), vec![(8, 11)]);
+        assert!(e.next_misspelled());
+        assert_eq!(e.anchor, Pos::new(2, 8));
+        assert!(e.next_misspelled());
+        assert_eq!(e.anchor, Pos::new(0, 3));
+        e.undo();
+        assert_eq!(texts(&e)[2], "teh end teh");
     }
 
     #[test]

@@ -14,7 +14,9 @@ use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
+use officina_spell::{Dictionary, Speller};
 use officina_text::find::Query;
+use pergola_richtext::{Checker, Editor};
 use pergola::text_edit::TextEdit;
 use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, ScrollState, TextField};
 use pergola::{Color, Mutable, TextStyle};
@@ -31,6 +33,9 @@ pub const FIND_H: f32 = 48.0;
 
 /// The paragraph styles the Style menu offers, in order.
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
+
+/// The Tools menu, in order.
+pub const TOOLS: [&str; 2] = ["Find and Replace", "Spelling"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 7] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers"];
@@ -62,6 +67,12 @@ pub enum Cmd {
     ReplaceAll,
     MatchCase,
     WholeWord,
+    SpellOpen,
+    SpellClose,
+    SpellNext,
+    SpellUse(usize),
+    SpellIgnore,
+    SpellAdd,
 }
 
 impl Cmd {
@@ -87,6 +98,24 @@ pub struct FindBar {
     pub message: String,
 }
 
+/// The spelling bar's state: the word selected and what to offer for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpellBar {
+    pub open: bool,
+    pub word: String,
+    pub suggestions: Vec<String>,
+    pub message: String,
+}
+
+/// The editor's view of the app's speller.
+pub struct AppChecker(pub Rc<RefCell<Speller>>);
+
+impl Checker for AppChecker {
+    fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
+        self.0.borrow().misspelled(text)
+    }
+}
+
 /// Cheap to clone: every field is shared.
 #[derive(Clone)]
 pub struct Write {
@@ -101,11 +130,36 @@ pub struct Write {
     pub find: Mutable<FindBar>,
     pub find_text: Mutable<TextEdit>,
     pub replace_text: Mutable<TextEdit>,
+    pub tools_menu: Mutable<MenuState>,
+    pub spell: Mutable<SpellBar>,
+    pub speller: Rc<RefCell<Speller>>,
+    /// Where words added to the dictionary are kept (one per line).
+    pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
 }
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")) }
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        w.attach_checker();
+        w
+    }
+
+    /// Hands the speller to the document's editor.
+    pub fn attach_checker(&self) {
+        let d = self.doc.borrow();
+        d.ed.borrow_mut().checker = Some(Rc::new(AppChecker(self.speller.clone())));
+    }
+
+    /// Keeps the person's own words in `path` (read now, appended to on Add).
+    pub fn keep_words(&self, path: std::path::PathBuf) {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            let mut sp = self.speller.borrow_mut();
+            for w in t.lines().map(str::trim).filter(|w| !w.is_empty() && w.len() <= 100).take(100_000) {
+                sp.added.insert(w.to_string());
+            }
+        }
+        *self.words_file.borrow_mut() = Some(path);
+        self.doc.borrow().ed.borrow_mut().recheck();
     }
 
     pub fn changed(&self) {
@@ -115,6 +169,7 @@ impl Write {
     /// A new document on screen, at its top.
     pub fn replace(&self, doc: Doc) -> Doc {
         let old = std::mem::replace(&mut *self.doc.borrow_mut(), doc);
+        self.attach_checker();
         let mut st = self.scroll.get();
         st.physics.set_position(0.0);
         self.scroll.set(st);
@@ -122,9 +177,10 @@ impl Write {
         old
     }
 
-    /// Where the pages go: under the toolbar and the find bar when it is open.
+    /// Where the pages go: under the toolbar and the find or spelling bar
+    /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
-        let top = TOOLBAR_H + if self.find.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -133,12 +189,67 @@ impl Write {
         Query { text: self.find_text.get_cloned().text().to_string(), match_case: f.match_case, whole_word: f.whole_word }
     }
 
+    /// Runs a spelling bar command.
+    fn spell_cmd(&self, c: Cmd) {
+        let mut sb = self.spell.get_cloned();
+        let ed = self.doc.borrow().ed.clone();
+        let word = |ed: &Editor| -> String { ed.selected_text() };
+        match c {
+            Cmd::SpellOpen => {
+                sb.open = true;
+                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+            }
+            Cmd::SpellClose => {
+                self.spell.set(SpellBar::default());
+                return;
+            }
+            Cmd::SpellUse(i) => {
+                if let Some(s) = sb.suggestions.get(i).cloned() {
+                    ed.borrow_mut().replace_selection(&s);
+                }
+            }
+            Cmd::SpellIgnore => {
+                if !sb.word.is_empty() {
+                    self.speller.borrow_mut().ignored.insert(sb.word.clone());
+                    ed.borrow_mut().recheck();
+                }
+            }
+            Cmd::SpellAdd => {
+                if !sb.word.is_empty() {
+                    self.speller.borrow_mut().added.insert(sb.word.clone());
+                    if let Some(p) = self.words_file.borrow().as_ref() {
+                        use std::io::Write as _;
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| writeln!(f, "{}", sb.word));
+                    }
+                    ed.borrow_mut().recheck();
+                }
+            }
+            _ => {}
+        }
+        // On to the next misspelled word.
+        let found = ed.borrow_mut().next_misspelled();
+        if found {
+            let w = word(&ed.borrow());
+            sb.suggestions = self.speller.borrow().suggest(&w);
+            sb.message = if sb.suggestions.is_empty() { "No suggestions.".into() } else { String::new() };
+            sb.word = w;
+        } else {
+            sb.word.clear();
+            sb.suggestions.clear();
+            sb.message = "No misspelled words.".into();
+        }
+        self.spell.set(sb);
+        let (w, h) = self.size.get();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+    }
+
     /// Runs a find bar command on the editor.
     fn find_cmd(&self, c: Cmd) {
         let mut f = self.find.get_cloned();
         match c {
             Cmd::FindOpen => {
                 f.open = true;
+                self.spell.set(SpellBar::default());
                 // The selection, when it is on one line, is what to find.
                 let sel = self.doc.borrow().ed.borrow().selected_text();
                 if !sel.is_empty() && !sel.contains('\n') && sel.chars().count() <= 200 {
@@ -224,6 +335,13 @@ impl Write {
                     }
                     Cmd::DeleteColumn => {
                         e.delete_column();
+                    }
+                    Cmd::SpellOpen | Cmd::SpellClose | Cmd::SpellNext | Cmd::SpellUse(_) | Cmd::SpellIgnore | Cmd::SpellAdd => {
+                        drop(e);
+                        drop(d);
+                        self.spell_cmd(c);
+                        self.changed();
+                        return false;
                     }
                     Cmd::FindOpen | Cmd::FindClose | Cmd::FindNext | Cmd::FindPrevious | Cmd::Replace | Cmd::ReplaceAll | Cmd::MatchCase | Cmd::WholeWord => {
                         drop(e);
@@ -323,7 +441,13 @@ impl View for Write {
             let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| MenuItem::new(*s).enabled(!(2..=5).contains(&i) || in_table)).collect();
             let cmds = self.cmds.clone();
             MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(96.0).render(ctx);
-            x += 112.0;
+            x += 100.0;
+        }
+        {
+            let items: Vec<MenuItem> = TOOLS.iter().map(|s| MenuItem::new(*s)).collect();
+            let cmds = self.cmds.clone();
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i == 0 { Cmd::FindOpen } else { Cmd::SpellOpen })).at(x, 8.0).width(88.0).render(ctx);
+            x += 104.0;
         }
         for (label, a) in [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)] {
             let wd = if label == "Justify" { 64.0 } else { 56.0 };
@@ -373,6 +497,41 @@ impl View for Write {
                 ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, (w - x - 56.0).max(0.0), 18.0), content: fb.message.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
             }
             Button::secondary("✕").at(w - 44.0, y + 8.0).width(32.0).on_click(push(Cmd::FindClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
+        // The spelling bar.
+        let sb = self.spell.get_cloned();
+        if sb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let mut x = 12.0;
+            let (label, color) = if sb.word.is_empty() { (sb.message.clone(), t.text_secondary()) } else { (format!("“{}”", sb.word), Color::from_srgb8(0xb0, 0x1c, 0x1c)) };
+            ctx.add(Node::Text { rect: Rect::new(x, y + 14.0, 180.0, 20.0), content: label, style: st(type_size::MD, Weight::Semibold, color) });
+            x += 188.0;
+            if !sb.word.is_empty() {
+                for (i, s) in sb.suggestions.iter().take(5).enumerate() {
+                    let wd = (Node::measure_text(s, &st(type_size::MD, Weight::Regular, t.text_primary())).w + 28.0).clamp(48.0, 180.0);
+                    if x + wd > w - 300.0 {
+                        break;
+                    }
+                    let b = if i == 0 { Button::primary(s.as_str()) } else { Button::secondary(s.as_str()) };
+                    b.at(x, y + 8.0).width(wd).on_click(push(Cmd::SpellUse(i))).render(ctx);
+                    x += wd + 4.0;
+                }
+                if !sb.message.is_empty() {
+                    ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, 140.0, 18.0), content: sb.message.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                }
+                let bx = w - 292.0;
+                Button::secondary("Ignore").at(bx, y + 8.0).width(72.0).on_click(push(Cmd::SpellIgnore)).render(ctx);
+                Button::secondary("Add").at(bx + 76.0, y + 8.0).width(60.0).on_click(push(Cmd::SpellAdd)).render(ctx);
+                Button::secondary("Next").at(bx + 140.0, y + 8.0).width(64.0).on_click(push(Cmd::SpellNext)).render(ctx);
+            }
+            Button::secondary("✕").at(w - 44.0, y + 8.0).width(32.0).on_click(push(Cmd::SpellClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
@@ -455,6 +614,22 @@ mod tests {
         run(Cmd::FindClose);
         assert_eq!(w.pages_rect(1200.0, 800.0).y(), TOOLBAR_H);
         assert_eq!(group(1234567), "1,234,567");
+        // Spelling: the bar finds the misspelled word, offers the fix, applies it.
+        w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 0), false);
+        let doc = Doc::from_text("s.txt", b"A wrod here and teh end.").unwrap();
+        w.replace(doc);
+        run(Cmd::SpellOpen);
+        let sb = w.spell.get_cloned();
+        assert_eq!(sb.word, "wrod");
+        assert!(sb.suggestions.contains(&"word".to_string()), "{:?}", sb.suggestions);
+        let i = sb.suggestions.iter().position(|s| s == "word").unwrap();
+        run(Cmd::SpellUse(i));
+        assert_eq!(w.spell.get_cloned().word, "teh");
+        run(Cmd::SpellIgnore);
+        assert_eq!(w.spell.get_cloned().message, "No misspelled words.");
+        assert_eq!(w.doc.borrow().ed.borrow().doc.plain_text(), "A word here and teh end.");
+        run(Cmd::FindOpen);
+        assert!(!w.spell.get_cloned().open);
         assert_eq!(group(12), "12");
     }
 }

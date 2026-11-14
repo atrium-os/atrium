@@ -125,6 +125,7 @@ dependencies = [
  "officina-convert",
  "officina-core",
  "officina-pdf",
+ "officina-spell",
  "officina-text",
  "pergola",
  "pergola-richtext",
@@ -1104,6 +1105,10 @@ dependencies = [
  "navigator-image",
  "officina-text",
 ]
+
+[[package]]
+name = "officina-spell"
+version = "0.1.0"
 
 [[package]]
 name = "officina-text"

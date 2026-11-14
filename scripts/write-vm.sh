@@ -5,6 +5,7 @@
 #   sh scripts/cloud-vm.sh up
 #   sh scripts/write-vm.sh [out.png]
 #   OPEN=scratch/sample.owrite sh scripts/write-vm.sh   # the file to show (default: that one)
+#   BAR=spell or BAR=find:TEXT                          # start with the spelling or find bar open
 #
 # Under TCG (the cloud container) timings are not product numbers.
 set -eu
@@ -47,7 +48,7 @@ SHOW="/tmp/sh/$(basename "$OPEN")"
 put "$OPEN" "$SHOW"
 echo "=== the app on $(basename "$OPEN")"
 start_frescod
-g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock daemon -f -o /tmp/sh/app.log $D/atrium-write $SHOW </dev/null"
+g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock ${BAR:+ATRIUM_WRITE_BAR=$BAR} daemon -f -o /tmp/sh/app.log $D/atrium-write $SHOW </dev/null"
 sleep ${SHOT_AFTER:-60}
 mkdir -p "$(dirname "$OUT")"
 g "ls -t /tmp/sh/screen* 2>/dev/null | head -1" | { read -r f && [ -n "$f" ] && get "$f" "$OUT" && echo "screenshot: $OUT"; } || echo "no screenshot"

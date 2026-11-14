@@ -203,6 +203,41 @@ impl RichTextView {
                         Item::Link { .. } => {}
                     }
                 }
+                // Spelling: a red dotted line under each misspelled word, but
+                // not the one being typed.
+                if ed.checker.is_some() {
+                    let page = ed.pages.pages()[i].clone();
+                    let red = Color::from_srgb8(0xd0, 0x20, 0x20);
+                    let caret = ed.caret;
+                    for s in &page.slices {
+                        let bad = ed.misspelled(s.block);
+                        if bad.is_empty() {
+                            continue;
+                        }
+                        let l = ed.layout(s.block);
+                        let mut top = s.y;
+                        for li in s.lines.clone() {
+                            let line = &l.lines[li];
+                            let natural = line.ascent + line.descent;
+                            let base = top + line.ascent + (line.height - natural).max(0) / 2;
+                            for &(a, b) in bad.iter() {
+                                if b <= line.start || a >= line.end.max(line.start + 1) || (caret.block == s.block && caret.at == b) {
+                                    continue;
+                                }
+                                let x0 = ed.x_in_line(s.block, &l, line, a.max(line.start));
+                                let x1 = ed.x_in_line(s.block, &l, line, b.min(line.end));
+                                let y = py as f64 + g.margin_y + (base + line.descent / 2) as f64 * g.k;
+                                let (sx0, sx1) = (px as f64 + g.margin_x + (s.x + x0) as f64 * g.k, px as f64 + g.margin_x + (s.x + x1) as f64 * g.k);
+                                let mut x = sx0;
+                                while x < sx1 {
+                                    ctx.add(Node::Rect { rect: Rect::new(q(x), q(y), 2.0f32.min((sx1 - x) as f32), 1.5), fill: red, radius: 0.0 });
+                                    x += 3.5;
+                                }
+                            }
+                            top += line.height;
+                        }
+                    }
+                }
                 ctx.pop();
             }
             // The overlay: selection and caret.
