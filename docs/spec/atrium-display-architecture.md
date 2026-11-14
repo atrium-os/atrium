@@ -335,14 +335,17 @@ the 2.x ioctls act on output 0.
   any output, the window goes back. Forum keeps each set's arrangement
   and each monitor's scale per user (`/var/db/atrium/<user>/forum-displays.state`)
   and puts them back when frescod, the WM or the machine starts again.
-- **Scale.** Each monitor has a scale (`WmOutput.scale_milli`): its pixel
-  density over 110 ppi in quarter steps from 1.0 to 3.0 (EDID physical
-  size; 1.0 without one), so a 24" 1080p or a 27" 1440p shows at 1.0 and a
-  27" 4K at 1.5. `OP_WM_SET_OUTPUT_SCALE` (`forum-ctl scale N F|auto`)
-  overrides it per monitor. A window is told the scale of the monitor it
-  mostly covers with `EV_WINDOW_DPI_CHANGED` whenever that changes (moved
-  to another monitor, or the monitor's scale set); it renders at that
-  scale. Window geometry stays in desktop pixels.
+- **Scale.** Each monitor has a scale (`WmOutput.scale_milli`): its
+  automatic scale times the user's UI size for it
+  (resolution-independence.md §4). The automatic scale is its pixel density
+  over 110 ppi in 1/8 steps from 1.0 to 4.0 (EDID physical size), or the
+  mode height over 1080 for a monitor without one (a TV), so a 24" 1080p or
+  a 27" 1440p shows at 1.0, a 27" 4K at 1.5 and a 4K TV at 2.0. The UI size
+  (`OP_WM_SET_OUTPUT_UI_SIZE`, `forum-ctl ui-size N S`) is Smaller (0.875,
+  a laptop panel's default), Default, or larger; being relative, it holds
+  when the mode changes. A window is told its scale with
+  `EV_WINDOW_RESIZED` whenever that changes; apps lay out in points, and
+  the WM's geometry stays in desktop pixels.
 - **Mirroring.** `OP_WM_MIRROR_OUTPUT` (`forum-ctl mirror A B|off`) makes a
   monitor show another's part of the desktop instead of a part of its own.
   It takes the source's size when its monitor offers that mode (pixel for

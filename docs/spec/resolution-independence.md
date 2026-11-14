@@ -120,6 +120,14 @@ a 27" monitor at 4K is 1.5 x Default, at 1440p it is 1.0 x Default, and windows 
 same size, only sharper or softer. forum-wm stores `ui_size` per monitor identity instead of
 the absolute scale; `forum-ctl scale` becomes `forum-ctl ui-size`.
 
+**Built in step 2a (2026-11-14).** `fresco_protocol::auto_scale` and `output_scale` hold the
+rules above; frescod reports each monitor's `auto_scale_milli`, `ui_size_milli` (with
+`ui_size_set`) and `internal` (an eDP connector) in `WmOutput`, and `scale_milli` is their
+product. `OP_WM_SET_OUTPUT_UI_SIZE` (0x0527, was `OP_WM_SET_OUTPUT_SCALE`) takes one of
+`UI_SIZES` or 0 for the monitor's default; anything else is refused. forum-wm remembers UI
+sizes per monitor (`uisize` lines in forum-displays.state; old absolute `scale` lines are
+dropped) and `forum-ctl ui-size N smaller|default|larger|1.25` sets them.
+
 ### 4.3 Resolution change on one monitor
 
 Mode change -> new auto scale -> the monitor's pt size stays (about) the same -> forum-wm's
@@ -348,7 +356,8 @@ Shankar took the recommendation on each:
    converted at each monitor's scale; the desktop itself stays device px. Test: the Pergola showcase
    pixel-compared at 1.0, 1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit
    at every scale.
-2. **Scale policy** (rows 8 to 10): `ui_size` relative preference, TV fallback, 1/8 steps,
+2. **Scale policy** (rows 8 to 10). **2a, built 2026-11-14:** `ui_size` relative
+   preference, TV fallback, 1/8 steps, laptop panels at Smaller (§4.2). **2b:** frescod's
    strip and cursor in pt. Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.
 3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,

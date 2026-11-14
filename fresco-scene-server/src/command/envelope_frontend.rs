@@ -329,9 +329,9 @@ pub struct EnvelopeFrontend {
     /// frescod's frame loop takes and applies.
     outputs: fresco_protocol::WmOutputsReply,
     arrange_request: Option<Vec<fresco_protocol::WmOutputPlacement>>,
-    /// Monitor scales `OP_WM_SET_OUTPUT_SCALE` asked for, in order, which
+    /// Monitor UI sizes `OP_WM_SET_OUTPUT_UI_SIZE` asked for, in order, which
     /// frescod's frame loop takes and applies.
-    scale_requests: Vec<fresco_protocol::WmSetOutputScalePayload>,
+    scale_requests: Vec<fresco_protocol::WmSetOutputUiSizePayload>,
     /// Mirrorings `OP_WM_MIRROR_OUTPUT` asked for, in order.
     mirror_requests: Vec<fresco_protocol::WmMirrorOutputPayload>,
     /// Spans `OP_WM_SPAN_GROUP` asked for, in order (fresco-span.md), and
@@ -565,7 +565,7 @@ impl EnvelopeFrontend {
     }
 
     /// Scales the WM asked for since the last call.
-    pub fn take_scale_requests(&mut self) -> Vec<fresco_protocol::WmSetOutputScalePayload> {
+    pub fn take_ui_size_requests(&mut self) -> Vec<fresco_protocol::WmSetOutputUiSizePayload> {
         std::mem::take(&mut self.scale_requests)
     }
 
@@ -855,7 +855,7 @@ impl EnvelopeFrontend {
             control::OP_WM_SET_DISPLAY_MODE  => self.handle_wm_set_display_mode(msg),
             control::OP_WM_OUTPUTS           => self.handle_wm_outputs(),
             control::OP_WM_ARRANGE_OUTPUTS   => self.handle_wm_arrange_outputs(msg),
-            control::OP_WM_SET_OUTPUT_SCALE  => self.handle_wm_set_output_scale(msg),
+            control::OP_WM_SET_OUTPUT_UI_SIZE => self.handle_wm_set_output_ui_size(msg),
             control::OP_WM_MIRROR_OUTPUT     => self.handle_wm_mirror_output(msg),
             control::OP_WM_SPAN_GROUP        => self.handle_wm_span_group(msg),
             control::OP_WM_SET_APPEARANCE    => self.handle_wm_set_appearance(msg),
@@ -1502,21 +1502,20 @@ impl EnvelopeFrontend {
         Ok(vec![Outbound { op: control::OP_WM_SPAN_GROUP, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
     }
 
-    /// `OP_WM_SET_OUTPUT_SCALE` — queue a monitor's scale (WM only): a
-    /// monitor on the desktop, 0 (automatic) or within the range.
-    fn handle_wm_set_output_scale(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+    /// `OP_WM_SET_OUTPUT_UI_SIZE` — queue a monitor's UI size (WM only): a
+    /// monitor on the desktop, 0 (its default) or one of `UI_SIZES`.
+    fn handle_wm_set_output_ui_size(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
         if !self.wm_capable.contains(&self.current_client) {
             return Err(DispatchError::Forbidden);
         }
-        let p: fresco_protocol::WmSetOutputScalePayload =
+        let p: fresco_protocol::WmSetOutputUiSizePayload =
             decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
-        let in_range = p.scale_milli == 0
-            || (fresco_protocol::OUTPUT_SCALE_MIN..=fresco_protocol::OUTPUT_SCALE_MAX).contains(&p.scale_milli);
-        if !in_range || !self.outputs.outputs.iter().any(|o| o.identity == p.identity) {
+        let listed = p.ui_size_milli == 0 || fresco_protocol::UI_SIZES.contains(&p.ui_size_milli);
+        if !listed || !self.outputs.outputs.iter().any(|o| o.identity == p.identity) {
             return Err(DispatchError::BadPayload);
         }
         self.scale_requests.push(p);
-        Ok(vec![Outbound { op: control::OP_WM_SET_OUTPUT_SCALE, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
+        Ok(vec![Outbound { op: control::OP_WM_SET_OUTPUT_UI_SIZE, flags: flag::IS_RESPONSE, payload: Vec::new(), fds: Vec::new() }])
     }
 
     /// `OP_WM_SET_DISPLAY_MODE` — queue a switch to a listed mode (WM only).
@@ -2493,7 +2492,7 @@ mod tests {
         let a = make_window(&mut f, 1, 100, 100);
         let out = |output, identity, x, scale_milli| WmOutput {
             output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+            refresh_mhz: 60000, present: true, scale_milli, auto_scale_milli: scale_milli, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
         let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
@@ -2518,14 +2517,14 @@ mod tests {
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 2000)]);
         assert_eq!(dpi(&rx), vec![(a, 2.0)]);
         // A scale request is checked and queued for frescod.
-        let ok = WmSetOutputScalePayload { identity: 20, scale_milli: 1250 };
-        f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 9).unwrap();
-        let bad = WmSetOutputScalePayload { identity: 99, scale_milli: 1250 };
-        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&bad).unwrap()), 9).is_err());
-        let tiny = WmSetOutputScalePayload { identity: 20, scale_milli: 100 };
-        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&tiny).unwrap()), 9).is_err());
-        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_SCALE, 0, encode(&ok).unwrap()), 1).is_err(), "WM only");
-        assert_eq!(f.take_scale_requests(), vec![ok]);
+        let ok = WmSetOutputUiSizePayload { identity: 20, ui_size_milli: 1250 };
+        f.dispatch(&msg(control::OP_WM_SET_OUTPUT_UI_SIZE, 0, encode(&ok).unwrap()), 9).unwrap();
+        let bad = WmSetOutputUiSizePayload { identity: 99, ui_size_milli: 1250 };
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_UI_SIZE, 0, encode(&bad).unwrap()), 9).is_err());
+        let unlisted = WmSetOutputUiSizePayload { identity: 20, ui_size_milli: 1300 };
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_UI_SIZE, 0, encode(&unlisted).unwrap()), 9).is_err());
+        assert!(f.dispatch(&msg(control::OP_WM_SET_OUTPUT_UI_SIZE, 0, encode(&ok).unwrap()), 1).is_err(), "WM only");
+        assert_eq!(f.take_ui_size_requests(), vec![ok]);
     }
 
     /// Clients ask in points (resolution-independence.md §3): a window
@@ -2537,7 +2536,7 @@ mod tests {
         let mut f = fixture();
         let out = |output, identity, x, scale_milli| WmOutput {
             output, identity, rect: WmRect { x, y: 0, w: 3840, h: 2160 },
-            refresh_mhz: 60000, present: true, scale_milli, scale_auto: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+            refresh_mhz: 60000, present: true, scale_milli, auto_scale_milli: scale_milli, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0, 1500), out(1, 20, 3840, 1000)]);
         assert_eq!(f.display_info().scale_milli, 1500);
@@ -2566,7 +2565,7 @@ mod tests {
         f.grant_window_management(9);
         let out = |output, identity, mirror_of| WmOutput {
             output, identity, rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
-            refresh_mhz: 60000, present: true, scale_milli: 1000, scale_auto: true, mirror_of, width_mm: 0, height_mm: 0, flapping: false,
+            refresh_mhz: 60000, present: true, scale_milli: 1000, auto_scale_milli: 1000, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of, width_mm: 0, height_mm: 0, flapping: false,
         };
         f.set_outputs(vec![out(0, 10, 0), out(1, 20, 10), out(2, 30, 0)]);
         let ask = |f: &mut EnvelopeFrontend, identity, of| {
@@ -2733,9 +2732,9 @@ mod tests {
             let p = WmArrangeOutputsPayload { placements };
             self.dispatch(control::OP_WM_ARRANGE_OUTPUTS, encode(&p).unwrap()).map(|_| ())
         }
-        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> std::io::Result<()> {
-            let p = WmSetOutputScalePayload { identity, scale_milli };
-            self.dispatch(control::OP_WM_SET_OUTPUT_SCALE, encode(&p).unwrap()).map(|_| ())
+        fn set_output_ui_size(&mut self, identity: u64, ui_size_milli: u32) -> std::io::Result<()> {
+            let p = WmSetOutputUiSizePayload { identity, ui_size_milli };
+            self.dispatch(control::OP_WM_SET_OUTPUT_UI_SIZE, encode(&p).unwrap()).map(|_| ())
         }
         fn mirror_output(&mut self, identity: u64, of: u64) -> std::io::Result<()> {
             let p = WmMirrorOutputPayload { identity, of };

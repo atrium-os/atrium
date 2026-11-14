@@ -419,7 +419,9 @@ pub mod displays {
         pub sets: HashMap<Vec<u64>, Vec<Place>>,
         /// By set of monitors: which mirrored which, (mirror, source).
         pub mirrors: HashMap<Vec<u64>, Vec<(u64, u64)>>,
-        /// Scales the session set, by monitor (thousandths).
+        /// UI sizes the user set, by monitor (thousandths,
+        /// `fresco_protocol::UI_SIZES`): relative to the monitor's automatic
+        /// scale, so they hold at any mode (resolution-independence.md §4.2).
         pub scales: HashMap<u64, u32>,
         /// By set of monitors: its span groups (fresco-span.md §3).
         pub spans: HashMap<Vec<u64>, Vec<forum_ctl::SpanGroupInfo>>,
@@ -512,7 +514,7 @@ pub mod displays {
             let mut scales: Vec<(&u64, &u32)> = self.scales.iter().collect();
             scales.sort();
             for (id, s) in scales {
-                lines.push(format!("scale {id:016x} {s}"));
+                lines.push(format!("uisize {id:016x} {s}"));
             }
             let mut sets: Vec<(&Vec<u64>, &Vec<Place>)> = self.sets.iter().collect();
             sets.sort_by(|a, b| a.0.cmp(b.0));
@@ -535,7 +537,7 @@ pub mod displays {
             for a in &self.no_span {
                 lines.push(format!("nospan {a}"));
             }
-            let mut t = String::from("# forum-wm: where each set of monitors sat, monitor scales, span groups\n");
+            let mut t = String::from("# forum-wm: where each set of monitors sat, monitor UI sizes, span groups\n");
             for l in lines {
                 t.push_str(&l);
                 t.push('\n');
@@ -550,9 +552,12 @@ pub mod displays {
             for line in t.lines() {
                 let w: Vec<&str> = line.split_whitespace().collect();
                 match w.first() {
-                    Some(&"scale") if w.len() == 3 => {
+                    // UI sizes; the absolute "scale" lines of before are dropped.
+                    Some(&"uisize") if w.len() == 3 => {
                         if let (Ok(id), Ok(s)) = (u64::from_str_radix(w[1], 16), w[2].parse::<u32>()) {
-                            m.scales.insert(id, s);
+                            if fresco_protocol::UI_SIZES.contains(&s) {
+                                m.scales.insert(id, s);
+                            }
                         }
                     }
                     Some(&"span") if w.len() == 5 => {
@@ -720,9 +725,9 @@ pub mod daemon {
         /// Move monitors on the desktop (OP_WM_ARRANGE_OUTPUTS); frescod
         /// applies it at its next frame and broadcasts EV_DISPLAY_CHANGED.
         fn arrange_outputs(&mut self, placements: Vec<WmOutputPlacement>) -> io::Result<()>;
-        /// Set a monitor's scale, thousandths, 0 = automatic
-        /// (OP_WM_SET_OUTPUT_SCALE); EV_DISPLAY_CHANGED follows.
-        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()>;
+        /// Set a monitor's UI size, thousandths, 0 = its default
+        /// (OP_WM_SET_OUTPUT_UI_SIZE); EV_DISPLAY_CHANGED follows.
+        fn set_output_ui_size(&mut self, identity: u64, ui_size_milli: u32) -> io::Result<()>;
         /// Make a monitor mirror another, `of` = 0 stops (OP_WM_MIRROR_OUTPUT);
         /// EV_DISPLAY_CHANGED follows.
         fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()>;
@@ -936,8 +941,8 @@ pub mod daemon {
             self.reconcile(conn).map(Some)
         }
 
-        /// Bring monitors back as the session left them: a remembered scale
-        /// for each one frescod has on automatic, and, with `restore`, the
+        /// Bring monitors back as the session left them: a remembered UI size
+        /// for each one frescod doesn't have it for, and, with `restore`, the
         /// remembered arrangement for this set. Otherwise (or when it is
         /// already in place) remember the arrangement as it is.
         pub fn apply_remembered_displays(&mut self, conn: &mut impl FrescoConn, outputs: &[WmOutput], restore: bool)
@@ -945,7 +950,7 @@ pub mod daemon {
         {
             for o in outputs {
                 match self.displays.scales.get(&o.identity) {
-                    Some(&s) if o.scale_auto || o.scale_milli != s => conn.set_output_scale(o.identity, s)?,
+                    Some(&s) if !o.ui_size_set || o.ui_size_milli != s => conn.set_output_ui_size(o.identity, s)?,
                     _ => {}
                 }
             }
@@ -990,17 +995,21 @@ pub mod daemon {
             conn.mirror_output(a.identity, src)
         }
 
-        /// Set output `which`'s scale (thousandths; 0 = automatic) and
+        /// Set output `which`'s UI size (thousandths, one of
+        /// `fresco_protocol::UI_SIZES`; 0 = the monitor's default) and
         /// remember it for that monitor.
-        pub fn set_scale(&mut self, conn: &mut impl FrescoConn, which: u32, scale_milli: u32) -> io::Result<()> {
+        pub fn set_ui_size(&mut self, conn: &mut impl FrescoConn, which: u32, ui_size_milli: u32) -> io::Result<()> {
             let Some(o) = self.outputs.iter().find(|o| o.output == which).copied() else {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
             };
-            conn.set_output_scale(o.identity, scale_milli)?;
-            if scale_milli == 0 {
+            if ui_size_milli != 0 && !fresco_protocol::UI_SIZES.contains(&ui_size_milli) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a UI size"));
+            }
+            conn.set_output_ui_size(o.identity, ui_size_milli)?;
+            if ui_size_milli == 0 {
                 self.displays.scales.remove(&o.identity);
             } else {
-                self.displays.scales.insert(o.identity, scale_milli);
+                self.displays.scales.insert(o.identity, ui_size_milli);
             }
             self.save_displays();
             Ok(())
@@ -1746,7 +1755,7 @@ pub mod control {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
-            Intent::SetOutputScale { output, scale_milli } => match wm.set_scale(conn, output, scale_milli) {
+            Intent::SetOutputUiSize { output, ui_size_milli } => match wm.set_ui_size(conn, output, ui_size_milli) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
             },
@@ -2118,8 +2127,8 @@ mod tests {
             self.arranged = Some(p);
             Ok(())
         }
-        fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
-            self.scaled.push((identity, scale_milli));
+        fn set_output_ui_size(&mut self, identity: u64, ui_size_milli: u32) -> io::Result<()> {
+            self.scaled.push((identity, ui_size_milli));
             Ok(())
         }
         fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
@@ -2439,7 +2448,7 @@ mod tests {
     fn mon(output: u32, identity: u64, x: i32, w: i32, h: i32) -> fresco_protocol::WmOutput {
         fresco_protocol::WmOutput {
             output, identity, rect: WmRect { x, y: 0, w, h }, refresh_mhz: 60000, present: true,
-            scale_milli: 1000, scale_auto: true, mirror_of: 0,
+            scale_milli: 1000, auto_scale_milli: 1000, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of: 0,
             // A 24" 1080p monitor's 0.275 mm pixels, at any size.
             width_mm: (w as u32 * 11).div_ceil(40), height_mm: (h as u32 * 11).div_ceil(40), flapping: false,
         }
@@ -2463,9 +2472,10 @@ mod tests {
         m.remember(&[mon(0, 10, 1920, 1920, 1080), mon(1, 20, 0, 1920, 1080)]);
         m.scales.insert(20, 1500);
         let t = m.to_text();
+        assert!(t.contains("uisize 0000000000000014 1500"), "{t}");
         assert_eq!(DisplayMemory::from_text(&t), m);
         assert_eq!(m.sets[&vec![10, 20]][0], Place { identity: 10, x: 1920, y: 0, w: 1920, h: 1080 });
-        let damaged = format!("{t}set zz@1,2:3x4\nscale 14\ngarbage\n");
+        let damaged = format!("{t}set zz@1,2:3x4\nscale 14\nuisize 15 1300\nscale 0000000000000016 1500\ngarbage\n");
         assert_eq!(DisplayMemory::from_text(&damaged), m);
     }
 
@@ -2481,7 +2491,7 @@ mod tests {
         wm.apply_remembered_displays(&mut conn, &fresh, true).unwrap();
         let p = conn.arranged.take().expect("asked to put them back");
         assert!(p.iter().any(|p| p.identity == 20 && p.x == 0) && p.iter().any(|p| p.identity == 10 && p.x == 1920));
-        assert_eq!(conn.scaled, vec![(20, 1500)], "the scale set for 20 comes back");
+        assert_eq!(conn.scaled, vec![(20, 1500)], "the UI size set for 20 comes back");
         // Once in place nothing more is asked, and moving them by hand (same
         // set) is remembered, not undone.
         wm.outputs = fresh;
@@ -2536,14 +2546,15 @@ mod tests {
     }
 
     #[test]
-    fn setting_a_scale_reaches_fresco_and_is_remembered() {
+    fn setting_a_ui_size_reaches_fresco_and_is_remembered() {
         let (mut wm, mut conn) = two_monitors();
-        wm.set_scale(&mut conn, 1, 1750).unwrap();
-        assert_eq!(conn.scaled, vec![(20, 1750)]);
-        assert_eq!(wm.displays.scales.get(&20), Some(&1750));
-        wm.set_scale(&mut conn, 1, 0).unwrap();
-        assert_eq!(wm.displays.scales.get(&20), None, "automatic again");
-        assert!(wm.set_scale(&mut conn, 7, 1000).is_err());
+        wm.set_ui_size(&mut conn, 1, 1250).unwrap();
+        assert_eq!(conn.scaled, vec![(20, 1250)]);
+        assert_eq!(wm.displays.scales.get(&20), Some(&1250));
+        wm.set_ui_size(&mut conn, 1, 0).unwrap();
+        assert_eq!(wm.displays.scales.get(&20), None, "the monitor's default again");
+        assert!(wm.set_ui_size(&mut conn, 7, 1000).is_err());
+        assert!(wm.set_ui_size(&mut conn, 1, 1750).is_err(), "not a listed UI size");
     }
 
     #[test]

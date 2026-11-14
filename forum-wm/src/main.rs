@@ -92,8 +92,8 @@ impl FrescoConn for ClientConn {
     fn arrange_outputs(&mut self, placements: Vec<fresco_protocol::WmOutputPlacement>) -> io::Result<()> {
         self.conn.wm_arrange_outputs(placements)
     }
-    fn set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
-        self.conn.wm_set_output_scale(identity, scale_milli)
+    fn set_output_ui_size(&mut self, identity: u64, ui_size_milli: u32) -> io::Result<()> {
+        self.conn.wm_set_output_ui_size(identity, ui_size_milli)
     }
     fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
         self.conn.wm_set_appearance(a)

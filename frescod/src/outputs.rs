@@ -67,19 +67,19 @@ pub fn size_mm(edid: &[u8]) -> Option<(u32, u32)> {
     (w > 0 && h > 0).then_some((w * 10, h * 10))
 }
 
-/// The scale a monitor gets unless the session sets one, in thousandths:
-/// its pixel density over 110 ppi, in quarter steps, from 1.0 to 3.0. 110
-/// ppi is a desktop monitor at arm's length shown at 1.0: a 24" 1080p or a
-/// 27" 1440p stays at 1.0, a 27" 4K gets 1.5, a 13" 2560x1600 laptop 2.0.
-/// Without a physical size, 1.0.
+/// The scale a monitor's pixel density gives (`fresco_protocol::auto_scale`,
+/// resolution-independence.md §4.1), from its EDID.
 pub fn auto_scale(edid: &[u8], width: u32, height: u32) -> u32 {
-    let Some((wmm, hmm)) = size_mm(edid) else { return 1000 };
-    /* Pixels per inch along the diagonal. */
-    let px = f64::from(width).hypot(f64::from(height));
-    let inch = f64::from(wmm).hypot(f64::from(hmm)) / 25.4;
-    let ppi = px / inch;
-    let quarters = (ppi / 110.0 * 4.0).round().clamp(4.0, 12.0);
-    (quarters * 250.0) as u32
+    fresco_protocol::auto_scale(size_mm(edid), width, height)
+}
+
+/// ATRIUM_DISPLAY_CONN_EDP: a laptop's own panel.
+pub const CONNECTOR_EDP: u32 = 5;
+
+/// The UI size a monitor has until the user sets one: Smaller for a
+/// laptop's own panel, seen closer than a desktop monitor (§11.1).
+pub fn default_ui_size(connector_type: u32) -> u32 {
+    if connector_type == CONNECTOR_EDP { fresco_protocol::UI_SIZE_INTERNAL } else { 1000 }
 }
 
 impl Viewport {
@@ -432,14 +432,22 @@ mod tests {
 
     #[test]
     fn automatic_scale_follows_pixel_density() {
-        // 27" 4K, 24" 1080p, 27" 1440p, 13.3" 2560x1600, no size.
+        // 27" 4K, 24" 1080p, 27" 1440p, 13.3" 2560x1600 (2.07, in eighths).
         assert_eq!(auto_scale(&edid((597, 336), (0, 0)), 3840, 2160), 1500);
         assert_eq!(auto_scale(&edid((531, 299), (0, 0)), 1920, 1080), 1000);
         assert_eq!(auto_scale(&edid((597, 336), (0, 0)), 2560, 1440), 1000);
-        assert_eq!(auto_scale(&edid((286, 179), (0, 0)), 2560, 1600), 2000);
-        assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 3840, 2160), 1000);
-        // A tiny 4K panel stops at 3.0.
-        assert_eq!(auto_scale(&edid((60, 34), (0, 0)), 3840, 2160), 3000);
+        assert_eq!(auto_scale(&edid((286, 179), (0, 0)), 2560, 1600), 2125);
+        // No size (a TV): by mode height, so a 4K TV is 2.0, not 1.0.
+        assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 3840, 2160), 2000);
+        assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 2560, 1440), 1375);
+        assert_eq!(auto_scale(&edid((0, 0), (0, 0)), 1280, 720), 1000);
+        // A tiny 4K panel stops at 4.0.
+        assert_eq!(auto_scale(&edid((60, 34), (0, 0)), 3840, 2160), 4000);
+        // A laptop panel starts at Smaller; the scale is auto x UI size.
+        assert_eq!(default_ui_size(CONNECTOR_EDP), 875);
+        assert_eq!(default_ui_size(3), 1000);
+        assert_eq!(fresco_protocol::output_scale(2125, 875), 1859);
+        assert_eq!(fresco_protocol::output_scale(1500, 1250), 1875);
     }
 
     #[test]

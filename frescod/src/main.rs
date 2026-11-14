@@ -132,7 +132,8 @@ fn main() -> std::io::Result<()> {
     let cx = heads::Ctx { gpu: &gpu, vm: &vm, dpy: &dpy };
     let mut heads: Vec<heads::Head> = Vec::new();
     let mut remembered: HashMap<outputs::DisplaySet, outputs::Arrangement> = HashMap::new();
-    /* Monitor scales the session set (OP_WM_SET_OUTPUT_SCALE), by identity. */
+    /* Monitor UI sizes the session set (OP_WM_SET_OUTPUT_UI_SIZE), by
+     * identity (resolution-independence.md §4.2). */
     let mut scales: HashMap<u64, u32> = HashMap::new();
     /* Which monitor mirrors which, remembered per set of monitors
      * (OP_WM_MIRROR_OUTPUT): (mirror, source) identities. */
@@ -517,16 +518,17 @@ fn main() -> std::io::Result<()> {
                 changed = true;
             }
         }
-        /* A WM setting a monitor's scale (OP_WM_SET_OUTPUT_SCALE): kept
-         * by monitor, wherever it is plugged; 0 goes back to automatic. */
-        for r in frontend.lock().unwrap().take_scale_requests() {
-            if r.scale_milli == 0 {
+        /* A WM setting a monitor's UI size (OP_WM_SET_OUTPUT_UI_SIZE):
+         * kept by monitor, wherever it is plugged and at any mode; 0 goes
+         * back to the monitor's default. */
+        for r in frontend.lock().unwrap().take_ui_size_requests() {
+            if r.ui_size_milli == 0 {
                 scales.remove(&r.identity);
             } else {
-                scales.insert(r.identity, r.scale_milli);
+                scales.insert(r.identity, r.ui_size_milli);
             }
-            eprintln!("frescod: monitor {:016x} scale {}", r.identity,
-                if r.scale_milli == 0 { "automatic".to_string() } else { format!("{:.2}", f64::from(r.scale_milli) / 1000.0) });
+            eprintln!("frescod: monitor {:016x} UI size {}", r.identity,
+                if r.ui_size_milli == 0 { "default".to_string() } else { format!("{:.3}", f64::from(r.ui_size_milli) / 1000.0) });
             changed = true;
         }
         /* A WM moving monitors on the desktop (OP_WM_ARRANGE_OUTPUTS). */
@@ -1165,14 +1167,19 @@ fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head
         .iter()
         .map(|h| {
             let set = scales.get(&h.identity).copied();
+            let auto = outputs::auto_scale(&h.conn.edid, h.mode.width, h.mode.height);
+            let ui = set.unwrap_or_else(|| outputs::default_ui_size(h.conn.connector_type));
             fresco_protocol::WmOutput {
                 output: h.output,
                 identity: h.identity,
                 rect: fresco_protocol::WmRect { x: h.vp.x as i32, y: h.vp.y as i32, w: h.vp.width as i32, h: h.vp.height as i32 },
                 refresh_mhz: h.mode.refresh_mhz,
                 present: h.present,
-                scale_milli: set.unwrap_or_else(|| outputs::auto_scale(&h.conn.edid, h.mode.width, h.mode.height)),
-                scale_auto: set.is_none(),
+                scale_milli: fresco_protocol::output_scale(auto, ui),
+                auto_scale_milli: auto,
+                ui_size_milli: ui,
+                ui_size_set: set.is_some(),
+                internal: h.conn.connector_type == outputs::CONNECTOR_EDP,
                 mirror_of: h.mirror_of.unwrap_or(0),
                 width_mm: outputs::size_mm(&h.conn.edid).map_or(0, |s| s.0),
                 height_mm: outputs::size_mm(&h.conn.edid).map_or(0, |s| s.1),

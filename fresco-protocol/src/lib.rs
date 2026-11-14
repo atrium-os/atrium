@@ -172,7 +172,7 @@ pub mod control {
     pub const OP_WM_OUTPUTS:            u16 = 0x0525; // → WmOutputsReply
     pub const OP_WM_ARRANGE_OUTPUTS:    u16 = 0x0526; // WmArrangeOutputsPayload
     // A monitor's scale (its UI size): windows on it get EV_WINDOW_RESIZED.
-    pub const OP_WM_SET_OUTPUT_SCALE:   u16 = 0x0527; // WmSetOutputScalePayload
+    pub const OP_WM_SET_OUTPUT_UI_SIZE: u16 = 0x0527; // WmSetOutputUiSizePayload
     // Show one monitor's part of the desktop on another as well (mirroring).
     pub const OP_WM_MIRROR_OUTPUT:      u16 = 0x0528; // WmMirrorOutputPayload
     // Bind a window as a credential slot in another (arca-autofill.md §4):
@@ -484,11 +484,21 @@ pub struct WmOutput {
     /// few seconds); nothing shows there meanwhile.
     pub present: bool,
     /// Its scale in thousandths (1000 = 1.0, 1500 = 1.5): what a window on
-    /// it is told by `EV_WINDOW_RESIZED`. From its pixel density
-    /// (EDID physical size) unless set with `OP_WM_SET_OUTPUT_SCALE`.
+    /// it is told by `EV_WINDOW_RESIZED`. `auto_scale_milli` times
+    /// `ui_size_milli` (resolution-independence.md §4).
     pub scale_milli: u32,
-    /// `scale_milli` is the automatic one (not set by the session).
-    pub scale_auto: bool,
+    /// The scale its pixel density gives (EDID physical size, 110 ppi =
+    /// 1.0, in 1/8 steps), or for a monitor that gives no size (a TV, a
+    /// projector) its mode height over 1080.
+    pub auto_scale_milli: u32,
+    /// The user's UI size for this monitor ([`UI_SIZES`]), a multiplier on
+    /// the automatic scale, so a new mode keeps the monitor's physical size.
+    pub ui_size_milli: u32,
+    /// `ui_size_milli` was set (`OP_WM_SET_OUTPUT_UI_SIZE`), not the
+    /// monitor's default (Smaller for a laptop panel, else Default).
+    pub ui_size_set: bool,
+    /// A laptop's own panel (eDP): seen closer, so it starts at Smaller.
+    pub internal: bool,
     /// The monitor (identity) this one mirrors, 0 for none. A mirror shows
     /// its source's part of the desktop (`rect` is the source's), scaled to
     /// fit its own mode when the sizes differ; it is not a place of its own
@@ -516,14 +526,49 @@ pub struct WmMirrorOutputPayload {
     pub of: u64,
 }
 
-/// `OP_WM_SET_OUTPUT_SCALE` — set a monitor's scale, by identity, in
-/// thousandths: 500 to 4000, or 0 for the automatic one. Kept for that
-/// monitor wherever it is plugged. `EV_DISPLAY_CHANGED` follows, and each
-/// window on it whose scale changes gets `EV_WINDOW_RESIZED`.
+/// `OP_WM_SET_OUTPUT_UI_SIZE` — set a monitor's UI size, by identity, in
+/// thousandths: one of [`UI_SIZES`], or 0 for the monitor's default. Its
+/// scale becomes its automatic scale times this (resolution-independence.md
+/// §4.2). Kept for that monitor wherever it is plugged and at any mode.
+/// `EV_DISPLAY_CHANGED` follows, and each window on it whose scale changes
+/// gets `EV_WINDOW_RESIZED`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WmSetOutputScalePayload {
+pub struct WmSetOutputUiSizePayload {
     pub identity: u64,
-    pub scale_milli: u32,
+    pub ui_size_milli: u32,
+}
+
+/// The UI sizes a user picks from (resolution-independence.md §4.2), in
+/// thousandths: Smaller, Default, then four steps larger.
+pub const UI_SIZES: [u32; 6] = [875, 1000, 1125, 1250, 1500, 2000];
+/// The UI size a laptop's own panel starts at (Smaller), every other
+/// monitor at 1000 (decision §11.1).
+pub const UI_SIZE_INTERNAL: u32 = 875;
+
+/// A monitor's automatic scale, in thousandths, in 1/8 steps from 1.0 to
+/// 4.0 (resolution-independence.md §4.1). `size_mm` is its picture's
+/// physical size: pixel density over 110 ppi (a 24" 1080p or 27" 1440p is
+/// 1.0, a 27" 4K 1.5, a 13" 2560x1600 laptop 2.125). Without one (a TV, a
+/// projector, seen from across a room) the mode height over 1080, so a 4K
+/// TV gets 2.0.
+pub fn auto_scale(size_mm: Option<(u32, u32)>, width: u32, height: u32) -> u32 {
+    let ratio = match size_mm {
+        Some((wmm, hmm)) if wmm > 0 && hmm > 0 => {
+            let px = f64::from(width).hypot(f64::from(height));
+            let inch = f64::from(wmm).hypot(f64::from(hmm)) / 25.4;
+            px / inch / 110.0
+        }
+        _ => f64::from(height) / 1080.0,
+    };
+    let eighths = (ratio * 8.0).round().clamp(8.0, 32.0);
+    (eighths * 125.0) as u32
+}
+
+/// A monitor's scale: its automatic scale times its UI size, kept within
+/// [`OUTPUT_SCALE_MIN`]..=[`OUTPUT_SCALE_MAX`].
+pub fn output_scale(auto_scale_milli: u32, ui_size_milli: u32) -> u32 {
+    let s = (u64::from(auto_scale_milli) * u64::from(ui_size_milli) + 500) / 1000;
+    (s as u32).clamp(OUTPUT_SCALE_MIN, OUTPUT_SCALE_MAX)
 }
 
 /// `OP_WM_SPAN_GROUP` — window `window_id`, zoomed by the WM, spans the
@@ -631,7 +676,7 @@ pub struct WindowSpanEvent {
     pub hidden: Vec<[u32; 4]>,
 }
 
-/// The scale range `OP_WM_SET_OUTPUT_SCALE` accepts (thousandths).
+/// The range a monitor's scale is kept within (thousandths).
 pub const OUTPUT_SCALE_MIN: u32 = 500;
 pub const OUTPUT_SCALE_MAX: u32 = 4000;
 

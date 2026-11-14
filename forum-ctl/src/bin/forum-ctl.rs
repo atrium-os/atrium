@@ -8,7 +8,8 @@
 //!   forum-ctl outputs             list the monitors and where they sit
 //!   forum-ctl arrange A SIDE B    put output A right-of / left-of / above / below output B
 //!   forum-ctl move-monitor        send the focused window to the next monitor
-//!   forum-ctl scale N F|auto      show output N at scale F (e.g. 1.5), or the automatic one
+//!   forum-ctl ui-size N S         show output N at UI size S: smaller, default, larger,
+//!                                 or 0.875 1 1.125 1.25 1.5 2 (a multiplier on its automatic scale)
 //!   forum-ctl mirror A B|off      show output B's picture on output A too, or stop
 //!   forum-ctl zoom                zoom the focused window, or un-zoom it
 //!   forum-ctl span A B.. [gap PX | bezel MM] make outputs A B.. a span group (a zoom covers them all);
@@ -26,7 +27,7 @@ use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor | scale N F|auto | mirror A B|off \
+               | arrange A right-of|left-of|above|below B | move-monitor | ui-size N smaller|default|larger|F | mirror A B|off \
                | zoom | span A [B..] [gap PX | bezel MM] | spans | span-app APP on|off \
                | pads | take-back [ID] | status | status-pick APP I | status-press APP ID");
     std::process::exit(2)
@@ -66,10 +67,13 @@ fn main() {
             output: a.parse().unwrap_or_else(|_| usage()),
             of: if *b == "off" { None } else { Some(b.parse().unwrap_or_else(|_| usage())) },
         },
-        ["scale", n, f] => Intent::SetOutputScale {
+        ["ui-size", n, f] => Intent::SetOutputUiSize {
             output: n.parse().unwrap_or_else(|_| usage()),
-            scale_milli: if *f == "auto" { 0 } else {
-                (f.parse::<f64>().unwrap_or_else(|_| usage()) * 1000.0).round() as u32
+            ui_size_milli: match *f {
+                "default" => 0,
+                "smaller" => 875,
+                "larger" => 1125,
+                f => (f.parse::<f64>().unwrap_or_else(|_| usage()) * 1000.0).round() as u32,
             },
         },
         ["zoom"] => Intent::ToggleZoom,
@@ -119,9 +123,10 @@ fn main() {
         Ok(Reply::Outputs { outputs }) => {
             if outputs.is_empty() { println!("no monitor"); }
             for o in outputs {
-                println!("output {} {}x{}@{:.2} at {},{} scale {:.2}{} monitor {:016x}{}", o.output, o.rect.w, o.rect.h,
+                println!("output {} {}x{}@{:.2} at {},{} scale {:.3} (auto {:.3} x UI size {:.3}{}){} monitor {:016x}{}", o.output, o.rect.w, o.rect.h,
                          o.refresh_mhz as f64 / 1000.0, o.rect.x, o.rect.y,
-                         o.scale_milli as f64 / 1000.0, if o.scale_auto { "" } else { " (set)" }, o.identity,
+                         o.scale_milli as f64 / 1000.0, o.auto_scale_milli as f64 / 1000.0, o.ui_size_milli as f64 / 1000.0,
+                         if o.ui_size_set { ", set" } else { "" }, if o.internal { " laptop panel" } else { "" }, o.identity,
                          if o.present { "" } else { " (gone, place kept)" });
                 if o.width_mm != 0 {
                     println!("  {}x{} mm", o.width_mm, o.height_mm);

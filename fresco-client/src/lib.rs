@@ -900,12 +900,12 @@ impl Connection {
         self.wm_response(control::OP_WM_PAD_RELEASE).map(|_| ())
     }
 
-    /// Set a monitor's scale in thousandths (0 = automatic), by identity
-    /// (WM only; `OP_WM_SET_OUTPUT_SCALE`).
-    pub fn wm_set_output_scale(&mut self, identity: u64, scale_milli: u32) -> io::Result<()> {
-        let p = fresco_protocol::WmSetOutputScalePayload { identity, scale_milli };
-        self.send_window_managed(control::OP_WM_SET_OUTPUT_SCALE, &p)?;
-        self.wm_response(control::OP_WM_SET_OUTPUT_SCALE).map(|_| ())
+    /// Set a monitor's UI size in thousandths (`UI_SIZES`, 0 = its
+    /// default), by identity (WM only; `OP_WM_SET_OUTPUT_UI_SIZE`).
+    pub fn wm_set_output_ui_size(&mut self, identity: u64, ui_size_milli: u32) -> io::Result<()> {
+        let p = fresco_protocol::WmSetOutputUiSizePayload { identity, ui_size_milli };
+        self.send_window_managed(control::OP_WM_SET_OUTPUT_UI_SIZE, &p)?;
+        self.wm_response(control::OP_WM_SET_OUTPUT_UI_SIZE).map(|_| ())
     }
 
     /// Wait for the IS_RESPONSE to WM op `op`, turning an IS_ERROR into an
