@@ -16,7 +16,8 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::courier::{app_persona, CourierLabel};
 use crate::label::Label;
-use crate::proto::{broker_op, courier_op, op, status, MAX_SIGN_MSG};
+use crate::proto::{broker_op, courier_op, op, share_op, status, MAX_SIGN_MSG};
+use crate::share::ShareLabel;
 
 /// Personas arrive with the label once insula.md §13.6 lands; until then
 /// every app item is in the user's main persona.
@@ -150,7 +151,7 @@ impl State {
                 .collect();
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
         }
-        let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id }) = who else { return None };
+        let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id } | Label::FileManager { user, publisher, app_id }) = who else { return None };
         if !matches!(op, op::PUBKEY | op::SIGN | op::RELEASE) || body.len() < 16 {
             return None;
         }
@@ -173,6 +174,12 @@ impl State {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
             },
+            Label::FileManager { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
+                Ok(me) if (0xA0..=0xA3).contains(&op) => self.file_manager_op(user, &me, op, body, &mut item),
+                Ok(me) => self.app_op(user, &me, op, body, &mut item),
+                Err(_) => reply(status::UNKNOWN_PEER),
+            },
+            Label::Share(sl) => self.share_op(sl, op, body, &mut item),
             Label::Vestibulum => self.vestibulum_op(op, body),
             Label::TrustedUi => self.ui_op(op, body, &mut item),
             Label::Courier(c) => self.courier_op(c, op, body, &mut item),
@@ -200,6 +207,11 @@ impl State {
                 format!("app:{app_id}/{p}@{user}")
             }
             Label::WebBroker { user, app_id, .. } => format!("broker:{app_id}@{user}"),
+            Label::FileManager { user, app_id, .. } => format!("files:{app_id}@{user}"),
+            Label::Share(sl) => match &sl.share {
+                Recipient::Share { host, port, .. } => format!("share:sftp:{host}:{port}@{}", sl.user),
+                _ => "share:?".into(),
+            },
             Label::Vestibulum => "vestibulum".into(),
             Label::TrustedUi => "ui".into(),
             Label::Service(n) => format!("service:{n}"),
@@ -1145,6 +1157,203 @@ impl State {
                 }
                 Reply { status: status::OK, body: Body::Secret(tri!(crate::cookie::header(found).map_err(Error::Io))) }
             }
+            _ => reply(status::DENIED),
+        }
+    }
+
+    // ── network shares ───────────────────────────────────────────────────
+
+    /// The file manager's share ops (network-shares.md §5.2). The value it
+    /// saves comes from its own credential field, by handle: the file
+    /// manager never sees it, and only it may bind a typed password to a
+    /// server, so another app can't have the user type a password and then
+    /// send it to a server of its choosing.
+    fn file_manager_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        use crate::handles::Source;
+        use crate::share::{read_share, write_share};
+        let mut r = Reader::new(body);
+        macro_rules! field {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => return malformed(),
+                }
+            };
+        }
+        // Shares' items are while-unlocked (a lock unmounts shares, §7).
+        if self.stores.get(user).is_none_or(|s| s.state() != LockState::Unlocked) {
+            return reply(status::LOCKED);
+        }
+        match op {
+            share_op::SH_SAVE => {
+                let h = field!(r.array::<16>());
+                let share = field!(read_share(&mut r));
+                let account = field!(r.str(caps::ACCOUNT));
+                field!(r.end());
+                if account.is_empty() {
+                    return malformed();
+                }
+                let Some(e) = self.handles.take(&h, user, PERSONA, me) else { return reply(status::DENIED) };
+                let store = self.stores.get_mut(user).expect("checked above");
+                if store.state() != LockState::Unlocked {
+                    return reply(status::LOCKED);
+                }
+                let (value, provenance) = match e.source {
+                    Source::Pending(v) => (v, if e.generated { Provenance::ArcaGenerated } else { Provenance::UserTyped }),
+                    Source::Item(id) => {
+                        // A password the user had saved for the file manager itself.
+                        let mine = Access { persona: PERSONA, recipient: me };
+                        let m = tri!(store.meta(&id, &mine));
+                        if m.kind != Kind::Password {
+                            return reply(status::DENIED);
+                        }
+                        (tri!(store.release(&id, &mine, None)).1, Provenance::UserTyped)
+                    }
+                };
+                let who = Access { persona: PERSONA, recipient: &share };
+                for m in tri!(store.list(&who)) {
+                    if m.kind == Kind::Password && m.account == account {
+                        tri!(store.delete(&m.id, &who));
+                    }
+                }
+                let m = tri!(store.add(NewItem {
+                    persona: PERSONA,
+                    recipient: share.clone(),
+                    class: Class::WhileUnlocked,
+                    kind: Kind::Password,
+                    provenance,
+                    account,
+                    scope: b"",
+                    value: value.as_ref(),
+                }));
+                *item = Some(m.id);
+                ok(m.id.0.to_vec())
+            }
+            share_op::SH_MINT => {
+                let share = field!(read_share(&mut r));
+                let account = field!(r.str(caps::ACCOUNT));
+                field!(r.end());
+                if account.is_empty() {
+                    return malformed();
+                }
+                let store = self.stores.get_mut(user).expect("checked above");
+                let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
+                let pk = signing_key(&seed).verifying_key().to_bytes();
+                let m = tri!(store.add(NewItem {
+                    persona: PERSONA,
+                    recipient: share,
+                    class: Class::WhileUnlocked,
+                    kind: Kind::Ed25519,
+                    provenance: Provenance::ArcaGenerated,
+                    account,
+                    scope: b"",
+                    value: seed.as_ref(),
+                }));
+                *item = Some(m.id);
+                let mut w = Writer::new();
+                w.raw(&m.id.0);
+                w.raw(&pk);
+                ok(w.buf)
+            }
+            share_op::SH_LIST => {
+                field!(r.end());
+                let store = &self.stores[user];
+                let mut n = 0u32;
+                let mut w = Writer::new();
+                for (persona, rec) in tri!(store.recipients()) {
+                    if persona != PERSONA || !matches!(rec, Recipient::Share { .. }) {
+                        continue;
+                    }
+                    for m in tri!(store.list(&Access { persona: PERSONA, recipient: &rec })) {
+                        write_share(&mut w, &rec);
+                        w.raw(&m.id.0);
+                        w.u16(m.kind as u16);
+                        w.str(&m.account);
+                        n += 1;
+                    }
+                }
+                let mut out = Writer::new();
+                out.u32(n);
+                out.raw(&w.buf);
+                ok(out.buf)
+            }
+            share_op::SH_DELETE => {
+                let share = field!(read_share(&mut r));
+                let id = ItemId(field!(r.array::<16>()));
+                field!(r.end());
+                *item = Some(id);
+                let store = self.stores.get_mut(user).expect("checked above");
+                tri!(store.delete(&id, &Access { persona: PERSONA, recipient: &share }));
+                ok(Vec::new())
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
+    /// A share server asks after its handshake, naming the identity the
+    /// server proved; Arca answers only if that is the identity pinned in
+    /// the share server's own label, and only with that share's items.
+    fn share_op(&mut self, sl: &ShareLabel, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        let mut r = Reader::new(body);
+        let Ok(key) = r.array::<32>() else { return malformed() };
+        if !matches!(op, share_op::SH_ITEMS | share_op::SH_FILL | share_op::SH_PUBKEY | share_op::SH_SIGN) {
+            return reply(status::DENIED);
+        }
+        if &key != sl.key() {
+            return reply(status::DENIED);
+        }
+        let Some(store) = self.stores.get(&sl.user).filter(|s| s.state() == LockState::Unlocked) else {
+            return reply(status::LOCKED);
+        };
+        let who = Access { persona: PERSONA, recipient: &sl.share };
+        if op == share_op::SH_ITEMS {
+            if r.end().is_err() {
+                return malformed();
+            }
+            let items = tri!(store.list(&who));
+            let mut w = Writer::new();
+            w.u32(items.len() as u32);
+            for m in items {
+                w.raw(&m.id.0);
+                w.u16(m.kind as u16);
+                w.str(&m.account);
+            }
+            return ok(w.buf);
+        }
+        let Ok(id) = r.array::<16>() else { return malformed() };
+        let id = ItemId(id);
+        *item = Some(id);
+        let msg = if op == share_op::SH_SIGN {
+            match r.bytes(MAX_SIGN_MSG) {
+                Ok(m) => m,
+                Err(_) => return malformed(),
+            }
+        } else {
+            &[][..]
+        };
+        if r.end().is_err() {
+            return malformed();
+        }
+        let m = tri!(store.meta(&id, &who));
+        match (op, m.kind) {
+            (share_op::SH_FILL, Kind::Password) => {
+                let (_, v) = tri!(store.release(&id, &who, None));
+                let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
+                out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                out.as_mut()[4..].copy_from_slice(v.as_ref());
+                Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            (share_op::SH_PUBKEY | share_op::SH_SIGN, Kind::Ed25519) => {
+                let (_, seed) = tri!(store.release(&id, &who, None));
+                let sk = signing_key(&seed);
+                drop(seed);
+                if op == share_op::SH_PUBKEY {
+                    ok(sk.verifying_key().to_bytes().to_vec())
+                } else {
+                    ok(sk.sign(msg).to_bytes().to_vec())
+                }
+            }
+            // A key's seed is never filled; a password signs nothing.
             _ => reply(status::DENIED),
         }
     }

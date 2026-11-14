@@ -19,6 +19,13 @@
 //!   SCRINIUM_SECS           [unset] exit after this many seconds (VM checks)
 //!   SCRINIUM_TRACE          [unset] log what is shown after each change
 //!   SCRINIUM_OPEN           [unset] open this place id (`da0s1`) and path at start
+//!   SCRINIUM_ARCA_SOCKET    [/atrium/sockets/arca/arcad.sock] saved network shares
+//!
+//! "Connect to server" (network-shares.md §5.2): dispensatord learns the
+//! server's key in a jail of its own, the user accepts it, types the
+//! password into Arca's field (a Limen `credential` slot), Scrinium has
+//! Arca save that entry for exactly this server and key, and dispensatord
+//! starts the share server, which gets the password from Arca itself.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -58,6 +65,8 @@ fn size_of(s: &str, d: (u32, u32)) -> (u32, u32) {
 
 /// One window, its app and its state: the file manager's or a picker's.
 struct Pane {
+    cred: pergola::widgets::CredentialField,
+    cred_state: Mutable<pergola::widgets::CredentialState>,
     win: Window,
     app: App<ScriniumView>,
     state: Mutable<Browser>,
@@ -77,8 +86,9 @@ impl Pane {
         let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
         let view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
         let mods = view.mods.clone();
+        let (cred, cred_state) = (view.cred.clone(), view.cred_state.clone());
         let app = App::new_with_flag(view, dirty);
-        Pane { win, app, state, field, size, mods, gen: u64::MAX, trace: std::env::var_os("SCRINIUM_TRACE").map(|_| String::new()) }
+        Pane { cred, cred_state, win, app, state, field, size, mods, gen: u64::MAX, trace: std::env::var_os("SCRINIUM_TRACE").map(|_| String::new()) }
     }
 
     /// One turn: an event (or `wait`), then the places if they changed.
@@ -337,6 +347,207 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
     });
 }
 
+// -- network shares ---------------------------------------------------------
+
+enum Job {
+    Learned(Result<String, String>),
+    /// The share's part, and the item to forget at disconnect (not remembered).
+    Connected(Result<String, String>, Option<scrinium::shares::Saved>),
+    Saved(Vec<scrinium::shares::Saved>),
+}
+
+/// "Connect to server" and the saved shares, for the manager's window.
+struct Network {
+    media: std::path::PathBuf,
+    arca: std::path::PathBuf,
+    embeds: Option<std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>>,
+    /// Arca's password field, while the form shows it.
+    cred_embed: Option<EmbedId>,
+    tx: Sender<Job>,
+    rx: Receiver<Job>,
+    /// Shares connected without "remember": their item goes at disconnect.
+    forget: HashMap<String, scrinium::shares::Saved>,
+}
+
+impl Network {
+    fn new(pane: &mut Pane, media: std::path::PathBuf) -> Self {
+        let embeds = match pergola::embed::Embeds::connect() {
+            Ok(e) => {
+                pane.win.set_slot_binder(pergola::embed::Embeds::binder(&e));
+                Some(e)
+            }
+            Err(e) => {
+                eprintln!("scrinium: limend: {e:?}: no password field for servers");
+                None
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new() };
+        n.refresh_saved();
+        n
+    }
+
+    fn refresh_saved(&self) {
+        let (arca, tx) = (self.arca.clone(), self.tx.clone());
+        std::thread::spawn(move || match scrinium::shares::list(&arca) {
+            Ok(l) => {
+                let _ = tx.send(Job::Saved(l));
+            }
+            Err(e) => eprintln!("scrinium: saved servers: {e}"),
+        });
+    }
+
+    fn disconnected(&mut self, part: &str) {
+        if let Some(s) = self.forget.remove(part) {
+            if let Err(e) = scrinium::shares::forget(&self.arca, &s) {
+                eprintln!("scrinium: forget {}: {e}", s.addr.host);
+            }
+        }
+    }
+
+    fn connect_job(&self, addr: scrinium::connect::Address, key: [u8; 32], save: Option<([u8; 16], bool)>) {
+        let (media, arca, tx) = (self.media.clone(), self.arca.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let mut forget = None;
+            if let Some((handle, remember)) = save {
+                match scrinium::shares::save(&arca, &handle, &addr, &key) {
+                    Ok(item) if !remember => forget = Some(scrinium::shares::Saved { addr: addr.clone(), key, item }),
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.send(Job::Connected(Err(e), None));
+                        return;
+                    }
+                }
+            }
+            let c = atrium_media::Connect {
+                host: addr.host.clone(),
+                port: addr.port,
+                path: addr.path.clone(),
+                user: addr.user.clone(),
+                fingerprint: scrinium::connect::fingerprint(&key),
+                read_only: false,
+            };
+            let r = atrium_media::client::connect(&media, &c).map_err(|(_, m)| m);
+            let _ = tx.send(Job::Connected(r, forget));
+        });
+    }
+
+    /// One turn; the part of a share that just connected, to open it.
+    fn step(&mut self, pane: &mut Pane) -> Option<String> {
+        use scrinium::connect::{Step, Want};
+        let mut b = pane.state.get_cloned();
+        let mut changed = false;
+        let mut open = None;
+        // What the form asks for.
+        if let Some(want) = b.connect.as_mut().and_then(|f| f.take_want()) {
+            changed = true;
+            match want {
+                Want::Learn(a) => {
+                    let (media, tx) = (self.media.clone(), self.tx.clone());
+                    std::thread::spawn(move || {
+                        let r = atrium_media::client::learn(&media, &atrium_media::Learn { host: a.host.clone(), port: a.port }).map_err(|(_, m)| m);
+                        let _ = tx.send(Job::Learned(r));
+                    });
+                }
+                Want::Connect { addr, fingerprint, remember } => {
+                    let handle = pane.cred_state.get_cloned().handle;
+                    match (handle, scrinium::connect::key_of(&fingerprint)) {
+                        (Some(h), Some(key)) => self.connect_job(addr, key, Some((h, remember))),
+                        _ => {
+                            if let Some(f) = &mut b.connect {
+                                f.failed("Type the password again".into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(i) = b.want_reconnect.take() {
+            changed = true;
+            if let Some(s) = b.saved.get(i).cloned() {
+                b.notice = Some(scrinium::browser::Notice { text: format!("Connecting to {}…", s.addr.host), error: false });
+                self.connect_job(s.addr, s.key, None);
+            }
+        }
+        // Arca's field: asked for when the form gets to the password, let go after.
+        let wants_field = matches!(b.connect.as_ref().map(|f| &f.step), Some(Step::Password { .. }));
+        if let Some(embeds) = &self.embeds {
+            match (wants_field, self.cred_embed) {
+                (true, None) => {
+                    if let Some(token) = pane.win.embed_token() {
+                        let asked = embeds.borrow_mut().request("credential", token, pane.cred.slot_key());
+                        match asked {
+                            Ok(e) => {
+                                let _ = embeds.borrow_mut().send(e, pane.cred.configure().encode());
+                                self.cred_embed = Some(e);
+                            }
+                            Err(e) => eprintln!("scrinium: Arca's password field: {e:?}"),
+                        }
+                    }
+                }
+                (false, Some(e)) => {
+                    let _ = embeds.borrow_mut().detach_embed(e);
+                    self.cred_embed = None;
+                    pane.cred_state.set(pergola::widgets::CredentialState::default());
+                }
+                _ => {}
+            }
+            loop {
+                let ev = embeds.borrow_mut().poll(Duration::from_millis(0));
+                match ev {
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.cred_embed => {
+                        if let Some(m) = limen::credential::ToParent::decode(&bytes) {
+                            pane.cred.apply(m);
+                            let s = pane.cred_state.get_cloned();
+                            if let Some(f) = &mut b.connect {
+                                f.field_filled(s.filled && s.handle.is_some());
+                                changed = true;
+                            }
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.cred_embed => self.cred_embed = None,
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("scrinium: limend: {e:?}");
+                        self.embeds = None;
+                        break;
+                    }
+                }
+            }
+        }
+        // What came back.
+        while let Ok(j) = self.rx.try_recv() {
+            changed = true;
+            match j {
+                Job::Learned(r) => {
+                    if let Some(f) = &mut b.connect {
+                        f.learned(r);
+                    }
+                }
+                Job::Connected(Ok(part), forget) => {
+                    if let Some(s) = forget {
+                        self.forget.insert(part.clone(), s);
+                    }
+                    b.connect = None;
+                    b.notice = Some(scrinium::browser::Notice { text: "Connected".into(), error: false });
+                    open = Some(part);
+                    self.refresh_saved();
+                }
+                Job::Connected(Err(e), _) => match &mut b.connect {
+                    Some(f) => f.failed(e),
+                    None => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't connect: {e}"), error: true }),
+                },
+                Job::Saved(l) => b.saved = l,
+            }
+        }
+        if changed {
+            pane.state.set(b);
+        }
+        open
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let window = !args.iter().any(|a| a == "--no-window");
@@ -397,6 +608,7 @@ fn main() {
     };
     let mut pane = Pane::new(win, Mode::Manager);
     let mut opened = std::env::var("SCRINIUM_OPEN").ok();
+    let mut net = Network::new(&mut pane, media_sock.clone());
     if let Err(e) = pane.win.paint(&mut pane.app) {
         eprintln!("scrinium: first paint: {e}");
     }
@@ -418,8 +630,15 @@ fn main() {
                 });
             }
         }
+        if let Some(part) = net.step(&mut pane) {
+            opened = Some(part);
+        }
         if let Some(part) = pane.state.get_cloned().want_eject {
             let msg = match atrium_media::client::eject(&media_sock, &part) {
+                Ok(_) if part.starts_with("share-") => {
+                    net.disconnected(&part);
+                    ("Disconnected".to_string(), false)
+                }
                 Ok(m) => (format!("Ejected: {}", if m.is_empty() { "safe to unplug".into() } else { m }), false),
                 Err((atrium_media::status::BUSY, _)) => ("A file on it is still open: close it, then eject".into(), true),
                 Err((_, m)) => (format!("Couldn't eject: {m}"), true),

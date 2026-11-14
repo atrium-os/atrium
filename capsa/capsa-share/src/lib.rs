@@ -5,6 +5,7 @@
 //! node ids survive renames (a renamed folder's children are re-keyed with
 //! it).
 
+pub mod arca;
 pub mod sftp;
 
 use std::collections::HashMap;

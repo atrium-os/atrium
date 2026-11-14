@@ -53,8 +53,14 @@ pub fn parse_line(line: &str) -> Option<(u32, CourierLabel)> {
 /// retiring it. A second label for a uid that is still live voids that uid
 /// for the rest of the file: a launcher bug, so fail closed.
 pub fn lookup(path: &str, uid: u32) -> Option<CourierLabel> {
+    lookup_with(path, uid, |l| parse_line(l).map(|(_, c)| c))
+}
+
+/// The registry rule shared by couriers and share servers: the live label
+/// of `uid` in the file at `path`, parsed by `parse`.
+pub fn lookup_with<T>(path: &str, uid: u32, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut live: Option<CourierLabel> = None;
+    let mut live: Option<T> = None;
     let mut poisoned = false;
     for l in text.lines() {
         let mut f = l.split_ascii_whitespace();
@@ -65,8 +71,8 @@ pub fn lookup(path: &str, uid: u32) -> Option<CourierLabel> {
             live = None;
             continue;
         }
-        match parse_line(l) {
-            Some((_, label)) if live.is_none() => live = Some(label),
+        match parse(l) {
+            Some(label) if live.is_none() => live = Some(label),
             _ => poisoned = true,
         }
     }

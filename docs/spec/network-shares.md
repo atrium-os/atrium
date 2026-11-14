@@ -4,7 +4,7 @@
 He asked whether the file manager mounts network shares and, if it belongs
 there, for a security audit of doing it properly with the credentials. Built
 so far: the S0 mount options, fusefs fuzzer and share-server syscall
-profile (§4.4). Decisions are in §9.
+profile (§4.4); S1 SFTP (2026-11-14, §10). Decisions are in §9.
 **Scope:** connecting to a file server on the LAN or the internet, showing it
 in Scrinium next to the sticks, handing its files and folders to apps through
 the picker, and where the passwords and keys live.
@@ -385,6 +385,26 @@ encryption. It checks:
 2. **S1 SFTP:** share-volume source in dispensatord, the jail/vnet/pf
    setup, `atrium-share-sftp` with Arca host-key pinning and signing,
    Scrinium's Connect form with the arca-ui slot, the gate's SFTP part.
+   **Built 2026-11-14.** Arca: share items keyed by `Recipient::Share`
+   (host, port, path and the SHA-256 of the host key), the file manager
+   (`ARCA_FILE_MANAGER`) saves what was typed in its own credential field
+   (a handle; it never sees the value), mints an Ed25519 key, lists and
+   forgets; a share-server uid gets items only through its registry line
+   (`/var/run/atrium/share-registry`, retired when the server ends) and
+   only for the key it names. `atrium-share-sftp` checks the pin before
+   asking Arca, logs in with the password or by Arca's signature (the key
+   never leaves Arca) and serves owner-only modes. jaild's
+   `[share_servers]`: FUSE with no device at `/media/share-<uid>`, fd 3.
+   dispensatord resolves the host once, refuses loopback and link-local,
+   runs `--learn` and the server in a routed vnet granted that one
+   address and port (jaild's pf also keeps it off the machine itself), and
+   ends a share on eject, lock or logout. Scrinium: "Connect to server"
+   (address, the key to accept, Arca's password field) and saved servers
+   in the sidebar. Gates on the cloud amd64 VM: `vm-share-sftp.sh` (Arca
+   and the server, 19 checks) and `vm-share-jail.sh` (the jailed path
+   through dispensatord and jaild, 27 checks), both 0 failed. Still to do:
+   the hard-stop sheet when a saved share's key changes, folder grants of
+   a share to apps, share sizes, a VM check of the Connect sheet itself.
 3. **S2 WebDAV over HTTPS**, reusing the TLS stack and courier rules.
 4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.

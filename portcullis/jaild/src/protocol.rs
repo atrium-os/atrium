@@ -346,7 +346,8 @@ pub struct CreateJailRequest {
 /// See [`CreateJailRequest::fuse`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FuseServe {
-    /// The block device relative to `/dev`: `da0p1`, `da1s1`.
+    /// The block device relative to `/dev`: `da0p1`, `da1s1`. Empty: no
+    /// device, a network share server's mount (`[share_servers]` only).
     pub device:     String,
     /// Absolute host path the filesystem appears on: `/media/usb-da0p1`.
     pub mountpoint: String,

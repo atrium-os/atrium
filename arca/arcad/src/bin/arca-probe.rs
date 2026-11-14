@@ -15,6 +15,12 @@
 //! arca-probe - persona PUBHEX APP            # the app's courier persona
 //! arca-probe SOCK accounts USER PUBHEX APP # as arca-ui's uid: the chip's list
 //! arca-probe SOCK generate USER PUBHEX APP # as arca-ui's uid: a handle
+//! arca-probe SOCK hold USER PUBHEX APP VALUE  # as arca-ui's uid: a typed value's handle
+//! arca-probe SOCK share-save HANDLE HOST PORT PATH KEYHEX ACCOUNT  # as the file manager
+//! arca-probe SOCK share-mint HOST PORT PATH KEYHEX ACCOUNT         # as the file manager
+//! arca-probe SOCK share-list                                       # as the file manager
+//! arca-probe SOCK share-items KEYHEX          # as a share server's uid
+//! arca-probe SOCK share-fill KEYHEX ID        # as a share server's uid
 //! ```
 //!
 //! Prints `status=N` and any body; exits 0 whatever the status, so a
@@ -26,7 +32,7 @@ use std::process::ExitCode;
 
 use arca_store::codec::Writer;
 use arcad::client::VestibulumLink;
-use arcad::proto::{self, op};
+use arcad::proto::{self, op, share_op};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -127,6 +133,35 @@ fn main() -> ExitCode {
             w.raw(&unhex(arg(4)));
             w.str(arg(5));
             call(sock, if arg(2) == "accounts" { op::U_ACCOUNTS } else { op::U_GENERATE }, &w.buf)
+        }
+        "hold" => {
+            w.str(arg(3));
+            w.raw(&unhex(arg(4)));
+            w.str(arg(5));
+            w.bytes(arg(6).as_bytes());
+            call(sock, op::U_HOLD, &w.buf)
+        }
+        "share-save" | "share-mint" => {
+            let save = arg(2) == "share-save";
+            let at = if save { 4 } else { 3 };
+            if save {
+                w.raw(&unhex(arg(3)));
+            }
+            let key: [u8; 32] = unhex(arg(at + 3)).try_into().unwrap_or([0; 32]);
+            let Ok(share) = arca_store::Recipient::share(arca_store::ShareProto::Sftp, arg(at), arg(at + 1).parse().unwrap_or(0), arg(at + 2), key) else {
+                eprintln!("bad share");
+                return ExitCode::from(2);
+            };
+            arcad::share::write_share(&mut w, &share);
+            w.str(arg(at + 4));
+            call(sock, if save { share_op::SH_SAVE } else { share_op::SH_MINT }, &w.buf)
+        }
+        "share-list" => call(sock, share_op::SH_LIST, &[]),
+        "share-items" => call(sock, share_op::SH_ITEMS, &unhex(arg(3))),
+        "share-fill" => {
+            w.raw(&unhex(arg(3)));
+            w.raw(&unhex(arg(4)));
+            call(sock, share_op::SH_FILL, &w.buf)
         }
         c => {
             eprintln!("unknown command {c}");

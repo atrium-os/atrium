@@ -141,6 +141,39 @@ pub mod sigillum_op {
     pub const P_LIST: u16 = 0x92;
 }
 
+/// Network shares' ops (0xA0..), network-shares.md §5. A share is
+/// `crate::share::read_share`'s wire. Items for a share live in the user's
+/// main persona with the share as recipient, class while-unlocked (a lock
+/// unmounts shares, §7).
+pub mod share_op {
+    /// File manager: save what the user typed (or picked) in the file
+    /// manager's own credential field as the password for a share:
+    /// `handle[16] | share | str account` → `id[16]`. The handle is redeemed
+    /// here, for the file manager itself; an item for the same share and
+    /// account is replaced.
+    pub const SH_SAVE: u16 = 0xA0;
+    /// File manager: mint an Ed25519 key for a share: `share | str account`
+    /// → `id[16] | pubkey[32]`. The key never leaves Arca; the share server
+    /// has Arca sign with it.
+    pub const SH_MINT: u16 = 0xA1;
+    /// File manager: → `u32 n | n × (share | id[16] | u16 kind | str
+    /// account)`, the saved shares' items.
+    pub const SH_LIST: u16 = 0xA2;
+    /// File manager: `share | id[16]` → nothing.
+    pub const SH_DELETE: u16 = 0xA3;
+
+    /// Share server, after its handshake: `key[32]` (the identity the
+    /// server proved) → `u32 n | n × (id[16] | u16 kind | str account)`.
+    pub const SH_ITEMS: u16 = 0xA8;
+    /// Share server: `key[32] | id[16]` → `bytes value`, a password.
+    pub const SH_FILL: u16 = 0xA9;
+    /// Share server: `key[32] | id[16]` → `pubkey[32]`.
+    pub const SH_PUBKEY: u16 = 0xAA;
+    /// Share server: `key[32] | id[16] | bytes msg` → `sig[64]`, the SSH
+    /// user-auth signature (RFC 4252 §7) with the share's key.
+    pub const SH_SIGN: u16 = 0xAB;
+}
+
 /// Courier ops (0x80..): only a courier's uid, for its own endpoint.
 pub mod courier_op {
     /// After TLS is up: `u8 n | n × (u8 source | ref[16])` → `n × bytes

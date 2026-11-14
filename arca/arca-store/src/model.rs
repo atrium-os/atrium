@@ -157,6 +157,35 @@ pub enum Recipient {
     /// An Atrium system service, verified by its fixed uid (arcad's
     /// configuration): `vinculumd` for Bluetooth bonds. Machine store only.
     Service(String),
+    /// A network share (network-shares.md §5.1): the server at host:port,
+    /// the folder, and the identity it proved, for SFTP the SHA-256 of its
+    /// SSH host key blob. Only the share server registered for exactly this
+    /// share, after its handshake proved that key, gets the item.
+    Share { proto: ShareProto, host: String, port: u16, path: String, key: [u8; 32] },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ShareProto {
+    Sftp = 1,
+}
+
+/// A share's host: a lowercase DNS name or an address literal (dotted IPv4,
+/// or IPv6 without brackets, lowercase). An SSH share's identity is its host
+/// key, not its name, so literals are fine here.
+fn valid_share_host(h: &str) -> bool {
+    if valid_host(h) {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip.to_string() == h;
+    }
+    false
+}
+
+/// A share's folder on the server: printable, at most 1024 bytes.
+fn valid_share_path(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 1024 && !p.chars().any(|c| c.is_control())
 }
 
 /// A service name: lowercase letters, digits, '-' and '_', at most 64.
@@ -207,6 +236,13 @@ impl Recipient {
         Ok(Recipient::App { publisher, app_id: app_id.into() })
     }
 
+    pub fn share(proto: ShareProto, host: &str, port: u16, path: &str, key: [u8; 32]) -> Result<Recipient, Error> {
+        if !valid_share_host(host) || port == 0 || !valid_share_path(path) {
+            return Err(Error::BadRecipient);
+        }
+        Ok(Recipient::Share { proto, host: host.into(), port, path: path.into(), key })
+    }
+
     pub fn service(name: &str) -> Result<Recipient, Error> {
         if !valid_service(name) {
             return Err(Error::BadRecipient);
@@ -251,6 +287,14 @@ impl Recipient {
                 w.u8(5);
                 w.str(n);
             }
+            Recipient::Share { proto, host, port, path, key } => {
+                w.u8(6);
+                w.u8(*proto as u8);
+                w.str(host);
+                w.u16(*port);
+                w.str(path);
+                w.raw(key);
+            }
         }
     }
 
@@ -288,6 +332,17 @@ impl Recipient {
             3 => Ok(Recipient::User),
             4 => Recipient::rp_id(r.str(caps::RP_ID)?).map_err(|_| Error::Corrupt("recipient")),
             5 => Recipient::service(r.str(64)?).map_err(|_| Error::Corrupt("recipient")),
+            6 => {
+                let proto = match r.u8()? {
+                    1 => ShareProto::Sftp,
+                    _ => return Err(Error::Corrupt("share protocol")),
+                };
+                let host = r.str(caps::HOST)?.to_string();
+                let port = r.u16()?;
+                let path = r.str(1024)?.to_string();
+                let key = r.array::<32>()?;
+                Recipient::share(proto, &host, port, &path, key).map_err(|_| Error::Corrupt("recipient"))
+            }
             _ => Err(Error::Corrupt("recipient tag")),
         }
     }

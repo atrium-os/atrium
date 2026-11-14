@@ -58,6 +58,9 @@ pub struct Policy {
     /// Arca's couriers (arca.md §5). Absent = none.
     #[serde(default)]
     pub couriers: Option<CourierPolicy>,
+    /// Network share servers (network-shares.md §4.1). Absent = none.
+    #[serde(default)]
+    pub share_servers: Option<ShareServerPolicy>,
     /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
@@ -185,6 +188,27 @@ pub struct CourierPolicy {
     pub exec_path:   String,
     pub uid_first:   u32,
     pub uid_last:    u32,
+}
+
+/// `[share_servers]`: dispensatord asks for one jail per mounted network
+/// share, named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
+/// running exactly `exec_path` as that uid, serving FUSE with no device at
+/// exactly `<mount_prefix>/share-<uid>` (network-shares.md §4.1, §6.1).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareServerPolicy {
+    pub name_prefix:  String,
+    pub exec_path:    String,
+    pub uid_first:    u32,
+    pub uid_last:     u32,
+    pub mount_prefix: String,
+}
+
+impl ShareServerPolicy {
+    /// The one mountpoint a share server's jail may serve.
+    pub fn mountpoint(&self, uid: u32) -> String {
+        format!("{}/share-{uid}", self.mount_prefix.trim_end_matches('/'))
+    }
 }
 
 /// `[mlock]`: jails whose processes may `mlock(2)`. A jail that holds secrets

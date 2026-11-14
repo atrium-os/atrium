@@ -116,6 +116,15 @@ fn args() -> Result<Args, String> {
             "--media" => a.media_cmd = Some("list".into()),
             "--media-watch" => a.media_cmd = Some("watch".into()),
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
+            // Tests: what the file manager asks for a share.
+            "--learn" => a.media_cmd = Some(format!("learn {}", val()?)),
+            "--connect" => {
+                let mut v = Vec::new();
+                for _ in 0..5 {
+                    v.push(it.next().ok_or("--connect needs HOST PORT PATH USER FINGERPRINT")?);
+                }
+                a.media_cmd = Some(format!("connect {}", v.join(" ")));
+            }
             "--devices-socket" => a.devices_socket = val()?.into(),
             "--devices" => a.devices_cmd = true,
             "--grant" => {
@@ -320,6 +329,33 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             }
         };
     }
+    let answer = |r: Result<String, (u8, String)>| match r {
+        Ok(m) => {
+            println!("ok {m}");
+            ExitCode::SUCCESS
+        }
+        Err((st, m)) => {
+            println!("error {m} (status {st})");
+            ExitCode::FAILURE
+        }
+    };
+    if let Some(rest) = cmd.strip_prefix("learn ") {
+        let (host, port) = rest.rsplit_once(':').and_then(|(h, p)| Some((h, p.parse().ok()?))).unwrap_or((rest, 22));
+        return answer(atrium_media::client::learn(sock, &atrium_media::Learn { host: host.into(), port }));
+    }
+    if let Some(rest) = cmd.strip_prefix("connect ") {
+        let f: Vec<&str> = rest.split(' ').collect();
+        let [host, port, path, user, fp] = f[..] else {
+            println!("error malformed");
+            return ExitCode::FAILURE;
+        };
+        let Ok(port) = port.parse() else {
+            println!("error port");
+            return ExitCode::FAILURE;
+        };
+        let c = atrium_media::Connect { host: host.into(), port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false };
+        return answer(atrium_media::client::connect(sock, &c));
+    }
     match cmd.split_once(' ') {
         Some(("revoke", jail)) => match atrium_media::client::revoke(sock, jail) {
             Ok(m) => {
@@ -439,6 +475,18 @@ mod run {
         next_grant: u64,
         /// File managers given every stick.
         standing: Vec<Standing>,
+        /// Connected network shares, by share-server uid (network-shares.md §6.1).
+        shares: BTreeMap<u32, ShareRun>,
+    }
+
+    /// One connected share: its jail runs while `pd` is held.
+    struct ShareRun {
+        label: String,
+        read_only: bool,
+        /// (host, port, path, user): one connection per share.
+        key: (String, u16, String, String),
+        session_user: String,
+        _pd: Option<OwnedFd>,
     }
 
     /// A grant: a FUSE mount at `dir` (the stick's server, rooted at the
@@ -455,6 +503,8 @@ mod run {
         Grant(atrium_media::Grant),
         Revoke(String),
         AttachAll(Standing),
+        /// A checked share and the address it resolved to, once.
+        Connect(dispensator::share::Share, std::net::Ipv4Addr, bool),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -551,6 +601,7 @@ mod run {
 
     /// The media service's view of the daemon, for its connection threads.
     struct MediaHost {
+        jaild: String,
         session: Arc<Mutex<Session>>,
         registry: String,
         apps_dir: String,
@@ -639,6 +690,42 @@ mod run {
             self.ask(Req::Grant(atrium_media::Grant { part: p.part.clone(), path: p.path.clone(), jail, uid: p.app_uid, gid, read_only: p.read_only }))
         }
 
+        /// The file manager connects a share it saved in Arca. The host is
+        /// resolved here, once: the share server dials that address only.
+        fn connect(&self, uid: u32, c: &atrium_media::Connect) -> (u8, String) {
+            let Some(app) = self.file_manager(uid) else { return (mstatus::NOT_ALLOWED, "only the session's file manager connects shares".into()) };
+            let sh = match dispensator::share::check(&c.host, c.port, &c.path, &c.user, &c.fingerprint) {
+                Ok(s) => s,
+                Err(e) => return (mstatus::MALFORMED, e),
+            };
+            let addr = match resolve(&sh.host, sh.port) {
+                Ok(a) => a,
+                Err(e) => return (mstatus::NOT_FOUND, e),
+            };
+            eprintln!("atrium-dispensatord: {app} connects sftp://{}@{}:{}{} ({addr})", sh.user, sh.host, sh.port, sh.path);
+            self.ask(Req::Connect(sh, addr, c.read_only))
+        }
+
+        /// A server's host key fingerprint, from a share server in its own
+        /// jail that connects, prints it and stops before anything secret.
+        /// Runs on this connection's thread: it waits on the network.
+        fn learn(&self, uid: u32, l: &atrium_media::Learn) -> (u8, String) {
+            if self.file_manager(uid).is_none() {
+                return (mstatus::NOT_ALLOWED, "only the session's file manager connects shares".into());
+            }
+            if !dispensator::share::valid_host(&l.host) || l.port == 0 {
+                return (mstatus::MALFORMED, "not a host and port".into());
+            }
+            let addr = match resolve(&l.host, l.port) {
+                Ok(a) => a,
+                Err(e) => return (mstatus::NOT_FOUND, e),
+            };
+            match learn_key(&self.jaild, addr, l.port) {
+                Ok(fp) => (mstatus::OK, fp),
+                Err(e) => (mstatus::FAILED, e),
+            }
+        }
+
         /// Root's own open, on the session's mount: no link followed, no
         /// directory, nothing above the stick (no `..`, checked before).
         fn open(&self, mountpoint: &str, o: &atrium_media::Open) -> Result<std::fs::File, (u8, String)> {
@@ -684,6 +771,217 @@ mod run {
         }
     }
 
+    /// The one IPv4 address a share's host names now (§4.3: resolved once).
+    fn resolve(host: &str, port: u16) -> Result<std::net::Ipv4Addr, String> {
+        use std::net::ToSocketAddrs;
+        let addrs = (host, port).to_socket_addrs().map_err(|e| format!("{host}: {e}"))?;
+        addrs
+            .filter_map(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            })
+            .find(|a| dispensator::share::dialable(*a))
+            .ok_or_else(|| format!("{host} has no address a share may use"))
+    }
+
+    /// A share server's jail: the share server binary and libraries,
+    /// Arca's socket, a routed vnet that reaches `addr:port` only, the
+    /// share-server system call profile, and (to serve) FUSE from jaild.
+    fn share_request(uid: u32, addr: std::net::Ipv4Addr, port: u16, argv: Vec<String>, fuse: Option<FuseServe>) -> Result<CreateJailRequest, String> {
+        use dispensator::share::{jail_name, EXEC, JAIL_ROOT};
+        use jaild::protocol::{NetDest, NetGrants};
+        let name = jail_name(uid);
+        let root = format!("{JAIL_ROOT}/{name}");
+        std::fs::create_dir_all(&root).map_err(|e| format!("{root}: {e}"))?;
+        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
+        mounts.push(MountSpec { source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
+        let id = portcullis_identity::for_app(&format!("org.atrium.share.{uid}")).map_err(|e| format!("host identity: {e}"))?;
+        let grants = NetGrants {
+            app_key: portcullis_identity::consent_key(&name),
+            outbound_any: false,
+            outbound: vec![NetDest { cidr: format!("{addr}/32"), port: Some(port), udp: false }],
+            peers: vec![],
+            inbound: vec![],
+        };
+        let stdio = fuse.is_none();
+        Ok(CreateJailRequest {
+            name: name.clone(),
+            path: root,
+            children_max: 0,
+            mounts,
+            devfs_ruleset: 22,
+            network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants) },
+            exec: Some(ExecSpec { path: EXEC.into(), argv, env: vec![], uid, gid: uid, stdio }),
+            rctl: None,
+            hostname: Some(name),
+            hostid: Some(id.hostid),
+            hostuuid: Some(id.hostuuid.clone()),
+            allow_mlock: false,
+            syscall_profile: Some("share-server".into()),
+            devfs_grant: None,
+            devfs_grants: vec![],
+            fuse,
+        })
+    }
+
+    /// The learning uid: one past the share range's busiest end, so it never
+    /// collides with a connected share's label (it has none: Arca gives it
+    /// nothing).
+    const LEARN_UID: u32 = dispensator::share::UID_LAST;
+
+    /// `--learn` in a jail: the fingerprint line from its stdout.
+    fn learn_key(jaild: &str, addr: std::net::Ipv4Addr, port: u16) -> Result<String, String> {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        remove_share_jail(jaild, LEARN_UID);
+        let req = share_request(LEARN_UID, addr, port, dispensator::share::learn_argv(addr, port), None)?;
+        let (mut rd, wr) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+        let null = std::fs::File::open("/dev/null").map_err(|e| e.to_string())?;
+        let err = std::io::stderr();
+        let sent = Client::connect(jaild).and_then(|mut c| c.send_with_fds(&Request::CreateJail(req), &[null.as_fd(), wr.as_fd(), err.as_fd()], 1));
+        drop(wr);
+        let pd = match sent {
+            // SAFETY: jaild handed us the procdesc; owned once, here.
+            Ok((Response::JailCreated(_), fds)) => fds.first().map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            Ok((other, _)) => return Err(format!("jaild: {other:?}")),
+            Err(e) => return Err(format!("jaild: {e}")),
+        };
+        let _ = rd.set_read_timeout(Some(Duration::from_secs(40)));
+        let mut out = Vec::new();
+        let _ = rd.by_ref().take(4096).read_to_end(&mut out);
+        drop(pd);
+        remove_share_jail(jaild, LEARN_UID);
+        dispensator::share::parse_learned(&String::from_utf8_lossy(&out)).ok_or_else(|| "the server showed no SSH host key".into())
+    }
+
+    /// End a share jail and take down the nullfs mounts it was created with
+    /// (jaild unmounts the jail's devfs and FUSE mount, not these).
+    fn remove_share_jail(jaild: &str, uid: u32) {
+        let name = dispensator::share::jail_name(uid);
+        let _ = Client::connect(jaild).and_then(|mut c| c.send(&Request::RemoveJail { jid: None, name: Some(name.clone()) }));
+        let root = format!("{}/{name}", dispensator::share::JAIL_ROOT);
+        for d in ["/atrium/sockets/arca", "/usr/local/bin", "/usr/lib", "/libexec", "/lib", "/dev"] {
+            unmount_force(Path::new(&format!("{root}{d}")));
+        }
+    }
+
+    fn append_registry(line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).create(true).open(dispensator::share::REGISTRY)?;
+        f.write_all(format!("{line}\n").as_bytes())
+    }
+
+    impl Agent {
+        /// Labels a previous run left live: none of their servers runs now.
+        fn retire_stale_shares(&mut self) {
+            let Ok(t) = std::fs::read_to_string(dispensator::share::REGISTRY) else { return };
+            let mut live = std::collections::BTreeSet::new();
+            for l in t.lines() {
+                let mut f = l.split_ascii_whitespace();
+                let Some(uid) = f.next().and_then(|u| u.parse::<u32>().ok()) else { continue };
+                if f.next() == Some("retired") {
+                    live.remove(&uid);
+                } else {
+                    live.insert(uid);
+                }
+            }
+            for uid in live {
+                let _ = append_registry(&dispensator::share::retired_line(uid));
+                remove_share_jail(&self.jaild, uid);
+                unmount_force(Path::new(&dispensator::share::mountpoint(uid)));
+            }
+        }
+
+        fn connect_share(&mut self, sh: dispensator::share::Share, addr: std::net::Ipv4Addr, read_only: bool) -> (u8, String) {
+            use dispensator::share as sr;
+            let Session::Active { user, uid: suid, gid: sgid } = self.session.clone() else { return (mstatus::NOT_ALLOWED, "no unlocked session".into()) };
+            let key = (sh.host.clone(), sh.port, sh.path.clone(), sh.user.clone());
+            if let Some((uid, _)) = self.shares.iter().find(|(_, r)| r.key == key) {
+                return (mstatus::OK, sr::part(*uid));
+            }
+            // The learning uid is never a share's.
+            let mut used: std::collections::BTreeSet<u32> = self.shares.keys().copied().collect();
+            used.insert(LEARN_UID);
+            let Some(uid) = sr::free_uid(&used) else { return (mstatus::BUSY, "too many shares connected".into()) };
+            if let Err(e) = append_registry(&sr::registry_line(uid, &user, &sh)) {
+                return (mstatus::FAILED, format!("share registry: {e}"));
+            }
+            let mnt = sr::mountpoint(uid);
+            let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: false };
+            let req = match share_request(uid, addr, sh.port, sr::argv(&sh, addr, suid, sgid, read_only), Some(fuse)) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = append_registry(&sr::retired_line(uid));
+                    return (mstatus::FAILED, e);
+                }
+            };
+            match Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::CreateJail(req))) {
+                Ok((Response::JailCreated(r), fd)) => {
+                    eprintln!("atrium-dispensatord: share {} -> {} (jid {}, pid {})", sr::part(uid), sr::jail_name(uid), r.jid, r.pid);
+                    // SAFETY: jaild just passed us this procdesc; held, it keeps the jail.
+                    let pd = fd.map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
+                    let label = format!("{}@{}:{}", sh.user, sh.host, sh.path);
+                    self.shares.insert(uid, ShareRun { label, read_only, key, session_user: user, _pd: pd });
+                    self.publish();
+                    (mstatus::OK, sr::part(uid))
+                }
+                other => {
+                    let _ = append_registry(&sr::retired_line(uid));
+                    unmount_force(Path::new(&mnt));
+                    (mstatus::FAILED, format!("jaild: {other:?}"))
+                }
+            }
+        }
+
+        /// The user disconnected: unmount (refused while a file is open, as
+        /// for a stick), then end the server and its label.
+        fn disconnect_share(&mut self, uid: u32) -> (u8, String) {
+            let part = dispensator::share::part(uid);
+            if !self.shares.contains_key(&uid) {
+                return (mstatus::NOT_FOUND, format!("{part} is not connected"));
+            }
+            let mnt = dispensator::share::mountpoint(uid);
+            if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
+                // SAFETY: a valid NUL-terminated path.
+                if unsafe { libc::unmount(c.as_ptr(), 0) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EBUSY) {
+                        return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
+                    }
+                }
+            }
+            self.stop_share(uid);
+            self.ejected_now.push(part.clone());
+            self.publish();
+            (mstatus::OK, format!("{part} disconnected"))
+        }
+
+        fn stop_share(&mut self, uid: u32) {
+            if self.shares.remove(&uid).is_none() {
+                return;
+            }
+            let name = dispensator::share::jail_name(uid);
+            remove_share_jail(&self.jaild, uid);
+            unmount_force(Path::new(&dispensator::share::mountpoint(uid)));
+            let _ = append_registry(&dispensator::share::retired_line(uid));
+            eprintln!("atrium-dispensatord: {name} removed");
+        }
+
+        /// A share server that exited (wrong password, server gone, a
+        /// changed host key) takes its share with it.
+        fn reap_shares(&mut self) {
+            let dead: Vec<u32> = self.shares.keys().copied().filter(|u| !jail_alive(&dispensator::share::jail_name(*u))).collect();
+            for uid in &dead {
+                eprintln!("atrium-dispensatord: {} ended", dispensator::share::part(*uid));
+                self.stop_share(*uid);
+            }
+            if !dead.is_empty() {
+                self.publish();
+            }
+        }
+    }
+
     pub fn serve(rules: Rules, jaild: String, state: PathBuf, seat: PathBuf, media_socket: PathBuf, devices_socket: PathBuf) -> ExitCode {
         let reshow = rules.services.values().map(|s| s.reshow_secs).min().unwrap_or(2);
         let reshow = Duration::from_secs(reshow.into());
@@ -713,7 +1011,9 @@ mod run {
             grants: Vec::new(),
             next_grant: 0,
             standing: Vec::new(),
+            shares: BTreeMap::new(),
         };
+        a.retire_stale_shares();
         a.session = a.read_session();
         *a.session_shared.lock().unwrap() = a.session.clone();
         if wants_media {
@@ -822,6 +1122,12 @@ mod run {
                 eprintln!("atrium-dispensatord: session {:?} -> {:?}", self.session, s);
                 self.session = s;
                 *self.session_shared.lock().unwrap() = self.session.clone();
+                // A lock, logout or user switch ends every share (§7).
+                let keep = match &self.session { Session::Active { user, .. } => Some(user.clone()), _ => None };
+                let gone: Vec<u32> = self.shares.iter().filter(|(_, r)| Some(&r.session_user) != keep.as_ref()).map(|(u, _)| *u).collect();
+                for uid in gone {
+                    self.stop_share(uid);
+                }
                 let acts = self.media.sync(&self.session);
                 self.act(acts);
                 self.publish();
@@ -847,6 +1153,7 @@ mod run {
             let _ = wake_rd.set_nonblocking(true);
             let (tx, rx) = mpsc::channel();
             let host = MediaHost {
+                jaild: self.jaild.clone(),
                 session: self.session_shared.clone(),
                 registry: portcullis_peer::DEFAULT_REGISTRY.into(),
                 apps_dir: std::env::var("DISPENSATOR_APPS_DIR").unwrap_or_else(|_| "/var/lib/atrium/apps".into()),
@@ -910,7 +1217,20 @@ mod run {
                 // A server that exited (not FAT, say) leaves no live mount.
                 let Some((size_bytes, free_bytes)) = fuse_space(&mnt) else { continue };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only });
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new() });
+            }
+            // A share's server answers only once it has logged in, so it is
+            // never statfs'd here (that would wait on the network): its
+            // size is the file manager's to ask.
+            for (uid, r) in &self.shares {
+                vols.push(Volume {
+                    part: dispensator::share::part(*uid),
+                    mountpoint: dispensator::share::mountpoint(*uid),
+                    size_bytes: 0,
+                    free_bytes: 0,
+                    read_only: r.read_only,
+                    label: r.label.clone(),
+                });
             }
             shared.update(vols, &std::mem::take(&mut self.ejected_now));
         }
@@ -936,6 +1256,7 @@ mod run {
                         (mstatus::OK, format!("{n} grants into {jail} ended"))
                     }
                     Req::AttachAll(s) => self.attach_all(s),
+                    Req::Connect(sh, addr, ro) => self.connect_share(sh, addr, ro),
                 };
                 let _ = reply.send(a);
             }
@@ -1085,6 +1406,9 @@ mod run {
         /// server stops (its final writes are done) and stays down until the
         /// stick is unplugged.
         fn eject(&mut self, device: &str) -> (u8, String) {
+            if let Some(uid) = dispensator::share::uid_of_part(device) {
+                return self.disconnect_share(uid);
+            }
             let Some(mnt) = self.mountpoint(device) else { return (mstatus::NOT_FOUND, format!("{device} is not mounted")) };
             if let Ok(c) = std::ffi::CString::new(mnt.as_str()) {
                 // SAFETY: a valid NUL-terminated path.
@@ -1144,6 +1468,7 @@ mod run {
                     // A grant lasts as long as its app's jail (one shot).
                     self.end_grants(|g| !jail_alive(&g.jail));
                     self.follow_session();
+                    self.reap_shares();
                     self.sync_standing();
                     self.publish();
                     self.publish_devices();

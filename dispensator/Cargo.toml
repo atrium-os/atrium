@@ -27,6 +27,7 @@ atrium-devices = { path = "devices" }
 jaild = { path = "../portcullis/jaild" }
 aqueduct = { path = "../aqueduct" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
+portcullis-identity = { path = "../portcullis/portcullis-identity" }
 
 # Standalone, like the other top-level crates.
 [workspace]

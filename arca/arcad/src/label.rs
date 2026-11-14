@@ -25,6 +25,14 @@ pub enum Label {
     Service(String),
     /// A courier (arca.md §5): carries one persona's items to one endpoint.
     Courier(crate::courier::CourierLabel),
+    /// A share server (network-shares.md §5.1): one share's items, after
+    /// its handshake proved the pinned server identity.
+    Share(crate::share::ShareLabel),
+    /// The system file manager (`ARCA_FILE_MANAGER`, network-shares.md
+    /// §5.2): a launched app that may also save shares' credentials from
+    /// its own credential field and mint shares' SSH keys. Otherwise it is
+    /// that app.
+    FileManager { user: String, publisher: [u8; 32], app_id: String },
     /// Anything else: refused every op.
     Unknown,
 }
@@ -44,6 +52,11 @@ pub struct Resolver {
     pub courier_registry: Option<PathBuf>,
     /// The web broker's (publisher, app id); `None`: no web profile.
     pub web_broker: Option<([u8; 32], String)>,
+    /// The share registry; `None` serves no share servers.
+    pub share_registry: Option<PathBuf>,
+    /// The file manager's (publisher, app id), `ARCA_FILE_MANAGER` in the
+    /// web broker's format; `None`: nobody saves shares.
+    pub file_manager: Option<([u8; 32], String)>,
     /// System services by uid (`ARCA_SERVICES`); each reaches only its own
     /// items in the machine store.
     pub services: Vec<(u32, String)>,
@@ -94,6 +107,13 @@ impl Resolver {
                 .and_then(|p| crate::courier::lookup(p.to_str()?, uid))
                 .map_or(Label::Unknown, Label::Courier);
         }
+        if (crate::share::UID_FIRST..=crate::share::UID_LAST).contains(&uid) {
+            return self
+                .share_registry
+                .as_ref()
+                .and_then(|p| crate::share::lookup(p.to_str()?, uid))
+                .map_or(Label::Unknown, Label::Share);
+        }
         // Read fresh each time: portcullisd appends at every launch. A read
         // failure is "unknown": fail closed.
         let Ok(reg) = portcullis_peer::AppRegistry::load(self.registry.to_str().unwrap_or("")) else {
@@ -123,6 +143,9 @@ impl Resolver {
         }
         if self.web_broker.as_ref().is_some_and(|(p, a)| *p == publisher && a == app_id) {
             return Label::WebBroker { user: user.into(), publisher, app_id: app_id.into() };
+        }
+        if self.file_manager.as_ref().is_some_and(|(p, a)| *p == publisher && a == app_id) {
+            return Label::FileManager { user: user.into(), publisher, app_id: app_id.into() };
         }
         Label::App { user: user.into(), publisher, app_id: app_id.into() }
     }

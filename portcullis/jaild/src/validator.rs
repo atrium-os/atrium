@@ -36,7 +36,7 @@ pub fn validate_create(
         validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
-        validate_exec(exec, policy, is_instance_root(req, policy), is_courier(req, policy))?;
+        validate_exec(exec, policy, is_instance_root(req, policy), is_courier(req, policy) || is_share_server(req, policy))?;
     }
     validate_host_identity(req)?;
     resolve_sysfil(req, policy)?;
@@ -143,6 +143,38 @@ pub fn is_courier(req: &CreateJailRequest, policy: &Policy) -> bool {
         && exec.uid == uid
         && exec.gid == uid
         && exec.path == c.exec_path
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// Whether `req` is a network share server's jail (`[share_servers]`,
+/// network-shares.md §4.1), named and rooted like a courier's, in one of
+/// two shapes:
+/// - serving: a FUSE mount with no device at exactly the policy's
+///   mountpoint for that uid; it gets `/dev/fuse` as a descriptor, no
+///   device, and needs no pinned devfs ruleset;
+/// - learning a server's host key for the user to accept (`--learn`): no
+///   FUSE, and the caller's stdio, which carries the fingerprint back.
+pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
+    let (Some(c), Some(dir), Some(exec)) =
+        (policy.share_servers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
+    else {
+        return false;
+    };
+    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+        return false;
+    };
+    req.name == format!("{}{uid}", c.name_prefix)
+        && (c.uid_first..=c.uid_last).contains(&uid)
+        && exec.uid == uid
+        && exec.gid == uid
+        && exec.path == c.exec_path
+        && match &req.fuse {
+            Some(f) => !exec.stdio && f.device.is_empty() && !f.control && f.mountpoint == c.mountpoint(uid),
+            None => exec.stdio,
+        }
+        && req.devfs_grant.is_none()
+        && req.devfs_grants.is_empty()
+        && req.children_max == 0
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
@@ -285,6 +317,17 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
             rule:   "devfs_grant.extra",
             detail: format!("devfs_grants needs devfs_grant and holds at most {MAX_EXTRA_GRANTS} nodes; got {}", req.devfs_grants.len()),
         });
+    }
+    if req.fuse.as_ref().is_some_and(|f| f.device.is_empty()) {
+        // FUSE without a device: a share server's, and only that.
+        return if is_share_server(req, policy) {
+            Ok(())
+        } else {
+            Err(JaildError::PolicyViolation {
+                rule:   "fuse.no_device",
+                detail: "a FUSE mount with no device is a share server's ([share_servers])".into(),
+            })
+        };
     }
     let Some(pin) = policy.devfs_rulesets.pin(req.devfs_ruleset) else {
         if req.fuse.is_some() {
@@ -927,6 +970,55 @@ mod tests {
                      "/usr/local/bin/atrium-arca-courier", 64001), "a non-canonical name"),
         ] {
             assert!(!is_courier(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+    }
+
+    /// Network share servers: exactly the policy's name, root, binary, uid
+    /// and mountpoint may serve FUSE with no device and no pinned ruleset;
+    /// any deviation is refused.
+    #[test]
+    fn a_share_server_jail_and_only_a_share_server_jail() {
+        let p = load_sample_policy();
+        let share = |name: &str, path: &str, exe: &str, uid: u32, mnt: &str| {
+            let mut r = instance_req(name, path, exe, false);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.fuse = Some(crate::protocol::FuseServe { device: String::new(), mountpoint: mnt.into(), read_only: false, control: false });
+            r
+        };
+        let root = |n: &str| format!("/var/lib/atrium/jails/{n}");
+        let exe = "/usr/local/bin/atrium-share-sftp";
+        let ok = share("system-share-63001", &root("system-share-63001"), exe, 63001, "/media/share-63001");
+        assert!(is_share_server(&ok, &p));
+        validate_create(&ok, &p).expect("a share server jail");
+        let mut stdio = ok.clone();
+        stdio.exec.as_mut().unwrap().stdio = true;
+        let mut dev = ok.clone();
+        dev.devfs_grant = Some("da0".into());
+        // Learning: no FUSE, the caller's stdio.
+        let mut learn = ok.clone();
+        learn.fuse = None;
+        learn.exec.as_mut().unwrap().stdio = true;
+        assert!(is_share_server(&learn, &p));
+        validate_create(&learn, &p).expect("a share server learning a key");
+        let mut quiet = learn.clone();
+        quiet.exec.as_mut().unwrap().stdio = false;
+        // No FUSE and no stdio is neither shape: an ordinary jail, judged as one.
+        assert!(!is_share_server(&quiet, &p));
+        for (r, why) in [
+            (share("system-share-63001", &root("system-share-63001"), exe, 63002, "/media/share-63001"), "uid not the name's"),
+            (share("system-share-64001", &root("system-share-64001"), exe, 64001, "/media/share-64001"), "uid outside the range"),
+            (share("system-share-63001", &root("system-share-63001"), exe, 63001, "/media/share-63002"), "another share's mountpoint"),
+            (share("system-share-63001", &root("system-share-63001"), exe, 63001, "/etc"), "a mountpoint outside /media"),
+            (share("system-share-63001", "/var/lib/atrium/jails/elsewhere", exe, 63001, "/media/share-63001"), "another root"),
+            (share("system-share-63001", &root("system-share-63001"), "/usr/local/bin/atrium-svc", 63001, "/media/share-63001"), "another binary"),
+            (share("app-x--1", &root("app-x--1"), exe, 1001, "/media/share-1001"), "not a share server"),
+            (stdio, "caller stdio"),
+            (dev, "a device node"),
+        ] {
+            assert!(!is_share_server(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
     }

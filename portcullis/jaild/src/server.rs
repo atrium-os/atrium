@@ -1265,19 +1265,25 @@ fn create_routed(
 /// Open the partition and `/dev/fuse` for a FUSE-serving jail and mount
 /// fusefs on its mountpoint, before anything runs (device-assignment.md
 /// §6.4). The validator has checked device and mountpoint against the pin.
-/// Returns the two descriptors for the child's fd 3 and fd 4.
-fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(OwnedFd, OwnedFd), JaildError> {
+/// Returns the two descriptors for the child's fd 3 and fd 4. A share
+/// server's mount has no device (the validator allows that only for
+/// `[share_servers]`): then the child gets `/dev/fuse` alone, as fd 3.
+fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(Option<OwnedFd>, OwnedFd), JaildError> {
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
     if let Err(e) = ffi::kld_ensure("fusefs") {
         warn!("jaild: kldload fusefs: {e} (the mount will say whether it matters)");
     }
-    let dev = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!f.read_only)
-        .open(format!("/dev/{}", f.device))
-        .map_err(|e| sys("open device", e))?;
+    let dev = if f.device.is_empty() {
+        None
+    } else {
+        Some(std::fs::OpenOptions::new()
+            .read(true)
+            .write(!f.read_only)
+            .open(format!("/dev/{}", f.device))
+            .map_err(|e| sys("open device", e))?)
+    };
     let fusefd = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fuse")
         .map_err(|e| sys("open /dev/fuse", e))?;
     match std::fs::create_dir(&f.mountpoint) {
@@ -1289,10 +1295,11 @@ fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(OwnedFd, OwnedFd), Ja
         Err(e) => return Err(sys("mkdir mountpoint", e)),
     }
     use std::os::unix::io::AsRawFd;
-    ffi::fusefs_mount(&f.mountpoint, fusefd.as_raw_fd(), f.read_only, &format!("capsa:{}", f.device))
+    let fsname = if f.device.is_empty() { "capsa-share".to_string() } else { format!("capsa:{}", f.device) };
+    ffi::fusefs_mount(&f.mountpoint, fusefd.as_raw_fd(), f.read_only, &fsname)
         .map_err(|e| sys("nmount fusefs", e))?;
-    info!("jaild: fusefs on {} for /dev/{}{}", f.mountpoint, f.device, if f.read_only { " (ro)" } else { "" });
-    Ok((OwnedFd::from(dev), OwnedFd::from(fusefd)))
+    info!("jaild: fusefs on {} for {}{}", f.mountpoint, fsname, if f.read_only { " (ro)" } else { "" });
+    Ok((dev.map(OwnedFd::from), OwnedFd::from(fusefd)))
 }
 
 fn handle_create_with_exec(
@@ -1379,7 +1386,8 @@ fn handle_create_with_exec(
 
         if let Some((dev, fusefd)) = &fuse {
             use std::os::unix::io::AsRawFd;
-            let mut fds = vec![dev.as_raw_fd(), fusefd.as_raw_fd()];
+            let mut fds: Vec<i32> = dev.iter().map(|d| d.as_raw_fd()).collect();
+            fds.push(fusefd.as_raw_fd());
             if let Some(c) = &control {
                 fds.push(c.as_raw_fd());
             }

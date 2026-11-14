@@ -168,6 +168,8 @@ fn services_are_configured_by_uid() {
         allow_unsigned: false,
         courier_registry: None,
         web_broker: None,
+        share_registry: None,
+        file_manager: None,
         services: parse_services("vinculumd=65023"),
     };
     assert_eq!(r.resolve(65023), vinculum());

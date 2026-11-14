@@ -22,6 +22,9 @@ pub struct Place {
     pub read_only: bool,
     pub size: u64,
     pub free: u64,
+    /// A network share (`stick` is set too: it is disconnected the way a
+    /// stick is ejected).
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +102,13 @@ pub struct Browser {
     pub outcome: Option<Outcome>,
     /// The sidebar asked to eject this stick: the app does it.
     pub want_eject: Option<String>,
+    /// "Connect to server", while it is open.
+    pub connect: Option<crate::connect::Form>,
+    /// Shares saved in Arca that aren't connected now.
+    pub saved: Vec<crate::shares::Saved>,
+    /// The sidebar asked to connect this saved share (an index into
+    /// `saved`): the app does it.
+    pub want_reconnect: Option<usize>,
 }
 
 impl Browser {
@@ -122,6 +132,9 @@ impl Browser {
             last_press: None,
             outcome: None,
             want_eject: None,
+            connect: None,
+            saved: Vec::new(),
+            want_reconnect: None,
         }
     }
 
@@ -512,6 +525,22 @@ impl Browser {
         }
     }
 
+    pub fn open_connect(&mut self) {
+        if self.picker().is_none() && self.connect.is_none() {
+            self.connect = Some(crate::connect::Form::default());
+        }
+    }
+
+    pub fn close_connect(&mut self) {
+        self.connect = None;
+    }
+
+    pub fn reconnect(&mut self, i: usize) {
+        if i < self.saved.len() {
+            self.want_reconnect = Some(i);
+        }
+    }
+
     pub fn eject(&mut self, i: usize) {
         if let Some(p) = self.places.get(i).filter(|p| p.stick) {
             self.want_eject = Some(p.id.clone());
@@ -605,7 +634,7 @@ mod tests {
         std::fs::write(d.join("Docs/note.txt"), "a note").unwrap();
         std::fs::write(d.join("Docs/plan.md"), "a plan").unwrap();
         std::fs::write(d.join("hello.txt"), "hello").unwrap();
-        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29 };
+        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29, network: false };
         (d, p)
     }
 

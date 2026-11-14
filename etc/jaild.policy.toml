@@ -300,6 +300,21 @@ exec_path   = "/usr/local/bin/atrium-arca-courier"
 uid_first   = 64000
 uid_last    = 64999
 
+# ---------------------------------------------------------------
+# Network share servers (docs/spec/network-shares.md §4.1, §6.1):
+# dispensatord asks for one jail per mounted share, named <name_prefix><uid>
+# at <instance_root_dir>/<name>, running exactly exec_path as that uid. jaild
+# opens /dev/fuse and mounts fusefs at exactly <mount_prefix>/share-<uid>; the
+# server gets that descriptor (fd 3) and no device. Its uids are Arca's share
+# registry range (arcad::share).
+# ---------------------------------------------------------------
+[share_servers]
+name_prefix  = "system-share-"
+exec_path    = "/usr/local/bin/atrium-share-sftp"
+uid_first    = 63000
+uid_last     = 63499
+mount_prefix = "/media"
+
 
 # ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not

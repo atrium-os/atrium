@@ -21,6 +21,7 @@ pub mod label;
 pub mod passkey;
 pub mod proto;
 pub mod server;
+pub mod share;
 pub mod tickets;
 pub mod verify;
 

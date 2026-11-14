@@ -187,6 +187,13 @@ impl<S: Read + Write> Client<S> {
         crypto::fingerprint(&self.host_key)
     }
 
+    /// SHA-256 of the server's host key blob: the identity Arca pins in a
+    /// share's recipient (network-shares.md §5.1).
+    pub fn host_key_digest(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(&self.host_key).into()
+    }
+
     fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
         let block = 16usize;
         let aead = self.tx.cipher.is_some();

@@ -17,10 +17,11 @@ use pergola::node::Node;
 use pergola::text_edit::TextEdit;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{Glyph, ScrollState, TextField, VirtualList};
+use pergola::widgets::{CredentialField, CredentialState, Glyph, ScrollState, TextField, VirtualList};
 use pergola::{Color, Event, Key, KeyEventKind, Mutable, NodeId, TextStyle};
 
 use crate::browser::{Browser, Edit, Mode, Mods, Outcome};
+use crate::connect::Step;
 use crate::fs;
 
 /// Phosphor codepoints (fonts/phosphor/Phosphor.ttf, regular weight).
@@ -33,6 +34,7 @@ pub mod ph {
     pub const FILM_STRIP: char = '\u{e792}';
     pub const WARNING: char = '\u{e4e0}';
     pub const LINK: char = '\u{e2e2}';
+    pub const GLOBE: char = '\u{e288}';
 }
 
 pub const SIDE_W: f32 = 208.0;
@@ -57,11 +59,18 @@ pub struct ScriniumView {
     /// event, which the click handler doesn't see).
     pub mods: Arc<Mutex<Mods>>,
     pub clock: Instant,
+    /// Arca's password field on "Connect to server" (a slot: the value is
+    /// typed into Arca's own surface, never this process).
+    pub cred: CredentialField,
+    /// What that field told the app: filled, and its handle.
+    pub cred_state: Mutable<CredentialState>,
 }
 
 impl ScriniumView {
     pub fn new(state: Mutable<Browser>, field: Mutable<TextEdit>, scroll: Mutable<ScrollState>, size: Mutable<(f32, f32)>) -> Self {
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now() }
+        let cred_state = Mutable::new(CredentialState::default());
+        let cred = CredentialField::password(cred_state.clone());
+        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state }
     }
 }
 
@@ -94,6 +103,13 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
     }
     let b = state.get_cloned();
     let picker = b.picker().is_some();
+    if b.connect.is_some() {
+        if *key == Key::Escape {
+            with(state, Browser::close_connect);
+            return true;
+        }
+        return false;
+    }
     if b.edit.is_some() || b.confirm_delete.is_some() {
         if *key == Key::Escape {
             with(state, |b| {
@@ -265,7 +281,12 @@ impl View for ScriniumView {
         let t = ctx.theme;
         rect(ctx, 0.0, 0.0, w, h, t.bg_canvas(), 0.0);
         match &b.mode {
-            Mode::Manager => self.manager(ctx, &b, w, h),
+            Mode::Manager => {
+                self.manager(ctx, &b, w, h);
+                if b.connect.is_some() {
+                    self.connect_sheet(ctx, &b, w, h);
+                }
+            }
             Mode::Picker { .. } => self.picker(ctx, &b, w, h),
         }
     }
@@ -287,21 +308,27 @@ impl ScriniumView {
         rect(ctx, 0.0, top, sw, h - top, t.bg_surface(), 0.0);
         rect(ctx, sw - 1.0, top, 1.0, h - top, t.border_default(), 0.0);
         text(ctx, 16.0, top + 22.0, "Places", type_size::XS, Weight::Semibold, t.text_tertiary());
+        let manager = b.picker().is_none();
+        if manager {
+            self.servers(ctx, b, top, sw, h);
+        }
         if b.places.is_empty() {
             text(ctx, 16.0, top + 54.0, "Plug in a USB stick", type_size::SM, Weight::Regular, t.text_tertiary());
             return;
         }
-        let manager = b.picker().is_none();
         for (i, p) in b.places.iter().enumerate() {
             let y = top + 38.0 + i as f32 * (PLACE_H + 2.0);
             let on = b.at == Some(i);
             let s = self.state.clone();
             ctx.key(1000 + i as u64);
             area(ctx, Rect::new(8.0, y, sw - 16.0, PLACE_H), 6.0, if on { t.selection_idle() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&s, |b| b.open_place(i)));
-            icon(ctx, 16.0, y + 7.0, if p.stick { ph::USB } else { ph::FOLDER }, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
+            let g = if p.network { ph::GLOBE } else if p.stick { ph::USB } else { ph::FOLDER };
+            icon(ctx, 16.0, y + 7.0, g, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
             let room = sw - 16.0 - 44.0 - if p.stick && manager { 30.0 } else { 0.0 };
             text(ctx, 44.0, y + 15.0, &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
-            let sub = if p.stick {
+            let sub = if p.network {
+                if p.read_only { "Server · read-only".into() } else { "Server".into() }
+            } else if p.stick {
                 let free = if p.size > 0 { format!("{} free", fs::size_text(p.free)) } else { "USB stick".into() };
                 if p.read_only { format!("{free} · read-only") } else { free }
             } else {
@@ -311,7 +338,131 @@ impl ScriniumView {
             ctx.pop();
             if p.stick && manager {
                 let s = self.state.clone();
-                icon_button(ctx, sw - 44.0, y + 8.0, ph::EJECT, true, "Eject", move || with(&s, |b| b.eject(i)));
+                icon_button(ctx, sw - 44.0, y + 8.0, ph::EJECT, true, if p.network { "Disconnect" } else { "Eject" }, move || with(&s, |b| b.eject(i)));
+            }
+        }
+    }
+
+    /// The foot of the sidebar: saved servers not connected now, and
+    /// "Connect to server".
+    fn servers(&self, ctx: &mut Ctx, b: &Browser, top: f32, sw: f32, h: f32) {
+        let t = ctx.theme;
+        let connected: Vec<&str> = b.places.iter().filter(|p| p.network).map(|p| p.label.as_str()).collect();
+        let saved: Vec<(usize, String)> = b
+            .saved
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, format!("{}@{}:{}", s.addr.user, s.addr.host, s.addr.path)))
+            .filter(|(_, l)| !connected.contains(&l.as_str()))
+            .collect();
+        let foot = h - 48.0;
+        let mut y = foot - saved.len() as f32 * 32.0;
+        if !saved.is_empty() && y > top + 38.0 + b.places.len() as f32 * (PLACE_H + 2.0) + 24.0 {
+            text(ctx, 16.0, y - 12.0, "Servers", type_size::XS, Weight::Semibold, t.text_tertiary());
+            for (i, label) in saved {
+                let s = self.state.clone();
+                ctx.key(3000 + i as u64);
+                area(ctx, Rect::new(8.0, y, sw - 16.0, 30.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.reconnect(i)));
+                icon(ctx, 16.0, y + 7.0, ph::GLOBE, 16.0, t.text_tertiary());
+                text(ctx, 40.0, y + 15.0, &fit(&label, type_size::SM, Weight::Regular, sw - 56.0), type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+                y += 32.0;
+            }
+        }
+        let s = self.state.clone();
+        ctx.key(2999);
+        area(ctx, Rect::new(8.0, foot + 8.0, sw - 16.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, Browser::open_connect));
+        icon(ctx, 16.0, foot + 14.0, ph::PLUS, 20.0, t.text_secondary());
+        text(ctx, 44.0, foot + 24.0, "Connect to server", type_size::SM, Weight::Medium, t.text_primary());
+        ctx.pop();
+    }
+
+    /// "Connect to server", over the window (network-shares.md §5.2).
+    fn connect_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
+        let t = ctx.theme;
+        let Some(form) = &b.connect else { return };
+        // A scrim that takes presses, so nothing behind reacts.
+        ctx.key(4000);
+        area(ctx, Rect::new(0.0, 0.0, w, h), 0.0, Color::rgba(0.0, 0.0, 0.0, 0.33), Color::rgba(0.0, 0.0, 0.0, 0.33), || {});
+        ctx.pop();
+        let (cw, ch) = (480.0_f32, 268.0_f32);
+        let (x, y) = (((w - cw) / 2.0).max(8.0), ((h - ch) / 2.0).max(8.0));
+        rect(ctx, x - 1.0, y - 1.0, cw + 2.0, ch + 2.0, t.border_strong(), 11.0);
+        rect(ctx, x, y, cw, ch, t.bg_surface(), 10.0);
+        let pad = 24.0;
+        let (lx, inner) = (x + pad, cw - 2.0 * pad);
+        let title = |ctx: &mut Ctx, s: &str| text(ctx, lx, y + 32.0, s, type_size::LG, Weight::Semibold, t.text_primary());
+        let line = |ctx: &mut Ctx, row: f32, s: &str, c: Color| text(ctx, lx, y + row, &fit(s, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, c);
+        let by = y + ch - 32.0 - pad;
+        let cancel = |ctx: &mut Ctx, s: Mutable<Browser>| {
+            let cw2 = width("Cancel", type_size::SM, Weight::Medium) + 28.0;
+            button(ctx, x + cw - pad - cw2, by, "Cancel", Look::Ghost, true, move || with(&s, Browser::close_connect));
+            cw2
+        };
+        let primary = |ctx: &mut Ctx, label: &str, left_of: f32, enabled: bool, on: Box<dyn Fn()>| {
+            let pw = width(label, type_size::SM, Weight::Medium) + 28.0;
+            button(ctx, x + cw - pad - left_of - 8.0 - pw, by, label, Look::Primary, enabled, move || on());
+        };
+        match &form.step {
+            Step::Address => {
+                title(ctx, "Connect to server");
+                line(ctx, 66.0, "Type the server's address with your name on it, and a folder if you like:", t.text_secondary());
+                line(ctx, 88.0, "alice@nas.local   or   alice@nas.local:/srv/photos", t.text_tertiary());
+                let fy = y + 108.0;
+                let s = self.state.clone();
+                let holder = ctx.push(Node::Rect { rect: Rect::new(lx, fy, inner, 32.0), fill: Color::TRANSPARENT, radius: 0.0 });
+                TextField::new(self.field.clone()).at(lx, fy).width(inner).on_submit(move |v| with(&s, |b| if let Some(f) = &mut b.connect { f.submit_address(v) })).render(ctx);
+                ctx.pop();
+                if let Some(&bg) = ctx.tree.children_of(holder).get(2) {
+                    ctx.autofocus(bg);
+                }
+                if let Some(e) = &form.error {
+                    line(ctx, 162.0, e, t.danger_fg());
+                }
+                let c = cancel(ctx, self.state.clone());
+                let (s, f) = (self.state.clone(), self.field.clone());
+                primary(ctx, "Next", c, true, Box::new(move || {
+                    let v = f.get_cloned().text().to_string();
+                    with(&s, |b| if let Some(f) = &mut b.connect { f.submit_address(&v) });
+                }));
+            }
+            Step::Checking(a) => {
+                title(ctx, "Connect to server");
+                line(ctx, 72.0, &format!("Asking {} who it is…", a.host), t.text_secondary());
+                cancel(ctx, self.state.clone());
+            }
+            Step::Key { addr, fingerprint } => {
+                icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.text_secondary());
+                text(ctx, lx + 28.0, y + 32.0, &format!("Is this really {}?", addr.host), type_size::LG, Weight::Semibold, t.text_primary());
+                line(ctx, 66.0, "The server shows this key. Check that it is the one the server's owner", t.text_secondary());
+                line(ctx, 86.0, "gives you. If it isn't, someone may be pretending to be the server.", t.text_secondary());
+                rect(ctx, lx, y + 106.0, inner, 36.0, t.bg_canvas(), 6.0);
+                text(ctx, lx + 10.0, y + 124.0, &fit(fingerprint, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
+                line(ctx, 160.0, "Scrinium remembers it, and refuses the server if it ever changes.", t.text_tertiary());
+                let c = cancel(ctx, self.state.clone());
+                let s = self.state.clone();
+                primary(ctx, "It's the right key", c, true, Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.trust() })));
+            }
+            Step::Password { addr, .. } => {
+                title(ctx, &format!("Password for {}@{}", addr.user, addr.host));
+                line(ctx, 66.0, "Arca keeps it: Scrinium never sees what you type.", t.text_secondary());
+                self.cred.clone().at(lx, y + 88.0).size(inner, 36.0).render(ctx);
+                let s = self.state.clone();
+                let mark = if form.remember { "☑  Remember it in Arca" } else { "☐  Remember it in Arca" };
+                ctx.key(4001);
+                area(ctx, Rect::new(lx - 6.0, y + 136.0, 240.0, 28.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| if let Some(f) = &mut b.connect { f.remember = !f.remember }));
+                text(ctx, lx, y + 150.0, mark, type_size::SM, Weight::Regular, t.text_primary());
+                ctx.pop();
+                if let Some(e) = &form.error {
+                    line(ctx, 184.0, e, t.danger_fg());
+                }
+                let c = cancel(ctx, self.state.clone());
+                let s = self.state.clone();
+                primary(ctx, "Connect", c, form.can_connect(), Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.connect() })));
+            }
+            Step::Connecting(a) => {
+                title(ctx, "Connect to server");
+                line(ctx, 72.0, &format!("Connecting to {}…", a.host), t.text_secondary());
             }
         }
     }
@@ -599,7 +750,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn place(d: &std::path::Path) -> Place {
-        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000 }
+        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000, network: false }
     }
 
     fn texts(app: &App<ScriniumView>) -> Vec<String> {

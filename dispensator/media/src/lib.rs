@@ -13,6 +13,8 @@
 //! | `ATTACH_ALL` 0x04 | empty | `u8 status`, then postcard `String`: the file manager asks for every stick, now and as they come, in its own jail |
 //! | `OPEN` 0x05 | postcard [`Open`] | `u8 status`, then postcard `String`; with `OK`, the open file as the message's one descriptor |
 //! | `PICKED` 0x06 | postcard [`Picked`] | `u8 status`, then postcard `String` (where it is in the app's jail, or why not): the system picker puts the folder the user picked into the app's jail |
+//! | `CONNECT` 0x07 | postcard [`Connect`] | `u8 status`, then postcard `String`: the share's `part` (`share-<uid>`), or why not. The file manager connects a network share it saved in Arca (network-shares.md §6.1); `EJECT` of that part disconnects |
+//! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: the server's host key fingerprint (`SHA256:...`) for the user to accept, or why not |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -35,6 +37,8 @@ pub mod op {
     pub const ATTACH_ALL: u16 = 0x04;
     pub const OPEN: u16 = 0x05;
     pub const PICKED: u16 = 0x06;
+    pub const CONNECT: u16 = 0x07;
+    pub const LEARN: u16 = 0x08;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -60,6 +64,9 @@ pub struct Volume {
     pub size_bytes: u64,
     pub free_bytes: u64,
     pub read_only: bool,
+    /// What to call it: empty for a stick (the file manager names it),
+    /// `user@host:path` for a network share.
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +105,26 @@ pub struct Picked {
     pub path: String,
     pub app_uid: u32,
     pub read_only: bool,
+}
+
+/// Connect an SFTP share whose credential the file manager saved in Arca
+/// for exactly this host, port, path and pinned host key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Connect {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub user: String,
+    /// `SHA256:...`, as [`op::LEARN`] gave it and the user accepted.
+    pub fingerprint: String,
+    pub read_only: bool,
+}
+
+/// Ask a server for its host key, before anything secret is involved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Learn {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +172,11 @@ pub mod server {
         /// request itself is checked here (part served, path absolute, no
         /// `..`).
         fn picked(&self, uid: u32, p: &Picked) -> (u8, String);
+        /// `uid` (the file manager) connects a share; the daemon checks who
+        /// it is and the request.
+        fn connect(&self, uid: u32, c: &Connect) -> (u8, String);
+        /// `uid` (the file manager) asks for a server's fingerprint.
+        fn learn(&self, uid: u32, l: &Learn) -> (u8, String);
     }
 
     pub struct Shared {
@@ -316,6 +348,20 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::PICKED, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::CONNECT => {
+                    let (st, msg) = match postcard::from_bytes::<Connect>(&m.payload) {
+                        Ok(c) => shared.host.connect(uid, &c),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::CONNECT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
+                op::LEARN => {
+                    let (st, msg) = match postcard::from_bytes::<Learn>(&m.payload) {
+                        Ok(l) => shared.host.learn(uid, &l),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::LEARN, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -413,6 +459,16 @@ pub mod client {
         status_call(sock, op::REVOKE, &jail.to_string())
     }
 
+    /// The file manager connects a saved share: its part name.
+    pub fn connect(sock: &Path, c: &Connect) -> Result<String, (u8, String)> {
+        status_call(sock, op::CONNECT, c)
+    }
+
+    /// The file manager asks for a server's host key fingerprint.
+    pub fn learn(sock: &Path, l: &Learn) -> Result<String, (u8, String)> {
+        status_call(sock, op::LEARN, l)
+    }
+
     /// The file manager asks for every stick in its jail.
     pub fn attach_all(sock: &Path) -> Result<String, (u8, String)> {
         status_call(sock, op::ATTACH_ALL, &())
@@ -499,11 +555,16 @@ mod tests {
         }
         fn picked(&self, uid: u32, p: &Picked) -> (u8, String) {
             if uid == 7 { (status::OK, format!("/media/{}", p.part)) } else { (status::NOT_ALLOWED, "not the picker".into()) }
+        }        fn connect(&self, _uid: u32, c: &Connect) -> (u8, String) {
+            (status::OK, format!("share-{}", c.port))
+        }
+        fn learn(&self, _uid: u32, _l: &Learn) -> (u8, String) {
+            (status::NOT_ALLOWED, "test".into())
         }
     }
 
     fn vol(p: &str) -> Volume {
-        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false }
+        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new() }
     }
 
     /// Over a real socket: list, subscribe, eject, a session change.

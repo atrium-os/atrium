@@ -29,6 +29,12 @@ pub enum ToChild {
     Configure { purpose: Purpose, username_field: bool },
 }
 
+impl ToChild {
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("encodes")
+    }
+}
+
 /// Child to parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToParent {

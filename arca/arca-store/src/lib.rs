@@ -15,7 +15,7 @@ pub mod root;
 pub mod secret;
 pub mod store;
 
-pub use model::{flags, Class, ItemId, ItemMeta, Kind, NewItem, Provenance, Recipient, Scheme, Shape};
+pub use model::{flags, Class, ItemId, ItemMeta, Kind, NewItem, Provenance, Recipient, Scheme, Shape, ShareProto};
 pub use root::{KdfParams, RootKey};
 pub use store::{Access, LockState, Store, UserVerified};
 

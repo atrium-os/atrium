@@ -6,6 +6,10 @@
 //! - `ARCA_APP_REGISTRY` (default the launch registry).
 //! - `ARCA_WEB_BROKER`: `app_id publisher-hex`, the app that issues web
 //!   tickets (arca.md §8.2); unset, no web courier gets a cookie.
+//! - `ARCA_FILE_MANAGER`: `app_id publisher-hex`, the file manager that may
+//!   save network shares' credentials (network-shares.md §5.2).
+//! - `ARCA_SHARE_REGISTRY` (default `/var/run/atrium/share-registry`): the
+//!   share servers' labels, written by dispensatord.
 //! - `ARCA_VESTIBULUM_UID`, `ARCA_UI_UID`: the system uids allowed the
 //!   Vestibulum and trusted-UI ops. Unset = nobody.
 //! - `ARCA_SIGILLUM_SOCKET` (default `/atrium/sockets/sigillum/sigillumd.sock`):
@@ -51,6 +55,10 @@ fn main() -> ExitCode {
             std::env::var("ARCA_COURIER_REGISTRY").unwrap_or_else(|_| arcad::courier::DEFAULT_REGISTRY.into()).into(),
         ),
         web_broker: std::env::var("ARCA_WEB_BROKER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
+        share_registry: Some(
+            std::env::var("ARCA_SHARE_REGISTRY").unwrap_or_else(|_| arcad::share::DEFAULT_REGISTRY.into()).into(),
+        ),
+        file_manager: std::env::var("ARCA_FILE_MANAGER").ok().and_then(|s| arcad::label::parse_web_broker(&s)),
         services: std::env::var("ARCA_SERVICES").ok().map(|s| arcad::label::parse_services(&s)).unwrap_or_default(),
     };
     if resolver.allow_unsigned {

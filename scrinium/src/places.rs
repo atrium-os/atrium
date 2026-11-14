@@ -28,7 +28,15 @@ pub fn media_socket() -> PathBuf {
 
 /// A stick as a place: named by its size, as the bar names it.
 pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
-    let label = if v.size_bytes > 0 { format!("{} stick", size_text(v.size_bytes)) } else { "USB stick".into() };
+    // A network share (`share-<uid>`) is named by where it is.
+    let network = v.part.starts_with("share-") && !v.label.is_empty();
+    let label = if network {
+        v.label.clone()
+    } else if v.size_bytes > 0 {
+        format!("{} stick", size_text(v.size_bytes))
+    } else {
+        "USB stick".into()
+    };
     Place {
         id: v.part.clone(),
         label,
@@ -37,6 +45,7 @@ pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
         read_only: v.read_only,
         size: v.size_bytes,
         free: v.free_bytes,
+        network,
     }
 }
 
@@ -51,7 +60,7 @@ pub fn parse_places(s: &str) -> Vec<Place> {
         .filter_map(|kv| kv.split_once('='))
         .filter(|(l, p)| !l.trim().is_empty() && p.starts_with('/'))
         .enumerate()
-        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0 })
+        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0, network: false })
         .collect()
 }
 
@@ -131,7 +140,7 @@ pub fn scan(media: &Path) -> Vec<Place> {
             continue;
         }
         let (size, free, ro) = statvfs(&e.path()).unwrap_or((0, 0, false));
-        out.push(stick(&atrium_media::Volume { part: name, mountpoint: String::new(), size_bytes: size, free_bytes: free, read_only: ro }, media));
+        out.push(stick(&atrium_media::Volume { part: name, mountpoint: String::new(), size_bytes: size, free_bytes: free, read_only: ro, label: String::new() }, media));
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
@@ -157,7 +166,7 @@ mod tests {
 
     #[test]
     fn sticks_and_configured_places() {
-        let v = atrium_media::Volume { part: "da0s1".into(), mountpoint: "/media/da0s1".into(), size_bytes: 16_000_000_000, free_bytes: 1, read_only: false };
+        let v = atrium_media::Volume { part: "da0s1".into(), mountpoint: "/media/da0s1".into(), size_bytes: 16_000_000_000, free_bytes: 1, read_only: false, label: String::new() };
         let p = stick(&v, Path::new("/media"));
         assert_eq!((p.label.as_str(), p.root.as_path(), p.stick), ("16 GB stick", Path::new("/media/da0s1"), true));
         let two = distinct(vec![p.clone(), Place { id: "da1s1".into(), ..p.clone() }]);
