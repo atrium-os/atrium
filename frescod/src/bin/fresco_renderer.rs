@@ -832,8 +832,8 @@ fn from_broker(
             Msg::VideoPresented { layer, seq, vblank_ns, dropped, .. } => {
                 let _ = events.send(DisplayEvent::VideoPresented { window_id: local, layer, seq, vblank_ns, dropped });
             }
-            Msg::Appearance { scheme, high_contrast, accent } => {
-                fe.lock().unwrap().set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast, accent });
+            Msg::Appearance { scheme, high_contrast, accent, text_size_milli } => {
+                fe.lock().unwrap().set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast, accent, text_size_milli });
             }
             Msg::SpanTile { .. } | Msg::SpanHidden { .. } => {
                 let mut s = state.lock().unwrap();

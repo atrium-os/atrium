@@ -431,6 +431,8 @@ pub mod displays {
         /// so a restarted WM keeps the dock's space before the dock (which
         /// reports once, at its start) says it again. 0: none reported.
         pub dock_pt: u32,
+        /// The system text size the user set (thousandths; 0 = 100%).
+        pub text_size_milli: u32,
     }
 
     /// The set a list of monitors makes, as `sets` keys it: every monitor
@@ -544,6 +546,9 @@ pub mod displays {
             if self.dock_pt != 0 {
                 lines.push(format!("dock {}", self.dock_pt));
             }
+            if self.text_size_milli != 0 {
+                lines.push(format!("textsize {}", self.text_size_milli));
+            }
             let mut t = String::from("# forum-wm: where each set of monitors sat, monitor UI sizes, span groups\n");
             for l in lines {
                 t.push_str(&l);
@@ -572,6 +577,13 @@ pub mod displays {
                         if let (Some(key), Some(members), Ok(gap), Ok(gap_mm)) = (ids(w[1]), ids(w[2]), w[3].parse::<u32>(), w[4].parse::<u32>()) {
                             if members.len() >= 2 {
                                 m.spans.entry(key).or_default().push(forum_ctl::SpanGroupInfo { members, gap, gap_mm });
+                            }
+                        }
+                    }
+                    Some(&"textsize") if w.len() == 2 => {
+                        if let Ok(t) = w[1].parse::<u32>() {
+                            if fresco_protocol::TEXT_SIZES.contains(&t) {
+                                m.text_size_milli = t;
                             }
                         }
                     }
@@ -746,6 +758,8 @@ pub mod daemon {
         /// Set the system appearance (OP_WM_SET_APPEARANCE); every client
         /// hears EV_APPEARANCE_CHANGED.
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()>;
+        /// The system appearance as frescod has it (OP_APPEARANCE).
+        fn appearance(&mut self) -> io::Result<fresco_protocol::AppearancePayload>;
         /// Span window `p.window_id` over monitors `p.members`
         /// (OP_WM_SPAN_GROUP), or end the span (no members); the reply is
         /// the rect the window must cover. EV_DISPLAY_CHANGED follows.
@@ -1196,6 +1210,23 @@ pub mod daemon {
         }
 
         /// Move the PiP window to `corner` and lay out again.
+        /// Set the system text size (thousandths, one of
+        /// `fresco_protocol::TEXT_SIZES`; 0 = 100%): frescod tells every
+        /// client (resolution-independence.md §6). Remembered.
+        pub fn set_text_size(&mut self, conn: &mut impl FrescoConn, text_size_milli: u32) -> io::Result<()> {
+            let t = if text_size_milli == 1000 { 0 } else { text_size_milli };
+            if t != 0 && !fresco_protocol::TEXT_SIZES.contains(&t) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a text size"));
+            }
+            let a = conn.appearance()?;
+            conn.set_appearance(fresco_protocol::AppearancePayload { text_size_milli: t, ..a })?;
+            if self.displays.text_size_milli != t {
+                self.displays.text_size_milli = t;
+                self.save_displays();
+            }
+            Ok(())
+        }
+
         /// The dock reported how tall it draws (`Intent::ReserveBottom`, in
         /// points): keep that much free at the bottom of the main monitor and
         /// re-lay out. Clamped to `forum_ctl::MAX_RESERVE_PT`.
@@ -1777,11 +1808,16 @@ pub mod control {
             },
             Intent::SetAppearance { dark } => {
                 let scheme = if dark { fresco_protocol::APPEARANCE_DARK } else { fresco_protocol::APPEARANCE_LIGHT };
-                match conn.set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast: false, accent: 0 }) {
+                let r = conn.appearance().and_then(|a| conn.set_appearance(fresco_protocol::AppearancePayload { scheme, ..a }));
+                match r {
                     Ok(()) => Reply::Ack,
                     Err(e) => Reply::Err { message: e.to_string() },
                 }
             }
+            Intent::SetTextSize { text_size_milli } => match wm.set_text_size(conn, text_size_milli) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::ToggleZoom => match wm.toggle_zoom(conn) {
                 Ok(_) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -2114,6 +2150,9 @@ mod tests {
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
             self.appearance = Some(a);
             Ok(())
+        }
+        fn appearance(&mut self) -> io::Result<fresco_protocol::AppearancePayload> {
+            Ok(self.appearance.unwrap_or_default())
         }
         fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
             Ok(self.surfaces.clone())
@@ -2773,6 +2812,24 @@ mod tests {
         handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 120 });
         let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
         assert_eq!(m.dock_pt, 120);
+    }
+
+    /// The system text size reaches frescod with the appearance, keeps
+    /// the scheme, is remembered, and only listed sizes are taken.
+    #[test]
+    fn the_text_size_is_set_kept_and_remembered() {
+        let mut wm = Wm::new(screen());
+        let mut conn = MockConn::default();
+        handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: true });
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1300 }), Reply::Ack);
+        let a = conn.appearance.unwrap();
+        assert_eq!((a.scheme, a.text_size_milli), (fresco_protocol::APPEARANCE_DARK, 1300));
+        handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: false });
+        assert_eq!(conn.appearance.unwrap().text_size_milli, 1300, "the scheme switch keeps the text size");
+        assert_eq!(crate::displays::DisplayMemory::from_text(&wm.displays.to_text()).text_size_milli, 1300);
+        assert!(matches!(handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1234 }), Reply::Err { .. }));
+        handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1000 });
+        assert_eq!((conn.appearance.unwrap().text_size_milli, wm.displays.text_size_milli), (0, 0));
     }
 
     #[test]

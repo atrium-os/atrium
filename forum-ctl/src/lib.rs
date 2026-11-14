@@ -92,6 +92,10 @@ pub enum Intent {
     /// "Make the system light or dark" (visual language §15): the bar's
     /// switch. The core asks frescod, which tells every client.
     SetAppearance { dark: bool },
+    /// "Make text this size" (thousandths, one of
+    /// `fresco_protocol::TEXT_SIZES`, 85% to 200%; 1000 = 100%): the
+    /// system text size (resolution-independence.md §6). Remembered.
+    SetTextSize { text_size_milli: u32 },
     /// "Zoom the focused window (fullscreen), or un-zoom it." On a monitor
     /// of a span group, zoom covers the whole group (fresco-span.md §3).
     ToggleZoom,

@@ -98,6 +98,9 @@ impl FrescoConn for ClientConn {
     fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> io::Result<()> {
         self.conn.wm_set_appearance(a)
     }
+    fn appearance(&mut self) -> io::Result<fresco_protocol::AppearancePayload> {
+        self.conn.appearance()
+    }
     fn mirror_output(&mut self, identity: u64, of: u64) -> io::Result<()> {
         self.conn.wm_mirror_output(identity, of)
     }
@@ -207,6 +210,13 @@ fn main() -> io::Result<()> {
     // last reported until it says again (it may be up already).
     wm.screen.dock_h = wm.displays.dock_pt as i32;
     wm.display_store = Some(store);
+    // The text size the user set comes back (frescod starts at 100%).
+    if wm.displays.text_size_milli != 0 {
+        let t = wm.displays.text_size_milli;
+        if let Err(e) = wm.set_text_size(&mut io_conn, t) {
+            eprintln!("forum-wm: restoring the text size: {e}");
+        }
+    }
     match io_conn.conn.wm_outputs() {
         Ok(r) => {
             wm.outputs = r.outputs.clone();

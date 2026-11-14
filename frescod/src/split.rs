@@ -1025,7 +1025,7 @@ fn event_records(r: &Renderer, ev: &DisplayEvent) -> Vec<Msg> {
         E::DragEnd { window_id, drag_id, dropped } => {
             r.local_of(*window_id).map(|window| Msg::DragEnd { window, drag_id: *drag_id, dropped: *dropped }).into_iter().collect()
         }
-        E::AppearanceChanged(a) => vec![Msg::Appearance { scheme: a.scheme, high_contrast: a.high_contrast, accent: a.accent }],
+        E::AppearanceChanged(a) => vec![Msg::Appearance { scheme: a.scheme, high_contrast: a.high_contrast, accent: a.accent, text_size_milli: a.text_size_milli }],
         E::WindowSpan { window_id, tiles, hidden } => {
             let Some(window) = r.local_of(*window_id) else { return Vec::new() };
             let mut v: Vec<Msg> = tiles.iter().map(|t| Msg::SpanTile { window, rect: t.rect, present: t.present }).collect();

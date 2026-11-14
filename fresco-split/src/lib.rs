@@ -33,6 +33,8 @@ pub const MAX_WINDOW_DIM: u32 = fresco_compute::MAX_DIM;
 /// The window scales a [`Msg::Scale`] may carry, thousandths.
 pub const SCALE_MIN: u32 = 500;
 pub const SCALE_MAX: u32 = 4000;
+/// The system text sizes (mirrors `fresco_protocol::TEXT_SIZES`).
+pub const TEXT_SIZES: [u32; 7] = [850, 1000, 1150, 1300, 1500, 1750, 2000];
 /// Most windows one renderer may have open.
 pub const MAX_WINDOWS: u32 = 64;
 
@@ -209,7 +211,7 @@ pub enum Msg {
     VideoPresented { window: u32, layer: u32, seq: u32, vblank_ns: u64, dropped: u32 },
     /// The system appearance (window 0): sent after [`Msg::Client`] and on
     /// every change. `scheme` 0 light, 1 dark.
-    Appearance { scheme: u32, high_contrast: bool, accent: u32 },
+    Appearance { scheme: u32, high_contrast: bool, accent: u32, text_size_milli: u32 },
     /// One tile of `window`'s span (fresco-span.md), `[x, y, w, h]` in
     /// window pixels; the tiles and hidden strips of one update precede
     /// its [`Msg::SpanDone`].
@@ -663,11 +665,12 @@ impl Msg {
                 r.put(6, *dropped);
                 r
             }
-            Msg::Appearance { scheme, high_contrast, accent } => {
+            Msg::Appearance { scheme, high_contrast, accent, text_size_milli } => {
                 let mut r = Rec::new(APPEARANCE, 0);
                 r.put(2, *scheme);
                 r.put(3, *high_contrast as u32);
                 r.put(4, *accent);
+                r.put(5, *text_size_milli);
                 r
             }
             Msg::SpanTile { window, rect, present } => {
@@ -907,10 +910,11 @@ impl Msg {
                 dropped: r.get(6),
             },
             APPEARANCE => {
-                if r.get(2) > 1 {
+                let text = r.get(5);
+                if r.get(2) > 1 || !(text == 0 || TEXT_SIZES.contains(&text)) {
                     return Err(Refused("unknown appearance"));
                 }
-                Msg::Appearance { scheme: r.get(2), high_contrast: flag(r.get(3))?, accent: r.get(4) }
+                Msg::Appearance { scheme: r.get(2), high_contrast: flag(r.get(3))?, accent: r.get(4), text_size_milli: text }
             }
             SPAN_TILE | SPAN_HIDDEN => {
                 let rect = [r.get(2), r.get(3), r.get(4), r.get(5)];

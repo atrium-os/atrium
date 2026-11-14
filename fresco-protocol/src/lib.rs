@@ -613,6 +613,21 @@ pub struct AppearancePayload {
     pub high_contrast: bool,
     /// Reserved for the accent colour's index: 0 for now.
     pub accent: u32,
+    /// The system text size in thousandths, one of [`TEXT_SIZES`] (0 is
+    /// read as 1000): text, and everything sized from text, grows by it;
+    /// layout gutters and hairlines don't (resolution-independence.md §6).
+    pub text_size_milli: u32,
+}
+
+/// The system text sizes a user picks from, in thousandths (85% to 200%,
+/// decision §11.3).
+pub const TEXT_SIZES: [u32; 7] = [850, 1000, 1150, 1300, 1500, 1750, 2000];
+
+impl AppearancePayload {
+    /// The text size as a factor (1.0 when unset).
+    pub fn text_scale(&self) -> f32 {
+        if self.text_size_milli == 0 { 1.0 } else { self.text_size_milli as f32 / 1000.0 }
+    }
 }
 
 /// One gamepad or joystick, as `OP_WM_PADS` lists it.
@@ -2625,7 +2640,7 @@ mod tests {
 
     #[test]
     fn roundtrip_appearance() {
-        let p = AppearancePayload { scheme: APPEARANCE_DARK, high_contrast: false, accent: 0 };
+        let p = AppearancePayload { scheme: APPEARANCE_DARK, high_contrast: false, accent: 0, text_size_milli: 1150 };
         let back: AppearancePayload = decode(&encode(&p).expect("encode")).expect("decode");
         assert_eq!(back, p);
     }

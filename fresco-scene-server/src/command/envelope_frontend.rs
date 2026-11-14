@@ -1490,7 +1490,8 @@ impl EnvelopeFrontend {
             return Err(DispatchError::Forbidden);
         }
         let a: fresco_protocol::AppearancePayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
-        if a.scheme > fresco_protocol::APPEARANCE_DARK || a.high_contrast || a.accent != 0 {
+        let text_ok = a.text_size_milli == 0 || fresco_protocol::TEXT_SIZES.contains(&a.text_size_milli);
+        if a.scheme > fresco_protocol::APPEARANCE_DARK || a.high_contrast || a.accent != 0 || !text_ok {
             return Err(DispatchError::BadPayload);
         }
         self.set_appearance(a);
@@ -2789,6 +2790,10 @@ mod tests {
         }
         fn set_appearance(&mut self, a: fresco_protocol::AppearancePayload) -> std::io::Result<()> {
             self.dispatch(control::OP_WM_SET_APPEARANCE, encode(&a).unwrap()).map(|_| ())
+        }
+        fn appearance(&mut self) -> std::io::Result<fresco_protocol::AppearancePayload> {
+            let out = self.dispatch(control::OP_APPEARANCE, Vec::new())?;
+            Ok(decode(&out[0].payload).unwrap())
         }
         fn span_group(&mut self, p: fresco_protocol::WmSpanGroupPayload) -> std::io::Result<WmRect> {
             let out = self.dispatch(control::OP_WM_SPAN_GROUP, encode(&p).unwrap())?;

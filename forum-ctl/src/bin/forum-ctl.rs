@@ -8,6 +8,7 @@
 //!   forum-ctl outputs             list the monitors and where they sit
 //!   forum-ctl arrange A SIDE B    put output A right-of / left-of / above / below output B
 //!   forum-ctl move-monitor        send the focused window to the next monitor
+//!   forum-ctl text-size P         system text size P% (85 100 115 130 150 175 200)
 //!   forum-ctl ui-size N S         show output N at UI size S: smaller, default, larger,
 //!                                 or 0.875 1 1.125 1.25 1.5 2 (a multiplier on its automatic scale)
 //!   forum-ctl mirror A B|off      show output B's picture on output A too, or stop
@@ -27,7 +28,7 @@ use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor | ui-size N smaller|default|larger|F | mirror A B|off \
+               | arrange A right-of|left-of|above|below B | move-monitor | ui-size N smaller|default|larger|F | text-size 85..200 | mirror A B|off \
                | zoom | span A [B..] [gap PX | bezel MM] | spans | span-app APP on|off \
                | pads | take-back [ID] | status | status-pick APP I | status-press APP ID");
     std::process::exit(2)
@@ -75,6 +76,9 @@ fn main() {
                 "larger" => 1125,
                 f => (f.parse::<f64>().unwrap_or_else(|_| usage()) * 1000.0).round() as u32,
             },
+        },
+        ["text-size", p] => Intent::SetTextSize {
+            text_size_milli: p.trim_end_matches('%').parse::<u32>().map(|p| p * 10).unwrap_or_else(|_| usage()),
         },
         ["zoom"] => Intent::ToggleZoom,
         ["spans"] => Intent::ListSpanGroups,

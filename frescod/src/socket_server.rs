@@ -254,7 +254,7 @@ fn fan_out(subs: &EventSubs, comp: &Arc<Mutex<Compositor>>, ev: DisplayEvent, ba
 
 /// The system appearance as last told to clients, for a split renderer
 /// that starts after the change. Written under the subscriber lock.
-pub static APPEARANCE: Mutex<fresco_protocol::AppearancePayload> = Mutex::new(fresco_protocol::AppearancePayload { scheme: 0, high_contrast: false, accent: 0 });
+pub static APPEARANCE: Mutex<fresco_protocol::AppearancePayload> = Mutex::new(fresco_protocol::AppearancePayload { scheme: 0, high_contrast: false, accent: 0, text_size_milli: 0 });
 
 /// Set by frescod (not the renderer, which shares this file): turns each
 /// event into the drag events it causes.
