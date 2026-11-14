@@ -27,6 +27,7 @@
 # another frescod is left alone. Under TCG (the cloud VM) the rates are slow and noisy: compare
 # the two phases only, never quote them as speeds, and give the hogs
 # LOADED=160 so the nodes hog reaches its limit (about 3,000 nodes/s there).
+# EXTRA_ENV passes more settings to frescod (FRESCOD_RASTER_SLICE_US=...).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=${TARGET:-x86_64-unknown-freebsd}
@@ -59,9 +60,9 @@ case "$RENDERER" in
     gpu) RENV="FRESCOD_RENDERER=gpu FRESCOD_FLIP_TIMEOUT_MS=${FLIP_MS:-900000}"; HEADLESS="" ;;
     *)   RENV="FRESCOD_RENDERER=compute"; HEADLESS="FRESCOD_HEADLESS_PNG=$S/screen" ;;
 esac
-g "cd $S && env RUST_LOG=${RUST_LOG:-warn} $RENV $HEADLESS FRESCOD_SPLIT=1 FRESCOD_RENDERER_LAUNCHER=unconfined \
+g "cd $S && env RUST_LOG=${RUST_LOG:-warn} $RENV $HEADLESS ${EXTRA_ENV:-} FRESCOD_SPLIT=1 FRESCOD_RENDERER_LAUNCHER=unconfined \
     FRESCOD_RENDERER_BIN=$D/fresco-renderer FRESCOD_APP_REGISTRY=$S/none FRESCOD_FRAME_STATS=$STATS \
-    FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock daemon -f -o $S/frescod.log $D/frescod </dev/null"
+    FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock FRESCOD_ACTIVATION_SOCK=$S/activation.sock daemon -f -o $S/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 90 ] && ! g "test -S $S/fresco.sock"; do sleep 2; i=$((i+1)); done
 g "test -S $S/fresco.sock" || { echo "frescod did not start"; g "tail -n 30 $S/frescod.log"; exit 1; }
 

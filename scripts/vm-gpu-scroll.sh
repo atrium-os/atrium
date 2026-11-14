@@ -23,7 +23,7 @@ R=$1; STEP=$2; N=$3; TAG=$4
 cd "$(dirname "$0")"
 pkill -f live-frescod; pkill -f atrium-scroll-demo; sleep 1
 rm -f /tmp/live.sock /tmp/live-wm.sock
-env RUST_LOG=info FRESCOD_SPLIT=0 FRESCOD_RENDERER=$R FRESCOD_FLIP_TIMEOUT_MS=900000 FRESCOD_SOCK=/tmp/live.sock FRESCOD_WM_SOCK=/tmp/live-wm.sock \
+env RUST_LOG=info FRESCOD_SPLIT=0 FRESCOD_RENDERER=$R FRESCOD_FLIP_TIMEOUT_MS=900000 FRESCOD_SOCK=/tmp/live.sock FRESCOD_WM_SOCK=/tmp/live-wm.sock FRESCOD_ACTIVATION_SOCK=/tmp/live-activation.sock \
   daemon -o /tmp/live-$TAG.log ./live-frescod
 i=0; while [ ! -S /tmp/live.sock ] && [ $i -lt 1800 ]; do sleep 1; i=$((i+1)); done
 [ -S /tmp/live.sock ] || { echo "frescod did not listen"; exit 1; }
