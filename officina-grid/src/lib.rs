@@ -25,6 +25,7 @@ pub mod numfmt;
 pub mod ops;
 pub mod recalc;
 pub mod strings;
+pub mod style;
 pub mod value;
 
 pub use addr::{CellAddr, Rect};

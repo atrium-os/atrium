@@ -106,6 +106,11 @@ fn native_reader() {
     }
     wb.fill_formula(0, 1, 0, 4999, "=A1*2").unwrap();
     wb.set_input(CellAddr::new(1, 0, 9), "=SUM(S!B:B)").unwrap();
+    let mut st = officina_grid::style::Style::default().with_num_fmt("0.00%");
+    st.font.italic = true;
+    st.borders[0].line = officina_grid::style::Line::Thick;
+    wb.set_style(&officina_grid::Rect { sheet: 1, r0: 3, c0: 0, r1: 900, c1: 4 }, st);
+    wb.set_style(&officina_grid::Rect { sheet: 0, r0: 0, c0: 1, r1: 10, c1: 1 }, officina_grid::style::Style::default().with_num_fmt("yyyy"));
     wb.recalc();
     let good = native::save_to_vec(&wb);
     let mut g = Rng(0xfeed_beef_dead_cafe);
@@ -145,9 +150,12 @@ fn op_decoder() {
         3,
         vec![vec![officina_grid::Input::Formula("=A1+1".into()), officina_grid::Input::Value(officina_grid::Value::str("x"))]],
     );
-    let good = op.encode();
+    let mut styled = officina_grid::style::Style::default().with_num_fmt("#,##0");
+    styled.fill = Some(0x112233);
+    let sop = GridOp::style(officina_grid::Rect { sheet: 0, r0: 1, c0: 1, r1: 30, c1: 2 }, styled);
     let mut g = Rng(42);
-    for _ in 0..iters(200_000) / 4 {
+    for good in [op.encode(), sop.encode()] {
+    for _ in 0..iters(200_000) / 8 {
         let mut b = good.clone();
         for _ in 0..1 + g.below(4) {
             let i = g.below(b.len() as u64) as usize;
@@ -157,5 +165,6 @@ fn op_decoder() {
         let n = g.below(40) as usize;
         let r: Vec<u8> = (0..n).map(|_| g.below(256) as u8).collect();
         let _ = GridOp::decode(&r);
+    }
     }
 }

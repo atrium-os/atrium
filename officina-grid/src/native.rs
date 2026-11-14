@@ -7,6 +7,8 @@
 //! | 2 | STRINGS | the texts cells use, renumbered densely on save |
 //! | 3 | COLUMN | one 4096-row chunk of one column: sheet, column, chunk number, encoding, cells |
 //! | 4 | FORMULAS | one sheet's formula groups: column, first and last row, A1 text at the first row |
+//! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
+//! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
 //! formulas. Column chunks are independent, so a reader can load the visible part of a
@@ -30,6 +32,8 @@ pub const WORKBOOK: u16 = 1;
 pub const STRINGS: u16 = 2;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
+pub const STYLES: u16 = 5;
+pub const STYLE_RUNS: u16 = 6;
 
 const ENC_LIST: u8 = 0;
 const ENC_NUM: u8 = 1;
@@ -173,6 +177,32 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
                 w.str(&crate::formula::to_a1(&g.expr, g.r0, g.col, &|s| wb.sheet_name(s)));
             }
             c.add(FORMULAS, &w.into_bytes())?;
+        }
+    }
+    if wb.styles.len() > 1 {
+        let mut w = Writer::new();
+        w.var(wb.styles.len() as u64 - 1);
+        for (_, st) in wb.styles.iter().skip(1) {
+            st.encode(&mut w);
+        }
+        c.add(STYLES, &w.into_bytes())?;
+        for (si, sh) in wb.sheets.iter().enumerate() {
+            let cols: Vec<_> = sh.styles.iter().enumerate().filter(|(_, r)| !r.is_empty()).collect();
+            if cols.is_empty() {
+                continue;
+            }
+            let mut w = Writer::new();
+            w.u16(si as u16);
+            w.var(cols.len() as u64);
+            for (ci, runs) in cols {
+                w.var(ci as u64);
+                w.var(runs.runs().len() as u64);
+                for &(r, st) in runs.runs() {
+                    w.var(r as u64);
+                    w.var(st as u64);
+                }
+            }
+            c.add(STYLE_RUNS, &w.into_bytes())?;
         }
     }
     c.finish()
@@ -365,6 +395,52 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         done(&r)?;
     }
 
+    // Styles: the file's ids map to this workbook's (equal styles intern to one).
+    let mut style_ids: Vec<u32> = vec![0];
+    let mut it = of(STYLES);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two STYLES chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("styles", crate::style::MAX_STYLES as u64 - 1, 20)?;
+        for _ in 0..k {
+            let st = crate::style::Style::decode(&mut r)?;
+            style_ids.push(wb.styles.intern(st));
+        }
+        done(&r)?;
+    }
+    for i in of(STYLE_RUNS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let s = r.u16()? as usize;
+        if s >= wb.sheets.len() {
+            return Err(LoadError::Bad("styles for a sheet that does not exist"));
+        }
+        let k = r.count("styled columns", MAX_COLS as u64, 2)?;
+        for _ in 0..k {
+            let col = r.len("column", MAX_COLS as u64 - 1)?;
+            let n = r.count("style runs", MAX_ROWS as u64, 2)?;
+            let mut runs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let row = r.len("row", MAX_ROWS as u64)? as u32;
+                if runs.last().is_some_and(|&(p, _)| p >= row) {
+                    return Err(LoadError::Bad("style runs out of order"));
+                }
+                let id = r.len("style id", style_ids.len() as u64 - 1)?;
+                runs.push((row, style_ids[id]));
+            }
+            let sh = &mut wb.sheets[s];
+            if sh.styles.len() <= col {
+                sh.styles.resize_with(col + 1, crate::style::StyleRuns::default);
+            }
+            if !sh.styles[col].runs().is_empty() {
+                return Err(LoadError::Bad("a column's styles twice"));
+            }
+            sh.styles[col] = crate::style::StyleRuns::from_runs(runs);
+        }
+        done(&r)?;
+    }
+
     // Stored results are current; only volatile formulas need a recalculation, and
     // `recalc` always takes those.
     wb.changed.clear();
@@ -394,6 +470,26 @@ mod tests {
     use super::*;
     use crate::addr::CellAddr;
     use crate::value::Value;
+
+    #[test]
+    fn styles_round_trip() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("A").unwrap();
+        wb.add_sheet("B").unwrap();
+        let mut st = crate::style::Style::default().with_num_fmt("#,##0.00");
+        st.font.bold = true;
+        st.fill = Some(0xDDEEFF);
+        wb.set_style(&crate::addr::Rect { sheet: 1, r0: 0, c0: 2, r1: 1_048_575, c1: 4 }, st.clone());
+        wb.set_style(&crate::addr::Rect { sheet: 1, r0: 5, c0: 3, r1: 9, c1: 3 }, crate::style::Style::default().with_num_fmt("0%"));
+        wb.set_value(CellAddr::new(1, 6, 3), Value::Num(0.5));
+        let back = load(&save_to_vec(&wb)).unwrap();
+        for (r, c) in [(0, 2), (6, 3), (10, 3), (1_048_575, 4), (0, 5), (0, 1)] {
+            let a = CellAddr::new(1, r, c);
+            assert_eq!(back.style(a), wb.style(a), "{r},{c}");
+        }
+        assert_eq!(back.formatted(CellAddr::new(1, 6, 3)).text, "50%");
+        assert_eq!(back.sheet(0).styles.len(), 0);
+    }
 
     #[test]
     fn round_trip() {

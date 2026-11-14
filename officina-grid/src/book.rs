@@ -8,7 +8,9 @@ use crate::eval::funcs::{self, text_key};
 use crate::eval::parse_number;
 use crate::fast::Fast;
 use crate::formula::{self, Expr, Func, ParseError};
+use crate::numfmt::Formatted;
 use crate::strings::StringPool;
+use crate::style::{Style, StyleId, StyleRuns, StyleTable};
 use crate::value::{ErrorKind, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -28,14 +30,20 @@ pub struct Sheet {
     pub(crate) fidx: Vec<BTreeMap<u32, GroupId>>,
     /// One past the last row ever written (an upper bound; never shrinks).
     pub(crate) rows_used: u32,
+    /// Per column: its cells' styles.
+    pub styles: Vec<StyleRuns>,
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0 }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
+    }
+    /// The style id of a cell.
+    pub fn style_id(&self, r: u32, c: u32) -> StyleId {
+        self.styles.get(c as usize).map_or(0, |s| s.get(r))
     }
 }
 
@@ -118,6 +126,7 @@ type LookupKey = (u16, u32, u32, u32);
 pub struct Workbook {
     pub(crate) sheets: Vec<Sheet>,
     pub strings: StringPool,
+    pub styles: StyleTable,
     pub(crate) groups: Vec<Option<Group>>,
     free_groups: Vec<GroupId>,
     pub(crate) deps: DepIndex,
@@ -142,6 +151,7 @@ impl Workbook {
         Workbook {
             sheets: Vec::new(),
             strings: StringPool::new(),
+            styles: StyleTable::new(),
             groups: Vec::new(),
             free_groups: Vec::new(),
             deps: DepIndex::default(),
@@ -588,4 +598,49 @@ fn check_depth(e: &Expr) -> Result<(), ParseError> {
         }
     }
     Ok(())
+}
+
+// ---------- styles ----------
+
+impl Workbook {
+    /// The style id of a cell.
+    pub fn style_id(&self, a: CellAddr) -> StyleId {
+        self.sheets.get(a.sheet as usize).map_or(0, |s| s.style_id(a.row, a.col))
+    }
+
+    /// The style of a cell.
+    pub fn style(&self, a: CellAddr) -> &Style {
+        self.styles.get(self.style_id(a))
+    }
+
+    /// Sets the style of every cell in `r`.
+    pub fn set_style_id(&mut self, r: &Rect, id: StyleId) {
+        let Some(sh) = self.sheets.get_mut(r.sheet as usize) else { return };
+        if id == 0 && r.c0 as usize >= sh.styles.len() {
+            return;
+        }
+        let need = (r.c1 as usize + 1).min(MAX_COLS as usize);
+        if id != 0 && sh.styles.len() < need {
+            sh.styles.resize_with(need, StyleRuns::default);
+        }
+        let last = (r.c1 as usize).min(sh.styles.len().saturating_sub(1));
+        for c in r.c0 as usize..=last {
+            sh.styles[c].set(r.r0, r.r1, id);
+        }
+        while sh.styles.last().is_some_and(|s| s.is_empty()) {
+            sh.styles.pop();
+        }
+    }
+
+    /// Interns `s` and sets it on every cell in `r`.
+    pub fn set_style(&mut self, r: &Rect, s: Style) {
+        let id = self.styles.intern(s);
+        self.set_style_id(r, id);
+    }
+
+    /// How a cell shows: its value through its number format.
+    pub fn formatted(&self, a: CellAddr) -> Formatted {
+        let v = self.get(a);
+        self.styles.format(self.style_id(a)).format(&v)
+    }
 }

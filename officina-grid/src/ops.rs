@@ -8,6 +8,7 @@
 use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use crate::book::{Input, Workbook};
 use crate::column::Cell;
+use crate::style::Style;
 use crate::formula;
 use crate::value::{ErrorKind, Value};
 use officina_core::history::Op;
@@ -31,9 +32,18 @@ pub struct Region {
     pub fills: Vec<Fill>,
 }
 
+/// The styles of a rectangle: spans of one column with a style other than the
+/// default, by value (ids are per workbook). Cells not covered have the default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyleRegion {
+    pub rect: Rect,
+    pub spans: Vec<(u32, u32, u32, Style)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridOp {
     Replace(Region),
+    Restyle(StyleRegion),
 }
 
 impl GridOp {
@@ -75,10 +85,53 @@ impl GridOp {
         GridOp::Replace(Region { rect, values: Vec::new(), fills: Vec::new() })
     }
 
+    /// Sets `style` on every cell of `rect`.
+    pub fn style(rect: Rect, style: Style) -> Self {
+        let spans = if style == Style::default() { Vec::new() } else { (rect.c0..=rect.c1).map(|c| (c, rect.r0, rect.r1, style.clone())).collect() };
+        GridOp::Restyle(StyleRegion { rect, spans })
+    }
+
+    /// Changes the style of every cell of `rect` with `f` (bold on, a new number
+    /// format, ...), keeping the rest of each cell's style.
+    pub fn restyle(wb: &Workbook, rect: Rect, f: impl Fn(&Style) -> Style) -> Self {
+        let mut spans = Vec::new();
+        for c in rect.c0..=rect.c1 {
+            let runs = wb.sheets.get(rect.sheet as usize).and_then(|s| s.styles.get(c as usize));
+            let parts = match runs {
+                Some(r) => r.spans(rect.r0, rect.r1),
+                None => vec![(rect.r0, rect.r1, 0)],
+            };
+            for (a, b, id) in parts {
+                let st = f(wb.styles.get(id));
+                if st != Style::default() {
+                    spans.push((c, a, b, st));
+                }
+            }
+        }
+        GridOp::Restyle(StyleRegion { rect, spans })
+    }
+
     /// The op as journal bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        let GridOp::Replace(r) = self;
+        let r = match self {
+            GridOp::Replace(r) => r,
+            GridOp::Restyle(s) => {
+                w.u8(2);
+                w.u16(s.rect.sheet);
+                for x in [s.rect.r0, s.rect.c0, s.rect.r1, s.rect.c1] {
+                    w.var(x as u64);
+                }
+                w.var(s.spans.len() as u64);
+                for (c, a, b, st) in &s.spans {
+                    w.var(*c as u64);
+                    w.var(*a as u64);
+                    w.var(*b as u64);
+                    st.encode(&mut w);
+                }
+                return w.into_bytes();
+            }
+        };
         w.u8(1);
         w.u16(r.rect.sheet);
         w.var(r.rect.r0 as u64);
@@ -104,7 +157,8 @@ impl GridOp {
     /// Reads an op written by [`encode`](Self::encode). Bounds everything; never panics.
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(b);
-        if r.u8()? != 1 {
+        let kind = r.u8()?;
+        if kind != 1 && kind != 2 {
             return Err(WireError::Invalid("op kind"));
         }
         let sheet = r.u16()?;
@@ -115,6 +169,21 @@ impl GridOp {
             return Err(WireError::Invalid("rectangle"));
         }
         let rect = Rect { sheet, r0, c0, r1, c1 };
+        if kind == 2 {
+            let n = r.count("style spans", u32::MAX as u64, 8)?;
+            let mut spans = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (x, a, b) = (col(&mut r)?, row(&mut r)?, row(&mut r)?);
+                if a > b || x < c0 || x > c1 || a < r0 || b > r1 {
+                    return Err(WireError::Invalid("style span outside rectangle"));
+                }
+                spans.push((x, a, b, Style::decode(&mut r)?));
+            }
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Restyle(StyleRegion { rect, spans }));
+        }
         let n = r.count("values", u32::MAX as u64, 3)?;
         let mut values = Vec::with_capacity(n);
         for _ in 0..n {
@@ -145,11 +214,40 @@ impl Op<Workbook> for GridOp {
     fn apply(self, wb: &mut Workbook) -> Self {
         match self {
             GridOp::Replace(region) => GridOp::Replace(wb.replace(region)),
+            GridOp::Restyle(region) => GridOp::Restyle(wb.replace_styles(region)),
         }
     }
 }
 
 impl Workbook {
+    /// The styles of `rect` now, as a [`StyleRegion`].
+    pub fn style_snapshot(&self, rect: &Rect) -> StyleRegion {
+        let mut spans = Vec::new();
+        if let Some(sh) = self.sheets.get(rect.sheet as usize) {
+            let last = rect.c1.min(sh.styles.len() as u32);
+            for c in rect.c0..=last {
+                let Some(runs) = sh.styles.get(c as usize) else { continue };
+                for (a, b, id) in runs.spans(rect.r0, rect.r1) {
+                    if id != 0 {
+                        spans.push((c, a, b, self.styles.get(id).clone()));
+                    }
+                }
+            }
+        }
+        StyleRegion { rect: *rect, spans }
+    }
+
+    /// Replaces the styles of `region.rect`; returns what they were.
+    pub fn replace_styles(&mut self, region: StyleRegion) -> StyleRegion {
+        let old = self.style_snapshot(&region.rect);
+        self.set_style_id(&region.rect, 0);
+        for (c, a, b, st) in region.spans {
+            let id = self.styles.intern(st);
+            self.set_style_id(&Rect { sheet: region.rect.sheet, r0: a, c0: c, r1: b, c1: c }, id);
+        }
+        old
+    }
+
     /// What `rect` holds now, as a [`Region`].
     pub fn snapshot(&self, rect: &Rect) -> Region {
         let mut values = Vec::new();
@@ -264,6 +362,40 @@ mod tests {
     fn a(s: &str) -> CellAddr {
         let (r, c) = crate::addr::parse_a1(s).unwrap();
         CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn styles_undo_and_encode() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        let mut h: History<GridOp> = History::new();
+        wb.set_value(a("B2"), Value::Num(0.256));
+        let all = Rect { sheet: 0, r0: 0, c0: 0, r1: 1_048_575, c1: 3 };
+        let op = GridOp::restyle(&wb, all, |s| s.clone().with_num_fmt("0.0%"));
+        h.run(&mut wb, "Percent", vec![op]);
+        assert_eq!(wb.formatted(a("B2")).text, "25.6%");
+        let bold = Rect { sheet: 0, r0: 1, c0: 1, r1: 2, c1: 1 };
+        let op = GridOp::restyle(&wb, bold, |s| {
+            let mut s = s.clone();
+            s.font.bold = true;
+            s
+        });
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        h.run(&mut wb, "Bold", vec![op]);
+        assert!(wb.style(a("B2")).font.bold && wb.style(a("B3")).font.bold && !wb.style(a("B4")).font.bold);
+        assert_eq!(&*wb.style(a("B2")).num_fmt, "0.0%");
+        // Whole columns stay a few runs.
+        assert_eq!(wb.sheet(0).styles[1].runs().len(), 4, "{:?}", wb.sheet(0).styles[1].runs());
+        h.undo(&mut wb);
+        assert!(!wb.style(a("B2")).font.bold);
+        assert_eq!(wb.formatted(a("B2")).text, "25.6%");
+        h.undo(&mut wb);
+        assert_eq!(wb.formatted(a("B2")).text, "0.256");
+        assert!(wb.sheet(0).styles.is_empty());
+        h.redo(&mut wb);
+        h.redo(&mut wb);
+        assert!(wb.style(a("B3")).font.bold);
+        assert!(GridOp::decode(&[2, 0, 0]).is_err());
     }
 
     #[test]
