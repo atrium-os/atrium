@@ -20,6 +20,8 @@ lyra-protocol = { path = "../lyra-protocol" }
 forum-ctl = { path = "../forum-ctl" }
 # USB sticks served for the session, and eject (dispensatord, device-assignment.md §6.6).
 atrium-media = { path = "../dispensator/media" }
+# Network status, Wi-Fi join and leave (atrium-netconf, atrium-net.md §7.1).
+atrium-netconf = { path = "../atrium-net/netconf" }
 # forum-bar draws its bar via Pergola (the UI toolkit) → frescod, the same way any
 # Atrium UI renders. It holds no window-management cap; it just draws + asks forum-ctl.
 pergola = { path = "../pergola" }

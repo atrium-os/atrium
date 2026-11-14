@@ -380,3 +380,17 @@ fn beacon_loss_leaves() {
     assert!(kernel(&o).iter().all(|r| !matches!(r, Req::TxMgmt { .. })), "{o:?}");
     assert_eq!(s.state_name(), "idle");
 }
+
+/// A join while a scan runs uses that scan (the radio refuses a second).
+#[test]
+fn join_during_a_scan_uses_it() {
+    let mut s = Station::new(OWN, Box::new(|b: &mut [u8]| b.fill(7)));
+    let o = s.cmd(&Line::new("scan"), 0);
+    assert!(matches!(kernel(&o)[..], [Req::Scan { .. }]));
+    let o = s.cmd(&Line::new("join").with_hex("ssid", b"aura-test").with("security", "psk").with("mac", "device"), 1);
+    assert!(kernel(&o).is_empty(), "no second scan: {o:?}");
+    assert_eq!(ctl_states(&o), vec!["scanning"]);
+    s.mgmt_rx(2437, -40, rx_flags::SCAN, &beacon(b"aura-test", Some(wpa2_pmf()), true, 6), 2);
+    let o = s.scan_done(0, 3);
+    assert!(matches!(kernel(&o)[0], Req::TxMgmt { frame, .. } if mgmt::subtype(frame) == mgmt::AUTH), "{o:?}");
+}

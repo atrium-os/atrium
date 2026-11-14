@@ -1,0 +1,17 @@
+[package]
+name = "atrium-netconf"
+version = "0.1.0"
+description = "Network settings on Aqueduct (CLASS_NETCONF, docs/spec/atrium-net.md §7.1): wire types, the client apps use, and atrium-netconf, the unprivileged front that serves the capability sockets for atrium-net."
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "atrium_netconf"
+path = "src/lib.rs"
+
+[dependencies]
+aqueduct = { path = "../../aqueduct" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+aura-ipc = { path = "../../aura/aura-ipc" }
+libc = "0.2"

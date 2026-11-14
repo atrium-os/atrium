@@ -253,6 +253,14 @@ As built (N2):
 Passwords pass through `atrium-net` to aura-keys' `remember` and are not kept. The
 Forum status item (online, Wi-Fi bars) uses `Status` + `Subscribe`.
 
+As built (N4, §10.5): manifest keys `network-read`, `network-details`, `network-wifi`,
+`network-configure`, and `wifi-nearby` for the list. The "user grant (location)" is the
+install consent line `wifi-nearby` adds ("See the Wi-Fi networks around you (this can
+tell where you are)"), so the list is a capability of its own rather than a second
+check on `network-wifi`; there is no separate grant store. `network-configure` is
+restricted (settings app only). Apps never reach atrium-net itself: `atrium-netconf`
+serves the five sockets.
+
 ### 7.2 atrium-netd
 
 One event, `egress-changed {iface}`, over atrium-netd's existing control socket; it
@@ -303,7 +311,7 @@ it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 | N1 | Wi-Fi: profiles, auto-join, roam keeps the lease, Transition Disable persisted | `aura-sim-gate.sh w1|w2` pass with atrium-net in place of aura-ctl + dhclient; restart keeps the WPA3-only flag |
 | N2 | IPv6: SLAAC, RFC 7217 + 8981, RDNSS | AP VM runs radvd; the VM gets a temporary address, reaches the AP over v6, resolves via the RA's server |
 | N3 | Ethernet + Wi-Fi together, egress events to atrium-netd, captive detection | pulling the VM's virtio link moves the default route and NAT to wlan0. **Built 2026-11-14** (§10.4); NAT waits for atrium-netd |
-| N4 | `CLASS_NETCONF`, capability checks, a `netctl` CLI, Forum status item | an app without `network_wifi` gets refused; one with it but no location grant gets no list |
+| N4 | `CLASS_NETCONF`, capability checks, a `netctl` CLI, Forum status item | an app without `network_wifi` gets refused; one with it but no location grant gets no list. **Built 2026-11-14** (§10.5) |
 
 N0–N3 need no hardware: the cloud VM (a second virtio NIC on a simulated LAN) and the AP
 VM from the Aura gates cover them.
@@ -411,3 +419,33 @@ VM from the Aura gates cover them.
   status line carried `link=` twice in the address grace period (now one: `lost`).
 - Not yet: real atrium-netd (NAT re-pointing); the Atrium-run probe endpoint (decided by Shankar
   2026-11-14: probing stays off until Atrium hosts one; no third-party default).
+
+### 10.5 N4 as built (2026-11-14)
+
+- `atrium-net/netconf` (crate `atrium-netconf`): the `CLASS_NETCONF` wire types
+  (postcard; `Status`, `Iface`, `Routes`, `Profile`, `Join`, `Nearby`), the client, the
+  per-socket rules (`Grant::allows`), and `server::serve`. `lines.rs` turns atrium-net's
+  control lines into those types (BSSIDs and channels never cross). Host tests over real
+  sockets with a fake backend: what each socket allows, status names hidden from
+  `network-read`, subscribe sends only changes.
+- `atrium-netconf` (binary): one socket per capability under `/atrium/sockets`; two
+  connections to atrium-net's control socket (requests; events), opened as root, then
+  setuid to `_atrium-netconf` (65036) and `cap_enter`. App input is decoded there, not in
+  the root daemon. It exits if atrium-net goes away.
+- atrium-net: `wifi=1` on status lines; `wifi-remember` without a secret changes an
+  already-remembered network's settings. aura-mlme: `rssi` in `status` while connected
+  (bars), and a join while a scan runs uses that scan (the radio refused a second one
+  with EBUSY: remember-then-join raced auto-join's scan).
+- Portcullis: the five capabilities mount their socket dirs; consent lines;
+  `network-configure` warns as restricted.
+- `atrium-netctl --app CAP ...`: the CLASS_NETCONF client as an app with one capability.
+- Forum bar: the network icon (cable, Wi-Fi bars, crossed out with no internet, slashed
+  with none) replaces the placeholder; its menu names the network, disconnects, and joins
+  a remembered or open network found by a scan when it opens. New secured networks need a
+  passphrase, so they are left to Settings. Manifest gains `network-read`,
+  `network-wifi`, `wifi-nearby`.
+- Gate: `aura-sim-gate.sh n4` (RUNBOOK §13.6e).
+- Not yet: a Settings page (passphrase entry, profiles), `SET_STATIC`/`SET_DNS`
+  (answer unsupported), service manifests for atrium-net and atrium-netconf, the bar
+  checked live under Forum.
+

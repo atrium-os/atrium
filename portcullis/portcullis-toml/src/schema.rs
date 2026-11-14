@@ -155,6 +155,30 @@ pub struct Capabilities {
     /// restricted.
     #[serde(rename = "device-list")]
     pub device_list: Option<bool>,
+    /// Whether the machine is online, over Wi-Fi or a cable, metered, and the
+    /// Wi-Fi signal (atrium-net.md §7.1), over atrium-netconf's `network-read/`
+    /// socket. No addresses and no network names.
+    #[serde(rename = "network-read")]
+    pub network_read: Option<bool>,
+    /// The interfaces, their addresses and routes (atrium-net.md §7.1), over
+    /// `network-details/`.
+    #[serde(rename = "network-details")]
+    pub network_details: Option<bool>,
+    /// Join, leave and forget Wi-Fi networks and change their settings, and the
+    /// name of the one in use (atrium-net.md §7.1), over `network-wifi/`.
+    /// Passphrases pass through to aura-keys and are kept nowhere else.
+    #[serde(rename = "network-wifi")]
+    pub network_wifi: Option<bool>,
+    /// The Wi-Fi networks around (names, security, signal; never BSSIDs) over
+    /// `wifi-nearby/` (atrium-net.md §7.1). They tell where the machine is, so
+    /// this is its own capability with its own consent line.
+    #[serde(rename = "wifi-nearby")]
+    pub wifi_nearby: Option<bool>,
+    /// Change how the machine is set up on the network (Wi-Fi country; static
+    /// addresses and DNS servers later) over `network-configure/`
+    /// (atrium-net.md §7.1). Restricted to the settings app.
+    #[serde(rename = "network-configure")]
+    pub network_configure: Option<bool>,
     /// navigatord's page socket (`navigator-page/`, navigator-ui.md §2.1):
     /// the Navigator's doc-viewer child redeems a page's one-shot ticket
     /// there for its recording, and can do nothing else on it. Restricted
@@ -393,6 +417,11 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         removable_media:  ovr.removable_media.or(base.removable_media),
         session_lock:     ovr.session_lock.or(base.session_lock),
         device_list:      ovr.device_list.or(base.device_list),
+        network_read: ovr.network_read.or(base.network_read),
+        network_details: ovr.network_details.or(base.network_details),
+        network_wifi: ovr.network_wifi.or(base.network_wifi),
+        wifi_nearby: ovr.wifi_nearby.or(base.wifi_nearby),
+        network_configure: ovr.network_configure.or(base.network_configure),
         navigator_page:   ovr.navigator_page.or(base.navigator_page),
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),

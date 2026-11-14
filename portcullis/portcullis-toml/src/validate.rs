@@ -198,6 +198,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.device-list = true: restricted to Curia's Devices page (every device \
              and its hardware ids); requires explicit policy approval"));
     }
+    if c.network_configure == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.network-configure = true: restricted to the settings app (changes how \
+             the machine is set up on the network); requires explicit policy approval"));
+    }
     if c.navigator_page == Some(true) {
         r.warnings.push(format!(
             "{ctx}.navigator-page = true: restricted to the Navigator's page child (redeems \

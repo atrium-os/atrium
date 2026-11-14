@@ -797,7 +797,10 @@ mod imp {
                 "wifi-remember" => {
                     let Some(s) = ssid() else { return err("bad-ssid") };
                     let open = l.get("open") == Some("1");
-                    if !open {
+                    let known = self.wifi.as_ref().unwrap().saved.get(&s).is_some_and(|p| p.open == open);
+                    // No secret: change the settings of a network already
+                    // remembered; its credential stays as it is in aura-keys.
+                    if !open && !(known && l.get("secret").is_none()) {
                         let Some(secret) = l.hex("secret") else { return err("no-secret") };
                         let r = self.keys_call(&Line::new("remember").with_hex("ssid", &s).with_hex("secret", &secret));
                         match r {
@@ -875,6 +878,9 @@ mod imp {
                 l = l.with("link", if lost { "lost" } else if i.link { "up" } else { "down" }).with("internet", i.inet.word());
                 if let Some(p) = &i.portal {
                     l = l.with_hex("portal", p.as_bytes());
+                }
+                if i.wifi {
+                    l = l.with("wifi", 1);
                 }
                 if k.is_some() && self.announced == k {
                     l = l.with("egress", 1);

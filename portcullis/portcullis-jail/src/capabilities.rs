@@ -63,6 +63,23 @@ pub fn apply_all(
         // dispensatord's device list (device-assignment.md §6.10).
         apply_socket("device-list.sock", jc, opts);
     }
+    // atrium-netconf's sockets (atrium-net.md §7.1): one per capability, so
+    // the socket an app reaches is what it may do.
+    if caps.network_read == Some(true) {
+        apply_socket("network-read.sock", jc, opts);
+    }
+    if caps.network_details == Some(true) {
+        apply_socket("network-details.sock", jc, opts);
+    }
+    if caps.network_wifi == Some(true) {
+        apply_socket("network-wifi.sock", jc, opts);
+    }
+    if caps.wifi_nearby == Some(true) {
+        apply_socket("wifi-nearby.sock", jc, opts);
+    }
+    if caps.network_configure == Some(true) {
+        apply_socket("network-configure.sock", jc, opts);
+    }
     if caps.navigator_page == Some(true) {
         // navigatord's ticket socket (navigator-ui.md §2.1), nothing else of it.
         apply_socket("navigator-page.sock", jc, opts);

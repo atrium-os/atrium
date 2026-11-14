@@ -194,6 +194,11 @@ pub struct CapabilityDelta {
     pub removable_media: bool,
     pub session_lock:    bool,
     pub device_list:     bool,
+    pub network_read: bool,
+    pub network_details: bool,
+    pub network_wifi: bool,
+    pub wifi_nearby: bool,
+    pub network_configure: bool,
     pub navigator_page:  bool,
     pub removable_files: bool,
     pub file_picker:     bool,
@@ -241,6 +246,11 @@ impl CapabilityDelta {
             && !self.removable_media
             && !self.session_lock
             && !self.device_list
+            && !self.network_read
+            && !self.network_details
+            && !self.network_wifi
+            && !self.wifi_nearby
+            && !self.network_configure
             && !self.navigator_page
             && !self.removable_files
             && !self.file_picker
@@ -284,6 +294,11 @@ impl CapabilityDelta {
         if self.removable_media { out.push("See the USB sticks plugged in and eject them".into()); }
         if self.session_lock    { out.push("Lock the screen".into()); }
         if self.device_list     { out.push("See every device in this machine and its hardware ids".into()); }
+        if self.network_read { out.push("See whether you are online and how (Wi-Fi or cable, metered, signal)".into()); }
+        if self.network_details { out.push("See the network interfaces, their addresses and routes".into()); }
+        if self.network_wifi { out.push("Join and forget Wi-Fi networks, and see the name of the one in use".into()); }
+        if self.wifi_nearby { out.push("See the Wi-Fi networks around you (this can tell where you are)".into()); }
+        if self.network_configure { out.push("Change the machine's network settings".into()); }
         if self.navigator_page  { out.push("Fetch the Navigator's pages by ticket (the Navigator's page view)".into()); }
         if self.removable_files { out.push("Read and change every file on the USB sticks plugged in".into()); }
         if self.file_picker     { out.push("Be the file picker: give other apps the files and folders you pick".into()); }
@@ -378,6 +393,11 @@ pub fn compute_delta(
     bool_cap!(removable_media);
     bool_cap!(session_lock);
     bool_cap!(device_list);
+    bool_cap!(network_read);
+    bool_cap!(network_details);
+    bool_cap!(network_wifi);
+    bool_cap!(wifi_nearby);
+    bool_cap!(network_configure);
     bool_cap!(navigator_page);
     bool_cap!(removable_files);
     bool_cap!(file_picker);
@@ -577,6 +597,11 @@ mod tests {
             removable_media: None,
             session_lock: None,
             device_list: None,
+            network_read: None,
+            network_details: None,
+            network_wifi: None,
+            wifi_nearby: None,
+            network_configure: None,
             navigator_page: None,
             removable_files: None,
             file_picker: None,

@@ -21,6 +21,15 @@ pub const MOON: char = '\u{e330}';
 pub const SPEAKER_SIMPLE_HIGH: char = '\u{e450}';
 pub const SPEAKER_SIMPLE_X: char = '\u{e458}';
 pub const BROADCAST: char = '\u{e0f2}';
+/// Network status (the bar, atrium-net.md §7.1).
+pub const WIFI_HIGH: char = '\u{e4ea}';
+pub const WIFI_MEDIUM: char = '\u{e4ee}';
+pub const WIFI_LOW: char = '\u{e4ec}';
+pub const WIFI_NONE: char = '\u{e4f0}';
+pub const WIFI_SLASH: char = '\u{e4f2}';
+pub const WIFI_X: char = '\u{e4f4}';
+pub const PLUGS_CONNECTED: char = '\u{eb5a}';
+pub const GLOBE_X: char = '\u{e286}';
 pub const BATTERY_CHARGING: char = '\u{e0ba}';
 pub const ARROWS_OUT_SIMPLE: char = '\u{e0a6}';
 pub const TRAY_ARROW_DOWN: char = '\u{e010}';

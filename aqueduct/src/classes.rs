@@ -150,6 +150,12 @@ pub const CLASS_MEDIA:     u8 = 16;
 /// Curia's Devices page. Postcard payloads (the `atrium-devices` crate).
 pub const CLASS_DEVICES:   u8 = 17;
 
+/// Network settings (docs/spec/atrium-net.md §7.1): status, interfaces,
+/// Wi-Fi networks and configuration, served by atrium-netconf for
+/// atrium-net on one socket per capability. Postcard payloads (the
+/// `atrium-netconf` crate). `CLASS_NET` (12) is the Insula connect broker.
+pub const CLASS_NETCONF:   u8 = 18;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -175,6 +181,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_VESTIBULUM => "vestibulum",
         CLASS_MEDIA      => "media",
         CLASS_DEVICES    => "devices",
+        CLASS_NETCONF    => "netconf",
         CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",

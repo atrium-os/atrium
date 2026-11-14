@@ -16,6 +16,9 @@ audio-control = true   # the volume control: levels and mutes, never samples
 media-control = true   # now-playing: the active player's app, state and controls
 removable-media = true # USB sticks served for the session, and eject
 session-lock  = true   # the Lock button: ostiarius locks; only the lock screen unlocks
+network-read  = true   # the network icon: online, how, Wi-Fi bars
+network-wifi  = true   # its menu: the network's name, join a remembered one, disconnect
+wifi-nearby   = true   # its menu: the networks around
 network       = "none"
 
 [supervision]

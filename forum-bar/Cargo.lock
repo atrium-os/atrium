@@ -47,6 +47,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-netconf"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "aura-ipc",
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "aura-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zeroize",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -205,6 +224,7 @@ name = "forum-bar"
 version = "0.1.0"
 dependencies = [
  "atrium-media",
+ "atrium-netconf",
  "forum-ctl",
  "fresco-client",
  "fresco-protocol",
@@ -1275,6 +1295,12 @@ name = "zeno"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd15f8e0dbb966fd9245e7498c7e9e5055d9e5c8b676b95bd67091cd11a1e697"
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zmij"

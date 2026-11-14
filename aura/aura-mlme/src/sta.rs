@@ -292,6 +292,11 @@ impl Station {
                     out.push(Out::Ctl(Line::new("error").with("why", "bad-join")));
                     return out;
                 };
+                // A scan already running (auto-join's, a list, a roam check)
+                // is used for the join: the radio takes one at a time and
+                // refuses a second (EBUSY). Scans use a random address, so
+                // it is the same scan either way.
+                let busy = matches!(self.st, State::Scanning { .. }) || self.roam_scan;
                 if !matches!(self.st, State::Idle) {
                     self.leave(REASON_LEAVING, true, "new-join", &mut out);
                 }
@@ -300,7 +305,11 @@ impl Station {
                 self.last_roam_scan = None;
                 self.roam_candidate = None;
                 self.roam_hold_until = 0;
-                self.start_scan(Some(JoinReq { ssid, want, mac }), &mut out);
+                if busy {
+                    self.st = State::Scanning { join: Some(JoinReq { ssid, want, mac }) };
+                } else {
+                    self.start_scan(Some(JoinReq { ssid, want, mac }), &mut out);
+                }
             }
             "country" => {
                 let cc = l.get("cc").map(|c| c.as_bytes().to_vec()).unwrap_or_default();
@@ -333,6 +342,9 @@ impl Station {
                     };
                     s = s.with("country", String::from_utf8_lossy(&self.country)).with("narrowed", self.narrowed as u8);
                     s = s.with_hex("ssid", &t.bss.ssid).with("bssid", fmt_mac(&t.bss.bssid)).with("freq", t.bss.freq).with("security", t.bss.security.name()).with("using", used).with("pmf", t.pmf as u8).with("mac", fmt_mac(&self.own));
+                    if let (State::Up { .. }, Some(r)) = (&self.st, self.rssi16) {
+                        s = s.with("rssi", r / 16);
+                    }
                 }
                 out.push(Out::Ctl(s));
             }

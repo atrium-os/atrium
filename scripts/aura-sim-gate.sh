@@ -81,9 +81,9 @@ setup() {
     fi
     # atrium-net is the network manager here (Wi-Fi policy, DHCP through its
     # sandboxed atrium-lease); atrium-netctl is the command line.
-    (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease --target "$T" >&2)
+    (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease -p atrium-netconf --target "$T" >&2)
     N="$ROOT/atrium-net/target/$T/release"
-    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$B/"
+    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$N/atrium-netconf" "$B/"
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 
@@ -565,6 +565,80 @@ weak_move() {
     "$V" "$CTL forget aura-other" >/dev/null
 }
 
+# N4 (atrium-net.md §7.1): apps reach atrium-net only through atrium-netconf,
+# one socket per capability; each socket allows its own requests only.
+n4() {
+    "$V" "set -e
+        id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net settings front'
+        pkill -x atrium-netconf 2>/dev/null || true; sleep 1
+        rm -rf /tmp/aura/sockets
+        daemon -f -o /tmp/aura/netconf.log /tmp/aura/atrium-netconf -v --ctl /tmp/aura/net.sock --dir /tmp/aura/sockets --uid 65036 --capsicum
+        sleep 2"
+    APP="/tmp/aura/atrium-netctl --dir /tmp/aura/sockets --app"
+    # app CAP ARGS...: output, and the exit status in $rc.
+    app() { cap=$1; shift; rc=0; out=$("$V" "$APP $cap $*" 2>&1) || rc=$?; }
+    refused() { [ "$rc" = 2 ] && echo "$out" | grep -q '^refused: not-allowed'; }
+
+    u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
+    [ "$u" = _atrium-netconf ] && ok "atrium-netconf runs as _atrium-netconf" || fail "atrium-netconf runs as '$u'"
+    "$V" "procstat -s \$(pgrep -x atrium-netconf) | awk 'NR==2{print \$10}'" | grep -q C && ok "atrium-netconf in capability mode" || fail "atrium-netconf capmode"
+    s=$("$V" 'ls /tmp/aura/sockets | tr "\n" " "')
+    [ "$s" = "network-configure network-details network-read network-wifi wifi-nearby " ] && ok "one socket per capability: $s" || fail "sockets: $s"
+
+    app network-read status
+    [ "$rc" = 0 ] && echo "$out" | grep -q '^status link=none online=no' && ok "network-read before any network: $out" || fail "status: $out"
+    app network-read join aura-test --open; refused && ok "network-read cannot join" || fail "network-read join: rc=$rc $out"
+    app network-read nearby; refused && ok "network-read cannot list nearby networks" || fail "network-read nearby: rc=$rc $out"
+    app network-wifi nearby; refused && ok "network-wifi without wifi-nearby gets no list (location)" || fail "network-wifi nearby: rc=$rc $out"
+    app network-read interfaces; refused && ok "network-read sees no interfaces" || fail "network-read interfaces: rc=$rc $out"
+
+    app wifi-nearby nearby
+    echo "$out" | sed 's/^/    /'
+    if [ "$rc" = 0 ] && echo "$out" | grep -q '^nearby ssid="aura-test" security=wpa2 bars=[0-4]'; then
+        echo "$out" | grep -Eq '([0-9a-f]{2}:){5}' && fail "a BSSID in the nearby list" || ok "wifi-nearby lists aura-test (WPA2, bars), no BSSIDs"
+    else
+        fail "nearby: rc=$rc"
+    fi
+
+    out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "network-wifi joins aura-test with a passphrase" || fail "join: $out"
+    i=0; until "$V" "$CTL status" | grep -q '^iface name=wlan0 .*state=bound'; do i=$((i + 1)); [ $i -lt 40 ] || fail "no lease"; sleep 3; done
+    app network-read status
+    echo "$out" | grep -q '^status link=wifi online=unknown metered=0 bars=[0-4]$' && ok "network-read: on Wi-Fi with bars, no network name ($out)" || fail "read status: $out"
+    app network-wifi status
+    echo "$out" | grep -q 'ssid="aura-test"' && ok "network-wifi: the network's name too" || fail "wifi status: $out"
+    app network-details interfaces
+    echo "$out" | grep -q '^iface name=wlan0 wifi=1 link=up addr=10.77.0.[0-9]*/24 router=10.77.0.1 .*egress=1' && ok "network-details: wlan0's address and router" || fail "interfaces: $out"
+    app network-details routes
+    [ "$out" = "default via 10.77.0.1 on wlan0" ] && ok "network-details: $out" || fail "routes: $out"
+    app network-wifi list
+    echo "$out" | grep -q '^net ssid="aura-test" open=0 auto=1' && ok "network-wifi lists the remembered network" || fail "list: $out"
+
+    app network-wifi country DE; refused && ok "network-wifi cannot set the country" || fail "wifi country: rc=$rc $out"
+    app network-configure country DE
+    [ "$rc" = 0 ] && ok "network-configure sets the country" || fail "configure country: rc=$rc $out"
+    app network-configure static
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^refused: unsupported' && ok "static addresses: unsupported for now" || fail "static: rc=$rc $out"
+
+    # Subscribe: the bar hears leaving at once.
+    "$V" "($APP network-read watch 40 > /tmp/aura/watch-n4.log 2>&1 &) ; sleep 4"
+    app network-wifi leave
+    [ "$out" = left ] || fail "leave: $out"
+    sleep 6
+    w=$("$V" 'cat /tmp/aura/watch-n4.log')
+    echo "$w" | sed 's/^/    /'
+    echo "$w" | head -n 1 | grep -q 'link=wifi' && echo "$w" | grep -q 'link=none' && ok "network-read subscriber heard Wi-Fi, then none" || fail "watch: $w"
+    echo "$w" | grep -q ssid && fail "a network name reached a network-read subscriber" || ok "no network name in network-read events"
+
+    out=$("$V" "echo 'not the passphrase' | $APP network-wifi join aura-test" 2>&1) || true
+    echo "$out" | grep -q '^refused: failed' && ok "wrong passphrase: join refused ($out)" || fail "wrong passphrase: $out"
+    out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "right passphrase again: joined" || fail "rejoin: $out"
+    app network-wifi leave
+    app network-wifi forget aura-test
+    app network-wifi list
+    [ -z "$out" ] && ok "network-wifi forgets it" || fail "after forget: $out"
+    "$V" 'pkill -x atrium-netconf' || true
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -594,6 +668,11 @@ move)
     weak_move
     teardown
     echo "weak-signal move: $pass checks passed" ;;
+n4)
+    setup hostapd-wpa2.conf
+    n4
+    teardown
+    echo "atrium-net N4 gate: $pass checks passed" ;;
 n3)
     setup hostapd-wpa2.conf
     n3

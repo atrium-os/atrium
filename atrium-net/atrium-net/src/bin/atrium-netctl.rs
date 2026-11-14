@@ -11,6 +11,17 @@
 //!   atrium-netctl leave | wifi-status | country CC | watch SECS
 //!
 //! Global: --sock PATH (/atrium/sockets/atrium-net/ctl.sock).
+//!
+//! As an app would (CLASS_NETCONF through atrium-netconf, §7.1), on the
+//! socket of one capability (network-read, network-details, network-wifi,
+//! wifi-nearby, network-configure) under --dir (/atrium/sockets):
+//!
+//!   atrium-netctl --app CAP [--dir DIR] status | interfaces | routes | list
+//!       | join SSID [--open] (passphrase on stdin unless --open; --known: none)
+//!       | leave | forget SSID | nearby | country CC | static | watch SECS
+//!
+//! A refusal prints `refused: <status> <why>` and exits 2 when the
+//! capability does not cover the request, 1 otherwise.
 
 use aura_ipc::{Got, Line, Reader};
 use std::io::{BufRead, Write};
@@ -112,12 +123,18 @@ fn ok_or_exit(v: &[Line]) {
 fn main() {
     let mut sock = "/atrium/sockets/atrium-net/ctl.sock".to_string();
     let mut args: Vec<String> = Vec::new();
+    let (mut app, mut dir) = (None, "/atrium/sockets".to_string());
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sock" => sock = it.next().unwrap_or_default(),
+            "--app" => app = Some(it.next().unwrap_or_default()),
+            "--dir" => dir = it.next().unwrap_or_default(),
             _ => args.push(a),
         }
+    }
+    if let Some(cap) = app {
+        as_app(&cap, &dir, &args);
     }
     let cmd = args.first().cloned().unwrap_or_default();
     let ssid = || args.get(1).map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| die("SSID missing"));
@@ -254,5 +271,98 @@ fn main() {
             eprintln!("usage: atrium-netctl [--sock PATH] status|scan|remember SSID [..]|forget SSID|list|join SSID [..]|leave|wifi-status|country CC|watch S");
             exit(2);
         }
+    }
+}
+
+/// The CLASS_NETCONF client, as an app with one capability.
+fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
+    use atrium_netconf::client::Client;
+    use atrium_netconf::{status as st, Fail, Grant, Join};
+    let g = Grant::ALL.into_iter().find(|g| g.name() == cap).unwrap_or_else(|| die(&format!("no capability {cap}")));
+    let path = Client::path(std::path::Path::new(dir), g);
+    let mut c = Client::connect(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    let ssid = || args.get(1).map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| die("SSID missing"));
+    let name = |s: &[u8]| String::from_utf8_lossy(s).into_owned();
+    let refused = |f: Fail| -> ! {
+        let word = match f.0 {
+            st::NOT_ALLOWED => "not-allowed",
+            st::MALFORMED => "malformed",
+            st::UNSUPPORTED => "unsupported",
+            st::FAILED => "failed",
+            st::NO_WIFI => "no-wifi",
+            _ => "unavailable",
+        };
+        println!("refused: {word} {}", f.1);
+        exit(if f.0 == st::NOT_ALLOWED { 2 } else { 1 })
+    };
+    let show = |s: &atrium_netconf::Status| {
+        let mut o = format!("status link={:?} online={:?} metered={}", s.link, s.online, s.metered as u8).to_lowercase();
+        if let Some(b) = s.bars {
+            o.push_str(&format!(" bars={b}"));
+        }
+        if let Some(n) = &s.ssid {
+            o.push_str(&format!(" ssid=\"{}\"", name(n)));
+        }
+        if let Some(p) = &s.portal {
+            o.push_str(&format!(" portal={p}"));
+        }
+        o
+    };
+    let r: Result<(), Fail> = match args.first().map(String::as_str).unwrap_or("") {
+        "status" => c.status().map(|s| println!("{}", show(&s))),
+        "interfaces" => c.interfaces().map(|v| {
+            for i in v {
+                println!("iface name={} wifi={} link={} addr={} router={} online={:?} egress={}", i.name, i.wifi as u8, i.link, i.addr.unwrap_or_default(), i.router.unwrap_or_default(), i.online, i.egress as u8);
+            }
+        }),
+        "routes" => c.routes().map(|r| match r.default4 {
+            Some((i, gw)) => println!("default via {gw} on {i}"),
+            None => println!("no default route"),
+        }),
+        "list" => c.profiles().map(|v| {
+            for p in v {
+                println!("net ssid=\"{}\" open={} auto={} prio={} metered={} mac={} wpa3_only={}", name(&p.ssid), p.open as u8, p.auto as u8, p.prio, p.metered as u8, p.mac, p.wpa3_only as u8);
+            }
+        }),
+        "join" => {
+            let open = args.iter().any(|a| a == "--open");
+            let known = args.iter().any(|a| a == "--known");
+            let passphrase = (!open && !known).then(|| {
+                let mut l = String::new();
+                std::io::stdin().lock().read_line(&mut l).ok();
+                l.trim_end_matches(['\r', '\n']).to_string()
+            });
+            c.join(&Join { ssid: ssid(), passphrase, open }).map(|_| println!("joined"))
+        }
+        "leave" => c.leave().map(|_| println!("left")),
+        "forget" => c.forget(&ssid()).map(|_| println!("forgotten")),
+        "nearby" => c.nearby().map(|v| {
+            for n in v {
+                println!("nearby ssid=\"{}\" security={} bars={} known={}", name(&n.ssid), n.security, n.bars, n.known as u8);
+            }
+        }),
+        "country" => c.set_country(args.get(1).map(String::as_str).unwrap_or("")).map(|_| println!("ok")),
+        "static" => c.set_static().map(|_| println!("ok")),
+        "watch" => {
+            let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let mut ch = c.subscribe().unwrap_or_else(|f| refused(f));
+            let end = Instant::now() + Duration::from_secs(secs);
+            while let Some(left) = end.checked_duration_since(Instant::now()) {
+                match ch.next_within(left) {
+                    Ok(Some(s)) => {
+                        println!("{}", show(&s));
+                        std::io::stdout().flush().ok();
+                    }
+                    Ok(None) => break,
+                    Err(e) => die(&format!("watch: {e}")),
+                }
+            }
+            Ok(())
+        }
+        _ => die("--app CAP status|interfaces|routes|list|join SSID [--open|--known]|leave|forget SSID|nearby|country CC|static|watch SECS"),
+    };
+    match r {
+        Ok(()) => exit(0),
+        Err(f) => refused(f),
     }
 }

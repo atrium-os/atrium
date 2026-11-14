@@ -5,6 +5,7 @@ members = [
     "net-proto",
     "atrium-lease",
     "atrium-net",
+    "netconf",
 ]
 
 [workspace.package]

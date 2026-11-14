@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod network;
 mod status_panel;
 
 use forum_ctl::{Intent, PadInfo, Reply, StatusContent, StatusEntry, StatusItem};
@@ -113,6 +114,10 @@ struct BarView {
     want_eject: Mutable<Option<String>>,
     /// The Lock button was pressed: the main loop asks ostiarius.
     want_lock: Mutable<bool>,
+    /// The network icon (atrium-net.md §7.1): status, its menu, and a pick.
+    net: Mutable<network::NetShown>,
+    net_open: Mutable<MenuState>,
+    want_net: Mutable<Option<network::NetAction>>,
 }
 
 /// An app's own panel to open (forum-status-items.md §4): under the icon
@@ -540,7 +545,23 @@ impl View for BarView {
             .attached();
             ctx.place(button);
         }
-        icon_glyph(ctx, phosphor::BROADCAST, None);
+        // The network (atrium-net.md §7.1): how the machine is online; the
+        // menu names the network, disconnects, and joins one remembered or
+        // open. Dimmed while atrium-netconf is away.
+        {
+            let n = self.net.get_cloned();
+            let (items, acts) = network::menu(&n);
+            let want = self.want_net.clone();
+            let colour = if n.status.is_some() { t.text_secondary() } else { t.text_disabled() };
+            let button = MenuButton::new("Network", self.net_open.clone(), items, move |i| {
+                if let Some(Some(a)) = acts.get(i) {
+                    want.set(Some(a.clone()));
+                }
+            })
+            .icon(network::glyph(n.status.as_ref()), 15.0, Some(colour))
+            .attached();
+            ctx.place(button);
+        }
         // The system volume (lyra-v1.md §7): an attached drop-down from the
         // speaker, drawn by the bar (fresco-popups.md §2): mute, the master
         // level, and the output in use. Dimmed while choragusd is away.
@@ -996,6 +1017,11 @@ fn main() -> std::io::Result<()> {
     let want_eject = Mutable::with_dirty(None, dirty.clone());
     let want_lock = Mutable::with_dirty(false, dirty.clone());
     let (stick_events, stick_tx) = follow_sticks();
+    let net = Mutable::with_dirty(network::NetShown::default(), dirty.clone());
+    let net_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let want_net = Mutable::with_dirty(None, dirty.clone());
+    let (net_events, net_tx) = network::follow();
+    let mut net_was_open = false;
     // The grants handed to apps for their own panels: token, app.
     let mut drawn: Vec<([u8; 16], String)> = Vec::new();
     let dirty_flag = dirty.clone();
@@ -1027,6 +1053,9 @@ fn main() -> std::io::Result<()> {
         stick_note: stick_note.clone(),
         want_eject: want_eject.clone(),
         want_lock: want_lock.clone(),
+        net: net.clone(),
+        net_open: net_open.clone(),
+        want_net: want_net.clone(),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
 
@@ -1190,6 +1219,34 @@ fn main() -> std::io::Result<()> {
                 sticks.set(l);
             }
         }
+        // The network: status events, scans when the menu opens, picks.
+        {
+            let mut n = net.get_cloned();
+            while let Ok(m) = net_events.try_recv() {
+                match m {
+                    network::NetMsg::Status(s) => n.status = s,
+                    network::NetMsg::Nearby(r) => {
+                        n.scanning = false;
+                        n.nearby = r.unwrap_or_default();
+                    }
+                    network::NetMsg::Done(r) => n.note = r.err().map(|e| format!("Could not join: {e}")),
+                }
+            }
+            let open = net_open.get().open;
+            if open && !net_was_open {
+                n.scanning = true;
+                n.note = None;
+                network::scan(net_tx.clone());
+            }
+            net_was_open = open;
+            if let Some(a) = want_net.get_cloned() {
+                want_net.set(None);
+                network::act(net_tx.clone(), a);
+            }
+            if n != net.get_cloned() {
+                net.set(n);
+            }
+        }
         // The Lock button: ostiarius's lock-only socket, on a thread.
         if want_lock.get() {
             want_lock.set(false);
@@ -1271,6 +1328,9 @@ mod tests {
             stick_note: Mutable::new(None),
             want_eject: Mutable::new(None),
             want_lock: Mutable::new(false),
+            net: Mutable::new(network::NetShown::default()),
+            net_open: Mutable::new(MenuState::default()),
+            want_net: Mutable::new(None),
         }
     }
 
