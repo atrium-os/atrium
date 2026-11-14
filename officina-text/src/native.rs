@@ -24,7 +24,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Align, AttrId, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -170,7 +170,7 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
 /// Paragraph properties: a mask of the fields set, then their values.
 pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     let mut m = 0u16;
-    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some(), p.list.is_some()].into_iter().enumerate() {
+    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some(), p.list.is_some(), p.cell.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -217,6 +217,12 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
             }
         }
     }
+    if let Some(c) = p.cell {
+        w.var(c.table as u64);
+        w.var(c.row as u64);
+        w.var(c.col as u64);
+        w.var(c.width as u64);
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -224,7 +230,7 @@ const MAX_TWIPS: i64 = 31_680;
 
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
-    if m >> 13 != 0 {
+    if m >> 14 != 0 {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -288,6 +294,16 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
             }
             _ => return Err(WireError::Invalid("list kind")),
         });
+    }
+    if on(13) {
+        let table = r.len("table", u32::MAX as u64)? as u32;
+        let row = r.len("row", u32::MAX as u64)? as u32;
+        let col = r.len("column", u16::MAX as u64)? as u16;
+        let width = r.var()?;
+        if !(1..=MAX_OBJECT_TWIPS as u64).contains(&width) {
+            return Err(WireError::Invalid("cell width"));
+        }
+        p.cell = Some(CellRef { table, row, col, width: width as u32 });
     }
     Ok(p)
 }
@@ -798,6 +814,7 @@ mod tests {
             d.push_para(&format!("Paragraph {i} with bold and a link; naïve ✓"), 0, vec![(0, 0), (14, bold), (18, 0), (27, link), (31, 0)]);
         }
         d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
+        d.blocks.update(4, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 2, row: 7, col: 1, width: 2000 }));
         d.page.margin_start = 1000;
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });

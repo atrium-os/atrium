@@ -13,7 +13,7 @@ use std::time::Duration;
 use officina_core::history::History;
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Align, AttrId, CharAttrs, CharFormat, ImageData, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, ImageData, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
@@ -176,7 +176,8 @@ impl Editor {
 
     pub fn layout(&mut self, block: usize) -> Rc<ParaLayout> {
         let p = self.doc.para(block).expect("block in range");
-        self.cache.get(&self.doc, p, self.pages.width(), &*self.fonts)
+        let w = self.doc.block_box(block, self.pages.width()).1;
+        self.cache.get(&self.doc, p, w, &*self.fonts)
     }
 
     fn text(&self, block: usize) -> &str {
@@ -306,9 +307,28 @@ impl Editor {
     }
 
     /// Ops that delete the selection, and where the caret ends up.
+    /// A selection across table cells clears each cell's part but never joins
+    /// cells (or a cell and the text around the table).
     fn delete_selection_ops(&self) -> (Vec<TextOp>, Pos) {
         let (a, b) = self.selection();
-        (self.doc.delete_ops(a.block, a.at, b.block, b.at), a)
+        let mut segs: Vec<(usize, usize)> = vec![(a.block, a.block)];
+        for k in a.block + 1..=b.block {
+            if self.doc.same_cell(k - 1, k) {
+                segs.last_mut().expect("one").1 = k;
+            } else {
+                segs.push((k, k));
+            }
+        }
+        let mut ops = Vec::new();
+        // Last first, so a join in one leaves the blocks before it in place.
+        for &(s0, s1) in segs.iter().rev() {
+            let from = if s0 == a.block { a.at } else { 0 };
+            let to = if s1 == b.block { b.at } else { self.len(s1) };
+            if (s0, from) != (s1, to) {
+                ops.extend(self.doc.delete_ops(s0, from, s1, to));
+            }
+        }
+        (ops, a)
     }
 
     /// The attributes typed text gets at `p`: those before it, with any
@@ -430,7 +450,8 @@ impl Editor {
             return self.list_level(-((MAX_LIST_LEVEL as i32) + 1));
         }
         let to = if word { self.word_left(c) } else { self.grapheme_left(c) };
-        if to == c {
+        if to == c || (to.block != c.block && !self.doc.same_cell(to.block, c.block)) {
+            // Cells don't join each other or the text around the table.
             return false;
         }
         self.anchor = to;
@@ -449,7 +470,7 @@ impl Editor {
         }
         let c = self.caret;
         let to = if word { self.word_right(c) } else { self.grapheme_right(c) };
-        if to == c {
+        if to == c || (to.block != c.block && !self.doc.same_cell(to.block, c.block)) {
             return false;
         }
         self.anchor = to;
@@ -684,6 +705,232 @@ impl Editor {
         self.set_page("Page Numbers", page, header, footer);
     }
 
+    // ---- tables ----
+
+    /// The blocks of the table holding block `b`.
+    pub fn table_range(&self, b: usize) -> std::ops::Range<usize> {
+        let Some(t) = self.doc.cell(b).map(|c| c.table) else { return b..b };
+        let same = |k: usize| self.doc.cell(k).is_some_and(|c| c.table == t);
+        let (mut a, mut e) = (b, b + 1);
+        while a > 0 && same(a - 1) {
+            a -= 1;
+        }
+        while same(e) {
+            e += 1;
+        }
+        a..e
+    }
+
+    /// The rows of the table holding block `b`, in order.
+    fn table_rows(&self, b: usize) -> Vec<std::ops::Range<usize>> {
+        let t = self.table_range(b);
+        let mut rows = Vec::new();
+        let mut k = t.start;
+        while k < t.end {
+            let r = self.doc.row_range(k);
+            let r = k..r.end.max(k + 1);
+            k = r.end;
+            rows.push(r);
+        }
+        rows
+    }
+
+    /// The cells of the row holding `b`, and which of them holds `b`.
+    fn cells_of(&self, b: usize) -> (Vec<(std::ops::Range<usize>, i64, i64)>, usize) {
+        let cells = self.doc.row_cells(self.doc.row_range(b), self.pages.width());
+        let k = cells.iter().position(|c| c.0.contains(&b)).unwrap_or(0);
+        (cells, k)
+    }
+
+    fn empty_cell(&mut self, like: usize, row: u32, col: u16, width: u32) -> Block {
+        let (style, mut props) = self.doc.para(like).map(|p| (p.style, p.props.clone())).unwrap_or_default();
+        let table = props.cell.map_or(0, |c| c.table);
+        props.cell = Some(CellRef { table, row, col, width: width.max(1) });
+        props.list = None;
+        let id = self.doc.new_id();
+        Block::Para(Para { id, text: String::new(), runs: vec![(0, 0)], style, props })
+    }
+
+    /// Puts a table of `rows` × `cols` empty cells after the caret's paragraph,
+    /// as wide as the column; the caret goes to its first cell.
+    pub fn insert_table(&mut self, rows: usize, cols: usize) -> bool {
+        let b = self.caret.block;
+        let (rows, cols) = (rows.clamp(1, 1000), cols.clamp(1, MAX_CELLS));
+        if self.doc.cell(b).is_some() {
+            return false;
+        }
+        let table = self.doc.blocks.iter().filter_map(|x| x.as_para().and_then(|p| p.props.cell)).map(|c| c.table).max().map_or(1, |t| t.wrapping_add(1).max(1));
+        let width = ((self.pages.width() * 20 / officina_text::LU) as u32 / cols as u32).clamp(1, MAX_OBJECT_TWIPS);
+        let mut blocks = Vec::with_capacity(rows * cols + 1);
+        for r in 0..rows {
+            for c in 0..cols {
+                let id = self.doc.new_id();
+                let props = ParaProps { cell: Some(CellRef { table, row: r as u32, col: c as u16, width }), space_after: Some(0), ..Default::default() };
+                blocks.push(Block::Para(Para { id, text: String::new(), runs: vec![(0, 0)], style: 0, props }));
+            }
+        }
+        if b + 1 >= self.blocks() || self.doc.cell(b + 1).is_some() {
+            // Somewhere to type after the table.
+            let id = self.doc.new_id();
+            blocks.push(Block::Para(Para::new(id, "", 0)));
+        }
+        self.apply("Insert Table", vec![TextOp::Insert { at: (b + 1) as u32, blocks }], Kind::Other);
+        self.set_caret(Pos::new(b + 1, 0), false);
+        true
+    }
+
+    /// Adds a row of empty cells below the caret's row (cells as wide as its).
+    pub fn insert_row_below(&mut self) -> bool {
+        let b = self.caret.block;
+        let Some(c) = self.doc.cell(b) else { return false };
+        let row = self.doc.row_range(b);
+        let fresh = self.table_rows(b).iter().filter_map(|r| self.doc.cell(r.start)).map(|x| x.row).max().unwrap_or(0).wrapping_add(1);
+        let (cells, _) = self.cells_of(b);
+        let mut blocks = Vec::new();
+        for (r, _, _) in &cells {
+            let cc = self.doc.cell(r.start).unwrap_or(c);
+            blocks.push(self.empty_cell(r.start, fresh, cc.col, cc.width));
+        }
+        self.apply("Insert Row", vec![TextOp::Insert { at: row.end as u32, blocks }], Kind::Other);
+        self.set_caret(Pos::new(row.end, 0), false);
+        true
+    }
+
+    /// Adds a column right of the caret's: in every row the cell at the
+    /// caret's place splits its width with a new empty cell after it.
+    pub fn insert_column_right(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let (_, k) = self.cells_of(b);
+        let mut ops = Vec::new();
+        let mut caret = None;
+        let mut shift = 0;
+        for row in self.table_rows(b).into_iter().rev() {
+            let cells = self.doc.row_cells(row.clone(), self.pages.width());
+            if cells.len() >= MAX_CELLS {
+                continue;
+            }
+            let (cell, _, _) = cells[k.min(cells.len() - 1)].clone();
+            let Some(cc) = self.doc.cell(cell.start) else { continue };
+            let col = (row.clone()).filter_map(|x| self.doc.cell(x)).map(|x| x.col).max().unwrap_or(0).wrapping_add(1);
+            let half = (cc.width / 2).max(1);
+            for x in cell.clone() {
+                if let Some(p) = self.doc.para(x) {
+                    let mut props = p.props.clone();
+                    props.cell = props.cell.map(|c| CellRef { width: half, ..c });
+                    ops.push(TextOp::SetPara { block: x as u32, style: p.style, props });
+                }
+            }
+            let blk = self.empty_cell(cell.start, cc.row, col, (cc.width - half).max(1));
+            ops.push(TextOp::Insert { at: cell.end as u32, blocks: vec![blk] });
+            if row.contains(&b) {
+                caret = Some(cell.end);
+            } else if caret.is_some() {
+                // A row above: its new cell comes before the caret's.
+                shift += 1;
+            }
+        }
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply("Insert Column", ops, Kind::Other);
+        if let Some(c) = caret {
+            self.set_caret(Pos::new(c + shift, 0), false);
+        }
+        true
+    }
+
+    /// Removes the caret's row (the table goes when it was the last).
+    pub fn delete_row(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let row = self.doc.row_range(b);
+        let mut ops = vec![TextOp::Remove { at: row.start as u32, n: row.len() as u32 }];
+        if row.len() == self.blocks() {
+            let id = self.doc.new_id();
+            ops.push(TextOp::Insert { at: 0, blocks: vec![Block::Para(Para::new(id, "", 0))] });
+        }
+        self.apply("Delete Row", ops, Kind::Other);
+        let at = row.start.min(self.blocks() - 1);
+        self.set_caret(Pos::new(at, 0), false);
+        true
+    }
+
+    /// Removes the cell at the caret's place from every row; its width goes to
+    /// the cell before it (or after, for the first).
+    pub fn delete_column(&mut self) -> bool {
+        let b = self.caret.block;
+        if self.doc.cell(b).is_none() {
+            return false;
+        }
+        let (_, k) = self.cells_of(b);
+        let start = self.table_range(b).start;
+        let mut ops = Vec::new();
+        let mut removed = 0;
+        for row in self.table_rows(b).into_iter().rev() {
+            let cells = self.doc.row_cells(row.clone(), self.pages.width());
+            if cells.len() == 1 {
+                ops.push(TextOp::Remove { at: row.start as u32, n: row.len() as u32 });
+                removed += row.len();
+                continue;
+            }
+            let i = k.min(cells.len() - 1);
+            let gone = cells[i].0.clone();
+            let w = self.doc.cell(gone.start).map_or(0, |c| c.width);
+            let heir = cells[if i > 0 { i - 1 } else { 1 }].0.clone();
+            for x in heir {
+                if let Some(p) = self.doc.para(x) {
+                    let mut props = p.props.clone();
+                    props.cell = props.cell.map(|c| CellRef { width: (c.width + w).min(MAX_OBJECT_TWIPS), ..c });
+                    ops.push(TextOp::SetPara { block: x as u32, style: p.style, props });
+                }
+            }
+            ops.push(TextOp::Remove { at: gone.start as u32, n: gone.len() as u32 });
+            removed += gone.len();
+        }
+        if removed == self.blocks() {
+            let id = self.doc.new_id();
+            ops.push(TextOp::Insert { at: 0, blocks: vec![Block::Para(Para::new(id, "", 0))] });
+        }
+        self.apply("Delete Column", ops, Kind::Other);
+        let at = start.min(self.blocks() - 1);
+        self.set_caret(Pos::new(at, 0), false);
+        true
+    }
+
+    /// Tab in a table: the next cell (Shift: the one before); from the last
+    /// cell, a new row.
+    pub fn next_cell(&mut self, forward: bool) {
+        let b = self.caret.block;
+        let mut k = b;
+        if forward {
+            while k + 1 < self.blocks() && self.doc.same_cell(k, k + 1) {
+                k += 1;
+            }
+            let t = self.table_range(b);
+            if k + 1 < t.end {
+                self.set_caret(Pos::new(k + 1, 0), false);
+            } else {
+                self.insert_row_below();
+            }
+        } else {
+            while k > 0 && self.doc.same_cell(k - 1, k) {
+                k -= 1;
+            }
+            if k > self.table_range(b).start {
+                let mut s = k - 1;
+                while s > 0 && self.doc.same_cell(s - 1, s) {
+                    s -= 1;
+                }
+                self.set_caret(Pos::new(s, 0), false);
+            }
+        }
+    }
+
     pub fn align(&mut self, a: Align) {
         self.set_paragraphs("Align", None, move |p| p.align = Some(a));
     }
@@ -852,23 +1099,7 @@ impl Editor {
                 let mut left = if matches!(m, Motion::PageUp | Motion::PageDown) { page_h.max(1) } else { 1 };
                 let (mut blk, mut ln) = (c.block, li);
                 loop {
-                    let next = if down {
-                        let n = self.layout(blk).lines.len();
-                        if ln + 1 < n {
-                            Some((blk, ln + 1))
-                        } else if blk + 1 < self.blocks() {
-                            Some((blk + 1, 0))
-                        } else {
-                            None
-                        }
-                    } else if ln > 0 {
-                        Some((blk, ln - 1))
-                    } else if blk > 0 {
-                        let n = self.layout(blk - 1).lines.len();
-                        Some((blk - 1, n - 1))
-                    } else {
-                        None
-                    };
+                    let next = self.step_line(blk, ln, down);
                     let Some((nb, nl)) = next else { break };
                     blk = nb;
                     ln = nl;
@@ -900,6 +1131,48 @@ impl Editor {
         self.set_caret(to, extend);
     }
 
+    /// The line above or below line `ln` of `blk`, moving through a table by
+    /// cells: down from a cell's last line goes to the cell below.
+    fn step_line(&mut self, blk: usize, ln: usize, down: bool) -> Option<(usize, usize)> {
+        let lines = |e: &mut Editor, b: usize| e.layout(b).lines.len();
+        let last_line = |e: &mut Editor, b: usize| (b, lines(e, b).saturating_sub(1));
+        let n = self.blocks();
+        if down && ln + 1 < lines(self, blk) {
+            return Some((blk, ln + 1));
+        }
+        if !down && ln > 0 {
+            return Some((blk, ln - 1));
+        }
+        let near = if down { blk + 1 } else { blk.wrapping_sub(1) };
+        if near < n && self.doc.cell(blk).is_some() && self.doc.same_cell(blk, near) {
+            return Some(if down { (near, 0) } else { last_line(self, near) });
+        }
+        let Some(c) = self.doc.cell(blk) else {
+            if near >= n {
+                return None;
+            }
+            if !down && self.doc.cell(near).is_some() {
+                // Into a table from below: its last row's first cell.
+                let cells = self.doc.row_cells(self.doc.row_range(near), self.pages.width());
+                return Some(last_line(self, cells[0].0.end - 1));
+            }
+            return Some(if down { (near, 0) } else { last_line(self, near) });
+        };
+        let row = self.doc.row_range(blk);
+        let cells = self.doc.row_cells(row.clone(), self.pages.width());
+        let k = cells.iter().position(|x| x.0.contains(&blk)).unwrap_or(0);
+        let beyond = if down { row.end } else { row.start.wrapping_sub(1) };
+        if beyond >= n {
+            return None;
+        }
+        if self.doc.cell(beyond).is_some_and(|d| d.table == c.table) {
+            let other = self.doc.row_cells(self.doc.row_range(beyond), self.pages.width());
+            let cell = other[k.min(other.len() - 1)].0.clone();
+            return Some(if down { (cell.start, 0) } else { last_line(self, cell.end - 1) });
+        }
+        Some(if down { (beyond, 0) } else { last_line(self, beyond) })
+    }
+
     // ---- geometry ----
 
     /// Paginates (synchronously) until the page holding `p` is laid out.
@@ -920,13 +1193,15 @@ impl Editor {
         self.ensure_paginated(p, li);
         let page = self.pages.page_of(p.block, li);
         let mut y = 0;
+        let mut x0 = self.doc.block_box(p.block, self.pages.width()).0;
         if let Some(pg) = self.pages.pages().get(page) {
             if let Some(s) = pg.slices.iter().find(|s| s.block == p.block && s.lines.contains(&li)) {
                 y = s.y + l.lines[s.lines.start..li].iter().map(|x| x.height).sum::<i64>();
+                x0 = s.x;
             }
         }
         let line = &l.lines[li];
-        Spot { page, x: self.x_in_line(p.block, &l, line, p.at), y, h: line.height }
+        Spot { page, x: x0 + self.x_in_line(p.block, &l, line, p.at), y, h: line.height }
     }
 
     /// The position nearest (x, y) on page `page` (layout units from its
@@ -939,13 +1214,18 @@ impl Editor {
         // The slice and line at y (above the first: its first line; below
         // the last: the last line).
         let mut target = None;
+        let pad = officina_text::twips(officina_text::model::CELL_PAD as i64);
         'outer: for s in &pg.slices {
+            if self.doc.cell(s.block).is_some() && (x < s.x - pad || x >= s.x + s.w + pad) {
+                // Another column of the table.
+                continue;
+            }
             let l = self.layout(s.block);
             let mut yy = s.y;
             for li in s.lines.clone() {
                 let h = l.lines[li].height;
                 if target.is_none() || y >= yy {
-                    target = Some((s.block, li));
+                    target = Some((s.block, li, s.x));
                 }
                 if y < yy + h {
                     break 'outer;
@@ -953,8 +1233,8 @@ impl Editor {
                 yy += h;
             }
         }
-        let Some((b, li)) = target else { return Pos::default() };
-        self.at_x(b, li, x)
+        let Some((b, li, sx)) = target else { return Pos::default() };
+        self.at_x(b, li, x - sx)
     }
 
     // ---- keys ----
@@ -1029,6 +1309,10 @@ impl Editor {
             Key::Char => edited(self.insert(chars)),
             // Tab in a list item (at its start, or over several paragraphs)
             // changes its level; elsewhere it types a tab.
+            Key::Tab if !cmd && self.doc.cell(self.caret.block).is_some() => {
+                self.next_cell(!m.shift);
+                Outcome::Moved
+            }
             Key::Tab if !cmd && (self.caret.at == 0 || self.selection().0.block != self.selection().1.block) && self.list_of(self.caret.block).is_some() => edited(self.list_level(if m.shift { -1 } else { 1 })),
             Key::Tab if !cmd && m.shift => Outcome::Ignored,
             Key::Tab if !cmd => edited(self.insert("\t")),
@@ -1279,6 +1563,81 @@ pub(crate) mod tests {
         e.undo();
         e.undo();
         assert_eq!(texts(&e), ["ab"]);
+    }
+
+    #[test]
+    fn tables_by_commands_and_keys() {
+        let mut e = ed(&["before", "after"]);
+        e.set_caret(Pos::new(0, 6), false);
+        assert!(e.insert_table(2, 3));
+        assert_eq!(e.blocks(), 2 + 6);
+        assert_eq!(e.caret, Pos::new(1, 0));
+        // Tab walks the cells; from the last one it adds a row.
+        typ(&mut e, "a");
+        e.key(Key::Tab, NO, "", 0);
+        assert_eq!(e.caret.block, 2);
+        typ(&mut e, "b");
+        for _ in 0..4 {
+            e.key(Key::Tab, NO, "", 0);
+        }
+        assert_eq!(e.caret.block, 6);
+        e.key(Key::Tab, NO, "", 0);
+        assert_eq!(e.blocks(), 2 + 9, "a third row");
+        assert_eq!(e.caret.block, 7);
+        e.key(Key::Tab, SHIFT, "", 0);
+        assert_eq!(e.caret.block, 6);
+        // Backspace at a cell's start and Delete at its end don't join cells.
+        e.set_caret(Pos::new(2, 0), false);
+        assert_eq!(e.key(Key::Backspace, NO, "", 0), Outcome::Ignored);
+        e.set_caret(Pos::new(1, 1), false);
+        assert_eq!(e.key(Key::Delete, NO, "", 0), Outcome::Ignored);
+        // Enter makes a second paragraph in the same cell; the row stays one row.
+        e.key(Key::Enter, NO, "", 0);
+        assert!(e.doc.same_cell(1, 2));
+        assert_eq!(e.doc.row_cells(e.doc.row_range(1), e.pages.width()).len(), 3);
+        // A selection across cells clears their text, keeping every cell
+        // (paragraphs inside one cell join as usual).
+        let before = e.blocks();
+        e.set_caret(Pos::new(1, 0), false);
+        e.set_caret(Pos::new(3, 1), true);
+        e.key(Key::Backspace, NO, "", 0);
+        assert_eq!(e.blocks(), before - 1);
+        assert_eq!(texts(&e)[1..3].concat(), "");
+        assert_eq!(e.doc.row_cells(e.doc.row_range(1), e.pages.width()).len(), 3);
+        // Columns and rows.
+        e.set_caret(Pos::new(1, 0), false);
+        let n = e.blocks();
+        assert!(e.insert_column_right());
+        assert_eq!(e.blocks(), n + 3);
+        assert_eq!(e.doc.row_cells(e.doc.row_range(1), e.pages.width()).len(), 4);
+        let t = e.table_range(1);
+        let mut k = t.start;
+        while k < t.end {
+            let r = e.doc.row_range(k);
+            assert_eq!(e.doc.row_cells(r.clone(), e.pages.width()).len(), 4, "every row has four cells");
+            k = r.end;
+        }
+        assert!(e.delete_column());
+        assert_eq!(e.blocks(), n);
+        assert!(e.delete_row());
+        assert!(e.insert_row_below());
+        // Undo takes it all back.
+        while e.undo() {}
+        assert_eq!(texts(&e), ["before", "after"]);
+        // Down from a cell goes to the cell below.
+        e.set_caret(Pos::new(0, 6), false);
+        e.insert_table(3, 2);
+        e.set_caret(Pos::new(2, 0), false);
+        e.key(Key::Down, NO, "", 0);
+        assert_eq!(e.caret.block, 4);
+        e.key(Key::Up, NO, "", 0);
+        assert_eq!(e.caret.block, 2);
+        // A click in the second column lands in it.
+        while !e.paginate(Duration::from_secs(1)) {}
+        let s = e.spot(Pos::new(2, 0));
+        assert_eq!(e.hit(s.page, s.x + 10, s.y + 10).block, 2);
+        let s1 = e.spot(Pos::new(1, 0));
+        assert!(s.x > s1.x && s.y == s1.y, "side by side");
     }
 
     #[test]

@@ -164,9 +164,18 @@ impl RichTextView {
                     let width = g.page_w - 2.0 * g.margin_x;
                     draw_text(ctx, faces, ed.fonts(), &text, &fmt, hf.align, px as f64 + g.margin_x, width, baseline, g.k);
                 }
+                // Table cell borders.
+                let rule = Color::rgba(0.55, 0.57, 0.6, 1.0);
+                for c in &page.cells {
+                    let (x, y, w, h) = (cx + c.x as f64 * g.k, cy + c.y as f64 * g.k, c.w as f64 * g.k, c.h as f64 * g.k);
+                    for (rx, ry, rw, rh) in [(x, y, w, 1.0), (x, y + h - 1.0, w, 1.0), (x, y, 1.0, h), (x + w - 1.0, y, 1.0, h)] {
+                        ctx.add(Node::Rect { rect: Rect::new(q(rx), q(ry), rw.max(1.0) as f32, rh.max(1.0) as f32), fill: rule, radius: 0.0 });
+                    }
+                }
                 for s in &page.slices {
                     let l = ed.layout(s.block);
                     let text = ed.doc.para(s.block).map(|p| p.text.clone()).unwrap_or_default();
+                    let cx = cx + s.x as f64 * g.k;
                     if s.lines.start == 0 {
                         if let Some(label) = numbering.label(s.block) {
                             draw_label(ctx, faces, &l, &label, ed.fonts(), cx, cy + s.y as f64 * g.k, g.k);
@@ -306,7 +315,6 @@ fn reveal(e: &mut Editor, g: &Geom, st: &mut ScrollState) {
 /// cover a..b on pages first..=last.
 fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) -> Vec<(usize, i64, i64, i64, i64)> {
     let mut out = Vec::new();
-    let width = e.pages.width();
     for pg in first..=last {
         let Some(page) = e.pages.pages().get(pg).cloned() else { continue };
         for s in &page.slices {
@@ -314,6 +322,7 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
                 continue;
             }
             let l = e.layout(s.block);
+            let width = s.w;
             let mut y = s.y;
             for li in s.lines.clone() {
                 let line = &l.lines[li];
@@ -332,7 +341,7 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
                         e.x_in_line(s.block, &l, line, to.at)
                     };
                     if x1 > x0 {
-                        out.push((pg, x0, y, x1 - x0, line.height));
+                        out.push((pg, s.x + x0, y, x1 - x0, line.height));
                     }
                 }
                 y += line.height;

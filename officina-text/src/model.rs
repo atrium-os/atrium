@@ -253,7 +253,28 @@ pub struct ParaProps {
     /// The list the paragraph is an item of; `Some(None)` takes it out of a
     /// list its style puts it in.
     pub list: Option<Option<ListRef>>,
+    /// The table cell the paragraph is in (never from a style).
+    pub cell: Option<CellRef>,
 }
+
+/// A paragraph's place in a table. Consecutive paragraphs with the same
+/// `table` and `row` are a row; within it, consecutive ones with the same
+/// `col` are a cell, laid out side by side in the order they come. `row` and
+/// `col` only tell neighbours apart: they needn't count from anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CellRef {
+    pub table: u32,
+    pub row: u32,
+    pub col: u16,
+    /// The cell's width, twips (scaled down when a row is wider than the column).
+    pub width: u32,
+}
+
+/// Space inside a cell's border, twips.
+pub const CELL_PAD: i32 = 80;
+/// Most cells in a row, and most paragraphs a row is looked through for.
+pub const MAX_CELLS: usize = 63;
+pub const MAX_ROW_BLOCKS: usize = 4096;
 
 /// How a list's items are marked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -640,6 +661,75 @@ impl TextDoc {
 
     pub fn para(&self, i: usize) -> Option<&Para> {
         self.blocks.get(i).and_then(Block::as_para)
+    }
+
+    /// The cell block `i` is in.
+    pub fn cell(&self, i: usize) -> Option<CellRef> {
+        self.para(i)?.props.cell
+    }
+
+    /// Whether blocks `a` and `b` are in the same cell (or both outside tables).
+    pub fn same_cell(&self, a: usize, b: usize) -> bool {
+        match (self.cell(a), self.cell(b)) {
+            (None, None) => true,
+            (Some(x), Some(y)) => (x.table, x.row, x.col) == (y.table, y.row, y.col),
+            _ => false,
+        }
+    }
+
+    /// The blocks of the row holding block `i` (empty outside tables).
+    pub fn row_range(&self, i: usize) -> std::ops::Range<usize> {
+        let Some(c) = self.cell(i) else { return i..i };
+        let same = |k: usize| self.cell(k).is_some_and(|d| (d.table, d.row) == (c.table, c.row));
+        let mut a = i;
+        while a > 0 && i - a < MAX_ROW_BLOCKS && same(a - 1) {
+            a -= 1;
+        }
+        let mut b = i + 1;
+        while b - a < MAX_ROW_BLOCKS && same(b) {
+            b += 1;
+        }
+        a..b
+    }
+
+    /// The cells of row `row`: their blocks, x and width in layout units, in
+    /// a column `col_w` wide (widths scaled down to fit it).
+    pub fn row_cells(&self, row: std::ops::Range<usize>, col_w: i64) -> Vec<(std::ops::Range<usize>, i64, i64)> {
+        let mut cells: Vec<(std::ops::Range<usize>, i64)> = Vec::new();
+        for k in row {
+            let w = self.cell(k).map_or(1, |c| c.width.clamp(1, 31680)) as i64;
+            let n = cells.len();
+            match cells.last_mut() {
+                // Past the most cells a row has, the rest join the last.
+                Some((r, _)) if n >= MAX_CELLS || self.same_cell(r.start, k) => r.end = k + 1,
+                _ => cells.push((k..k + 1, crate::twips(w))),
+            }
+        }
+        let total: i64 = cells.iter().map(|c| c.1).sum::<i64>().max(1);
+        let scale = |w: i64| if total > col_w { (w * col_w / total).max(crate::LU) } else { w };
+        let mut x = 0;
+        cells
+            .into_iter()
+            .map(|(r, w)| {
+                let w = scale(w);
+                let c = (r, x, w);
+                x += w;
+                c
+            })
+            .collect()
+    }
+
+    /// Where block `i` sits across a column `col_w` wide: its x and the width
+    /// its text is laid out in (a cell's, inside the padding, or the column).
+    pub fn block_box(&self, i: usize, col_w: i64) -> (i64, i64) {
+        if self.cell(i).is_none() {
+            return (0, col_w);
+        }
+        let pad = crate::twips(CELL_PAD as i64);
+        self.row_cells(self.row_range(i), col_w)
+            .into_iter()
+            .find(|c| c.0.contains(&i))
+            .map_or((0, col_w), |(_, x, w)| (x + pad, (w - 2 * pad).max(crate::LU)))
     }
 
     /// Appends a paragraph (building documents in code and in converters).

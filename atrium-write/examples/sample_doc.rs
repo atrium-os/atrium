@@ -3,7 +3,7 @@
 //!
 //! cargo run --example sample_doc [OUT]
 
-use officina_text::model::{Align, CharAttrs, ImageData, ListKind, ListRef, ObjectRef, ParaProps, TextDoc};
+use officina_text::model::{Align, CellRef, CharAttrs, ImageData, ListKind, ListRef, ObjectRef, ParaProps, TextDoc};
 use officina_text::native;
 
 fn main() {
@@ -31,6 +31,15 @@ fn main() {
     let c0 = s.find("colour").unwrap() as u32;
     let h0 = s.find("highlighting").unwrap() as u32;
     d.push_para(s, 0, vec![(0, 0), (b0, bold), (b0 + 4, 0), (i0, ital), (i0 + 6, 0), (u0, under), (u0 + 9, 0), (l0, link), (l0 + 5, 0), (c0, red), (c0 + 6, 0), (h0, mark), (h0 + 12, 0)]);
+    // A table: rows side by side, a header row in bold.
+    let rows = [["Part", "Crate", "Pages laid out per keystroke"], ["Engine", "officina-text", "1"], ["Editor", "pergola-richtext", "1"], ["App", "atrium-write", "1"]];
+    let widths = [1800u32, 3000, 4200];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, text) in row.iter().enumerate() {
+            let k = d.push_para(text, 0, if r == 0 { vec![(0, bold)] } else { vec![] });
+            d.blocks.update(k, |b| b.as_para_mut().unwrap().props = ParaProps { cell: Some(CellRef { table: 1, row: r as u32, col: c as u16, width: widths[c] }), space_after: Some(0), ..Default::default() });
+        }
+    }
     let j = "Justified text stretches the spaces of every line but the last, so both edges of the column are straight. It is the usual setting for books and long reports, and the paginator treats it like any other paragraph: what changes is only where the glyphs sit on each line.";
     let k = d.push_para(j, 0, vec![]);
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.align = Some(Align::Justify));
@@ -56,6 +65,7 @@ fn main() {
     let img = d.images.add(ImageData { bytes: png.into(), width: 640, height: 160 });
     let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 5760, height: 1440 }), ..Default::default() });
     d.push_para("A picture: \u{FFFC} sits on the baseline.", 0, vec![(0, 0), (11, pic), (14, 0)]);
+
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.align = Some(Align::End));
     let item = |d: &mut TextDoc, t: &str, id, kind, level| {
         let i = d.push_para(t, 0, vec![]);

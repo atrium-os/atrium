@@ -14,7 +14,9 @@
 //! - keep together moves a paragraph that would break to the next page, and
 //!   keep with next moves a paragraph whose next one would start on the next
 //!   page, both only when what they keep fits on one page;
-//! - a line taller than the page still goes on the page, alone.
+//! - a line taller than the page still goes on the page, alone;
+//! - a table row stays on one page (a row taller than the page goes on a page
+//!   alone and is cut off at its foot).
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -39,12 +41,27 @@ pub struct Slice {
     pub block: usize,
     pub lines: Range<usize>,
     pub y: i64,
+    /// The lines' left edge from the content box's (a cell's text inside its
+    /// padding; 0 outside tables) and the width they were laid out in.
+    pub x: i64,
+    pub w: i64,
+}
+
+/// A table cell's border box on a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellBox {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub start: Checkpoint,
     pub slices: Vec<Slice>,
+    /// Table cells' borders.
+    pub cells: Vec<CellBox>,
     /// Content height used.
     pub height: i64,
 }
@@ -250,7 +267,33 @@ impl Paginator {
 
     fn layout(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, i: usize) -> Rc<ParaLayout> {
         let p = doc.para(i).expect("paragraph");
-        cache.get(doc, p, self.width, fonts)
+        cache.get(doc, p, doc.block_box(i, self.width).1, fonts)
+    }
+
+    /// Lays out the table row starting at block `b` at `y`; returns the slices,
+    /// the cell boxes, the row's height and the block after it.
+    fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize) {
+        let row = doc.row_range(b);
+        let row = b..row.end.max(b + 1);
+        let pad = twips(crate::model::CELL_PAD as i64);
+        let mut slices = Vec::new();
+        let mut boxes = Vec::new();
+        let mut row_h = 0;
+        for (blocks, x, w) in doc.row_cells(row.clone(), self.width) {
+            let mut yy = y + pad;
+            let last = blocks.end - 1;
+            for k in blocks {
+                let l = self.layout(doc, cache, fonts, k);
+                slices.push(Slice { block: k, lines: 0..l.lines.len(), y: yy, x: x + pad, w: (w - 2 * pad).max(crate::LU) });
+                yy += l.height + if k < last { l.space_after } else { 0 };
+            }
+            row_h = row_h.max(yy + pad - y);
+            boxes.push(CellBox { x, y, w, h: 0 });
+        }
+        for c in &mut boxes {
+            c.h = row_h;
+        }
+        (slices, boxes, row_h, row.end)
     }
 
     /// Height that must fit for block `b` to start here, when it keeps with the
@@ -260,6 +303,10 @@ impl Paginator {
         let mut need = 0;
         let mut i = b;
         loop {
+            if i > b && doc.cell(i).is_some() {
+                // Keeps don't reach into a table.
+                return if i == b + 1 { None } else { Some(need) };
+            }
             let l = self.layout(doc, cache, fonts, i);
             let f = &l.format;
             let kwn = f.keep_with_next && i + 1 < n;
@@ -291,20 +338,38 @@ impl Paginator {
         let mut slices: Vec<Slice> = Vec::new();
         let mut y = 0i64;
         let (mut b, mut line) = (start.block, start.line);
-        let done = |slices: Vec<Slice>, y: i64, next: Option<Checkpoint>| (Page { start, slices, height: y }, next);
+        let mut cells: Vec<CellBox> = Vec::new();
+        let done = |slices: Vec<Slice>, cells: Vec<CellBox>, y: i64, next: Option<Checkpoint>| (Page { start, slices, cells, height: y }, next);
         loop {
             if b >= n {
-                return done(slices, y, None);
+                return done(slices, cells, y, None);
+            }
+            if doc.cell(b).is_some() {
+                // A table row: whole, on this page if it fits.
+                let (s, c, h_row, next) = self.row(doc, cache, fonts, b, y);
+                if !slices.is_empty() && y + h_row > h {
+                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
+                }
+                slices.extend(s);
+                cells.extend(c);
+                y += h_row;
+                b = next;
+                line = 0;
+                if doc.cell(b).is_none() && b < n {
+                    // Space between the table and what follows.
+                    y += twips(120);
+                }
+                continue;
             }
             let l = self.layout(doc, cache, fonts, b);
             let top = slices.is_empty();
             if line == 0 && !top {
                 if l.format.page_break_before {
-                    return done(slices, y, Some(Checkpoint { block: b, line: 0 }));
+                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
                 }
                 if let Some(need) = self.keep_need(doc, cache, fonts, b) {
                     if y + l.space_before + need > h && need <= h {
-                        return done(slices, y, Some(Checkpoint { block: b, line: 0 }));
+                        return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }));
                     }
                 }
             }
@@ -321,7 +386,7 @@ impl Paginator {
                 li += 1;
             }
             if li == total {
-                slices.push(Slice { block: b, lines: l0..li, y: y0 });
+                slices.push(Slice { block: b, lines: l0..li, y: y0, x: 0, w: self.width });
                 y = yy + l.space_after;
                 b += 1;
                 line = 0;
@@ -341,14 +406,14 @@ impl Paginator {
             if cut == l0 {
                 if !top {
                     // The paragraph starts on the next page.
-                    return done(slices, y - if l0 == 0 { l.space_before } else { 0 }, Some(Checkpoint { block: b, line: l0 }));
+                    return done(slices, cells, y - if l0 == 0 { l.space_before } else { 0 }, Some(Checkpoint { block: b, line: l0 }));
                 }
                 // Alone on an empty page it must break somewhere.
                 cut = li.max(l0 + 1);
             }
             let used: i64 = l.lines[l0..cut].iter().map(|x| x.height).sum();
-            slices.push(Slice { block: b, lines: l0..cut, y: y0 });
-            return done(slices, y0 + used, Some(Checkpoint { block: b, line: cut }));
+            slices.push(Slice { block: b, lines: l0..cut, y: y0, x: 0, w: self.width });
+            return done(slices, cells, y0 + used, Some(Checkpoint { block: b, line: cut }));
         }
     }
 }
@@ -469,6 +534,57 @@ mod tests {
             panic!("{e:?}: page {i} differs\n inc {:?}\n new {:?}\n prev {:?}", p.pages().get(i), fresh.pages().get(i), fresh.pages().get(i.wrapping_sub(1)));
         }
         p.laid - before
+    }
+
+    /// `doc_with`, then rows of `cols` one-line cells in place of blocks `at..`.
+    fn with_table(paras: &[usize], lines: i64, at: usize, rows: usize, cols: usize) -> TextDoc {
+        let mut d = doc_with(paras, lines);
+        let w = (d.page.width - 200) as u32 / cols as u32;
+        for r in 0..rows {
+            for c in 0..cols {
+                let id = d.new_id();
+                let mut p = Para::new(id, &format!("r{r}c{c}"), 0);
+                p.props.space_after = Some(0);
+                p.props.cell = Some(crate::model::CellRef { table: 1, row: r as u32, col: c as u16, width: w });
+                d.blocks.insert(at + r * cols + c, Block::Para(p));
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn table_rows_sit_side_by_side_and_stay_on_one_page() {
+        let d = with_table(&[1, 1], 5, 1, 4, 3);
+        let (p, _) = all(&d);
+        let pg = &p.pages()[0];
+        // Block 0, then row 0's three cells at one y, left to right.
+        let r0: Vec<&Slice> = pg.slices.iter().filter(|s| (1..4).contains(&s.block)).collect();
+        assert_eq!(r0.len(), 3);
+        assert!(r0.iter().all(|s| s.y == r0[0].y));
+        assert!(r0[0].x < r0[1].x && r0[1].x < r0[2].x);
+        assert_eq!(pg.cells.len() % 3, 0);
+        // Each row is whole on its page.
+        for pg in p.pages() {
+            for s in &pg.slices {
+                if d.cell(s.block).is_some() {
+                    let row = d.row_range(s.block);
+                    assert!(row.clone().all(|k| pg.slices.iter().any(|t| t.block == k)), "row {row:?} split");
+                }
+            }
+        }
+        assert!(p.pages().len() >= 2, "4 rows and 2 lines don't fit 5 lines");
+    }
+
+    #[test]
+    fn an_edit_in_a_cell_repaginates_like_a_fresh_pagination() {
+        let paras: Vec<usize> = (0..120).map(|i| 1 + (i * 7) % 5).collect();
+        let mut d = with_table(&paras, 20, 30, 40, 3);
+        let (mut p, mut c) = all(&d);
+        // A cell grows a line: its row and the rows after move.
+        check_edit(&mut d, &mut p, &mut c, TextOp::Splice { block: 40, at: 0, del: 0, ins: crate::ops::Fragment { text: "y".repeat(30), runs: vec![(0, 0)] } }, Edit { first: 40, last: 41, delta: 0 });
+        let id = d.new_id();
+        let props = d.para(41).unwrap().props.clone();
+        check_edit(&mut d, &mut p, &mut c, TextOp::Split { block: 41, at: 1, id, style: 0, props }, Edit { first: 41, last: 43, delta: 1 });
     }
 
     #[test]

@@ -1372,6 +1372,42 @@ Not yet: decoding off the UI thread (a large JPEG decodes in the frame that firs
 shows it), resizing a picture by dragging its handles, floating pictures with wrap
 (O5), pictures dropped from the store when unused (they go on saving until reopened).
 
+### 16.15 O3d part 3 as built (2026-11-14): tables
+
+- **Model**: a table is paragraphs with a `cell: CellRef { table, row, col, width }`
+  property (direct only, never from a style). Consecutive paragraphs with the same
+  table and row are a row; within it, consecutive ones with the same column are a cell,
+  so a cell holds any number of paragraphs and every existing op (typing, Enter, undo,
+  the journal, the native file: property mask bit 13) works in cells unchanged. Row and
+  column numbers only tell neighbours apart. Cells are laid out left to right in the
+  order they come, at their widths, scaled down when a row is wider than the column;
+  a row has at most 63 cells and is looked through for at most 4,096 paragraphs, so a
+  hostile file can't make layout quadratic.
+- **Pagination**: a row is laid out whole (each cell's paragraphs at the cell's width
+  inside 80-twip padding; the row as tall as its tallest cell) and goes on one page; a
+  row taller than a page goes alone and is cut at its foot. Slices carry their x and
+  width; pages carry the cell boxes for the borders. Keep-with-next doesn't reach into
+  a table. Edits in cells repaginate and converge like any other.
+- **Editor**: clicks pick the cell by x; Up and Down move to the cell above or below;
+  Tab and Shift+Tab move between cells, Tab in the last cell adds a row; Backspace and
+  Delete never join cells or a cell and the text around it; a selection across cells
+  clears each cell's part. Commands: insert table (after the caret's paragraph, with a
+  paragraph after it when needed), insert row below, insert column right (the caret's
+  cell splits its width with the new one in every row), delete row, delete column (its
+  width goes to the neighbour). All are one undo step.
+- **atrium-write**: an Insert menu (Picture…, Table, Row Below, Column Right, Delete Row,
+  Delete Column, Page Numbers) replaces the Picture and Page # buttons; table items are
+  enabled in a table.
+
+Gates: rows side by side and never split across pages; an edit and a split in a cell
+repaginate like a fresh pagination; native round trip with a cell; the commands, Tab,
+Enter in a cell, deletes at cell edges and across cells, Up and Down, clicks by column,
+undo of all of it.
+
+Not yet: rows split across pages and repeated header rows (§7.4 long tables), merged
+cells, cell shading and border styles, column resizing by dragging, nested tables,
+automatic column widths (fixed widths now, as the spec asks for long tables).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

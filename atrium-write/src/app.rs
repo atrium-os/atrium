@@ -28,6 +28,9 @@ pub const STATUS_H: f32 = 26.0;
 /// The paragraph styles the Style menu offers, in order.
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
+/// The Insert menu, in order.
+pub const INSERT: [&str; 7] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
     Open,
@@ -41,6 +44,18 @@ pub enum Cmd {
     List(ListKind),
     PageNumbers,
     InsertPicture,
+    Table,
+    RowBelow,
+    ColumnRight,
+    DeleteRow,
+    DeleteColumn,
+}
+
+impl Cmd {
+    /// The command of Insert menu item `i`.
+    pub fn insert(i: usize) -> Cmd {
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers][i.min(INSERT.len() - 1)]
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,11 +73,12 @@ pub struct Write {
     pub cmds: Arc<Mutex<Vec<Cmd>>>,
     pub size: Rc<Cell<(f32, f32)>>,
     pub style_menu: Mutable<MenuState>,
+    pub insert_menu: Mutable<MenuState>,
 }
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()) }
+        Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()) }
     }
 
     pub fn changed(&self) {
@@ -104,6 +120,21 @@ impl Write {
                     Cmd::Style(i) => e.style_named(STYLES[i.min(STYLES.len() - 1)]),
                     Cmd::List(k) => e.toggle_list(k),
                     Cmd::PageNumbers => e.toggle_page_numbers(),
+                    Cmd::Table => {
+                        e.insert_table(3, 3);
+                    }
+                    Cmd::RowBelow => {
+                        e.insert_row_below();
+                    }
+                    Cmd::ColumnRight => {
+                        e.insert_column_right();
+                    }
+                    Cmd::DeleteRow => {
+                        e.delete_row();
+                    }
+                    Cmd::DeleteColumn => {
+                        e.delete_column();
+                    }
                     _ => return true,
                 }
                 drop(e);
@@ -161,9 +192,7 @@ impl View for Write {
         button(ctx, "I", Cmd::Toggle(Toggle::Italic), 36.0, 4.0);
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 16.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
-        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 4.0);
-        button(ctx, "Page #", Cmd::PageNumbers, 68.0, 4.0);
-        button(ctx, "Picture…", Cmd::InsertPicture, 76.0, 16.0);
+        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 16.0);
         let (style_name, cur_align) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
@@ -177,6 +206,13 @@ impl View for Write {
             let cmds = self.cmds.clone();
             MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
             x += 136.0;
+        }
+        {
+            let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
+            let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| MenuItem::new(*s).enabled(!(2..=5).contains(&i) || in_table)).collect();
+            let cmds = self.cmds.clone();
+            MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(96.0).render(ctx);
+            x += 112.0;
         }
         for (label, a) in [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)] {
             let wd = if label == "Justify" { 64.0 } else { 56.0 };
