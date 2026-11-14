@@ -352,7 +352,8 @@ impl<B: Backend> State<B> {
                     if valid & proto::FATTR_MTIME_NOW != 0 {
                         self.fs.set_mtime(&mut n, now()).map_err(e)?;
                     } else if valid & proto::FATTR_MTIME != 0 {
-                        let t = u64le(b, 48).ok_or(libc::EINVAL)? as i64;
+                        // fuse_setattr_in: valid, padding, fh, size, lock_owner, atime, mtime (40).
+                        let t = u64le(b, 40).ok_or(libc::EINVAL)? as i64;
                         self.fs.set_mtime(&mut n, t).map_err(e)?;
                     }
                 }

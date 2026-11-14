@@ -6,7 +6,7 @@
 //!
 //! arcad's wire, kept here in a few lines: a request is `u32 LE length |
 //! u16 LE op | body`, a reply `u32 LE length | u8 status | body`; strings
-//! are u32-LE-length prefixed. A share is `u8 proto (1 sftp, 2 webdav) | str host |
+//! are u32-LE-length prefixed. A share is `u8 proto (1 sftp, 2 webdav, 3 smb) | str host |
 //! u16 port | str path | key[32]`.
 
 use std::io::{self, Read, Write};

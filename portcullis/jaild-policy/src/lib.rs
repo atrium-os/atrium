@@ -198,7 +198,7 @@ pub struct CourierPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ShareServerPolicy {
     pub name_prefix:  String,
-    /// One server per protocol (SFTP, WebDAV): a share jail runs exactly
+    /// One server per protocol (SFTP, WebDAV, SMB): a share jail runs exactly
     /// one of these.
     pub exec_paths:   Vec<String>,
     pub uid_first:    u32,

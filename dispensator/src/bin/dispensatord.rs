@@ -339,11 +339,14 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    // `https://HOST` for WebDAV, else SFTP.
+    // `https://HOST` for WebDAV, `smb://HOST` for SMB, else SFTP.
     let proto_of = |h: &str| -> (atrium_media::ShareProto, String, u16) {
-        match h.strip_prefix("https://") {
-            Some(h) => (atrium_media::ShareProto::Webdav, h.to_string(), 443),
-            None => (atrium_media::ShareProto::Sftp, h.to_string(), 22),
+        if let Some(h) = h.strip_prefix("https://") {
+            (atrium_media::ShareProto::Webdav, h.to_string(), 443)
+        } else if let Some(h) = h.strip_prefix("smb://") {
+            (atrium_media::ShareProto::Smb, h.to_string(), 445)
+        } else {
+            (atrium_media::ShareProto::Sftp, h.to_string(), 22)
         }
     };
     if let Some(rest) = cmd.strip_prefix("learn ") {
@@ -889,6 +892,7 @@ mod run {
         match p {
             atrium_media::ShareProto::Sftp => dispensator::share::Proto::Sftp,
             atrium_media::ShareProto::Webdav => dispensator::share::Proto::Webdav,
+            atrium_media::ShareProto::Smb => dispensator::share::Proto::Smb,
         }
     }
 
@@ -914,9 +918,14 @@ mod run {
         let _ = rd.by_ref().take(4096).read_to_end(&mut out);
         drop(pd);
         remove_share_jail(jaild, LEARN_UID);
-        dispensator::share::parse_learned(proto, &String::from_utf8_lossy(&out)).ok_or_else(|| match proto {
+        let out = String::from_utf8_lossy(&out);
+        if let Some(why) = dispensator::share::learn_refusal(&out) {
+            return Err(format!("refused: {why}"));
+        }
+        dispensator::share::parse_learned(proto, &out).ok_or_else(|| match proto {
             dispensator::share::Proto::Sftp => "the server showed no SSH host key".into(),
             dispensator::share::Proto::Webdav => "the server showed no TLS certificate".into(),
+            dispensator::share::Proto::Smb => "the server didn't answer as SMB".into(),
         })
     }
 

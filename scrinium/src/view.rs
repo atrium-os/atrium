@@ -419,6 +419,8 @@ impl ScriniumView {
         let by_name = k.saved.addr.proto == crate::connect::Proto::Webdav && k.saved.key == [0; 32];
         if by_name {
             line(ctx, 66.0, "Its certificate is no longer one Atrium trusts, so Scrinium won't connect", t.text_secondary());
+        } else if k.saved.addr.proto == crate::connect::Proto::Smb {
+            line(ctx, 66.0, "A different machine answers at its address, so Scrinium won't connect", t.text_secondary());
         } else {
             line(ctx, 66.0, "It shows a different key from the one you accepted, so Scrinium won't connect", t.text_secondary());
         }
@@ -471,7 +473,7 @@ impl ScriniumView {
             Step::Address => {
                 title(ctx, "Connect to server");
                 line(ctx, 66.0, "Type the server's address with your name on it, and a folder if you like:", t.text_secondary());
-                line(ctx, 88.0, "alice@nas.local:/srv/photos  (SFTP)   or   https://alice@nas.local/dav  (WebDAV)", t.text_tertiary());
+                line(ctx, 88.0, "alice@nas.local:/srv  (SFTP),  https://alice@nas.local/dav,  smb://alice@nas.local/photos", t.text_tertiary());
                 let fy = y + 108.0;
                 let s = self.state.clone();
                 let holder = ctx.push(Node::Rect { rect: Rect::new(lx, fy, inner, 32.0), fill: Color::TRANSPARENT, radius: 0.0 });
@@ -510,6 +512,23 @@ impl ScriniumView {
                 let c = cancel(ctx, self.state.clone());
                 let s = self.state.clone();
                 primary(ctx, "It's the right key", c, true, Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.trust() })));
+            }
+            Step::Key { addr, .. } if addr.proto == crate::connect::Proto::Smb => {
+                // A password server can't prove who it is (§5.3): say so,
+                // and remember it by its ID.
+                let i = form.smb.clone().unwrap_or_default();
+                icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.text_secondary());
+                text(ctx, lx + 28.0, y + 32.0, &format!("Connect to {}?", addr.host), type_size::LG, Weight::Semibold, t.text_primary());
+                line(ctx, 62.0, &format!("It speaks SMB 3.1.1 and everything is encrypted ({}).", i.cipher), t.text_secondary());
+                line(ctx, 82.0, "A password server can't prove who it is. Scrinium remembers this one", t.text_secondary());
+                line(ctx, 102.0, "by its ID and won't connect if a different machine answers:", t.text_secondary());
+                rect(ctx, lx, y + 112.0, inner, 32.0, t.bg_canvas(), 6.0);
+                text(ctx, lx + 10.0, y + 128.0, &fit(&format!("Server ID {}", i.guid), type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.text_primary());
+                line(ctx, 164.0, "Someone on this network could try to guess the password:", t.danger_fg());
+                line(ctx, 184.0, "use one you use nowhere else.", t.danger_fg());
+                let c = cancel(ctx, self.state.clone());
+                let s = self.state.clone();
+                primary(ctx, "Connect to it", c, true, Box::new(move || with(&s, |b| if let Some(f) = &mut b.connect { f.trust() })));
             }
             Step::Key { addr, fingerprint } => {
                 icon(ctx, lx, y + 20.0, ph::WARNING, 20.0, t.text_secondary());

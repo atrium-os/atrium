@@ -14,7 +14,7 @@
 //! | `OPEN` 0x05 | postcard [`Open`] | `u8 status`, then postcard `String`; with `OK`, the open file as the message's one descriptor |
 //! | `PICKED` 0x06 | postcard [`Picked`] | `u8 status`, then postcard `String` (where it is in the app's jail, or why not): the system picker puts the folder the user picked into the app's jail |
 //! | `CONNECT` 0x07 | postcard [`Connect`] | `u8 status`, then postcard `String`: the share's `part` (`share-<uid>`), or why not. The file manager connects a network share it saved in Arca (network-shares.md §6.1); `EJECT` of that part disconnects |
-//! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; or why not |
+//! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; SMB, `smb 3.1.1 <cipher>`, the fingerprint of the server's GUID, `guid <text>`; or why not (a server below the SMB floor: why) |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -113,6 +113,8 @@ pub enum ShareProto {
     Sftp,
     /// WebDAV over HTTPS.
     Webdav,
+    /// SMB 3.1.1, encrypted, with a password.
+    Smb,
 }
 
 /// Connect a share whose credential the file manager saved in Arca for
@@ -126,7 +128,7 @@ pub struct Connect {
     pub user: String,
     /// `SHA256:...`, as [`op::LEARN`] gave it and the user accepted; for
     /// WebDAV, the pinned key's, or `trusted` (the trust store vouches for
-    /// the host name).
+    /// the host name); for SMB, the server GUID's.
     pub fingerprint: String,
     pub read_only: bool,
 }

@@ -172,6 +172,9 @@ pub enum ShareProto {
     /// public key (SPKI) for a pinned, self-signed server, or all zeros
     /// for one whose certificate the trust store vouches for by name.
     Webdav = 2,
+    /// SMB 3.1.1 with a password (S3). The key is a digest of the server's
+    /// GUID: a hint that the same machine answers, not proof (§5.3).
+    Smb = 3,
 }
 
 impl ShareProto {
@@ -179,6 +182,7 @@ impl ShareProto {
         match b {
             1 => Some(ShareProto::Sftp),
             2 => Some(ShareProto::Webdav),
+            3 => Some(ShareProto::Smb),
             _ => None,
         }
     }
@@ -188,6 +192,7 @@ impl ShareProto {
         match self {
             ShareProto::Sftp => "sftp",
             ShareProto::Webdav => "webdav",
+            ShareProto::Smb => "smb",
         }
     }
 
@@ -195,6 +200,7 @@ impl ShareProto {
         match s {
             "sftp" => Some(ShareProto::Sftp),
             "webdav" => Some(ShareProto::Webdav),
+            "smb" => Some(ShareProto::Smb),
             _ => None,
         }
     }

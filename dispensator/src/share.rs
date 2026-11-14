@@ -3,7 +3,8 @@
 //! The file manager asks to connect a share it has saved in Arca (the
 //! password or key is Arca's, never ours). dispensatord resolves the host
 //! once, takes a share-server uid, records that uid's label in Arca's share
-//! registry, and has jaild start `atrium-share-sftp` in its own jail: FUSE
+//! registry, and has jaild start the protocol's server (`atrium-share-sftp`,
+//! `-webdav`, `-smb`) in its own jail: FUSE
 //! from jaild, a routed vnet whose only way out is that one address and
 //! port, and the `share-server` system call profile. dispensatord never
 //! parses a byte from the network and never holds a credential.
@@ -21,6 +22,7 @@ pub const REGISTRY: &str = "/var/run/atrium/share-registry";
 pub const NAME_PREFIX: &str = "system-share-";
 pub const EXEC: &str = "/usr/local/bin/atrium-share-sftp";
 pub const EXEC_WEBDAV: &str = "/usr/local/bin/atrium-share-webdav";
+pub const EXEC_SMB: &str = "/usr/local/bin/atrium-share-smb";
 /// The trust store a WebDAV share server reads (nullfs, read-only).
 pub const TRUST_DIR: &str = "/etc/ssl";
 
@@ -29,6 +31,8 @@ pub enum Proto {
     Sftp,
     /// WebDAV over HTTPS (S2).
     Webdav,
+    /// SMB 3.1.1, encrypted, password (S3).
+    Smb,
 }
 
 impl Proto {
@@ -36,6 +40,7 @@ impl Proto {
         match self {
             Proto::Sftp => "sftp",
             Proto::Webdav => "webdav",
+            Proto::Smb => "smb",
         }
     }
 
@@ -43,6 +48,7 @@ impl Proto {
         match self {
             Proto::Sftp => EXEC,
             Proto::Webdav => EXEC_WEBDAV,
+            Proto::Smb => EXEC_SMB,
         }
     }
 
@@ -50,7 +56,7 @@ impl Proto {
     /// socket.
     pub fn ro_mounts(self) -> &'static [&'static str] {
         match self {
-            Proto::Sftp => &["/lib", "/libexec", "/usr/lib", "/usr/local/bin"],
+            Proto::Sftp | Proto::Smb => &["/lib", "/libexec", "/usr/lib", "/usr/local/bin"],
             Proto::Webdav => &["/lib", "/libexec", "/usr/lib", "/usr/local/bin", TRUST_DIR],
         }
     }
@@ -155,6 +161,9 @@ pub fn check(proto: Proto, host: &str, port: u16, path: &str, user: &str, finger
     if proto == Proto::Webdav && !path.starts_with('/') {
         return Err("a WebDAV folder starts with /".into());
     }
+    if proto == Proto::Smb && (!path.starts_with('/') || path.trim_matches('/').is_empty()) {
+        return Err("an SMB path is /share or /share/folder".into());
+    }
     let key = if proto == Proto::Webdav && fingerprint == TRUSTED { Some([0; 32]) } else { key_of(fingerprint) };
     let key = key.ok_or("not a SHA256 fingerprint")?;
     Ok(Share { proto, host: host.into(), port, path: path.into(), user: user.into(), fingerprint: fingerprint.into(), key })
@@ -214,7 +223,7 @@ pub fn argv(s: &Share, addr: Ipv4Addr, session_uid: u32, session_gid: u32, read_
         Proto::Sftp => v.extend(["--host".into(), addr.to_string()]),
         // The name is what the certificate is checked against; the address
         // is the one it dials.
-        Proto::Webdav => v.extend(["--host".into(), s.host.clone(), "--addr".into(), addr.to_string()]),
+        Proto::Webdav | Proto::Smb => v.extend(["--host".into(), s.host.clone(), "--addr".into(), addr.to_string()]),
     }
     let identity = match s.proto {
         Proto::Webdav if s.fingerprint == TRUSTED => vec!["--trusted".to_string()],
@@ -246,7 +255,7 @@ pub fn learn_argv(proto: Proto, host: &str, addr: Ipv4Addr, port: u16) -> Vec<St
     let mut v = vec![proto.exec().to_string(), "--host".into()];
     match proto {
         Proto::Sftp => v.push(addr.to_string()),
-        Proto::Webdav => v.extend([host.to_string(), "--addr".into(), addr.to_string()]),
+        Proto::Webdav | Proto::Smb => v.extend([host.to_string(), "--addr".into(), addr.to_string()]),
     }
     v.extend(["--port".into(), port.to_string(), "--learn".into()]);
     v
@@ -255,11 +264,21 @@ pub fn learn_argv(proto: Proto, host: &str, addr: Ipv4Addr, port: u16) -> Vec<St
 /// What `--learn` printed. SFTP: the fingerprint line. WebDAV: `trusted`
 /// or `untrusted <why>`, the fingerprint, then `subject`, `issuer` and
 /// `expires` lines, as one text for the file manager (printable, at most
-/// 1 KiB).
+/// 1 KiB). SMB: `smb 3.1.1 <cipher>`, the fingerprint of the server's GUID
+/// and `guid <text>`.
 pub fn parse_learned(proto: Proto, out: &str) -> Option<String> {
     let fp = out.lines().map(str::trim).find(|l| key_of(l).is_some()).map(String::from)?;
+    let clean = |v: Vec<String>| -> String { v.join("\n").chars().filter(|c| *c == '\n' || !c.is_control()).take(1024).collect() };
     match proto {
         Proto::Sftp => Some(fp),
+        Proto::Smb => {
+            let first = out.lines().next()?.trim();
+            let guid = out.lines().map(str::trim).find(|l| l.starts_with("guid "))?;
+            if !first.starts_with("smb 3.1.1 ") {
+                return None;
+            }
+            Some(clean(vec![first.to_string(), fp, guid.to_string()]))
+        }
         Proto::Webdav => {
             let first = out.lines().next()?.trim();
             if first != "trusted" && !first.starts_with("untrusted") {
@@ -272,6 +291,13 @@ pub fn parse_learned(proto: Proto, out: &str) -> Option<String> {
             Some(t)
         }
     }
+}
+
+/// Why `--learn` refused a server (`refused <why>`: an SMB server below
+/// the floor, §5.3), for the file manager to show.
+pub fn learn_refusal(out: &str) -> Option<String> {
+    let why = out.lines().next()?.trim().strip_prefix("refused ")?;
+    Some(why.chars().filter(|c| !c.is_control()).take(200).collect())
 }
 
 #[cfg(test)]
@@ -291,6 +317,11 @@ mod tests {
         let w = parse_learned(Proto::Webdav, &format!("untrusted invalid peer certificate: UnknownIssuer\n{FP}\nkey 5a\nsubject my-nas\nissuer my-nas\nexpires 261214\n")).unwrap();
         assert_eq!(w, format!("untrusted invalid peer certificate: UnknownIssuer\n{FP}\nsubject my-nas\nissuer my-nas\nexpires 261214"));
         assert_eq!(parse_learned(Proto::Webdav, &format!("{FP}\n")), None);
+        let s = parse_learned(Proto::Smb, &format!("smb 3.1.1 AES-128-GCM\nguid 00006d76-0000-0000-0000-000000000000\n{FP}\nkey 5a\n")).unwrap();
+        assert_eq!(s, format!("smb 3.1.1 AES-128-GCM\n{FP}\nguid 00006d76-0000-0000-0000-000000000000"));
+        assert_eq!(parse_learned(Proto::Smb, &format!("{FP}\nguid x\n")), None);
+        assert_eq!(learn_refusal("refused the server won't encrypt (no AES-GCM)\n").as_deref(), Some("the server won't encrypt (no AES-GCM)"));
+        assert_eq!(learn_refusal(&format!("{FP}\n")), None);
     }
 
     #[test]
@@ -312,6 +343,9 @@ mod tests {
         assert_eq!(check(Proto::Webdav, "nas.lan", 443, "/dav", "alice", TRUSTED).unwrap().key, [0; 32]);
         assert!(check(Proto::Sftp, "nas.lan", 22, "/x", "alice", TRUSTED).is_err(), "trusted is WebDAV's alone");
         assert!(check(Proto::Webdav, "nas.lan", 443, "dav", "alice", FP).is_err());
+        assert!(check(Proto::Smb, "nas.lan", 445, "/files/Photos", "HOME\\alice", FP).is_ok());
+        assert!(check(Proto::Smb, "nas.lan", 445, "/", "alice", FP).is_err(), "no share named");
+        assert!(check(Proto::Smb, "nas.lan", 445, "/files", "alice", TRUSTED).is_err(), "trusted is WebDAV's alone");
         assert!(!dialable("169.254.169.254".parse().unwrap()));
         assert!(!dialable("127.0.0.1".parse().unwrap()));
         assert!(dialable("192.168.1.5".parse().unwrap()));

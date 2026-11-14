@@ -8,9 +8,10 @@
 //! a share server can only ever reach its own share's items.
 //!
 //! Registry lines: `uid user proto host port key-hex path-hex`, proto
-//! `sftp` or `webdav`. The key is the SHA-256 of the server's SSH host key
-//! blob, or of a WebDAV server's pinned public key (zeros: the trust store
-//! vouches for the host name) (64 hex digits); the path
+//! `sftp`, `webdav` or `smb`. The key is the SHA-256 of the server's SSH
+//! host key blob, of a WebDAV server's pinned public key (zeros: the trust
+//! store vouches for the host name), or of an SMB server's GUID (64 hex
+//! digits); the path
 //! is hex so that a folder with spaces stays one field. `uid retired` ends
 //! a label, as in the courier registry (`crate::courier::lookup_with`).
 
@@ -87,7 +88,7 @@ pub fn label_line(uid: u32, l: &ShareLabel) -> Option<String> {
     Some(format!("{uid} {} {} {host} {port} {} {}", l.user, proto.name(), hex(key), hex(path.as_bytes())))
 }
 
-/// A share on the wire: `u8 proto (1 sftp, 2 webdav) | str host | u16 port | str path
+/// A share on the wire: `u8 proto (1 sftp, 2 webdav, 3 smb) | str host | u16 port | str path
 /// | key[32]`.
 pub fn read_share(r: &mut Reader<'_>) -> Result<Recipient, arca_store::Error> {
     let proto = ShareProto::from_u8(r.u8()?).ok_or(arca_store::Error::BadRecipient)?;
@@ -128,10 +129,12 @@ mod tests {
         let (_, w) = parse_line(&format!("63002 alice webdav nas.lan 443 {} 2f646176", "00".repeat(32))).unwrap();
         assert!(matches!(&w.share, Recipient::Share { proto: ShareProto::Webdav, path, .. } if path == "/dav"));
         assert_eq!(label_line(63002, &w).unwrap(), format!("63002 alice webdav nas.lan 443 {} 2f646176", "00".repeat(32)));
+        let (_, s) = parse_line(&format!("63003 alice smb nas.lan 445 {} 2f66696c6573", "ab".repeat(32))).unwrap();
+        assert!(matches!(&s.share, Recipient::Share { proto: ShareProto::Smb, path, .. } if path == "/files"));
         for bad in [
             line(64001, "/x"),                                                     // a courier uid
             line(62999, "/x"),                                                     // below the range
-            format!("63001 alice smb nas.lan 22 {} 2f", "ab".repeat(32)),           // protocol
+            format!("63001 alice nfs nas.lan 22 {} 2f", "ab".repeat(32)),           // protocol
             format!("63001 alice sftp nas.lan 22 {} 2f", "AB".repeat(32)),          // not canonical hex
             format!("63001 alice sftp nas.lan 22 {} 2f", "ab".repeat(31)),          // short key
             format!("63001 alice sftp nas.lan 0 {} 2f", "ab".repeat(32)),           // port

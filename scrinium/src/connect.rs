@@ -10,6 +10,8 @@ pub enum Proto {
     Sftp,
     /// WebDAV over HTTPS (S2).
     Webdav,
+    /// SMB 3.1.1, encrypted, with a password (S3).
+    Smb,
 }
 
 impl Proto {
@@ -18,6 +20,7 @@ impl Proto {
         match self {
             Proto::Sftp => 1,
             Proto::Webdav => 2,
+            Proto::Smb => 3,
         }
     }
 
@@ -25,6 +28,7 @@ impl Proto {
         match b {
             1 => Some(Proto::Sftp),
             2 => Some(Proto::Webdav),
+            3 => Some(Proto::Smb),
             _ => None,
         }
     }
@@ -33,6 +37,7 @@ impl Proto {
         match self {
             Proto::Sftp => atrium_media::ShareProto::Sftp,
             Proto::Webdav => atrium_media::ShareProto::Webdav,
+            Proto::Smb => atrium_media::ShareProto::Smb,
         }
     }
 }
@@ -43,7 +48,9 @@ pub const TRUSTED: &str = "trusted";
 
 /// Where a share is: `user@host[:port][/path]`, with or without `sftp://`,
 /// or scp-style `user@host:path` (no path is the user's home); or
-/// `https://user@host[:port]/path` for WebDAV (no path is `/`).
+/// `https://user@host[:port]/path` for WebDAV (no path is `/`); or
+/// `smb://[domain;]user@host[:port]/share[/folder]` for SMB (the user is
+/// kept as `domain\user`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
     pub proto: Proto,
@@ -55,6 +62,10 @@ pub struct Address {
 
 impl Address {
     pub fn text(&self) -> String {
+        if self.proto == Proto::Smb {
+            let port = if self.port == 445 { String::new() } else { format!(":{}", self.port) };
+            return format!("smb://{}@{}{port}{}", self.user.replacen('\\', ";", 1), self.host, self.path);
+        }
         if self.proto == Proto::Webdav {
             let port = if self.port == 443 { String::new() } else { format!(":{}", self.port) };
             return format!("https://{}@{}{port}{}", self.user, self.host, self.path);
@@ -100,8 +111,50 @@ fn parse_webdav(rest: &str) -> Result<Address, String> {
     Ok(Address { proto: Proto::Webdav, user: user.into(), host, port, path })
 }
 
+/// A share name or folder name SMB can use (capsa-share's smb_name).
+fn smb_component(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 255 && n != "." && n != ".." && !n.contains(['\\', ':', '*', '?', '"', '<', '>', '|']) && !n.chars().any(|c| c.is_control())
+}
+
+/// `smb://[domain;]user@host[:port]/share[/folder]`.
+fn parse_smb(rest: &str) -> Result<Address, String> {
+    const HOW: &str = "Type it as smb://name@server/share, for example smb://alice@nas.local/photos";
+    let (user, rest) = rest.split_once('@').ok_or(HOW)?;
+    let user = match user.split_once(';') {
+        Some((d, u)) if !d.is_empty() => format!("{d}\\{u}"),
+        _ => user.to_string(),
+    };
+    let bare = user.rsplit('\\').next().unwrap_or("");
+    if !user_ok(&user) || bare.is_empty() || user.matches('\\').count() > 1 {
+        return Err("That user name can't be used".into());
+    }
+    let (hostport, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).ok_or(HOW)?;
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("That port can't be used")?),
+        None => (hostport, 445),
+    };
+    let host = host.to_ascii_lowercase();
+    if !host_ok(&host) {
+        return Err("That server name can't be used".into());
+    }
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return Err(HOW.into());
+    }
+    if path.len() > 1024 || !parts.iter().all(|p| smb_component(p)) {
+        return Err("That share or folder can't be used".into());
+    }
+    Ok(Address { proto: Proto::Smb, user, host, port, path: format!("/{}", parts.join("/")) })
+}
+
 pub fn parse_address(s: &str) -> Result<Address, String> {
     let s = s.trim();
+    if let Some(rest) = s.strip_prefix("smb://") {
+        return parse_smb(rest);
+    }
+    if s.starts_with("\\\\") {
+        return Err("Type it as smb://name@server/share, with your name on it".into());
+    }
     if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("davs://")) {
         return parse_webdav(rest);
     }
@@ -204,6 +257,30 @@ pub fn identity_of(proto: Proto, key: &[u8; 32]) -> String {
     }
 }
 
+/// What an SMB server said when asked (dispensatord's learn answer).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SmbInfo {
+    /// AES-128-GCM or AES-256-GCM.
+    pub cipher: String,
+    /// Of the server's GUID: what the share is pinned to.
+    pub fingerprint: String,
+    pub guid: String,
+}
+
+pub fn parse_smb_info(s: &str) -> Option<SmbInfo> {
+    let mut lines = s.lines().map(str::trim);
+    let cipher = lines.next()?.strip_prefix("smb 3.1.1 ")?.to_string();
+    let mut i = SmbInfo { cipher, ..Default::default() };
+    for l in lines {
+        if key_of(l).is_some() {
+            i.fingerprint = l.into();
+        } else if let Some(g) = l.strip_prefix("guid ") {
+            i.guid = g.into();
+        }
+    }
+    (!i.fingerprint.is_empty()).then_some(i)
+}
+
 /// What a WebDAV server's certificate says (dispensatord's learn answer).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cert {
@@ -264,6 +341,14 @@ pub enum Recheck {
 }
 
 pub fn recheck(proto: Proto, saved: &[u8; 32], learned: &str) -> Recheck {
+    if proto == Proto::Smb {
+        let Some(i) = parse_smb_info(learned) else { return Recheck::Odd };
+        return match key_of(&i.fingerprint) {
+            Some(k) if &k == saved => Recheck::Same,
+            Some(_) => Recheck::Changed { now: format!("{} (server ID {})", i.fingerprint, i.guid) },
+            None => Recheck::Odd,
+        };
+    }
     if proto == Proto::Webdav {
         let Some(c) = parse_cert(learned) else { return Recheck::Odd };
         if saved == &[0; 32] {
@@ -322,6 +407,8 @@ pub struct Form {
     pub armed: Option<std::time::Instant>,
     /// A WebDAV server's certificate, as learned.
     pub cert: Option<Cert>,
+    /// What an SMB server said, as learned.
+    pub smb: Option<SmbInfo>,
 }
 
 /// How long a press on Connect waits for the field's handle.
@@ -329,7 +416,7 @@ pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_millis(150
 
 impl Default for Form {
     fn default() -> Self {
-        Form { step: Step::Address, error: None, remember: true, want: None, armed: None, cert: None }
+        Form { step: Step::Address, error: None, remember: true, want: None, armed: None, cert: None, smb: None }
     }
 }
 
@@ -353,6 +440,17 @@ impl Form {
     pub fn learned(&mut self, r: Result<String, String>) {
         let Step::Checking(addr) = self.step.clone() else { return };
         match r {
+            Ok(learned) if addr.proto == Proto::Smb => match parse_smb_info(&learned) {
+                Some(i) => {
+                    self.error = None;
+                    self.step = Step::Key { addr, fingerprint: i.fingerprint.clone() };
+                    self.smb = Some(i);
+                }
+                None => {
+                    self.error = Some(format!("{} didn't answer as an SMB server", addr.host));
+                    self.step = Step::Address;
+                }
+            },
             Ok(learned) if addr.proto == Proto::Webdav => {
                 self.error = None;
                 match parse_cert(&learned) {
@@ -376,7 +474,11 @@ impl Form {
                 self.step = Step::Key { addr, fingerprint };
             }
             Err(e) => {
-                self.error = Some(format!("Couldn't reach {}: {e}", addr.host));
+                // dispensatord's word for a server below the floor (§5.3).
+                self.error = Some(match e.strip_prefix("refused: ") {
+                    Some(why) => format!("Not connecting to {}: {why}", addr.host),
+                    None => format!("Couldn't reach {}: {e}", addr.host),
+                });
                 self.step = Step::Address;
             }
         }
@@ -464,6 +566,13 @@ mod tests {
 
     #[test]
     fn addresses() {
+        let smb = |user: &str, host: &str, port: u16, path: &str| Address { proto: Proto::Smb, user: user.into(), host: host.into(), port, path: path.into() };
+        assert_eq!(parse_address("smb://alice@NAS.local/photos").unwrap(), smb("alice", "nas.local", 445, "/photos"));
+        assert_eq!(parse_address("smb://HOME;alice@nas.local:4450/files/2026/").unwrap(), smb("HOME\\alice", "nas.local", 4450, "/files/2026"));
+        assert_eq!(smb("HOME\\alice", "nas.local", 4450, "/files").text(), "smb://HOME;alice@nas.local:4450/files");
+        for bad in ["smb://nas.local/photos", "smb://alice@nas.local", "smb://alice@nas.local/", "smb://alice@nas.local/a:b", "smb://alice@nas.local/x/../y", "smb://a\\b\\c@nas.local/x", "\\\\nas\\photos"] {
+            assert!(parse_address(bad).is_err(), "{bad}");
+        }
         assert_eq!(parse_address("alice@nas.local").unwrap(), a("alice", "nas.local", 22, "."));
         assert_eq!(parse_address("sftp://alice@NAS.local:2222/srv/photos").unwrap(), a("alice", "nas.local", 2222, "/srv/photos"));
         assert_eq!(parse_address("alice@nas.local:photos").unwrap(), a("alice", "nas.local", 22, "photos"));
@@ -554,6 +663,29 @@ mod tests {
         assert!(matches!(&f.step, Step::Key { fingerprint: fp, .. } if fp == &fingerprint(&[4; 32])));
         assert!(untrusted_text(f.cert.as_ref().unwrap().untrusted.as_deref().unwrap()).contains("authority"));
         assert!(untrusted_text("invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))").contains("self-signed"));
+    }
+
+    #[test]
+    fn an_smb_server_is_shown_then_pinned_by_its_id() {
+        let fp = fingerprint(&[5; 32]);
+        let said = format!("smb 3.1.1 AES-128-GCM\n{fp}\nguid 00006d76-0000-0000-0000-000000000000");
+        let mut f = Form::default();
+        f.submit_address("smb://alice@nas.lan/files");
+        assert!(matches!(f.take_want(), Some(Want::Learn(a)) if a.proto == Proto::Smb));
+        f.learned(Ok(said.clone()));
+        assert!(matches!(&f.step, Step::Key { fingerprint: k, .. } if k == &fp));
+        assert_eq!(f.smb.as_ref().unwrap().cipher, "AES-128-GCM");
+        f.trust();
+        assert!(matches!(f.step, Step::Password { .. }));
+        assert_eq!(recheck(Proto::Smb, &[5; 32], &said), Recheck::Same);
+        assert!(matches!(recheck(Proto::Smb, &[6; 32], &said), Recheck::Changed { now } if now.contains("00006d76")));
+        assert_eq!(recheck(Proto::Smb, &[5; 32], &fp), Recheck::Odd);
+        // A server below the floor: why, and no key to accept.
+        let mut f = Form::default();
+        f.submit_address("smb://alice@old-nas/files");
+        f.learned(Err("refused: the server won't encrypt (no AES-GCM)".into()));
+        assert_eq!(f.step, Step::Address);
+        assert_eq!(f.error.as_deref(), Some("Not connecting to old-nas: the server won't encrypt (no AES-GCM)"));
     }
 
     #[test]

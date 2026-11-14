@@ -29,6 +29,7 @@ use std::time::Duration;
 use capsa_fuse::server::serve_with;
 use capsa_fuse::Options;
 use capsa_share::arca::{Arca, KIND_ED25519, KIND_PASSWORD};
+use capsa_share::mount_self;
 use capsa_share::sftp::Sftp;
 use capsa_share::SftpFs;
 use capsa_ssh::{Auth, Client, HostKeyPolicy};
@@ -96,49 +97,6 @@ fn args() -> Option<Args> {
     Some(a)
 }
 
-/// Mounts fusefs on `dir` with jaild's options (portcullis/jaild ffi.rs).
-#[cfg(target_os = "freebsd")]
-fn mount_self(dir: &str) -> std::io::Result<File> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let dev = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fuse")?;
-    let fd = dev.as_raw_fd().to_string();
-    let opts: Vec<(&str, Option<&str>)> = vec![
-        ("fstype", Some("fusefs")),
-        ("fspath", Some(dir)),
-        ("from", Some("/dev/fuse")),
-        ("fd", Some(&fd)),
-        ("allow_other", None),
-        ("default_permissions", None),
-        ("timeout=", Some("30")),
-    ];
-    let mut keep: Vec<CString> = Vec::new();
-    let mut iov: Vec<libc::iovec> = Vec::new();
-    for (k, v) in opts {
-        let kc = CString::new(k).unwrap();
-        iov.push(libc::iovec { iov_base: kc.as_ptr() as *mut _, iov_len: kc.as_bytes_with_nul().len() });
-        keep.push(kc);
-        match v {
-            Some(v) => {
-                let vc = CString::new(v).unwrap();
-                iov.push(libc::iovec { iov_base: vc.as_ptr() as *mut _, iov_len: vc.as_bytes_with_nul().len() });
-                keep.push(vc);
-            }
-            None => iov.push(libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }),
-        }
-    }
-    // SAFETY: iov points into `keep`, alive across the call.
-    let rc = unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as u32, libc::MNT_NOSUID | libc::MNT_NOEXEC) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(dev)
-}
-
-#[cfg(not(target_os = "freebsd"))]
-fn mount_self(_dir: &str) -> std::io::Result<File> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "--mnt needs FreeBSD"))
-}
 
 /// The share's credential from Arca, for the identity this connection
 /// proved: its key if it has one for `user`, else its password.

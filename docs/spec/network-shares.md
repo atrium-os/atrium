@@ -475,4 +475,39 @@ encryption. It checks:
    saved as trusted both refused with nothing from Arca.
 4. **S3 SMB 3.1.1** with NTLMv2 and encryption; Kerberos when a realm
    exists.
+   **Built 2026-11-14** (password shares; Kerberos still later).
+   `atrium-share-smb` (capsa-share `smb`, `ntlm`): our own SMB2 client,
+   one TCP connection, one request at a time. Negotiation offers dialect
+   3.1.1 alone with the SHA-512 pre-authentication hash and AES-256-GCM
+   then AES-128-GCM; a server that answers another dialect, no SHA-512 or
+   no AES-GCM is refused before any login (`--learn` prints `refused
+   <why>`, and Scrinium shows it: "Not connecting to nas: the server won't
+   encrypt"). The login is NTLMv2 in SPNEGO (no LM, NTLMv1, key exchange or
+   anonymous; a guest or null session is refused); its final reply must be
+   signed (AES-CMAC) with the key derived from the password and the
+   pre-authentication hash, and every message after it is sealed with
+   AES-GCM (unsealed replies are refused). The password is used for that
+   one login and wiped (§5.1). The identity a share is pinned to is the
+   server's GUID (the digest of it in Arca's item): a different GUID stops
+   the server before Arca is asked, on the changed-server sheet. It is a
+   hint, as §5.3 says, not proof. Scrinium's Connect takes
+   `smb://[domain;]user@host[:port]/share[/folder]` and, before the
+   password, shows that the server encrypts, its ID, and the one-line
+   warning that someone on the network could try to guess the password.
+   Names Windows can't use are hidden, a second name differing only by
+   case is hidden, reparse points (links on the server) are neither shown
+   nor followed. Writes go straight to the server (no gathering, unlike
+   WebDAV); up to 8 files stay open, closed on flush, and the share's root
+   stays open so the server keeps the session. A lost connection ends the
+   share (status 4); reconnecting is S4. Found on the way: capsa-fuse read
+   SETATTR's mtime from the wrong offset (48, ctime, instead of 40), so
+   `touch -t` and `cp -p` set every file's time to the epoch, on sticks
+   too. Gate `vm-share-smb.sh` against Samba 4.19 on the host
+   (`scripts/smb-test-server.sh`: 3.1.1 with encryption required, a 2.1
+   server and an unencrypted one; 32 checks, 0 failed): learn and the two
+   refusals, connect through dispensatord and jaild, read, list, write,
+   edit in place, 3 MiB both ways, set a time, rename, delete, mkdir,
+   rmdir (and a full folder kept), another user refused, a folder as the
+   root, eject; a wrong GUID gets nothing from Arca, an unknown user gets
+   no guest session.
 5. **S4** disconnected-state UI, reconnect, "connect at login".
