@@ -445,7 +445,11 @@ VM from the Aura gates cover them.
   passphrase, so they are left to Settings. Manifest gains `network-read`,
   `network-wifi`, `wifi-nearby`.
 - Gate: `aura-sim-gate.sh n4` (RUNBOOK §13.6e).
-- Not yet: a Settings page (passphrase entry, profiles), `SET_STATIC`/`SET_DNS`
-  (answer unsupported), service manifests for atrium-net and atrium-netconf, the bar
-  checked live under Forum.
+- Not yet: `SET_STATIC`/`SET_DNS` (answer unsupported), service manifests for
+  atrium-net and atrium-netconf.
+- Since (2026-11-14): the bar checked live under Forum (`aura-sim-gate.sh bar`, icon and
+  menu frames); the Settings page is Curia's Network page ([curia.md](curia.md) §7).
+  aura-mlme answers `scan` while connected with a scan on the association's address
+  (the roam scan, listed as `bss` lines and `scan-done`), so the nearby list works
+  while joined; atrium-netconf answers a busy radio (a join running) at once.
 

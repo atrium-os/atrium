@@ -127,6 +127,8 @@ pub struct Station {
     joined: Option<JoinReq>,
     rssi16: Option<i32>,
     roam_scan: bool,
+    /// The running background scan was asked for as a list (`scan` while connected).
+    list_scan: bool,
     last_roam_scan: Option<u64>,
     /// The BSS that won the last background scan (it must win twice), and
     /// no roam scans before this time (set by a join or a roam).
@@ -151,7 +153,7 @@ fn state_line(name: &str) -> Line {
 
 impl Station {
     pub fn new(own: Mac, rand: Box<dyn FnMut(&mut [u8])>) -> Self {
-        Station { device: own, own, mac_key: None, wpa3_only: HashSet::new(), joined: None, rssi16: None, roam_scan: false, last_roam_scan: None, roam_candidate: None, roam_hold_until: 0, last_beacon: 0, country: *b"00", narrowed: false, st: State::Idle, results: Vec::new(), seq: 0, sa_query: None, rand }
+        Station { device: own, own, mac_key: None, wpa3_only: HashSet::new(), joined: None, rssi16: None, roam_scan: false, list_scan: false, last_roam_scan: None, roam_candidate: None, roam_hold_until: 0, last_beacon: 0, country: *b"00", narrowed: false, st: State::Idle, results: Vec::new(), seq: 0, sa_query: None, rand }
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -232,6 +234,7 @@ impl Station {
         self.sa_query = None;
         self.rssi16 = None;
         self.roam_scan = false;
+        self.list_scan = false;
         self.st = State::Idle;
         self.unnarrow(out);
         out.push(Out::Ctl(state_line("disconnected").with("reason", reason).with("why", why)));
@@ -266,10 +269,18 @@ impl Station {
         let mut out = Vec::new();
         match l.verb.as_str() {
             "scan" => {
-                // W1 scans only while idle (no background scans when
-                // connected yet: that needs off-channel time from the radio).
+                // Idle: a scan of its own. Connected: the background scan
+                // (our association's address, never a second identity), its
+                // results listed when it ends; one already running is used.
                 if matches!(self.st, State::Idle) {
                     self.start_scan(None, &mut out);
+                } else if matches!(self.st, State::Up { .. }) {
+                    self.list_scan = true;
+                    if !self.roam_scan {
+                        self.roam_scan = true;
+                        self.results.clear();
+                        out.push(Out::Kernel(Req::Scan { mac: self.own }));
+                    }
                 } else {
                     out.push(Out::Ctl(Line::new("error").with("why", "busy")));
                 }
@@ -467,6 +478,20 @@ impl Station {
             out.push(Out::Ctl(Line::new("nearby").with_hex("ssid", &ssid).with("rssi", rssi)));
         }
         out.push(Out::Ctl(Line::new("event").with("what", "roam-scan-done")));
+        // Someone asked for the list (a scan while connected).
+        if std::mem::take(&mut self.list_scan) {
+            for b in &self.results {
+                out.push(Out::Ctl(
+                    Line::new("bss")
+                        .with_hex("ssid", &b.ssid)
+                        .with("bssid", fmt_mac(&b.bssid))
+                        .with("freq", b.freq)
+                        .with("rssi", b.rssi)
+                        .with("security", b.security.name()),
+                ));
+            }
+            out.push(Out::Ctl(Line::new("scan-done").with("status", 0).with("count", self.results.len())));
+        }
         let (Some(j), State::Up { t }) = (self.joined.clone(), &self.st) else {
             return out;
         };

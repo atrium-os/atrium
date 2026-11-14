@@ -1,0 +1,21 @@
+[package]
+name = "curia"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Curia, Atrium's Settings app (docs/spec/curia.md): a sidebar of pages, each talking to the service that owns its settings. First page: Network (Wi-Fi over atrium-netconf, CLASS_NETCONF)."
+
+[lib]
+name = "curia"
+path = "src/lib.rs"
+
+[[bin]]
+name = "curia"
+path = "src/main.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+atrium-netconf = { path = "../atrium-net/netconf" }

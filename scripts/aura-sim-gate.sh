@@ -639,6 +639,45 @@ n4() {
     "$V" 'pkill -x atrium-netconf' || true
 }
 
+# The Forum bar's network icon live (atrium-net.md §10.5): headless frescod,
+# forum-wm and forum-bar in the FreeBSD VM, the bar on atrium-netconf's
+# sockets, Wi-Fi joined; a frame before and after opening the menu.
+# BAR_X: the icon's x in the frame (find it in the first one).
+bar() {
+    "$V" "set -e
+        id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin
+        id appui >/dev/null 2>&1 || pw useradd appui -u 50004 -m -s /bin/sh
+        pkill -x atrium-netconf 2>/dev/null || true; sleep 1; rm -rf /tmp/aura/sockets
+        daemon -f -o /tmp/aura/netconf.log /tmp/aura/atrium-netconf -v --ctl /tmp/aura/net.sock --dir /tmp/aura/sockets --uid 65036 --capsicum
+        sleep 2"
+    out=$("$V" "echo '$PASS' | /tmp/aura/atrium-netctl --dir /tmp/aura/sockets --app network-wifi join aura-test" 2>&1) && ok "joined aura-test for the bar" || fail "join: $out"
+    for c in frescod forum-wm forum-bar; do
+        (cd "$ROOT/$c" && RUSTFLAGS="$X" cargo build -q --release --target "$T" --bin "$c" >&2)
+    done
+    D=/opt/bar-net; Sx=/tmp/st
+    "$V" "pkill -x frescod; pkill -x forum-wm; pkill -x forum-bar; sleep 1; rm -rf $Sx; mkdir -p $D $Sx /usr/local/share/fonts/ibm-plex; chmod 777 $Sx; true"
+    for c in frescod forum-wm forum-bar; do scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q "$ROOT/$c/target/$T/release/$c" "root@localhost:$D/"; done
+    for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+        "$V" "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
+    done
+    E2="FRESCO_SOCKET=$Sx/fresco.sock FRESCO_WM_SOCKET=$Sx/wm.sock FORUM_CTL_SOCKET=$Sx/ctl.sock"
+    "$V" "cd $Sx && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$Sx/screen FRESCOD_SOCK=$Sx/fresco.sock FRESCOD_CHROME_UIDS=50004 FRESCOD_WM_SOCK=$Sx/wm.sock FRESCOD_INPUT_SOCK=$Sx/inject.sock daemon -f -o $Sx/frescod.log $D/frescod </dev/null"
+    i=0; while [ $i -lt 60 ] && ! "$V" "test -S $Sx/fresco.sock"; do sleep 2; i=$((i+1)); done
+    "$V" "cd $Sx && env $E2 daemon -f -o $Sx/wm.log $D/forum-wm </dev/null; sleep 4; chmod 666 $Sx/*.sock"
+    "$V" "chmod 755 /tmp/aura; cd $Sx && env $E2 FORUM_BAR_NET_DIR=/tmp/aura/sockets daemon -f -u appui -o $Sx/bar.log $D/forum-bar </dev/null"
+    sleep ${SETTLE:-60}
+    O="$ROOT/scratch"; mkdir -p "$O"
+    "$V" "cp $Sx/screen.png $Sx/shot1.png"; scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q root@localhost:$Sx/shot1.png "$O/bar-network.png"
+    echo "frame: $O/bar-network.png"
+    if [ -n "${BAR_X:-}" ]; then
+        "$V" "printf 'MOVE $BAR_X 19\n' | nc -N -U $Sx/inject.sock; sleep 2; printf 'BTN 1 1\n' | nc -N -U $Sx/inject.sock; sleep 1; printf 'BTN 1 0\n' | nc -N -U $Sx/inject.sock"
+        sleep ${GAP:-45}
+        "$V" "cp $Sx/screen.png $Sx/shot2.png"; scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q root@localhost:$Sx/shot2.png "$O/bar-network-menu.png"
+        echo "frame: $O/bar-network-menu.png"
+    fi
+    "$V" "tail -n 20 $Sx/bar.log; tail -n 20 /tmp/aura/netconf.log"
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -668,6 +707,10 @@ move)
     weak_move
     teardown
     echo "weak-signal move: $pass checks passed" ;;
+bar)
+    setup hostapd-wpa2.conf
+    bar
+    echo "bar: frames in scratch/ (VMs left running; teardown with w1's end or reboot)" ;;
 n4)
     setup hostapd-wpa2.conf
     n4

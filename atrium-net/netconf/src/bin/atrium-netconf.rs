@@ -253,6 +253,7 @@ impl Backend for Front {
             match x.verb.as_str() {
                 "bss" if bss.len() < 512 => bss.push(x),
                 "scan-done" if x.get("for").is_none() => return Ok(lines::nearby(&bss, &known)),
+                "error" if x.get("why") == Some("busy") => return Err(Fail::new(status::FAILED, "the radio is busy (joining)")),
                 "state" if x.get("state") == Some("failed") && x.get("why") == Some("scan") => {
                     return Err(Fail::new(status::FAILED, "scan failed"));
                 }

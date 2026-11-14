@@ -394,3 +394,20 @@ fn join_during_a_scan_uses_it() {
     let o = s.scan_done(0, 3);
     assert!(matches!(kernel(&o)[0], Req::TxMgmt { frame, .. } if mgmt::subtype(frame) == mgmt::AUTH), "{o:?}");
 }
+
+/// `scan` while connected: the background scan with our own address, then
+/// the list, then the end.
+#[test]
+fn scan_while_connected_lists() {
+    let (mut s, _) = joined(true);
+    s.keys_msg(&Line::new("authorized"), 5);
+    let o = s.cmd(&Line::new("scan"), 10);
+    // mac=device: the association's address is the device's.
+    assert!(matches!(kernel(&o)[..], [Req::Scan { mac }] if *mac == OWN), "{o:?}");
+    let o = s.cmd(&Line::new("scan"), 10);
+    assert!(kernel(&o).is_empty(), "a second scan uses the first");
+    s.mgmt_rx(2412, -50, rx_flags::SCAN, &beacon(b"cafe", None, false, 1), 11);
+    let o = s.scan_done(0, 12);
+    let c: Vec<&str> = ctl(&o).iter().map(|l| l.verb.as_str()).collect();
+    assert!(c.contains(&"bss") && c.last() == Some(&"scan-done"), "{c:?}");
+}
