@@ -427,6 +427,32 @@ pub struct TextDoc {
     pub styles: StyleSheet,
     pub page: PageSetup,
     next_id: BlockId,
+    /// What ops changed since [`TextDoc::take_changes`] last ran.
+    changes: Option<Edit>,
+}
+
+/// Which blocks an edit touched: in the new document, blocks `first..last`
+/// are new or changed and every block from `last` on is block `i - delta` of
+/// the old document, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edit {
+    pub first: usize,
+    pub last: usize,
+    pub delta: isize,
+}
+
+impl Edit {
+    /// This edit followed by `e` (given in the numbering `self` left), as one.
+    pub fn then(self, e: Edit) -> Edit {
+        let last1 = if self.last as isize >= e.last as isize - e.delta {
+            (self.last as isize + e.delta) as usize
+        } else if self.last <= e.first {
+            self.last
+        } else {
+            e.last
+        };
+        Edit { first: self.first.min(e.first), last: last1.max(e.last), delta: self.delta + e.delta }
+    }
 }
 
 impl Default for TextDoc {
@@ -438,10 +464,23 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), next_id: 1 };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d
+    }
+
+    /// Notes that an op changed blocks (ops call this).
+    pub fn note(&mut self, e: Edit) {
+        self.changes = Some(match self.changes {
+            Some(c) => c.then(e),
+            None => e,
+        });
+    }
+
+    /// What changed since the last call, as one edit (for the paginator).
+    pub fn take_changes(&mut self) -> Option<Edit> {
+        self.changes.take()
     }
 
     /// A fresh block id.

@@ -58,15 +58,7 @@ impl Page {
     }
 }
 
-/// Which blocks an edit touched: in the new document, blocks `first..last`
-/// are new or changed and every block from `last` on is block `i - delta` of
-/// the old document, unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Edit {
-    pub first: usize,
-    pub last: usize,
-    pub delta: isize,
-}
+pub use crate::model::Edit;
 
 /// Longest keep-with-next chain looked at; longer chains don't keep.
 const MAX_CHAIN: usize = 64;
@@ -443,7 +435,11 @@ mod tests {
     /// Applies `op`, tells the paginator, repaginates, and checks the pages
     /// against a fresh pagination. Returns pages laid out.
     fn check_edit(d: &mut TextDoc, p: &mut Paginator, c: &mut LayoutCache, op: TextOp, e: Edit) -> u64 {
+        d.take_changes();
         op.apply(d);
+        if let Some(noted) = d.take_changes() {
+            assert_eq!(noted, e, "the op notes the edit it made");
+        }
         let before = p.laid;
         p.edit(d, c, &FixedFonts, e);
         assert!(p.run(d, c, &FixedFonts, usize::MAX));
@@ -500,7 +496,7 @@ mod tests {
             let len = d.blocks.len();
             let b = rnd(len as u64) as usize;
             let tl = d.para(b).unwrap().text.len();
-            match rnd(6) {
+            match rnd(7) {
                 0 | 1 => {
                     let k = rnd(90) as usize;
                     let ins = crate::ops::Fragment { text: "w ".repeat(k / 2) + "v", runs: vec![(0, 0)] };
@@ -515,6 +511,21 @@ mod tests {
                     let at = if d.para(b).unwrap().text.is_char_boundary(at as usize) { at } else { 0 };
                     let id = d.new_id();
                     check_edit(&mut d, &mut p, &mut c, TextOp::Split { block: (b) as u32, at, id, style: 0, props: Default::default() }, Edit { first: b, last: b + 2, delta: 1 });
+                }
+                6 if b + 1 < len => {
+                    // A selection across paragraphs deleted as one action.
+                    let b1 = (b + 1 + rnd(4) as usize).min(len - 1);
+                    let o0 = 0;
+                    let o1 = (d.para(b1).unwrap().text.len() as u32).min(5);
+                    d.take_changes();
+                    for op in d.delete_ops(b, o0, b1, o1) {
+                        op.apply(&mut d);
+                    }
+                    let e = d.take_changes().unwrap();
+                    p.edit(&d, &mut c, &FixedFonts, e);
+                    assert!(p.run(&d, &mut c, &FixedFonts, usize::MAX));
+                    let (fresh, _) = all(&d);
+                    assert_eq!(p.pages(), fresh.pages(), "{e:?}");
                 }
                 4 if b + 1 < len => {
                     check_edit(&mut d, &mut p, &mut c, TextOp::Join { block: (b ) as u32}, Edit { first: b, last: b + 1, delta: -1 });

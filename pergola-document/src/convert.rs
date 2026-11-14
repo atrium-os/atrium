@@ -27,6 +27,11 @@ impl Faces {
         Faces(fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect())
     }
 
+    /// The face registered for `FontSet` index `i`.
+    pub fn get(&self, i: usize) -> Option<&Face> {
+        self.0.get(i)
+    }
+
     /// The shared set's faces, registered once per process (so every
     /// document in a window shares atlas entries).
     pub fn shared() -> Result<&'static Faces, String> {

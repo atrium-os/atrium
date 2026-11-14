@@ -50,6 +50,17 @@ impl<O> History<O> {
         }
     }
 
+    /// Applies `ops` as part of the last action (a run of typing undoes as one
+    /// step); with no last action, as a new one labelled `label`. Clears redo.
+    pub fn extend_last<D>(&mut self, doc: &mut D, label: &str, ops: Vec<O>)
+    where
+        O: Op<D>,
+    {
+        let Some(last) = self.undo.last_mut() else { return self.run(doc, label, ops) };
+        last.ops.extend(ops.into_iter().map(|o| o.apply(doc)));
+        self.redo.clear();
+    }
+
     pub fn undo<D>(&mut self, doc: &mut D) -> Option<String>
     where
         O: Op<D>,

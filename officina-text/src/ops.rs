@@ -106,8 +106,33 @@ fn p_attr(runs: &[(u32, AttrId)], at: u32) -> AttrId {
     runs.get(i).map_or(0, |r| r.1)
 }
 
+impl TextOp {
+    /// The change that applying the op whose inverse is `self` made.
+    fn edit_of_inverse(&self) -> Option<crate::model::Edit> {
+        use crate::model::Edit;
+        Some(match *self {
+            TextOp::Nop => return None,
+            TextOp::Splice { block, .. } | TextOp::Restyle { block, .. } | TextOp::SetPara { block, .. } => Edit { first: block as usize, last: block as usize + 1, delta: 0 },
+            TextOp::Join { block } => Edit { first: block as usize, last: block as usize + 2, delta: 1 },
+            TextOp::Split { block, .. } => Edit { first: block as usize, last: block as usize + 1, delta: -1 },
+            TextOp::Remove { at, n } => Edit { first: at as usize, last: (at + n) as usize, delta: n as isize },
+            TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
+        })
+    }
+}
+
 impl Op<TextDoc> for TextOp {
     fn apply(self, d: &mut TextDoc) -> TextOp {
+        let inv = self.apply_inner(d);
+        if let Some(e) = inv.edit_of_inverse() {
+            d.note(e);
+        }
+        inv
+    }
+}
+
+impl TextOp {
+    fn apply_inner(self, d: &mut TextDoc) -> TextOp {
         match self {
             TextOp::Nop => TextOp::Nop,
             TextOp::Splice { block, at, del, ins } => d.splice(block as usize, at, del, ins),

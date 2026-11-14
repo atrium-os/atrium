@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4). O3a (text engine) built 2026-11-14 (§16.10).
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 built 2026-11-14 (§16.2). O4a (`.xlsx`) built 2026-11-14 (§16.3); O4b (styles and number formats) built 2026-11-14 (§16.4). O3a (text engine) built 2026-11-14 (§16.10); O3b (`RichTextEditor`) built 2026-11-14 (§16.11).
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -1214,6 +1214,55 @@ pages in 2.1 s (first page 2.3 ms; 30 s allowed); with layouts cached, 13 ms. Ty
 characters on page 757 relays 1 page per keystroke (worst 0.1 ms); Enter there relays 4
 pages; inserting a page of text on page 1 relays 553 pages in 7 ms until a break lines
 up; the result equals a fresh pagination.
+
+### 16.11 O3b as built (2026-11-14): `RichTextEditor`
+
+A new crate, `pergola-richtext`, beside `pergola-document`, so Pergola itself does
+not depend on Officina's engine.
+
+- **Editing core** (`editor.rs`, no pixels). Caret and selection as (block, byte) on
+  grapheme boundaries, across paragraphs. Motions: grapheme, word (Ctrl or Alt), line
+  start and end, up and down keeping the goal column, Page Up and Down by the view's
+  height, document start and end; Shift extends. Typing replaces the selection; Enter
+  splits (at the end of a heading the new paragraph takes the style's "next", body
+  text); Shift+Enter a line break (U+2028); Tab a tab; Backspace and Delete by
+  grapheme or word, joining paragraphs at their edges. Cut, copy and paste as plain
+  text (newlines make paragraphs). Ctrl+B/I/U toggle by what the caret shows, on the
+  selection or, with none, on what is typed next; Ctrl+0/1/2/3 Normal and Heading 1–3;
+  Ctrl+L/E/R/J alignment. Undo and redo through `officina_core::history`: a run of
+  typing or deleting is one step (`History::extend_last`), other actions one step each.
+- **Ops say what they changed.** Each applied `TextOp` notes its block range on the
+  document (`TextDoc::take_changes`, composed with `Edit::then`), so the editor hands
+  the paginator one edit per action, undo and redo included. Pagination then runs for
+  up to 4 ms after a key; the rest continues in later frames.
+- **Geometry.** A position's page, x, line top and height (`Editor::spot`) from the
+  pages' slices and the cached line layouts; a page point back to a position
+  (`Editor::hit`), cluster by cluster, so a ligature or a mark stays whole.
+- **Paged view** (`view.rs`). Pages down a scroll view at zoom 1 = 4/3 units a point;
+  only the pages in view and one each side are sent, each a scene group keyed by its
+  page number; text is shaped glyph runs (`Node::Glyphs`, faces from
+  `pergola_document::Faces`), with highlight, underline and strike rects. Selection
+  and caret are an overlay group, so moving the caret sends no page. Content is placed
+  relative to a base moving in 8,192-unit steps (as `GridView`), so page 1,500 has
+  small coordinates. While pagination runs, the page count and scroll height are
+  estimated from the characters reached. Pointer press places the caret, drag
+  selects; keys scroll the caret into view.
+
+Gates: 8 tests (typing, Enter, joins and undo in steps; graphemes with combining marks
+and emoji modifiers; word motions; selection across paragraphs with copy, cut and
+multi-line paste; formatting keys and typing attributes; up and down keeping the
+column; hit testing; edits, undo and redo repaginating to what a fresh pagination
+gives; a 1,800-page document sends only the pages near the view, at small
+coordinates; a click places the caret; a key changes one page and the overlay; an
+arrow key only the overlay). `examples/keystroke_500.rs` (release, cloud container,
+real shaping): in a 510-page document, 261 keys on page 255 (typing, Enter, Backspace,
+Down) take p50 0.64 ms, p99 1.4 ms, max 1.6 ms from key to scene diff, against a
+8.3 ms frame at 120 Hz.
+
+Not yet: IME composition (no composition events reach apps yet, §17 D10), bidi, spell
+underlines, accessibility, the flowing layout, double-click word selection and
+Shift+click (pointer events carry neither), auto-scroll while dragging past the edge,
+caret blink.
 
 ## 17. Decisions (accepted 2026-11-14)
 
