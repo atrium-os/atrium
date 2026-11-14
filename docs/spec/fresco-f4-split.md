@@ -166,6 +166,14 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 - Found on the way: the scene server's CAS kept every texture blob ever sent, bound or not, so an app cycling textures grew its renderer forever. It now keeps only blobs a slot is bound to and those sent since the last upload pass.
 - `OP_BUDGET` (65,536 kernel ops per frame after culling) still drops whole nodes at pack time; this budget is the memory side, that one the per-frame raster side.
 
+### F4i. A shipped frescod refuses the unsplit modes. Done (2026-11-14)
+
+`FRESCOD_SPLIT=0`, `FRESCOD_RENDERER=vulkan` (split mode stays off with it), `FRESCOD_SPLIT_PIXELS=0` (frescod rasters clients' frames), `FRESCOD_RENDERER_LAUNCHER` (renderers outside portcullisd's jails) and the test modes `FRESCOD_GPU_ISOLATION_PROBE` / `FRESCOD_GPU_ONLY` each put clients' scenes or their raster back into frescod, or out of their jails, where one huge scene could stall the whole screen. They stay for development.
+
+- A shipped frescod (run as `_frescod`, 65010, or installed as `atrium-frescod`, which is what `40-atrium-frescod.toml` does) checks its environment first thing (`fresco_split::production::check`) and exits 78 (`EX_CONFIG`) naming every development setting it found. It never falls back to an unsplit mode by itself.
+- Development runs (`frescod` as root from the VM scripts) are unchanged.
+- Gate: `scripts/fresco-production-gate.sh` runs the policy's tests and checks that the shipped service runs `atrium-frescod` as `_frescod` with none of those variables, and that no install or launch file sets them; `... vm <frescod>` also starts it as `atrium-frescod` in the VM with each setting and expects exit 78.
+
 ### F4f. Secure input for passwords (waits on F5 and Navigator C0)
 
 - A password field is marked in the window's semantic tree, and the broker validates the mark (§6.4).
@@ -173,7 +181,7 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 
 ## Order
 
-F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e, F4g and F4h are done.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e, F4g, F4h and F4i are done.
 
 ## Decisions taken (recommended; say if you want otherwise)
 

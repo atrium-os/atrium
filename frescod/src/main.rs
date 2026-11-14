@@ -82,6 +82,16 @@ fn flip_timeout_ms() -> u32 {
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
 
+    // A shipped frescod never runs a development mode that would put
+    // clients' scenes back in this process (officina.md §10.5).
+    let argv0 = std::env::args().next().unwrap_or_default();
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if let Err(e) = fresco_split::production::check(euid, &argv0, |k| std::env::var(k).ok()) {
+        eprintln!("frescod: {e}");
+        std::process::exit(78); // EX_CONFIG
+    }
+
     // The app GPU channel alone, with no display or renderer: for testing
     // the channel (atrium-gpu-fuzz) on a machine that cannot compose.
     if std::env::var_os("FRESCOD_GPU_ONLY").is_some() {
