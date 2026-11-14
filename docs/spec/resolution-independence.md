@@ -242,7 +242,7 @@ parent's scale, so it keeps its size and its place against the parent on any mon
 - **Moving the parent to another monitor** moves its pop-ups and sheets with it; they switch
   scale with the parent on release (§7), in one frame, never one before the other.
 
-### 7.2 The bar, its icons and its panels
+### 7.2 The bar, the dock, their icons and panels
 
 - **The bar** (forum-bar) is a Pergola app, so its height (`shell::BAR_H`, 38), its text and
   its status icons are in pt and draw at the monitor's scale. Its icons are vector (Phosphor,
@@ -260,6 +260,12 @@ parent's scale, so it keeps its size and its place against the parent on any mon
   sized in pt by the app and placed by frescod against the bar's icon at the bar's scale; the
   app's process is told that scale (it opens at it, `WindowCreateReply`). frescod's label gap
   between bar and panel (`HOSTED_LABEL_GAP`) becomes pt too.
+- **The dock** (forum-dock) is a Pergola app too, started with the session: its tiles
+  (`TILE`, 60) and its Lucide icons are vector and in pt, so they follow the scale like the
+  bar. Its reservation is forum-wm's hard-coded 48 device px today and becomes the dock's
+  reported height in pt, as for the bar. It has no panels yet; when it gets them (a tile's
+  menu, a stack of a folder), they are its pop-ups (§7.1). App icons that arrive as bitmaps
+  (an app's manifest icon) follow §6.4: declared density, chosen for the device size.
 - **The trusted strip** above everything is frescod's (§8), 24 pt.
 
 ## 8. frescod's own drawing
