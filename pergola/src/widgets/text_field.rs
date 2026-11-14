@@ -37,6 +37,7 @@ pub struct TextField {
     pub placeholder: String,
     pub rect: Rect,
     on_submit: Option<SubmitCallback>,
+    autofocus: bool,
 }
 
 impl TextField {
@@ -46,6 +47,7 @@ impl TextField {
             placeholder: String::new(),
             rect: Rect::new(0.0, 0.0, 0.0, size::input_height()),
             on_submit: None,
+            autofocus: false,
         }
     }
 
@@ -56,6 +58,13 @@ impl TextField {
 
     pub fn on_submit(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.on_submit = Some(Rc::new(f));
+        self
+    }
+
+    /// Take keyboard focus when the field first appears (a find bar, a
+    /// dialog's first field).
+    pub fn autofocus(mut self, on: bool) -> Self {
+        self.autofocus = on;
         self
     }
 
@@ -180,6 +189,9 @@ impl View for TextField {
         ctx.tree.insert(Some(bg_id), Node::Rect { rect: under, fill: theme.text_primary(), radius: 0.0 });
 
         ctx.focusable(bg_id);
+        if self.autofocus {
+            ctx.autofocus(bg_id);
+        }
         let state = self.state.clone();
         let submit = self.on_submit.clone();
         ctx.on_key(bg_id, move |ev| {

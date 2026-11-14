@@ -14,7 +14,9 @@ use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, ScrollState};
+use officina_text::find::Query;
+use pergola::text_edit::TextEdit;
+use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, ScrollState, TextField};
 use pergola::{Color, Mutable, TextStyle};
 use pergola_richtext::editor::Toggle;
 use pergola_richtext::RichTextView;
@@ -24,6 +26,8 @@ use crate::doc::Doc;
 pub const PICKER_SLOT: u64 = 1;
 pub const TOOLBAR_H: f32 = 48.0;
 pub const STATUS_H: f32 = 26.0;
+/// The find bar, under the toolbar while it is open.
+pub const FIND_H: f32 = 48.0;
 
 /// The paragraph styles the Style menu offers, in order.
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
@@ -49,6 +53,14 @@ pub enum Cmd {
     ColumnRight,
     DeleteRow,
     DeleteColumn,
+    FindOpen,
+    FindClose,
+    FindNext,
+    FindPrevious,
+    Replace,
+    ReplaceAll,
+    MatchCase,
+    WholeWord,
 }
 
 impl Cmd {
@@ -63,6 +75,17 @@ pub struct Ui {
     pub asking: bool,
 }
 
+/// The find bar's state (its two fields are [`Write::find_text`] and
+/// [`Write::replace_text`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FindBar {
+    pub open: bool,
+    pub match_case: bool,
+    pub whole_word: bool,
+    /// What the last find or replace found.
+    pub message: String,
+}
+
 /// Cheap to clone: every field is shared.
 #[derive(Clone)]
 pub struct Write {
@@ -74,11 +97,14 @@ pub struct Write {
     pub size: Rc<Cell<(f32, f32)>>,
     pub style_menu: Mutable<MenuState>,
     pub insert_menu: Mutable<MenuState>,
+    pub find: Mutable<FindBar>,
+    pub find_text: Mutable<TextEdit>,
+    pub replace_text: Mutable<TextEdit>,
 }
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()) }
+        Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")) }
     }
 
     pub fn changed(&self) {
@@ -95,8 +121,71 @@ impl Write {
         old
     }
 
-    pub fn pages_rect(w: f32, h: f32) -> Rect {
-        Rect::new(0.0, TOOLBAR_H, w, (h - TOOLBAR_H - STATUS_H).max(40.0))
+    /// Where the pages go: under the toolbar and the find bar when it is open.
+    pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
+        let top = TOOLBAR_H + if self.find.get_cloned().open { FIND_H } else { 0.0 };
+        Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
+    }
+
+    fn query(&self) -> Query {
+        let f = self.find.get_cloned();
+        Query { text: self.find_text.get_cloned().text().to_string(), match_case: f.match_case, whole_word: f.whole_word }
+    }
+
+    /// Runs a find bar command on the editor.
+    fn find_cmd(&self, c: Cmd) {
+        let mut f = self.find.get_cloned();
+        match c {
+            Cmd::FindOpen => {
+                f.open = true;
+                // The selection, when it is on one line, is what to find.
+                let sel = self.doc.borrow().ed.borrow().selected_text();
+                if !sel.is_empty() && !sel.contains('\n') && sel.chars().count() <= 200 {
+                    let mut t = TextEdit::new(&sel);
+                    t.select_all();
+                    self.find_text.set(t);
+                }
+                f.message.clear();
+            }
+            Cmd::FindClose => f = FindBar { open: false, ..f },
+            Cmd::MatchCase => f.match_case = !f.match_case,
+            Cmd::WholeWord => f.whole_word = !f.whole_word,
+            _ => {}
+        }
+        self.find.set(f.clone());
+        if !matches!(c, Cmd::FindNext | Cmd::FindPrevious | Cmd::Replace | Cmd::ReplaceAll) {
+            return;
+        }
+        let q = self.query();
+        if q.text.is_empty() {
+            return;
+        }
+        let with = self.replace_text.get_cloned().text().to_string();
+        let msg = {
+            let d = self.doc.borrow();
+            let mut e = d.ed.borrow_mut();
+            match c {
+                Cmd::ReplaceAll => match e.replace_all(&q, &with) {
+                    0 => "No matches.".to_string(),
+                    1 => "Replaced 1 match.".to_string(),
+                    n => format!("Replaced {n} matches."),
+                },
+                _ => {
+                    let found = match c {
+                        Cmd::Replace => {
+                            e.replace(&q, &with);
+                            e.has_selection()
+                        }
+                        _ => e.find_next(&q, c == Cmd::FindNext),
+                    };
+                    if found { String::new() } else { "No matches.".to_string() }
+                }
+            }
+        };
+        self.find.set(FindBar { message: msg, ..self.find.get_cloned() });
+        let (w, h) = self.size.get();
+        let ed = self.doc.borrow().ed.clone();
+        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
     }
 
     /// Runs the editing commands queued since the last call and journals what
@@ -135,6 +224,13 @@ impl Write {
                     Cmd::DeleteColumn => {
                         e.delete_column();
                     }
+                    Cmd::FindOpen | Cmd::FindClose | Cmd::FindNext | Cmd::FindPrevious | Cmd::Replace | Cmd::ReplaceAll | Cmd::MatchCase | Cmd::WholeWord => {
+                        drop(e);
+                        drop(d);
+                        self.find_cmd(c);
+                        self.changed();
+                        return false;
+                    }
                     _ => return true,
                 }
                 drop(e);
@@ -166,6 +262,19 @@ impl Write {
             self.changed();
         }
     }
+}
+
+/// 1234567 as "1,234,567".
+pub fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl View for Write {
@@ -229,8 +338,45 @@ impl View for Write {
         ctx.add(Node::Text { rect: Rect::new(x + 12.0, 14.0, (w - x - 24.0).max(0.0), 22.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
         ctx.add(Node::Rect { rect: Rect::new(0.0, TOOLBAR_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
 
+        // The find bar.
+        let fb = self.find.get_cloned();
+        if fb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let fw = ((w - 640.0) / 2.0).clamp(140.0, 260.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.find_text.clone()).placeholder("Find").autofocus(true).at(12.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::FindNext)).render(ctx);
+            let mut x = 12.0 + fw + 6.0;
+            Button::secondary("‹").at(x, y + 8.0).width(32.0).on_click(push(Cmd::FindPrevious)).render(ctx);
+            x += 36.0;
+            Button::secondary("›").at(x, y + 8.0).width(32.0).on_click(push(Cmd::FindNext)).render(ctx);
+            x += 36.0;
+            let toggle = |on: bool, label: &str| if on { Button::primary(label) } else { Button::secondary(label) };
+            toggle(fb.match_case, "Aa").at(x, y + 8.0).width(40.0).on_click(push(Cmd::MatchCase)).render(ctx);
+            x += 44.0;
+            toggle(fb.whole_word, "Word").at(x, y + 8.0).width(56.0).on_click(push(Cmd::WholeWord)).render(ctx);
+            x += 72.0;
+            let cmds = self.cmds.clone();
+            TextField::new(self.replace_text.clone()).placeholder("Replace with").at(x, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Replace)).render(ctx);
+            x += fw + 6.0;
+            Button::secondary("Replace").at(x, y + 8.0).width(76.0).on_click(push(Cmd::Replace)).render(ctx);
+            x += 80.0;
+            Button::secondary("All").at(x, y + 8.0).width(48.0).on_click(push(Cmd::ReplaceAll)).render(ctx);
+            x += 60.0;
+            if !fb.message.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, (w - x - 56.0).max(0.0), 18.0), content: fb.message.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            Button::secondary("✕").at(w - 44.0, y + 8.0).width(32.0).on_click(push(Cmd::FindClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The pages.
-        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), Self::pages_rect(w, h)).emit(ctx);
+        let cmds = self.cmds.clone();
+        RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).emit(ctx);
 
         // Status line: page, pages (≈ while pagination runs), and the last message.
         let sy = h - STATUS_H;
@@ -241,8 +387,13 @@ impl View for Write {
             let page = e.spot(c).page + 1;
             let n = e.pages.pages().len();
             let total = if e.pages.done() { format!("{n}") } else { format!("≈{n}+") };
-            let paras = e.doc.blocks.len();
-            let pos = format!("Page {page} of {total} · {paras} paragraphs");
+            let words = if e.has_selection() {
+                format!("{} of {} words", group(e.counts().words), group(e.words.total().words))
+            } else {
+                let c = e.words.total();
+                format!("{} words, {} characters", group(c.words), group(c.chars))
+            };
+            let pos = format!("Page {page} of {total} · {words}");
             if status.is_empty() {
                 pos
             } else {
@@ -256,5 +407,52 @@ impl View for Write {
             ctx.slot(id, PICKER_SLOT);
         }
         ctx.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_bar_commands() {
+        let doc = Doc::from_text("t.txt", b"one cat\ntwo cats\nCat three").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let sel = || {
+            let d = w.doc.borrow();
+            let e = d.ed.borrow();
+            (e.anchor.block, e.anchor.at, e.caret.at)
+        };
+        run(Cmd::FindOpen);
+        assert!(w.find.get_cloned().open);
+        assert!(w.pages_rect(1200.0, 800.0).y() > TOOLBAR_H);
+        w.find_text.set(TextEdit::new("cat"));
+        run(Cmd::FindNext);
+        assert_eq!(sel(), (0, 4, 7));
+        run(Cmd::WholeWord);
+        run(Cmd::FindNext);
+        assert_eq!(sel(), (2, 0, 3));
+        run(Cmd::MatchCase);
+        run(Cmd::FindNext);
+        assert_eq!(sel(), (0, 4, 7));
+        run(Cmd::MatchCase);
+        run(Cmd::WholeWord);
+        w.replace_text.set(TextEdit::new("dog"));
+        run(Cmd::ReplaceAll);
+        assert_eq!(w.find.get_cloned().message, "Replaced 3 matches.");
+        assert_eq!(w.doc.borrow().ed.borrow().doc.plain_text(), "one dog\ntwo dogs\ndog three");
+        run(Cmd::Undo);
+        assert_eq!(w.doc.borrow().ed.borrow().doc.plain_text(), "one cat\ntwo cats\nCat three");
+        w.find_text.set(TextEdit::new("zebra"));
+        run(Cmd::FindNext);
+        assert_eq!(w.find.get_cloned().message, "No matches.");
+        run(Cmd::FindClose);
+        assert_eq!(w.pages_rect(1200.0, 800.0).y(), TOOLBAR_H);
+        assert_eq!(group(1234567), "1,234,567");
+        assert_eq!(group(12), "12");
     }
 }

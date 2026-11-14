@@ -59,6 +59,30 @@ fn main() {
     let chars = d.blocks.counts().chars;
     println!("built {} blocks, {} characters in {:.2?}", d.blocks.len(), chars, built);
 
+    // Find (§15: first result under 100 ms, all under 1 s) and word count.
+    use officina_text::find::{Query, Search};
+    for (what, q) in [("a rare word", Query { text: "größer".into(), ..Default::default() }), ("a common word, whole words", Query { text: "the".into(), whole_word: true, ..Default::default() }), ("absent text", Query { text: "zebra".into(), ..Default::default() })] {
+        let t = Instant::now();
+        let first = d.find(&q, d.blocks.len() / 2, 0, true);
+        let first_t = t.elapsed();
+        let t = Instant::now();
+        let mut s = Search::new(&q);
+        s.step(&d, usize::MAX);
+        println!("find {what}: first {:?} in {:.2?}; all {} in {:.2?}", first.map(|m| m.block), first_t, s.matches.len(), t.elapsed());
+    }
+    let t = Instant::now();
+    let c = d.counts();
+    println!("word count: {} words, {} characters in {:.2?}", c.words, c.chars, t.elapsed());
+    let t = Instant::now();
+    let ops = d.replace_all_ops(&Query { text: "café".into(), ..Default::default() }, "coffee shop");
+    let n = ops.len();
+    let mut h = officina_core::history::History::new();
+    h.run(&mut d, "Replace All", ops);
+    let replaced = t.elapsed();
+    let t = Instant::now();
+    h.undo(&mut d);
+    println!("replace all: {n} replacements in {:.2?}, one undo in {:.2?}", replaced, t.elapsed());
+
     let mut cache = LayoutCache::default();
     let mut p = Paginator::new(&d);
     let t = Instant::now();

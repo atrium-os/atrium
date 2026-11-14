@@ -80,11 +80,12 @@ pub struct RichTextView {
     pub rect: Rect,
     pub zoom: f32,
     key: u64,
+    on_find: Option<Rc<dyn Fn()>>,
 }
 
 impl RichTextView {
     pub fn new(editor: Rc<RefCell<Editor>>, scroll: Mutable<ScrollState>, rev: Mutable<u64>, rect: Rect) -> Self {
-        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578 }
+        RichTextView { editor, scroll, rev, rect, zoom: 1.0, key: 0x7274_6578, on_find: None }
     }
     pub fn zoom(mut self, z: f32) -> Self {
         self.zoom = z.clamp(0.25, 5.0);
@@ -92,6 +93,11 @@ impl RichTextView {
     }
     pub fn key(mut self, k: u64) -> Self {
         self.key = k;
+        self
+    }
+    /// Called on Ctrl+F (and Ctrl+H) in the text.
+    pub fn on_find(mut self, f: impl Fn() + 'static) -> Self {
+        self.on_find = Some(Rc::new(f));
         self
     }
 
@@ -105,6 +111,18 @@ impl RichTextView {
         let reached = ed.pages.pages().last().map_or(0, |p| ed.doc.blocks.char_of_block(p.start.block)).max(1);
         let total = ed.doc.blocks.counts().chars.max(1);
         (n, ((n as f64 * total as f64 / reached as f64).ceil() as usize).max(n))
+    }
+
+    /// Scrolls so the editor's caret shows (after a command moved it: find,
+    /// go to).
+    pub fn reveal_caret(&self) {
+        let mut e = self.editor.borrow_mut();
+        let g = Geom::of(&e, self.rect, self.zoom);
+        let mut st = self.scroll.get();
+        reveal(&mut e, &g, &mut st);
+        if st != self.scroll.get() {
+            self.scroll.set(st);
+        }
     }
 
     pub fn emit(&self, ctx: &mut Ctx) -> NodeId {
@@ -242,7 +260,7 @@ impl RichTextView {
             more
         });
         {
-            let (ed, sc, rev) = (self.editor.clone(), self.scroll.clone(), self.rev.clone());
+            let (ed, sc, rev, find) = (self.editor.clone(), self.scroll.clone(), self.rev.clone(), self.on_find.clone());
             ctx.on_key(body, move |ev| {
                 let Event::Key { kind, key, modifiers, chars } = ev else { return };
                 if *kind == KeyEventKind::Up {
@@ -253,6 +271,13 @@ impl RichTextView {
                 let out = e.key(*key, *modifiers, chars, page_h);
                 match out {
                     Outcome::Ignored => return,
+                    Outcome::Find => {
+                        drop(e);
+                        if let Some(f) = &find {
+                            f();
+                        }
+                        return;
+                    }
                     Outcome::Copy(t) => {
                         let _ = pergola::clipboard::copy_text(&t, false);
                     }

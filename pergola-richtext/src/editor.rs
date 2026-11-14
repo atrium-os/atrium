@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use officina_core::history::History;
+use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
 use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, ImageData, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
@@ -59,6 +60,8 @@ pub enum Outcome {
     Copy(String),
     /// Ask the clipboard for text, then call [`Editor::insert`].
     Paste,
+    /// Ctrl+F: the app opens its find bar.
+    Find,
     Ignored,
 }
 
@@ -113,12 +116,15 @@ pub struct Editor {
     attrs_logged: usize,
     images_logged: usize,
     numbering: Option<(u64, Rc<Numbering>)>,
+    /// Word count, kept current through edits.
+    pub words: WordCounter,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default() };
+        e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
     }
@@ -295,6 +301,7 @@ impl Editor {
     fn changed(&mut self) {
         self.revision += 1;
         if let Some(e) = self.doc.take_changes() {
+            self.words.edit(&self.doc, e);
             if !self.pages.fits(&self.doc) {
                 // New page geometry: every line may break differently.
                 self.pages.reset(&self.doc);
@@ -499,6 +506,75 @@ impl Editor {
         let t = self.selected_text();
         self.delete_selection("Cut");
         Some(t)
+    }
+
+    // ---- find and replace ----
+
+    /// Selects the next match after the selection (or the one before it),
+    /// wrapping round. False when there is none.
+    pub fn find_next(&mut self, q: &Query, forward: bool) -> bool {
+        let (a, b) = self.selection();
+        let from = if forward { b } else { a };
+        match self.doc.find(q, from.block, from.at, forward) {
+            Some(m) => {
+                self.set_caret(Pos::new(m.block, m.start), false);
+                self.set_caret(Pos::new(m.block, m.end), true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the selection is exactly a match.
+    fn selection_matches(&self, q: &Query) -> bool {
+        let (a, b) = self.selection();
+        if a.block != b.block || a == b {
+            return false;
+        }
+        let t = self.text(a.block);
+        Matcher::new(q).all(t).iter().any(|&(s, e)| (s, e) == (a.at, b.at))
+    }
+
+    /// Replaces the selection when it is a match, then finds the next one.
+    /// Returns whether it replaced.
+    pub fn replace(&mut self, q: &Query, with: &str) -> bool {
+        let did = self.selection_matches(q);
+        if did {
+            let (a, b) = self.selection();
+            let attr = self.doc.para(a.block).map(|p| p.attr_at(a.at)).unwrap_or(0);
+            let attr = self.doc.plain_attr(attr);
+            let op = TextOp::Splice { block: a.block as u32, at: a.at, del: b.at - a.at, ins: Fragment { text: with.to_string(), runs: vec![(0, attr)] } };
+            self.apply("Replace", vec![op], Kind::Other);
+            let end = Pos::new(a.block, a.at + with.len() as u32);
+            self.set_caret(end, false);
+        }
+        self.find_next(q, true);
+        did
+    }
+
+    /// Replaces every match, as one undoable action. Returns how many.
+    pub fn replace_all(&mut self, q: &Query, with: &str) -> usize {
+        let ops = self.doc.replace_all_ops(q, with);
+        let n = ops.len();
+        self.apply("Replace All", ops, Kind::Other);
+        let c = self.clamp(self.caret);
+        self.set_caret(c, false);
+        n
+    }
+
+    /// Word count over the selection (when there is one) or the document.
+    pub fn counts(&self) -> Counts {
+        if !self.has_selection() {
+            return self.words.total();
+        }
+        let (a, b) = self.selection();
+        if a.block == b.block {
+            return count(&self.text(a.block)[a.at as usize..b.at as usize]);
+        }
+        let mut c = count(&self.text(a.block)[a.at as usize..]);
+        c.add(self.words.over(a.block + 1..b.block));
+        c.add(count(&self.text(b.block)[..b.at as usize]));
+        c
     }
 
     pub fn undo(&mut self) -> bool {
@@ -1257,6 +1333,7 @@ impl Editor {
                 "c" if self.has_selection() => Outcome::Copy(self.selected_text()),
                 "x" => self.cut().map_or(Outcome::Ignored, Outcome::Copy),
                 "v" => Outcome::Paste,
+                "f" | "h" => Outcome::Find,
                 "z" if m.shift => edited(self.redo()),
                 "z" => edited(self.undo()),
                 "y" => edited(self.redo()),
@@ -1370,6 +1447,42 @@ pub(crate) mod tests {
         for c in s.chars() {
             e.key(Key::Char, NO, &c.to_string(), 0);
         }
+    }
+
+    #[test]
+    fn find_replace_and_counts() {
+        let mut e = ed(&["The cat sat.", "A cat, a Cat."]);
+        let q = Query { text: "cat".into(), ..Default::default() };
+        assert!(e.find_next(&q, true));
+        assert_eq!((e.anchor, e.caret), (Pos::new(0, 4), Pos::new(0, 7)));
+        assert!(e.find_next(&q, true));
+        assert_eq!(e.anchor, Pos::new(1, 2));
+        assert!(e.find_next(&q, false));
+        assert_eq!(e.anchor, Pos::new(0, 4));
+        // Replace replaces the selected match and moves on.
+        assert!(e.replace(&q, "dog"));
+        assert_eq!(texts(&e), ["The dog sat.", "A cat, a Cat."]);
+        assert_eq!(e.anchor, Pos::new(1, 2));
+        // Replace with no match selected only finds.
+        e.set_caret(Pos::new(0, 0), false);
+        assert!(!e.replace(&q, "dog"));
+        assert_eq!(e.anchor, Pos::new(1, 2));
+        assert_eq!(e.counts().words, 1);
+        assert_eq!(e.replace_all(&q, "bird"), 2);
+        assert_eq!(texts(&e), ["The dog sat.", "A bird, a bird."]);
+        assert_eq!(e.words.total().words, 7);
+        e.undo();
+        assert_eq!(texts(&e), ["The dog sat.", "A cat, a Cat."]);
+        e.undo();
+        assert_eq!(texts(&e), ["The cat sat.", "A cat, a Cat."]);
+        assert_eq!(e.words.total().words, 7);
+        e.set_caret(Pos::new(0, 4), false);
+        e.set_caret(Pos::new(1, 5), true);
+        assert_eq!(e.counts().words, 4);
+        let whole = Query { text: "a".into(), whole_word: true, match_case: true, ..Default::default() };
+        assert!(e.find_next(&whole, true));
+        assert_eq!(e.anchor, Pos::new(1, 7));
+        assert!(!e.find_next(&Query { text: "zebra".into(), ..Default::default() }, true));
     }
 
     #[test]

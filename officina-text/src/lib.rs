@@ -13,6 +13,7 @@
 //! Lengths are in layout units ([`LU`] per point, integers), so layout is exact
 //! and the same on every machine.
 
+pub mod find;
 pub mod layout;
 pub mod lists;
 pub mod model;
