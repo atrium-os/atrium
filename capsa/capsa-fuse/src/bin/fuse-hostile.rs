@@ -503,6 +503,32 @@ mod freebsd {
                     // server never answers that READLINK.
                     let p = format!("{}/lnk/x", a.mnt);
                     while Instant::now() < until { let _ = std::fs::metadata(&p); }
+                } else if a.repro.as_deref() == Some("fsync-timeout") {
+                    // Two handles on one file (read-only and write-only
+                    // opens), then fsync: the kernel sends one FSYNC per
+                    // handle, reusing its ticket after the first one timed
+                    // out (the server never answers FSYNC).
+                    let p = format!("{}/a", a.mnt);
+                    let r = std::fs::File::open(&p);
+                    let w = std::fs::OpenOptions::new().write(true).open(&p);
+                    match (&r, &w) {
+                        (Ok(_), Ok(w)) => eprintln!("fuse-hostile: repro: fsync with two handles: {:?}", w.sync_all()),
+                        _ => eprintln!("fuse-hostile: repro: open failed: {:?} {:?}", r.err(), w.err()),
+                    }
+                    while Instant::now() < until { std::thread::sleep(Duration::from_millis(100)); }
+                } else if a.repro.as_deref() == Some("dir-cycle") {
+                    // One driver walks down through "up" (which the server
+                    // says is the root) while the other walks root -> dir1:
+                    // with the cycle accepted, they take the same two vnode
+                    // locks in opposite orders.
+                    let p = if k == 0 { format!("{}/dir1/up/dir1/up/dir1/a", a.mnt) } else { format!("{}/dir1/a", a.mnt) };
+                    if k == 0 {
+                        match std::fs::metadata(format!("{}/dir1/up", a.mnt)) {
+                            Ok(_) => eprintln!("fuse-hostile: repro: dir1/up accepted: the kernel took the root as dir1's child"),
+                            Err(e) => eprintln!("fuse-hostile: repro: dir1/up refused: {e}"),
+                        }
+                    }
+                    while Instant::now() < until { let _ = std::fs::metadata(&p); }
                 } else {
                     drive(&a.mnt, a.seed ^ (k as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15), until);
                 }
@@ -610,6 +636,14 @@ mod freebsd {
                 eprintln!("fuse-hostile: repro: holding READLINK {}, killing the driver", req.unique);
                 parked.push(req.unique);
                 stop_at = Instant::now();
+                continue;
+            }
+            if a.repro.as_deref() == Some("fsync-timeout") && req.opcode == proto::FSYNC && !honest_only {
+                drops += 1;
+                continue; // never answered: the kernel times out
+            }
+            if a.repro.as_deref() == Some("dir-cycle") && req.opcode == proto::LOOKUP && proto::cstr(req.body).is_some_and(|(n, _)| n == "up") {
+                let _ = dev.write(&frame(req.unique, 0, &entry(&attr(1, a.uid), 0)));
                 continue;
             }
             let Some(good) = honest(&req, a.uid) else { continue };

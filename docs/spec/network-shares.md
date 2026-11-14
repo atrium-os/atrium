@@ -148,7 +148,17 @@ remote attacker can reach, and the kernel work is there:
    fusefs waits on a `READLINK` inside `namei()` trips the
    `error != ERESTART` assertion and panics
    (docs/reviews/2026-11-14-fusefs-namei-erestart.md, reproducer
-   `--repro readlink-kill`; release kernels unaffected). fusefs's own
+   `--repro readlink-kill`; release kernels unaffected). Second find: a
+   server naming a directory's ancestor as its child makes lookups
+   deadlock on vnode locks for good, release kernels included
+   (docs/reviews/2026-11-14-fusefs-dir-cycle-deadlock.md, `--repro
+   dir-cycle`). Third: fsync reused a request still queued when the server
+   didn't answer, corrupting fusefs's request lists
+   (docs/reviews/2026-11-14-fusefs-fsync-ticket-reuse.md, `--repro
+   fsync-timeout`). All three fixed in the fork (`fbsd:a7f02efce`,
+   `fbsd:52048d225`, `fbsd:47dfe5c94`); on that kernel the stock fusefs
+   suite passes (690/771, 0 failed, 81 skipped) and 13 fuzz rounds (12,916
+   requests, 3,754 mutated) ran clean. fusefs's own
    "FUSE protocol violation" warnings are the kernel catching the server
    and are expected.
 2. **Mount options** set by jaild, done 2026-11-14 for every FUSE mount

@@ -64,7 +64,8 @@ produce. Patch against upstream main (line 933 there):
  	nameicap_cleanup(ndp, error);
 ```
 
-Status: not yet applied to the fork (atrium-os/freebsd-src) nor tested on a
-patched kernel; not reported upstream. The fuzz rounds stop their drivers
-with `SIGTERM` (which fusefs holds until the answer) so they can keep
-looking past this one.
+Status: applied to the fork as `fbsd:a7f02efce` (Shankar 2026-11-14:
+"Apply it. We can report it later"). On the patched GENERIC kernel the
+reproducer runs clean and the stock fusefs suite passes (690/771, 0 failed,
+81 skipped). Not reported upstream yet. The fuzz rounds still stop their
+drivers with `SIGTERM`, which fusefs holds until the answer.
