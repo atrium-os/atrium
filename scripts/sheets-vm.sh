@@ -6,6 +6,7 @@
 #   sh scripts/cloud-vm.sh up
 #   sh scripts/sheets-vm.sh [out.png]
 #   BENCH="all 1048576 8 60" sh scripts/sheets-vm.sh    # the bench's arguments
+#   OPEN=scratch/styled.osheet BENCH=none sh scripts/sheets-vm.sh   # look at a file, no bench
 #
 # Under TCG (the cloud container) frame times are not product numbers: this run is
 # functional (the app draws, scrolls and reports). Real timing: the same steps on the
@@ -52,6 +53,12 @@ CSV=$(mktemp)
 } > "$CSV"
 put "$CSV" /tmp/sh/sales.csv
 rm -f "$CSV"
+# OPEN=path: open that file instead (an .osheet, say; .xlsx needs the converter).
+SHOW=/tmp/sh/sales.csv
+if [ -n "${OPEN:-}" ]; then
+    SHOW="/tmp/sh/$(basename "$OPEN")"
+    put "$OPEN" "$SHOW"
+fi
 
 start_frescod() {
     g "cd /tmp/sh && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/sh/screen FRESCOD_SOCK=/tmp/sh/fresco.sock \
@@ -62,12 +69,13 @@ start_frescod() {
 
 echo "=== the app on a CSV (formulas read as text by CSV; the app shows them as typed)"
 start_frescod
-g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock daemon -f -o /tmp/sh/app.log $D/atrium-sheets /tmp/sh/sales.csv </dev/null"
+g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock daemon -f -o /tmp/sh/app.log $D/atrium-sheets $SHOW </dev/null"
 sleep ${SHOT_AFTER:-60}
 mkdir -p "$(dirname "$OUT")"
 g "ls -t /tmp/sh/screen* 2>/dev/null | head -1" | { read -r f && [ -n "$f" ] && get "$f" "$OUT" && echo "screenshot: $OUT"; } || echo "no screenshot"
 g "pkill -x atrium-sheets; sleep 1; cat /tmp/sh/app.log"
 
+[ "$BENCH" = none ] && { g "pkill -x frescod; true"; exit 0; }
 echo "=== scroll gate: atrium-sheets --bench $BENCH"
 g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock $D/atrium-sheets --bench $BENCH" || echo "(bench exit $?)"
 g "pkill -x frescod; true"

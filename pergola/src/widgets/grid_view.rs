@@ -81,14 +81,18 @@ pub struct CellView {
     pub bold: bool,
     /// A number: shown as `###` when it doesn't fit, never cut.
     pub numeric: bool,
+    /// Background over the grid lines.
+    pub fill: Option<Color>,
+    /// Left, right, top, bottom: width in points and colour.
+    pub borders: [Option<(f32, Color)>; 4],
 }
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4] }
     }
     pub fn number(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Right, color: None, bold: false, numeric: true }
+        Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
     }
 }
 
@@ -351,12 +355,25 @@ impl GridView {
                             let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
                             for col in c0..=c1 {
                                 let Some(cv) = src.cell(row, col) else { continue };
-                                if cv.text.is_empty() {
-                                    continue;
-                                }
                                 let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
                                 let (cx, cy) = at(xl, yt);
                                 let (cw, ch) = ((xr - xl) as f32, (yb - yt) as f32);
+                                if let Some(f) = cv.fill {
+                                    ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: f, radius: 0.0 });
+                                }
+                                for (k, b) in cv.borders.iter().enumerate() {
+                                    let Some((w, c)) = *b else { continue };
+                                    let r = match k {
+                                        0 => Rect::new(cx - 1.0, cy - 1.0, w, ch + 1.0),
+                                        1 => Rect::new(cx + cw - w, cy - 1.0, w, ch + 1.0),
+                                        2 => Rect::new(cx - 1.0, cy - 1.0, cw + 1.0, w),
+                                        _ => Rect::new(cx - 1.0, cy + ch - w, cw + 1.0, w),
+                                    };
+                                    ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
+                                }
+                                if cv.text.is_empty() {
+                                    continue;
+                                }
                                 let style = text(TEXT_SIZE, if cv.bold { Weight::Semibold } else { Weight::Regular }, cv.color.unwrap_or(t.text_primary()));
                                 let (shown, w) = fit_text(&cv, cw - 2.0 * PAD, &style);
                                 let tx0 = match cv.align {

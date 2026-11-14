@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use officina_grid::addr::{CellAddr, MAX_COLS, MAX_ROWS};
+use officina_grid::style::{HAlign, Line, StyleId, StyleTable};
 use officina_grid::Value;
+use pergola::Color;
 use pergola::theme::palette;
 use pergola::widgets::{CellAlign, CellView, GridSource};
 
@@ -45,6 +47,48 @@ pub fn view_of(v: &Value) -> Option<CellView> {
     })
 }
 
+fn rgb(c: u32) -> Color {
+    Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// How a value shows in a cell with a style: through its number format, in its
+/// font's colour and weight, its fill and borders, aligned as it says.
+pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
+    let st = t.get(id);
+    let has_look = st.fill.is_some() || st.borders.iter().any(|b| b.line != Line::None);
+    let mut cv = match v {
+        Value::Empty if !has_look => return None,
+        Value::Empty => CellView::text(""),
+        Value::Num(_) | Value::Str(_) => {
+            let f = t.format(id).format(v);
+            let text = if f.hashes { "#".repeat(8) } else { f.text };
+            let mut cv = if matches!(v, Value::Num(_)) { CellView::number(text) } else { CellView::text(text) };
+            if let Some(c) = f.color {
+                cv.color = Some(rgb(c.rgb()));
+            }
+            cv
+        }
+        _ => view_of(v)?,
+    };
+    if cv.color.is_none() {
+        cv.color = st.font.color.map(rgb);
+    }
+    cv.bold = st.font.bold;
+    cv.fill = st.fill.map(rgb);
+    for (k, e) in st.borders.iter().enumerate() {
+        if e.line != Line::None {
+            cv.borders[k] = Some((e.line.width(), rgb(e.color.unwrap_or(0))));
+        }
+    }
+    cv.align = match st.h_align {
+        HAlign::General => cv.align,
+        HAlign::Left | HAlign::Fill | HAlign::Justify | HAlign::Distributed => CellAlign::Left,
+        HAlign::Center | HAlign::CenterAcross => CellAlign::Center,
+        HAlign::Right => CellAlign::Right,
+    };
+    Some(cv)
+}
+
 impl GridSource for SheetSource {
     fn rows(&self) -> u32 {
         let (r, _) = self.used();
@@ -72,7 +116,13 @@ impl GridSource for SheetSource {
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
         let d = self.doc.borrow();
-        view_of(&d.wb.value(d.sheet, r, c))
+        let v = d.wb.value(d.sheet, r, c);
+        let sh = d.wb.sheet(d.sheet);
+        let id = sh.style_id(r, c);
+        if id == 0 {
+            return view_of(&v);
+        }
+        styled_view(&d.wb.styles, id, &v)
     }
     fn edit_text(&self, r: u32, c: u32) -> String {
         let d = self.doc.borrow();
@@ -131,6 +181,29 @@ impl GridSource for SheetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styled_cells_show_their_format_and_look() {
+        use officina_grid::style::{Edge, Style};
+        let mut t = StyleTable::new();
+        let mut st = Style::default().with_num_fmt("#,##0.00;[Red]-#,##0.00");
+        st.font.bold = true;
+        st.fill = Some(0xFFFF00);
+        st.borders[3] = Edge { line: Line::Thick, color: None };
+        let id = t.intern(st);
+        let cv = styled_view(&t, id, &Value::Num(-1234.5)).unwrap();
+        assert_eq!(cv.text, "-1,234.50");
+        assert!(cv.bold && cv.numeric && cv.align == CellAlign::Right);
+        assert_eq!(cv.color, Some(rgb(0xFF0000)));
+        assert_eq!(cv.fill, Some(rgb(0xFFFF00)));
+        assert_eq!(cv.borders[3].map(|b| b.0), Some(3.0));
+        // An empty cell with a fill still draws; an empty plain one does not.
+        assert!(styled_view(&t, id, &Value::Empty).is_some_and(|c| c.text.is_empty()));
+        let d = t.intern(Style::default().with_num_fmt("yyyy-mm-dd"));
+        assert!(styled_view(&t, d, &Value::Empty).is_none());
+        assert_eq!(styled_view(&t, d, &Value::Num(46340.0)).unwrap().text, "2026-11-14");
+        assert_eq!(styled_view(&t, d, &Value::Num(-1.0)).unwrap().text, "########");
+    }
 
     fn src(cells: &[(u32, u32, &str)]) -> SheetSource {
         let mut d = Doc::new("t");
