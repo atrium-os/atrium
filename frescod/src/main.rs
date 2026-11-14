@@ -1424,6 +1424,9 @@ fn render_one_frame(
     };
 
     let mut windows: Vec<WindowFrame> = Vec::with_capacity(layers.len());
+    /* Clients' socket threads wait on this lock to apply their ops, so
+     * how long packing holds it is how long frescod stops reading them. */
+    let t_pack = Instant::now();
     {
         let fe = frontend.lock().unwrap();
         for (win_id, pos, size) in &layers {
@@ -1451,10 +1454,15 @@ fn render_one_frame(
         }
     }
 
+    let held = t_pack.elapsed();
     let (uploads, clears) = {
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()
     };
+    if held >= Duration::from_millis(20) {
+        let ops: usize = windows.iter().map(|w| w.rects.len() + w.paths.len() + w.fills.len() + w.run_ids.iter().map(|r| r.len()).sum::<usize>()).sum();
+        eprintln!("frescod: packing held the scene lock {} ms ({} windows, {} nodes); clients' ops waited", held.as_millis(), windows.len(), ops);
+    }
     /* What compose puts on screen, for pointer hit-testing (F4c): each
      * window at its rounded position, at its surface's size. */
     let mut rects: Vec<(u32, [i32; 4])> = windows.iter().map(|w| {
