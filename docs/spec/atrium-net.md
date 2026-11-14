@@ -320,7 +320,13 @@ VM from the Aura gates cover them.
   increments it); the next RA or NA walks the freed prefix and the kernel panics in
   `pfxlist_onlink_check`. `lan.py flap6` plus address deletions in a loop reproduce it
   in about 15 s. atrium-net turns RA processing off on the interface while it deletes
-  addresses, which closes its own window; the kernel fix (address-prefix linkage under
-  the ND6 write lock, a prefix reference held across the purge) is for the fork.
+  addresses, which closes its own window. With that fixed, the same stress found a second
+  bug: `nd6_na_input` removes a router whose NA dropped the Router flag while holding the
+  neighbor entry's lock, and `defrouter_del` then takes the ND6 lock, the reverse of
+  `pfxlist_onlink_check`'s order: the IPv6 stack deadlocks (seen in DDB). Both are fixed
+  in a fork patch (address-prefix linkage under the ND6 write lock with a prefix
+  reference held across the purge; router removal after the neighbor unlock): 509 SLAAC
+  addresses made and deleted under the flood with no panic or hang, 10 minutes clean, the
+  gate 28/28 on that kernel. The patch is not yet on the fork's branch.
 - Not yet: DHCPv6, the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
   wired), RA MTU beyond what the kernel applies.
