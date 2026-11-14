@@ -75,6 +75,9 @@ pub struct Paginator {
     old_at: usize,
     settle: usize,
     delta: isize,
+    /// Where pagination had got to when the edit came, in new block numbers:
+    /// old pages end there, so after converging, pagination goes on from it.
+    resume: Option<Checkpoint>,
     width: i64,
     height: i64,
     /// Pages laid out since creation (for the gates).
@@ -96,7 +99,14 @@ impl Paginator {
         self.height = twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64);
         self.pages.clear();
         self.old.clear();
+        self.resume = None;
         self.cursor = Some(Checkpoint::default());
+    }
+
+    /// Whether the pages were laid out for `doc`'s page geometry.
+    pub fn fits(&self, doc: &TextDoc) -> bool {
+        let g = &doc.page;
+        self.width == twips((g.width - g.margin_start - g.margin_end).max(720) as i64) && self.height == twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64)
     }
 
     /// Column width in layout units, for laying paragraphs out.
@@ -139,11 +149,14 @@ impl Paginator {
             k -= 1;
         }
         let restart = self.pages.get(k).map(|p| p.start).unwrap_or_default();
-        if !self.old.is_empty() || self.cursor.is_some_and(|cur| cur < restart) {
+        // Old block number of the first block past the edit.
+        let old_last = e.last as isize - e.delta;
+        if !self.old.is_empty() || self.cursor.is_some_and(|cur| cur < restart || (cur.block as isize) < old_last) {
             // Already behind: pages past the cursor were never laid out, and a
             // second edit before convergence would compose shifts; repaginate
             // from the earlier point to the end instead.
             self.old.clear();
+            self.resume = None;
             let from = self.cursor.map_or(restart, |cur| cur.min(restart));
             let k = self.pages.partition_point(|p| p.start < from);
             self.pages.truncate(k);
@@ -154,6 +167,7 @@ impl Paginator {
         self.old_at = 0;
         self.settle = e.last;
         self.delta = e.delta;
+        self.resume = self.cursor.map(|c| Checkpoint { block: (c.block as isize + e.delta) as usize, line: c.line });
         self.cursor = Some(restart);
     }
 
@@ -203,6 +217,7 @@ impl Paginator {
     fn finish(&mut self) {
         self.cursor = None;
         self.old.clear();
+        self.resume = None;
     }
 
     /// If an old page started at `n` (past the edit), take it and all after it.
@@ -221,6 +236,12 @@ impl Paginator {
                 rest.iter_mut().for_each(|p| p.shift(delta));
             }
             self.pages.append(&mut rest);
+            if let Some(r) = self.resume.take() {
+                // The old pages stopped short of the end: carry on from there.
+                self.old.clear();
+                self.cursor = Some(r);
+                return false;
+            }
             self.finish();
             return true;
         }
@@ -448,6 +469,24 @@ mod tests {
             panic!("{e:?}: page {i} differs\n inc {:?}\n new {:?}\n prev {:?}", p.pages().get(i), fresh.pages().get(i), fresh.pages().get(i.wrapping_sub(1)));
         }
         p.laid - before
+    }
+
+    #[test]
+    fn an_edit_before_pagination_finishes_still_reaches_the_end() {
+        let paras: Vec<usize> = (0..400).map(|i| 1 + (i * 7) % 5).collect();
+        let mut d = doc_with(&paras, 20);
+        let mut p = Paginator::new(&d);
+        let mut c = LayoutCache::default();
+        p.run(&d, &mut c, &FixedFonts, 20);
+        assert!(!p.done());
+        let edge = p.pages().last().unwrap().start.block;
+        // Behind the cursor: converges onto the old pages, then goes on.
+        check_edit(&mut d, &mut p, &mut c, TextOp::Splice { block: 10, at: 0, del: 1, ins: Default::default() }, Edit { first: 10, last: 11, delta: 0 });
+        // Across the cursor.
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut c, &FixedFonts, 20);
+        let id = d.new_id();
+        check_edit(&mut d, &mut p, &mut c, TextOp::Split { block: edge as u32, at: 1, id, style: 0, props: Default::default() }, Edit { first: edge, last: edge + 2, delta: 1 });
     }
 
     #[test]

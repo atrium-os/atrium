@@ -1300,6 +1300,40 @@ opened; save marks clean; text files in UTF-8 and Windows-1252. The cloud VM scr
 Not yet: the converters (O3e), a "save changes?" prompt, Scrinium's Save As sheet,
 the jailed per-document launch, zoom and the ruler, lists, tables and images (O3d).
 
+### 16.13 O3d part 1 as built (2026-11-14): lists, headers and footers
+
+- **Lists** (`officina-text/src/model.rs`, `lists.rs`): a list item is a paragraph
+  property `list: ListRef { id, kind: Bullet | Numbered, level 0–8 }` (in a style or
+  set on the paragraph; "set to none" overrides a style's list). Numbers are not
+  stored: `lists::Numbering::build` counts items per list id and level in document
+  order (a deeper item restarts the levels below it), and labels cycle by level:
+  `1.`, `a.`, `i.` and `•`, `◦`, `▪`. An item indents 720 twips a level and its label
+  hangs 360 twips into the indent; the first line starts at the indent whatever the
+  first-line indent. In the native file the list is bit 12 of the property mask; a
+  reader refuses unknown bits.
+- **Editing** (`pergola-richtext`): `toggle_list` (a new list continues one of the same
+  kind just above), Tab and Shift+Tab change level inside items, Enter on an empty
+  item and Backspace at an item's start leave the list (text kept), Ctrl+Shift+7
+  numbered and Ctrl+Shift+8 bullets. Toolbar buttons "• List" and "1. List".
+- **Headers and footers**: one plain header and one footer per document
+  (`HeaderFooter { text, align }`, `{page}` and `{pages}` filled per page), drawn 720
+  twips from the page edge outside the margins, so they never move body text.
+  `TextOp::SetPage` changes page setup, header and footer as one undoable op (native op
+  8, DOCUMENT carries both); a geometry change repaginates from the start. Toolbar
+  "Page #" toggles "Page n of m", centred, in the footer.
+- **Pagination fix**: an edit that came while the first pagination was still running
+  converged onto the old pages and then stopped, so the last pages were lost until the
+  next edit. The paginator now remembers where it had got to and carries on from there
+  after converging; an edit past that point repaginates from the edit.
+
+Gates: numbering and labels per level; list keys in the editor (make, nest, leave,
+undo); page setup and footer undo; an edit before pagination finishes still reaches
+the end and matches a fresh pagination; native round trip with lists, header and
+footer.
+
+Not yet: tables, images, section-level headers (first page, odd and even), header
+editing beyond page numbers, list restart and start-at.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

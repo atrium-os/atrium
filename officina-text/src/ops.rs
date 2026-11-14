@@ -34,6 +34,8 @@ pub enum TextOp {
     Insert { at: u32, blocks: Vec<Block> },
     /// Removes `n` blocks from `at`.
     Remove { at: u32, n: u32 },
+    /// Sets the page setup, header and footer.
+    SetPage { page: crate::model::PageSetup, header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -117,6 +119,8 @@ impl TextOp {
             TextOp::Split { block, .. } => Edit { first: block as usize, last: block as usize + 1, delta: -1 },
             TextOp::Remove { at, n } => Edit { first: at as usize, last: (at + n) as usize, delta: n as isize },
             TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
+            // Every page may change (the paginator resets on a new geometry).
+            TextOp::SetPage { .. } => Edit { first: 0, last: 0, delta: 0 },
         })
     }
 }
@@ -244,6 +248,17 @@ impl TextOp {
                     out.extend(d.blocks.remove(at as usize));
                 }
                 TextOp::Insert { at, blocks: out }
+            }
+            TextOp::SetPage { page, header, footer } => {
+                let ok = |t: i32| (0..=63_360).contains(&t);
+                if !(page.width >= 1440 && page.height >= 1440 && [page.width, page.height, page.margin_top, page.margin_bottom, page.margin_start, page.margin_end].into_iter().all(ok)) || page.margin_start + page.margin_end + 720 > page.width || page.margin_top + page.margin_bottom + 720 > page.height {
+                    return TextOp::Nop;
+                }
+                let old = TextOp::SetPage { page: d.page, header: d.header.take(), footer: d.footer.take() };
+                d.page = page;
+                d.header = header;
+                d.footer = footer;
+                old
             }
         }
     }

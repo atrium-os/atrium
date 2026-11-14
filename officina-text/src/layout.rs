@@ -217,7 +217,9 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         (cum[e as usize] - cum[start as usize], e)
     };
     let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
-    let avail = |first: bool| (full - if first { twips(pf.first_line as i64) } else { 0 }).max(LU);
+    // A list item's hang holds its label; its text starts at the indent.
+    let first_line = if pf.list.is_some() { pf.first_line.max(0) } else { pf.first_line };
+    let avail = |first: bool| (full - if first { twips(first_line as i64) } else { 0 }).max(LU);
     let ops = opportunities(&p.text);
     let mut breaks: Vec<(u32, bool)> = Vec::new(); // (end byte, mandatory)
     let mut start = 0u32;
@@ -298,7 +300,7 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         };
         let first = li == 0;
         let room = avail(first);
-        let base = twips(pf.indent_start as i64) + if first { twips(pf.first_line as i64) } else { 0 };
+        let base = twips(pf.indent_start as i64) + if first { twips(first_line as i64) } else { 0 };
         let last = li + 1 == count || mand;
         let (x, space_extra) = match pf.align {
             Align::Start => (base, 0),

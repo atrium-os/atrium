@@ -23,7 +23,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Align, AttrId, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Align, AttrId, HeaderFooter, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -149,7 +149,7 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
 /// Paragraph properties: a mask of the fields set, then their values.
 pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     let mut m = 0u16;
-    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some()].into_iter().enumerate() {
+    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some(), p.list.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -183,6 +183,19 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     if let Some(l) = p.outline_level {
         w.u8(l);
     }
+    if let Some(l) = p.list {
+        match l {
+            None => w.u8(0),
+            Some(l) => {
+                w.u8(match l.kind {
+                    ListKind::Bullet => 1,
+                    ListKind::Numbered => 2,
+                });
+                w.var(l.id as u64);
+                w.u8(l.level);
+            }
+        }
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -190,7 +203,7 @@ const MAX_TWIPS: i64 = 31_680;
 
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
-    if m >> 12 != 0 {
+    if m >> 13 != 0 {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -243,6 +256,17 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     p.widows = b(10, r)?;
     if on(11) {
         p.outline_level = Some(r.u8()?.min(9));
+    }
+    if on(12) {
+        p.list = Some(match r.u8()? {
+            0 => None,
+            k @ (1 | 2) => {
+                let id = r.len("list", u32::MAX as u64)? as u32;
+                let level = r.u8()?.min(MAX_LIST_LEVEL);
+                Some(ListRef { id, kind: if k == 1 { ListKind::Bullet } else { ListKind::Numbered }, level })
+            }
+            _ => return Err(WireError::Invalid("list kind")),
+        });
     }
     Ok(p)
 }
@@ -303,6 +327,49 @@ fn decode_block(r: &mut Reader, attrs: usize, styles: usize) -> Result<Block, Wi
     }
 }
 
+fn encode_hf(w: &mut Writer, hf: &Option<HeaderFooter>) {
+    match hf {
+        None => w.u8(0),
+        Some(h) => {
+            w.u8(1);
+            w.str(&h.text);
+            w.u8(h.align as u8);
+        }
+    }
+}
+
+fn decode_hf(r: &mut Reader) -> Result<Option<HeaderFooter>, WireError> {
+    Ok(match r.u8()? {
+        0 => None,
+        1 => {
+            let text = r.str("header text", 4096)?.chars().filter(|c| !c.is_control()).collect();
+            let align = match r.u8()? {
+                0 => Align::Start,
+                1 => Align::Center,
+                2 => Align::End,
+                3 => Align::Justify,
+                _ => return Err(WireError::Invalid("alignment")),
+            };
+            Some(HeaderFooter { text, align })
+        }
+        _ => return Err(WireError::Invalid("header")),
+    })
+}
+
+fn encode_page(w: &mut Writer, g: &PageSetup) {
+    for v in [g.width, g.height, g.margin_top, g.margin_bottom, g.margin_start, g.margin_end] {
+        w.ivar(v as i64);
+    }
+}
+
+fn decode_page(r: &mut Reader) -> Result<PageSetup, WireError> {
+    let mut g = [0i32; 6];
+    for v in g.iter_mut() {
+        *v = r.ivar()?.clamp(0, MAX_TWIPS * 2) as i32;
+    }
+    Ok(PageSetup { width: g[0].max(1440), height: g[1].max(1440), margin_top: g[2], margin_bottom: g[3], margin_start: g[4], margin_end: g[5] })
+}
+
 // ---------- ops (the autosave journal) ----------
 
 pub fn encode_op(op: &TextOp) -> Vec<u8> {
@@ -358,6 +425,12 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             w.u8(7);
             w.var(*at as u64);
             w.var(*n as u64);
+        }
+        TextOp::SetPage { page, header, footer } => {
+            w.u8(8);
+            encode_page(&mut w, page);
+            encode_hf(&mut w, header);
+            encode_hf(&mut w, footer);
         }
     }
     w.into_bytes()
@@ -415,6 +488,11 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             TextOp::Insert { at, blocks }
         }
         7 => TextOp::Remove { at: u32v(&mut r, "block")?, n: u32v(&mut r, "count")? },
+        8 => {
+            let page = decode_page(&mut r)?;
+            let header = decode_hf(&mut r)?;
+            TextOp::SetPage { page, header, footer: decode_hf(&mut r)? }
+        }
         _ => return Err(WireError::Invalid("op")),
     };
     if !r.is_empty() {
@@ -451,6 +529,9 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         w.ivar(v as i64);
     }
     w.var(doc.id_watermark());
+    for hf in [&doc.header, &doc.footer] {
+        encode_hf(&mut w, hf);
+    }
     c.add(DOCUMENT, &w.into_bytes())?;
 
     let mut w = Writer::new();
@@ -539,6 +620,10 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
     }
     doc.page = PageSetup { width: g[0].max(1440), height: g[1].max(1440), margin_top: g[2], margin_bottom: g[3], margin_start: g[4], margin_end: g[5] };
     let watermark = r.var()?;
+    if !r.is_empty() {
+        doc.header = decode_hf(&mut r)?;
+        doc.footer = decode_hf(&mut r)?;
+    }
 
     let mut r = Reader::new(one(STYLES, "STYLES chunk")?);
     let n = r.count("styles", MAX_STYLES as u64, 6)?;
@@ -644,8 +729,9 @@ mod tests {
         for i in 0..700 {
             d.push_para(&format!("Paragraph {i} with bold and a link; naïve ✓"), 0, vec![(0, 0), (14, bold), (18, 0), (27, link), (31, 0)]);
         }
-        d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), ..Default::default() });
+        d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
         d.page.margin_start = 1000;
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         d
     }
 
@@ -658,6 +744,7 @@ mod tests {
             assert_eq!(a.attrs.get(i as AttrId), b.attrs.get(i as AttrId));
         }
         assert_eq!(a.id_watermark(), b.id_watermark());
+        assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
     }
 
     #[test]
@@ -683,6 +770,7 @@ mod tests {
             TextOp::SetPara { block: 7, style: 2, props: ParaProps::default() },
             TextOp::Insert { at: 9, blocks },
             TextOp::Remove { at: 12, n: 3 },
+            TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End }), footer: None },
             TextOp::Nop,
         ];
         for op in ops {

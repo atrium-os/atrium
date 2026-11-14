@@ -151,9 +151,27 @@ impl RichTextView {
                 ctx.add(Node::Rect { rect: Rect::new(px, py, g.page_w as f32, g.page_h as f32), fill: paper, radius: 0.0 });
                 let (cx, cy) = (px as f64 + g.margin_x, py as f64 + g.margin_y);
                 let page = ed.pages.pages()[i].clone();
+                let numbering = ed.numbering();
+                // Header and footer, in the margins.
+                let pages_text = if ed.pages.done() { known.to_string() } else { format!("{est}") };
+                for (hf, top) in [(&ed.doc.header, true), (&ed.doc.footer, false)] {
+                    let Some(hf) = hf else { continue };
+                    let text = hf.resolve(i + 1, &pages_text);
+                    let from = twips(officina_text::model::HEADER_FROM_EDGE as i64) as f64 * g.k;
+                    let fmt = officina_text::model::CharFormat { size: 18, color: 0x555555, ..Default::default() };
+                    let size = size_lu(&fmt) as f64 * g.k;
+                    let baseline = if top { py as f64 + from + size * 0.8 } else { py as f64 + g.page_h - from };
+                    let width = g.page_w - 2.0 * g.margin_x;
+                    draw_text(ctx, faces, ed.fonts(), &text, &fmt, hf.align, px as f64 + g.margin_x, width, baseline, g.k);
+                }
                 for s in &page.slices {
                     let l = ed.layout(s.block);
                     let text = ed.doc.para(s.block).map(|p| p.text.clone()).unwrap_or_default();
+                    if s.lines.start == 0 {
+                        if let Some(label) = numbering.label(s.block) {
+                            draw_label(ctx, faces, &l, &label, ed.fonts(), cx, cy + s.y as f64 * g.k, g.k);
+                        }
+                    }
                     let mut ly = s.y;
                     for li in s.lines.clone() {
                         draw_line(ctx, faces, &l, li, &text, cx, cy + ly as f64 * g.k, g.k);
@@ -369,6 +387,67 @@ fn draw_line(ctx: &mut Ctx, faces: Option<&Faces>, l: &ParaLayout, li: usize, te
         }
         if f.strike {
             ctx.add(Node::Rect { rect: Rect::new(rx as f32, (baseline - size * 0.28) as f32, rw as f32, thick), fill: color, radius: 0.0 });
+        }
+    }
+}
+
+/// A list item's label in its hang, on the first line's baseline, in the
+/// format the item's text starts with.
+#[allow(clippy::too_many_arguments)]
+fn draw_label(ctx: &mut Ctx, faces: Option<&Faces>, l: &ParaLayout, label: &str, fonts: &dyn officina_text::layout::Fonts, left: f64, top: f64, k: f64) {
+    let Some(line) = l.lines.first() else { return };
+    let f = l.glyphs.first().map_or(&l.formats[0], |g| &l.formats[g.fmt as usize]);
+    let mut f = f.clone();
+    f.underline = false;
+    f.strike = false;
+    f.link = None;
+    let glyphs = fonts.shape(label, &f);
+    let natural = line.ascent + line.descent;
+    let baseline = top + (line.ascent + (line.height - natural).max(0) / 2) as f64 * k;
+    let x0 = twips((l.format.indent_start + l.format.first_line) as i64) as f64;
+    let size = (size_lu(&f) as f64 * k) as f32;
+    let mut pen = 0i64;
+    let mut i = 0;
+    while i < glyphs.len() {
+        let face = glyphs[i].face;
+        let start = pen;
+        let mut run = Vec::new();
+        while i < glyphs.len() && glyphs[i].face == face {
+            run.push(PGlyph { id: glyphs[i].id, dx: ((pen - start + glyphs[i].dx) as f64 * k) as f32, dy: (glyphs[i].dy as f64 * k) as f32 });
+            pen += glyphs[i].adv;
+            i += 1;
+        }
+        if let Some(fc) = faces.and_then(|fs| fs.get(face as usize)) {
+            ctx.add(Node::Glyphs { origin: Point::new(q(left + (x0 + start as f64) * k), q(baseline)), face: fc.clone(), size, color: rgb(f.color), glyphs: Arc::from(run) });
+        }
+    }
+}
+
+/// One line of text in `fmt`, aligned in a box `width` wide from `left`.
+#[allow(clippy::too_many_arguments)]
+fn draw_text(ctx: &mut Ctx, faces: Option<&Faces>, fonts: &dyn officina_text::layout::Fonts, text: &str, fmt: &officina_text::model::CharFormat, align: officina_text::model::Align, left: f64, width: f64, baseline: f64, k: f64) {
+    use officina_text::model::Align;
+    let glyphs = fonts.shape(text, fmt);
+    let w = glyphs.iter().map(|g| g.adv).sum::<i64>() as f64 * k;
+    let x0 = match align {
+        Align::Center => left + (width - w) / 2.0,
+        Align::End => left + width - w,
+        _ => left,
+    };
+    let size = (size_lu(fmt) as f64 * k) as f32;
+    let mut pen = 0i64;
+    let mut i = 0;
+    while i < glyphs.len() {
+        let face = glyphs[i].face;
+        let start = pen;
+        let mut run = Vec::new();
+        while i < glyphs.len() && glyphs[i].face == face {
+            run.push(PGlyph { id: glyphs[i].id, dx: ((pen - start + glyphs[i].dx) as f64 * k) as f32, dy: (glyphs[i].dy as f64 * k) as f32 });
+            pen += glyphs[i].adv;
+            i += 1;
+        }
+        if let Some(fc) = faces.and_then(|fs| fs.get(face as usize)) {
+            ctx.add(Node::Glyphs { origin: Point::new(q(x0 + start as f64 * k), q(baseline)), face: fc.clone(), size, color: rgb(fmt.color), glyphs: Arc::from(run) });
         }
     }
 }

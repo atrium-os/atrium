@@ -14,6 +14,7 @@
 //! and the same on every machine.
 
 pub mod layout;
+pub mod lists;
 pub mod model;
 pub mod native;
 pub mod ops;

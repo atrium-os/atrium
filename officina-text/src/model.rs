@@ -178,7 +178,34 @@ pub struct ParaProps {
     pub widows: Option<bool>,
     /// A heading's level, 1 to 9.
     pub outline_level: Option<u8>,
+    /// The list the paragraph is an item of; `Some(None)` takes it out of a
+    /// list its style puts it in.
+    pub list: Option<Option<ListRef>>,
 }
+
+/// How a list's items are marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListKind {
+    /// • ◦ ▪ by level.
+    Bullet,
+    /// 1. a. i. by level, then again.
+    Numbered,
+}
+
+/// A paragraph's place in a list: which list (items of one list number on
+/// from each other, across paragraphs between), its kind, and its level (0–8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListRef {
+    pub id: u32,
+    pub kind: ListKind,
+    pub level: u8,
+}
+
+/// Deepest list level.
+pub const MAX_LIST_LEVEL: u8 = 8;
+/// A list level's indent step and its label's hang, twips.
+pub const LIST_INDENT: i32 = 720;
+pub const LIST_HANG: i32 = 360;
 
 /// Paragraph properties with every field decided.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -195,11 +222,12 @@ pub struct ParaFormat {
     pub page_break_before: bool,
     pub widows: bool,
     pub outline_level: Option<u8>,
+    pub list: Option<ListRef>,
 }
 
 impl Default for ParaFormat {
     fn default() -> Self {
-        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None }
+        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None }
     }
 }
 
@@ -211,6 +239,12 @@ impl ParaFormat {
         set!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows);
         if p.outline_level.is_some() {
             self.outline_level = p.outline_level.filter(|l| (1..=9).contains(l));
+        }
+        if let Some(l) = p.list {
+            self.list = l.map(|mut l| {
+                l.level = l.level.min(MAX_LIST_LEVEL);
+                l
+            });
         }
     }
 }
@@ -294,6 +328,16 @@ impl StyleSheet {
             cf.apply(&s.chars);
         }
         pf.apply(direct);
+        // A list item hangs its label at its level's indent, unless the
+        // paragraph sets its own indents.
+        if let Some(l) = pf.list {
+            if direct.indent_start.is_none() {
+                pf.indent_start = LIST_INDENT * (l.level as i32 + 1);
+            }
+            if direct.first_line.is_none() {
+                pf.first_line = -LIST_HANG;
+            }
+        }
         (pf, cf)
     }
 
@@ -419,6 +463,25 @@ impl Default for PageSetup {
     }
 }
 
+/// A page header or footer: one line of text, where `{page}` and `{pages}`
+/// stand for the page number and count, drawn in the margin, half an inch
+/// from the page's edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HeaderFooter {
+    pub text: String,
+    pub align: Align,
+}
+
+impl HeaderFooter {
+    /// The text for page `page` (1-based) of `pages`.
+    pub fn resolve(&self, page: usize, pages: &str) -> String {
+        self.text.replace("{page}", &page.to_string()).replace("{pages}", pages)
+    }
+}
+
+/// Distance of a header or footer's line from the page edge, twips.
+pub const HEADER_FROM_EDGE: i32 = 720;
+
 /// One text document.
 #[derive(Debug, Clone)]
 pub struct TextDoc {
@@ -426,6 +489,9 @@ pub struct TextDoc {
     pub attrs: AttrTable,
     pub styles: StyleSheet,
     pub page: PageSetup,
+    /// Text in the top and bottom margins of every page.
+    pub header: Option<HeaderFooter>,
+    pub footer: Option<HeaderFooter>,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -464,7 +530,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

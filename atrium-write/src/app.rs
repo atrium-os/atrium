@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::Align;
+use officina_text::model::{Align, ListKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -38,6 +38,8 @@ pub enum Cmd {
     Toggle(Toggle),
     Align(Align),
     Style(usize),
+    List(ListKind),
+    PageNumbers,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,6 +101,8 @@ impl Write {
                     Cmd::Toggle(t) => e.toggle(t),
                     Cmd::Align(a) => e.align(a),
                     Cmd::Style(i) => e.style_named(STYLES[i.min(STYLES.len() - 1)]),
+                    Cmd::List(k) => e.toggle_list(k),
+                    Cmd::PageNumbers => e.toggle_page_numbers(),
                     _ => return true,
                 }
                 drop(e);
@@ -142,6 +146,9 @@ impl View for Write {
         button(ctx, "B", Cmd::Toggle(Toggle::Bold), 36.0, 4.0);
         button(ctx, "I", Cmd::Toggle(Toggle::Italic), 36.0, 4.0);
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 16.0);
+        button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
+        button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 4.0);
+        button(ctx, "Page #", Cmd::PageNumbers, 68.0, 16.0);
         let (style_name, cur_align) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
@@ -157,7 +164,7 @@ impl View for Write {
             x += 136.0;
         }
         for (label, a) in [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)] {
-            let wd = if label == "Justify" { 68.0 } else { 60.0 };
+            let wd = if label == "Justify" { 64.0 } else { 56.0 };
             let cmds = self.cmds.clone();
             let b = if a == cur_align { Button::primary(label) } else { Button::secondary(label) };
             b.at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(Cmd::Align(a))).render(ctx);

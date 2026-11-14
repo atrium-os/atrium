@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use officina_core::history::History;
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
-use officina_text::model::{Align, AttrId, CharAttrs, CharFormat, ParaProps, StyleId, TextDoc};
+use officina_text::lists::Numbering;
+use officina_text::model::{Align, AttrId, CharAttrs, CharFormat, ListKind, ListRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
@@ -110,12 +111,13 @@ pub struct Editor {
     /// Actions since [`Editor::take_log`], when journaling.
     log: Option<Vec<Logged>>,
     attrs_logged: usize,
+    numbering: Option<(u64, Rc<Numbering>)>,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0 };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, numbering: None };
         e.paginate(SETTLE);
         e
     }
@@ -284,7 +286,12 @@ impl Editor {
     fn changed(&mut self) {
         self.revision += 1;
         if let Some(e) = self.doc.take_changes() {
-            self.pages.edit(&self.doc, &mut self.cache, &*self.fonts, e);
+            if !self.pages.fits(&self.doc) {
+                // New page geometry: every line may break differently.
+                self.pages.reset(&self.doc);
+            } else {
+                self.pages.edit(&self.doc, &mut self.cache, &*self.fonts, e);
+            }
             self.paginate(SETTLE);
         }
         self.cache.prune(&self.doc);
@@ -343,6 +350,10 @@ impl Editor {
     /// Enter: a new paragraph. At the end of a heading it takes the style's
     /// "next" (body text); elsewhere it keeps the paragraph's style.
     pub fn new_paragraph(&mut self) {
+        if !self.has_selection() && self.len(self.caret.block) == 0 && self.list_of(self.caret.block).is_some() {
+            self.list_level(-((MAX_LIST_LEVEL as i32) + 1));
+            return;
+        }
         let (mut ops, start) = self.delete_selection_ops();
         let Some(p) = self.doc.para(start.block) else { return };
         let at_end = start.at as usize == p.text.len() && !self.has_selection();
@@ -360,6 +371,10 @@ impl Editor {
             return self.delete_selection("Delete");
         }
         let c = self.caret;
+        if c.at == 0 && self.list_of(c.block).is_some() {
+            // At an item's start: out of the list first, text kept.
+            return self.list_level(-((MAX_LIST_LEVEL as i32) + 1));
+        }
         let to = if word { self.word_left(c) } else { self.grapheme_left(c) };
         if to == c {
             return false;
@@ -535,6 +550,84 @@ impl Editor {
             }
         }
         self.apply(label, ops, Kind::Other);
+    }
+
+    /// List numbering as the document stands (rebuilt after a change).
+    pub fn numbering(&mut self) -> Rc<Numbering> {
+        match &self.numbering {
+            Some((r, n)) if *r == self.revision => n.clone(),
+            _ => {
+                let n = Rc::new(Numbering::build(&self.doc));
+                self.numbering = Some((self.revision, n.clone()));
+                n
+            }
+        }
+    }
+
+    /// The list block `b` is an item of.
+    pub fn list_of(&self, b: usize) -> Option<ListRef> {
+        let p = self.doc.para(b)?;
+        self.doc.styles.para_format(p.style, &p.props).0.list
+    }
+
+    /// Makes the selected paragraphs items of a list of `kind`, or, when they
+    /// all are already, plain paragraphs. A new list continues one of the same
+    /// kind just above.
+    pub fn toggle_list(&mut self, kind: ListKind) {
+        let (a, b) = self.selection();
+        let all = (a.block..=b.block).all(|k| self.list_of(k).is_some_and(|l| l.kind == kind));
+        if all {
+            self.set_paragraphs("List", None, |p| p.list = None);
+            return;
+        }
+        let above = a.block.checked_sub(1).and_then(|k| self.list_of(k)).filter(|l| l.kind == kind);
+        let id = match above {
+            Some(l) => l.id,
+            None => self.numbering().max_id.map_or(1, |m| m + 1),
+        };
+        self.set_paragraphs("List", None, move |p| {
+            let level = p.list.flatten().map_or(0, |l| l.level);
+            p.list = Some(Some(ListRef { id, kind, level }));
+        });
+    }
+
+    /// Moves the selected list items `delta` levels deeper (negative: out);
+    /// out of level 0 leaves the list. False when no paragraph is an item.
+    pub fn list_level(&mut self, delta: i32) -> bool {
+        let (a, b) = self.selection();
+        if !(a.block..=b.block).any(|k| self.list_of(k).is_some()) {
+            return false;
+        }
+        let items: Vec<Option<ListRef>> = (a.block..=b.block).map(|k| self.list_of(k)).collect();
+        let first = a.block;
+        let label = if delta > 0 { "Indent" } else { "Outdent" };
+        let mut ops = Vec::new();
+        for (i, l) in items.into_iter().enumerate() {
+            let Some(l) = l else { continue };
+            let k = first + i;
+            let Some(p) = self.doc.para(k) else { continue };
+            let mut props = p.props.clone();
+            let lv = l.level as i32 + delta;
+            props.list = if lv < 0 { if p.props.list.flatten().is_some() { None } else { Some(None) } } else { Some(Some(ListRef { level: lv.min(MAX_LIST_LEVEL as i32) as u8, ..l })) };
+            if props != p.props {
+                ops.push(TextOp::SetPara { block: k as u32, style: p.style, props });
+            }
+        }
+        self.apply(label, ops, Kind::Other);
+        true
+    }
+
+    /// Sets the page setup, header and footer (one undo step).
+    pub fn set_page(&mut self, label: &str, page: officina_text::model::PageSetup, header: Option<officina_text::model::HeaderFooter>, footer: Option<officina_text::model::HeaderFooter>) {
+        self.apply(label, vec![TextOp::SetPage { page, header, footer }], Kind::Other);
+    }
+
+    /// Page numbers in the footer ("Page 3 of 12", centred), on or off.
+    pub fn toggle_page_numbers(&mut self) {
+        let on = self.doc.footer.as_ref().is_some_and(|f| f.text.contains("{page}"));
+        let footer = if on { None } else { Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center }) };
+        let (page, header) = (self.doc.page, self.doc.header.clone());
+        self.set_page("Page Numbers", page, header, footer);
     }
 
     pub fn align(&mut self, a: Align) {
@@ -861,6 +954,14 @@ impl Editor {
                     self.align(Align::Justify);
                     Outcome::Edited
                 }
+                "7" | "&" if m.shift => {
+                    self.toggle_list(ListKind::Numbered);
+                    Outcome::Edited
+                }
+                "8" | "*" if m.shift => {
+                    self.toggle_list(ListKind::Bullet);
+                    Outcome::Edited
+                }
                 "0" => {
                     self.style_named("Normal");
                     Outcome::Edited
@@ -872,6 +973,10 @@ impl Editor {
                 _ => Outcome::Ignored,
             },
             Key::Char => edited(self.insert(chars)),
+            // Tab in a list item (at its start, or over several paragraphs)
+            // changes its level; elsewhere it types a tab.
+            Key::Tab if !cmd && (self.caret.at == 0 || self.selection().0.block != self.selection().1.block) && self.list_of(self.caret.block).is_some() => edited(self.list_level(if m.shift { -1 } else { 1 })),
+            Key::Tab if !cmd && m.shift => Outcome::Ignored,
             Key::Tab if !cmd => edited(self.insert("\t")),
             Key::Enter if m.shift => edited(self.insert("\u{2028}")),
             Key::Enter => {
@@ -1043,6 +1148,62 @@ mod tests {
         e.key(Key::End, NO, "", 0);
         e.key(Key::Home, SHIFT, "", 0);
         assert!(e.has_selection());
+    }
+
+    #[test]
+    fn page_setup_and_footer_undo() {
+        let paras: Vec<String> = (0..80).map(|i| format!("{i} ") + &"word ".repeat(40)).collect();
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        let mut e = ed(&refs);
+        while !e.paginate(Duration::from_secs(1)) {}
+        let a4 = e.pages.pages().len();
+        e.toggle_page_numbers();
+        assert!(e.doc.footer.is_some());
+        let mut g = e.doc.page;
+        g.width = 16838;
+        g.height = 11906;
+        e.set_page("Landscape", g, e.doc.header.clone(), e.doc.footer.clone());
+        while !e.paginate(Duration::from_secs(1)) {}
+        assert!(e.pages.pages().len() != a4, "landscape paginates again");
+        e.undo();
+        while !e.paginate(Duration::from_secs(1)) {}
+        assert_eq!(e.pages.pages().len(), a4);
+        e.undo();
+        assert!(e.doc.footer.is_none());
+    }
+
+    #[test]
+    fn lists_by_keys() {
+        let mut e = ed(&["alpha", "beta", "gamma", "after"]);
+        e.set_caret(Pos::new(0, 0), false);
+        e.set_caret(Pos::new(2, 1), true);
+        e.key(Key::Char, CTRL_SHIFT, "7", 0);
+        let labels = |e: &mut Editor| (0..e.doc.blocks.len()).map(|i| e.numbering().label(i).unwrap_or_default()).collect::<Vec<_>>();
+        assert_eq!(labels(&mut e), ["1.", "2.", "3.", ""]);
+        // Tab at the start of an item: one level in.
+        e.set_caret(Pos::new(1, 0), false);
+        e.key(Key::Tab, NO, "", 0);
+        assert_eq!(labels(&mut e), ["1.", "a.", "2.", ""]);
+        // Enter at the end of an item: another item; Enter again on the empty one ends the list.
+        e.set_caret(Pos::new(2, 5), false);
+        e.key(Key::Enter, NO, "", 0);
+        assert_eq!(labels(&mut e), ["1.", "a.", "2.", "3.", ""]);
+        e.key(Key::Enter, NO, "", 0);
+        assert_eq!(labels(&mut e), ["1.", "a.", "2.", "", ""]);
+        // Backspace at an item's start takes it out of the list, keeping the text.
+        e.set_caret(Pos::new(1, 0), false);
+        e.key(Key::Backspace, NO, "", 0);
+        assert_eq!(labels(&mut e), ["1.", "", "2.", "", ""]);
+        assert_eq!(texts(&e)[1], "beta");
+        // Bullets toggle off again; a tab elsewhere is a tab.
+        e.set_caret(Pos::new(4, 0), false);
+        e.key(Key::Char, CTRL_SHIFT, "8", 0);
+        assert_eq!(labels(&mut e)[4], "•");
+        e.key(Key::Char, CTRL_SHIFT, "8", 0);
+        assert_eq!(labels(&mut e)[4], "");
+        e.set_caret(Pos::new(4, 2), false);
+        e.key(Key::Tab, NO, "", 0);
+        assert!(texts(&e)[4].contains('\t'));
     }
 
     #[test]
