@@ -457,6 +457,52 @@ impl Upstream {
     }
 }
 
+impl Upstream {
+    /// The page itself (a navigation): its reply and, fetched the plain
+    /// way, the chain it went through (legacy-web §5.4.1e). A cookied
+    /// view's chain is the broker's, and reports none.
+    fn navigate(&mut self, url: &str) -> (Reply, Vec<navigator_cookies::Hop>) {
+        let hop = |(status, set_cookie, url): (u16, bool, String)| navigator_cookies::Hop { url, status, set_cookie };
+        match self {
+            Upstream::Fetchd(f) => match f.exchange_navigation(url) {
+                Ok((r, hops)) => (r, hops.into_iter().map(hop).collect()),
+                Err(e) => (Reply::Err(e), vec![]),
+            },
+            // A stand-in chain beside a fixture: `<page>.chain`, one hop a
+            // line, `<status> <0|1> <url>`; the last hop's status answers.
+            Upstream::Fixtures(dir) => match fixture_chain(dir, url) {
+                Some(hops) => {
+                    let last = hops.last().map_or(404, |h| h.status);
+                    let at = hops.last().map_or(url.to_string(), |h| h.url.clone());
+                    (Reply::Ok { status: last, rest: format!("{} 0 {at}", hops.len().saturating_sub(1)), body: vec![] }, hops)
+                }
+                None => (self.reply(Ask::Fetch(url)), vec![]),
+            },
+            Upstream::Cookied { .. } => (self.reply(Ask::Fetch(url)), vec![]),
+        }
+    }
+}
+
+/// A fixture's stand-in redirect chain (`<page>.chain`), bounded.
+fn fixture_chain(dir: &Path, url: &str) -> Option<Vec<navigator_cookies::Hop>> {
+    let u = url::Url::parse(url).ok()?;
+    let host = u.host_str()?;
+    if host.contains("..") || u.path().contains("..") {
+        return None;
+    }
+    let p = dir.join(host).join(format!("{}.chain", u.path().trim_start_matches('/')));
+    let text = std::fs::read_to_string(p).ok()?;
+    let hops: Vec<_> = text
+        .lines()
+        .take(16)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.splitn(3, ' ').collect();
+            Some(navigator_cookies::Hop { status: f.first()?.parse().ok()?, set_cookie: *f.get(1)? == "1", url: f.get(2)?.to_string() })
+        })
+        .collect();
+    (!hops.is_empty()).then_some(hops)
+}
+
 /// A fixture page: `<dir>/<host>/<path>`, `index.html` for a directory.
 fn fixture(dir: &Path, url: &str) -> Option<Vec<u8>> {
     let u = url::Url::parse(url).ok()?;
@@ -501,6 +547,10 @@ enum Got {
     /// Not a document (files.rs): kept for the person to save, never
     /// converted.
     File { url: String, what: &'static str, ext: &'static str, body: Vec<u8> },
+    /// Fetched without cookies, the page failed the site's own cookie
+    /// check (`navigator_cookies::site_needs_cookies`): the site needs to
+    /// know you to show it. Carries the failure as it would be told.
+    NeedsCookies(String),
 }
 
 fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Got, String> {
@@ -511,12 +561,19 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         up = Upstream::Cookied { cookies, view, host, navigated: false, plain: Box::new(up) };
     }
     let mut budget = FetchBudget::new(FetchBudget::DEFAULT);
-    let (base, doc) = match budget.admit(url, |u| up.reply(Ask::Fetch(u))) {
+    let mut hops = vec![];
+    let (base, doc) = match budget.admit(url, |u| {
+        let (r, h) = up.navigate(u);
+        hops = h;
+        r
+    }) {
         Reply::Ok { status, rest, body } if (200..300).contains(&status) => {
             let fin = rest.splitn(3, ' ').nth(2).filter(|f| !f.is_empty()).unwrap_or(url).to_string();
             (fin, body)
         }
+        Reply::Ok { status, .. } if navigator_cookies::site_needs_cookies(&hops) => return Ok(Got::NeedsCookies(format!("the site answered {status}"))),
         Reply::Ok { status, .. } => return Err(format!("the site answered {status}")),
+        Reply::Err(e) if navigator_cookies::site_needs_cookies(&hops) => return Ok(Got::NeedsCookies(e)),
         Reply::Err(e) => return Err(e),
     };
     if let Some((what, ext)) = files::kind(&doc) {
@@ -844,8 +901,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                             }
                         }
                     };
-                    let ctx = Ctx { jar, knows: cookied.is_some() };
-                    let view = cookied.as_ref().map(|(_, v)| *v);
+                    let mut ctx = Ctx { jar, knows: cookied.is_some() };
+                    let mut view = cookied.as_ref().map(|(_, v)| *v);
+                    // The site asked (§6.2): set when its cookie check failed
+                    // without cookies and the page opened again with them.
+                    let mut asked = false;
                     let hit = if fresh { None } else { state.lock().unwrap().cached(&url, Some(ctx)) };
                     let saved = saved.filter(|_| !fresh);
                     let page = match hit {
@@ -862,7 +922,36 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     if let Some(Err(e)) = other {
                                         eprintln!("navigatord: {url}: not reopened from the store ({e}); fetching");
                                     }
-                                    match convert(&cfg, &url, ctx, cookied) {
+                                    let mut got = convert(&cfg, &url, ctx, cookied);
+                                    if let Ok(Got::NeedsCookies(failed)) = &got {
+                                        // The backend's own rule (legacy-web §5.4.1e): the
+                                        // view turns cookied, in this page's jar, and the
+                                        // UI is told, so the change is never silent.
+                                        let failed = failed.clone();
+                                        got = match &cookies {
+                                            None => Err(format!("{failed}: this site needs to know you (cookies) to show it, and Arca isn't running here")),
+                                            Some(c) => {
+                                                let v = VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                let r = {
+                                                    let mut b = c.lock().unwrap();
+                                                    b.show_in(v, &url, jar_id(jar)).and_then(|_| b.set_cookied(v, Why::SiteNeedsIt))
+                                                };
+                                                match r {
+                                                    Ok(()) => {
+                                                        eprintln!("navigatord: {url}: the site's cookie check failed without cookies ({failed}); opening it with the site knowing you");
+                                                        ctx = Ctx { jar, knows: true };
+                                                        view = Some(v);
+                                                        asked = true;
+                                                        note = Some("this site needs to know you to show this page".into());
+                                                        convert(&cfg, &url, ctx, Some((c.clone(), v)))
+                                                    }
+                                                    Err(e) => Err(format!("{failed}: this site needs to know you, and that can't be done here ({e:?})")),
+                                                }
+                                            }
+                                        };
+                                    }
+                                    match got {
+                                        Ok(Got::NeedsCookies(failed)) => Err(failed),
                                         Ok(Got::Page(p)) => {
                                             let mut st = state.lock().unwrap();
                                             let p = Arc::new(st.stored(p));
@@ -907,7 +996,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     st.set(&origin(&p.url).unwrap_or_default());
                                 }
                             }
-                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, note });
+                            send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
                         }
                         Err(why) => {
                             eprintln!("navigatord: {url}: {why}");
@@ -1127,6 +1216,26 @@ mod tests {
         assert_eq!(fixture(&d, "https://atlas.example/wiki/Atrium?x=1").as_deref(), Some(&b"atrium"[..]));
         assert_eq!(fixture(&d, "https://atlas.example/../etc/passwd"), None);
         assert_eq!(fixture(&d, "file:///etc/passwd"), None);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_failed_cookie_check_is_told_from_an_error() {
+        let d = std::env::temp_dir().join(format!("navigatord-chain-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sd.example")).unwrap();
+        // The site sets a cookie, checks for it, and fails without it.
+        std::fs::write(d.join("sd.example/article.chain"), "302 1 https://sd.example/article\n302 0 https://auth.sd.example/check\n400 0 https://sd.example/article?x=1\n").unwrap();
+        std::fs::write(d.join("sd.example/gone.chain"), "404 0 https://sd.example/gone\n").unwrap();
+        let mut up = Upstream::Fixtures(d.clone());
+        let (r, hops) = up.navigate("https://sd.example/article");
+        assert!(matches!(r, Reply::Ok { status: 400, .. }));
+        assert!(navigator_cookies::site_needs_cookies(&hops));
+        let (r, hops) = up.navigate("https://sd.example/gone");
+        assert!(matches!(r, Reply::Ok { status: 404, .. }) && !navigator_cookies::site_needs_cookies(&hops));
+        // No chain beside it: the page as before, no hops.
+        let (_, hops) = up.navigate("https://sd.example/other");
+        assert!(hops.is_empty());
+        assert_eq!(fixture_chain(&d, "https://sd.example/../../etc/x"), None);
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -787,6 +787,16 @@ impl TrailStore {
         }
     }
 
+    /// The site of `url` asked to know you in trail `trail`'s jar (its cookie
+    /// check failed without cookies, §6.2), and navigatord let it: the
+    /// control and the rail say so, and its next pages go cookied.
+    pub fn know(&mut self, trail: u64, url: &str) {
+        if let Some(t) = self.trails.iter().find(|t| t.id == trail) {
+            let key = (Self::jar_of(t), site(url).to_string());
+            self.known.insert(key);
+        }
+    }
+
     /// Whether `site` knows you in trail `index`'s jar (the rail's person glyph).
     pub fn trail_knows(&self, index: usize, site: &str) -> bool {
         self.known.contains(&(Self::jar_of(&self.trails[index]), site.to_string()))
@@ -1035,5 +1045,25 @@ mod tests {
         let f = Facts { insecure: true, light: Light::Red, ..Facts::green("") }.settle();
         assert_eq!(f.light, Light::Red);
         assert_eq!(Facts::green("").settle().light, Light::Green);
+    }
+}
+
+#[cfg(test)]
+mod asked_tests {
+    use super::*;
+
+    /// A site that asked to know you (§6.2) knows you in that trail's jar
+    /// only: another Unrecorded trail's jar is apart.
+    #[test]
+    fn a_site_that_asked_knows_you_in_its_trails_jar_only() {
+        let mut s = TrailStore::empty();
+        let a = s.new_trail(true);
+        let b = s.new_trail(true);
+        let (ta, tb) = (s.trails[a].id, s.trails[b].id);
+        s.know(ta, "https://www.sd.example/article");
+        assert!(s.trail_knows(a, "sd.example") && !s.trail_knows(b, "sd.example"));
+        s.unknow(ta, "https://sd.example/");
+        assert!(!s.trail_knows(a, "sd.example"));
+        let _ = tb;
     }
 }

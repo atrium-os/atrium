@@ -5704,7 +5704,9 @@ Arca in this run the page opens again anonymously and the UI says so.
 
 Step 5 against the real Arca is `scripts/arca-vm-test.sh` §8 (it also runs `navctl signout` and
 `navctl accounts`: Sign out here ends the session cookie and the next page goes without it while
-the site still knows you, and Arca names no accounts for the test site; `NAV=0` skips it; `SKIP_SUITES=1` skips
+the site still knows you, and Arca names no accounts for the test site; then a page whose stand-in
+chain (`ck.chain` beside the fixture) is a failed cookie check opens with `knows=true` and the
+note "this site needs to know you to show this page", while a plain 404 stays a failure; `NAV=0` skips it; `SKIP_SUITES=1` skips
 §1's suites): navigatord as the web broker (uid 50803) with `NAVIGATORD_ARCA`/`NAVIGATORD_COURIERD`,
 driven by `navctl` (navigator-control's example). The test TLS server's log decides each check: a page
 whose site knows you carries its jar's cookie, an Unrecorded trail's jar is its own and goes when the

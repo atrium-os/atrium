@@ -349,6 +349,17 @@ check "…the next page goes without it" - "$(K /s3)"
 check "…and the site still knows you" "opened 12 $U/s3 knows=true from=Fetched" "$(echo "$r" | grep '^opened 12 ')"
 check "Arca's accounts for the site, by name (none here)" "accounts 0" "$(echo "$r" | grep '^accounts' | sed 's/ *$//')"
 check "an Unrecorded jar with nothing in it: nothing to end" "signedout 0" "$(echo "$r" | grep '^signedout' | sed -n 2p)"
+# The site asking (§6.2): a page whose cookie check fails without cookies
+# (a stand-in chain beside the fixture) opens again with the site knowing
+# you, in a jar of its own here (an Unrecorded trail's).
+g "printf '302 1 $U/ck\n302 0 $U/ck-check\n400 0 $U/ck?e=1\n' > $N8/fix/api.example/ck.chain && printf '404 0 $U/gone\n' > $N8/fix/api.example/gone.chain && chown arcabroker $N8/fix/api.example/*.chain"
+N=$(wc -l < "$SRV/log")
+r=$(nav open 13 $U/ck u:d4 0  open 14 $U/gone u:d4 0)
+echo "$r" | sed 's/^/    /'
+check "a failed cookie check: the page opened with the site knowing you, and says why" \
+    "opened 13 $U/ck knows=true from=Fetched note=this site needs to know you to show this page" "$(echo "$r" | grep '^opened 13 ')"
+check "…through Arca, in that trail's jar (empty at first)" - "$(K /ck)"
+check "an error that is not a cookie check stays an error" "failed 14 the site answered 404" "$(echo "$r" | grep '^failed 14 ')"
 # A crash leaves an Unrecorded jar (b2 has a cookie): the next navigatord
 # forgets every Unrecorded jar before it serves.
 g "pkill -x navigatord; sleep 2; true"

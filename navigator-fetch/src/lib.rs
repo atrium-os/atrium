@@ -59,6 +59,16 @@ pub struct Fetched {
     pub redirects: usize,
 }
 
+/// One response of a navigation's chain (legacy-web §5.4.1e): its URL, its
+/// status, and whether it set a cookie. The broker reads a chain fetched
+/// without cookies to tell a site that needs them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hop {
+    pub url: String,
+    pub status: u16,
+    pub set_cookie: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum FetchError {
     BadUrl(String),
@@ -219,6 +229,15 @@ impl<'a> Conversation<'a> {
         self.fetch_inner(url, None)
     }
 
+    /// `fetch`, with the chain it went through: every response, redirects
+    /// and the last, also when it failed part way. A redirect back to a URL
+    /// already in the chain is a loop, ended at once as too many redirects.
+    pub fn fetch_traced(&mut self, url: &str) -> (Result<Fetched, FetchError>, Vec<Hop>) {
+        let mut hops = Vec::new();
+        let r = self.fetch_chain(url, None, &mut hops);
+        (r, hops)
+    }
+
     /// ★ Bytes `start .. start + len` of the resource and no more
     /// (legacy-web §5.4.5.7, cut A: an image's header): asked for with
     /// `Range`, and read to at most `len` bytes whatever the server sends.
@@ -232,14 +251,23 @@ impl<'a> Conversation<'a> {
     }
 
     fn fetch_inner(&mut self, url: &str, range: Option<(u64, u64)>) -> Result<Fetched, FetchError> {
+        self.fetch_chain(url, range, &mut Vec::new())
+    }
+
+    fn fetch_chain(&mut self, url: &str, range: Option<(u64, u64)>, hops: &mut Vec<Hop>) -> Result<Fetched, FetchError> {
         let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         for redirects in 0..=MAX_REDIRECTS {
             let response = self.get_once(&current, range)?;
+            hops.push(Hop { url: current.to_string(), status: response.status, set_cookie: response.header("set-cookie").is_some() });
             if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 let loc = response.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
                 let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
                 if current.scheme() == "https" && next.scheme() != "https" {
                     return Err(FetchError::Refused(format!("redirect downgrades to {next}")));
+                }
+                if hops.iter().any(|h| h.url == next.as_str()) {
+                    hops.push(Hop { url: next.to_string(), status: 0, set_cookie: false });
+                    return Err(FetchError::TooManyRedirects);
                 }
                 current = next;
                 continue;
@@ -524,6 +552,9 @@ pub fn peek_window_option(args: &[String]) -> Duration {
 ///   images' headers. It is kept HERE, with the network's other timeouts,
 ///   so the converter's decisions read no clock (threat model §2.6): to the
 ///   converter a header not in time is a fetch that failed;
+/// - `N <url>`: the page itself, never from a prefetch, answered as a fetch
+///   then followed by its chain (`hops <n>`, n lines `<status> <0|1> <url>`,
+///   status 0 for a redirect target that would loop);
 /// - `B <bytes>`: the most hints may pull, no answer;
 /// - `--gate`: `gate` is called (fetchd prints its M1 gate).
 pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRead, out: impl std::io::Write,
@@ -566,6 +597,24 @@ pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration
             // may pull (prefetch::DEFAULT_BUDGET until told).
             if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }
             if url == "--gate" { let _ = out.flush(); gate(&mut out); continue }
+            // `N <url>`: the page itself (a navigation), answered as a fetch
+            // is, then `hops <n>\n` and n lines `<status> <0|1 set-cookie> <url>`.
+            if let Some(u) = url.strip_prefix("N ") {
+                let (r, hops) = pf.fetch_traced(u.trim());
+                match r {
+                    Ok(f) => {
+                        let _ = writeln!(out, "ok {} {} {} {}", f.response.status, f.redirects, f.response.body.len(), f.url);
+                        let _ = out.write_all(&f.response.body);
+                    }
+                    Err(e) => { let _ = writeln!(out, "err {}", e.to_string().replace(['\n', '\r'], " ")); }
+                }
+                let _ = writeln!(out, "hops {}", hops.len());
+                for h in &hops {
+                    let _ = writeln!(out, "{} {} {}", h.status, h.set_cookie as u8, h.url.replace(['\n', '\r', ' '], ""));
+                }
+                let _ = out.flush();
+                continue;
+            }
             match pf.fetch(url) {
                 Ok(f) => {
                     let _ = writeln!(out, "ok {} {} {} {}", f.response.status, f.redirects, f.response.body.len(), f.url);

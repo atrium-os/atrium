@@ -311,6 +311,11 @@ impl<'a> Prefetcher<'a> {
         self.conv.fetch(url)
     }
 
+    /// A navigation (`N`): fetched on the asking thread with its chain.
+    pub fn fetch_traced(&mut self, url: &str) -> (Result<Fetched, FetchError>, Vec<crate::Hop>) {
+        self.conv.fetch_traced(url)
+    }
+
     /// (answered from a finished prefetch, waited for one in flight,
     /// fetched on the asking thread, hints accepted)
     pub fn stats(&self) -> (usize, usize, usize, usize) {

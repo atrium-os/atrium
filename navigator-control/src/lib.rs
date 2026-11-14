@@ -140,7 +140,9 @@ pub enum Event {
     /// UI's trail record; `from`: where it came from.
     /// `knows`: whether it was fetched with the site knowing you (false
     /// if asked but Arca could not carry it; `note` says why).
-    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source, knows: bool, note: Option<String> },
+    /// `asked`: the site asked to know you (§6.2): its cookie check failed
+    /// without cookies, so navigatord opened it with them; the UI shows it.
+    Opened { id: u32, url: String, title: String, insecure: bool, ticket: Ticket, ms: u32, saved: String, from: Source, knows: bool, asked: bool, note: Option<String> },
     Failed { id: u32, url: String, why: String },
     Link { id: u32, action: LinkAction },
     /// The page an `Open` asked for is a file, not a document: navigatord

@@ -310,7 +310,7 @@ impl Live {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
-                Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from, knows, note } => {
+                Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from, knows, asked, note } => {
                     let Some(i) = self.children.iter().position(|c| c.asked == Some(id)) else { continue };
                     eprintln!("navigator-ui: opened {url} in {took} ms ({from:?}{})", if knows { ", the site knowing you" } else { "" });
                     if let Some(n) = note {
@@ -322,6 +322,13 @@ impl Live {
                         let (t, u) = (self.children[i].key.0, self.children[i].url.clone());
                         s.store.unknow(t, &u);
                         self.children[i].knows = false;
+                    }
+                    // The site asked (§6.2): it knows you now in this jar.
+                    if asked && knows && !self.children[i].knows {
+                        let (t, u) = (self.children[i].key.0, url.clone());
+                        eprintln!("navigator-ui: {} asked to know you; it does now in this trail's jar", crate::trail::site(&u));
+                        s.store.know(t, &u);
+                        self.children[i].knows = true;
                     }
                     let c = &mut self.children[i];
                     c.asked = None;

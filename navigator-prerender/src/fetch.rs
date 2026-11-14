@@ -339,6 +339,9 @@ impl FetchdFetcher {
     /// Kept in step with navigator-fetch's body limit.
     pub const MAX_BODY: usize = 8 * 1024 * 1024;
     const MAX_HEADER: usize = 16 * 1024;
+    /// A chain is at most navigator-fetch's redirects, the last response
+    /// and a loop's repeated target.
+    const MAX_HOPS: usize = 16;
     const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
@@ -407,6 +410,35 @@ impl FetchdFetcher {
         if let Err(e) = self.stdout.read_exact(&mut body) { return self.fail(format!("short body: {e}")) }
         self.bytes += len as u64;
         Ok(Reply::Ok { status, rest: rest.to_string(), body })
+    }
+
+    /// `N <url>`: the page itself with its chain (status, set a cookie,
+    /// URL), bounded like the rest of the reply. Only fetchd itself
+    /// answers it (not the converter's relay).
+    pub fn exchange_navigation(&mut self, url: &str) -> Result<(Reply, Vec<(u16, bool, String)>), String> {
+        let r = self.exchange_line(url, "", "N ")?;
+        let line = match read_line_bounded(&mut self.stdout, Self::MAX_HEADER) {
+            Ok(Some(l)) => l,
+            Ok(None) => return self.fail("fetcher exited".into()),
+            Err(e) => return self.fail(e),
+        };
+        let Some(n) = line.strip_prefix("hops ").and_then(|n| n.parse::<usize>().ok()).filter(|&n| n <= Self::MAX_HOPS) else {
+            return self.fail(format!("unrecognised chain {line:?}"));
+        };
+        let mut hops = Vec::with_capacity(n);
+        for _ in 0..n {
+            let l = match read_line_bounded(&mut self.stdout, Self::MAX_HEADER) {
+                Ok(Some(l)) => l,
+                Ok(None) => return self.fail("fetcher exited".into()),
+                Err(e) => return self.fail(e),
+            };
+            let f: Vec<&str> = l.splitn(3, ' ').collect();
+            match (f.first().and_then(|v| v.parse::<u16>().ok()), f.get(1), f.get(2)) {
+                (Some(st), Some(&c @ ("0" | "1")), Some(u)) => hops.push((st, c == "1", u.to_string())),
+                _ => return self.fail(format!("unrecognised hop {l:?}")),
+            }
+        }
+        Ok((r, hops))
     }
 
     /// The body as it came off the wire. `get` is this, decoded.

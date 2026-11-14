@@ -208,3 +208,40 @@ fn hints_stop_at_the_byte_budget() {
     });
     assert!(conns.load(Ordering::SeqCst) >= 1);
 }
+
+/// A site whose cookie check goes round without the cookie: `/start` sets
+/// one and sends you to `/check`, which sends you back to `/start`.
+fn cookie_check_server() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || for s in l.incoming() {
+        let Ok(mut s) = s else { return };
+        std::thread::spawn(move || loop {
+            let mut head = Vec::new();
+            let mut b = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut b) { Ok(0) | Err(_) => return, Ok(n) => head.extend_from_slice(&b[..n]) }
+            }
+            let line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+            let r = match line.split(' ').nth(1).unwrap_or("/") {
+                "/start" => "HTTP/1.1 302 Found\r\nSet-Cookie: c=1; Path=/\r\nLocation: /check\r\nContent-Length: 0\r\n\r\n".to_string(),
+                "/check" => "HTTP/1.1 302 Found\r\nLocation: /start\r\nContent-Length: 0\r\n\r\n".to_string(),
+                _ => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string(),
+            };
+            if s.write_all(r.as_bytes()).is_err() { return }
+        });
+    });
+    addr
+}
+
+/// `N <url>`: the page with its chain, also when the chain loops.
+#[test]
+fn a_navigation_is_answered_with_its_chain() {
+    let net = ToServer { addr: cookie_check_server(), lookups: AtomicUsize::new(0) };
+    let conv = Conversation::new(&net, tls(), GRANT);
+    let mut out = Vec::new();
+    navigator_fetch::serve(&conv, 1, &b"N http://site.test/start\nN http://site.test/plain\n"[..], &mut out, &mut |_| {});
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text, "err TooManyRedirects\nhops 3\n302 1 http://site.test/start\n302 0 http://site.test/check\n0 0 http://site.test/start\n\
+                      ok 200 0 2 http://site.test/plain\nokhops 1\n200 0 http://site.test/plain\n");
+}

@@ -1170,7 +1170,18 @@ Each step runs in the VM on headless frescod before the next.
      fetched. Cookies with an expiry stay, and so does the site knowing you: *Forget this
      site* is the way to drop everything. Checked in `arcad/tests/cookies.rs`, against the
      real Arca in `scripts/arca-vm-test.sh` §8, and the menu in `scripts/navigator-live-vm.sh`.
-     Not yet: the site asking (consent buttons, `SiteNeedsIt`), named personas,
+   - **The site asking** (§6.2, 2026-11-14): the redirect half. navigatord fetches the page
+     itself with fetchd's new `N <url>` request, which answers with the chain (each response's
+     status, whether it set a cookie, its URL; a redirect back into the chain ends it as a
+     loop). When the plain fetch fails and `navigator_cookies::site_needs_cookies` reads the
+     chain as a failed cookie check (a cookie set, the same origin again, then an error, a loop
+     or a URL naming a cookie error), navigatord opens the page again cookied in the page's own
+     jar (`Why::SiteNeedsIt`) and says so (`Opened { asked: true }`, note "this site needs to
+     know you to show this page"). The UI marks the site known in that trail's jar, so the
+     control and the rail's person glyph show it. Without Arca the failure says the site needs
+     to know you. Checked against the real Arca in `scripts/arca-vm-test.sh` §8 (a stand-in
+     chain beside a fixture, `<page>.chain`).
+     Not yet: consent buttons pressed in a page, named personas,
      session cookies ending with the last view, and moving a branch into its own trail with its
      jar.
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
