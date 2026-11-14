@@ -166,9 +166,20 @@ impl RichTextView {
                 }
                 // Table cell borders.
                 let rule = Color::rgba(0.55, 0.57, 0.6, 1.0);
+                // Each cell draws its top and left rule; the right and bottom ones
+                // only where no cell continues, so shared edges are drawn once.
                 for c in &page.cells {
                     let (x, y, w, h) = (cx + c.x as f64 * g.k, cy + c.y as f64 * g.k, c.w as f64 * g.k, c.h as f64 * g.k);
-                    for (rx, ry, rw, rh) in [(x, y, w, 1.0), (x, y + h - 1.0, w, 1.0), (x, y, 1.0, h), (x + w - 1.0, y, 1.0, h)] {
+                    let right = !page.cells.iter().any(|d| d.y == c.y && d.x == c.x + c.w);
+                    let below = !page.cells.iter().any(|d| d.y == c.y + c.h && d.x < c.x + c.w && d.x + d.w > c.x);
+                    let mut rules = vec![(x, y, w, 1.0), (x, y, 1.0, h)];
+                    if right {
+                        rules.push((x + w, y, 1.0, h + 1.0));
+                    }
+                    if below {
+                        rules.push((x, y + h, w + 1.0, 1.0));
+                    }
+                    for (rx, ry, rw, rh) in rules {
                         ctx.add(Node::Rect { rect: Rect::new(q(rx), q(ry), rw.max(1.0) as f32, rh.max(1.0) as f32), fill: rule, radius: 0.0 });
                     }
                 }
