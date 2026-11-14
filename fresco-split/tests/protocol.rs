@@ -20,6 +20,7 @@ fn samples() -> Vec<Msg> {
         Msg::Geometry { window: 2, width: 1920, height: 1080 },
         Msg::Focus { window: 2, gained: true, cause: 2 },
         Msg::CloseRequested { window: 2 },
+        Msg::RasterRefused { window: 2, cost_mops: 975_000, limit_mops: 2147 },
         Msg::Scale { window: 2, scale_milli: 1500 },
         Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2, activation: [9; 16], repeat: true } },
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },

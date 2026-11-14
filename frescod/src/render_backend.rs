@@ -291,6 +291,26 @@ impl<'a> Backend<'a> {
     }
 
     /// The fills the last render dropped, for each window it packed.
+    /// GPU renderer: a window's raster is still running (frescod looks
+    /// again soon, to show it once it lands).
+    pub fn rasters_pending(&self) -> bool {
+        matches!(self, Backend::Gpu(g) if g.rasters_pending())
+    }
+
+    /// GPU renderer: a window's raster finished and is not on screen yet.
+    pub fn raster_landed(&self) -> bool {
+        matches!(self, Backend::Gpu(g) if g.raster_landed())
+    }
+
+    /// GPU renderer: windows whose frame was refused for its raster cost
+    /// since the last call: (window, estimate, limit) in pixel-ops.
+    pub fn take_raster_refusals(&mut self) -> Vec<(u32, u64, u64)> {
+        match self {
+            Backend::Gpu(g) => std::mem::take(&mut g.refusals),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn take_fill_drops(&mut self) -> FillDrops {
         match self {
             Backend::Compute(c) => std::mem::take(&mut c.fill_drops),
@@ -645,6 +665,29 @@ pub struct GpuCompute<'a> {
     composed: HashMap<u64, Composed>,
     /// The scanout buffer composed last.
     last_target: Option<u64>,
+    /// Windows whose latest frame is refused for its raster cost
+    /// (`fresco_compute::cost::FAR_OVER`), and the refusals not yet
+    /// reported: (window, estimate, limit).
+    cost_refused: std::collections::HashSet<u32>,
+    refusals: Vec<(u32, u64, u64)>,
+    /// The raster cost ceiling (`FRESCOD_RASTER_LIMIT` pixel-ops, for
+    /// measuring on hardware; default `cost::FAR_OVER`).
+    raster_limit: u64,
+}
+
+/// A window's raster on the GPU, not finished yet: compose keeps showing
+/// the window's last finished surface meanwhile (fresco-f4-split.md §F4j).
+struct Inflight {
+    /// `sync` reaches this when it is done.
+    seq: u64,
+    /// The tile signatures and scroll viewports of the drawing it makes.
+    sig: Vec<u64>,
+    scrolls: Vec<(crate::pack::Scroll, u64)>,
+    /// What it changes against the front surface (surface pixels).
+    changed: [u32; 4],
+    started: std::time::Instant,
+    /// Logged as slow already.
+    slow: bool,
 }
 
 /// What a scanout buffer was last composed from: the windows, their
@@ -666,14 +709,21 @@ struct WinVm<'a> {
     vm: Vm<'a>,
     /// The code, mapped read-only.
     code: Bo<'a>,
-    /// Its surface: written here, mapped read-only into frescod's VM
-    /// (`shown`).
-    surface: Bo<'a>,
-    shown: Bo<'a>,
+    /// Its two surfaces: written here, mapped read-only into frescod's VM
+    /// (`shown`). Compose reads `front`, the last finished drawing; a
+    /// raster writes the other, and they swap once it is done. So compose
+    /// never waits on, nor reads half of, a window's raster.
+    surfaces: [Bo<'a>; 2],
+    shown: [Bo<'a>; 2],
+    front: usize,
+    /// A drawing has finished at least once (before that the window is
+    /// not composed: its surfaces hold nothing of it yet).
+    landed: bool,
+    inflight: Option<Inflight>,
     size: (u32, u32),
-    /// Tile signatures of what the surface holds.
+    /// Tile signatures of what the front surface holds.
     held: Option<Vec<u64>>,
-    /// The scroll viewports of the drawing it holds, with their keys.
+    /// The scroll viewports of the front drawing, with their keys.
     scrolls: Vec<(crate::pack::Scroll, u64)>,
     /// Where a scroll's moves stage the pixels they copy.
     scratch: Option<Bo<'a>>,
@@ -689,11 +739,14 @@ impl<'a> WinVm<'a> {
     fn new(gpu: &'a atrium_gpu::amd::Gpu, main: &Vm<'a>, code: &Bo<'a>, w: u32, h: u32) -> std::io::Result<Self> {
         let vm = gpu.create_vm()?;
         let bytes = (w as u64 * h as u64 * 4).next_multiple_of(4096);
-        let surface = vm.alloc(bytes, BO_VRAM)?;
+        let surfaces = [vm.alloc(bytes, BO_VRAM)?, vm.alloc(bytes, BO_VRAM)?];
         Ok(WinVm {
             code: vm.share(code, true)?,
-            shown: main.share(&surface, true)?,
-            surface,
+            shown: [main.share(&surfaces[0], true)?, main.share(&surfaces[1], true)?],
+            surfaces,
+            front: 0,
+            landed: false,
+            inflight: None,
             size: (w, h),
             held: None,
             scrolls: Vec::new(),
@@ -825,7 +878,22 @@ impl<'a> GpuCompute<'a> {
             changes: HashMap::new(),
             composed: HashMap::new(),
             last_target: None,
+            cost_refused: Default::default(),
+            refusals: Vec::new(),
+            raster_limit: std::env::var("FRESCOD_RASTER_LIMIT").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(fresco_compute::cost::FAR_OVER),
         })
+    }
+
+    /// Whether a window's raster is still running on the GPU.
+    pub fn rasters_pending(&self) -> bool {
+        self.wins.values().any(|v| v.inflight.is_some())
+    }
+
+    /// Whether a window's raster finished since it was last looked at (a
+    /// frame is due to show it).
+    pub fn raster_landed(&self) -> bool {
+        self.wins.values().any(|v| v.inflight.as_ref().is_some_and(|f| v.sync.query().is_ok_and(|d| d >= f.seq)))
     }
 
     /// Apply the frame's uploads, give each window a VM and a surface of its
@@ -837,6 +905,7 @@ impl<'a> GpuCompute<'a> {
         self.wins.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.version.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.changes.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
+        self.cost_refused.retain(|id| f.windows.iter().any(|w| w.id == *id));
         let gpu = self.vm.gpu();
         let mut frames = Vec::with_capacity(f.windows.len());
         let mut scrolls = HashMap::new();
@@ -862,13 +931,14 @@ impl<'a> GpuCompute<'a> {
     /// The compose layers, and the heap they address: every surface as
     /// frescod's VM maps it, as word offsets from the lowest.
     fn layers(&self, windows: &[(u32, Arc<fresco_compute::Frame>)], pos: &HashMap<u32, (i32, i32)>) -> Result<(Vec<Layer>, u64, u32)> {
-        let base = self.wins.values().map(|v| v.shown.gpu_va()).min().unwrap_or(0);
+        let base = self.wins.values().flat_map(|v| v.shown.iter().map(|b| b.gpu_va())).min().unwrap_or(0);
         let mut end = base;
         let mut layers = Vec::new();
         for (id, _) in windows {
             let v = &self.wins[id];
-            let off = (v.shown.gpu_va() - base) / 4;
-            end = end.max(v.shown.gpu_va() + v.size.0 as u64 * v.size.1 as u64 * 4);
+            let shown = &v.shown[v.front];
+            let off = (shown.gpu_va() - base) / 4;
+            end = end.max(shown.gpu_va() + v.size.0 as u64 * v.size.1 as u64 * 4);
             let off = u32::try_from(off).map_err(|_| "surfaces spread over more than 16 GiB of VA")?;
             let (x, y) = pos[id];
             layers.push(Layer::at([off, v.size.0, v.size.0, v.size.1], x, y, 1.0));
@@ -891,17 +961,34 @@ impl<'a> GpuCompute<'a> {
         // VM per window it must fault (the work is lost, EIO) or land in the
         // window's own memory, and the first window must stay as it was.
         let probe = std::env::var_os("FRESCOD_GPU_ISOLATION_PROBE").is_some()
-            .then(|| p.frames.first().and_then(|(id, _)| self.wins.get(id)).map(|v| v.shown.gpu_va()))
+            .then(|| p.frames.first().and_then(|(id, _)| self.wins.get(id)).map(|v| v.shown[v.front].gpu_va()))
             .flatten();
         // Each window whose tiles changed: its dirty rects, in its own VM.
         // A scrolled viewport first moves what it shows on the GPU
         // (fresco-scene-groups.md §4); then only what that left to draw.
+        let limit = self.raster_limit;
         for (n, (id, f)) in p.frames.iter().enumerate() {
             let v = self.wins.get_mut(id).ok_or("window without a VM")?;
-            let sig = damage::tile_signatures(f);
             let now = p.scrolls.remove(id).unwrap_or_default();
+            // A raster that finished: its surface is the front now.
+            if let Some(fl) = v.inflight.as_mut() {
+                if v.sync.query()? < fl.seq {
+                    // Still running: compose shows the last finished
+                    // drawing; this frame's changes wait for the next.
+                    let took = fl.started.elapsed();
+                    if !fl.slow && took > std::time::Duration::from_millis(SLOW_RASTER_MS) {
+                        fl.slow = true;
+                        log::warn!("gpu: window {id}: raster running {} ms; showing its last frame", took.as_millis());
+                    }
+                    continue;
+                }
+                land(*id, v, &mut self.version, &mut self.changes);
+            }
+            let sig = damage::tile_signatures(f);
             let (fw, fh) = (f.header.width, f.header.height);
-            let (moves, rects) = match v.held.as_mut() {
+            // What this frame changes against the front drawing.
+            let mut held = v.held.clone();
+            let (moves, rects) = match held.as_mut() {
                 Some(held) if held.len() == sig.len() && (fw, fh) == v.size => {
                     let sh = crate::pack::shifts(&v.scrolls, &now);
                     let (moves, out) = if sh.is_empty() { Default::default() } else { damage::plan(fw, fh, &sig, held, &sh) };
@@ -912,21 +999,24 @@ impl<'a> GpuCompute<'a> {
                     (Vec::new(), damage::rects(&dirty, f.header.tiles_x, f.header.tiles_y, MAX_DAMAGE_RECTS))
                 }
             };
-            v.held = Some(sig);
-            v.scrolls = now;
             if rects.is_empty() && moves.is_empty() {
                 continue;
             }
-            let ver = self.version.entry(*id).or_insert(0);
-            *ver += 1;
+            // H6: a frame far too costly to raster is not drawn; the window
+            // keeps its last frame and its client is told (once, until a
+            // frame of it fits again).
+            let cost = fresco_compute::cost::estimate(f, &rects);
+            if cost > limit {
+                if self.cost_refused.insert(*id) {
+                    log::warn!("gpu: window {id}: frame not drawn, raster estimate {cost} over {limit} pixel-ops");
+                    self.refusals.push((*id, cost, limit));
+                }
+                continue;
+            }
+            self.cost_refused.remove(id);
             let changed = moves.iter().map(|m| m.dst)
                 .chain(rects.iter().map(|t| [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(fw), (t[3] * TILE).min(fh)]))
                 .fold([0; 4], union);
-            let log = self.changes.entry(*id).or_default();
-            log.push((*ver, changed));
-            if log.len() > CHANGE_LOG {
-                log.remove(0);
-            }
             let mut stage = Vec::new();
             let mut offs = [0u64; binding::COUNT];
             for (b, bytes) in f.buffers().into_iter().enumerate() {
@@ -962,13 +1052,20 @@ impl<'a> GpuCompute<'a> {
             }
             v.staging.write(0, &stage)?;
             let data_va = v.data.as_ref().unwrap().gpu_va();
+            // The back surface: first a copy of the front (the drawing the
+            // damage is against), then the moves and the dirty tiles.
+            let back = v.surfaces[v.front ^ 1].gpu_va();
             let mut va: [u64; binding::COUNT] = std::array::from_fn(|b| data_va + offs[b]);
             va[binding::TARGET as usize] = match probe {
                 Some(other) if n > 0 => other,
-                _ => v.surface.gpu_va(),
+                _ => back,
             };
             let mut ib = self.arch.stream();
             ib.copy(v.staging.gpu_va(), data_va, stage.len() as u64);
+            if v.held.is_some() {
+                ib.copy(v.surfaces[v.front].gpu_va(), back, surface_words as u64 * 4);
+                ib.barrier();
+            }
             if let Some(scratch) = v.scratch.as_ref().filter(|_| !move_offs.is_empty()) {
                 let (surf, scr) = (va[binding::TARGET as usize], scratch.gpu_va());
                 for &(size, out, _) in &move_offs {
@@ -986,12 +1083,38 @@ impl<'a> GpuCompute<'a> {
             ib.end(v.ring.gpu_va() + FENCE_OFFSET);
             v.seq += 1;
             run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns)?;
+            v.inflight = Some(Inflight { seq: v.seq, sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false });
             if probe.is_some() && n > 0 {
                 let r = v.sync.wait(v.seq, flip_wait_ms());
                 eprintln!("frescod: isolation probe: window {id} raster to {:#x} (window {} in frescod's VM): {r:?}",
                     va[binding::TARGET as usize], p.frames[0].0);
             }
         }
+
+        // Rasters that are quick land in this frame: wait for them a little
+        // (they run side by side, one queue per window VM), never longer.
+        let t0 = std::time::Instant::now();
+        let quick = std::time::Duration::from_micros(QUICK_RASTER_US);
+        loop {
+            let mut all = true;
+            for v in self.wins.values() {
+                if let Some(fl) = &v.inflight {
+                    all &= v.sync.query()? >= fl.seq;
+                }
+            }
+            if all || t0.elapsed() >= quick {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        for (id, v) in self.wins.iter_mut() {
+            if v.inflight.as_ref().is_some_and(|fl| v.sync.query().is_ok_and(|d| d >= fl.seq)) {
+                land(*id, v, &mut self.version, &mut self.changes);
+            }
+        }
+
+        // Only windows with a finished drawing are composed.
+        p.frames.retain(|(id, _)| self.wins.get(id).is_some_and(|v| v.landed));
 
         // What to compose: everywhere if the layers changed since this
         // scanout buffer was composed, else where a surface changed.
@@ -1012,7 +1135,9 @@ impl<'a> GpuCompute<'a> {
                 let (w, h) = (self.width, self.height);
                 let mut r = Vec::new();
                 for (((id, _), l), old) in p.frames.iter().zip(&layers).zip(old_layers) {
-                    if l != old {
+                    // The surface's place in the heap moves when its two
+                    // surfaces swap; what it shows changes by its version.
+                    if !same_place(l, old) {
                         r.extend(on_screen(old, w, h));
                         r.extend(on_screen(l, w, h));
                     } else if held.get(id) != versions.get(id) {
@@ -1076,6 +1201,34 @@ impl<'a> GpuCompute<'a> {
         Ok(())
     }
 }
+
+/// Window `id`'s finished raster becomes its front surface: a new version,
+/// changed where the raster drew.
+fn land(id: u32, v: &mut WinVm<'_>, version: &mut HashMap<u32, u64>, changes: &mut HashMap<u32, Vec<(u64, [u32; 4])>>) {
+    let Some(fl) = v.inflight.take() else { return };
+    v.front ^= 1;
+    v.landed = true;
+    v.held = Some(fl.sig);
+    v.scrolls = fl.scrolls;
+    let ver = version.entry(id).or_insert(0);
+    *ver += 1;
+    let log = changes.entry(id).or_default();
+    log.push((*ver, fl.changed));
+    if log.len() > CHANGE_LOG {
+        log.remove(0);
+    }
+}
+
+/// A layer in the same place on screen, whichever surface it shows.
+fn same_place(a: &Layer, b: &Layer) -> bool {
+    a.rect == b.rect && a.origin == b.origin && a.surface[1..] == b.surface[1..] && a.opacity == b.opacity
+}
+
+/// A window raster running longer than this is logged (once per raster).
+const SLOW_RASTER_MS: u64 = 100;
+/// How long a frame waits for a window's raster to land before composing
+/// without it (its last finished drawing shows instead).
+const QUICK_RASTER_US: u64 = 2000;
 
 /// How long frescod waits on GPU work it depends on: the flip timeout
 /// (`FRESCOD_FLIP_TIMEOUT_MS`, raised on gpusim, where a frame takes

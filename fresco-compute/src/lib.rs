@@ -26,6 +26,7 @@
 //! batches, each in list order.
 
 pub mod compose;
+pub mod cost;
 pub mod damage;
 pub mod fill;
 pub mod fuzz;

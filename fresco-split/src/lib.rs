@@ -148,6 +148,11 @@ pub enum Msg {
     Focus { window: u32, gained: bool, cause: u8 },
     /// The user asked to close the window.
     CloseRequested { window: u32 },
+    /// The window's latest frame was not drawn: its raster cost estimate,
+    /// in millions of pixel-ops, is far over the limit
+    /// (`fresco_compute::cost`). The window keeps its last frame; the
+    /// renderer tells its client (`budget::RASTER_TIME`).
+    RasterRefused { window: u32, cost_mops: u32, limit_mops: u32 },
     /// The window is on a monitor of this scale (thousandths, 500..=4000):
     /// the client should render at it.
     Scale { window: u32, scale_milli: u32 },
@@ -245,6 +250,7 @@ mod kind {
     pub const FOCUS: u32 = 0x104;
     pub const CLOSE: u32 = 0x105;
     pub const SCALE: u32 = 0x106;
+    pub const RASTER_REFUSED: u32 = 0x107;
     pub const KEY: u32 = 0x110;
     pub const MOTION: u32 = 0x111;
     pub const BUTTON: u32 = 0x112;
@@ -335,6 +341,7 @@ impl Msg {
             | Msg::Geometry { window, .. }
             | Msg::Focus { window, .. }
             | Msg::CloseRequested { window }
+            | Msg::RasterRefused { window, .. }
             | Msg::Scale { window, .. }
             | Msg::Input { window, .. }
             | Msg::DragFormat { window, .. }
@@ -430,6 +437,12 @@ impl Msg {
                 r
             }
             Msg::CloseRequested { window } => Rec::new(CLOSE, *window),
+            Msg::RasterRefused { window, cost_mops, limit_mops } => {
+                let mut r = Rec::new(RASTER_REFUSED, *window);
+                r.put(2, *cost_mops);
+                r.put(3, *limit_mops);
+                r
+            }
             Msg::Scale { window, scale_milli } => {
                 let mut r = Rec::new(SCALE, *window);
                 r.put(2, *scale_milli);
@@ -697,7 +710,7 @@ impl Msg {
             SCROLL => (3, false),
             MAGNIFY => (4, false),
             SLOTS | FRAME_DONE | SCALE => (1, false),
-            FOCUS => (2, false),
+            FOCUS | RASTER_REFUSED => (2, false),
             KEY => (4, false), // usage, pressed, modifiers, repeat
             CLIENT => (5, false),
             BUTTON => (5, false),
@@ -798,6 +811,7 @@ impl Msg {
                 cause: if r.get(3) <= 3 { r.get(3) as u8 } else { return Err(Refused("focus cause")) },
             },
             CLOSE => Msg::CloseRequested { window },
+            RASTER_REFUSED => Msg::RasterRefused { window, cost_mops: r.get(2), limit_mops: r.get(3) },
             SCALE => {
                 let scale_milli = r.get(2);
                 if !(SCALE_MIN..=SCALE_MAX).contains(&scale_milli) {

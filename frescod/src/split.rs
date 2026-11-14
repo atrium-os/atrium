@@ -1042,6 +1042,10 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
     let (global, input) = match *ev {
         E::WindowFocusChanged { window_id, gained, cause } => return Some(Msg::Focus { window: r.local_of(window_id)?, gained, cause }),
         E::WindowCloseRequested { window_id } => return Some(Msg::CloseRequested { window: r.local_of(window_id)? }),
+        E::BudgetRefused { window_id, resource: fresco_protocol::budget::RASTER_TIME, used, limit, .. } => {
+            let mops = |v: u64| u32::try_from(v / 1_000_000).unwrap_or(u32::MAX);
+            return Some(Msg::RasterRefused { window: r.local_of(window_id)?, cost_mops: mops(used), limit_mops: mops(limit) });
+        }
         E::PopupPlaced { window_id, x, y, width, height, side } => {
             return Some(Msg::PopupPlaced { window: r.local_of(window_id)?, x, y, width, height, side });
         }

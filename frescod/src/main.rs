@@ -331,6 +331,8 @@ fn main() -> std::io::Result<()> {
      * monitor) is marked stale and gets the newest desktop frame as soon
      * as it lands, without a re-render. */
     const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+    /* How often to look whether a window's GPU raster has landed. */
+    const RASTER_POLL: Duration = Duration::from_millis(2);
     /* How often to look at stale heads while idle. */
     const STALE_POLL: Duration = Duration::from_millis(2);
     /* The heartbeat is a SAFETY NET, and it must never become the
@@ -602,7 +604,10 @@ fn main() -> std::io::Result<()> {
             vrr_floor.and_then(|lo| video::VIDEOS.repeat_ns(lo)).map(|r| last_present_ns + r),
         ].into_iter().flatten().min();
         let video_due = video_at.is_some_and(|t| t <= now_ns);
-        if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due {
+        /* GPU renderer: a window's raster finished since the last frame
+         * (compose showed its previous drawing meanwhile). */
+        let raster_due = renderer.raster_landed();
+        if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due && !raster_due {
             /* Heads that missed the newest frame get it once they land. */
             let mut stale = false;
             if multi {
@@ -643,6 +648,9 @@ fn main() -> std::io::Result<()> {
             }
             if let Some(t) = video_at {
                 until_beat = until_beat.min(Duration::from_nanos(t.saturating_sub(now_ns)));
+            }
+            if renderer.rasters_pending() {
+                until_beat = until_beat.min(RASTER_POLL);
             }
             /* Video frames on screen once the flip carrying them lands. */
             if video::VIDEOS.awaiting() {
@@ -1552,6 +1560,13 @@ fn render_one_frame(
         windows.iter().filter(|w| w.pixels.is_some()).map(|w| w.id).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
     /* Fills packed here that did not draw: their owners hear which. */
+    /* A window's frame too costly to raster on the GPU (H6): its owner is
+     * told; in split mode the broker passes it to the window's renderer. */
+    for (id, cost, limit) in renderer.take_raster_refusals() {
+        comp.lock().unwrap().emit(fresco_scene_server::window::DisplayEvent::BudgetRefused {
+            window_id: id, resource: fresco_protocol::budget::RASTER_TIME, id: 0, used: cost, limit,
+        });
+    }
     let drops = renderer.take_fill_drops();
     if !drops.is_empty() {
         let mut c = comp.lock().unwrap();

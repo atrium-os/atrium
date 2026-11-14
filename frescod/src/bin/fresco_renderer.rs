@@ -712,6 +712,15 @@ fn from_broker(
             Msg::Focus { gained, cause, .. } => {
                 let _ = events.send(DisplayEvent::WindowFocusChanged { window_id: local, gained, cause });
             }
+            Msg::RasterRefused { cost_mops, limit_mops, .. } => {
+                let _ = events.send(DisplayEvent::BudgetRefused {
+                    window_id: local,
+                    resource: fresco_protocol::budget::RASTER_TIME,
+                    id: 0,
+                    used: cost_mops as u64 * 1_000_000,
+                    limit: limit_mops as u64 * 1_000_000,
+                });
+            }
             Msg::CloseRequested { .. } => {
                 comp.lock().unwrap().request_close(local as u16);
             }

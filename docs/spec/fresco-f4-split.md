@@ -137,7 +137,7 @@ Still open:
 
 - Each window's `bin` and `raster` run in a VM of its own (`GpuCompute`'s `WinVm`), which maps only the kernels' code (read-only), that window's inputs, staging and ring (staging read-only to the GPU), and its surface.
 - Compose runs in frescod's VM, which maps every window's surface read-only (`Vm::share`, VM_BIND2 `BIND_READONLY`; no driver change was needed) plus the scanout buffers. The compose heap is the span of those mappings: each layer's offset is its surface's VA minus the lowest, in words, so `compose.comp` is unchanged; frescod refuses a span over 16 GiB.
-- Ordering: one submission per drawn window in its VM, each signalling that window's syncobj, then compose. The driver starts another VM's work on a queue only once the queue is idle, so compose sees every raster; if that wait times out (EBUSY), frescod waits on the windows' syncobjs and submits again.
+- Ordering: one submission per drawn window in its VM, each signalling that window's syncobj, then compose. ~~The driver starts another VM's work on a queue only once the queue is idle, so compose sees every raster~~ (true of the old single-ring SUBMIT; with a user queue per VM, 5c, rasters and compose can run side by side, and compose never waits on a raster: F4j).
 - A window that is resized or new gets a fresh VM and surface; a closed window's VM goes with it.
 - Verified on gpusim 354fffb with the ABI rev 4 driver: three windows draw (`frescod-f4e-per-window-vms.png`). With `FRESCOD_GPU_ISOLATION_PROBE=1`, windows 2 and 3 raster to the address window 1's surface has in frescod's VM: both fault (EIO, `isolation.vm_faults` 2), and window 1 is drawn intact (`frescod-f4e-isolation-probe.png`). In the one-VM design that write would have landed in window 1.
 - The compute (Tier-2) renderer gets the same protection another way: F4g.
@@ -174,6 +174,16 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 - Development runs (`frescod` as root from the VM scripts) are unchanged.
 - Gate: `scripts/fresco-production-gate.sh` runs the policy's tests and checks that the shipped service runs `atrium-frescod` as `_frescod` with none of those variables, and that no install or launch file sets them; `... vm <frescod>` also starts it as `atrium-frescod` in the VM with each setting and expects exit 78.
 
+### F4j. GPU renderer: compose never waits on a window's raster; frames far too costly are not drawn. Done (2026-11-14), needs a gpusim and an R9700 run
+
+The other half of officina.md §10.5: with the GPU renderer every window's raster runs on the shared GPU before compose, so one window whose frame takes very long (within `MAX_OPS`: thousands of large overlapping translucent fills) could hold up the whole screen.
+
+- **Two surfaces per window** (`WinVm::surfaces`, both mapped read-only into frescod's VM). Compose reads the *front*, the last drawing that finished. A raster writes the other: a DMA copy of the front first (the damage is against it), then the scroll moves and the dirty tiles. When its syncobj reaches the raster's value the two swap, the window's version goes up and the change log gets the rect it drew, so compose recomposes only that.
+- **No waiting.** frescod submits every changed window, then gives them together at most 2 ms (`QUICK_RASTER_US`) to land; whatever has not lands later, and compose shows those windows' previous drawings. While a raster is out the window gets no new raster (its changes wait for the next frame), and frescod's loop polls every 2 ms (`RASTER_POLL`) for it to land (`Backend::raster_landed`), then shows it. A raster running past 100 ms is logged once. A window is composed from its first finished drawing on, never from an empty surface.
+- This also closes a race: with a user queue per VM nothing ordered compose after the rasters on silicon, so compose could read a surface while it was being drawn.
+- **Cost estimate (H6).** Before submitting, `fresco_compute::cost::estimate` sums, over the frame's ops, the dirty pixels each op's tiles cover, weighted by kind (fills 4, textures and isolated layers 2, the rest 1), plus the mask scan: O(ops x dirty rects) on the CPU. A frame over `cost::FAR_OVER` (2^31 pixel-ops, about 580 opaque full-window layers at 1440p) is not drawn: the window keeps its last frame and its client gets `EV_BUDGET_REFUSED` / `budget::RASTER_TIME` (once, until one of its frames fits again; in split mode the broker passes it to the renderer as `RASTER_REFUSED`). Below that, slowness is not refused (the hardening note's "legitimate content can be expensive"): the no-wait rule handles it. `FRESCOD_RASTER_LIMIT` sets another ceiling, for measuring.
+- **To do:** run on gpusim (`scripts/vm-gpu-scroll.sh`: the screen must still match the compute renderer once settled) and measure on the R9700 what a window raster costs per pixel-op, to set `FAR_OVER` from time rather than from a guess. Each R9700 run needs Shankar's go.
+
 ### F4f. Secure input for passwords (waits on F5 and Navigator C0)
 
 - A password field is marked in the window's semantic tree, and the broker validates the mark (§6.4).
@@ -181,7 +191,7 @@ Asked by Shankar (officina.md §10.5): a huge document must not take down compos
 
 ## Order
 
-F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e, F4g, F4h and F4i are done.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e, F4g, F4h, F4i and F4j are done (F4j waits on a gpusim run).
 
 ## Decisions taken (recommended; say if you want otherwise)
 

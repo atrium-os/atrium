@@ -111,6 +111,10 @@ pub enum DisplayEvent {
     /// reason. Sent whenever the set changes, so an empty list says every
     /// node draws again.
     WindowFillsDropped { window_id: u32, dropped: Vec<(u32, u8)> },
+    /// To the window's owner: something of it was refused for a budget
+    /// (`fresco_protocol::BudgetRefusedEvent`; frescod sends
+    /// `budget::RASTER_TIME` when a frame is far too costly to raster).
+    BudgetRefused { window_id: u32, resource: u8, id: u32, used: u64, limit: u64 },
     /// A drag (docs/spec/tabula.md §4) came over, moved over or left the
     /// window; `formats` on `Enter` only.
     Drag { phase: DragPhase, window_id: u32, drag_id: u64, x: f32, y: f32, formats: Vec<String> },
@@ -354,6 +358,10 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
                 dropped: dropped.iter().map(|&(node_id, reason)| FillDrop { node_id, reason }).collect(),
             };
             Ok((control::EV_WINDOW_FILLS_DROPPED, encode(&p)?))
+        }
+        DisplayEvent::BudgetRefused { window_id, resource, id, used, limit } => {
+            let p = fresco_protocol::BudgetRefusedEvent { window_id: *window_id, resource: *resource, id: *id, used: *used, limit: *limit };
+            Ok((control::EV_BUDGET_REFUSED, encode(&p)?))
         }
         DisplayEvent::Drag { phase, window_id, drag_id, x, y, formats } => {
             let op = match phase {
