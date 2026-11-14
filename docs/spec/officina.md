@@ -1664,6 +1664,128 @@ Not yet: editing a comment on the balloon itself, rich text in comments, mention
 showing comments in the PDF, a comments list pane, Word's paragraph-level comment
 dates in local time (we keep what the file says).
 
+### 16.22 O5c design (proposed 2026-11-15): tracked changes, compare and merge
+
+**What goes wrong today.** Word and LibreOffice show a reviewed document as one
+surface carrying everything at once: the new text, the old text struck through,
+insertions underlined in one colour per author, a balloon for every formatting
+change, and the comments. Three edits to a sentence become nine fragments; retyping
+one letter shows as a deleted word and an inserted word; a moved paragraph shows as a
+deletion here and an insertion there; and nobody can read the result. Accepting is
+item by item through hundreds of fragments. Compare produces the same markup from a
+character diff with no idea of moves or formatting, and merging two reviewers' copies
+piles both sets of markup together, with overlapping edits shown as interleaved
+fragments instead of as a conflict.
+
+The causes are the same each time: (1) reading and reviewing are one view, (2) changes
+are kept and shown at the grain they were typed (characters) rather than the grain
+people think in (words, sentences, moves, "made the headings bold"), (3) there is no
+unit larger than a change (who proposed what, in which pass), and (4) compare and merge
+are bolted on to the markup instead of sharing one model with it.
+
+**The design in one paragraph.** The document always reads clean: the text shown is
+the proposed text, and changes are only a thin bar in the margin and a count in the
+status line. Reviewing is a separate mode, like reviewing code: a lane beside the page
+lists changes as *edits* (word-level, a replacement as one item, moves as moves,
+formatting-only and whitespace-only edits collapsed into one line each), grouped into
+*change sets* (one person's pass, optionally named); selecting an edit shows that one
+edit in place, old and new, and Accept, Reject, Next go through them by key. Compare
+and merge produce the same edits and change sets from two or three documents, so they
+are reviewed the same way, and a real conflict (two people changing the same words
+differently) is one card with three choices, never two sets of markup on top of each
+other. Comments keep the balloon column (§16.21); changes never get balloons.
+
+#### Model (officina-text)
+
+- **Insertions** are runs with `CharAttrs::rev = Some(RevId)`; a revision is author,
+  time and change set, kept in `TextDoc::revisions` (like comments).
+- **Deletions are not left in the text.** Deleted text moves into a *tombstone*: a
+  U+FFFC anchor with `CharAttrs::deleted = Some(DelId)`, whose entry holds the removed
+  runs (and paragraph breaks with the second paragraph's properties) and its revision.
+  So the text is always the proposed text: layout, find, word count, spelling, the
+  caret and the PDF need nothing new, and a tombstone is one character to them like a
+  note anchor (drawn as nothing, or, for the edit being reviewed, as the old text
+  struck through).
+- **Formatting changes** are runs with `CharAttrs::fmt_rev`, the revision holding the
+  attributes the runs had; paragraph changes the same on `ParaProps`.
+- **Paragraphs inserted or deleted whole** are insertions and tombstones that hold
+  paragraph breaks; joining or splitting paragraphs is the same.
+- **Your own pending text is just text.** Typing inside your own unaccepted
+  insertion edits it; deleting part of it removes it outright (no tombstone);
+  deleting someone else's insertion is a rejection of that part, recorded as yours.
+  Re-formatting text twice keeps the first old attributes. This is most of why a
+  tracked document stays small.
+- **Accept and reject** are plain undoable ops: accepting an insertion clears `rev`,
+  rejecting it deletes the text; accepting a deletion drops the tombstone, rejecting
+  it splices the old text back; formatting likewise. Reject-all gives the original
+  exactly, accept-all the proposed text, which the gates check.
+- **Tracking** is a document setting kept in the file; while it is on the editor turns
+  each typed or deleted piece into these ops, attributing it to the current author and
+  change set.
+
+#### Edits and change sets (what people see)
+
+- An *edit* is computed, never stored: adjacent revisions of one author in one
+  paragraph, widened to whole words, with a deletion next to an insertion read as a
+  replacement ("quick → fast"). A tombstone and an insertion holding the same text are
+  a move ("moved ‘Costs’ above ‘Plan’"). Formatting-only edits of one kind are one line
+  ("bold on 6 headings"); punctuation- and white-space-only edits are marked minor.
+- A *change set* is one author's revisions in one session, or a named proposal
+  ("Legal's pass"). The lane lists sets, then edits; filters by person and kind; and
+  Accept or Reject applies to an edit, a set, all minor edits, or everything.
+- **Views.** *Reading* (default): proposed text, margin bars in the author's colour,
+  "14 edits by 3 people · Review" in the status line. *Review*: the lane, and only the
+  selected edit drawn in place (old struck, new marked), plus its paragraph's other
+  edits faintly. *Original*: reject-all, read-only. *All markup*: every edit in place,
+  Word's way, for those who want it and for printing a record.
+- A change can carry a comment thread (§16.21) for the "why", shown in the lane.
+
+#### Compare
+
+Compare (Write ▸ Compare with…) takes two documents and produces a change set that
+turns the first into the second, reviewed in the same lane (and kept as tracked
+changes only if asked). It works in three passes: paragraphs are matched by stable
+paragraph id when both come from one native document, else by a patience diff over
+paragraph hashes with similar-paragraph pairing for edited ones; unmatched pairs with
+the same text are moves; matched paragraphs get a word-level diff (Myers over word
+tokens, so edits are never smaller than a word); formatting and paragraph properties
+are compared apart from text, so a restyle is one formatting edit and not a
+rewrite. A side-by-side view aligns matched paragraphs.
+
+#### Merge
+
+Copies sent out for review are saved with tracking on, so each returned copy carries
+its original: reject-all of it. Merging copies whose originals are the same (same
+document id and content hash) is applying each copy's change sets to one document:
+edits that touch different words go in as they are, each person's as their own change
+set; edits that overlap are a *conflict*, one lane entry showing the two (or more)
+versions with Take A, Take B, Keep both, Edit. Copies edited without tracking are
+first compared with the original (the user picks it, or the document's last
+"shared for review" snapshot) and then merged the same way. The merge result is still
+a reviewable document, so nothing is accepted behind anyone's back.
+
+#### Files
+
+`.docx`: `w:ins`, `w:del`, `w:moveFrom`/`w:moveTo`, `w:rPrChange`, `w:pPrChange`,
+paragraph-mark `w:ins`/`w:del`, and `w:trackRevisions` in settings, both ways, so Word
+and LibreOffice users see ordinary tracked changes. `.odt`: `text:tracked-changes`
+with `text:changed-region` (insertion, deletion, format-change), `text:change`,
+`text:change-start`/`end`, both ways. On reading, fragments are coalesced into our
+revisions (one per author and time); edits and change sets are derived as above.
+
+#### Steps and gates
+
+| step | what | gate |
+|---|---|---|
+| O5c1 | model: insert runs, tombstones, formatting and paragraph revisions, tracking in the editor, own-text rules, accept/reject ops, native chunk and journal | 10,000 random tracked edit sequences: reject-all = original, accept-all = the same edits untracked, undo and journal replay exact |
+| O5c2 | edits and change sets, Reading/Review/Original/All views, margin bars, lane, accept/reject by edit, set, kind, all | grouping tests (replacements, moves, formatting batches); live screenshots |
+| O5c3 | `.docx` and `.odt` tracked changes both ways | LibreOffice both ways; the corpus's tracked-change files read the same as LibreOffice with changes shown, and our round trip keeps them |
+| O5c4 | compare (paragraph matching, moves, word diff, formatting) and side by side | compare(A, B) applied to A = B and rejected = A on corpus pairs and random edits; moves found |
+| O5c5 | merge of reviewed copies with conflicts | merges of random non-overlapping edits equal applying both; overlaps always become conflicts, never lost text |
+
+Spreadsheets get the same idea later (cell-level edits in change sets, a lane, no
+cell-comment clutter) but are not part of O5c.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
