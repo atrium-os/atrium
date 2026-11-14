@@ -562,8 +562,11 @@ fn icon_trigger(ctx: &mut Ctx, r: Rect, ic: TriggerIcon, menu: &Mutable<MenuStat
     let color = if lit { t.text_on_accent() } else { ic.color.unwrap_or_else(|| t.text_secondary()) };
     if let Some(v) = &ic.vector {
         // Strokes as Lucide draws them (2 in 24), centred in the button.
-        let (x, y) = (r.x() + (r.w() - ic.size) / 2.0, r.y() + (r.h() - ic.size) / 2.0);
-        crate::icon::draw_icon(ctx, v, x, y, ic.size, (ic.size / 12.0).max(1.0), color);
+        // `size` is points, like a glyph's: a glyph grows with the text
+        // size where it is drawn, so a vector icon grows here.
+        let sz = crate::theme::size::em(ic.size);
+        let (x, y) = (r.x() + (r.w() - sz) / 2.0, r.y() + (r.h() - sz) / 2.0);
+        crate::icon::draw_icon(ctx, v, x, y, sz, (sz / 12.0).max(1.0), color);
     } else {
         let gs = Node::measure_text(&ic.glyph.to_string(), &text(color, ic.size, font::ICONS, Weight::Regular));
         ctx.tree.insert(Some(edge), Node::Text {
@@ -650,7 +653,7 @@ impl MenuButton {
         self.on_slide = Some(Rc::new(f));
         self
     }
-    /// Show a Phosphor glyph (`size` px, `color` or `text-secondary`)
+    /// Show a Phosphor glyph (`size` pt, grown with the text size; `color` or `text-secondary`)
     /// instead of the label: a square ghost button `size` + 12 wide, as
     /// tall as its rect. In a row it takes its natural size.
     pub fn icon(mut self, glyph: char, size: f32, color: Option<Color>) -> Self {
@@ -660,7 +663,7 @@ impl MenuButton {
         self
     }
     /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
-    /// `size` px; `glyph` is drawn if the geometry is empty.
+    /// `size` pt, grown with the text size; `glyph` is drawn if the geometry is empty.
     pub fn vector_icon(self, geometry: std::sync::Arc<crate::icon::IconGeometry>, glyph: char, size: f32, color: Option<Color>) -> Self {
         let mut b = self.icon(glyph, size, color);
         if !geometry.is_empty() {
@@ -767,7 +770,7 @@ impl PanelButton {
         self
     }
     /// A vector icon (`pergola::icon`, viewBox 0..24) instead of a glyph,
-    /// `size` px; `glyph` is drawn if the geometry is empty.
+    /// `size` pt, grown with the text size; `glyph` is drawn if the geometry is empty.
     pub fn vector_icon(self, geometry: std::sync::Arc<crate::icon::IconGeometry>, glyph: char, size: f32, color: Option<Color>) -> Self {
         let mut b = self.icon(glyph, size, color);
         if !geometry.is_empty() {

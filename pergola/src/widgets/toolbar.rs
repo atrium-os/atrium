@@ -134,7 +134,7 @@ impl View for Toolbar {
         })
         .at(self.rect.x() + self.rect.w() - mw, y)
         .height(bh)
-        .icon(crate::widgets::phosphor::DOTS_THREE, size::em(16.0), None)
+        .icon(crate::widgets::phosphor::DOTS_THREE, 16.0, None)
         .render(ctx);
     }
 }
@@ -192,6 +192,12 @@ mod tests {
         assert!(t.contains(&"Copy".to_string()) && t.contains(&"Paste".to_string()), "{t:?}");
         assert!(!t.contains(&"Rename".to_string()) && !t.contains(&"Delete".to_string()), "{t:?}");
         assert!(t.contains(&crate::widgets::phosphor::DOTS_THREE.to_string()), "More is there: {t:?}");
+        // Its glyph is 16 pt: the renderer applies the text size once.
+        let more_size = app.tree().iter().find_map(|(_, n)| match n {
+            Node::Text { content, style, .. } if *content == crate::widgets::phosphor::DOTS_THREE.to_string() => Some(style.size),
+            _ => None,
+        });
+        assert_eq!(more_size, Some(16.0));
         more.set(MenuState::opened(None));
         app.tick();
         let t = texts(&app);
