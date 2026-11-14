@@ -5585,6 +5585,21 @@ answers neighbor solicitations, pings and DNS (AAAA). `vtnet0` keeps ssh.
 `sh scripts/aura-sim-gate.sh vms` boots the same VM with the LAN NIC too, so the Aura
 and atrium-net gates share one VM (and one boot of the fork kernel).
 
+N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP VM):
+
+    sh scripts/aura-sim-gate.sh vms      # both VMs; the FreeBSD one with vtnet1 on lan.py
+    sh scripts/aura-sim-gate.sh n3       # atrium-net on vtnet1 + wlan0, probe, egress checks
+
+- "The internet" sits beyond each network's router: lan.py answers HTTP for
+  198.51.100.80 (`web-ok|web-dead|web-captive` on its control port), and
+  `aura/sim-ap/inet.py` in the AP VM for 192.0.2.80 on the AP's lo (`/tmp/inet-mode`:
+  `ok|dead|captive`); each network's DNS answers `probe.atrium.test` with its own one.
+- The cable is QEMU's monitor: `set_link lan off|on` on `~/atrium-vm/mon.sock`.
+- atrium-netd is stood in for by `nc -lkU /tmp/netd/ctl.sock` (events in
+  `/tmp/netd/events`); the probe runs as `_atrium-probe` (65035), created by the gate.
+- Hold-downs are measured from atrium-net's log clock (`atrium-net: [12.3] ...`), not
+  from ssh timing, which TCG stretches.
+
 What it checks: address, default route, ping, unbound forwarders and a lookup through
 unbound; IPv6: router solicitation, a stable-private (RFC 7217, not EUI-64) and a
 temporary (RFC 8981) SLAAC address, the RA's router, ping6 from the temporary address,

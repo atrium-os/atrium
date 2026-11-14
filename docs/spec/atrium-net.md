@@ -113,10 +113,10 @@ How each kind of trouble plays out. "Gate" marks what a simulated gate checks.
   the other is above -70 dBm on two scans in a row, with the same 30 s hold-down.
 - **Flaky internet (link fine, upstream dead or lossy).** The link layer cannot see this.
   DHCP keeps running to the lease's end (renew, then rebind by broadcast at T2, then drop
-  and start over). N3 adds the connectivity probe (shared with captive-portal detection):
-  an interface whose probe fails is reported `internet=0`; when another interface has
-  internet, the default route moves to it with the same doubling hold-down as decision 9.
-  With only one interface it is reported, never torn down.
+  and start over). The connectivity probe (§4.2) runs on every bound interface: one whose
+  probe fails is reported `internet=no`; when another interface has internet, the default
+  route moves to it, and back only after the doubling hold-down of decision 9. With only
+  one interface it is reported, never torn down. Gate: n3 dead-upstream scenario.
 - **A network that keeps failing** (wrong password, AP refusing us, no association).
   Three failures in a row skip it for 10 min and emit `event what=network-failing`, so
   auto-join tries the next network rather than hammering one. Gate: unit test.
@@ -128,6 +128,48 @@ How each kind of trouble plays out. "Gate" marks what a simulated gate checks.
   prefixes (an iPhone's /28) are ordinary. A hotspot restarted with a new subnet NAKs the
   old lease and a new one is taken. Gate: metered unit test.
 - **Ethernet and Wi-Fi flapping.** Decision 9: doubling hold-down before moving back.
+  Gate: n3 cable-pull and flapping scenarios.
+
+### 4.2 Egress and the connectivity probe (N3)
+
+**Egress.** One managed interface carries the IPv4 default route (`egress.rs`, pure and
+unit-tested). A candidate is bound (a checked lease with a router) with its link up.
+Better means: internet not known to be broken, then wired over Wi-Fi. Losing the current
+egress (link down, lease gone) moves at once; moving *to* a better interface waits until
+it has been that good for its hold-down: 5 s, doubled for each flap within 2 min of the
+last (a flap is its link dropping, or its probe failing while it carried the route), up
+to 5 min. Wi-Fi in its 60 s grace keeps the route only when nothing else is up. IPv6
+follows: only the egress interface takes default routers from RAs (`ND6_IFF_NO_RADR` on
+the others), the router list is flushed on each change and the egress sends fresh router
+solicitations. Each change is an `egress iface=..` event on the control socket and, when
+atrium-net runs with `--netd-dir`, an `egress-changed iface=..` line on atrium-netd's
+`ctl.sock` (§7.2); atrium-netd is still a design (atrium-netd.md), so the gate checks the
+line with a stand-in listener.
+
+**Probe.** A plain-HTTP GET to `--probe URL` (off without one: no third party should
+learn when the machine joins a network, so the default waits for an Atrium-run endpoint, Shankar's choice 2026-11-14;
+`--probe-expect TEXT` takes a 200 with a known body instead of a 204),
+per bound interface, after each new lease and then every 5 min (`--probe-every`), 30 s
+after a failure. A first failure is retried after 5 s before it counts (a probe sent as a
+lease binds can lose its first packets). The name is resolved with that interface's own DHCP DNS server, and
+when the interface does not carry the default route atrium-net pins a /32 host route to
+the DNS server (if off-link) and to the answer through that interface's router for the
+probe's duration, so each interface is judged by its own path. Results: 204 (or the
+expected body) is `internet=yes`; any other HTTP answer is `internet=captive` with the
+`Location` reported (hex, printable ASCII, at most 256 bytes) as `portal=`; no answer,
+NXDOMAIN or a refused connection is `internet=no`. Reported in `status` and as
+`internet iface=.. state=..` events. Captive sign-in UX is later (§8).
+
+**Who parses it.** Decision 8 said "through Nuntius"; as built, the probe is its own
+sandboxed process instead, `atrium-probe`, because Nuntius is a per-app fetcher started by
+portcullisd that cannot be pinned to one interface or ask a given DNS server, and
+atrium-net cannot start anything once in capability mode. atrium-net spawns it before
+`cap_enter`; it chroots to `/var/empty`, drops to uid `_atrium-probe` (65035), and sets
+`RLIMIT_NPROC` 0 and `RLIMIT_NOFILE` 8. It needs to connect, so it is not in capability
+mode. It parses one DNS reply and one HTTP head (`probe.rs`, host-fuzzed); atrium-net
+checks the address it reports (ordinary unicast, not one of ours) and the Location
+before using either. A compromised probe can at worst claim an interface has no internet,
+which moves the route between our own already-checked interfaces.
 
 ## 5. Addresses
 
@@ -256,7 +298,7 @@ it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 | N0 | `atrium-net` core: interface list, link events, bpf, proposal checks; `atrium-lease` DHCPv4; unbound forwarders | the VM gets its address on a simulated LAN through atrium-net, resolves a name through unbound; a hostile DHCP server never changes host state outside §5.2. **Done 2026-11-14** (§10.1) |
 | N1 | Wi-Fi: profiles, auto-join, roam keeps the lease, Transition Disable persisted | `aura-sim-gate.sh w1|w2` pass with atrium-net in place of aura-ctl + dhclient; restart keeps the WPA3-only flag |
 | N2 | IPv6: SLAAC, RFC 7217 + 8981, RDNSS | AP VM runs radvd; the VM gets a temporary address, reaches the AP over v6, resolves via the RA's server |
-| N3 | Ethernet + Wi-Fi together, egress events to atrium-netd, captive detection | pulling the VM's virtio link moves the default route and NAT to wlan0 |
+| N3 | Ethernet + Wi-Fi together, egress events to atrium-netd, captive detection | pulling the VM's virtio link moves the default route and NAT to wlan0. **Built 2026-11-14** (§10.4); NAT waits for atrium-netd |
 | N4 | `CLASS_NETCONF`, capability checks, a `netctl` CLI, Forum status item | an app without `network_wifi` gets refused; one with it but no location grant gets no list |
 
 N0–N3 need no hardware: the cloud VM (a second virtio NIC on a simulated LAN) and the AP
@@ -331,3 +373,31 @@ VM from the Aura gates cover them.
   92ffd19c3; a private report to the FreeBSD Security Officer is drafted, not sent.
 - Not yet: DHCPv6, the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
   wired), RA MTU beyond what the kernel applies.
+
+### 10.4 N3 as built (2026-11-14)
+
+- Egress policy and probe as in §4.2: `atrium-net/src/egress.rs` (8 unit tests: cable
+  pull, doubling and its 5 min cap and 2 min reset, dead upstream, captive, a lone
+  interface, Wi-Fi grace), `atrium-lease/src/probe.rs` + `src/bin/atrium-probe.rs`
+  (DNS and HTTP parsing, 20 000-round mutation fuzz each). Leases no longer install the
+  default route themselves (`plan.rs`); `route_default()` does, every loop round.
+- Gate: `scripts/aura-sim-gate.sh n3` runs atrium-net on `vtnet1` (lan.py) and `wlan0`
+  (the AP VM) together. Each network has its own "internet" beyond its router (lan.py
+  198.51.100.80, inet.py in the AP VM 192.0.2.80 on its lo), and each network's DNS
+  answers `probe.atrium.test` with its own one, so a probe sent out the wrong interface
+  fails. The cable is QEMU's `set_link lan off|on` on the monitor. Hold-downs are measured
+  from atrium-net's log, which now carries its clock (`[12.3]`). 28 checks; one run's timeline:
+  cable pulled, Wi-Fi at once; cable back, Ethernet 5.0 s later; two more quick flaps,
+  20 s; Ethernet's upstream dead, Wi-Fi at once; upstream back, 40 s.
+- Found by the gate: (1) with multipath routing (on by default) `RTM_CHANGE` of the
+  default only edits the path whose gateway it names, and the `RTM_ADD` fallback adds a
+  second path, so flows hashed onto the pulled cable; the default is now deleted whole
+  (no gateway named) and added again, and the gate checks there is one. (2) A kernel
+  panic: aura_wlan changed `wlan0`'s MAC (per-network address) from a `write(2)` on its
+  device with no vnet set, and with IPv6 on, the stack's link-address handler
+  (`nd6_grand_start`) read `V_` variables through a NULL vnet; `aura_wlan.c` now enters
+  the interface's vnet around `if_setlladdr`.
+- Not yet: the cross-network low-signal move (§4.1: below -80 dBm for 30 s, another
+  remembered network above -70 dBm on two scans) needs background scans while connected;
+  real atrium-netd (NAT re-pointing); the Atrium-run probe endpoint (decided by Shankar
+  2026-11-14: probing stays off until Atrium hosts one; no third-party default).

@@ -41,6 +41,7 @@
 #include <net/if_types.h>
 #include <net/if_media.h>
 #include <net/ethernet.h>
+#include <net/vnet.h>
 
 #include "../aura_wlan.h"
 
@@ -377,11 +378,17 @@ aura_write(struct cdev *dev, struct uio *uio, int ioflag)
 	/*
 	 * A SetMac went through: the interface takes the address too (ARP,
 	 * DHCP and every frame the stack builds use it). Outside the lock:
-	 * if_setlladdr takes the ifnet's own locks.
+	 * if_setlladdr takes the ifnet's own locks. A write(2) on our device
+	 * has no network stack context, and the address change runs the
+	 * stack's handlers (IPv6 sends gratuitous NAs through V_ variables),
+	 * so enter the interface's vnet.
 	 */
 	if (error == 0 && n->which == AURA_CHAN_CTL &&
-	    memcmp(mac, if_getlladdr(w->ifp), ETHER_ADDR_LEN) != 0)
+	    memcmp(mac, if_getlladdr(w->ifp), ETHER_ADDR_LEN) != 0) {
+		CURVNET_SET(if_getvnet(w->ifp));
 		if_setlladdr(w->ifp, mac, ETHER_ADDR_LEN);
+		CURVNET_RESTORE();
+	}
 	free(in, M_AURA);
 	return (error);
 }

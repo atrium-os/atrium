@@ -17,6 +17,10 @@
 #                                     anti-clogging tokens), transition mode
 #                                     and Transition Disable, per-network
 #                                     MAC, roaming between two BSSs
+#   sh scripts/aura-sim-gate.sh n3    atrium-net N3: Ethernet (vtnet1 on
+#                                     atrium-net/sim/lan.py) and Wi-Fi together:
+#                                     cable pulls and flaps, dead upstream,
+#                                     captive portal (docs/spec/atrium-net.md)
 #
 # AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
 # memory store. The FreeBSD VM must have been started with
@@ -59,7 +63,7 @@ start_net() {
         pkill -x atrium-net 2>/dev/null || true; sleep 1
         id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
         mkdir -p /var/empty /tmp/aura/net-state
-        daemon -f -o /tmp/aura/net.log /tmp/aura/atrium-net -v --wifi wlan0 --capsicum --no-unbound --lease /tmp/aura/atrium-lease --sock /tmp/aura/net.sock --state-dir /tmp/aura/net-state
+        daemon -f -o /tmp/aura/net.log /tmp/aura/atrium-net -v ${NET_ARGS:---wifi wlan0 --no-probe} --capsicum --no-unbound --lease /tmp/aura/atrium-lease --sock /tmp/aura/net.sock --state-dir /tmp/aura/net-state
         sleep 2"
 }
 
@@ -79,7 +83,7 @@ setup() {
     # sandboxed atrium-lease); atrium-netctl is the command line.
     (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease --target "$T" >&2)
     N="$ROOT/atrium-net/target/$T/release"
-    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-netctl" "$B/"
+    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$B/"
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 
@@ -386,6 +390,148 @@ w2() {
     "$V" "grep -q 'secret=\\|correct horse' $MLOG /tmp/aura/net.log && exit 1; true" && ok "no secret in aura-mlme's or atrium-net's log" || fail "secret leaked to a log"
 }
 
+# The QEMU monitor of the FreeBSD VM: `lan on|off` is the Ethernet cable.
+cable() {
+    python3 -I -c "import socket,sys,time;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(b'set_link lan '+sys.argv[2].encode()+b'\n');time.sleep(0.5)" "$HOME/atrium-vm/mon.sock" "$1"
+}
+
+lanctl() {
+    python3 -I -c "import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(5);s.sendto(sys.argv[1].encode(),('127.0.0.1',7803));print(s.recv(4096).decode())" "$1"
+}
+
+n3_cleanup() {
+    cable on 2>/dev/null || true
+    "$V" 'pkill -x atrium-net; pkill -f "nc -lkU /tmp/netd"; sleep 1
+        for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
+        ifconfig vtnet1 inet6 -accept_rtadv
+        for a in $(ifconfig vtnet1 inet6 | awk "/inet6 fd77:/{print \$2}"); do ifconfig vtnet1 inet6 $a -alias; done
+        ndp -i vtnet1 -- -no_radr >/dev/null 2>&1; ndp -i wlan0 -- -no_radr >/dev/null 2>&1
+        g=$(cat /tmp/aura/default.saved 2>/dev/null); [ -n "$g" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default $g; }
+        true' || true
+    sh "$AP" ssh "echo ok > /tmp/inet-mode" >/dev/null 2>&1 || true
+}
+
+# n3: Ethernet and Wi-Fi together (docs/spec/atrium-net.md §4.1, §4.2, §10).
+# "The internet" sits beyond each network's router: lan.py answers for
+# 198.51.100.80 behind 10.88.0.1, inet.py in the AP VM for 192.0.2.80 (on
+# its lo) behind 10.77.0.1, and each network's DNS answers probe.atrium.test
+# with its own one; so a probe that leaves by the wrong interface fails.
+n3() {
+    gw() { "$V" 'route -n get default 2>/dev/null | awk "/gateway/{print \$2}"'; }
+    wait_gw() {
+        i=0; while [ $i -lt "$2" ]; do [ "$(gw)" = "$1" ] && return 0; sleep 2; i=$((i + 2)); done; return 1
+    }
+    st() { "$V" "$CTL status"; }
+    # wait_st PATTERN SECS: until a status line matches (extended regex).
+    wait_st() {
+        i=0; while [ $i -lt "$2" ]; do st | grep -Eq "$1" && return 0; sleep 3; i=$((i + 3)); done; return 1
+    }
+    # Seconds (atrium-net's clock) of the last log line matching PATTERN.
+    t_of() { "$V" "grep -E '$1' /tmp/aura/net.log | tail -n 1" | sed -n 's/^atrium-net: \[\([0-9.]*\)\].*/\1/p'; }
+    hold_of() { "$V" "grep -E 'egress $1 ' /tmp/aura/net.log | tail -n 1" | sed -n 's/.*hold-down \([0-9]*\) s.*/\1/p'; }
+    gap() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.1f", b - a}'; }
+
+    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    python3 "$ROOT/atrium-net/sim/lan.py" 600 > "$HOME/atrium-vm/lan.log" 2>&1 &
+    LANPID=$!
+    trap 'n3_cleanup; kill $LANPID 2>/dev/null || true' EXIT
+    sh "$AP" ssh "ip addr add 192.0.2.80/32 dev lo 2>/dev/null; echo ok > /tmp/inet-mode; pkill -f '[i]net.py'; (nohup python3 /tmp/inet.py >/tmp/inet.log 2>&1 &); sleep 2; true"
+    "$V" "set -e
+        ifconfig vtnet1 >/dev/null 2>&1 || { echo 'no vtnet1: boot with the vms step'; exit 1; }
+        id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'
+        pkill -f 'nc -lkU /tmp/netd' 2>/dev/null || true
+        rm -rf /tmp/netd && mkdir -p /tmp/netd
+        daemon -f -o /tmp/netd/events nc -lkU /tmp/netd/ctl.sock
+        g=\$(route -n get default 2>/dev/null | awk '/gateway/{print \$2}'); case \$g in 10.0.2.*) echo \$g > /tmp/aura/default.saved ;; esac
+        for a in \$(ifconfig vtnet1 inet | awk '/inet /{print \$2}'); do ifconfig vtnet1 inet \$a -alias; done
+        ifconfig vtnet1 inet6 -ifdisabled up"
+    cable on
+    NET_ARGS="--iface vtnet1 --wifi wlan0 --probe http://probe.atrium.test/generate_204 --probe-every 20 --probe-bin /tmp/aura/atrium-probe --netd-dir /tmp/netd" start_net
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember: $r"
+    out=$("$V" "$CTL join aura-test --wait 240 --dhcp wlan0" 2>&1) || fail "join: $out"
+    echo "$out" | grep -q 'address inet 10\.77\.0\.' || fail "no Wi-Fi address: $out"
+    wait_st 'name=vtnet1 .*state=bound' 120 || fail "vtnet1 not bound"
+    ok "both up: vtnet1 bound on the LAN, wlan0 joined aura-test"
+
+    wait_gw 10.88.0.1 30 && ok "Ethernet carries the default route (10.88.0.1) with Wi-Fi up too" || fail "default route: $(gw)"
+    wait_st 'name=vtnet1 .*internet=yes' 120 && wait_st 'name=wlan0 .*internet=yes' 120 \
+        && ok "probe through each interface: internet on both" || fail "probes: $(st)"
+    sh "$AP" ssh "grep -q 'http 10.77.0.1[0-2][0-9] /generate_204' /tmp/inet.log" \
+        && ok "Wi-Fi's probe reached 192.0.2.80 through 10.77.0.1 while Ethernet had the default route (pinned host route)" || fail "AP inet.log: $(sh "$AP" ssh 'tail -5 /tmp/inet.log')"
+    [ "$(lanctl stats | python3 -c 'import json,sys; print(json.load(sys.stdin).get("web_get", 0))')" -ge 1 ] && ok "Ethernet's probe reached 198.51.100.80 through 10.88.0.1" || fail "lan.py got no probe"
+    "$V" 'route -n get 192.0.2.80 | grep -q "gateway: 10.88.0.1"' && ok "probe's host route removed afterwards" || fail "pinned route left: $("$V" 'route -n get 192.0.2.80')"
+    "$V" 'grep -q "egress-changed iface=vtnet1" /tmp/netd/events' && ok "atrium-netd told: egress-changed iface=vtnet1" || fail "netd events: $("$V" 'cat /tmp/netd/events')"
+    i=0; while [ $i -lt 30 ] && ! "$V" 'ndp -rn' | grep -q '^fe80::1%vtnet1 '; do sleep 3; i=$((i + 3)); done
+    "$V" 'ndp -rn' | grep -q '^fe80::1%vtnet1 ' && ok "IPv6 default router from Ethernet's RA (fe80::1%vtnet1)" || fail "ndp -rn: $("$V" 'ndp -rn')"
+
+    # Pull the cable: Wi-Fi at once.
+    cable off
+    wait_gw 10.77.0.1 30 && ok "cable pulled: default route moved to Wi-Fi (10.77.0.1)" || fail "after cable pull: $(gw)"
+    nd=$("$V" 'netstat -rn4 | grep -c "^default"')
+    [ "$nd" = 1 ] && ok "one default route, not a second path beside the old one" || fail "default routes: $("$V" 'netstat -rn4 | grep "^default"')"
+    t_down=$(t_of 'vtnet1: link down'); t_eg=$(t_of 'egress wlan0')
+    echo "    link down at ${t_down}s, egress wlan0 at ${t_eg}s"
+    if "$V" 'nc -z -w 20 192.0.2.80 80' >/dev/null 2>&1; then
+        ok "the internet through Wi-Fi (TCP to 192.0.2.80:80)"
+    else
+        sh "$AP" ssh "(nohup timeout 40 tcpdump -c 12 -ni br0 host 192.0.2.80 or arp > /tmp/aptd.txt 2>&1 &); sleep 2" >/dev/null 2>&1
+        d=$("$V" '(tcpdump -c 8 -ni wlan0 not port 7701 > /tmp/td.txt 2>&1 &); sleep 1; nc -z -w 8 192.0.2.80 80; nc -z -w 8 10.77.0.1 80; sleep 1; cat /tmp/td.txt; netstat -rn4; sysctl net.aura.wlan0; tail -n 20 /tmp/aura/net.log' 2>&1)
+        a=$(sh "$AP" ssh 'sleep 5; cat /tmp/aptd.txt; ip route; ip -4 addr; tail -5 /tmp/inet.log' 2>&1)
+        fail "no internet over Wi-Fi:
+$d
+--- AP:
+$a"
+    fi
+    "$V" 'grep -q "egress-changed iface=wlan0" /tmp/netd/events' && ok "atrium-netd told: egress-changed iface=wlan0" || fail "netd events: $("$V" 'cat /tmp/netd/events')"
+    "$V" 'ndp -rn' | grep -q '%vtnet1' && fail "IPv6 router through the pulled cable: $("$V" 'ndp -rn')" || ok "no IPv6 default router through the pulled cable"
+
+    # Cable back: the route returns only after the hold-down.
+    cable on
+    wait_gw 10.88.0.1 90 || fail "route did not return to Ethernet: $(gw)"
+    t_up=$(t_of 'vtnet1: link up'); t_eg=$(t_of 'egress vtnet1'); h=$(hold_of vtnet1)
+    g=$(gap "$t_up" "$t_eg")
+    awk -v g="$g" -v h="$h" 'BEGIN{exit !(h >= 5 && g >= h)}' && ok "cable back: route returned to Ethernet ${g} s after the link (hold-down $h s)" || fail "cable back: gap $g s, hold $h"
+
+    # A flapping cable: each flap within 2 min doubles the wait.
+    for n in 1 2; do cable off; wait_gw 10.77.0.1 30 || fail "flap $n: $(gw)"; cable on; sleep 2; done
+    wait_gw 10.88.0.1 180 || fail "route never came back after flapping: $(gw)"
+    t_up=$(t_of 'vtnet1: link up'); t_eg=$(t_of 'egress vtnet1'); h=$(hold_of vtnet1)
+    g=$(gap "$t_up" "$t_eg")
+    awk -v g="$g" -v h="$h" 'BEGIN{exit !(h >= 10 && g >= h)}' && ok "flapping cable: hold-down doubled to $h s (returned after $g s)" || fail "flapping: gap $g s, hold $h"
+
+    # Ethernet's upstream dies (link fine): Wi-Fi still has internet, so the route moves.
+    lanctl web-dead >/dev/null
+    wait_st 'name=vtnet1 .*internet=no' 90 || fail "dead upstream not seen: $(st)"
+    wait_gw 10.77.0.1 30 && ok "Ethernet's internet dead (link up): route moved to Wi-Fi, which still has internet" || fail "dead upstream: $(gw)"
+    lanctl web-ok >/dev/null
+    wait_st 'name=vtnet1 .*internet=yes' 90 && ok "Ethernet probed again through a pinned route while Wi-Fi had the default: internet back" || fail "vtnet1 internet: $(st)"
+    wait_gw 10.88.0.1 120 || fail "route did not return after the upstream came back: $(gw)"
+    t_ok=$(t_of 'vtnet1: internet yes'); t_eg=$(t_of 'egress vtnet1'); h=$(hold_of vtnet1)
+    g=$(gap "$t_ok" "$t_eg")
+    awk -v g="$g" -v h="$h" 'BEGIN{exit !(g >= h)}' && ok "route back on Ethernet ${g} s after its internet returned (hold-down $h s)" || fail "upstream back: gap $g, hold $h"
+
+    # A captive portal on the Wi-Fi network.
+    sh "$AP" ssh "echo captive > /tmp/inet-mode"
+    portal=$(printf 'http://10.77.0.1/portal' | od -An -tx1 | tr -d ' \n')
+    wait_st "name=wlan0 .*internet=captive.*portal=$portal" 90 && ok "captive portal on Wi-Fi detected, sign-in page reported (http://10.77.0.1/portal)" || fail "captive: $(st)"
+    [ "$(gw)" = 10.88.0.1 ] && ok "route stays on Ethernet" || fail "captive moved the route: $(gw)"
+    sh "$AP" ssh "echo ok > /tmp/inet-mode"
+
+    # The probe's sandbox.
+    p=$("$V" 'pgrep -x atrium-probe')
+    [ "$("$V" "ps -o user= -p $p")" = _atrium-probe ] && ok "atrium-probe runs as _atrium-probe" || fail "probe uid"
+    "$V" "procstat -f $p | awk '\$3==\"root\"{print \$NF}'" | grep -q '^/var/empty$' && ok "atrium-probe is chrooted to /var/empty" || fail "probe root: $("$V" "procstat -f $p")"
+    "$V" "procstat -l $p | awk '/openfiles/{print \$4}'" | grep -qx 8 && ok "atrium-probe limited to 8 descriptors, no children" || fail "probe limits: $("$V" "procstat -l $p")"
+    "$V" "procstat -s \$(pgrep -x atrium-net) | awk 'NR==2{print \$10}'" | grep -q C && ok "atrium-net still in capability mode" || fail "atrium-net capmode"
+
+    # One network left, its upstream dead: reported, the route kept.
+    leave
+    lanctl web-dead >/dev/null
+    wait_st 'name=vtnet1 .*internet=no' 90 || fail "dead upstream not seen: $(st)"
+    [ "$(gw)" = 10.88.0.1 ] && ok "only Ethernet left, no internet: reported (internet=no), route kept" || fail "lone interface lost its route: $(gw)"
+    lanctl web-ok >/dev/null
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -407,6 +553,12 @@ w2)
     w2
     teardown
     echo "W2 gate: $pass checks passed" ;;
+n3)
+    setup hostapd-wpa2.conf
+    n3
+    n3_cleanup
+    teardown
+    echo "atrium-net N3 gate: $pass checks passed" ;;
 *)
     sed -n 2,26p "$0"; exit 2 ;;
 esac

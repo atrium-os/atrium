@@ -31,6 +31,8 @@ const ND6_IFF_ACCEPT_RTADV: u32 = 0x2;
 const ND6_IFF_IFDISABLED: u32 = 0x8;
 const ND6_IFF_AUTO_LINKLOCAL: u32 = 0x20;
 const ND6_IFF_STABLEADDR: u32 = 0x800;
+const ND6_IFF_NO_RADR: u32 = 0x40;
+const SIOCSRTRFLUSH_IN6: u64 = ioc(IOC_IN | IOC_OUT, b'i', 80, IN6_IFREQ);
 const BIOCGBLEN: u64 = ioc(IOC_OUT, b'B', 102, 4);
 const BIOCSETF: u64 = ioc(IOC_IN, b'B', 103, 16);
 const BIOCSETIF: u64 = ioc(IOC_IN, b'B', 108, IFREQ);
@@ -104,6 +106,27 @@ impl Ifc {
         } else {
             self.nd6_flags(name, 0, ND6_IFF_ACCEPT_RTADV)
         }
+    }
+
+    /// Take default routers from this interface's RAs, or not: only the
+    /// egress interface's routers become IPv6 default routes (egress.rs).
+    pub fn no_radr(&self, name: &str, on: bool) -> io::Result<()> {
+        if on {
+            self.nd6_flags(name, ND6_IFF_NO_RADR, 0)
+        } else {
+            self.nd6_flags(name, 0, ND6_IFF_NO_RADR)
+        }
+    }
+
+    /// Forget every IPv6 default router (they come back from the next RAs
+    /// on interfaces that take them).
+    pub fn flush_routers6(&self) -> io::Result<()> {
+        let mut r = [0u8; IN6_IFREQ];
+        r[..16].copy_from_slice(&ifreq("lo0")[..16]);
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCSRTRFLUSH_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCSRTRFLUSH_IN6");
+        }
+        Ok(())
     }
 
     fn nd6_flags(&self, name: &str, set: u32, clear: u32) -> io::Result<()> {
@@ -291,6 +314,27 @@ impl Rtsock {
         let n = unsafe { libc::write(self.s.as_raw_fd(), m.as_ptr().cast(), m.len()) };
         if n != m.len() as isize {
             return err(match op { RTM_ADD => "RTM_ADD", RTM_DELETE => "RTM_DELETE", _ => "RTM_CHANGE" });
+        }
+        Ok(())
+    }
+
+    /// Delete the IPv4 default route, every path of it (no gateway named,
+    /// so a multipath default goes whole).
+    pub fn del_default(&mut self) -> io::Result<()> {
+        self.seq += 1;
+        let mut m = vec![0u8; RT_MSGHDR];
+        m.extend_from_slice(&sin(Ipv4Addr::UNSPECIFIED));
+        m.extend_from_slice(&sin(Ipv4Addr::UNSPECIFIED));
+        let len = m.len() as u16;
+        m[0..2].copy_from_slice(&len.to_ne_bytes());
+        m[2] = RTM_VERSION;
+        m[3] = RTM_DELETE;
+        m[8..12].copy_from_slice(&RTF_UP.to_ne_bytes());
+        m[12..16].copy_from_slice(&(RTA_DST | RTA_NETMASK).to_ne_bytes());
+        m[20..24].copy_from_slice(&self.seq.to_ne_bytes());
+        let n = unsafe { libc::write(self.s.as_raw_fd(), m.as_ptr().cast(), m.len()) };
+        if n != m.len() as isize {
+            return err("RTM_DELETE default");
         }
         Ok(())
     }

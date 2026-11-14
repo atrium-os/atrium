@@ -105,7 +105,7 @@ up() {
 
 ap() {
     [ $# -gt 0 ] || set -- hostapd-wpa2.conf
-    for f in air-hwsim.py udhcpd.conf "$@"; do
+    for f in air-hwsim.py udhcpd.conf inet.py "$@"; do
         scp -q -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
             -P "$SSH_PORT" "$ROOT/aura/sim-ap/$f" ubuntu@localhost:/tmp/
     done

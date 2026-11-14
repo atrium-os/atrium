@@ -5,8 +5,12 @@ QEMU's `-netdev socket,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802` puts the
 guest's second NIC on this script: every guest frame arrives as one UDP
 datagram on 7801 and every datagram we send to 7802 is a frame for the guest.
 
-On the LAN (10.88.0.0/24): the router 10.88.0.1 (ARP, ping, DHCP server) and a
-DNS server 10.88.0.53 that answers gate.atrium.test with 10.88.0.77.
+On the LAN (10.88.0.0/24): the router 10.88.0.1 (ARP, ping, DHCP server), a
+DNS server 10.88.0.53 that answers gate.atrium.test with 10.88.0.77 and
+probe.atrium.test with 198.51.100.80, and "the internet" at 198.51.100.80,
+beyond the router (so a probe reaches it only through this LAN): a
+minimal TCP that serves one HTTP answer per connection on port 80 (204, or a
+captive portal's 302, or nothing at all).
 
 IPv6: the router fe80::1 sends RAs (on solicitation and every 30 s) for
 fd77:0:0:88::/64 with RDNSS fd77:0:0:88::53 and fe80::1; it answers neighbor
@@ -18,6 +22,7 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
   hostile6 | good6          -- a rogue router fe80::66 sends bad RAs every 2 s
   flap6                     -- kernel stress: RAs every 0.2 s and unsolicited
                                NAs for fe80::1 without the Router flag
+  web-ok | web-dead | web-captive  -- what 198.51.100.80:80 does (default ok)
   stats                     -- counters
 """
 import json, random, socket, struct, sys
@@ -29,6 +34,7 @@ RMAC = bytes.fromhex("024e000000fe")
 ROUTER = bytes([10, 88, 0, 1])
 DNS = bytes([10, 88, 0, 53])
 YOU = bytes([10, 88, 0, 50])
+WEB = bytes([198, 51, 100, 80])  # beyond the router
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 MAGIC = bytes([99, 130, 83, 99])
 
@@ -37,6 +43,8 @@ stats = {"discover": 0, "request": 0, "renew": 0, "rebind": 0, "reboot": 0,
          "hostile_sent": 0, "dns": 0, "ping": 0, "arp": 0, "frames": 0,
          "rs": 0, "ra": 0, "ns": 0, "ping6": 0, "dns6": 0, "hostile6_sent": 0}
 mode6 = "good6"
+web = "web-ok"
+tcp = {}  # (client ip, port) -> bytes of our answer already sent
 rnd = random.Random(7)
 
 
@@ -161,15 +169,56 @@ def dns_answer(q):
     qtype = struct.unpack("!H", q[i + 1:i + 3])[0] if qend <= len(q) else 0
     name = ".".join(labels)
     question = q[12:qend]
-    hit = name == "gate.atrium.test" and qtype in (1, 28)
+    hit = (name == "gate.atrium.test" and qtype in (1, 28)) or (name == "probe.atrium.test" and qtype == 1)
     rflags = 0x8180 | (0 if name.endswith("atrium.test") else 3)
     if hit and qtype == 1:
-        ans = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([10, 88, 0, 77])
+        ans = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + (WEB if name.startswith("probe") else bytes([10, 88, 0, 77]))
     elif hit:
         ans = b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 60, 16) + V6_HOST
     else:
         ans = b""
     return struct.pack("!HHHHHH", qid, rflags, 1, 1 if hit else 0, 0, 0) + question + ans
+
+
+# ---- "the internet": one HTTP answer per TCP connection ----------------------
+
+def tcp_seg(s, d, sport, dport, seq, ack, flags, data=b""):
+    h = struct.pack("!HHIIBBHHH", sport, dport, seq, ack, 5 << 4, flags, 65535, 0, 0) + data
+    c = csum(s + d + struct.pack("!BBH", 0, 6, len(h)) + h)
+    return ip(s, d, 6, h[:16] + struct.pack("!H", c) + h[18:])
+
+
+def http_answer():
+    if web == "web-captive":
+        return (b"HTTP/1.1 302 Found\r\nLocation: http://10.88.0.1/login?from=atrium\r\n"
+                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+    return b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+
+def handle_tcp(src_mac, s, body):
+    if len(body) < 20 or web == "web-dead":
+        return []
+    sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", body[:14])
+    if dport != 80:
+        return [eth(src_mac, RMAC, 0x0800, tcp_seg(WEB, s, 80, sport, 0, seq + 1, 0x14))]  # RST
+    data = body[(off >> 4) * 4:]
+    key = (s, sport)
+    out = []
+    if flags & 0x02:  # SYN
+        stats["web_syn"] = stats.get("web_syn", 0) + 1
+        tcp[key] = None
+        out.append(tcp_seg(WEB, s, 80, sport, 1000, seq + 1, 0x12))
+    elif data and key in tcp and tcp[key] is None:
+        a = http_answer()
+        tcp[key] = a
+        stats["web_get"] = stats.get("web_get", 0) + 1
+        # Data, then FIN with it: the client reads to the end.
+        out.append(tcp_seg(WEB, s, 80, sport, 1001, seq + len(data), 0x18, a))
+        out.append(tcp_seg(WEB, s, 80, sport, 1001 + len(a), seq + len(data), 0x11))
+    elif flags & 0x01 and key in tcp:  # FIN
+        a = tcp.pop(key) or b""
+        out.append(tcp_seg(WEB, s, 80, sport, 1002 + len(a), seq + len(data) + 1, 0x10))
+    return [eth(src_mac, RMAC, 0x0800, o) for o in out]
 
 
 # ---- IPv6 -------------------------------------------------------------------
@@ -314,7 +363,9 @@ def frame(f):
             a = dns_answer(body[8:])
             if a:
                 return [eth(src, RMAC, 0x0800, ip(DNS, s, 17, udp(DNS, s, 53, sport, a)))]
-    if proto == 1 and len(body) >= 8 and body[0] == 8 and d in (ROUTER, DNS):
+    if proto == 6 and d == WEB:
+        return handle_tcp(src, s, body)
+    if proto == 1 and len(body) >= 8 and body[0] == 8 and d in (ROUTER, DNS, WEB):
         stats["ping"] += 1
         r = b"\0\0\0\0" + body[4:]
         r = r[:2] + struct.pack("!H", csum(r)) + r[4:]
@@ -323,7 +374,7 @@ def frame(f):
 
 
 def main():
-    global mode, mode6
+    global mode, mode6, web
     lan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -356,10 +407,13 @@ def main():
             if w in ("good", "hostile", "silent"):
                 mode = w
                 print(f"lan: mode {w}", flush=True)
+            if w in ("web-ok", "web-dead", "web-captive"):
+                web = w
+                print(f"lan: {w}", flush=True)
             if w in ("good6", "hostile6", "flap6"):
                 mode6 = w
                 print(f"lan: mode {w}", flush=True)
-            ctl.sendto(json.dumps(dict(stats, mode=mode)).encode(), a)
+            ctl.sendto(json.dumps(dict(stats, mode=mode, web=web)).encode(), a)
 
 
 if __name__ == "__main__":

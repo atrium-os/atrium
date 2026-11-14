@@ -305,3 +305,16 @@ mod tests {
         }
     }
 }
+
+/// A host name the connectivity probe may put on the wire: LDH labels of
+/// 1-63 bytes (spec §4.2).
+pub fn valid_host_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 253
+        && n.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !l.starts_with('-'))
+}
+
+/// A path for the probe's request line: printable ASCII, no spaces, from '/'.
+pub fn valid_http_path(p: &str) -> bool {
+    p.starts_with('/') && p.len() <= 256 && p.bytes().all(|b| (0x21..0x7f).contains(&b))
+}

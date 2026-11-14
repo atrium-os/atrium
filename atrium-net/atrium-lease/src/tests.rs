@@ -491,3 +491,90 @@ fn lan_py_ra_parses() {
     assert_eq!(ra.dns.iter().map(|d| d.0).collect::<Vec<_>>(), want);
     assert_eq!(ra.router_life, 1800);
 }
+
+// ---- connectivity probe (probe.rs) -------------------------------------------
+
+fn dns_reply(q: &[u8], rcode: u8, answers: &[(u16, &[u8])]) -> Vec<u8> {
+    let mut r = q[..2].to_vec();
+    r.extend_from_slice(&[0x81, 0x80 | rcode, 0, 1, 0, answers.len() as u8, 0, 0, 0, 0]);
+    r.extend_from_slice(&q[12..]);
+    for (typ, data) in answers {
+        r.extend_from_slice(&[0xc0, 0x0c]);
+        r.extend_from_slice(&typ.to_be_bytes());
+        r.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        r.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        r.extend_from_slice(data);
+    }
+    r
+}
+
+#[test]
+fn probe_dns() {
+    use crate::probe::{dns_answer, dns_query, DnsErr};
+    let q = dns_query(0x1234, "probe.atrium.test");
+    assert_eq!(&q[..2], &[0x12, 0x34]);
+    // A CNAME first, then the A record.
+    let r = dns_reply(&q, 0, &[(5, &[0xc0, 0x0c]), (1, &[10, 88, 0, 80])]);
+    assert_eq!(dns_answer(&q, &r), Ok(Ipv4Addr::new(10, 88, 0, 80)));
+    assert_eq!(dns_answer(&q, &dns_reply(&q, 3, &[])), Err(DnsErr::Rcode(3)));
+    assert_eq!(dns_answer(&q, &dns_reply(&q, 0, &[(28, &[0; 16])])), Err(DnsErr::NoAnswer));
+    // Another id, or another question: not ours.
+    let mut other = r.clone();
+    other[1] ^= 1;
+    assert_eq!(dns_answer(&q, &other), Err(DnsErr::NotOurs));
+    let q2 = dns_query(0x1234, "evil.atrium.test");
+    assert_eq!(dns_answer(&q2, &r), Err(DnsErr::NotOurs));
+    // Upper case in the reply's question is fine (0x20 encoding).
+    let mut up = r.clone();
+    up[13] = b'P';
+    assert!(dns_answer(&q, &up).is_ok());
+    // A compression loop and lengths past the end are errors, not hangs.
+    let mut lp = dns_reply(&q, 0, &[]);
+    lp[7] = 1;
+    lp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 40, 1]);
+    assert_eq!(dns_answer(&q, &lp), Err(DnsErr::Malformed));
+    let mut rnd = rng(9);
+    for _ in 0..20_000 {
+        let mut m = r.clone();
+        let n = (rnd() % 6) as usize;
+        for _ in 0..n {
+            let i = rnd() as usize % m.len();
+            m[i] = rnd() as u8;
+        }
+        m.truncate(rnd() as usize % (m.len() + 1));
+        let _ = dns_answer(&q, &m);
+    }
+}
+
+#[test]
+fn probe_http() {
+    use crate::probe::{http_reply, valid_name, valid_path};
+    let ok = http_reply(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", None).unwrap();
+    assert_eq!((ok.status, ok.location, ok.matched), (204, None, false));
+    let cap = http_reply(b"HTTP/1.0 302 Found\r\nLOCATION: http://10.77.0.1/login?x=1\r\n\r\n", None).unwrap();
+    assert_eq!((cap.status, cap.location.as_deref()), (302, Some("http://10.77.0.1/login?x=1")));
+    let body = http_reply(b"HTTP/1.1 200 OK\r\n\r\n<html>success</html>", Some(b"success")).unwrap();
+    assert!(body.matched);
+    assert!(!http_reply(b"HTTP/1.1 200 OK\r\n\r\n<html>sign in</html>", Some(b"success")).unwrap().matched);
+    // A Location with control bytes or too long is dropped, not passed on.
+    assert_eq!(http_reply(b"HTTP/1.1 302 x\r\nLocation: http://a/\x1b[2J\r\n\r\n", None).unwrap().location, None);
+    let long = format!("HTTP/1.1 302 x\r\nLocation: http://a/{}\r\n\r\n", "a".repeat(300));
+    assert_eq!(http_reply(long.as_bytes(), None).unwrap().location, None);
+    for bad in [&b""[..], b"SSH-2.0-x\r\n", b"HTTP/2 200\r\n\r\n", b"HTTP/1.1 2x4 x\r\n", b"HTTP/1.1 2040\r\n"] {
+        assert_eq!(http_reply(bad, None), None, "{:?}", String::from_utf8_lossy(bad));
+    }
+    assert!(valid_name("connectivitycheck.gstatic.com") && !valid_name("a..b") && !valid_name("a b") && !valid_name("-a"));
+    assert!(valid_path("/generate_204") && !valid_path("x") && !valid_path("/a b") && !valid_path("/\r\nHost: x"));
+    let mut rnd = rng(11);
+    let base = b"HTTP/1.1 302 Found\r\nLocation: http://10.77.0.1/login\r\nX: y\r\n\r\nbody".to_vec();
+    for _ in 0..20_000 {
+        let mut m = base.clone();
+        for _ in 0..(rnd() % 6) {
+            let i = rnd() as usize % m.len();
+            m[i] = rnd() as u8;
+        }
+        if let Some(h) = http_reply(&m, Some(b"success")) {
+            assert!(h.location.as_ref().is_none_or(|l| l.len() <= 256 && l.bytes().all(|c| (0x21..0x7f).contains(&c))));
+        }
+    }
+}

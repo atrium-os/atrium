@@ -27,7 +27,7 @@ cleanup() {
         ifconfig vtnet1 inet6 -accept_rtadv
         for a in $(ifconfig vtnet1 inet6 | awk "/inet6 fd77:/{print \$2}"); do ifconfig vtnet1 inet6 $a -alias; done
         ifconfig vtnet1 inet6 ifdisabled
-        g=$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n "$g" ] && { route -q change default $g || route -q add default $g; }
+        g=$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n "$g" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default $g; }
         [ -f /tmp/atrium-net/resolv.conf.saved ] && cp /tmp/atrium-net/resolv.conf.saved /etc/resolv.conf
         true' || true
 }
@@ -92,7 +92,7 @@ n0)
         cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
         printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
         route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > /tmp/atrium-net/default.saved
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock
         sleep 1"
 
     wait_addr 10.88.0.50 120 && ok "DHCPv4 through atrium-lease: vtnet1 has 10.88.0.50" || fail "no address (have: $(addrs))"
@@ -161,7 +161,7 @@ n0)
     # Hostile server: restart atrium-net into a LAN that sends bad leases.
     lanctl hostile >/dev/null
     "$V" 'pkill -f "atrium-net -v"; sleep 1; for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
     bad=""
     i=0
     while [ $i -lt 300 ] && [ "$(stat hostile_sent)" -lt 34 ]; do

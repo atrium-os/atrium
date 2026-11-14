@@ -21,12 +21,10 @@ pub struct Applied {
     pub lease: Option<LeaseV4>,
 }
 
+/// The lease's own routes. The default route through its router is not
+/// here: which interface carries it is the egress policy's (egress.rs).
 fn routes_of(l: &LeaseV4) -> Vec<Route> {
-    let mut v = l.routes.clone();
-    if let Some(r) = l.router {
-        v.push(Route { dst: Ipv4Addr::UNSPECIFIED, prefix: 0, gw: r });
-    }
-    v
+    l.routes.clone()
 }
 
 impl Applied {
@@ -96,17 +94,17 @@ mod tests {
         let first = a.bind(l([10, 77, 0, 5], 1));
         assert_eq!(first[0], Action::AddAddr { addr: Ipv4Addr::new(10, 77, 0, 5), prefix: 24 });
         assert!(matches!(first[1], Action::AddRoute(Route { prefix: 16, .. })));
-        assert!(matches!(first[2], Action::AddRoute(Route { prefix: 0, .. })));
-        assert!(matches!(first[3], Action::SetDns(_)));
+        assert!(matches!(first[2], Action::SetDns(_)));
+        assert_eq!(first.len(), 3, "no default route: egress.rs places it");
         // Renewal with identical values: nothing.
         assert!(a.bind(l([10, 77, 0, 5], 1)).is_empty());
         // New DNS only.
         assert_eq!(a.bind(l([10, 77, 0, 5], 3)), vec![Action::SetDns(vec![Ipv4Addr::new(10, 77, 0, 3)])]);
         // New network: routes out, address swapped, routes in.
         let moved = a.bind(l([192, 168, 7, 9], 1));
-        assert!(matches!(moved[0], Action::DelRoute(_)) && matches!(moved[1], Action::DelRoute(_)));
-        assert_eq!(moved[2], Action::DelAddr { addr: Ipv4Addr::new(10, 77, 0, 5) });
-        assert_eq!(moved[3], Action::AddAddr { addr: Ipv4Addr::new(192, 168, 7, 9), prefix: 24 });
+        assert!(matches!(moved[0], Action::DelRoute(_)));
+        assert_eq!(moved[1], Action::DelAddr { addr: Ipv4Addr::new(10, 77, 0, 5) });
+        assert_eq!(moved[2], Action::AddAddr { addr: Ipv4Addr::new(192, 168, 7, 9), prefix: 24 });
         let lost = a.lose();
         assert_eq!(lost.last(), Some(&Action::DelAddr { addr: Ipv4Addr::new(192, 168, 7, 9) }));
         assert!(a.lose().is_empty());

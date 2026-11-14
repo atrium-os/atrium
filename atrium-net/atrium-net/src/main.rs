@@ -8,10 +8,21 @@
 //!                   [--lease PATH] [--sock PATH] [--state-dir DIR]
 //!                   [--aura-dir DIR] [--keys-dir DIR]
 //!                   [--no-unbound] [--unbound-dir DIR] [--capsicum]
+//!                   [--probe URL | --no-probe] [--probe-expect TEXT]
+//!                   [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR]
+//!
+//! With more than one interface, one carries the default route (egress.rs:
+//! Ethernet over Wi-Fi, working internet over broken, doubling hold-down);
+//! each change is an `egress` event and, with --netd-dir, an
+//! `egress-changed iface=..` line to atrium-netd's ctl.sock. Each bound
+//! interface is probed through the sandboxed atrium-probe (§4.2): plain HTTP
+//! to URL, resolved with that interface's DNS server and pinned to it by a
+//! host route; `internet` events report yes / no / captive.
 //!
 //! Control socket (root only), one line per request, answered with lines
 //! ending in `ok` or `error`; `subscribe` turns the connection into an event
-//! stream as well (aura-mlme's lines, `lease`, `lease-lost`):
+//! stream as well (aura-mlme's lines, `lease`, `lease-lost`, `egress`,
+//! `internet`):
 //!   status | subscribe | wifi-scan | wifi-status | wifi-list | wifi-leave
 //!   wifi-join ssid=HEX [security=open|psk|sae] [mac=network|random|device]
 //!   wifi-remember ssid=HEX [secret=HEX] [open=1] [auto=0] [prio=N] [mac=..]
@@ -19,13 +30,14 @@
 
 #[cfg(target_os = "freebsd")]
 mod imp {
+    use atrium_net::egress::{Cand, Egress, Inet};
     use atrium_net::plan::{Action, Applied};
     use atrium_net::sys::{self, Bpf, Dir, Ifc, Rtsock, Unbound};
     use atrium_net::wifi::{Act, Profile, Saved, Wifi};
     use atrium_net::wrap;
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
-    use net_proto::{check_dns6, check_v4, HostView, LeaseV4};
+    use net_proto::{check_dns6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
     use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::fd::AsRawFd;
@@ -36,6 +48,12 @@ mod imp {
     use std::time::{Duration, Instant};
 
     const STATE_FILE: &str = "networks";
+    /// A probe that has not answered by then is abandoned (atrium-probe's
+    /// own timeouts add up to about 15 s).
+    const PROBE_DEADLINE_MS: u64 = 30_000;
+    /// After a failed probe, try again this soon (or --probe-every if less).
+    const PROBE_RETRY_MS: u64 = 30_000;
+    const PROBE_CONFIRM_MS: u64 = 5_000;
 
     struct Opts {
         verbose: bool,
@@ -48,6 +66,31 @@ mod imp {
         keys: String,
         unbound: Option<String>,
         capsicum: bool,
+        probe: Option<String>,
+        probe_expect: Option<String>,
+        probe_every: u64,
+        probe_bin: String,
+        netd: Option<String>,
+    }
+
+    /// The probe's target, from --probe http://HOST/PATH.
+    struct ProbeCfg {
+        host: String,
+        path: String,
+        expect: Option<Vec<u8>>,
+        every_ms: u64,
+    }
+
+    fn probe_cfg(url: &str, expect: Option<&str>, every_s: u64) -> ProbeCfg {
+        let rest = url.strip_prefix("http://").unwrap_or_else(|| die("--probe takes a plain http:// URL"));
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        if !net_proto::valid_host_name(host) || !net_proto::valid_http_path(path) {
+            die("--probe: bad host or path");
+        }
+        ProbeCfg { host: host.into(), path: path.into(), expect: expect.map(|e| e.as_bytes().to_vec()), every_ms: every_s.max(5) * 1000 }
     }
 
     fn die(s: &str) -> ! {
@@ -67,6 +110,13 @@ mod imp {
             keys: "/atrium/sockets/aura-keys".into(),
             unbound: Some("/var/run".into()),
             capsicum: false,
+            // Off unless a URL is given: no third party learns when this
+            // machine joins a network (spec §4.2, endpoint decision pending).
+            probe: None,
+            probe_expect: None,
+            probe_every: 300,
+            probe_bin: "/usr/local/libexec/atrium-probe".into(),
+            netd: None,
         };
         let mut a = std::env::args().skip(1);
         let val = |a: &mut std::iter::Skip<std::env::Args>, f: &str| a.next().unwrap_or_else(|| die(&format!("{f} needs a value")));
@@ -83,7 +133,13 @@ mod imp {
                 "--aura-dir" => o.aura = val(&mut a, "--aura-dir"),
                 "--keys-dir" => o.keys = val(&mut a, "--keys-dir"),
                 "--unbound-dir" => o.unbound = Some(val(&mut a, "--unbound-dir")),
-                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum]"),
+                "--probe" => o.probe = Some(val(&mut a, "--probe")),
+                "--no-probe" => o.probe = None,
+                "--probe-expect" => o.probe_expect = Some(val(&mut a, "--probe-expect")),
+                "--probe-every" => o.probe_every = val(&mut a, "--probe-every").parse().unwrap_or_else(|_| die("--probe-every SECS")),
+                "--probe-bin" => o.probe_bin = val(&mut a, "--probe-bin"),
+                "--netd-dir" => o.netd = Some(val(&mut a, "--netd-dir")),
+                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum] [--probe URL | --no-probe] [--probe-expect TEXT] [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR]"),
             }
         }
         if let Some(w) = &o.wifi {
@@ -117,6 +173,32 @@ mod imp {
         dns6: Vec<Ipv6Addr>,
         rs_left: u8,
         rs_at: u64,
+        /// Link up (wired: the kernel's link state; Wi-Fi: port open).
+        link: bool,
+        /// What the connectivity probe last found, and when it runs next.
+        inet: Inet,
+        portal: Option<String>,
+        next_probe: u64,
+        /// Failed probes in a row: one failure is retried after
+        /// PROBE_CONFIRM_MS before the interface is reported without internet
+        /// (a probe sent the moment a lease binds can lose its first packets).
+        probe_fails: u8,
+    }
+
+    struct Job {
+        k: usize,
+        id: u64,
+        /// Host routes added for this probe (dst, gw, our address).
+        pins: Vec<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>,
+        deadline: u64,
+    }
+
+    struct Prober {
+        c: Conn,
+        _child: Child,
+        cfg: ProbeCfg,
+        busy: Option<Job>,
+        next_id: u64,
     }
 
     struct Ctl {
@@ -145,6 +227,13 @@ mod imp {
         wifi_grace: Option<u64>,
         /// What unbound forwards to now.
         forwarders: Vec<String>,
+        egress: Egress,
+        /// The default route we installed (interface, router), and the
+        /// interface last announced as the egress.
+        def4: Option<(usize, Ipv4Addr)>,
+        announced: Option<usize>,
+        prober: Option<Prober>,
+        netd: Option<Dir>,
     }
 
     /// How long a Wi-Fi address outlives the link.
@@ -155,9 +244,11 @@ mod imp {
             self.t0.elapsed().as_millis() as u64
         }
 
+        /// Verbose log lines carry the daemon's clock (seconds), so a gate can
+        /// measure hold-downs from them.
         fn log(&self, s: &str) {
             if self.v {
-                eprintln!("atrium-net: {s}");
+                eprintln!("atrium-net: [{:.1}] {s}", self.now() as f64 / 1000.0);
             }
         }
 
@@ -250,6 +341,255 @@ mod imp {
             }
         }
 
+        fn cands(&self) -> Vec<Cand> {
+            self.ifs
+                .iter()
+                .map(|i| Cand {
+                    bound: i.applied.lease.as_ref().is_some_and(|l| l.router.is_some()),
+                    link: i.link && !(i.wifi && self.wifi_grace.is_some()),
+                    wired: !i.wifi,
+                    inet: i.inet,
+                })
+                .collect()
+        }
+
+        /// Put the default route where the egress policy says, and tell
+        /// atrium-netd and subscribers when the interface changes.
+        fn route_default(&mut self) {
+            let now = self.now();
+            let c = self.cands();
+            let (cur, _) = self.egress.decide(&c, now);
+            let want = cur.and_then(|k| self.ifs[k].applied.lease.as_ref().and_then(|l| l.router.map(|g| (k, g, l.addr))));
+            if want.map(|(k, g, _)| (k, g)) != self.def4 {
+                let any = Ipv4Addr::UNSPECIFIED;
+                // Every existing default goes first, all its paths: with
+                // multipath routing (on by default) RTM_CHANGE edits only the
+                // path whose gateway it names, and RTM_ADD puts a second path
+                // beside the old one, so flows would hash onto a dead link.
+                let mut r = Ok(());
+                for _ in 0..16 {
+                    match self.rt.del_default() {
+                        Ok(()) => continue,
+                        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => break,
+                        Err(e) => {
+                            r = Err(e);
+                            break;
+                        }
+                    }
+                }
+                if let (Ok(()), Some((_, gw, ia))) = (&r, want) {
+                    r = self.rt.route(sys::RTM_ADD, any, 0, gw, ia);
+                }
+                match r {
+                    Ok(()) => {
+                        match want {
+                            Some((k, gw, _)) => self.log(&format!("default route via {gw} on {}", self.ifs[k].name)),
+                            None => self.log("no default route"),
+                        }
+                        self.def4 = want.map(|(k, g, _)| (k, g));
+                    }
+                    Err(e) => eprintln!("atrium-net: default route: {e}"),
+                }
+            }
+            if cur != self.announced {
+                self.announced = cur;
+                let name = cur.map_or("none".to_string(), |k| self.ifs[k].name.clone());
+                self.log(&format!("egress {name}{}", cur.map_or(String::new(), |k| format!(" (hold-down {} s)", self.egress.hold_ms(k, now) / 1000))));
+                self.egress6(cur);
+                let ev = Line::new("egress").with("iface", &name);
+                self.event(&ev);
+                if let Some(d) = &self.netd {
+                    let l = Line::new("egress-changed").with("iface", &name);
+                    match d.connect("ctl.sock") {
+                        Ok(mut s) => {
+                            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+                            if let Err(e) = l.send(&mut s) {
+                                eprintln!("atrium-net: atrium-netd: {e}");
+                            }
+                        }
+                        Err(e) => self.log(&format!("atrium-netd not reachable: {e}")),
+                    }
+                }
+            }
+        }
+
+        /// IPv6 follows: only the egress interface's RAs give default
+        /// routers; the others' are flushed, and the egress solicits anew.
+        fn egress6(&mut self, cur: Option<usize>) {
+            if self.ifs.len() < 2 {
+                return;
+            }
+            for k in 0..self.ifs.len() {
+                if let Err(e) = self.ifc.no_radr(&self.ifs[k].name, Some(k) != cur) {
+                    eprintln!("atrium-net: {}: IPv6 routers: {e}", self.ifs[k].name);
+                }
+            }
+            if let Err(e) = self.ifc.flush_routers6() {
+                eprintln!("atrium-net: IPv6 router flush: {e}");
+            }
+            if let Some(k) = cur {
+                let now = self.now();
+                self.ifs[k].rs_left = 3;
+                self.ifs[k].rs_at = now;
+            }
+        }
+
+        /// Start the next probe that is due (one at a time), and give up on
+        /// one that has hung.
+        fn probe_tick(&mut self) {
+            let now = self.now();
+            let Some(p) = &self.prober else { return };
+            if let Some(j) = &p.busy {
+                if now >= j.deadline {
+                    let k = j.k;
+                    eprintln!("atrium-net: {}: probe timed out; probing off", self.ifs[k].name);
+                    let j = self.prober.as_mut().unwrap().busy.take().unwrap();
+                    self.unpin(&j.pins);
+                    self.prober = None;
+                }
+                return;
+            }
+            let Some(k) = (0..self.ifs.len()).find(|&k| {
+                let i = &self.ifs[k];
+                i.link && i.applied.lease.is_some() && now >= i.next_probe
+            }) else {
+                return;
+            };
+            let i = &self.ifs[k];
+            let l = i.applied.lease.as_ref().unwrap();
+            let Some(&dns) = l.dns.first() else {
+                self.ifs[k].next_probe = now + PROBE_RETRY_MS;
+                return;
+            };
+            let mut pins = Vec::new();
+            self.pin(k, dns, &mut pins);
+            let p = self.prober.as_mut().unwrap();
+            p.next_id += 1;
+            let id = p.next_id;
+            let host = p.cfg.host.clone();
+            let ok = p.c.send(&Line::new("resolve").with("id", id).with("dns", dns).with("name", &host)).is_ok();
+            p.busy = Some(Job { k, id, pins, deadline: now + PROBE_DEADLINE_MS });
+            self.log(&format!("{}: probing ({host} via {dns})", self.ifs[k].name));
+            if !ok {
+                self.probe_gone();
+            }
+        }
+
+        /// A host route to `a` through interface k, unless it is k's own
+        /// subnet or k already carries the default route.
+        fn pin(&mut self, k: usize, a: Ipv4Addr, pins: &mut Vec<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>) {
+            let Some(l) = &self.ifs[k].applied.lease else { return };
+            let (Some(gw), ia) = (l.router, l.addr) else { return };
+            if in_net(a, l.addr, l.prefix) || self.def4.map(|(d, _)| d) == Some(k) {
+                return;
+            }
+            match self.rt.route(sys::RTM_ADD, a, 32, gw, ia) {
+                Ok(()) => pins.push((a, gw, ia)),
+                Err(e) => eprintln!("atrium-net: {}: probe route to {a}: {e}", self.ifs[k].name),
+            }
+        }
+
+        fn unpin(&mut self, pins: &[(Ipv4Addr, Ipv4Addr, Ipv4Addr)]) {
+            for &(a, gw, ia) in pins {
+                let _ = self.rt.route(sys::RTM_DELETE, a, 32, gw, ia);
+            }
+        }
+
+        fn probe_gone(&mut self) {
+            eprintln!("atrium-net: atrium-probe went away; probing off");
+            if let Some(j) = self.prober.as_mut().and_then(|p| p.busy.take()) {
+                self.unpin(&j.pins);
+            }
+            self.prober = None;
+        }
+
+        fn probe_line(&mut self, l: &Line) {
+            let Some(p) = self.prober.as_mut() else { return };
+            let Some(j) = p.busy.as_ref() else { return };
+            if l.num::<u64>("id") != Some(j.id) {
+                return;
+            }
+            let k = j.k;
+            match l.verb.as_str() {
+                "addr" => {
+                    let a = l.get("a").and_then(|x| x.parse::<Ipv4Addr>().ok());
+                    let ours = |a: Ipv4Addr| self.host.iter().any(|&(_, h, _)| h == a);
+                    match a {
+                        Some(a) if ordinary_unicast(a) && !ours(a) => {
+                            let mut pins = std::mem::take(&mut self.prober.as_mut().unwrap().busy.as_mut().unwrap().pins);
+                            self.pin(k, a, &mut pins);
+                            let p = self.prober.as_mut().unwrap();
+                            let j = p.busy.as_mut().unwrap();
+                            j.pins = pins;
+                            let mut x = Line::new("fetch").with("id", j.id).with("a", a).with("host", &p.cfg.host).with("path", &p.cfg.path);
+                            if let Some(e) = &p.cfg.expect {
+                                x = x.with_hex("expect", e);
+                            }
+                            if p.c.send(&x).is_err() {
+                                self.probe_gone();
+                            }
+                        }
+                        _ => self.probe_done(k, Inet::No, None, "bad address"),
+                    }
+                }
+                "http" => {
+                    let status = l.num::<u16>("status").unwrap_or(0);
+                    let matched = l.get("match") == Some("1");
+                    let expect = p.cfg.expect.is_some();
+                    let loc = l.hex("location").filter(|v| v.len() <= 256 && v.iter().all(|&c| (0x21..0x7f).contains(&c))).map(|v| String::from_utf8_lossy(&v).into_owned());
+                    let good = if expect { status == 200 && matched } else { status == 204 };
+                    if good {
+                        self.probe_done(k, Inet::Yes, None, "ok");
+                    } else {
+                        self.probe_done(k, Inet::Captive, loc, &format!("HTTP {status}"));
+                    }
+                }
+                "fail" => {
+                    let why = l.get("why").unwrap_or("?").to_string();
+                    self.probe_done(k, Inet::No, None, &why);
+                }
+                _ => {}
+            }
+        }
+
+        fn probe_done(&mut self, k: usize, inet: Inet, portal: Option<String>, why: &str) {
+            let now = self.now();
+            if let Some(j) = self.prober.as_mut().and_then(|p| p.busy.take()) {
+                self.unpin(&j.pins);
+            }
+            let every = self.prober.as_ref().map_or(PROBE_RETRY_MS, |p| p.cfg.every_ms);
+            let i = &mut self.ifs[k];
+            // Lost the lease meanwhile: the answer is about a network we left.
+            if i.applied.lease.is_none() {
+                return;
+            }
+            if inet == Inet::No && i.inet != Inet::No && i.probe_fails == 0 {
+                i.probe_fails = 1;
+                i.next_probe = now + PROBE_CONFIRM_MS;
+                let name = i.name.clone();
+                self.log(&format!("{name}: probe failed ({why}), trying again"));
+                return;
+            }
+            i.probe_fails = if inet == Inet::No { i.probe_fails.saturating_add(1) } else { 0 };
+            i.next_probe = now + if inet == Inet::Yes { every } else { PROBE_RETRY_MS.min(every) };
+            let old = i.inet;
+            i.inet = inet;
+            if old == inet && i.portal == portal {
+                return;
+            }
+            i.portal = portal.clone();
+            let name = i.name.clone();
+            self.log(&format!("{name}: internet {} ({why})", inet.word()));
+            if old.ok() && !inet.ok() && self.announced == Some(k) {
+                self.egress.flap(k, now);
+            }
+            let mut ev = Line::new("internet").with("iface", &name).with("state", inet.word());
+            if let Some(p) = &portal {
+                ev = ev.with_hex("portal", p.as_bytes());
+            }
+            self.event(&ev);
+        }
+
         /// Router solicitations due, and the interfaces' IPv6 addresses.
         fn tick6(&mut self) {
             let now = self.now();
@@ -289,6 +629,10 @@ mod imp {
         }
 
         fn lose(&mut self, k: usize, why: &str) {
+            self.ifs[k].inet = Inet::Unknown;
+            self.ifs[k].portal = None;
+            self.ifs[k].next_probe = 0;
+            self.ifs[k].probe_fails = 0;
             let ia = self.ifs[k].applied.lease.as_ref().map(|x| x.addr);
             let acts = self.ifs[k].applied.lose();
             if !acts.is_empty() {
@@ -367,6 +711,10 @@ mod imp {
                                 // The address stays for a grace period so a
                                 // short drop does not reset every connection;
                                 // nothing reaches the dead link meanwhile.
+                                self.ifs[k].link = up;
+                                if !up {
+                                    self.egress.flap(k, now);
+                                }
                                 if up {
                                     self.wifi_grace = None;
                                     self.ifs[k].rs_left = 3;
@@ -518,6 +866,14 @@ mod imp {
                 if !i.dns6.is_empty() {
                     l = l.with("dns6", i.dns6.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
                 }
+                let k = self.ifs.iter().position(|x| x.name == i.name);
+                l = l.with("link", if i.link { "up" } else { "down" }).with("internet", i.inet.word());
+                if let Some(p) = &i.portal {
+                    l = l.with_hex("portal", p.as_bytes());
+                }
+                if k.is_some() && self.announced == k {
+                    l = l.with("egress", 1);
+                }
                 l = l.with("refused", i.refusals).with("sends_refused", i.sends_refused);
                 if !i.last_refusal.is_empty() {
                     l = l.with("last_refusal", &i.last_refusal);
@@ -548,6 +904,12 @@ mod imp {
                         Ok(()) => {
                             self.log(&format!("{name}: lease {}/{} router {:?} dns {:?} for {} s", lease.addr, lease.prefix, lease.router, lease.dns, lease.lease_s));
                             let addr = lease.addr;
+                            if self.ifs[k].applied.lease.as_ref().map(|o| (o.addr, o.router)) != Some((lease.addr, lease.router)) {
+                                self.ifs[k].inet = Inet::Unknown;
+                                self.ifs[k].portal = None;
+                                self.ifs[k].next_probe = self.now();
+                                self.ifs[k].probe_fails = 0;
+                            }
                             let ev = Line::new("lease").with("iface", &name).with("addr", format!("{}/{}", lease.addr, lease.prefix));
                             let acts = self.ifs[k].applied.bind(lease);
                             self.apply(&name, Some(addr), acts);
@@ -637,7 +999,7 @@ mod imp {
         }
     }
 
-    fn spawn_lease(path: &str, v: bool) -> (Child, Conn) {
+    fn spawn_child(path: &str, v: bool) -> (Child, Conn) {
         let (ours, theirs) = UnixStream::pair().unwrap_or_else(|_| die("socketpair"));
         let fd = theirs.as_raw_fd();
         let mut cmd = Command::new(path);
@@ -685,6 +1047,11 @@ mod imp {
             mlme_retry: 0,
             wifi_grace: None,
             forwarders: Vec::new(),
+            egress: Egress::new(o.ifaces.len()),
+            def4: None,
+            announced: None,
+            prober: None,
+            netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
         };
         // Temporary addresses (RFC 8981) preferred for outgoing connections;
         // stable-private (RFC 7217) for the rest. Before capability mode.
@@ -703,7 +1070,7 @@ mod imp {
                 eprintln!("atrium-net: {name}: IPv6: {e}");
             }
             let bpf = Bpf::open(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
-            let (child, mut lease) = spawn_lease(&o.lease, o.verbose);
+            let (child, mut lease) = spawn_child(&o.lease, o.verbose);
             lease.send(&Line::new("hello").with("mac", fmt_mac(&mac))).unwrap_or_else(|_| die("hello"));
             // Wired links start now; Wi-Fi when aura-mlme reports the port open.
             if !is_wifi {
@@ -728,7 +1095,19 @@ mod imp {
                 dns6: Vec::new(),
                 rs_left: if is_wifi { 0 } else { 3 },
                 rs_at: 0,
+                link: !is_wifi,
+                inet: Inet::Unknown,
+                portal: None,
+                next_probe: 0,
+                probe_fails: 0,
             });
+        }
+        // The probe must exist before capability mode (no exec after it).
+        if let Some(url) = &o.probe {
+            let cfg = probe_cfg(url, o.probe_expect.as_deref(), o.probe_every);
+            let (child, c) = spawn_child(&o.probe_bin, o.verbose);
+            net.log(&format!("probing http://{}{}", cfg.host, cfg.path));
+            net.prober = Some(Prober { c, _child: child, cfg, busy: None, next_id: 0 });
         }
         if let Some(d) = o.sock.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -742,7 +1121,7 @@ mod imp {
         net.mlme_connect();
 
         loop {
-            let mut fds = vec![net.rt.s.as_raw_fd(), listener.as_raw_fd(), net.mlme.as_ref().map_or(-1, |c| c.fd())];
+            let mut fds = vec![net.rt.s.as_raw_fd(), listener.as_raw_fd(), net.mlme.as_ref().map_or(-1, |c| c.fd()), net.prober.as_ref().map_or(-1, |p| p.c.fd())];
             for i in &net.ifs {
                 fds.push(i.bpf.fd.as_raw_fd());
                 fds.push(i.lease.fd());
@@ -763,7 +1142,13 @@ mod imp {
 
             if ready[0] {
                 for (idx, up) in net.rt.read_ifinfo() {
-                    if let Some(i) = net.ifs.iter_mut().find(|i| i.index == idx && !i.wifi) {
+                    let now = net.now();
+                    if let Some(k) = net.ifs.iter().position(|i| i.index == idx && !i.wifi) {
+                        if net.ifs[k].link && !up {
+                            net.egress.flap(k, now);
+                        }
+                        let i = &mut net.ifs[k];
+                        i.link = up;
                         let m = format!("{}: link {}", i.name, if up { "up" } else { "down" });
                         if up {
                             i.rs_left = 3;
@@ -804,15 +1189,28 @@ mod imp {
                     }
                 }
             }
+            if ready[3] {
+                match net.prober.as_mut().map(|p| p.c.lines()) {
+                    Some(Ok(v)) => {
+                        for g in v {
+                            if let Got::Line(l) = g {
+                                net.probe_line(&l);
+                            }
+                        }
+                    }
+                    Some(Err(_)) => net.probe_gone(),
+                    None => {}
+                }
+            }
             for k in 0..net.ifs.len() {
-                if ready[3 + 2 * k] {
+                if ready[4 + 2 * k] {
                     for f in net.ifs[k].bpf.read() {
                         if f.len() <= 1514 {
                             let _ = net.ifs[k].lease.send(&Line::new("frame").with_hex("hex", &f));
                         }
                     }
                 }
-                if ready[4 + 2 * k] {
+                if ready[5 + 2 * k] {
                     let lines = match net.ifs[k].lease.lines() {
                         Ok(l) => l,
                         Err(_) => die(&format!("{}: atrium-lease exited", net.ifs[k].name)),
@@ -862,6 +1260,8 @@ mod imp {
                 net.wifi_acts(a);
             }
             net.mlme_connect();
+            net.route_default();
+            net.probe_tick();
         }
     }
 
