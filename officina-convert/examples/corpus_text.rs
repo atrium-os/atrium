@@ -49,8 +49,11 @@ fn labelled(d: &TextDoc) -> String {
         }
         let Some(p) = b.as_para() else { continue };
         for (at, ch) in p.text.char_indices() {
-            match d.attrs.get(p.attr_at(at as u32)).note {
+            let a = d.attrs.get(p.attr_at(at as u32));
+            match a.note {
                 Some(n) if ch == '\u{FFFC}' => out.push_str(&d.note_label(n)),
+                // A tracked deletion's tombstone takes no room.
+                _ if ch == '\u{FFFC}' && a.deleted.is_some() => {}
                 _ => out.push(ch),
             }
         }
@@ -85,6 +88,9 @@ struct Row {
     missing: Vec<String>,
     notes: usize,
     comments: usize,
+    /// Tracked edits read, and whether our writer and reader keep them.
+    edits: usize,
+    edits_kept: bool,
 }
 
 fn read(path: &Path, data: &[u8]) -> Result<(TextDoc, Vec<String>), String> {
@@ -114,7 +120,7 @@ fn main() {
             let took = t.elapsed();
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
             let lo = std::fs::read_to_string(Path::new(txt).join(Path::new(&name).with_extension("txt"))).ok();
-            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0 };
+            let mut row = Row { file: format!("{src}/{name}"), ok: Ok(()), took, recall: f64::NAN, precision: f64::NAN, lo_words: 0, roundtrip: false, missing: Vec::new(), notes: 0, comments: 0, edits: 0, edits_kept: true };
             match got {
                 Err(e) => row.ok = Err(e),
                 Ok((doc, ns)) => {
@@ -125,6 +131,9 @@ fn main() {
                     let ours = doc.plain_text();
                     row.notes = doc.note_numbers().len();
                     row.comments = doc.live_comments().len();
+                    let edits = |d: &TextDoc| d.edits().into_iter().map(|e| (d.revisions.get(e.rev).map(|r| r.author.to_string()), e.summary)).collect::<Vec<_>>();
+                    let ours_edits = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| edits(&doc))).unwrap_or_default();
+                    row.edits = ours_edits.len();
                     if let Some(lo) = &lo {
                         let ours = labelled(&doc);
                         let (a, b) = (words(lo), words(&ours));
@@ -151,6 +160,22 @@ fn main() {
                     let full = |t: &str| t.split('\n').filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
                     let ours_all = ours.clone() + &notes_text(&doc);
                     row.roundtrip = matches!(again, Ok(Some(t)) if full(&t) == full(&ours_all));
+                    if row.edits > 0 {
+                        let back = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if odt_file {
+                                odt::write(&doc, Vec::new()).ok().and_then(|b| odt::read(&b).ok()).map(|(d, _)| edits(&d))
+                            } else {
+                                docx::write(&doc, Vec::new()).ok().and_then(|b| docx::read(&b).ok()).map(|(d, _)| edits(&d))
+                            }
+                        }));
+                        row.edits_kept = matches!(&back, Ok(Some(e)) if *e == ours_edits);
+                        if !row.edits_kept {
+                            if let Ok(Some(e)) = &back {
+                                let k = e.iter().zip(&ours_edits).position(|(a, b)| a != b).unwrap_or(e.len().min(ours_edits.len()));
+                                eprintln!("edits differ {}: {} vs {}; first {:?} vs {:?}", row.file, e.len(), ours_edits.len(), e.get(k), ours_edits.get(k));
+                            }
+                        }
+                    }
                 }
             }
             rows.push(row);
@@ -173,6 +198,8 @@ fn main() {
     println!("our writer then our reader keep the text (and notes) of {rt} of {read_ok}");
     println!("{} notes in {} files", rows.iter().map(|r| r.notes).sum::<usize>(), rows.iter().filter(|r| r.notes > 0).count());
     println!("{} comments in {} files", rows.iter().map(|r| r.comments).sum::<usize>(), rows.iter().filter(|r| r.comments > 0).count());
+    let tracked: Vec<&Row> = rows.iter().filter(|r| r.edits > 0).collect();
+    println!("{} tracked edits in {} files; our writer then our reader keep them all in {} of those files", tracked.iter().map(|r| r.edits).sum::<usize>(), tracked.len(), tracked.iter().filter(|r| r.edits_kept).count());
     for r in &panics {
         println!("PANIC {}", r.file);
     }

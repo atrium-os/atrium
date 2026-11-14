@@ -1859,6 +1859,44 @@ formatting in two places, minor comma); an app test (track, review from the care
 reject one, accept one, undo, reject all, other bars close review); screenshot of
 `examples/review_doc.rs` on the cloud VM (`BAR=review:3 scripts/write-vm.sh`).
 
+### 16.25 O5c3 as built (2026-11-15): tracked changes in `.docx` and `.odt`
+
+- **Shared** (`officina-text::track`). `expanded()` gives the document with every
+  deletion put back as text marked `deleted` (nested ones too) and the paragraphs
+  whose break before was deleted, for formats that keep deleted text inline.
+  `make_deletions(ranges)` is the way back: text read as deleted (and deleted breaks,
+  as end-of-paragraph to start-of-next ranges) becomes tombstones through
+  `tracked_delete_ops`, touching ranges of one revision joined. Revisions read are
+  one per author (dated by their first change; a set each).
+- **`.docx`.** Read: `w:ins`/`w:moveTo` mark runs, `w:del`/`w:moveFrom` text
+  (`w:delText`) is read inline then made tombstones, `w:rPrChange` gives the
+  formatting before, a paragraph mark's `w:ins` marks the break after it (the next
+  paragraph's `props.rev`), its `w:del` joins the next paragraph, `w:trackRevisions`
+  turns tracking on. Breaks are only taken inside one cell or outside tables
+  (deleted rows and cell ends are reported and kept). Write: from `expanded()`,
+  runs in `w:ins`/`w:del` with author and date, `w:rPrChange` last in the run
+  properties, mark `w:ins`/`w:del`, settings.xml with `w:trackRevisions`.
+- **`.odt`.** ODF's model is ours: the body is the proposed text,
+  `text:change` marks a deletion whose content (paragraphs) lives in its
+  `text:changed-region`, and `text:change-start`/`-end` bound insertions (over
+  paragraph breaks too) and formatting changes. Read: regions by id, deletions
+  straight into tombstones with their pieces, an insertion open at a paragraph's
+  start marks its break. ODF keeps no formatting before a format change: we write
+  it as an automatic text style named in `officina:old-style` on the region (our
+  namespace, which LibreOffice drops); without it the formatting before is plain.
+- **Not yet:** tracked changes in notes, headers and footers (insertions kept,
+  deletions dropped, as before); paragraph property changes (`w:pPrChange`,
+  ODF paragraph format changes) are kept as made; deleted and inserted table rows.
+
+Gates: the 10,000-sequence random gate now also expands and collapses every
+document (deleted text inline and back) and checks the proposed text, accept all
+and reject all; `.docx` and `.odt` round trips of a sample with a deletion, an
+insertion, bold, an inserted and a deleted break by two people keep every change
+(`docx::tests`, `odt::tests`); LibreOffice both ways: `.docx` 26/26 and `.odt`
+52/52 (edits by author, accept all, reject all, tracking on). Corpus (1,858 files):
+0 panics, 343 tracked edits read in 78 files, our writer then reader keep every
+edit of all 78; text recall against LibreOffice 99.51 %.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -45,6 +45,15 @@ pub enum ChangeKind {
     Format,
 }
 
+/// A document with every deletion's text back in place, for formats that keep
+/// deleted text inline (`.docx`): deleted text keeps `deleted` naming its
+/// deletion (it is no longer a tombstone), and a paragraph whose break before
+/// it was deleted is in `deleted_breaks` by id, with the revision.
+pub struct Expanded {
+    pub doc: TextDoc,
+    pub deleted_breaks: std::collections::HashMap<BlockId, RevId>,
+}
+
 impl TextDoc {
     /// Ops that put revision `rev` in the store; its id.
     pub fn add_revision_ops(&self, rev: Revision) -> (RevId, Vec<TextOp>) {
@@ -107,6 +116,112 @@ impl TextDoc {
         }
         out.sort_unstable();
         out
+    }
+
+    /// This document with its deletions put back as marked text
+    /// ([`Expanded`]).
+    pub fn expanded(&self) -> Expanded {
+        use officina_core::history::Op;
+        let mut d = self.clone();
+        let mut breaks = std::collections::HashMap::new();
+        let mut done = std::collections::HashSet::new();
+        let mut from = d.blocks.len();
+        while !d.deletions.is_empty() {
+            // The last tombstone not yet put back (nested ones come back with
+            // their deletion, after it).
+            let mut found = None;
+            'scan: for b in (0..from.min(d.blocks.len())).rev() {
+                let Some(p) = d.para(b) else { continue };
+                if !p.text.contains(OBJECT_CHAR) {
+                    continue;
+                }
+                let spans: Vec<(u32, u32, AttrId)> = p.spans().collect();
+                for &(s, e, a) in spans.iter().rev() {
+                    if e - s == TOMB && &p.text[s as usize..e as usize] == "\u{FFFC}" {
+                        if let Some(t) = d.attrs.get(a).deleted.filter(|t| !done.contains(t)) {
+                            if d.attrs.get(a).object.is_none() && d.attrs.get(a).note.is_none() {
+                                found = Some((b, s, t));
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((b, at, t)) = found else { break };
+            done.insert(t);
+            let Some(del) = d.deletions.get(t).cloned() else { continue };
+            let pieces: Vec<DelPiece> = del
+                .pieces
+                .iter()
+                .map(|q| {
+                    let runs = q
+                        .runs
+                        .iter()
+                        .map(|&(s, a)| {
+                            let x = d.attrs.get(a).clone();
+                            let tomb = x.deleted.is_some() && x.object.is_none() && x.note.is_none();
+                            if tomb {
+                                (s, a)
+                            } else {
+                                let mut y = x;
+                                y.deleted = Some(t);
+                                (s, d.attrs.intern(y))
+                            }
+                        })
+                        .collect();
+                    DelPiece { para: q.para.clone(), text: q.text.clone(), runs }
+                })
+                .collect();
+            for q in &pieces[1..] {
+                if let Some((id, _, _)) = &q.para {
+                    breaks.insert(*id, del.rev);
+                }
+            }
+            let mut ops = Vec::new();
+            d.restore_ops(b, at, TOMB, &pieces, &mut ops);
+            for op in ops {
+                op.apply(&mut d);
+            }
+            from = b + pieces.len();
+        }
+        Expanded { doc: d, deleted_breaks: breaks }
+    }
+
+    /// Turns text read as deleted into tombstones, for readers of formats that
+    /// keep deleted text inline: each range is (from, to, revision), a deleted
+    /// paragraph break being (end of one, start of the next); ranges of one
+    /// revision that touch become one.
+    pub fn make_deletions(&mut self, mut ranges: Vec<((usize, u32), (usize, u32), RevId)>) {
+        use officina_core::history::Op;
+        ranges.retain(|r| r.0 < r.1);
+        ranges.sort_by_key(|r| (r.0, r.1));
+        let mut merged: Vec<((usize, u32), (usize, u32), RevId)> = Vec::new();
+        for r in ranges {
+            if let Some(l) = merged.last_mut() {
+                // A deleted break is a range of its own, from the end of one
+                // paragraph to the start of the next, so touching is enough.
+                if l.2 == r.2 && l.1 >= r.0 {
+                    l.1 = l.1.max(r.1);
+                    continue;
+                }
+                if l.1 > r.0 {
+                    // Overlapping deletions by two people: the first keeps it.
+                    let rest = (l.1, r.1, r.2);
+                    if rest.1 > rest.0 {
+                        merged.push(rest);
+                    }
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        for (from, to, rev) in merged.into_iter().rev() {
+            let id = self.deletions.next_id();
+            let (ops, _) = self.tracked_delete_ops(from.0, from.1, to.0, to.1, rev, id);
+            for op in ops {
+                op.apply(self);
+            }
+        }
     }
 
     /// The tracked changes in the text, in document order.
@@ -816,8 +931,8 @@ impl TextDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CharAttrs, Para};
-    use officina_core::history::History;
+    use crate::model::CharAttrs;
+    use officina_core::history::{History, Op};
 
     struct Rng(u64);
     impl Rng {
@@ -916,6 +1031,35 @@ mod tests {
         v
     }
 
+    /// What a reader of a format with inline deleted text rebuilds from
+    /// [`TextDoc::expanded`]: the marked text and breaks made deletions again.
+    fn collapse(ex: Expanded) -> TextDoc {
+        let mut d = ex.doc;
+        let mut ranges = Vec::new();
+        for b in 0..d.blocks.len() {
+            let p = d.para(b).unwrap().clone();
+            if let Some(&r) = ex.deleted_breaks.get(&p.id) {
+                let prev = d.para(b - 1).unwrap().text.len() as u32;
+                ranges.push(((b - 1, prev), (b, 0), r));
+            }
+            for (s, e, a) in p.spans() {
+                let x = d.attrs.get(a).clone();
+                let Some(t) = x.deleted else { continue };
+                if s == e {
+                    continue;
+                }
+                let rev = d.deletions.get(t).unwrap().rev;
+                ranges.push(((b, s), (b, e), rev));
+                let mut y = x;
+                y.deleted = None;
+                let ya = d.attrs.intern(y);
+                TextOp::Restyle { block: b as u32, start: s, end: e, runs: vec![(s, ya)] }.apply(&mut d);
+            }
+        }
+        d.make_deletions(ranges);
+        d
+    }
+
     #[test]
     fn random_tracked_edits_accept_and_reject_exactly() {
         for seed in 1..=10_000u64 {
@@ -1004,6 +1148,21 @@ mod tests {
             let back = crate::native::load(&crate::native::save_to_vec(&t, &[])).unwrap().doc;
             assert_eq!(exact(&back), exact(&t), "seed {seed}: native round trip");
             assert_eq!(back.tracking, t.tracking);
+            // Deleted text inline (as .docx keeps it) and back: the same
+            // proposed text, accepting and rejecting the same.
+            let mut c = collapse(t.expanded());
+            assert_eq!(view(&c), view(&p), "seed {seed}: expanded and collapsed");
+            let mut cc = c.clone();
+            let ops = cc.resolve_ops(Resolve::Reject, |_| true);
+            for op in ops {
+                op.apply(&mut cc);
+            }
+            assert_eq!(view(&cc), view(&original), "seed {seed}: collapsed, reject all");
+            let ops = c.resolve_ops(Resolve::Accept, |_| true);
+            for op in ops {
+                op.apply(&mut c);
+            }
+            assert_eq!(view(&c), view(&p), "seed {seed}: collapsed, accept all");
             // Reject everything: the original exactly.
             let ops = t.resolve_ops(Resolve::Reject, |_| true);
             ht.run(&mut t, "reject", ops);

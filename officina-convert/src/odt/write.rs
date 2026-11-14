@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
 
-const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" office:version="1.3""#;
+const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" xmlns:officina="urn:atrium:officina:1.0" office:version="1.3""#;
 
 /// Twips as points.
 fn pt(t: i64) -> String {
@@ -160,6 +160,12 @@ struct Out<'a> {
     marks: HashMap<usize, Vec<(u32, bool, CommentId)>>,
     /// The block being written (none in notes).
     cur: Option<usize>,
+    /// Tracked changes: the changed regions written, and the insertion open
+    /// (it may run over paragraph breaks).
+    regions: String,
+    nchange: u32,
+    ins_open: Option<(RevId, String)>,
+    pending_end: Option<String>,
 }
 
 /// The name an annotation goes by.
@@ -189,6 +195,9 @@ impl Out<'_> {
         k.link = None;
         k.object = None;
         k.note = None;
+        k.rev = None;
+        k.deleted = None;
+        k.fmt = None;
         if k == CharAttrs::default() {
             return None;
         }
@@ -282,6 +291,70 @@ impl Out<'_> {
         flush(&mut spaces, out, start);
     }
 
+    /// A changed region of kind `tag` (insertion, deletion, format-change) by
+    /// revision `rev`; its id.
+    fn region(&mut self, tag: &str, rev: RevId, extra: &str, content: &str) -> String {
+        self.nchange += 1;
+        let id = format!("ct{}", self.nchange);
+        let (author, date) = self.doc.revisions.get(rev).map(|r| (r.author.to_string(), r.date.to_string())).unwrap_or_default();
+        let date = if date.is_empty() { "1970-01-01T00:00:00".to_string() } else { date };
+        let _ = write!(self.regions, r#"<text:changed-region xml:id="{id}" text:id="{id}"><text:{tag}{extra}><office:change-info><dc:creator>{}</dc:creator><dc:date>{}</dc:date></office:change-info>{content}</text:{tag}></text:changed-region>"#, esc(&author), esc(&date));
+        id
+    }
+
+    /// Closes the insertion open, if any.
+    fn close_ins(&mut self, out: &mut String) {
+        if let Some((_, id)) = self.ins_open.take() {
+            let _ = write!(out, r#"<text:change-end text:change-id="{id}"/>"#);
+        }
+    }
+
+    /// The insertion over what comes next is `rev`'s (or none).
+    fn ins_to(&mut self, rev: Option<RevId>, out: &mut String) {
+        if self.ins_open.as_ref().map(|o| o.0) == rev {
+            return;
+        }
+        self.close_ins(out);
+        if let Some(r) = rev {
+            let id = self.region("insertion", r, "", "");
+            let _ = write!(out, r#"<text:change-start text:change-id="{id}"/>"#);
+            self.ins_open = Some((r, id));
+        }
+    }
+
+    /// A deletion's place in the text, its content in a region.
+    fn deletion(&mut self, t: officina_text::model::DelId, style: u16, out: &mut String) {
+        let doc = self.doc;
+        let Some(d) = doc.deletions.get(t) else { return };
+        let mut content = String::new();
+        for (k, piece) in d.pieces.iter().enumerate() {
+            let (st, props) = match &piece.para {
+                Some((_, s, p)) if k > 0 => (*s, p.clone()),
+                _ => (style, ParaProps::default()),
+            };
+            let name = self.para_style(st, &para_key(&props));
+            let _ = write!(content, r#"<text:p text:style-name="{}">"#, esc(&name));
+            for (i, &(rs, ra)) in piece.runs.iter().enumerate() {
+                let re = piece.runs.get(i + 1).map_or(piece.text.len() as u32, |r| r.0);
+                if rs >= re {
+                    continue;
+                }
+                let text: String = piece.text[rs as usize..re as usize].chars().filter(|&c| c != OBJECT_CHAR).collect();
+                let mut inner = String::new();
+                Self::text(&text, &mut inner);
+                match self.text_style(doc.attrs.get(ra)) {
+                    Some(n) => {
+                        let _ = write!(content, r#"<text:span text:style-name="{n}">{inner}</text:span>"#);
+                    }
+                    None => content.push_str(&inner),
+                }
+            }
+            content.push_str("</text:p>");
+        }
+        let id = self.region("deletion", d.rev, "", &content);
+        let _ = write!(out, r#"<text:change text:change-id="{id}"/>"#);
+    }
+
     fn para(&mut self, b: usize, out: &mut String) {
         let doc = self.doc;
         let Some(p) = doc.para(b) else { return };
@@ -338,8 +411,28 @@ impl Out<'_> {
                 continue;
             }
             let attrs = doc.attrs.get(a).clone();
-            let mut inner = String::new();
             let piece = &p.text[s as usize..e as usize];
+            let tracked = self.in_note == 0 && self.cur.is_some();
+            let mut fmt_end = false;
+            if tracked {
+                if let Some(t) = attrs.deleted.filter(|_| attrs.object.is_none() && attrs.note.is_none()) {
+                    for _ in piece.chars() {
+                        self.deletion(t, p.style, out);
+                    }
+                    continue;
+                }
+                self.ins_to(attrs.rev, out);
+                if let Some(m) = attrs.fmt {
+                    let mut old = doc.attrs.get(m.old).clone();
+                    old.comments = None;
+                    let name = self.text_style(&old).unwrap_or_default();
+                    let id = self.region("format-change", m.rev, &format!(r#" officina:old-style="{}""#, esc(&name)), "");
+                    let _ = write!(out, r#"<text:change-start text:change-id="{id}"/>"#);
+                    fmt_end = true;
+                    self.pending_end = Some(id);
+                }
+            }
+            let mut inner = String::new();
             let mut from = 0;
             for (i, c) in piece.char_indices().chain(std::iter::once((piece.len(), '\0'))) {
                 if c != OBJECT_CHAR && i < piece.len() {
@@ -385,9 +478,25 @@ impl Out<'_> {
                 }
                 None => out.push_str(&inner),
             }
+            if fmt_end {
+                if let Some(id) = self.pending_end.take() {
+                    let _ = write!(out, r#"<text:change-end text:change-id="{id}"/>"#);
+                }
+            }
         }
         for &(_, end, id) in &marks[m..] {
             self.annotation(out, end, id);
+        }
+        // An insertion runs on over the break after this paragraph when that
+        // break is inserted too.
+        if self.in_note == 0 {
+            if let Some(b) = self.cur {
+                let next = doc.para(b + 1).filter(|_| doc.same_cell(b, b + 1)).and_then(|q| q.props.rev);
+                match next {
+                    Some(r) => self.ins_to(Some(r), out),
+                    None => self.close_ins(out),
+                }
+            }
         }
         let _ = write!(out, "</{tag}>");
     }
@@ -515,7 +624,7 @@ fn margin(hf: &HeaderFooter, tag: &str, style: &str) -> String {
 /// The document as an `.odt`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None };
     // Comments: each anchored one's start and end; its replies right after its start.
     let ranges = doc.comment_ranges();
     let live: std::collections::HashSet<CommentId> = doc.live_comments().into_iter().collect();
@@ -611,7 +720,12 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     master += "</style:master-page>";
     let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
-    let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{body}</office:text></office:body></office:document-content>"#, o.auto);
+    let tracked = if o.regions.is_empty() && !doc.tracking {
+        String::new()
+    } else {
+        format!(r#"<text:tracked-changes text:track-changes="{}">{}</text:tracked-changes>"#, doc.tracking, o.regions)
+    };
+    let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:automatic-styles>{}</office:automatic-styles><office:body><office:text>{tracked}{body}</office:text></office:body></office:document-content>"#, o.auto);
 
     let mut z = ZipWriter::new(out);
     z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text")?;

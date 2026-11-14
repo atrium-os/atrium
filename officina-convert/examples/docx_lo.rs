@@ -88,10 +88,67 @@ pub fn sample() -> TextDoc {
             officina_core::history::Op::apply(op, &mut d);
         }
     }
+    // Tracked changes by two people.
+    let k = d.push_para("Tracked: the quick brown fox.", 0, vec![]);
+    d.push_para("Joined to the one before.", 0, vec![]);
+    d.push_para("Split here, please.", 0, vec![]);
+    tracked(&mut d, k);
     d.take_changes();
     d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
     d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
     d
+}
+
+/// Tracked changes on paragraph `k` and the two after it: Ann deletes
+/// "quick " and the break after the first, makes "fox" bold; Bo inserts
+/// "slow " and splits the third.
+pub fn tracked(d: &mut TextDoc, k: usize) {
+    use officina_core::history::Op;
+    use officina_text::model::Revision;
+    use officina_text::ops::{Fragment, TextOp};
+    let run = |d: &mut TextDoc, ops: Vec<TextOp>| {
+        for op in ops {
+            op.apply(d);
+        }
+    };
+    let (ann, ops) = d.add_revision_ops(Revision { author: "Ann Author".into(), date: "2026-11-15T08:00:00Z".into(), set: 0, name: "".into() });
+    run(d, ops);
+    let (bo, ops) = d.add_revision_ops(Revision { author: "Bo Reviewer".into(), date: "2026-11-15T09:00:00Z".into(), set: 1, name: "".into() });
+    run(d, ops);
+    d.tracking = true;
+    let (style, mut props) = { let p = d.para(k + 2).unwrap(); (p.style, p.props.clone()) };
+    props.rev = Some(bo);
+    let id = d.new_id();
+    run(d, vec![TextOp::Split { block: k as u32 + 2, at: 11, id, style, props }]);
+    let len = d.para(k).unwrap().text.len() as u32;
+    let (ops, _) = d.tracked_delete_ops(k, len, k + 1, 0, ann, d.deletions.next_id());
+    run(d, ops);
+    let at = d.para(k).unwrap().text.find("fox").unwrap() as u32;
+    let ops = d.tracked_format_ops(k, at, at + 3, ann, |a| a.bold = Some(true));
+    run(d, ops);
+    let at = d.para(k).unwrap().text.find("brown").unwrap() as u32;
+    let a = d.with_rev(0, bo);
+    run(d, vec![TextOp::Splice { block: k as u32, at, del: 0, ins: Fragment { text: "slow ".into(), runs: vec![(0, a)] } }]);
+    let at = d.para(k).unwrap().text.find("quick ").unwrap() as u32;
+    let (ops, _) = d.tracked_delete_ops(k, at, k, at + 6, ann, d.deletions.next_id());
+    run(d, ops);
+}
+
+/// The tracked edits as (author, sentence), and the text with everything
+/// accepted and with everything rejected.
+pub fn tracked_view(d: &TextDoc) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use officina_core::history::Op;
+    use officina_text::track::Resolve;
+    let edits = d.edits().into_iter().map(|e| format!("{} {}", d.revisions.get(e.rev).map(|r| r.author.to_string()).unwrap_or_default(), e.summary)).collect();
+    let resolved = |how| {
+        let mut x = d.clone();
+        let ops = x.resolve_ops(how, |_| true);
+        for op in ops {
+            op.apply(&mut x);
+        }
+        x.visible_text().into_iter().filter(|t| t.contains("Tracked") || t.contains("Joined") || t.contains("Split")).collect::<Vec<_>>()
+    };
+    (edits, resolved(Resolve::Accept), resolved(Resolve::Reject))
 }
 
 pub fn soffice(home: &Path, filter: &str, input: &Path, out: &Path) -> Vec<u8> {
@@ -208,6 +265,12 @@ pub fn compare(c: &mut Checks, d: &TextDoc, back: &TextDoc) {
     c.check("comment date", date.starts_with("2026-11-14T10:00:00"), || date.clone());
     let sup = block(back, "E = mc2").map(|b| attrs_at(back, b, 6).vert);
     c.check("superscript", sup == Some(Some(VertAlign::Super)), || format!("{sup:?}"));
+    let (te, ta, tr) = tracked_view(back);
+    let (de, da, dr) = tracked_view(d);
+    c.check("tracked edits by author", te == de, || format!("{te:?}\n vs {de:?}"));
+    c.check("tracked changes accepted", ta == da, || format!("{ta:?} vs {da:?}"));
+    c.check("tracked changes rejected", tr == dr, || format!("{tr:?} vs {dr:?}"));
+    c.check("tracking on", back.tracking, String::new);
     c.check("page size and margins", back.page == d.page, || format!("{:?} vs {:?}", back.page, d.page));
 }
 

@@ -14,7 +14,11 @@
 //! annotations as comments (ranges, replies by LibreOffice's parent name, resolved)
 //! are read.
 //!
-//! Reported, not carried: notes inside notes or headers, annotations there, tracked changes,
+//! Tracked changes (`text:tracked-changes`): insertions (across paragraph
+//! breaks too), deletions with what they took out, and formatting changes (the
+//! formatting before from our `officina:old-style`, else plain) are read.
+//!
+//! Reported, not carried: notes inside notes or headers, annotations there,
 //! sections and columns, frames anchored to the page (kept in line), merged
 //! cells, nested tables (their text kept), fields other than page numbers (their
 //! text kept), drawings and charts, embedded objects.
@@ -22,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -237,6 +241,31 @@ struct Reader<'a> {
     active: Vec<CommentId>,
     /// Where comments start and end in the paragraph being read.
     events: Vec<(u32, CommentId, Ev)>,
+    /// Tracked changes: the regions by id, our revision per author, the
+    /// insertions open (they may span paragraph breaks).
+    regions: HashMap<String, Region>,
+    revs: HashMap<String, RevId>,
+    ins_open: Vec<(String, RevId)>,
+    /// The cell the last body paragraph was in (a break is only ours to mark
+    /// inside one cell or outside tables).
+    last_cell: Option<Option<CellRef>>,
+}
+
+/// A changed region of `text:tracked-changes`.
+struct Region {
+    kind: RegionKind,
+    author: String,
+    date: String,
+    /// A deletion's content; a format change's old style name.
+    el: Option<El>,
+    old_style: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegionKind {
+    Insert,
+    Delete,
+    Format,
 }
 
 /// A comment range's change at a place in a paragraph.
@@ -355,6 +384,11 @@ fn apply_comments(p: &mut Para, active: &mut Vec<CommentId>, events: Vec<(u32, C
 struct Para {
     text: String,
     runs: Vec<(u32, CharAttrs)>,
+    /// Tracked: the insertion over the text being read; the formatting change
+    /// (revision, index into `olds` of the attributes before).
+    ins: Option<RevId>,
+    fmt: Option<(RevId, CharAttrs)>,
+    olds: Vec<CharAttrs>,
 }
 
 impl Para {
@@ -362,9 +396,29 @@ impl Para {
         if s.is_empty() {
             return;
         }
+        let mut a = a.clone();
+        if a.deleted.is_none() {
+            a.rev = self.ins;
+            if let Some((rev, old)) = &self.fmt {
+                // The attributes before, kept until the paragraph is interned.
+                let mut o = old.clone();
+                o.link = a.link.clone();
+                o.rev = a.rev;
+                if o != a {
+                    let i = match self.olds.iter().position(|x| *x == o) {
+                        Some(i) => i,
+                        None => {
+                            self.olds.push(o);
+                            self.olds.len() - 1
+                        }
+                    };
+                    a.fmt = Some(FmtChange { rev: *rev, old: i as u32 });
+                }
+            }
+        }
         let at = self.text.len() as u32;
-        if self.runs.last().map(|r| &r.1) != Some(a) {
-            self.runs.push((at, a.clone()));
+        if self.runs.last().map(|r| &r.1) != Some(&a) {
+            self.runs.push((at, a));
         }
         self.text.push_str(s);
     }
@@ -668,7 +722,8 @@ impl<'a> Reader<'a> {
                         }
                     }
                     "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments in notes, headers and footers"),
-                    "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes (shown as they stand)"),
+                    "text:change" | "text:change-start" | "text:change-end" if at == Where::Body && !self.in_note => self.change_mark(x, p, a),
+                    "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes in notes, headers and footers (shown as they stand)"),
                     "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:soft-page-break" | "text:reference-mark" | "text:reference-mark-start" | "text:reference-mark-end" | "text:alphabetical-index-mark" | "text:toc-mark" | "text:sequence-ref" => {}
                     "text:ruby" => {
                         if let Some(b) = x.child("text:ruby-base") {
@@ -690,6 +745,118 @@ impl<'a> Reader<'a> {
                 },
             }
         }
+    }
+
+    /// Our revision for a change's author (one per author, dated by their
+    /// first change).
+    fn rev_for(&mut self, author: &str, date: &str) -> Option<RevId> {
+        if let Some(&r) = self.revs.get(author) {
+            return Some(r);
+        }
+        let set = self.revs.len() as u32;
+        let r = self.doc.revisions.add(Revision { author: author.into(), date: date.into(), set, name: "".into() })?;
+        self.revs.insert(author.to_string(), r);
+        Some(r)
+    }
+
+    /// `text:tracked-changes`: the regions by id.
+    fn read_regions(&mut self, e: &El) {
+        self.doc.tracking = e.attr("text:track-changes") != Some("false");
+        for r in e.children("text:changed-region").take(1 << 16) {
+            let Some(id) = r.attr("text:id").or_else(|| r.attr("xml:id")) else { continue };
+            let Some(k) = r.els().next() else { continue };
+            let kind = match k.name.as_str() {
+                "text:insertion" => RegionKind::Insert,
+                "text:deletion" => RegionKind::Delete,
+                "text:format-change" => RegionKind::Format,
+                _ => continue,
+            };
+            let info = k.child("office:change-info");
+            let text_of = |n: &str| info.and_then(|i| i.child(n)).map(|c| c.text().trim().chars().take(256).collect::<String>()).unwrap_or_default();
+            let mut author = text_of("dc:creator");
+            if author.is_empty() {
+                author = "Unknown".into();
+            }
+            let old_style = k.attr("officina:old-style").map(str::to_string);
+            self.regions.insert(id.to_string(), Region { kind, author, date: text_of("dc:date"), el: (kind == RegionKind::Delete).then(|| k.clone()), old_style });
+        }
+    }
+
+    /// A change mark in the text: a deletion's place, or where an insertion or
+    /// formatting change starts or ends.
+    fn change_mark(&mut self, x: &El, p: &mut Para, a: &CharAttrs) {
+        let Some(id) = x.attr("text:change-id") else { return };
+        let Some(reg) = self.regions.get(id) else { return };
+        let (kind, author, date) = (reg.kind, reg.author.clone(), reg.date.clone());
+        let Some(rev) = self.rev_for(&author, &date) else { return };
+        match (x.name.as_str(), kind) {
+            ("text:change-start", RegionKind::Insert) => {
+                self.ins_open.push((id.to_string(), rev));
+                p.ins = Some(rev);
+            }
+            ("text:change-end", RegionKind::Insert) => {
+                self.ins_open.retain(|o| o.0 != id);
+                p.ins = self.ins_open.last().map(|o| o.1);
+            }
+            ("text:change-start", RegionKind::Format) => {
+                let mut old = match self.regions.get(id).and_then(|r| r.old_style.clone()) {
+                    Some(n) if !n.is_empty() => self.span_attrs(Some(&n)),
+                    _ => CharAttrs::default(),
+                };
+                old.comments = None;
+                let _ = a;
+                p.fmt = Some((rev, old));
+            }
+            ("text:change-end", RegionKind::Format) => p.fmt = None,
+            ("text:change", RegionKind::Delete) => {
+                let Some(el) = self.regions.get(id).and_then(|r| r.el.clone()) else { return };
+                let pieces = self.deleted_pieces(&el);
+                if let Some(t) = self.doc.deletions.add(Deletion { rev, pieces }) {
+                    p.push(&OBJECT_CHAR.to_string(), &CharAttrs { deleted: Some(t), ..Default::default() });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A deletion's content as pieces: a piece a paragraph.
+    fn deleted_pieces(&mut self, el: &El) -> Vec<DelPiece> {
+        let mut paras: Vec<&El> = Vec::new();
+        fn walk<'e>(e: &'e El, out: &mut Vec<&'e El>, depth: usize) {
+            for x in e.els() {
+                if out.len() >= MAX_NOTE_PARAS {
+                    return;
+                }
+                match x.name.as_str() {
+                    "text:p" | "text:h" => out.push(x),
+                    "office:change-info" => {}
+                    _ if depth < 16 => walk(x, out, depth + 1),
+                    _ => {}
+                }
+            }
+        }
+        walk(el, &mut paras, 0);
+        let mut out = Vec::new();
+        let outer = std::mem::take(&mut self.events);
+        let open = std::mem::take(&mut self.ins_open);
+        for (k, q) in paras.iter().enumerate() {
+            let (style, props, chars) = self.para_style(q.attr("text:style-name"));
+            let mut p = Para::default();
+            self.inline(q, &mut p, &chars, Where::Margin);
+            let runs: Vec<(u32, u32)> = if p.text.is_empty() { vec![(0, 0)] } else { p.runs.into_iter().map(|(at, mut a)| {
+                a.fmt = None;
+                a.rev = None;
+                (at, self.doc.attrs.intern(a))
+            }).collect() };
+            let para = (k > 0).then(|| (self.doc.new_id(), style, props));
+            out.push(DelPiece { para, text: p.text, runs });
+        }
+        self.events = outer;
+        self.ins_open = open;
+        if out.is_empty() {
+            out.push(DelPiece { para: None, text: String::new(), runs: vec![(0, 0)] });
+        }
+        out
     }
 
     /// An annotation: a comment from here to its end (by name), or a reply
@@ -762,10 +929,38 @@ impl<'a> Reader<'a> {
             props.space_after = props.space_after.or(Some(0));
         }
         let mut p = Para::default();
+        if !self.in_note {
+            // An insertion open across the break before this paragraph.
+            if let Some(&(_, r)) = self.ins_open.last() {
+                let same = match (self.last_cell, cell) {
+                    (Some(None), None) => true,
+                    (Some(Some(x)), Some(y)) => (x.table, x.row, x.col) == (y.table, y.row, y.col),
+                    _ => false,
+                };
+                if same {
+                    props.rev = Some(r);
+                }
+                p.ins = Some(r);
+            }
+            self.last_cell = Some(cell);
+        }
         let outer = std::mem::take(&mut self.events);
         self.inline(e, &mut p, &chars, Where::Body);
         let events = std::mem::replace(&mut self.events, outer);
         apply_comments(&mut p, &mut self.active, events);
+        // Formatting changes: the attributes before, interned first.
+        let olds: Vec<u32> = p.olds.iter().map(|o| self.doc.attrs.intern(o.clone())).collect();
+        for r in p.runs.iter_mut() {
+            if let Some(m) = &mut r.1.fmt {
+                let mut o = self.doc.attrs.get(olds[m.old as usize]).clone();
+                if o.comments != r.1.comments {
+                    o.comments = r.1.comments.clone();
+                    m.old = self.doc.attrs.intern(o);
+                } else {
+                    m.old = olds[m.old as usize];
+                }
+            }
+        }
         // Trailing collapsed space.
         let mut runs: Vec<(u32, u32)> = p.runs.into_iter().map(|(at, a)| (at, self.doc.attrs.intern(a))).collect();
         if runs.is_empty() {
@@ -975,11 +1170,8 @@ impl<'a> Reader<'a> {
                     }
                     self.flush_boxes(None);
                 }
-                "text:sequence-decls" | "text:variable-decls" | "text:user-field-decls" | "office:forms" | "text:tracked-changes" | "text:soft-page-break" => {
-                    if x.name == "text:tracked-changes" && !x.kids.is_empty() {
-                        self.rep.note(Kind::Approximate, "tracked changes (shown as they stand)");
-                    }
-                }
+                "text:tracked-changes" => self.read_regions(x),
+                "text:sequence-decls" | "text:variable-decls" | "text:user-field-decls" | "office:forms" | "text:soft-page-break" => {}
                 _ => {}
             }
         }
@@ -1082,7 +1274,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None };
     r.font_decls(styles.as_ref());
     r.font_decls(Some(&content));
     for s in [styles.as_ref().and_then(|s| s.child("office:styles")), styles.as_ref().and_then(|s| s.child("office:automatic-styles")), content.child("office:automatic-styles")].into_iter().flatten() {

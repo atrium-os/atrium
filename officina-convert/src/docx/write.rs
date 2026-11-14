@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -179,6 +179,10 @@ struct Out {
     marks: HashMap<usize, Vec<(u32, bool, CommentId)>>,
     /// The block being written (none in notes).
     cur: Option<usize>,
+    /// Tracked changes: paragraphs whose break before was deleted, by id;
+    /// the last change id given.
+    del_breaks: HashMap<officina_text::model::BlockId, RevId>,
+    change: u32,
 }
 
 /// A comment range's start or its end and reference.
@@ -191,6 +195,19 @@ fn comment_marker(out: &mut String, end: bool, id: CommentId) {
 }
 
 impl Out {
+    /// A tracked change's attributes: id, author, date.
+    fn change_attrs(&mut self, doc: &TextDoc, rev: RevId) -> String {
+        self.change += 1;
+        let mut s = format!(r#" w:id="{}""#, self.change);
+        if let Some(r) = doc.revisions.get(rev) {
+            let _ = write!(s, r#" w:author="{}""#, esc(&r.author));
+            if r.date.len() >= 10 && r.date.as_bytes()[4] == b'-' {
+                let _ = write!(s, r#" w:date="{}""#, esc(&r.date));
+            }
+        }
+        s
+    }
+
     fn rel(&mut self, kind: &str, target: String, external: bool) -> String {
         let id = format!("rId{}", self.rels.len() + 10);
         self.rels.push((id.clone(), kind.to_string(), target, external));
@@ -232,7 +249,17 @@ impl Out {
                 continue;
             }
             let attrs = doc.attrs.get(a as AttrId).clone();
-            let props = rpr(&attrs, &self.styles);
+            let mut props = rpr(&attrs, &self.styles);
+            // A formatting change: what it was, last in the run's properties.
+            if let Some(m) = attrs.fmt {
+                let old = rpr(doc.attrs.get(m.old), &self.styles);
+                let old = if old.is_empty() { "<w:rPr/>".to_string() } else { old };
+                let ch = format!("<w:rPrChange{}>{old}</w:rPrChange>", self.change_attrs(doc, m.rev));
+                props = match props.strip_suffix("</w:rPr>") {
+                    Some(head) => format!("{head}{ch}</w:rPr>"),
+                    None => format!("<w:rPr>{ch}</w:rPr>"),
+                };
+            }
             let link = attrs.link.as_ref().map(|l| l.to_string());
             let mut body = String::new();
             let mut text = String::new();
@@ -275,6 +302,16 @@ impl Out {
                 }
             }
             flush(&mut text, &mut body);
+            // Deleted text (put back inline by `expanded`), inserted text.
+            if let Some(t) = attrs.deleted {
+                if let Some(rev) = doc.deletions.get(t).map(|d| d.rev) {
+                    body = body.replace(r#"<w:t xml:space="preserve">"#, r#"<w:delText xml:space="preserve">"#).replace("</w:t>", "</w:delText>");
+                    body = format!("<w:del{}>{body}</w:del>", self.change_attrs(doc, rev));
+                }
+            }
+            if let Some(rev) = attrs.rev {
+                body = format!("<w:ins{}>{body}</w:ins>", self.change_attrs(doc, rev));
+            }
             match link {
                 Some(url) if url.starts_with('#') => {
                     let _ = write!(out, r#"<w:hyperlink w:anchor="{}">{body}</w:hyperlink>"#, esc(&url[1..]));
@@ -316,9 +353,25 @@ impl Out {
             None => {}
         }
         pp += &ppr_body(&p.props);
-        // The paragraph mark takes the formatting of an empty paragraph's run.
+        // The paragraph mark: inserted or deleted with the break after it, and
+        // the formatting of an empty paragraph's run.
+        let mut mark = String::new();
+        if let Some(b) = self.cur {
+            if let Some(next) = doc.para(b + 1).filter(|_| doc.same_cell(b, b + 1)) {
+                if let Some(r) = next.props.rev {
+                    let _ = write!(mark, "<w:ins{}/>", self.change_attrs(doc, r));
+                }
+                if let Some(&r) = self.del_breaks.get(&next.id) {
+                    let _ = write!(mark, "<w:del{}/>", self.change_attrs(doc, r));
+                }
+            }
+        }
         if p.text.is_empty() {
-            pp += &rpr(doc.attrs.get(p.attr_at(0)), &self.styles);
+            let r = rpr(doc.attrs.get(p.attr_at(0)), &self.styles);
+            mark += r.strip_prefix("<w:rPr>").and_then(|r| r.strip_suffix("</w:rPr>")).unwrap_or("");
+        }
+        if !mark.is_empty() {
+            let _ = write!(pp, "<w:rPr>{mark}</w:rPr>");
         }
         out.push_str("<w:p>");
         if !pp.is_empty() {
@@ -472,10 +525,16 @@ fn numbering_part(lists: &HashMap<(u32, ListKind), (u32, ListKind)>) -> String {
 
 /// The document as a `.docx`.
 pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
+    // Tracked deletions are written inline: put their text back, marked.
+    let ex = (!doc.deletions.is_empty()).then(|| doc.expanded());
+    let (doc, del_breaks) = match &ex {
+        Some(x) => (&x.doc, x.deleted_breaks.clone()),
+        None => (doc, HashMap::new()),
+    };
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
     // Notes are numbered in the file in anchor order, each kind from 1.
     let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None };
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000 };
     // Comments: a reply's range is the comment it answers.
     let live = doc.live_comments();
     let ranges = doc.comment_ranges();
@@ -529,7 +588,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             continue;
         }
         ours.sort_unstable();
-        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None };
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0 };
         let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
         // Lists in notes come out as plain paragraphs (the numbering part is the body's).
         for (n, id) in ours {
@@ -611,6 +670,11 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let _ = write!(sect, r#"<w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{h}" w:footer="{h}" w:gutter="0"/></w:sectPr>"#, g.width, g.height, g.margin_top, g.margin_end, g.margin_bottom, g.margin_start, h = HEADER_FROM_EDGE);
     let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}><w:body>{body}{sect}</w:body></w:document>"#);
 
+    // Settings: tracking on.
+    if doc.tracking {
+        o.rel("settings", "settings.xml".into(), false);
+        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}><w:trackRevisions/></w:settings>"#)));
+    }
     let mut z = ZipWriter::new(out);
     let mut types = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="webp" ContentType="image/webp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#);
     if !o.lists.is_empty() {
@@ -623,7 +687,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         let _ = write!(types, r#"<Override PartName="/word/{part}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"/>"#);
     }
     for (name, _) in &parts {
-        let kind = if name.contains("header") { "header" } else { "footer" };
+        let kind = if name.contains("header") {
+            "header"
+        } else if name.contains("settings") {
+            "settings"
+        } else {
+            "footer"
+        };
         let _ = write!(types, r#"<Override PartName="/{name}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.{kind}+xml"/>"#);
     }
     types += "</Types>";

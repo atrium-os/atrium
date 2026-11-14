@@ -10,19 +10,22 @@
 //! numbered, level), tables (rows of cells of paragraphs, widths from the grid),
 //! inline pictures (their bytes and frame), paragraph and character styles with
 //! inheritance and the document defaults, page size and margins, and a header and
-//! footer (page number fields become `{page}` and `{pages}`).
+//! footer (page number fields become `{page}` and `{pages}`). Tracked changes
+//! (`w:ins`, `w:del`, moves, `w:rPrChange`, inserted and deleted paragraph
+//! marks, `w:trackRevisions`): one revision per author; deleted text is read
+//! inline and made tombstones afterwards.
 //!
 //! Reported, not carried: floating pictures (kept in line), merged cells, nested
 //! tables (their text kept), notes inside notes or headers, comments without a
-//! range, tracked changes
-//! (insertions kept, deletions dropped), sections after the first, fields other than
+//! range, tracked changes in notes and headers (insertions kept, deletions
+//! dropped), deleted table rows, paragraph property changes (kept as made), sections after the first, fields other than
 //! page numbers (their shown result kept), text boxes, charts, equations, embedded
 //! objects. Kept inert: macros (`.docm`, not read).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -333,6 +336,14 @@ struct Reader<'a> {
     comment_ids: HashMap<String, CommentId>,
     /// The comments over the text being read, sorted.
     active: Vec<CommentId>,
+    /// Tracked changes: our revision for each author; the insertion being
+    /// read; the break before the next paragraph inserted; deleted text read
+    /// inline (made tombstones after the text); deleted paragraph marks.
+    revs: HashMap<String, RevId>,
+    ins: Option<RevId>,
+    break_rev: Option<(RevId, Option<CellRef>)>,
+    dels: Vec<((usize, u32), (usize, u32), RevId)>,
+    del_marks: Vec<(usize, RevId)>,
 }
 
 /// A comment's text: a line a paragraph.
@@ -407,6 +418,9 @@ fn all_of<'a>(e: &'a El, name: &str, out: &mut Vec<&'a El>, depth: usize) {
 struct Para {
     text: String,
     runs: Vec<(u32, CharAttrs)>,
+    /// The deletion being read, and the deleted text read: (from, to, revision).
+    del: Option<RevId>,
+    dels: Vec<(u32, u32, RevId)>,
 }
 
 impl Para {
@@ -419,6 +433,13 @@ impl Para {
             self.runs.push((at, a.clone()));
         }
         self.text.push_str(s);
+        if let Some(r) = self.del {
+            let end = self.text.len() as u32;
+            match self.dels.last_mut() {
+                Some(l) if l.1 == at && l.2 == r => l.1 = end,
+                _ => self.dels.push((at, end, r)),
+            }
+        }
     }
 }
 
@@ -566,6 +587,24 @@ impl<'a> Reader<'a> {
                     if !self.active.is_empty() && !self.in_note && !field.in_margin {
                         a.comments = Some(self.active.as_slice().into());
                     }
+                    if !self.in_note && !field.in_margin {
+                        a.rev = self.ins;
+                        // A formatting change: the attributes before it.
+                        if let Some(ch) = x.child("w:rPr").and_then(|r| r.child("w:rPrChange")) {
+                            if let Some(rev) = self.rev_of(ch) {
+                                let mut old = ch.child("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
+                                if let Some(rs) = ch.child("w:rPr").and_then(|r| r.child("w:rStyle")).and_then(val).and_then(|s| self.styles.get(s)) {
+                                    old.style = Some(*rs);
+                                }
+                                old.link = a.link.clone();
+                                old.comments = a.comments.clone();
+                                old.rev = a.rev;
+                                if old != a {
+                                    a.fmt = Some(FmtChange { rev, old: self.doc.attrs.intern(old) });
+                                }
+                            }
+                        }
+                    }
                     // Markup compatibility: the choice we read, else the fallback.
                     let mut kids: Vec<&El> = Vec::new();
                     for k in x.els() {
@@ -609,7 +648,7 @@ impl<'a> Reader<'a> {
                                     field.instr.push_str(&k.text());
                                 }
                             }
-                            "w:t" | "w:delText" if k.name == "w:t" => {
+                            "w:t" | "w:delText" if k.name == "w:t" || p.del.is_some() => {
                                 if field.shows_result() {
                                     // Without xml:space="preserve" the ends' white space is
                                     // layout of the XML; a line end inside is a space.
@@ -698,21 +737,50 @@ impl<'a> Reader<'a> {
                         self.runs(b, p, link, field);
                     }
                 }
+                "w:ins" | "w:moveTo" if !self.in_note && !field.in_margin => {
+                    let was = self.ins;
+                    self.ins = self.rev_of(x).or(was);
+                    self.runs(x, p, link, field);
+                    self.ins = was;
+                }
+                "w:del" | "w:moveFrom" if !self.in_note && !field.in_margin => {
+                    // Read inline, made a tombstone once the text is read.
+                    if let Some(rev) = self.rev_of(x) {
+                        let was = p.del;
+                        p.del = Some(rev);
+                        self.runs(x, p, link, field);
+                        p.del = was;
+                    }
+                }
                 "w:ins" | "w:moveTo" | "w:smartTag" | "w:customXml" | "w:sdt" | "w:sdtContent" | "w:dir" | "w:bdo" => {
                     if x.name == "w:ins" || x.name == "w:moveTo" {
-                        self.rep.note(Kind::Approximate, "tracked changes (insertions kept, deletions dropped)");
+                        self.rep.note(Kind::Approximate, "tracked changes in notes, headers and footers (insertions kept, deletions dropped)");
                     }
                     let inner = if x.name == "w:sdt" { x.child("w:sdtContent") } else { Some(x) };
                     if let Some(i) = inner {
                         self.runs(i, p, link, field);
                     }
                 }
-                "w:del" | "w:moveFrom" => self.rep.note(Kind::Approximate, "tracked changes (insertions kept, deletions dropped)"),
+                "w:del" | "w:moveFrom" => self.rep.note(Kind::Approximate, "tracked changes in notes, headers and footers (insertions kept, deletions dropped)"),
                 "m:oMath" | "m:oMathPara" => self.rep.note(Kind::Dropped, "equations"),
                 "w:commentRangeStart" | "w:commentRangeEnd" => self.comment_mark(x),
                 _ => {}
             }
         }
+    }
+
+    /// Our revision for a tracked change's author (one per author, dated by
+    /// their first change read).
+    fn rev_of(&mut self, x: &El) -> Option<RevId> {
+        let author: String = x.attr("w:author").unwrap_or("Unknown").chars().take(256).collect();
+        if let Some(&r) = self.revs.get(&author) {
+            return Some(r);
+        }
+        let date: String = x.attr("w:date").unwrap_or("").chars().take(64).collect();
+        let set = self.revs.len() as u32;
+        let r = self.doc.revisions.add(Revision { author: author.as_str().into(), date: date.into(), set, name: "".into() })?;
+        self.revs.insert(author, r);
+        Some(r)
     }
 
     /// A comment range's start or end: the comment joins or leaves the set
@@ -806,6 +874,17 @@ impl<'a> Reader<'a> {
         if cell.is_some() {
             props.space_after = props.space_after.or(Some(0));
         }
+        let tracked = !self.in_note && !field.in_margin;
+        if tracked {
+            // Only a break inside one cell (or outside tables) is ours to mark.
+            let same = |a: Option<CellRef>, b: Option<CellRef>| match (a, b) {
+                (None, None) => true,
+                (Some(x), Some(y)) => (x.table, x.row, x.col) == (y.table, y.row, y.col),
+                _ => false,
+            };
+            props.rev = self.break_rev.take().filter(|b| same(b.1, cell)).map(|b| b.0);
+        }
+        let mark_rpr = pp.and_then(|p| p.child("w:rPr"));
         let mut p = Para::default();
         // The paragraph mark's formatting is its typing format when it is empty.
         let mark = pp.and_then(|p| p.child("w:rPr")).map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
@@ -820,6 +899,21 @@ impl<'a> Reader<'a> {
                 q.props = props;
             }
         });
+        if tracked {
+            self.dels.extend(p.dels.iter().map(|&(s, e, r)| ((k, s), (k, e), r)));
+            // The paragraph mark inserted: the break after it; deleted: it
+            // joins the next paragraph.
+            if let Some(m) = mark_rpr {
+                if let Some(x) = m.child("w:ins").or_else(|| m.child("w:moveTo")) {
+                    self.break_rev = self.rev_of(x).map(|r| (r, cell));
+                }
+                if let Some(x) = m.child("w:del").or_else(|| m.child("w:moveFrom")) {
+                    if let Some(r) = self.rev_of(x) {
+                        self.del_marks.push((k, r));
+                    }
+                }
+            }
+        }
         // Text boxes anchored in it: their paragraphs after it.
         let boxes = std::mem::take(&mut self.boxes);
         if !boxes.is_empty() {
@@ -1165,7 +1259,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1212,7 +1306,9 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
         }
     }
     if let Some(p) = find("settings") {
-        r.even_odd = part(&archive, &p)?.is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
+        let st = part(&archive, &p)?;
+        r.even_odd = st.as_ref().is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
+        r.doc.tracking = st.as_ref().is_some_and(|s| s.child("w:trackRevisions").is_some_and(on));
     }
     r.read_styles(styles.as_ref());
     r.body(body);
@@ -1221,6 +1317,19 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     }
     r.read_notes();
     r.read_replies(&comment_order);
+    // Deleted text and paragraph marks become tombstones; a mark is only
+    // taken between paragraphs of one cell (or outside tables).
+    let mut dels = std::mem::take(&mut r.dels);
+    for (k, rev) in std::mem::take(&mut r.del_marks) {
+        if k + 1 < r.doc.blocks.len() && r.doc.same_cell(k, k + 1) {
+            if let (Some(a), Some(_)) = (r.doc.para(k), r.doc.para(k + 1)) {
+                dels.push(((k, a.text.len() as u32), (k + 1, 0), rev));
+            }
+        } else {
+            r.rep.note(Kind::Approximate, "deleted table rows and cell ends (kept)");
+        }
+    }
+    r.doc.make_deletions(dels);
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);
     }

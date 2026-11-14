@@ -65,11 +65,81 @@ pub(crate) mod tests {
         for op in d.add_comment_ops(0, 4, 1, 6, com("Cy", "Shorter title.", None, false)) {
             officina_core::history::Op::apply(op, &mut d);
         }
+        // Tracked changes by two people: a deletion, an insertion, a
+        // formatting change, an inserted and a deleted paragraph break.
+        let k = d.push_para("Tracked: the quick brown fox.", 0, vec![]);
+        d.push_para("Joined to the one before.", 0, vec![]);
+        d.push_para("Split here, please.", 0, vec![]);
+        tracked(&mut d, k);
         d.take_changes();
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
         d.page.margin_start = 1000;
         d
+    }
+
+    /// Tracked changes on paragraph `k` and the two after it (see `sample`).
+    pub fn tracked(d: &mut TextDoc, k: usize) {
+        use officina_core::history::Op;
+        use officina_text::model::Revision;
+        let mut run = |d: &mut TextDoc, ops: Vec<officina_text::ops::TextOp>| {
+            for op in ops {
+                op.apply(d);
+            }
+        };
+        let (ann, ops) = d.add_revision_ops(Revision { author: "Ann".into(), date: "2026-11-15T08:00:00Z".into(), set: 0, name: "".into() });
+        run(d, ops);
+        let (bo, ops) = d.add_revision_ops(Revision { author: "Bo".into(), date: "2026-11-15T09:00:00Z".into(), set: 1, name: "".into() });
+        run(d, ops);
+        d.tracking = true;
+        // Bo: "Split here," | " please." with an inserted break.
+        let (style, mut props) = { let p = d.para(k + 2).unwrap(); (p.style, p.props.clone()) };
+        props.rev = Some(bo);
+        let id = d.new_id();
+        run(d, vec![officina_text::ops::TextOp::Split { block: k as u32 + 2, at: 11, id, style, props }]);
+        // Ann: the break between the first two paragraphs deleted.
+        let len = d.para(k).unwrap().text.len() as u32;
+        let (ops, _) = d.tracked_delete_ops(k, len, k + 1, 0, ann, d.deletions.next_id());
+        run(d, ops);
+        // Ann: "fox" bold.
+        let at = d.para(k).unwrap().text.find("fox").unwrap() as u32;
+        let ops = d.tracked_format_ops(k, at, at + 3, ann, |a| a.bold = Some(true));
+        run(d, ops);
+        // Bo: "slow " inserted before "brown".
+        let at = d.para(k).unwrap().text.find("brown").unwrap() as u32;
+        let a = d.with_rev(0, bo);
+        run(d, vec![officina_text::ops::TextOp::Splice { block: k as u32, at, del: 0, ins: officina_text::ops::Fragment { text: "slow ".into(), runs: vec![(0, a)] } }]);
+        // Ann: "quick " deleted.
+        let at = d.para(k).unwrap().text.find("quick ").unwrap() as u32;
+        let (ops, _) = d.tracked_delete_ops(k, at, k, at + 6, ann, d.deletions.next_id());
+        run(d, ops);
+    }
+
+    /// A run's tracked changes by who made them and what they hold, with the
+    /// ids (which a file renumbers) taken out of `x`.
+    pub fn track_key(d: &TextDoc, x: &mut CharAttrs) -> String {
+        let who = |r: officina_text::model::RevId| d.revisions.get(r).map(|r| format!("{}@{}", r.author, r.date)).unwrap_or_default();
+        let mut k = String::new();
+        if let Some(r) = x.rev.take() {
+            k += &format!("ins {} ", who(r));
+        }
+        if let Some(t) = x.deleted.take() {
+            let del = d.deletions.get(t).unwrap();
+            let pieces: Vec<(String, Option<(String, ParaProps)>, Vec<CharAttrs>)> = del
+                .pieces
+                .iter()
+                .map(|p| {
+                    let para = p.para.as_ref().map(|(_, s, props)| (d.styles.styles[*s as usize].name.to_string(), props.clone()));
+                    let runs = p.runs.iter().filter(|r| !p.text.is_empty() || r.0 > 0).map(|r| d.attrs.get(r.1).clone()).collect();
+                    (p.text.clone(), para, runs)
+                })
+                .collect();
+            k += &format!("del {} {pieces:?} ", who(del.rev));
+        }
+        if let Some(m) = x.fmt.take() {
+            k += &format!("fmt {} {:?}", who(m.rev), d.attrs.get(m.old));
+        }
+        k
     }
 
     /// What must survive a round trip: text, style names, runs' attributes,
@@ -94,11 +164,14 @@ pub(crate) mod tests {
                     format!("{}|{}|{}|{}|{}|{replies:?}", c.author, c.initials, c.date, c.text, c.done)
                 };
                 let comments = x.comments.take().map(|c| c.iter().map(|&id| thread(id)).collect::<std::collections::BTreeSet<_>>());
-                (s, e, x, note, comments)
+                let track = track_key(d, &mut x);
+                (s, e, x, note, comments, track)
             }).collect::<Vec<_>>();
             assert_eq!(spans(a, p), spans(b, q), "runs of {i}");
             let mut pp = p.props.clone();
             let mut qp = q.props.clone();
+            let who = |d: &TextDoc, r: Option<officina_text::model::RevId>| r.and_then(|r| d.revisions.get(r)).map(|r| r.author.to_string());
+            assert_eq!(who(a, pp.rev.take()), who(b, qp.rev.take()), "inserted break before {i}");
             // Table and list ids are renumbered.
             if let (Some(x), Some(y)) = (&mut pp.cell, &mut qp.cell) {
                 x.table = 0;
@@ -111,6 +184,8 @@ pub(crate) mod tests {
             assert_eq!(pp, qp, "props of {i}");
         }
         assert_eq!(a.live_comments().len(), b.live_comments().len());
+        assert_eq!(a.tracking, b.tracking);
+        assert_eq!(a.visible_text(), b.visible_text());
         assert_eq!(a.page, b.page);
         assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
         assert_eq!(a.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>(), b.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>());
@@ -122,6 +197,9 @@ pub(crate) mod tests {
         let bytes = super::write(&d, Vec::new()).unwrap();
         let (r, loaded) = super::read(&bytes).unwrap();
         same(&d, &r);
+        let sums = |d: &TextDoc| d.edits().into_iter().map(|e| e.summary).collect::<Vec<_>>();
+        assert_eq!(sums(&r), sums(&d));
+        assert_eq!(sums(&d).len(), 5, "{:?}", sums(&d));
         assert_eq!(loaded.pictures, 1);
         assert!(loaded.report.is_empty(), "{:?}", loaded.report.lines());
     }
