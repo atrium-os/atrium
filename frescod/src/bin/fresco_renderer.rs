@@ -99,6 +99,9 @@ struct Win {
     /// A pop-up: the `PopupPlace` last sent, and the time it was shown
     /// (`Popup::shown`) that it was sent for.
     popup: Option<(Msg, u32)>,
+    /// Packed mode: its client was told its frame does not fit a slot
+    /// (`budget::RASTER_TIME`); told again only after a frame fits.
+    too_big: bool,
 }
 
 impl Win {
@@ -627,7 +630,26 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             None => {
                 w.seq = w.seq.wrapping_add(1);
                 log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}");
-                slot::write(w.slots.as_mut().unwrap()[i].as_mut_slice(), &frame, w.seq).map_err(str::to_string)
+                let r = slot::write(w.slots.as_mut().unwrap()[i].as_mut_slice(), &frame, w.seq).map_err(str::to_string);
+                // A frame too large for its slot never reaches frescod's cost
+                // check, so it is refused here, the same way (F4j): the window
+                // keeps its last frame and its client is told RASTER_TIME, with
+                // the frame's estimated cost, once until a frame fits again.
+                if r.is_err() && !w.too_big {
+                    w.too_big = true;
+                    let all = [[0, 0, frame.header.tiles_x, frame.header.tiles_y]];
+                    let cost = fresco_compute::cost::estimate(&frame, &all);
+                    comp.lock().unwrap().emit(fresco_scene_server::window::DisplayEvent::BudgetRefused {
+                        window_id: id,
+                        resource: fresco_protocol::budget::RASTER_TIME,
+                        id: 0,
+                        used: cost,
+                        limit: fresco_compute::cost::FAR_OVER.min(cost),
+                    });
+                } else if r.is_ok() {
+                    w.too_big = false;
+                }
+                r
             }
         };
         if let Err(e) = written {

@@ -22,7 +22,9 @@
 # Builds first (x86_64-unknown-freebsd release, CROSS_RUSTFLAGS as
 # cloud-vm.sh env): frescod (frescod, fresco-renderer), atrium-test-client
 # (atrium-noisy). SSH_PORT (2222) and KEY pick the VM, as the other vm-*
-# checks. Under TCG (the cloud VM) the rates are slow and noisy: compare
+# checks; TARGET=aarch64-unknown-freebsd for the Mac's arm64 VM. Only this
+# gate's own frescod ($D/frescod) is stopped or checked, so a VM shared with
+# another frescod is left alone. Under TCG (the cloud VM) the rates are slow and noisy: compare
 # the two phases only, never quote them as speeds, and give the hogs
 # LOADED=160 so the nodes hog reaches its limit (about 3,000 nodes/s there).
 set -u
@@ -48,7 +50,7 @@ fails=0
 ok() { echo "  ok: $*"; }
 bad() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 
-g "pkill -x frescod; pkill -f atrium-noisy; sleep 1; rm -rf $S; mkdir -p $D $S; chmod 777 $S; true"
+g "pkill -f '^$D/frescod'; pkill -f atrium-noisy; sleep 1; rm -rf $S; mkdir -p $D $S; chmod 777 $S; true"
 for b in frescod/target/$T/$R/frescod frescod/target/$T/$R/fresco-renderer atrium-test-client/target/$T/$R/atrium-noisy; do
     put "$ROOT/$b" "$D/" || { echo "missing $b: build it first"; exit 2; }
 done
@@ -104,8 +106,8 @@ grep -q 'still connected' "$OUT/fills.log" && ok "fills hog still connected at t
 if [ "$RENDERER" = gpu ]; then
     grep -q 'resource 5 ' "$OUT/fills.log" && ok "fills hog was told its frames cost too much (RASTER_TIME)" || bad "fills hog never refused for raster cost"
 fi
-g "pgrep -x frescod >/dev/null" && ok "frescod still running" || bad "frescod died"
+g "pgrep -f '^$D/frescod' >/dev/null" && ok "frescod still running" || bad "frescod died"
 grep -E 'panicked|killed|renderer.*exit' "$OUT/frescod.log" | head -5
-g "pkill -f atrium-noisy; pkill -x frescod; true"
+g "pkill -f atrium-noisy; pkill -f '^$D/frescod'; true"
 echo "noisy-neighbour ($RENDERER): $fails failed"
 [ "$fails" -eq 0 ]

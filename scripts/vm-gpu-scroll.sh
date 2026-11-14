@@ -5,6 +5,8 @@
 # Runs IN THE GUEST from a directory holding live-frescod (frescod) and
 # atrium-scroll-demo:
 #   sh vm-gpu-scroll.sh RENDERER STEP FRAMES TAG
+# (over ssh, give it </dev/null >log: its daemons keep ssh's stdio, so the
+# ssh call would not return while frescod runs).
 # frescod runs unjailed with split mode off on /tmp/live.sock; the demo
 # scrolls STEP px per frame for FRAMES frames at 2 fps, then holds. The host
 # then screendumps gpusim0 (QEMU monitor: screendump FILE gpusim0 0) and
@@ -20,8 +22,8 @@
 R=$1; STEP=$2; N=$3; TAG=$4
 cd "$(dirname "$0")"
 pkill -f live-frescod; pkill -f atrium-scroll-demo; sleep 1
-rm -f /tmp/live.sock
-env RUST_LOG=info FRESCOD_SPLIT=0 FRESCOD_RENDERER=$R FRESCOD_FLIP_TIMEOUT_MS=900000 FRESCOD_SOCK=/tmp/live.sock \
+rm -f /tmp/live.sock /tmp/live-wm.sock
+env RUST_LOG=info FRESCOD_SPLIT=0 FRESCOD_RENDERER=$R FRESCOD_FLIP_TIMEOUT_MS=900000 FRESCOD_SOCK=/tmp/live.sock FRESCOD_WM_SOCK=/tmp/live-wm.sock \
   daemon -o /tmp/live-$TAG.log ./live-frescod
 i=0; while [ ! -S /tmp/live.sock ] && [ $i -lt 1800 ]; do sleep 1; i=$((i+1)); done
 [ -S /tmp/live.sock ] || { echo "frescod did not listen"; exit 1; }
