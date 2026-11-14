@@ -16,6 +16,7 @@ use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
 use officina_spell::{Dictionary, Speller};
 use officina_text::find::Query;
+use officina_text::track::Resolve;
 use pergola_richtext::{Checker, Editor};
 use pergola::text_edit::TextEdit;
 use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, ScrollState, TextField};
@@ -35,7 +36,7 @@ pub const FIND_H: f32 = 48.0;
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
 /// The Tools menu, in order.
-pub const TOOLS: [&str; 2] = ["Find and Replace", "Spelling"];
+pub const TOOLS: [&str; 4] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 12] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment"];
@@ -89,6 +90,16 @@ pub enum Cmd {
     CommentResolve,
     CommentDelete,
     CommentClose,
+    /// Tracking on or off.
+    TrackToggle,
+    ReviewOpen,
+    ReviewClose,
+    ReviewPrevious,
+    ReviewNext,
+    ReviewAccept,
+    ReviewReject,
+    ReviewAcceptAll,
+    ReviewRejectAll,
 }
 
 impl Cmd {
@@ -235,7 +246,8 @@ impl Write {
     /// Where the pages go: under the toolbar and the find or spelling bar
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
-        let top = TOOLBAR_H + if self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open { FIND_H } else { 0.0 };
+        let review = self.doc.borrow().ed.borrow().review;
+        let top = TOOLBAR_H + if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -508,7 +520,62 @@ impl Write {
             .filter(|&c| {
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
+                // The bars share one place under the toolbar.
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_)) {
+                    e.review = false;
+                }
                 match c {
+                    Cmd::TrackToggle => {
+                        let on = !e.doc.tracking;
+                        e.set_tracking(on);
+                    }
+                    Cmd::ReviewOpen => {
+                        drop(e);
+                        drop(d);
+                        self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                        self.spell.set(SpellBar::default());
+                        self.note.set(NoteBar::default());
+                        self.comment.set(CommentBar::default());
+                        let ed = self.doc.borrow().ed.clone();
+                        let mut e = ed.borrow_mut();
+                        e.review = true;
+                        // Start at the edit at or after the caret.
+                        let c = (e.caret.block, e.caret.at);
+                        let i = e.edits().iter().position(|x| x.ranges[0].1 >= c).unwrap_or(0);
+                        e.review_select(i);
+                        drop(e);
+                        let (w, h) = self.size.get();
+                        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::ReviewClose => e.review = false,
+                    Cmd::ReviewPrevious | Cmd::ReviewNext | Cmd::ReviewAccept | Cmd::ReviewReject | Cmd::ReviewAcceptAll | Cmd::ReviewRejectAll => {
+                        let at = e.review_at;
+                        match c {
+                            Cmd::ReviewPrevious => e.review_select(at.saturating_sub(1)),
+                            Cmd::ReviewNext => e.review_select(at + 1),
+                            Cmd::ReviewAccept => {
+                                e.review_resolve(Resolve::Accept);
+                            }
+                            Cmd::ReviewReject => {
+                                e.review_resolve(Resolve::Reject);
+                            }
+                            Cmd::ReviewAcceptAll => {
+                                e.resolve(Resolve::Accept, |_| true);
+                            }
+                            _ => {
+                                e.resolve(Resolve::Reject, |_| true);
+                            }
+                        }
+                        drop(e);
+                        drop(d);
+                        let ed = self.doc.borrow().ed.clone();
+                        let (w, h) = self.size.get();
+                        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+                        self.changed();
+                        return false;
+                    }
                     Cmd::Undo => {
                         e.undo();
                     }
@@ -662,9 +729,13 @@ impl View for Write {
             x += 100.0;
         }
         {
-            let items: Vec<MenuItem> = TOOLS.iter().map(|s| MenuItem::new(*s)).collect();
+            let tracking = self.doc.borrow().ed.borrow().doc.tracking;
+            let items: Vec<MenuItem> = TOOLS.iter().enumerate().map(|(i, s)| match i {
+                2 => MenuItem::new(*s).checked(tracking).separated(),
+                _ => MenuItem::new(*s),
+            }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i == 0 { Cmd::FindOpen } else { Cmd::SpellOpen })).at(x, 8.0).width(88.0).render(ctx);
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen][i.min(3)])).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
         {
@@ -796,6 +867,37 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The review bar: the picked edit in a sentence, and what to do with it.
+        let (reviewing, edits, picked, author, tracking) = {
+            let mut e = ed.borrow_mut();
+            let edits = e.edits();
+            let picked = e.review_edit();
+            let author = picked.as_ref().and_then(|x| e.doc.revisions.get(x.rev)).map(|r| r.author.to_string()).unwrap_or_default();
+            (e.review, edits, picked, author, e.doc.tracking)
+        };
+        if reviewing {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let line = match &picked {
+                Some(p) => format!("Edit {} of {} · {author} · {}", edits.iter().position(|x| x == p).map_or(0, |i| i + 1), edits.len(), p.summary),
+                None => "No changes to review".to_string(),
+            };
+            let bx = w - 540.0;
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, (bx - 24.0).max(0.0), 20.0), content: line, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            Button::secondary("‹").at(bx, y + 8.0).width(32.0).on_click(push(Cmd::ReviewPrevious)).render(ctx);
+            Button::secondary("›").at(bx + 36.0, y + 8.0).width(32.0).on_click(push(Cmd::ReviewNext)).render(ctx);
+            Button::primary("Accept").at(bx + 76.0, y + 8.0).width(72.0).on_click(push(Cmd::ReviewAccept)).render(ctx);
+            Button::secondary("Reject").at(bx + 152.0, y + 8.0).width(68.0).on_click(push(Cmd::ReviewReject)).render(ctx);
+            Button::secondary("Accept All").at(bx + 228.0, y + 8.0).width(96.0).on_click(push(Cmd::ReviewAcceptAll)).render(ctx);
+            Button::secondary("Reject All").at(bx + 328.0, y + 8.0).width(92.0).on_click(push(Cmd::ReviewRejectAll)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ReviewClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The pages.
         let cmds = self.cmds.clone();
         let cmds2 = self.cmds.clone();
@@ -816,7 +918,28 @@ impl View for Write {
                 let c = e.words.total();
                 format!("{} words, {} characters", group(c.words), group(c.chars))
             };
-            let pos = format!("Page {page} of {total} · {words}");
+            let mut pos = format!("Page {page} of {total} · {words}");
+            // The page reads clean; the count says what is tracked.
+            if !edits.is_empty() {
+                let mut people: Vec<officina_text::model::RevId> = Vec::new();
+                let mut names: Vec<&str> = Vec::new();
+                for x in edits.iter() {
+                    if !people.contains(&x.rev) {
+                        people.push(x.rev);
+                        if let Some(r) = e.doc.revisions.get(x.rev) {
+                            if !names.contains(&&*r.author) {
+                                names.push(&r.author);
+                            }
+                        }
+                    }
+                }
+                let n = edits.len();
+                let things = if n == 1 { "1 edit".to_string() } else { format!("{n} edits") };
+                pos += &if names.len() > 1 { format!(" · {things} by {} people", names.len()) } else { format!(" · {things}") };
+            }
+            if tracking {
+                pos += " · Tracking changes";
+            }
             if status.is_empty() {
                 pos
             } else {
@@ -861,6 +984,55 @@ mod tests {
         run(Cmd::Undo);
         run(Cmd::Undo);
         assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "");
+    }
+
+    #[test]
+    fn review_bar_commands() {
+        let doc = Doc::from_text("r.txt", b"The quick brown fox.\nIt jumps over the dog.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let text = || w.doc.borrow().ed.borrow().doc.visible_text();
+        run(Cmd::TrackToggle);
+        assert!(w.doc.borrow().ed.borrow().doc.tracking);
+        {
+            let d = w.doc.borrow();
+            let mut e = d.ed.borrow_mut();
+            e.author = "Ann".into();
+            e.set_caret(pergola_richtext::Pos::new(0, 4), false);
+            e.set_caret(pergola_richtext::Pos::new(0, 9), true);
+            e.insert("fast");
+            e.set_caret(pergola_richtext::Pos::new(1, 18), false);
+            e.set_caret(pergola_richtext::Pos::new(1, 21), true);
+            e.insert("cat");
+        }
+        assert_eq!(text(), vec!["The fast brown fox.", "It jumps over the cat."]);
+        let top = w.pages_rect(1200.0, 800.0).y();
+        // Review starts at the edit at or after the caret.
+        w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 0), false);
+        run(Cmd::ReviewOpen);
+        assert!(w.pages_rect(1200.0, 800.0).y() > top, "the review bar takes the bars' place");
+        assert_eq!(w.doc.borrow().ed.borrow().review_at, 0);
+        assert_eq!(w.doc.borrow().ed.borrow_mut().edits().len(), 2);
+        // Reject the first, accept the second: the document is clean.
+        run(Cmd::ReviewReject);
+        assert_eq!(text()[0], "The quick brown fox.");
+        assert_eq!(w.doc.borrow().ed.borrow_mut().edits().len(), 1);
+        run(Cmd::ReviewAccept);
+        assert_eq!(text(), vec!["The quick brown fox.", "It jumps over the cat."]);
+        assert!(w.doc.borrow().ed.borrow_mut().edits().is_empty());
+        assert!(w.doc.borrow().ed.borrow().doc.live_deletions().is_empty());
+        // Undo brings the edit back; Reject All takes everything out.
+        run(Cmd::Undo);
+        run(Cmd::ReviewRejectAll);
+        assert_eq!(text(), vec!["The quick brown fox.", "It jumps over the dog."]);
+        // Opening another bar closes review.
+        run(Cmd::FindOpen);
+        assert!(!w.doc.borrow().ed.borrow().review);
+        run(Cmd::TrackToggle);
+        assert!(!w.doc.borrow().ed.borrow().doc.tracking);
     }
 
     #[test]

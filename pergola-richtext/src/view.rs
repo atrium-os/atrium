@@ -31,6 +31,8 @@ use pergola::widgets::scroll_view::ScrollState;
 use pergola::Color;
 use pergola_document::Faces;
 
+use officina_text::track::{Edit, EditKind};
+
 use crate::editor::{Editor, Outcome, Pos};
 
 /// Space between pages and around them, in units.
@@ -62,7 +64,10 @@ impl Geom {
         // With comments, the page and the balloon column are centred together
         // when both fit.
         let side = BALLOON_W as f64 + 16.0;
-        let left = if !ed.doc.comments.is_empty() && rect.w() as f64 >= page_w + side + 2.0 * GAP as f64 {
+        let left = if ed.review {
+            // The review lane takes the right of the view.
+            ((rect.w() as f64 - LANE_W as f64 - page_w) / 2.0).max(GAP as f64)
+        } else if !ed.doc.comments.is_empty() && rect.w() as f64 >= page_w + side + 2.0 * GAP as f64 {
             ((rect.w() as f64 - page_w - side) / 2.0).max(GAP as f64)
         } else {
             ((rect.w() as f64 - page_w) / 2.0).max(GAP as f64)
@@ -94,6 +99,35 @@ pub struct RichTextView {
 
 /// A comment balloon's width beside the page, and the room it needs.
 pub const BALLOON_W: f32 = 200.0;
+/// The review lane's width (officina.md §16.22).
+pub const LANE_W: f32 = 280.0;
+/// One edit's row in the review lane.
+const LANE_ROW: f32 = 44.0;
+
+/// Colours for authors' changes, in the order authors first edited.
+const AUTHOR_COLORS: [u32; 8] = [0x2f6fdf, 0xc2410c, 0x15803d, 0x9333ea, 0x0e7490, 0xa16207, 0xbe185d, 0x4b5563];
+
+/// The colour of `author`'s changes in `ed`'s document: the n-th author to
+/// edit gets the n-th colour, so two people never share one (up to eight).
+pub fn author_color(ed: &Editor, author: &str) -> Color {
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, r) in ed.doc.revisions.iter() {
+        if !seen.contains(&&*r.author) {
+            seen.push(&r.author);
+        }
+    }
+    let i = seen.iter().position(|a| *a == author).unwrap_or(seen.len());
+    rgb(AUTHOR_COLORS[i % AUTHOR_COLORS.len()])
+}
+
+fn rev_author(ed: &Editor, rev: officina_text::model::RevId) -> String {
+    ed.doc.revisions.get(rev).map_or_else(|| "?".to_string(), |r| r.author.to_string())
+}
+
+/// Whether text `block`, `start..end` lies in one of `e`'s ranges.
+fn in_edit(e: &Edit, block: usize, start: u32, end: u32) -> bool {
+    e.ranges.iter().any(|&(a, b)| (block, start) < b.max((b.0, b.1 + 1)) && (block, end) > a)
+}
 
 impl RichTextView {
     pub fn new(editor: Rc<RefCell<Editor>>, scroll: Mutable<ScrollState>, rev: Mutable<u64>, rect: Rect) -> Self {
@@ -179,6 +213,7 @@ impl RichTextView {
             let first = g.page_at(y, known).saturating_sub(1);
             let last = (g.page_at(y + r.h() as f64, known) + 1).min(known - 1);
             let paper = Color::rgba(1.0, 1.0, 1.0, 1.0);
+            let picked = if ed.review { ed.review_edit() } else { None };
             for i in first..=last {
                 let (px, py) = at(g.left, g.page_top(i));
                 ctx.key(2 + i as u64);
@@ -205,6 +240,8 @@ impl RichTextView {
                 };
                 let (ox, oy) = (px as f64, py as f64);
                 let mut balloons: Vec<(CommentId, f64)> = Vec::new();
+                let mut bars: Vec<(i64, String)> = Vec::new();
+                let mut labels: Vec<(f64, f64, String)> = Vec::new();
                 for it in items {
                     match it {
                         Item::Rect { x, y, w, h, color } => {
@@ -240,13 +277,54 @@ impl RichTextView {
                                 }
                             }
                         }
+                        Item::Change { x, y, w, h, block, start, end, rev } => {
+                            // The page reads clean: a bar in the left margin
+                            // says a line has changes, in its author's colour.
+                            let author = rev_author(&ed, rev);
+                            let col = author_color(&ed, &author);
+                            // Two people on one line: two bars side by side.
+                            if !bars.iter().any(|b| b.0 == y && b.1 == author) {
+                                let n = bars.iter().filter(|b| b.0 == y).count() as f64;
+                                bars.push((y, author.clone()));
+                                ctx.add(Node::Rect { rect: Rect::new(q(ox + g.margin_x * 0.5 - 1.5 - 5.0 * n), q(oy + y as f64 * g.k), 3.0, (h as f64 * g.k).max(2.0) as f32), fill: col, radius: 1.5 });
+                            }
+                            // In review, the picked edit is shown in place.
+                            let Some(e) = picked.as_ref().filter(|e| in_edit(e, block, start, end)) else { continue };
+                            let (rx, ry, rh) = (ox + x as f64 * g.k, oy + y as f64 * g.k, (h as f64 * g.k) as f32);
+                            if w == 0 {
+                                ctx.add(Node::Rect { rect: Rect::new(q(rx - 1.0), q(ry), 2.0, rh), fill: Color::from_srgb8(0xc0, 0x26, 0x26), radius: 0.0 });
+                                let old = e.old.trim();
+                                let text = if e.kind == EditKind::Move {
+                                    "moved from here".to_string()
+                                } else if old.chars().count() > 60 {
+                                    old.chars().take(59).chain(std::iter::once('…')).collect()
+                                } else {
+                                    old.to_string()
+                                };
+                                if !text.is_empty() && !labels.iter().any(|l| l.2 == text) {
+                                    labels.push((rx, ry, text));
+                                }
+                            } else {
+                                let fill = if e.kind == EditKind::Format { Color::rgba(0.2, 0.45, 0.95, 0.18) } else { Color::rgba(0.1, 0.65, 0.3, 0.2) };
+                                ctx.add(Node::Rect { rect: Rect::new(q(rx), q(ry), (w as f64 * g.k).max(1.0) as f32, rh), fill, radius: 0.0 });
+                            }
+                        }
                         Item::Link { .. } => {}
                     }
+                }
+                // What a deletion took away, struck through, over its place.
+                for (lx, ly, text) in labels {
+                    let style = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: pergola::theme::Weight::Regular, color: Color::from_srgb8(0x99, 0x1b, 0x1b) };
+                    let tw = Node::measure_text(&text, &style).w + 12.0;
+                    let (bx, by) = (q(lx - 6.0), q(ly - 20.0));
+                    ctx.add(Node::Rect { rect: Rect::new(bx, by, tw, 18.0), fill: Color::rgba(1.0, 0.93, 0.93, 1.0), radius: 4.0 });
+                    ctx.add(Node::Text { rect: Rect::new(bx + 6.0, by + 1.0, tw - 8.0, 16.0), content: text, style });
+                    ctx.add(Node::Rect { rect: Rect::new(bx + 6.0, by + 9.0, tw - 12.0, 1.0), fill: Color::from_srgb8(0x99, 0x1b, 0x1b), radius: 0.0 });
                 }
                 // Comment balloons in the space right of the page, each at its
                 // text's first line on this page, pushed down so none overlap.
                 let room = r.w() as f64 - (g.left + g.page_w);
-                if !balloons.is_empty() && room >= BALLOON_W as f64 + 16.0 {
+                if !ed.review && !balloons.is_empty() && room >= BALLOON_W as f64 + 16.0 {
                     let at_caret = ed.comment_at_caret();
                     let bx = px + g.page_w as f32 + 8.0;
                     let mut next_y = f64::MIN;
@@ -335,6 +413,9 @@ impl RichTextView {
             ctx.pop();
         }
         ctx.pop();
+        if ed.review {
+            self.lane(ctx, &mut ed);
+        }
         drop(ed);
         ctx.focusable(body);
 
@@ -405,6 +486,84 @@ impl RichTextView {
             });
         }
         body
+    }
+}
+
+impl RichTextView {
+    /// The review lane at the right: the document's edits in order, each in
+    /// a sentence, the picked one marked; a click picks one.
+    fn lane(&self, ctx: &mut Ctx, ed: &mut Editor) {
+        let t = ctx.theme;
+        let r = self.rect;
+        let edits = ed.edits();
+        let picked = ed.review_at;
+        let lx = r.x() + r.w() - LANE_W;
+        ctx.add(Node::Rect { rect: Rect::new(lx - 1.0, r.y(), 1.0, r.h()), fill: t.border_default(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(lx, r.y(), LANE_W, r.h()), fill: t.bg_surface(), radius: 0.0 });
+        let text = |c: Color, wt, size| pergola::TextStyle { family: pergola::theme::font::SANS.into(), size, weight: wt, color: c };
+        let xs = pergola::theme::type_size::XS;
+        let sm = pergola::theme::type_size::SM;
+        let mut authors: Vec<String> = Vec::new();
+        for e in edits.iter() {
+            let a = rev_author(ed, e.rev);
+            if !authors.contains(&a) {
+                authors.push(a);
+            }
+        }
+        let head = match (edits.len(), authors.len()) {
+            (0, _) => "No changes".to_string(),
+            (1, _) => "1 edit".to_string(),
+            (n, 1) => format!("{n} edits"),
+            (n, m) => format!("{n} edits by {m} people"),
+        };
+        ctx.add(Node::Text { rect: Rect::new(lx + 12.0, r.y() + 10.0, LANE_W - 24.0, 20.0), content: head, style: text(t.text_primary(), pergola::theme::Weight::Semibold, sm) });
+        // Who changed what, one line per author.
+        let mut y = r.y() + 34.0;
+        for a in &authors {
+            let n = edits.iter().filter(|e| rev_author(ed, e.rev) == *a).count();
+            ctx.add(Node::Rect { rect: Rect::new(lx + 12.0, y + 5.0, 8.0, 8.0), fill: author_color(ed, a), radius: 4.0 });
+            ctx.add(Node::Text { rect: Rect::new(lx + 26.0, y, LANE_W - 38.0, 18.0), content: format!("{a} · {n}"), style: text(t.text_secondary(), pergola::theme::Weight::Regular, xs) });
+            y += 18.0;
+        }
+        y += 8.0;
+        ctx.add(Node::Rect { rect: Rect::new(lx + 12.0, y, LANE_W - 24.0, 1.0), fill: t.border_default(), radius: 0.0 });
+        y += 6.0;
+        // The rows, scrolled so the picked one shows.
+        let fit = (((r.y() + r.h() - y) / LANE_ROW).floor() as usize).max(1);
+        let first = picked.saturating_sub(fit / 2).min(edits.len().saturating_sub(fit));
+        for (i, e) in edits.iter().enumerate().skip(first).take(fit) {
+            let a = rev_author(ed, e.rev);
+            let row = Rect::new(lx + 6.0, y, LANE_W - 12.0, LANE_ROW - 4.0);
+            let bg = if i == picked { t.selection_bg() } else { t.bg_surface() };
+            let node = ctx.add(Node::Rect { rect: row, fill: bg, radius: 6.0 });
+            ctx.add(Node::Rect { rect: Rect::new(lx + 10.0, y + 6.0, 3.0, LANE_ROW - 16.0), fill: author_color(ed, &a), radius: 1.5 });
+            let kind = match e.kind {
+                EditKind::Insert => "Insertion",
+                EditKind::Delete => "Deletion",
+                EditKind::Replace => "Replacement",
+                EditKind::Move => "Move",
+                EditKind::Break => "Paragraph",
+                EditKind::Format => "Formatting",
+            };
+            let meta = if e.minor { format!("{a} · {kind} · minor") } else { format!("{a} · {kind}") };
+            ctx.add(Node::Text { rect: Rect::new(lx + 20.0, y + 3.0, LANE_W - 36.0, 16.0), content: meta, style: text(t.text_secondary(), pergola::theme::Weight::Regular, xs) });
+            let summary: String = if e.summary.chars().count() > 38 { e.summary.chars().take(37).chain(std::iter::once('…')).collect() } else { e.summary.clone() };
+            ctx.add(Node::Text { rect: Rect::new(lx + 20.0, y + 19.0, LANE_W - 36.0, 18.0), content: summary, style: text(t.text_primary(), pergola::theme::Weight::Regular, xs) });
+            let (edc, rev, sc) = (self.editor.clone(), self.rev.clone(), self.scroll.clone());
+            let (rect, zoom) = (self.rect, self.zoom);
+            ctx.on_click(node, move || {
+                let mut e = edc.borrow_mut();
+                e.review_select(i);
+                let g = Geom::of(&e, rect, zoom);
+                let mut st = sc.get();
+                reveal(&mut e, &g, &mut st);
+                if st != sc.get() {
+                    sc.set(st);
+                }
+                rev.set(rev.get().wrapping_add(1));
+            });
+            y += LANE_ROW;
+        }
     }
 }
 

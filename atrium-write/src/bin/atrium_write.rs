@@ -346,6 +346,13 @@ fn main() {
     // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, comment, or find:TEXT).
     match std::env::var("ATRIUM_WRITE_BAR").ok().as_deref() {
         Some("spell") => run.write.cmds.lock().unwrap().push(Cmd::SpellOpen),
+        Some(f) if f.starts_with("review") => {
+            // BAR=review:N opens review on edit N (from 0).
+            let n: usize = f.strip_prefix("review:").and_then(|n| n.parse().ok()).unwrap_or(0);
+            let mut q = run.write.cmds.lock().unwrap();
+            q.push(Cmd::ReviewOpen);
+            q.extend(std::iter::repeat_n(Cmd::ReviewNext, n));
+        }
         Some("comment") => run.write.cmds.lock().unwrap().push(Cmd::CommentOpen(0)),
         Some(f) if f.starts_with("find:") => {
             run.write.find_text.set(pergola::text_edit::TextEdit::new(&f[5..]));

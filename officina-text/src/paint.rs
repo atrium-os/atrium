@@ -49,6 +49,11 @@ pub enum Item {
     /// Text under comments (the last one listed is the innermost): the screen
     /// marks it, a PDF leaves it out. Comes before the text it covers.
     Mark { x: i64, y: i64, w: i64, h: i64, comments: std::sync::Arc<[crate::model::CommentId]> },
+    /// Tracked change over text (an insertion or formatting change) or at a
+    /// point (a tombstone, `w` 0): bytes `start..end` of paragraph `block`. The
+    /// screen draws a bar in the margin, and in review the edit it belongs
+    /// to; a PDF leaves it out.
+    Change { x: i64, y: i64, w: i64, h: i64, block: usize, start: u32, end: u32, rev: crate::model::RevId },
 }
 
 /// A table rule's thickness: half a point.
@@ -108,7 +113,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         }
         let mut ly = s.y;
         for li in s.lines.clone() {
-            line(&mut out, doc, &l, li, &p.text, left, my + ly);
+            line(&mut out, doc, &l, li, &p.text, left, my + ly, Some(s.block));
             ly += l.lines[li].height;
         }
     }
@@ -139,7 +144,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
             if li >= l.lines.len() {
                 break;
             }
-            line(&mut out, doc, &l, li, &p.text, left, my + ly);
+            line(&mut out, doc, &l, li, &p.text, left, my + ly, None);
             ly += l.lines[li].height;
         }
     }
@@ -161,7 +166,8 @@ fn cluster_text(text: &str, start: u32, next: Option<u32>) -> &str {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64) {
+#[allow(clippy::too_many_arguments)]
+fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64, block: Option<usize>) {
     let line = &l.lines[li];
     let baseline = baseline_of(l, li, top);
     let bytes = text.as_bytes();
@@ -173,6 +179,11 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
         let f = &l.formats[fmt as usize];
         if face == OBJECT_FACE {
             let g = gl[i];
+            if let (Some(t), Some(b)) = (f.deleted, block) {
+                if let Some(d) = doc.deletions.get(t) {
+                    out.push(Item::Change { x: left + pen, y: top, w: 0, h: line.height, block: b, start: g.cluster, end: g.cluster + OBJECT_CHAR.len_utf8() as u32, rev: d.rev });
+                }
+            }
             if let Some(o) = &f.object {
                 let h = object_height(o, g.adv);
                 out.push(Item::Image { image: o.image, x: left + pen, y: baseline - h, w: g.adv, h });
@@ -185,6 +196,7 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
             continue;
         }
         let x0 = pen;
+        let first = i;
         let mut run = GlyphRun { face, size: size_lu(f), color: f.color, x: left + x0, y: baseline, glyphs: Vec::new(), text: String::new() };
         let mut last_cluster = None;
         while i < gl.len() && gl[i].face == face && gl[i].fmt == fmt {
@@ -218,6 +230,11 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
         }
         let (rx, rw) = (left + x0, pen - x0);
         let size = run.size;
+        if let (Some(rev), Some(b)) = (f.rev.or(f.fmt.map(|m| m.rev)), block) {
+            let start = gl.get(first).map_or(line.start, |g| g.cluster);
+            let end = gl.get(i).map_or(line.end, |g| g.cluster).max(start);
+            out.push(Item::Change { x: rx, y: top, w: rw, h: line.height, block: b, start, end, rev });
+        }
         if let Some(h) = f.highlight {
             out.push(Item::Rect { x: rx, y: top, w: rw, h: line.height, color: h });
         }

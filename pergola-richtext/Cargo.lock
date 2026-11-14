@@ -116,6 +116,10 @@ name = "atrium-spv-runtime"
 version = "0.1.0"
 
 [[package]]
+name = "atrium-types"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,6 +1318,7 @@ dependencies = [
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
+ "atrium-types",
  "hex",
  "portcullis-toml",
  "serde",
@@ -1325,6 +1330,7 @@ dependencies = [
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
+ "atrium-types",
  "serde",
  "thiserror 1.0.69",
  "toml",

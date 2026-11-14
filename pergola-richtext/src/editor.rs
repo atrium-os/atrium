@@ -17,7 +17,7 @@ use officina_text::lists::Numbering;
 use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::model::{RevId, Revision};
-use officina_text::track::{Change, ChangeKind, Resolve};
+use officina_text::track::{Change, ChangeKind, Edit, Resolve};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -135,12 +135,18 @@ pub struct Editor {
     pub now: std::sync::Arc<str>,
     /// This session's revision, once a tracked edit made it.
     track_rev: Option<RevId>,
+    /// Review mode: the edits are listed beside the page, the one selected is
+    /// shown in place.
+    pub review: bool,
+    /// The selected edit, an index into [`Editor::edits`].
+    pub review_at: usize,
+    edits_cache: Option<(u64, Rc<Vec<Edit>>)>,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -592,6 +598,53 @@ impl Editor {
         }
         self.apply(if how == Resolve::Accept { "Accept Change" } else { "Reject Change" }, ops, Kind::Other);
         self.clamp_caret();
+        true
+    }
+
+    /// The document's edits (cached until the next change).
+    pub fn edits(&mut self) -> Rc<Vec<Edit>> {
+        if let Some((r, e)) = &self.edits_cache {
+            if *r == self.revision {
+                return e.clone();
+            }
+        }
+        let e = Rc::new(self.doc.edits());
+        self.edits_cache = Some((self.revision, e.clone()));
+        e
+    }
+
+    /// The selected edit in review, if there are any.
+    pub fn review_edit(&mut self) -> Option<Edit> {
+        let e = self.edits();
+        if e.is_empty() {
+            return None;
+        }
+        self.review_at = self.review_at.min(e.len() - 1);
+        Some(e[self.review_at].clone())
+    }
+
+    /// Selects edit `i` and puts the caret at its start.
+    pub fn review_select(&mut self, i: usize) {
+        let e = self.edits();
+        if e.is_empty() {
+            return;
+        }
+        self.review_at = i.min(e.len() - 1);
+        let (b, at) = e[self.review_at].ranges[0].0;
+        self.set_caret(Pos::new(b, at), false);
+    }
+
+    /// Accepts or rejects the selected edit; the next one is selected.
+    pub fn review_resolve(&mut self, how: Resolve) -> bool {
+        let Some(e) = self.review_edit() else { return false };
+        let ops = self.doc.resolve_edit_ops(how, &e);
+        if ops.is_empty() {
+            return false;
+        }
+        let at = self.review_at;
+        self.apply(if how == Resolve::Accept { "Accept Change" } else { "Reject Change" }, ops, Kind::Other);
+        self.clamp_caret();
+        self.review_select(at);
         true
     }
 

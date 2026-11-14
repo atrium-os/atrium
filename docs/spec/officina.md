@@ -1826,6 +1826,39 @@ rejecting everything gives the original exactly, paragraph ids included (2.4 s).
 editor test covers replacement, repeated Backspace, own-typo fixes, Enter, bold,
 journal replay, rejecting one change, reject all, accept all.
 
+### 16.24 O5c2 as built (2026-11-15): edits, review mode, margin bars
+
+- **Edits** (`officina-text::track`). `edits()` turns the marks into what a person
+  would call one edit: touching changes by one revision merge, the range widens to
+  whole words, and each gets a kind (insertion, deletion, replacement, move,
+  paragraph, formatting), old and new text, a `minor` flag (only spaces or
+  punctuation) and a sentence: “thirty” → “fourteen”, deleted “…”, moved “…”, bold in
+  2 places. Replacements name only the words that differ (“two percent” → “five
+  percent” reads “two” → “five”). A deletion and an insertion of the same text (8+
+  characters) by one author are a move. Formatting edits group by revision and change.
+  `change_sets()` groups edits by set; `resolve_edit_ops` accepts or rejects one edit
+  across all its ranges.
+- **The page reads clean.** The painter emits `Item::Change` for marked runs and
+  tombstones; the screen draws only a 3-unit bar in the left margin per line, in the
+  author's colour (authors take colours in the order they first edited, so two people
+  never share one; two people on a line get two bars). PDF draws nothing. The status
+  line says "7 edits by 2 people" and "Tracking changes".
+- **Review mode** (Tools ▸ Review Changes). A bar under the toolbar reads "Edit 4 of
+  7 · Raj · deleted “…”" with ‹ › Accept Reject Accept All Reject All Close; the lane at
+  the right lists the edits in document order (author colour, kind, sentence), the
+  picked one highlighted, a click picks one and scrolls to it. Only the picked edit is
+  shown in place: inserted text tinted green, formatting tinted blue, a deletion as a
+  red mark with what it took away struck through above it. Accepting or rejecting
+  picks the next edit; every step is undoable. Comment balloons step aside while the
+  lane is open. Tools ▸ Track Changes turns tracking on and off (undoable, saved).
+- **Not yet:** filtering the lane by author or set, accepting a whole set from the
+  lane, keyboard shortcuts for review, the Original and All views (§16.22).
+
+Gates: an engine test that edits read as people think of them (replacement, move,
+formatting in two places, minor comma); an app test (track, review from the caret,
+reject one, accept one, undo, reject all, other bars close review); screenshot of
+`examples/review_doc.rs` on the cloud VM (`BAR=review:3 scripts/write-vm.sh`).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

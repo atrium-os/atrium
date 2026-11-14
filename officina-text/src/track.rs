@@ -497,6 +497,322 @@ impl TextDoc {
     }
 }
 
+/// What an edit did, as people read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    Insert,
+    Delete,
+    /// Text taken out and other text put in its place.
+    Replace,
+    /// The same text taken out in one place and put in another.
+    Move,
+    /// Paragraph breaks put in (a new paragraph).
+    Break,
+    /// Formatting changed (one entry for all the places of one change).
+    Format,
+}
+
+/// An edit: tracked changes grouped the way people think of them. Never
+/// stored; derived from the marks each time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edit {
+    pub kind: EditKind,
+    pub rev: RevId,
+    /// Where it is: (block, byte) from and to. A move has the place it left
+    /// first; a formatting edit has every place.
+    pub ranges: Vec<((usize, u32), (usize, u32))>,
+    /// The words around the change before and after (whole words).
+    pub old: String,
+    pub new: String,
+    /// Only spaces or punctuation changed.
+    pub minor: bool,
+    /// "replaced “quick” with “fast”".
+    pub summary: String,
+}
+
+/// A change set: one author's pass, its edits in document order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeSet {
+    pub set: u32,
+    pub author: String,
+    pub name: String,
+    pub edits: Vec<Edit>,
+}
+
+/// Longest text an edit's summary quotes.
+const QUOTE: usize = 40;
+
+/// `old` and `new` without the whole words they share at either end ("two
+/// percent" → "five percent" reads "two" → "five").
+fn differing_words<'a>(old: &'a str, new: &'a str) -> (&'a str, &'a str) {
+    let (ow, nw): (Vec<&str>, Vec<&str>) = (old.split(' ').collect(), new.split(' ').collect());
+    let mut head = ow.iter().zip(&nw).take_while(|(a, b)| a == b).count();
+    head = head.min(ow.len() - 1).min(nw.len() - 1);
+    let mut tail = ow[head..].iter().rev().zip(nw[head..].iter().rev()).take_while(|(a, b)| a == b).count();
+    tail = tail.min(ow.len() - head - 1).min(nw.len() - head - 1);
+    if head == 0 && tail == 0 {
+        return (old, new);
+    }
+    let span = |s: &'a str, w: &[&str]| {
+        let start: usize = w[..head].iter().map(|x| x.len() + 1).sum();
+        let end = s.len() - w[w.len() - tail..].iter().map(|x| x.len() + 1).sum::<usize>();
+        &s[start..end]
+    };
+    (span(old, &ow), span(new, &nw))
+}
+
+fn quote(s: &str) -> String {
+    let t: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() > QUOTE {
+        format!("“{}…”", t.chars().take(QUOTE).collect::<String>())
+    } else {
+        format!("“{t}”")
+    }
+}
+
+/// The formatting difference between two attribute sets, for a summary.
+fn fmt_diff(old: &CharAttrs, new: &CharAttrs) -> String {
+    let mut v: Vec<String> = Vec::new();
+    let flag = |v: &mut Vec<String>, name: &str, a: Option<bool>, b: Option<bool>| {
+        if a.unwrap_or(false) != b.unwrap_or(false) {
+            v.push(if b.unwrap_or(false) { name.to_string() } else { format!("not {name}") });
+        }
+    };
+    flag(&mut v, "bold", old.bold, new.bold);
+    flag(&mut v, "italic", old.italic, new.italic);
+    flag(&mut v, "underlined", old.underline, new.underline);
+    flag(&mut v, "struck through", old.strike, new.strike);
+    if old.size != new.size {
+        v.push(match new.size {
+            Some(s) => format!("{} pt", s as f32 / 2.0),
+            None => "default size".into(),
+        });
+    }
+    if old.color != new.color {
+        v.push("colour".into());
+    }
+    if old.highlight != new.highlight {
+        v.push(if new.highlight.is_some() { "highlighted".into() } else { "not highlighted".into() });
+    }
+    if old.family != new.family {
+        v.push(new.family.as_deref().map_or("default font".to_string(), |f| f.to_string()));
+    }
+    if old.style != new.style {
+        v.push("character style".into());
+    }
+    if old.vert != new.vert {
+        v.push("raised or lowered".into());
+    }
+    if old.link != new.link {
+        v.push("link".into());
+    }
+    if v.is_empty() {
+        "formatting".into()
+    } else {
+        v.join(", ")
+    }
+}
+
+impl TextDoc {
+    /// Byte where the word around (`b`, `at`) starts, or ends, in paragraph `b`.
+    fn word_edge(&self, b: usize, at: u32, forward: bool) -> u32 {
+        let Some(p) = self.para(b) else { return at };
+        let t = &p.text;
+        let word = |c: char| c.is_alphanumeric() || c == '\'' || c == '’' || c == OBJECT_CHAR;
+        let mut i = at as usize;
+        if forward {
+            while let Some(c) = t[i..].chars().next() {
+                if !word(c) {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+        } else {
+            while let Some(c) = t[..i].chars().next_back() {
+                if !word(c) {
+                    break;
+                }
+                i -= c.len_utf8();
+            }
+        }
+        i as u32
+    }
+
+    /// The text of (`from`)..(`to`) as it was (`old`) and as it is (`new`):
+    /// tombstones give their text to the old, insertions theirs to the new.
+    fn old_new(&self, from: (usize, u32), to: (usize, u32), rev: RevId) -> (String, String) {
+        let (mut old, mut new) = (String::new(), String::new());
+        for b in from.0..=to.0 {
+            let Some(p) = self.para(b) else { break };
+            if b > from.0 {
+                new.push('\n');
+                if !p.props.rev.is_some_and(|r| r == rev) {
+                    old.push('\n');
+                }
+            }
+            let (s0, e0) = (if b == from.0 { from.1 } else { 0 }, if b == to.0 { to.1 } else { p.text.len() as u32 });
+            for (s, e, a) in p.spans() {
+                let (s, e) = (s.max(s0), e.min(e0));
+                if s >= e {
+                    continue;
+                }
+                let x = self.attrs.get(a);
+                let t = &p.text[s as usize..e as usize];
+                match (x.deleted, x.rev) {
+                    (Some(d), _) => {
+                        match self.deletions.get(d) {
+                            Some(del) if del.rev == rev => old.push_str(&del.text()),
+                            // Someone else's deletion: gone in both.
+                            _ => {}
+                        }
+                    }
+                    (None, Some(r)) if r == rev => new.push_str(t),
+                    _ => {
+                        old.push_str(t);
+                        new.push_str(t);
+                    }
+                }
+            }
+        }
+        (old, new)
+    }
+
+    /// The tracked changes grouped into edits, in document order (formatting
+    /// edits after the text ones they share a place with).
+    pub fn edits(&self) -> Vec<Edit> {
+        let changes = self.changes();
+        // Text changes of one revision that touch are one edit.
+        let mut groups: Vec<(RevId, (usize, u32), (usize, u32), bool, bool, bool)> = Vec::new(); // rev, from, to, ins, del, break
+        let mut formats: Vec<Change> = Vec::new();
+        for c in changes {
+            if c.kind == ChangeKind::Format {
+                formats.push(c);
+                continue;
+            }
+            let (ins, del, brk) = (c.kind == ChangeKind::Insert, matches!(c.kind, ChangeKind::Delete(_)), c.kind == ChangeKind::InsertBreak);
+            let touches = |g: &(RevId, (usize, u32), (usize, u32), bool, bool, bool)| {
+                g.0 == c.rev && (g.2 == c.from || (brk && c.from.0 == g.2 .0 + 1 && self.para(g.2 .0).is_some_and(|p| p.text.len() as u32 == g.2 .1)))
+            };
+            match groups.last_mut() {
+                Some(g) if touches(g) => {
+                    g.2 = c.to;
+                    g.3 |= ins;
+                    g.4 |= del;
+                    g.5 |= brk;
+                }
+                _ => groups.push((c.rev, c.from, c.to, ins, del, brk)),
+            }
+        }
+        let mut out: Vec<Edit> = Vec::new();
+        for (rev, from, to, ins, del, brk) in groups {
+            // Whole words around it, in its paragraphs.
+            let wf = (from.0, self.word_edge(from.0, from.1, false));
+            let wt = (to.0, self.word_edge(to.0, to.1, true));
+            let (old, new) = self.old_new(wf, wt, rev);
+            let kind = match (ins || brk, del) {
+                (true, true) => EditKind::Replace,
+                (false, true) => EditKind::Delete,
+                (true, false) if !ins => EditKind::Break,
+                _ => EditKind::Insert,
+            };
+            let changed = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+            let minor = changed(&old) == changed(&new) && kind != EditKind::Break;
+            let (o, n) = self.old_new(from, to, rev);
+            let summary = match kind {
+                EditKind::Insert => format!("inserted {}", quote(&n)),
+                EditKind::Delete => format!("deleted {}", quote(&o)),
+                EditKind::Replace if !old.contains('\n') && !new.contains('\n') => {
+                    let (a, b) = differing_words(&old, &new);
+                    format!("{} → {}", quote(a), quote(b))
+                }
+                EditKind::Replace => format!("replaced {} with {}", quote(&o), quote(&n)),
+                EditKind::Break => "new paragraph".into(),
+                _ => String::new(),
+            };
+            out.push(Edit { kind, rev, ranges: vec![(from, to)], old, new, minor, summary });
+        }
+        // Moves: a deletion and an insertion of the same text by one author.
+        let author = |r: RevId| self.revisions.get(r).map(|v| v.author.clone());
+        let mut k = 0;
+        while k < out.len() {
+            if out[k].kind == EditKind::Delete {
+                let (o, _) = self.old_new(out[k].ranges[0].0, out[k].ranges[0].1, out[k].rev);
+                let t = o.trim().to_string();
+                if t.chars().count() >= 8 {
+                    if let Some(j) = out.iter().position(|e| e.kind == EditKind::Insert && author(e.rev) == author(out[k].rev) && self.old_new(e.ranges[0].0, e.ranges[0].1, e.rev).1.trim() == t) {
+                        let to = out[j].ranges[0];
+                        out[k].kind = EditKind::Move;
+                        out[k].ranges.push(to);
+                        out[k].summary = format!("moved {}", quote(&t));
+                        out[k].minor = false;
+                        out.remove(j);
+                        if j < k {
+                            k -= 1;
+                        }
+                    }
+                }
+            }
+            k += 1;
+        }
+        // Formatting: one edit per revision and change, wherever it is.
+        let mut fmt: Vec<(RevId, String, Vec<((usize, u32), (usize, u32))>)> = Vec::new();
+        for c in formats {
+            let Some(p) = self.para(c.from.0) else { continue };
+            let a = self.attrs.get(p.attr_at(c.from.1));
+            let Some(m) = a.fmt else { continue };
+            let what = fmt_diff(self.attrs.get(m.old), a);
+            match fmt.iter_mut().find(|f| f.0 == c.rev && f.1 == what) {
+                Some(f) => {
+                    match f.2.last_mut() {
+                        Some(l) if l.1 == c.from => l.1 = c.to,
+                        _ => f.2.push((c.from, c.to)),
+                    }
+                }
+                None => fmt.push((c.rev, what, vec![(c.from, c.to)])),
+            }
+        }
+        for (rev, what, ranges) in fmt {
+            let n = ranges.len();
+            let summary = if n == 1 {
+                let (_, t) = self.old_new(ranges[0].0, ranges[0].1, rev);
+                format!("{what}: {}", quote(&t))
+            } else {
+                format!("{what} in {n} places")
+            };
+            out.push(Edit { kind: EditKind::Format, rev, ranges, old: String::new(), new: String::new(), minor: false, summary });
+        }
+        out.sort_by_key(|e| e.ranges[0].0);
+        out
+    }
+
+    /// Edits by change set, sets in order.
+    pub fn change_sets(&self) -> Vec<ChangeSet> {
+        let mut sets: Vec<ChangeSet> = Vec::new();
+        for e in self.edits() {
+            let Some(r) = self.revisions.get(e.rev) else { continue };
+            match sets.iter_mut().find(|s| s.set == r.set) {
+                Some(s) => s.edits.push(e),
+                None => sets.push(ChangeSet { set: r.set, author: r.author.to_string(), name: r.name.to_string(), edits: vec![e] }),
+            }
+        }
+        sets.sort_by_key(|s| s.set);
+        sets
+    }
+
+    /// Ops that accept or reject one edit (each of its places).
+    pub fn resolve_edit_ops(&mut self, how: Resolve, e: &Edit) -> Vec<TextOp> {
+        let mut ranges = e.ranges.clone();
+        // Last place first, so earlier ones keep their positions.
+        ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        let rev = e.rev;
+        let mut ops = Vec::new();
+        for (from, to) in ranges {
+            ops.extend(self.resolve_range_ops(how, |r| r == rev, from, to));
+        }
+        ops
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +1055,61 @@ mod tests {
         h.run(&mut d, "reject", ops);
         assert_eq!(d.visible_text()[1], "g jumps over");
         assert!(d.changes().iter().any(|c| c.kind == ChangeKind::Insert && c.rev == ann));
+    }
+
+    #[test]
+    fn edits_read_as_people_think_of_them() {
+        let mut d = doc();
+        let (ann, ops) = d.add_revision_ops(Revision { author: "Ann".into(), set: 0, ..Default::default() });
+        let mut h: History<TextOp> = History::new();
+        h.run(&mut d, "rev", ops);
+        // "quick" → "fast": a tombstone then an insertion.
+        let (ops, t) = d.tracked_delete_ops(0, 4, 0, 9, ann, d.deletions.next_id());
+        h.run(&mut d, "del", ops);
+        let at = t.unwrap().1 + TOMB;
+        let a = d.with_rev(0, ann);
+        h.run(&mut d, "ins", vec![TextOp::Splice { block: 0, at, del: 0, ins: Fragment { text: "fast".into(), runs: vec![(0, a)] } }]);
+        // One letter inside a word: the whole word, before and after.
+        let p = d.para(1).unwrap().text.clone();
+        let o = p.find("over").unwrap() as u32;
+        let (ops, t) = d.tracked_delete_ops(1, o + 2, 1, o + 3, ann, d.deletions.next_id());
+        h.run(&mut d, "del", ops);
+        h.run(&mut d, "ins", vec![TextOp::Splice { block: 1, at: t.unwrap().1 + TOMB, del: 0, ins: Fragment { text: "a".into(), runs: vec![(0, a)] } }]);
+        // A sentence moved from paragraph 4 to paragraph 2.
+        let (ops, _) = d.tracked_delete_ops(4, 0, 4, 8, ann, d.deletions.next_id());
+        h.run(&mut d, "del", ops);
+        h.run(&mut d, "ins", vec![TextOp::Splice { block: 2, at: 0, del: 0, ins: Fragment { text: "Last one".into(), runs: vec![(0, a)] } }]);
+        // Bold on two places: one edit.
+        let ops = d.tracked_format_ops(2, 8, 12, ann, |x| x.bold = Some(true));
+        h.run(&mut d, "b", ops);
+        let ops = d.tracked_format_ops(1, 0, 3, ann, |x| x.bold = Some(true));
+        h.run(&mut d, "b", ops);
+        // A comma added: minor.
+        let e = d.para(0).unwrap().text.find(" fox").unwrap() as u32;
+        h.run(&mut d, "ins", vec![TextOp::Splice { block: 0, at: e, del: 0, ins: Fragment { text: ",".into(), runs: vec![(0, a)] } }]);
+        let edits = d.edits();
+        let sums: Vec<&str> = edits.iter().map(|e| e.summary.as_str()).collect();
+        assert!(sums.contains(&"“quick” → “fast”"), "{sums:?}");
+        assert_eq!(differing_words("two percent", "five percent"), ("two", "five"));
+        assert_eq!(differing_words("in the box", "in a box"), ("the", "a"));
+        assert_eq!(differing_words("a b", "a b c"), ("b", "b c"));
+        assert!(sums.contains(&"“over” → “ovar”"), "{sums:?}");
+        assert!(sums.contains(&"moved “Last one”"), "{sums:?}");
+        assert!(sums.contains(&"bold in 2 places"), "{sums:?}");
+        assert!(edits.iter().any(|e| e.minor && e.kind == EditKind::Insert), "{sums:?}");
+        assert_eq!(edits.len(), 5, "{sums:?}");
+        assert_eq!(d.change_sets().len(), 1);
+        // Rejecting one edit leaves the others.
+        let fast = edits.iter().find(|e| e.summary.contains("fast")).unwrap().clone();
+        let ops = d.resolve_edit_ops(Resolve::Reject, &fast);
+        h.run(&mut d, "reject", ops);
+        assert!(d.visible_text()[0].starts_with("The quick"));
+        assert_eq!(d.edits().len(), 4);
+        // Accepting the move takes both places.
+        let mv = d.edits().into_iter().find(|e| e.kind == EditKind::Move).unwrap();
+        let ops = d.resolve_edit_ops(Resolve::Accept, &mv);
+        h.run(&mut d, "accept", ops);
+        assert_eq!(d.edits().len(), 3);
+        assert_eq!(d.visible_text()[4], "");
     }
 }
