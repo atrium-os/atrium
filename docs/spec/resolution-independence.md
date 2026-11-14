@@ -1,0 +1,284 @@
+# Resolution and text-size independence
+
+Status: **proposal** (2026-11-14), for Shankar's review before any build.
+Covers Pergola, frescod, Forum and the Navigator. No backward compatibility is kept.
+
+## 1. The problem
+
+On most systems, apps size things in device pixels, so one of these happens:
+
+1. **Higher resolution, everything shrinks.** A 13 px label is 13 device pixels on a 1080p
+   and on a 4K panel of the same size, so it is half as tall on the 4K one.
+2. **Windows scale, text doesn't** (or the reverse). A scale factor reaches some layers and
+   not others: the window grows but the app still lays text out in pixels, or the text grows
+   and the controls around it stay put, so labels clip and overflow.
+3. **Proportions break.** Some sizes scale (fonts), some don't (a 1 px border, a 32 px
+   button, a 200 px sidebar), so a dialog designed at 100% looks different at 150%.
+4. **Text size changes break layout.** Bigger text wraps differently, and anything sized
+   for the old wrapping (fixed-height rows, inline images, "fits on one line" toolbars)
+   breaks.
+5. **Moving a window between monitors** of different density makes it jump in physical
+   size, or it is drawn blurry on one of them.
+
+The goal: **what you see is the same physical size on every monitor and at every
+resolution, unless you ask for it bigger; and asking for bigger text makes everything
+that holds text grow with it, consistently.**
+
+## 2. What the code does today (atrium c593a81)
+
+Some of the right pieces exist, but they don't agree with each other. Found by reading the
+code; none of the per-scale paths has run live at a scale other than 1.0.
+
+| # | Where | What it does | Effect |
+|---|---|---|---|
+| 1 | Pergola `surface.rs`, `node.rs` | Layout is in logical px; the surface multiplies by `scale` at emission; text is shaped at the device size (never bitmap-scaled). | Right. |
+| 2 | frescod `outputs::auto_scale` | Per-monitor scale = diagonal ppi / 110, in 0.25 steps, 1.0 to 3.0. | Right idea; see 7, 8. |
+| 3 | fresco-scene-server `update_window_scales` | A window gets `EV_WINDOW_DPI_CHANGED` with the scale of the monitor it mostly covers. | Right. |
+| 4 | Pergola `window.rs` | `Resized`'s width/height (device px on the wire) are taken as **logical** px. | At scale 1.5, content is laid out 1.5x too wide and runs off the window. |
+| 5 | Pergola `input.rs` | Pointer x/y (device px) are used as logical px, not divided by the scale. | At any scale other than 1, clicks land on the wrong control. |
+| 6 | Pergola `Window::open_on` | `SizeSpec::Fixed(w, h)` is passed to `window_create` as device px, and the scale starts at 1.0 until the first DPI event. | Windows open small on HiDPI, then the first frame is drawn at the wrong scale. |
+| 7 | frescod / forum-wm | The desktop, monitor rects and window rects are in **device** pixels. A scale change resizes nothing. | A window moved from a 1.5 to a 1.0 monitor becomes 1.5x bigger physically; tiles stay sized for the old scale. |
+| 8 | forum-wm `displays.scales` | A scale the user sets is stored as an absolute number per monitor. | Change that monitor's resolution and the override pins the wrong scale: the problem in §1.1 comes back. |
+| 9 | `auto_scale` | A monitor with no physical size in its EDID (TVs, projectors) gets 1.0. | A 4K TV gets a tiny UI. |
+| 10 | frescod `chrome.rs` | The origin strip is `STRIP_H = 24` device px. | The trusted strip shrinks on HiDPI. |
+| 11 | `pergola/src/theme/tokens.rs` | Control heights are fixed numbers (button 32, row 32, toolbar 40), not derived from the type size. | There is no system text size yet; adding one would make text outgrow its controls (§1.2). |
+| 12 | `EV_WINDOW_DPI_CHANGED` doc | Says 1.0 = 96 dpi; `auto_scale` uses 110 ppi. | Two references. |
+
+## 3. Units
+
+One unit for everything an app sees: the **point** (pt).
+
+- **1 pt is a fixed angle at the eye**, not a pixel. Reference: 1 pt = 1 px on a 110 ppi
+  desktop monitor at arm's length (what `auto_scale` already uses; the 96 dpi comment goes).
+- **Device pixels** exist only in two places: inside frescod (scanout, compositing) and at
+  Pergola's emission step (the scene the app sends is in its buffer's device pixels, so text
+  and paths are rasterized at full resolution and nothing is resampled).
+- **Window geometry, the desktop, monitor rects, pointer positions, popup anchors, slot
+  rects, min/max sizes**: all in pt, as `f32` (sub-pixel pointer positions survive).
+- `scale` = device px per pt, per window, from the monitor it lives on. An app never picks it.
+
+Everything an app or the WM reasons about is in pt; the only code that multiplies by
+`scale` is Pergola's emission, frescod's compositor, and renderers of embedded surfaces
+(§9). This is the macOS "points and backing scale" model, applied per monitor, and it fixes
+rows 4 to 7 of §2 by construction.
+
+### 3.1 Wire changes
+
+- `window_create`, `Resized`, `PopupPlaced`, `WindowHints.min_size`, popup anchors and sizes:
+  pt.
+- `window_create`'s reply carries the window's `scale` and its buffer size in device px, so
+  the first frame is right (row 6).
+- `EV_WINDOW_DPI_CHANGED` becomes `EV_WINDOW_SCALE` with `{ scale, buffer_w, buffer_h }`.
+- Pointer events: pt, in the window's coordinates.
+- The scene stays in device px of the window's buffer (as now). A window's buffer size is
+  `round(size_pt * scale)`; frescod says what it chose so app and compositor agree on the
+  rounding.
+- WM ops (`OP_WM_OUTPUTS`, arrange, move, tile rects): pt. Each `WmOutput` has its mode in
+  device px and its `rect` in pt (mode / scale).
+
+## 4. Per-monitor scale
+
+### 4.1 Automatic scale
+
+- From EDID size: `ppi / 110`, rounded to **1/8** steps (0.125) rather than 0.25, clamped
+  1.0 to 4.0. Finer steps keep physical sizes within about 6% across common panels.
+- **No physical size in EDID** (TVs, projectors): assume a living-room or wall distance and
+  scale by mode height, `max(1, height / 1080)`, so a 4K TV gets 2.0, not 1.0.
+- **Laptop panels** (eDP connectors) are seen closer; open question, §11.
+
+### 4.2 The user's size preference
+
+The user doesn't set a scale; they set **"UI size"** per monitor as a multiplier on the
+automatic scale: Smaller (0.875), Default (1.0), Larger (1.125, 1.25, 1.5, 2.0).
+
+`scale = auto_scale(monitor, mode) x ui_size(monitor)`
+
+Because the preference is relative, changing the resolution keeps the physical size (row 8):
+a 27" monitor at 4K is 1.5 x Default, at 1440p it is 1.0 x Default, and windows look the
+same size, only sharper or softer. forum-wm stores `ui_size` per monitor identity instead of
+the absolute scale; `forum-ctl scale` becomes `forum-ctl ui-size`.
+
+### 4.3 Resolution change on one monitor
+
+Mode change -> new auto scale -> the monitor's pt size stays (about) the same -> forum-wm's
+layout in pt doesn't change -> each window gets `EV_WINDOW_SCALE` and redraws at the new
+density, same size, same wrapping. Nothing re-tiles, nothing shrinks.
+
+## 5. Fractional scales and crispness
+
+At 1.25, 1.375 or 1.5, a 1 pt line is 1.25 to 1.5 device px: blurry if drawn as is. Pergola
+snaps at emission, not in layout:
+
+- **Edges** of rects, borders, focus rings and dividers snap to device pixel boundaries.
+  Layout keeps exact pt values; only the drawn edge is snapped, so proportions don't drift.
+- **Hairlines and 1 pt strokes** are `max(1, round(scale))` device px wide (visual language:
+  "1px logical, crisp at any DPI").
+- **Text baselines** snap to device px vertically; glyphs are rasterized at the device size
+  (as now). Horizontal glyph positions stay fractional.
+- **Icons** are vector (Phosphor), flattened at the device size (as now in `icon.rs`).
+- frescod never resamples a window's buffer except in §7's straddle case and in mirroring.
+
+## 6. Text size and relative sizing of widgets
+
+This is the core of Shankar's second point: widgets must keep their proportions, and must
+grow with text when text grows.
+
+### 6.1 Two scales, and what each one moves
+
+| Knob | Who sets it | What grows | What stays |
+|---|---|---|---|
+| **Display scale** (§4) | Per monitor, automatic x UI size | Everything, uniformly: text, controls, gaps, icons, images, window sizes. Proportions are identical at every scale. | Nothing changes shape. Wrapping is identical. |
+| **Text size** (new, accessibility) | One system setting: 85%, 100%, 115%, 130%, 150%, 175%, 200% | Text, and everything sized from text: control heights and paddings, row heights, inline icons, text-relative gaps, min window sizes. | Layout gutters between groups, window margins, hairlines, photos at their own size. |
+
+A third, **content zoom** (Navigator, documents, image viewers), is per app and scales only
+the content area, not the chrome (§10).
+
+Display scale never changes wrapping. Text size does, on purpose, and the layout has to
+absorb that (§6.3).
+
+### 6.2 Sizes come from text, not from fixed numbers
+
+In Pergola, every size token becomes one of three kinds, and a widget may only use these:
+
+- **`em`-based** (text-relative): control heights, inner paddings, row heights, inline icon
+  sizes, the gap between an icon and its label. Defined from the control's own type size and
+  line height. `BUTTON_HEIGHT_DEFAULT = 32` becomes "line height of md text + 2 x 0.55 em
+  padding", which is 32 pt at 100% text and grows with it.
+- **`pt`-based** (layout): gaps between groups, window and panel margins, sidebar minimum
+  widths, the spacing scale between sibling blocks. They follow the display scale only.
+- **Hairline**: 1 pt borders and dividers (§5).
+
+This is what keeps relative sizing right: at any display scale everything multiplies by the
+same number, and at any text size a control and its label grow together, so a label never
+outgrows its button and a row never clips its text. The touch target rule (1.25x) becomes a
+floor in pt (44 pt on touch, 24 pt with a pointer) applied after the em size.
+
+A lint (test) walks the widget catalogue at text sizes 85% to 200% and display scales 1.0 to
+3.0 and fails on clipped text, overlapping controls, or a control below the touch floor.
+
+### 6.3 When text gets bigger, layout reflows
+
+- **Wrapping**: Pergola already wraps text leaves to the width they get; bigger text gives
+  more lines and taller rows. Rows are never fixed-height unless the widget is a virtual list,
+  and virtual lists measure their row height from the text size (re-measured on change).
+- **Toolbars and button rows** that no longer fit move items into an overflow menu (lowest
+  priority first) rather than clipping or shrinking text. Labels may drop to icon-only only
+  where the widget declares an icon.
+- **Min window size** is the layout's natural minimum, sent to the WM as a hint. When text
+  grows, min sizes grow, and forum-wm re-tiles if a window no longer fits its tile.
+- **Scroll position** is kept by anchor (the first visible element and the offset into it),
+  not by pixel offset, so a reflow doesn't jump the reader. ScrollView already anchors zoom
+  settles this way; the same anchor is used for text-size and width changes.
+- **Truncation** with an ellipsis is a last resort, only where the widget says so, with the
+  full text in a tooltip and in the accessibility tree.
+
+### 6.4 Inline images and other inline objects
+
+An inline object in a line of text (an image, an icon, an emoji, a chip, an embedded control)
+declares how it sizes, and that decides what happens when text or display scale changes:
+
+| Kind | Sized by | Examples | Text grows | Display scale grows |
+|---|---|---|---|---|
+| **Glyph-like** | `em` (a multiple of the line's font size), sits on the baseline | Icons in labels, emoji, status dots, inline math, file-type badges, mentions as chips | Grows with the text | Grows |
+| **Intrinsic** | Its own size in pt (pixels / image density), capped to the line's width | Photos and screenshots in a document or a message, avatars with a set size | Stays; the line gets taller to hold it; wraps to its own line if wider than the remaining space | Grows (it's in pt) |
+| **Container-relative** | A fraction of the available width, keeping aspect ratio | Hero images, full-width figures, video | Stays relative to the column; reflows with it | Grows with the column |
+
+Rules that make this predictable:
+
+- **An image's pt size is its pixel size divided by its density**, where density defaults to
+  1 (1 image px = 1 pt) and comes from the source when it says (`srcset` 2x, a PNG pHYs
+  chunk, an app-declared asset density). An app-shipped bitmap that wants to stay sharp
+  ships at 2x and declares it; vector assets are preferred.
+- **Decode and upload at device resolution**: the image is decoded or chosen (srcset) for
+  `pt size x scale x zoom`, so it's sharp at 2.0 and not wastefully large at 1.0. A change of
+  scale re-picks the candidate after the change settles.
+- **Line height**: a line's height is the max of its text line height and its inline
+  objects' heights; glyph-like objects are sized so they don't increase it (at most 1 em,
+  centred on the x-height or on the baseline as the object declares).
+- **Aspect ratio is always kept**; an intrinsic image wider than its line shrinks to fit,
+  never crops.
+- **Placeholders** have the right size before the image arrives (from declared intrinsic
+  sizes, which the Navigator's normalizer already requires), so nothing jumps when it loads.
+
+Pergola gains an inline-object leaf in its text flow (`Inline { size: Em | Intrinsic |
+Fraction, baseline }`) used by both widgets and DocumentView.
+
+## 7. Moving windows between monitors
+
+- A window has **one scale at a time**: that of the monitor it mostly covers (as now).
+- **Its size is in pt**, so moving it to a monitor with a different scale keeps its physical
+  size and its layout; only its buffer is re-made at the new density.
+- **While being dragged**, the window keeps its scale; frescod draws the part on the other
+  monitor resampled by the ratio of the two scales, so it looks the same physical size on
+  both (slightly soft on the denser one for that moment). On release, if the majority moved,
+  the window gets `EV_WINDOW_SCALE` and redraws sharp. No relayout storms mid-drag.
+- **A window that straddles for good** stays at its majority monitor's scale, with the
+  minority part resampled.
+- **Rescue and restore** (multi-monitor phase 4) work in pt, so a window rescued to a lower
+  density monitor keeps its physical size, clamped to fit.
+- Popups take their parent window's scale, even when they hang over another monitor.
+
+## 8. frescod's own drawing
+
+The origin strip, the cursor, Arca's ring, the lock screen, focus outlines drawn by frescod
+and frescod-side text all use the scale of the monitor they're drawn on: `STRIP_H` becomes
+24 pt. The cursor is vector or provided at 1x/2x/3x and picked per monitor.
+
+## 9. Embedded and non-Pergola surfaces
+
+- **Limen slots** (embedded jailed surfaces, e.g. Navigator pages): the parent places the slot
+  in pt; frescod tells the child its scale and buffer size the same way as a window
+  (`EV_WINDOW_SCALE`). The child renders at that density.
+- **GPU apps / video**: get the buffer size in device px and the scale; video is a texture
+  frescod scales anyway.
+- **Mirroring** keeps resampling as now.
+
+## 10. The Navigator and its reading controls
+
+Three factors multiply for page content:
+
+`device px = CSS px x zoom x display scale`, and `font size = CSS font size x text size`
+
+- **CSS px = 1 pt at zoom 1.** A page looks the same physical size on every monitor.
+- **Display scale** is invisible to the page (no script reads it); it only decides render
+  density and which `srcset` candidate is fetched.
+- **Zoom** (Ctrl +/-, pinch) scales the content group, layout included (pergola.md §10.4).
+- **Text size** in the Aa controls multiplies with the **system text size**: page font
+  sizes = CSS size x system text size x per-site text size. A user who chose 130% system-wide
+  gets 130% pages by default, and a per-site step adjusts from there. `text_scale_64` gets
+  the product.
+- **Comfortable** width stays `680 pt x text size x zoom` (navigator-ui.md §7), so it keeps
+  about 70 characters per line at any text size.
+- **Inline images** in pages follow §6.4: intrinsic from declared sizes, capped to the
+  column, re-picked by density. The Navigator's chrome is Pergola and follows §6 like any app.
+
+## 11. Open questions for Shankar
+
+1. **Reference density.** Keep 110 ppi = 1.0 for all monitors, or a separate reference for
+   laptop panels (seen closer, so about 130 ppi = 1.0)? Proposal: one reference, with laptop
+   panels detected by connector type and given UI size "Smaller" by default.
+2. **Steps.** 1/8 steps for automatic scale and the UI size list in §4.2. Finer or coarser?
+3. **Text size range.** 85% to 200% system-wide; larger needs a magnifier, not layout.
+4. **Straddling windows** resampled on the minority monitor (§7), or render twice? Proposal:
+   resample (simpler, costs nothing, only while straddling).
+5. **Per-app text size** besides the system one: proposal is no, only the system setting and
+   each app's content zoom.
+
+## 12. Build order (after review)
+
+1. **Units fix** (rows 4 to 7, 12): pt on the wire for geometry and input, scale in the
+   `window_create` reply, `EV_WINDOW_SCALE`, Pergola divides input and sizes in one place,
+   forum-wm lays out the desktop in pt. Test: the Pergola showcase pixel-compared at 1.0,
+   1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit at every scale.
+2. **Scale policy** (rows 8 to 10): `ui_size` relative preference, TV fallback, 1/8 steps,
+   strip and cursor in pt. Test: change a monitor's mode in the VM and check every window's
+   pt size is unchanged.
+3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,
+   1.5 and 1.75.
+4. **Text size** (§6.1, 6.2, 6.3): system setting broadcast like appearance, em-based tokens,
+   overflow menus, min-size hints, anchor-kept scroll. Test: the catalogue lint.
+5. **Inline objects** (§6.4) in Pergola's text flow and DocumentView, with density-aware
+   image picking.
+6. **Monitor moves** (§7): drag-time resampling and scale switch on release; chaos test
+   extended with mixed-scale monitors.
+7. **Navigator** (§10): system text size into `text_scale_64`, density-picked images.
