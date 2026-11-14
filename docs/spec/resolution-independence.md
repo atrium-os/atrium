@@ -223,8 +223,14 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   a change relays out). `TextStyle.size` stays the type ramp's pt and `TextStyle::em()` is
   what is measured, wrapped, shaped and drawn. Control heights are em-based through
   `theme::size::{button_height, input_height, menu_item, list_row, toolbar, ...}`; the
-  constants are the 100% reference. Still pt and to be moved: widgets' inner paddings, the
-  bar's height (and the WM's reservation of it), virtual list rows, app-shaped `Glyphs` text.
+  constants are the 100% reference. A catalogue lint (pergola/tests/text_size.rs) lays out
+  the controls at every text size and checks each label fits its body.
+- **4c, the bar:** `shell::bar_h()` is 38 pt times the text size, rounded; forum-bar tells
+  forum-wm with `Intent::ReserveTop { pt }` at start and on each change, and forum-wm gives
+  the bar that height (24 to 96 pt), remembers it (`bar` in forum-displays.state) and keeps
+  it across mode changes and restarts.
+- Still pt and to be moved: widgets' inner paddings, virtual list rows, app-shaped `Glyphs`
+  text.
   The overflow menus, min-size hints, anchor-kept scroll and the catalogue lint (§6.2, §6.3)
   are next.
 

@@ -120,6 +120,11 @@ pub enum Intent {
     /// scale; at most [`MAX_RESERVE_PT`]. 0 gives the space back. Only a
     /// session component reaches this socket (`forum-control`).
     ReserveBottom { pt: u32 },
+    /// "The bar is `pt` points tall": the bar's height grows with the
+    /// system text size, and forum-wm gives it that much at the top of the
+    /// main monitor (resolution-independence.md §7.2). Clamped to
+    /// [`MIN_BAR_PT`]..=[`MAX_BAR_PT`].
+    ReserveTop { pt: u32 },
     /// "Which gamepads are there, and which app holds each?" — the
     /// controller menu (fresco-capabilities.md §4). Read-only.
     ListPads,
@@ -144,6 +149,9 @@ pub enum Intent {
 /// The most a [`Intent::ReserveBottom`] may keep free, in points: a dock
 /// that asks for more is clamped, so it cannot take the screen from apps.
 pub const MAX_RESERVE_PT: u32 = 240;
+/// The bar's height range, points: 38 at 100% text, 76 at 200%.
+pub const MIN_BAR_PT: u32 = 24;
+pub const MAX_BAR_PT: u32 = 96;
 
 // ── status items (docs/spec/forum-status-items.md) ──────────────────────────
 

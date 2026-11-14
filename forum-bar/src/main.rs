@@ -294,7 +294,7 @@ impl View for BarView {
         // hairline is a separate absolute rect below the fill.
         let root = ctx.push(Node::stack_filled(
             Axis::Horizontal,
-            Rect::new(0.0, 0.0, self.w.get(), shell::BAR_H - 1.0),
+            Rect::new(0.0, 0.0, self.w.get(), shell::bar_h() - 1.0),
             16.0,
             t.bg_surface(),
             0.0,
@@ -642,7 +642,7 @@ impl View for BarView {
 
         // Bottom hairline.
         ctx.add(Node::Rect {
-            rect: Rect::new(0.0, shell::BAR_H - 1.0, self.w.get(), 1.0),
+            rect: Rect::new(0.0, shell::bar_h() - 1.0, self.w.get(), 1.0),
             fill: t.border_default(),
             radius: 0.0,
         });
@@ -1030,6 +1030,7 @@ fn main() -> std::io::Result<()> {
 
     // Session chrome: stays up. Step with a 1s timeout — events repaint
     // immediately; the timeout refreshes clock + surface status.
+    let mut bar_sent = 0.0f32;
     loop {
         let stepped = window.step(&mut app, Some(Duration::from_secs(1)))?;
         // A new width in points (the monitor's scale changed live, or its
@@ -1040,6 +1041,16 @@ fn main() -> std::io::Result<()> {
             w.set(window.width);
             app.invalidate();
             window.paint(&mut app)?;
+        }
+        // The bar's height is em-based: tell forum-wm when the text size
+        // changes it, and once at start (resolution-independence.md §7.2).
+        let bh = shell::bar_h();
+        if bh != bar_sent {
+            bar_sent = bh;
+            if let Err(e) = forum_ctl::request(forum_ctl::default_socket_path(), &forum_ctl::Intent::ReserveTop { pt: bh as u32 }) {
+                eprintln!("forum-bar: could not tell forum-wm the bar's height: {e}");
+            }
+            app.invalidate();
         }
         match stepped {
             StepResult::Closed => return Ok(()),
@@ -1140,7 +1151,7 @@ fn main() -> std::io::Result<()> {
         if let Some(ask) = want_drawn.get_cloned() {
             want_drawn.set(None);
             // Points, as the bar lays out (resolution-independence.md §3).
-            let anchor = [ask.rect.x(), 0.0, ask.rect.w(), shell::BAR_H];
+            let anchor = [ask.rect.x(), 0.0, ask.rect.w(), shell::bar_h()];
             let (w, h) = (u32::from(ask.width), u32::from(ask.height));
             let id = window.id();
             match window.connection().popup_grant(id, anchor, fresco_protocol::popup_side::BELOW, fresco_protocol::popup_align::END, w, h) {

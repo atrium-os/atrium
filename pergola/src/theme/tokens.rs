@@ -478,6 +478,13 @@ pub mod shell {
     use crate::color::Color;
 
     pub const BAR_H: f32 = 38.0;
+
+    /// The bar's height at the system text size, whole points
+    /// (em-based, resolution-independence.md §7.2): what the bar draws and
+    /// asks forum-wm to keep free (`Intent::ReserveTop`).
+    pub fn bar_h() -> f32 {
+        (BAR_H * crate::text::text_scale()).round()
+    }
     /// The Forum-owned identity strip drawn over every surface.
     pub const SEAM_H: f32 = 28.0;
     pub const DOCK_W: f32 = 56.0;

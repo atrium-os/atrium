@@ -431,6 +431,9 @@ pub mod displays {
         /// so a restarted WM keeps the dock's space before the dock (which
         /// reports once, at its start) says it again. 0: none reported.
         pub dock_pt: u32,
+        /// The bar's reported height in points (`Intent::ReserveTop`);
+        /// 0: none reported (the 38 pt default).
+        pub bar_pt: u32,
         /// The system text size the user set (thousandths; 0 = 100%).
         pub text_size_milli: u32,
     }
@@ -546,6 +549,9 @@ pub mod displays {
             if self.dock_pt != 0 {
                 lines.push(format!("dock {}", self.dock_pt));
             }
+            if self.bar_pt != 0 {
+                lines.push(format!("bar {}", self.bar_pt));
+            }
             if self.text_size_milli != 0 {
                 lines.push(format!("textsize {}", self.text_size_milli));
             }
@@ -585,6 +591,11 @@ pub mod displays {
                             if fresco_protocol::TEXT_SIZES.contains(&t) {
                                 m.text_size_milli = t;
                             }
+                        }
+                    }
+                    Some(&"bar") if w.len() == 2 => {
+                        if let Ok(pt) = w[1].parse::<u32>() {
+                            m.bar_pt = pt.clamp(forum_ctl::MIN_BAR_PT, forum_ctl::MAX_BAR_PT);
                         }
                     }
                     Some(&"dock") if w.len() == 2 => {
@@ -1210,6 +1221,22 @@ pub mod daemon {
         }
 
         /// Move the PiP window to `corner` and lay out again.
+        /// The bar reported its height (`Intent::ReserveTop`, points; it
+        /// grows with the text size): give it that and re-lay out.
+        pub fn set_bar_reserve(&mut self, conn: &mut impl FrescoConn, pt: u32) -> io::Result<()> {
+            let pt = pt.clamp(forum_ctl::MIN_BAR_PT, forum_ctl::MAX_BAR_PT);
+            if self.displays.bar_pt != pt {
+                self.displays.bar_pt = pt;
+                self.save_displays();
+            }
+            if pt as i32 == self.screen.bar_h {
+                return Ok(());
+            }
+            self.screen.bar_h = pt as i32;
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces).map(|_| ())
+        }
+
         /// Set the system text size (thousandths, one of
         /// `fresco_protocol::TEXT_SIZES`; 0 = 100%): frescod tells every
         /// client (resolution-independence.md §6). Remembered.
@@ -1607,7 +1634,7 @@ pub mod daemon {
         {
             // The dock's reservation is the dock's word (`set_dock_reserve`),
             // not the mode's: a new mode keeps it.
-            let screen = Screen { dock_h: self.screen.dock_h, ..screen };
+            let screen = Screen { dock_h: self.screen.dock_h, bar_h: self.screen.bar_h, ..screen };
             if screen.rect.w <= 0 || screen.rect.h <= 0 || screen == self.screen {
                 return Ok(None);
             }
@@ -1830,6 +1857,10 @@ pub mod control {
                 let (groups, spanning) = wm.span_groups();
                 Reply::SpanGroups { groups, spanning, no_span: wm.displays.no_span.iter().cloned().collect() }
             }
+            Intent::ReserveTop { pt } => match wm.set_bar_reserve(conn, pt) {
+                Ok(()) => Reply::Ack,
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::ReserveBottom { pt } => match wm.set_dock_reserve(conn, pt) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -2812,6 +2843,11 @@ mod tests {
         handle_intent(&mut wm, &mut conn, Intent::ReserveBottom { pt: 120 });
         let m = crate::displays::DisplayMemory::from_text(&wm.displays.to_text());
         assert_eq!(m.dock_pt, 120);
+        // The bar's height follows the text size: 57 pt at 150%.
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::ReserveTop { pt: 57 }), Reply::Ack);
+        assert_eq!(rect_for(&wm.screen, WmRole::Chrome).h, 57);
+        assert_eq!(wm.screen.work_area().y, 57);
+        assert_eq!(crate::displays::DisplayMemory::from_text(&wm.displays.to_text()).bar_pt, 57);
     }
 
     /// The system text size reaches frescod with the appearance, keeps

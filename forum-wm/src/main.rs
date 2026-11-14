@@ -209,6 +209,9 @@ fn main() -> io::Result<()> {
     // The dock reports its height once, at its start: keep the space it
     // last reported until it says again (it may be up already).
     wm.screen.dock_h = wm.displays.dock_pt as i32;
+    if wm.displays.bar_pt != 0 {
+        wm.screen.bar_h = wm.displays.bar_pt as i32;
+    }
     wm.display_store = Some(store);
     // The text size the user set comes back (frescod starts at 100%).
     if wm.displays.text_size_milli != 0 {
