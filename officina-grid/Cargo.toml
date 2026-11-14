@@ -1,0 +1,17 @@
+[package]
+name = "officina-grid"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's spreadsheet engine (docs/spec/officina.md §8): column-chunked cell storage, the formula language, the range dependency graph and incremental, ordered, vectorised and parallel recalculation. No UI."
+
+[lib]
+name = "officina_grid"
+path = "src/lib.rs"
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+
+[profile.release]
+debug = 1

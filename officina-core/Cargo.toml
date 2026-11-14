@@ -1,0 +1,11 @@
+[package]
+name = "officina-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's document core (docs/spec/officina.md §6, §5.1): bounded wire encoding, the chunked native container, the op history (undo/redo) and the autosave journal. No UI, no dependencies."
+
+[lib]
+name = "officina_core"
+path = "src/lib.rs"

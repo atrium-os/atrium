@@ -1,0 +1,339 @@
+//! Undoable grid edits for `officina_core::history`.
+//!
+//! Every edit is "replace this rectangle's contents with a snapshot". Applying one
+//! returns the snapshot of what it replaced, which is its inverse, so undo and redo are
+//! the same operation. A snapshot keeps formulas as fills (one per group piece), not as
+//! cells, so undoing an edit inside a million-row fill costs one fill, not a million.
+
+use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
+use crate::book::{Input, Workbook};
+use crate::column::Cell;
+use crate::formula;
+use crate::value::{ErrorKind, Value};
+use officina_core::history::Op;
+use officina_core::wire::{Reader, WireError, Writer};
+
+/// A formula filled down rows `r0..=r1` of one column; `src` is written for row `r0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fill {
+    pub col: u32,
+    pub r0: u32,
+    pub r1: u32,
+    pub src: String,
+}
+
+/// The contents of a rectangle: constants by cell, formulas by fill. Cells of the
+/// rectangle not named are empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Region {
+    pub rect: Rect,
+    pub values: Vec<(u32, u32, Value)>,
+    pub fills: Vec<Fill>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GridOp {
+    Replace(Region),
+}
+
+impl GridOp {
+    /// Sets one cell.
+    pub fn set(a: CellAddr, input: Input) -> Self {
+        Self::block(a.sheet, a.row, a.col, vec![vec![input]])
+    }
+
+    /// Sets a block of cells from `rows[r][c]` at (`r0`, `c0`), as a paste does.
+    pub fn block(sheet: u16, r0: u32, c0: u32, rows: Vec<Vec<Input>>) -> Self {
+        let h = rows.len().max(1) as u32;
+        let w = rows.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+        let mut values = Vec::new();
+        let mut fills = Vec::new();
+        for (i, row) in rows.into_iter().enumerate() {
+            for (j, input) in row.into_iter().enumerate() {
+                let (r, c) = (r0 + i as u32, c0 + j as u32);
+                match input {
+                    Input::Empty | Input::Value(Value::Empty) => {}
+                    Input::Value(v) => values.push((r, c, v)),
+                    Input::Formula(src) => fills.push(Fill { col: c, r0: r, r1: r, src }),
+                }
+            }
+        }
+        GridOp::Replace(Region { rect: Rect { sheet, r0, c0, r1: r0 + h - 1, c1: c0 + w - 1 }, values, fills })
+    }
+
+    /// Fills `src` (written for row `r0`) down `r0..=r1` of a column.
+    pub fn fill(sheet: u16, col: u32, r0: u32, r1: u32, src: &str) -> Self {
+        GridOp::Replace(Region {
+            rect: Rect { sheet, r0, c0: col, r1, c1: col },
+            values: Vec::new(),
+            fills: vec![Fill { col, r0, r1, src: src.to_string() }],
+        })
+    }
+
+    /// Empties a rectangle.
+    pub fn clear(rect: Rect) -> Self {
+        GridOp::Replace(Region { rect, values: Vec::new(), fills: Vec::new() })
+    }
+
+    /// The op as journal bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        let GridOp::Replace(r) = self;
+        w.u8(1);
+        w.u16(r.rect.sheet);
+        w.var(r.rect.r0 as u64);
+        w.var(r.rect.c0 as u64);
+        w.var(r.rect.r1 as u64);
+        w.var(r.rect.c1 as u64);
+        w.var(r.values.len() as u64);
+        for (row, col, v) in &r.values {
+            w.var(*row as u64);
+            w.var(*col as u64);
+            write_value(&mut w, v);
+        }
+        w.var(r.fills.len() as u64);
+        for f in &r.fills {
+            w.var(f.col as u64);
+            w.var(f.r0 as u64);
+            w.var(f.r1 as u64);
+            w.str(&f.src);
+        }
+        w.into_bytes()
+    }
+
+    /// Reads an op written by [`encode`](Self::encode). Bounds everything; never panics.
+    pub fn decode(b: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(b);
+        if r.u8()? != 1 {
+            return Err(WireError::Invalid("op kind"));
+        }
+        let sheet = r.u16()?;
+        let row = |r: &mut Reader| -> Result<u32, WireError> { r.len("row", MAX_ROWS as u64 - 1).map(|x| x as u32) };
+        let col = |r: &mut Reader| -> Result<u32, WireError> { r.len("column", MAX_COLS as u64 - 1).map(|x| x as u32) };
+        let (r0, c0, r1, c1) = (row(&mut r)?, col(&mut r)?, row(&mut r)?, col(&mut r)?);
+        if r0 > r1 || c0 > c1 {
+            return Err(WireError::Invalid("rectangle"));
+        }
+        let rect = Rect { sheet, r0, c0, r1, c1 };
+        let n = r.count("values", u32::MAX as u64, 3)?;
+        let mut values = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (y, x) = (row(&mut r)?, col(&mut r)?);
+            if !rect.contains(CellAddr::new(sheet, y, x)) {
+                return Err(WireError::Invalid("value outside rectangle"));
+            }
+            values.push((y, x, read_value(&mut r)?));
+        }
+        let n = r.count("fills", u32::MAX as u64, 4)?;
+        let mut fills = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (x, a, b) = (col(&mut r)?, row(&mut r)?, row(&mut r)?);
+            if a > b || x < c0 || x > c1 || a < r0 || b > r1 {
+                return Err(WireError::Invalid("fill outside rectangle"));
+            }
+            let src = r.str("formula", formula::MAX_STORED_FORMULA_LEN as u64)?.to_string();
+            fills.push(Fill { col: x, r0: a, r1: b, src });
+        }
+        if !r.is_empty() {
+            return Err(WireError::Invalid("trailing bytes"));
+        }
+        Ok(GridOp::Replace(Region { rect, values, fills }))
+    }
+}
+
+impl Op<Workbook> for GridOp {
+    fn apply(self, wb: &mut Workbook) -> Self {
+        match self {
+            GridOp::Replace(region) => GridOp::Replace(wb.replace(region)),
+        }
+    }
+}
+
+impl Workbook {
+    /// What `rect` holds now, as a [`Region`].
+    pub fn snapshot(&self, rect: &Rect) -> Region {
+        let mut values = Vec::new();
+        let mut fills = Vec::new();
+        let Some(sheet) = self.sheets.get(rect.sheet as usize) else {
+            return Region { rect: *rect, values, fills };
+        };
+        let last = rect.c1.min(sheet.cols.len().max(sheet.fidx.len()) as u32);
+        for c in rect.c0..=last {
+            // Fills first: they decide which stored cells are formula results.
+            let start = fills.len();
+            if let Some(f) = sheet.fidx.get(c as usize) {
+                let mut hit: Vec<u32> = f.range(..=rect.r1).rev().take_while(|(_, &g)| self.group(g).r1 >= rect.r0).map(|(_, &g)| g).collect();
+                hit.reverse();
+                for g in hit {
+                    let grp = self.group(g);
+                    let (a, b) = (grp.r0.max(rect.r0), grp.r1.min(rect.r1));
+                    let src = formula::to_a1(&grp.expr, a, c, &|s| self.sheet_name(s));
+                    fills.push(Fill { col: c, r0: a, r1: b, src });
+                }
+            }
+            let Some(column) = sheet.cols.get(c as usize) else { continue };
+            let mine = &fills[start..];
+            let mut k = 0;
+            column.each(rect.r0, rect.r1, &mut |r, cell| {
+                while k < mine.len() && mine[k].r1 < r {
+                    k += 1;
+                }
+                if k < mine.len() && mine[k].r0 <= r {
+                    return;
+                }
+                values.push((r, c, self.cell_value(cell)));
+            });
+        }
+        Region { rect: *rect, values, fills }
+    }
+
+    /// Replaces `region.rect` with `region`; returns what was there.
+    pub fn replace(&mut self, region: Region) -> Region {
+        let rect = region.rect;
+        let old = self.snapshot(&rect);
+        if (rect.sheet as usize) >= self.sheets.len() {
+            return old;
+        }
+        // Empty the rectangle.
+        let last = rect.c1.min(self.sheets[rect.sheet as usize].cols.len().max(self.sheets[rect.sheet as usize].fidx.len()) as u32);
+        for c in rect.c0..=last {
+            self.clear_formulas_in(rect.sheet, c, rect.r0, rect.r1);
+            let mut rows = Vec::new();
+            if let Some(col) = self.sheets[rect.sheet as usize].cols.get(c as usize) {
+                col.each(rect.r0, rect.r1, &mut |r, _| rows.push(r));
+            }
+            for r in rows {
+                self.store_cell(rect.sheet, r, c, Cell::Empty);
+            }
+        }
+        self.changed.push(rect);
+        for (r, c, v) in &region.values {
+            self.store(rect.sheet, *r, *c, v);
+        }
+        for f in &region.fills {
+            if self.fill_formula(rect.sheet, f.col, f.r0, f.r1, &f.src).is_err() {
+                // The text no longer parses (a sheet it named is gone): keep the cells
+                // visibly broken rather than silently empty.
+                for r in f.r0..=f.r1.min(f.r0 + 65_535) {
+                    self.store(rect.sheet, r, f.col, &Value::Err(ErrorKind::Ref));
+                }
+            }
+        }
+        old
+    }
+}
+
+// ---------- values on the wire (shared with the native format) ----------
+
+pub(crate) fn write_value(w: &mut Writer, v: &Value) {
+    match v {
+        Value::Empty => w.u8(0),
+        Value::Num(x) => {
+            w.u8(1);
+            w.f64(*x);
+        }
+        Value::Str(s) => {
+            w.u8(2);
+            w.str(s);
+        }
+        Value::Bool(b) => w.u8(if *b { 4 } else { 3 }),
+        Value::Err(e) => {
+            w.u8(5);
+            w.u8(*e as u8);
+        }
+    }
+}
+
+pub(crate) fn read_value(r: &mut Reader) -> Result<Value, WireError> {
+    Ok(match r.u8()? {
+        0 => Value::Empty,
+        1 => Value::num(r.f64()?),
+        2 => Value::str(r.str("text", crate::strings::MAX_TEXT as u64)?),
+        3 => Value::Bool(false),
+        4 => Value::Bool(true),
+        5 => Value::Err(ErrorKind::from_u8(r.u8()?).ok_or(WireError::Invalid("error value"))?),
+        _ => return Err(WireError::Invalid("value tag")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use officina_core::history::History;
+
+    fn a(s: &str) -> CellAddr {
+        let (r, c) = crate::addr::parse_a1(s).unwrap();
+        CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn undo_redo_inside_a_fill() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        let mut h: History<GridOp> = History::new();
+        let n = 10_000u32;
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        wb.set_numbers(0, 0, 0, &vals);
+        h.run(&mut wb, "Fill", vec![GridOp::fill(0, 1, 0, n - 1, "=A1*2")]);
+        wb.recalc();
+        assert_eq!(wb.groups().count(), 1);
+        assert_eq!(wb.get(a("B5000")), Value::Num(9998.0));
+
+        h.run(&mut wb, "Typing", vec![GridOp::set(a("B5000"), Input::Value(Value::str("x")))]);
+        wb.recalc();
+        assert_eq!(wb.groups().count(), 2);
+        assert_eq!(wb.get(a("B5000")), Value::str("x"));
+
+        assert_eq!(h.undo(&mut wb).as_deref(), Some("Typing"));
+        wb.recalc();
+        assert_eq!(wb.get(a("B5000")), Value::Num(9998.0));
+        assert_eq!(wb.groups().count(), 1, "the fill joins up again");
+        assert_eq!(wb.formula_text(a("B5000")).as_deref(), Some("=A5000*2"));
+
+        h.redo(&mut wb);
+        wb.recalc();
+        assert_eq!(wb.get(a("B5000")), Value::str("x"));
+
+        h.undo(&mut wb);
+        h.undo(&mut wb);
+        wb.recalc();
+        assert_eq!(wb.groups().count(), 0);
+        assert_eq!(wb.get(a("B5000")), Value::Empty);
+        assert_eq!(wb.get(a("A5000")), Value::Num(4999.0));
+    }
+
+    #[test]
+    fn block_paste_and_undo() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        wb.set_input(a("A1"), "old").unwrap();
+        wb.set_input(a("C3"), "=1+1").unwrap();
+        let before = wb.snapshot(&Rect { sheet: 0, r0: 0, c0: 0, r1: 9, c1: 9 });
+        let mut h: History<GridOp> = History::new();
+        let rows = vec![
+            vec![Input::Value(Value::Num(1.0)), Input::Formula("=A1+1".into())],
+            vec![Input::Empty, Input::Formula("=A2+1".into())],
+        ];
+        h.run(&mut wb, "Paste", vec![GridOp::block(0, 0, 0, rows)]);
+        wb.recalc();
+        assert_eq!(wb.get(a("B1")), Value::Num(2.0));
+        assert_eq!(wb.get(a("B2")), Value::Num(1.0));
+        assert_eq!(wb.groups().count(), 2, "B1:B2 is one fill, plus C3");
+        h.undo(&mut wb);
+        wb.recalc();
+        assert_eq!(wb.snapshot(&Rect { sheet: 0, r0: 0, c0: 0, r1: 9, c1: 9 }), before);
+    }
+
+    #[test]
+    fn journal_round_trip_and_garbage() {
+        let op = GridOp::block(0, 3, 4, vec![vec![Input::Value(Value::str("é")), Input::Formula("=SUM(A1:A9)".into())], vec![Input::Value(Value::Err(ErrorKind::NA)), Input::Value(Value::Bool(true))]]);
+        let b = op.encode();
+        assert_eq!(GridOp::decode(&b).unwrap(), op);
+        for i in 0..b.len() {
+            let _ = GridOp::decode(&b[..i]);
+            let mut c = b.clone();
+            c[i] ^= 0x5a;
+            let _ = GridOp::decode(&c);
+        }
+    }
+}

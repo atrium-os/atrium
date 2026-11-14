@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). Scope only, nothing built; O1 is next.
+**Status:** accepted 2026-11-14: Shankar agreed to all 17 decisions in §17 as recommended (§7.4 very large documents, §9.3 very large decks and §10.5 compositing safety added the same day). O1 built 2026-11-14 (§16.1); O2 is next.
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
 traditional ones don't make sense for Atrium: Java based, huge monolithic apps. We can do
@@ -783,6 +783,45 @@ use as test data, and a set Shankar provides of real files he cares about.
 The spreadsheet goes first: it carries the hardest engine work (scale, recalc), it needs
 only the simplest text (one-line cells), and the grid widget it forces is useful to other
 apps at once.
+
+### 16.1 O1 as built (2026-11-14)
+
+Two crates, no dependencies outside the repository, all Rust:
+
+- **`officina-core`**: the container (§5.1: header, chunks with CRC-32, index, trailer; a
+  reader that bounds every count and offset), the append-only journal (length + CRC per
+  record, replay stops at a torn tail), undo history over ops that return their own
+  inverse, and the bounded wire encoding.
+- **`officina-grid`**: column-chunked storage (4,096-row chunks; sparse, dense numeric and
+  mixed encodings), string pool, row/column sizes by prefix sums; formula parser (Excel
+  en-US syntax, bounded length, depth and arity) and printer; evaluator with 90 first-tier
+  functions and Excel's coercion, comparison, 15-digit and 1900-date rules; formula groups
+  (one AST per fill run) with range footprints in an interval index; recalculation that
+  propagates dirty row runs, orders groups by strongly connected components, runs
+  independent groups in parallel through a vectorised path, runs running totals in order,
+  and evaluates mutually dependent cells by their cell-graph components (cells on a cycle
+  are `#CIRC!`, judged by references as Excel does, and the result is independent of
+  visiting order); undoable grid ops (every edit is "replace a rectangle with a snapshot",
+  formulas kept as fills, so undoing an edit in a million-row fill costs one fill); the
+  native file v0 (WORKBOOK, STRINGS, COLUMN and FORMULAS chunks, stored results, no
+  recalculation on load except volatile formulas).
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| formula conformance, first tier | 152 hand-checked cases with Excel's results (`tests/conformance.rs`), all pass; print/parse round trip on all of them. The automatic differential against Excel-saved results comes with the `.xlsx` converter (O4), since no Excel runs here |
+| incremental = full | 1,000 random workbooks (formulas, fills, cycles, errors, 1–4 threads): incremental recalculation equals recalculation from scratch after every edit batch |
+| 100 M cells | 10 columns × 10 M rows: 776 MB of storage (8.14 bytes a cell), 781 MB resident, loaded in 1.9 s (`examples/scale.rs`) |
+| recalculation | a 10 M-row fill plus `SUM` and `AVERAGE` over whole columns: 0.4 s full; one edit under that `SUM`: 26 ms; one edit with 1 M dependents: 57 ms; `MATCH` over 10 M rows: 1.3 s with the index build, then 0.01 ms |
+| native file | that workbook: 861 MB file, saved in 3.4 s and loaded in 4–5 s from memory |
+| fuzzing | 2 M parser inputs (random bytes and token soup, all that parsed then evaluated, saved and reloaded), mutated native files and op records: no panic, no hang. It found two parser bugs on its first run (a slice inside a multi-byte character, an endless loop on a non-name character), both fixed |
+
+Not in O1, by plan: visible-first recalculation and cancellation (they need the O2 view),
+inserting and deleting rows with reference adjustment, styles and number formats (O4),
+dynamic arrays and spills (O5), the space (intersection) operator, lazy loading of
+column chunks. The memory target is met for numbers; text-heavy sheets cost more (16
+bytes a cell in a mixed chunk plus the pool) and get their own measurement in O4.
 
 ## 17. Decisions (accepted 2026-11-14)
 
