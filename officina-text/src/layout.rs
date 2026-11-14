@@ -268,6 +268,8 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         let text = &p.text[s as usize..e as usize];
         // Tabs: four spaces' width for now (tab stops come with the ruler).
         let mut g = match (&f.object, f.note) {
+            // A tombstone (tracked deletion) takes no room.
+            _ if f.deleted.is_some() => text.char_indices().map(|(i, _)| Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: i as u32, fmt: 0 }).collect(),
             (Some(o), _) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
             (None, Some(n)) => shape_with_label(fonts, text, &f, &doc.note_label(n)),
             (None, None) => fonts.shape(text, &f),

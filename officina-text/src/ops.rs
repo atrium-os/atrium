@@ -40,6 +40,12 @@ pub enum TextOp {
     SetNote { id: crate::model::NoteId, note: Option<crate::model::Note> },
     /// Sets comment `id` (None takes it out of the store).
     SetComment { id: crate::model::CommentId, comment: Option<crate::model::Comment> },
+    /// Sets revision `id` (None takes it out).
+    SetRevision { id: crate::model::RevId, rev: Option<crate::model::Revision> },
+    /// Sets deletion `id`, what a tombstone holds (None takes it out).
+    SetDeletion { id: crate::model::DelId, del: Option<crate::model::Deletion> },
+    /// Turns tracking on or off.
+    SetTracking { on: bool },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -131,7 +137,9 @@ impl TextOp {
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } => return None,
             // Comments change no layout; the editor redraws on every action.
-            TextOp::SetComment { .. } => return None,
+            TextOp::SetComment { .. } | TextOp::SetRevision { .. } | TextOp::SetTracking { .. } => return None,
+            // A tombstone takes no room; its text is drawn only in review.
+            TextOp::SetDeletion { .. } => return None,
         })
     }
 
@@ -313,6 +321,33 @@ impl TextOp {
                 }
                 let old = d.comments.set(id, comment);
                 TextOp::SetComment { id, comment: old }
+            }
+            TextOp::SetRevision { id, rev } => {
+                if id as usize >= crate::model::MAX_REVISIONS || rev.as_ref().is_some_and(|r| r.author.len() > 1024 || r.date.len() > 64 || r.name.len() > 1024) {
+                    return TextOp::Nop;
+                }
+                let old = d.revisions.set(id, rev);
+                TextOp::SetRevision { id, rev: old }
+            }
+            TextOp::SetDeletion { id, del } => {
+                if id as usize >= crate::model::MAX_DELETIONS {
+                    return TextOp::Nop;
+                }
+                if let Some(x) = &del {
+                    let bytes: usize = x.pieces.iter().map(|p| p.text.len()).sum();
+                    if x.pieces.is_empty() || bytes > crate::model::MAX_DELETION_TEXT || x.pieces.iter().enumerate().any(|(i, p)| (i > 0) != p.para.is_some() || p.runs.iter().any(|r| r.1 as usize >= d.attrs.len() || !boundary(&p.text, r.0)) || p.para.as_ref().is_some_and(|q| q.1 as usize >= d.styles.styles.len())) {
+                        return TextOp::Nop;
+                    }
+                    for p in x.pieces.iter().filter_map(|p| p.para.as_ref()) {
+                        d.raise_watermark(p.0 + 1);
+                    }
+                }
+                let old = d.deletions.set(id, del);
+                TextOp::SetDeletion { id, del: old }
+            }
+            TextOp::SetTracking { on } => {
+                let old = std::mem::replace(&mut d.tracking, on);
+                TextOp::SetTracking { on: old }
             }
             TextOp::SetPage { page, header, footer } => {
                 let ok = |t: i32| (0..=63_360).contains(&t);

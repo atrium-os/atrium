@@ -16,6 +16,8 @@ use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
 use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
+use officina_text::model::{RevId, Revision};
+use officina_text::track::{Change, ChangeKind, Resolve};
 use officina_text::paginate::Paginator;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -128,12 +130,17 @@ pub struct Editor {
     pub checker: Option<Rc<dyn Checker>>,
     /// Misspellings per paragraph, by the hash of its text.
     spelling: std::collections::HashMap<u64, (u64, Rc<Vec<(u32, u32)>>)>,
+    /// Who tracked edits are made as, and when this session's first was.
+    pub author: std::sync::Arc<str>,
+    pub now: std::sync::Arc<str>,
+    /// This session's revision, once a tracked edit made it.
+    track_rev: Option<RevId>,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new() };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -330,7 +337,63 @@ impl Editor {
     /// Ops that delete the selection, and where the caret ends up.
     /// A selection across table cells clears each cell's part but never joins
     /// cells (or a cell and the text around the table).
-    fn delete_selection_ops(&self) -> (Vec<TextOp>, Pos) {
+    fn delete_selection_ops(&mut self) -> (Vec<TextOp>, Pos) {
+        let (ops, p, _) = self.delete_selection_ops_tracked();
+        (ops, p)
+    }
+
+    /// This session's revision while edits are tracked, with the ops that put
+    /// it in the store the first time.
+    fn track(&mut self) -> Option<(RevId, Vec<TextOp>)> {
+        if !self.doc.tracking {
+            return None;
+        }
+        if let Some(r) = self.track_rev.filter(|&r| self.doc.revisions.get(r).is_some_and(|v| v.author == self.author)) {
+            return Some((r, Vec::new()));
+        }
+        let set = self.doc.revisions.iter().map(|(_, v)| v.set + 1).max().unwrap_or(0);
+        let (id, ops) = self.doc.add_revision_ops(Revision { author: self.author.clone(), date: self.now.clone(), set, name: "".into() });
+        self.track_rev = Some(id);
+        Some((id, ops))
+    }
+
+    /// [`Editor::delete_selection_ops`], and whether a tombstone was left
+    /// where the caret goes (tracked).
+    fn delete_selection_ops_tracked(&mut self) -> (Vec<TextOp>, Pos, bool) {
+        let (a, b) = self.selection();
+        if a != b {
+            if let Some((rev, mut ops)) = self.track() {
+                let mut segs: Vec<(usize, usize)> = vec![(a.block, a.block)];
+                for k in a.block + 1..=b.block {
+                    if self.doc.same_cell(k - 1, k) {
+                        segs.last_mut().expect("one").1 = k;
+                    } else {
+                        segs.push((k, k));
+                    }
+                }
+                let mut id = self.doc.deletions.next_id();
+                let mut at = a;
+                let mut tomb = false;
+                for &(s0, s1) in segs.iter().rev() {
+                    let from = if s0 == a.block { a.at } else { 0 };
+                    let to = if s1 == b.block { b.at } else { self.len(s1) };
+                    if (s0, from) != (s1, to) {
+                        let (o, t) = self.doc.tracked_delete_ops(s0, from, s1, to, rev, id);
+                        if t.is_some() {
+                            id += 1;
+                        }
+                        if s0 == a.block {
+                            if let Some((tb, tat)) = t {
+                                at = Pos::new(tb, tat);
+                                tomb = true;
+                            }
+                        }
+                        ops.extend(o);
+                    }
+                }
+                return (ops, at, tomb);
+            }
+        }
         let (a, b) = self.selection();
         let mut segs: Vec<(usize, usize)> = vec![(a.block, a.block)];
         for k in a.block + 1..=b.block {
@@ -349,7 +412,7 @@ impl Editor {
                 ops.extend(self.doc.delete_ops(s0, from, s1, to));
             }
         }
-        (ops, a)
+        (ops, a, false)
     }
 
     /// The attributes typed text gets at `p`: those before it, with any
@@ -357,9 +420,16 @@ impl Editor {
     /// Text typed next to a picture takes its formatting, not the picture.
     fn typing_attr(&mut self, p: Pos) -> Option<AttrId> {
         let para = self.doc.para(p.block)?;
-        let before = para.attr_at(p.at.saturating_sub(1));
+        // Tombstones (tracked deletions) before the caret don't format typing.
+        let mut k = p.at;
+        while k >= 3 && para.text[..k as usize].ends_with(OBJECT_CHAR) && self.doc.attrs.get(para.attr_at(k - 3)).deleted.is_some() {
+            k -= 3;
+        }
+        let before = para.attr_at(k.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
-        let pic = base.object.take().is_some() | base.note.take().is_some();
+        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.deleted.take().is_some() | (k != p.at);
+        // Tracking marks are the typing's own, never inherited.
+        pic |= base.rev.take().is_some() | base.fmt.take().is_some();
         // Typing inside commented text stays in the comment; at its end it doesn't.
         let after = para.attr_at(p.at);
         let after_comments = (p.at < para.text.len() as u32).then(|| self.doc.attrs.get(after).comments.clone()).flatten();
@@ -378,7 +448,17 @@ impl Editor {
         let mut a = t.over(&base);
         a.object = None;
         a.note = None;
+        a.deleted = None;
+        a.rev = None;
+        a.fmt = None;
         Some(self.doc.attrs.intern(a))
+    }
+
+    /// What text typed at `p` is formatted as, tracked: the typing attributes
+    /// (or those before `p`) with this session's revision.
+    fn tracked_attr(&mut self, p: Pos, rev: RevId) -> AttrId {
+        let a = self.typing_attr(p).unwrap_or_else(|| self.doc.para(p.block).map_or(0, |q| q.attr_at(p.at.saturating_sub(1))));
+        self.doc.with_rev(a, rev)
     }
 
     /// Puts a comment on the selection (or the word at the caret); its id.
@@ -471,6 +551,79 @@ impl Editor {
         }
         self.apply("Delete Comment", ops, Kind::Other);
         true
+    }
+
+    // ---- tracked changes ----
+
+    /// Turns tracking on or off (an undoable change to the document).
+    pub fn set_tracking(&mut self, on: bool) {
+        if self.doc.tracking != on {
+            self.apply(if on { "Track Changes" } else { "Stop Tracking" }, vec![TextOp::SetTracking { on }], Kind::Other);
+        }
+    }
+
+    /// Accepts or rejects every change whose revision `pick` takes.
+    pub fn resolve(&mut self, how: Resolve, pick: impl Fn(RevId) -> bool) -> bool {
+        let ops = self.doc.resolve_ops(how, pick);
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply(if how == Resolve::Accept { "Accept Changes" } else { "Reject Changes" }, ops, Kind::Other);
+        self.clamp_caret();
+        true
+    }
+
+    /// The change at the caret (or just before it).
+    pub fn change_at_caret(&self) -> Option<Change> {
+        let c = self.caret;
+        self.doc.changes().into_iter().find(|ch| {
+            let hit = |p: (usize, u32)| (ch.from.0, ch.from.1) <= p && p <= (ch.to.0, ch.to.1);
+            hit((c.block, c.at)) || (ch.kind == ChangeKind::InsertBreak && ch.from.0 == c.block && c.at == 0)
+        })
+    }
+
+    /// Accepts or rejects one change: its whole revision's text in that place
+    /// (the run of it the caret is in).
+    pub fn resolve_change(&mut self, how: Resolve, ch: &Change) -> bool {
+        let rev = ch.rev;
+        let ops = self.doc.resolve_range_ops(how, |r| r == rev, ch.from, ch.to);
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply(if how == Resolve::Accept { "Accept Change" } else { "Reject Change" }, ops, Kind::Other);
+        self.clamp_caret();
+        true
+    }
+
+    /// Moves the caret to the next (or previous) change; whether there was one.
+    pub fn next_change(&mut self, forward: bool) -> bool {
+        let c = (self.caret.block, self.caret.at);
+        let chs = self.doc.changes();
+        let pick = if forward { chs.iter().find(|ch| ch.from > c) } else { chs.iter().rev().find(|ch| ch.from < c) };
+        match pick {
+            Some(ch) => {
+                let (f, t) = (Pos::new(ch.from.0, ch.from.1), Pos::new(ch.to.0, ch.to.1));
+                self.set_caret(f, false);
+                self.set_caret(t, true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn clamp_caret(&mut self) {
+        let n = self.blocks();
+        let fix = |p: Pos, e: &Self| -> Pos {
+            let b = p.block.min(n.saturating_sub(1));
+            let t = e.text(b);
+            let mut at = (p.at as usize).min(t.len());
+            while !t.is_char_boundary(at) {
+                at -= 1;
+            }
+            Pos::new(b, at as u32)
+        };
+        self.caret = fix(self.caret, self);
+        self.anchor = fix(self.anchor, self);
     }
 
     /// Puts a new footnote or endnote at the caret (over the selection) with
@@ -567,9 +720,21 @@ impl Editor {
         if s.is_empty() {
             return false;
         }
-        let (mut ops, start) = self.delete_selection_ops();
+        let (mut ops, mut start, tomb) = self.delete_selection_ops_tracked();
         let had_sel = !ops.is_empty();
-        let attr = self.typing_attr(start);
+        // A replacement reads old, then new: typing goes after the tombstone.
+        if tomb {
+            start.at += OBJECT_CHAR.len_utf8() as u32;
+        }
+        let track = self.track();
+        let attr = match &track {
+            Some((rev, rops)) => {
+                ops.extend(rops.iter().cloned());
+                Some(self.tracked_attr(start, *rev))
+            }
+            None => self.typing_attr(start),
+        };
+        let rev = track.map(|t| t.0);
         let frag = |t: &str| Fragment { text: t.to_string(), runs: attr.map(|a| vec![(0, a)]).unwrap_or_default() };
         let mut p = start;
         let parts: Vec<&str> = s.split('\n').collect();
@@ -579,7 +744,8 @@ impl Editor {
                 p.at += part.len() as u32;
             }
             if i + 1 < parts.len() {
-                let (style, props) = self.doc.para(start.block).map(|q| (q.style, q.props.clone())).unwrap_or_default();
+                let (style, mut props) = self.doc.para(start.block).map(|q| (q.style, q.props.clone())).unwrap_or_default();
+                props.rev = rev;
                 let id = self.doc.new_id();
                 ops.push(TextOp::Split { block: p.block as u32, at: p.at, id, style, props });
                 p = Pos::new(p.block + 1, 0);
@@ -601,11 +767,20 @@ impl Editor {
             self.list_level(-((MAX_LIST_LEVEL as i32) + 1));
             return;
         }
-        let (mut ops, start) = self.delete_selection_ops();
+        let (mut ops, mut start, tomb) = self.delete_selection_ops_tracked();
+        if tomb {
+            start.at += OBJECT_CHAR.len_utf8() as u32;
+        }
+        let track = self.track();
         let Some(p) = self.doc.para(start.block) else { return };
         let at_end = start.at as usize == p.text.len() && !self.has_selection();
         let style = if at_end { self.doc.styles.styles.get(p.style as usize).and_then(|s| s.next).unwrap_or(p.style) } else { p.style };
-        let props = if at_end && style != p.style { ParaProps::default() } else { p.props.clone() };
+        let mut props = if at_end && style != p.style { ParaProps::default() } else { p.props.clone() };
+        props.rev = None;
+        if let Some((rev, rops)) = track {
+            props.rev = Some(rev);
+            ops.extend(rops);
+        }
         let id = self.doc.new_id();
         ops.push(TextOp::Split { block: start.block as u32, at: start.at, id, style, props });
         self.apply("New Paragraph", ops, Kind::Other);
@@ -628,7 +803,7 @@ impl Editor {
             return false;
         }
         self.anchor = to;
-        let (ops, p) = self.delete_selection_ops();
+        let (ops, p, _) = self.delete_selection_ops_tracked();
         self.apply("Delete", ops, Kind::Deleting);
         self.caret = p;
         self.anchor = p;
@@ -647,8 +822,12 @@ impl Editor {
             return false;
         }
         self.anchor = to;
-        let (ops, p) = self.delete_selection_ops();
+        let (ops, mut p, tomb) = self.delete_selection_ops_tracked();
         self.apply("Delete", ops, Kind::Deleting);
+        // Deleting forward leaves the caret after what it took.
+        if tomb {
+            p.at += OBJECT_CHAR.len_utf8() as u32;
+        }
         self.caret = p;
         self.anchor = p;
         true
@@ -878,12 +1057,16 @@ impl Editor {
             return;
         }
         let (a, b) = self.selection();
-        let mut ops = Vec::new();
+        let track = self.track();
+        let mut ops = track.as_ref().map(|t| t.1.clone()).unwrap_or_default();
         for k in a.block..=b.block {
             let s = if k == a.block { a.at } else { 0 };
             let e = if k == b.block { b.at } else { self.len(k) };
             if s < e {
-                ops.extend(self.doc.format_ops(k, s, e, &f));
+                match &track {
+                    Some((rev, _)) => ops.extend(self.doc.tracked_format_ops(k, s, e, *rev, &f)),
+                    None => ops.extend(self.doc.format_ops(k, s, e, &f)),
+                }
             }
         }
         self.apply(label, ops, Kind::Other);
@@ -1258,7 +1441,16 @@ impl Editor {
         }
         let t = &self.text(p.block)[..p.at as usize];
         let g = t.grapheme_indices(true).next_back().map_or(0, |(i, _)| i);
+        // Tombstones take no room: step over them to the character before.
+        if self.tomb_at(Pos::new(p.block, g as u32)) {
+            return self.grapheme_left(Pos::new(p.block, g as u32));
+        }
         Pos::new(p.block, g as u32)
+    }
+
+    /// Whether a tombstone (a tracked deletion) is at `p`.
+    pub fn tomb_at(&self, p: Pos) -> bool {
+        self.doc.para(p.block).is_some_and(|q| q.text[p.at.min(q.text.len() as u32) as usize..].starts_with(OBJECT_CHAR) && self.doc.attrs.get(q.attr_at(p.at)).deleted.is_some())
     }
 
     fn grapheme_right(&self, p: Pos) -> Pos {
@@ -1267,6 +1459,9 @@ impl Editor {
             return if p.block + 1 >= self.blocks() { p } else { Pos::new(p.block + 1, 0) };
         }
         let g = t[p.at as usize..].graphemes(true).next().map_or(0, str::len);
+        if self.tomb_at(p) {
+            return self.grapheme_right(Pos::new(p.block, p.at + g as u32));
+        }
         Pos::new(p.block, p.at + g as u32)
     }
 
@@ -1687,6 +1882,69 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn tracked_editing_reads_clean_and_resolves() {
+        let mut e = ed(&["The quick brown fox", "jumps over"]);
+        e.start_log();
+        e.author = "Ann".into();
+        e.set_tracking(true);
+        // Replace "quick" with "fast": select, type.
+        e.set_caret(Pos::new(0, 4), false);
+        e.set_caret(Pos::new(0, 9), true);
+        typ(&mut e, "fast");
+        assert_eq!(e.doc.visible_text()[0], "The fast brown fox");
+        // Backspace "fox" one letter at a time: one tombstone.
+        e.set_caret(Pos::new(0, e.len(0)), false);
+        for _ in 0..3 {
+            e.key(Key::Backspace, NO, "", 0);
+        }
+        assert_eq!(e.doc.visible_text()[0], "The fast brown ");
+        assert_eq!(e.doc.live_deletions().len(), 2, "one for quick, one for fox");
+        // Typing at the end goes after the tombstone and is Ann's insertion.
+        typ(&mut e, "cat");
+        assert_eq!(e.doc.visible_text()[0], "The fast brown cat");
+        // Fixing her own typo leaves no trace of it.
+        e.key(Key::Backspace, NO, "", 0);
+        typ(&mut e, "r");
+        assert_eq!(e.doc.visible_text()[0], "The fast brown car");
+        assert_eq!(e.doc.live_deletions().len(), 2);
+        // Enter is an inserted paragraph break; bold is a formatting change.
+        e.set_caret(Pos::new(1, 5), false);
+        e.key(Key::Enter, NO, "", 0);
+        assert_eq!(e.doc.visible_text(), vec!["The fast brown car", "jumps", " over"]);
+        e.set_caret(Pos::new(2, 1), false);
+        e.set_caret(Pos::new(2, 5), true);
+        e.toggle(Toggle::Bold);
+        let kinds: Vec<ChangeKind> = e.doc.changes().iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&ChangeKind::InsertBreak) && kinds.contains(&ChangeKind::Format));
+        // The journal replays to the same document.
+        let log = e.take_log();
+        let mut f = ed(&["The quick brown fox", "jumps over"]);
+        for l in log {
+            f.replay(l);
+        }
+        assert_eq!(texts(&f), texts(&e));
+        assert_eq!(f.doc.visible_text(), e.doc.visible_text());
+        // Reject one change at the caret: the bold.
+        e.set_caret(Pos::new(2, 2), false);
+        let ch = e.change_at_caret().unwrap();
+        assert_eq!(ch.kind, ChangeKind::Format);
+        assert!(e.resolve_change(Resolve::Reject, &ch));
+        assert!(!e.doc.changes().iter().any(|c| c.kind == ChangeKind::Format));
+        // Reject everything: the original; undo, accept everything: the edit.
+        assert!(e.resolve(Resolve::Reject, |_| true));
+        assert_eq!(texts(&e), vec!["The quick brown fox", "jumps over"]);
+        e.undo();
+        assert!(e.resolve(Resolve::Accept, |_| true));
+        assert_eq!(texts(&e), vec!["The fast brown car", "jumps", " over"]);
+        assert!(e.doc.changes().is_empty());
+        // Tracking off: typing is plain again.
+        e.set_tracking(false);
+        e.set_caret(Pos::new(0, 0), false);
+        typ(&mut e, "X");
+        assert!(e.doc.changes().is_empty());
     }
 
     #[test]

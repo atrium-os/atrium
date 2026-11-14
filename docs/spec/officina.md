@@ -1664,7 +1664,7 @@ Not yet: editing a comment on the balloon itself, rich text in comments, mention
 showing comments in the PDF, a comments list pane, Word's paragraph-level comment
 dates in local time (we keep what the file says).
 
-### 16.22 O5c design (proposed 2026-11-15): tracked changes, compare and merge
+### 16.22 O5c design (accepted 2026-11-15): tracked changes, compare and merge
 
 **What goes wrong today.** Word and LibreOffice show a reviewed document as one
 surface carrying everything at once: the new text, the old text struck through,
@@ -1785,6 +1785,46 @@ revisions (one per author and time); edits and change sets are derived as above.
 
 Spreadsheets get the same idea later (cell-level edits in change sets, a lane, no
 cell-comment clutter) but are not part of O5c.
+
+### 16.23 O5c1 as built (2026-11-15): the tracked-changes model
+
+- **Model** (`officina-text::model`, `track`). `CharAttrs` gained `rev` (inserted
+  under a revision), `deleted` (the U+FFFC is a tombstone naming a `Deletion`) and
+  `fmt` (a `FmtChange`: the revision and the earlier attribute entry the text had);
+  `ParaProps::rev` marks an inserted paragraph break. `TextDoc` gained `revisions`
+  (author, date, change set, set name), `deletions` (the revision and the pieces taken
+  out: text, runs, and for each deleted break the following paragraph's id, style and
+  properties) and `tracking`. Both stores share a generic `Store<T>`.
+- **Ops.** `SetRevision`, `SetDeletion`, `SetTracking`; everything else is the
+  existing splice, restyle, split and join. `tracked_delete_ops` moves what isn't the
+  author's own pending text into one tombstone at the start, drops own text and own
+  inserted breaks outright, and takes in tombstones of the same revision either
+  side, so ten Backspaces leave one tombstone. `tracked_format_ops` keeps the first
+  attributes in `fmt` and drops the mark when formatting is put back as it was.
+  `resolve_ops` / `resolve_range_ops` accept or reject the changes a filter picks,
+  last paragraph first; rejecting a deletion puts its pieces back (splitting at its
+  breaks) with the changes inside them resolved too. `changes()` lists the marks in
+  document order; `live_deletions()` follows tombstones inside tombstones.
+- **Layout.** A tombstone is a zero-width glyph that draws nothing, so the page,
+  find, word count, spelling and PDF show the proposed text with no other change.
+- **Editor.** With tracking on, typing, Enter, Backspace, Delete, typing over a
+  selection (old, then new after the tombstone), cut and the formatting keys make
+  tracked changes as `author` in one revision per session; the caret steps over
+  tombstones; typing never inherits tracking marks. `set_tracking`, `resolve`,
+  `resolve_change`, `change_at_caret`, `next_change`. Not tracked yet: paragraph
+  properties and styles, tables, pictures, notes, find-and-replace.
+- **File.** Attribute mask bit 14 (`rev`) and bit 15 (a second mask: `deleted`,
+  `fmt`), paragraph bit 14, REVISIONS chunk (9, with the tracking flag) and DELETIONS
+  chunk (10, live deletions only); journal ops 11–13. A formatting change may only
+  name an earlier attribute entry.
+
+Gates: 10,000 random sequences of 30 tracked edits by two authors in three revisions
+(insertions, deletions across paragraphs, splits, formatting, undo) keep the proposed
+text equal to the same edits made untracked after every step; accepting everything
+gives that document with no marks left; the native file round trips it exactly;
+rejecting everything gives the original exactly, paragraph ids included (2.4 s). An
+editor test covers replacement, repeated Backspace, own-typo fixes, Enter, bold,
+journal replay, rejecting one change, reject all, accept all.
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -11,6 +11,8 @@
 //! | 6 | IMAGE | one picture: its index, its size in pixels, its encoded bytes (one chunk each, so a reader can load them late) |
 //! | 7 | NOTES | footnotes and endnotes: id, kind, paragraphs |
 //! | 8 | COMMENTS | comments: id, author, initials, date, text, the comment answered, resolved |
+//! | 9 | REVISIONS | whether edits are tracked; revisions: id, author, date, change set, its name |
+//! | 10 | DELETIONS | tracked deletions a tombstone holds: id, revision, pieces (paragraph, text, runs) |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -26,7 +28,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Comment, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -38,6 +40,8 @@ pub const CHECKPOINTS: u16 = 5;
 pub const IMAGE: u16 = 6;
 pub const NOTES: u16 = 7;
 pub const COMMENTS: u16 = 8;
+pub const REVISIONS: u16 = 9;
+pub const DELETIONS: u16 = 10;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -86,12 +90,20 @@ impl From<WireError> for LoadError {
 /// Character attributes: a mask of the fields set, then their values.
 pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     let mut m = 0u16;
-    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some(), a.vert.is_some(), a.note.is_some(), a.comments.is_some()].into_iter().enumerate() {
+    for (i, on) in [a.bold.is_some(), a.italic.is_some(), a.underline.is_some(), a.strike.is_some(), a.size.is_some(), a.color.is_some(), a.highlight.is_some(), a.family.is_some(), a.style.is_some(), a.link.is_some(), a.object.is_some(), a.vert.is_some(), a.note.is_some(), a.comments.is_some(), a.rev.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
     }
+    // Bit 15: a second mask follows (tracked deletions and formatting).
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1;
+    if ext != 0 {
+        m |= 1 << 15;
+    }
     w.u16(m);
+    if ext != 0 {
+        w.u16(ext);
+    }
     for b in [a.bold, a.italic, a.underline, a.strike].into_iter().flatten() {
         w.u8(b as u8);
     }
@@ -134,11 +146,22 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
             w.var(id as u64);
         }
     }
+    if let Some(v) = a.rev {
+        w.var(v as u64);
+    }
+    if let Some(v) = a.deleted {
+        w.var(v as u64);
+    }
+    if let Some(f) = a.fmt {
+        w.var(f.rev as u64);
+        w.var(f.old as u64);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
-    if m >> 14 != 0 {
+    let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
+    if ext >> 2 != 0 || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -206,13 +229,24 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         }
         a.comments = Some(v.into());
     }
+    if on(14) {
+        a.rev = Some(r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId);
+    }
+    if ext & 1 != 0 {
+        a.deleted = Some(r.len("deletion", MAX_DELETIONS as u64 - 1)? as DelId);
+    }
+    if ext & 2 != 0 {
+        let rev = r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId;
+        let old = r.len("attribute", MAX_ATTRS)? as AttrId;
+        a.fmt = Some(FmtChange { rev, old });
+    }
     Ok(a)
 }
 
 /// Paragraph properties: a mask of the fields set, then their values.
 pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     let mut m = 0u16;
-    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some(), p.list.is_some(), p.cell.is_some()].into_iter().enumerate() {
+    for (i, on) in [p.align.is_some(), p.indent_start.is_some(), p.indent_end.is_some(), p.first_line.is_some(), p.space_before.is_some(), p.space_after.is_some(), p.line_spacing.is_some(), p.keep_with_next.is_some(), p.keep_together.is_some(), p.page_break_before.is_some(), p.widows.is_some(), p.outline_level.is_some(), p.list.is_some(), p.cell.is_some(), p.rev.is_some()].into_iter().enumerate() {
         if on {
             m |= 1 << i;
         }
@@ -265,6 +299,9 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         w.var(c.col as u64);
         w.var(c.width as u64);
     }
+    if let Some(v) = p.rev {
+        w.var(v as u64);
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -272,7 +309,7 @@ const MAX_TWIPS: i64 = 31_680;
 
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
-    if m >> 14 != 0 {
+    if m >> 15 != 0 {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -347,6 +384,9 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
         }
         p.cell = Some(CellRef { table, row, col, width: width as u32 });
     }
+    if on(14) {
+        p.rev = Some(r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId);
+    }
     Ok(p)
 }
 
@@ -408,6 +448,60 @@ pub fn decode_comment(r: &mut Reader) -> Result<Comment, WireError> {
         _ => return Err(WireError::Invalid("resolved flag")),
     };
     Ok(Comment { author, initials, date, text, parent, done })
+}
+
+pub fn encode_revision(w: &mut Writer, v: &Revision) {
+    w.str(&v.author);
+    w.str(&v.date);
+    w.var(v.set as u64);
+    w.str(&v.name);
+}
+
+pub fn decode_revision(r: &mut Reader) -> Result<Revision, WireError> {
+    let author = Arc::from(r.str("author", MAX_NAME)?);
+    let date = Arc::from(r.str("date", 64)?);
+    let set = r.len("change set", u32::MAX as u64)? as u32;
+    let name = Arc::from(r.str("change set name", MAX_NAME)?);
+    Ok(Revision { author, date, set, name })
+}
+
+pub fn encode_deletion(w: &mut Writer, d: &Deletion) {
+    w.var(d.rev as u64);
+    w.var(d.pieces.len() as u64);
+    for p in &d.pieces {
+        if let Some((id, style, props)) = &p.para {
+            w.var(*id);
+            w.u16(*style);
+            encode_props(w, props);
+        }
+        w.str(&p.text);
+        encode_runs(w, &p.runs);
+    }
+}
+
+pub fn decode_deletion(r: &mut Reader, attrs: usize, styles: usize) -> Result<Deletion, WireError> {
+    let rev = r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId;
+    let n = r.count("deleted pieces", MAX_BLOCKS, 2)?;
+    if n == 0 {
+        return Err(WireError::Invalid("empty deletion"));
+    }
+    let mut pieces = Vec::with_capacity(n);
+    for i in 0..n {
+        let para = if i > 0 {
+            let id = r.var()?;
+            let style = r.u16()?;
+            if style as usize >= styles {
+                return Err(WireError::Invalid("paragraph style"));
+            }
+            Some((id, style, decode_props(r)?))
+        } else {
+            None
+        };
+        let text = r.str("deleted text", MAX_DELETION_TEXT as u64)?.to_string();
+        let runs = decode_runs(r, &text, attrs)?;
+        pieces.push(DelPiece { para, text, runs });
+    }
+    Ok(Deletion { rev, pieces })
 }
 
 /// A note: its kind, then its paragraphs as blocks.
@@ -578,6 +672,32 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
                 }
             }
         }
+        TextOp::SetRevision { id, rev } => {
+            w.u8(11);
+            w.var(*id as u64);
+            match rev {
+                None => w.u8(0),
+                Some(v) => {
+                    w.u8(1);
+                    encode_revision(&mut w, v);
+                }
+            }
+        }
+        TextOp::SetDeletion { id, del } => {
+            w.u8(12);
+            w.var(*id as u64);
+            match del {
+                None => w.u8(0),
+                Some(v) => {
+                    w.u8(1);
+                    encode_deletion(&mut w, v);
+                }
+            }
+        }
+        TextOp::SetTracking { on } => {
+            w.u8(13);
+            w.u8(*on as u8);
+        }
         TextOp::SetNote { id, note } => {
             w.u8(9);
             w.var(*id as u64);
@@ -668,6 +788,31 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             };
             TextOp::SetNote { id, note }
         }
+        11 => {
+            let id = r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId;
+            let rev = match r.u8()? {
+                0 => None,
+                1 => Some(decode_revision(&mut r)?),
+                _ => return Err(WireError::Invalid("revision")),
+            };
+            TextOp::SetRevision { id, rev }
+        }
+        12 => {
+            let id = r.len("deletion", MAX_DELETIONS as u64 - 1)? as DelId;
+            let del = match r.u8()? {
+                0 => None,
+                1 => Some(decode_deletion(&mut r, attrs, styles)?),
+                _ => return Err(WireError::Invalid("deletion")),
+            };
+            TextOp::SetDeletion { id, del }
+        }
+        13 => TextOp::SetTracking {
+            on: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid("tracking flag")),
+            },
+        },
         _ => return Err(WireError::Invalid("op")),
     };
     if !r.is_empty() {
@@ -778,6 +923,28 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         c.add(COMMENTS, &w.into_bytes())?;
     }
 
+    let revs: Vec<(RevId, &Arc<Revision>)> = doc.revisions.iter().collect();
+    if doc.tracking || !revs.is_empty() {
+        let mut w = Writer::new();
+        w.u8(doc.tracking as u8);
+        w.var(revs.len() as u64);
+        for (id, v) in revs {
+            w.var(id as u64);
+            encode_revision(&mut w, v);
+        }
+        c.add(REVISIONS, &w.into_bytes())?;
+    }
+    let dels = doc.live_deletions();
+    if !dels.is_empty() {
+        let mut w = Writer::new();
+        w.var(dels.len() as u64);
+        for id in dels {
+            w.var(id as u64);
+            encode_deletion(&mut w, doc.deletions.get(id).expect("live deletions exist"));
+        }
+        c.add(DELETIONS, &w.into_bytes())?;
+    }
+
     if !checkpoints.is_empty() {
         let mut w = Writer::new();
         w.var(checkpoints.len() as u64);
@@ -850,7 +1017,7 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         *v = r.ivar()?.clamp(0, MAX_TWIPS * 2) as i32;
     }
     doc.page = PageSetup { width: g[0].max(1440), height: g[1].max(1440), margin_top: g[2], margin_bottom: g[3], margin_start: g[4], margin_end: g[5] };
-    let watermark = r.var()?;
+    let mut watermark = r.var()?;
     if !r.is_empty() {
         doc.header = decode_hf(&mut r)?;
         doc.footer = decode_hf(&mut r)?;
@@ -905,6 +1072,10 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         let a = decode_attrs(&mut r)?;
         if a.object.is_some_and(|o| o.image as usize >= doc.images.len()) {
             return Err(LoadError::Bad("picture reference"));
+        }
+        // A formatting change names an earlier entry (never itself or a later one).
+        if a.fmt.is_some_and(|f| f.old as usize > i) {
+            return Err(LoadError::Bad("formatting change"));
         }
         if doc.attrs.intern(a) as usize != i + 1 {
             return Err(LoadError::Bad("attribute listed twice"));
@@ -972,6 +1143,38 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
                 return Err(LoadError::Bad("comment listed twice"));
             }
             doc.comments.set(id, Some(cm));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == REVISIONS) {
+        let mut r = Reader::new(one(REVISIONS, "REVISIONS chunk")?);
+        doc.tracking = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(LoadError::Bad("tracking flag")),
+        };
+        let n = r.count("revisions", MAX_REVISIONS as u64, 4)?;
+        for _ in 0..n {
+            let id = r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId;
+            let v = decode_revision(&mut r)?;
+            if doc.revisions.get(id).is_some() {
+                return Err(LoadError::Bad("revision listed twice"));
+            }
+            doc.revisions.set(id, Some(v));
+        }
+    }
+    if c.entries().iter().any(|e| e.kind == DELETIONS) {
+        let mut r = Reader::new(one(DELETIONS, "DELETIONS chunk")?);
+        let n = r.count("deletions", MAX_DELETIONS as u64, 3)?;
+        for _ in 0..n {
+            let id = r.len("deletion", MAX_DELETIONS as u64 - 1)? as DelId;
+            let d = decode_deletion(&mut r, attrs, styles)?;
+            if doc.deletions.get(id).is_some() {
+                return Err(LoadError::Bad("deletion listed twice"));
+            }
+            for p in d.pieces.iter().filter_map(|p| p.para.as_ref()) {
+                watermark = watermark.max(p.0 + 1);
+            }
+            doc.deletions.set(id, Some(d));
         }
     }
     doc.raise_watermark(watermark);
@@ -1086,6 +1289,11 @@ mod tests {
             TextOp::SetNote { id: 5, note: None },
             TextOp::SetComment { id: 9, comment: Some(Comment { author: "A".into(), text: "c".into(), parent: Some(0), ..Default::default() }) },
             TextOp::SetComment { id: 9, comment: None },
+            TextOp::SetRevision { id: 2, rev: Some(crate::model::Revision { author: "Ann".into(), date: "2026-11-15T00:00:00Z".into(), set: 3, name: "Legal".into() }) },
+            TextOp::SetRevision { id: 2, rev: None },
+            TextOp::SetDeletion { id: 4, del: Some(Deletion { rev: 2, pieces: vec![DelPiece { para: None, text: "gone".into(), runs: vec![(0, 1)] }, DelPiece { para: Some((77, 1, ParaProps { rev: Some(1), ..Default::default() })), text: "".into(), runs: vec![(0, 0)] }] }) },
+            TextOp::SetDeletion { id: 4, del: None },
+            TextOp::SetTracking { on: true },
             TextOp::Nop,
         ];
         for op in ops {

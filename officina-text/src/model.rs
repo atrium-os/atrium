@@ -42,7 +42,123 @@ pub struct CharAttrs {
     pub note: Option<NoteId>,
     /// The comments of the document's [`Comments`] this text is under, sorted.
     pub comments: Option<Arc<[CommentId]>>,
+    /// Tracked: the text was inserted under this revision (not yet accepted).
+    pub rev: Option<RevId>,
+    /// Tracked: the character (U+FFFC) is a tombstone holding this deletion of
+    /// the document's [`Deletions`]; it takes no room on the page.
+    pub deleted: Option<DelId>,
+    /// Tracked: the formatting was changed under a revision; `old` is what the
+    /// text had (an earlier entry of the attribute table).
+    pub fmt: Option<FmtChange>,
 }
+
+/// A formatting change: its revision and the attributes before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FmtChange {
+    pub rev: RevId,
+    pub old: AttrId,
+}
+
+/// A revision of the document's [`Revisions`].
+pub type RevId = u32;
+/// A deletion of the document's [`Deletions`].
+pub type DelId = u32;
+
+/// Who changed the text and when: one author's tracked edits in one session (or
+/// one change set a compare or merge made).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Revision {
+    pub author: Arc<str>,
+    /// ISO 8601 UTC, when the session's first edit was made.
+    pub date: Arc<str>,
+    /// The change set it belongs to (revisions of one set are accepted together).
+    pub set: u32,
+    /// The set's name, if it has one ("Legal's pass").
+    pub name: Arc<str>,
+}
+
+/// What a tracked deletion took out: pieces of text with their runs; every
+/// piece after the first starts a paragraph (the one that followed the
+/// deleted paragraph break), with its id, style and properties.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Deletion {
+    pub rev: RevId,
+    pub pieces: Vec<DelPiece>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DelPiece {
+    /// For a piece after the first: the paragraph it began.
+    pub para: Option<(BlockId, StyleId, ParaProps)>,
+    pub text: String,
+    /// Run starts relative to `text`.
+    pub runs: Vec<(u32, AttrId)>,
+}
+
+impl Deletion {
+    /// The deleted text, paragraph breaks as `\n`.
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for (i, p) in self.pieces.iter().enumerate() {
+            if i > 0 {
+                s.push('\n');
+            }
+            s.push_str(&p.text);
+        }
+        s
+    }
+}
+
+/// Most revisions and deletions in a document; most bytes one deletion holds.
+pub const MAX_REVISIONS: usize = 1 << 16;
+pub const MAX_DELETIONS: usize = 1 << 20;
+pub const MAX_DELETION_TEXT: usize = 64 << 20;
+
+/// A store of entries by id, an id staying taken while the document is open.
+#[derive(Debug, Clone)]
+pub struct Store<T> {
+    list: Vec<Option<Arc<T>>>,
+    max: usize,
+}
+
+impl<T: Clone> Store<T> {
+    pub fn new(max: usize) -> Self {
+        Store { list: Vec::new(), max }
+    }
+    pub fn get(&self, id: u32) -> Option<&Arc<T>> {
+        self.list.get(id as usize).and_then(|n| n.as_ref())
+    }
+    pub fn add(&mut self, c: T) -> Option<u32> {
+        if self.list.len() >= self.max {
+            return None;
+        }
+        self.list.push(Some(Arc::new(c)));
+        Some((self.list.len() - 1) as u32)
+    }
+    /// Sets entry `id` (growing the store to it); the old one.
+    pub fn set(&mut self, id: u32, c: Option<T>) -> Option<T> {
+        let i = id as usize;
+        if i >= self.max {
+            return None;
+        }
+        if self.list.len() <= i {
+            self.list.resize(i + 1, None);
+        }
+        std::mem::replace(&mut self.list[i], c.map(Arc::new)).map(|a| (*a).clone())
+    }
+    pub fn next_id(&self) -> u32 {
+        self.list.len() as u32
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.iter().all(|n| n.is_none())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Arc<T>)> {
+        self.list.iter().enumerate().filter_map(|(i, n)| n.as_ref().map(|n| (i as u32, n)))
+    }
+}
+
+pub type Revisions = Store<Revision>;
+pub type Deletions = Store<Deletion>;
 
 /// A comment of the document's [`Comments`].
 pub type CommentId = u32;
@@ -300,6 +416,9 @@ impl CharAttrs {
             vert: self.vert.or(under.vert),
             note: self.note.or(under.note),
             comments: self.comments.clone().or_else(|| under.comments.clone()),
+            rev: self.rev.or(under.rev),
+            deleted: self.deleted.or(under.deleted),
+            fmt: self.fmt.or(under.fmt),
         }
     }
 }
@@ -321,11 +440,15 @@ pub struct CharFormat {
     pub vert: VertAlign,
     pub note: Option<NoteId>,
     pub comments: Option<Arc<[CommentId]>>,
+    /// Tracked changes over the text (see [`CharAttrs`]).
+    pub rev: Option<RevId>,
+    pub deleted: Option<DelId>,
+    pub fmt: Option<FmtChange>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None }
     }
 }
 
@@ -363,6 +486,15 @@ impl CharFormat {
         }
         if a.comments.is_some() {
             self.comments = a.comments.clone();
+        }
+        if a.rev.is_some() {
+            self.rev = a.rev;
+        }
+        if a.deleted.is_some() {
+            self.deleted = a.deleted;
+        }
+        if a.fmt.is_some() {
+            self.fmt = a.fmt;
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -450,6 +582,9 @@ pub struct ParaProps {
     pub list: Option<Option<ListRef>>,
     /// The table cell the paragraph is in (never from a style).
     pub cell: Option<CellRef>,
+    /// Tracked: the paragraph break before this paragraph was inserted under
+    /// this revision (never from a style).
+    pub rev: Option<RevId>,
 }
 
 /// A paragraph's place in a table. Consecutive paragraphs with the same
@@ -786,6 +921,11 @@ pub struct TextDoc {
     pub notes: Notes,
     /// Comments on ranges of the text.
     pub comments: Comments,
+    /// Tracked changes: who made them, and what deletions took out.
+    pub revisions: Revisions,
+    pub deletions: Deletions,
+    /// Edits are tracked (a setting the file keeps).
+    pub tracking: bool,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -824,7 +964,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), tracking: false, next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

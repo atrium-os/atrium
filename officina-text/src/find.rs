@@ -198,14 +198,18 @@ impl TextDoc {
         ops
     }
 
-    /// `a` without a picture or note anchor in it.
+    /// `a` without a picture, note anchor or tracking mark in it.
     pub fn plain_attr(&mut self, a: crate::model::AttrId) -> crate::model::AttrId {
-        if self.attrs.get(a).object.is_none() && self.attrs.get(a).note.is_none() {
+        let x = self.attrs.get(a);
+        if x.object.is_none() && x.note.is_none() && x.deleted.is_none() && x.rev.is_none() && x.fmt.is_none() {
             return a;
         }
         let mut c = self.attrs.get(a).clone();
         c.object = None;
         c.note = None;
+        c.deleted = None;
+        c.rev = None;
+        c.fmt = None;
         self.attrs.intern(c)
     }
 }

@@ -297,6 +297,9 @@ impl Doc {
     pub fn from_text_doc(d: TextDoc, name: &str) -> Self {
         let mut e = Editor::new(d, fonts());
         e.history.limit = UNDO_LIMIT;
+        // Tracked edits are made as the comment author, dated from this session.
+        e.author = crate::app::comment_author().0.into();
+        e.now = crate::app::comment_date().into();
         Self { ed: Rc::new(RefCell::new(e)), name: name.into(), dirty: false, status: String::new(), autosave: None }
     }
 

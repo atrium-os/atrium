@@ -197,6 +197,7 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         outline_level: over.outline_level.or(under.outline_level),
         list: over.list.or(under.list),
         cell: over.cell.or(under.cell),
+        rev: over.rev.or(under.rev),
     }
 }
 
