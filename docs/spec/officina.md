@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** proposal, 2026-11-14. Scope only, nothing built. The decisions in §17 are
+**Status:** proposal, 2026-11-14 (§7.4 very large documents added the same day). Scope only, nothing built. The decisions in §17 are
 Shankar's to make; each has a recommendation.
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
@@ -47,6 +47,11 @@ decoding), [fresco-scene-groups.md](fresco-scene-groups.md), [insula.md](insula.
   per run, a range-based dependency graph, incremental and multi-threaded recalculation that
   computes what is on screen first and never blocks the UI. Targets: 100 million cells in a
   workbook, a 1,048,576 × 20 sheet open in seconds, 60 Hz scrolling anywhere (§8, §15).
+- **Documents built for size too.** A 1,000+ page document with thousands of images, a
+  TOC, cross-references and long tables: an indexed block tree, images laid out by size and
+  decoded only near the viewport within a fixed budget, pagination that resumes from a page
+  checkpoint and stops when breaks line up again, numbering and references derived from
+  counts, pages as bands (§7.4).
 - **Secrets and signatures through the system.** Document passwords through Arca's secure
   input, data-source credentials through Arca's courier, external data only through Nuntius
   with a per-document consent, document signing with Sigillum's tokens (PAdES / XAdES), keys
@@ -296,6 +301,118 @@ bidirectional text, spell check underlines, drag of selections, and accessibilit
 | O5 | footnotes and endnotes, sections and columns, table of contents and cross-references, comments, tracked changes (accept / reject, shown and kept on round-trip), floating images with wrap |
 | later | equations (MathML; OMML converted), bibliography, mail merge from a sheet, master documents, document signing (§11.3) |
 
+### 7.4 Very large documents (asked by Shankar, 2026-11-14)
+
+*"What about huge docs? 1000+ pages, lots of images, links, table of contents, tables,
+figures."* The design rule is the spreadsheet's: **memory and time per action depend on what
+is on screen and what changed, never on the document's length.** A thesis, a 3,000-page
+manual or ECMA-376 Part 1 itself (about 5,000 pages, which makes it a good test file) should
+feel like a 10-page letter once it is open.
+
+**The model is indexed, not a list.**
+
+- Paragraphs and other blocks sit in a balanced tree (a B-tree over blocks) whose internal
+  nodes keep counts: characters, blocks, headings, captions by kind, footnotes, and the
+  estimated height. Finding "character 4,000,000", "heading 312", "figure 87" or "the block
+  at y" is O(log n), and an insert updates counts on one path.
+- Text inside a block is a rope; a block's attribute runs are stored with it.
+- The native file stores the tree in chunks of a few hundred blocks (§5.1), so opening reads
+  the chunk index and the chunks around the reading position; other chunks load on demand
+  and in the background. Saving writes changed chunks only.
+
+**Images: layout needs sizes, not pixels.**
+
+- On import the converter validates each image, records its pixel size and colour space, and
+  stores it once in the native file as its own content-addressed chunk (the same picture used
+  twenty times is stored once). Formats the decoders don't trust well are transcoded in the
+  converter to PNG or JPEG.
+- Layout uses only the recorded size and the frame the document gives it, so paginating a
+  document with 5,000 images decodes none of them.
+- Pixels are decoded only for pages near the viewport, at the size they are drawn (a 24 MP
+  photo shown 300 pt wide decodes to about that, using the JPEG decoder's scaled decode where it
+  can), with memory-safe decoders and dimension caps checked before allocation, as the
+  Navigator's worker does (threat model §2.4). The document process is already the jail that
+  holds only this document, so decoding there gives nothing away (§17 D16).
+- Decoded pixels live in an LRU cache with a fixed budget (start at 256 MB). An image that
+  isn't ready draws a placeholder in its frame, the same "placeholders, not stalls" rule as
+  ScrollView (pergola.md §10.1); pages never move when it arrives, since its size was known.
+- Thumbnails for the page strip come from the same cache at small size.
+
+**Pagination: checkpoints and convergence.**
+
+- At each page start the layout saves a small **checkpoint**: the block and line it starts at,
+  the floats and footnotes still waiting for a place, counters (page, footnote, list numbers
+  that restart per page), and the section's page style. The Navigator's backend does the same
+  at band boundaries (atrium-navigator-backend.md §4.8); the idea carries over.
+- An edit relayouts its paragraph (cached per paragraph, §7.1), then repaginates from the
+  checkpoint of the page it is on, and **stops as soon as a page starts at the same block and
+  line with the same state as the stored checkpoint**. Typing usually changes one or two pages;
+  inserting a page of text pushes page breaks along until an explicit break, a section start
+  or a paragraph that soaks up the difference (Knuth–Plass's stretch does this often).
+- A change that genuinely shifts every later page (a new chapter near the start) repaginates
+  in the background, in order, on a worker thread. Pages on screen are done first; later page
+  numbers in the status bar show "≈" until pagination reaches them. The visible page never
+  waits for page 900.
+- On open, the reading position is laid out first (the last place the user read, or the
+  start), from the nearest checkpoint saved in the native file (checkpoints are saved with the
+  document, so a reopened file needs no full pagination before showing anything). Foreign
+  files have no checkpoints: their first open paginates in the background, with the scrollbar
+  and page count estimated from block heights and corrected by ScrollView's anchoring, so
+  reading doesn't jump.
+- Pages are the bands of pergola.md §10.4. A window of pages around the viewport (about three
+  screens) is resident as scene groups; everything else is evicted. A 1,000-page document
+  holds the same number of scene nodes as a 10-page one.
+
+**Table of contents, numbering, cross-references, links.**
+
+- **Numbering** (Figure 12, Table 4, equation (3.7), heading numbers, footnote numbers) is
+  derived from the order-statistic counts in the block tree, not stored in the text. Inserting
+  a figure renumbers nothing physically; each caption asks the tree "how many figure captions
+  precede me" when it is drawn. Cost: O(log n) per visible caption.
+- **Cross-references and the TOC** need page numbers, which need pagination, and the TOC's own
+  length can move pages, like LaTeX. The rule: fields that show page numbers are resolved after
+  pagination reaches the target; a field whose text changed relayouts its own paragraph and
+  repaginates from there; at most three rounds, and if it still doesn't settle (a page number
+  that oscillates between two values at a page break) the field keeps the larger width, which
+  ends it. Only fields whose target page changed are touched; a TOC of 2,000 entries updates
+  the entries whose numbers moved.
+- A TOC, list of figures and index are ordinary generated blocks, regenerated in the
+  background when headings or captions change (a heading edit shows immediately in the
+  navigation pane, in the TOC after the update).
+- **Links.** Internal links and cross-references point to anchors (stable block ids), so they
+  survive edits and can never dangle silently: deleting an anchor marks its references broken
+  and lists them. External links open only on a press, through the Navigator, with the address
+  shown first (Limen `LinkActivated`'s rule, limen.md §2.1).
+
+**Long tables.**
+
+- A table spanning 300 pages is laid out row by row; rows split across pages and header rows
+  repeat. Only rows on resident pages have scenes.
+- Automatic column widths over 50,000 rows would read every cell for every edit. So a table
+  has fixed column widths once it has more than a few hundred rows (imported tables already
+  carry widths in `.docx` and `.odt`); "fit to contents" is an explicit command that runs in
+  the background.
+
+**Moving around a big document.**
+
+- A navigation pane of headings (from the block tree, so it is complete before pagination
+  ends), a virtualized page-thumbnail strip, go to page / heading / figure / bookmark, and
+  back and forward through jumps.
+- Find searches the model's text, not the laid-out pages, streaming results as it goes, with
+  a per-chunk text index built in the background so the second search is instant. Replace all
+  over 1,000 pages is one op-log transaction (one undo).
+- Selecting all and changing a style is one op over a range; the restyle relayouts what is on
+  screen and repaginates the rest in the background.
+
+**Export.** PDF export streams page by page from the checkpoints, embedding each image once
+(by content address) and subsetting fonts, so exporting 1,500 pages needs about one page of
+layout state in memory at a time. It runs in the background with progress, and the document
+stays editable (the export works from a snapshot of the op log).
+
+**Not needed: master documents.** Splitting a book into several files is how other word
+processors cope with size. With the above, one file scales, so master documents are left out
+of v1 (§17 D17). Files from other suites that use them import as one document.
+
 ## 8. Spreadsheet (`atrium-sheets`)
 
 ### 8.1 Storage
@@ -517,6 +634,11 @@ Measured on the dev VM for comparison between builds, and on real hardware for n
 | scroll anywhere in a sheet or a 500-page document | the ScrollView gates: 0 stalls over 100 ms, p99.9 ≤ 2 periods, ≤ 1 % missed, 60 Hz |
 | edit a cell with 1 M dependents in one formula group | visible cells updated in one frame; the rest under 1 s on 8 cores |
 | keystroke in a 500-page document | on screen within one frame |
+| open a 1,500-page native document with 3,000 images | reading position on screen under 1 s; memory under 500 MB whatever the image count |
+| open a 1,500-page `.docx` for the first time | first page under 3 s; full pagination in the background under 30 s |
+| insert a figure near the start of a 1,500-page document | visible pages updated in one frame; all later numbers, cross-references and the TOC settled under 10 s |
+| find in a 1,500-page document | first result under 100 ms; all results under 1 s once the index is built |
+| PDF export of 1,500 pages with images | under 60 s on 8 cores, memory flat during export |
 | formula results vs Excel | 100 % of a differential corpus of real workbooks, with reasons for each listed exception |
 | round-trip `.docx` / `.xlsx` / `.odt` / `.ods` | the file reopens in Word, Excel and LibreOffice without repair prompts; visual diff of rendered pages within a set threshold |
 | converters | fuzzed (cargo-fuzz, a corpus of real and malformed files) with no panics outside the jail's handled exit, no memory growth past caps |
@@ -532,7 +654,7 @@ use as test data, and a set Shankar provides of real files he cares about.
 | **O0** | this spec reviewed; Pergola, Scrinium and Fresco owners agree to §10 and §4.2 | decisions in §17 made |
 | **O1** | `officina-core` (model, op log, undo, native format v0), `officina-grid` storage + formula parser + evaluator for the first tier of functions + dependency graph; headless | formula differential corpus, first tier; 100 M-cell synthetic workbook within memory target; fuzzed parser |
 | **O2** | `GridView` + 2D ScrollView + frescod two-axis shift; `atrium-sheets` with CSV open/save, picker open and Save As (§4.2), autosave journal | scroll gates on a 1 M-row sheet on frescod; crash-recovery test |
-| **O3** | `RichTextEditor` (flowing mode first, then paged), `officina-text` paged layout, `atrium-write` with `.odt`/`.docx` converters, PDF export | round-trip gate for text; keystroke-latency gate on a 500-page document |
+| **O3** | `RichTextEditor` (flowing mode first, then paged), `officina-text` paged layout, `atrium-write` with `.odt`/`.docx` converters, PDF export | round-trip gate for text; keystroke-latency gate on a 500-page document; the large-document gates of §15 on a generated 1,500-page document and ECMA-376 Part 1 |
 | **O4** | `.xlsx`/`.ods` converters, styles, number formats, charts, sort/filter, structured tables, macros kept inert | round-trip gate for sheets; 1,048,576-row `.xlsx` open target |
 | **O5** | tracked changes, comments, footnotes, TOC; pivot tables, conditional formats, dynamic arrays, `LAMBDA`; recent files via bookmarks (needs Scrinium home folders) | the corresponding corpus files |
 | **O6** | `atrium-slides`: masters, layouts, presenter view, transitions, `.pptx`/`.odp` | round-trip gate for slides; presenter view on two monitors |
@@ -589,6 +711,12 @@ Each with a recommendation.
     the apps.** *Recommend yes,* per NAMING.md's rule that apps keep plain names.
 15. **Order: spreadsheet first (O1, O2, O4), then word processor (O3, O5), then slides
     (O6).** *Recommend yes,* for the reasons at the end of §16.
+16. **Images in large documents decode in the document process (memory-safe decoders, caps
+    before allocation), with a fixed decoded-pixel budget.** *Recommend yes,* as the
+    Navigator's worker does: the process holds only this document. A decoder jail per image
+    costs about 50 ms each (threat model §2.4), seconds per screen of figures.
+17. **No master documents in v1; one file scales to thousands of pages (§7.4).**
+    *Recommend yes.*
 
 ## 18. Not in scope
 
