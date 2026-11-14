@@ -144,6 +144,26 @@ fn fixture(cases: &[(String, String)], st: &[(Style, Value)]) -> Workbook {
     let f = AutoFilter { rect: Rect { sheet: 1, r0: 9, c0: 2, r1: 15, c1: 3 }, conds: vec![(2, Cond::Values(vec!["pear".into(), "apple".into()])), (3, Cond::Compare(vec![(">".into(), 3.0)], true))] };
     let fst = wb.filtered(1, Some(f));
     wb.replace_filter(fst);
+    // A table: header, three data rows, a calculated column; used from another sheet.
+    for (c, h) in ["Item", "Qty", "Double"].iter().enumerate() {
+        wb.set_value(CellAddr::new(1, 40, c as u32), Value::str(h));
+    }
+    for r in 41..44u32 {
+        wb.set_value(CellAddr::new(1, r, 0), Value::str(&format!("item {r}")));
+        wb.set_value(CellAddr::new(1, r, 1), Value::Num(r as f64));
+    }
+    wb.add_table(officina_grid::tables::Table {
+        name: "Stock".into(),
+        rect: Rect { sheet: 1, r0: 40, c0: 0, r1: 43, c1: 2 },
+        header: true,
+        totals: false,
+        columns: vec!["Item".into(), "Qty".into(), "Double".into()],
+        style: Some("TableStyleMedium2".into()),
+        stripes: true,
+    })
+    .unwrap();
+    wb.fill_formula(1, 2, 41, 43, "=[@Qty]*2").unwrap();
+    wb.set_formula(CellAddr::new(0, 70, 27), "=SUM(Stock[Double])+ROWS(Stock[#All])").unwrap();
     for (i, (s, v)) in st.iter().enumerate() {
         let a = CellAddr::new(2, i as u32, SCOL);
         wb.set_value(a, v.clone());
@@ -217,6 +237,17 @@ fn compare(what: &str, wb: &Workbook, back: &Workbook, cases: &[(String, String)
     if !filter_ok {
         println!("  {what}: filter {:?}\n      → {:?}", wb.sheet(1).filter, back.sheet(1).filter);
     }
+    let tb = |w: &Workbook| w.tables().iter().map(|t| (t.name.to_string(), t.rect, t.header, t.columns.clone())).collect::<Vec<_>>();
+    let mut table_ok = tb(back) == tb(wb);
+    if !table_ok {
+        println!("  {what}: tables {:?}\n      → {:?}", tb(wb), tb(back));
+    }
+    for a in [CellAddr::new(0, 70, 27), CellAddr::new(1, 42, 2)] {
+        if back.get(a) != wb.get(a) {
+            table_ok = false;
+            println!("  {what}: table formula {:?} shows {:?} (want {:?}), formula {:?}", a, back.get(a), wb.get(a), back.formula_text(a));
+        }
+    }
     let mut n_ok = 0;
     for (k, f) in NAMED.iter().enumerate() {
         let a = CellAddr::new(if k == 3 { 1 } else { 0 }, 60 + k as u32, 27);
@@ -226,7 +257,7 @@ fn compare(what: &str, wb: &Workbook, back: &Workbook, cases: &[(String, String)
             println!("  {what}: {f} shows {:?} (want {:?}), formula {:?}", back.get(a), wb.get(a), back.formula_text(a));
         }
     }
-    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}; {n_ok}/{} name formulas, {} names; hidden rows kept {rows_ok}, filter kept {filter_ok}", cases.len(), st.len(), NAMED.len(), back.names().len())
+    format!("{what}: {} formulas, {f_ok} show Excel's result, {src_ok} same source; {} styled cells, {s_ok} same; whole-column style {col_ok}; fixture values {kept}; {n_ok}/{} name formulas, {} names; hidden rows kept {rows_ok}, filter kept {filter_ok}, table kept {table_ok}", cases.len(), st.len(), NAMED.len(), back.names().len())
 }
 
 fn main() {

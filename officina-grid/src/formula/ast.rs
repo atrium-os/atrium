@@ -66,6 +66,31 @@ impl RangeRef {
     }
 }
 
+/// Which rows of a table a structured reference takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TableArea {
+    /// The data rows (no specifier, or `[#Data]`).
+    Data,
+    All,
+    Headers,
+    Totals,
+    /// `[#Headers],[#Data]`
+    HeadersData,
+    /// `[#Data],[#Totals]`
+    DataTotals,
+    /// `[@Col]`, `[#This Row]`: the formula's own row.
+    ThisRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableRef {
+    /// Empty: the table around the formula's cell (`[@Qty]` written inside a table).
+    pub table: Arc<str>,
+    pub area: TableArea,
+    /// The columns, first and last, by header name; `None`: every column.
+    pub cols: Option<(Arc<str>, Arc<str>)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
@@ -117,8 +142,10 @@ pub enum Expr {
     Err(ErrorKind),
     Ref(CellRef),
     Range(RangeRef),
-    /// A name Officina doesn't define (named ranges come later): `#NAME?`.
+    /// A defined name or a table's name (its data rows); `#NAME?` when neither.
     Name(Arc<str>),
+    /// A structured reference: `Sales[Amount]`, `[@Qty]`, `T[[#Headers],[A]:[C]]`.
+    Table(Arc<TableRef>),
     Neg(Box<Expr>),
     Plus(Box<Expr>),
     Pct(Box<Expr>),

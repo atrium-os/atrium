@@ -20,7 +20,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use officina_grid::filter::{AutoFilter, Cond};
-use officina_grid::addr::{a1, parse_a1, CellAddr, MAX_COLS, MAX_ROWS};
+use officina_grid::tables::Table;
+use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
 use officina_grid::formula::{self, Expr};
 use officina_grid::strings::MAX_TEXT;
@@ -566,7 +567,6 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
             b"hyperlink" => seg.rep.note(Kind::Dropped, "hyperlinks"),
             b"drawing" => seg.rep.note(Kind::Dropped, "charts, pictures and shapes (O4e)"),
             b"legacyDrawing" => seg.rep.note(Kind::Dropped, "comments"),
-            b"tablePart" => seg.rep.note(Kind::Approximate, "tables kept as plain cells (O4d)"),
             b"autoFilter" => {
                 if let Some(rf) = attr(&e, b"ref")? {
                     seg.filter = Some((rf, Vec::new()));
@@ -1019,6 +1019,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         all_f.push((i as u16, fcells, shared));
     }
 
+    // Tables, before the formulas that use them.
+    for (i, (_, part)) in sheets.iter().enumerate() {
+        let mut parts: Vec<String> = rels(&z, part)?.into_values().filter(|(t, _)| t.ends_with("/table")).map(|(_, p)| p).collect();
+        parts.sort();
+        for p in parts {
+            if let Some(data) = z.read_name(&p)? {
+                table(&mut wb, i as u16, &data, &mut rep)?;
+            }
+        }
+    }
+
     // Formulas, once every sheet exists (they name each other).
     let mut cached: Vec<(CellAddr, Value)> = Vec::new();
     for (s, fcells, shared) in all_f {
@@ -1077,6 +1088,61 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     }
     out.report.merge(rep);
     Ok((wb, out))
+}
+
+/// One `xl/tables/tableN.xml`.
+fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result<(), XlsxError> {
+    let mut r = xml(data);
+    let mut buf = Vec::new();
+    let mut t: Option<Table> = None;
+    let mut filtered = false;
+    loop {
+        match r.read_event_into(&mut buf)? {
+            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+                b"table" => {
+                    let name = attr(&e, b"displayName")?.or(attr(&e, b"name")?).unwrap_or_default();
+                    let Some((r0, c0, r1, c1)) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) else {
+                        rep.note(Kind::Dropped, "tables without a range");
+                        return Ok(());
+                    };
+                    let header = attr(&e, b"headerRowCount")?.map_or(true, |v| v != "0");
+                    let totals = attr(&e, b"totalsRowCount")?.is_some_and(|v| v != "0");
+                    t = Some(Table { name: name.into(), rect: Rect { sheet, r0, c0, r1, c1 }, header, totals, columns: Vec::new(), style: None, stripes: false });
+                }
+                b"tableColumn" => {
+                    if let (Some(t), Some(n)) = (t.as_mut(), attr(&e, b"name")?) {
+                        if t.columns.len() < MAX_COLS as usize {
+                            t.columns.push(decode_escapes(&n).as_ref().into());
+                        }
+                    }
+                }
+                b"filterColumn" => filtered = true,
+                b"sortState" => rep.note(Kind::Approximate, "a table's saved sort order (rows stay as saved)"),
+                b"tableStyleInfo" => {
+                    if let Some(t) = t.as_mut() {
+                        t.style = attr(&e, b"name")?.filter(|n| !n.is_empty() && n.len() <= 255).map(Into::into);
+                        t.stripes = attr(&e, b"showRowStripes")?.is_some_and(|v| v == "1" || v == "true");
+                    }
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    let Some(t) = t else { return Ok(()) };
+    if filtered {
+        rep.note(Kind::Approximate, "filters inside tables (rows stay as the file hid them)");
+    }
+    if t.style.is_some() {
+        rep.note(Kind::Approximate, "table styles kept but not drawn");
+    }
+    let name = t.name.clone();
+    if let Err(why) = wb.add_table(t) {
+        rep.note_at(Kind::Dropped, "tables this engine can't use (kept as plain cells)", || format!("{name}: {why}"));
+    }
+    Ok(())
 }
 
 fn wb_parse(wb: &Workbook, src: &str, s: u16, row: u32, col: u32) -> Option<Expr> {

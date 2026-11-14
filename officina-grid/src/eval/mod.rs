@@ -13,7 +13,7 @@ pub mod funcs;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
-use crate::formula::{BinOp, Expr, Func, RangeRef};
+use crate::formula::{BinOp, Expr, Func, RangeRef, TableArea, TableRef};
 use crate::value::{compare, format_general, ErrorKind, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -79,12 +79,18 @@ impl<'a> Ctx<'a> {
             Expr::Bool(b) => Ev::V(Value::Bool(*b)),
             Expr::Err(k) => Ev::err(*k),
             Expr::Name(n) if n.is_empty() => Ev::V(Value::Empty),
-            Expr::Name(n) => match self.wb.names.get(self.sheet, n) {
-                Some(d) => {
-                    let x = d.expr.clone();
-                    crate::names::deeper(|| self.eval(&x)).unwrap_or(Ev::err(ErrorKind::Name))
+            Expr::Name(n) => match self.wb.bound(self.sheet, self.row, self.col, e) {
+                Some(x) => crate::names::deeper(|| self.eval(&x)).unwrap_or(Ev::err(ErrorKind::Name)),
+                None => {
+                    let _ = n;
+                    Ev::err(ErrorKind::Name)
                 }
-                None => Ev::err(ErrorKind::Name),
+            },
+            Expr::Table(t) => match self.wb.resolve_table(self.sheet, self.row, self.col, t) {
+                // `@` outside the table's data rows: Excel's #VALUE!.
+                Some(_) if t.area == TableArea::ThisRow && !self.this_row_ok(t) => Ev::err(ErrorKind::Value),
+                Some(x) => self.eval(&x),
+                None => Ev::err(ErrorKind::Ref),
             },
             Expr::Ref(r) => {
                 let sheet = r.sheet.unwrap_or(self.sheet);
@@ -121,6 +127,11 @@ impl<'a> Ctx<'a> {
                 Ev::A(Arc::new(Array { rows: rows.len(), cols, vals }))
             }
         }
+    }
+
+    fn this_row_ok(&self, t: &TableRef) -> bool {
+        let tb = if t.table.is_empty() { self.wb.table_at(self.sheet, self.row, self.col) } else { self.wb.table(&t.table) };
+        tb.and_then(|tb| tb.data_rows()).is_some_and(|(a, b)| (a..=b).contains(&self.row))
     }
 
     pub fn range(&self, r: &RangeRef) -> Option<Rect> {

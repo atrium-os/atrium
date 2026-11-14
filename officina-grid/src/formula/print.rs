@@ -3,16 +3,31 @@
 use super::ast::*;
 use crate::addr::{col_name, MAX_COLS, MAX_ROWS};
 use crate::eval::funcs;
+use std::sync::Arc;
 
 /// `=...` text of `e` as it reads in cell (`row`, `col`). `sheet_name` names sheets for
 /// cross-sheet references (quoted when needed).
 pub fn to_a1(e: &Expr, row: u32, col: u32, sheet_name: &dyn Fn(u16) -> String) -> String {
     let mut s = String::from("=");
-    pr(e, row, col, sheet_name, &mut s);
+    pr(e, row, col, &Out { sn: sheet_name, file: None }, &mut s);
     s
 }
 
-fn pr(e: &Expr, row: u32, col: u32, sn: &dyn Fn(u16) -> String, s: &mut String) {
+/// [`to_a1`] in the form `.xlsx` files carry: structured references name their table
+/// (`table_at(row, col)` names the table around a cell) and spell `@` as
+/// `[#This Row]`.
+pub fn to_a1_file(e: &Expr, row: u32, col: u32, sheet_name: &dyn Fn(u16) -> String, table_at: &dyn Fn(u32, u32) -> Option<Arc<str>>) -> String {
+    let mut s = String::from("=");
+    pr(e, row, col, &Out { sn: sheet_name, file: Some(table_at) }, &mut s);
+    s
+}
+
+struct Out<'a> {
+    sn: &'a dyn Fn(u16) -> String,
+    file: Option<&'a dyn Fn(u32, u32) -> Option<Arc<str>>>,
+}
+
+fn pr(e: &Expr, row: u32, col: u32, o: &Out, s: &mut String) {
     match e {
         Expr::Num(v) => s.push_str(&num(*v)),
         Expr::Str(t) => {
@@ -23,13 +38,20 @@ fn pr(e: &Expr, row: u32, col: u32, sn: &dyn Fn(u16) -> String, s: &mut String) 
         Expr::Bool(b) => s.push_str(if *b { "TRUE" } else { "FALSE" }),
         Expr::Err(k) => s.push_str(k.text()),
         Expr::Name(n) => s.push_str(n),
+        Expr::Table(t) => {
+            let named = match (o.file, t.table.is_empty()) {
+                (Some(at), true) => at(row, col),
+                _ => None,
+            };
+            table(t, named.as_deref(), o.file.is_some(), s);
+        }
         Expr::Ref(r) => {
-            sheet(r.sheet, sn, s);
+            sheet(r.sheet, o.sn, s);
             coord_col(r.col, col, s);
             coord_row(r.row, row, s);
         }
         Expr::Range(r) => {
-            sheet(r.sheet, sn, s);
+            sheet(r.sheet, o.sn, s);
             match r.kind {
                 RangeKind::Cells => {
                     coord_col(r.c0, col, s);
@@ -52,25 +74,25 @@ fn pr(e: &Expr, row: u32, col: u32, sn: &dyn Fn(u16) -> String, s: &mut String) 
         }
         Expr::Neg(a) => {
             s.push('-');
-            pr(a, row, col, sn, s);
+            pr(a, row, col, o, s);
         }
         Expr::Plus(a) => {
             s.push('+');
-            pr(a, row, col, sn, s);
+            pr(a, row, col, o, s);
         }
         Expr::Pct(a) => {
-            pr(a, row, col, sn, s);
+            pr(a, row, col, o, s);
             s.push('%');
         }
         Expr::Paren(a) => {
             s.push('(');
-            pr(a, row, col, sn, s);
+            pr(a, row, col, o, s);
             s.push(')');
         }
         Expr::Bin(op, a, b) => {
-            pr(a, row, col, sn, s);
+            pr(a, row, col, o, s);
             s.push_str(op.text());
-            pr(b, row, col, sn, s);
+            pr(b, row, col, o, s);
         }
         Expr::Call(f, args) => {
             match f {
@@ -82,7 +104,7 @@ fn pr(e: &Expr, row: u32, col: u32, sn: &dyn Fn(u16) -> String, s: &mut String) 
                 if i > 0 {
                     s.push(',');
                 }
-                pr(a, row, col, sn, s);
+                pr(a, row, col, o, s);
             }
             s.push(')');
         }
@@ -96,7 +118,7 @@ fn pr(e: &Expr, row: u32, col: u32, sn: &dyn Fn(u16) -> String, s: &mut String) 
                     if j > 0 {
                         s.push(',');
                     }
-                    pr(a, row, col, sn, s);
+                    pr(a, row, col, o, s);
                 }
             }
             s.push('}');
@@ -155,5 +177,77 @@ fn coord_row(r: Coord, at: u32, s: &mut String) {
             Some(v) => s.push_str(&(v as u64 + 1).to_string()),
             None => s.push_str("#REF!"),
         },
+    }
+}
+
+/// A column name inside brackets, with `[ ] # '` escaped by `'`.
+fn col_esc(c: &str, s: &mut String) {
+    for ch in c.chars() {
+        if matches!(ch, '[' | ']' | '#' | '\'') {
+            s.push('\'');
+        }
+        s.push(ch);
+    }
+}
+
+/// Whether a column name can stand alone in one pair of brackets (`T[Amount]`).
+fn simple_col(c: &str) -> bool {
+    !c.is_empty() && c.trim() == c && !c.starts_with('#') && !c.chars().any(|ch| matches!(ch, ',' | ':' | '@' | '[' | ']' | '\''))
+}
+
+fn cols(c: &(Arc<str>, Arc<str>), s: &mut String) {
+    s.push('[');
+    col_esc(&c.0, s);
+    s.push(']');
+    if c.1 != c.0 {
+        s.push_str(":[");
+        col_esc(&c.1, s);
+        s.push(']');
+    }
+}
+
+fn table(t: &TableRef, named: Option<&str>, file: bool, s: &mut String) {
+    s.push_str(named.unwrap_or(&t.table));
+    let kw = match t.area {
+        TableArea::Data => None,
+        TableArea::All => Some("[#All]"),
+        TableArea::Headers => Some("[#Headers]"),
+        TableArea::Totals => Some("[#Totals]"),
+        TableArea::HeadersData => Some("[#Headers],[#Data]"),
+        TableArea::DataTotals => Some("[#Data],[#Totals]"),
+        TableArea::ThisRow if file => Some("[#This Row]"),
+        TableArea::ThisRow => {
+            s.push_str("[@");
+            match &t.cols {
+                Some(c) if c.0 == c.1 && simple_col(&c.0) => s.push_str(&c.0),
+                Some(c) => cols(c, s),
+                None => {}
+            }
+            s.push(']');
+            return;
+        }
+    };
+    match (kw, &t.cols) {
+        (None, None) if t.table.is_empty() && named.is_none() => s.push_str("[#Data]"),
+        (None, None) => s.push_str("[]"),
+        (None, Some(c)) if c.0 == c.1 && simple_col(&c.0) => {
+            s.push('[');
+            s.push_str(&c.0);
+            s.push(']');
+        }
+        (Some(k), None) if !k.contains(',') => s.push_str(k),
+        (k, c) => {
+            s.push('[');
+            if let Some(k) = k {
+                s.push_str(k);
+            }
+            if let Some(c) = c {
+                if k.is_some() {
+                    s.push(',');
+                }
+                cols(c, s);
+            }
+            s.push(']');
+        }
     }
 }

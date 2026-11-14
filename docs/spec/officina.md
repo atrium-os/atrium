@@ -996,6 +996,51 @@ Gates, on the 4-core cloud machine:
 | round trip | `tests/ods.rs`: values, formulas (fills, other sheets, arrays, newer functions), awkward text, sizes and styles equal after our write and read |
 | hostile input | 1,500 mutated packages (XML tokens, repeats of 4 G rows, bad dates and durations) plus truncations: no panic; a repeated-value bomb refused at once |
 
+### 16.6 O4d as built (2026-11-14): names, sort, filter, tables
+
+Engine and files; the Sheets UI for them (sort and filter menus, table creation, the
+filter buttons) is the next step.
+
+- **Defined names** (`officina-grid::names`): workbook and sheet scope (a sheet name
+  hides a workbook one), stored parsed as if in A1 so their relative parts follow the
+  using cell, as in Excel's files; footprints and evaluation follow names up to 16 deep,
+  a cycle of names is `#NAME?`; changing a name re-binds the formulas that use names.
+  `.xlsx` `definedNames` (`localSheetId`), `.ods` named ranges and expressions with
+  their base cell, native chunk 7.
+- **Sort** (`officina-grid::sort`): Excel's order (numbers, text ignoring case, logicals,
+  errors; empties last both ways), stable, by several keys; one undoable edit moving
+  whole rows of the range (values, formulas copied with their relative references, as
+  Excel does, and styles); a sorted fill stays one fill.
+- **Filter** (`officina-grid::filter`): one auto-filter per sheet (value lists matched
+  on shown text ignoring case; one or two numeric tests joined by and/or) and hidden
+  row ranges, swapped as one undoable `GridOp::Filter` (journal kind 4, native chunk 8);
+  hidden rows have height 0 in the view. `.xlsx`: `row hidden`, `autoFilter` with
+  `filters`/`customFilters`, the hidden `_xlnm._FilterDatabase` name Excel expects.
+  `.ods`: row `visibility` (`filter` / `collapse`) and anonymous database ranges with
+  their conditions (LibreOffice leaves numeric order tests untyped and repeats the first
+  set item; both handled). Text, wildcard and top-N filters are reported and their rows
+  stay as the file hid them.
+- **Structured tables** (`officina-grid::tables`): named range, header and totals rows,
+  named columns, style name kept; tables and names share one namespace; tables don't
+  overlap. Formulas keep structured references as written (`Sales[Amount]`,
+  `[@Qty]`, `Sales[[#Headers],[A]:[C]]`, `#All/#Data/#Headers/#Totals/#This Row`, `'`
+  escapes, a table's name alone for its data) and resolve them when evaluated, with the
+  range's footprints (`@` is the formula's own row; outside the data rows `#VALUE!`).
+  `.xlsx`: `xl/tables/tableN.xml` both ways, formulas in the file form
+  (`Sales[[#This Row],[Qty]]`), shown as Excel shows them inside their table
+  (`[@Qty]`). `.ods` has no structured references: formulas are written with the ranges
+  they reach, the table as a named database range (header and data rows) read back as a
+  table named by its header cells. Native chunk 9. Table styles are kept but not drawn
+  yet (reported); filters inside tables keep their rows as the file hid them.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| LibreOffice both ways (`examples/ods_lo.rs`) | 4 names, a two-column auto-filter with hand-hidden rows and a table with a calculated column, used from another sheet: all kept in and out, values equal |
+| round trips | `tests/roundtrip.rs` and `tests/ods.rs`: names, filter state and hidden rows, tables and their formulas equal after write and read; native round trip in the grid tests |
+| hostile input | structured-reference parser: unbalanced brackets, bad keywords, three-part ranges refused; print/parse round trip; existing formula and package fuzzers clean |
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

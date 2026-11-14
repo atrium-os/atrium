@@ -214,3 +214,47 @@ fn filter_round_trip() {
     let again = xlsx::write(&back, Vec::new()).unwrap();
     assert_eq!(xlsx::read(&again).unwrap().0.names().len(), back.names().len());
 }
+
+fn with_table(mut wb: Workbook) -> Workbook {
+    use officina_grid::addr::Rect;
+    use officina_grid::tables::Table;
+    // Data!F1:H6: header, four data rows, totals.
+    for (c, h) in ["Item", "Qty", "Line total"].iter().enumerate() {
+        wb.set_value(CellAddr::new(0, 0, 5 + c as u32), Value::str(h));
+    }
+    for r in 1..5u32 {
+        wb.set_value(CellAddr::new(0, r, 5), Value::str(&format!("thing {r}")));
+        wb.set_value(CellAddr::new(0, r, 6), Value::Num(r as f64));
+    }
+    wb.set_value(CellAddr::new(0, 5, 5), Value::str("Total"));
+    wb.add_table(Table {
+        name: "Orders".into(),
+        rect: Rect { sheet: 0, r0: 0, c0: 5, r1: 5, c1: 7 },
+        header: true,
+        totals: true,
+        columns: vec!["Item".into(), "Qty".into(), "Line total".into()],
+        style: Some("TableStyleMedium2".into()),
+        stripes: true,
+    })
+    .unwrap();
+    wb.fill_formula(0, 7, 1, 4, "=[@Qty]*Data!A1").unwrap();
+    wb.set_formula(CellAddr::new(0, 5, 7), "=SUM(Orders[Line total])").unwrap();
+    wb.set_formula(CellAddr::new(1, 20, 0), "=SUM(Orders[Qty])+ROWS(Orders[#All])").unwrap();
+    wb.recalc();
+    wb
+}
+
+#[test]
+fn table_round_trip() {
+    let wb = with_table(book());
+    assert_eq!(wb.get(CellAddr::new(1, 20, 0)), Value::Num(10.0 + 6.0));
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert_eq!(loaded.report.human(), vec!["approximate: table styles kept but not drawn".to_string()]);
+    assert_eq!(back.tables(), wb.tables());
+    for a in [CellAddr::new(0, 2, 7), CellAddr::new(0, 5, 7), CellAddr::new(1, 20, 0)] {
+        assert_eq!(back.get(a), wb.get(a), "{a:?}");
+        assert_eq!(back.formula_text(a), wb.formula_text(a), "{a:?}");
+    }
+    assert_eq!(back.formula_text(CellAddr::new(0, 3, 7)).unwrap(), "=[@Qty]*Data!A3");
+}

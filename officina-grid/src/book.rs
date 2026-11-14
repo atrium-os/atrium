@@ -7,7 +7,7 @@ use crate::deps::{footprints, DepIndex, Footprint, GroupId, RowSet};
 use crate::eval::funcs::{self, text_key};
 use crate::eval::parse_number;
 use crate::fast::Fast;
-use crate::formula::{self, Expr, Func, ParseError};
+use crate::formula::{self, Expr, Func, ParseError, TableArea, TableRef};
 use crate::names::{valid_name, NameDef, Names};
 use crate::numfmt::Formatted;
 use crate::strings::StringPool;
@@ -134,6 +134,8 @@ pub struct Workbook {
     pub styles: StyleTable,
     /// Defined names; change them with [`Workbook::define_name`] so formulas re-bind.
     pub(crate) names: Names,
+    /// Structured tables; change them with [`Workbook::add_table`] so formulas re-bind.
+    pub(crate) tables: Vec<crate::tables::Table>,
     pub(crate) groups: Vec<Option<Group>>,
     free_groups: Vec<GroupId>,
     pub(crate) deps: DepIndex,
@@ -160,6 +162,7 @@ impl Workbook {
             strings: StringPool::new(),
             styles: StyleTable::new(),
             names: Names::default(),
+            tables: Vec::new(),
             groups: Vec::new(),
             free_groups: Vec::new(),
             deps: DepIndex::default(),
@@ -468,6 +471,19 @@ impl Workbook {
         formula::to_a1(&d.expr, 0, 0, &|s| self.sheet_name(s))
     }
 
+    /// What a name or structured reference in cell (`sheet`, `row`, `col`) stands for: a
+    /// defined name's formula, else a table's data rows; `None` for anything else.
+    pub(crate) fn bound(&self, sheet: u16, row: u32, col: u32, n: &Expr) -> Option<Expr> {
+        match n {
+            Expr::Name(x) if !x.is_empty() => match self.names.get(sheet, x) {
+                Some(d) => Some((*d.expr).clone()),
+                None => self.table(x)?.resolve(&TableRef { table: x.clone(), area: TableArea::Data, cols: None }),
+            },
+            Expr::Table(t) => self.resolve_table(sheet, row, col, t),
+            _ => None,
+        }
+    }
+
     /// Re-adds every group that uses a name (its footprints follow the names) and
     /// marks it for recalculation.
     pub(crate) fn rebind_names(&mut self) {
@@ -478,7 +494,7 @@ impl Workbook {
             .filter_map(|(i, g)| {
                 let g = g.as_ref()?;
                 let mut named = false;
-                g.expr.walk(&mut |n| named |= matches!(n, Expr::Name(x) if !x.is_empty()));
+                g.expr.walk(&mut |n| named |= matches!(n, Expr::Table(_)) || matches!(n, Expr::Name(x) if !x.is_empty()));
                 named.then_some(i as GroupId)
             })
             .collect();
@@ -509,7 +525,12 @@ impl Workbook {
     /// joined with the group just above or below when that is the same fill.
     pub fn fill_formula(&mut self, sheet: u16, col: u32, r0: u32, r1: u32, src: &str) -> Result<GroupId, ParseError> {
         assert!(r0 <= r1 && r1 < MAX_ROWS && col < MAX_COLS);
-        let e = Arc::new(self.parse(src, sheet, r0, col)?);
+        let e = self.parse(src, sheet, r0, col)?;
+        // `Sales[@Qty]` inside Sales reads as Excel shows it, `[@Qty]`.
+        let e = Arc::new(match self.table_at(sheet, r0, col) {
+            Some(t) if self.table_at(sheet, r1, col).is_some_and(|u| u.name == t.name) => crate::tables::unqualify(&e, &t.name),
+            _ => e,
+        });
         self.clear_formulas_in(sheet, col, r0, r1);
         self.changed.push(Rect { sheet, r0, r1, c0: col, c1: col });
         let above = if r0 > 0 { self.group_at(sheet, r0 - 1, col) } else { None };
@@ -545,7 +566,7 @@ impl Workbook {
                 volatile |= funcs::FUNCS[*id as usize].volatile;
             }
         });
-        let fps = footprints(&expr, sheet, col, r0, r1, &|s, n| self.names.get(s, n).map(|d| d.expr.clone()));
+        let fps = footprints(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));
         let fast = Fast::compile(&expr, sheet, col).map(Arc::new);
         let g = Group { sheet, col, r0, r1, expr, volatile, fps, fast, dep_ids: Vec::new() };
         let id = match self.free_groups.pop() {

@@ -780,7 +780,15 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
     }
     if let Some(g) = wb.group_at(s, r, c) {
         let grp = wb.group(g);
-        let a1 = formula::to_a1(&grp.expr, r, c, &|id| wb.sheet_name(id));
+        // OpenFormula has no structured references: the ranges they reach.
+        let inl;
+        let e = if wb.tables().is_empty() || !Workbook::uses_tables(&grp.expr) {
+            &*grp.expr
+        } else {
+            inl = wb.inline_tables(&grp.expr, s, r, c);
+            &inl
+        };
+        let a1 = formula::to_a1(e, r, c, &|id| wb.sheet_name(id));
         out.push_str(r#" table:formula=""#);
         esc(out, &super::formula::to_of(&a1));
         out.push('"');
@@ -1086,6 +1094,19 @@ fn filters_xml(wb: &Workbook) -> String {
             out.push_str("</table:filter-and></table:filter>");
         }
         out.push_str("</table:database-range>");
+    }
+    // Tables as named database ranges, header and data rows (a totals row stays
+    // plain cells).
+    for t in wb.tables() {
+        let r = &t.rect;
+        let last = r.r1 - (t.totals && r.r1 > r.r0) as u32;
+        let sh = super::formula::sheet_a1(&wb.sheet_name(r.sheet));
+        let addr = format!("{sh}.{}{}:{sh}.{}{}", officina_grid::addr::col_name(r.c0), r.r0 + 1, officina_grid::addr::col_name(r.c1), last + 1);
+        out.push_str(r#"<table:database-range table:name=""#);
+        esc(&mut out, &t.name);
+        out.push_str(r#"" table:target-range-address=""#);
+        esc(&mut out, &addr);
+        let _ = write!(out, r#"" table:contains-header="{}"/>"#, t.header);
     }
     if out.is_empty() {
         return out;

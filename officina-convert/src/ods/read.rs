@@ -696,6 +696,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut hidden_rows: Vec<(u32, u32)> = Vec::new();
     let mut db: Option<(String, Vec<(u32, Cond)>)> = None;
     let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
+    // Named database ranges: (name, range, header row).
+    let mut db_tables: Vec<(String, String, bool)> = Vec::new();
     let mut filter_and = true;
     let mut in_set = false;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
@@ -884,7 +886,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:database-range" => {
                         let a = attrs(e);
                         db = None;
-                        if a.get("table:display-filter-buttons").is_some_and(|v| v == "true") {
+                        let named = a.get("table:name").filter(|n| !n.starts_with("__Anonymous_Sheet_DB__") && officina_grid::names::valid_name(n));
+                        if let (Some(n), Some(t)) = (named, a.get("table:target-range-address")) {
+                            // A named range with a header row: a table.
+                            if db_tables.len() < officina_grid::tables::MAX_TABLES {
+                                db_tables.push((n.clone(), t.clone(), a.get("table:contains-header").map_or(true, |v| v != "false")));
+                            }
+                        } else if a.get("table:display-filter-buttons").is_some_and(|v| v == "true") {
                             if let Some(t) = a.get("table:target-range-address") {
                                 db = Some((t.clone(), Vec::new()));
                             }
@@ -1064,17 +1072,31 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
 
     // Auto-filters: their range names the sheet.
     for (target, mut conds) in filters {
-        let Some(a1) = super::formula::from_of(&format!("of:=[{}]", target.replace(':', ":"))) else { continue };
-        let (sh, rf) = match a1.trim_start_matches('=').rsplit_once('!') {
-            Some((sh, rf)) => (sh.trim_matches('\'').replace("''", "'"), rf.to_string()),
-            None => continue,
-        };
-        let (Some(s), Some((r0, c0, r1, c1))) = (wb.sheet_id(&sh), crate::xlsx::read::parse_ref(&rf)) else { continue };
+        let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
         conds.retain_mut(|(c, _)| {
             *c += c0;
             *c <= c1
         });
         wb.sheet_mut(s).filter = Some(officina_grid::filter::AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
+    }
+
+    // Tables, from named database ranges; their columns are named by the header row.
+    for (name, target, header) in db_tables {
+        let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
+        let mut columns: Vec<Arc<str>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for c in c0..=c1.min(c0 + 16_383) {
+            let mut n = if header { wb.formatted(CellAddr::new(s, r0, c)).text.trim().to_string() } else { String::new() };
+            if n.is_empty() || n.len() > officina_grid::tables::MAX_COL_NAME || !seen.insert(n.to_lowercase()) {
+                n = format!("Column{}", c - c0 + 1);
+                seen.insert(n.to_lowercase());
+            }
+            columns.push(n.as_str().into());
+        }
+        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: None, stripes: false };
+        if let Err(why) = wb.add_table(t) {
+            rep.note_at(Kind::Dropped, "tables this engine can't use (kept as plain cells)", || format!("{name}: {why}"));
+        }
     }
 
     // Names, before the formulas that use them; relative parts are from the base cell.
@@ -1201,4 +1223,13 @@ mod tests {
         assert_eq!(time_value("P1DT6H"), Some(1.25));
         assert_eq!(time_value("nope"), None);
     }
+}
+
+/// A database range's `target-range-address`: sheet and range.
+fn target_rect(wb: &Workbook, target: &str) -> Option<(u16, u32, u32, u32, u32)> {
+    let a1 = super::formula::from_of(&format!("of:=[{target}]"))?;
+    let (sh, rf) = a1.trim_start_matches('=').rsplit_once('!')?;
+    let sh = sh.trim_matches('\'').replace("''", "'");
+    let (r0, c0, r1, c1) = crate::xlsx::read::parse_ref(rf)?;
+    Some((wb.sheet_id(&sh)?, r0, c0, r1, c1))
 }

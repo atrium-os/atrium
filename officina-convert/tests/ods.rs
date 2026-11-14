@@ -216,3 +216,27 @@ fn ods_filter_round_trip() {
     assert_eq!(back.filter_state(0), want);
     assert_eq!(back.filter_state(1).filter, None);
 }
+
+#[test]
+fn ods_tables_become_ranges_and_named_database_ranges() {
+    use officina_grid::tables::Table;
+    let mut wb = book();
+    for (c, h) in ["Item", "Qty"].iter().enumerate() {
+        wb.set_value(CellAddr::new(0, 0, 5 + c as u32), Value::str(h));
+    }
+    for r in 1..5u32 {
+        wb.set_value(CellAddr::new(0, r, 6), Value::Num(r as f64));
+    }
+    wb.add_table(Table { name: "Orders".into(), rect: Rect { sheet: 0, r0: 0, c0: 5, r1: 4, c1: 6 }, header: true, totals: false, columns: vec!["Item".into(), "Qty".into()], style: None, stripes: false }).unwrap();
+    wb.fill_formula(0, 7, 1, 4, "=Orders[@Qty]*2").unwrap();
+    wb.set_formula(CellAddr::new(1, 20, 0), "=SUM(Orders[Qty])").unwrap();
+    wb.recalc();
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.tables(), wb.tables());
+    assert_eq!(back.get(CellAddr::new(1, 20, 0)), Value::Num(10.0));
+    assert_eq!(back.get(CellAddr::new(0, 3, 7)), Value::Num(6.0));
+    // As plain references: OpenFormula has no structured ones.
+    assert_eq!(back.formula_text(CellAddr::new(1, 20, 0)).unwrap(), "=SUM(Data!$G$2:$G$5)");
+}

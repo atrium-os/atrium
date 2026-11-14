@@ -10,6 +10,7 @@
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
+//! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -38,6 +39,7 @@ pub const STYLES: u16 = 5;
 pub const STYLE_RUNS: u16 = 6;
 pub const NAMES: u16 = 7;
 pub const ROWS_SHOWN: u16 = 8;
+pub const TABLES: u16 = 9;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -194,6 +196,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
         c.add(NAMES, &w.into_bytes())?;
     }
+    if !wb.tables.is_empty() {
+        let mut w = Writer::new();
+        w.var(wb.tables.len() as u64);
+        for t in &wb.tables {
+            t.encode(&mut w);
+        }
+        c.add(TABLES, &w.into_bytes())?;
+    }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sh.hidden.is_empty() && sh.filter.is_none() {
             continue;
@@ -302,6 +312,21 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
                 return Err(LoadError::Bad("a name twice"));
             }
             wb.define_name_stored(name, scope, src).map_err(|_| LoadError::Bad("a name's formula"))?;
+        }
+        done(&r)?;
+    }
+
+    // Tables, also before formulas.
+    let mut it = of(TABLES);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two TABLES chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("tables", crate::tables::MAX_TABLES as u64, 8)?;
+        for _ in 0..k {
+            let t = crate::tables::Table::decode(&mut r)?;
+            wb.add_table(t).map_err(LoadError::Bad)?;
         }
         done(&r)?;
     }

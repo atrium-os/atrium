@@ -43,7 +43,31 @@ enum Tok {
     Sheet(String),
     /// `3:5`, `$3:$5` (whole rows), lexed as one token so it isn't a number
     Rows(String, String),
+    /// A structured reference: the table (empty when unqualified) and what is
+    /// between its outer brackets.
+    Table(String, String),
     Op(&'static str),
+}
+
+/// The end (past the closing `]`) of the bracket group starting at `b[i] == b'['`;
+/// `'` escapes the next character.
+fn bracket_end(b: &[u8], mut i: usize) -> Option<usize> {
+    let mut depth = 0u32;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => i += 1,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn err<T>(at: usize, msg: impl Into<String>) -> Result<T, ParseError> {
@@ -226,9 +250,18 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
                 if i < b.len() && b[i] == b'!' {
                     i += 1;
                     out.push((start, Tok::Sheet(w.to_string())));
+                } else if i < b.len() && b[i] == b'[' {
+                    let end = bracket_end(b, i).ok_or(ParseError { at: i, msg: "'[' without its ']'".into() })?;
+                    out.push((start, Tok::Table(w.to_string(), s[i + 1..end - 1].to_string())));
+                    i = end;
                 } else {
                     out.push((start, Tok::Word(w.to_string())));
                 }
+            }
+            b'[' => {
+                let end = bracket_end(b, i).ok_or(ParseError { at: i, msg: "'[' without its ']'".into() })?;
+                out.push((start, Tok::Table(String::new(), s[i + 1..end - 1].to_string())));
+                i = end;
             }
             _ => return err(i, format!("unexpected character {:?}", s[i..].chars().next().unwrap())),
         }
@@ -470,6 +503,13 @@ impl P<'_> {
                 Ok(e)
             }
             Tok::Rows(a, z) => self.rows(None, &a, &z, at),
+            Tok::Table(t, inner) => {
+                if !t.is_empty() && (t.contains('$') || self.cell(&t).is_some()) {
+                    return err(at, format!("not a table: {t}"));
+                }
+                let (area, cols) = table_spec(&inner).ok_or(ParseError { at, msg: "bad structured reference".into() })?;
+                Ok(Expr::Table(Arc::new(TableRef { table: Arc::from(t.as_str()), area, cols })))
+            }
             Tok::Word(w) => {
                 if self.peek_op() == Some("(") {
                     self.pos += 1;
@@ -674,4 +714,147 @@ impl P<'_> {
         }
         Ok(Expr::Array(rows))
     }
+}
+
+/// A column name with its `'` escapes removed.
+fn unesc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\'' {
+            if let Some(n) = it.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The top-level `[...]` items of `s` (separated by `,` and `:`), each with the
+/// separator before it.
+fn items(s: &str) -> Option<Vec<(char, &str)>> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut sep = ',';
+    loop {
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'[' {
+            return None;
+        }
+        let end = bracket_end(b, i)?;
+        out.push((sep, &s[i + 1..end - 1]));
+        i = end;
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+        if i >= b.len() {
+            return Some(out);
+        }
+        sep = b[i] as char;
+        if sep != ',' && sep != ':' {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+type Cols = Option<(Arc<str>, Arc<str>)>;
+
+/// What a structured reference's brackets hold.
+fn table_spec(inner: &str) -> Option<(TableArea, Cols)> {
+    let t = inner.trim();
+    let one = |c: &str| -> Cols {
+        let c: Arc<str> = Arc::from(unesc(c).as_str());
+        Some((c.clone(), c))
+    };
+    if t.is_empty() {
+        return Some((TableArea::Data, None));
+    }
+    if let Some(rest) = t.strip_prefix('@') {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some((TableArea::ThisRow, None));
+        }
+        if !rest.starts_with('[') {
+            return Some((TableArea::ThisRow, one(rest)));
+        }
+        let (area, cols) = table_items(rest)?;
+        return (area == TableArea::Data).then_some((TableArea::ThisRow, cols));
+    }
+    if !t.starts_with('[') {
+        if let Some(k) = t.strip_prefix('#') {
+            return Some((keyword(k)?.into_area()?, None));
+        }
+        return Some((TableArea::Data, one(t)));
+    }
+    table_items(t)
+}
+
+#[derive(Default)]
+struct Kw {
+    all: bool,
+    data: bool,
+    headers: bool,
+    totals: bool,
+    this_row: bool,
+}
+
+impl Kw {
+    fn into_area(self) -> Option<TableArea> {
+        Some(match (self.all, self.headers, self.data, self.totals, self.this_row) {
+            (false, false, _, false, false) => TableArea::Data,
+            (true, false, false, false, false) => TableArea::All,
+            (false, true, false, false, false) => TableArea::Headers,
+            (false, false, false, true, false) => TableArea::Totals,
+            (false, true, true, false, false) => TableArea::HeadersData,
+            (false, false, true, true, false) => TableArea::DataTotals,
+            (false, false, false, false, true) => TableArea::ThisRow,
+            _ => return None,
+        })
+    }
+}
+
+fn keyword(k: &str) -> Option<Kw> {
+    let mut kw = Kw::default();
+    match k.trim().to_ascii_lowercase().as_str() {
+        "all" => kw.all = true,
+        "data" => kw.data = true,
+        "headers" => kw.headers = true,
+        "totals" => kw.totals = true,
+        "this row" => kw.this_row = true,
+        _ => return None,
+    }
+    Some(kw)
+}
+
+fn table_items(t: &str) -> Option<(TableArea, Cols)> {
+    let mut kw = Kw::default();
+    let mut cols: Vec<(char, String)> = Vec::new();
+    for (sep, it) in items(t)? {
+        if let Some(k) = it.trim_start().strip_prefix('#') {
+            if sep != ',' || !cols.is_empty() {
+                return None;
+            }
+            let k = keyword(k)?;
+            kw.all |= k.all;
+            kw.data |= k.data;
+            kw.headers |= k.headers;
+            kw.totals |= k.totals;
+            kw.this_row |= k.this_row;
+        } else {
+            cols.push((sep, unesc(it)));
+        }
+    }
+    let cols = match cols.as_slice() {
+        [] => None,
+        [(_, a)] => Some((Arc::from(a.as_str()), Arc::from(a.as_str()))),
+        [(_, a), (':', b)] => Some((Arc::from(a.as_str()), Arc::from(b.as_str()))),
+        _ => return None,
+    };
+    Some((kw.into_area()?, cols))
 }

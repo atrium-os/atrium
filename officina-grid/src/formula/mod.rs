@@ -8,4 +8,4 @@ pub mod print;
 
 pub use ast::*;
 pub use parse::{parse, parse_stored, ParseError, MAX_DEPTH, MAX_FORMULA_LEN, MAX_STORED_FORMULA_LEN};
-pub use print::to_a1;
+pub use print::{to_a1, to_a1_file};

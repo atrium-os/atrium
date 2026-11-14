@@ -63,15 +63,16 @@ impl Footprint {
 }
 
 /// The footprints of a formula in column `col` of `sheet`, for rows `r0..=r1`.
-/// `names` gives a name's formula as seen from a sheet: a formula's footprints include
-/// those of the names it uses (names are relative to the using cell, as if inlined).
-pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, &str) -> Option<Arc<Expr>>) -> Vec<Footprint> {
+/// `names` gives what a name or structured reference stands for, seen from a cell (sheet,
+/// row, column): a formula's footprints include those of the names and tables it uses
+/// (names are relative to the using cell, as if inlined).
+pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>) -> Vec<Footprint> {
     let mut out = footprints_d(e, sheet, col, r0, r1, names, 0);
     out.dedup();
     out
 }
 
-fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, &str) -> Option<Arc<Expr>>, depth: u32) -> Vec<Footprint> {
+fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>, depth: u32) -> Vec<Footprint> {
     let mut out = Vec::new();
     let mut named: Vec<Arc<Expr>> = Vec::new();
     let rowspan = |a: Coord, b: Coord| -> Span {
@@ -96,8 +97,9 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
                 out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
             }
         }
-        Expr::Name(n) if !n.is_empty() && depth < crate::names::MAX_NAME_DEPTH => {
-            if let Some(x) = names(sheet, n) {
+        Expr::Name(x) if x.is_empty() => {}
+        Expr::Name(_) | Expr::Table(_) if depth < crate::names::MAX_NAME_DEPTH => {
+            if let Some(x) = names(sheet, r0, col, n) {
                 named.push(x);
             }
         }

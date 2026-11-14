@@ -292,21 +292,21 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
                 let grp = wb.group(g);
                 if grp.r0 == grp.r1 {
                     o.extend_from_slice(b"<f>");
-                    esc(&mut o, &formula_out(&formula::to_a1(&grp.expr, r, c, &|id| wb.sheet_name(id))));
+                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
                     o.extend_from_slice(b"</f>");
                 } else if r == grp.r0 {
                     let id = next_si;
                     next_si += 1;
                     si.insert(g, id);
                     let _ = write!(o, r#"<f t="shared" ref="{}:{}" si="{id}">"#, a1(grp.r0, c), a1(grp.r1, c));
-                    esc(&mut o, &formula_out(&formula::to_a1(&grp.expr, r, c, &|id| wb.sheet_name(id))));
+                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
                     o.extend_from_slice(b"</f>");
                 } else if let Some(id) = si.get(&g) {
                     let _ = write!(o, r#"<f t="shared" si="{id}"/>"#);
                 } else {
                     // A fill whose first row was cut off: write the cell's own text.
                     o.extend_from_slice(b"<f>");
-                    esc(&mut o, &formula_out(&formula::to_a1(&grp.expr, r, c, &|id| wb.sheet_name(id))));
+                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
                     o.extend_from_slice(b"</f>");
                 }
             }
@@ -393,8 +393,48 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings) -> io::Result<Vec<u8>
             }
         }
     }
+    let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
+    if k > 0 {
+        let _ = write!(o, r#"<tableParts count="{k}">"#);
+        for j in 0..k {
+            let _ = write!(o, r#"<tablePart r:id="rId{}"/>"#, j + 1);
+        }
+        o.extend_from_slice(b"</tableParts>");
+    }
     o.extend_from_slice(b"</worksheet>");
     Ok(o)
+}
+
+/// `xl/tables/tableN.xml` for table `t`, numbered `id` (from 1).
+fn table_xml(t: &officina_grid::tables::Table, id: usize) -> Vec<u8> {
+    let r = &t.rect;
+    let mut o: Vec<u8> = Vec::new();
+    let _ = write!(o, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="{id}" name=""#);
+    esc(&mut o, &t.name);
+    o.extend_from_slice(b"\" displayName=\"");
+    esc(&mut o, &t.name);
+    let _ = write!(o, r#"" ref="{}:{}""#, a1(r.r0, r.c0), a1(r.r1, r.c1));
+    if !t.header {
+        o.extend_from_slice(br#" headerRowCount="0""#);
+    }
+    o.extend_from_slice(if t.totals { br#" totalsRowCount="1">"# as &[u8] } else { br#" totalsRowShown="0">"# });
+    if t.header {
+        let _ = write!(o, r#"<autoFilter ref="{}:{}"/>"#, a1(r.r0, r.c0), a1(r.r1 - t.totals as u32, r.c1));
+    }
+    let _ = write!(o, r#"<tableColumns count="{}">"#, t.columns.len());
+    for (i, c) in t.columns.iter().enumerate() {
+        let _ = write!(o, r#"<tableColumn id="{}" name=""#, i + 1);
+        esc(&mut o, c);
+        o.extend_from_slice(b"\"/>");
+    }
+    o.extend_from_slice(b"</tableColumns>");
+    if let Some(st) = &t.style {
+        o.extend_from_slice(b"<tableStyleInfo name=\"");
+        esc(&mut o, st);
+        let _ = write!(o, r#"" showFirstColumn="0" showLastColumn="0" showRowStripes="{}" showColumnStripes="0"/>"#, t.stripes as u8);
+    }
+    o.extend_from_slice(b"</table>");
+    o
 }
 
 /// Every cell in row-major order, formula cells included even when their value is
@@ -443,6 +483,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#);
     for s in 0..n {
         ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#, s + 1));
+    }
+    for i in 0..wb.tables().len() {
+        ct.push_str(&format!(r#"<Override PartName="/xl/tables/table{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#, i + 1));
     }
     ct.push_str("</Types>");
     z.add("[Content_Types].xml", ct.as_bytes())?;
@@ -502,6 +545,19 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     z.add("xl/sharedStrings.xml", &sst)?;
     for (s, p) in parts.into_iter().enumerate() {
         z.add(&format!("xl/worksheets/sheet{}.xml", s + 1), &p)?;
+        // Its tables, in the order its tableParts name them.
+        let mine: Vec<usize> = (0..wb.tables().len()).filter(|&i| wb.tables()[i].rect.sheet as usize == s).collect();
+        if !mine.is_empty() {
+            let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
+            for (j, i) in mine.iter().enumerate() {
+                r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
+            }
+            r.push_str("</Relationships>");
+            z.add(&format!("xl/worksheets/_rels/sheet{}.xml.rels", s + 1), r.as_bytes())?;
+        }
+    }
+    for (i, t) in wb.tables().iter().enumerate() {
+        z.add(&format!("xl/tables/table{}.xml", i + 1), &table_xml(t, i + 1))?;
     }
     z.finish()
 }

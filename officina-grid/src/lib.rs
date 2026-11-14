@@ -29,6 +29,7 @@ pub mod recalc;
 pub mod sort;
 pub mod strings;
 pub mod style;
+pub mod tables;
 pub mod value;
 
 pub use addr::{CellAddr, Rect};
