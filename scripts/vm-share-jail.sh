@@ -32,10 +32,17 @@
 #   - hangs (network-shares.md §4.4): a share server that is stopped
 #     (SIGSTOP) holds nobody: dispensatord answers at once and the share
 #     disconnects; a server killed outright is reaped with its mounts and
-#     grants; a server whose SSH peer stops answering ends itself (25 s
-#     read timeout) and is reaped; dispensatord killed with a share up
-#     leaves no jail or mount once it starts again;
-#   - connected again, locking the screen ends it.
+#     grants; dispensatord killed with a share up leaves no jail or mount
+#     once it starts again;
+#   - S4, the server goes and comes back: a read from a silent server
+#     fails inside fusefs' 30 s and the share stays; the next read connects
+#     again; with sshd down, reads fail fast, and once it is back the
+#     share works again by itself;
+#   - connected again, locking the screen ends it; unlocking brings it
+#     back (a new login, through Arca), in the file manager's jail too;
+#   - connect at login (D8): off unless asked, only the file manager sets
+#     it; set, a user switch ends the share and alice's login connects it;
+#     unset, it doesn't.
 #
 # Ends "share-jail: N failed".
 set -u
@@ -239,24 +246,72 @@ V "kill -9 $SP"
 gone 20 && ok "a killed server is reaped with its mounts and grants" || bad "after kill -9: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
 check "its label retired" "63000 retired" "$(V "tail -1 /var/run/atrium/share-registry")"
 
+echo "=== the server goes and comes back (S4)"
 out=$(fm_connect)
+case "$out" in "ok share-"*) ok "connected ($out)" ;; *) bad "connect: $out" ;; esac
+# Its SSH session goes silent: the read waits out the 20 s timeout and
+# fails, the share stays, and the next read connects again (sshd itself
+# still answers new connections).
+fills0=$(V "grep -c 'op=0x00a9.*status=0' $G/db/audit.log" | tr -d ' ')
 pkill -STOP -f 'sshd: sharetest' 2>/dev/null
-V "su -m alice -c 'cat $M/hello.txt' >/dev/null 2>&1 &"
-gone 120 && ok "a server whose peer went silent ends itself and is reaped" || bad "a silent peer: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
-pkill -CONT -f 'sshd: sharetest' 2>/dev/null; pkill -f 'sshd: sharetest' 2>/dev/null
+t0=$(date +%s); V "su -m alice -c 'cat $M/hello.txt'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+check "a read from a silent server fails (${t}s)" failed "$r"
+[ $t -le 29 ] && ok "inside fusefs' 30 s" || bad "the read took ${t}s"
+V "jls -n name | grep -q system-share-63000" && ok "the share stays" || bad "the share ended with its connection"
+check "and the next read connects again" from-server "$(V "su -m alice -c 'cat $M/hello.txt'" 2>&1)"
+pkill -CONT -f 'sshd: sharetest' 2>/dev/null
+# sshd gone altogether: reads fail at once, and work again once it's back.
+kill "$(cat $SD/sshd.pid)" 2>/dev/null; pkill -f 'sshd: sharetest' 2>/dev/null; sleep 1
+t0=$(date +%s); V "su -m alice -c 'cat $M/hello.txt'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+check "the server down: a read fails (${t}s)" failed "$r"
+t0=$(date +%s); V "su -m alice -c 'ls $M'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+[ "$r" = failed ] && [ $t -le 8 ] && ok "and the next fails fast too (${t}s)" || bad "the next read: $r in ${t}s"
+V "jls -n name | grep -q system-share-63000" && ok "the share stays, waiting" || bad "the share ended while its server was down"
+/usr/sbin/sshd -f $SD/sshd_config
+i=0; r=""; while [ $i -lt 45 ] && [ "$r" != from-server ]; do sleep 1; r=$(V "su -m alice -c 'cat $M/hello.txt'" 2>/dev/null); i=$((i+1)); done
+check "the server back: the share works again (${i}s)" from-server "$r"
+V "su -m alice -c 'echo again > $M/again.txt'"
+check "and writes again" again "$(cat $SHAREPATH/again.txt 2>&1)"
+rm -f $SHAREPATH/again.txt
+check "Arca filled it again for each new login" 2 "$(( $(V "grep -c 'op=0x00a9.*status=0' $G/db/audit.log" | tr -d ' ') - fills0 ))"
+V "su -m alice -c '$DD --eject share-63000'" >/dev/null 2>&1; gone 20 || bad "the share stayed after eject"
 
 out=$(fm_connect)
 V "pkill -9 -f 'atrium-dispensatord --rules'; sleep 1; service atrium-dispensatord start >/dev/null 2>&1"
 gone 30 && ok "dispensatord killed with a share up: once it restarts no jail or mount is left" || bad "after a restart: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"
 V "printf '%s\n' alice > $SEAT"; sleep 4
+# A new dispensatord: the file manager asks for its standing grant again.
+V "jexec -u grantfm $JF /bin/dd --media-socket /sock/removable-media.sock --attach-all" >/dev/null 2>&1
 
 echo "=== the screen locks"
 out=$(V "su -m grantfm -c '$DD --connect $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
 case "$out" in "ok share-"*) ok "connected again ($out)" ;; *) bad "reconnect: $out" ;; esac
 V "printf '%s\n' alice > $LOCK"; sleep 8
 V "jls -n name | grep -q system-share-" && bad "a share jail outlived the lock" || ok "locked: the share ended"
-V ": > $LOCK"; sleep 4
 check "no mounts left in share jails" 0 "$(V "mount -p | grep -c /jails/system-share-" | tr -d ' ')"
+V ": > $LOCK"
+i=0; while [ $i -lt 40 ] && ! V "su -m alice -c 'test -e $M/hello.txt'" 2>/dev/null; do sleep 1; i=$((i+1)); done
+check "unlocked: the share is back, logged in again (${i}s)" from-server "$(V "su -m alice -c 'cat $M/hello.txt'" 2>&1)"
+i=0; while [ $i -lt 20 ] && ! V "test -e $F/hello.txt"; do sleep 1; i=$((i+1)); done
+V "test -e $F/hello.txt" && ok "and in the file manager's jail again" || bad "not in the file manager's jail after unlock"
+
+echo "=== connect at login (D8)"
+check "off unless asked" "ok off" "$(V "su -m grantfm -c '$DD --at-login share-63000 ask'" 2>&1)"
+check "alice can't set it" "error" "$(V "su -m alice -c '$DD --at-login share-63000 on'" 2>&1 | cut -d' ' -f1)"
+check "the file manager ticks it" "ok on" "$(V "su -m grantfm -c '$DD --at-login share-63000 on'" 2>&1)"
+V "printf '%s\n' bob > $SEAT"; sleep 8
+V "jls -n name | grep -q system-share-" && bad "a share outlived the user switch" || ok "another user: the share ended"
+V "printf '%s\n' alice > $SEAT"
+i=0; while [ $i -lt 40 ] && ! V "su -m alice -c 'test -e $M/hello.txt'" 2>/dev/null; do sleep 1; i=$((i+1)); done
+check "alice logs in: it connects by itself (${i}s)" from-server "$(V "su -m alice -c 'cat $M/hello.txt'" 2>&1)"
+check "the file manager unticks it" "ok off" "$(V "su -m grantfm -c '$DD --at-login share-63000 off'" 2>&1)"
+V "printf '%s\n' bob > $SEAT"; sleep 8; V "printf '%s\n' alice > $SEAT"; sleep 10
+V "jls -n name | grep -q system-share-" && bad "an unticked share connected at login" || ok "unticked: no connection at login"
+out=$(V "su -m grantfm -c '$DD --connect-at-login $HOST $SPORT $SHAREPATH sharetest $WANT'" 2>&1)
+case "$out" in "ok share-"*) ok "connected with connect at login ticked ($out)" ;; *) bad "connect-at-login: $out" ;; esac
+check "it is on" "ok on" "$(V "su -m grantfm -c '$DD --at-login ${out#ok } ask'" 2>&1)"
+V "su -m grantfm -c '$DD --at-login ${out#ok } off'" >/dev/null 2>&1
+V "su -m alice -c '$DD --eject ${out#ok }'" >/dev/null 2>&1; gone 20 || bad "the share stayed after eject"
 V "umount -f $RF/sock; for j in $JF $JA $JB; do $JC $JS remove \$j >/dev/null; done; true"
 rm -rf $SHAREPATH/j.txt $SHAREPATH/Docs; V "pkill -f $B/arcad; true"; kill "$(cat $SD/sshd.pid)" 2>/dev/null
 

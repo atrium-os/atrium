@@ -34,6 +34,8 @@
 //! atrium-dispensatord --revoke JAIL      (root: a folder of a stick in an app's jail, §4.8)
 //! atrium-dispensatord --attach-all       (the file manager, from its jail: every stick)
 //! atrium-dispensatord --open PART PATH [--write]   (root: print the file, as handed over)
+//! atrium-dispensatord --connect[-at-login] HOST PORT PATH USER FINGERPRINT   (the file manager: a share)
+//! atrium-dispensatord --at-login PART on|off|ask   (the file manager: connect it at login?)
 //! ```
 //!
 //! The media socket speaks Aqueduct class `media` (atrium-media, §6.6):
@@ -118,12 +120,19 @@ fn args() -> Result<Args, String> {
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
             // Tests: what the file manager asks for a share.
             "--learn" => a.media_cmd = Some(format!("learn {}", val()?)),
-            "--connect" => {
+            "--connect" | "--connect-at-login" => {
                 let mut v = Vec::new();
                 for _ in 0..5 {
                     v.push(it.next().ok_or("--connect needs HOST PORT PATH USER FINGERPRINT")?);
                 }
-                a.media_cmd = Some(format!("connect {}", v.join(" ")));
+                let login = if x == "--connect-at-login" { " login" } else { "" };
+                a.media_cmd = Some(format!("connect {}{login}", v.join(" ")));
+            }
+            // PART, then `on`, `off` or `ask`.
+            "--at-login" => {
+                let part = val()?;
+                let on = it.next().ok_or("--at-login needs PART on|off|ask")?;
+                a.media_cmd = Some(format!("at-login {part} {on}"));
             }
             "--devices-socket" => a.devices_socket = val()?.into(),
             "--devices" => a.devices_cmd = true,
@@ -356,17 +365,30 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
     }
     if let Some(rest) = cmd.strip_prefix("connect ") {
         let f: Vec<&str> = rest.split(' ').collect();
-        let [host, port, path, user, fp] = f[..] else {
-            println!("error malformed");
-            return ExitCode::FAILURE;
+        let (host, port, path, user, fp, at_login) = match f[..] {
+            [h, p, pa, u, fp] => (h, p, pa, u, fp, false),
+            [h, p, pa, u, fp, "login"] => (h, p, pa, u, fp, true),
+            _ => {
+                println!("error malformed");
+                return ExitCode::FAILURE;
+            }
         };
         let Ok(port) = port.parse() else {
             println!("error port");
             return ExitCode::FAILURE;
         };
         let (proto, host, _) = proto_of(host);
-        let c = atrium_media::Connect { proto, host, port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false };
+        let c = atrium_media::Connect { proto, host, port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false, at_login };
         return answer(atrium_media::client::connect(sock, &c));
+    }
+    if let Some(rest) = cmd.strip_prefix("at-login ") {
+        let (part, on) = rest.split_once(' ').unwrap_or((rest, "ask"));
+        let on = match on {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+        return answer(atrium_media::client::at_login(sock, &atrium_media::AtLogin { part: part.into(), on }));
     }
     match cmd.split_once(' ') {
         Some(("revoke", jail)) => match atrium_media::client::revoke(sock, jail) {
@@ -489,6 +511,12 @@ mod run {
         standing: Vec<Standing>,
         /// Connected network shares, by share-server uid (network-shares.md §6.1).
         shares: BTreeMap<u32, ShareRun>,
+        /// The shares a lock ended, for its user's unlock to bring back
+        /// (§7, S4): the session user, each share, its address, read-only.
+        paused: Option<(String, Vec<(dispensator::share::Share, std::net::Ipv4Addr, bool)>)>,
+        /// Shares to connect at login, resolved off the loop's thread: the
+        /// session user each was for.
+        logins: (mpsc::Sender<(String, dispensator::share::Share, std::net::Ipv4Addr, bool)>, mpsc::Receiver<(String, dispensator::share::Share, std::net::Ipv4Addr, bool)>),
     }
 
     /// One connected share: its jail runs while `pd` is held.
@@ -501,6 +529,9 @@ mod run {
         _pd: Option<OwnedFd>,
         /// Its server has logged in and answers: grants may go to it.
         ready: bool,
+        /// What it is, to connect it again (unlock, connect at login).
+        share: dispensator::share::Share,
+        addr: std::net::Ipv4Addr,
     }
 
     /// A grant: a FUSE mount at `dir` (the stick's server, rooted at the
@@ -517,8 +548,11 @@ mod run {
         Grant(atrium_media::Grant),
         Revoke(String),
         AttachAll(Standing),
-        /// A checked share and the address it resolved to, once.
-        Connect(dispensator::share::Share, std::net::Ipv4Addr, bool),
+        /// A checked share and the address it resolved to, once; read-only;
+        /// connect it at login from now on.
+        Connect(dispensator::share::Share, std::net::Ipv4Addr, bool, bool),
+        /// A connected share's "connect at login": asked, or set.
+        AtLogin(String, Option<bool>),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -760,7 +794,14 @@ mod run {
                 Err(e) => return (mstatus::NOT_FOUND, e),
             };
             eprintln!("atrium-dispensatord: {app} connects {}://{}@{}:{}{} ({addr})", sh.proto.name(), sh.user, sh.host, sh.port, sh.path);
-            self.ask(Req::Connect(sh, addr, c.read_only))
+            self.ask(Req::Connect(sh, addr, c.read_only, c.at_login))
+        }
+
+        fn at_login(&self, uid: u32, a: &atrium_media::AtLogin) -> (u8, String) {
+            if self.file_manager(uid).is_none() {
+                return (mstatus::NOT_ALLOWED, "only the session's file manager connects shares".into());
+            }
+            self.ask(Req::AtLogin(a.part.clone(), a.on))
         }
 
         /// A server's host key fingerprint, from a share server in its own
@@ -1039,7 +1080,7 @@ mod run {
                     // SAFETY: jaild just passed us this procdesc; held, it keeps the jail.
                     let pd = fd.map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
                     let label = format!("{}@{}:{}", sh.user, sh.host, sh.path);
-                    self.shares.insert(uid, ShareRun { label, read_only, key, session_user: user, _pd: pd, ready: false });
+                    self.shares.insert(uid, ShareRun { label, read_only, key, session_user: user, _pd: pd, ready: false, share: sh, addr });
                     self.publish();
                     // The file manager's standing grant takes it once its
                     // server answers (reap_shares), not now: a grant waits on
@@ -1080,6 +1121,69 @@ mod run {
             self.ejected_now.push(part.clone());
             self.publish();
             (mstatus::OK, format!("{part} disconnected"))
+        }
+
+        /// dispensatord's list of shares to connect at login (D8).
+        fn at_login_file(&self) -> PathBuf {
+            self.state.with_extension("shares")
+        }
+
+        fn set_at_login(&self, sh: &dispensator::share::Share, read_only: bool, on: bool) -> bool {
+            let Session::Active { user, .. } = &self.session else { return false };
+            let f = self.at_login_file();
+            let old = std::fs::read_to_string(&f).unwrap_or_default();
+            let new = dispensator::share::at_login_set(&old, user, sh, read_only, on);
+            let tmp = f.with_extension("shares.tmp");
+            if std::fs::write(&tmp, new).and_then(|_| std::fs::rename(&tmp, &f)).is_err() {
+                eprintln!("atrium-dispensatord: {}: can't write", f.display());
+                return false;
+            }
+            eprintln!("atrium-dispensatord: {}://{}@{}{}: connect at login {}", sh.proto.name(), sh.user, sh.host, sh.path, if on { "on" } else { "off" });
+            true
+        }
+
+        fn at_login(&mut self, part: &str, on: Option<bool>) -> (u8, String) {
+            let Some(r) = dispensator::share::uid_of_part(part).and_then(|u| self.shares.get(&u)) else { return (mstatus::NOT_FOUND, format!("{part} is not connected")) };
+            let (sh, ro) = (r.share.clone(), r.read_only);
+            if let Some(on) = on {
+                if !self.set_at_login(&sh, ro, on) {
+                    return (mstatus::FAILED, "couldn't save it".into());
+                }
+            }
+            let Session::Active { user, .. } = &self.session else { return (mstatus::NOT_ALLOWED, "no unlocked session".into()) };
+            let has = dispensator::share::at_login_has(&std::fs::read_to_string(self.at_login_file()).unwrap_or_default(), user, &sh);
+            (mstatus::OK, if has { "on" } else { "off" }.into())
+        }
+
+        /// Resolve `user`'s login shares off this thread (DNS may wait);
+        /// each connects once resolved, if `user` is still the one at the
+        /// seat (take_logins).
+        fn connect_at_login(&self, user: String) {
+            let list = dispensator::share::at_login_for(&std::fs::read_to_string(self.at_login_file()).unwrap_or_default(), &user);
+            if list.is_empty() {
+                return;
+            }
+            let tx = self.logins.0.clone();
+            std::thread::spawn(move || {
+                for (sh, ro) in list {
+                    match resolve(&sh.host, sh.port) {
+                        Ok(addr) => {
+                            let _ = tx.send((user.clone(), sh, addr, ro));
+                        }
+                        Err(e) => eprintln!("atrium-dispensatord: at login: {e}"),
+                    }
+                }
+            });
+        }
+
+        fn take_logins(&mut self) {
+            while let Ok((who, sh, addr, ro)) = self.logins.1.try_recv() {
+                if !matches!(&self.session, Session::Active { user, .. } if *user == who) {
+                    continue;
+                }
+                let (st, m) = self.connect_share(sh, addr, ro);
+                eprintln!("atrium-dispensatord: at login: {m} ({st})");
+            }
         }
 
         fn stop_share(&mut self, uid: u32) {
@@ -1172,6 +1276,8 @@ mod run {
             next_grant: 0,
             standing: Vec::new(),
             shares: BTreeMap::new(),
+            paused: None,
+            logins: mpsc::channel(),
         };
         a.retire_stale_shares();
         a.sweep_orphan_grants();
@@ -1181,6 +1287,11 @@ mod run {
             a.start_media_service(&media_socket);
         }
         a.start_devices_service(&devices_socket);
+        // Started inside a session (a restart ended its shares): the
+        // ones its user asked for at login come back.
+        if let Session::Active { user, .. } = a.session.clone() {
+            a.connect_at_login(user);
+        }
         eprintln!("atrium-dispensatord: session {:?}", a.session);
         loop {
             // Listen first, then enumerate, so nothing falls between.
@@ -1281,13 +1392,40 @@ mod run {
             let s = self.read_session();
             if s != self.session {
                 eprintln!("atrium-dispensatord: session {:?} -> {:?}", self.session, s);
-                self.session = s;
+                let was = std::mem::replace(&mut self.session, s);
                 *self.session_shared.lock().unwrap() = self.session.clone();
-                // A lock, logout or user switch ends every share (§7).
+                // A lock, logout or user switch ends every share (§7). A
+                // lock remembers them, for its user's unlock.
                 let keep = match &self.session { Session::Active { user, .. } => Some(user.clone()), _ => None };
+                if let Session::Locked { user } = &self.session {
+                    let mine: Vec<_> = self.shares.values().filter(|r| &r.session_user == user).map(|r| (r.share.clone(), r.addr, r.read_only)).collect();
+                    if !mine.is_empty() {
+                        self.paused = Some((user.clone(), mine));
+                    }
+                }
                 let gone: Vec<u32> = self.shares.iter().filter(|(_, r)| Some(&r.session_user) != keep.as_ref()).map(|(u, _)| *u).collect();
                 for uid in gone {
                     self.stop_share(uid);
+                }
+                match (&was, &self.session) {
+                    // Unlocked: the shares the lock ended come back, each
+                    // through its own identity check and login (D7).
+                    (Session::Locked { user: a }, Session::Active { user: b, .. }) if a == b => {
+                        if let Some((who, list)) = self.paused.take().filter(|(w, _)| w == b) {
+                            for (sh, addr, ro) in list {
+                                let (st, m) = self.connect_share(sh, addr, ro);
+                                eprintln!("atrium-dispensatord: unlock: {who}'s share back: {m} ({st})");
+                            }
+                        }
+                    }
+                    // A login (or this daemon starting in a session): the
+                    // shares the user asked for at login (D8).
+                    (_, Session::Active { user, .. }) => {
+                        self.paused = None;
+                        self.connect_at_login(user.clone());
+                    }
+                    (_, Session::Locked { .. }) => {}
+                    _ => self.paused = None,
                 }
                 let acts = self.media.sync(&self.session);
                 self.act(acts);
@@ -1425,7 +1563,14 @@ mod run {
                         (mstatus::OK, format!("{n} grants into {jail} ended"))
                     }
                     Req::AttachAll(s) => self.attach_all(s),
-                    Req::Connect(sh, addr, ro) => self.connect_share(sh, addr, ro),
+                    Req::Connect(sh, addr, ro, at_login) => {
+                        let r = self.connect_share(sh.clone(), addr, ro);
+                        if r.0 == mstatus::OK && at_login {
+                            self.set_at_login(&sh, ro, true);
+                        }
+                        r
+                    }
+                    Req::AtLogin(part, on) => self.at_login(&part, on),
                 };
                 let _ = reply.send(a);
             }
@@ -1643,6 +1788,7 @@ mod run {
                     // A grant lasts as long as its app's jail (one shot).
                     self.end_grants(|g| !jail_alive(&g.jail));
                     self.follow_session();
+                    self.take_logins();
                     self.reap_shares();
                     self.sync_standing();
                     self.publish();

@@ -15,20 +15,26 @@
 //! wiped. `--password-fd` is the development path without Arca. Then log
 //! in, start sftp, enter Capsicum, serve. `--learn` connects, prints the server's fingerprint for
 //! the user to accept, and stops before anything secret is involved.
+//! With Arca, a lost connection leaves the mount (S4): requests fail at
+//! once, and the next one connects again through the dialer, checking the
+//! key and logging in again; status 3 or 4 ends the share when the key
+//! changed or the login is refused.
 //! `--mnt` mounts by itself with jaild's options (root, tests only);
 //! `--as-uid N` then mounts first and drops to uid and gid N before
 //! connecting, standing in for jaild's launch as a share-server uid.
 
 use std::fs::File;
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::FromRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use capsa_fuse::server::serve_with;
 use capsa_fuse::Options;
 use capsa_share::arca::{Arca, KIND_ED25519, KIND_PASSWORD};
+use capsa_share::dialer::{Dialer, CONNECT_WAIT};
 use capsa_share::mount_self;
 use capsa_share::sftp::Sftp;
 use capsa_share::SftpFs;
@@ -99,19 +105,46 @@ fn args() -> Option<Args> {
 
 
 /// The share's credential from Arca, for the identity this connection
-/// proved: its key if it has one for `user`, else its password.
-fn login_with_arca(ssh: &mut Client<TcpStream>, sock: &str, user: &str) -> Result<(), String> {
-    let mut arca = Arca::connect(sock, ssh.host_key_digest()).map_err(|e| format!("arca: {e}"))?;
-    let items = arca.items().map_err(|e| format!("arca: {e}"))?;
+/// proved: its key if it has one for `user`, else its password. `Err(true)`:
+/// final (no credential saved for it any more).
+fn login_with_arca(ssh: &mut Client<TcpStream>, arca: UnixStream, user: &str) -> Result<(), (bool, String)> {
+    let soft = |e: capsa_share::arca::ArcaError| (false, format!("arca: {e}"));
+    let mut arca = Arca::from_stream(arca, ssh.host_key_digest()).map_err(soft)?;
+    let items = arca.items().map_err(soft)?;
     let mine = |k: u16| items.iter().find(|i| i.kind == k && i.account == user).map(|i| i.id);
-    if let Some(id) = mine(KIND_ED25519) {
-        let public = arca.pubkey(&id).map_err(|e| format!("arca: {e}"))?;
+    let r = if let Some(id) = mine(KIND_ED25519) {
+        let public = arca.pubkey(&id).map_err(soft)?;
         let mut sign = |m: &[u8]| arca.sign(&id, m).map_err(|e| e.to_string());
-        return ssh.login(user, Auth::Ed25519 { public, sign: &mut sign }, "sftp").map_err(|e| e.to_string());
-    }
-    let id = mine(KIND_PASSWORD).ok_or("no saved credential for this share")?;
-    let pw = arca.fill(&id).map_err(|e| format!("arca: {e}"))?;
-    ssh.login(user, Auth::Password(&pw), "sftp").map_err(|e| e.to_string())
+        ssh.login(user, Auth::Ed25519 { public, sign: &mut sign }, "sftp")
+    } else {
+        let id = mine(KIND_PASSWORD).ok_or((true, "no saved credential for this share".to_string()))?;
+        let pw = arca.fill(&id).map_err(soft)?;
+        ssh.login(user, Auth::Password(&pw), "sftp")
+    };
+    r.map_err(|e| (matches!(e, capsa_ssh::Error::AuthFailed(_)), e.to_string()))
+}
+
+/// How long the server may stay silent before a request fails and the
+/// connection counts as lost: under fusefs' 30 s per request.
+const SILENT: Duration = Duration::from_secs(20);
+
+/// A session over `sock`, the server's key checked against `pin`
+/// (`Err(3)`: it changed), logged in with Arca's credential through
+/// `arca` (`Err(4)`: refused for good). `Err(1)`: try again later.
+fn session(sock: TcpStream, pin: &str, user: &str, arca: impl FnOnce() -> std::io::Result<UnixStream>) -> Result<Sftp<TcpStream>, (u8, String)> {
+    let _ = sock.set_read_timeout(Some(SILENT));
+    let _ = sock.set_write_timeout(Some(SILENT));
+    let _ = sock.set_nodelay(true);
+    let mut ssh = match Client::connect(sock, &HostKeyPolicy::Pinned(pin.to_string())) {
+        Ok(c) => c,
+        // A changed key is a hard stop (§5.1): nothing secret was read.
+        Err(e @ capsa_ssh::Error::HostKeyMismatch { .. }) => return Err((3, e.to_string())),
+        Err(e) => return Err((1, format!("ssh: {e}"))),
+    };
+    // The server has proved it holds the pinned key: now the secret.
+    let a = arca().map_err(|e| (1, format!("arca: {e}")))?;
+    login_with_arca(&mut ssh, a, user).map_err(|(fin, e)| (if fin { 4 } else { 1 }, format!("login: {e}")))?;
+    Sftp::start(ssh).map_err(|e| (1, format!("sftp: {e}")))
 }
 
 /// Development without Arca: the password from a descriptor, read once.
@@ -153,38 +186,77 @@ fn main() -> ExitCode {
             return fail("--as-uid", std::io::Error::last_os_error());
         }
     }
-    let sock = match TcpStream::connect((a.host.as_str(), a.port)) {
-        Ok(s) => s,
-        Err(e) => return fail("connect", e),
-    };
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(25)));
-    let _ = sock.set_nodelay(true);
-    let policy = match &a.pin {
-        Some(p) if !a.learn => HostKeyPolicy::Pinned(p.clone()),
-        _ => HostKeyPolicy::Learn,
-    };
-    let mut ssh = match Client::connect(sock, &policy) {
-        Ok(c) => c,
-        Err(e @ capsa_ssh::Error::HostKeyMismatch { .. }) => {
-            // A changed key is a hard stop (§5.1): nothing secret was read.
-            eprintln!("atrium-share-sftp: {e}");
-            return ExitCode::from(3);
-        }
-        Err(e) => return fail("ssh", e),
+    let Some(to) = (a.host.as_str(), a.port).to_socket_addrs().ok().and_then(|mut i| i.next()) else {
+        return fail("address", format!("{} doesn't resolve", a.host));
     };
     if a.learn {
+        let sock = match TcpStream::connect_timeout(&to, CONNECT_WAIT) {
+            Ok(s) => s,
+            Err(e) => return fail("connect", e),
+        };
+        let _ = sock.set_read_timeout(Some(SILENT));
+        let ssh = match Client::connect(sock, &HostKeyPolicy::Learn) {
+            Ok(c) => c,
+            Err(e) => return fail("ssh", e),
+        };
         // The fingerprint for the user; the digest that Arca pins.
         println!("{}", ssh.host_fingerprint());
         println!("key {}", ssh.host_key_digest().iter().map(|b| format!("{b:02x}")).collect::<String>());
         ssh.disconnect();
         return ExitCode::SUCCESS;
     }
-    // The server has proved it holds the pinned key: now the secret.
-    if let Some(sock) = &a.arca {
-        if let Err(e) = login_with_arca(&mut ssh, sock, &a.user) {
-            return fail("login", e);
+    let pin = a.pin.clone().unwrap_or_default();
+    let fs = if a.arca.is_some() {
+        // Every connection, the first and any after a loss, comes from
+        // the dialer, so that this process can reconnect from inside
+        // capability mode (S4).
+        let mut d = match Dialer::start(to, a.arca.clone()) {
+            Ok(d) => d,
+            Err(e) => return fail("dialer", e),
+        };
+        let s = match d.tcp().map_err(|e| (1, format!("connect: {e}"))).and_then(|t| session(t, &pin, &a.user, || d.arca())) {
+            Ok(s) => s,
+            Err((3, e)) => {
+                eprintln!("atrium-share-sftp: {e}");
+                return ExitCode::from(3);
+            }
+            Err((_, e)) => return fail("connect", e),
+        };
+        let user = a.user.clone();
+        let again = move || -> Result<Sftp<TcpStream>, String> {
+            let t = d.tcp().map_err(|e| format!("connect: {e}"))?;
+            match session(t, &pin, &user, || d.arca()) {
+                Ok(s) => Ok(s),
+                Err((1, e)) => Err(e),
+                // Final: the key changed, or the login is refused for
+                // good. The share ends; dispensatord reaps it.
+                Err((code, e)) => {
+                    eprintln!("atrium-share-sftp: {e}: ending the share");
+                    std::process::exit(code.into());
+                }
+            }
+        };
+        match SftpFs::new(s, &a.root, !a.opts.read_only) {
+            Ok(f) => f.reconnect_with(Box::new(again)),
+            Err(e) => return fail("share root", e),
         }
     } else {
+        // Development without Arca: one connection, and the share ends
+        // with it.
+        let sock = match TcpStream::connect_timeout(&to, CONNECT_WAIT) {
+            Ok(s) => s,
+            Err(e) => return fail("connect", e),
+        };
+        let _ = sock.set_read_timeout(Some(SILENT));
+        let _ = sock.set_nodelay(true);
+        let mut ssh = match Client::connect(sock, &HostKeyPolicy::Pinned(pin)) {
+            Ok(c) => c,
+            Err(e @ capsa_ssh::Error::HostKeyMismatch { .. }) => {
+                eprintln!("atrium-share-sftp: {e}");
+                return ExitCode::from(3);
+            }
+            Err(e) => return fail("ssh", e),
+        };
         let pw = match read_password(a.password_fd) {
             Ok(p) => p,
             Err(e) => return fail("password", e),
@@ -192,16 +264,15 @@ fn main() -> ExitCode {
         if let Err(e) = ssh.login(&a.user, Auth::Password(&pw), "sftp") {
             return fail("login", e);
         }
-    }
-    let s = match Sftp::start(ssh) {
-        Ok(s) => s,
-        Err(e) => return fail("sftp", e),
-    };
-    let fs = match SftpFs::new(s, &a.root, !a.opts.read_only) {
-        // A server that stops answering (25 s per read) or a dropped
-        // connection ends the share rather than leaving one that fails.
-        Ok(f) => f.exit_on_loss(),
-        Err(e) => return fail("share root", e),
+        drop(pw);
+        let s = match Sftp::start(ssh) {
+            Ok(s) => s,
+            Err(e) => return fail("sftp", e),
+        };
+        match SftpFs::new(s, &a.root, !a.opts.read_only) {
+            Ok(f) => f.exit_on_loss(),
+            Err(e) => return fail("share root", e),
+        }
     };
     let fuse = match (a.fuse_fd, &a.mnt) {
         _ if early.is_some() => early.take().unwrap(),

@@ -155,6 +155,17 @@ V "su -m bob -c 'ls $M' >/dev/null 2>&1" && bad "bob lists alice's share" || ok 
 JID=$(V "jls -j system-share-63000 jid")
 check "the server runs as 63000 in its jail" "63000" "$(V "ps -J $JID -o uid= | tr -d ' ' | sort -u")"
 check "Arca filled it once" 1 "$(fills)"
+# S4: Samba goes and comes back; the share stays and logs in again.
+sh "$ROOT/scripts/smb-test-server.sh" down $SD
+t0=$(date +%s); V "su -m alice -c 'cat $M/hello.txt'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+[ "$r" = failed ] && [ $t -le 10 ] && ok "the server down: a read fails (${t}s)" || bad "with the server down: $r in ${t}s"
+t0=$(date +%s); V "su -m alice -c 'ls $M'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+[ "$r" = failed ] && [ $t -le 8 ] && ok "and the next fails fast (${t}s)" || bad "the next read: $r in ${t}s"
+V "jls -n name | grep -q system-share-63000" && ok "the share stays" || bad "the share ended while its server was down"
+sh "$ROOT/scripts/smb-test-server.sh" up $SD >/dev/null || bad "Samba didn't start again"
+i=0; r=""; while [ $i -lt 45 ] && [ "$r" != from-smb ]; do sleep 1; r=$(V "su -m alice -c 'cat $M/hello.txt'" 2>/dev/null); i=$((i+1)); done
+check "the server back: the share works again (${i}s)" from-smb "$r"
+check "after the same GUID check and a new login (Arca filled it again)" 2 "$(fills)"
 out=$(V "su -m alice -c '$DD --eject share-63000'" 2>&1)
 case "$out" in "ok "*) ok "alice disconnects it" ;; *) bad "eject: $out" ;; esac
 gone 20 && ok "its jail and mount are gone" || bad "after eject: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"

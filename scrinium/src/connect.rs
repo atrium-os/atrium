@@ -390,7 +390,7 @@ pub enum Want {
     /// Ask dispensatord for the server's fingerprint.
     Learn(Address),
     /// Save the field's handle in Arca for this share, then connect.
-    Connect { addr: Address, fingerprint: String, remember: bool },
+    Connect { addr: Address, fingerprint: String, remember: bool, at_login: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +399,8 @@ pub struct Form {
     /// Shown under the address, or on the key sheet.
     pub error: Option<String>,
     pub remember: bool,
+    /// Connect it again at each login (D8): only for a remembered share.
+    pub at_login: bool,
     pub want: Option<Want>,
     /// Connect was pressed before the field's handle came. Arca's field
     /// hands one over only when it loses focus (or on Enter or Tab), and
@@ -416,7 +418,7 @@ pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_millis(150
 
 impl Default for Form {
     fn default() -> Self {
-        Form { step: Step::Address, error: None, remember: true, want: None, armed: None, cert: None, smb: None }
+        Form { step: Step::Address, error: None, remember: true, at_login: false, want: None, armed: None, cert: None, smb: None }
     }
 }
 
@@ -527,7 +529,7 @@ impl Form {
         self.error = None;
         let Step::Password { addr, fingerprint, .. } = self.step.clone() else { return };
         self.step = Step::Connecting(addr.clone());
-        self.want = Some(Want::Connect { addr, fingerprint, remember: self.remember });
+        self.want = Some(Want::Connect { addr, fingerprint, remember: self.remember, at_login: self.remember && self.at_login });
     }
 
     /// Connecting failed: back to the password, with why.
@@ -725,7 +727,7 @@ mod tests {
         f.connect();
         assert_eq!(
             f.take_want(),
-            Some(Want::Connect { addr: a("alice", "nas.local", 22, "/srv"), fingerprint: "SHA256:x".into(), remember: false })
+            Some(Want::Connect { addr: a("alice", "nas.local", 22, "/srv"), fingerprint: "SHA256:x".into(), remember: false, at_login: false })
         );
         f.failed("Wrong password".into());
         assert_eq!((f.step.clone(), f.error.as_deref()), (Step::Address, Some("Wrong password")));

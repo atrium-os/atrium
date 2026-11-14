@@ -29,7 +29,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ use std::time::Duration;
 use capsa_fuse::server::serve_with;
 use capsa_fuse::Options;
 use capsa_share::arca::{Arca, KIND_PASSWORD};
+use capsa_share::dialer::Dialer;
 use capsa_share::mount_self;
 use capsa_share::http::{Client, Dial, Request};
 use capsa_share::tls::{self, Identity};
@@ -109,104 +110,10 @@ fn args() -> Option<Args> {
     Some(a)
 }
 
-// ---- the dialer -----------------------------------------------------------
-
-fn send_fd(s: &UnixStream, fd: Option<RawFd>) -> io::Result<()> {
-    let mut byte = [u8::from(fd.is_some())];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    // SAFETY: a zeroed msghdr with one iovec and, when sending, one
-    // SCM_RIGHTS control message sized by CMSG_SPACE.
-    unsafe {
-        let space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-        let mut ctl = vec![0u8; space];
-        let mut m: libc::msghdr = std::mem::zeroed();
-        m.msg_iov = &mut iov;
-        m.msg_iovlen = 1;
-        if let Some(fd) = fd {
-            m.msg_control = ctl.as_mut_ptr().cast();
-            m.msg_controllen = space as _;
-            let c = libc::CMSG_FIRSTHDR(&m);
-            (*c).cmsg_level = libc::SOL_SOCKET;
-            (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-            std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>(), fd);
-        }
-        if libc::sendmsg(s.as_raw_fd(), &m, 0) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn recv_fd(s: &UnixStream) -> io::Result<Option<RawFd>> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    // SAFETY: as in send_fd; the received descriptor is taken only from a
-    // control message of the right level, type and length.
-    unsafe {
-        let space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-        let mut ctl = vec![0u8; space];
-        let mut m: libc::msghdr = std::mem::zeroed();
-        m.msg_iov = &mut iov;
-        m.msg_iovlen = 1;
-        m.msg_control = ctl.as_mut_ptr().cast();
-        m.msg_controllen = space as _;
-        let n = libc::recvmsg(s.as_raw_fd(), &mut m, 0);
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        let c = libc::CMSG_FIRSTHDR(&m);
-        if byte[0] == 1 && !c.is_null() && (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-            return Ok(Some(std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<RawFd>())));
-        }
-        Ok(None)
-    }
-}
-
-/// Fork the dialer: it connects to `to` each time it is asked, and nothing
-/// else. It ends when this process does (its socket closes).
-fn start_dialer(to: SocketAddr) -> io::Result<UnixStream> {
-    let (ours, theirs) = UnixStream::pair()?;
-    // SAFETY: called before any thread starts; the child only uses
-    // async-signal-safe calls plus a TcpStream connect.
-    match unsafe { libc::fork() } {
-        -1 => Err(io::Error::last_os_error()),
-        0 => {
-            drop(ours);
-            // Nothing of the share's (FUSE, control) stays open here.
-            let keep = theirs.as_raw_fd();
-            for fd in 3..1024 {
-                if fd != keep {
-                    // SAFETY: closing descriptors this child doesn't use.
-                    unsafe { libc::close(fd) };
-                }
-            }
-            let mut s = theirs;
-            let mut b = [0u8; 1];
-            while matches!(s.read(&mut b), Ok(1)) {
-                match TcpStream::connect_timeout(&to, Duration::from_secs(15)) {
-                    Ok(t) => {
-                        let _ = send_fd(&s, Some(t.as_raw_fd()));
-                    }
-                    Err(_) => {
-                        let _ = send_fd(&s, None);
-                    }
-                }
-            }
-            // SAFETY: leave without running the parent's atexit handlers.
-            unsafe { libc::_exit(0) }
-        }
-        _ => Ok(ours),
-    }
-}
-
 /// How the share server gets a connection: from the dialer, or (`--learn`,
 /// the parent before the fork) directly.
 enum Line {
-    Dialer(UnixStream),
+    Dialer(Dialer),
     Direct(SocketAddr),
 }
 
@@ -220,15 +127,7 @@ impl TlsDial {
     fn tcp(&mut self) -> io::Result<TcpStream> {
         match &mut self.line {
             Line::Direct(a) => TcpStream::connect_timeout(a, Duration::from_secs(15)),
-            Line::Dialer(s) => {
-                use std::io::Write;
-                s.write_all(b"d")?;
-                match recv_fd(s)? {
-                    // SAFETY: the dialer just passed us this connected socket.
-                    Some(fd) => Ok(unsafe { TcpStream::from_raw_fd(fd) }),
-                    None => Err(io::Error::new(io::ErrorKind::ConnectionRefused, "the server can't be reached")),
-                }
-            }
+            Line::Dialer(d) => d.tcp(),
         }
     }
 }
@@ -328,8 +227,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let line = match start_dialer(to) {
-        Ok(s) => Line::Dialer(s),
+    let line = match Dialer::start(to, None) {
+        Ok(d) => Line::Dialer(d),
         Err(e) => return fail("dialer", e),
     };
     let host_header = if a.port == 443 { a.host.clone() } else { format!("{}:{}", a.host, a.port) };

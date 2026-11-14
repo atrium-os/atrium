@@ -21,12 +21,16 @@
 //! `--learn` negotiates, prints what the server is (dialect, cipher, GUID,
 //! and the fingerprint of the GUID that a share is pinned to) or why it is
 //! refused (`refused <why>`), and stops before any login. Exit status 3:
-//! the GUID changed.
+//! the GUID changed. With Arca, a lost connection leaves the mount (S4):
+//! requests fail at once, and the next one connects again through the
+//! dialer, checking the GUID and logging in again; status 3 or 4 ends the
+//! share when the server changed or the login is refused.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::FromRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -34,6 +38,7 @@ use capsa_fuse::server::serve_with;
 use capsa_fuse::Options;
 use capsa_share::arca::{Arca, KIND_PASSWORD};
 use capsa_share::cert::{fingerprint, key_of};
+use capsa_share::dialer::{Dialer, CONNECT_WAIT};
 use capsa_share::mount_self;
 use capsa_share::smb::{cipher_name, guid_key, guid_text, smb_name, Conn, Error as SmbError, SmbFs, STATUS_BAD_NETWORK_NAME};
 use zeroize::Zeroizing;
@@ -116,6 +121,68 @@ fn read_password(fd: Option<i32>) -> Result<Zeroizing<Vec<u8>>, String> {
     Ok(buf)
 }
 
+/// How long the server may stay silent before a request fails and the
+/// connection counts as lost: under fusefs' 30 s per request.
+const SILENT: Duration = Duration::from_secs(20);
+
+/// What a connection must reach: the same server, share and account.
+struct Session {
+    host: String,
+    share: String,
+    user: String,
+    pin: [u8; 32],
+}
+
+/// An error and what it means: 1 try again later, 3 a different server,
+/// 4 refused for good.
+type Fail = (u8, String);
+
+impl Session {
+    /// Negotiate over `sock`, check the server's GUID against the pin,
+    /// and only then take the password from `password` and log in.
+    fn open(&self, sock: TcpStream, password: impl FnOnce([u8; 32]) -> Result<Zeroizing<Vec<u8>>, Fail>) -> Result<Conn<TcpStream>, Fail> {
+        // A server that goes silent fails the request rather than hang it.
+        let _ = sock.set_read_timeout(Some(SILENT));
+        let _ = sock.set_write_timeout(Some(SILENT));
+        let _ = sock.set_nodelay(true);
+        let mut c = match Conn::negotiate(sock) {
+            Ok(c) => c,
+            // Below the floor now: not the server the share was saved with.
+            Err(SmbError::Refused(why)) => return Err((3, format!("negotiate: refused: {why}"))),
+            Err(e) => return Err((1, format!("negotiate: {e}"))),
+        };
+        let key = guid_key(&c.negotiated.guid);
+        if key != self.pin {
+            // A different machine at the address: a hard stop (§5.1),
+            // before anything secret is read.
+            return Err((3, format!("SERVER CHANGED: it now reports GUID {} ({}), not the one this share was saved with", guid_text(&c.negotiated.guid), fingerprint(&key))));
+        }
+        let pw = password(key)?;
+        let r = c.login(&self.user, &pw);
+        // Used once (§5.1): gone before anything else happens.
+        drop(pw);
+        match r {
+            Ok(()) => {}
+            Err(e @ SmbError::Auth) => return Err((4, format!("login: {e}"))),
+            Err(e) => return Err((1, format!("login: {e}"))),
+        }
+        match c.tree_connect(&format!("\\\\{}\\{}", self.host, self.share)) {
+            Ok(()) => Ok(c),
+            Err(SmbError::Status(STATUS_BAD_NETWORK_NAME)) => Err((4, format!("share: the server has no share named {}", self.share))),
+            Err(e) => Err((1, format!("share: {e}"))),
+        }
+    }
+}
+
+/// The share's password from Arca, for the identity `key` just checked.
+fn arca_password(sock: io::Result<UnixStream>, key: [u8; 32], user: &str) -> Result<Zeroizing<Vec<u8>>, Fail> {
+    let soft = |e: String| (1, format!("arca: {e}"));
+    let mut arca = Arca::from_stream(sock.map_err(|e| soft(e.to_string()))?, key).map_err(|e| soft(e.to_string()))?;
+    let items = arca.items().map_err(|e| soft(e.to_string()))?;
+    let item = items.iter().find(|i| i.kind == KIND_PASSWORD && i.account == user).ok_or((4, "login: no saved password for this share".to_string()))?;
+    arca.fill(&item.id).map_err(|e| soft(e.to_string()))
+}
+
 fn main() -> ExitCode {
     let Some(a) = args() else { return usage() };
     let mut early: Option<File> = None;
@@ -140,67 +207,80 @@ fn main() -> ExitCode {
     let Some(to) = (dial.as_str(), a.port).to_socket_addrs().ok().and_then(|mut i| i.next()) else {
         return fail("address", format!("{dial} doesn't resolve"));
     };
-    let sock = match TcpStream::connect_timeout(&to, Duration::from_secs(15)) {
-        Ok(s) => s,
-        Err(e) => return fail("connect", e),
-    };
-    // A server that goes silent ends the share rather than hang it.
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(25)));
-    let _ = sock.set_write_timeout(Some(Duration::from_secs(25)));
-    let _ = sock.set_nodelay(true);
-    let mut c = match Conn::negotiate(sock) {
-        Ok(c) => c,
-        Err(SmbError::Refused(why)) if a.learn => {
-            println!("refused {why}");
-            return ExitCode::FAILURE;
-        }
-        Err(e) => return fail("negotiate", e),
-    };
-    let key = guid_key(&c.negotiated.guid);
     if a.learn {
+        let sock = match TcpStream::connect_timeout(&to, CONNECT_WAIT) {
+            Ok(s) => s,
+            Err(e) => return fail("connect", e),
+        };
+        let _ = sock.set_read_timeout(Some(SILENT));
+        let c = match Conn::negotiate(sock) {
+            Ok(c) => c,
+            Err(SmbError::Refused(why)) => {
+                println!("refused {why}");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => return fail("negotiate", e),
+        };
+        let key = guid_key(&c.negotiated.guid);
         println!("smb 3.1.1 {}", cipher_name(c.negotiated.cipher));
         println!("guid {}", guid_text(&c.negotiated.guid));
         println!("{}", fingerprint(&key));
         println!("key {}", key.iter().map(|b| format!("{b:02x}")).collect::<String>());
         return ExitCode::SUCCESS;
     }
-    if Some(key) != a.pin {
-        // A different machine at the address: a hard stop (§5.1), before
-        // anything secret is read.
-        eprintln!("{NAME}: SERVER CHANGED: it now reports GUID {} ({}), not the one this share was saved with", guid_text(&c.negotiated.guid), fingerprint(&key));
-        return ExitCode::from(3);
-    }
-    let pw = if let Some(sock) = &a.arca {
-        let r = (|| -> Result<Zeroizing<Vec<u8>>, String> {
-            let mut arca = Arca::connect(sock, key).map_err(|e| format!("arca: {e}"))?;
-            let items = arca.items().map_err(|e| format!("arca: {e}"))?;
-            let item = items.iter().find(|i| i.kind == KIND_PASSWORD && i.account == a.user).ok_or("no saved password for this share")?;
-            arca.fill(&item.id).map_err(|e| format!("arca: {e}"))
-        })();
-        match r {
-            Ok(p) => p,
-            Err(e) => return fail("login", e),
+    let s = Session { host: a.host.clone(), share, user: a.user.clone(), pin: a.pin.unwrap_or_default() };
+    let fs = if a.arca.is_some() {
+        // Every connection, the first and any after a loss, comes from
+        // the dialer, so that this process can reconnect from inside
+        // capability mode (S4).
+        let mut d = match Dialer::start(to, a.arca.clone()) {
+            Ok(d) => d,
+            Err(e) => return fail("dialer", e),
+        };
+        let c = match d.tcp().map_err(|e| (1, format!("connect: {e}"))).and_then(|t| s.open(t, |key| arca_password(d.arca(), key, &s.user))) {
+            Ok(c) => c,
+            Err((3, e)) => {
+                eprintln!("{NAME}: {e}");
+                return ExitCode::from(3);
+            }
+            Err((_, e)) => return fail("connect", e),
+        };
+        let again = move || -> Result<Conn<TcpStream>, String> {
+            let t = d.tcp().map_err(|e| format!("connect: {e}"))?;
+            match s.open(t, |key| arca_password(d.arca(), key, &s.user)) {
+                Ok(c) => Ok(c),
+                Err((1, e)) => Err(e),
+                // Final: a different server, or the login or share
+                // refused for good. The share ends; dispensatord reaps it.
+                Err((code, e)) => {
+                    eprintln!("{NAME}: {e}: ending the share");
+                    std::process::exit(code.into());
+                }
+            }
+        };
+        match SmbFs::new(c, &folder.join("/"), !a.opts.read_only) {
+            Ok(f) => f.reconnect_with(Box::new(again)),
+            Err(e) => return fail("share root", e),
         }
     } else {
-        match read_password(a.password_fd) {
-            Ok(p) => p,
-            Err(e) => return fail("password", e),
+        // Development without Arca: one connection, and the share ends
+        // with it.
+        let t = match TcpStream::connect_timeout(&to, CONNECT_WAIT) {
+            Ok(t) => t,
+            Err(e) => return fail("connect", e),
+        };
+        let c = match s.open(t, |_| read_password(a.password_fd).map_err(|e| (1, format!("password: {e}")))) {
+            Ok(c) => c,
+            Err((3, e)) => {
+                eprintln!("{NAME}: {e}");
+                return ExitCode::from(3);
+            }
+            Err((_, e)) => return fail("connect", e),
+        };
+        match SmbFs::new(c, &folder.join("/"), !a.opts.read_only) {
+            Ok(f) => f.exit_on_loss(),
+            Err(e) => return fail("share root", e),
         }
-    };
-    let r = c.login(&a.user, &pw);
-    // Used once (§5.1): gone before anything else happens.
-    drop(pw);
-    if let Err(e) = r {
-        return fail("login", e);
-    }
-    match c.tree_connect(&format!("\\\\{}\\{share}", a.host)) {
-        Ok(()) => {}
-        Err(SmbError::Status(STATUS_BAD_NETWORK_NAME)) => return fail("share", format!("the server has no share named {share}")),
-        Err(e) => return fail("share", e),
-    }
-    let fs = match SmbFs::new(c, &folder.join("/"), !a.opts.read_only) {
-        Ok(f) => f.exit_on_loss(),
-        Err(e) => return fail("share root", e),
     };
     let fuse = match (a.fuse_fd, &a.mnt) {
         _ if early.is_some() => early.take().unwrap(),

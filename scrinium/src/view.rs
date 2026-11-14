@@ -345,7 +345,13 @@ impl ScriniumView {
             let room = sw - 16.0 - 44.0 - if p.stick && manager { 30.0 } else { 0.0 };
             text(ctx, 44.0, y + 15.0, &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
             let sub = if p.network {
-                let free = if p.size > 0 { format!("Server · {} free", fs::size_text(p.free)) } else { "Server".into() };
+                let free = if p.offline {
+                    "Reconnecting…".into()
+                } else if p.size > 0 {
+                    format!("Server · {} free", fs::size_text(p.free))
+                } else {
+                    "Server".into()
+                };
                 if p.read_only { format!("{free} · read-only") } else { free }
             } else if p.stick {
                 let free = if p.size > 0 { format!("{} free", fs::size_text(p.free)) } else { "USB stick".into() };
@@ -558,8 +564,18 @@ impl ScriniumView {
                 rect(ctx, lx + 1.0, y + 143.0, 14.0, 14.0, if form.remember { t.accent_fg() } else { t.bg_surface() }, 3.0);
                 text(ctx, lx + 24.0, y + 150.0, "Remember it in Arca", type_size::SM, Weight::Regular, t.text_primary());
                 ctx.pop();
+                // Connect at login (D8): off unless ticked, and only for a
+                // share Arca remembers.
+                let s = self.state.clone();
+                ctx.key(4002);
+                area(ctx, Rect::new(lx - 6.0, y + 166.0, 240.0, 28.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| if let Some(f) = &mut b.connect { if f.remember { f.at_login = !f.at_login } }));
+                let on = form.remember && form.at_login;
+                rect(ctx, lx, y + 172.0, 16.0, 16.0, t.border_strong(), 4.0);
+                rect(ctx, lx + 1.0, y + 173.0, 14.0, 14.0, if on { t.accent_fg() } else { t.bg_surface() }, 3.0);
+                text(ctx, lx + 24.0, y + 180.0, "Connect when I log in", type_size::SM, Weight::Regular, if form.remember { t.text_primary() } else { t.text_tertiary() });
+                ctx.pop();
                 if let Some(e) = &form.error {
-                    line(ctx, 184.0, e, t.danger_fg());
+                    line(ctx, 210.0, e, t.danger_fg());
                 }
                 let c = cancel(ctx, self.state.clone());
                 let s = self.state.clone();
@@ -781,10 +797,26 @@ impl ScriniumView {
             }
         };
         text(ctx, x0 + 16.0, sy + status_h() / 2.0, &fit(&msg, type_size::XS, Weight::Regular, w - x0 - 220.0), type_size::XS, Weight::Regular, color);
+        let mut right = w - 16.0;
         if let Some(p) = b.place().filter(|p| p.stick && p.size > 0) {
             let r = format!("{} free of {}{}", fs::size_text(p.free), fs::size_text(p.size), if p.read_only { " · read-only" } else { "" });
             let rw = width(&r, type_size::XS, Weight::Regular);
             text(ctx, w - rw - 16.0, sy + status_h() / 2.0, &r, type_size::XS, Weight::Regular, t.text_tertiary());
+            right -= rw + 16.0;
+        }
+        // A share's "connect at login" (D8), once dispensatord said which.
+        if let Some((part, on)) = b.place().filter(|p| p.network).and_then(|p| b.at_login.get(&p.id).map(|on| (p.id.clone(), *on))) {
+            let label = "Connect at login";
+            let lw = width(label, type_size::XS, Weight::Regular) + 20.0;
+            let x = right - lw;
+            let s = self.state.clone();
+            ctx.key(4100);
+            area(ctx, Rect::new(x - 4.0, sy + 2.0, lw + 8.0, status_h() - 4.0), 4.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.want_at_login = Some((part.clone(), !on))));
+            let cy = sy + status_h() / 2.0;
+            rect(ctx, x, cy - 6.0, 12.0, 12.0, t.border_strong(), 3.0);
+            rect(ctx, x + 1.0, cy - 5.0, 10.0, 10.0, if on { t.accent_fg() } else { t.bg_surface() }, 2.0);
+            text(ctx, x + 18.0, cy, label, type_size::XS, Weight::Regular, t.text_secondary());
+            ctx.pop();
         }
     }
 
@@ -855,7 +887,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn place(d: &std::path::Path) -> Place {
-        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000, network: false }
+        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000, network: false, offline: false }
     }
 
     fn texts(app: &App<ScriniumView>) -> Vec<String> {
@@ -900,6 +932,22 @@ mod tests {
         app.tick();
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t.starts_with("Delete “hello.txt”?")), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_share_without_its_server_says_so() {
+        let d = std::env::temp_dir().join(format!("scrinium-view-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        let share = Place { id: "share-63000".into(), label: "files on nas".into(), network: true, offline: true, ..place(&d) };
+        b.set_places(vec![share]);
+        b.at_login.insert("share-63000".into(), true);
+        let (app, _) = app_for(b, (960.0, 600.0));
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "Reconnecting…"), "{tx:?}");
+        assert!(tx.iter().any(|t| t == "Connect at login"), "{tx:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

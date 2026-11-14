@@ -383,10 +383,16 @@ enum Job {
     /// A share's size and free space (its server answers over the network,
     /// so it is asked off the window's thread).
     Space(String, Option<(u64, u64)>),
+    /// A share's "connect at login", as dispensatord answered.
+    /// `true`: the user asked to change it (a failure is shown).
+    AtLogin(String, Result<bool, String>, bool),
 }
 
-/// How often a share's free space is asked again.
+/// How often a share's free space is asked again: also how a share that
+/// lost its server finds out it is back (its server connects again on the
+/// next request, S4), so more often while it is away.
 const SHARE_SPACE_EVERY: Duration = Duration::from_secs(30);
+const SHARE_OFFLINE_EVERY: Duration = Duration::from_secs(5);
 
 /// "Connect to server" and the saved shares, for the manager's window.
 struct Network {
@@ -398,10 +404,17 @@ struct Network {
     tx: Sender<Job>,
     rx: Receiver<Job>,
     /// Shares connected without "remember": their item goes at disconnect.
+    /// By the share's label (`user@host:path`), which stays when a lock
+    /// and unlock bring the share back under another part (S4).
     forget: HashMap<String, scrinium::shares::Saved>,
     /// Shares' (size, free) by part, and when each was asked.
     space: HashMap<String, (u64, u64)>,
     asked: HashMap<String, std::time::Instant>,
+    /// Shares whose server didn't answer the last time.
+    offline: std::collections::HashSet<String>,
+    /// Shares whose "connect at login" was asked (the answer is in the
+    /// browser's state).
+    asked_login: std::collections::HashSet<String>,
 }
 
 impl Network {
@@ -417,7 +430,7 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
     }
@@ -432,15 +445,15 @@ impl Network {
         });
     }
 
-    fn disconnected(&mut self, part: &str) {
-        if let Some(s) = self.forget.remove(part) {
+    fn disconnected(&mut self, label: &str) {
+        if let Some(s) = self.forget.remove(label) {
             if let Err(e) = scrinium::shares::forget(&self.arca, &s) {
                 eprintln!("scrinium: forget {}: {e}", s.addr.host);
             }
         }
     }
 
-    fn connect_job(&self, addr: scrinium::connect::Address, key: [u8; 32], save: Option<([u8; 16], bool)>) {
+    fn connect_job(&self, addr: scrinium::connect::Address, key: [u8; 32], save: Option<([u8; 16], bool)>, at_login: bool) {
         let (media, arca, tx) = (self.media.clone(), self.arca.clone(), self.tx.clone());
         std::thread::spawn(move || {
             let mut forget = None;
@@ -462,6 +475,7 @@ impl Network {
                 user: addr.user.clone(),
                 fingerprint: scrinium::connect::identity_of(addr.proto, &key),
                 read_only: false,
+                at_login,
             };
             let r = atrium_media::client::connect(&media, &c).map_err(|(_, m)| m);
             let _ = tx.send(Job::Connected(r, forget));
@@ -489,10 +503,10 @@ impl Network {
                         let _ = tx.send(Job::Learned(r));
                     });
                 }
-                Want::Connect { addr, fingerprint, remember } => {
+                Want::Connect { addr, fingerprint, remember, at_login } => {
                     let handle = pane.cred_state.get_cloned().handle;
                     match (handle, scrinium::connect::key_for(&fingerprint)) {
-                        (Some(h), Some(key)) => self.connect_job(addr, key, Some((h, remember))),
+                        (Some(h), Some(key)) => self.connect_job(addr, key, Some((h, remember)), at_login),
                         _ => {
                             if let Some(f) = &mut b.connect {
                                 f.failed("Type the password again".into());
@@ -575,9 +589,31 @@ impl Network {
                 }
             }
         }
+        // A share that went takes what was known of it along: another
+        // may come under its name.
+        let here_ids: std::collections::HashSet<String> = b.places.iter().filter(|p| p.network).map(|p| p.id.clone()).collect();
+        let here = &here_ids;
+        self.offline.retain(|k| here.contains(k));
+        self.asked.retain(|k, _| here.contains(k));
+        self.space.retain(|k, _| here.contains(k));
+        self.asked_login.retain(|k| here.contains(k));
+        // Each share's "connect at login", asked once; set when the status
+        // line asks.
+        b.at_login.retain(|k, _| here_ids.contains(k));
+        let unasked: Vec<String> = here_ids.iter().filter(|k| !b.at_login.contains_key(*k) && !self.asked_login.contains(*k)).cloned().collect();
+        for part in unasked.into_iter().map(|p| (p, None)).chain(b.want_at_login.take().map(|(p, on)| (p, Some(on)))) {
+            changed = true;
+            self.asked_login.insert(part.0.clone());
+            let (media, tx) = (self.media.clone(), self.tx.clone());
+            std::thread::spawn(move || {
+                let r = atrium_media::client::at_login(&media, &atrium_media::AtLogin { part: part.0.clone(), on: part.1 }).map(|m| m == "on").map_err(|(_, m)| m);
+                let _ = tx.send(Job::AtLogin(part.0, r, part.1.is_some()));
+            });
+        }
         // Shares' sizes: asked now and then, each on its own thread.
         for p in b.places.iter().filter(|p| p.network) {
-            if self.asked.get(&p.id).is_some_and(|t| t.elapsed() < SHARE_SPACE_EVERY) {
+            let every = if self.offline.contains(&p.id) { SHARE_OFFLINE_EVERY } else { SHARE_SPACE_EVERY };
+            if self.asked.get(&p.id).is_some_and(|t| t.elapsed() < every) {
                 continue;
             }
             self.asked.insert(p.id.clone(), std::time::Instant::now());
@@ -598,7 +634,7 @@ impl Network {
                 }
                 Job::Connected(Ok(part), forget) => {
                     if let Some(s) = forget {
-                        self.forget.insert(part.clone(), s);
+                        self.forget.insert(format!("{}@{}:{}", s.addr.user, s.addr.host, s.addr.path), s);
                     }
                     b.connect = None;
                     b.notice = Some(scrinium::browser::Notice { text: "Connected".into(), error: false });
@@ -610,18 +646,32 @@ impl Network {
                     None => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't connect: {e}"), error: true }),
                 },
                 Job::Saved(l) => b.saved = l,
+                Job::AtLogin(part, r, set) => match r {
+                    Ok(on) => {
+                        b.at_login.insert(part, on);
+                    }
+                    Err(e) if !set => eprintln!("scrinium: {part}: connect at login: {e}"),
+                    Err(e) => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't change “connect at login”: {e}"), error: true }),
+                },
                 Job::Space(part, r) => match r {
                     Some(sf) => {
+                        // Back: show the open folder again if it couldn't be read.
+                        if self.offline.remove(&part) && b.place().is_some_and(|p| p.id == part) && b.unreadable.is_some() {
+                            b.reload();
+                        }
                         self.space.insert(part, sf);
                     }
                     None => {
+                        // The server can't be reached (its requests fail at
+                        // once, EIO) or the share just went.
+                        self.offline.insert(part.clone());
                         self.space.remove(&part);
                     }
                 },
                 Job::Rechecked(s, Ok(fp)) => match scrinium::connect::recheck(s.addr.proto, &s.key, &fp) {
                     scrinium::connect::Recheck::Same => {
                         b.notice = Some(scrinium::browser::Notice { text: format!("Connecting to {}…", s.addr.host), error: false });
-                        self.connect_job(s.addr, s.key, None);
+                        self.connect_job(s.addr, s.key, None, false);
                     }
                     scrinium::connect::Recheck::Changed { now } => {
                         eprintln!("scrinium: {} shows another key ({now}): stopped", s.addr.host);
@@ -635,8 +685,9 @@ impl Network {
         }
         for p in b.places.iter_mut().filter(|p| p.network) {
             let (size, free) = self.space.get(&p.id).copied().unwrap_or((0, 0));
-            if (p.size, p.free) != (size, free) {
-                (p.size, p.free) = (size, free);
+            let offline = self.offline.contains(&p.id);
+            if (p.size, p.free, p.offline) != (size, free, offline) {
+                (p.size, p.free, p.offline) = (size, free, offline);
                 changed = true;
             }
         }
@@ -733,9 +784,10 @@ fn main() {
             opened = Some(part);
         }
         if let Some(part) = pane.state.get_cloned().want_eject {
+            let label = pane.state.get_cloned().places.iter().find(|p| p.id == part).map(|p| p.label.clone()).unwrap_or_default();
             let msg = match atrium_media::client::eject(&media_sock, &part) {
                 Ok(_) if part.starts_with("share-") => {
-                    net.disconnected(&part);
+                    net.disconnected(&label);
                     ("Disconnected".to_string(), false)
                 }
                 Ok(m) => (format!("Ejected: {}", if m.is_empty() { "safe to unplug".into() } else { m }), false),

@@ -8,6 +8,7 @@
 
 pub mod arca;
 pub mod cert;
+pub mod dialer;
 pub mod http;
 pub mod ntlm;
 pub mod sftp;
@@ -41,12 +42,20 @@ pub struct SftpFs<S: Read + Write> {
     /// One open read handle and one open write handle, by node id.
     rd: Option<(u64, Vec<u8>)>,
     wr: Option<(u64, Vec<u8>)>,
-    /// The connection failed: every operation fails from here on.
+    /// The connection failed: operations fail at once until `backoff`
+    /// says to try `reconnect` (S4); without it, for good.
     dead: bool,
+    reconnect: Option<Reconnect<Sftp<S>>>,
+    backoff: dialer::Backoff,
     /// Leave instead: the share then ends for good, and whoever started
     /// the server sees it go (dispensatord reaps it and unmounts).
     exit_on_loss: bool,
 }
+
+/// A new session to the same server, with its identity checked again
+/// (S4). It may end the process itself when the answer is final (a
+/// changed key, a refused login).
+pub type Reconnect<C> = Box<dyn FnMut() -> std::result::Result<C, String>>;
 
 fn map(e: sftp::Error) -> Error {
     match e {
@@ -67,7 +76,7 @@ impl<S: Read + Write> SftpFs<S> {
         }
         let mut ids = HashMap::new();
         ids.insert(root.clone(), 1);
-        Ok(SftpFs { s, paths: vec![None, Some(root)], ids, writable, rd: None, wr: None, dead: false, exit_on_loss: false })
+        Ok(SftpFs { s, paths: vec![None, Some(root)], ids, writable, rd: None, wr: None, dead: false, reconnect: None, backoff: Default::default(), exit_on_loss: false })
     }
 
     fn path(&self, id: u64) -> Result<&str> {
@@ -99,19 +108,51 @@ impl<S: Read + Write> SftpFs<S> {
         self
     }
 
-    fn live(&self) -> Result<()> {
-        if self.dead {
-            Err(Error::Io("the connection to the server is gone".into()))
-        } else {
-            Ok(())
+    /// Connect again after a loss, through `f`, instead of failing for
+    /// good: the mount stays, and its requests fail at once while the
+    /// server can't be reached.
+    pub fn reconnect_with(mut self, f: Reconnect<Sftp<S>>) -> Self {
+        self.reconnect = Some(f);
+        self
+    }
+
+    fn live(&mut self) -> Result<()> {
+        if !self.dead {
+            return Ok(());
         }
+        if let Some(f) = self.reconnect.as_mut() {
+            if self.backoff.ready() {
+                match f() {
+                    Ok(s) => {
+                        eprintln!("atrium-share-sftp: reconnected");
+                        self.s = s;
+                        // Handles were the old session's.
+                        self.rd = None;
+                        self.wr = None;
+                        self.dead = false;
+                        self.backoff.ok();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("atrium-share-sftp: reconnect: {e}");
+                        self.backoff.failed();
+                    }
+                }
+            }
+            return Err(Error::Io("the server can't be reached: trying again soon".into()));
+        }
+        Err(Error::Io("the connection to the server is gone".into()))
     }
 
     /// Turns a connection-level failure into a dead share.
     fn chk<T>(&mut self, r: std::result::Result<T, sftp::Error>) -> Result<T> {
         if let Err(e @ (sftp::Error::Ssh(_) | sftp::Error::Protocol(_))) = &r {
+            if !self.dead && self.reconnect.is_some() {
+                // The next request tries at once; then less often.
+                eprintln!("atrium-share-sftp: the connection is gone ({e}): reconnecting on the next request");
+            }
             self.dead = true;
-            if self.exit_on_loss {
+            if self.exit_on_loss && self.reconnect.is_none() {
                 eprintln!("atrium-share-sftp: the connection is gone ({e}): ending the share");
                 std::process::exit(4);
             }

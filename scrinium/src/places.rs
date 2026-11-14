@@ -46,6 +46,7 @@ pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
         size: v.size_bytes,
         free: v.free_bytes,
         network,
+        offline: false,
     }
 }
 
@@ -60,7 +61,7 @@ pub fn parse_places(s: &str) -> Vec<Place> {
         .filter_map(|kv| kv.split_once('='))
         .filter(|(l, p)| !l.trim().is_empty() && p.starts_with('/'))
         .enumerate()
-        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0, network: false })
+        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
         .collect()
 }
 

@@ -150,6 +150,17 @@ V "su -m bob -c 'ls $M' >/dev/null 2>&1" && bad "bob lists alice's share" || ok 
 JID=$(V "jls -j system-share-63000 jid")
 check "the server and its dialer run as 63000 in their jail" "63000 63000" "$(V "ps -J $JID -o uid= | tr -d ' ' | sort | tr '\n' ' ' | sed 's/ $//'")"
 check "Arca filled it once" 1 "$(fills 8443)"
+# S4: the server goes and comes back; the share stays and works again.
+sh "$ROOT/scripts/webdav-test-server.sh" down $WD
+t0=$(date +%s); V "su -m alice -c 'cat $M/hello.txt'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+[ "$r" = failed ] && [ $t -le 10 ] && ok "the server down: a read fails (${t}s)" || bad "with the server down: $r in ${t}s"
+t0=$(date +%s); V "su -m alice -c 'ls $M'" >/dev/null 2>&1 && r=read || r=failed; t=$(( $(date +%s) - t0 ))
+[ "$r" = failed ] && [ $t -le 8 ] && ok "and the next fails fast (${t}s)" || bad "the next read: $r in ${t}s"
+V "jls -n name | grep -q system-share-63000" && ok "the share stays" || bad "the share ended while its server was down"
+sh "$ROOT/scripts/webdav-test-server.sh" up $WD >/dev/null || bad "apache didn't start again"
+i=0; r=""; while [ $i -lt 45 ] && [ "$r" != from-dav ]; do sleep 1; r=$(V "su -m alice -c 'cat $M/hello.txt'" 2>/dev/null); i=$((i+1)); done
+check "the server back: the share works again (${i}s)" from-dav "$r"
+check "with the password it holds (Arca not asked again)" 1 "$(fills 8443)"
 out=$(V "su -m alice -c '$DD --eject share-63000'" 2>&1)
 case "$out" in "ok "*) ok "alice disconnects it" ;; *) bad "eject: $out" ;; esac
 gone 20 && ok "its jail and mount are gone" || bad "after eject: $(V "jls -n name | grep share; mount -p | grep share-6300" | tr '\n' ';')"

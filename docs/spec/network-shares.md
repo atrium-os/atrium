@@ -417,8 +417,9 @@ encryption. It checks:
    most 2 s, one at a time per mount; a share whose server doesn't answer
    is ended before it is unmounted (FUSE_DESTROY would wait on it), a
    stick's eject is refused instead; a share server's exit is seen at once
-   on its process descriptor; a server whose SSH peer goes silent ends
-   itself (25 s read timeout) rather than serve errors; dispensatord at
+   on its process descriptor; a server whose SSH peer goes silent ended
+   itself (25 s read timeout) rather than serve errors (since S4 it fails
+   that request after 20 s and connects again); dispensatord at
    start removes every share jail and orphaned grant an earlier run left.
    Readers on a wedged mount fail after fusefs' 30 s timeout (S0).
    `vm-share-jail.sh` checks each of these: 47 checks, 0 failed.
@@ -498,8 +499,8 @@ encryption. It checks:
    case is hidden, reparse points (links on the server) are neither shown
    nor followed. Writes go straight to the server (no gathering, unlike
    WebDAV); up to 8 files stay open, closed on flush, and the share's root
-   stays open so the server keeps the session. A lost connection ends the
-   share (status 4); reconnecting is S4. Found on the way: capsa-fuse read
+   stays open so the server keeps the session. A lost connection ended the
+   share (status 4) until S4. Found on the way: capsa-fuse read
    SETATTR's mtime from the wrong offset (48, ctime, instead of 40), so
    `touch -t` and `cp -p` set every file's time to the epoch, on sticks
    too. Gate `vm-share-smb.sh` against Samba 4.19 on the host
@@ -510,4 +511,42 @@ encryption. It checks:
    rmdir (and a full folder kept), another user refused, a folder as the
    root, eject; a wrong GUID gets nothing from Arca, an unknown user gets
    no guest session.
-5. **S4** disconnected-state UI, reconnect, "connect at login".
+5. **S4** disconnected-state UI, reconnect, "connect at login". *Built
+   2026-11-14.* A lost connection no longer ends a share: its server keeps
+   the mount, the request that found the loss fails (`EIO`), and the next
+   request connects again at once; while the server can't be reached,
+   requests fail at once and tries are spaced 2, 5, 10, 20, then every
+   30 s (capsa-share `dialer::Backoff`), so no access waits on a connect
+   more than once. A silent server fails a request after 20 s, inside
+   fusefs' 30 s. Every connection, the first and later ones, comes from
+   the server's dialer (`dialer.rs`, forked before anything else, outside
+   capability mode): it connects to the one address and port and to
+   Arca's socket, and passes each back over a socket pair, so the process
+   that parses the network stays in capability mode and still reconnects.
+   A reconnect repeats the identity-first login (§5.1): SFTP checks the
+   host key and SMB the GUID before Arca is asked, then logs in with a
+   credential Arca gives again (used once and wiped); WebDAV checks the
+   certificate or pin and uses the password it holds in locked memory. A
+   changed key or GUID (status 3), a refused login or a credential gone
+   from Arca (status 4) ends the share, which dispensatord reaps. The
+   development path without Arca (`--password-fd`) still ends on a loss.
+   Scrinium asks a share's size every 30 s off its window's thread, every
+   5 s while it fails: those statfs calls are what bring a share back when
+   nobody is using it. A share that doesn't answer reads "Reconnecting…" in
+   the sidebar, a folder of it that can't be read says the server can't be
+   reached, and it is read again when the share answers. Lock (§7, D7):
+   dispensatord remembers the user's shares as it ends them; the same
+   user's unlock connects each again, through its server's own identity
+   check and a new login (Arca, unlocked a moment later, is waited for up
+   to 10 s); logout or another user forgets them. Connect at login (D8):
+   off unless ticked, in the Connect form ("Connect when I log in", only
+   for a share Arca remembers) or for a connected share in Scrinium's
+   status line; dispensatord keeps the list (`<state>.shares`: session
+   user, protocol, host, port, path, user, the pinned identity, read-only),
+   checks each line again when it reads it, resolves off its loop and
+   connects them when that user's session starts. Only the session's file
+   manager asks or sets it (`AT_LOGIN`, `--at-login PART on|off|ask`). To
+   stop one that can't connect any more, connect it and untick, or forget
+   its password. Gates: `vm-share-jail.sh` (SSH session silent, sshd down
+   and back, lock and unlock, user switch and login), `vm-share-webdav.sh`
+   and `vm-share-smb.sh` (server down and back).

@@ -66,8 +66,13 @@ pub struct Arca {
 
 impl Arca {
     pub fn connect(path: &str, key: [u8; 32]) -> Result<Arca, ArcaError> {
-        let s = UnixStream::connect(path)?;
-        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        Arca::from_stream(UnixStream::connect(path)?, key)
+    }
+
+    /// Over a connection made elsewhere: the dialer's, once this process
+    /// is in capability mode (S4).
+    pub fn from_stream(s: UnixStream, key: [u8; 32]) -> Result<Arca, ArcaError> {
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
         Ok(Arca { s, key })
     }
 
@@ -95,8 +100,17 @@ impl Arca {
         Ok(body)
     }
 
+    /// This share's items. Arca still locked waits a little: a share
+    /// brought back at unlock (S4) may ask a moment before Arca has its
+    /// keys again.
     pub fn items(&mut self) -> Result<Vec<Item>, ArcaError> {
-        let b = self.call(SH_ITEMS, &[])?;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let b = loop {
+            match self.call(SH_ITEMS, &[]) {
+                Err(ArcaError::Refused(2)) if std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(500)),
+                r => break r?,
+            }
+        };
         let mut r = Cur(&b);
         let n = r.u32()?;
         let mut out = Vec::new();

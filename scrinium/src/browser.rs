@@ -25,6 +25,9 @@ pub struct Place {
     /// A network share (`stick` is set too: it is disconnected the way a
     /// stick is ejected).
     pub network: bool,
+    /// A share whose server can't be reached just now (S4): its server
+    /// keeps the mount and connects again on its own.
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +116,11 @@ pub struct Browser {
     pub key_changed: Option<KeyChanged>,
     /// The key-changed sheet asked to forget that server: the app does it.
     pub want_forget: Option<crate::shares::Saved>,
+    /// Connected shares' "connect at login", by part, as dispensatord
+    /// answered.
+    pub at_login: std::collections::HashMap<String, bool>,
+    /// The status line asked to set it: the app does it.
+    pub want_at_login: Option<(String, bool)>,
 }
 
 /// A saved server whose key isn't the one the user accepted.
@@ -149,6 +157,8 @@ impl Browser {
             want_reconnect: None,
             key_changed: None,
             want_forget: None,
+            at_login: Default::default(),
+            want_at_login: None,
         }
     }
 
@@ -220,7 +230,14 @@ impl Browser {
             }
             Err(e) => {
                 self.entries.clear();
-                self.unreadable = Some(if e.kind() == std::io::ErrorKind::NotFound { "This folder is gone".into() } else { format!("Can't read this folder ({e})") });
+                let net = self.place().is_some_and(|p| p.network);
+                self.unreadable = Some(if e.kind() == std::io::ErrorKind::NotFound {
+                    "This folder is gone".into()
+                } else if net && e.raw_os_error().is_some_and(|n| n == libc::EIO || n == libc::ETIMEDOUT) {
+                    "The server can't be reached. Trying again…".into()
+                } else {
+                    format!("Can't read this folder ({e})")
+                });
             }
         }
         self.selected = self.entries.iter().enumerate().filter(|(_, e)| keep.contains(&e.name)).map(|(i, _)| i).collect();
@@ -661,7 +678,7 @@ mod tests {
         std::fs::write(d.join("Docs/note.txt"), "a note").unwrap();
         std::fs::write(d.join("Docs/plan.md"), "a plan").unwrap();
         std::fs::write(d.join("hello.txt"), "hello").unwrap();
-        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29, network: false };
+        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29, network: false, offline: false };
         (d, p)
     }
 

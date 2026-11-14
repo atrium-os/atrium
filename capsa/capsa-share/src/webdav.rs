@@ -379,7 +379,10 @@ pub struct DavFs<D: Dial> {
     wr: Option<Writing<D::Stream>>,
     /// A whole file the server sent for a ranged read.
     whole: Option<(u64, Instant, Vec<u8>)>,
+    /// The connection failed: requests fail at once until `backoff` says
+    /// to try the server again (every request dials if it must).
     dead: bool,
+    backoff: crate::dialer::Backoff,
     exit_on_loss: bool,
 }
 
@@ -406,11 +409,12 @@ impl<D: Dial> DavFs<D> {
         ids.insert(root.clone(), 1);
         let mut dirs = HashMap::new();
         dirs.insert(1, true);
-        Ok(DavFs { dav, paths: vec![None, Some(root)], ids, dirs, writable, wr: None, whole: None, dead: false, exit_on_loss: false })
+        Ok(DavFs { dav, paths: vec![None, Some(root)], ids, dirs, writable, wr: None, whole: None, dead: false, backoff: Default::default(), exit_on_loss: false })
     }
 
-    /// A lost connection or refused credentials end the process (status 4)
-    /// rather than leave a share that fails every request.
+    /// Refused credentials end the process (status 4) rather than leave a
+    /// share that fails every request. A lost connection doesn't: the share
+    /// stays, its requests fail at once, and it is tried again (S4).
     pub fn exit_on_loss(mut self) -> Self {
         self.exit_on_loss = true;
         self
@@ -441,23 +445,44 @@ impl<D: Dial> DavFs<D> {
         Ok(format!("{}/{name}", self.path(d)?))
     }
 
-    fn live(&self) -> FsResult<()> {
-        if self.dead {
-            Err(FsError::Io("the connection to the server is gone".into()))
-        } else {
-            Ok(())
+    fn live(&mut self) -> FsResult<()> {
+        if self.dead && !self.backoff.ready() {
+            return Err(FsError::Io("the server can't be reached: trying again soon".into()));
         }
+        // Try again: the next request dials.
+        self.dead = false;
+        Ok(())
     }
 
     fn chk<T>(&mut self, r: Result<T, Error>) -> FsResult<T> {
-        if let Err(e @ (Error::Http(http::Error::Io(_) | http::Error::Protocol(_)) | Error::Auth(401))) = &r {
-            self.dead = true;
-            if self.exit_on_loss {
+        match &r {
+            Err(e @ Error::Auth(401)) if self.exit_on_loss => {
                 eprintln!("atrium-share-webdav: {e}: ending the share");
                 std::process::exit(4);
             }
+            Err(e @ Error::Http(http::Error::Io(_) | http::Error::Protocol(_))) => {
+                if !self.dead {
+                    eprintln!("atrium-share-webdav: {e}: disconnected, trying again later");
+                }
+                self.dead = true;
+                self.backoff.failed();
+                // A stream up is cut: what it carried is lost, and its
+                // writer has had the error.
+                if matches!(self.wr, Some(Writing::Stream { .. })) {
+                    self.wr = None;
+                }
+            }
+            Ok(_) if self.backoff_pending() => {
+                eprintln!("atrium-share-webdav: reconnected");
+                self.backoff.ok();
+            }
+            _ => {}
         }
         r.map_err(map)
+    }
+
+    fn backoff_pending(&self) -> bool {
+        self.backoff.fails() > 0
     }
 
     /// Put what is being written.

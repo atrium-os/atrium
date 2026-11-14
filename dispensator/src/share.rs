@@ -44,6 +44,10 @@ impl Proto {
         }
     }
 
+    pub fn from_name(n: &str) -> Option<Proto> {
+        [Proto::Sftp, Proto::Webdav, Proto::Smb].into_iter().find(|p| p.name() == n)
+    }
+
     pub fn exec(self) -> &'static str {
         match self {
             Proto::Sftp => EXEC,
@@ -209,6 +213,70 @@ pub fn registry_line(uid: u32, session_user: &str, s: &Share) -> String {
     format!("{uid} {session_user} {} {} {} {} {}", s.proto.name(), s.host, s.port, hex(&s.key), hex(s.path.as_bytes()))
 }
 
+// ---- connect at login (D8, S4) ---------------------------------------------
+
+/// The shares a user ticked "connect at login" for, one line each in
+/// dispensatord's own file: `session-user proto host port path-hex
+/// user-hex fingerprint ro|rw`. What the line names is checked again when
+/// it is read, as the file manager's request was.
+pub fn at_login_line(session_user: &str, s: &Share, read_only: bool) -> String {
+    format!("{session_user} {} {} {} {} {} {} {}", s.proto.name(), s.host, s.port, hex(s.path.as_bytes()), hex(s.user.as_bytes()), s.fingerprint, if read_only { "ro" } else { "rw" })
+}
+
+fn unhex(h: &str) -> Option<String> {
+    if h.len() % 2 != 0 {
+        return None;
+    }
+    let b: Option<Vec<u8>> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect();
+    String::from_utf8(b?).ok()
+}
+
+fn parse_at_login_line(l: &str) -> Option<(String, Share, bool)> {
+    let f: Vec<&str> = l.split(' ').collect();
+    let [who, proto, host, port, path, user, fp, ro] = f[..] else { return None };
+    let sh = check(Proto::from_name(proto)?, host, port.parse().ok()?, &unhex(path)?, &unhex(user)?, fp).ok()?;
+    let ro = match ro {
+        "ro" => true,
+        "rw" => false,
+        _ => return None,
+    };
+    Some((who.to_string(), sh, ro))
+}
+
+/// `session_user`'s shares to connect at login, from the file's text.
+pub fn at_login_for(text: &str, session_user: &str) -> Vec<(Share, bool)> {
+    text.lines().filter_map(parse_at_login_line).filter(|(w, ..)| w == session_user).map(|(_, s, ro)| (s, ro)).collect()
+}
+
+fn same_share(a: &Share, b: &Share) -> bool {
+    (a.proto, &a.host, a.port, &a.path, &a.user) == (b.proto, &b.host, b.port, &b.path, &b.user)
+}
+
+/// Is this share in `session_user`'s list?
+pub fn at_login_has(text: &str, session_user: &str, s: &Share) -> bool {
+    at_login_for(text, session_user).iter().any(|(o, _)| same_share(o, s))
+}
+
+/// The file's text with this share in or out of `session_user`'s list
+/// (the newest identity and mode replace an older line). Lines that no
+/// longer check are dropped.
+pub fn at_login_set(text: &str, session_user: &str, s: &Share, read_only: bool, on: bool) -> String {
+    let mut out = String::new();
+    for l in text.lines() {
+        let Some((w, o, _)) = parse_at_login_line(l) else { continue };
+        if w == session_user && same_share(&o, s) {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if on {
+        out.push_str(&at_login_line(session_user, s, read_only));
+        out.push('\n');
+    }
+    out
+}
+
 pub fn retired_line(uid: u32) -> String {
     format!("{uid} retired")
 }
@@ -302,6 +370,25 @@ pub fn learn_refusal(out: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn at_login_lines() {
+        let fp = format!("SHA256:{}", "A".repeat(43));
+        let a = super::check(super::Proto::Smb, "nas.local", 445, "/files/team a", "ACME\\alice", &fp).unwrap();
+        let b = super::check(super::Proto::Sftp, "10.0.2.2", 22, "/srv", "bob", &fp).unwrap();
+        let t = super::at_login_set("", "alice", &a, false, true);
+        let t = super::at_login_set(&t, "alice", &b, true, true);
+        let t = super::at_login_set(&t, "carol", &b, false, true);
+        // A line that doesn't check is dropped, never connected.
+        let t = format!("{t}alice smb evil;host 445 2f 61 {fp} rw\n");
+        let mine = super::at_login_for(&t, "alice");
+        assert_eq!(mine, vec![(a.clone(), false), (b.clone(), true)]);
+        assert!(super::at_login_has(&t, "alice", &a));
+        let t = super::at_login_set(&t, "alice", &a, false, false);
+        assert_eq!(super::at_login_for(&t, "alice"), vec![(b.clone(), true)]);
+        assert_eq!(super::at_login_for(&t, "carol"), vec![(b, false)]);
+        assert!(!t.contains("evil"));
+    }
+
     use super::*;
 
     const FP: &str = "SHA256:WmXuVRg10pJRVYDpsFPc/bGwkJRcX4mhTs6Zz3tuWEQ";

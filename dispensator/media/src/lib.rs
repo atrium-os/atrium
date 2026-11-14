@@ -39,6 +39,8 @@ pub mod op {
     pub const PICKED: u16 = 0x06;
     pub const CONNECT: u16 = 0x07;
     pub const LEARN: u16 = 0x08;
+    /// Whether a connected share comes back at login, asked or set.
+    pub const AT_LOGIN: u16 = 0x09;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -131,6 +133,16 @@ pub struct Connect {
     /// the host name); for SMB, the server GUID's.
     pub fingerprint: String,
     pub read_only: bool,
+    /// Connect it again at each login (D8): off unless the user ticks it.
+    pub at_login: bool,
+}
+
+/// A connected share's "connect at login" (D8): `on` sets it, `None`
+/// only asks. The reply is `on` or `off`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtLogin {
+    pub part: String,
+    pub on: Option<bool>,
 }
 
 /// Ask a server who it is, before anything secret is involved.
@@ -191,6 +203,9 @@ pub mod server {
         fn connect(&self, uid: u32, c: &Connect) -> (u8, String);
         /// `uid` (the file manager) asks for a server's fingerprint.
         fn learn(&self, uid: u32, l: &Learn) -> (u8, String);
+        /// `uid` (the file manager) asks or sets whether a connected share
+        /// comes back at login.
+        fn at_login(&self, uid: u32, a: &AtLogin) -> (u8, String);
     }
 
     pub struct Shared {
@@ -376,6 +391,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::LEARN, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::AT_LOGIN => {
+                    let (st, msg) = match postcard::from_bytes::<AtLogin>(&m.payload) {
+                        Ok(a) if a.part.starts_with("share-") && a.part.len() <= 32 => shared.host.at_login(uid, &a),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::AT_LOGIN, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -483,6 +505,12 @@ pub mod client {
         status_call(sock, op::LEARN, l)
     }
 
+    /// The file manager asks (`on: None`) or sets whether a connected
+    /// share comes back at login: `on` or `off`.
+    pub fn at_login(sock: &Path, a: &AtLogin) -> Result<String, (u8, String)> {
+        status_call(sock, op::AT_LOGIN, a)
+    }
+
     /// The file manager asks for every stick in its jail.
     pub fn attach_all(sock: &Path) -> Result<String, (u8, String)> {
         status_call(sock, op::ATTACH_ALL, &())
@@ -574,6 +602,9 @@ mod tests {
         }
         fn learn(&self, _uid: u32, _l: &Learn) -> (u8, String) {
             (status::NOT_ALLOWED, "test".into())
+        }
+        fn at_login(&self, _uid: u32, a: &AtLogin) -> (u8, String) {
+            (status::OK, if a.on == Some(true) { "on" } else { "off" }.into())
         }
     }
 

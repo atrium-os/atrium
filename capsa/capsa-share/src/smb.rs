@@ -903,7 +903,11 @@ pub struct SmbFs<S: Read + Write> {
     /// The root folder, held open (statfs, and so the server keeps the
     /// session).
     root: FileId,
+    /// The connection failed: requests fail at once until `backoff` says
+    /// to try `reconnect` (S4).
     dead: bool,
+    reconnect: Option<crate::Reconnect<Conn<S>>>,
+    backoff: crate::dialer::Backoff,
     exit_on_loss: bool,
 }
 
@@ -936,7 +940,7 @@ impl<S: Read + Write> SmbFs<S> {
         }
         let mut ids = HashMap::new();
         ids.insert(root.clone(), 1);
-        Ok(SmbFs { c, paths: vec![None, Some(root)], ids, writable, open: Vec::new(), root: fid, dead: false, exit_on_loss: false })
+        Ok(SmbFs { c, paths: vec![None, Some(root)], ids, writable, open: Vec::new(), root: fid, dead: false, reconnect: None, backoff: Default::default(), exit_on_loss: false })
     }
 
     /// A lost connection ends the process (status 4) rather than leave a
@@ -968,18 +972,53 @@ impl<S: Read + Write> SmbFs<S> {
         id
     }
 
-    fn live(&self) -> FsResult<()> {
-        if self.dead {
-            Err(FsError::Io("the connection to the server is gone".into()))
-        } else {
-            Ok(())
+    /// Connect again after a loss, through `f` (a session logged in and
+    /// connected to the share), instead of ending.
+    pub fn reconnect_with(mut self, f: crate::Reconnect<Conn<S>>) -> Self {
+        self.reconnect = Some(f);
+        self
+    }
+
+    fn live(&mut self) -> FsResult<()> {
+        if !self.dead {
+            return Ok(());
         }
+        if let Some(f) = self.reconnect.as_mut() {
+            if self.backoff.ready() {
+                let root = self.paths[1].clone().unwrap_or_default();
+                let r = f().and_then(|mut c| {
+                    let (fid, _) = c.create(&root, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, DIRECTORY_FILE).map_err(|e| e.to_string())?;
+                    Ok((c, fid))
+                });
+                match r {
+                    Ok((c, fid)) => {
+                        eprintln!("atrium-share-smb: reconnected");
+                        self.c = c;
+                        self.root = fid;
+                        // Handles were the old session's.
+                        self.open.clear();
+                        self.dead = false;
+                        self.backoff.ok();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("atrium-share-smb: reconnect: {e}");
+                        self.backoff.failed();
+                    }
+                }
+            }
+            return Err(FsError::Io("the server can't be reached: trying again soon".into()));
+        }
+        Err(FsError::Io("the connection to the server is gone".into()))
     }
 
     fn chk<T>(&mut self, r: R<T>) -> FsResult<T> {
         if let Err(e @ (Error::Io(_) | Error::Protocol(_) | Error::Status(0xC000_035C | 0xC000_0203))) = &r {
+            if !self.dead && self.reconnect.is_some() {
+                eprintln!("atrium-share-smb: {e}: reconnecting on the next request");
+            }
             self.dead = true;
-            if self.exit_on_loss {
+            if self.exit_on_loss && self.reconnect.is_none() {
                 eprintln!("atrium-share-smb: {e}: ending the share");
                 std::process::exit(4);
             }
