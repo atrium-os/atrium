@@ -31,6 +31,7 @@ limen           = { path = "../limen" }
 aqueduct        = { path = "../aqueduct" }
 serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
+libc            = "0.2"
 
 [dev-dependencies]
 forum-ctl = { path = "../forum-ctl" }

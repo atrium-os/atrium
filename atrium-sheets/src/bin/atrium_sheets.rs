@@ -514,6 +514,17 @@ fn bench_main(a: &[String]) -> i32 {
             mean(&|p| p.send_ms),
             mean(&|p| p.deltas as f64),
         );
+        // Whether a slow send was this thread working, waiting on frescod, or waiting
+        // for a CPU (preempted).
+        println!(
+            "  send of slow frames: cpu {:.1} ms, pop-ups {:.1} ms, preempted {:.1} times on average; worst send {:.1} ms with cpu {:.1} ms, {} preemptions",
+            mean(&|p| p.send_cpu_ms),
+            mean(&|p| p.popups_ms),
+            mean(&|p| p.send_preempted as f64),
+            slow.iter().map(|p| p.send_ms).fold(0.0, f64::max),
+            slow.iter().max_by(|a, b| a.send_ms.total_cmp(&b.send_ms)).map_or(0.0, |p| p.send_cpu_ms),
+            slow.iter().max_by(|a, b| a.send_ms.total_cmp(&b.send_ms)).map_or(0, |p| p.send_preempted),
+        );
         // Let a fling settle, then back to the top for the next pattern.
         let settle = Instant::now();
         while app.wants_frame() && settle.elapsed() < Duration::from_secs(10) {

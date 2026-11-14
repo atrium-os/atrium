@@ -102,6 +102,25 @@ pub struct PaintTiming {
     pub build_ms: f64,
     pub send_ms: f64,
     pub deltas: usize,
+    /// Of the send: this thread's CPU time, the time in pop-up sync, and the
+    /// involuntary context switches (preemptions) it suffered. Wall time far over
+    /// CPU time with preemptions means the thread was waiting for a CPU, not for
+    /// frescod.
+    pub send_cpu_ms: f64,
+    pub popups_ms: f64,
+    pub send_preempted: i64,
+}
+
+/// This thread's CPU time (ms) and involuntary context switches.
+fn thread_cpu() -> (f64, i64) {
+    // SAFETY: plain out-parameters.
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_THREAD, &mut ru);
+        (ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6, ru.ru_nivcsw as i64)
+    }
 }
 
 /// Opens pop-ups for [`crate::popup::Popups`] on the window's connection.
@@ -254,8 +273,9 @@ impl Window {
         app.frame();
         let deltas = app.tick();
         let t1 = std::time::Instant::now();
-        self.last_paint = PaintTiming { build_ms: (t1 - t0).as_secs_f64() * 1e3, send_ms: 0.0, deltas: deltas.len() };
+        self.last_paint = PaintTiming { build_ms: (t1 - t0).as_secs_f64() * 1e3, deltas: deltas.len(), ..Default::default() };
         if !deltas.is_empty() {
+            let (cpu0, sw0) = thread_cpu();
             // Pop-ups open (or move, or close) before what they show is sent.
             let mut host = PopupHost {
                 conn: self.surface.connection(),
@@ -272,6 +292,7 @@ impl Window {
             for root in refused {
                 app.popup_dismissed(root);
             }
+            self.last_paint.popups_ms = t1.elapsed().as_secs_f64() * 1e3;
             for (win, batch) in self.popups.route(deltas, app.tree(), self.main) {
                 if batch.is_empty() {
                     continue;
@@ -282,6 +303,9 @@ impl Window {
             }
             self.surface.select(self.main);
             self.last_paint.send_ms = t1.elapsed().as_secs_f64() * 1e3;
+            let (cpu1, sw1) = thread_cpu();
+            self.last_paint.send_cpu_ms = cpu1 - cpu0;
+            self.last_paint.send_preempted = sw1 - sw0;
         }
         // After the present, so a slot never sits over a frame that does
         // not yet show the space for it.
