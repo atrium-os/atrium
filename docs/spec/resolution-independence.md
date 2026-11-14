@@ -242,6 +242,26 @@ parent's scale, so it keeps its size and its place against the parent on any mon
 - **Moving the parent to another monitor** moves its pop-ups and sheets with it; they switch
   scale with the parent on release (§7), in one frame, never one before the other.
 
+### 7.2 The bar, its icons and its panels
+
+- **The bar** (forum-bar) is a Pergola app, so its height (`shell::BAR_H`, 38), its text and
+  its status icons are in pt and draw at the monitor's scale. Its icons are vector (Phosphor,
+  and apps' vector status icons), flattened at the device size, so they stay crisp at 1.25
+  or 2.0 with no 1x/2x assets.
+- **The space it reserves** is the gap today: forum-wm hard-codes `BAR_H = 38` and the dock's
+  48 as device px, so at scale 1.5 the bar draws 57 px tall while windows are laid out 38 px
+  down, under it. The reservations become pt, the same constants Pergola uses, times the
+  monitor's scale, so the bar and the work area always meet exactly. With text size above
+  100% the bar's height is em-based (§6.2) and the WM reserves the bar's reported height.
+- **A bar on each monitor** (where Forum shows one) draws at that monitor's scale, so on a
+  mixed setup each bar is the same physical height.
+- **Its drop-down panels**: the bar's own menus and the volume/clipboard panels are its
+  pop-ups (§7.1). Panels an app draws through the bar's grant (forum-status-items.md §4) are
+  sized in pt by the app and placed by frescod against the bar's icon at the bar's scale; the
+  app's process is told that scale (it opens at it, `WindowCreateReply`). frescod's label gap
+  between bar and panel (`HOSTED_LABEL_GAP`) becomes pt too.
+- **The trusted strip** above everything is frescod's (§8), 24 pt.
+
 ## 8. frescod's own drawing
 
 The origin strip, the cursor, Arca's ring, the lock screen, focus outlines drawn by frescod
@@ -295,7 +315,7 @@ Shankar took the recommendation on each:
    forum-wm lays out the desktop in pt. Test: the Pergola showcase pixel-compared at 1.0,
    1.5 and 2.0 (2.0 must equal 1.0 upscaled 2x in geometry), clicks hit at every scale.
 2. **Scale policy** (rows 8 to 10): `ui_size` relative preference, TV fallback, 1/8 steps,
-   strip and cursor in pt. Test: change a monitor's mode in the VM and check every window's
+   strip, cursor and forum-wm's bar and dock reservations in pt. Test: change a monitor's mode in the VM and check every window's
    pt size is unchanged.
 3. **Crispness** (§5): emission snapping. Test: hairlines are solid device pixels at 1.25,
    1.5 and 1.75.
