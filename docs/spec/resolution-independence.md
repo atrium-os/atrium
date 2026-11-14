@@ -249,7 +249,9 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   did not change but that text moved (a text size or width change), the position moves with
   it and the view's state is told (`Ctx::on_reflow`). A wrapped paragraph is matched by its
   words, so it is found again however it rewraps; a reader's own scroll is never undone.
-- **Minimum window size:** Pergola measures the main root's natural minimum (taffy at
+- **Minimum window size:** Pergola measures the natural minimum of the stack the app names
+  with `Ctx::min_size_from` (a flex root filling the window; a hand-placed layout must not,
+  as its minimum would be its current size, and without it no minimum is sent) (taffy at
   min-content width; the content's height at the window's width) at open and whenever the
   text size or the width changes, and sends it in points with `OP_WINDOW_SET_HINTS`
   (`WindowHints.min_size`, never below the app's own; at most `MAX_MIN_SIZE_PT`, 8192).
@@ -258,7 +260,10 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   `EV_WINDOW_MIN_SIZE` (WM only). forum-wm gives split columns at least their documents'
   minimums (stacking them when the minimums don't fit side by side), grows a dialog about its
   centre and a panel leftwards, and gives a snapped document too wide for its half the work
-  area; nothing leaves the work area.
+  area; nothing leaves the work area. Live check (2026-11-14): the chain works end to end
+  (a split column got exactly its document's minimum; two that didn't fit stacked); borders
+  are 2 px on all four sides at 1.5 and 1 px at 1.25 after keeping glyph strokes and dots out
+  of the edge table (5835fad9). A scroll view's natural minimum height is 0.
 - **Toolbar overflow:** `pergola::widgets::Toolbar` lays out `ToolItem`s (label, priority,
   enabled, action) in its width; when they don't fit, the lowest priorities (the later of
   equals first) move into a "More" menu at its end, in their order, and come back when there

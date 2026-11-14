@@ -175,6 +175,16 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).on_frame = Some(Box::new(handler));
     }
 
+    /// The window's minimum size is `id`'s natural minimum: the narrowest
+    /// it lays out in and its height at the window's width
+    /// (resolution-independence.md §6.3). `id` is a top-level flex stack
+    /// that fills the window; a layout placed by hand (right-aligned at the
+    /// window's width) should not say this, as its minimum would be its
+    /// current size. Without it the window gives the WM no minimum.
+    pub fn min_size_from(&mut self, id: NodeId) {
+        self.tree.set_min_root(id);
+    }
+
     /// Keep a scroll view's place across a reflow (resolution-independence.md
     /// §6.3): when its content lays out again with its position unchanged
     /// (a text size or width change), `handler` gets the position that

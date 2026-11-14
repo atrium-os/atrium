@@ -342,7 +342,8 @@ impl Window {
 
     /// Tell the WM the layout's natural minimum, if it changed.
     fn send_min_size<V: View>(&mut self, app: &App<V>) {
-        let Some(m) = app.tree().roots().next().and_then(crate::layout::take_natural_min) else { return };
+        // Always taken, so the request ends with this layout.
+        let Some(m) = crate::layout::take_natural_min(app.tree().min_root()) else { return };
         let side = |v: f32, floor: u32| (v.ceil().max(0.0) as u32).max(floor).min(fresco_protocol::MAX_MIN_SIZE_PT);
         let min = (side(m.w, self.min_floor.0), side(m.h, self.min_floor.1));
         if min != self.min_sent {

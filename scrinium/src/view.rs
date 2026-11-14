@@ -178,7 +178,7 @@ fn sans(size: f32, weight: Weight, color: Color) -> TextStyle {
 
 /// One line of text whose middle is at `cy`.
 fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, color: Color) -> NodeId {
-    let h = size * 1.5;
+    let h = em(size) * 1.5;
     ctx.add(Node::Text { rect: Rect::new(x, cy - h / 2.0, 0.0, h), content: s.into(), style: sans(size, weight, color) })
 }
 
@@ -245,11 +245,11 @@ enum Look {
     Danger,
 }
 
-/// A text button 32 px high at (`x`, `y`); returns its width.
+/// A text button 32 pt high (at 100% text) at (`x`, `y`); returns its width.
 fn button(ctx: &mut Ctx, x: f32, y: f32, label: &str, look: Look, enabled: bool, on: impl Fn() + 'static) -> f32 {
     let t = ctx.theme;
-    let w = width(label, type_size::SM, Weight::Medium) + 28.0;
-    let r = Rect::new(x, y, w, 32.0);
+    let (w, h) = (width(label, type_size::SM, Weight::Medium) + em(28.0), em(32.0));
+    let r = Rect::new(x, y, w, h);
     let (fill, hover, fg) = match look {
         Look::Ghost => (Color::TRANSPARENT, t.state_hover(), t.text_primary()),
         Look::Secondary => (t.bg_surface(), t.state_hover(), t.text_primary()),
@@ -257,15 +257,15 @@ fn button(ctx: &mut Ctx, x: f32, y: f32, label: &str, look: Look, enabled: bool,
         Look::Danger => (t.danger_fg(), t.danger_fg(), t.text_on_accent()),
     };
     if look == Look::Secondary {
-        rect(ctx, x, y, w, 32.0, t.border_strong(), 6.0);
+        rect(ctx, x, y, w, h, t.border_strong(), 6.0);
     }
-    let inner = if look == Look::Secondary { Rect::new(x + 1.0, y + 1.0, w - 2.0, 30.0) } else { r };
+    let inner = if look == Look::Secondary { Rect::new(x + 1.0, y + 1.0, w - 2.0, h - 2.0) } else { r };
     if enabled {
         area(ctx, inner, 6.0, fill, hover, on);
     } else {
         ctx.push(Node::Rect { rect: inner, fill: if look == Look::Primary || look == Look::Danger { t.state_hover() } else { fill }, radius: 6.0 });
     }
-    text(ctx, x + 14.0, y + 16.0, label, type_size::SM, Weight::Medium, if enabled { fg } else { t.text_disabled() });
+    text(ctx, x + em(14.0), y + h / 2.0, label, type_size::SM, Weight::Medium, if enabled { fg } else { t.text_disabled() });
     ctx.pop();
     w
 }
@@ -370,25 +370,26 @@ impl ScriniumView {
             .map(|(i, s)| (i, format!("{}@{}:{}", s.addr.user, s.addr.host, s.addr.path)))
             .filter(|(_, l)| !connected.contains(&l.as_str()))
             .collect();
-        let foot = h - 48.0;
-        let mut y = foot - saved.len() as f32 * 32.0;
+        let foot = h - em(48.0);
+        let mut y = foot - saved.len() as f32 * em(32.0);
         if !saved.is_empty() && y > top + 38.0 + b.places.len() as f32 * (place_h() + 2.0) + 24.0 {
             text(ctx, 16.0, y - 12.0, "Servers", type_size::XS, Weight::Semibold, t.text_tertiary());
             for (i, label) in saved {
                 let s = self.state.clone();
                 ctx.key(3000 + i as u64);
-                area(ctx, Rect::new(8.0, y, sw - 16.0, 30.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.reconnect(i)));
-                icon(ctx, 16.0, y + 7.0, ph::GLOBE, 16.0, t.text_tertiary());
-                text(ctx, 40.0, y + 15.0, &fit(&label, type_size::SM, Weight::Regular, sw - 56.0), type_size::SM, Weight::Regular, t.text_secondary());
+                area(ctx, Rect::new(8.0, y, sw - 16.0, em(30.0)), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, |b| b.reconnect(i)));
+                icon(ctx, 16.0, y + em(7.0), ph::GLOBE, 16.0, t.text_tertiary());
+                let tx = 24.0 + em(16.0);
+                text(ctx, tx, y + em(15.0), &fit(&label, type_size::SM, Weight::Regular, sw - tx - 16.0), type_size::SM, Weight::Regular, t.text_secondary());
                 ctx.pop();
-                y += 32.0;
+                y += em(32.0);
             }
         }
         let s = self.state.clone();
         ctx.key(2999);
-        area(ctx, Rect::new(8.0, foot + 8.0, sw - 16.0, 32.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, Browser::open_connect));
-        icon(ctx, 16.0, foot + 14.0, ph::PLUS, 20.0, t.text_secondary());
-        text(ctx, 44.0, foot + 24.0, "Connect to server", type_size::SM, Weight::Medium, t.text_primary());
+        area(ctx, Rect::new(8.0, foot + 8.0, sw - 16.0, em(32.0)), 6.0, Color::TRANSPARENT, t.state_hover(), move || with(&s, Browser::open_connect));
+        icon(ctx, 16.0, foot + 8.0 + em(6.0), ph::PLUS, 20.0, t.text_secondary());
+        text(ctx, 24.0 + em(20.0), foot + 8.0 + em(16.0), "Connect to server", type_size::SM, Weight::Medium, t.text_primary());
         ctx.pop();
     }
 
@@ -419,7 +420,7 @@ impl ScriniumView {
         rect(ctx, lx, y + 178.0, inner, 30.0, t.bg_canvas(), 6.0);
         text(ctx, lx + 10.0, y + 193.0, &fit(&k.now, type_size::SM, Weight::Medium, inner - 20.0), type_size::SM, Weight::Medium, t.danger_fg());
         line(ctx, 226.0, "If its owner says the key really changed, forget it and connect to it again.", t.text_tertiary());
-        let by = y + ch - 32.0 - pad;
+        let by = y + ch - em(32.0) - pad;
         let close = width("Close", type_size::SM, Weight::Medium) + 28.0;
         let s = self.state.clone();
         button(ctx, x + cw - pad - close, by, "Close", Look::Primary, true, move || with(&s, Browser::close_key_changed));
@@ -444,7 +445,7 @@ impl ScriniumView {
         let (lx, inner) = (x + pad, cw - 2.0 * pad);
         let title = |ctx: &mut Ctx, s: &str| text(ctx, lx, y + 32.0, s, type_size::LG, Weight::Semibold, t.text_primary());
         let line = |ctx: &mut Ctx, row: f32, s: &str, c: Color| text(ctx, lx, y + row, &fit(s, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, c);
-        let by = y + ch - 32.0 - pad;
+        let by = y + ch - em(32.0) - pad;
         let cancel = |ctx: &mut Ctx, s: Mutable<Browser>| {
             let cw2 = width("Cancel", type_size::SM, Weight::Medium) + 28.0;
             button(ctx, x + cw - pad - cw2, by, "Cancel", Look::Ghost, true, move || with(&s, Browser::close_connect));
@@ -559,7 +560,7 @@ impl ScriniumView {
         let t = ctx.theme;
         let lw = x1 - x0;
         // Columns, right to left: modified, size, kind.
-        let (mod_w, size_w, kind_w) = if wide { (140.0, 90.0, 100.0) } else { (0.0, 84.0, 0.0) };
+        let (mod_w, size_w, kind_w) = if wide { (em(140.0), em(90.0), em(100.0)) } else { (0.0, em(84.0), 0.0) };
         let size_x = lw - mod_w - size_w - 12.0;
         let kind_x = size_x - kind_w;
         rect(ctx, x0, y0, lw, header_h(), t.bg_canvas(), 0.0);
@@ -570,10 +571,10 @@ impl ScriniumView {
         head(ctx, 44.0, "Name");
         if wide {
             head(ctx, kind_x, "Kind");
-            head(ctx, size_x + size_w - 30.0, "Size");
+            head(ctx, size_x + size_w - width("Size", type_size::XS, Weight::Semibold), "Size");
             head(ctx, lw - mod_w, "Modified");
         } else {
-            head(ctx, size_x + size_w - 30.0, "Size");
+            head(ctx, size_x + size_w - width("Size", type_size::XS, Weight::Semibold), "Size");
         }
         let top = y0 + header_h();
         let lh = (y1 - top).max(0.0);
@@ -647,7 +648,7 @@ impl ScriniumView {
         // A toolbar: when the text grows or the window narrows, what no
         // longer fits goes into its "More" menu (resolution-independence.md §6.3).
         let hid = if b.show_hidden { "Hide hidden files" } else { "Show hidden files" };
-        let hw = width(hid, type_size::SM, Weight::Medium) + 28.0;
+        let hw = width(hid, type_size::SM, Weight::Medium) + em(28.0);
         let (s1, f1, s2, f2) = (self.state.clone(), self.field.clone(), self.state.clone(), self.field.clone());
         let (s3, s4, s5, s6) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
         let items = vec![
@@ -661,7 +662,7 @@ impl ScriniumView {
         let tx = x0 + 8.0;
         Toolbar::new(Rect::new(tx, ay, (w - hw - 16.0 - tx).max(0.0), actions_h() - 8.0), self.more.clone(), items).render(ctx);
         let s = self.state.clone();
-        button(ctx, w - hw - 8.0, ay, hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
+        button(ctx, w - hw - 8.0, ay + ((actions_h() - 8.0 - em(32.0)) / 2.0).max(0.0), hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
         let mut y = toolbar_h() + actions_h();
         rect(ctx, x0, y - 1.0, w - x0, 1.0, t.border_default(), 0.0);
 

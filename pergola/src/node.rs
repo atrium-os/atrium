@@ -393,6 +393,9 @@ pub struct NodeTree {
     next_key: Option<u64>,
     /// Top-level nodes so far (their position key).
     root_count: u32,
+    /// The stack whose natural minimum is the window's minimum size
+    /// (`Ctx::min_size_from`); none: the window gives no minimum.
+    min_root: Option<NodeId>,
 }
 
 impl NodeTree {
@@ -402,6 +405,10 @@ impl NodeTree {
     pub fn continuing(prev: &mut NodeTree) -> Self {
         Self { keys: std::mem::take(&mut prev.keys), ..Self::default() }
     }
+
+    /// The stack whose natural minimum is the window's ([`crate::view::Ctx::min_size_from`]).
+    pub fn min_root(&self) -> Option<NodeId> { self.min_root }
+    pub fn set_min_root(&mut self, id: NodeId) { self.min_root = Some(id); }
 
     /// Forget the keys this render did not use.
     pub fn sweep_keys(&mut self) {

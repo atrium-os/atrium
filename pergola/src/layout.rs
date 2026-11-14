@@ -217,10 +217,10 @@ pub fn request_natural_min() {
 /// narrowest it can lay out (its widest word, control or fixed part) and
 /// how tall it is at its width. What a window tells the WM as its minimum
 /// size (resolution-independence.md §6.3); it grows with the text size.
-pub fn take_natural_min(root: PNodeId) -> Option<crate::geom::Size> {
+pub fn take_natural_min(root: Option<PNodeId>) -> Option<crate::geom::Size> {
     MIN_WANTED.with(|w| w.set(false));
     let all = MINS.with(|m| std::mem::take(&mut *m.borrow_mut()));
-    all.into_iter().find(|(id, _)| *id == root).map(|(_, s)| s)
+    all.into_iter().find(|(id, _)| Some(*id) == root).map(|(_, s)| s)
 }
 
 /// Lay out `t_root` in `available`, measuring text leaves.
@@ -633,18 +633,18 @@ mod tests {
         let (mut tree, col) = build();
         request_natural_min();
         layout(&mut tree, col);
-        let m = take_natural_min(col).expect("measured");
+        let m = take_natural_min(Some(col)).expect("measured");
         let word = crate::text::measure("Incomprehensibilities", &style).w;
         assert_eq!(m.w, (220.0f32.max(word) + 16.0).ceil(), "the widest part and the padding");
         let text_h: f32 = tree.children_of(tree.children_of(col)[1]).iter().map(|&l| tree.get(l).unwrap().rect().h()).sum();
         assert_eq!(m.h, (8.0 + 30.0 + 10.0 + text_h + 8.0).ceil(), "the content's height at 600 wide");
         let rects = |t: &NodeTree| t.iter().map(|(_, n)| n.rect()).collect::<Vec<_>>();
         assert_eq!(rects(&tree), rects(&plain), "measuring did not change the layout");
-        assert_eq!(take_natural_min(col), None, "taken once");
+        assert_eq!(take_natural_min(Some(col)), None, "taken once");
         // Not asked: not measured.
         let (mut again, col) = build();
         layout(&mut again, col);
-        assert_eq!(take_natural_min(col), None);
+        assert_eq!(take_natural_min(Some(col)), None);
     }
 
     #[test]
