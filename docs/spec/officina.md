@@ -1,6 +1,6 @@
 # Officina: a native office suite for Atrium
 
-**Status:** proposal, 2026-11-14 (§7.4 very large documents added the same day). Scope only, nothing built. The decisions in §17 are
+**Status:** proposal, 2026-11-14 (§7.4 very large documents and §9.3 very large decks added the same day). Scope only, nothing built. The decisions in §17 are
 Shankar's to make; each has a recommendation.
 
 *Asked by Shankar, 2026-11-14:* "a key set of apps for any [OS] is an office suite. The
@@ -51,7 +51,9 @@ decoding), [fresco-scene-groups.md](fresco-scene-groups.md), [insula.md](insula.
   TOC, cross-references and long tables: an indexed block tree, images laid out by size and
   decoded only near the viewport within a fixed budget, pagination that resumes from a page
   checkpoint and stops when breaks line up again, numbering and references derived from
-  counts, pages as bands (§7.4).
+  counts, pages as bands (§7.4). Decks likewise: slides laid out independently, media stored
+  once and decoded near the screen, video only in the media player, and presenter mode
+  preparing the next slides ahead of the click (§9.3).
 - **Secrets and signatures through the system.** Document passwords through Arca's secure
   input, data-source credentials through Arca's courier, external data only through Nuntius
   with a per-document consent, document signing with Sigillum's tokens (PAdES / XAdES), keys
@@ -512,6 +514,58 @@ glyph runs. A chart of a million points is decimated for drawing (min/max per pi
 column), never one fill per point. The same chart object appears in text documents and
 slides.
 
+### 9.3 Very large decks (asked by Shankar, 2026-11-14)
+
+*"The same can be said for slides too."* Yes: the rules of §7.4 hold (work follows the screen,
+images laid out by size and decoded near the viewport, chunks loaded on demand). A deck
+differs from a book in three ways, which change where the effort goes:
+
+- **Slides don't flow into each other.** Editing slide 40 never moves slide 41, so there is
+  no pagination chain and no checkpoints. Each slide is laid out on its own, cached by
+  content hash, and only when it is shown or thumbnailed. A 1,000-slide deck costs one
+  slide's layout per edit.
+- **The weight is media, not text.** Real big decks are a few hundred slides of full-screen
+  photos, screenshots and video, often hundreds of megabytes to gigabytes. So:
+  - Each image and video is one content-addressed chunk in the native file, stored once
+    however many slides use it (the same logo on 600 slides is one chunk; master and layout
+    pictures are shared by reference, never copied per slide).
+  - Pictures decode at the size they are drawn, into the same fixed pixel budget as §7.4.
+    The editor decodes for the slide being edited and the thumbnails in view; thumbnails
+    decode at thumbnail size (a 6000 × 4000 photo becomes a 200 px thumbnail with the JPEG
+    decoder's scaled decode, not a full decode and a resize).
+  - Video is never decoded by the deck: a slide's video is a Limen `media-player` embed
+    (fresco-video.md) given the chunk as a blob, started on the slide or a press. Until then
+    the slide shows the poster frame stored with it. The editor holds no video frames.
+  - Opening reads the chunk index, the masters and the slides near the last one viewed;
+    media chunks are read when a slide needs them. A 3 GB deck opens like a 3 MB one.
+- **Presenting has a hard real-time edge.** The next slide must be ready before the click,
+  and a transition must not stutter. So in presenter mode:
+  - the current, next and previous slides (and the next one's builds) are laid out, their
+    pictures decoded at the display's size and their scenes resident before they are needed;
+    jumping to any slide from the presenter's sorter shows it at once from a lower-resolution
+    decode and sharpens it within a frame or two;
+  - transitions are declarative animations run by frescod (pergola.md §4.2) between two
+    already-resident scene groups, so a busy app (decoding the slide after next) cannot drop
+    their frames;
+  - the presenter view's notes and timer run on the other monitor's window, off the audience
+    window's path;
+  - a "rehearse" pass can decode every slide once and report slides that won't be ready in
+    time (a 200 MP photo on a slow machine) before the talk, not during it.
+
+**The slide sorter and the slide strip** are virtualized lists (`VirtualList` / `GridView`)
+of thumbnails rendered from each slide's scene at small scale and cached as small images in
+the native file, so scrolling a 1,000-slide sorter never lays out 1,000 slides.
+
+**Size on disk and when sharing.** "Reduce file size" recompresses pictures down to the
+largest size they are shown at (a deck for a projector rarely needs more than 1920 px), and
+trims video to the used range. It runs on a copy, reports the saving and is never automatic.
+Export to `.pptx` and PDF writes each media chunk once.
+
+**Gates** (added to §15): open a 1,000-slide, 2 GB deck with 1,500 photos to the first slide
+under 1 s, memory under 500 MB; scroll the sorter at the ScrollView gates; in presenter mode,
+the next slide on screen within one frame of the click, transitions with no missed frame at
+60 Hz while the following slides decode.
+
 ## 10. Pergola and Fresco work this needs
 
 These land in Pergola or Fresco, not in Officina, so every app benefits. Each is its own
@@ -639,6 +693,8 @@ Measured on the dev VM for comparison between builds, and on real hardware for n
 | insert a figure near the start of a 1,500-page document | visible pages updated in one frame; all later numbers, cross-references and the TOC settled under 10 s |
 | find in a 1,500-page document | first result under 100 ms; all results under 1 s once the index is built |
 | PDF export of 1,500 pages with images | under 60 s on 8 cores, memory flat during export |
+| open a 1,000-slide, 2 GB deck with 1,500 photos | first slide under 1 s; memory under 500 MB |
+| presenting: next slide after the click | on screen within one frame; transitions with no missed frame at 60 Hz |
 | formula results vs Excel | 100 % of a differential corpus of real workbooks, with reasons for each listed exception |
 | round-trip `.docx` / `.xlsx` / `.odt` / `.ods` | the file reopens in Word, Excel and LibreOffice without repair prompts; visual diff of rendered pages within a set threshold |
 | converters | fuzzed (cargo-fuzz, a corpus of real and malformed files) with no panics outside the jail's handled exit, no memory growth past caps |
@@ -657,7 +713,7 @@ use as test data, and a set Shankar provides of real files he cares about.
 | **O3** | `RichTextEditor` (flowing mode first, then paged), `officina-text` paged layout, `atrium-write` with `.odt`/`.docx` converters, PDF export | round-trip gate for text; keystroke-latency gate on a 500-page document; the large-document gates of §15 on a generated 1,500-page document and ECMA-376 Part 1 |
 | **O4** | `.xlsx`/`.ods` converters, styles, number formats, charts, sort/filter, structured tables, macros kept inert | round-trip gate for sheets; 1,048,576-row `.xlsx` open target |
 | **O5** | tracked changes, comments, footnotes, TOC; pivot tables, conditional formats, dynamic arrays, `LAMBDA`; recent files via bookmarks (needs Scrinium home folders) | the corresponding corpus files |
-| **O6** | `atrium-slides`: masters, layouts, presenter view, transitions, `.pptx`/`.odp` | round-trip gate for slides; presenter view on two monitors |
+| **O6** | `atrium-slides`: masters, layouts, presenter view, transitions, `.pptx`/`.odp` | round-trip gate for slides; presenter view on two monitors; the large-deck gates of §9.3 |
 | **O7** | signing via Sigillum, encrypted documents, external data via Nuntius, IME-dependent scripts, legacy binary import if D8 says yes | per feature |
 
 The spreadsheet goes first: it carries the hardest engine work (scale, recalc), it needs
