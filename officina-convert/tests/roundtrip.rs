@@ -306,3 +306,27 @@ fn chart_round_trip() {
         assert_eq!(b.data(&back, 100), a.data(&wb, 100));
     }
 }
+
+#[test]
+fn ods_chart_round_trip() {
+    let wb = charted(book());
+    let file = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    let (back, loaded) = officina_convert::ods::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.charts().len(), wb.charts().len());
+    let near = |a: (u32, u32, f32, f32), b: (u32, u32, f32, f32)| a.0 == b.0 && a.1 == b.1 && (a.2 - b.2).abs() < 0.05 && (a.3 - b.3).abs() < 0.05;
+    for (a, b) in wb.charts().iter().zip(back.charts()) {
+        assert!(near(a.anchor.from, b.anchor.from) && near(a.anchor.to, b.anchor.to), "{:?} vs {:?}", a.anchor, b.anchor);
+        // ODF has no typed-in series names: those come back unnamed.
+        let mut a2 = a.clone();
+        for s in &mut a2.series {
+            if matches!(s.name, Some(officina_grid::charts::ChartText::Lit(_))) {
+                s.name = None;
+            }
+        }
+        let mut b2 = b.clone();
+        b2.anchor = a.anchor;
+        assert_eq!(b2, a2);
+        assert_eq!(b.data(&back, 100), a2.data(&wb, 100));
+    }
+}

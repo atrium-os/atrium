@@ -716,6 +716,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut runs: Vec<Vec<(u32, u32, StyleId)>> = Vec::new();
     let mut expanded: u64 = 0;
     let mut annotation_depth = 0u32;
+    // Frames (charts, images) and the one being read, with its depth.
+    let mut frames: Vec<super::chart::FrameIn> = Vec::new();
+    let mut frame: Option<super::chart::FrameIn> = None;
+    let mut frame_depth = 0u32;
 
     let finish_sheet = |wb: &mut Workbook, s: u16, widths: &mut Vec<(u32, f64)>, heights: &mut Vec<(u32, f64)>, runs: &mut Vec<Vec<(u32, u32, StyleId)>>| {
         let sh = wb.sheet_mut(s);
@@ -757,6 +761,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                 let empty = matches!(ev, Event::Empty(_));
                 let name = e.name();
                 let name = name.as_ref();
+                if frame_depth > 0 {
+                    if frame_depth == 1 && name == b"draw:object" {
+                        if let Some(f) = frame.as_mut() {
+                            f.href = attrs(e).get("xlink:href").cloned();
+                        }
+                    }
+                    if !empty {
+                        frame_depth += 1;
+                    }
+                    continue;
+                }
                 if annotation_depth > 0 {
                     if !empty {
                         annotation_depth += 1;
@@ -871,7 +886,29 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             annotation_depth = 1;
                         }
                     }
-                    b"draw:frame" | b"draw:custom-shape" | b"draw:g" => rep.note(Kind::Dropped, "charts, images and drawings"),
+                    b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS => {
+                        let a = attrs(e);
+                        let len = |k: &str| a.get(k).and_then(|v| length_px(v)).unwrap_or(0.0);
+                        let f = super::chart::FrameIn {
+                            sheet: sheet.unwrap_or(0),
+                            cell: cell.is_some().then(|| ((row.min(MAX_ROWS as u64 - 1)) as u32, (col.min(MAX_COLS as u64 - 1)) as u32)),
+                            x: len("svg:x"),
+                            y: len("svg:y"),
+                            w: len("svg:width"),
+                            h: len("svg:height"),
+                            end: a.get("table:end-cell-address").cloned(),
+                            end_x: len("table:end-x"),
+                            end_y: len("table:end-y"),
+                            href: None,
+                        };
+                        if empty {
+                            frames.push(f);
+                        } else {
+                            frame = Some(f);
+                            frame_depth = 1;
+                        }
+                    }
+                    b"draw:frame" | b"draw:custom-shape" | b"draw:g" => rep.note(Kind::Dropped, "images and drawings"),
                     b"table:named-range" | b"table:named-expression" => {
                         let a = attrs(e);
                         let src = if name == b"table:named-range" { a.get("table:cell-range-address").map(|r| format!("of:=[{r}]")) } else { a.get("table:expression").cloned() };
@@ -951,7 +988,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     _ => {}
                 }
             }
-            Event::Text(t) if in_p && annotation_depth == 0 => {
+            Event::Text(t) if in_p && annotation_depth == 0 && frame_depth == 0 => {
                 if let Some(c) = cell.as_mut() {
                     let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
                     if c.text.len() + s.len() <= MAX_TEXT {
@@ -962,6 +999,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             Event::End(e) => {
                 let name = e.name();
                 let name = name.as_ref();
+                if frame_depth > 0 {
+                    frame_depth -= 1;
+                    if frame_depth == 0 {
+                        frames.extend(frame.take());
+                    }
+                    continue;
+                }
                 if annotation_depth > 0 {
                     annotation_depth -= 1;
                     continue;
@@ -1141,6 +1185,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             rep.note_at(Kind::Approximate, "formula results that differ from the file's saved results", || format!("{}: {} vs {}", officina_grid::addr::a1(a.row, a.col), got.display(), want.display()));
         }
     }
+    // Charts, once every sheet and its sizes exist.
+    super::chart::read_frames(&mut wb, &z, frames, &mut rep);
     out.report.merge(rep);
     Ok((wb, out))
 }

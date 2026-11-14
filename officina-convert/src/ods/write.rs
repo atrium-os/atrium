@@ -37,6 +37,8 @@ const NS: &str = concat!(
     r#"xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" "#,
     r#"xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" "#,
     r#"xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" "#,
+    r#"xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" "#,
+    r#"xmlns:xlink="http://www.w3.org/1999/xlink" "#,
     r#"xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" "#,
     r#"xmlns:calcext="urn:org:documentfoundation:names:experimental:calc:xmlns:calcext:1.0" "#,
     r#"xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" "#,
@@ -896,6 +898,14 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     out.push_str("<table:table table:name=\"");
     esc(out, &name);
     out.push_str("\">");
+    // Charts on this sheet, as frames anchored to it.
+    let mut shapes = String::new();
+    for (i, ch) in wb.charts().iter().enumerate().filter(|(_, c)| c.anchor.sheet == s) {
+        shapes.push_str(&super::chart::frame_xml(wb, ch, i));
+    }
+    if !shapes.is_empty() {
+        let _ = write!(out, "<table:shapes>{shapes}</table:shapes>");
+    }
     // Columns: (width, default style) grouped.
     let ncols = cols.max(tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1)).max(sh.col_sizes.overrides().last().map_or(0, |o| o.0 + 1)).min(ODS_COLS);
     let width = |c: u32| sh.col_sizes.overrides().binary_search_by_key(&c, |o| o.0).map(|i| sh.col_sizes.overrides()[i].1).unwrap_or(sh.col_sizes.default);
@@ -1220,7 +1230,12 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&filters_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/></office:styles></office:document-styles>"#);
-    let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/></manifest:manifest>"#);
+    let mut objects = String::new();
+    for i in 0..wb.charts().len() {
+        let n = i + 1;
+        let _ = write!(objects, r#"<manifest:file-entry manifest:full-path="Object {n}/" manifest:version="1.3" manifest:media-type="application/vnd.oasis.opendocument.chart"/><manifest:file-entry manifest:full-path="Object {n}/content.xml" manifest:media-type="text/xml"/>"#);
+    }
+    let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>{objects}</manifest:manifest>"#);
     let meta = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" office:version="1.3"><office:meta><meta:generator>Officina</meta:generator></office:meta></office:document-meta>"#);
     let mut z = ZipWriter::new(out);
     // The mimetype first and stored, so the file can be recognised by its bytes.
@@ -1229,6 +1244,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     z.add("meta.xml", meta.as_bytes())?;
     z.add("styles.xml", styles.as_bytes())?;
     z.add("content.xml", content.as_bytes())?;
+    for (i, ch) in wb.charts().iter().enumerate() {
+        z.add(&format!("Object {}/content.xml", i + 1), super::chart::object_xml(wb, ch).as_bytes())?;
+    }
     z.finish()
 }
 

@@ -46,6 +46,7 @@ dependencies = [
  "limen",
  "officina-convert",
  "officina-core",
+ "officina-draw",
  "officina-grid",
  "pergola",
 ]
@@ -501,6 +502,13 @@ dependencies = [
 [[package]]
 name = "officina-core"
 version = "0.1.0"
+
+[[package]]
+name = "officina-draw"
+version = "0.1.0"
+dependencies = [
+ "officina-grid",
+]
 
 [[package]]
 name = "officina-grid"

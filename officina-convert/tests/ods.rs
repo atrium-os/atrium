@@ -126,7 +126,24 @@ fn repeats_are_bounded() {
 
 #[test]
 fn hostile_ods_never_panics() {
-    let file = ods::write(&book(), Vec::new()).unwrap();
+    let mut wb = book();
+    // Charts too, so their frames and objects are mutated.
+    use officina_grid::charts::*;
+    let col = |c: u32| Rect { sheet: 0, r0: 0, c0: c, r1: 9, c1: c };
+    for kind in ChartKind::ALL {
+        wb.add_chart(Chart {
+            kind,
+            grouping: Grouping::Stacked,
+            title: Some(ChartText::Lit("t".into())),
+            series: vec![Series { name: Some(ChartText::Cell(CellAddr::new(0, 0, 1))), cats: Some(col(1)), vals: col(0), kind: None }],
+            legend: Some(LegendPos::Right),
+            x_title: Some("x".into()),
+            y_title: None,
+            anchor: Anchor { sheet: 0, from: (1, 3, 1.0, 2.0), to: (12, 9, 0.0, 0.0) },
+        })
+        .unwrap();
+    }
+    let file = ods::write(&wb, Vec::new()).unwrap();
     let z = Archive::open(&file).unwrap();
     let parts: Vec<(String, Vec<u8>)> = z.entries.clone().into_iter().map(|e| (e.name.clone(), z.read(&e).unwrap())).collect();
     let mut x: u64 = 0xD1B5_4A32_D192_ED03;
@@ -136,7 +153,7 @@ fn hostile_ods_never_panics() {
         x ^= x << 17;
         x
     };
-    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"table:number-columns-repeated=\"99999999\" ", b"table:number-rows-repeated=\"4000000000\" ", b"office:value-type=\"date\" office:date-value=\"-9999-99-99\" ", b"office:time-value=\"PT99999999999H\" ", b"table:formula=\"of:=[.A1\" ", b"<table:table-row>", b"</table:table-row>", b"<table:table-cell>", b"style:parent-style-name=\"ce1\" ", b"\xff\xfe"];
+    const TOKENS: &[&[u8]] = &[b"<", b">", b"/>", b"\"", b"&amp;", b"&#0;", b"table:number-columns-repeated=\"99999999\" ", b"table:number-rows-repeated=\"4000000000\" ", b"office:value-type=\"date\" office:date-value=\"-9999-99-99\" ", b"office:time-value=\"PT99999999999H\" ", b"table:formula=\"of:=[.A1\" ", b"<table:table-row>", b"</table:table-row>", b"<table:table-cell>", b"style:parent-style-name=\"ce1\" ", b"\xff\xfe", b"<draw:frame svg:x=\"-1e308in\" svg:width=\"NaNin\" table:end-cell-address=\"Data.ZZZZZ99999999\">", b"</draw:frame>", b"xlink:href=\"./../content.xml\" ", b"chart:values-cell-range-address=\"Data.A1:Data.Z99\" ", b"<chart:series chart:class=\"chart:stock\">", b"<draw:object xlink:href=\"./Object 99\"/>"];
     let n = if cfg!(debug_assertions) { 150 } else { 1500 };
     for i in 0..n {
         let mut ps = parts.clone();

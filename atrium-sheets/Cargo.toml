@@ -22,6 +22,7 @@ path = "examples/scroll_cost.rs"
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
 officina-convert = { path = "../officina-convert" }
+officina-draw = { path = "../officina-draw" }
 pergola = { path = "../pergola" }
 limen = { path = "../limen" }
 fresco-protocol = { path = "../fresco-protocol" }

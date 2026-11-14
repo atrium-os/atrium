@@ -156,6 +156,33 @@ impl Chart {
             .collect()
     }
 
+    /// Changes whenever a cell the chart reads may have changed (a hash of its
+    /// columns' versions), so a drawing of it can be kept until then.
+    pub fn data_version(&self, wb: &Workbook) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut col = |sheet: u16, c: u32| {
+            if (sheet as usize) < wb.sheet_count() {
+                (sheet, c, wb.sheet(sheet).cols.get(c as usize).map_or(0, |c| c.generation)).hash(&mut h);
+            }
+        };
+        let mut texts: Vec<&ChartText> = self.series.iter().filter_map(|s| s.name.as_ref()).collect();
+        texts.extend(self.title.as_ref());
+        for t in texts {
+            if let ChartText::Cell(a) = t {
+                col(a.sheet, a.col);
+            }
+        }
+        for s in &self.series {
+            for r in [Some(s.vals), s.cats].into_iter().flatten() {
+                for c in r.c0..=r.c1.min(r.c0 + 4096) {
+                    col(r.sheet, c);
+                }
+            }
+        }
+        h.finish()
+    }
+
     pub fn encode(&self, w: &mut Writer) {
         w.u8(self.kind.code());
         w.u8(match self.grouping {

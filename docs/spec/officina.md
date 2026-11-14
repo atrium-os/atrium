@@ -1042,6 +1042,51 @@ Gates, on the 4-core cloud machine:
 | round trips | `tests/roundtrip.rs` and `tests/ods.rs`: names, filter state and hidden rows, tables and their formulas equal after write and read; native round trip in the grid tests |
 | hostile input | structured-reference parser: unbalanced brackets, bad keywords, three-part ranges refused; print/parse round trip; existing formula and package fuzzers clean |
 
+### 16.7 O4e as built (2026-11-14): charts
+
+Engine, files and drawing; the Sheets UI for making and editing charts is the next step.
+
+- **Model** (`officina-grid::charts`): column, bar, line, area, scatter, pie and
+  doughnut; standard, stacked and 100 % grouping; per-series kind for combos (columns
+  with a line); title, series names (a cell or typed text), axis titles, legend
+  position; series ranges are one row or one column. Anchored to a sheet from a cell
+  plus an offset to a cell plus an offset (offsets in points), so a chart moves with
+  its cells as in Excel. `Chart::data` reads at most a given number of points per
+  series; `Chart::data_version` hashes the generations of the columns a chart reads,
+  so a view redraws a chart only when its data changed. At most 4,096 charts and 255
+  series per chart. Native chunk 10.
+- **Drawing** (`officina-draw::chart`): a chart laid out in a box as rectangles,
+  polylines, areas, wedges, dots and text, which the UI turns into its own nodes; text
+  is measured by the caller. Bounded at any size: a line of a million points becomes at
+  most two points per pixel column (minimum and maximum, in order), a scatter at most
+  one dot per pixel, bars at most one per pixel column. Nice axis steps, a legend,
+  colours from Excel's default palette (sRGB, turned linear for Pergola), a dark style.
+- **Sheets**: Pergola's `GridView` gained floats (`GridSource::floats`): nodes placed
+  in sheet coordinates, drawn above the cells and moving with the scroll. Sheets lays
+  out each chart that touches the view and keeps the nodes until its size, data or theme
+  changes.
+- **`.xlsx`**: drawing parts (`twoCellAnchor`) and chart parts (`c:barChart`,
+  `lineChart`, `areaChart`, `scatterChart`, `pieChart`, `doughnutChart`, several groups
+  for combos) both ways, with Excel's automatic title for a one-series chart. Charts
+  with typed-in data, 3-D charts, other kinds and chart styling are reported and
+  dropped.
+- **`.ods`**: frames anchored to the sheet (or, as LibreOffice also writes them, to a
+  cell) holding an embedded chart object (`Object N/content.xml`), with the plot-area
+  properties for horizontal bars, stacked and percent. ODF has no typed-in series names:
+  LibreOffice's `loext:label-string` is read but not written, because LibreOffice 24.2
+  drops the whole chart when it meets it, so a typed name comes back unnamed.
+  LibreOffice calls a doughnut's series "circle"; a round chart's series take its kind.
+
+Gates, on the 4-core cloud machine:
+
+| gate | result |
+|---|---|
+| LibreOffice both ways (`examples/charts_lo.rs`, LibreOffice 24.2) | 9 charts (every kind, stacked and percent, scatter, a combo): `.xlsx` 9/9 the same after LibreOffice (anchors move by its rounding to cell plus offset); `.ods` 9/9 the same, anchors exact |
+| round trips | `tests/roundtrip.rs`: every kind through `.xlsx` and `.ods` equal (`.ods` anchors within 0.05 pt), and the data they read equal; native round trip in the grid tests |
+| drawing | `officina-draw` tests: a million-point line stays within two points per pixel column; `examples/chart_svg.rs` rendered and checked by eye |
+| live | Sheets on the cloud VM shows a combo, a pie and an area chart over the grid (screenshot checked) |
+| hostile input | the `.xlsx` and package fuzzers now run on a book with a table, a filter and charts; clean |
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

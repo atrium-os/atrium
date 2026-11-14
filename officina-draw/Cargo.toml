@@ -1,0 +1,17 @@
+[package]
+name = "officina-draw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's drawn objects (docs/spec/officina.md §9.2): charts laid out as plain shapes and text, decimated so a million points cost a few hundred shapes. No UI toolkit dependency."
+
+[lib]
+name = "officina_draw"
+path = "src/lib.rs"
+
+[dependencies]
+officina-grid = { path = "../officina-grid" }
+
+[profile.release]
+debug = 1

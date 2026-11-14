@@ -135,9 +135,36 @@ pub trait GridSource {
         };
         (r, c)
     }
+    /// What is drawn over the cells (charts) meeting `view` (content px: x, y,
+    /// width, height), in `theme`'s colours.
+    fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
+        Vec::new()
+    }
     /// The last used cell (Ctrl + End).
     fn last_used(&self) -> (u32, u32) {
         (self.rows().saturating_sub(1), self.cols().saturating_sub(1))
+    }
+}
+
+/// Something drawn over the cells, such as a chart.
+#[derive(Clone)]
+pub struct GridFloat {
+    /// The app's name for it (stable across frames).
+    pub key: u64,
+    /// Where it sits, content px: x, y, width, height.
+    pub at: [f64; 4],
+    /// What it draws, placed at its own origin (0, 0).
+    pub nodes: Rc<Vec<Node>>,
+}
+
+/// `n` moved by (dx, dy): rectangles, text and fills.
+fn shift(n: &Node, dx: f32, dy: f32) -> Node {
+    let mv = |r: &Rect| Rect::new(r.x() + dx, r.y() + dy, r.w(), r.h());
+    match n {
+        Node::Rect { rect, fill, radius } => Node::Rect { rect: mv(rect), fill: *fill, radius: *radius },
+        Node::Text { rect, content, style } => Node::Text { rect: mv(rect), content: content.clone(), style: style.clone() },
+        Node::Fill(f) => Node::Fill(std::sync::Arc::new(crate::node::fill_to(f, crate::geom::Point::new(-dx, -dy), 1.0))),
+        other => other.clone(),
     }
 }
 
@@ -438,6 +465,17 @@ impl GridView {
                 }
             }
             ctx.pop();
+            // Floats (charts) over the cells, those meeting the view.
+            for f in src.floats([x, y, body.w() as f64, body.h() as f64], &t) {
+                let (fx, fy) = at(f.at[0], f.at[1]);
+                ctx.key((1u64 << 63) | f.key);
+                let id = ctx.push(Node::vstack(Rect::new(fx, fy, f.at[2] as f32, f.at[3] as f32), 0.0));
+                ctx.set_flex(id, FlexStyle { free: true, ..FlexStyle::default() });
+                for n in f.nodes.iter() {
+                    ctx.add(shift(n, fx, fy));
+                }
+                ctx.pop();
+            }
             ctx.pop();
         }
         ctx.pop();

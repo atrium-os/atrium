@@ -1,6 +1,6 @@
-//! charts_lo: our `.xlsx` charts through LibreOffice and back.
+//! charts_lo: our `.xlsx` and `.ods` charts through LibreOffice and back.
 //!
-//! Our writer → LibreOffice opens the `.xlsx` and saves `.xlsx` again → our reader:
+//! Our writer → LibreOffice opens the file and saves the same format again → our reader:
 //! each chart's kind, grouping, series ranges, titles and legend should come back.
 //! Needs `soffice` on PATH. `KEEP=1` keeps the files.
 
@@ -80,15 +80,25 @@ fn soffice(dir: &Path, filter: &str, input: &Path, out: &Path) -> Vec<u8> {
 }
 
 fn main() {
+    for fmt in std::env::var("FMT").map_or(vec!["xlsx".to_string(), "ods".to_string()], |f| vec![f]) {
+        run(&fmt);
+    }
+}
+
+fn run(fmt: &str) {
     let wb = book();
-    let dir = std::env::temp_dir().join(format!("charts-lo-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("charts-lo-{fmt}-{}", std::process::id()));
     let (a, b) = (dir.join("ours"), dir.join("lo"));
     std::fs::create_dir_all(&a).unwrap();
     std::fs::create_dir_all(&b).unwrap();
-    let x = a.join("charts.xlsx");
-    std::fs::write(&x, officina_convert::xlsx::write(&wb, Vec::new()).unwrap()).unwrap();
-    let back = soffice(&dir, "xlsx:Calc MS Excel 2007 XML", &x, &b);
-    let (rb, loaded) = officina_convert::xlsx::read(&back).unwrap();
+    let x = a.join(format!("charts.{fmt}"));
+    let (rb, loaded) = if fmt == "ods" {
+        std::fs::write(&x, officina_convert::ods::write(&wb, Vec::new()).unwrap()).unwrap();
+        officina_convert::ods::read(&soffice(&dir, "ods:calc8", &x, &b)).unwrap()
+    } else {
+        std::fs::write(&x, officina_convert::xlsx::write(&wb, Vec::new()).unwrap()).unwrap();
+        officina_convert::xlsx::read(&soffice(&dir, "xlsx:Calc MS Excel 2007 XML", &x, &b)).unwrap()
+    };
     println!("report {:?}", loaded.report.human());
     let mut same = 0;
     for (i, c) in wb.charts().iter().enumerate() {
@@ -110,7 +120,7 @@ fn main() {
     }
     // LibreOffice's own drawing of the first data, as a check that it read the values.
     let pdf = soffice(&dir, "pdf", &x, &b);
-    println!("summary: {} charts, {same} same after LibreOffice; LibreOffice drew a {} byte PDF", wb.charts().len(), pdf.len());
+    println!("{fmt} summary: {} charts, {same} same after LibreOffice; LibreOffice drew a {} byte PDF", wb.charts().len(), pdf.len());
     if std::env::var_os("KEEP").is_none() {
         let _ = std::fs::remove_dir_all(&dir);
     } else {

@@ -20,16 +20,19 @@ pub const MIN_COLS: u32 = 16384;
 /// The sheet on screen.
 pub struct SheetSource {
     pub doc: Rc<RefCell<Doc>>,
+    /// Charts as drawn, by chart: (sheet, size, data version, nodes).
+    charts: RefCell<Vec<Option<(ChartKey, Rc<Vec<pergola::Node>>)>>>,
     /// Row sizes with hidden rows zero high, while the sheet hides any, keyed by what
     /// they were built from.
     view: RefCell<Option<(ViewKey, officina_grid::column::Sizes)>>,
 }
 
 type ViewKey = (u16, usize, usize, usize, usize, u64);
+type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None) }
+        Self { doc, view: RefCell::new(None), charts: RefCell::new(Vec::new()) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
@@ -110,7 +113,128 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
     Some(cv)
 }
 
+/// sRGB components to Pergola's linear colour.
+fn linear(c: [f32; 4]) -> Color {
+    let l = |v: f32| if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    Color::rgba(l(c[0]), l(c[1]), l(c[2]), c[3])
+}
+
+/// A chart's shapes as Pergola nodes at the chart's origin.
+fn chart_nodes(prims: Vec<officina_draw::chart::Prim>, theme: &pergola::theme::Semantic) -> Vec<pergola::Node> {
+    use officina_draw::chart::{Align, Prim};
+    use pergola::shape::{Paint, PathData, Shape, Stroke};
+    use pergola::theme::font;
+    let fills = |sh: Shape| sh.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))).collect::<Vec<_>>();
+    let poly = |pts: &[(f32, f32)], close: bool| {
+        let mut p = PathData::new();
+        for (i, (x, y)) in pts.iter().enumerate() {
+            p = if i == 0 { p.move_to(*x, *y) } else { p.line_to(*x, *y) };
+        }
+        if close {
+            p = p.close();
+        }
+        p
+    };
+    let mut out = Vec::new();
+    for p in prims {
+        match p {
+            Prim::Rect { x, y, w, h, color } => out.push(pergola::Node::Rect { rect: pergola::Rect::new(x, y, w, h), fill: linear(color), radius: 0.0 }),
+            Prim::Line { pts, width, color } => {
+                let mut st = Stroke::new(Paint::Solid(linear(color)), width);
+                st.join = pergola::shape::Join::Round;
+                out.extend(fills(Shape::new(poly(&pts, false)).stroke(st)));
+            }
+            Prim::Area { pts, color } => out.extend(fills(Shape::new(poly(&pts, true)).fill(Paint::Solid(linear([color[0], color[1], color[2], 0.85]))))),
+            Prim::Dot { x, y, r, color } => out.extend(fills(Shape::new(PathData::ellipse(pergola::Point::new(x, y), r, r)).fill(Paint::Solid(linear(color))))),
+            Prim::Wedge { cx, cy, r_in, r_out, a0, a1, color } => {
+                // Arcs as segments of at most 3 degrees.
+                let n = (((a1 - a0) / 0.05).ceil() as usize).clamp(1, 128);
+                let at = |r: f32, a: f32| (cx + r * a.sin(), cy - r * a.cos());
+                let mut pts: Vec<(f32, f32)> = (0..=n).map(|k| at(r_out, a0 + (a1 - a0) * k as f32 / n as f32)).collect();
+                if r_in > 0.0 {
+                    pts.extend((0..=n).rev().map(|k| at(r_in, a0 + (a1 - a0) * k as f32 / n as f32)));
+                } else {
+                    pts.push((cx, cy));
+                }
+                let bg = theme.bg_canvas();
+                let mut st = Stroke::new(Paint::Solid(bg), 1.0);
+                st.join = pergola::shape::Join::Round;
+                out.extend(fills(Shape::new(poly(&pts, true)).fill(Paint::Solid(linear(color))).stroke(st)));
+            }
+            Prim::Text { x, y, text, size, color, align, bold } => {
+                let style = pergola::TextStyle { family: font::SANS.into(), size, weight: if bold { pergola::theme::Weight::Semibold } else { pergola::theme::Weight::Regular }, color: linear(color) };
+                let w = pergola::text::measure(&text, &style).w;
+                let x = match align {
+                    Align::Start => x,
+                    Align::Middle => x - w / 2.0,
+                    Align::End => x - w,
+                };
+                out.push(pergola::Node::Text { rect: pergola::Rect::new(x, y, w, size * 1.3), content: text, style });
+            }
+        }
+    }
+    out
+}
+
 impl GridSource for SheetSource {
+    fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
+        let d = self.doc.borrow();
+        let charts = d.wb.charts();
+        if charts.is_empty() {
+            return Vec::new();
+        }
+        let dark = theme.mode == pergola::theme::Mode::Dark;
+        let mut cache = self.charts.borrow_mut();
+        cache.resize(charts.len(), None);
+        let mut out = Vec::new();
+        for (i, ch) in charts.iter().enumerate() {
+            let a = ch.anchor;
+            if a.sheet != d.sheet {
+                continue;
+            }
+            // Offsets are points; the grid is in px.
+            let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0;
+            let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0;
+            let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0;
+            let y1 = self.row_top(a.to.0) + a.to.3 as f64 * 96.0 / 72.0;
+            let (w, h) = ((x1 - x0).clamp(0.0, 8000.0), (y1 - y0).clamp(0.0, 8000.0));
+            if w < 4.0 || h < 4.0 || x0 > view[0] + view[2] || y0 > view[1] + view[3] || x0 + w < view[0] || y0 + h < view[1] {
+                continue;
+            }
+            let key = (d.sheet, w as u32, h as u32, ch.data_version(&d.wb), dark);
+            let nodes = match &cache[i] {
+                Some((k, n)) if *k == key => n.clone(),
+                _ => {
+                    // At most four points per pixel column are drawn; read no more
+                    // than a million.
+                    let data = ch.data(&d.wb, 1_000_000);
+                    let title = ch.title.as_ref().map(|t| officina_grid::charts::Chart::text(&d.wb, t));
+                    let mut st = officina_draw::chart::Style::default();
+                    if dark {
+                        st.background = [0.13, 0.14, 0.15, 1.0];
+                        st.text = [0.91, 0.92, 0.93, 1.0];
+                        st.muted = [0.65, 0.67, 0.70, 1.0];
+                        st.grid = [0.25, 0.26, 0.28, 1.0];
+                        st.axis = [0.45, 0.46, 0.48, 1.0];
+                    }
+                    let measure = |t: &str, size: f32| {
+                        let style = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size, weight: pergola::theme::Weight::Regular, color: Color::TRANSPARENT };
+                        pergola::text::measure_chars(t, &style)
+                    };
+                    let prims = officina_draw::chart::layout(ch, &data, title.as_deref(), w as f32, h as f32, &st, &measure);
+                    let mut nodes = chart_nodes(prims, theme);
+                    // A frame round it.
+                    nodes.insert(0, pergola::Node::Rect { rect: pergola::Rect::new(-1.0, -1.0, w as f32 + 2.0, h as f32 + 2.0), fill: theme.border_default(), radius: 0.0 });
+                    let n = Rc::new(nodes);
+                    cache[i] = Some((key, n.clone()));
+                    n
+                }
+            };
+            out.push(pergola::widgets::GridFloat { key: i as u64, at: [x0, y0, w, h], nodes });
+        }
+        out
+    }
+
     fn rows(&self) -> u32 {
         let (r, _) = self.used();
         MIN_ROWS.max(r.saturating_add(1000)).min(MAX_ROWS)
