@@ -1,6 +1,6 @@
 # Opening files: types, "Open with", and what never runs
 
-Status: proposal, 2026-11-14. Not accepted yet: the decisions are in §11.
+Status: accepted 2026-11-14 (Shankar: "accept as recommended", all of §11 D1–D10 as recommended). Building T1–T5.
 Asked by Shankar (2026-11-14): open documents, audio, video and so on by
 clicking them in Scrinium, safely; can apps be run that way.
 
