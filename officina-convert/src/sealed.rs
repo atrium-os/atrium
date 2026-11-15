@@ -127,6 +127,47 @@ impl Sealer {
     }
 }
 
+impl Sealer {
+    /// A short record (a journal entry) sealed: a random nonce, then the
+    /// ciphertext and tag (28 bytes more than `plain`).
+    pub fn seal_small(&self, plain: &[u8]) -> Vec<u8> {
+        let n = random(12);
+        let mut out = n.clone();
+        out.extend(Aes256Gcm::new_from_slice(&self.key).unwrap().encrypt(Nonce::from_slice(&n), plain).expect("in-memory encryption"));
+        out
+    }
+
+    /// A record [`Sealer::seal_small`] made; `None` when it fails its check.
+    pub fn open_small(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+        if sealed.len() < 28 {
+            return None;
+        }
+        Aes256Gcm::new_from_slice(&self.key).unwrap().decrypt(Nonce::from_slice(&sealed[..12]), &sealed[12..]).ok()
+    }
+}
+
+/// A document's password, kept while it is open: foreign formats are
+/// encrypted with the password on each save, the native file and the
+/// journal with the [`Sealer`].
+#[derive(Clone, Debug)]
+pub struct Protection {
+    pub password: String,
+    pub sealer: Sealer,
+}
+
+impl Protection {
+    /// A new key under `password` (one Argon2id run).
+    pub fn new(password: &str) -> Protection {
+        Protection { password: password.to_string(), sealer: Sealer::new(password) }
+    }
+
+    /// The same key under a new password.
+    pub fn change(&mut self, password: &str) {
+        self.sealer.rewrap(password, (PASSES, MEMORY, LANES));
+        self.password = password.to_string();
+    }
+}
+
 /// The native bytes in `file`, a sealed file, and its [`Sealer`] (to seal
 /// the next save with).
 pub fn unseal(file: &[u8], password: &str) -> Result<(Vec<u8>, Sealer), CryptError> {
@@ -192,6 +233,18 @@ mod tests {
         }
         // Two seals of one text differ (a new file id each time).
         assert_ne!(s.seal(b"same"), s.seal(b"same"));
+    }
+
+    #[test]
+    fn small_records() {
+        let s = Sealer::with_cost("pw", CHEAP);
+        let r = s.seal_small(b"an action");
+        assert_eq!(r.len(), 9 + 28);
+        assert_eq!(s.open_small(&r).unwrap(), b"an action");
+        let mut bad = r.clone();
+        bad[20] ^= 1;
+        assert!(s.open_small(&bad).is_none());
+        assert!(Sealer::with_cost("pw", CHEAP).open_small(&r).is_none());
     }
 
     #[test]

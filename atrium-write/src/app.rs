@@ -38,7 +38,7 @@ pub const FIND_H: f32 = 48.0;
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
 /// The Tools menu, in order.
-pub const TOOLS: [&str; 6] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…"];
+pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 28] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right"];
@@ -48,6 +48,11 @@ pub const NOTE_PARA_MARK: &str = " ¶ ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
+    /// Tools ▸ Password…: set, change or remove the document's password.
+    PasswordOpen,
+    /// The password bar's field submitted (to set, or to open a file).
+    PasswordDone,
+    PasswordClose,
     Open,
     Save,
     SaveAs,
@@ -160,6 +165,16 @@ pub struct SpellBar {
     pub message: String,
 }
 
+/// The password bar: asking for a protected file's password, or for the
+/// document's new one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PasswordBar {
+    pub open: bool,
+    pub prompt: String,
+    /// Setting the document's password (else opening a file).
+    pub setting: bool,
+}
+
 /// The note bar: which note's text its field holds.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NoteBar {
@@ -241,6 +256,8 @@ pub struct Write {
     pub tools_menu: Mutable<MenuState>,
     pub spell: Mutable<SpellBar>,
     pub xref: Mutable<XrefBar>,
+    pub password: Mutable<PasswordBar>,
+    pub password_text: Mutable<TextEdit>,
     pub note: Mutable<NoteBar>,
     pub note_text: Mutable<TextEdit>,
     pub comment: Mutable<CommentBar>,
@@ -252,7 +269,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -606,6 +623,23 @@ impl Write {
         RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
     }
 
+    /// Shows the password bar with `prompt`, its field empty.
+    pub fn ask_password(&self, prompt: &str, setting: bool) {
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.password.set(PasswordBar { open: true, prompt: prompt.into(), setting });
+        self.changed();
+    }
+
+    /// The password bar's text, and the bar closed and emptied.
+    pub fn take_password(&self) -> (PasswordBar, String) {
+        let bar = self.password.get_cloned();
+        let text = self.password_text.get_cloned().text().to_string();
+        self.password.set(PasswordBar::default());
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.changed();
+        (bar, text)
+    }
+
     /// Runs the editing commands queued since the last call and journals what
     /// the editor did; returns the file commands for the event loop.
     pub fn take_cmds(&self) -> Vec<Cmd> {
@@ -769,6 +803,21 @@ impl Write {
                         self.changed();
                         return false;
                     }
+                    Cmd::PasswordOpen => {
+                        let protected = d.protection.is_some();
+                        drop(e);
+                        drop(d);
+                        self.ask_password(if protected { "New password (empty removes it)" } else { "Password to protect this document" }, true);
+                        return false;
+                    }
+                    Cmd::PasswordClose => {
+                        drop(e);
+                        drop(d);
+                        self.password.set(PasswordBar::default());
+                        self.password_text.set(TextEdit::new("").secret(true));
+                        self.changed();
+                        return true;
+                    }
                     Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::NoteDone | Cmd::NoteClose => {
                         drop(e);
                         drop(d);
@@ -917,7 +966,7 @@ impl View for Write {
                 _ => MenuItem::new(*s),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith][i.min(5)])).at(x, 8.0).width(88.0).render(ctx);
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith, Cmd::PasswordOpen][i.min(6)])).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
         {
@@ -1127,6 +1176,25 @@ impl View for Write {
             Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ReviewClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
+        // The password bar, over any other bar.
+        let pb = self.password.get_cloned();
+        if pb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let lw = 300.0f32.min(w * 0.4);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 24.0 - lw - 160.0).max(120.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.password_text.clone()).placeholder("Password").autofocus(true).at(lw + 20.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
+            Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordDone)).render(ctx);
+            Button::secondary("Cancel").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
 
         // The pages.
         let cmds = self.cmds.clone();

@@ -16,10 +16,12 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use officina_convert::crypt::CryptError;
+use officina_convert::sealed::{self, Protection, Sealer};
 use officina_core::journal::{self, JournalWriter};
 use officina_core::wire::{Reader, WireError, Writer};
 use officina_text::layout::{Fonts, PinnedFonts};
@@ -147,14 +149,24 @@ fn decode(b: &[u8], attrs: usize, styles: usize) -> Result<Record, WireError> {
 pub struct Autosave {
     dir: PathBuf,
     journal: JournalWriter<File>,
+    /// A protected document's key: the base and each record are sealed.
+    sealer: Option<Sealer>,
     unsynced: usize,
     _lock: File,
 }
 
 impl Autosave {
     /// Starts autosaving `base` (a native file's bytes) into `dir` (created).
-    pub fn start(dir: &Path, base: &[u8], name: &str) -> io::Result<Self> {
+    pub fn start(dir: &Path, base: &[u8], name: &str, sealer: Option<&Sealer>) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
+        let sealed;
+        let base = match sealer {
+            Some(s) => {
+                sealed = s.seal(base);
+                &sealed[..]
+            }
+            None => base,
+        };
         let l = lock(dir)?;
         let old = generation(dir).ok();
         let g = old.map_or(1, |g| g + 1);
@@ -181,19 +193,23 @@ impl Autosave {
             let _ = fs::remove_file(base_path(dir, o));
             let _ = fs::remove_file(dir.join(format!("journal.{o}")));
         }
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer: sealer.cloned(), unsynced: 0, _lock: l })
     }
 
-    fn resume(dir: &Path, l: File, g: u64, good: u64) -> io::Result<Self> {
+    fn resume(dir: &Path, l: File, g: u64, good: u64, sealer: Option<Sealer>) -> io::Result<Self> {
         let mut j = OpenOptions::new().write(true).open(dir.join(format!("journal.{g}")))?;
         j.set_len(good)?;
         j.seek(io::SeekFrom::End(0))?;
         j.sync_all()?;
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer, unsynced: 0, _lock: l })
     }
 
     fn append(&mut self, r: &Record) -> io::Result<()> {
-        self.journal.append(&encode(r))?;
+        let rec = encode(r);
+        match &self.sealer {
+            Some(s) => self.journal.append(&s.seal_small(&rec))?,
+            None => self.journal.append(&rec)?,
+        }
         self.unsynced += 1;
         Ok(())
     }
@@ -245,11 +261,35 @@ pub struct Recovered {
     pub torn_bytes: usize,
 }
 
+/// Whether the autosave folder `dir` is a protected document's (its
+/// recovery needs the password).
+pub fn recovery_locked(dir: &Path) -> bool {
+    let Ok(g) = generation(dir) else { return false };
+    let mut head = [0u8; 160];
+    File::open(base_path(dir, g)).and_then(|mut f| f.read_exact(&mut head)).is_ok() && sealed::is_sealed(&head)
+}
+
 /// Rebuilds the document an autosave folder describes.
 pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
+    recover_with(dir, None)
+}
+
+/// [`recover`], for a protected document with its password. A wrong one is
+/// `PermissionDenied`.
+pub fn recover_with(dir: &Path, password: Option<&str>) -> io::Result<(Doc, Recovered)> {
     let l = lock(dir)?;
     let g = generation(dir)?;
-    let base = fs::read(base_path(dir, g))?;
+    let mut base = fs::read(base_path(dir, g))?;
+    let mut protection = None;
+    if sealed::is_sealed(&base) {
+        let Some(pw) = password else { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the document is protected with a password")) };
+        let (plain, sealer) = sealed::unseal(&base, pw).map_err(|e| match e {
+            CryptError::WrongPassword => io::Error::new(io::ErrorKind::PermissionDenied, "that password doesn't open it"),
+            e => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+        })?;
+        base = plain;
+        protection = Some(Protection { password: pw.to_string(), sealer });
+    }
     let loaded = native::load(&base).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let name = fs::read_to_string(dir.join(META)).unwrap_or_else(|_| "Recovered".into());
     let mut doc = Doc::from_text_doc(loaded.doc, &name);
@@ -259,6 +299,17 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
     {
         let mut e = doc.ed.borrow_mut();
         for (i, rec) in replay.records.iter().enumerate() {
+            let opened;
+            let rec: &[u8] = match &protection {
+                Some(p) => match p.sealer.open_small(rec) {
+                    Some(r) => {
+                        opened = r;
+                        &opened
+                    }
+                    None => &[0xFF],
+                },
+                None => rec,
+            };
             match decode(rec, e.doc.attrs.len(), e.doc.styles.styles.len()) {
                 Ok(Record::Saved) => since_save = 0,
                 Ok(Record::Action(a)) => {
@@ -275,7 +326,8 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
         e.start_log();
     }
     doc.dirty = since_save > 0;
-    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64)?);
+    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64, protection.as_ref().map(|p| p.sealer.clone()))?);
+    doc.protection = protection;
     Ok((doc, Recovered { actions, torn_bytes: torn }))
 }
 
@@ -287,6 +339,9 @@ pub struct Doc {
     pub dirty: bool,
     pub status: String,
     autosave: Option<Autosave>,
+    /// The password, while a protected document is open: saves and the
+    /// journal are encrypted with it.
+    pub protection: Option<Protection>,
 }
 
 impl Doc {
@@ -300,7 +355,7 @@ impl Doc {
         // Tracked edits are made as the comment author, dated from this session.
         e.author = crate::app::comment_author().0.into();
         e.now = crate::app::comment_date().into();
-        Self { ed: Rc::new(RefCell::new(e)), name: name.into(), dirty: false, status: String::new(), autosave: None }
+        Self { ed: Rc::new(RefCell::new(e)), name: name.into(), dirty: false, status: String::new(), autosave: None, protection: None }
     }
 
     /// A native file.
@@ -333,9 +388,35 @@ impl Doc {
             a.remove()?;
         }
         let base = self.native_bytes();
-        self.autosave = Some(Autosave::start(dir, &base, &self.name)?);
+        self.autosave = Some(Autosave::start(dir, &base, &self.name, self.protection.as_ref().map(|p| &p.sealer))?);
         self.ed.borrow_mut().start_log();
         Ok(())
+    }
+
+    /// Sets, changes (keeping the key) or removes the password; the
+    /// journal starts again, sealed or not, in place of the old one.
+    pub fn set_password(&mut self, password: Option<&str>) -> io::Result<()> {
+        match (password, &mut self.protection) {
+            (Some(pw), Some(p)) => p.change(pw),
+            (Some(pw), None) => self.protection = Some(Protection::new(pw)),
+            (None, _) => self.protection = None,
+        }
+        if let Some(dir) = self.autosave.as_ref().map(|a| a.dir.clone()) {
+            self.sync_log();
+            let dirty = self.dirty;
+            self.autosave_to(&dir)?;
+            self.dirty = dirty;
+        }
+        Ok(())
+    }
+
+    /// The native file's bytes as saved: sealed when protected.
+    pub fn stored_native(&self) -> Vec<u8> {
+        let b = self.native_bytes();
+        match &self.protection {
+            Some(p) => p.sealer.seal(&b),
+            None => b,
+        }
     }
 
     pub fn autosave(&mut self) -> Option<&mut Autosave> {
@@ -506,6 +587,55 @@ mod tests {
         assert_eq!(back.plain_text(), "Hi\n");
         d.close().unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_protected_document_keeps_nothing_in_the_clear() {
+        let dir = tmp("protected");
+        let mut d = Doc::from_text("secret.txt", b"launch codes\n").unwrap();
+        d.autosave_to(&dir).unwrap();
+        d.set_password(Some("correct horse")).unwrap();
+        d.ed.borrow_mut().set_caret(Pos::new(0, 12), false);
+        for c in " zebra".chars() {
+            key(&mut d, Key::Char, NO, &c.to_string());
+        }
+        d.autosave().unwrap().sync().unwrap();
+        let want = d.plain_text();
+        // Nothing in the folder holds the words.
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let b = fs::read(e.path()).unwrap();
+            assert!(!b.windows(6).any(|w| w == b"launch" || w == b" zebra"), "{:?}", e.path());
+        }
+        // The saved native file is sealed and opens only with the password.
+        let file = d.stored_native();
+        assert!(officina_convert::sealed::is_sealed(&file));
+        use crate::files::load_with;
+        use officina_convert::launch::ConvertError;
+        assert!(matches!(load_with("s.owrite", &file, None), Err(ConvertError::NeedsPassword)));
+        assert!(matches!(load_with("s.owrite", &file, Some("wrong")), Err(ConvertError::WrongPassword)));
+        let opened = load_with("s.owrite", &file, Some("correct horse")).unwrap();
+        assert_eq!(opened.plain_text(), want);
+        assert!(opened.protection.is_some());
+        std::mem::forget(d);
+        let copy = tmp("protected-copy");
+        fs::create_dir_all(&copy).unwrap();
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            if e.file_name() != LOCK {
+                fs::copy(e.path(), copy.join(e.file_name())).unwrap();
+            }
+        }
+        assert!(recovery_locked(&copy));
+        assert_eq!(recover(&copy).err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(recover_with(&copy, Some("nope")).err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        let (r, rec) = recover_with(&copy, Some("correct horse")).unwrap();
+        assert_eq!(r.plain_text(), want);
+        assert_eq!(rec.actions, 6);
+        assert!(r.protection.is_some());
+        // Removing the password writes the journal in the clear again.
+        let mut r = r;
+        r.set_password(None).unwrap();
+        assert!(!recovery_locked(&copy));
+        r.close().unwrap();
     }
 
     #[test]

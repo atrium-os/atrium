@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 
 use atrium_write::app::{Cmd, Ui, Write, PICKER_SLOT};
 use atrium_write::doc::{self, Doc};
-use atrium_write::files::{encode, format_of, load, stem_of, Format};
+use atrium_write::files::{encode, format_of, load, load_with, stem_of, Format};
+use officina_convert::launch::ConvertError;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
@@ -126,9 +127,17 @@ fn place_new(dir: &Path, stem: &str, ext: &str, fill: impl FnOnce(&mut File) -> 
 }
 
 
+/// A protected file waiting for its password.
+enum Locked {
+    File { name: String, data: Vec<u8>, target: Option<Target> },
+    /// A protected document's autosave folder, to restore.
+    Recovery { dir: PathBuf, name: String },
+}
+
 struct Run {
     write: Write,
     target: Option<Target>,
+    locked: Option<Locked>,
     root: PathBuf,
     /// A PDF export running in the background: its latest word.
     export: Option<std::sync::Arc<std::sync::Mutex<(String, bool)>>>,
@@ -280,15 +289,82 @@ impl Run {
     /// A picked file arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
-        match read_all(&mut f).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
+        let format = format_of(&name);
+        match read_all(&mut f) {
+            Ok(data) => {
+                let read_only = !write;
+                self.open_bytes(name, data, write.then_some(Target::Picked { file: f, format }), read_only, None);
+            }
+            Err(e) => self.set_status(format!("Couldn't read “{name}”: {e}")),
+        }
+    }
+
+    /// Opens `data` (named `name`), with `password` when it is protected;
+    /// without the right one, the password bar asks and the file waits.
+    fn open_bytes(&mut self, name: String, data: Vec<u8>, target: Option<Target>, read_only: bool, password: Option<&str>) {
+        match load_with(&name, &data, password) {
             Ok(mut d) => {
-                let format = format_of(&name);
-                if !write {
+                if read_only {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
                 }
-                self.show(d, write.then_some(Target::Picked { file: f, format }));
+                self.show(d, target);
             }
-            Err(e) => self.set_status(e),
+            Err(e @ (ConvertError::NeedsPassword | ConvertError::WrongPassword)) => {
+                let again = e == ConvertError::WrongPassword;
+                self.write.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("“{name}” is protected. Its password") }, false);
+                self.locked = Some(Locked::File { name, data, target });
+            }
+            Err(ConvertError::Failed(e)) => self.set_status(e),
+        }
+    }
+
+    /// Restores a protected document's autosave folder, asking for its
+    /// password.
+    fn recover_locked(&mut self, dir: PathBuf, name: String, password: Option<&str>) {
+        match password.map(|pw| doc::recover_with(&dir, Some(pw))) {
+            Some(Ok((mut d, rec))) => {
+                d.status = format!("Restored “{name}” as it was before Write last stopped ({} changes since its last save).", rec.actions);
+                self.show(d, None);
+            }
+            Some(Err(e)) if e.kind() != io::ErrorKind::PermissionDenied => self.set_status(format!("Couldn't restore “{name}”: {e}")),
+            r => {
+                let again = r.is_some();
+                self.write.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("Restore “{name}”: its password") }, false);
+                self.locked = Some(Locked::Recovery { dir, name });
+            }
+        }
+    }
+
+    /// The password bar's answer: a waiting file opened, or the document's
+    /// password set.
+    fn password_done(&mut self) {
+        let (bar, text) = self.write.take_password();
+        if bar.setting {
+            let pw = (!text.is_empty()).then_some(text.as_str());
+            let r = self.write.doc.borrow_mut().set_password(pw);
+            let mut d = self.write.doc.borrow_mut();
+            d.dirty = true;
+            d.status = match (r, pw) {
+                (Err(e), _) => format!("The password is set, but autosave stopped: {e}."),
+                (Ok(()), Some(_)) => format!("“{}” is protected with a password from its next save. Plain text files can't carry one.", d.name),
+                (Ok(()), None) => format!("“{}” has no password from its next save.", d.name),
+            };
+            drop(d);
+            self.write.changed();
+            return;
+        }
+        match self.locked.take() {
+            Some(Locked::File { name, data, target }) => self.open_bytes(name, data, target, false, Some(&text)),
+            Some(Locked::Recovery { dir, name }) => self.recover_locked(dir, name, Some(&text)),
+            None => {}
+        }
+    }
+
+    fn password_cancelled(&mut self) {
+        match self.locked.take() {
+            Some(Locked::File { name, .. }) => self.set_status(format!("“{name}” stayed closed.")),
+            Some(Locked::Recovery { name, .. }) => self.set_status(format!("“{name}” wasn't restored; it comes back next time Write starts.")),
+            None => {}
         }
     }
 }
@@ -300,21 +376,31 @@ fn main() {
     let _ = fs::create_dir_all(&root);
     // A document a crash left comes back first.
     let mut first: Option<(Doc, Option<Target>)> = None;
+    let mut locked: Option<(PathBuf, String)> = None;
+    let mut locked_file: Option<(String, Vec<u8>, Target)> = None;
     if let Some((dir, name)) = doc::pending(&root).pop() {
-        match doc::recover(&dir) {
-            Ok((mut d, rec)) => {
-                d.status = format!("Restored “{name}” as it was before Write last stopped ({} changes since its last save).", rec.actions);
-                first = Some((d, None));
+        if doc::recovery_locked(&dir) {
+            locked = Some((dir, name));
+        } else {
+            match doc::recover(&dir) {
+                Ok((mut d, rec)) => {
+                    d.status = format!("Restored “{name}” as it was before Write last stopped ({} changes since its last save).", rec.actions);
+                    first = Some((d, None));
+                }
+                Err(e) => eprintln!("atrium-write: couldn't restore {}: {e}", dir.display()),
             }
-            Err(e) => eprintln!("atrium-write: couldn't restore {}: {e}", dir.display()),
         }
     }
-    if first.is_none() {
+    if first.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-            match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, &data)) {
-                Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
+            match fs::read(&p) {
+                Ok(data) => match load_with(&name, &data, None) {
+                    Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
+                    Err(ConvertError::Failed(e)) => eprintln!("atrium-write: {e}"),
+                    Err(_) => locked_file = Some((name, data, Target::Path { path: p.clone(), format: format_of(&p.to_string_lossy()) })),
+                },
                 Err(e) => eprintln!("atrium-write: {e}"),
             }
         }
@@ -347,8 +433,13 @@ fn main() {
         (win.width, win.height),
     );
     write.keep_words(root.join("words"));
-    let mut run = Run { write, target: None, root: root.clone(), export: None };
+    let mut run = Run { write, target: None, locked: None, root: root.clone(), export: None };
     run.show(doc, target);
+    if let Some((dir, name)) = locked {
+        run.recover_locked(dir, name, None);
+    } else if let Some((name, data, t)) = locked_file {
+        run.open_bytes(name, data, Some(t), false, None);
+    }
     // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, comment, xref:N, or find:TEXT).
     match std::env::var("ATRIUM_WRITE_BAR").ok().as_deref() {
         Some("spell") => run.write.cmds.lock().unwrap().push(Cmd::SpellOpen),
@@ -419,6 +510,8 @@ fn main() {
         for c in run.write.take_cmds() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::PasswordDone => run.password_done(),
+                Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::CompareWith => want_picker = Some(Asking::Compare),
                 Cmd::MergeWith => want_picker = Some(Asking::Merge),
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
