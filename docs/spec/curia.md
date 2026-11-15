@@ -54,6 +54,9 @@ service is not reachable says so in place ("atrium-net is not running") and offe
   mistake shows under the fields with the row left open. These are not secrets, so
   they are Curia's own fields, not Arca's. A saved network's setting is used whenever it
   is joined and applies at once to the one in use (atrium-net.md §5.1).
+  Checked live 2026-11-15 in the cloud VM (`curia-vm.sh shot`, then click/type, which now
+  types digits, `.`, `/` and `,`): a fixed 10.77.0.201/24 on aura-test applied from the
+  page, DNS servers 9.9.9.9, back to Automatic (a fresh DHCP lease).
 - **DNS servers** (`network-configure`): "Each network's own" or the machine's own list,
   and Change: one field (up to 3, IPv4 or IPv6; empty goes back to each network's).
 - **Wi-Fi country** (`network-configure`): a list of countries.

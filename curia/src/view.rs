@@ -413,7 +413,7 @@ impl CuriaView {
                 let fx = x0 + em(24.0);
                 let fy = y + em(2.0);
                 let widths = [em(170.0), em(130.0), em(190.0)];
-                let holders = ["Address, e.g. 192.168.1.20/24", "Router", "DNS servers (optional)"];
+                let holders = ["e.g. 192.168.1.20/24", "Router", "DNS servers (optional)"];
                 let mut x = fx;
                 for i in 0..3 {
                     let (pg, f) = (self.page.clone(), self.net_fields.clone());
