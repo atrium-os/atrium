@@ -84,7 +84,9 @@ impl Pane {
         let field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
         let scroll = Mutable::with_dirty(ScrollState::default(), dirty.clone());
         let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
-        let view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
+        let mut view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
+        // The More menu's state (highlight, scroll) repaints when it moves.
+        view.more = view.more.clone().attach(dirty.clone());
         let mods = view.mods.clone();
         let (cred, cred_state) = (view.cred.clone(), view.cred_state.clone());
         let app = App::new_with_flag(view, dirty);
@@ -102,7 +104,10 @@ impl Pane {
                     E::PointerButton { pressed: true, modifiers, .. } => {
                         *self.mods.lock().unwrap() = Mods { shift: modifiers & 0x22 != 0, ctrl: modifiers & 0x11 != 0 };
                     }
-                    E::Key { .. } => {
+                    // A key for one of our pop-ups (an open menu, which
+                    // takes the keys) is the menu's alone: an arrow there
+                    // must not also move the file selection under it.
+                    E::Key { window_id, .. } if *window_id == self.win.id() => {
                         if let Some(k) = translate(&ev) {
                             on_key(&self.state, &self.field, &k);
                         }
