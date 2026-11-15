@@ -178,7 +178,10 @@ placed from that one (`max(1, round(d x k))` pixels away), preferring the edge o
 span; a group's own box (0 and its size) counts as placed edges for what it holds. So a
 border inset, a child group's inset and a divider at a box's edge are equally wide on all
 sides at every scale, and neighbours that share an edge still meet. Unrelated edges round
-as before. Not yet re-checked live.
+as before. Re-checked live 2026-11-15 (PASS at 1.25 and 1.5). Since 2026-11-15 a node is
+placed only from edges of nodes painted before it in its group (its paint order), so an
+update of one node lands it where a full redraw would: Scrinium's divider had sat a row
+lower after a partial update, placed from a later sibling's edge.
 
 ## 6. Text size and relative sizing of widgets
 

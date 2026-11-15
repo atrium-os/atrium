@@ -245,10 +245,12 @@ struct Edges {
     /// own box is the `ROOT` group's bounds.
     size: (f32, f32),
     /// Per group (`ROOT` for the window), per axis, a placed edge in points
-    /// (in 1/64 pt) to its device position and how many nodes hold it.
-    groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, (f32, u32)>; 2]>,
-    /// The edges each node holds, to let go when it changes or goes.
-    nodes: std::collections::HashMap<u32, (u32, Vec<(u8, i32)>)>,
+    /// (in 1/64 pt) to its device position and the paint orders of the
+    /// nodes holding it (order -> count).
+    groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, (f32, std::collections::BTreeMap<u32, u32>)>; 2]>,
+    /// The edges each node holds and its order, to let go when it
+    /// changes or goes.
+    nodes: std::collections::HashMap<u32, (u32, u32, Vec<(u8, i32)>)>,
     /// Each group's own box: points `w`, `h`, pixels `dw`, `dh`.
     bounds: std::collections::HashMap<u32, [f32; 4]>,
 }
@@ -287,7 +289,13 @@ impl Edges {
     /// the side the span lies on (+1 a start edge, -1 an end edge): an edge
     /// is placed from one at the same point, else from the nearest placed
     /// edge outside the span within [`NEAR`], else rounded.
-    fn place(&self, group: u32, axis: u8, e: f32, toward: f32) -> f32 {
+    ///
+    /// Only edges of nodes painted before this one (`order`, its paint
+    /// order in the group) count, so a node lands where it would in a
+    /// full redraw, whatever else changed first: an update of one node
+    /// must not see its later siblings' edges, which a full redraw places
+    /// after it.
+    fn place(&self, group: u32, axis: u8, e: f32, toward: f32, order: u32) -> f32 {
         let k = self.k;
         let key = edge_key(e);
         let own = self.bounds.get(&group).map(|&[w, h, dw, dh]| {
@@ -298,7 +306,8 @@ impl Edges {
         // Saturating: an edge far off (a huge or infinite extent) saturates
         // its key at i32::MAX, and `key + reach` would wrap below `key - reach`.
         let held = self.groups.get(&group).map(|g| g[axis as usize].range(key.saturating_sub(reach)..=key.saturating_add(reach)));
-        let all = own.iter().flatten().copied().chain(held.into_iter().flatten().map(|(&b, &(dev, _))| (b, dev)));
+        let before = |holders: &std::collections::BTreeMap<u32, u32>| holders.keys().next().is_some_and(|&o| o < order);
+        let all = own.iter().flatten().copied().chain(held.into_iter().flatten().filter(|(_, (_, h))| before(h)).map(|(&b, &(dev, _))| (b, dev)));
         // The same point, else outside the span first (a box's own
         // border), then inside.
         let mut best: Option<(f32, f32)> = None;
@@ -323,29 +332,30 @@ impl Edges {
 
     /// A span (`x`, `w` in points) on `axis` in `group`, in device pixels,
     /// like [`snap_span`] but placed from the edges near it.
-    fn span(&self, group: u32, axis: u8, x: f32, w: f32) -> (f32, f32) {
-        let x0 = self.place(group, axis, x, 1.0);
+    fn span(&self, group: u32, axis: u8, x: f32, w: f32, order: u32) -> (f32, f32) {
+        let x0 = self.place(group, axis, x, 1.0, order);
         if w <= 0.0 {
             return (x0, 0.0);
         }
         if w <= NEAR {
             return (x0, (w * self.k).round().max(1.0));
         }
-        let x1 = self.place(group, axis, x + w, -1.0);
+        let x1 = self.place(group, axis, x + w, -1.0, order);
         (x0, (x1 - x0).max(1.0))
     }
 
     /// Note a node's placed edges, (axis, points, device) each.
-    fn hold(&mut self, node: u32, group: u32, edges: &[(u8, f32, f32)]) {
+    fn hold(&mut self, node: u32, group: u32, order: u32, edges: &[(u8, f32, f32)]) {
         self.drop_node(node);
         let g = self.groups.entry(group).or_default();
         let mut keys = Vec::with_capacity(edges.len());
         for &(axis, e, dev) in edges {
             let key = edge_key(e);
-            g[axis as usize].entry(key).or_insert((dev, 0)).1 += 1;
+            let entry = g[axis as usize].entry(key).or_insert((dev, Default::default()));
+            *entry.1.entry(order).or_insert(0) += 1;
             keys.push((axis, key));
         }
-        self.nodes.insert(node, (group, keys));
+        self.nodes.insert(node, (group, order, keys));
     }
 
     /// A group's own box, `w` x `h` points drawn `dw` x `dh` pixels: its
@@ -355,14 +365,18 @@ impl Edges {
     }
 
     fn drop_node(&mut self, node: u32) {
-        let Some((group, keys)) = self.nodes.remove(&node) else { return };
+        let Some((group, order, keys)) = self.nodes.remove(&node) else { return };
         if let Some(g) = self.groups.get_mut(&group) {
             for (axis, key) in keys {
                 let m = &mut g[axis as usize];
-                match m.get_mut(&key) {
-                    Some(v) if v.1 > 1 => v.1 -= 1,
-                    Some(_) => { m.remove(&key); }
+                let Some(v) = m.get_mut(&key) else { continue };
+                match v.1.get_mut(&order) {
+                    Some(c) if *c > 1 => *c -= 1,
+                    Some(_) => { v.1.remove(&order); }
                     None => {}
+                }
+                if v.1.is_empty() {
+                    m.remove(&key);
                 }
             }
         }
@@ -486,7 +500,7 @@ impl FrescoSurface {
 
     /// `rect` (points, in `group`) in device pixels, its edges placed
     /// from those near it, and held by `id` for what comes after.
-    fn place_rect(&mut self, id: u32, group: Option<NodeId>, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
+    fn place_rect(&mut self, id: u32, group: Option<NodeId>, order: u32, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
         self.edges.reset_if(self.scale);
         self.edges.drop_node(id);
         // A dot (an icon's round join, a mark) is no border: snapped on its
@@ -497,18 +511,18 @@ impl FrescoSurface {
             return (x, y, w, h);
         }
         let g = group.map_or(ROOT, |g| g.0);
-        let (x, w) = self.edges.span(g, 0, rect.x(), rect.w());
-        let (y, h) = self.edges.span(g, 1, rect.y(), rect.h());
-        self.edges.hold(id, g, &[
+        let (x, w) = self.edges.span(g, 0, rect.x(), rect.w(), order);
+        let (y, h) = self.edges.span(g, 1, rect.y(), rect.h(), order);
+        self.edges.hold(id, g, order, &[
             (0, rect.x(), x), (0, rect.x() + rect.w(), x + w),
             (1, rect.y(), y), (1, rect.y() + rect.h(), y + h),
         ]);
         (x, y, w, h)
     }
 
-    fn rect_params(&mut self, id: u32, group: Option<NodeId>, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
+    fn rect_params(&mut self, id: u32, group: Option<NodeId>, order: u32, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
         let k = self.scale;
-        let (x, y, w, h) = self.place_rect(id, group, rect);
+        let (x, y, w, h) = self.place_rect(id, group, order, rect);
         fresco_protocol::RectParams {
             x, y, w, h,
             r: fill.r, g: fill.g, b: fill.b, a: fill.a,
@@ -526,7 +540,7 @@ impl FrescoSurface {
         let Node::Scroll { rect, offset, offset_x, zoom, stretch, backdrop, .. } = node else { unreachable!() };
         use fresco_protocol::{group_flags, GroupParams};
         let k = self.scale;
-        let (x, y, w, h) = self.place_rect(id.0, group, *rect);
+        let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
         let mut outer = GroupParams {
             parent: group.map(|g| g.0),
             order,
@@ -595,7 +609,7 @@ impl Surface for FrescoSurface {
         let k = self.scale;
         match node {
             Node::Rect { rect, fill, radius } => {
-                let params = self.rect_params(id.0, group, *rect, *fill, *radius);
+                let params = self.rect_params(id.0, group, order, *rect, *fill, *radius);
                 self.conn.scene_node_rect(id.0, params)?;
             }
             Node::Text { rect, content, style } => {
@@ -654,7 +668,7 @@ impl Surface for FrescoSurface {
                     let hash = self.conn.upload_blob(&d.rgba)?;
                     self.conn.slot_set_texture(slot, hash, d.width, d.height, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
                 }
-                let (x, y, w, h) = self.place_rect(id.0, group, *rect);
+                let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
                 self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x, y, w, h, slot_id: slot })?;
             }
             Node::Glyphs { origin, face, size, color, glyphs } => {
@@ -684,7 +698,7 @@ impl Surface for FrescoSurface {
         };
         // Whole device pixels, placed from the edges near it, so its
         // contents keep their snapped edges and an inset keeps its border.
-        let (x, y, w, h) = self.place_rect(id.0, group, *rect);
+        let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
         self.edges.bounds(id.0, rect.w(), rect.h(), w, h);
         g.transform[4] = x;
         g.transform[5] = y;
@@ -722,10 +736,10 @@ mod tests {
         // A tall page (or an infinite clip) puts an edge past i32 in 1/64 pt.
         let mut e = super::Edges::default();
         e.reset_if(1.5);
-        e.hold(1, super::ROOT, &[(1, 1.0e30, -1.0)]);
-        let _ = e.place(super::ROOT, 1, f32::MAX, 1.0);
-        let _ = e.place(super::ROOT, 1, f32::INFINITY, -1.0);
-        let _ = e.place(super::ROOT, 1, -1.0e30, 1.0);
+        e.hold(1, super::ROOT, 1, &[(1, 1.0e30, -1.0)]);
+        let _ = e.place(super::ROOT, 1, f32::MAX, 1.0, 2);
+        let _ = e.place(super::ROOT, 1, f32::INFINITY, -1.0, 2);
+        let _ = e.place(super::ROOT, 1, -1.0e30, 1.0, 2);
     }
 
     use super::snap_span;
@@ -766,21 +780,21 @@ mod tests {
                     let mut e = Edges::default();
                     e.reset_if(k);
                     // Siblings: the edge rect, then the body inset by 1 pt.
-                    let (ox, ow) = e.span(ROOT, 0, x, w);
-                    e.hold(1, ROOT, &[(0, x, ox), (0, x + w, ox + ow)]);
-                    let (ix, iw) = e.span(ROOT, 0, x + 1.0, w - 2.0);
-                    e.hold(2, ROOT, &[(0, x + 1.0, ix), (0, x + w - 1.0, ix + iw)]);
+                    let (ox, ow) = e.span(ROOT, 0, x, w, 1);
+                    e.hold(1, ROOT, 1, &[(0, x, ox), (0, x + w, ox + ow)]);
+                    let (ix, iw) = e.span(ROOT, 0, x + 1.0, w - 2.0, 2);
+                    e.hold(2, ROOT, 2, &[(0, x + 1.0, ix), (0, x + w - 1.0, ix + iw)]);
                     assert_eq!(ix - ox, line, "near border at {k}, x {x}, w {w}");
                     assert_eq!(ox + ow - (ix + iw), line, "far border at {k}, x {x}, w {w}");
                     // A group: its box is its contents' frame.
                     e.bounds(7, w, w, ow, ow);
-                    let (cx, cw) = e.span(7, 0, 1.0, w - 2.0);
+                    let (cx, cw) = e.span(7, 0, 1.0, w - 2.0, 1);
                     assert_eq!((cx, ow - (cx + cw)), (line, line), "child inset at {k}, w {w}");
                     // A 1 pt divider at the bottom of the group.
-                    let (dy, dh) = e.span(7, 1, w - 1.0, 1.0);
+                    let (dy, dh) = e.span(7, 1, w - 1.0, 1.0, 1);
                     assert_eq!((dy + dh, dh), (ow, line), "divider at the bottom at {k}, w {w}");
                     // Something unrelated is rounded as before.
-                    assert_eq!(e.span(7, 0, w / 2.0 - 0.3, 3.0 + w / 4.0).0, ((w / 2.0 - 0.3) * k).round());
+                    assert_eq!(e.span(7, 0, w / 2.0 - 0.3, 3.0 + w / 4.0, 1).0, ((w / 2.0 - 0.3) * k).round());
                 }
             }
         }
@@ -798,23 +812,23 @@ mod tests {
         let mut e = Edges::default();
         e.reset_if(1.25);
         e.window(1536.0, 38.0);
-        let bg = e.span(ROOT, 1, 0.0, 38.0);
-        e.hold(1, ROOT, &[(1, 0.0, bg.0), (1, 38.0, bg.0 + bg.1)]);
-        let line = e.span(ROOT, 1, 37.0, 1.0);
-        e.hold(2, ROOT, &[(1, 37.0, line.0), (1, 38.0, line.0 + line.1)]);
+        let bg = e.span(ROOT, 1, 0.0, 38.0, 1);
+        e.hold(1, ROOT, 1, &[(1, 0.0, bg.0), (1, 38.0, bg.0 + bg.1)]);
+        let line = e.span(ROOT, 1, 37.0, 1.0, 2);
+        e.hold(2, ROOT, 2, &[(1, 37.0, line.0), (1, 38.0, line.0 + line.1)]);
         assert_eq!((bg, line), ((0.0, 48.0), (47.0, 1.0)), "38 pt: 47.5 px, its foot at 48");
         // forum-wm gives it 48 px: 38.4 pt.
         e.window(1536.0, 38.4);
         e.drop_node(1);
-        let bg = e.span(ROOT, 1, 0.0, 38.4);
-        e.hold(1, ROOT, &[(1, 0.0, bg.0), (1, 38.4, bg.0 + bg.1)]);
+        let bg = e.span(ROOT, 1, 0.0, 38.4, 1);
+        e.hold(1, ROOT, 1, &[(1, 0.0, bg.0), (1, 38.4, bg.0 + bg.1)]);
         e.drop_node(2);
-        let line = e.span(ROOT, 1, 37.4, 1.0);
+        let line = e.span(ROOT, 1, 37.4, 1.0, 2);
         assert_eq!(bg, (0.0, 48.0), "to the window's foot, not past it");
         assert_eq!(line, (47.0, 1.0), "the hairline on the last row");
         // A new scale keeps the size.
         e.reset_if(1.5);
-        assert_eq!(e.span(ROOT, 1, 0.0, 38.4), (0.0, (38.4f32 * 1.5).round()));
+        assert_eq!(e.span(ROOT, 1, 0.0, 38.4, 1), (0.0, (38.4f32 * 1.5).round()));
     }
 
     #[test]
@@ -822,12 +836,45 @@ mod tests {
         use super::{Edges, ROOT};
         let mut e = Edges::default();
         e.reset_if(1.5);
-        e.hold(1, ROOT, &[(0, 10.0, 15.0)]);
-        assert_eq!(e.span(ROOT, 0, 11.0, 1.0).0, 17.0, "placed from 10");
+        e.hold(1, ROOT, 1, &[(0, 10.0, 15.0)]);
+        assert_eq!(e.span(ROOT, 0, 11.0, 1.0, 2).0, 17.0, "placed from 10");
         e.drop_node(1);
-        assert_eq!(e.span(ROOT, 0, 11.0, 1.0).0, (11.0f32 * 1.5).round());
-        e.hold(1, ROOT, &[(0, 10.0, 15.0)]);
+        assert_eq!(e.span(ROOT, 0, 11.0, 1.0, 2).0, (11.0f32 * 1.5).round());
+        e.hold(1, ROOT, 1, &[(0, 10.0, 15.0)]);
         e.forget(1);
         assert!(e.groups[&ROOT][0].is_empty());
+    }
+
+    /// Where a node lands doesn't depend on what was sent before it: a
+    /// node updated alone, with its later siblings already placed, lands
+    /// where a full redraw (in paint order) puts it. Scrinium's 1 pt
+    /// divider at 1.25 sat a row lower after a partial update than after
+    /// a full one, placed from a later sibling's edge.
+    #[test]
+    fn a_node_lands_the_same_in_an_update_as_in_a_full_redraw() {
+        use super::{Edges, ROOT};
+        for k in [1.25f32, 1.5] {
+            // A divider (order 1) at 47 pt and a row (order 2) whose top is
+            // 1 pt below it: in a full redraw the divider comes first.
+            let full = {
+                let mut e = Edges::default();
+                e.reset_if(k);
+                let d = e.span(ROOT, 1, 46.6, 1.0, 1);
+                e.hold(1, ROOT, 1, &[(1, 46.6, d.0), (1, 47.6, d.0 + d.1)]);
+                let r = e.span(ROOT, 1, 48.0, 30.0, 2);
+                e.hold(2, ROOT, 2, &[(1, 48.0, r.0), (1, 78.0, r.0 + r.1)]);
+                (d, r)
+            };
+            // Then an update sends the divider alone, the row in place.
+            let mut e = Edges::default();
+            e.reset_if(k);
+            let d = e.span(ROOT, 1, 46.6, 1.0, 1);
+            e.hold(1, ROOT, 1, &[(1, 46.6, d.0), (1, 47.6, d.0 + d.1)]);
+            let r = e.span(ROOT, 1, 48.0, 30.0, 2);
+            e.hold(2, ROOT, 2, &[(1, 48.0, r.0), (1, 78.0, r.0 + r.1)]);
+            e.drop_node(1);
+            let d = e.span(ROOT, 1, 46.6, 1.0, 1);
+            assert_eq!((d, r), full, "at {k}");
+        }
     }
 }
