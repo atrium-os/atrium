@@ -228,11 +228,73 @@ and `libmd-dev` for `vm-automount-check.sh`.
 
 ## 8. Not yet
 
-- Home folders: Scrinium's jail does not hold the user's files; giving it
-  them (and the picker over them) needs Castellum/volumes work and a decision.
+- Home folders: proposed in §9, awaiting Shankar's decision.
 - "Open with" ([opening-files.md](opening-files.md), proposed), thumbnails, search, drag and drop (Tabula), trash.
 - "Always allow for this app" (device-assignment.md §4.8.4), listed in Curia.
 - Activation tokens: a pick is a user gesture inside Scrinium's own window;
   dispensatord could also ask frescod for proof (tabula.md §2).
 - More than one file per pick is in the protocol and the model but the gate
   only covers one.
+
+## 9. Home folders (proposed 2026-11-15)
+
+Asked for by Officina's O5h (recent files), which needs Scrinium to hold
+the user's files and to issue bookmarks (officina.md §4.3). Today no app
+can reach the user's files: portcullisd runs every app as its own per-app
+uid, never the person's (portcullis.md §9.0), and `filesystem = ["~/…"]`
+names the app uid's own home, not the person's.
+
+**The folders.** Documents, Downloads, Pictures, Music and Videos, under
+the person's own home on the host (`/home/<user>/`), made at first login.
+They are the only part of the home Scrinium ever sees; dotfiles and app
+state are elsewhere.
+
+**Who may touch them (H1, the choice).**
+
+| option | how | for | against |
+|---|---|---|---|
+| **A. A files group (recommended)** | each person gets a group `files-<user>`; the five folders are `<user>:files-<user>`, mode 2770 (setgid, so new files keep the group), and files are made 0660. A new restricted capability `home-files` (system apps only, like `removable-files`) makes portcullisd add that one group to the app uid's supplementary groups at launch, and mounts the five folders into the jail. Only Scrinium asks for it. | keeps the per-app uid rule; the kernel enforces it; a small change in portcullisd | files written by the person's own shell need the group and mode (atrium-session sets umask 007 and the setgid folders do the rest) |
+| B. Scrinium runs as the person | an exception to the per-app uid rule for one system app | least code | breaks portcullis.md §9.0; Scrinium decodes thumbnails and previews of untrusted files later, so it should be the least privileged, not the most |
+| C. Everything through dispensatord | Scrinium holds no permission; every list, rename, copy and open is a request to root | the narrowest app | every file operation becomes IPC to a root daemon: much more root code and slower listings |
+
+**Picking from home.** Files: as today, Scrinium opens the file and hands
+the app a Capsicum-narrowed descriptor (`EMIT_FD`), so the app's uid
+doesn't matter. Folders: refused for home in v1 ("pick a folder on a stick,
+or pick files"), because a folder mount would need the app to hold the
+group for as long as it runs. Folder picks from home get their own
+decision later.
+
+**Bookmarks (for O5h and "open recent").** A bookmark is an Arca-sealed
+token naming (person, app id, file handle). The file handle is FreeBSD's
+`fhandle_t` (the file system id and the file's inode and generation), which
+is the file identity officina.md §4.3 asked for: a moved file is the same
+file, a copy is a different one, and a deleted and reused inode doesn't
+match. Only root can open by handle and only root can see the generation,
+so:
+
+1. Scrinium, when it hands over a file, asks dispensatord for a bookmark;
+   dispensatord takes the handle (`getfh(2)` on the path in
+   Scrinium's grant), seals {uid, app id, handle, time} with Arca and
+   returns it. The app keeps it (Officina keeps them in its recent list).
+2. To open it, the app gives the token to Scrinium's picker channel with
+   no sheet shown; Scrinium passes it to dispensatord, which unseals it,
+   checks the app id and person match the caller, `fhopen`s it, checks the
+   file is still a regular file under one of the person's home folders
+   (owner and group as above), narrows the descriptor and sends it back
+   through `EMIT_FD`. Missing, moved out of the home folders, or not the
+   person's: "The file is no longer there."
+3. Bookmarks for files on sticks are not issued in v1 (msdosfs handles
+   are not stable across remounts).
+
+**Build steps.** H1 the group, folders and `home-files` (portcullisd,
+atrium-session, Scrinium's places list); H2 the picker over home (files
+only); H3 bookmarks (dispensatord `BOOKMARK` and `REDEEM`, Arca sealing,
+`limen::picker` messages); gate: `vm-scrinium-check.sh` grows home checks,
+and a bookmark survives a rename and is refused after a copy-and-delete.
+
+| | decision | recommendation |
+|---|---|---|
+| H1 | how Scrinium may touch the person's files | A, a per-person files group given by the restricted capability `home-files` |
+| H2 | folder picks from home | not in v1; files only |
+| H3 | bookmark identity | `fhandle_t` through dispensatord, sealed by Arca; home folders only |
+
