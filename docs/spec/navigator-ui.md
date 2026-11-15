@@ -168,7 +168,7 @@ In Atrium nothing runs as the person's own uid: an app runs as its per-app uid f
    person's Downloads (`filesystem`). No network: pages come through fetcher jails.
 5. **Configuration** comes from the bundle (`etc/navigatord.conf`, the same keys as today's
    environment), since a jail gets no environment of the caller's.
-6. **Hand-offs** go through `open-uri` (the broker socket) instead of `NAVIGATORD_OPENER`.
+6. **Hand-offs** go through `open-uri` (Monstrator, [opening-links.md](opening-links.md)) instead of `NAVIGATORD_OPENER`.
 
 `PROMPT` stays self-spent (tabula.md): the UI's windows are navigatord's connection, so the
 press's window owner and the spender are the same uid.
@@ -207,7 +207,8 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   and the trail store, which navigatord keeps (`NAVIGATORD_TRAILS`, 0600, written whole, at most 4
   MiB in 48 KiB parts; `SaveTrails`). Run without a channel (the live script), the UI keeps its
   own file as before.
-- **J4.** hand-offs through `open-uri`.
+- **J4.** hand-offs through `open-uri`: the link opener Monstrator (opening-links.md, proposed
+  2026-11-15, step L4).
 
 ### 2.4 Personas: what pages may share
 

@@ -255,7 +255,7 @@ keep-alive  = false               # if true, restart immediately on exit
 | `gpu.scanout = true` | Additionally allocate scanout BOs (`ATRIUM_GPU_BO_SCANOUT`) and call `page_flip`. Granted only to display-server processes (`frescod` today). **Restricted capability**: not user-grantable without explicit policy approval. | Kmod cross-checks the calling fd's cap token (set via `IOC_SET_CAPS` at portcullisd-mediated open time) against the `ATRIUM_GPU_BO_SCANOUT` flag at `IOC_ALLOC`; rejects with `EPERM` if not granted. See `aqueduct-gpu.md` §12.4. |
 | `clipboard = true` | Talk to clipboard daemon | nullfs `/atrium/sockets/clipboard.sock` |
 | `notify = true` | Send notifications | nullfs `/atrium/sockets/notify.sock` |
-| `open-uri = true` | Ask broker to open URLs | nullfs `/atrium/sockets/broker.sock` |
+| `open-uri = true` | Ask the link opener to open URLs, each on a press | nullfs `/atrium/sockets/monstrator/` (Monstrator, [opening-links.md](opening-links.md); proposed 2026-11-15) |
 | `audio = true` | Play audio through Lyra | nullfs `/atrium/sockets/audio/` (choragusd) only. No `/dev/dsp*`: only lyrad holds the device ([lyra-v1.md](lyra-v1.md) §3) |
 | `filesystem = [...]` | Read/write listed paths | nullfs each path |
 | `fonts.mode = "read-only", paths = [...]` | Read fonts | nullfs read-only |

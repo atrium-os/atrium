@@ -1,0 +1,182 @@
+# Opening links: Monstrator, the link opener
+
+Status: proposed 2026-11-15, awaiting Shankar's review. Nothing here is built.
+Asked by Shankar (2026-11-15): the better long-term design for the Navigator's hand-offs
+(navigator-ui.md §2.3a J4). Chosen: a separate, unprivileged, jailed service rather than
+link handling inside portcullisd.
+
+Related: [opening-files.md](opening-files.md) (the same rules for files; this is its twin
+for links), [portcullis.md](portcullis.md) §3 (`open-uri`), [tabula.md](tabula.md) §2
+(activation tokens), [navigator-ui.md](navigator-ui.md) §2.3a and §14 step 6 (hand-offs),
+[atrium-navigator-threat-model.md](atrium-navigator-threat-model.md) §2.10,
+[NAMING.md](../NAMING.md) (Nomenclator, `atrium-app://`).
+
+## 1. Short answer
+
+- One system service, **Monstrator** (`monstratord`, "the one who shows the way"), takes
+  every request to open a link in another app: `mailto:` from a page, `https:` from a mail
+  app, `atrium-app://` from anywhere.
+- It runs **jailed, as its own system uid** (`_monstrator`, 65038), with no network, no
+  files of the person's and no authority to launch anything. It parses the link (untrusted
+  text stays out of root), picks the app, asks the person when that is a choice, and asks
+  portcullisd to deliver it.
+- **portcullisd stays the only launcher.** It checks the press, that the app declares the
+  scheme and that the person's policy lets it run, then starts or finds the app and gives it
+  the link on the app's existing document channel (opening-files.md §6.2).
+- **Every open needs a press** in the asking app's window (a frescod activation token,
+  new purpose `LINK`). An app in the background can't open anything.
+- Apps **declare** the schemes they take in their signed manifest, like `[[opens]]` for
+  types. The **default per scheme** is the person's choice; installing an app changes no
+  default. `http`/`https` are the Navigator's alone.
+- The Navigator's hand-offs (J4) become one call to Monstrator; `NAVIGATORD_OPENER` goes.
+
+## 2. Why a separate service
+
+| | in portcullisd | Monstrator (chosen) |
+|---|---|---|
+| Who parses link text from any app | root | a jailed uid with nothing to lose |
+| Who draws the "Open with" sheet | root, or a UI process it trusts | Monstrator's own window, its own presses |
+| What a bug in the opener gets | everything portcullisd can do | asking portcullisd to deliver a link the person pressed for, to an app that declares that scheme |
+| portcullisd's code | grows a URL parser, a chooser and Nomenclator lookups | grows three small messages |
+
+The second column keeps portcullisd as small as Atrium can make it, and keeps the rule
+"root never reads untrusted text" true for links as it is for files (where Scrinium, not
+portcullisd, reads the directory).
+
+## 3. Threats
+
+1. **An app opens links on its own** (spam windows, drive-by launches of a handler with a
+   bug). Every open needs a `LINK` press in the asker's focused window, spent by portcullisd.
+2. **An app makes itself the handler** for `https`, `mailto` or a scheme another app uses.
+   Declaring only puts it on the list; defaults change only in Monstrator's sheet or Curia,
+   each on a press; `http`/`https` can be declared by system-signed bundles only.
+3. **A link that lies** (look-alike hosts, a long `mailto:` with a hidden body, control
+   characters). Monstrator shows scheme and host only, the host in its ASCII (punycode) form
+   when it mixes scripts, and refuses control characters, embedded newlines and links over
+   8 KiB.
+4. **A link that is a command** (`file:`, `javascript:`, `data:`, `vbscript:`, `about:`,
+   custom schemes that name programs). Those schemes are never taken (§4.2); no handler runs
+   a program named by a link.
+5. **A compromised Monstrator.** It can't launch, can't read files, has no network. Without
+   a press it can do nothing; with one it can send that link to a wrong app among those that
+   declare the scheme. Accepted.
+6. **Learning what the person has installed.** The asker learns only "opened" or "not
+   opened" (no app names, no list).
+
+## 4. Schemes
+
+### 4.1 The manifest
+
+```toml
+[[links]]
+schemes = ["mailto"]
+
+[[links]]
+schemes = ["org.example.notes"]   # its own scheme
+```
+
+Validation (portcullis-toml): schemes are `[a-z][a-z0-9+.-]{0,31}`, at most 16 per app.
+`http` and `https` only in system-signed bundles (the Navigator). The install screen says
+"Opens links: email (mailto)". An update that adds schemes shows them again.
+
+### 4.2 Never taken
+
+`file`, `javascript`, `data`, `vbscript`, `about`, `blob`, `filesystem`, `jar`, `view-source`,
+`ms-*`, `shell`, and anything that isn't a valid scheme. Monstrator refuses them before
+anything else; portcullis-toml refuses them in manifests.
+
+### 4.3 `atrium-app://`
+
+`atrium-app://<app id>` opens an installed app (its start, no link given). Resolving a
+publisher's name to a signed bundle that isn't installed is Nomenclator's work; until it
+exists Monstrator answers "not installed", and later it hands that case to Opifex's install
+screen ("Try it" there, not in the asking app).
+
+### 4.4 Defaults
+
+A table scheme → app id per person, next to the type table (`<user>/links.toml`, kept by
+portcullisd like `opens.toml`). It starts from the system's: the Navigator for `http`/`https`,
+nothing else until Atrium ships a mail app. A scheme with one app and no default asks once;
+with several, the sheet lists them, and "Always use this app" sets the default. Curia's Default
+apps page gets a Links section. portcullisd takes default changes only from Monstrator and
+Curia, each with a press.
+
+## 5. The flow
+
+```
+asker ── OpenLink { url, token } ─────────────────────────────▶ monstratord
+monstratord ── LinkGrant { asker uid, token } ────────────────▶ portcullisd
+portcullisd ── ACTIVATION_CONSUME(token, asker uid, LINK) ────▶ frescod
+portcullisd ── Granted { grant, person, apps for scheme, default } ─▶ monstratord
+           (monstratord shows its sheet if there is a choice; the person presses)
+monstratord ── DeliverLink { grant, app, url } ───────────────▶ portcullisd
+portcullisd ── starts or finds the app ── LINK { url } on opens.sock ─▶ app
+monstratord ── Opened | NotOpened { why } ────────────────────▶ asker
+```
+
+- **The asker** sends the link with its press's token straight away (the token lives 1 s).
+  `LINK` accepts `BUTTON` and `KEY` (Enter) presses, like `OPEN`.
+- **monstratord** checks the link (§3.3, §4.2), takes the scheme, and asks portcullisd for a
+  grant. It never spends the token itself, so a compromised Monstrator can't mint presses.
+- **portcullisd** knows the asker by peer uid and the launch registry (person, app). It spends
+  the token for that uid, and returns a grant: one link, that person, two minutes, once. It
+  lists the apps that declare the scheme and that person's policy lets run, minus the asker.
+- **The sheet** (Pergola, Monstrator's own frescod window, a system sheet like Arca's and
+  Sigillum's): "Open this link in…", scheme and host, the apps, Cancel. Its presses are
+  self-spent (`PROMPT`). No sheet when there is a default, or exactly one app the person has
+  already confirmed.
+- **Delivery** reuses the document channel: portcullisd serves `opens.sock` for every app that
+  declares `[[opens]]` or `[[links]]`, and sends `LINK { url }` (atrium-open crate). The app
+  gets the text only, no descriptor.
+- Rate: one open per asker in flight, ten a minute; more are refused without a sheet.
+
+## 6. Where it runs
+
+- Bundle `org.atrium.monstrator`, a per-person system service started at login by portcullisd, as `_monstrator` (65038). Restricted capability `link-opener`: mounts
+  `/atrium/sockets/monstrator/` (served), `portcullis/` and `fresco-chrome/`; a frescod
+  window for the sheet; nothing else; no network.
+- **`open-uri = true`** mounts `/atrium/sockets/monstrator/` into the app's jail (replacing the
+  planned `broker.sock` in portcullis.md §3.2). `navigator-broker` mounts it too.
+
+## 7. The Navigator (J4)
+
+The page's hand-off prompt (navigator-ui.md §14 step 6) stays: navigatord still hands on only
+a link it decided as a hand-off on that connection, once. Its prompt names no app ("Open in
+another app?", with the scheme), since it can't know which. The UI's press on *Open* now goes
+to navigatord as `Hand { url, how, token }`, and navigatord sends `OpenLink { url, token }` to
+Monstrator instead of spending `PROMPT` and running `NAVIGATORD_OPENER`. The prompt row's
+window is navigatord's chrome connection, so the press is in the asker's window by uid.
+Links from other apps (`https:` from mail) arrive at the Navigator as `LINK` and open in a
+new trail.
+
+## 8. Pieces and build order
+
+| piece | where |
+|---|---|
+| `[[links]]` schemes, refused schemes | portcullis-toml |
+| `LINK` purpose, portcullisd as its consumer | frescod activation |
+| `LinkGrant`, `DeliverLink`, defaults table, `LINK` on opens.sock | portcullisd, portcullis-ipc, atrium-open |
+| `monstratord`, its sheet, `link-opener`, `open-uri` mount | new crate `monstrator/` |
+| hand-offs through Monstrator | navigatord, navigator-ui |
+
+1. **L1** manifest `[[links]]`, frescod `LINK`, portcullisd grant/deliver and defaults,
+   `LINK` on the document channel; host tests.
+2. **L2** `monstratord` in its jail with the link checks and the flow, no sheet (default or
+   single app only); a test app bundle that takes `mailto`; VM gate.
+3. **L3** the sheet and "Always use", Curia's Links section.
+4. **L4** (= navigator-ui J4) navigatord's hand-offs through Monstrator, `NAVIGATORD_OPENER`
+   removed; links into the Navigator open trails; `navigator-confined-vm.sh`.
+5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
+
+## 9. Decisions, with recommendations
+
+| # | question | recommendation |
+|---|---|---|
+| D1 | Separate service or inside portcullisd | Separate, jailed (Shankar, 2026-11-15) |
+| D2 | Name | Monstrator (`monstratord`, `_monstrator` 65038) |
+| D3 | A press for every open | Yes, no background opens; notifications already give presses (tabula.md §2.4) |
+| D4 | Who spends the press | portcullisd, so a compromised Monstrator can't open links on its own |
+| D5 | `http`/`https` handlers | The Navigator only (system-signed bundles) |
+| D6 | Does the asker learn the app | No: opened or not, nothing else |
+| D7 | Move Scrinium's `OpenFile` here too | Not now: it passes descriptors portcullisd must narrow anyway; revisit if Monstrator's sheet should become the one "Open with" for files and links |
+| D8 | Delivery channel | The existing `opens.sock` with a `LINK` message, not a second socket |
