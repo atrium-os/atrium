@@ -1325,21 +1325,28 @@ fn cmd_remove(app_id: &str, keep_overlay: bool) -> ExitCode {
      * stays on disk — the worst of both answers. Go through the volume
      * lifecycle instead; it degrades to a plain remove_dir_all when the
      * overlay really is just a directory. */
-    if !keep_overlay && overlay_dir.exists() {
-        if let Err(e) = portcullis_overlay::destroy(app_id) {
-            eprintln!("portcullis remove: {e}");
-            return ExitCode::from(1);
+    // Every person's overlay of the app, and the machine-wide one (homes.md §3).
+    let _ = &overlay_dir;
+    for pl in portcullis_overlay::all_places(app_id) {
+        if !pl.dir.exists() && !pl.img.exists() {
+            continue;
         }
-        println!("removed {} and its backing volume", overlay_dir.display());
-    } else if keep_overlay && overlay_dir.exists() {
-        /* Unmount it, but keep the image: a kept overlay whose volume stays
-         * mounted would hold an md(4) device open against an app that is no
-         * longer installed. The next launch mounts it again. */
-        if let Err(e) = portcullis_overlay::teardown(app_id) {
-            eprintln!("portcullis remove: {e}");
-            return ExitCode::from(1);
+        if !keep_overlay {
+            if let Err(e) = portcullis_overlay::destroy(&pl) {
+                eprintln!("portcullis remove: {e}");
+                return ExitCode::from(1);
+            }
+            println!("removed {} and its backing volume", pl.dir.display());
+        } else {
+            /* Unmount it, but keep the image: a kept overlay whose volume stays
+             * mounted would hold an md(4) device open against an app that is no
+             * longer installed. The next launch mounts it again. */
+            if let Err(e) = portcullis_overlay::teardown(&pl) {
+                eprintln!("portcullis remove: {e}");
+                return ExitCode::from(1);
+            }
+            println!("kept {} (--keep-overlay)", pl.dir.display());
         }
-        println!("kept {} (--keep-overlay)", overlay_dir.display());
     }
 
     ExitCode::SUCCESS

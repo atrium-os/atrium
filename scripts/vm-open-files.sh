@@ -38,7 +38,9 @@
 #     stand-in, limen's view-probe) in its own jail and uid, read-only, no
 #     path, no /media, and a Web page and a PNG to the real doc-viewer,
 #     the Navigator's page worker, which decodes the picture in its jail;
-#     each goes when the pane moves on or closes;
+#     and a PDF to the pdf-viewer, Atrium PDF's child (folium.md §8),
+#     which draws its pages in a jail of its own; each goes when the pane
+#     moves on or closes;
 #   - nobody but the file manager may ask: the opener itself and alice are
 #     refused; the file manager without a press, or with a made-up one, is
 #     refused, and a refused "Always" changes no default.
@@ -82,7 +84,7 @@ V 'test -x /root/am/atrium-portcullisd-jclient && id grantfm >/dev/null' || { ec
 
 # What an earlier run that was stopped left: its sticks, Scrinium's jails.
 for d in $(mon "info usb" | tr -d '\r' | grep -o 'ID: ost[0-9]*' | cut -d' ' -f2); do mon "device_del $d" >/dev/null; done
-V "pkill -f /bin/scrinium; pkill -x open-probe; pkill -x atrium-write; pkill -x limend; pkill -x limen-view-probe; pkill -x navigator-page; for j in \$(jls name | grep '^app-scrinium-o'); do for m in \$(mount -p | awk -v r=/var/lib/atrium/jails/\$j/ 'index(\$2, r)==1 {print \$2}' | sort -r); do umount -f \$m; done; /root/am/atrium-portcullisd-jclient /var/run/atrium/jaild.sock remove \$j >/dev/null; done; true"
+V "pkill -f /bin/scrinium; pkill -x open-probe; pkill -x atrium-write; pkill -x limend; pkill -x limen-view-probe; pkill -x navigator-page; pkill -x atrium-pdf; for j in \$(jls name | grep '^app-scrinium-o'); do for m in \$(mount -p | awk -v r=/var/lib/atrium/jails/\$j/ 'index(\$2, r)==1 {print \$2}' | sort -r); do umount -f \$m; done; /root/am/atrium-portcullisd-jclient /var/run/atrium/jaild.sock remove \$j >/dev/null; done; true"
 sleep 3
 
 echo "=== the stick: a FLAC, an ODT, a PDF that is HTML, a script, a text file"
@@ -117,6 +119,33 @@ z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships 
 z.writestr("word/document.xml", '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="%s"><w:body><w:p><w:r><w:t>Once upon a time.</w:t></w:r></w:p></w:body></w:document>' % W)
 z.close()
 PY
+python3 -I - "$SD/zine.pdf" <<'PY'
+# A typical two-page PDF: standard-14 text (drawn with the Liberation
+# faces), filled and stroked paths, a rule.
+import sys
+pages = []
+for n in (1, 2):
+    c = (b"0.1 0.3 0.7 rg 72 640 200 80 re f 0 0 0 RG 2 w 300 640 m 520 720 l S 0.5 w 72 600 m 540 600 l S "
+         b"0.1 g BT /F1 28 Tf 72 560 Td (A typical page %d) Tj /F2 12 Tf 0 -30 Td 14 TL "
+         b"(Folium draws this text with its own fonts and renderer,) Tj T* (in a jail of its own, from a read-only descriptor.) Tj ET" % n)
+    pages.append(c)
+objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+        b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R >> >> >>",
+        b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R >> >> >>"]
+for c in pages:
+    objs.append(b"<< /Length %d >>\nstream\n" % len(c) + c + b"\nendstream")
+objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+objs.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>")
+objs.append(b"<< /Title (A typical PDF) >>")
+out = b"%PDF-1.4\n"; offs = []
+for i, o in enumerate(objs):
+    offs.append(len(out)); out += b"%d 0 obj\n" % (i + 1) + o + b"\nendobj\n"
+x = len(out)
+out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offs)
+out += b"trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, len(objs), x)
+open(sys.argv[1], "wb").write(out)
+PY
 rm -f "$IMG"; truncate -s 64M "$IMG"
 python3 -I - "$IMG" <<'PY'
 import struct,sys
@@ -125,7 +154,7 @@ e=struct.pack("<B3sB3sII",0,b"\0\2\0",0x0C,b"\xfe\xff\xff",2048,size-2048)
 f.seek(446); f.write(e); f.seek(510); f.write(b"\x55\xaa")
 PY
 mkfs.fat -F 32 --offset 2048 -n OPENS "$IMG" $(( (64*1024*1024 - 1048576) / 1024 )) >/dev/null || { echo "mkfs failed"; exit 1; }
-for f in song.flac notes.odt invoice.pdf run.sh hello.txt story.docx web.html wide.png; do MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" "$SD/$f" ::$f || exit 1; done
+for f in song.flac notes.odt invoice.pdf run.sh hello.txt story.docx web.html wide.png zine.pdf; do MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" "$SD/$f" ::$f || exit 1; done
 ODT_SUM=$(sha256sum "$SD/notes.odt" | cut -d' ' -f1)
 DOCX_SUM=$(sha256sum "$SD/story.docx" | cut -d' ' -f1)
 rm -rf "$SD"
@@ -142,6 +171,7 @@ xb atrium-write "--bin atrium-write"
 xb officina-convert "--bin officina-convert"
 xb limen "--bin limend --example limen-view-probe"
 xb navigator-page "--bin navigator-page"
+xb atrium-pdf "--bin atrium-pdf"
 
 echo "=== copy and set up"
 B=/var/tmp/of
@@ -151,7 +181,7 @@ for b in "frescod/target/$TARGET/release/frescod" "scrinium/target/$TARGET/relea
          "atrium-open/target/$TARGET/release/examples/open-probe" "atrium-write/target/$TARGET/release/atrium-write" \
          "officina-convert/target/$TARGET/release/officina-convert" "atrium-write/atrium.toml" \
          "limen/target/$TARGET/release/limend" "limen/target/$TARGET/release/examples/limen-view-probe" \
-         "navigator-page/target/$TARGET/release/navigator-page"; do
+         "navigator-page/target/$TARGET/release/navigator-page" "atrium-pdf/target/$TARGET/release/atrium-pdf"; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || exit 1
     [ "$(sha256sum "$ROOT/$b" | cut -d' ' -f1)" = "$(V "sha256 -q $B/$(basename $b)")" ] || { echo "ABORT: $(basename $b) arrived damaged"; exit 1; }
     case $b in atrium-write/atrium.toml) V "mv $B/atrium.toml $B/write.toml" ;; esac
@@ -230,11 +260,19 @@ opifex uninstall org.test.page >/dev/null 2>&1 || true
 openssl dgst -sha256 -sign /root/of-key.pem -out \$V3/atrium.toml.sig \$V3/atrium.toml
 opifex install \$V3 >/dev/null
 portcullis policy grant --system org.test.page >/dev/null
+# Atrium PDF's child as the pdf-viewer (folium.md §8): its own bundle.
+V4=$B/fbundle; rm -rf \$V4; mkdir -p \$V4/bin; cp $B/atrium-pdf \$V4/bin/
+printf '[app]\nid = "org.test.pdf"\nname = "PDF"\nversion = "1"\nentry = "bin/atrium-pdf"\n\n[resources]\nmemory = "512M"\ncpu = 100\n' > \$V4/atrium.toml
+opifex uninstall org.test.pdf >/dev/null 2>&1 || true
+openssl dgst -sha256 -sign /root/of-key.pem -out \$V4/atrium.toml.sig \$V4/atrium.toml
+opifex install \$V4 >/dev/null
+portcullis policy grant --system org.test.pdf >/dev/null
 pw usershow _limen >/dev/null 2>&1 || pw useradd _limen -u 65022 -d /nonexistent -s /usr/sbin/nologin
 # In jaild's user range: a test worker, not a system one.
 [ "\$(id -u _viewer 2>/dev/null)" = 50650 ] || { pw userdel _viewer 2>/dev/null || true; pw groupdel _viewer 2>/dev/null || true; pw groupadd _viewer -g 50650; pw useradd _viewer -u 50650 -g _viewer -d /nonexistent -s /usr/sbin/nologin; }
 grep -q 'workers."org.test.viewer"' /etc/atrium/policy.toml 2>/dev/null || printf '\n[workers."org.test.viewer"]\ncallers    = ["_limen"]\nrun_as     = "_viewer"\nconcurrent = 8\n' >> /etc/atrium/policy.toml
 grep -q 'workers."org.test.page"' /etc/atrium/policy.toml 2>/dev/null || printf '\n[workers."org.test.page"]\ncallers    = ["_limen"]\nrun_as     = "_viewer"\nconcurrent = 8\n' >> /etc/atrium/policy.toml
+grep -q 'workers."org.test.pdf"' /etc/atrium/policy.toml 2>/dev/null || printf '\n[workers."org.test.pdf"]\ncallers    = ["_limen"]\nrun_as     = "_viewer"\nconcurrent = 8\n' >> /etc/atrium/policy.toml
 chmod 644 /etc/atrium/policy.toml
 rm -f /var/db/atrium/alice/opens.toml
 rm -rf /tmp/of; mkdir -p /tmp/of; chmod 777 /tmp/of
@@ -274,7 +312,7 @@ V "cd /tmp/of && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/of/screen FRESCOD
    daemon -f -o /tmp/of/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 /tmp/of/*.sock /atrium/sockets/fresco/fresco.sock"
-V "cd /tmp/of && env LIMEN_SOCKET=/tmp/of/limend.sock LIMEN_DEFAULTS=doc-viewer=org.test.page,media-player=org.test.viewer \
+V "cd /tmp/of && env LIMEN_SOCKET=/tmp/of/limend.sock LIMEN_DEFAULTS=doc-viewer=org.test.page,media-player=org.test.viewer,pdf-viewer=org.test.pdf \
    LIMEN_FRESCOD_ACTIVATION=/tmp/of/activation.sock daemon -f -o /tmp/of/limend.log -u _limen $B/limend </dev/null"
 i=0; while [ $i -lt 20 ] && ! V "test -S /tmp/of/limend.sock"; do sleep 1; i=$((i+1)); done
 SENV="LIMEN_SOCKET=/tmp/of/limend.sock FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock SCRINIUM_MEDIA_SOCKET=/sock/removable-media.sock SCRINIUM_TRACE=1"
@@ -298,7 +336,7 @@ sleep $WAIT
 waitfor "places=\[$PART\]" 30 && ok "up with the stick" || bad "Scrinium: $(trace | cut -c1-200) $(V 'tail -3 /tmp/of/scrinium.log' | tr '\n' ';')"
 # The stick may need a press in the sidebar to open.
 waitfor "place=$PART" 4 || { press 90 92; waitfor "place=$PART" 10 || press 90 80; }
-waitfor "entries=\[hello.txt,invoice.pdf,notes.odt,run.sh,song.flac,story.docx,web.html,wide.png\]" 20 && ok "the stick's files listed" || bad "listing: $(trace | cut -c1-240)"
+waitfor "entries=\[hello.txt,invoice.pdf,notes.odt,run.sh,song.flac,story.docx,web.html,wide.png,zine.pdf\]" 20 && ok "the stick's files listed" || bad "listing: $(trace | cut -c1-240)"
 shot 2 open-0-files
 
 # Rows: the window is 960x600 at the origin; the list's first row is at
@@ -535,10 +573,23 @@ waitlook "wide.png:embed:doc-viewer" && ok "a PNG goes to the doc-viewer too" ||
 waitnp "picture " && ok "the worker decoded it in its jail: $(np 'picture ' | sed 's/.*picture //')" || bad "no picture: $(V "grep navigator-page $LL | tail -4" | tr '\n' ';')"
 check "reduced to fit, never past 2048" "picture 1600x400" "$(np 'picture ' | grep -o 'picture [0-9]*x[0-9]*')"
 shot 3 open-11-look-picture
+key 81
+waitlook "zine.pdf:embed:pdf-viewer" && ok "a PDF goes to the pdf-viewer" || bad "look: $(look)"
+ap() { V "grep 'atrium-pdf: $1' $LL | tail -1"; }
+waitap() { i=0; while [ $i -lt ${2:-90} ] && [ -z "$(ap "$1")" ]; do sleep 3; i=$((i+3)); done; [ -n "$(ap "$1")" ]; }
+fj() { V "jls name | grep -c org-test-pdf" | tr -d ' '; }
+waitap "2 pages" && ok "Atrium PDF opened it: $(ap '2 pages' | sed 's/.*atrium-pdf: //')" || bad "not opened: $(V "grep atrium-pdf $LL | tail -4" | tr '\n' ';')"
+waitap "first screen" && ok "and drew the first screen: $(ap 'first screen' | sed 's/.*atrium-pdf: //')" || bad "no first screen: $(V "grep atrium-pdf $LL | tail -4" | tr '\n' ';')"
+check "in a jail of its own" 1 "$(fj)"
+check "as the viewer's own user" 50650 "$(V "ps -o uid= -p \$(pgrep -x atrium-pdf | head -1)" | tr -d ' ')"
+check "the jail has no stick" "" "$(V "mount -p | awk '\$2 ~ /org-test-pdf.*media/'")"
+shot 4 open-12-look-pdf
 key 44
 waitlook "^-$" 10 && ok "Space again closes the pane" || bad "look: $(look)"
 i=0; while [ $i -lt 30 ] && [ "$(pj)" != 0 ]; do sleep 2; i=$((i+2)); done
 check "and the worker's jail goes with it" 0 "$(pj)"
+i=0; while [ $i -lt 30 ] && [ "$(fj)" != 0 ]; do sleep 2; i=$((i+2)); done
+check "and Atrium PDF's" 0 "$(fj)"
 
 echo "=== only the file manager, only with a press"
 ask() { # user json-line: hello, then the line, as that user

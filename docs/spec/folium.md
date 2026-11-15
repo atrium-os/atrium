@@ -2,6 +2,16 @@
 
 Status: accepted 2026-11-15 as recommended (D1–D20); building. P1 built
 2026-11-15 (`folium-syntax`, `folium-doc`, `folium-dump`, fuzz target).
+P2 built 2026-11-15: `folium-font`, `folium-content`, `folium-render`
+(tiny-skia; Liberation as the standard 14), first corpus score 73/74 pages
+within tolerance of Poppler; the `atrium-pdf` engine (lazy pages, 512 px
+tiles in a 192 MB cache, 24 display lists, worker pool with cancellation;
+first screen 7–163 ms on the heavy set) as Limen's `pdf-viewer` child;
+Scrinium quick look sends PDFs (`vm-open-files.sh`); `officina-pdf` on the
+shared base (`folium-syntax::write`, `folium-font::subset` and ToUnicode,
+`folium-content::ops`), export gate unchanged (1,474 pages in 5.4 s, pages
+pixel-identical, read back by Folium 12/12). Open: content and render fuzz
+targets, the vector Fresco path (D11).
 Asked by Shankar (2026-11-15): after comparing an existing pure-Rust
 renderer with our own, "let's build our own... build the specs and let me
 review".

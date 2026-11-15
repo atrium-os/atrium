@@ -2,7 +2,13 @@
 
 Status: accepted 2026-11-15 (Shankar: "accept as recommended", H4–H7 as recommended), from a discussion with Shankar ("you work in an
 app context, not a user context"; "a standard terminal defeats the purpose of
-jailed apps"; per-app data under the person's home: yes).
+jailed apps"; per-app data under the person's home: yes). W1 built
+2026-11-15 (§8): overlays at `~/.atrium/apps/<id>`, the app uid's, 0700,
+moved from the machine-wide place on first launch; session state at
+`~/.atrium/state`; the five folders and `files-<person>` with `home-files`;
+gate `scripts/vm-homes-check.sh` 0 failed. On FreeBSD a folder's group
+always passes to what is made in it, so 2770's setgid bit only documents
+the intent there.
 
 Related: [portcullis.md](portcullis.md) §4 (app jails and overlays), §9.0
 (per-app uids); [forum.md](forum.md) §6 (session components' state folders);

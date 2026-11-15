@@ -179,6 +179,8 @@ pub fn look_kind(name: &str, head: &[u8]) -> LookBody {
         // in its jail; the kinds its decoders don't read say so.
         Detected::Known(t) if t.family == Family::Image && PICTURES.contains(&t.mime) => LookBody::Embed { role: "doc-viewer", mime: t.mime.into(), words: t.words.into() },
         Detected::Known(t) if t.family == Family::Image => LookBody::Info { words: t.words.into(), why: Some("No viewer shows these yet".into()) },
+        // PDFs go to Atrium PDF's own viewer (folium.md §8, D4).
+        Detected::Known(t) if t.mime == "application/pdf" => LookBody::Embed { role: "pdf-viewer", mime: t.mime.into(), words: t.words.into() },
         Detected::Known(t) if matches!(t.family, Family::Audio | Family::Video) => LookBody::Embed { role: "media-player", mime: t.mime.into(), words: t.words.into() },
         Detected::Known(t) if text && matches!(t.family, Family::Text | Family::Link) => LookBody::Text { text: String::new(), words: t.words.into(), cut: false },
         Detected::Known(t) => LookBody::Info { words: t.words.into(), why: None },
@@ -1270,6 +1272,7 @@ mod tests {
         assert!(matches!(look_kind("cat.png", b"\x89PNG\r\n\x1a\n"), LookBody::Embed { role: "doc-viewer", .. }));
         assert!(matches!(look_kind("logo.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\">"), LookBody::Embed { role: "doc-viewer", .. }));
         assert!(matches!(look_kind("scan.tiff", b"II*\x00"), LookBody::Info { why: Some(_), .. }));
+        assert!(matches!(look_kind("guide.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"), LookBody::Embed { role: "pdf-viewer", .. }));
         // A Web page named as a PDF: no viewer, only its text.
         let LookBody::Text { words, .. } = look_kind("invoice.pdf", b"<!DOCTYPE html><script>steal()</script>") else { panic!() };
         assert!(words.contains("PDF"), "{words}");

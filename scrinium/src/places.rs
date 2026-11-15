@@ -5,6 +5,10 @@
 //!   `/media/<part>` (device-assignment.md §4.8), and tells it on the
 //!   `removable-media/` socket which come and go. Without that socket (a
 //!   development run) the media folder is looked at every two seconds.
+//! - **The person's own folders** (homes.md §2, scrinium.md §9 H1): with
+//!   `home-files`, portcullisd puts Documents, Downloads, Pictures, Music
+//!   and Videos in the jail at `/atrium/home` (`SCRINIUM_HOME` in a
+//!   development run); they come first.
 //! - **Folders it was given**, from `SCRINIUM_PLACES`
 //!   (`Label=/path;Other=/path`): the app's `filesystem` grants.
 
@@ -48,6 +52,24 @@ pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
         network,
         offline: false,
     }
+}
+
+/// The person's folders, in the order the sidebar shows them.
+pub const HOME_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures", "Music", "Videos"];
+
+/// The person's folders present in `dir` (`SCRINIUM_HOME`, else
+/// `/atrium/home`) as places.
+pub fn home() -> Vec<Place> {
+    let dir = std::env::var_os("SCRINIUM_HOME").map(PathBuf::from).unwrap_or_else(|| "/atrium/home".into());
+    home_in(&dir)
+}
+
+pub fn home_in(dir: &Path) -> Vec<Place> {
+    HOME_FOLDERS
+        .iter()
+        .filter(|f| dir.join(f).is_dir())
+        .map(|f| Place { id: format!("home:{}", f.to_ascii_lowercase()), label: (*f).into(), root: dir.join(f), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
+        .collect()
 }
 
 /// `SCRINIUM_PLACES`.
@@ -176,5 +198,18 @@ mod tests {
         let c = parse_places("Documents=/home/ana/Documents; bad ;Rel=relative;=/x");
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].label.as_str(), c[0].stick), ("Documents", false));
+    }
+
+    #[test]
+    fn home_folders_in_order() {
+        let d = std::env::temp_dir().join(format!("scr-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["Music", "Documents", "Stray"] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+        }
+        let h = home_in(&d);
+        assert_eq!(h.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["Documents", "Music"]);
+        assert_eq!(h[0].id, "home:documents");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

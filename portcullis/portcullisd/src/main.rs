@@ -1269,9 +1269,34 @@ fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<Str
     if !plain_segment(owner) || !plain_segment(app_id) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a plain name"));
     }
-    let person = std::path::Path::new(STATE_ROOT).join(owner);
+    /* homes.md §2: in the person's home, at ~/.atrium/state/<component>
+     * (`.atrium` and `state` root's, 0755), when they have a home; the
+     * machine-wide STATE_ROOT/<person> otherwise. A folder left at the old
+     * place is moved in the first time. */
+    let legacy = std::path::Path::new(STATE_ROOT).join(owner);
+    let person = match portcullis_overlay::home_of(owner) {
+        Some(home) => {
+            portcullis_overlay::apps_root(&home).map_err(std::io::Error::other)?;
+            let st = home.join(".atrium").join("state");
+            if std::fs::symlink_metadata(&st).is_err() {
+                std::fs::DirBuilder::new().mode(0o755).create(&st)?;
+                std::os::unix::fs::chown(&st, Some(0), Some(0))?;
+            }
+            st
+        }
+        None => legacy.clone(),
+    };
     std::fs::DirBuilder::new().recursive(true).mode(0o755).create(&person)?;
     let dir = person.join(app_id);
+    let old = legacy.join(app_id);
+    if person != legacy && std::fs::symlink_metadata(&dir).is_err() && std::fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
+        if std::fs::rename(&old, &dir).is_err() {
+            let ok = std::process::Command::new("cp").arg("-Rp").arg(&old).arg(&dir).status().is_ok_and(|s| s.success());
+            if ok {
+                let _ = std::fs::remove_dir_all(&old);
+            }
+        }
+    }
     match std::fs::symlink_metadata(&dir) {
         Ok(m) if !m.file_type().is_dir() =>
             return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "not a folder")),

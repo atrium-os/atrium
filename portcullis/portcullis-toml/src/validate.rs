@@ -244,6 +244,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.removable-files = true: restricted to the file manager (every USB stick, \
              read-write, while it runs); requires explicit policy approval"));
     }
+    if c.home_files == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.home-files = true: restricted to the file manager (every one of the person's \
+             own files, read-write, while it runs); requires explicit policy approval"));
+    }
     if c.file_picker == Some(true) {
         r.warnings.push(format!(
             "{ctx}.file-picker = true: restricted to the system file picker (puts what the \

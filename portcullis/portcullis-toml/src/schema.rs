@@ -260,6 +260,13 @@ pub struct Capabilities {
     /// by itself (that is `removable-files`). Restricted to Scrinium.
     #[serde(rename = "file-picker")]
     pub file_picker: Option<bool>,
+    /// The person's own files (homes.md §2, scrinium.md §9 H1): their
+    /// Documents, Downloads, Pictures, Music and Videos, read-write, in the
+    /// jail at `/atrium/home/<folder>`, through the person's `files-<person>`
+    /// group. Restricted to the file manager; every other app gets files the
+    /// person picks, one at a time.
+    #[serde(rename = "home-files")]
+    pub home_files: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -488,6 +495,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         navigator_page:   ovr.navigator_page.or(base.navigator_page),
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),
+        home_files:       ovr.home_files.or(base.home_files),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

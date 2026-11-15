@@ -506,6 +506,8 @@ impl Network {
         let msg = if role == "doc-viewer" {
             let kind = if mime.starts_with("image/") { limen::doc_viewer::DocKind::Picture } else { limen::doc_viewer::DocKind::Html };
             limen::doc_viewer::ToChild::Load { kind, base: String::new(), dark: false }.encode()
+        } else if role == "pdf-viewer" {
+            limen::pdf_viewer::ToChild::Load { dark: false }.encode()
         } else {
             limen::media_player::ToChild::Load { source: limen::media_player::Source::Fd, mime, growing: false }.encode()
         };
@@ -875,7 +877,9 @@ fn main() {
             Err((st, m)) => eprintln!("scrinium: no standing grant of the sticks: {m} (status {st})"),
         }
     }
-    let configured = places::configured();
+    // The person's folders first, then the folders it was given.
+    let mut configured = places::home();
+    configured.extend(places::configured());
     let shared: SharedPlaces = Arc::new(Mutex::new(Places { list: configured.clone(), gen: 1 }));
     let (ptx, prx) = mpsc::channel();
     places::watch(ptx);

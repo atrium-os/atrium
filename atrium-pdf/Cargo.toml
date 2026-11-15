@@ -1,0 +1,28 @@
+[package]
+name = "atrium-pdf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Atrium PDF (docs/spec/folium.md §8): the Limen pdf-viewer child, and later the app, in one binary. Pages are laid out lazily, interpreted once into display lists, and drawn as tiles at the painted size by a worker pool that drops work the reader scrolled away from."
+
+[lib]
+name = "atrium_pdf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-pdf"
+path = "src/bin/atrium-pdf.rs"
+
+[dependencies]
+limen = { path = "../limen" }
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+folium-syntax = { path = "../folium-syntax" }
+folium-doc = { path = "../folium-doc" }
+folium-content = { path = "../folium-content" }
+folium-render = { path = "../folium-render" }
+
+[profile.release]
+debug = 1

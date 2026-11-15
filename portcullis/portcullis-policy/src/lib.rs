@@ -205,6 +205,7 @@ pub struct CapabilityDelta {
     pub navigator_page:  bool,
     pub removable_files: bool,
     pub file_picker:     bool,
+    pub home_files:      bool,
     pub status_item:     bool,
     pub audio_device:    bool,
     pub net_fetch:       bool,
@@ -258,6 +259,7 @@ impl CapabilityDelta {
             && !self.navigator_page
             && !self.removable_files
             && !self.file_picker
+            && !self.home_files
             && !self.status_item
             && !self.audio_device
             && !self.net_fetch
@@ -307,6 +309,7 @@ impl CapabilityDelta {
         if self.navigator_page  { out.push("Fetch the Navigator's pages by ticket (the Navigator's page view)".into()); }
         if self.removable_files { out.push("Read and change every file on the USB sticks plugged in".into()); }
         if self.file_picker     { out.push("Be the file picker: give other apps the files and folders you pick".into()); }
+        if self.home_files      { out.push("Read and change all of your own files (Documents, Downloads, Pictures, Music, Videos)".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
@@ -407,6 +410,7 @@ pub fn compute_delta(
     bool_cap!(navigator_page);
     bool_cap!(removable_files);
     bool_cap!(file_picker);
+    bool_cap!(home_files);
     bool_cap!(status_item);
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
@@ -612,6 +616,7 @@ mod tests {
             navigator_page: None,
             removable_files: None,
             file_picker: None,
+            home_files: None,
             status_item: None,
             audio_device: None,
             net_fetch: None,

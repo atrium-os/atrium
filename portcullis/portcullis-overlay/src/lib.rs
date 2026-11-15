@@ -1,8 +1,14 @@
-//! Per-app overlay VOLUMES (`docs/spec/portcullis.md` §4.1, §4.2).
+//! Per-app overlay VOLUMES (`docs/spec/portcullis.md` §4.1, §4.2), one per
+//! person and app (`docs/spec/homes.md` §3, H7).
 //!
-//! Each app's writable overlay is its own Tessera volume mounted at
-//! `/var/lib/atrium/overlays/<app.id>`, backed by an image file under
-//! `/var/lib/atrium/overlay-vols/<app.id>.img` through `md(4)`:
+//! Each app's writable overlay is its own Tessera volume. For a person with a
+//! home it lives in that home: mounted at `~/.atrium/apps/<app.id>/`, backed
+//! by `~/.atrium/apps/<app.id>.img`, so everything that is the person's is one
+//! tree. Without a person (or a home) it is the older machine-wide place:
+//! mounted at `/var/lib/atrium/overlays/<app.id>`, backed by an image file
+//! under `/var/lib/atrium/overlay-vols/<app.id>.img`; a person's first launch
+//! moves an overlay found there into their home ([`adopt_legacy`]). Either
+//! way through `md(4)`:
 //!
 //! ```text
 //! mkfs-tessera --create -s <MiB> overlay-vols/<id>.img
@@ -91,14 +97,90 @@ pub enum Backing {
     Directory,
 }
 
-/// Where the app's overlay is mounted.
-pub fn overlay_dir(app_id: &str) -> PathBuf {
-    PathBuf::from(OVERLAYS_DIR).join(app_id)
+/// Where an overlay is mounted and the image that backs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub dir: PathBuf,
+    pub img: PathBuf,
+    /// The person whose home holds it (None: the machine-wide place).
+    pub person: Option<String>,
 }
 
-/// The backing image for the app's overlay volume.
-pub fn image_path(app_id: &str) -> PathBuf {
-    PathBuf::from(OVERLAY_VOLS_DIR).join(format!("{app_id}.img"))
+/// The machine-wide place (before homes.md, and for launches with no person).
+pub fn legacy_place(app_id: &str) -> Place {
+    Place { dir: PathBuf::from(OVERLAYS_DIR).join(app_id), img: PathBuf::from(OVERLAY_VOLS_DIR).join(format!("{app_id}.img")), person: None }
+}
+
+/// A name that is one plain path segment (an app id, a login name).
+pub fn plain_segment(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && s.len() <= 255 && !s.contains('/') && !s.contains('\0')
+}
+
+/// The person's home from the password database, when it is a real
+/// directory (not `/nonexistent`, not a link) and not `/`.
+pub fn home_of(person: &str) -> Option<PathBuf> {
+    if !plain_segment(person) {
+        return None;
+    }
+    let c = std::ffi::CString::new(person).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut res) };
+    if r != 0 || res.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = PathBuf::from(unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_string_lossy().into_owned());
+    let m = fs::symlink_metadata(&dir).ok()?;
+    (m.is_dir() && dir != Path::new("/") && dir.is_absolute()).then_some(dir)
+}
+
+/// `~/.atrium/apps` in `home`, made if missing: `.atrium` and `apps` are
+/// root's, 0755, so nothing but root can swap an app's folder for a link
+/// (homes.md §2). Refuses either when it is a link or not root's.
+pub fn apps_root(home: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let mut at = home.to_path_buf();
+    for part in [".atrium", "apps"] {
+        at.push(part);
+        match fs::symlink_metadata(&at) {
+            Ok(m) if m.is_dir() && m.uid() == 0 => {}
+            Ok(_) => return Err(format!("{} is not root's own folder", at.display())),
+            Err(_) => {
+                fs::DirBuilder::new().mode(0o755).create(&at).map_err(|e| format!("create {}: {e}", at.display()))?;
+                std::os::unix::fs::chown(&at, Some(0), Some(0)).map_err(|e| format!("chown {}: {e}", at.display()))?;
+            }
+        }
+    }
+    Ok(at)
+}
+
+/// Where `person`'s overlay of `app_id` lives: in their home when they have
+/// one, else the machine-wide place.
+pub fn place(person: Option<&str>, app_id: &str) -> Place {
+    if let Some(p) = person {
+        if let (Some(home), true) = (home_of(p), plain_segment(app_id)) {
+            let apps = home.join(".atrium").join("apps");
+            return Place { dir: apps.join(app_id), img: apps.join(format!("{app_id}.img")), person: Some(p.to_string()) };
+        }
+    }
+    legacy_place(app_id)
+}
+
+/// Every place an overlay of `app_id` may be: the machine-wide one and each
+/// person's under `/home` (for `portcullis remove`).
+pub fn all_places(app_id: &str) -> Vec<Place> {
+    let mut v = vec![legacy_place(app_id)];
+    if let Ok(rd) = fs::read_dir("/home") {
+        for e in rd.flatten() {
+            let person = e.file_name().to_string_lossy().into_owned();
+            let p = place(Some(&person), app_id);
+            if p.person.is_some() && (p.img.exists() || p.dir.exists()) {
+                v.push(p);
+            }
+        }
+    }
+    v
 }
 
 /// Image size for a given quota: the quota plus the filesystem's own overhead.
@@ -161,9 +243,9 @@ fn mount_at(dir: &Path) -> Option<(String, String)> {
     Some((cstr(&sfs.f_fstypename), cstr(&sfs.f_mntfromname)))
 }
 
-/// Is the app's overlay currently mounted as its own Tessera volume?
-pub fn mounted_volume(app_id: &str) -> Option<String> {
-    match mount_at(&overlay_dir(app_id)) {
+/// Is the overlay at `pl` currently mounted as its own Tessera volume?
+pub fn mounted_volume(pl: &Place) -> Option<String> {
+    match mount_at(&pl.dir) {
         Some((fstype, from)) if fstype == "tessera" => Some(from),
         _ => None,
     }
@@ -236,12 +318,19 @@ fn detach(unit: &str) {
 ///   - The image DOES exist and cannot be mounted: hard error. The app's
 ///     persistent state lives inside that image, and quietly substituting an
 ///     empty directory would present as data loss.
-pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String> {
-    let dir = overlay_dir(app_id);
-    let img = image_path(app_id);
+pub fn ensure_mounted(pl: &Place, app_id: &str, quota_bytes: u64) -> Result<Backing, String> {
+    let (dir, img) = (pl.dir.clone(), pl.img.clone());
 
-    if let Some(device) = mounted_volume(app_id) {
+    if let Some(device) = mounted_volume(pl) {
         return Ok(Backing::Volume { device });
+    }
+    if pl.person.is_some() {
+        let home_apps = dir.parent().ok_or("an overlay with no folder above it")?;
+        apps_root(home_apps.parent().and_then(Path::parent).ok_or("no home above .atrium")?)?;
+        adopt_legacy(pl, app_id)?;
+        if let Some(device) = mounted_volume(pl) {
+            return Ok(Backing::Volume { device });
+        }
     }
 
     /* Clamp, but never silently: an app that declared 20 GiB and quietly got
@@ -295,19 +384,20 @@ pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String>
         }
     }
 
+    let vols = img.parent().unwrap_or(Path::new(OVERLAY_VOLS_DIR)).to_path_buf();
     if !img_exists {
-        if let Err(e) = fs::create_dir_all(OVERLAY_VOLS_DIR) {
-            return fail(format!("create {OVERLAY_VOLS_DIR}: {e}"));
+        if let Err(e) = fs::create_dir_all(&vols) {
+            return fail(format!("create {}: {e}", vols.display()));
         }
         /* The image can be no larger than the store holding it: Tessera
          * refuses to extend a file past its own volume's capacity. Clamp here
          * rather than let mkfs-tessera die with EFBIG and demote the app to a
          * directory. */
-        if let Some(store) = store_bytes(Path::new(OVERLAY_VOLS_DIR)) {
+        if let Some(store) = store_bytes(&vols) {
             let fits = max_quota_fitting(store);
             if fits < MIN_QUOTA_BYTES {
-                return fail(format!("{OVERLAY_VOLS_DIR} is only {} MiB, too \
-                    small for a {} MiB overlay", store / (1024 * 1024),
+                return fail(format!("{} is only {} MiB, too \
+                    small for a {} MiB overlay", vols.display(), store / (1024 * 1024),
                     MIN_QUOTA_BYTES / (1024 * 1024)));
             }
             if quota > fits {
@@ -396,9 +486,9 @@ pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String>
 /// Unmount the app's overlay volume and release its `md(4)` device. Leaves the
 /// image file alone — the app's state is in there. Used when the app is
 /// uninstalled with its overlay kept, and as the first half of [`destroy`].
-pub fn teardown(app_id: &str) -> Result<(), String> {
-    let dir = overlay_dir(app_id);
-    let Some(device) = mounted_volume(app_id) else { return Ok(()) };
+pub fn teardown(pl: &Place) -> Result<(), String> {
+    let dir = &pl.dir;
+    let Some(device) = mounted_volume(pl) else { return Ok(()) };
 
     let st = Command::new("umount").arg(&dir).status();
     match st {
@@ -419,20 +509,68 @@ pub fn teardown(app_id: &str) -> Result<(), String> {
 /// mounted volume that empties the volume's contents and then fails to remove
 /// the mount point, leaving the volume mounted and the image on disk — the
 /// state is gone but the space is not.
-pub fn destroy(app_id: &str) -> Result<(), String> {
-    teardown(app_id)?;
-    let img = image_path(app_id);
+pub fn destroy(pl: &Place) -> Result<(), String> {
+    teardown(pl)?;
+    let img = &pl.img;
     if img.exists() {
         fs::remove_file(&img)
             .map_err(|e| format!("remove {}: {e}", img.display()))?;
     }
-    let dir = overlay_dir(app_id);
+    let dir = &pl.dir;
     if dir.exists() {
         // Now an ordinary empty directory (or a directory-backed overlay).
         fs::remove_dir_all(&dir)
             .map_err(|e| format!("remove {}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// Move an overlay from the machine-wide place into `pl` (a person's home),
+/// the first time that person launches the app after homes.md (§3,
+/// "Migration"). Only when `pl` holds nothing yet: a home that already has
+/// the app's state keeps it, and the machine-wide copy is left alone.
+///
+/// A volume is unmounted and its image moved (renamed, or copied and then
+/// removed when the home is on another file system); a plain-directory
+/// overlay is moved the same way. The volume is mounted again at its new
+/// place by the caller.
+pub fn adopt_legacy(pl: &Place, app_id: &str) -> Result<(), String> {
+    let old = legacy_place(app_id);
+    if pl.person.is_none() || pl.img.exists() {
+        return Ok(());
+    }
+    let occupied = |d: &Path| fs::read_dir(d).map(|mut r| r.next().is_some()).unwrap_or(false);
+    if occupied(&pl.dir) {
+        return Ok(());
+    }
+    if old.img.exists() {
+        teardown(&old)?;
+        move_path(&old.img, &pl.img)?;
+        let _ = fs::remove_dir(&old.dir);
+        eprintln!("portcullis: moved {app_id}'s overlay into {} (homes.md §3)", pl.img.display());
+    } else if occupied(&old.dir) && mount_at(&old.dir).is_none() {
+        let _ = fs::remove_dir(&pl.dir);
+        move_path(&old.dir, &pl.dir)?;
+        eprintln!("portcullis: moved {app_id}'s overlay folder into {} (homes.md §3)", pl.dir.display());
+    }
+    Ok(())
+}
+
+/// Rename, or copy (keeping modes, owners and times) and remove when the two
+/// are on different file systems.
+fn move_path(from: &Path, to: &Path) -> Result<(), String> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            let st = Command::new("cp").arg("-Rp").arg(from).arg(to).status().map_err(|e| format!("cp {}: {e}", from.display()))?;
+            if !st.success() {
+                let _ = if to.is_dir() { fs::remove_dir_all(to) } else { fs::remove_file(to) };
+                return Err(format!("cp -Rp {} {}: {st}", from.display(), to.display()));
+            }
+            if from.is_dir() { fs::remove_dir_all(from) } else { fs::remove_file(from) }.map_err(|e| format!("remove {}: {e}", from.display()))
+        }
+        Err(e) => Err(format!("move {} to {}: {e}", from.display(), to.display())),
+    }
 }
 
 /// Parse a size like `512M`, `2G`, `1024K` or a bare byte count, as used by
@@ -513,9 +651,35 @@ mod tests {
 
     #[test]
     fn paths_are_per_app() {
-        assert_eq!(overlay_dir("org.atrium.edit"),
-            PathBuf::from("/var/lib/atrium/overlays/org.atrium.edit"));
-        assert_eq!(image_path("org.atrium.edit"),
-            PathBuf::from("/var/lib/atrium/overlay-vols/org.atrium.edit.img"));
+        let l = legacy_place("org.atrium.edit");
+        assert_eq!(l.dir, PathBuf::from("/var/lib/atrium/overlays/org.atrium.edit"));
+        assert_eq!(l.img, PathBuf::from("/var/lib/atrium/overlay-vols/org.atrium.edit.img"));
+        // No such person: the machine-wide place.
+        assert_eq!(place(Some("nobody-here-at-all"), "org.atrium.edit"), l);
+        assert_eq!(place(Some("../etc"), "org.atrium.edit"), l);
+        assert_eq!(place(None, "org.atrium.edit"), l);
+    }
+
+    #[test]
+    fn a_person_with_a_home_gets_theirs() {
+        // root's home is a real folder on any test host.
+        let Some(home) = home_of("root") else { return };
+        let p = place(Some("root"), "org.atrium.edit");
+        assert_eq!(p.dir, home.join(".atrium/apps/org.atrium.edit"));
+        assert_eq!(p.img, home.join(".atrium/apps/org.atrium.edit.img"));
+        assert_eq!(p.person.as_deref(), Some("root"));
+        assert!(!plain_segment("a/b") && !plain_segment("..") && plain_segment("org.atrium.edit"));
+    }
+
+    #[test]
+    fn moving_a_folder_keeps_its_contents() {
+        let t = std::env::temp_dir().join(format!("ovl-move-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        fs::create_dir_all(t.join("a/sub")).unwrap();
+        fs::write(t.join("a/sub/state"), b"kept").unwrap();
+        move_path(&t.join("a"), &t.join("b")).unwrap();
+        assert_eq!(fs::read(t.join("b/sub/state")).unwrap(), b"kept");
+        assert!(!t.join("a").exists());
+        let _ = fs::remove_dir_all(&t);
     }
 }

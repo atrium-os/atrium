@@ -18,6 +18,7 @@
 //! files with `network = "none"`).
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,7 +27,6 @@ use portcullis_jail::{build, jail_name_from_app_id, BuildOpts, JailConfig};
 use portcullis_toml::{merge_capabilities, Manifest};
 
 const APPS_DIR:     &str = "/var/lib/atrium/apps";
-const OVERLAYS_DIR: &str = "/var/lib/atrium/overlays";
 const JAILS_DIR:    &str = "/var/lib/atrium/jails";
 const SENTINEL:     &str = ".atrium-firstrun-done";
 
@@ -83,7 +83,6 @@ pub fn launch_with_stdio(
         return Err(LaunchError::Failed("manifest", msg));
     }
 
-    let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
 
     /* PRIVILEGE INVARIANT (portcullis.md §9.0): the app runs under a dedicated,
@@ -149,7 +148,10 @@ pub fn launch_with_stdio(
         .and_then(|r| r.storage.as_deref())
         .and_then(portcullis_overlay::parse_size)
         .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
-    let backing = portcullis_overlay::ensure_mounted(app_id, overlay_quota)
+    // The person's own overlay, in their home (homes.md §3).
+    let place = portcullis_overlay::place(Some(user), app_id);
+    let overlay_dir = place.dir.clone();
+    let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
         .map_err(|m| LaunchError::Failed("mount", m))?;
     if backing == portcullis_overlay::Backing::Directory {
         /* No volume, so the structural mitigation is not in place. Fall back
@@ -161,6 +163,14 @@ pub fn launch_with_stdio(
                      format!("create {}: {e}", overlay_dir.display())))?;
         arm_overlay_dedup(&overlay_dir)?;
     }
+    /* homes.md §2: the overlay is the app uid's, 0700. Inside the jail it is
+     * the union's root, so the app can make its own /var, /tmp and $HOME
+     * there (the signed tree's folders stay root's); outside, nobody but
+     * root and the app reads it, other apps of the same person included. */
+    std::os::unix::fs::chown(&overlay_dir, Some(app_uid), Some(app_uid))
+        .and_then(|_| fs::set_permissions(&overlay_dir, fs::Permissions::from_mode(0o700)))
+        .map_err(|e| LaunchError::Failed("mount",
+                 format!("own {}: {e}", overlay_dir.display())))?;
     fs::create_dir_all(&jail_path)
         .map_err(|e| LaunchError::Failed("mount",
                  format!("create {}: {e}", jail_path.display())))?;
@@ -207,6 +217,8 @@ pub fn launch_with_stdio(
         return Err(LaunchError::Failed("mount",
             format!("mkdir {}: {e}", home_in_jail.display())));
     }
+    // Made by root through the union; the app's own (homes.md §2).
+    let _ = std::os::unix::fs::chown(&home_in_jail, Some(app_uid), Some(app_uid));
 
     /* Phase 4.5: first-run setup. Sentinel lives in the overlay so
      * it persists across launches; portcullis reinstall removes it
@@ -274,6 +286,24 @@ pub fn launch_with_stdio(
         let dir = portcullisd::opens::Hub::global().listen(app_id)
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
+    }
+    /* ★ The person's own files (homes.md §2, scrinium.md §9 H1): only for an
+     * app granted `home-files` (the file manager). Its own uid gets the
+     * person's files group; the five folders go in at /atrium/home. */
+    if manifest.capabilities.home_files == Some(true) {
+        let person = portcullisd::home::ensure_person(user)
+            .and_then(|(home, _)| portcullisd::home::grant_group(user, &run_as_user).map(|_| home));
+        match person {
+            Ok(home) => {
+                for (src, dst) in portcullisd::home::mounts(&home, &jail_path) {
+                    jc.add_mount(&src, &dst, "nullfs", &["rw"]);
+                }
+            }
+            Err(e) => {
+                full_teardown(&jail_path, None);
+                return Err(LaunchError::Failed("home-files", e));
+            }
+        }
     }
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
