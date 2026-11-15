@@ -13,6 +13,8 @@ use pergola::{Color, Mutable, NodeId, TextStyle};
 use atrium_netconf::{Link, Online};
 
 use crate::apps::{self, AppsPage};
+use crate::bluetooth::{self as bt, BtPage};
+use vinculum_control::Prompt;
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
 use crate::sound::{self as snd, SoundPage};
@@ -31,6 +33,7 @@ pub fn side_w() -> f32 {
 pub enum Which {
     #[default]
     Network,
+    Bluetooth,
     Display,
     Sound,
     Devices,
@@ -48,6 +51,10 @@ pub struct CuriaView {
     pub sound_scroll: Mutable<ScrollState>,
     pub apps: Mutable<AppsPage>,
     pub apps_scroll: Mutable<ScrollState>,
+    pub bt: Mutable<BtPage>,
+    pub bt_scroll: Mutable<ScrollState>,
+    /// The code a device being paired shows, typed here.
+    pub bt_code: Mutable<pergola::text_edit::TextEdit>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -146,7 +153,7 @@ impl View for CuriaView {
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
         let now = self.which.get();
-        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps")].into_iter().enumerate() {
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Bluetooth, ph::BLUETOOTH, "Bluetooth"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps")].into_iter().enumerate() {
             let y = em(56.0) + i as f32 * em(38.0);
             let on = now == which;
             let sel = self.which.clone();
@@ -157,6 +164,7 @@ impl View for CuriaView {
         }
         match now {
             Which::Network => self.network(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Bluetooth => self.bluetooth(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Display => self.display(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Sound => self.sound(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
@@ -895,6 +903,198 @@ impl CuriaView {
     }
 }
 
+pub fn with_bt(page: &Mutable<BtPage>, f: impl FnOnce(&mut BtPage)) {
+    let mut p = page.get_cloned();
+    f(&mut p);
+    page.set(p);
+}
+
+impl CuriaView {
+    /// The Bluetooth page (curia.md §14).
+    fn bluetooth(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
+        let p = self.bt.get_cloned();
+        let t = ctx.theme;
+        let mut y = em(20.0);
+        text(ctx, x0, y + em(16.0), "Bluetooth", type_size::XL, Weight::Semibold, t.text_primary());
+        y += em(48.0);
+        let card = |ctx: &mut Ctx, y: f32, g: char, head: &str, sub: &str| {
+            let t = ctx.theme;
+            rect(ctx, x0, y, pw, em(64.0), t.bg_surface(), 8.0);
+            icon(ctx, x0 + em(16.0), y + em(20.0), g, em(24.0), t.text_secondary());
+            text(ctx, x0 + em(56.0), y + em(24.0), head, type_size::MD, Weight::Medium, t.text_primary());
+            text(ctx, x0 + em(56.0), y + em(44.0), sub, type_size::SM, Weight::Regular, t.text_secondary());
+        };
+        match (&p.link, &p.status) {
+            (Some(Err(why)), _) => {
+                card(ctx, y, ph::BLUETOOTH_SLASH, "Bluetooth is not available", &format!("{why}; trying again"));
+                return;
+            }
+            (_, None) => {
+                text(ctx, x0, y + em(10.0), "Asking vinculumd for Bluetooth…", type_size::SM, Weight::Regular, t.text_tertiary());
+                return;
+            }
+            _ => {}
+        }
+        let st = p.status.clone().unwrap_or(bt::Status { ready: false, address: None, scanning: false, pairable: false });
+        let sub = match (&st.address, st.ready) {
+            (_, false) => "The Bluetooth adapter is starting or not plugged in".to_string(),
+            (Some(a), true) => format!("This computer is {a}"),
+            (None, true) => "Ready".to_string(),
+        };
+        card(ctx, y, if st.ready { ph::BLUETOOTH } else { ph::BLUETOOTH_SLASH }, if st.ready { "Bluetooth is on" } else { "Bluetooth is not ready" }, &sub);
+        if st.ready {
+            let l = if st.scanning { "Stop looking" } else { "Find devices" };
+            let bw = width(l, type_size::SM, Weight::Medium) + em(24.0);
+            let pg = self.bt.clone();
+            button(ctx, x0 + pw - bw - em(16.0), y + em(17.0), l, if st.scanning { Look::Secondary } else { Look::Primary }, true, move || with_bt(&pg, BtPage::toggle_scan));
+        }
+        y += em(76.0);
+        let name_of = |a: &vinculum_control::Addr| {
+            p.found.iter().find(|f| f.address == *a).map(|f| bt::label(f.name.as_deref(), a))
+                .or_else(|| p.devices.as_ref().and_then(|v| v.iter().find(|d| d.address == *a)).map(|d| bt::label(Some(&d.name), a)))
+                .unwrap_or_else(|| a.to_string())
+        };
+        // A pairing prompt: drawn here, by the trusted settings app only.
+        if let Some((a, prompt)) = p.prompt {
+            let name = name_of(&a);
+            let ch = em(if matches!(prompt, Prompt::EnterPasskey) { 108.0 } else { 76.0 });
+            rect(ctx, x0, y, pw, ch, t.accent_bg(), 8.0);
+            let (head, sub) = match prompt {
+                Prompt::Confirm { number: Some(n) } => (format!("Does {name} show {:03} {:03}?", n / 1000, n % 1000), "Pair only if the numbers match.".to_string()),
+                Prompt::Confirm { number: None } => (format!("Pair with {name}?"), "It shows no code to compare.".to_string()),
+                Prompt::Display { passkey } => (format!("Type {:06} on {name}", passkey), "Then press Enter on it.".to_string()),
+                Prompt::EnterPasskey => (format!("Type the code {name} shows"), "Six digits.".to_string()),
+            };
+            text(ctx, x0 + em(16.0), y + em(24.0), &head, type_size::MD, Weight::Semibold, t.text_primary());
+            text(ctx, x0 + em(16.0), y + em(48.0), &sub, type_size::SM, Weight::Regular, t.text_secondary());
+            let mut bx = x0 + pw - em(16.0);
+            let by = y + em(23.0);
+            let mut right = |ctx: &mut Ctx, l: &str, look: Look, f: Box<dyn Fn()>| {
+                bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
+                button(ctx, bx, by, l, look, true, f);
+                bx -= em(8.0);
+            };
+            match prompt {
+                Prompt::Confirm { .. } => {
+                    let pg = self.bt.clone();
+                    right(ctx, "Cancel", Look::Ghost, Box::new(move || with_bt(&pg, |b| b.confirm(false))));
+                    let pg = self.bt.clone();
+                    right(ctx, "Pair", Look::Primary, Box::new(move || with_bt(&pg, |b| b.confirm(true))));
+                }
+                Prompt::Display { .. } => {
+                    let pg = self.bt.clone();
+                    right(ctx, "Done", Look::Secondary, Box::new(move || with_bt(&pg, BtPage::dismiss_display)));
+                }
+                Prompt::EnterPasskey => {
+                    let (pg, code) = (self.bt.clone(), self.bt_code.clone());
+                    right(ctx, "Cancel", Look::Ghost, Box::new(move || { code.set(Default::default()); with_bt(&pg, |b| b.passkey(None)) }));
+                    let (pg, code) = (self.bt.clone(), self.bt_code.clone());
+                    right(ctx, "Pair", Look::Primary, Box::new(move || { let c = code.get_cloned().text().to_string(); code.set(Default::default()); with_bt(&pg, |b| b.passkey(Some(&c))) }));
+                    let (pg, code) = (self.bt.clone(), self.bt_code.clone());
+                    pergola::widgets::TextField::new(self.bt_code.clone())
+                        .placeholder("123456")
+                        .autofocus(true)
+                        .at(x0 + em(16.0), y + em(64.0))
+                        .width(em(160.0))
+                        .on_submit(move |v| { code.set(Default::default()); with_bt(&pg, |b| b.passkey(Some(v))) })
+                        .render(ctx);
+                }
+            }
+            y += ch + em(12.0);
+        }
+        if let Some(n) = &p.note {
+            text(ctx, x0, y + em(10.0), n, type_size::SM, Weight::Regular, t.text_secondary());
+            y += em(28.0);
+        }
+        let top = y;
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let t = ctx.theme;
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+            ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+            let mut y = em(4.0);
+            let row = |ctx: &mut Ctx, y: f32, head: &str, sub: &str| {
+                let t = ctx.theme;
+                rect(ctx, 0.0, y, pw, em(56.0), t.bg_surface(), 8.0);
+                text(ctx, em(16.0), y + em(20.0), head, type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, em(16.0), y + em(40.0), sub, type_size::SM, Weight::Regular, t.text_secondary());
+            };
+            let buttons = |ctx: &mut Ctx, y: f32, items: Vec<(String, Look, bool, Box<dyn Fn()>)>| {
+                let mut bx = pw - em(12.0);
+                for (l, look, on, f) in items {
+                    bx -= width(&l, type_size::SM, Weight::Medium) + em(24.0);
+                    button(ctx, bx, y + em(13.0), &l, look, on, f);
+                    bx -= em(8.0);
+                }
+            };
+            text(ctx, 0.0, y + em(10.0), "Paired devices", type_size::SM, Weight::Semibold, t.text_secondary());
+            y += em(30.0);
+            match &p.devices {
+                Some(v) if v.is_empty() => {
+                    text(ctx, 0.0, y + em(10.0), "None yet. Find devices to pair one.", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(32.0);
+                }
+                None => {
+                    y += em(8.0);
+                }
+                Some(v) => {
+                    for d in v {
+                        let a = d.address;
+                        row(ctx, y, &bt::label(Some(&d.name), &a), &bt::device_line(d));
+                        let pg = self.bt.clone();
+                        let mut items: Vec<(String, Look, bool, Box<dyn Fn()>)> = Vec::new();
+                        if p.confirm_forget != Some(a) {
+                            let pg2 = pg.clone();
+                            items.push(("Forget".into(), Look::Ghost, true, Box::new(move || with_bt(&pg2, |b| b.forget(a)))));
+                            if d.connected {
+                                items.push(("Disconnect".into(), Look::Secondary, true, Box::new(move || with_bt(&pg, |b| b.disconnect(a)))));
+                            } else {
+                                items.push(("Connect".into(), Look::Secondary, st.ready, Box::new(move || with_bt(&pg, |b| b.connect(a)))));
+                            }
+                        }
+                        buttons(ctx, y, items);
+                        y += em(60.0);
+                        if p.confirm_forget == Some(a) {
+                            text(ctx, em(16.0), y + em(15.0), &format!("Forget {}? To use it again, pair it again.", bt::label(Some(&d.name), &a)), type_size::SM, Weight::Regular, t.text_primary());
+                            let pg = self.bt.clone();
+                            let pg2 = pg.clone();
+                            buttons(ctx, y - em(13.0), vec![
+                                ("Cancel".into(), Look::Ghost, true, Box::new(move || with_bt(&pg, BtPage::cancel_forget))),
+                                ("Forget".into(), Look::Danger, true, Box::new(move || with_bt(&pg2, |b| b.forget(a)))),
+                            ]);
+                            y += em(38.0);
+                        }
+                    }
+                }
+            }
+            if st.scanning || !p.found.is_empty() {
+                y += em(8.0);
+                text(ctx, 0.0, y + em(10.0), "Devices nearby", type_size::SM, Weight::Semibold, t.text_secondary());
+                y += em(30.0);
+                if p.found.is_empty() {
+                    text(ctx, 0.0, y + em(10.0), "Looking… Put the device in pairing mode.", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(32.0);
+                }
+                for f in &p.found {
+                    let a = f.address;
+                    row(ctx, y, &bt::label(f.name.as_deref(), &a), bt::signal(f.rssi));
+                    let pg = self.bt.clone();
+                    let busy = p.pairing == Some(a);
+                    buttons(ctx, y, vec![(if busy { "Pairing…".into() } else { "Pair".into() }, Look::Primary, !busy && p.pairing.is_none() && st.ready, Box::new(move || with_bt(&pg, |b| b.pair(a))))]);
+                    y += em(60.0);
+                }
+            }
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = y;
+            }
+            ctx.pop();
+        });
+        ScrollView::new(self.bt_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
+            .key(95)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
+    }
+}
+
 pub fn with_devs(page: &Mutable<DevPage>, f: impl FnOnce(&mut DevPage)) {
     let mut p = page.get_cloned();
     f(&mut p);
@@ -918,7 +1118,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -940,7 +1140,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -959,7 +1159,7 @@ mod tests {
     fn the_sound_page_shows_volume_outputs_and_apps() {
         use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
         with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
@@ -979,7 +1179,7 @@ mod tests {
         use crate::apps::Got;
         use portcullis_ipc::{AccessBy, AccessEntry};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
@@ -1001,10 +1201,34 @@ mod tests {
     }
 
     #[test]
+    fn the_bluetooth_page_shows_the_prompt_paired_and_nearby() {
+        use vinculum_control::{Addr, DeviceInfo, Event};
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        assert!(texts(&v).iter().any(|s| s == "Asking vinculumd for Bluetooth…"));
+        with_bt(&v.bt, |p| p.lost("vinculumd is not running".into()));
+        assert!(texts(&v).iter().any(|s| s == "vinculumd is not running; trying again"));
+        let a = |n: u8| Addr { bytes: [0xC0, 1, 2, 3, 4, n], random: true };
+        with_bt(&v.bt, |p| {
+            p.connected();
+            p.apply(Event::Ok);
+            p.apply(Event::Status { ready: true, address: Some(Addr { bytes: [0, 0x1B, 0xDC, 1, 2, 3], random: false }), scanning: true, pairable: true, agents: 1, connections: 1 });
+            p.apply(Event::Devices { devices: vec![DeviceInfo { address: a(1), identity: None, name: "Keys".into(), authenticated: true, secure_connections: true, keyboard_allowed: true, connected: true }] });
+            p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -70 });
+            p.pair(a(2));
+            p.apply(Event::Prompt { address: a(2), prompt: vinculum_control::Prompt::Confirm { number: Some(42) } });
+        });
+        let all = texts(&v);
+        for want in ["Bluetooth", "Bluetooth is on", "This computer is 00:1B:DC:01:02:03", "Stop looking", "Does Mouse show 000 042?", "Pair only if the numbers match.", "Pair", "Cancel", "Paired devices", "Keys", "Connected", "Disconnect", "Forget", "Devices nearby", "Mouse", "Good signal", "Pairing…"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
+    }
+
+    #[test]
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

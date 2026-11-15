@@ -7,6 +7,8 @@
 //! `DISPLAY_SETTINGS_SOCKET` (forum-wm's settings socket,
 //! /atrium/sockets/display-settings/display-settings.sock),
 //! portcullisd's socket (the Apps page; portcullis_ipc::resolve_socket_path),
+//! `CURIA_BT_SOCK` (vinculumd's control socket,
+//! /atrium/sockets/bluetooth-control/control.sock),
 //! `CURIA_SIZE` (960x720), `CURIA_SECS` (quit after, for checks).
 
 use std::path::PathBuf;
@@ -273,6 +275,91 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
     });
 }
 
+enum BtMsg {
+    Up,
+    /// The thread asked for the status itself (a quiet connection).
+    Probe,
+    Got(vinculum_control::Event),
+    Lost(String),
+}
+
+type BtSend = Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>>;
+
+/// vinculumd's control socket (curia.md §14), as the pairing agent: what it
+/// says, and a writer for what the page asks. A quiet connection is asked
+/// for its status after 30 s and dropped as hung 10 s later.
+fn follow_bt(tx: Sender<BtMsg>, send: BtSend) {
+    use std::io::{Read, Write};
+    use vinculum_control::{encode, Reader, Request};
+    let path = std::env::var("CURIA_BT_SOCK").unwrap_or_else(|_| "/atrium/sockets/bluetooth-control/control.sock".into());
+    std::thread::spawn(move || loop {
+        let why = match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(mut s) => {
+                let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+                let why = if s.write_all(&encode(&Request::Hello { agent: true })).is_err() {
+                    "vinculumd went away".to_string()
+                } else {
+                    *send.lock().unwrap_or_else(|p| p.into_inner()) = s.try_clone().ok();
+                    if tx.send(BtMsg::Up).is_err() {
+                        return;
+                    }
+                    let mut r = Reader::default();
+                    let mut buf = [0u8; 4096];
+                    let mut probing = false;
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                    'conn: loop {
+                        match s.read(&mut buf) {
+                            Ok(0) => break "vinculumd went away".to_string(),
+                            Ok(n) => {
+                                if probing {
+                                    probing = false;
+                                    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+                                }
+                                r.push(&buf[..n]);
+                                loop {
+                                    match r.next::<vinculum_control::Event>() {
+                                        Ok(Some(e)) => {
+                                            if tx.send(BtMsg::Got(e)).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(_) => break 'conn "vinculumd sent something unreadable".to_string(),
+                                    }
+                                }
+                            }
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) && !probing => {
+                                probing = true;
+                                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                                // The page counts the answer as one it asked for.
+                                if tx.send(BtMsg::Probe).is_err() {
+                                    return;
+                                }
+                                if s.write_all(&encode(&Request::Status)).is_err() {
+                                    break "vinculumd went away".to_string();
+                                }
+                            }
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break "vinculumd is not answering".to_string(),
+                            Err(_) => break "vinculumd went away".to_string(),
+                        }
+                    }
+                };
+                *send.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                why
+            }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => "vinculumd is not running".to_string(),
+                std::io::ErrorKind::PermissionDenied => "Settings may not change Bluetooth".to_string(),
+                _ => format!("vinculumd: {e}"),
+            },
+        };
+        if tx.send(BtMsg::Lost(why)).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+}
+
 /// One Apps page ask of portcullisd (curia.md §13), on a thread of its own.
 fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc<AtomicBool>) {
     use curia::apps::{Got, Want};
@@ -356,11 +443,16 @@ fn main() {
     let sound_send: SoundSend = Arc::new(std::sync::Mutex::new(None));
     follow_sound(stx, sound_send.clone());
     let disp = Mutable::with_dirty(curia::display::DispPage::new(), dirty.clone());
+    let bt = Mutable::with_dirty(curia::bluetooth::BtPage::default(), dirty.clone());
+    let (btx, brx) = channel();
+    let bt_send: BtSend = Arc::new(std::sync::Mutex::new(None));
+    follow_bt(btx, bt_send.clone());
+    let mut next_bt = Instant::now();
     let apps = Mutable::with_dirty(curia::apps::AppsPage::default(), dirty.clone());
     let (atx, arx) = channel();
     let apps_refreshing = Arc::new(AtomicBool::new(false));
     let mut next_apps = Instant::now();
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -465,6 +557,42 @@ fn main() {
             }
             for w in wants {
                 display_work(w, ptx.clone(), refreshing.clone());
+            }
+        }
+        // The Bluetooth page: what vinculumd says, and what the page asks;
+        // the controller and the paired devices again every 10 s while it
+        // shows.
+        {
+            let mut b = bt.get_cloned();
+            let mut bch = false;
+            while let Ok(m) = brx.try_recv() {
+                match m {
+                    BtMsg::Up => b.connected(),
+                    BtMsg::Probe => b.probed(),
+                    BtMsg::Got(e) => b.apply(e),
+                    BtMsg::Lost(why) => b.lost(why),
+                }
+                bch = true;
+            }
+            if which.get() == curia::view::Which::Bluetooth && Instant::now() >= next_bt {
+                // A controller still starting is asked again sooner.
+                next_bt = Instant::now() + Duration::from_secs(if b.ready() { 10 } else { 2 });
+                b.refresh();
+            } else if which.get() != curia::view::Which::Bluetooth {
+                next_bt = Instant::now();
+            }
+            let wants = b.take_wants();
+            if !wants.is_empty() {
+                use std::io::Write;
+                if let Some(c) = bt_send.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                    for w in &wants {
+                        let _ = c.write_all(&vinculum_control::encode(w));
+                    }
+                }
+                bch = true;
+            }
+            if bch {
+                bt.set(b);
             }
         }
         // The Apps page: asked again every 10 s while it shows (an app

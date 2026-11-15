@@ -106,7 +106,7 @@ V "daemon -f -o $B/curia.log su -m alice -c 'portcullis launch --no-prompt $CURI
 i=0; while [ $i -lt 60 ] && ! V "grep -q 'launching $CURIA as uid' $LOG"; do sleep 2; i=$((i+2)); done
 sleep 20
 shot apps-0
-press 70 225
+press 70 263
 i=0; while [ $i -lt 40 ] && [ "$(count "access -> $CURIA")" = 0 ]; do sleep 2; i=$((i+2)); done
 L=$(V "grep 'access -> $CURIA' $LOG | tail -1")
 case "$L" in *"for alice: "*" app(s)"*) ok "Curia lists the apps for alice ($(echo "$L" | sed 's/.*: //'))" ;; *) bad "no list: $L / $(V "tail -5 $LOG")" ;; esac

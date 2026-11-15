@@ -491,8 +491,9 @@ model:
 power on/off, scan for devices to pair, pair, confirm/enter passkeys, list and remove
 devices, toggle profiles per device, the app grants of §12, and the chooser. Pairing prompts
 (numeric comparison, passkey display or entry) are drawn only by this trusted UI; a pairing
-request with no UI open is refused (§7). Until Curia exists, a `vinculum-ctl` CLI and a Forum
-bar menu cover it, as `forum-ctl` did for displays.
+request with no UI open is refused (§7). `vinculum-ctl` (CLI and agent) covers stock FreeBSD.
+Curia's Bluetooth page is built (2026-11-15, [curia.md](curia.md) §14) and the capability
+`bluetooth-control` exists in Portcullis; the Forum bar menu is still to come.
 
 ## 14. Tests
 

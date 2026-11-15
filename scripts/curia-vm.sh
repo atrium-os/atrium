@@ -90,7 +90,7 @@ away)
     GAP=50 frame away-3-netconf-hung
     "$V" "pkill -CONT -x atrium-netconf"
     GAP=40 frame away-4-netconf-answers
-    inj "MOVE 70 225"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    inj "MOVE 70 263"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     "$V" "service atrium-dispensatord stop >/dev/null"
     GAP=10 frame away-5-devices-gone
     "$V" "service atrium-dispensatord start >/dev/null"
@@ -118,7 +118,7 @@ display)
     scp $K -P 2222 -q "$ROOT/forum-wm/target/$T/release/forum-wm" "root@localhost:$D/"
     "$V" "cd $Sx && env $E2 daemon -f -o $Sx/wm.log $D/forum-wm </dev/null; sleep 4; chmod 666 $Sx/*.sock; ls -l $Sx/display.sock"
     GAP=${GAP:-40} sh "$0" shot
-    inj "MOVE 70 149"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    inj "MOVE 70 187"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     GAP=8 frame display ;;
 sound)
     for c in frescod forum-wm curia; do
@@ -143,7 +143,7 @@ sound)
         daemon -f -u appa -o $Sx/play.log /usr/local/bin/lyra-play $L/audio.sock media 900 </dev/null
         env $E2 CURIA_AUDIO_SOCK=$AC CURIA_NET_DIR=/nonexistent CURIA_DEVICES_SOCK=/nonexistent daemon -f -u appui -o $Sx/curia.log $D/curia </dev/null"
     sleep 60
-    inj "MOVE 70 187"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    inj "MOVE 70 225"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     GAP=10 frame sound ;;
 core)
     t=${2:-correct horse battery staple}

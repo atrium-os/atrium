@@ -63,6 +63,10 @@ pub fn apply_all(
         // dispensatord's device list (device-assignment.md §6.10).
         apply_socket("device-list.sock", jc, opts);
     }
+    if caps.bluetooth_control == Some(true) {
+        // vinculumd's control socket (bluetooth.md §13).
+        apply_socket("bluetooth-control.sock", jc, opts);
+    }
     if caps.display_settings == Some(true) {
         // forum-wm's settings socket (curia.md §11): displays, text size,
         // light/dark, and nothing else of forum-ctl.

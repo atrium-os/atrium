@@ -5,7 +5,7 @@ id          = "org.atrium.curia"
 name        = "Settings"
 version     = "0.1.0"
 entry       = "bin/curia"
-description = "Settings: network and Wi-Fi, display, sound, devices, apps."
+description = "Settings: network and Wi-Fi, Bluetooth, display, sound, devices, apps."
 icon        = "settings"
 
 [capabilities]
@@ -19,6 +19,7 @@ device-list       = true   # every device and its owner (restricted: Curia only)
 display-settings  = true   # displays, text size, light/dark (restricted: Curia only)
 audio-control     = true   # the volume, apps' levels, outputs (restricted: Forum, Curia)
 app-grants        = true   # what each app may do; allow, remove (restricted: Curia only)
+bluetooth-control = true   # pair, connect, forget Bluetooth devices (restricted: Curia, Forum bar)
 network           = "none"
 
 [supervision]

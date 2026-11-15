@@ -259,6 +259,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.file-picker = true: restricted to the system file picker (puts what the \
              user picks into other apps' jails); requires explicit policy approval"));
     }
+    if c.bluetooth_control == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.bluetooth-control = true: restricted to the settings app and Forum's bar \
+             (pairs and forgets Bluetooth devices); requires explicit policy approval"));
+    }
     if c.app_grants == Some(true) {
         r.warnings.push(format!(
             "{ctx}.app-grants = true: restricted to the settings app (sees and changes \

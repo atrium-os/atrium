@@ -5599,6 +5599,7 @@ N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP
     sh scripts/curia-vm.sh display       # forum-wm with its settings socket ($Sx/display.sock), then Curia's Display page
     sh scripts/curia-vm.sh sound         # VM booted with lyra-vm-check.sh qemu-args, after cloud-vm.sh lyra: lyrad, choragusd, a tone, Curia's Sound page
     sh scripts/vm-apps-access-check.sh   # after cloud-vm.sh up: portcullisd, frescod headless, Curia's Apps page as alice; Allow (a real press), Remove; ends "apps-access: N failed"
+    sh scripts/curia-bt-check.sh         # Linux host: Rootcanal + vinculumd + Bumble peers; the Bluetooth page model pairs (3 prompt kinds), reconnects, forgets; ends "curia-bt: N failed"
     # Devices page: needs atrium-dispensatord with the devices socket on the VM (curia.md §9); then shot, click the sidebar's Devices
 
 - "The internet" sits beyond each network's router: lan.py answers HTTP for

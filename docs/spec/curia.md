@@ -2,7 +2,7 @@
 
 **Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
 to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
-passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11), C4b the Sound page built 2026-11-15 (§12), C4c the Apps page built 2026-11-15 (§13).
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11), C4b the Sound page built 2026-11-15 (§12), C4c the Apps page built 2026-11-15 (§13), C4d the Bluetooth page built 2026-11-15 (§14).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -75,7 +75,7 @@ C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; si
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
 | C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
 | C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check. **Built 2026-11-15** (§9) |
-| C4 | further pages: C4a Display (light/dark, text size, monitors), C4b Sound, C4c Apps' grants | each with its own gate. **C4a, C4b and C4c built 2026-11-15** (§11, §12, §13) |
+| C4 | further pages: C4a Display (light/dark, text size, monitors), C4b Sound, C4c Apps' grants, C4d Bluetooth | each with its own gate. **C4a to C4d built 2026-11-15** (§11 to §14) |
 
 ## 6. Decisions
 
@@ -324,4 +324,42 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   `credential::STILL_NS` (half a second) up to the press; otherwise `OBSCURED`, which
   portcullisd words "the window was covered or had just moved; press again". Ordinary
   windows count for `APPROVE` alone: `FILL` and `IDENTITY` still need a slot or a sheet.
+
+## 14. C4d as built: the Bluetooth page (2026-11-15)
+
+- Over vinculumd's control socket (bluetooth.md §13), `bluetooth-control/control.sock`,
+  behind the new restricted capability `bluetooth-control` (Curia and the Forum bar; it
+  mounts that socket directory and nothing else). Curia says `Hello { agent: true }`: it
+  is the pairing agent, so pairing prompts are drawn by Settings and nowhere else, and
+  with Settings closed vinculumd refuses to pair (§7 there). No new protocol.
+- The page (`curia/src/bluetooth.rs`, `BtPage`; sidebar second, after Network): the
+  adapter ("Bluetooth is on · This computer is …", or not ready), Find devices / Stop
+  looking, the pairing prompt when one is open (Confirm: "Does Mouse show 123 456?" with
+  Pair and Cancel, or "Pair with Mouse?" when there is no number; Display: "Type 035714 on
+  Mouse", Done; EnterPasskey: a code field, six digits, Pair and Cancel), a line for what
+  went wrong or "Paired with Mouse", Paired devices (name, Connected or not, "paired
+  without a code check", "typing not allowed"; Connect or Disconnect; Forget, which asks
+  once more), and while looking, Devices nearby (name or "Unnamed device (address)", a
+  signal word, Pair; one pairing at a time; devices already paired are not offered). At
+  most 40 found devices are kept. vinculumd answers each request once, in order, so the
+  model counts what it asked to match each `Ok` or `Error` (a refused Pair ends that
+  pairing). Status and the paired list are asked for when the page shows, every 10 s
+  while it does (2 s while the adapter is starting), and after a connect, disconnect or
+  pairing.
+- The connection (`follow_bt` in main.rs): every 5 s while vinculumd is away ("Bluetooth
+  is not available / vinculumd is not running; trying again"); a quiet connection is
+  asked for its status after 30 s and dropped as hung 10 s later.
+- Not yet: Classic devices (keyboards, headphones) are not found by vinculumd's LE scan;
+  `PairClassic` by address has no place on the page yet. Power on/off and per-device
+  profiles wait for vinculumd to offer them. Deploying vinculumd on Atrium, its
+  `--control-uid` must admit Settings' per-app uid (or vinculumd learns to check the
+  launch registry and manifest, as choragusd does for `audio-control`).
+- Live check on the Linux host, 2026-11-15 (`scripts/curia-bt-check.sh`): Rootcanal,
+  vinculum-hci, vinculumd with its control socket, and a Bumble peer; the page model
+  (`curia/examples/bt_drive.rs`) finds the peer, pairs it answering the prompt as the
+  page's buttons would, sees it in the paired list connected, disconnects, connects
+  again with the stored bond, and forgets it after asking. Three peers, one per prompt
+  (numbers to compare; a code Settings shows, typed on the device; a code the device
+  shows, typed into Settings): 0 failed. The drawn page is checked by the host render
+  test; no VM run, as the cloud VM has no Bluetooth controller.
 

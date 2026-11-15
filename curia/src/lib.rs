@@ -2,6 +2,7 @@
 //! (pure, tested on the host); `view.rs` draws them, `main.rs` does the I/O.
 
 pub mod apps;
+pub mod bluetooth;
 pub mod devices;
 pub mod display;
 pub mod network;
