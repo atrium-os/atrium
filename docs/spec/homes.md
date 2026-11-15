@@ -264,6 +264,33 @@ workspaces.
   replaces H6's "no general terminal": there is one, and it reaches
   nothing until the person switches it.
 
+### 5.4 Not rebuilding everything (proposal, 2026-11-15)
+
+Big projects carry large build output and caches; moving work to another
+workspace must not mean rebuilding from nothing.
+
+- **Uses links** (§5.2) already let B build against A's output where it
+  is, read-only: A's `target/` or `build/` is never rebuilt in B.
+- **Download cache, per person, shared (W8).** Crates, Go modules, npm and
+  pip packages and git dependencies go in `~/.atrium/cache/downloads`,
+  mounted read-write at `/cache` in every workspace of that person and
+  persona, with the toolchains pointed at it (`CARGO_HOME`, `GOMODCACHE`,
+  `npm_config_cache`, `PIP_CACHE_DIR`). Sharing is safe because each tool
+  checks what it takes from there against its lockfile's hashes, so one
+  workspace can't hand another a changed package. A tool that doesn't
+  check hashes is not pointed at it.
+- **Compiled-output cache, by group, opt-in (W9).** ccache/sccache-style
+  objects can't be checked by hash, so a compromised workspace could plant
+  a bad object. They are shared only within a group of workspaces linked
+  by uses (they already trust each other's output), at
+  `~/.atrium/cache/objects/<group>`; off by default, turned on in the
+  Workspaces app per workspace.
+- **Duplicate workspace (W8).** A copy-on-write clone of the workspace
+  (its `work` and its root, a Tessera snapshot; a plain copy where the
+  volume isn't Tessera) brings its build output along: splitting a
+  project out or trying something risky costs no rebuild. The copy gets
+  its own uid; files are re-owned as they are cloned.
+
 ## 6. The host shell
 
 Root's shell is for administration and recovery: Curia's Recovery page opens
@@ -284,6 +311,7 @@ people ship without `sshd` on the host.
 | H9 | dev app grants | asked per run, restricted capabilities refused, "keep" to remember |
 | H10 | the IDE's reach | `workspace-exec`: only workspaces the person picked in it, commands run in the workspace's jail |
 | H11 | Terminal | a regular app; alone it is an empty jail, switched into a workspace or app console by a press (Shankar 2026-11-15) |
+| H12 | caches across workspaces | shared download cache per person (hash-checked), compiled cache only within a uses group and opt-in, Duplicate workspace by copy-on-write (Shankar 2026-11-15) |
 
 (H1–H3 are scrinium.md §9's.)
 
@@ -318,3 +346,8 @@ people ship without `sshd` on the host.
 7. **W7 Terminal app.** Empty-jail shell, the switcher, the grid entry.
    Gate: an empty tab sees no home and no network; switching to Scratch
    needs the press and lands in `~/work`.
+8. **W8 download cache and Duplicate.** Gate: a crate fetched in one
+   workspace is not fetched again in another; a duplicate builds without
+   recompiling.
+9. **W9 group object cache.** Gate: a workspace outside the group can't
+   read or write the group's objects.
