@@ -14,7 +14,7 @@ branch `atrium-os`, `gpusim:` = atrium-os/gpusim.
 
 | Workstream | State | Latest | Next |
 |---|---|---|---|
-| [Native RDNA4 backend + gpusim](#1-native-rdna4-gpu-stack) | R9700 oracle v19: **54/54 jobs, 82 MATCH, 0 MISMATCH**; bench v5 ours ≤ RADV | spilling stage 3 `4bf3191`; VA reuse `2dac848` | bench v7 staged on the box (atrium16), waiting for an idle GPU |
+| [Native RDNA4 backend + gpusim](#1-native-rdna4-gpu-stack) | R9700 oracle v19: **54/54 jobs, 82 MATCH, 0 MISMATCH**; bench v7 (2026-11-16): unspilled desktop shaders ≤ RADV, Fresco raster 3-4× slower than RADV, **spilled benches give wrong output on silicon** (cause open); compile time 0.5-0.9× RADV on small shaders, 2-3× on raster | spilling stage 3 `4bf3191`; VA reuse `2dac848`; logs `docs/r9700-runs/bench-v7/` | why spilled raster / glyph_run / path go wrong on silicon (compiler vs bench scratch); raster runtime and compile time |
 | [GPU driver isolation (F1/F6)](#2-gpu-driver-isolation) | F1 done; F6 G1–G4 done (watchdog, VM-fault → EIO, read-only binds, app GPU channel, hostile-ISA fuzz); `CAP_ISA` (ABI rev 4) | `622693d`, `bb3f7ba`, `8023c92`, `a8a595d` | G5; silicon run of `test_gpu_isolation` before a production grant |
 | [Fresco display pipeline](#3-fresco-display-pipeline) | compute is the default renderer; split mode on by default, renderers jailed as `_fresco-render`; F2, F3, F4a–F4e and F4g done; F4h per-client scene budget (refuse with `EV_BUDGET_REFUSED`, not a renderer kill), F4i shipped frescod refuses unsplit/dev modes (gate `fresco-production-gate.sh`, PASS in VM), F4j GPU compose never waits on a window raster + H6 cost refusal; noisy-neighbour gate on compute 0 failed (2026-11-14); F5 deferred | `3ccac5d`, `1455488`, `e7c3187`, `ad77c13`, `9fd041f`, `5ecb954`, `3487cac` | F4f (secure password input); F4j on gpusim and R9700 (`FAR_OVER` from measured time); noisy-neighbour on the GPU renderer |
 | [Compressed memory](#4-compressed-memory) | zram v2 increments 0–6 done; design A (swap fast path) **kept**, B shelved | spec `3da0acb` | — (closed 2026-11-04) |
@@ -63,8 +63,40 @@ Command streams in `atrium-rdna4-cmd`, ISA tables in `atrium-rdna4-isa`
   SPIR-V → RDNA4 per stage; bench-script now times RADV's `vkCreateComputePipelines`
   (no caches) on the box, and ours there given a Linux build of `compile-time`. Host
   (Apple Silicon): Fresco raster 250 → 40 ms (`fac48fd`: GIR post-dominators cached),
-  spilled at 96/64 VGPRs 560–610 → ~60 ms (`3a70d15`); output byte-identical. RADV
-  side not yet measured; desktop op_* shaders need slangc.
+  spilled at 96/64 VGPRs 560–610 → ~60 ms (`3a70d15`); output byte-identical.
+  **On the box (2026-11-16, Xeon E-2288G, Mesa 26.0.8, main 9ab59de4; median of 10,
+  RADV with `RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1`):**
+
+  | Shader (VGPR cap) | RADV ms | ours ms | ours/RADV |
+  |---|---|---|---|
+  | op_texture | 0.40 | 0.20 | 0.49× |
+  | op_rectangle | 0.57 | 0.31 | 0.54× |
+  | op_path | 0.57 | 0.31 | 0.55× |
+  | op_glyph_run | 0.92 | 0.85 | 0.92× |
+  | Fresco bin | 0.87 | 0.78 | 0.90× |
+  | Fresco raster | 27.6 | 53.9 | 1.96× |
+  | Fresco raster (96) | 27.2 | 85.1 | 3.12× |
+  | Fresco raster (64) | 27.8 | 81.3 | 2.93× |
+  | op_glyph_run (16) | 0.88 | 1.08 | 1.23× |
+  | op_path (16) | 0.56 | 0.34 | 0.60× |
+
+  RADV has no cap, so its raster rows are one pipeline. Raster is the gap (box
+  CPU ~1.35× slower than the Mac host's 40 ms). The desktop op_* SPIR-V came from
+  the v7 script (slang sources unchanged since then; no slangc here).
+- **Bench v7** (2026-11-16, quiet box; `docs/r9700-runs/bench-v7/`). Run twice: as
+  staged on 11-04 (compiler at `5c022033`) and regenerated at main 9ab59de4. GPU
+  medians, µs, main: op_texture 1M 75.6 vs RADV 78.6, op_rectangle 1M 200.3 vs
+  200.5, op_path 1M 204.3 vs 204.3, glyph_run 1M 375.7 vs 525.6, 256K 144.3 vs
+  177.3, Fresco bin 384 vs 315, Fresco raster 1957 vs 441-659 (target differs in
+  31 bytes). **Spilled benches are wrong on silicon:** raster at 96 and 64 VGPRs
+  run (2.09 / 5.25 ms vs RADV 0.45) but 6.67 MB of the 8.3 MB target differs
+  (twice, the first time on a GPU with no earlier fault); glyph_run 256K at 16
+  VGPRs counts 394152 glyphs vs 394142 and writes past its instances buffer
+  (TCP faults, 14 ring resets); path 1M at 16 differs in its instances (unspilled
+  path matches). At `5c022033` raster@96 faulted and timed out, raster@64 took
+  2 s per dispatch, glyph_run@16 counted 393405. Cause not investigated: the
+  compiler's spill code or the bench's scratch setup (`bench_ring`) at these
+  sizes. The oracle's `spill_*` jobs (16 VGPRs, small inputs) matched in v19.
 - **Spilling:** stages 1–3 done (scratch ST mode; demand-driven spill + remat;
   SGPRs into VGPR lanes, `4bf3191`). Design doc in the artifact linked from
   project memory `rdna4-spill-design`.

@@ -1,0 +1,135 @@
+=== compile time, ns (RADV: vkCreateComputePipelines, no caches; atrium: SPIR-V to machine code) ===
+model name	: Intel(R) Xeon(R) E-2288G CPU @ 3.70GHz
+mesa-vulkan-drivers 26.0.8-1ubuntu0.3
+--- op_texture_4096 (caps 256/106, spv 5de6de7db6f0)
+[radv]
+compile_ns_first=804318
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=373698
+compile_ns_median=420387
+status=ok
+[atrium]
+status=ok
+compile_ns_first=301446
+compile_ns_min=191072
+compile_ns_median=206014
+code_dwords=43
+--- op_rectangle_4096 (caps 256/106, spv a4ace5ba2293)
+[radv]
+compile_ns_first=924591
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=516346
+compile_ns_median=552908
+status=ok
+[atrium]
+status=ok
+compile_ns_first=423330
+compile_ns_min=280931
+compile_ns_median=286738
+code_dwords=61
+--- op_path_4096 (caps 256/106, spv 6ee16fac4dda)
+[radv]
+compile_ns_first=942681
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=537167
+compile_ns_median=585136
+status=ok
+[atrium]
+status=ok
+compile_ns_first=468709
+compile_ns_min=294912
+compile_ns_median=303028
+code_dwords=57
+--- op_glyph_run_4096 (caps 256/106, spv df90fc238ce5)
+[radv]
+compile_ns_first=1289919
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=876950
+compile_ns_median=922578
+status=ok
+[atrium]
+status=ok
+compile_ns_first=974205
+compile_ns_min=798860
+compile_ns_median=844292
+code_dwords=209
+--- fresco_bin_1080p (caps 256/106, spv 8b0a5d269526)
+[radv]
+compile_ns_first=1219026
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=723933
+compile_ns_median=738166
+status=ok
+[atrium]
+status=ok
+compile_ns_first=764842
+compile_ns_min=636849
+compile_ns_median=685515
+code_dwords=152
+--- fresco_raster_1080p (caps 256/106, spv 6540224d54bd)
+[radv]
+compile_ns_first=12020004
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=10238372
+compile_ns_median=10606437
+status=ok
+[atrium]
+status=ok
+compile_ns_first=14286474
+compile_ns_min=13472486
+compile_ns_median=13601430
+code_dwords=1533
+--- fresco_raster_1080p_v96 (caps 96/106, spv 6540224d54bd)
+[radv]
+compile_ns_first=12641702
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=10396323
+compile_ns_median=10953009
+status=ok
+[atrium]
+status=ok
+compile_ns_first=14448304
+compile_ns_min=13361163
+compile_ns_median=13506718
+code_dwords=1533
+--- fresco_raster_1080p_v64 (caps 64/106, spv 6540224d54bd)
+[radv]
+compile_ns_first=12259118
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=10293377
+compile_ns_median=10478661
+status=ok
+[atrium]
+status=ok
+compile_ns_first=15740527
+compile_ns_min=14312079
+compile_ns_median=14599757
+code_dwords=1615
+--- op_glyph_run_262144_v16 (caps 16/106, spv df90fc238ce5)
+[radv]
+compile_ns_first=1684369
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=866478
+compile_ns_median=904671
+status=ok
+[atrium]
+status=ok
+compile_ns_first=1186669
+compile_ns_min=1041310
+compile_ns_median=1066260
+code_dwords=316
+--- op_path_1048576_v16 (caps 16/106, spv 6ee16fac4dda)
+[radv]
+compile_ns_first=1781154
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=561921
+compile_ns_median=567253
+status=ok
+[atrium]
+status=ok
+compile_ns_first=439841
+compile_ns_min=324533
+compile_ns_median=329464
+code_dwords=73
+=== end ===
+rc=0

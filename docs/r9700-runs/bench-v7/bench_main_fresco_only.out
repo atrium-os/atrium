@@ -1,0 +1,132 @@
+=== atrium rdna4 vs radv bench ===
+Linux 7.0.0-38-generic x86_64
+render node: /dev/dri/renderD128
+mem_info_vram_total=34208743424
+mem_info_vis_vram_total=268435456
+mem_info_gtt_total=32439459840
+mesa-vulkan-drivers 26.0.8-1ubuntu0.3
+--- fresco_bin_1080p (ours: 194 dwords, 13 VGPRs, 17 SGPRs)
+[atrium]
+status=ok
+wait_status=0
+elapsed_ns=308866
+counter_khz=100000
+gpu_ns_min=143520
+gpu_ns_median=147760
+[radv]
+device=AMD Radeon AI PRO R9700 (RADV GFX1201)
+driver=radv Mesa 26.0.8-1ubuntu0.3
+vram_buffers=3/3
+compile_ns_first=1158582
+status=ok
+gpu_ns_min=171160
+gpu_ns_median=179080
+mask: identical
+--- fresco_raster_1080p (ours: 3654 dwords, 137 VGPRs, 46 SGPRs)
+[atrium]
+status=ok
+wait_status=0
+elapsed_ns=2148019
+counter_khz=100000
+gpu_ns_min=1946840
+gpu_ns_median=1973040
+[radv]
+device=AMD Radeon AI PRO R9700 (RADV GFX1201)
+driver=radv Mesa 26.0.8-1ubuntu0.3
+vram_buffers=7/7
+compile_ns_first=30271156
+status=ok
+gpu_ns_min=443480
+gpu_ns_median=448520
+target: DIFFER (31 bytes)
+--- fresco_raster_1080p_v96 (ours: 4122 dwords, 96 VGPRs, 46 SGPRs)
+[atrium]
+status=ok
+wait_status=0
+elapsed_ns=2385223
+counter_khz=100000
+gpu_ns_min=2090640
+gpu_ns_median=2114880
+[radv]
+device=AMD Radeon AI PRO R9700 (RADV GFX1201)
+driver=radv Mesa 26.0.8-1ubuntu0.3
+vram_buffers=7/7
+compile_ns_first=98769
+status=ok
+gpu_ns_min=446640
+gpu_ns_median=658400
+target: DIFFER (6684091 bytes)
+--- fresco_raster_1080p_v64 (ours: 4986 dwords, 61 VGPRs, 46 SGPRs)
+[atrium]
+status=ok
+wait_status=0
+elapsed_ns=5765728
+counter_khz=100000
+gpu_ns_min=3688800
+gpu_ns_median=5229320
+[radv]
+device=AMD Radeon AI PRO R9700 (RADV GFX1201)
+driver=radv Mesa 26.0.8-1ubuntu0.3
+vram_buffers=7/7
+compile_ns_first=100290
+status=ok
+gpu_ns_min=444600
+gpu_ns_median=450880
+target: DIFFER (6666012 bytes)
+=== compile time, ns (RADV: vkCreateComputePipelines, no caches; atrium: SPIR-V to machine code) ===
+model name	: Intel(R) Xeon(R) E-2288G CPU @ 3.70GHz
+--- fresco_bin_1080p
+[radv]
+compile_ns_first=1166607
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=846777
+compile_ns_median=866348
+status=ok
+[atrium]
+status=ok
+compile_ns_first=947920
+compile_ns_min=744885
+compile_ns_median=800853
+code_dwords=194
+--- fresco_raster_1080p
+[radv]
+compile_ns_first=30494878
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=27727947
+compile_ns_median=28295516
+status=ok
+[atrium]
+status=ok
+compile_ns_first=55837767
+compile_ns_min=54122144
+compile_ns_median=54739626
+code_dwords=3654
+--- fresco_raster_1080p_v96
+[radv]
+compile_ns_first=30442823
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=26850566
+compile_ns_median=27392544
+status=ok
+[atrium]
+status=ok
+compile_ns_first=88415825
+compile_ns_min=85537774
+compile_ns_median=86646184
+code_dwords=4122
+--- fresco_raster_1080p_v64
+[radv]
+compile_ns_first=28875331
+cache_env=RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+compile_ns_min=26254867
+compile_ns_median=26670000
+status=ok
+[atrium]
+status=ok
+compile_ns_first=84362741
+compile_ns_min=81215552
+compile_ns_median=82125683
+code_dwords=4986
+=== RADV shader dumps (RADV_DEBUG=shaders,shaderstats) ===
+=== end ===
+rc=0
