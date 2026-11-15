@@ -54,6 +54,8 @@ enum Asking {
     Open,
     SaveAs,
     Picture,
+    /// A folder for Reduce File Size's copy.
+    Reduce,
 }
 
 fn state_root() -> PathBuf {
@@ -125,6 +127,44 @@ struct Run {
     slides: Slides,
     target: Option<Target>,
     root: PathBuf,
+    /// Rehearse or Reduce File Size running on its own copy of the deck.
+    background: Option<Background>,
+}
+
+/// Work on a thread: its progress line and, once done, its report.
+struct Background {
+    what: &'static str,
+    done: Arc<std::sync::atomic::AtomicUsize>,
+    of: Arc<std::sync::atomic::AtomicUsize>,
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl Background {
+    fn start(what: &'static str, f: impl FnOnce(&dyn Fn(usize, usize)) -> String + Send + 'static) -> Background {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (done, of) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (d, o) = (done.clone(), of.clone());
+        let _ = std::thread::Builder::new().name(what.into()).spawn(move || {
+            let msg = f(&|a, b| {
+                d.store(a, Ordering::Relaxed);
+                o.store(b, Ordering::Relaxed);
+            });
+            let _ = tx.send(msg);
+        });
+        Background { what, done, of, rx }
+    }
+    fn poll(&self) -> Option<String> {
+        match self.rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(format!("{} stopped.", self.what)),
+            Err(_) => None,
+        }
+    }
+    fn progress(&self) -> String {
+        use std::sync::atomic::Ordering;
+        format!("{}… {} of {}", self.what, self.done.load(Ordering::Relaxed), self.of.load(Ordering::Relaxed))
+    }
 }
 
 impl Run {
@@ -209,6 +249,48 @@ impl Run {
         }
     }
 
+    /// Rehearse on a copy of the deck, on a thread.
+    fn rehearse(&mut self) {
+        if self.background.is_some() {
+            return self.set_status("Wait for the work running to finish.");
+        }
+        let mut deck = self.slides.doc.borrow().deck.clone();
+        self.background = Some(Background::start("Rehearsing", move |progress| {
+            let costs = atrium_slides::tools::rehearse(&mut deck, (1920, 1080), |a, b| progress(a, b));
+            atrium_slides::tools::rehearse_summary(&costs)
+        }));
+    }
+
+    /// Reduce File Size into a new file in `dir`, on a thread.
+    fn reduce_into(&mut self, dir: PathBuf) {
+        if self.background.is_some() {
+            return self.set_status("Wait for the work running to finish.");
+        }
+        let (mut deck, stem) = {
+            let d = self.slides.doc.borrow();
+            (d.deck.clone(), format!("{} (smaller)", stem_of(&d.name)))
+        };
+        self.background = Some(Background::start("Making pictures smaller", move |progress| {
+            let r = atrium_slides::tools::reduce(&mut deck, 1920, |a, b| progress(a, b));
+            let tmp = dir.join(format!(".{}.reduce.tmp", std::process::id()));
+            let written = (|| {
+                let f = OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+                let f = officina_slides::native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
+                f.sync_all()?;
+                let p = write_new(&dir, &stem, &f);
+                let _ = fs::remove_file(&tmp);
+                p
+            })();
+            match written {
+                Ok(p) => format!("{} Saved as “{}”.", atrium_slides::tools::reduce_summary(&r), p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    format!("The smaller copy couldn't be saved: {e}.")
+                }
+            }
+        }));
+    }
+
     /// A picked deck arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
@@ -288,7 +370,7 @@ fn main() {
     let dirty = Arc::new(AtomicBool::new(true));
     let slides = Slides::new(Doc::from_deck(officina_slides::model::Deck::new(), ""), Mutable::with_dirty(Ui::default(), dirty.clone()), Mutable::with_dirty(0u64, dirty.clone()), (win.width, win.height));
     slides.scale.set(win.scale() as f64);
-    let mut run = Run { slides, target: None, root: root.clone() };
+    let mut run = Run { slides, target: None, root: root.clone(), background: None };
     run.show(doc, target);
     // Development: start on slide N (screenshots).
     if let Some(n) = std::env::var("ATRIUM_SLIDES_SLIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
@@ -306,7 +388,7 @@ fn main() {
     let mut want_picker: Option<Asking> = None;
     let mut last_sync = Instant::now();
     loop {
-        let busy = atrium_slides::render::decoding() + atrium_slides::render::previewing() > 0;
+        let busy = atrium_slides::render::decoding() + atrium_slides::render::previewing() > 0 || run.background.is_some();
         match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() || busy { 20 } else { 250 }))) {
             Ok(StepResult::Closed) | Err(_) => break,
             _ => {}
@@ -327,6 +409,8 @@ fn main() {
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Picture => want_picker = Some(Asking::Picture),
                 Cmd::Present(cur) => present = Some(cur),
+                Cmd::Rehearse => run.rehearse(),
+                Cmd::Reduce => want_picker = Some(Asking::Reduce),
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
@@ -363,6 +447,7 @@ fn main() {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["oslides", "pptx", "odp"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a presentation".into() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
                         Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
+                        Asking::Reduce => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save a smaller copy of “{}”", stem_of(&name)) },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
@@ -390,9 +475,11 @@ fn main() {
                     }
                 }
                 Ok(Some(ParentEvent::Message { bytes, .. })) => match ToParent::decode(&bytes) {
-                    Some(ToParent::Folder { at, read_only, name }) if asking == Some(Asking::SaveAs) => {
+                    Some(ToParent::Folder { at, read_only, name }) if matches!(asking, Some(Asking::SaveAs | Asking::Reduce)) => {
                         if read_only {
                             run.set_status(format!("“{name}” is read-only; choose another folder."));
+                        } else if asking == Some(Asking::Reduce) {
+                            run.reduce_into(PathBuf::from(&at));
                         } else {
                             run.save_into(Path::new(&at));
                         }
@@ -417,6 +504,15 @@ fn main() {
                 }
                 asking = None;
                 run.slides.ui.set(Ui { asking: false });
+            }
+        }
+        if let Some(msg) = run.background.as_ref().and_then(|b| b.poll()) {
+            run.background = None;
+            run.set_status(msg);
+        } else if let Some(b) = &run.background {
+            let p = b.progress();
+            if p != run.slides.doc.borrow().status {
+                run.set_status(p);
             }
         }
         if last_sync.elapsed() >= SYNC_EVERY {

@@ -69,6 +69,10 @@ pub enum Cmd {
     SelectAll,
     /// Present the deck: from the first slide, or (true) from the current.
     Present(bool),
+    /// Decode every slide's pictures as the show would and report slow ones.
+    Rehearse,
+    /// Save a copy with pictures no bigger than they are shown.
+    Reduce,
 }
 
 /// The Arrange menu: (label, command).
@@ -510,7 +514,7 @@ impl Slides {
                 let to = if c == Cmd::BringForward { at + 1 } else { at.saturating_sub(1) };
                 d.run(if c == Cmd::BringForward { "Bring Forward" } else { "Send Backward" }, vec![DeckOp::MoveShape { target: Target::Slide(sid), id, to }]);
             }
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) => return false,
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce => return false,
         }
         drop(d);
         self.changed();
@@ -1068,15 +1072,17 @@ impl View for Slides {
             let mut items: Vec<MenuItem> = layouts.iter().map(MenuItem::new).collect();
             items.push(MenuItem::new("Duplicate Slide"));
             items.push(MenuItem::new("Delete Slide"));
+            items.push(MenuItem::new("Rehearse Show"));
+            items.push(MenuItem::new("Reduce File Size…"));
             let n = layouts.len();
             let cmds = self.cmds.clone();
             MenuButton::new("Slide", self.new_menu.clone(), items, move |i| {
-                let c = if i < n {
-                    Cmd::NewSlide(i)
-                } else if i == n {
-                    Cmd::DuplicateSlide
-                } else {
-                    Cmd::DeleteSlide
+                let c = match i.saturating_sub(n) {
+                    _ if i < n => Cmd::NewSlide(i),
+                    0 => Cmd::DuplicateSlide,
+                    1 => Cmd::DeleteSlide,
+                    2 => Cmd::Rehearse,
+                    _ => Cmd::Reduce,
                 };
                 cmds.lock().unwrap().push(c);
             })

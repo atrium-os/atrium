@@ -964,6 +964,26 @@ impl Deck {
         true
     }
 
+    /// Puts new bytes under media `id` (Reduce File Size on a copy of a deck:
+    /// not an op, not undoable). Its preview, if any, stays with it.
+    pub fn replace_media(&mut self, id: MediaId, mime: &str, bytes: &[u8]) -> bool {
+        let hash = content_hash(bytes);
+        let Some(m) = self.media.get_mut(&id) else { return false };
+        let old = m.hash;
+        *m = MediaItem { mime: mime.into(), hash, len: bytes.len() as u64, bytes: MediaBytes::Loaded(bytes.into()) };
+        if self.by_hash.get(&old) == Some(&id) {
+            self.by_hash.remove(&old);
+        }
+        self.by_hash.entry(hash).or_insert(id);
+        if let Some(p) = self.previews.get(&old).cloned() {
+            if !self.media.values().any(|m| m.hash == old) {
+                self.previews.remove(&old);
+            }
+            self.previews.entry(hash).or_insert(p);
+        }
+        true
+    }
+
     /// Pictures (image media) with no preview yet, by id.
     pub fn pictures_without_preview(&self) -> Vec<MediaId> {
         let mut v: Vec<MediaId> = self.media.iter().filter(|(_, m)| m.mime.starts_with("image/") && !self.previews.contains_key(&m.hash)).map(|(&id, _)| id).collect();
