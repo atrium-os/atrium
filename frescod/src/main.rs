@@ -42,6 +42,7 @@ mod pack;
 mod tactus_client;
 mod redraw;
 mod render_backend;
+mod sprites;
 mod socket_server;
 mod split;
 mod gpu_app;
@@ -1508,6 +1509,8 @@ fn render_one_frame(
     };
 
     let mut windows: Vec<WindowFrame> = Vec::with_capacity(layers.len());
+    /* The compute backend draws animated groups as sprites (sprites.rs). */
+    let promote = renderer.takes_pixels();
     /* Clients' socket threads wait on this lock to apply their ops, so
      * how long packing holds it is how long frescod stops reading them. */
     let t_pack = Instant::now();
@@ -1537,13 +1540,20 @@ fn render_one_frame(
                     frame: Some(f),
                     ..Default::default()
                 });
-            } else if let Some(w) = pack::window_frame(&fe, *win_id, *pos, *size) {
+            } else if let Some(w) = if promote {
+                pack::window_frame_promoted(&fe, *win_id, *pos, *size)
+            } else {
+                pack::window_frame(&fe, *win_id, *pos, *size)
+            } {
                 windows.push(w);
             }
         }
     }
 
     let held = t_pack.elapsed();
+    if std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
+        eprintln!("frescod: snapshot {:.1} ms ({} windows)", held.as_secs_f64() * 1e3, windows.len());
+    }
     let (uploads, clears) = {
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()

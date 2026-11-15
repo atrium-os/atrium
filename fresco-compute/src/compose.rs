@@ -247,6 +247,107 @@ pub fn render(c: &Compose, heap: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Decode and encode tables for [`over`]: the LUT's 256 decode values,
+/// and a 65536-step encode (within one step of [`crate::reference::encode`]).
+struct Tables {
+    dec: Vec<f32>,
+    enc: Vec<u8>,
+}
+
+fn tables() -> &'static Tables {
+    static T: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let l = lut();
+        let enc = (0..65536u32).map(|i| crate::reference::encode(&l, i as f32 / 65535.0) as u8).collect();
+        Tables { dec: l[..256].to_vec(), enc }
+    })
+}
+
+/// Src-over one row: `s` onto `d` at opacity `o` (0 < o <= 1).
+fn over_row(d: &mut [u32], s: &[u32], o: f32, t: &Tables) {
+    let full = o >= 1.0;
+    let enc = |v: f32| t.enc[(v.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize] as u32;
+    for (dp, &sp) in d.iter_mut().zip(s) {
+        if sp == 0 {
+            continue;
+        }
+        let sa = sp >> 24;
+        if full && sa == 255 {
+            *dp = sp;
+            continue;
+        }
+        let k = 1.0 - sa as f32 * (1.0 / 255.0) * o;
+        let dw = *dp;
+        let ch = |sh: u32| enc(t.dec[((sp >> sh) & 255) as usize] * o + t.dec[((dw >> sh) & 255) as usize] * k);
+        let a = (sa as f32 * o + (dw >> 24) as f32 * k + 0.5).min(255.0) as u32;
+        *dp = ch(0) | (ch(8) << 8) | (ch(16) << 16) | (a << 24);
+    }
+}
+
+/// Src-over `src` (`src_size` pixels, `src_pitch` words a row) onto `dst`
+/// (`dst_pitch` words a row) inside `rect` (dst pixels `[x0, y0, x1, y1)`)
+/// at `opacity`: dst pixel (x, y) takes src pixel (x - at.0, y - at.1);
+/// what falls outside `src` is left alone. Both hold surface pixels
+/// (premultiplied, sRGB-encoded, linear alpha on top). A wholly opaque
+/// source pixel at opacity 1 is copied and a zero one skipped; others blend
+/// in linear light as `compose.comp` does, encoded through a table (within
+/// one step of the kernels' exact encode). Rows are spread over `threads`.
+///
+/// frescod draws an animating group this way (a sprite rastered once,
+/// moved and faded per frame), so a transition costs a copy of what
+/// moved, not a raster.
+#[allow(clippy::too_many_arguments)]
+pub fn over(dst: &mut [u32], dst_pitch: u32, src: &[u32], src_pitch: u32, src_size: (u32, u32), rect: [u32; 4], at: (i32, i32), opacity: f32, threads: usize) {
+    let o = if opacity >= 0.0 { opacity.min(1.0) } else { 0.0 };
+    if o <= 0.0 {
+        return;
+    }
+    // The rect, clipped to where src has pixels.
+    let lo = |a: u32, d: i32| (a as i64).max(d as i64).max(0) as u32;
+    let hi = |a: u32, d: i32, n: u32| (a as i64).min(d as i64 + n as i64).max(0) as u32;
+    let (x0, y0) = (lo(rect[0], at.0), lo(rect[1], at.1));
+    let (x1, y1) = (hi(rect[2], at.0, src_size.0), hi(rect[3], at.1, src_size.1));
+    let dp = dst_pitch as usize;
+    if x0 >= x1 || y0 >= y1 || dp == 0 || (y1 as usize - 1) * dp + x1 as usize > dst.len() || x1 > dst_pitch {
+        return;
+    }
+    let sp = src_pitch as usize;
+    let (sx0, sy0) = ((x0 as i64 - at.0 as i64) as usize, (y0 as i64 - at.1 as i64) as usize);
+    let w = (x1 - x0) as usize;
+    if (sy0 + (y1 - y0) as usize - 1) * sp + sx0 + w > src.len() {
+        return;
+    }
+    let t = tables();
+    let rows = (y1 - y0) as usize;
+    let row = |i: usize, d: &mut [u32]| {
+        let s = &src[(sy0 + i) * sp + sx0..][..w];
+        over_row(&mut d[x0 as usize..x0 as usize + w], s, o, t);
+    };
+    let dst = &mut dst[y0 as usize * dp..];
+    let n = if rows * w < 1 << 16 { 1 } else { threads.clamp(1, rows) };
+    if n == 1 {
+        for (i, d) in dst.chunks_mut(dp).take(rows).enumerate() {
+            row(i, d);
+        }
+        return;
+    }
+    let per = rows.div_ceil(n);
+    std::thread::scope(|s| {
+        for (k, band) in dst.chunks_mut(dp * per).enumerate() {
+            let first = k * per;
+            if first >= rows {
+                break;
+            }
+            let row = &row;
+            s.spawn(move || {
+                for (i, d) in band.chunks_mut(dp).take(rows - first).enumerate() {
+                    row(first + i, d);
+                }
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +370,42 @@ mod tests {
         assert_eq!(out[(1 * 6 + 2) as usize], heap[16]);
         assert_eq!(out[(1 * 6 + 1) as usize], heap[4 + 1]);
         assert_eq!(out[(4 * 6) as usize], pixel(&Compose::new(&[], 1, 1, 1, 0), &[], 0, 0), "uncovered is the clear colour");
+    }
+
+    /// `over` matches compose.comp's blend of the same two surfaces: an
+    /// opaque base (the destination), a source at an offset and opacity.
+    #[test]
+    fn over_matches_the_compose_kernels_blend() {
+        let (w, h) = (40u32, 30u32);
+        let mut seed = 7u32;
+        let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed };
+        let base: Vec<u32> = (0..w * h).map(|_| 0xff00_0000 | (rnd() & 0xff_ffff)).collect();
+        // Premultiplied source: each channel at most its alpha, some zero
+        // words, some opaque.
+        let src: Vec<u32> = (0..w * h).map(|i| match i % 5 {
+            0 => 0,
+            1 => 0xff00_0000 | (rnd() & 0xff_ffff),
+            _ => {
+                let a = rnd() % 256;
+                let c = |r: u32| if a == 0 { 0 } else { r % (a + 1) };
+                (a << 24) | (c(rnd()) << 16) | (c(rnd()) << 8) | c(rnd())
+            }
+        }).collect();
+        for (op, at) in [(1.0f32, (0, 0)), (0.5, (3, -2)), (0.2, (-5, 4))] {
+            let mut heap = base.clone();
+            heap.extend_from_slice(&src);
+            let layers = [Layer::at([0, w, w, h], 0, 0, 1.0), Layer::at([w * h, w, w, h], at.0, at.1, op)];
+            let c = Compose::new(&layers, w, h, w, heap.len() as u32);
+            let want = render(&c, &heap);
+            let mut got = base.clone();
+            over(&mut got, w, &src, w, (w, h), [0, 0, w, h], at, op, 3);
+            for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                for sh in [0, 8, 16] {
+                    let (a, b) = ((g >> sh) & 255, (e >> sh) & 255);
+                    assert!(a.abs_diff(b) <= 1, "pixel {i} at opacity {op}: {g:08x} vs {e:08x}");
+                }
+                assert_eq!(g >> 24, 255, "an opaque base stays opaque");
+            }
+        }
     }
 }

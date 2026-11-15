@@ -311,34 +311,61 @@ impl Tier2 {
         if groups.is_empty() {
             return Ok(());
         }
-        if groups.iter().any(|r| r[0] == 0 && r[1] == 0 && r[2] >= g[0] && r[3] >= g[1]) {
-            return self.compose(c, heap, target); // all of it
-        }
         // Where the top layer is opaque the pixel is the surface's: copy
         // it here, and run the kernel only on workgroups with a blend.
-        let (l, pitch) = (COMPOSE_LOCAL, c.header.pitch);
-        let mut blend: Vec<[u32; 4]> = Vec::new();
+        // Bands of workgroup rows go to the threads, each writing only its
+        // own rows of `target` (a whole-screen change, as a slide
+        // transition makes, is mostly copies).
+        let (l, pitch) = (COMPOSE_LOCAL, c.header.pitch as usize);
+        let mut spans: Vec<Vec<(u32, u32)>> = vec![Vec::new(); g[1] as usize];
         for r in &groups {
             for gy in r[1]..r[3] {
-                for gx in r[0]..r[2] {
-                    let mut all = true;
-                    'px: for y in gy * l..((gy + 1) * l).min(c.header.height) {
-                        for x in gx * l..((gx + 1) * l).min(c.header.width) {
-                            match crate::compose::opaque_pixel(c, heap, x, y) {
-                                Some(p) => target[(y * pitch + x) as usize] = p,
-                                None => {
-                                    all = false;
-                                    break 'px;
+                spans[gy as usize].push((r[0], r[2]));
+            }
+        }
+        let band = l as usize * pitch;
+        let mut bands: Vec<(u32, &mut [u32])> = target
+            .chunks_mut(band)
+            .enumerate()
+            .filter(|(gy, _)| spans.get(*gy).is_some_and(|s| !s.is_empty()))
+            .map(|(gy, t)| (gy as u32, t))
+            .collect();
+        let per = bands.len().div_ceil(self.threads.max(1)).max(1);
+        let spans = &spans;
+        let scan = move |part: &mut [(u32, &mut [u32])]| -> Vec<[u32; 4]> {
+            let mut blend = Vec::new();
+            for (gy, t) in part.iter_mut() {
+                let gy = *gy;
+                for &(x0, x1) in &spans[gy as usize] {
+                    for gx in x0..x1 {
+                        let mut all = true;
+                        'px: for y in gy * l..((gy + 1) * l).min(c.header.height) {
+                            for x in gx * l..((gx + 1) * l).min(c.header.width) {
+                                match crate::compose::opaque_pixel(c, heap, x, y) {
+                                    Some(p) => t[(y - gy * l) as usize * pitch + x as usize] = p,
+                                    None => {
+                                        all = false;
+                                        break 'px;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if !all {
-                        blend.push([gx, gy, gx + 1, gy + 1]);
+                        if !all {
+                            blend.push([gx, gy, gx + 1, gy + 1]);
+                        }
                     }
                 }
             }
-        }
+            blend
+        };
+        let blend: Vec<[u32; 4]> = if bands.len() <= 1 || self.threads <= 1 {
+            scan(&mut bands)
+        } else {
+            std::thread::scope(|s| {
+                let hs: Vec<_> = bands.chunks_mut(per).map(|part| s.spawn(move || scan(part))).collect();
+                hs.into_iter().flat_map(|h| h.join().expect("compose scan")).collect()
+            })
+        };
         let groups = blend;
         if groups.is_empty() {
             return Ok(());

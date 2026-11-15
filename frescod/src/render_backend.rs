@@ -457,6 +457,12 @@ pub struct Compute {
     /// Where the last render changed `target` (see [`Backend::damage`]).
     damage: Option<[u32; 4]>,
     fill_drops: FillDrops,
+    /// Per window with sprites, its sprite drawing (crate::sprites).
+    sprites: HashMap<u32, crate::sprites::Sprites>,
+    /// Per window, the key ([`SceneState::window_key`]) of the scene its
+    /// surface holds, and the frame packed from it: an unchanged window
+    /// is neither packed nor rastered again.
+    keys: HashMap<u32, (u64, Arc<fresco_compute::Frame>)>,
 }
 
 /// Where the installer puts frescod's precompiled Tier-2 kernels
@@ -538,10 +544,13 @@ impl Compute {
             composed: None,
             damage: None,
             fill_drops: Vec::new(),
+            sprites: HashMap::new(),
+            keys: HashMap::new(),
         })
     }
 
     fn render(&mut self, f: ScreenInput) -> Result<()> {
+        let mut times = Times::start();
         self.scene.apply(f.uploads, f.clears);
         self.fill_drops.clear();
         let sizes: Vec<(u32, u32, u32)> = f.windows.iter().map(|w| {
@@ -552,7 +561,11 @@ impl Compute {
             self.heap = vec![0; self.surfaces.words as usize];
             self.held.clear();
             self.composed = None;
+            self.sprites.clear();
+            self.keys.clear();
         }
+        self.sprites.retain(|id, _| f.windows.iter().any(|w| w.id == *id && !w.sprites.is_empty()));
+        self.keys.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.last.clear();
         // Each surface's change this frame, in its own pixels.
         let mut changed: HashMap<u32, [u32; 4]> = HashMap::new();
@@ -581,9 +594,61 @@ impl Compute {
                 self.held.insert(w.id, vec![p.gen]);
                 continue;
             }
+            if !w.sprites.is_empty() {
+                // Animated groups as sprites over the rest of the window.
+                let t = std::time::Instant::now();
+                let (off, len) = (s[0] as usize, (s[1] * s[3]) as usize);
+                let mut cost = crate::sprites::Cost::default();
+                let sp = self.sprites.entry(w.id).or_default();
+                let r = sp.draw(&self.t2, &self.scene, w, &mut self.heap[off..off + len], s[2], s[3], &mut cost);
+                times.raster += t.elapsed();
+                times.tiles += cost.base_tiles;
+                times.sprites += cost.sprites_rastered;
+                times.composite += cost.composite;
+                match r {
+                    Ok(Some(r)) => {
+                        changed.insert(w.id, r);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.sprites.remove(&w.id);
+                        return Err(e.into());
+                    }
+                }
+                // The surface no longer holds a plain drawing; hit tests
+                // use the window's last frame.
+                self.held.remove(&w.id);
+                if let Some((_, f)) = self.keys.get(&w.id) {
+                    self.last.push((w.id, f.clone()));
+                }
+                continue;
+            }
+            let key = w.frame.is_none().then(|| self.scene.window_key(w));
+            if let (Some(k), Some((held, frame))) = (key, self.keys.get(&w.id)) {
+                if k == *held && self.held.contains_key(&w.id) {
+                    self.last.push((w.id, frame.clone()));
+                    continue;
+                }
+            }
+            let t = std::time::Instant::now();
             let frame = frame_of(&self.scene, w, s, &mut self.fill_drops);
             self.last.push((w.id, frame.clone()));
+            match key {
+                Some(k) => {
+                    self.keys.insert(w.id, (k, frame.clone()));
+                }
+                None => {
+                    self.keys.remove(&w.id);
+                }
+            }
+            times.pack += t.elapsed();
+            if times.on {
+                times.per.push((w.id, t.elapsed(), frame.header.op_count));
+            }
+            let t = std::time::Instant::now();
             let sig = fresco_compute::damage::tile_signatures(&frame);
+            times.sig += t.elapsed();
+            let t = std::time::Instant::now();
             let (off, len) = (s[0] as usize, (s[1] * s[3]) as usize);
             let surface = &mut self.heap[off..off + len];
             match self.held.get(&w.id) {
@@ -594,6 +659,8 @@ impl Compute {
                     let dirty = damage::dirty(&sig, self.held.get(&w.id).map(Vec::as_slice));
                     let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
                     self.t2.render_tiles(&frame, surface, &tiles)?;
+                    times.raster += t.elapsed();
+                    times.tiles += tiles.iter().map(|t| (t[2] - t[0]) * (t[3] - t[1])).sum::<u32>();
                     let r = tiles.iter().map(|t| [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(s[2]), (t[3] * TILE).min(s[3])])
                         .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
                     if let Some(r) = r {
@@ -602,11 +669,14 @@ impl Compute {
                 }
                 _ => {
                     self.t2.render(&frame, surface)?;
+                    times.raster += t.elapsed();
+                    times.tiles += frame.header.tiles_x * frame.header.tiles_y;
                     changed.insert(w.id, whole);
                 }
             }
             self.held.insert(w.id, sig);
         }
+        let t_compose = std::time::Instant::now();
         let layers = self.surfaces.layers(&f.windows);
         let c = Compose::new(&layers, self.width, self.height, self.width, self.heap.len() as u32);
         if self.composed.as_ref() == Some(&layers) {
@@ -630,11 +700,51 @@ impl Compute {
             self.t2.compose_rects(&c, &self.heap, &mut self.target, &rects)?;
             self.damage = Some(rects.into_iter().reduce(union).unwrap_or([0; 4]));
         } else {
-            self.t2.compose(&c, &self.heap, &mut self.target)?;
+            self.t2.compose_rects(&c, &self.heap, &mut self.target, &[[0, 0, self.width, self.height]])?;
             self.composed = Some(layers);
             self.damage = None;
         }
+        times.compose = t_compose.elapsed();
+        times.report();
         Ok(())
+    }
+}
+
+/// Where a compute frame's time went, logged per frame when
+/// `FRESCOD_RENDER_TIMES` is set (to find what a transition costs).
+struct Times {
+    on: bool,
+    begun: std::time::Instant,
+    pack: std::time::Duration,
+    sig: std::time::Duration,
+    raster: std::time::Duration,
+    tiles: u32,
+    compose: std::time::Duration,
+    /// Sprites rastered, and the time compositing them.
+    sprites: u32,
+    composite: std::time::Duration,
+    /// Per window packed: id, time, ops.
+    per: Vec<(u32, std::time::Duration, u32)>,
+}
+
+impl Times {
+    fn start() -> Times {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("FRESCOD_RENDER_TIMES").is_some());
+        let z = std::time::Duration::ZERO;
+        Times { on, begun: std::time::Instant::now(), pack: z, sig: z, raster: z, tiles: 0, compose: z, sprites: 0, composite: z, per: Vec::new() }
+    }
+    fn report(&self) {
+        if self.on {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "frescod: render {:.1} ms: pack {:.1}, signatures {:.1}, raster {:.1} ({} tiles, {} sprites, composite {:.1}), compose {:.1}",
+                ms(self.begun.elapsed()), ms(self.pack), ms(self.sig), ms(self.raster), self.tiles, self.sprites, ms(self.composite), ms(self.compose)
+            );
+            for (id, d, ops) in &self.per {
+                eprintln!("frescod:   window {id}: packed {ops} ops in {:.1} ms", ms(*d));
+            }
+        }
     }
 }
 /// A ring BO: the packets, then the end-of-pipe fence word.
@@ -1549,5 +1659,62 @@ mod tests {
         // A drawing the consumer never held: copied whole.
         let p3 = Arc::new(Pixels { gen: 9, width: 40, height: 30, px: vec![0xff77_7777; 1200], seq: 7, since: vec![(8, [0, 0, 1, 1])] });
         check(&mut inc, &|| input(&p3, [0.0, 1.0, 0.0, 1.0], (50.0, 30.0)));
+    }
+
+    /// A group an animation moves or fades, drawn as a sprite over the
+    /// rest of the window, looks as the window rastered whole does: the
+    /// same at opacity 1 (whole-pixel moves), within a step faded (as if
+    /// the group were `ISOLATE`); and each frame reports what changed.
+    #[test]
+    fn sprites_match_a_full_raster() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{group_flags, GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (96u32, 64u32);
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 96.0, 64.0, [0.2, 0.3, 0.4, 1.0], None);
+        let slide = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 8.0, 8.0], clip: Some([8.0, 8.0, 72.0, 56.0]), opacity: 1.0, flags: 0 };
+        s.set_group(10, slide, 1).unwrap();
+        rect(&mut s, 11, 0.0, 0.0, 64.0, 48.0, [1.0, 0.0, 0.0, 1.0], Some(10));
+        rect(&mut s, 12, 10.5, 10.0, 20.0, 20.0, [0.0, 0.0, 1.0, 0.5], Some(10));
+        let mut c = Compute::new(w, h).expect("kernels");
+        let scene = SceneState::default();
+        let mut sp = crate::sprites::Sprites::default();
+        let mut out = vec![0u32; (w * h) as usize];
+        let mut step = |s: &mut WindowSceneState, dx: f32, op: f32, tol: u32| -> Option<[u32; 4]> {
+            s.anim_now.insert(10, GroupParams { transform: [1.0, 0.0, 0.0, 1.0, 8.0 + dx, 8.0], opacity: op, ..slide });
+            let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(s, &mut pw, true), "promoted");
+            assert_eq!(pw.sprites.len(), 1);
+            let mut cost = crate::sprites::Cost::default();
+            let d = sp.draw(&c.t2, &scene, &pw, &mut out, w, h, &mut cost).unwrap();
+            // The same frame, rastered whole (the group isolated).
+            let mut iso = s.anim_now[&10];
+            iso.flags = group_flags::ISOLATE;
+            s.anim_now.insert(10, iso);
+            let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(s, &mut fw, false));
+            let mut want = vec![0u32; (w * h) as usize];
+            c.t2.render(&scene.pack(&fw, w, h), &mut want).unwrap();
+            for (i, (g, e)) in out.iter().zip(&want).enumerate() {
+                for sh in [0, 8, 16, 24] {
+                    let (a, b) = ((g >> sh) & 255, (e >> sh) & 255);
+                    assert!(a.abs_diff(b) <= tol, "dx {dx} opacity {op}: pixel ({}, {}) {g:08x} vs {e:08x}", i as u32 % w, i as u32 / w);
+                }
+            }
+            d
+        };
+        assert_eq!(step(&mut s, 0.0, 1.0, 0), Some([0, 0, w, h]), "the first drawing is whole");
+        assert_eq!(step(&mut s, 0.0, 1.0, 0), None, "nothing changed");
+        // Moved right 20: what it covered before and covers now (the
+        // clip ends at 72).
+        assert_eq!(step(&mut s, 20.0, 1.0, 0), Some([8, 8, 72, 56]));
+        assert_eq!(step(&mut s, 20.0, 0.5, 2), Some([28, 8, 72, 56]));
     }
 }

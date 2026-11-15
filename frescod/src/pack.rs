@@ -47,6 +47,32 @@ pub struct WindowFrame {
     /// The window's scroll viewports (`SCROLL` groups in the shape §4
     /// shifts), in paint order.
     pub scrolls: Vec<Scroll>,
+    /// Groups an animation moves, fades or clips, drawn as sprites (see
+    /// [`Sprite`]); only from [`window_frame_promoted`]. When there are
+    /// any, they are the end of `order`: the window is `order` up to the
+    /// first, then each sprite over it.
+    pub sprites: Vec<Sprite>,
+}
+
+/// A group an animation is moving, fading or clipping (not scaling),
+/// drawn apart from the window while it runs: its content is rastered once
+/// in its own space and composited each frame at its offset, opacity and
+/// clip, so a slide transition costs a copy of what moved rather than a
+/// raster of the window. The group's opacity applies to the sprite as a
+/// whole (as if `ISOLATE`); the frame after the animation ends is rastered
+/// whole, exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sprite {
+    pub group: u32,
+    /// Its content: `order[range]`, drawn as if the group sat at (0, 0)
+    /// of the window, within the window's size.
+    pub range: std::ops::Range<usize>,
+    /// Where the content's (0, 0) is in the window, whole pixels.
+    pub offset: [i32; 2],
+    pub opacity: f32,
+    /// Window pixels `[x0, y0, x1, y1)` it shows in (the group's and its
+    /// ancestors' clips).
+    pub clip: [i32; 4],
 }
 
 /// A scroll viewport, for the pixel renderer's shift
@@ -407,15 +433,31 @@ impl SceneState {
 /// Window `id`'s scene as the frontend holds it, for a surface of `size`
 /// whose (0, 0) is at `pos` on the screen. None if it has drawn nothing.
 pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32)) -> Option<WindowFrame> {
+    window_frame_as(fe, id, pos, size, false)
+}
+
+/// [`window_frame`], with the groups an animation moves, fades or clips
+/// as [`Sprite`]s, for a pixel renderer that composites them
+/// ([`crate::sprites`]).
+pub fn window_frame_promoted(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32)) -> Option<WindowFrame> {
+    window_frame_as(fe, id, pos, size, true)
+}
+
+fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32), promote: bool) -> Option<WindowFrame> {
     let state = fe.window_state(id)?;
-    let mut w = WindowFrame {
+    let fresh = || WindowFrame {
         id,
         pos,
         size: (size.0.ceil() as u32, size.1.ceil() as u32),
         ..Default::default()
     };
+    let mut w = fresh();
     if state.has_groups() {
-        grouped_frame(state, &mut w);
+        if promote && !state.anim_now.is_empty() && grouped_frame(state, &mut w, true) {
+            return Some(w);
+        }
+        w = fresh();
+        grouped_frame(state, &mut w, false);
         return Some(w);
     }
     /* Paint in node_id order (lower id → drawn first → bottom).
@@ -499,7 +541,153 @@ pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32,
     Some(w)
 }
 
+/// `v` as bytes: plain `repr(C)` data of `f32`/`i32`/`u32` fields only
+/// (no padding), for hashing.
+fn raw<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: callers pass slices of padding-free plain data; any byte
+    // pattern is a valid u8 and the length is the slice's size.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn hash_fill<H: std::hash::Hasher>(h: &mut H, f: &fresco_compute::fill::Fill) {
+    use std::hash::Hash;
+    f.verbs.hash(h);
+    h.write(raw(&f.points));
+    h.write(raw(&[f.transform]));
+    h.write(raw(&[f.color]));
+    (f.rule == fresco_compute::fill::FillRule::EvenOdd).hash(h);
+    f.clip.map(|c| c.map(f32::to_bits)).hash(h);
+    match &f.gradient {
+        None => h.write_u8(0),
+        Some(g) => {
+            match g.shape {
+                fresco_compute::fill::GradientShape::Linear { p0, p1 } => h.write(raw(&[p0, p1])),
+                fresco_compute::fill::GradientShape::Radial { center, radius } => {
+                    h.write(raw(&[center]));
+                    h.write_u32(radius.to_bits());
+                }
+            }
+            for (o, c) in &g.stops {
+                h.write_u32(o.to_bits());
+                h.write(raw(&[*c]));
+            }
+        }
+    }
+}
+
 impl SceneState {
+    /// Hash what `items` of `f` draw: their nodes, clips and the uploads
+    /// of the slots they sample. Equal keys draw equal pixels.
+    fn items_hash<H: std::hash::Hasher>(&self, h: &mut H, f: &WindowFrame, items: &[OrderItem]) {
+        use fresco_compute::Node;
+        use std::hash::Hash;
+        for o in items {
+            o.clip.map(|c| c.map(f32::to_bits)).hash(h);
+            match o.item {
+                Node::Rect(i) => h.write(raw(f.rects.get(i..i + 1).unwrap_or(&[]))),
+                Node::Path(i) => h.write(raw(f.paths.get(i..i + 1).unwrap_or(&[]))),
+                Node::Fill(i) => {
+                    if let Some(fl) = f.fills.get(i) {
+                        hash_fill(h, fl);
+                    }
+                }
+                Node::Quad(b, q) => {
+                    if let Some(batch) = f.batches.get(b) {
+                        (batch.slot_id, self.gens.get(&batch.slot_id)).hash(h);
+                        h.write(raw(batch.nodes.get(q..q + 1).unwrap_or(&[])));
+                    }
+                }
+                Node::Run(b, r) => {
+                    if let Some(batch) = f.glyph_batches.get(b) {
+                        (batch.atlas_slot_id, self.gens.get(&batch.atlas_slot_id)).hash(h);
+                        if let Some(n) = batch.nodes.get(r) {
+                            h.write(raw(&[*n]));
+                            let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
+                            h.write(raw(batch.glyphs.get(off..off + count).unwrap_or(&[])));
+                        }
+                    }
+                }
+                Node::Push(bits) => (1u8, bits).hash(h),
+                Node::Pop => 2u8.hash(h),
+            }
+        }
+    }
+
+    /// A key for what `f` draws on a surface of its size: equal keys,
+    /// equal pixels, so a window whose key did not change need not be
+    /// packed again.
+    pub fn window_key(&self, f: &WindowFrame) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (f.id != 0, f.size).hash(&mut h);
+        match &f.order {
+            Some(order) => self.items_hash(&mut h, f, order),
+            None => {
+                h.write(raw(&f.rects));
+                h.write(raw(&f.paths));
+                for fl in &f.fills {
+                    hash_fill(&mut h, fl);
+                }
+                for b in &f.batches {
+                    (b.slot_id, self.gens.get(&b.slot_id)).hash(&mut h);
+                    h.write(raw(&b.nodes));
+                }
+                for b in &f.glyph_batches {
+                    (b.atlas_slot_id, self.gens.get(&b.atlas_slot_id)).hash(&mut h);
+                    h.write(raw(&b.nodes));
+                    h.write(raw(&b.glyphs));
+                }
+            }
+        }
+        for s in &f.sprites {
+            (s.group, s.range.clone(), s.offset, s.opacity.to_bits(), s.clip).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The key of sprite `i` of `f`'s content (see [`Self::window_key`]).
+    pub fn sprite_key(&self, f: &WindowFrame, i: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let (Some(order), Some(s)) = (&f.order, f.sprites.get(i)) else { return 0 };
+        (f.size, s.range.len()).hash(&mut h);
+        self.items_hash(&mut h, f, &order[s.range.clone()]);
+        h.finish()
+    }
+
+    /// The key of what `f` draws under its sprites.
+    pub fn base_key(&self, f: &WindowFrame) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let Some(order) = &f.order else { return self.window_key(f) };
+        (f.id != 0, f.size).hash(&mut h);
+        self.items_hash(&mut h, f, &order[..f.sprites.first().map_or(order.len(), |s| s.range.start)]);
+        h.finish()
+    }
+
+    /// Pack the part of `f` under its sprites (`sprite` None), or sprite
+    /// `i`'s content (on a transparent clear), for a `width` x `height`
+    /// surface, with the fills dropped.
+    pub fn pack_part(&self, f: &WindowFrame, sprite: Option<usize>, width: u32, height: u32) -> (fresco_compute::Frame, Vec<(u32, u8)>) {
+        use fresco_compute as fc;
+        let Some(order) = &f.order else { return self.pack_report(f, width, height) };
+        let range = match sprite {
+            None => 0..f.sprites.first().map_or(order.len(), |s| s.range.start),
+            Some(i) => f.sprites.get(i).map_or(0..0, |s| s.range.clone()),
+        };
+        let scene = fc::Scene {
+            rects: f.rects.iter().map(|n| fc::Rect { position: n.position, size: n.size, color: n.color, radius: n.radius }).collect(),
+            paths: f.paths.iter().map(|n| fc::Path { model: n.model, angle: n.extra[0], color: n.color }).collect(),
+            fills: f.fills.clone(),
+            ..Default::default()
+        };
+        let (mut frame, drops) = self.pack_grouped(f, &order[range], scene, width, height);
+        if sprite.is_some() {
+            frame.header.clear = fc::TRANSPARENT;
+        }
+        (frame, drops)
+    }
+
     /// `pack_report` for a window that uses groups: its elements in tree
     /// order, kinds interleaved, each under its clip.
     fn pack_grouped(
@@ -611,7 +799,10 @@ fn empty(c: Option<[f32; 4]>) -> bool {
 /// Fill `w` from a window that uses groups: unplaced leaves first, in the
 /// flat path's kind-then-id order (so a client that never places a node
 /// draws as before), then the tree, depth first, siblings by (order, id).
-fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::WindowSceneState, w: &mut WindowFrame) {
+/// With `promote`, animated groups become [`Sprite`]s; `false` if that
+/// was asked and the window is not in a shape that allows it (`w` is then
+/// to be built again without).
+pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::WindowSceneState, w: &mut WindowFrame, promote: bool) -> bool {
     use fresco_compute::Node as Item;
     let mut order: Vec<OrderItem> = Vec::new();
     let sorted = |keys: Vec<&u32>| { let mut k: Vec<u32> = keys.into_iter().copied().collect(); k.sort_unstable(); k };
@@ -705,13 +896,21 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
             }
         }
     };
-    push_kids(&mut stack, None, At { x: Xf::ID, op: 1.0, seen: 1.0, clip: None, layers: 0 });
+    push_kids(&mut stack, None, At { x: Xf::ID, op: 1.0, seen: 1.0, clip: None, layers: 0, sprite: false });
     let mut viewports = Vec::new();
+    let mut sprites: Vec<Sprite> = Vec::new();
     while let Some(entry) = stack.pop() {
         let (id, at) = match entry {
             Walk::Node(id, at) => (id, at),
             Walk::End(id) => {
                 order.push(OrderItem { item: Item::Pop, clip: None, node: id });
+                continue;
+            }
+            Walk::SpriteEnd(mut s) => {
+                s.range.end = order.len();
+                if !s.range.is_empty() {
+                    sprites.push(s);
+                }
                 continue;
             }
         };
@@ -727,12 +926,32 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
                 // transition): skip the subtree.
                 continue;
             }
-            if g.flags & fresco_protocol::group_flags::SCROLL != 0 {
+            // A sprite: an animation moves, fades or clips the group, but
+            // does not scale it (its content would change every frame).
+            let scroll = g.flags & fresco_protocol::group_flags::SCROLL != 0;
+            let still = |a: &fresco_protocol::GroupParams| {
+                state.group_nodes.get(&id).is_some_and(|b| a.transform[..4] == b.transform[..4])
+            };
+            if promote && !at.sprite && at.layers == 0 && !scroll && state.anim_now.get(&id).is_some_and(still) {
+                let t = &g.transform;
+                let inner_x = x.then(&[t[0], t[1], t[2], t[3], 0.0, 0.0]);
+                let clip = c.map_or([i32::MIN, i32::MIN, i32::MAX, i32::MAX], |c| c.map(|v| v.round() as i32));
+                stack.push(Walk::SpriteEnd(Sprite {
+                    group: id,
+                    range: order.len()..order.len(),
+                    offset: [(x.s * t[4] as f64).round() as i32, (x.s * t[5] as f64).round() as i32],
+                    opacity: op * g.opacity,
+                    clip,
+                }));
+                push_kids(&mut stack, Some(id), At { x: inner_x, op: 1.0, seen: at.seen * g.opacity, clip: None, layers: 0, sprite: true });
+                continue;
+            }
+            if scroll && !at.sprite {
                 if let Some(v) = viewport(state, &kids, id, g, x, at.seen, c, w.size) {
                     viewports.push(v);
                 }
             }
-            let mut inner = At { x: x.then(&g.transform), op: op * g.opacity, seen: at.seen * g.opacity, clip: c, layers: at.layers };
+            let mut inner = At { x: x.then(&g.transform), op: op * g.opacity, seen: at.seen * g.opacity, clip: c, layers: at.layers, sprite: at.sprite };
             // ISOLATE (§2.4): the group is drawn into a layer, then blended
             // at its opacity (and what it inherited), exactly. Past the
             // kernel's depth, or at opacity 1, opacity multiplies down.
@@ -747,6 +966,34 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
         } else {
             emit(w, &mut order, id, x, op, clip);
         }
+    }
+    if promote {
+        // The sprites must end the order, back to back, each within the
+        // window's size in its own space.
+        let Some(first) = sprites.first().map(|s| s.range.start) else { return false };
+        let mut at = first;
+        for s in &sprites {
+            if s.range.start != at {
+                return false;
+            }
+            at = s.range.end;
+            let (sw, sh) = (w.size.0 as f32 + 0.5, w.size.1 as f32 + 0.5);
+            for o in &order[s.range.clone()] {
+                if let Some(b) = item_box(w, o.item) {
+                    let b = meet(Some(b), o.clip).unwrap();
+                    if b[0] < b[2] && b[1] < b[3] && (b[0] < -0.5 || b[1] < -0.5 || b[2] > sw || b[3] > sh) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if at != order.len() {
+            return false;
+        }
+        // The window under the sprites is rastered by tiles only.
+        w.sprites = sprites;
+        w.order = Some(order);
+        return true;
     }
     // What is drawn after each viewport's content, over its area.
     for (mut s, content) in viewports {
@@ -769,6 +1016,7 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
         w.scrolls.push(s);
     }
     w.order = Some(order);
+    true
 }
 
 /// Where the walk in [`grouped_frame`] is.
@@ -783,12 +1031,16 @@ struct At {
     clip: Option<[f32; 4]>,
     /// Isolated layers open around this node.
     layers: u32,
+    /// Inside a sprite's content.
+    sprite: bool,
 }
 
 enum Walk {
     Node(u32, At),
     /// The end of isolated group `id`.
     End(u32),
+    /// The end of a sprite's content.
+    SpriteEnd(Sprite),
 }
 
 /// A `SCROLL` group `id` (composed transform `x` of its parent, opacity
@@ -1105,7 +1357,7 @@ mod group_tests {
     }
     fn grouped(s: &WindowSceneState) -> WindowFrame {
         let mut w = WindowFrame { id: 1, size: (W, W), ..Default::default() };
-        grouped_frame(s, &mut w);
+        grouped_frame(s, &mut w, false);
         w
     }
     fn draw(w: &WindowFrame) -> Vec<u32> {

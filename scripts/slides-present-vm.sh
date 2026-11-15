@@ -12,6 +12,7 @@
 #   OPEN=deck.oslides sh scripts/slides-present-vm.sh   # another deck (default: the show_deck example's)
 #   PRESS_MS=4000                                      # time between presses
 #   EVERY=1                                            # also keep every animation frame
+#   FRESCOD_ENV="FRESCOD_RENDER_TIMES=1"               # more environment for frescod
 #
 # Under TCG (the cloud container) the gaps measure the emulator, not the
 # product: run it on the Mac (HVF) for the 60 Hz figure.
@@ -52,7 +53,7 @@ done
 
 SHOW="/tmp/sh/$(basename "$OPEN")"
 put "$OPEN" "$SHOW"
-g "cd /tmp/sh && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/sh/screen FRESCOD_HEADLESS_OUTPUTS=1280x720,1280x720 FRESCOD_HEADLESS_HZ=60 ${EVERY:+FRESCOD_HEADLESS_EVERY_FRAME=1} \
+g "cd /tmp/sh && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/sh/screen FRESCOD_HEADLESS_OUTPUTS=1280x720,1280x720 FRESCOD_HEADLESS_HZ=60 ${EVERY:+FRESCOD_HEADLESS_EVERY_FRAME=1} ${FRESCOD_ENV:-} \
     FRESCOD_SOCK=/tmp/sh/fresco.sock FRESCOD_WM_SOCK=/tmp/sh/wm.sock FRESCOD_INPUT_SOCK=/tmp/sh/inject.sock daemon -f -o /tmp/sh/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 90 ] && ! g "test -S /tmp/sh/fresco.sock"; do sleep 2; i=$((i+1)); done
 g "test -S /tmp/sh/fresco.sock" || { echo "frescod did not listen"; g "tail -20 /tmp/sh/frescod.log"; exit 1; }
@@ -66,7 +67,7 @@ g "n=0; while [ \$n -lt ${SHOTS:-90} ] && pgrep -x atrium-slides >/dev/null; do 
 g "pkill -x atrium-slides; sleep 1; true"
 echo "=== app log"
 g "cat /tmp/sh/app.log" | tee "$OUTDIR/app.log"
-g "tail -5 /tmp/sh/frescod.log; pkill -x frescod; true"
+g "cat /tmp/sh/frescod.log" > "$OUTDIR/frescod.log"; g "tail -5 /tmp/sh/frescod.log; pkill -x frescod; true"
 rm -f "$OUTDIR"/shot-*.png
 for f in $(g "cd /tmp/sh/shots && ls | awk 'NR%3==0'"); do get "/tmp/sh/shots/$f" "$OUTDIR/shot-$f"; done
 if [ -n "${EVERY:-}" ]; then

@@ -50,6 +50,8 @@ use fresco_split::{slot, Input, Msg, Role, MAX_WINDOWS, MAX_WINDOW_DIM};
 mod laminar;
 #[path = "../pack.rs"]
 mod pack;
+#[path = "../sprites.rs"]
+mod sprites;
 #[path = "../redraw.rs"]
 mod redraw;
 #[path = "../credential.rs"]
@@ -106,12 +108,18 @@ struct Win {
     too_big: bool,
     /// The monitor frescod was told to put it full screen on.
     full_screen: Option<u64>,
+    /// The key of the scene last drawn ([`pack::SceneState::window_key`]).
+    key: Option<u64>,
+    /// Pixel mode, while the window has sprites: their drawing.
+    sprites: Option<sprites::Sprites>,
 }
 
 impl Win {
     /// Forget what was drawn: the next frame is drawn and sent whole.
     fn forget(&mut self) {
         self.sig = None;
+        self.key = None;
+        self.sprites = None;
         self.tiles = None;
         self.scrolls.clear();
         self.slot_seq = [0; 2];
@@ -612,9 +620,45 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
     let mut s = state.lock().unwrap();
     for (&id, w) in s.wins.iter_mut() {
         let (true, Some((width, height))) = (w.slots.is_some(), w.size) else { continue };
-        let Some(wf) = pack::window_frame(&fe.lock().unwrap(), id, (0.0, 0.0), (width as f32, height as f32)) else {
-            continue;
+        // Pixel mode draws animated groups as sprites (sprites.rs).
+        let wf = {
+            let fe = fe.lock().unwrap();
+            let size = (width as f32, height as f32);
+            if t2.is_some() { pack::window_frame_promoted(&fe, id, (0.0, 0.0), size) } else { pack::window_frame(&fe, id, (0.0, 0.0), size) }
         };
+        let Some(wf) = wf else { continue };
+        // An unchanged scene draws the same pixels: not packed again.
+        let key = scene.window_key(&wf);
+        if w.key == Some(key) {
+            continue;
+        }
+        if let (Some(t2), false) = (t2, wf.sprites.is_empty()) {
+            let Some(i) = (0..2).find(|&i| !w.busy[i]) else { continue }; // FRAME_DONE wakes us
+            let n = width as usize * height as usize;
+            if w.px.len() != n {
+                w.px = vec![0; n];
+            }
+            let mut cost = sprites::Cost::default();
+            let r = w.sprites.get_or_insert_with(Default::default).draw(t2, scene, &wf, &mut w.px, width, height, &mut cost);
+            // `px` no longer holds a plain drawing.
+            w.tiles = None;
+            w.scrolls.clear();
+            match r {
+                Ok(Some(d)) => {
+                    w.key = Some(key);
+                    w.sig = None;
+                    send_pixels(broker, id, w, i, width, height, Some(d), animating);
+                }
+                Ok(None) => w.key = Some(key),
+                Err(e) => {
+                    log::warn!("fresco-renderer: window {id}: {e}; not drawn");
+                    w.forget();
+                    w.key = Some(key);
+                }
+            }
+            continue;
+        }
+        w.sprites = None;
         let (frame, drops) = scene.pack_report(&wf, width, height);
         let comp = fe.lock().unwrap().compositor_arc().clone();
         comp.lock().unwrap().set_fill_drops(id as u16, drops);
@@ -627,6 +671,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             h.finish()
         };
         if w.sig == Some(sig) {
+            w.key = Some(key);
             continue;
         }
         let Some(i) = (0..2).find(|&i| !w.busy[i]) else { continue }; // FRAME_DONE wakes us
@@ -639,28 +684,21 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
                     Ok(None) => {
                         // Not a pixel changed.
                         w.sig = Some(sig);
+                        w.key = Some(key);
                         continue;
                     }
                     Err(e) => {
                         log::warn!("fresco-renderer: window {id}: {e}; not drawn");
                         w.forget();
                         w.sig = Some(sig);
+                        w.key = Some(key);
                         continue;
                     }
                 };
-                w.seq = w.seq.wrapping_add(1).max(1);
-                w.history.push_back((w.seq, damage));
-                while w.history.len() > 4 {
-                    w.history.pop_front();
-                }
-                let copy = w.stale(i);
-                log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}, damage {damage:?}, copy {copy:?}");
-                let r = slot::write_pixels_damage(w.slots.as_mut().unwrap()[i].as_mut_slice(), width, height, &w.px, w.seq, copy, damage)
-                    .map_err(str::to_string);
-                if r.is_ok() {
-                    w.slot_seq[i] = w.seq;
-                }
-                r
+                w.sig = Some(sig);
+                w.key = Some(key);
+                send_pixels(broker, id, w, i, width, height, damage, animating);
+                continue;
             }
             None => {
                 w.seq = w.seq.wrapping_add(1);
@@ -691,12 +729,35 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             log::warn!("fresco-renderer: window {id}: {e}; not drawn");
             w.forget();
             w.sig = Some(sig);
+            w.key = Some(key);
             continue;
         }
         w.busy[i] = true;
         w.sig = Some(sig);
+        w.key = Some(key);
         send(broker, &Msg::FrameReady { window: id, slot: i as u32, seq: w.seq, animating });
     }
+}
+
+/// Pixel mode: send `w.px`, which differs from the last drawing inside
+/// `damage` (`None`: anywhere), through free slot `i`.
+#[allow(clippy::too_many_arguments)]
+fn send_pixels(broker: &Chan, id: u32, w: &mut Win, i: usize, width: u32, height: u32, damage: Option<slot::Rect>, animating: bool) {
+    w.seq = w.seq.wrapping_add(1).max(1);
+    w.history.push_back((w.seq, damage));
+    while w.history.len() > 4 {
+        w.history.pop_front();
+    }
+    let copy = w.stale(i);
+    log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}, damage {damage:?}, copy {copy:?}");
+    if let Err(e) = slot::write_pixels_damage(w.slots.as_mut().unwrap()[i].as_mut_slice(), width, height, &w.px, w.seq, copy, damage) {
+        log::warn!("fresco-renderer: window {id}: {e}; not drawn");
+        w.forget();
+        return;
+    }
+    w.slot_seq[i] = w.seq;
+    w.busy[i] = true;
+    send(broker, &Msg::FrameReady { window: id, slot: i as u32, seq: w.seq, animating });
 }
 
 fn send(broker: &Chan, m: &Msg) {
