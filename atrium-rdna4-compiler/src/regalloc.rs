@@ -58,12 +58,11 @@ pub fn intervals(mi: &[MI], n: usize) -> (Vec<usize>, Vec<usize>) {
             MI::LoopEnd => loops.push((open.pop().expect("unbalanced loop"), pos)),
             _ => {}
         }
-        let (u, d) = m.regs();
-        for r in u.into_iter().chain(d) {
+        m.each_reg(|r, _| {
             let r = r as usize;
             start[r] = start[r].min(pos);
             end[r] = end[r].max(pos);
-        }
+        });
     }
     loop {
         let mut changed = false;

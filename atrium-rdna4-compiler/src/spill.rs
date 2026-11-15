@@ -68,16 +68,36 @@ fn allocate_with(
             Err(f) => f,
         };
         let depth = loop_depth(mi);
-        let cost = |r: usize| -> f64 {
-            let mut c = 0f64;
-            for (p, m) in mi.iter().enumerate() {
-                let (u, d) = m.regs();
-                let k = u.iter().chain(&d).filter(|x| **x as usize == r).count();
-                c += k as f64 * 10f64.powi(depth[p].min(6) as i32);
+        // Loop-weighted reads and writes of every register, one pass: per
+        // instruction, k mentions of r add k * 10^depth (in instruction
+        // order, as a per-register scan would).
+        let mut weight = vec![0f64; vregs.len()];
+        // Definitions of every register: how many, and the last one.
+        let mut defs = vec![(0u32, 0usize); vregs.len()];
+        let mut seen: Vec<(VR, u32)> = vec![];
+        for (p, m) in mi.iter().enumerate() {
+            seen.clear();
+            m.each_reg(|x, def| {
+                let e = &mut defs[x as usize];
+                if def && (e.0 == 0 || e.1 != p) {
+                    // Counted once per defining instruction.
+                    *e = (e.0 + 1, p);
+                }
+                match seen.iter_mut().find(|e| e.0 == x) {
+                    Some(e) => e.1 += 1,
+                    None => seen.push((x, 1)),
+                }
+            });
+            let w = 10f64.powi(depth[p].min(6) as i32);
+            for &(x, k) in &seen {
+                weight[x as usize] += k as f64 * w;
             }
-            let c = c / (end[r] - start[r] + 1) as f64;
+        }
+        let cost = |r: usize| -> f64 {
+            let c = weight[r] / (end[r] - start[r] + 1) as f64;
             // Recomputing costs one VALU op, a reload a memory round trip.
-            if remat_def(mi, r as VR).is_some() { c * 0.1 } else { c }
+            let (n, at) = defs[r];
+            if n == 1 && is_remat(&mi[at]) { c * 0.1 } else { c }
         };
         let victim = f
             .active
@@ -138,22 +158,21 @@ fn loop_depth(mi: &[MI]) -> Vec<u32> {
 fn remat_def(mi: &[MI], x: VR) -> Option<MI> {
     let mut def = None;
     for m in mi {
-        let (_, d) = m.regs();
-        if d.contains(&x) {
+        let mut is_def = false;
+        m.each_reg(|r, d| is_def |= d && r == x);
+        if is_def {
             if def.is_some() {
                 return None;
             }
             def = Some(m);
         }
     }
-    match def? {
-        m @ MI::Valu { name: "V_MOV_B32", dst: O::R(_, 0), sdst: None, src, neg: 0 }
-            if matches!(src[..], [O::Imm(_)]) =>
-        {
-            Some(m.clone())
-        }
-        _ => None,
-    }
+    def.filter(|m| is_remat(m)).cloned()
+}
+
+/// A definition cheap enough to recompute at each use: a constant move.
+fn is_remat(m: &MI) -> bool {
+    matches!(m, MI::Valu { name: "V_MOV_B32", dst: O::R(_, 0), sdst: None, src, neg: 0 } if matches!(src[..], [O::Imm(_)]))
 }
 
 /// Replace `x` by a recomputation of `def` before each use.

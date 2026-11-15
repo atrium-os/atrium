@@ -146,63 +146,69 @@ pub enum MI {
 impl MI {
     /// Virtual registers read and written: (uses, defs).
     pub fn regs(&self) -> (Vec<VR>, Vec<VR>) {
-        let r = |o: &O, v: &mut Vec<VR>| {
+        let (mut u, mut d) = (vec![], vec![]);
+        self.each_reg(|x, def| if def { d.push(x) } else { u.push(x) });
+        (u, d)
+    }
+
+    /// Every virtual register operand, with whether it is a definition, in
+    /// the order [`Self::regs`] lists them; allocates nothing.
+    pub fn each_reg(&self, mut f: impl FnMut(VR, bool)) {
+        let mut r = |o: &O, def: bool| {
             if let O::R(x, _) = o {
-                v.push(*x)
+                f(*x, def)
             }
         };
-        let (mut u, mut d) = (vec![], vec![]);
         match self {
             MI::Valu { dst, sdst, src, .. } => {
-                r(dst, &mut d);
+                r(dst, true);
                 if let Some(s) = sdst {
-                    r(s, &mut d);
+                    r(s, true);
                 }
                 for s in src {
-                    r(s, &mut u);
+                    r(s, false);
                 }
             }
             MI::Salu { dst, src, .. } => {
-                r(dst, &mut d);
+                r(dst, true);
                 for s in src {
-                    r(s, &mut u);
+                    r(s, false);
                 }
             }
             MI::Smem { sdst, soff, .. } => {
-                r(sdst, &mut d);
+                r(sdst, true);
                 if let Some(x) = soff {
-                    r(x, &mut u);
+                    r(x, false);
                 }
             }
             MI::Ds { vdst, addr, data, .. } => {
                 if let Some(x) = vdst {
-                    r(x, &mut d);
+                    r(x, true);
                 }
-                r(addr, &mut u);
+                r(addr, false);
                 if let Some(x) = data {
-                    r(x, &mut u);
+                    r(x, false);
                 }
             }
             MI::Global { vdst, vaddr, data, .. } => {
                 if let Some(x) = vdst {
-                    r(x, &mut d);
+                    r(x, true);
                 }
-                r(vaddr, &mut u);
+                r(vaddr, false);
                 if let Some(x) = data {
-                    r(x, &mut u);
+                    r(x, false);
                 }
             }
             MI::Scratch { vdst, data, .. } => {
                 if let Some(x) = vdst {
-                    r(x, &mut d);
+                    r(x, true);
                 }
                 if let Some(x) = data {
-                    r(x, &mut u);
+                    r(x, false);
                 }
             }
             _ => {}
         }
-        (u, d)
     }
 
     /// Every register operand, mutably, each with whether it is a
