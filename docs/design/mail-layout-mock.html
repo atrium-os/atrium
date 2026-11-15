@@ -1,0 +1,111 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+:root{--bg:#FAFBFC;--s0:#FFFFFF;--s1:#F2F4F6;--div:#E4E8EC;--bd:#CFD5DA;--t3:#7C858E;--t2:#5A636C;--t1:#2A3137;--tx:#181C20;--ac:#BD7F3A;--ac5:#9E6628;--ac50:#FBF1E5;--ac100:#F4DEC0;--ok:#226B43;--warn:#8A5E14;--warnbg:#FBF3E2;--dan:#962E2E;--work:#4A7BAB}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"IBM Plex Sans","Inter","Helvetica Neue",Arial,sans-serif;font-size:13px;color:var(--tx);background:#d9dde1;width:1440px;height:900px}
+.strip{height:26px;background:#181C20;color:#E4E8EC;display:flex;align-items:center;padding:0 12px;gap:10px;font-size:12px}
+.chip{background:var(--work);color:#fff;border-radius:9px;padding:1px 8px;font-size:11px;font-weight:600}
+.win{position:absolute;top:26px;left:0;right:0;bottom:0;display:flex;flex-direction:column;border:3px solid var(--work);border-top:none;background:var(--bg)}
+.top{height:52px;display:flex;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--div);background:var(--s0)}
+.btn{border:1px solid var(--bd);background:var(--s0);border-radius:6px;padding:6px 12px;font-size:13px;color:var(--t1)}
+.btn.p{background:var(--ac5);color:#fff;border-color:var(--ac5);font-weight:600}
+.search{flex:1;max-width:620px;margin-left:96px;border:1px solid var(--bd);border-radius:8px;padding:8px 12px;color:var(--t3);background:var(--bg)}
+.main{flex:1;display:flex;min-height:0}
+.side{width:224px;border-right:1px solid var(--div);padding:10px 8px;display:flex;flex-direction:column;gap:2px;background:var(--s1)}
+.sec{font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.06em;margin:12px 8px 4px}
+.it{display:flex;justify-content:space-between;padding:6px 10px;border-radius:6px;color:var(--t1)}
+.it.on{background:var(--ac100);font-weight:600}
+.n{color:var(--t2);font-variant-numeric:tabular-nums}.n.o{color:var(--dan);font-weight:600}
+.act{margin-top:auto;font-size:11px;color:var(--t3);padding:8px 10px;border-top:1px solid var(--div)}
+.list{width:400px;border-right:1px solid var(--div);display:flex;flex-direction:column;background:var(--s0)}
+.lh{padding:10px 14px 6px;display:flex;justify-content:space-between;align-items:center}
+.lh b{font-size:16px}
+.seg{display:flex;border:1px solid var(--bd);border-radius:6px;overflow:hidden;font-size:12px}
+.seg span{padding:3px 9px}.seg .on{background:var(--ac100);font-weight:600}
+.chips{display:flex;gap:6px;padding:4px 14px 10px;flex-wrap:wrap}
+.c{border:1px solid var(--bd);border-radius:12px;padding:2px 9px;font-size:12px;color:var(--t2)}
+.c.on{background:var(--ac50);border-color:var(--ac);color:var(--ac5);font-weight:600}
+.grp{font-size:11px;color:var(--t3);padding:6px 14px;background:var(--bg);border-top:1px solid var(--div);border-bottom:1px solid var(--div)}
+.row{padding:9px 14px;border-bottom:1px solid var(--div);display:block;flex:none}.row .who{display:inline-block;max-width:300px}.row .tm{float:right}.row .sub,.row .pre{display:block;margin-top:2px}
+.row.sel{background:var(--ac50);box-shadow:inset 3px 0 0 var(--ac)}
+.who{font-weight:600}.row.old .who,.row.old .sub{font-weight:400;color:var(--t2)}
+.v{color:var(--ok);font-size:11px;font-weight:600}
+.tm{color:var(--t3);font-size:12px;text-align:right}
+.sub{font-weight:600;grid-column:1/3;color:var(--t1)}
+.pre{grid-column:1/3;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.due{font-size:11px;background:var(--warnbg);color:var(--warn);border-radius:4px;padding:0 5px;margin-left:6px;font-weight:600}
+.read{flex:1;display:flex;flex-direction:column;min-width:0}
+.rh{padding:14px 22px 10px;background:var(--s0);border-bottom:1px solid var(--div)}
+.rh h1{font-size:19px;font-weight:600;color:var(--tx);margin-bottom:6px}
+.tools{display:flex;gap:6px;margin-top:8px}
+.msgs{flex:1;overflow:hidden;padding:14px 22px;display:flex;flex-direction:column;gap:10px}
+.m{background:var(--s0);border:1px solid var(--div);border-radius:8px}
+.mc{padding:10px 14px;display:flex;justify-content:space-between;color:var(--t2)}
+.new{display:flex;align-items:center;gap:8px;color:var(--ac5);font-size:11px;font-weight:600}
+.new:before,.new:after{content:"";flex:1;height:1px;background:var(--ac)}
+.mh{padding:12px 14px 8px;display:flex;justify-content:space-between}
+.note{margin:0 14px 8px;padding:6px 10px;border-radius:6px;background:var(--warnbg);color:var(--warn);font-size:12px}
+.bar{margin:0 14px 8px;padding:6px 10px;border-radius:6px;background:var(--s1);color:var(--t2);font-size:12px;display:flex;justify-content:space-between}
+.att{display:flex;gap:8px;margin:0 14px 10px}
+.a{border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:12px}
+.body{margin:0 14px 14px;padding:14px;border:1px dashed var(--bd);border-radius:6px;color:var(--t1);line-height:1.55}
+.tag{font-size:10px;color:var(--t3);float:right}
+.reply{margin:0 22px 14px;border:1px solid var(--bd);border-radius:8px;padding:10px 14px;color:var(--t3);background:var(--s0)}
+.lb{margin:0 22px 10px;padding:8px 12px;border-radius:8px;background:#22282E;color:#E4E8EC;display:flex;justify-content:space-between;align-items:center}
+.lb b{color:#fff}.lb .btn{padding:3px 10px}
+.k{font-family:"IBM Plex Mono",monospace;font-size:10px;border:1px solid var(--bd);border-radius:3px;padding:0 3px;color:var(--t3)}
+</style></head><body>
+<div class="strip"><span>●</span><b>Mail</b><span class="chip">Work</span><span style="margin-left:auto;color:#A8B0B8">frescod strip (drawn by the system)</span></div>
+<div class="win">
+ <div class="top"><span class="btn p">✎ Write</span><div class="search">Search mail and attachments… <span style="float:right">from: · has:attachment · before:</span></div><span style="margin-left:auto;color:var(--t3)">⌘K commands</span></div>
+ <div class="main">
+  <div class="side">
+   <div class="it on"><span>Inbox</span><span class="n">12</span></div>
+   <div class="it"><span>Later</span><span class="n o">2 overdue · 3</span></div>
+   <div class="it"><span>Waiting</span><span class="n">4</span></div>
+   <div class="it"><span>Drafts</span><span class="n">1</span></div>
+   <div class="it"><span>Sent</span><span></span></div>
+   <div class="sec">Views</div>
+   <div class="it"><span>Newsletters</span><span class="n">31</span></div>
+   <div class="it"><span>New senders</span><span class="n">2</span></div>
+   <div class="it"><span>Files</span><span></span></div>
+   <div class="sec">Saved searches</div>
+   <div class="it"><span>Invoices</span><span></span></div>
+   <div class="it"><span>From the board</span><span></span></div>
+   <div class="sec">Accounts</div>
+   <div class="it"><span>▸ priya@acme.example</span><span></span></div>
+   <div class="it"><span>▸ ops@acme.example</span><span></span></div>
+   <div class="act">✓ Up to date · getting older mail: back to 2023 <u>Pause</u></div>
+  </div>
+  <div class="list">
+   <div class="lh"><b>Inbox</b><div class="seg"><span class="on">Conversations</span><span>Messages</span></div></div>
+   <div class="chips"><span class="c on">Unread</span><span class="c">To me</span><span class="c">Needs reply</span><span class="c">From people</span><span class="c">Has file</span></div>
+   <div class="grp">TODAY</div>
+   <div class="row sel"><span class="who">Arun Mehta, Priya <span class="v">✓ acme.example</span> <span style="color:var(--t3);font-weight:400">4</span></span><span class="tm">09:41</span><span class="sub">Q4 numbers for the board deck: final version before Thursday</span><span class="pre">Here's the revised sheet. I folded in the APAC numbers and…</span></div>
+   <div class="row"><span class="who">Lena Ortiz <span class="v">✓ partner.example</span></span><span class="tm">08:15</span><span class="sub">Contract redlines, round 2 📎</span><span class="pre">Attached the redlines from legal; clause 7 is the only open…</span></div>
+   <div class="row old"><span class="who">Build bot <span class="v">✓ ci.acme.example</span></span><span class="tm">07:02</span><span class="sub">Nightly: 3 tests failed on release-2.4</span><span class="pre">tests/sync_resume, tests/flags_merge, tests/idle_reconnect</span></div>
+   <div class="grp">YESTERDAY</div>
+   <div class="row"><span class="who">Sam Wu <span class="v">✓ acme.example</span></span><span class="tm">Sun<span class="due">Later · today</span></span><span class="sub">Can you review the hiring plan?</span><span class="pre">No rush, but it'd help to have your thoughts before…</span></div>
+   <div class="row old"><span class="who">IT Helpdesk <span style="color:var(--dan);font-size:11px;font-weight:600">not verified</span></span><span class="tm">Sun</span><span class="sub">Your password expires in 24 hours</span><span class="pre">Click here to keep your current password…</span></div>
+   <div class="row old"><span class="who">Travel desk <span class="v">✓ acme.example</span></span><span class="tm">Sun</span><span class="sub">Itinerary: BLR → SFO, 2 Dec</span><span class="pre">Your booking is confirmed. Seat 32A…</span></div>
+  </div>
+  <div class="read">
+   <div class="rh"><h1>Q4 numbers for the board deck: final version before Thursday</h1>
+    <div style="color:var(--t2)">Arun Mehta, Priya Nair, you · 4 messages · 2 files</div>
+    <div class="tools"><span class="btn">↩ Reply <span class="k">r</span></span><span class="btn">Reply all <span class="k">a</span></span><span class="btn">Forward <span class="k">f</span></span><span class="btn">⏰ Later <span class="k">l</span></span><span class="btn">✓ Archive <span class="k">e</span></span><span class="btn">⋯</span></div>
+   </div>
+   <div class="msgs">
+    <div class="att"><span class="a">📊 Q4-board.xlsx · 412 KB</span><span class="a">📄 notes.pdf · 88 KB</span><span class="a" style="color:var(--t3)">all files in this thread</span></div>
+    <div class="m"><div class="mc"><span><b style="color:var(--t1)">Priya Nair</b> · Sounds good, I'll check the APAC tab tonight.</span><span>Sat</span></div></div>
+    <div class="m"><div class="mc"><span><b style="color:var(--t1)">You</b> · Thanks. Can we split APAC by quarter?</span><span>Sat</span></div></div>
+    <div class="new">NEW SINCE YOU LAST LOOKED</div>
+    <div class="m">
+     <div class="mh"><span><b>Arun Mehta</b> <span class="v">✓ acme.example</span> <span style="color:var(--t3)">to Priya, you</span></span><span style="color:var(--t3)">09:41</span></div>
+     <div class="bar"><span>3 pictures not loaded · 1 tracking pixel removed</span><span><u>Load pictures</u> · <u>Always for Arun</u></span></div>
+     <div class="body"><span class="tag">message body: jailed doc-viewer slot</span>Hi both,<br><br>Here's the revised sheet. I folded in the APAC numbers and split them by quarter as you asked. The <u style="color:var(--ac5)">dashboard link</u> has the live view.<br><br>Can we lock this by Wednesday so design has a day for the deck?<br><span style="color:var(--t3)">··· quoted text and signature folded</span></div>
+    </div>
+   </div>
+   <div class="lb"><span>Opens in Navigator: <b>dash.acme.example</b><span style="color:#A8B0B8">/q4/apac?view=quarter</span> <span style="color:#A8B0B8">(Safe Links wrapper and utm_ removed)</span></span><span class="btn p">Open ↵</span></div>
+   <div class="reply">Reply to Arun and Priya…  <span style="float:right"><span class="k">r</span></span></div>
+  </div>
+ </div>
+</div></body></html>

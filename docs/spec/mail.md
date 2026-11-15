@@ -835,16 +835,99 @@ CardDAV sync and a Contacts app are a separate spec (§17 D8).
 schema.org JSON-LD in HTML mail (orders, flights, reservations) parsed in the parse jail
 into small fixed cards, shown only when DMARC passes for the sender's domain.
 
-## 15. Keyboard, accessibility, layout
+## 15. Layout (Shankar 2026-11-16: "what should be the UI layout to make it intuitive")
 
-- Three panes (folders, list, message) that collapse to two and one as the window narrows;
-  all sizes in points (resolution-independence.md).
-- Every action has a key; a command palette (Ctrl-K) for the rest; the common single-key
-  set (j/k next/previous, e archive, r reply, a reply all, f forward, s star, / search,
-  # delete, z undo) on by default with a switch.
-- Undo for every list action (archive, delete, move) for 10 s.
+Mockup: `docs/design/mail-layout-mock.html` (an HTML sketch in the visual-language tokens,
+not Pergola; screenshot in project files `mail/mail-layout-main.png`).
+
+### 15.1 Principles
+
+- **Three columns people already know** (places, list, reader), so nothing has to be
+  learned before the first day; what is new (Later, verified senders, the link bar) sits
+  where the familiar thing was.
+- **One obvious next step per message**: Reply, Later, or Archive ("done"). Archive is the
+  primary action, not Delete, so the inbox empties without fear; everything is undoable for
+  10 s from an in-window undo bar.
+- **Search is the main way to find things**, so it is the widest control at the top, over
+  the list and reader, with operator hints as you type.
+- **Trust is shown in Mail's chrome, never inside the message**: the verified domain on
+  every sender, warnings in a band above the body, the remote-pictures bar, the link bar.
+  The message body is a framed slot (Limen) that can't draw over any of them.
+- **The persona is the system's**: frescod's strip shows the persona chip and forum-wm the
+  coloured frame (personas.md §7); Mail never draws them.
+
+### 15.2 The main window
+
+```
+┌ strip: Mail · [Work] ─────────────────────────────────────────── (frescod) ┐
+│ [Write]   [ Search mail and attachments…   from: has:attachment ]   Ctrl-K │
+├──────────────┬──────────────────────────┬──────────────────────────────────┤
+│ Inbox     12 │ Inbox  [Conversations|Msgs]│ Subject, in full                │
+│ Later 2!· 3  │ (Unread)(To me)(Needs reply)│ people · 4 messages · 2 files   │
+│ Waiting    4 │ TODAY                     │ [Reply][Reply all][Fwd][Later][Archive][⋯]│
+│ Drafts     1 │ ▌Arun, Priya ✓acme   09:41│ [files strip]                    │
+│ Sent         │  Q4 numbers for the…      │ older messages, one line each    │
+│ VIEWS        │  preview line…            │ ── new since you last looked ──  │
+│ Newsletters  │ Lena ✓partner  08:15 📎   │ Arun ✓acme.example → Priya, you  │
+│ New senders  │ …                         │ [3 pictures not loaded · Load]   │
+│ Files        │ YESTERDAY                 │ ┌ body (jailed doc-viewer) ────┐ │
+│ SAVED        │ Sam  ✓acme  Later·today   │ └──────────────────────────────┘ │
+│ ACCOUNTS ▸   │ IT Helpdesk  not verified │ [link bar: Opens dash.acme… Open]│
+│ ✓ up to date │                           │ [Reply to Arun and Priya…      ] │
+└──────────────┴──────────────────────────┴──────────────────────────────────┘
+```
+
+- **Sidebar (left, 224 pt, collapsible to icons):** what needs the person first: *Inbox*
+  (all accounts of this persona), *Later* (with the overdue count in red), *Waiting*,
+  *Drafts*, *Sent*. Then *Views* (Newsletters, New senders when the screener is on, Files,
+  later the lanes), *Saved searches*, and *Accounts* with their server folders, folded by
+  default because most people never need them. At the bottom one quiet sync line (§6.4)
+  with *Pause*.
+- **List (middle, 400 pt):** the folder name, the Conversations/Messages toggle (§11.7) and
+  the filter chips; date group headers; rows of three lines: sender(s) with the verified
+  domain and count, time and any Later chip; the subject in full (wrapping to two lines,
+  not cut at one); one preview line. Unread is bold, the selected row has the accent bar.
+  Hovering a row shows Archive and Later at its right edge; a two-finger swipe does the
+  same (right = Archive, left = Later).
+- **Reader (right, the rest):** the subject in full and who is in the thread; one toolbar
+  with keys shown on the buttons; the thread's files; older messages collapsed to one line
+  each; the "new since you last looked" line; the newest message open with its sender line,
+  trust notes, pictures bar and body; the link bar appears at the bottom when a link is
+  pressed (§7.6); a reply box always at the bottom ("Reply to Arun and Priya…"), which grows
+  into the full composer in place, so replying never opens a new window.
+
+### 15.3 Other screens
+
+- **Compose a new message** opens a separate window (so it can sit beside the mail it
+  draws on); a reply stays inline and can pop out. To, Cc/Bcc on demand, Subject, the
+  editor, attachments as chips, and *Send* (with *Send later* on its arrow). The From line
+  shows the identity and persona.
+- **First run**: one field, "Your email address", then the sign-in (Arca's field or the
+  provider's page), then straight into the inbox while §6.4 fills in. Server settings only
+  behind "Set up manually".
+- **Later list**: grouped *Overdue / Today / Upcoming / Waiting*, each row with its note and
+  `d` / `l` / `x` (§11.4). The daily review opens here.
+- **Empty inbox**: says so plainly, with what is due in Later next; no illustrations.
+- **Settings** in a sheet inside Mail (accounts, signatures, notifications, quiet hours,
+  pictures, the screener); Atrium-wide things (Do Not Disturb, default mail app) stay in
+  Curia.
+
+### 15.4 Sizes
+
+All in points (resolution-independence.md). Wide (≥ 1200 pt): three columns. Medium
+(800–1200): the sidebar folds to icons. Narrow (< 800): one column at a time, list then
+reader, with Back. Reading width in the reader is capped (about 80 characters) and
+centred, so wide windows don't make long lines.
+
+### 15.5 Keyboard and accessibility
+
+- Every action has a key, shown on its button; a command palette (Ctrl-K) for the rest;
+  the common single-key set (j/k next/previous, e archive, r reply, a reply all, f forward,
+  l later, d done, / search, # delete, z undo) on by default with a switch.
+- Undo for every list action (archive, delete, move, Later) for 10 s.
 - Pergola accessibility tree for every pane; the doc-viewer child's tree joins it through
-  Limen (limen.md §9).
+  Limen (limen.md §9). Focus order follows the columns; screen readers hear the verified
+  domain and any warning before the body.
 
 ## 16. Pieces and build order
 
