@@ -27,7 +27,7 @@ column. §17 D1 asks which go into the first release; my recommendation is the *
 
 | # | idea | what the person gets | v1? | § |
 |---|---|---|---|---|
-| E1 | **Undo send, send later, snooze, follow-up nudges** | a 10 s window to take a message back; send at 8:00 tomorrow; a thread disappears until Monday; "no reply in 3 days" brings it back | yes | §9.3, §11.4 |
+| E1 | **Undo send, send later, and *Later* that never rots** | a 10 s window to take a message back; send at 8:00 tomorrow; set a thread aside for Reply / Read / Do / Waiting with a time it comes back, auto-closed when you reply or they do, a daily review so nothing flagged is forgotten | yes | §9.3, §11.4 |
 | E2 | **Instant search that finds things inside attachments** | type and see results as you type, across all accounts of a persona, including text in PDFs and office files; a saved search becomes a folder | yes | §11.2 |
 | E3 | **Conversations that read well, or a plain timeline** | per folder: threads or strictly chronological messages; quick filters (Unread, To me, Needs reply, Has attachment); optional grouping by date, sender or account; quoted text and signatures folded, a "new since you last looked" line, every file in the thread in one strip at the top | yes | §11.1, §11.7 |
 | E4 | **One-press unsubscribe and a newsletter lane** | a real unsubscribe button (RFC 8058) on every list mail, newsletters read with the Navigator's reading settings (text size, dark, comfortable) | yes | §11.3 |
@@ -570,13 +570,61 @@ key, with the reason when it isn't.
   headers (`List-Id`, `Precedence`, known transactional senders, schema.org types), editable,
   never a cloud classifier.
 
-### 11.4 Snooze and follow-up
+### 11.4 Later: flags, snooze and reminders that don't get forgotten (Shankar 2026-11-16)
 
-- **Snooze** a thread to a time ("tomorrow morning", "next week", a date). Stored as a local op plus an IMAP keyword
-  (`$Snoozed`) and a hidden folder so other clients see it gone; JMAP the same with
-  keywords.
-- **Follow-up**: on send, "remind me if nobody replies in N days"; the thread comes back
-  to the top with a note.
+Shankar: "flags, reminders, look later in a way that we won't mark them and forget about
+them." The usual failure is a flag with no date: it is easy to set, nothing ever brings it
+back, and after a month the flagged folder is a second inbox nobody reads. So in Mail
+**nothing set aside is without a time it comes back**, and **anything set aside has to be
+closed, not just left**.
+
+**One action, *Later*** (key `l`), replaces flag, star, snooze and pin. It asks two things
+in one small sheet, both with defaults so it is one press when you're in a hurry:
+
+- **What for**: *Reply*, *Read*, *Do*, or *Waiting* (for someone else). Default: *Reply*
+  when the last message is to me, *Read* for lists and newsletters.
+- **When**: *This evening*, *Tomorrow morning*, *This weekend*, *Next week*, a date, or
+  *Someday*. *Someday* is still a date: 30 days out, when it asks again.
+  An optional one-line note ("send Priya the numbers") is shown when it comes back.
+
+**What happens:**
+
+- The thread leaves the inbox (unless "keep in inbox" is on for that kind) and goes to the
+  **Later** list in the sidebar: *Overdue*, *Today*, *Upcoming*, *Waiting*, by date. Its
+  count is always shown; overdue ones are marked.
+- **At its time it comes back** to the top of the inbox with its note and when it was set
+  aside ("Set aside Mon: send Priya the numbers"), and a notification if the person wants
+  one. Quiet hours apply (§12): a Work item due on Saturday comes back on Monday morning.
+- **Closing is automatic where Mail can tell**: a *Reply* item closes when you send a
+  reply in that thread; a *Waiting* item closes when someone replies (the follow-up of
+  §9, "remind me if nobody replies in N days", is a *Waiting* item set on send); a *Read*
+  item closes when the message has been open and scrolled to its end. *Do* items close
+  only with *Done* (key `d`).
+- **New mail in a set-aside thread** brings it back at once if the new message is to me
+  and from a person; otherwise it waits for its date.
+
+**So they don't rot:**
+
+- **Daily review** at a time the person picks (default: the start of the persona's
+  working hours, or 9:00): one notification, "3 due today, 2 overdue", which opens the
+  Later list with one-key answers on each row: *Done* (`d`), *Later again* (`l`, with the
+  same choices), *Drop* (`x`, no longer needed). Nothing else is asked.
+- **Pushed-back count**: an item moved again three times is marked "pushed back 3 times"
+  and the review asks *Do it now*, *Drop*, or *Make it someday*. No silent infinite snooze.
+- **Overdue items don't pile up quietly**: after 7 days overdue an item is asked about in
+  the review on every day until it is answered; after 30 it moves to *Dropped* with an
+  undo, so the Later list stays a list of real things.
+- **Weekly look** (optional, Friday afternoon by default): everything due next week and
+  everything *Waiting* for more than 7 days, so chasing people is a habit.
+
+**Where it is stored**: in the engine, per persona, with the thread's message ids, kind,
+date, note and history. The server sees `\Flagged` on the newest message (so phones and
+webmail still see it as flagged) and, for snoozed threads, the `$Snoozed` keyword and a
+hidden `Snoozed` folder so other clients show it gone. A thread flagged elsewhere arrives
+as a *Reply* item due tomorrow morning, so even flags from another client get a date.
+
+**Later** is per persona: the Work list shows only Work mail, and the review respects each
+persona's quiet hours.
 
 ### 11.5 Local assistance (later, opt-in)
 
