@@ -3,14 +3,19 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 
 use crate::{Msg, Refused, MSG_BYTES};
 
 /// Most fds one record carries (a window's two slots).
 pub const MAX_FDS: usize = 2;
 
-/// One end of a broker ⇄ renderer channel.
-pub struct Chan(OwnedFd);
+/// One end of a broker ⇄ renderer channel. The lock serializes this
+/// end's non-waiting sends (shared with its clones): FreeBSD takes a
+/// socket's send I/O lock with a try-lock under `MSG_DONTWAIT`, so two
+/// threads sending at once would see `EWOULDBLOCK` on a channel with room,
+/// and the broker would retire a renderer that is reading fine.
+pub struct Chan(OwnedFd, Arc<Mutex<()>>);
 
 /// What [`Chan::recv`] got.
 pub enum Recv {
@@ -41,11 +46,11 @@ impl Chan {
         // SAFETY: socketpair writes two fds into `fds`.
         cvt(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) })?;
         // SAFETY: both fds are fresh and ours.
-        Ok(unsafe { (Chan(OwnedFd::from_raw_fd(fds[0])), Chan(OwnedFd::from_raw_fd(fds[1]))) })
+        Ok(unsafe { (Chan::from_fd(OwnedFd::from_raw_fd(fds[0])), Chan::from_fd(OwnedFd::from_raw_fd(fds[1]))) })
     }
 
     pub fn from_fd(fd: OwnedFd) -> Chan {
-        Chan(fd)
+        Chan(fd, Arc::default())
     }
 
     pub fn into_fd(self) -> OwnedFd {
@@ -62,7 +67,7 @@ impl Chan {
     }
 
     pub fn try_clone(&self) -> io::Result<Chan> {
-        Ok(Chan(self.0.try_clone()?))
+        Ok(Chan(self.0.try_clone()?, self.1.clone()))
     }
 
     /// Send one record, with `fds` attached.
@@ -93,6 +98,9 @@ impl Chan {
 
     fn send_bytes(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd], flags: libc::c_int) -> io::Result<()> {
         assert!(fds.len() <= MAX_FDS);
+        // Only a send that cannot wait takes the lock, so its holder is
+        // never blocked: one waiting here waits for one syscall at most.
+        let _one = (flags & libc::MSG_DONTWAIT != 0).then(|| self.1.lock().unwrap_or_else(|e| e.into_inner()));
         let mut iov = libc::iovec { iov_base: rec.as_ptr() as *mut _, iov_len: rec.len() };
         let mut cbuf = [0u64; 8];
         // SAFETY: msghdr is plain data; every pointer in it outlives the call.
@@ -236,7 +244,7 @@ pub fn accept(listener: &OwnedFd) -> io::Result<(Chan, u32)> {
         let fd = OwnedFd::from_raw_fd(fd);
         libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         let uid = peer_uid(fd.as_raw_fd())?;
-        Ok((Chan(fd), uid))
+        Ok((Chan::from_fd(fd), uid))
     }
 }
 
@@ -262,7 +270,7 @@ pub fn connect(path: &std::path::Path) -> io::Result<Chan> {
     unsafe {
         let fd = OwnedFd::from_raw_fd(cvt(libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0))?);
         cvt(libc::connect(fd.as_raw_fd(), &a as *const _ as *const libc::sockaddr, len))?;
-        Ok(Chan(fd))
+        Ok(Chan::from_fd(fd))
     }
 }
 
