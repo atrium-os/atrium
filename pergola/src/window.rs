@@ -416,6 +416,12 @@ impl Window {
                     _ => {}
                 }
             }
+            // One of ours, shrunk to fit the screen: its list scrolls.
+            fresco_client::Event::PopupPlaced { window_id, height, .. } if self.popups.is_popup(window_id) => {
+                if let Some((root, asked)) = self.popups.root_of(window_id) {
+                    app.popup_placed(root, (height + 0.5 < asked.h()).then_some(height));
+                }
+            }
             // A granted pop-up may land smaller than asked.
             fresco_client::Event::PopupPlaced { window_id, width, height, .. }
                 if window_id == main && (width, height) != (self.width, self.height) =>

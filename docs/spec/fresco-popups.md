@@ -124,8 +124,15 @@ re-sent to a window that missed rows). A `Menu` with an anchor
 (tests) it draws as an overlay. The anchor includes the 4 px gap, trimmed
 to the window when the control sits at its edge.
 
-Not yet: a list frescod shrank does not scroll (`EV_POPUP_PLACED` is
-not used yet), and tooltips and submenus as pop-ups.
+A list frescod shrank scrolls (2026-11-15): on `EV_POPUP_PLACED` for one
+of its pop-ups shorter than it asked, `Window` tells the app
+(`App::popup_placed`); inside `Ctx::popup`, `Ctx::popup_room` gives that
+height, and a `Menu` shows the items that fit whole from
+`MenuState::first`, moved by the arrows (the highlight stays in view) and
+the wheel (an item a notch). The pop-up keeps asking its full size, so it
+grows back when there is room.
+
+Not yet: tooltips and submenus as pop-ups.
 
 `Menu` and `Dropdown` open as pop-ups when the app's window allows
 (`Window` holds the connection); the overlay path stays for tests and for

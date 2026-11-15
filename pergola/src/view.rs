@@ -57,6 +57,8 @@ pub struct Ctx<'a> {
     /// Widgets placed in a layout ([`Ctx::place`]), drawn once layout has
     /// given their slot its rect.
     placements: Vec<(NodeId, Placement)>,
+    /// The pop-up being drawn ([`Ctx::popup`]), for [`Ctx::popup_room`].
+    popup_root: Option<NodeId>,
 }
 
 /// A placed widget waiting for its laid-out rect.
@@ -102,7 +104,7 @@ impl<'a> Ctx<'a> {
         theme: Semantic,
         state: InteractionState,
     ) -> Self {
-        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new(), placements: Vec::new() }
+        Self { tree, interactions, parent_stack: Vec::new(), theme, state, overlays: Vec::new(), placements: Vec::new(), popup_root: None }
     }
 
     /// Whether `id` is the current hover target. Valid for nodes whose
@@ -217,9 +219,18 @@ impl<'a> Ctx<'a> {
         self.set_flex(id, crate::layout::FlexStyle { free: true, ..Default::default() });
         self.tree.set_popup(id, spec);
         self.interactions.entry(id).on_dismiss = Some(Box::new(on_dismiss));
+        let outer = self.popup_root.replace(id);
         f(self);
+        self.popup_root = outer;
         self.parent_stack = saved;
         id
+    }
+
+    /// Inside [`Ctx::popup`]'s `f`: the height frescod gave the pop-up when
+    /// the screen had less room than it asked (fresco-popups.md §4), so a
+    /// list can scroll within it. `None`: it got all it asked.
+    pub fn popup_room(&self) -> Option<f32> {
+        crate::popup::room(self.popup_root?)
     }
 
     /// Draw `f` above everything the view draws, at the window's top

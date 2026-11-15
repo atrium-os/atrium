@@ -119,12 +119,15 @@ impl MenuItem {
 pub struct MenuState {
     pub open: bool,
     pub highlight: Option<usize>,
+    /// The first item shown, when frescod gave the menu less height than
+    /// all its items need and it scrolls ([`Ctx::popup_room`]).
+    pub first: usize,
 }
 
 impl MenuState {
     /// Open with `highlight` on an item (keyboard opening: the first or the
     /// current one), or none (pointer opening).
-    pub fn opened(highlight: Option<usize>) -> Self { Self { open: true, highlight } }
+    pub fn opened(highlight: Option<usize>) -> Self { Self { open: true, highlight, first: 0 } }
 }
 
 pub struct Menu {
@@ -225,21 +228,67 @@ impl View for Menu {
             // press outside (which goes no further) or a change of focus.
             let spec = crate::popup::Spec { anchor, side, align, grab: true };
             let s = self.state.clone();
-            ctx.popup(r, spec, move || s.set(MenuState::default()), |ctx| self.body(ctx, st, r));
+            ctx.popup(r, spec, move || s.set(MenuState::default()), |ctx| {
+                // Shrunk to fit the screen: the items scroll in what it got.
+                let room = ctx.popup_room().filter(|h| *h < r.h());
+                self.body(ctx, st, r, room)
+            });
             return;
         }
         // A press anywhere outside closes it, and goes no further.
         let catcher = ctx.add(Node::Rect { rect: EVERYWHERE, fill: Color::TRANSPARENT, radius: 0.0 });
         let s = self.state.clone();
         ctx.on_click(catcher, move || s.set(MenuState::default()));
-        self.body(ctx, st, r);
+        self.body(ctx, st, r, None);
     }
 }
 
 impl Menu {
-    /// The menu's surface and items in `r`.
-    fn body(&self, ctx: &mut Ctx, st: MenuState, r: Rect) {
+    /// Each item's top, from the menu's top (separators included), and
+    /// the height they all take.
+    fn tops(&self) -> (Vec<f32>, f32) {
+        let mut y = MENU_INSET;
+        let mut tops = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            if item.separated {
+                y += stroke::DEFAULT + 2.0 * MENU_INSET;
+            }
+            tops.push(y);
+            y += size::menu_item();
+        }
+        (tops, y + MENU_INSET)
+    }
+
+    /// How many items from `first` show whole in `room` (at least one).
+    fn fitting(tops: &[f32], first: usize, room: f32) -> usize {
+        let Some(&top) = tops.get(first) else { return 1 };
+        tops[first..].iter().take_while(|&&y| y - top + MENU_INSET + size::menu_item() <= room - MENU_INSET).count().max(1)
+    }
+
+    /// The menu's surface and items in `r`; with `room`, only that much of
+    /// it shows (frescod shrank it), and the items scroll from `st.first`.
+    fn body(&self, ctx: &mut Ctx, st: MenuState, r: Rect, room: Option<f32>) {
         let t = ctx.theme;
+        let (tops, _) = self.tops();
+        let n = self.items.len();
+        let (first, shown) = match room {
+            Some(h) => {
+                // The last items whole at the bottom at most.
+                let mut last_first = n.saturating_sub(1);
+                while last_first > 0 && Self::fitting(&tops, last_first - 1, h) + last_first - 1 >= n {
+                    last_first -= 1;
+                }
+                let first = st.first.min(last_first);
+                (first, Self::fitting(&tops, first, h))
+            }
+            None => (0, n),
+        };
+        // Scrolled: the first item shown sits where the first would.
+        let shift = if room.is_some() { tops.get(first).map_or(0.0, |y| y - MENU_INSET) } else { 0.0 };
+        let r = match room {
+            Some(h) => Rect::new(r.x(), r.y(), r.w(), h),
+            None => r,
+        };
         let body = if self.attached {
             // Joined to the lit button: its accent as a 2px edge.
             let e = ctx.add(Node::Rect { rect: r, fill: self.tint.unwrap_or_else(|| t.accent_fill()), radius: radius::MD });
@@ -250,11 +299,22 @@ impl Menu {
         ctx.autofocus(body);
         // Marks get a gutter; then every label starts after it.
         let gutter = if self.items.iter().any(|i| i.mark != Mark::None) { MARK_GUTTER } else { 0.0 };
-        let mut y = r.y() + MENU_INSET;
+        let mut y = r.y() + MENU_INSET - shift;
         for (i, item) in self.items.iter().enumerate() {
+            if i < first || i >= first + shown {
+                // Scrolled out of what frescod gave it.
+                if item.separated {
+                    y += stroke::DEFAULT + 2.0 * MENU_INSET;
+                }
+                y += size::menu_item();
+                continue;
+            }
             if item.separated {
                 y += MENU_INSET;
-                ctx.tree.insert(Some(body), Node::Rect { rect: Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, stroke::DEFAULT), fill: t.border_default(), radius: 0.0 });
+                // Not above the first item a scrolled list shows.
+                if !(room.is_some() && i == first) {
+                    ctx.tree.insert(Some(body), Node::Rect { rect: Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, stroke::DEFAULT), fill: t.border_default(), radius: 0.0 });
+                }
                 y += stroke::DEFAULT + MENU_INSET;
             }
             let row = Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, size::menu_item());
@@ -322,6 +382,24 @@ impl Menu {
         }
         // Presses on the body between items close nothing.
         ctx.on_click(body, || {});
+        let scrolls = shown < n;
+        if scrolls {
+            // The wheel moves the list an item a notch.
+            let s = self.state.clone();
+            let last = n - shown;
+            ctx.on_scroll(body, move |input| {
+                let crate::interaction::ScrollKind::Wheel { dy, .. } = input.kind else { return };
+                if dy.abs() < 4.0 {
+                    return;
+                }
+                let mut st = s.get();
+                let from = st.first.min(last);
+                st.first = if dy > 0.0 { (from + 1).min(last) } else { from.saturating_sub(1) };
+                if st.first != from || st.first != s.get().first {
+                    s.set(st);
+                }
+            });
+        }
         let (s, pick, items, slide) = (self.state.clone(), self.on_pick.clone(), self.items.clone(), self.on_slide.clone());
         ctx.on_key(body, move |ev| {
             let Event::Key { kind, key, chars, .. } = ev else { return };
@@ -342,8 +420,19 @@ impl Menu {
                 return;
             }
             match key {
-                Key::Down => st.highlight = Menu::step(&items, st.highlight, 1),
-                Key::Up => st.highlight = Menu::step(&items, st.highlight, -1),
+                Key::Down | Key::Up => {
+                    st.highlight = Menu::step(&items, st.highlight, if *key == Key::Down { 1 } else { -1 });
+                    // Scrolled: keep the highlight in view.
+                    if let (Some(h), true) = (st.highlight, scrolls) {
+                        st.first = if h < first {
+                            h
+                        } else if h >= first + shown {
+                            h + 1 - shown
+                        } else {
+                            first
+                        };
+                    }
+                }
                 Key::Escape => st = MenuState::default(),
                 Key::Enter => {
                     if let Some(i) = st.highlight.filter(|&i| items[i].enabled && items[i].slider.is_none()) {
@@ -1068,6 +1157,71 @@ mod tests {
         app.tick();
         assert!(!menu.get().open);
         assert_eq!(value.get(), 1);
+    }
+
+    struct Long {
+        value: Mutable<usize>,
+        menu: Mutable<MenuState>,
+    }
+    impl View for Long {
+        fn render(&self, ctx: &mut Ctx) {
+            let options: Vec<String> = (0..10).map(|i| format!("Option {i}")).collect();
+            Dropdown::new(self.value.clone(), self.menu.clone(), options).at(10.0, 10.0).render(ctx);
+        }
+    }
+
+    /// frescod gave the list less height than it asked (the screen had
+    /// no more room): the items scroll in it, by the arrows and the wheel,
+    /// and none is cut (fresco-popups.md §4).
+    #[test]
+    fn a_list_frescod_shrank_scrolls_within_what_it_got() {
+        let d = Arc::new(AtomicBool::new(true));
+        let (value, menu) = (Mutable::with_dirty(0usize, d.clone()), Mutable::with_dirty(MenuState::default(), d.clone()));
+        let mut app = App::new_with_flag(Long { value: value.clone(), menu: menu.clone() }, d);
+        app.set_popups(true);
+        app.tick();
+        click(&mut app, 20.0, 20.0);
+        let root = app.tree().popups().next().unwrap().0;
+        let asked = app.tree().get(root).unwrap().rect();
+        let room = MENU_INSET * 2.0 + 4.0 * size::menu_item() + 3.0;
+        app.popup_placed(root, Some(room));
+        app.tick();
+        let shown = |app: &App<Long>| -> Vec<(String, Rect)> {
+            app.tree().iter().filter_map(|(_, n)| match n {
+                // The list's, not the dropdown's own label above it.
+                Node::Text { content, rect, .. } if content.starts_with("Option") && rect.y() > 10.0 + size::button_height() => Some((content.clone(), *rect)),
+                _ => None,
+            }).collect()
+        };
+        let v = shown(&app);
+        assert_eq!(v.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["Option 0", "Option 1", "Option 2", "Option 3"]);
+        for (c, r) in &v {
+            assert!(r.y() >= asked.y() && r.y() + r.h() <= asked.y() + room, "{c} at {r:?} inside {room}");
+        }
+        // The arrows walk past the bottom: the list follows.
+        for _ in 0..6 {
+            key(&mut app, Key::Down);
+        }
+        assert_eq!(menu.get().highlight, Some(5));
+        let v = shown(&app);
+        assert!(v.iter().any(|(c, _)| c == "Option 5") && !v.iter().any(|(c, _)| c == "Option 0"), "{v:?}");
+        for (c, r) in &v {
+            assert!(r.y() >= asked.y() && r.y() + r.h() <= asked.y() + room, "{c} at {r:?}");
+        }
+        // The wheel takes it to the end, and no further.
+        for _ in 0..10 {
+            let at = Point::new(30.0, asked.y() + 10.0);
+            app.handle_event(Event::Scroll { at: Some(at), dx: 0.0, dy: 8.0, modifiers: Modifiers::default(), phase: crate::event::ScrollPhase::None });
+            app.tick();
+        }
+        let v = shown(&app);
+        assert_eq!(v.last().map(|(c, _)| c.as_str()), Some("Option 9"), "{v:?}");
+        assert_eq!(v.len(), 4);
+        // Given all it asked again: everything shows.
+        app.popup_placed(root, None);
+        app.tick();
+        assert_eq!(shown(&app).len(), 10);
+        let _ = value;
     }
 
     struct Bar {

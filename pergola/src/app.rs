@@ -353,6 +353,14 @@ impl<V: View> App<V> {
         }
     }
 
+    /// frescod placed pop-up `root` `h` tall, less than it asked (`None`:
+    /// all of it): its list scrolls within that ([`Ctx::popup_room`]).
+    pub fn popup_placed(&mut self, root: NodeId, h: Option<f32>) {
+        if crate::popup::set_room(root, h) {
+            self.touch();
+        }
+    }
+
     /// frescod took pop-up `root` down: run its `on_dismiss`.
     pub fn popup_dismissed(&mut self, root: NodeId) {
         if let Some(cb) = self.interactions.get(root).and_then(|h| h.on_dismiss.as_ref()) {

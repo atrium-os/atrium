@@ -91,6 +91,31 @@ struct Open {
     dismissed: bool,
 }
 
+thread_local! {
+    /// How tall frescod made each pop-up it shrank to fit the screen
+    /// (`EV_POPUP_PLACED`), by root: its content scrolls in that.
+    static ROOMS: std::cell::RefCell<HashMap<NodeId, f32>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Record the height frescod gave pop-up `root` (`None`: all it asked).
+/// Returns whether that changed.
+pub fn set_room(root: NodeId, h: Option<f32>) -> bool {
+    ROOMS.with(|r| {
+        let mut r = r.borrow_mut();
+        let old = r.get(&root).copied();
+        match h {
+            Some(h) => r.insert(root, h),
+            None => r.remove(&root),
+        };
+        old != h
+    })
+}
+
+/// The height frescod gave pop-up `root`, when it is less than asked.
+pub fn room(root: NodeId) -> Option<f32> {
+    ROOMS.with(|r| r.borrow().get(&root).copied())
+}
+
 /// The window of nodes whose pop-up was destroyed.
 const GONE: u32 = 0;
 
@@ -116,6 +141,7 @@ impl Popups {
         for id in gone {
             let o = self.open.remove(&id).unwrap();
             host.destroy(o.window);
+            set_room(id, None);
             // Its nodes went with it: their removals go nowhere.
             for w in self.owner.values_mut().filter(|w| **w == o.window) {
                 *w = GONE;
@@ -205,6 +231,11 @@ impl Popups {
         let (id, o) = self.open.iter_mut().find(|(_, o)| o.window == window)?;
         o.dismissed = true;
         Some(*id)
+    }
+
+    /// Pop-up `window`'s root and the rect it asked for.
+    pub fn root_of(&self, window: u32) -> Option<(NodeId, Rect)> {
+        self.open.iter().find(|(_, o)| o.window == window).map(|(id, o)| (*id, o.rect))
     }
 
     /// A point in pop-up `window`'s coordinates, in the tree's.
