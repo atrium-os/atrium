@@ -163,7 +163,10 @@ mod tests {
     use super::*;
 
     fn plex() -> Face {
-        Face::new(std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../fonts/ibm-plex/IBMPlexSans.ttf")).unwrap(), 0)
+        // Built in, not read at run time: a test binary cross-built on one
+        // machine and run on another (the dev VM) has no source tree there.
+        static PLEX: &[u8] = include_bytes!("../../fonts/ibm-plex/IBMPlexSans.ttf");
+        Face::new(PLEX.to_vec(), 0)
     }
 
     #[test]
