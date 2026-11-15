@@ -14,7 +14,7 @@ fn ask(app: &str, activation: [u8; 16]) -> String {
     if !matches!(round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }), Ok(Response::Hello { .. })) {
         return "err handshake".into();
     }
-    match round_trip(&mut s, &Request::Console { app_id: app.into(), activation }) {
+    match round_trip(&mut s, &Request::Console { app_id: app.into(), activation, tab_of: None, new_window: false }) {
         Ok(Response::ConsoleOpened { title }) => format!("ok {title}"),
         Ok(Response::Error { message }) => format!("err {message}"),
         other => format!("err {other:?}"),

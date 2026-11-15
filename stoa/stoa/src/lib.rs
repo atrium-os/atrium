@@ -24,6 +24,7 @@
 
 use stoa_proto::MsgType;
 
+pub mod link;
 pub mod persist;
 pub mod predict;
 

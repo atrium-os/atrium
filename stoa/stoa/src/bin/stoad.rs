@@ -26,7 +26,7 @@
 //! same trait.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -41,6 +41,7 @@ use stoa::persist::{
     default_state_dir, load_scrollback, remove_scrollback, save_scrollback, PersistDivider,
     PersistPane, PersistSession, PersistState, PersistWindow,
 };
+use stoa::link::Link;
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
@@ -52,7 +53,7 @@ use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
 /// - `$STOA_REORDER=N` (N>0): hold every Nth datagram back and release it
 ///   *after* the next one (adjacent swap → the client sees a stale older diff
 ///   arrive late, exercising its drop-non-advancing rule).
-fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
+fn send_output(udp: &Link, buf: &[u8], addr: SocketAddr) {
     static DROP_N: OnceLock<u64> = OnceLock::new();
     static REORDER_N: OnceLock<u64> = OnceLock::new();
     static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +103,7 @@ fn snapshot_state(reg: &Reg) -> PersistState {
     let map = reg.lock().unwrap();
     let mut sessions = Vec::new();
     for (name, s) in map.iter() {
-        if s.dead.load(Ordering::SeqCst) {
+        if s.dead.load(Ordering::SeqCst) || name.starts_with(CONSOLE_PREFIX) {
             continue;
         }
         let inner = s.inner.lock().unwrap();
@@ -200,17 +201,24 @@ fn restore_sessions(reg: &Reg, path: &Path) {
         if map.contains_key(&ps.name) {
             continue;
         }
+        // An app's console isn't kept: its shells came from portcullisd,
+        // and only a press there makes new ones.
+        if ps.name.starts_with(CONSOLE_PREFIX) {
+            continue;
+        }
         let udp = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(u) => u,
+            Ok(u) => Link::udp(u),
             Err(_) => continue,
         };
-        let port = udp.local_addr().unwrap().port();
+        let port = udp.port();
         let (cols, rows) = (ps.cols, ps.rows);
         let name = ps.name.clone();
         let state = Arc::new(SessionState {
             port,
             target: ps.target.clone(),
             dead: AtomicBool::new(false),
+            adopted: Mutex::new(Vec::new()),
+        link: None,
             inner: Mutex::new(Inner {
                 key: gen_key(),
                 tx_seq: 0,
@@ -245,7 +253,7 @@ fn rebuild_from_restore(
     name: &str,
     state: &Arc<SessionState>,
     inner: &mut Inner,
-    udp: &UdpSocket,
+    udp: &Link,
     reg: &Reg,
     ps: PersistSession,
 ) {
@@ -506,9 +514,12 @@ impl Inner {
     fn seal_active_snapshot(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let (cols, rows) = (self.cols, self.rows);
         if self.sync {
-            // Force a full repaint: diff the current window against blanks.
+            // Force a full repaint: diff the current window against blanks,
+            // and say so (the size), so the client blanks its grid first.
+            // The client's grid holds whatever it showed (another window,
+            // the scrollback): blank cells alone wouldn't clear it.
             self.last_sent = stoa_term::Grid::new(cols, rows);
-            return self.seal_sync_update();
+            return self.seal_sync_diff(true);
         }
         let addr = self.last_addr?;
         let bytes = {
@@ -525,11 +536,20 @@ impl Inner {
     /// `StateDiff` as an OUTPUT datagram and advance `last_sent`. `None` if
     /// nothing changed or there's no client address yet.
     fn seal_sync_update(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        self.seal_sync_diff(false)
+    }
+
+    /// `full`: the diff resets the client's grid (as a resize does) and
+    /// paints every non-blank cell.
+    fn seal_sync_diff(&mut self, full: bool) -> Option<(SocketAddr, Vec<u8>)> {
         let addr = self.last_addr?;
         let (cols, rows) = (self.cols, self.rows);
         let grid = self.windows.get(self.active).filter(|w| w.alive)?.grid(cols, rows);
-        let diff = stoa_term::StateDiff::between(&self.last_sent, &grid);
-        if diff.is_empty() && grid.cursor() == self.last_sent.cursor() {
+        let mut diff = stoa_term::StateDiff::between(&self.last_sent, &grid);
+        if full {
+            diff.resized = Some((grid.cols(), grid.rows()));
+        }
+        if !full && diff.is_empty() && grid.cursor() == self.last_sent.cursor() {
             return None; // nothing to send
         }
         let wire = seal(&self.key, self.tx_seq, OUTPUT, &diff.encode());
@@ -598,8 +618,17 @@ struct SessionState {
     /// running jail, via the portcullisd broker — stoa.md §4.5).
     target: String,
     dead: AtomicBool,
+    /// An app's console: shells portcullisd started, waiting for a window.
+    adopted: Mutex<Vec<PtyShell>>,
+    /// An app's console's local link (attached and detached by root).
+    link: Option<Link>,
     inner: Mutex<Inner>,
 }
+
+/// Sessions holding apps' consoles (docs/spec/homes.md §4) are named
+/// `console.<person>.<app id>.<n>`. Only root (portcullisd) makes, lists,
+/// attaches or ends them; their target is `console:<app id>`.
+const CONSOLE_PREFIX: &str = "console.";
 
 type Reg = Arc<Mutex<HashMap<String, Arc<SessionState>>>>;
 
@@ -651,13 +680,86 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
         return;
     }
 
-    let mut reader = BufReader::new(&stream);
+    // One line, read a byte at a time: ADOPT and ATTACH send descriptors
+    // after it, which a buffered read could swallow.
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
+    {
+        let mut b = [0u8; 1];
+        loop {
+            match (&stream).read(&mut b) {
+                Ok(1) if b[0] != b'\n' && line.len() < 1024 => line.push(b[0] as char),
+                Ok(1) => break,
+                _ => return,
+            }
+        }
     }
     let mut parts = line.split_whitespace();
-    match parts.next() {
+    let cmd = parts.next();
+    // ★ Apps' consoles are root's (portcullisd's) alone: nobody else makes,
+    // finds, attaches or ends one.
+    let console = line.split_whitespace().nth(1).is_some_and(|n| n.starts_with(CONSOLE_PREFIX));
+    if uid != 0 && (console || matches!(cmd, Some("ADOPT" | "ATTACH" | "CONSOLES"))) {
+        eprintln!("stoad: {cmd:?} refused to uid {uid}: apps' consoles are portcullisd's");
+        let _ = (&stream).write_all(b"ERR not yours\n");
+        return;
+    }
+    match cmd {
+        Some("ADOPT") => {
+            // `ADOPT <name> <app id> <pid> <cols> <rows>` + [procdesc, pty
+            // master]: a shell portcullisd started in the app's jail, as a
+            // new window of console session <name> (made if need be).
+            let (Some(name), Some(app), Some(pid)) = (parts.next(), parts.next(), parts.next().and_then(|p| p.parse::<i32>().ok())) else {
+                let _ = (&stream).write_all(b"ERR usage: ADOPT <name> <app> <pid> <cols> <rows>\n");
+                return;
+            };
+            let cols = parts.next().and_then(|v| v.parse().ok()).unwrap_or(80);
+            let rows = parts.next().and_then(|v| v.parse().ok()).unwrap_or(24);
+            let _ = (&stream).write_all(b"READY\n");
+            let reply = match recv_fds(&stream, 2) {
+                Ok(fds) if fds.len() == 2 => {
+                    let mut it = fds.into_iter();
+                    let (pd, master) = (it.next().unwrap(), it.next().unwrap());
+                    adopt(&reg, name, app, pid, pd, master, cols, rows)
+                }
+                Ok(fds) => format!("ERR expected 2 descriptors, got {}", fds.len()),
+                Err(e) => format!("ERR {e}"),
+            };
+            let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+        }
+        Some("ATTACH") => {
+            // `ATTACH <name>` + [datagram socket]: the terminal's link (its
+            // other end goes to the terminal); answers the session key.
+            let Some(name) = parts.next() else { return };
+            let _ = (&stream).write_all(b"READY\n");
+            let reply = match recv_fds(&stream, 1) {
+                Ok(mut fds) if fds.len() == 1 => attach(&reg, name, std::os::unix::net::UnixDatagram::from(fds.pop().unwrap())),
+                Ok(fds) => format!("ERR expected 1 descriptor, got {}", fds.len()),
+                Err(e) => format!("ERR {e}"),
+            };
+            let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+        }
+        Some("CONSOLES") => {
+            // `CONSOLES <prefix>`: `<name> <live windows> <attached 0|1>` per
+            // live console session whose name starts with <prefix>.
+            let prefix = parts.next().unwrap_or(CONSOLE_PREFIX);
+            let map = reg.lock().unwrap();
+            let mut body = String::new();
+            let mut names: Vec<_> = map.keys().filter(|n| n.starts_with(prefix)).cloned().collect();
+            names.sort();
+            for n in names {
+                let s = &map[&n];
+                if s.dead.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let live = s.inner.lock().unwrap().windows.iter().filter(|w| w.alive).count();
+                let attached = s.link.as_ref().is_some_and(|l| l.check());
+                body.push_str(&format!("{n} {live} {}\n", attached as u8));
+            }
+            let _ = (&stream).write_all(body.as_bytes());
+        }
+        Some("MINT") if console => {
+            let _ = (&stream).write_all(b"ERR an app's console is attached by portcullisd\n");
+        }
         Some("MINT") => {
             // `MINT <name> [target]` — target "session" (default) or "jail:<id>".
             let name = parts.next().unwrap_or("default").to_string();
@@ -670,6 +772,7 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
             // One session per line: `<name>\t<nwindows>\t<active title>`.
             let body: String = list_sessions(&reg)
                 .into_iter()
+                .filter(|(n, _, _)| uid == 0 || !n.starts_with(CONSOLE_PREFIX))
                 .map(|(n, nw, title)| format!("{n}\t{nw}\t{title}\n"))
                 .collect();
             let _ = (&stream).write_all(body.as_bytes());
@@ -692,6 +795,139 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
             let _ = (&stream).write_all(b"ERR unknown command\n");
         }
     }
+}
+
+/// Receive up to `max` descriptors (one message) on the control socket.
+fn recv_fds(s: &UnixStream, max: usize) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    // SAFETY: a size computation.
+    let space = unsafe { libc::CMSG_SPACE((max * std::mem::size_of::<i32>()) as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    // SAFETY: zeroed msghdr filled with buffers that outlive the call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // SAFETY: recvmsg into the buffers above.
+    let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = Vec::new();
+    // SAFETY: walking the control messages the kernel filled in.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(c) as *const i32;
+                let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
+                for i in 0..k {
+                    out.push(std::os::fd::OwnedFd::from_raw_fd(*data.add(i)));
+                }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    Ok(out)
+}
+
+/// ADOPT: the shell joins console session `name` (made, detached, if new)
+/// as a new window, made the active one. Answers `OK <windows>`.
+#[allow(clippy::too_many_arguments)]
+fn adopt(reg: &Reg, name: &str, app: &str, pid: i32, procdesc: std::os::fd::OwnedFd, master: std::os::fd::OwnedFd, cols: u16, rows: u16) -> String {
+    #[cfg(target_os = "freebsd")]
+    let shell = stoa_spawn::pty_shell_from_broker(master, procdesc, pid);
+    #[cfg(not(target_os = "freebsd"))]
+    let shell: PtyShell = {
+        let _ = (master, procdesc, pid);
+        return "ERR consoles are FreeBSD's".into();
+    };
+    let target = format!("console:{app}");
+    let state = {
+        let mut map = reg.lock().unwrap();
+        if map.get(name).is_some_and(|s| s.dead.load(Ordering::SeqCst)) {
+            map.remove(name);
+        }
+        match map.get(name) {
+            Some(s) if s.target != target => return format!("ERR {name} is not {app}'s"),
+            Some(s) => s.clone(),
+            None => {
+                let link = Link::local();
+                let state = Arc::new(SessionState {
+                    port: 0,
+                    target,
+                    dead: AtomicBool::new(false),
+                    adopted: Mutex::new(Vec::new()),
+                    link: Some(link.clone()),
+                    inner: Mutex::new(Inner {
+                        key: gen_key(),
+                        tx_seq: 0,
+                        rx: ReplayWindow::new(),
+                        last_addr: None,
+                        started: true,
+                        cols,
+                        rows,
+                        windows: Vec::new(),
+                        active: 0,
+                        last_active: 0,
+                        need_snapshot: false,
+                        scroll: 0,
+                        sync: false,
+                        last_sent: stoa_term::Grid::new(cols, rows),
+                        restore: None,
+                    }),
+                });
+                map.insert(name.to_string(), state.clone());
+                let (n, st, r) = (name.to_string(), state.clone(), reg.clone());
+                thread::spawn(move || recv_loop(n, st, link, r));
+                state
+            }
+        }
+    };
+    let link = state.link.clone().expect("a console session has a local link");
+    state.adopted.lock().unwrap().push(shell);
+    let mut inner = state.inner.lock().unwrap();
+    match spawn_window(name, &state, &mut inner, &link, reg, None) {
+        Some(idx) => {
+            let first = inner.windows.iter().filter(|w| w.alive).count() == 1;
+            if first {
+                inner.active = idx;
+            } else {
+                inner.set_active(idx);
+            }
+            inner.need_snapshot = true;
+            let live = inner.windows.iter().filter(|w| w.alive).count();
+            eprintln!("stoad: console {name:?} ({app}) took shell pid {pid} as window {idx}");
+            format!("OK {live}")
+        }
+        None => "ERR no window".into(),
+    }
+}
+
+/// ATTACH: `s` becomes console session `name`'s link, with a fresh key
+/// (whoever held the last one is detached). Answers the key, in hex.
+fn attach(reg: &Reg, name: &str, s: std::os::unix::net::UnixDatagram) -> String {
+    let map = reg.lock().unwrap();
+    let Some(state) = map.get(name).filter(|s| !s.dead.load(Ordering::SeqCst)) else {
+        return format!("ERR no console {name}");
+    };
+    let Some(link) = &state.link else { return format!("ERR {name} is not a console") };
+    if let Err(e) = link.attach(s) {
+        return format!("ERR {e}");
+    }
+    let mut inner = state.inner.lock().unwrap();
+    let key = gen_key();
+    inner.key = key;
+    inner.tx_seq = 0;
+    inner.rx = ReplayWindow::new();
+    inner.last_addr = None;
+    inner.need_snapshot = inner.started;
+    eprintln!("stoad: console {name:?} attached");
+    to_hex(&key)
 }
 
 /// All live sessions as `(name, live_window_count, active_window_title)`,
@@ -779,13 +1015,15 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
     }
     // New session: its own UDP port + key; the shell spawns lazily on the
     // first datagram (so its prompt has somewhere to go).
-    let udp = UdpSocket::bind("0.0.0.0:0").expect("bind session udp");
-    let port = udp.local_addr().unwrap().port();
+    let udp = Link::udp(UdpSocket::bind("0.0.0.0:0").expect("bind session udp"));
+    let port = udp.port();
     let key = gen_key();
     let state = Arc::new(SessionState {
         port,
         target: target.to_string(),
         dead: AtomicBool::new(false),
+        adopted: Mutex::new(Vec::new()),
+        link: None,
         inner: Mutex::new(Inner {
             key,
             tx_seq: 0,
@@ -813,7 +1051,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
 
 /// Per-session receive loop: authenticate, anti-replay, learn the client
 /// address, lazily spawn the shell, route Input to the pty.
-fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
+fn recv_loop(name: String, state: Arc<SessionState>, udp: Link, reg: Reg) {
     udp.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let mut buf = [0u8; 65536];
     loop {
@@ -823,6 +1061,13 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
         let (n, src) = match udp.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                // A console's terminal closed: detached (it keeps running).
+                if let Link::Local(_) = &udp {
+                    let was = udp.attached();
+                    if was && !udp.check() {
+                        eprintln!("stoad: console {name:?} detached");
+                    }
+                }
                 continue;
             }
             Err(_) => continue,
@@ -1094,6 +1339,16 @@ fn stoad_is_jailed() -> bool {
     }
 }
 
+/// The next shell for a session: an adopted one for an app's console
+/// (stoad has no way to start those itself), else [`spawn_for`].
+fn next_shell(state: &SessionState, cols: u16, rows: u16, cwd: Option<&str>) -> std::io::Result<PtyShell> {
+    if state.target.starts_with("console:") {
+        return state.adopted.lock().unwrap().pop().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied, "an app's console gets its shells from portcullisd (a press on Terminal)"));
+    }
+    spawn_for(&parse_target(&state.target), cols, rows, cwd)
+}
+
 /// Spawn the shell for a session target: `Jail(id)` via the portcullisd
 /// `BrokerSpawner` (FreeBSD); `SessionJail` via [`resolve_session_target`]
 /// (DirectSpawner when unjailed, broker when a session jail is configured,
@@ -1143,14 +1398,15 @@ fn spawn_window(
     name: &str,
     state: &Arc<SessionState>,
     inner: &mut Inner,
-    udp: &UdpSocket,
+    udp: &Link,
     reg: &Reg,
     cwd: Option<&str>,
 ) -> Option<usize> {
     let (cols, rows) = (inner.cols, inner.rows);
-    match spawn_for(&parse_target(&state.target), cols, rows, cwd) {
+    match next_shell(state, cols, rows, cwd) {
         Ok(shell) => {
             let fd = shell.master_fd();
+            let _ = shell.resize(cols, rows);
             let widx = inner.windows.len();
             inner.windows.push(Window {
                 panes: vec![Pane {
@@ -1186,13 +1442,13 @@ fn spawn_pane(
     inner: &mut Inner,
     win_idx: usize,
     region: (u16, u16, u16, u16),
-    udp: &UdpSocket,
+    udp: &Link,
     reg: &Reg,
 ) -> Option<usize> {
     let (top, left, prows, pcols) = region;
     // Split panes respawn at the shell default (restoring a 2nd pane's cwd is
     // a minor follow-up; the window's primary pane carries cwd).
-    match spawn_for(&parse_target(&state.target), pcols, prows, None) {
+    match next_shell(state, pcols, prows, None) {
         Ok(shell) => {
             let fd = shell.master_fd();
             let w = inner.windows.get_mut(win_idx)?;
@@ -1223,7 +1479,7 @@ fn split_active(
     name: &str,
     state: &Arc<SessionState>,
     inner: &mut Inner,
-    udp: &UdpSocket,
+    udp: &Link,
     reg: &Reg,
     vertical: bool,
 ) {
@@ -1288,7 +1544,7 @@ fn spawn_reader(
     pane_idx: usize,
     fd: i32,
     state: &Arc<SessionState>,
-    udp: &UdpSocket,
+    udp: &Link,
     reg: &Reg,
 ) {
     let rstate = state.clone();
@@ -1312,7 +1568,7 @@ enum CloseOutcome {
 /// Per-pane pty reader: feed this pane's mirror; if its window is active,
 /// stream (single pane) or re-composite (multi-pane) to the client. On shell
 /// exit, close the pane (un-split if a sibling survives, else close window).
-fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
+fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc<SessionState>, udp: Link, reg: Reg) {
     let mut buf = [0u8; 8192];
     loop {
         // SAFETY: read this pane's pty master into our buffer.

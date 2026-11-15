@@ -594,6 +594,31 @@ Clipboard:
 This means cross-host copy/paste actually works without xforwarding
 or tmux-hacks.
 
+## 10a. App consoles: adopted shells and local links
+
+Atrium's app consoles (homes.md §4) are Stoa sessions whose shells stoad
+did not start. portcullisd starts each one in the app's jail and passes
+it over stoad's control socket; three commands, accepted from uid 0 only:
+
+- `ADOPT <name> <app> <pid> <cols> <rows>` with two descriptors (the
+  shell's process descriptor and its pty master): a new window in session
+  `<name>` (made if new), the shell as stoad's child to reap.
+- `ATTACH <name>` with one descriptor, a connected Unix datagram socket:
+  the session's link becomes it, and the reply is the session key (hex).
+- `CONSOLES <prefix>`: `name live attached` per session.
+
+A session is `console.<person>:<app>:<n>`; it is never persisted, and a
+new window in it (Ctrl+Shift+T in the terminal) is another adopted shell,
+never one stoad spawns. The link is a `Link::Local` slot in place of the
+UDP socket: same envelope, MAC and sequence numbers, no addresses. An
+empty probe on each idle tick finds a closed client end: the session is
+then detached and runs on. Both ends' buffers are 1 MiB, since a Unix
+datagram must fit whole (FreeBSD's default is 2 KiB); a datagram lost
+anyway shows as a sequence gap, and the client asks for a repaint
+(`SyncMode`). A full repaint in sync mode carries the size, so the
+client blanks its grid before painting: after a window switch the grid
+held another window.
+
 ## 11. Security
 
 - `stoad` runs **jailed + non-root** (a dedicated `_stoad` uid). It

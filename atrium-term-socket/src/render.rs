@@ -5,7 +5,7 @@
 //! becomes one shaped run on the server side; trailing blanks are
 //! trimmed before sending to keep the run short.
 
-use crate::grid::Grid;
+use stoa_term::Grid;
 
 use fresco_client::Connection;
 use fresco_protocol::RectParams;
@@ -43,10 +43,19 @@ impl Renderer {
 
     pub fn render(&self, conn: &mut Connection, grid: &Grid) -> std::io::Result<()> {
         let mut f = conn.frame()?;
-
-        let cur_x = self.pad_x + (grid.cursor_col as f32) * self.cell_w;
-        let cur_y = self.pad_y + (grid.cursor_row as f32) * self.line_h;
         let k = self.k;
+        let (rows, cols) = (grid.rows(), grid.cols());
+        // The window's own background, so it is never see-through.
+        f.rect(RectParams {
+            x: 0.0, y: 0.0,
+            w: ((2.0 * self.pad_x + cols as f32 * self.cell_w) * k).ceil(),
+            h: ((2.0 * self.pad_y + rows as f32 * self.line_h) * k).ceil(),
+            r: 0.07, g: 0.08, b: 0.09, a: 1.0, radius: 0.0,
+        })?;
+
+        let (cur_row, cur_col) = grid.cursor();
+        let cur_x = self.pad_x + (cur_col as f32) * self.cell_w;
+        let cur_y = self.pad_y + (cur_row as f32) * self.line_h;
         let (x0, y0) = ((cur_x * k).round(), (cur_y * k).round());
         f.rect(RectParams {
             x: x0, y: y0,
@@ -54,14 +63,9 @@ impl Renderer {
             r: 1.0, g: 0.80, b: 0.20, a: 0.5, radius: 0.0,
         })?;
 
-        let cells = grid.cells();
-        for row in 0..grid.rows {
+        for row in 0..rows {
             /* Build the row string, trimming trailing spaces. */
-            let mut s = String::with_capacity(grid.cols as usize);
-            for col in 0..grid.cols {
-                let cell = cells[row as usize * grid.cols as usize + col as usize];
-                s.push(cell.ch);
-            }
+            let s: String = grid.row(row).iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect();
             let trimmed = s.trim_end_matches(' ');
             if trimmed.is_empty() { continue; }
             let y_base = ((self.pad_y + (row as f32) * self.line_h + self.baseline) * k).round();

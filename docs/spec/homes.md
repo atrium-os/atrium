@@ -110,8 +110,30 @@ Right-click an app's icon (the dock, the Applications grid, the overview),
   to edit by hand, and a console there would be a way around their own
   checks. Third-party apps always have one; the person owns that data
   anyway (decision H5).
-- The window's title names the app ("Terminal: Atrium Player"), and the
-  console ends when the window closes; the app keeps running if it was.
+- The window's title names the app ("Terminal: Atrium Player").
+- **Kept like tmux (Stoa).** When stoad runs, portcullisd still starts
+  every shell itself (jail, uid, toolbox) and hands it to stoad (`ADOPT`
+  on stoad's root-only control socket: name, app, the process descriptor
+  and the pty master). Each console is a Stoa session named
+  `console.<person>:<app>:<n>`; the terminal gets a local link to it (a
+  Unix datagram socketpair, `ATTACH`, with the session key), not a
+  network port: its jail has no network. Closing the window detaches; the
+  shells run on. **Terminal** on the app again reattaches the person's
+  detached session, as it was. Without stoad the console is a bare pty
+  that ends with its window.
+- **Tabs and windows.** Ctrl+Shift+T asks portcullisd for another shell
+  in the same session (a Stoa window, a tab); Ctrl+PageUp and
+  Ctrl+PageDown move between them. Ctrl+Shift+N asks for another console
+  window (a session of its own). The terminal holds the `consoles`
+  capability, and portcullisd grants these only for an app the terminal
+  already has a console of, for the same person, with the same press
+  rules; it never names a jail or a uid itself.
+- Console sessions are not saved to disk and stoad never starts their
+  shells: a shell that exits is gone; when the last one goes, the session
+  ends.
+- Room left for personas (personas.md, proposal): the console runs in the
+  jail of what it serves, so it inherits that instance's network and,
+  later, its persona.
 
 ## 5. Workspaces
 
@@ -187,6 +209,9 @@ people ship without `sshd` on the host.
    `atrium-term`, the toolbox mount, Forum's menu item. Gate: a console in
    an app's jail sees its overlay and nothing else, has the app's uid, and
    is refused for Arca.
+   **Built 2026-11-15**: the bare-pty console (47974e49), then
+   Stoa-backed consoles with tabs, windows, detach and reattach;
+   `scripts/vm-console-check.sh` 0 failed (33 checks).
 3. **W3 workspaces.** New workspace and Scratch in Forum, on
    `atrium-devjail`; Scrinium's Workspaces place. Gate: `cc hello.c && ./a.out`
    in Scratch; a second workspace using the first links its library.

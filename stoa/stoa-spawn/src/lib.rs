@@ -296,9 +296,10 @@ pub(crate) fn pty_shell_from_raw(master: i32, pid: libc::pid_t) -> PtyShell {
 }
 
 /// Construct a `PtyShell` from a pty master + a procdesc received over the
-/// broker (the process is jaild's pdfork child). Internal to BrokerSpawner.
+/// broker (the process is jaild's or portcullisd's pdfork child): what
+/// BrokerSpawner gets, and an app's console that portcullisd hands stoad.
 #[cfg(target_os = "freebsd")]
-pub(crate) fn pty_shell_from_broker(master: OwnedFd, procdesc: OwnedFd, pid: libc::pid_t) -> PtyShell {
+pub fn pty_shell_from_broker(master: OwnedFd, procdesc: OwnedFd, pid: libc::pid_t) -> PtyShell {
     PtyShell { master, reaper: Reaper::Procdesc { fd: procdesc, pid } }
 }
 

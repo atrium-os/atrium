@@ -16,4 +16,7 @@ fresco-protocol = { path = "../fresco-protocol" }
 libc = "0.2"
 atrium-open     = { path = "../atrium-open" }
 portcullis-ipc  = { path = "../portcullis/portcullis-ipc" }
+stoa            = { path = "../stoa/stoa" }
+stoa-proto      = { path = "../stoa/stoa-proto" }
+stoa-term       = { path = "../stoa/stoa-term" }
 vte = "0.13"

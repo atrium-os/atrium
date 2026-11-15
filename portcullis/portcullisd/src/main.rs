@@ -435,8 +435,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             continue;
         }
         /* ★ App consoles (homes.md §4): gated on the PEER UID, a launcher. */
-        if let Request::Console { app_id, activation } = req {
-            let resp = handle_console(uid, &owner, &app_id, activation, &shared);
+        if let Request::Console { app_id, activation, tab_of, new_window } = req {
+            let resp = handle_console(uid, &owner, &app_id, activation, tab_of, new_window, &shared);
             write_response(&mut writer, &resp)?;
             continue;
         }
@@ -1074,7 +1074,7 @@ fn start_for(app: &str, owner: &str, why: &'static str) {
 
 /// Console (homes.md §4). `uid` is the caller's peer uid; `owner` the
 /// person it belongs to, whose app instance the shell joins.
-fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], shared: &Mutex<Tenants>) -> Response {
+fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab_of: Option<String>, new_window: bool, shared: &Mutex<Tenants>) -> Response {
     use portcullisd::opens::{self, Delivery, Hub};
     let refuse = |why: String| {
         eprintln!("portcullisd: console for {app_id} REFUSED to uid {uid}: {why}");
@@ -1083,10 +1083,16 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], sha
     let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
     /* A launcher opens any app's console; the terminal (`consoles`) only
-     * another tab or window in an app this person has one in already. */
-    let launcher = caller.as_deref().is_some_and(launch::app_may_launch_apps);
-    let terminal = caller.as_deref().is_some_and(launch::app_shows_consoles);
-    if !launcher && !(terminal && console::live(owner, app_id)) {
+     * another tab or window in an app this person has one in already: a tab
+     * in one of the person's Stoa sessions for that app. */
+    let stoa = console::stoad_up();
+    let mine = if stoa { console::sessions(owner, app_id) } else { Vec::new() };
+    let launcher = caller.as_deref().is_some_and(launch::app_may_launch_apps) && tab_of.is_none();
+    let terminal = caller.as_deref().is_some_and(launch::app_shows_consoles) && match &tab_of {
+        Some(t) => mine.iter().any(|(n, _)| n == t),
+        None => new_window && (console::live(owner, app_id) || !mine.is_empty()),
+    };
+    if !launcher && !terminal {
         return refuse(format!("cap.console.denied: only a launcher opens consoles, and the terminal more of one it shows (caller {})",
                               caller.as_deref().unwrap_or("is not a launched app")));
     }
@@ -1133,21 +1139,57 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], sha
     if let Err(why) = console::mount_toolbox(&PathBuf::from(launch::JAILS_DIR).join(app_id)) {
         return refuse(why);
     }
-    let master = match console::spawn(&console::Spec { owner, jid, uid: app_uid, gid, home: "/nonexistent", app_id, cols: 80, rows: 24 }) {
-        Ok(m) => m,
-        Err(e) => return refuse(format!("the shell: {e}")),
-    };
+    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: "/nonexistent", app_id, cols: 80, rows: 24 };
     let title = format!("Terminal: {name}");
     let hub = Hub::global();
     if let Err(e) = hub.listen(console::TERMINAL) {
         return refuse(format!("the terminal's channel: {e}"));
     }
-    match hub.deliver(owner, console::TERMINAL, &title, &format!("{}; app={app_id}", console::MIME), true, master) {
+    let (fd, mime) = if stoa {
+        /* Stoa: Terminal on the app comes back to a session left running
+         * (the window was closed); otherwise a new shell, in a new session
+         * or, for a tab, the terminal's. */
+        let back = (launcher && !new_window).then(|| mine.iter().find(|(_, att)| !att).map(|(n, _)| n.clone())).flatten();
+        let session = match back {
+            Some(n) => {
+                eprintln!("portcullisd: console {n} reattached for {owner}");
+                n
+            }
+            None => {
+                let n = tab_of.clone().unwrap_or_else(|| console::new_session(owner, app_id));
+                let shell = match console::spawn_raw(&spec) {
+                    Ok(s) => s,
+                    Err(e) => return refuse(format!("the shell: {e}")),
+                };
+                if let Err(e) = console::adopt(&n, app_id, shell) {
+                    return refuse(e);
+                }
+                eprintln!("portcullisd: console in {app_id} (jid {jid}) as uid {app_uid} for {owner}: {n}");
+                n
+            }
+        };
+        if tab_of.is_some() {
+            // The terminal's link shows the session's new active window.
+            return Response::ConsoleOpened { title };
+        }
+        match console::attach(&session) {
+            Ok((fd, key)) => (fd, format!("{}; app={app_id}; session={session}; key={key}", console::STOA_MIME)),
+            Err(e) => return refuse(e),
+        }
+    } else {
+        match console::spawn(&spec) {
+            Ok(m) => {
+                eprintln!("portcullisd: console in {app_id} (jid {jid}) as uid {app_uid} for {owner}");
+                (m, format!("{}; app={app_id}", console::MIME))
+            }
+            Err(e) => return refuse(format!("the shell: {e}")),
+        }
+    };
+    match hub.deliver(owner, console::TERMINAL, &title, &mime, true, fd) {
         Ok(Delivery::Sent) => {}
         Ok(Delivery::Queued) => start_for(console::TERMINAL, owner, "a console"),
         Err(e) => return refuse(e.to_string()),
     }
-    eprintln!("portcullisd: console in {app_id} (jid {jid}) as uid {app_uid} for {owner}");
     Response::ConsoleOpened { title }
 }
 

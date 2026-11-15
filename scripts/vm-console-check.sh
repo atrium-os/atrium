@@ -22,7 +22,11 @@
 #     files, the toolbox read-only, no host;
 #   - Ctrl+Shift+N in the console: a second window, from portcullisd;
 #   - a system app: refused, naming why;
-#   - `exit`: the shell ends and portcullisd reaps it.
+#   - Stoa (stoad runs, as root here): Ctrl+Shift+T is a tab (another shell
+#     in the session), Ctrl+PageUp goes back; the terminal going away only
+#     detaches (the shells run on); Terminal on the app again reattaches,
+#     with the screen as it was;
+#   - `exit`: that shell ends and is reaped.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/console-shots}
@@ -44,13 +48,15 @@ xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release -
 xb frescod "--bin frescod"
 xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bin portcullis --bin opifex --example home_probe"
 xb atrium-term-socket "--bin atrium-term-socket --example console_probe"
+xb stoa "-p stoa --bin stoad"
 
 echo "=== install"
 B=/var/tmp/console
-V "pkill -x portcullisd; pkill -x frescod; pkill -f atrium-term-socket; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+V "pkill -x portcullisd; pkill -x frescod; pkill -x stoad; pkill -f atrium-term-socket; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/examples/home_probe \
-         atrium-term-socket/target/$TARGET/release/atrium-term-socket atrium-term-socket/target/$TARGET/release/examples/console_probe; do
+         atrium-term-socket/target/$TARGET/release/atrium-term-socket atrium-term-socket/target/$TARGET/release/examples/console_probe \
+         stoa/target/$TARGET/release/stoad; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "console: 1 failed"; exit 1; }
 done
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
@@ -75,10 +81,12 @@ mk() { # id name binary-in-B entry-name extra-capabilities
 }
 mk $STAY Stay home_probe stay_probe ''
 mk $SYS Sys home_probe stay_probe 'status-item = true'
-mk $LAUNCHER Launcher console_probe console_probe 'graphics = "fresco"\napp-launch = true' '$STAY\n$SYS\n' targets
+mk $LAUNCHER Launcher console_probe console_probe 'graphics = "fresco"\napp-launch = true' '$STAY\n$SYS\n$STAY\n' targets
 mk $TERM_ID Terminal atrium-term-socket atrium-term-socket 'graphics = "fresco"\nconsoles = true' 'on\n' .trace
-mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
+mkdir -p /atrium/sockets/portcullis /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
+daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=off $B/stoad
+sleep 1; chmod 600 /var/run/atrium/stoad.sock
 daemon -f -o $LOG env PORTCULLISD_FRESCO_ACTIVATION=$B/activation.sock /usr/local/bin/portcullisd --socket $PSOCK
 sleep 3; test -S $PSOCK; chmod 666 $PSOCK
 EOS
@@ -137,6 +145,7 @@ L=$(V "grep 'console-probe: $STAY ->' $B/launcher.log | tail -1")
 check "a click on Terminal opens one" "ok Terminal: Stay" "$(echo "$L" | sed 's/.*-> //')"
 waitscreen "org.test.stay \\$" 60 && ok "its window shows the prompt" || bad "no prompt: $(screen) / $(V "grep -i 'term\|console' $LOG | tail -5")"
 check "the window is the terminal's" "1" "$(V "grep -c 'atrium-term-socket: window .*Terminal: Stay' $LOG" | tr -d ' ')"
+screen | grep -qi "termcap" && bad "the shell found no terminal description: $(screen | head -c 200)" || ok "the shell knows its terminal"
 shot console-1
 
 echo "=== inside"
@@ -159,12 +168,34 @@ typ "cp /var/console-mark /atrium/console/x
 waitscreen "Read-only" 20 && ok "the toolbox is read-only" || bad "toolbox write: $(screen)"
 shot console-2
 
+# The jail id, from the first shell stoad took (jls -j can miss a name).
+SH1=$(V "sed -n 's/.*took shell pid \\([0-9]*\\).*/\\1/p' $B/stoad.log | head -1")
+JID=$(V "ps -o jid= -p $SH1" | tr -d ' ')
+echo "  (jail $JID, first shell $SH1)"
+shells() { V "ps -ax -o jid= -o args= | awk '\$1==$JID && \$2==\"sh\"' | wc -l" | tr -d ' '; }
+check "the shell is stoad's (session console.alice:$STAY:1)" "1" "$(V "grep -c 'console \"console.alice:$STAY:1\" ($STAY) took shell' $B/stoad.log" | tr -d ' ')"
+
+echo "=== a tab: Ctrl+Shift+T, Ctrl+PageUp"
+inj "KEY 0xe0 1 1" "KEY 0xe1 1 3" "KEY 0x17 1 3" "KEY 0x17 0 3" "KEY 0xe1 0 1" "KEY 0xe0 0 0"
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'took shell pid [0-9]* as window 1' $B/stoad.log"; do sleep 2; i=$((i+2)); done
+V "grep -q 'took shell pid [0-9]* as window 1' $B/stoad.log" && ok "another shell in the session (window 1)" || bad "no tab: $(V "tail -3 $B/stoad.log") / $(V "grep 'REFUSED' $LOG | tail -1")"
+sleep 3
+screen | grep -q "stay-mark" && bad "the tab shows the first shell: $(screen)" || ok "the tab is a new screen"
+typ "echo tabtwo
+"
+waitscreen "tabtwo" 20 && ok "it takes input" || bad "tab input: $(screen)"
+check "two shells in the app's jail" "2" "$(shells)"
+inj "KEY 0xe0 1 1" "KEY 0x4b 1 1" "KEY 0x4b 0 1" "KEY 0xe0 0 0"
+waitscreen "stay-mark" 20 && ok "Ctrl+PageUp: back to the first" || bad "previous tab: $(screen)"
+sleep 1; screen | grep -q "tabtwo" && bad "the first tab still shows the second's text: $(screen)" || ok "and only the first's text"
+shot console-3
+
 echo "=== another window: Ctrl+Shift+N"
 inj "KEY 0xe0 1 1" "KEY 0xe1 1 3" "KEY 0x11 1 3" "KEY 0x11 0 3" "KEY 0xe1 0 1" "KEY 0xe0 0 0"
 i=0; while [ $i -lt 30 ] && [ "$(V "grep -c 'atrium-term-socket: window .*Terminal: Stay' $LOG" | tr -d ' ')" -lt 2 ]; do sleep 2; i=$((i+2)); done
 check "a second window, from portcullisd" "2" "$(V "grep -c 'atrium-term-socket: window .*Terminal: Stay' $LOG" | tr -d ' ')"
-check "two shells in the app's jail" "2" "$(V "grep -c 'console in $STAY .* as uid $SU for alice' $LOG" | tr -d ' ')"
-shot console-3
+check "in a session of its own" "1" "$(V "grep -c 'console \"console.alice:$STAY:2\" ($STAY) took shell' $B/stoad.log" | tr -d ' ')"
+check "three shells now" "3" "$(shells)"
 
 echo "=== a system app"
 press 60 60
@@ -172,13 +203,29 @@ i=0; while [ $i -lt 30 ] && ! V "grep -q 'console-probe: $SYS ->' $B/launcher.lo
 L=$(V "grep 'console-probe: $SYS ->' $B/launcher.log | tail -1")
 case "$L" in *"part of the system (status-item)"*) ok "refused: $(echo "$L" | sed 's/.*-> err //')" ;; *) bad "system app: $L" ;; esac
 
+echo "=== the terminal goes: detached, not ended"
+V "pkill -f atrium-term-socket"
+i=0; while [ $i -lt 20 ] && [ "$(V "grep -c 'detached' $B/stoad.log" | tr -d ' ')" -lt 2 ]; do sleep 2; i=$((i+2)); done
+check "both sessions detached" "2" "$(V "grep -c 'detached' $B/stoad.log" | tr -d ' ')"
+check "the shells run on" "3" "$(shells)"
+sleep 12   # the terminal's jail goes before it is started again
+
+echo "=== Terminal again: reattached"
+press 60 60
+i=0; while [ $i -lt 30 ] && [ "$(V "grep -c 'console-probe: $STAY ->' $B/launcher.log" | tr -d ' ')" -lt 2 ]; do sleep 2; i=$((i+2)); done
+check "the press opens it" "ok Terminal: Stay" "$(V "grep 'console-probe: $STAY ->' $B/launcher.log | tail -1" | sed 's/.*-> //')"
+V "grep -q 'reattached for alice' $LOG" && ok "a session left running is reattached" || bad "not reattached: $(V "grep console $LOG | tail -3")"
+check "no new shell for it" "3" "$(shells)"
+waitscreen "stay-mark" 60 && ok "the screen as it was (the mark, from before)" || bad "screen after reattach: $(screen)"
+shot console-4
+
 echo "=== exit"
 press 600 500
 typ "exit
 "
-i=0; while [ $i -lt 20 ] && ! V "grep -q \"$STAY's console (pid [0-9]*) ended\" $LOG"; do sleep 2; i=$((i+2)); done
-V "grep -q \"$STAY's console (pid [0-9]*) ended\" $LOG" && ok "the shell ended and was reaped" || bad "no end: $(V "tail -5 $LOG")"
-check "no zombie shells" "0" "$(V "ps -axo stat,comm | grep -c '^Z.*sh'" | tr -d ' ')"
+i=0; while [ $i -lt 20 ] && [ "$(shells)" != 2 ]; do sleep 2; i=$((i+2)); done
+check "the shell ended" "2" "$(shells)"
+check "no zombie shells" "0" "$(V "ps -ax -o jid= -o stat= | awk '\$1==$JID && \$2 ~ /^Z/' | wc -l" | tr -d ' ')"
 
-V "pkill -f console_probe; pkill -f stay_probe; pkill -f atrium-term-socket" >/dev/null 2>&1
+V "pkill -f console_probe; pkill -f stay_probe; pkill -f atrium-term-socket; pkill -x stoad" >/dev/null 2>&1
 echo "console: $fails failed"

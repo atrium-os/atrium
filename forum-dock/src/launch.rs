@@ -148,7 +148,7 @@ pub fn console(app_id: &str, activation: [u8; 16]) -> Result<String, String> {
         Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
         other => return Err(format!("handshake: {other:?}")),
     }
-    match round_trip(&mut s, &Request::Console { app_id: app_id.into(), activation }) {
+    match round_trip(&mut s, &Request::Console { app_id: app_id.into(), activation, tab_of: None, new_window: false }) {
         Ok(Response::ConsoleOpened { title }) => Ok(title),
         Ok(Response::Error { message }) => Err(message),
         other => Err(format!("unexpected reply: {other:?}")),

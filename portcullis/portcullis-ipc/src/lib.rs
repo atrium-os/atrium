@@ -294,7 +294,18 @@ pub enum Request {
     /// window that portcullisd spends with frescod (purpose CONSOLE). Never
     /// for a system app (one the installer granted, or one asking for a
     /// system-only capability). Answer: `ConsoleOpened`.
-    Console { app_id: String, activation: [u8; 16] },
+    ///
+    /// The terminal (`consoles`) asks for more of an app it shows a console
+    /// of, with a key press in its window: `tab_of` a Stoa session of the
+    /// person's for `app_id` (another shell in it), or `new_window`.
+    Console {
+        app_id:     String,
+        activation: [u8; 16],
+        #[serde(default)]
+        tab_of:     Option<String>,
+        #[serde(default)]
+        new_window: bool,
+    },
 }
 
 /// An app that opens a type, for the Open with sheet.
