@@ -1,0 +1,1333 @@
+== run Sun Nov 15 20:16:41 UTC 2026 stages: fc kenvs: psp_bootload psp_ipfw gc_up_ok attach client
+sha256 ok: 25d0b5354ce786a016d5350fc380b121bcc1debc2775efa4c67b0fc847a484c6
+sha256 ok: gpu module b26cdd63f179951834e49177dcd5c32342bc1fe0db67384434bd8ac4f8e218de, test ed2e9e9780723b9bd81947a72e13739c4257030076a9d932ba8aea7ca82955fe
+sha256 ok: frescod 322039d21905d21e614436b75ae57db72b83cbde7658ed0d34c5cc53b104f8e9
+== before
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== kldload
+kldload rc=0
+kldload gpu module rc=0
+attach rc=0 (0 expected: stays attached)
+crw-------  1 root wheel 0x81 Nov 15 20:16 /dev/atrium-gpu0
+crw-------  1 root wheel 0x82 Nov 15 20:16 /dev/atrium-gpu0ctl
+== frescod gpu renderer check
+isolation.gpu_wx=1
+frescod-gpu-check: device "Atrium AMD (silicon)" isa "gfx1201", screen 640x480, tolerance 0
+frescod-gpu-check: architecture rdna4
+frescod-gpu-check: code uploaded in 3 ms
+frescod-gpu-check: rects: PASS (0 pixels differ, max 0; gpu 11 ms)
+frescod-gpu-check: damage: PASS (0 pixels differ, max 0; gpu 0 ms)
+frescod-gpu-check: paths: PASS (0 pixels differ, max 0; gpu 47 ms)
+frescod-gpu-check: pixels: PASS (0 pixels differ, max 0; gpu 49 ms)
+frescod-gpu-check: pixels-damage: PASS (0 pixels differ, max 0; gpu 0 ms)
+frescod-gpu-check: stack: PASS (0 pixels differ, max 0; gpu 81 ms)
+frescod-gpu-check: moved: PASS (0 pixels differ, max 0; gpu 0 ms)
+frescod-gpu-check: fullscreen: PASS (0 pixels differ, max 0; gpu 180 ms)
+frescod-gpu-check: 8 passed, 0 failed (window VMs at the end: 5)
+RESULT: PASS
+frescod check rc=0
+reinits 0
+== si-client-test after the check (its health check)
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+PASS: 1 queue: a second job on the same queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+2b: VM fd 10, queue fd 15: shader 0x10000000, IB 0x10001000, out 0x10002000
+2c: VM fd 16, queue fd 21: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 2 same VAs in both VMs (out 0x10002000 / 0x10002000)
+PASS: 2 two VMs: each queue writes 64 x 42 on its own page (B No error: 0 64/64, C No error: 0 64/64)
+PASS: 3 two queues in one VM: the second runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 3 two queues in one VM: the first still runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+4: VM fd 23, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 4 queue fd over SCM_RIGHTS: the child's submit runs (child exit 0, completion ok, 64/64 words 42)
+PASS: 5 close in flight: the completion lands or is cancelled (Operation canceled after 0 ms)
+PASS: 5 close in flight: the VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 6 the retired ring SUBMIT ('A',4) is unknown (Inappropriate ioctl for device)
+PASS: 6 unknown queue family refused (Invalid argument)
+PASS: 6 priority other than 0 refused (Invalid argument)
+PASS: 6 QUEUE_CREATE on the client node refused (Inappropriate ioctl for device)
+PASS: 6 QUEUE_SUBMIT on a VM fd refused (Inappropriate ioctl for device)
+PASS: 6 in-dependencies refused (not yet) (Operation not supported)
+PASS: 6 a blob that is not whole dwords refused (Invalid argument)
+PASS: 6 an empty blob refused (Invalid argument)
+PASS: 6 the first queue still runs after the refusals (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+7: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 7 fault: the faulting queue's work fails with EIO (got Input/output error after 0 ms)
+PASS: 7 fault: the lost queue refuses new work (Input/output error)
+PASS: 7 fault: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 7 fault: the faulting VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung queue's work fails with EIO after hang_ms (got Input/output error after 5010 ms)
+PASS: 8 hang: the lost queue refuses new work (Input/output error)
+PASS: 8 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+9: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 9 user mode: QUEUE_MAP2 layout (ring 0+0x1000, wptr 0x1008, doorbell 0x2000+0x1000, fence VA 0x200031010)
+PASS: 9 user mode: write_42 rung from user space (fence 1 (want 1) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 12, wptr 12)
+PASS: 9 user mode: a second job on the same ring (fence 2 (want 2) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 24, wptr 24)
+PASS: 9 user mode: QUEUE_SUBMIT on it refused (Operation not supported)
+PASS: 9 user mode: QUEUE_MAP2 of a kernel-mode queue refused (Invalid argument)
+PASS: 9 user mode: mmap of a kernel-mode queue refused (Operation not supported by device)
+PASS: 9 user mode: a private mapping refused (Permission denied)
+PASS: 9 user mode: an executable mapping refused (Permission denied)
+PASS: 9 user mode: a mapping past the queue's pages refused (Invalid argument)
+PASS: 9 user mode: after close, the ring is gone (SIGBUS) (child status 0xa)
+PASS: 9 user mode: after close, the doorbell is gone (SIGBUS) (child status 0xa)
+PASS: 9 hang: a stuck user ring is lost after hang_ms (QUEUE_MAP2: EIO) (Input/output error after 5250 ms, fence 0)
+PASS: 9 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 9 user mode: the VM runs clean on a kernel-mode queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 10 free rule: a BO of a VM with a live queue is freed at its close (preempted, not deferred) (deferred 0 -> 0, now 0)
+PASS: 10 free rule: the queue runs on after the preemption (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+10: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+10: BO closed under a stuck queue: freed at once (deferred 0 -> 0)
+PASS: 10 free rule (stuck): the stuck queue is still lost after hang_ms (got Input/output error after 4831 ms)
+PASS: 10 free rule (stuck): nothing deferred is left once the queue is gone (deferred_now 0)
+PASS: 10 free rule (stuck): another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 11 VRAM: the allocator is up and its initial scrub finished (total 31980 MiB, base 0x8000000, clean after 20 ms, scrubbed 31986 MiB)
+11: VRAM BO of 1024 KiB at VA 0x10004000
+PASS: 11 VRAM: CPU read of a VRAM BO refused (Invalid argument)
+PASS: 11 VRAM: a new VRAM BO reads zero (64/64 words 0 (ok), first 0)
+PASS: 11 VRAM: a fill of the BO reads back (64/64 words 0xc0de1234 (ok), first 0xc0de1234)
+PASS: 11 VRAM: the freed BO is scrubbed (clean after 20 ms, scrubbed +1024 KiB)
+PASS: 11 VRAM: the next VRAM BO reads zero (no data from the freed one) (64/64 words 0 (ok), first 0)
+11: vram used 114688, dirty 1048576, allocs 181, frees 153, scrub jobs 184 (failed 0)
+PASS: 11 VRAM: the queue runs on after the VRAM work (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 12 real ops: COPY, System source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, System source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, System source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: COPY, VRAM source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, VRAM source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, VRAM source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: write_42 runs on after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: BIND_EXEC without READONLY is refused (Invalid argument)
+PASS: 13 W^X: code and IB bound EXEC run, data without X (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: a jump into a read-write data BO faults and fails the work (completion Input/output error after 0 ms, 0/64 words 42)
+PASS: 13 W^X: the VM runs clean on a new queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at a high VA (VA 0x7ffffff00000) is lost with EIO (got Input/output error after 0 ms)
+15: stores at a high VA: time to fail 0 ms
+PASS: 15 hostile ISA: stores at a high VA: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at a high VA: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at a high VA, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at a high VA, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores past its own buffer (VA 0x10003000) is lost with EIO (got Input/output error after 0 ms)
+15: stores past its own buffer: time to fail 0 ms
+PASS: 15 hostile ISA: stores past its own buffer: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores past its own buffer: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores past its own buffer, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores past its own buffer, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: a shader that never ends (VA 0x10002000) is lost with EIO (got Input/output error after 5035 ms)
+15: a shader that never ends: time to fail 5035 ms
+PASS: 15 hostile ISA: a shader that never ends: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: a shader that never ends: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after a shader that never ends, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after a shader that never ends, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at VA 0 (VA 0) is lost with EIO (got Input/output error after 0 ms)
+15: stores at VA 0: time to fail 0 ms
+PASS: 15 hostile ISA: stores at VA 0: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 0 -> 0)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 5032 ms; fault IVs +1, IH overflows +0
+PASS: 16 fault storm: the storm is cut short (+1 fault IVs, re-inits 0 -> 1)
+PASS: 16 fault storm: the IH ring barely overflows (+0 overflows)
+16 bystander after the reset: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 16 fault storm: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+16: re-inits 0 -> 1
+17 reader before: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: before any write: 0/64 pattern words, out[0] 0 (completed)
+17 writer: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: writer's store to the unmapped VA: Input/output error
+17: fault page scrubs that found it written: +0
+17 reader after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: a store to unmapped VA does not reach the fault page (+0 dirty scrubs)
+17: reader's load from the unmapped VA: completed; 0/64 pattern words, out[0] 0; re-inits 1 -> 1
+PASS: 17 dummy page: no VM reads another VM's faulting writes (0/64 words carried the writer's pattern (out[0] 0))
+PASS: 17 dummy page: unmapped VA reads as zeros (64/64 words 0)
+17 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+18-0: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-1: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-2: VM fd 34, queue fd 39: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-3: VM fd 40, queue fd 45: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-4: VM fd 46, queue fd 51: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-5: VM fd 52, queue fd 57: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-6: VM fd 58, queue fd 63: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-7: VM fd 64, queue fd 69: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-8: VM fd 70, queue fd 75: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-9: VM fd 76, queue fd 81: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-10: VM fd 82, queue fd 87: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-11: VM fd 88, queue fd 93: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-12: VM fd 94, queue fd 99: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-13: VM fd 100, queue fd 105: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-14: VM fd 106, queue fd 111: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-15: VM fd 112, queue fd 117: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-16: VM fd 118, queue fd 123: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-17: VM fd 124, queue fd 129: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-18: VM fd 130, queue fd 135: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-19: VM fd 136, queue fd 141: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-20: VM fd 142, queue fd 147: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-21: VM fd 148, queue fd 153: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-22: VM fd 154, queue fd 159: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-23: VM fd 160, queue fd 165: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-24: VM fd 166, queue fd 171: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-25: VM fd 172, queue fd 177: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-26: VM fd 178, queue fd 183: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-27: VM fd 184, queue fd 189: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-28: VM fd 190, queue fd 195: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-29: VM fd 196, queue fd 201: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-30: VM fd 202, queue fd 207: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-31: VM fd 208, queue fd 213: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-32: VM fd 214, queue fd 219: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-33: VM fd 220, queue fd 225: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-34: VM fd 226, queue fd 231: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-35: VM fd 232, queue fd 237: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-36: VM fd 238, queue fd 243: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-37: VM fd 244, queue fd 249: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-38: VM fd 250, queue fd 255: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-39: VM fd 256, queue fd 261: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 18 scale: VMs with a queue each open at once (40 of 40 (the 5c limit was 7 VMs, 8 queues))
+PASS: 18 scale: more queues in the same VMs (12 of 12 (52 queues in all))
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 0: 40 VMs, 12 extra queues, 0 bad)
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 1: 40 VMs, 12 extra queues, 0 bad)
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 2: 40 VMs, 12 extra queues, 0 bad)
+18-after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 18 scale: a fresh VM runs after they all closed (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 19 unbind: unknown flags refused (Invalid argument)
+PASS: 19 unbind: a BO not bound in the VM refused (No such file or directory)
+PASS: 19 unbind: a VM fd as the BO refused (Invalid argument)
+PASS: 19 unbind: a shared BO unbinds from each of its VMs, once (4/4 unbound, again: No such file or directory)
+PASS: 19 unbind: unbound, the VMs go when their fds close (vms 3 -> 3)
+PASS: 19 unbind: a binding left in place holds its VM until the BO closes (bind ok, vms 3 -> 4 -> 3)
+19: VM fd 22, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+FAIL: 19 unbind: a BO unbound under work that may use it, then closed, leaves nothing deferred (unbind ok, the work Input/output error after 0 ms, deferred_now 1)
+FAIL: 19 unbind: the VM runs clean after (completion Operation timed out after 2125 ms, 0/64 words 42, out[0] 0xa5a5a5a5)
+PASS: 19 unbind: a store to the unbound page faults and fails the work, the BO untouched (completion Input/output error after 2886 ms, 0/64 words 42)
+PASS: 19 unbind: the BO binds again at the same VA (ok)
+FAIL: 19 unbind: and the VM runs clean on it (completion Operation timed out after 2126 ms, 0/64 words 42, out[0] 0xa5a5a5a5)
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 1)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 62301: Input/output error after 5048 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x10, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +0, register 0x10 -> 0x10)
+FAIL: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion Operation timed out after 2126 ms, 0/64 words 42, out[0] 0xa5a5a5a5)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 62302: Input/output error after 5008 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0xc000000, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +0, register 0xc000000 -> 0xc000000)
+FAIL: 14 after WRITE_DATA to cp_mes_cntl: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA gc_vm_ctx0_pt_base_lo as uid 62303: Input/output error after 5043 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after WRITE_DATA to gc_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 WRITE_DATA to gc_vm_ctx0_pt_base_lo: refused (refused, CP errors +0, register 0x5800001 -> 0x5800001)
+FAIL: 14 after WRITE_DATA to gc_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA mm_vm_ctx0_pt_base_lo as uid 62304: Input/output error after 5050 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after WRITE_DATA to mm_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 WRITE_DATA to mm_vm_ctx0_pt_base_lo: refused (refused, CP errors +0, register 0x5800001 -> 0x5800001)
+FAIL: 14 after WRITE_DATA to mm_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA imm ih_rb_base as uid 62305: Input/output error after 5046 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x10, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA imm to ih_rb_base: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA imm to ih_rb_base: refused (refused, CP errors +0, register 0x10 -> 0x10)
+FAIL: 14 after COPY_DATA imm to ih_rb_base: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA imm cp_mes_cntl as uid 62306: Input/output error after 5045 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0xc000000, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA imm to cp_mes_cntl: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA imm to cp_mes_cntl: refused (refused, CP errors +0, register 0xc000000 -> 0xc000000)
+FAIL: 14 after COPY_DATA imm to cp_mes_cntl: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA imm gc_vm_ctx0_pt_base_lo as uid 62307: Input/output error after 5044 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA imm to gc_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA imm to gc_vm_ctx0_pt_base_lo: refused (refused, CP errors +0, register 0x5800001 -> 0x5800001)
+FAIL: 14 after COPY_DATA imm to gc_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA imm mm_vm_ctx0_pt_base_lo as uid 62308: Input/output error after 5044 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA imm to mm_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA imm to mm_vm_ctx0_pt_base_lo: refused (refused, CP errors +0, register 0x5800001 -> 0x5800001)
+FAIL: 14 after COPY_DATA imm to mm_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA read ih_rb_base as uid 62309: Input/output error after 5000 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x10, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA read to ih_rb_base: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA read of ih_rb_base: refused or not the real value (refused, read 0x5b5b5b5b, real 0x10)
+FAIL: 14 after COPY_DATA read to ih_rb_base: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA read cp_mes_cntl as uid 62310: Input/output error after 5044 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0xc000000, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA read to cp_mes_cntl: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA read of cp_mes_cntl: refused or not the real value (refused, read 0x5b5b5b5b, real 0xc000000)
+FAIL: 14 after COPY_DATA read to cp_mes_cntl: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA read gc_vm_ctx0_pt_base_lo as uid 62311: Input/output error after 5044 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA read to gc_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA read of gc_vm_ctx0_pt_base_lo: refused or not the real value (refused, read 0x5b5b5b5b, real 0x5800001)
+FAIL: 14 after COPY_DATA read to gc_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA read mm_vm_ctx0_pt_base_lo as uid 62312: Input/output error after 5045 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0x5800001, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA read to mm_vm_ctx0_pt_base_lo: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA read of mm_vm_ctx0_pt_base_lo: refused or not the real value (refused, read 0x5b5b5b5b, real 0x5800001)
+FAIL: 14 after COPY_DATA read to mm_vm_ctx0_pt_base_lo: another VM runs clean (submit: Input/output error)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: COPY_DATA read smu_msg_arg as uid 62313: Input/output error after 5043 ms, marker not written, CP errors +0, word 0x5b5b5b5b, register now 0, re-inits 1 (+0), the uid's next queue: created
+PASS: 14 after COPY_DATA read to smu_msg_arg: the uid's next queue is created (no GPU reset) (created)
+PASS: 14 COPY_DATA read of smu_msg_arg: refused or not the real value (refused, read 0x5b5b5b5b, real 0)
+FAIL: 14 after COPY_DATA read to smu_msg_arg: another VM runs clean (submit: Input/output error)
+PASS: 14 hostile PM4: a refused packet costs its queue, not a whole-GPU re-init (re-inits 1 -> 1)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+FAIL: 14 hostile PM4: a new VM runs clean after (completion Operation timed out after 2126 ms, 0/64 words 42, out[0] 0xa5a5a5a5)
+si_client_test: 134 passed, 17 failed: FAIL
+si-client-test rc=1
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 1
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 0
+dev.atrium_gpu_amd.0.isolation.bos: 0
+dev.atrium_gpu_amd.0.isolation.vms: 0
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 0
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 1
+dev.atrium_gpu_amd.0.isolation.cp_errors: 0
+dev.atrium_gpu_amd.0.isolation.quota_refused: 0
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.dummy_dirty: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 8
+dev.atrium_gpu_amd.0.isolation.hangs: 20
+dev.atrium_gpu_amd.0.isolation.reaped: 74
+dev.atrium_gpu_amd.0.isolation.deferred: 74
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 2
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+detach + give-back rc=0 (try 1)
+== kernel log
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x838, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq11: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 660 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq11: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 660 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq11: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 850 us (status 0x1)
+atrium_gpu_amd_pci0: uq11: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq11 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 135; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 135 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x852, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq12: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 640 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq12: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 650 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq12: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 830 us (status 0x1)
+atrium_gpu_amd_pci0: uq12: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq12 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 138; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 138 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x866, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq13: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 630 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq13: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 620 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq13: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 810 us (status 0x1)
+atrium_gpu_amd_pci0: uq13: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq13 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 141; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 141 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x880, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq14: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 600 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq14: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 600 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq14: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 790 us (status 0x1)
+atrium_gpu_amd_pci0: uq14: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq14 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 144; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 144 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x894, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq15: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 590 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq15: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 570 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq15: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 770 us (status 0x1)
+atrium_gpu_amd_pci0: uq15: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq15 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 147; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 147 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x908, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq16: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 560 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq16: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 560 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq16: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 740 us (status 0x1)
+atrium_gpu_amd_pci0: uq16: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq16 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 150; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 150 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x922, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq17: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 550 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq17: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 540 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq17: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 730 us (status 0x1)
+atrium_gpu_amd_pci0: uq17: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq17 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 153; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 153 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x936, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq18: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 520 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq18: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 530 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq18: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 700 us (status 0x1)
+atrium_gpu_amd_pci0: uq18: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq18 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 156; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 156 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x950, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq19: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 510 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq19: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 500 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq19: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 680 us (status 0x1)
+atrium_gpu_amd_pci0: uq19: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq19 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 159; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 159 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x964, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq20: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 490 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq20: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 480 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq20: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 660 us (status 0x1)
+atrium_gpu_amd_pci0: uq20: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq20 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 162; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 162 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x978, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq21: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 460 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq21: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 470 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq21: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 630 us (status 0x1)
+atrium_gpu_amd_pci0: uq21: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq21 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 165; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 165 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x992, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq22: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 450 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq22: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 430 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq22: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 610 us (status 0x1)
+atrium_gpu_amd_pci0: uq22: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq22 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 168; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 168 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1006, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq23: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 420 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq23: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 430 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq23: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 590 us (status 0x1)
+atrium_gpu_amd_pci0: uq23: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq23 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 171; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 171 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1020, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq24: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 390 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq24: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 380 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq24: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 570 us (status 0x1)
+atrium_gpu_amd_pci0: uq24: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq24 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 174; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 174 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1034, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq25: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 380 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq25: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 380 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq25: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 550 us (status 0x1)
+atrium_gpu_amd_pci0: uq25: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq25 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 177; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 177 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1048, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq26: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 340 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: uq26: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 360 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq26: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 520 us (status 0x1)
+atrium_gpu_amd_pci0: uq26: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq26 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 180; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 180 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1062, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq27: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 340 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq27: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 340 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq27: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 500 us (status 0x1)
+atrium_gpu_amd_pci0: uq27: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq27 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 183; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 183 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1076, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq28: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 310 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq28: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 320 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq28: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 490 us (status 0x1)
+atrium_gpu_amd_pci0: uq28: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq28 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 186; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 186 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1090, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq29: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 310 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq29: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 300 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq29: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 460 us (status 0x1)
+atrium_gpu_amd_pci0: uq29: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq29 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 189; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 189 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1104, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq30: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 270 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq30: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 290 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq30: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 430 us (status 0x1)
+atrium_gpu_amd_pci0: uq30: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq30 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 192; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 192 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1118, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq31: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq31: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq31: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 420 us (status 0x1)
+atrium_gpu_amd_pci0: uq31: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq31 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 195; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 195 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1132, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq32: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq32: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq32: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 400 us (status 0x1)
+atrium_gpu_amd_pci0: uq32: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq32 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 198; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 198 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1146, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq33: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq33: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq33: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 370 us (status 0x1)
+atrium_gpu_amd_pci0: uq33: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq33 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 201; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 201 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1160, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq34: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq34: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq34: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 350 us (status 0x1)
+atrium_gpu_amd_pci0: uq34: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq34 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 204; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 204 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1174, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq35: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq35: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq35: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 330 us (status 0x1)
+atrium_gpu_amd_pci0: uq35: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq35 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 207; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 207 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1188, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq36: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq36: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq36: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 310 us (status 0x1)
+atrium_gpu_amd_pci0: uq36: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq36 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 210; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 210 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1202, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq37: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq37: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq37: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 280 us (status 0x1)
+atrium_gpu_amd_pci0: uq37: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq37 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 213; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 213 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1216, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 140 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq38: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 120 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq38: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq38: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: uq38: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq38 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 216; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 216 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1230, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq39: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq39: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq39: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq39: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq39 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 219; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 219 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1244, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq40: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq40: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq40: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 220 us (status 0x1)
+atrium_gpu_amd_pci0: uq40: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq40 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 222; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 222 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1258, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq41: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq41: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq41: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq41: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq41 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 225; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 225 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1272, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq42: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq42: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq42: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: uq42: removed (seq 3, fence 3)
+atrium_gpu_amd_pci0: si: uq42 closed: 3 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 228; retired by IV 246, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 228 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1286, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8026001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 255, unrouted 0, MES own 0, MES preemption 231; retired by IV 247, by poll 0; queues lost to faults 6, hangs 5; preempted for frees 231 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x1, 6 x2, 7 x0, 8 x1302, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x803f001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x100, first VMID 8 at 0x10002000
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 55 us ago, ended 43 us ago
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0x841040: client TCP (0x8), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x4, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: uq3: VMID 8's fault interrupts muted until the queue is removed (GFXHUB CONTEXT8_CNTL now 0x3aaa807)
+atrium_gpu_amd_pci0: si: uq3 faulted (VMID 8, 0x10002000): its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: IH: queue marked lost: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 57 us after the fault
+atrium_gpu_amd_pci0: si: MES queue notice (type 1) for doorbell 0x26
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): refused (fence 0x1a6 of 0x1a6, status 0x8100060200000000, rptr 0)
+atrium_gpu_amd_pci0: si: uq3 could not be preempted (5); the BO waits for its queues to close
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 2000610 us after the fault
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 2000632 us after the fault
+atrium_gpu_amd_pci0: uq3: VMID 8, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 2000648 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa0000001, CP_CPC_STATUS 0x80000001, CP_CPC_BUSY_STAT 0x810/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa800c001, CP_CPC_STATUS 0xa0000000, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: uq3: VMID 8's waves killed (0); fence landed after 100 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4100000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x40033
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 231; retired by IV 247, by poll 0; queues lost to faults 7, hangs 5; preempted for frees 231 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1308, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x803f001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4646: edge 35 C, hotspot 41 C, mem 35 C, VR 35 C; power 37 W of 300 W limit, board 37 W; fan 893 rpm (20%); gfx 1844 MHz, mem 94 MHz, gfx busy 57%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: si: uq3 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 9013364 us after the fault
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 2, fence 0, wptr 24, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 9013449 us after the fault
+atrium_gpu_amd_pci0: uq3: VMID 8, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 9013508 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0x88000001, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x10000000, RLC_GPM_STAT 0x140016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0x88000001, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x14110000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq3: VMID 8's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0x88000001, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x14110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0x88000001, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x14110000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0x88000001); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x14110000, RLC_GPM_STAT 0xc0016
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 2, fence 0)
+atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+atrium_gpu_amd_pci0: si: uq3 closed: 2 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 232; retired by IV 247, by poll 0; queues lost to faults 7, hangs 6; preempted for frees 232 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1316, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x803f001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4464: edge 35 C, hotspot 43 C, mem 34 C, VR 35 C; power 57 W of 300 W limit, board 57 W; fan 894 rpm (20%); gfx 3366 MHz, mem 11 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 70 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 11340917 us after the fault
+atrium_gpu_amd_pci0: uq3: VMID 8, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 11340976 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc001a, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x40033, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq3: VMID 8's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 6; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1332, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8026001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4375: edge 35 C, hotspot 41 C, mem 34 C, VR 35 C; power 28 W of 300 W limit, board 28 W; fan 893 rpm (20%); gfx 1324 MHz, mem 4 MHz, gfx busy 40%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 16592563 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 16592650 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 15, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 16592781 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc003b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc003b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq4: VMID 15's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 7; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1338, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 7; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1342, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4327: edge 34 C, hotspot 39 C, mem 34 C, VR 34 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 44 MHz, mem 2 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: watch #12: telemetry ok
+atrium_gpu_amd_pci0: si: uq3 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 22335861 us after the fault
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 22335942 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0x88000001, 22335998 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 24436050 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 24436136 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 15, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 24436267 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc003b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc003b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq4: VMID 15's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 280 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 9; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1348, other x0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4490: edge 34 C, hotspot 40 C, mem 34 C, VR 35 C; power 33 W of 300 W limit, board 33 W; fan 893 rpm (20%); gfx 1850 MHz, mem 9 MHz, gfx busy 57%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 9; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1352, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4460: edge 34 C, hotspot 38 C, mem 34 C, VR 34 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 38 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 30189148 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 30189237 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 30189351 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 10; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1356, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 10; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1360, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4408: edge 33 C, hotspot 38 C, mem 34 C, VR 34 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 37 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 35748106 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 35748194 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 35748309 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 11; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1364, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 11; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1368, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4312: edge 32 C, hotspot 37 C, mem 32 C, VR 33 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 36 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 41302046 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 41302150 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 41302286 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 12; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1372, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 12; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1376, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4459: edge 32 C, hotspot 36 C, mem 32 C, VR 33 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 38 MHz, mem 2 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 46856059 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 46856169 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 46856328 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 120 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 13; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1380, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 13; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1384, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4399: edge 31 C, hotspot 36 C, mem 32 C, VR 32 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 37 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: watch #18: telemetry ok
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 52408425 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 52408513 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 52408628 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 14; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1388, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 14; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1392, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4430: edge 31 C, hotspot 35 C, mem 32 C, VR 32 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 37 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 57961046 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 57961133 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 57961249 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 15; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1396, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 15; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1400, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4501: edge 31 C, hotspot 35 C, mem 31 C, VR 32 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 38 MHz, mem 4 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 63470131 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 63470235 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 63470372 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 16; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1404, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 16; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1408, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4440: edge 30 C, hotspot 35 C, mem 30 C, VR 32 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 38 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 69023047 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 69023135 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 69023258 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 17; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1412, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 17; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1416, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4425: edge 30 C, hotspot 34 C, mem 30 C, VR 31 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 38 MHz, mem 2 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 74575454 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 74575557 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 74575696 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 18; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1420, other x0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4315: edge 30 C, hotspot 34 C, mem 30 C, VR 31 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 35 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 18; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1424, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4365: edge 29 C, hotspot 34 C, mem 30 C, VR 30 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 36 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: watch #24: telemetry ok
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 80129059 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 80129146 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 80129260 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 19; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1428, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 19; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1432, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8005001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4415: edge 29 C, hotspot 33 C, mem 30 C, VR 30 C; power 9 W of 300 W limit, board 9 W; fan 893 rpm (20%); gfx 37 MHz, mem 3 MHz, gfx busy 3%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 85681097 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 85681200 us after the fault
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 85681337 us after the fault
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1436, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8012001, queue pages at VA 0x200040000 (pa 0x3255fa000), MQD GART 0x210000, doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 0, fence 0)
+atrium_gpu_amd_pci0: si: uq4 closed: 0 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1440, other x0
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 235; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 235 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1440, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8012001, queue pages at VA 0x200030000 (pa 0x554840000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 88317160 us after the fault
+atrium_gpu_amd_pci0: uq3: VMID 15, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0, 88317264 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4104000, RLC_GPM_STAT 0xc001b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0xc003b, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq3: VMID 15's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4110000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 0)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 238; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 238 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1456, other x0
+atrium_gpu_amd_pci0: uq0: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq0 closed: 22 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 238; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 238 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1456, other x0
+atrium_gpu_amd_pci0: uq1: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 238; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 238 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1456, other x0
+atrium_gpu_amd_pci0: uq2: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 238; retired by IV 247, by poll 0; queues lost to faults 7, hangs 20; preempted for frees 238 (failed 1)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x2, 6 x2, 7 x0, 8 x1456, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4407: edge 29 C, hotspot 33 C, mem 30 C, VR 30 C; power 8 W of 300 W limit, board 8 W; fan 893 rpm (20%); gfx 29 MHz, mem 4 MHz, gfx busy 2%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4817: edge 28 C, hotspot 33 C, mem 28 C, VR 29 C; power 6 W of 300 W limit, board 6 W; fan 893 rpm (20%); gfx 0 MHz, mem 2 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: VRAM scrub: 1112 fills, 0 waits for an idle queue
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd0: detached
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x554838000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 120 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 40 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: si: dispatch after 135 s attached: PASS
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 4 vmid 0 pasid 0 data 0 0 0 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: si: 7 CP EOP IV(s) since attach, 1152 interrupt(s)
+atrium_gpu_amd_pci0: mes: MES running, no work: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: MES running: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: pipe 1 REMOVE_QUEUE (scheduler): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 3 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: me 3 pipe 1 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: queues gone, MES still running: GRBM_STATUS 0xa800382c -> 0x382c, idle after 1 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: MES halted, CP still running: GRBM_STATUS 0x382c -> 0x382c, idle after 1 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: CP halted again: CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_STAT 0
+atrium_gpu_amd_pci0: mes: torn down: CP_MES_CNTL 0x40030000; pipe 0: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: torn down: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: gfx: MES torn down: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: MES halted: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: GC idle sequence again after MES: 0
+atrium_gpu_amd_pci0: gfx: 100 ms after the idle sequence: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: ih: disabled: RB_CNTL 0x4031011c, RPTR 0, WPTR 0 (writeback 0xa740), STATUS 0xc0847, MSI interrupts 1153
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [detached] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #3674: edge 28 C, hotspot 32 C, mem 28 C, VR 29 C; power 7 W of 300 W limit, board 7 W; fan 893 rpm (20%); gfx 1 MHz, mem 8 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: card proven idle at detach
+atrium_gpu_amd_pci0: si: stage 5a: detached
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+== done, log /root/runs/20261115T201641Z.log
+kernel log for the run: /root/runs/20261115T201641Z.kern (    2477 lines)
