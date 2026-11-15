@@ -97,3 +97,91 @@ fn at_200_the_picker_fits_its_sheet() {
     let _ = std::fs::remove_dir_all(&d);
     pergola::text::set_text_scale(1000);
 }
+
+/// Arrow keys at 200% in a short picker list (live: 60 pt rows in 48 pt
+/// of list), with keys handed out as the window does: the browser first
+/// (take_key), the app only what it left. The app also scrolled the list a
+/// line (40 pt) for each arrow, on top of the cursor's reveal, so the row
+/// ended 40 pt off: only its bottom showed going down, the row above it
+/// going up.
+#[test]
+fn at_200_an_arrow_shows_the_cursor_row_and_does_not_scroll_past_it() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use pergola::text_edit::TextEdit;
+    use pergola::widgets::ScrollState;
+    use pergola::{App, Event, Key, KeyEventKind, Mutable};
+    use scrinium::browser::{Browser, Mode, Place};
+    use scrinium::view::{header_h, pick_foot_h, pick_path_h, pick_title_h, row_h, take_key, ScriniumView};
+
+    let _one = SCALE.lock().unwrap_or_else(|e| e.into_inner());
+    pergola::text::set_text_scale(2000);
+    let d = std::env::temp_dir().join(format!("scrinium-keys-200-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    for i in 0..20 {
+        std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    let mut b = Browser::new(Mode::Picker { filter: limen::picker::Filter::file(), app: "org.test.notes".into() });
+    b.set_places(vec![Place { id: "place:0".into(), label: "Documents".into(), root: d.clone(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false }]);
+    // The list 0.8 of a row, as live.
+    let lh = 0.8 * row_h() as f64;
+    let h = pick_title_h() + pick_path_h() + header_h() + lh as f32 + pick_foot_h();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(b, dirty.clone());
+    let field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
+    let scroll = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+    let v = ScriniumView::new(state.clone(), field.clone(), scroll.clone(), Mutable::with_dirty((928.0, h), dirty.clone()));
+    let mut app = App::new_with_flag(v, dirty);
+    let mut t = 0.0;
+    app.tick();
+    // A click on the first row, as live: the list has focus, so an arrow
+    // the app sees goes to its scroll view.
+    let at = pergola::geom::Point::new(700.0, pick_title_h() + pick_path_h() + header_h() + 10.0);
+    app.handle_event(Event::PointerDown { at });
+    app.handle_event(Event::PointerUp { at });
+    app.tick();
+    assert_eq!(state.get_cloned().cursor, Some(0), "the click landed on the first row");
+    // As Window::paint: step the animations, then draw.
+    let paint = |app: &mut App<ScriniumView>, t: f64| {
+        app.set_time(t);
+        app.frame();
+        app.tick();
+    };
+    let mut press = |app: &mut App<ScriniumView>, key: Key| {
+        for kind in [KeyEventKind::Down, KeyEventKind::Up] {
+            let ev = Event::Key { kind, key, modifiers: Default::default(), chars: String::new() };
+            if !take_key(&state, &field, &ev) {
+                app.handle_event(ev);
+            }
+            paint(app, t);
+        }
+        // Frames until an eased scroll (200 ms) is long done.
+        for _ in 0..50 {
+            t += 8.0;
+            paint(app, t);
+        }
+    };
+    // A row taller than the list shows its top: the top at the list's top.
+    let at_top = |what: &str| {
+        let cur = state.get_cloned().cursor.unwrap() as f64;
+        let y = scroll.get().physics.y;
+        assert!((y - cur * row_h() as f64).abs() < 0.5, "{what}: row {cur} starts at {}, the list shows from {y}", cur * row_h() as f64);
+    };
+    for i in 0..6 {
+        press(&mut app, Key::Down);
+        at_top(&format!("down {i}"));
+    }
+    for i in 0..3 {
+        press(&mut app, Key::Up);
+        at_top(&format!("up {i}"));
+    }
+    press(&mut app, Key::End);
+    assert_eq!(state.get_cloned().cursor, Some(19));
+    at_top("end");
+    press(&mut app, Key::Home);
+    at_top("home");
+
+    let _ = std::fs::remove_dir_all(&d);
+    pergola::text::set_text_scale(1000);
+}

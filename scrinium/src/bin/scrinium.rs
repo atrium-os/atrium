@@ -43,7 +43,7 @@ use pergola::window::StepResult;
 use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
 use scrinium::browser::{Browser, Mode, Mods, Outcome, Place};
 use scrinium::places;
-use scrinium::view::{on_key, with, ScriniumView};
+use scrinium::view::{take_key, with, ScriniumView};
 
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
@@ -94,23 +94,21 @@ impl Pane {
     /// One turn: an event (or `wait`), then the places if they changed.
     /// `false` once the window is closed.
     fn step(&mut self, wait: Duration, places: &SharedPlaces, who: &str) -> bool {
-        match self.win.step(&mut self.app, Some(wait)) {
+        // The browser hears a key before the app does: an arrow that moved
+        // the cursor must not also scroll the list (take_key). A key for
+        // one of our pop-ups (an open menu, which takes the keys) is the
+        // menu's alone: an arrow there must not also move the file
+        // selection under it.
+        let (id, state, field) = (self.win.id(), &self.state, &self.field);
+        let first = |ev: &fresco_client::Event| match ev {
+            fresco_client::Event::Key { window_id, .. } if *window_id == id => translate(ev).is_some_and(|k| take_key(state, field, &k)),
+            _ => false,
+        };
+        match self.win.step_with(&mut self.app, Some(wait), first) {
             Ok(StepResult::Closed) => return false,
             Ok(StepResult::Event(ev)) => {
-                use fresco_client::Event as E;
-                match &ev {
-                    E::PointerButton { pressed: true, modifiers, .. } => {
-                        *self.mods.lock().unwrap() = Mods { shift: modifiers & 0x22 != 0, ctrl: modifiers & 0x11 != 0 };
-                    }
-                    // A key for one of our pop-ups (an open menu, which
-                    // takes the keys) is the menu's alone: an arrow there
-                    // must not also move the file selection under it.
-                    E::Key { window_id, .. } if *window_id == self.win.id() => {
-                        if let Some(k) = translate(&ev) {
-                            on_key(&self.state, &self.field, &k);
-                        }
-                    }
-                    _ => {}
+                if let fresco_client::Event::PointerButton { pressed: true, modifiers, .. } = &ev {
+                    *self.mods.lock().unwrap() = Mods { shift: modifiers & 0x22 != 0, ctrl: modifiers & 0x11 != 0 };
                 }
             }
             Ok(StepResult::Timeout) => {}

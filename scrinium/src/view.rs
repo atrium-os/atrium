@@ -220,6 +220,18 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
     true
 }
 
+/// `on_key`, and whether the window's app must not see the key too: a
+/// navigation key the browser took (an arrow moved the cursor, Space
+/// opened quick look) would otherwise also scroll the list, which then
+/// ends a line past the row the cursor's reveal showed. Other keys reach
+/// the app as before (Tab and Enter for a sheet's buttons).
+pub fn take_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -> bool {
+    let nav = matches!(ev, Event::Key { key, chars, .. }
+        if matches!(key, Key::Up | Key::Down | Key::Left | Key::Right | Key::PageUp | Key::PageDown | Key::Home | Key::End)
+            || (*key == Key::Char && chars == " "));
+    on_key(state, field, ev) && nav
+}
+
 // -- drawing helpers ---------------------------------------------------------
 
 fn sans(size: f32, weight: Weight, color: Color) -> TextStyle {

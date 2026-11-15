@@ -526,6 +526,20 @@ impl Window {
         app: &mut App<V>,
         timeout: Option<Duration>,
     ) -> io::Result<StepResult> {
+        self.step_with(app, timeout, |_| false)
+    }
+
+    /// `step`, with `first` seeing each event before the app does, as
+    /// `run`'s hook does: when it returns true the event was the caller's
+    /// and the app's default dispatch never sees it (an arrow that moved
+    /// the caller's cursor must not also scroll the list under it). The
+    /// event is still returned, and the window repainted.
+    pub fn step_with<V: View>(
+        &mut self,
+        app: &mut App<V>,
+        timeout: Option<Duration>,
+        mut first: impl FnMut(&fresco_client::Event) -> bool,
+    ) -> io::Result<StepResult> {
         let wait = self.wait_for(app, timeout);
         let ev = self.surface.connection().wait_event(wait)?;
         app.set_time(self.now_ms());
@@ -535,9 +549,11 @@ impl Window {
                 if self.closes(&ev) {
                     return Ok(StepResult::Closed);
                 }
-                self.window_event(&ev, app);
-                if let Some(pev) = translate(&ev) {
-                    app.handle_event_activated(pev, activation_of(&ev));
+                if !first(&ev) {
+                    self.window_event(&ev, app);
+                    if let Some(pev) = translate(&ev) {
+                        app.handle_event_activated(pev, activation_of(&ev));
+                    }
                 }
                 StepResult::Event(ev)
             }
