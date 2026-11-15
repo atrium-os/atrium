@@ -19,7 +19,12 @@
 # tree); Super+A opens the view; typing "beta" and Enter launches Beta in its
 # own jail as its own uid; the view closes; the dock shows Beta running (its
 # uid from the catalog matches its window's owner); pressing Beta's dock
-# tile again is AlreadyRunning and focuses it.
+# tile again is AlreadyRunning and focuses it. Then the dock as a SESSION
+# COMPONENT (portcullisd's LaunchSessionComponent, as ostiarius asks at
+# login): it gets the person's state folder, read-write at /atrium/state;
+# Ctrl+D unpins the selected app, the pins land in
+# /var/db/atrium/state/<person>/org.atrium.forum-dock/pinned, and they are
+# read back after a teardown and a fresh launch.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/tmp/apps-grid-jail}
@@ -57,14 +62,19 @@ sh "$ROOT/scripts/deploy-portcullis.sh" 2>&1 | grep -v -e '^warning' -e '^ *|' -
 PT="$ROOT/portcullis/target/$T/release"
 for b in portcullisd portcullis opifex; do
   h=$(sha256sum "$PT/$b" | cut -d' ' -f1); gh=$(g "sha256 -q /usr/local/bin/$b" | tr -d '\r')
-  [ "$h" = "$gh" ] || die "/usr/local/bin/$b is not the build just made"
+  # deploy-portcullis.sh builds with -p (other features): use the workspace build.
+  if [ "$h" != "$gh" ]; then
+    put "$PT/$b" /tmp/$b.new && g "install -m 755 /tmp/$b.new /usr/local/bin/$b && rm /tmp/$b.new" || die "install $b"
+    gh=$(g "sha256 -q /usr/local/bin/$b" | tr -d '\r')
+    [ "$h" = "$gh" ] || die "/usr/local/bin/$b is not the build just made"
+  fi
 done
 
 echo "== copy binaries"
 g "pkill -x frescod; pkill -x forum-wm; pkill -x forum-dock; pkill -x beta; pkill -x alpha; sleep 1; rm -rf $W $S; mkdir -p $W $S; chmod 777 $S"
 for b in frescod/target/$T/release/frescod frescod/target/$T/release/fresco-renderer \
          forum-wm/target/$T/release/forum-wm forum-dock/target/$T/release/forum-dock \
-         forum-dock/target/$T/release/examples/sample_app; do
+         forum-dock/target/$T/release/examples/sample_app portcullis/target/$T/release/sesstest; do
   put "$ROOT/$b" "$W/" || die "copy $b"
   h=$(sha256sum "$ROOT/$b" | cut -d' ' -f1); gh=$(g "sha256 -q $W/$(basename "$b")" | tr -d '\r')
   [ "$h" = "$gh" ] || die "$(basename "$b") hash mismatch"
@@ -154,6 +164,44 @@ press $((bx + 152)) "$by"
 sleep 30
 has "'org.example.beta' is already running" && ok "a second press is AlreadyRunning" || bad "no AlreadyRunning: $(g "tail -3 $S/dock.log")"
 has "asked the WM to focus its surface" && ok "the dock asked forum-wm to focus Beta" || bad "Beta's window not found by its uid"
+
+echo "== the dock as a session component: pins kept in the person's state folder"
+SD=/var/db/atrium/state/root/org.atrium.forum-dock
+JN=app-org-atrium-forum-dock
+# The app-launched dock goes (portcullisd cleans its jail up); Beta too.
+g "pkill -x forum-dock; pkill -x beta; sleep 5; rm -rf /var/db/atrium/state/root
+  mkdir -p /etc/atrium/session.d /usr/local/share/atrium/apps/org.atrium.forum-dock/bin
+  install -m 755 $W/forum-dock /usr/local/share/atrium/apps/org.atrium.forum-dock/bin/forum-dock
+  printf 'enabled = false\nname = \"gate-session-launcher\"\npath = \"/var/lib/atrium/jails/gate-session-launcher\"\n[capabilities]\nsession_launch = true\n[exec]\npath = \"/usr/bin/true\"\nargv = [\"true\"]\nuid = 0\ngid = 0\n' > /etc/atrium/services.d/99-gate-session-launcher.toml"
+put "$ROOT/portcullis/ostiarius/etc/session.d/org.atrium.forum-dock.toml" /etc/atrium/session.d/
+sess() { g "$W/sesstest $PSOCK $*"; }
+sess launch $JN root | tee "$OUT/session-launch.txt"
+grep -q SessionComponentLaunched "$OUT/session-launch.txt" && ok "launched as a session component" || bad "no session launch"
+sleep ${SETTLE:-60}
+g "stat -f '%Su %Lp' $SD" | tee "$OUT/state-dir.txt"
+DU=$(g "ps -o uid= -p \$(pgrep -x forum-dock | head -1)" | tr -d ' \r')
+grep -q " 700" "$OUT/state-dir.txt" && ok "state folder made, mode 700" || bad "no state folder"
+[ -n "$DU" ] && g "test \$(stat -f %u $SD) = $DU" && ok "owned by the dock's session uid ($DU)" || bad "state folder not owned by the dock (uid ${DU:-?})"
+g "mount -p | grep -q '^$SD[[:space:]].*/atrium/state[[:space:]]*nullfs[[:space:]]*rw'" \
+  && ok "mounted into the dock's jail" || bad "state folder not mounted"
+key 0x04 0x08
+sleep 10
+inj "KEY 0x07 1 0x01"; inj "KEY 0x07 0 0x01"   # Ctrl+D on the selected app (Alpha)
+sleep 6
+g "cat $SD/pinned 2>&1" | tee "$OUT/pinned.txt"
+grep -q '^org.example.beta$' "$OUT/pinned.txt" && ! grep -q alpha "$OUT/pinned.txt" \
+  && ok "Ctrl+D unpinned Alpha; the pins are in the state folder" || bad "pins not saved to the state folder"
+key 0x29
+shot 4-unpinned
+sess teardown $JN | tee "$OUT/session-teardown.txt"
+sleep 5
+g "pgrep -x forum-dock" >/dev/null && bad "the dock outlived its teardown" || ok "torn down"
+sess launch $JN root | grep -q SessionComponentLaunched && ok "launched again" || bad "second session launch"
+sleep ${SETTLE:-60}
+g "cat $SD/pinned" | grep -q '^org.example.beta$' && ok "pins survived the teardown" || bad "pins lost"
+shot 5-relaunched
+sess teardown $JN >/dev/null
+g "rm -f /etc/atrium/services.d/99-gate-session-launcher.toml"
 
 echo "== logs"
 g "for f in portcullisd wm dock; do echo -- \$f; grep -v '^\$' $S/\$f.log | tail -10; done"

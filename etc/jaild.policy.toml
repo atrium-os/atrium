@@ -154,6 +154,9 @@ rw_patterns = [
 # allow-list here.
 rw_subtrees = [
     "/var/lib/atrium/storage/jails/",
+    # Session components' own state, one folder per person and component
+    # (/var/db/atrium/state/<person>/<component>, docs/spec/forum.md §6.1).
+    "/var/db/atrium/state/",
 ]
 
 

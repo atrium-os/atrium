@@ -13,6 +13,10 @@ pub fn path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("FORUM_DOCK_PINS") {
         return Some(PathBuf::from(p));
     }
+    // A session component's own state folder (portcullisd mounts it).
+    if let Some(d) = std::env::var_os("ATRIUM_STATE_DIR") {
+        return Some(PathBuf::from(d).join("pinned"));
+    }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/forum-dock/pinned"))
 }
 

@@ -153,8 +153,9 @@ fn toggle_pin(shared: &SharedRef, id: &str) {
     s.pins.toggle(&apps, id);
     s.bump();
     if let Some(p) = pins::path() {
-        if let Err(e) = s.pins.save(&p) {
-            eprintln!("forum-dock: could not save pins to {} ({e}); they hold until logout", p.display());
+        match s.pins.save(&p) {
+            Ok(()) => eprintln!("forum-dock: pins saved to {}: {:?}", p.display(), s.pins.ids),
+            Err(e) => eprintln!("forum-dock: could not save pins to {} ({e}); they hold until logout", p.display()),
         }
     }
 }
@@ -163,6 +164,7 @@ fn toggle_pin(shared: &SharedRef, id: &str) {
 
 const KEY_ENTER: u16 = 0x28;
 const KEY_ESCAPE: u16 = 0x29;
+const KEY_D: u16 = 0x07;
 const KEY_PAGE_UP: u16 = 0x4B;
 const KEY_PAGE_DOWN: u16 = 0x4E;
 const KEY_RIGHT: u16 = 0x4F;
@@ -252,6 +254,14 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
         let mut close = false;
         use fresco_client::Event as E;
         match ev {
+            // Ctrl+D pins or unpins the selected app (the keyboard's pin button).
+            Some(E::Key { hid_usage: KEY_D, pressed: true, modifiers, .. })
+                if modifiers & 0x11 != 0 && modifiers & 0x88 == 0 => {
+                let s = state.get_cloned();
+                if let Some(&i) = matches().get(s.selected) {
+                    actions.borrow_mut().push(Action::TogglePin(s.apps[i].id.clone()));
+                }
+            }
             Some(E::Key { hid_usage, pressed: true, modifiers, .. }) if modifiers & 0x88 == 0 => match hid_usage {
                 KEY_ESCAPE => {
                     if query.get_cloned().text().is_empty() {
@@ -443,7 +453,14 @@ fn poll_running(shared: &SharedRef) {
 }
 
 fn render_dock() -> io::Result<()> {
-    let shared: SharedRef = Arc::new(Mutex::new(Shared { pins: Pins::load(pins::path().as_deref()), ..Default::default() }));
+    let pin_file = pins::path();
+    let pins = Pins::load(pin_file.as_deref());
+    match (&pin_file, pins.from_file) {
+        (Some(p), true) => eprintln!("forum-dock: pins from {}: {:?}", p.display(), pins.ids),
+        (p, _) => eprintln!("forum-dock: default pins (nothing at {})",
+                            p.as_ref().map_or("-".into(), |p| p.display().to_string())),
+    }
+    let shared: SharedRef = Arc::new(Mutex::new(Shared { pins, ..Default::default() }));
     refresh_catalog(&shared);
 
     // The dock paints the full-screen wallpaper and the launcher row, so it is

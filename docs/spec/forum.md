@@ -276,8 +276,8 @@ first match is selected, so typing a few letters and Enter launches it.
 
 **Keyboard.** Arrows move the selection (Left/Right by one, Up/Down by a row;
 the filter field's caret is moved with the pointer, Home and End). Page Up and
-Page Down turn pages. Enter launches the selection. Escape clears the filter
-first, then closes.
+Page Down turn pages. Enter launches the selection. Ctrl+D pins or unpins it.
+Escape clears the filter first, then closes.
 
 **Pages, not scrolling.** As many rows as fit the work area are shown; more apps
 go on further pages, with page dots under the grid (pressable). The wheel and
@@ -314,18 +314,35 @@ In the Applications view, each tile has a pin button on hover ("Keep in Dock" /
   app's uid for the person (`CatalogEntry::uid`, from the launch registry; `None`
   until it first ran). The catalog is fetched again when a surface with an
   unknown uid appears and each time the view opens.
-- *Pinned* is a list of app ids, one per line, at `$FORUM_DOCK_PINS` or
-  `$HOME/.config/forum-dock/pinned`. With no file the first five apps of the
-  catalog are pinned. If the file can't be written (a session jail with no
-  writable home), pins hold until logout. *Open: a per-person settings store for
-  session components.*
+- *Pinned* is a list of app ids, one per line, in `pinned` in the dock's state
+  folder (below). With no file the first five apps of the catalog are pinned.
+  `$FORUM_DOCK_PINS` overrides the place; outside a session it falls back to
+  `$HOME/.config/forum-dock/pinned`. If the file can't be written, pins hold
+  until logout.
+
+**State folders for session components** (decided 2026-11-15). Session
+components run as a per-session uid in a jail whose mounts are all read-only, so
+they had nowhere to keep anything. When portcullisd launches one
+(`LaunchSessionComponent`), it makes `/var/db/atrium/state/<person>/<component id>`
+(the person's folder root's, 0755; the component's folder owned by the
+component's session uid, 0700, re-owned at each launch in case the uid changed)
+and mounts it read-write at `/atrium/state` in the jail, with
+`ATRIUM_STATE_DIR=/atrium/state` in the environment. It is unmounted at teardown.
+jaild's policy allows it as an `rw_subtrees` source. The session uid also gets a
+nologin passwd entry, as an app's uid does: portcullisd refuses a peer it can't
+name, so before this a session-launched dock could not fetch the catalog. A name that is not one
+plain path segment gets no folder (the component still runs). The bar and the
+others can use theirs the same way.
 
 Forum's own components (the bar, the dock, the WM, the shelf, the overview,
 Vestibulum) are not listed: they are started by the session, not by the person
 (ids `org.atrium.forum-*` and `org.atrium.vestibulum`).
 
 Code: `forum-dock/src/{apps.rs, apps_view.rs, launch.rs, pins.rs, icons.rs}`,
-`forum-wm` (`WaitAppsKey`), `portcullis-ipc` (`CatalogEntry::uid`).
+`forum-wm` (`WaitAppsKey`), `portcullis-ipc` (`CatalogEntry::uid`), portcullisd
+`prepare_state_dir`. Live checks: `scripts/vm-apps-grid-check.sh` (unjailed) and
+`scripts/vm-apps-grid-jail-check.sh` (jailed, through portcullisd, then as a
+session component with its state folder).
 
 ## 7. Seat / multi-session / FUS
 

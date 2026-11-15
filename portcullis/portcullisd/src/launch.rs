@@ -507,18 +507,24 @@ fn resolve_app_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> R
             uid
         }
     };
-    // Ensure a host passwd entry exists (jail(8) resolves exec.jail_user via it).
-    let run_as = match portcullis_peer::username(uid) {
-        Some(name) => name,
+    let run_as = ensure_passwd(uid).map_err(fail)?;
+    Ok((uid, run_as))
+}
+
+/// Ensure a host passwd entry exists for a dedicated 50000+ uid (jail(8)
+/// resolves exec.jail_user via it, and portcullisd refuses a peer whose uid
+/// isn't in passwd). Returns the username. Used for apps and session components.
+pub fn ensure_passwd(uid: u32) -> Result<String, String> {
+    match portcullis_peer::username(uid) {
+        Some(name) => Ok(name),
         None => {
             let name = portcullis_peer::app_username(uid);
             run("pw", &["useradd", &name, "-u", &uid.to_string(),
                         "-d", "/nonexistent", "-s", "/usr/sbin/nologin"])
-                .map_err(|e| fail(format!("create passwd {name} (uid {uid}): {e}")))?;
-            name
+                .map_err(|e| format!("create passwd {name} (uid {uid}): {e}"))?;
+            Ok(name)
         }
-    };
-    Ok((uid, run_as))
+    }
 }
 
 /* ── dedup-oracle containment on overlays (tessera-quotas.md §3.6.2) ──

@@ -1251,6 +1251,38 @@ fn handle_exec_in_jail(uid: u32, req: Request, writer: &mut UnixStream) -> std::
 /// session-scoped: the exec.uid is a placeholder overridden per-session).
 const SESSION_DIR: &str = "/etc/atrium/session.d";
 
+/// Per-person state of session components: STATE_ROOT/<person>/<component>,
+/// mounted read-write at STATE_DEST inside the component's jail (forum.md §6.1).
+const STATE_ROOT: &str = "/var/db/atrium/state";
+const STATE_DEST: &str = "atrium/state";
+
+/// One path segment: no separators, no dot names, nothing odd.
+fn plain_segment(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s != "." && s != ".."
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b))
+}
+
+/// Make (or re-own) STATE_ROOT/<owner>/<app_id> for `uid`, 0700, and return it.
+/// The person's folder is root's (0755), so one component can't reach another's.
+fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !plain_segment(owner) || !plain_segment(app_id) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a plain name"));
+    }
+    let person = std::path::Path::new(STATE_ROOT).join(owner);
+    std::fs::DirBuilder::new().recursive(true).mode(0o755).create(&person)?;
+    let dir = person.join(app_id);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if !m.file_type().is_dir() =>
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "not a folder")),
+        Ok(_) => {}
+        Err(_) => std::fs::DirBuilder::new().mode(0o700).create(&dir)?,
+    }
+    std::os::unix::fs::chown(&dir, Some(uid), Some(uid))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
     use portcullisd::system_services;
 
@@ -1337,6 +1369,29 @@ fn launch_session_component(component_id: &str, owner_name: &str,
         exec.uid = owner_uid;
         exec.gid = owner_uid;
     }
+    // A passwd entry, as an app's uid has: portcullisd refuses peers it can't
+    // name, so without one the dock (a session component) could never ask for
+    // the catalog or a launch.
+    if let Err(e) = launch::ensure_passwd(owner_uid) {
+        return Response::Error { message: format!("session uid: {e}") };
+    }
+    // The component's own state folder (forum.md §6.1): kept across sessions,
+    // writable only by this component's session uid, at STATE_DEST in the jail.
+    match prepare_state_dir(owner_name, &app_id, owner_uid) {
+        Ok(src) => {
+            create.mounts.push(jaild::protocol::MountSpec {
+                source: src, dest: STATE_DEST.into(),
+                kind: jaild::protocol::MountKind::RwNullfs, size_mb: None, owner: None,
+            });
+            if let Some(exec) = create.exec.as_mut() {
+                exec.env.push(jaild::protocol::EnvPair {
+                    key: "ATRIUM_STATE_DIR".into(), value: format!("/{STATE_DEST}"),
+                });
+            }
+        }
+        // Not fatal: the component runs, it just keeps nothing.
+        Err(e) => eprintln!("portcullisd: state folder for {owner_name}/{app_id}: {e}"),
+    }
     let jail_name = create.name.clone();
 
     let mut client = match Client::connect(JAILD_SOCK) {
@@ -1385,6 +1440,12 @@ fn teardown_session_component(jail_name: &str, shared: &Mutex<Tenants>) -> Respo
     if let Ok(o) = system_services::load_dir(std::path::Path::new(SESSION_DIR)) {
         if let Some(m) = o.manifests.into_iter().find(|m| m.name == jail_name) {
             let create = m.to_create_request();
+            // The state folder was mounted last, so it goes first.
+            if let Err(e) = host_mount::unmount_jail_dest(&create.path, STATE_DEST) {
+                if e.raw_os_error() != Some(libc::EINVAL) && e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("portcullisd: teardown unmount {} {STATE_DEST}: {e}", create.path);
+                }
+            }
             for mt in &create.mounts {
                 if let Err(e) = host_mount::unmount_jail_dest(&create.path, &mt.dest) {
                     eprintln!("portcullisd: teardown unmount {} {}: {e}", create.path, mt.dest);
