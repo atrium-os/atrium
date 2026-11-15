@@ -52,6 +52,9 @@ pub fn picture_mime(b: &[u8]) -> Option<&'static str> {
         F::Gif => "image/gif",
         F::Webp => "image/webp",
         F::Svg => "image/svg+xml",
+        F::Wmf => "image/wmf",
+        F::Emf => "image/emf",
+        F::Bmp => "image/bmp",
     })
 }
 

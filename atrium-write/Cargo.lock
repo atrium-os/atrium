@@ -1189,6 +1189,7 @@ dependencies = [
  "image-webp",
  "navigator-dom",
  "navigator-svg",
+ "officina-pict",
  "png 0.17.16",
  "resvg",
  "usvg",
@@ -1258,6 +1259,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "officina-core",
  "officina-grid",
+ "officina-pict",
  "officina-slides",
  "officina-text",
  "pbkdf2",
@@ -1286,6 +1288,14 @@ dependencies = [
  "folium-syntax",
  "navigator-image",
  "officina-text",
+]
+
+[[package]]
+name = "officina-pict"
+version = "0.1.0"
+dependencies = [
+ "tiny-skia 0.11.4",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -1419,7 +1429,7 @@ dependencies = [
  "swash",
  "tabula",
  "taffy",
- "tiny-skia-path",
+ "tiny-skia-path 0.12.0",
  "unicode-linebreak",
  "unicode-segmentation",
 ]
@@ -1741,7 +1751,7 @@ dependencies = [
  "pico-args",
  "rgb",
  "svgtypes",
- "tiny-skia",
+ "tiny-skia 0.12.0",
  "usvg",
 ]
 
@@ -2141,6 +2151,20 @@ dependencies = [
 
 [[package]]
 name = "tiny-skia"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "bytemuck",
+ "cfg-if",
+ "log",
+ "tiny-skia-path 0.11.4",
+]
+
+[[package]]
+name = "tiny-skia"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
@@ -2151,7 +2175,18 @@ dependencies = [
  "cfg-if",
  "log",
  "png 0.18.1",
- "tiny-skia-path",
+ "tiny-skia-path 0.12.0",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
 ]
 
 [[package]]
@@ -2342,7 +2377,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path",
+ "tiny-skia-path 0.12.0",
 ]
 
 [[package]]

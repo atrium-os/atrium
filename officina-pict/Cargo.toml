@@ -1,0 +1,30 @@
+[package]
+name = "officina-pict"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Old Windows picture formats drawn as pixels (docs/spec/officina.md §16.45): WMF and EMF metafiles and BMP/DIB bitmaps, as Office files carry them. Pure Rust, no system fonts."
+
+[lib]
+name = "officina_pict"
+path = "src/lib.rs"
+
+[features]
+default = ["render"]
+# Drawing. Without it only the headers are read (sizes, sniffing), which is
+# all the converter needs.
+render = ["dep:tiny-skia", "dep:ttf-parser"]
+
+[dependencies]
+# LICENCE: tiny-skia BSD-3 (already in the tree through resvg), ttf-parser
+# MIT OR Apache-2.0 (folium-font). Text is drawn with the Liberation faces
+# in fonts/liberation (OFL).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"], optional = true }
+ttf-parser = { version = "0.25", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+png = "0.17"
+
+[profile.release]
+debug = 1

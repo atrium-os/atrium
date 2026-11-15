@@ -623,7 +623,7 @@ impl<'a> Tr<'a> {
                 Ok((ext, data)) => Some((ext, data.to_vec())),
                 Err(other) => {
                     if other {
-                        self.rep.note(Kind::Dropped, "pictures in formats not shown (EMF, WMF, PICT, BMP, TIFF)");
+                        self.rep.note(Kind::Dropped, "pictures in formats not shown (PICT, TIFF)");
                     }
                     None
                 }

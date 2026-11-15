@@ -360,7 +360,7 @@ impl<'a> Reader<'a> {
         let id = got.map(|b| {
             let (mime, shown) = mime_of(&target, &b);
             if !shown {
-                self.rep.note_at(Kind::Approximate, "pictures in formats not drawn (EMF, WMF, TIFF, BMP, SVM) kept and shown as boxes", || target.clone());
+                self.rep.note_at(Kind::Approximate, "pictures in formats not drawn (TIFF, SVM) kept and shown as boxes", || target.clone());
             }
             self.loaded.pictures += 1;
             self.deck.add_media(mime, &b)

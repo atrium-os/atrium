@@ -172,17 +172,19 @@ pub(crate) fn mime_of(name: &str, b: &[u8]) -> (&'static str, bool) {
         "gif" => ("image/gif", true),
         "svg" => ("image/svg+xml", true),
         "webp" => ("image/webp", true),
-        "emf" => ("image/emf", false),
-        "wmf" => ("image/wmf", false),
+        "emf" => ("image/emf", true),
+        "wmf" => ("image/wmf", true),
         "tif" | "tiff" => ("image/tiff", false),
-        "bmp" => ("image/bmp", false),
+        "bmp" => ("image/bmp", true),
         "mp4" | "m4v" => ("video/mp4", true),
         "mov" => ("video/quicktime", true),
         "webm" => ("video/webm", true),
         "mp3" => ("audio/mpeg", true),
         "wav" => ("audio/wav", true),
         _ => {
-            if b.starts_with(b"\x89PNG") {
+            if let Some(k) = officina_pict::sniff(b) {
+                (k.mime(), true)
+            } else if b.starts_with(b"\x89PNG") {
                 ("image/png", true)
             } else if b.starts_with(&[0xFF, 0xD8]) {
                 ("image/jpeg", true)
@@ -218,7 +220,7 @@ impl<'a> Reader<'a> {
         let id = got.map(|b| {
             let (mime, shown) = mime_of(target, &b);
             if !shown {
-                self.rep.note_at(Kind::Approximate, "pictures in formats not drawn (EMF, WMF, TIFF, BMP) kept and shown as boxes", || target.clone());
+                self.rep.note_at(Kind::Approximate, "pictures in formats not drawn (TIFF) kept and shown as boxes", || target.clone());
             }
             self.loaded.pictures += 1;
             self.deck.add_media(mime, &b)

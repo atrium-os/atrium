@@ -2944,9 +2944,84 @@ their container never panic; the slowest takes 82 ms. Unit tests build a deck
 record by record, plain and protected, and Slides opens both through the real
 converter.
 
-Open: EMF/WMF pictures, formula-driven custom shapes (guide formulas), more
+Open: ~~EMF/WMF pictures~~ (§16.45), formula-driven custom shapes (guide formulas), more
 preset types, picture and pattern fills, tables (drawn as groups by
 PowerPoint), embedded objects and sounds, comments.
+
+### 16.45 Old Windows pictures (2026-11-15): WMF, EMF, BMP
+
+The gap §16.43 and §16.44 left: `.doc` and `.ppt` keep most pictures as
+Windows metafiles, and many `.docx`/`.pptx` files do too (the corpus holds
+171 WMF and 53 EMF parts, 768 with duplicates). They were dropped or shown as
+boxes.
+
+**`officina-pict`** (new crate, MIT OR Apache-2.0) draws them. Its headers
+half (`sniff`, `natural_size`, no dependencies) is all the converter uses;
+the `render` feature plays the file into a `tiny-skia` canvas (BSD-3,
+already in the tree through resvg):
+
+- `dib`: BMP files and the DIBs inside metafiles: 1/4/8/16/24/32 bits,
+  run-length 4 and 8, bit fields, top-down, core headers, 32-bit alpha for
+  AlphaBlend, colour tables of palette indices (`DIB_PAL_COLORS`) and DIBs
+  with no table that take the selected palette.
+- `gdi`: the device context: object table (WMF lowest free slot, EMF by
+  index, stock objects), save/restore, mapping modes (text, metric,
+  English, twips, isotropic, anisotropic), world transforms, pens (cosmetic
+  and geometric, dashes, caps, joins), brushes (solid, hatched, DIB
+  patterns, monochrome patterns in the text and background colours),
+  polygons, Béziers, arcs, chords and pies in GDI's direction, rounded
+  rectangles, paths (begin/end, fill, stroke, clip), clipping by rectangles,
+  regions and paths, bitmaps with the common raster ops (copy, AND, paint,
+  invert, NOT copy, AlphaBlend, TransparentBlt), gradients, text.
+- Text is drawn with Liberation Sans, Serif and Mono (regular and bold,
+  italic slanted), picked by face name and pitch family; escapement, the
+  four alignments, update-current-position, opaque and clipped rectangles,
+  underline and strikeout. Per-character advances from the file are kept,
+  and a face wider than the file's own is narrowed to them. 8-bit text is
+  read in the code page of the font's charset (1250–1258); the Symbol font
+  maps to Unicode Greek and maths; dingbat fonts draw nothing.
+- Office's way of clipping a fill to a shape (fill with XOR, the shape in
+  black, the fill with XOR again) is played as layers: the first fill masked
+  by the shape.
+- A WMF's frame is its placeable header; else the window it sets before it
+  draws (unless a text mapping set afterwards voids it); else the box its
+  drawing covers. An EMF's is its header's frame in hundredths of a
+  millimetre. EMF+ records are skipped; an "EMF+ only" file is refused.
+- Bounded: 64 MB file, 8,192 px a side and 32 Mpx drawn, 2^20 records,
+  2^20 points per call, 65,535 objects, 2^18 glyphs, 1,024 saved states, and
+  a painting budget of 64 canvas areas; coordinates far outside the canvas
+  are pulled in before they reach the rasteriser (its fixed point panics on
+  them).
+
+**Where it is drawn.** `navigator-image` gains a feature, `office`, adding
+`Format::Wmf`, `Emf` and `Bmp`: metafiles are drawn at the painted size (up
+as well as down, like SVG), bitmaps decoded and reduced like the rasters.
+Slides, Write, `pergola-richtext` and `officina-pdf` turn it on; Navigator
+never does, so web content never reaches these parsers. Slides takes BMP,
+WMF and EMF from Insert Picture too.
+
+**Converter.** `.doc` and `.ppt` blips: EMF and WMF inflated from the blip
+(a WMF given back the placeable header the blip keeps apart: its bounds and
+size), DIBs made BMP files; PICT and TIFF still noted. `.docx` and `.odt`
+pictures in these formats are sized from their headers and kept; `.pptx`
+and `.odp` show them instead of boxes. Writers name and type `.emf`, `.wmf`
+and `.bmp` parts.
+
+**Gates.** 147 distinct pictures (one per corpus document) drawn here and by
+LibreOffice, compared side by side cropped to content: equal apart from
+fonts (Liberation for Calibri, Tahoma), one ActiveX button drawn with its
+real monochrome pattern colours (LibreOffice ignores the pattern), CJK text
+(no CJK face yet) and a starburst LibreOffice leaves unclipped. All 768 corpus
+metafiles draw in 3.6 s. 40,000 mutated files: no panics (the first run
+found the rasteriser's), slowest 246 ms. `.doc` corpus pictures 73 → 193;
+`.ppt` 195 → 368 (3 PICT/TIFF notes left). Unit tests build WMFs and EMFs
+record by record (fills, text colour, the XOR clip, every truncation) and a
+deflated WMF blip; `navigator-image` tests the feature (drawn at the target,
+BMP). LibreOffice gates unchanged: `.doc` 31/31, `.ppt` 19/19 without the
+POI deck.
+
+Open: a CJK face, PICT and TIFF, SVM (LibreOffice's own metafile, in
+`.odp`), EMF+ drawing, glyph-index text (`ETO_GLYPH_INDEX`), embedded fonts.
 
 ## 17. Decisions (accepted 2026-11-14)
 

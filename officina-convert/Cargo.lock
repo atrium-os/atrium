@@ -891,6 +891,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "officina-core",
  "officina-grid",
+ "officina-pict",
  "officina-slides",
  "officina-text",
  "pbkdf2",
@@ -909,6 +910,10 @@ version = "0.1.0"
 dependencies = [
  "officina-core",
 ]
+
+[[package]]
+name = "officina-pict"
+version = "0.1.0"
 
 [[package]]
 name = "officina-slides"

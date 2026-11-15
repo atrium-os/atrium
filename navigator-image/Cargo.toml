@@ -29,3 +29,9 @@ navigator-svg = { path = "../navigator-svg" }
 blake3 = { version = "1", features = ["pure"] }
 # The profile's ceilings (MAX_IMAGE_DIMENSION, MAX_DECODED_IMAGE_BYTES).
 navigator-dom = { path = "../navigator-dom" }
+# Office's WMF/EMF/BMP pictures, for Officina only (feature `office`):
+# Navigator never enables it, so web content never reaches these parsers.
+officina-pict = { path = "../officina-pict", optional = true }
+
+[features]
+office = ["dep:officina-pict"]

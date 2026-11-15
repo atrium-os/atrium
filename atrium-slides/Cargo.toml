@@ -19,7 +19,7 @@ officina-core = { path = "../officina-core" }
 officina-convert = { path = "../officina-convert" }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
-navigator-image = { path = "../navigator-image" }
+navigator-image = { path = "../navigator-image", features = ["office"] }
 pergola = { path = "../pergola" }
 pergola-document = { path = "../pergola-document" }
 fresco-protocol = { path = "../fresco-protocol" }

@@ -618,7 +618,7 @@ impl<'a> Reader<'a> {
                     return None;
                 }
                 let Some((w, h)) = pixel_size(&bytes) else {
-                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (EMF, WMF, TIFF, SVG)", || target.clone());
+                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, PICT)", || target.clone());
                     return None;
                 };
                 let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });
@@ -1554,7 +1554,8 @@ pub fn pixel_size(b: &[u8]) -> Option<(u32, u32)> {
             _ => None,
         }
     } else {
-        None
+        // WMF, EMF, BMP: drawn by officina-pict in the apps.
+        officina_pict::natural_size(b).map(|(_, w, h)| (w, h))
     };
     size.filter(|&(w, h)| (1..=65536).contains(&w) && (1..=65536).contains(&h))
 }

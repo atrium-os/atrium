@@ -89,11 +89,23 @@ impl Default for Ceilings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format { Png, Jpeg, Gif, Webp, Svg }
+pub enum Format {
+    Png, Jpeg, Gif, Webp, Svg,
+    /// Office's old picture formats (feature `office`, never Navigator's):
+    /// Windows metafiles and bitmaps, drawn by `officina-pict`.
+    #[cfg(feature = "office")] Wmf,
+    #[cfg(feature = "office")] Emf,
+    #[cfg(feature = "office")] Bmp,
+}
 
 impl Format {
     pub fn name(self) -> &'static str {
-        match self { Format::Png => "png", Format::Jpeg => "jpeg", Format::Gif => "gif", Format::Webp => "webp", Format::Svg => "svg" }
+        match self {
+            Format::Png => "png", Format::Jpeg => "jpeg", Format::Gif => "gif", Format::Webp => "webp", Format::Svg => "svg",
+            #[cfg(feature = "office")] Format::Wmf => "wmf",
+            #[cfg(feature = "office")] Format::Emf => "emf",
+            #[cfg(feature = "office")] Format::Bmp => "bmp",
+        }
     }
 }
 
@@ -189,6 +201,13 @@ pub fn sniff(b: &[u8]) -> Result<Format, &'static str> {
     if b.starts_with(&[0xFF, 0xD8, 0xFF]) { return Ok(Format::Jpeg) }
     if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") { return Ok(Format::Gif) }
     if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") { return Ok(Format::Webp) }
+    #[cfg(feature = "office")]
+    match officina_pict::sniff(b) {
+        Some(officina_pict::Kind::Wmf) => return Ok(Format::Wmf),
+        Some(officina_pict::Kind::Emf) => return Ok(Format::Emf),
+        Some(officina_pict::Kind::Bmp) => return Ok(Format::Bmp),
+        None => {}
+    }
     // What it is instead, so a failure count says something.
     if b.get(4..8) == Some(b"ftyp") {
         return Err(match b.get(8..12) { Some(b"avif") | Some(b"avis") => "avif", Some(b"heic") | Some(b"heix") | Some(b"mif1") => "heif", _ => "isobmff" });
@@ -216,6 +235,8 @@ pub fn natural_size(b: &[u8]) -> Result<(Format, u32, u32), &'static str> {
         Format::Gif => le16(6).zip(le16(8)),
         Format::Webp => webp_size(b),
         Format::Svg => return Err("svg"),
+        #[cfg(feature = "office")]
+        Format::Wmf | Format::Emf | Format::Bmp => officina_pict::natural_size(b).map(|(_, w, h)| (w, h)),
     };
     match size {
         Some((w, h)) if w > 0 && h > 0 => Ok((format, w, h)),
@@ -256,7 +277,34 @@ pub fn decode_unaddressed(bytes: &[u8], c: Ceilings) -> Result<Pixels, DecodeErr
         validate(px.width, px.height, px.rgba.len(), c).map_err(|why| DecodeError::Corrupt { format, why })?;
         return Ok(px);
     }
+    // ★ A metafile is drawn at the painted size, like SVG.
+    #[cfg(feature = "office")]
+    if matches!(format, Format::Wmf | Format::Emf) {
+        let (_, nw, nh) = natural_size(bytes).map_err(|why| DecodeError::Header { format, why: why.into() })?;
+        // Up as well as down: a vector picture is as sharp at any size.
+        let (ow, oh) = match c.target {
+            Some((tw, th)) => {
+                let k = (tw as f64 / nw as f64).min(th as f64 / nh as f64);
+                (((nw as f64 * k).round() as u32).clamp(1, tw.max(1)), ((nh as f64 * k).round() as u32).clamp(1, th.max(1)))
+            }
+            None => (nw, nh),
+        };
+        admit(format, ow, oh, Ceilings { target: None, ..c })?;
+        let px = officina_pict::render(bytes, ow, oh).ok_or_else(|| DecodeError::Corrupt { format, why: "not drawn".into() })?;
+        validate(px.width, px.height, px.data.len(), c).map_err(|why| DecodeError::Corrupt { format, why })?;
+        return Ok(Pixels { width: px.width, height: px.height, rgba: px.data });
+    }
     let px = match format {
+        #[cfg(feature = "office")]
+        Format::Wmf | Format::Emf => unreachable!("drawn above"),
+        #[cfg(feature = "office")]
+        Format::Bmp => {
+            let (_, w, h) = natural_size(bytes).map_err(|why| DecodeError::Header { format, why: why.into() })?;
+            admit(format, w, h, c)?;
+            officina_pict::render(bytes, w, h)
+                .map(|p| Pixels { width: p.width, height: p.height, rgba: p.data })
+                .ok_or_else(|| DecodeError::Corrupt { format, why: "not decoded".into() })
+        }
         Format::Png => png_decode(bytes, c),
         Format::Jpeg => jpeg_decode(bytes, c),
         Format::Gif => gif_decode(bytes, c),

@@ -708,7 +708,7 @@ impl<'a> Reader<'a> {
                     return None;
                 }
                 let Some((w, h)) = pixel_size(&bytes) else {
-                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (EMF, WMF, TIFF, SVG)", || href.clone());
+                    self.rep.note_at(Kind::Dropped, "pictures in formats not shown (TIFF, SVG, SVM)", || href.clone());
                     return None;
                 };
                 let i = self.doc.images.add(ImageData { bytes: Arc::from(bytes), width: w, height: h });

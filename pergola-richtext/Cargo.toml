@@ -11,7 +11,7 @@ pergola = { path = "../pergola" }
 pergola-document = { path = "../pergola-document" }
 officina-core = { path = "../officina-core" }
 officina-text = { path = "../officina-text" }
-navigator-image = { path = "../navigator-image" }
+navigator-image = { path = "../navigator-image", features = ["office"] }
 unicode-segmentation = "1"
 
 [dev-dependencies]

@@ -275,7 +275,7 @@ fn numbering_xml(lsts: &[(i32, Vec<Level>)], lfos: &[i32]) -> String {
 }
 
 /// The first PNG or JPEG in OfficeArt records (a picture's `BLIP`).
-pub(crate) fn find_blip(b: &[u8], depth: usize) -> Result<(&'static str, &[u8]), bool> {
+pub(crate) fn find_blip(b: &[u8], depth: usize) -> Result<(&'static str, std::borrow::Cow<'_, [u8]>), bool> {
     let mut p = 0;
     let mut other = false;
     while p + 8 <= b.len() && depth < 8 {
@@ -299,21 +299,77 @@ pub(crate) fn find_blip(b: &[u8], depth: usize) -> Result<(&'static str, &[u8]),
             let (ext, two) = match ty {
                 0xF01E => ("png", inst == 0x6E1),
                 0xF01D | 0xF02A => ("jpeg", inst == 0x46B || inst == 0x6E3),
-                0xF01A | 0xF01B | 0xF01C | 0xF01F | 0xF029 => {
+                0xF01A => ("emf", inst == 0x3D5),
+                0xF01B => ("wmf", inst == 0x217),
+                0xF01F => ("bmp", inst == 0x7A9),
+                0xF01C | 0xF029 => {
                     other = true;
                     ("", false)
                 }
                 _ => ("", false),
             };
             if !ext.is_empty() {
-                if let Some(d) = body.get(if two { 33 } else { 17 }..) {
-                    return Ok((ext, d));
+                let skip = if two { 33 } else { 17 };
+                let got = match ext {
+                    "emf" | "wmf" => body.get(skip - 1..).and_then(|d| metafile(d, ext == "wmf")).map(std::borrow::Cow::Owned),
+                    "bmp" => body.get(skip..).and_then(bmp_file).map(std::borrow::Cow::Owned),
+                    _ => body.get(skip..).map(std::borrow::Cow::Borrowed),
+                };
+                match got {
+                    Some(d) => return Ok((ext, d)),
+                    None => other = true,
                 }
             }
         }
         p += 8 + len;
     }
     Err(other)
+}
+
+/// An Escher metafile blip's picture (after its uids): its 34-byte header,
+/// then the file, deflated or not. A WMF gets the placeable header the
+/// blip keeps apart (its bounds, and its size in EMUs).
+fn metafile(b: &[u8], wmf: bool) -> Option<Vec<u8>> {
+    let size = (u32_at(b, 0) as usize).min(64 << 20);
+    let i32_at = |b: &[u8], i: usize| u32_at(b, i) as i32;
+    let (l, t, r, bo) = (i32_at(b, 4), i32_at(b, 8), i32_at(b, 12), i32_at(b, 16));
+    let (cx, save, compression) = (i32_at(b, 20), u32_at(b, 28) as usize, *b.get(32)?);
+    let data = b.get(34..34usize.checked_add(save)?.min(b.len()))?;
+    let mut file = match compression {
+        0 => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(data, size.max(1)).ok()?,
+        _ => data.to_vec(),
+    };
+    if wmf && u32_at(&file, 0) != 0x9AC6_CDD7 {
+        let fit = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let (l, t, r, bo) = (fit(l), fit(t), fit(r), fit(bo));
+        // Units per inch: the bounds' width over the width in inches.
+        let inch = if cx > 0 && r > l { ((r as f64 - l as f64) * 914_400.0 / cx as f64).round().clamp(1.0, 65535.0) as u16 } else { 1440 };
+        let mut h = Vec::with_capacity(22 + file.len());
+        h.extend(0x9AC6_CDD7u32.to_le_bytes());
+        h.extend([0, 0]);
+        for v in [l, t, r, bo] {
+            h.extend(v.to_le_bytes());
+        }
+        h.extend(inch.to_le_bytes());
+        h.extend([0; 4]);
+        let sum = h.chunks(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
+        h.extend(sum.to_le_bytes());
+        h.append(&mut file);
+        file = h;
+    }
+    officina_pict::sniff(&file).is_some().then_some(file)
+}
+
+/// A DIB blip (after its uids and tag byte) as a BMP file.
+fn bmp_file(dib: &[u8]) -> Option<Vec<u8>> {
+    let off = officina_pict::dib::bits_offset(dib)?;
+    let mut f = Vec::with_capacity(14 + dib.len());
+    f.extend(b"BM");
+    f.extend(((14 + dib.len()) as u32).to_le_bytes());
+    f.extend([0; 4]);
+    f.extend(((14 + off) as u32).to_le_bytes());
+    f.extend(dib);
+    officina_pict::sniff(&f).is_some().then_some(f)
 }
 
 /// One cell's or row's content being collected into a table.
@@ -488,7 +544,7 @@ impl<'a> Doc<'a> {
             Ok(x) => x,
             Err(other) => {
                 if other {
-                    self.rep.note(Kind::Dropped, "pictures in formats not shown (EMF, WMF, PICT, BMP, TIFF)");
+                    self.rep.note(Kind::Dropped, "pictures in formats not shown (PICT, TIFF)");
                 }
                 return None;
             }
@@ -1114,4 +1170,45 @@ pub fn read(data: &[u8], password: Option<&str>) -> Result<(TextDoc, Loaded), Do
     rep.merge(std::mem::take(&mut loaded.report));
     loaded.report = rep;
     Ok((doc, loaded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An Escher WMF blip: record header, uid, metafile header, deflated file.
+    fn wmf_blip(file: &[u8]) -> Vec<u8> {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(file, 6);
+        let mut body = vec![0u8; 16];
+        body.extend((file.len() as u32).to_le_bytes());
+        for v in [0i32, 0, 2880, 1440, 1_828_800, 914_400] {
+            body.extend(v.to_le_bytes());
+        }
+        body.extend((z.len() as u32).to_le_bytes());
+        body.extend([0, 0xFE]);
+        body.extend(&z);
+        let mut r = Vec::new();
+        r.extend((0x216u16 << 4).to_le_bytes());
+        r.extend(0xF01Bu16.to_le_bytes());
+        r.extend((body.len() as u32).to_le_bytes());
+        r.extend(body);
+        r
+    }
+
+    #[test]
+    fn metafile_blips_become_files() {
+        // A raw WMF: header, one EOF record.
+        let mut raw = vec![1, 0, 9, 0, 0, 3, 12, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0];
+        raw.extend([3, 0, 0, 0, 0, 0]);
+        let blip = wmf_blip(&raw);
+        let (ext, file) = find_blip(&blip, 0).unwrap();
+        assert_eq!(ext, "wmf");
+        // The placeable header the blip kept apart: 2 × 1 inches.
+        assert_eq!(officina_pict::natural_size(&file).map(|s| (s.1, s.2)), Some((192, 96)));
+        assert_eq!(&file[22..], &raw[..]);
+        // Cut short: the deflated data doesn't end, nothing is shown.
+        for cut in 8..blip.len() {
+            assert!(find_blip(&blip[..cut], 0).map_or(true, |(_, f)| officina_pict::sniff(&f).is_some()));
+        }
+    }
 }
