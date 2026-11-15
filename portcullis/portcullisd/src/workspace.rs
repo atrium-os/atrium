@@ -1,0 +1,428 @@
+//! Workspaces (docs/spec/homes.md §5): a person's own development jails.
+//!
+//! A workspace is a jail on the base system (read-only), with a writable
+//! root of its own, the person's `work` folder at `~/work`, and the `work`
+//! of each workspace it uses, read-only, at `/workspaces/<name>`. It runs as
+//! its own uid (per person and workspace, as an app's), which is in the
+//! person's files group, so the file manager and the workspace can hand
+//! files to each other through `work`.
+//!
+//! On disk, under the person's home (root's `~/.atrium`):
+//!
+//! ```text
+//! .atrium/workspaces/              root:files-<person> 0750
+//!   <name>/                        root:files-<person> 0750
+//!     work/                        <person>:files-<person> 2770   ~/work
+//!     .state/                      root 0700
+//!       workspace.toml             the record
+//!       root/                      the jail's writable root
+//! ```
+//!
+//! The file manager is given `.atrium/workspaces` and sees each `work`,
+//! never `.state`. Its jail is created with `persist` and stays until
+//! stopped (or the machine stops); a console joins it.
+//!
+//! Toolchains: the base system has C (cc, ld, make) and the shell; the
+//! others wait for their layers (atrium-devjail.md §4) and are listed as
+//! unavailable. Personas (personas.md, a proposal) will key a workspace by
+//! persona: the record carries one, "personal".
+
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+use crate::launch;
+
+/// The one made for everyone at the first ask.
+pub const SCRATCH: &str = "scratch";
+/// Where the jails' roots are assembled.
+pub const JAILS: &str = "/var/lib/atrium/workspaces";
+/// Where a workspace's `work` is, under its uid's home in the jail.
+pub const WORK: &str = "work";
+/// Where the file manager (`home-files`) finds them.
+pub const IN_FILE_MANAGER: &str = "atrium/workspaces";
+/// Where the workspaces it uses appear.
+pub const LINKS: &str = "workspaces";
+
+/// (id, name, available now).
+pub const TOOLCHAINS: &[(&str, &str, bool)] = &[
+    ("c", "C (cc, make)", true),
+    ("shell", "Plain shell", true),
+    ("rust", "Rust", false),
+    ("python", "Python", false),
+    ("go", "Go", false),
+    ("node", "Node", false),
+];
+
+/// The base system, read-only in every workspace.
+const BASE: &[&str] = &[
+    "bin", "lib", "libexec", "sbin",
+    "usr/bin", "usr/include", "usr/lib", "usr/lib32", "usr/libdata", "usr/libexec", "usr/sbin", "usr/share",
+];
+
+/// Files the jail's `/etc` starts with, from the host's.
+const ETC: &[&str] = &[
+    "login.conf", "login.conf.db", "resolv.conf", "hosts", "services", "protocols",
+    "shells", "nsswitch.conf", "libmap.conf", "networks",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub name:      String,
+    pub toolchain: String,
+    #[serde(default = "personal")]
+    pub persona:   String,
+    /// "outbound" or "none".
+    pub network:   String,
+    #[serde(default)]
+    pub uses:      Vec<String>,
+}
+
+fn personal() -> String { "personal".into() }
+
+/// A name: what a folder, a jail and a prompt can all carry.
+pub fn valid_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    !b.is_empty() && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+pub fn valid_network(n: &str) -> bool { matches!(n, "outbound" | "none") }
+
+/// The console target of a workspace.
+pub fn target(name: &str) -> String { format!("{}{name}", crate::console::WORKSPACE_PREFIX) }
+
+/// The id its uid is registered under (and its host identity derived
+/// from): `/` is in no app id, so it never names an app.
+fn reg_id(name: &str) -> String { target(name) }
+
+/// Its synthetic manifest id; the jail is named after it (`.` → `_`).
+fn manifest_id(owner: &str, name: &str) -> String { format!("ws.{owner}.{name}") }
+
+pub fn jail_name(owner: &str, name: &str) -> String {
+    portcullis_jail::jail_name_from_app_id(&manifest_id(owner, name))
+}
+
+pub fn jail_path(owner: &str, name: &str) -> PathBuf { Path::new(JAILS).join(owner).join(name) }
+
+/// `.atrium/workspaces`, made root's with the files group.
+pub fn root_dir(home: &Path, files_gid: u32) -> Result<PathBuf, String> {
+    let d = home.join(".atrium").join("workspaces");
+    own_dir(&d, 0, files_gid, 0o750)?;
+    Ok(d)
+}
+
+/// Make `d` (one level) or put it right: a folder, not a link, ours.
+fn own_dir(d: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
+    match fs::symlink_metadata(d) {
+        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", d.display())),
+        Ok(m) if m.uid() != uid && m.uid() != 0 => return Err(format!("{} is someone else's", d.display())),
+        Ok(_) => {}
+        Err(_) => fs::DirBuilder::new().mode(0o700).create(d).map_err(|e| format!("create {}: {e}", d.display()))?,
+    }
+    std::os::unix::fs::chown(d, Some(uid), Some(gid)).map_err(|e| format!("chown {}: {e}", d.display()))?;
+    fs::set_permissions(d, fs::Permissions::from_mode(mode)).map_err(|e| format!("chmod {}: {e}", d.display()))
+}
+
+fn person_uid(person: &str) -> Option<u32> {
+    let o = Command::new("id").args(["-u", person]).output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+/// The person's home and files group (made if missing).
+fn person(owner: &str) -> Result<(PathBuf, u32), String> {
+    crate_home::ensure_person(owner)
+}
+
+use portcullisd::home as crate_home;
+
+fn record_path(dir: &Path) -> PathBuf { dir.join(".state").join("workspace.toml") }
+
+fn load(dir: &Path) -> Option<Record> {
+    let t = fs::read_to_string(record_path(dir)).ok()?;
+    toml::from_str(&t).ok()
+}
+
+fn save(dir: &Path, r: &Record) -> Result<(), String> {
+    let p = record_path(dir);
+    let t = toml::to_string(r).map_err(|e| e.to_string())?;
+    let tmp = p.with_extension("new");
+    fs::write(&tmp, t).and_then(|_| fs::rename(&tmp, &p)).map_err(|e| format!("write {}: {e}", p.display()))
+}
+
+/// Make a workspace's folders (work, .state) for `owner`.
+fn make_dirs(owner: &str, home: &Path, gid: u32, name: &str) -> Result<PathBuf, String> {
+    let root = root_dir(home, gid)?;
+    let dir = root.join(name);
+    own_dir(&dir, 0, gid, 0o750)?;
+    let uid = person_uid(owner).ok_or_else(|| format!("no such person {owner}"))?;
+    own_dir(&dir.join(WORK), uid, gid, 0o2770)?;
+    own_dir(&dir.join(".state"), 0, 0, 0o700)?;
+    Ok(dir)
+}
+
+/// The person's workspaces; Scratch is made the first time.
+pub fn list(owner: &str) -> Result<Vec<(Record, bool)>, String> {
+    let (home, gid) = person(owner)?;
+    let root = root_dir(&home, gid)?;
+    if load(&root.join(SCRATCH)).is_none() {
+        create(owner, Record {
+            name: SCRATCH.into(), toolchain: "c".into(), persona: personal(),
+            network: "outbound".into(), uses: vec![],
+        })?;
+    }
+    let mut v = Vec::new();
+    for e in fs::read_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !valid_name(&n) {
+            continue;
+        }
+        if let Some(r) = load(&e.path()) {
+            let running = running_jid(owner, &r.name).is_some();
+            v.push((r, running));
+        }
+    }
+    // Scratch first, then by name.
+    v.sort_by(|a, b| (a.0.name != SCRATCH, &a.0.name).cmp(&(b.0.name != SCRATCH, &b.0.name)));
+    Ok(v)
+}
+
+fn check(owner: &str, home: &Path, r: &Record) -> Result<(), String> {
+    if !valid_name(&r.name) {
+        return Err(format!("{:?}: a name is up to 32 lowercase letters, digits and dashes", r.name));
+    }
+    match TOOLCHAINS.iter().find(|t| t.0 == r.toolchain) {
+        None => return Err(format!("no toolchain {:?}", r.toolchain)),
+        Some((_, n, false)) => return Err(format!("{n} isn't available yet: its toolchain layer comes with atrium-pkg")),
+        Some(_) => {}
+    }
+    if !valid_network(&r.network) {
+        return Err(format!("network {:?}: outbound or none", r.network));
+    }
+    for u in &r.uses {
+        if *u == r.name {
+            return Err("a workspace can't use itself".into());
+        }
+        let Some(other) = load(&home.join(".atrium/workspaces").join(u)).filter(|_| valid_name(u)) else {
+            return Err(format!("no workspace {u:?} of {owner}'s to use"));
+        };
+        // personas.md §6: crossing personas is off by default.
+        if other.persona != r.persona {
+            return Err(format!("{u} is {}'s, {} is {}'s: links don't cross personas", other.persona, r.name, r.persona));
+        }
+    }
+    Ok(())
+}
+
+pub fn create(owner: &str, r: Record) -> Result<Record, String> {
+    let (home, gid) = person(owner)?;
+    check(owner, &home, &r)?;
+    let dir = root_dir(&home, gid)?.join(&r.name);
+    if load(&dir).is_some() {
+        return Err(format!("{owner} has a workspace {} already", r.name));
+    }
+    let dir = make_dirs(owner, &home, gid, &r.name)?;
+    save(&dir, &r)?;
+    // §3: a project carries what reproduces its workspace.
+    let uid = person_uid(owner).unwrap_or(0);
+    let meta = dir.join(WORK).join(".atrium");
+    if fs::symlink_metadata(&meta).is_err() && fs::create_dir(&meta).is_ok() {
+        let _ = std::os::unix::fs::chown(&meta, Some(uid), Some(gid));
+        let _ = fs::set_permissions(&meta, fs::Permissions::from_mode(0o2770));
+        let text = format!("# Made by New workspace (homes.md §5; atrium-devjail.md §3).\nname = {:?}\n\n[toolchain]\nlanguage = {:?}\n\n[network]\noutbound = {:?}\n",
+                           r.name, r.toolchain, if r.network == "none" { "none" } else { "any" });
+        let f = meta.join("devjail.toml");
+        if fs::write(&f, text).is_ok() {
+            let _ = std::os::unix::fs::chown(&f, Some(uid), Some(gid));
+            let _ = fs::set_permissions(&f, fs::Permissions::from_mode(0o660));
+        }
+    }
+    eprintln!("portcullisd: workspace {} made for {owner} ({}, network {})", r.name, r.toolchain, r.network);
+    Ok(r)
+}
+
+/// Change its settings; a running one is stopped so the change applies.
+pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>) -> Result<Record, String> {
+    let (home, gid) = person(owner)?;
+    let dir = root_dir(&home, gid)?.join(name);
+    let mut r = load(&dir).filter(|_| valid_name(name)).ok_or_else(|| format!("no workspace {name:?}"))?;
+    if let Some(n) = network {
+        r.network = n;
+    }
+    if let Some(u) = uses {
+        r.uses = u;
+    }
+    check(owner, &home, &r)?;
+    stop(owner, name);
+    save(&dir, &r)?;
+    eprintln!("portcullisd: workspace {name} of {owner}: network {}, uses {:?}", r.network, r.uses);
+    Ok(r)
+}
+
+pub fn running_jid(owner: &str, name: &str) -> Option<i32> {
+    let out = Command::new("jls").args(["-j", &jail_name(owner, name), "jid"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// What a console needs to start a shell in a running workspace.
+pub struct Running {
+    pub jid:    i32,
+    pub uid:    u32,
+    pub gid:    u32,
+    /// The person's files group.
+    pub files:  u32,
+    /// `$HOME` in the jail; `work` is under it.
+    pub home:   String,
+}
+
+/// Seed the jail's `/etc`: its own accounts (root and the workspace's) and
+/// what the base system's tools read.
+fn seed_etc(root: &Path, user: &str, uid: u32, gid: u32, files: u32, home_in: &str) -> Result<(), String> {
+    let etc = root.join("etc");
+    fs::create_dir_all(&etc).map_err(|e| format!("{}: {e}", etc.display()))?;
+    for f in ETC {
+        let src = Path::new("/etc").join(f);
+        if src.is_file() {
+            let _ = fs::copy(&src, etc.join(f));
+        }
+    }
+    let _ = fs::remove_file(etc.join("termcap"));
+    let _ = std::os::unix::fs::symlink("/usr/share/misc/termcap", etc.join("termcap"));
+    let mp = etc.join("master.passwd");
+    fs::write(&mp, format!(
+        "root:*:0:0::0:0:Charlie &:/root:/usr/sbin/nologin\n{user}:*:{uid}:{gid}::0:0:Workspace:{home_in}:/bin/sh\n"))
+        .map_err(|e| format!("{}: {e}", mp.display()))?;
+    fs::set_permissions(&mp, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    fs::write(etc.join("group"), format!("wheel:*:0:root\n{user}:*:{gid}:\nfiles:*:{files}:{user}\n"))
+        .map_err(|e| e.to_string())?;
+    let st = Command::new("pwd_mkdb").arg("-d").arg(&etc).arg(&mp).status().map_err(|e| format!("pwd_mkdb: {e}"))?;
+    if !st.success() {
+        return Err(format!("pwd_mkdb: {st}"));
+    }
+    Ok(())
+}
+
+/// Start the workspace if it isn't running, and say where it is.
+pub fn start(owner: &str, name: &str) -> Result<Running, String> {
+    let (home, files) = person(owner)?;
+    let dir = root_dir(&home, files)?.join(name);
+    let r = load(&dir).filter(|_| valid_name(name)).ok_or_else(|| format!("no workspace {name:?}"))?;
+    check(owner, &home, &r)?;
+    let (uid, user) = launch::resolve_app_uid(owner, &reg_id(name), None).map_err(|e| format!("{e:?}"))?;
+    let gid = crate::console::gid_of(uid).ok_or_else(|| format!("no group for uid {uid}"))?;
+    crate_home::grant_group(owner, &user)?;
+    let home_in = format!("/home/{user}");
+    let running = Running { jid: 0, uid, gid, files, home: home_in.clone() };
+    if let Some(jid) = running_jid(owner, name) {
+        return Ok(Running { jid, ..running });
+    }
+
+    // The writable root, kept between starts (what `pkg` or `make install`
+    // put in /usr/local stays).
+    let root = dir.join(".state").join("root");
+    for (d, mode, o) in [("", 0o755, 0), ("tmp", 0o1777, 0), ("var", 0o755, 0), ("var/tmp", 0o1777, 0),
+                         ("usr", 0o755, 0), ("usr/local", 0o755, uid), ("root", 0o700, 0), ("dev", 0o555, 0),
+                         ("home", 0o755, 0), (&home_in[1..], 0o755, uid), (LINKS, 0o755, 0)] {
+        let p = root.join(d);
+        fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let _ = std::os::unix::fs::chown(&p, Some(o), Some(if o == 0 { 0 } else { gid }));
+        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(mode));
+    }
+    seed_etc(&root, &user, uid, gid, files, &home_in)?;
+
+    let jp = jail_path(owner, name);
+    fs::create_dir_all(&jp).map_err(|e| format!("{}: {e}", jp.display()))?;
+    let _ = launch::umount_silent(&jp);
+    launch::run("mount", &["-t", "nullfs", "-o", "rw", root.to_str().unwrap_or(""), jp.to_str().unwrap_or("")])
+        .map_err(|e| format!("mount its root: {e}"))?;
+
+    let mid = manifest_id(owner, name);
+    let text = format!("[app]\nid = {mid:?}\nname = {name:?}\nversion = \"1\"\nentry = \"usr/bin/true\"\n\n[capabilities]\nnetwork = {:?}\n",
+                       if r.network == "outbound" { "full" } else { "none" });
+    let manifest = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("its manifest: {e}"))?;
+    let fail = |m: String| {
+        launch::full_teardown(&jp, None);
+        m
+    };
+    let sysfil = launch::app_sysfil(&manifest).map_err(|e| fail(format!("{e:?}")))?;
+    let host_identity = portcullis_identity::for_app(&mid).map_err(|e| fail(format!("identity: {e}")))?;
+    let opts = portcullis_jail::BuildOpts {
+        root_path: jp.clone(),
+        host_sockets: PathBuf::from("/atrium/sockets"),
+        user_home: PathBuf::from(&home_in),
+        user_name: user.clone(),
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
+        instance: None,
+        persist: true,
+        host_identity,
+        sysfil,
+    };
+    let mut jc = portcullis_jail::build(&manifest, &opts).map_err(|e| fail(format!("build: {e}")))?;
+    // Nothing runs at creation (the entry is `true`), and the workspace's
+    // account has no home on the host for jail(8) to change to: it runs as
+    // the jail's root, in /root.
+    jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
+    for b in BASE {
+        let src = Path::new("/").join(b);
+        if src.is_dir() {
+            jc.add_mount(&src, &jp.join(b), "nullfs", &["ro"]);
+        }
+    }
+    jc.add_mount(&dir.join(WORK), &jp.join(&home_in[1..]).join(WORK), "nullfs", &["rw"]);
+    for u in &r.uses {
+        jc.add_mount(&home.join(".atrium/workspaces").join(u).join(WORK), &jp.join(LINKS).join(u), "nullfs", &["ro"]);
+    }
+    launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
+    launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
+    let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
+    eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?})", r.network, r.uses);
+    Ok(Running { jid, ..running })
+}
+
+/// Stop it: its processes end, its mounts go; its files stay.
+pub fn stop(owner: &str, name: &str) {
+    if running_jid(owner, name).is_none() {
+        return;
+    }
+    let (home, gid) = match person(owner) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let networked = root_dir(&home, gid).ok()
+        .and_then(|d| load(&d.join(name)))
+        .is_some_and(|r| r.network == "outbound");
+    launch::remove_persistent(&jail_name(owner, name), &jail_path(owner, name), networked);
+    eprintln!("portcullisd: workspace {name} of {owner} stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names() {
+        assert!(valid_name("scratch") && valid_name("lib-a") && valid_name("2d"));
+        for bad in ["", "A", "a b", "a/b", "../x", ".x", "-x", "a.b", &"a".repeat(33)] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn targets_and_jails() {
+        assert_eq!(target("scratch"), "workspace/scratch");
+        assert_eq!(jail_name("alice", "lib-a"), "ws_alice_lib-a");
+        assert_ne!(jail_name("alice", "b"), jail_name("bob", "b"));
+        // An app id never has a '/', so a workspace's uid is never an app's.
+        assert!(reg_id("x").contains('/'));
+    }
+}

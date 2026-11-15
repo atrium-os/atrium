@@ -79,7 +79,12 @@ fn refresh_catalog(shared: &SharedRef) {
         (_, true) => eprintln!("forum-dock: catalog from {src:?} is empty — no apps installed"),
         (_, false) => {}
     }
-    let listed = apps::listed(&all);
+    let mut listed = apps::listed(&all);
+    // The person's workspaces after the apps (homes.md §5).
+    match launch::workspaces() {
+        Ok(ws) => listed.extend(ws.iter().map(forum_dock::workspace_entry)),
+        Err(e) => eprintln!("forum-dock: no workspaces listed: {e}"),
+    }
     let mut s = shared.lock().unwrap();
     if s.apps != listed {
         eprintln!("forum-dock: {} app(s) from {src:?}, {} with their own icon", listed.len(), listed.iter().filter(|a| a.vector.is_some()).count());
@@ -319,10 +324,15 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
         // Typing: the best match is selected, and an old note goes.
         let q = query.get_cloned().text().to_string();
         if q != last_query {
-            last_query = q;
             let mut s = state.get_cloned();
             s.selected = 0;
             s.note = None;
+            // A name no workspace has offers New workspace.
+            s.apps.retain(|a| !a.id.starts_with(forum_dock::NEW_WORKSPACE));
+            if let Some(e) = forum_dock::new_workspace_entry(&s.apps, &q) {
+                s.apps.push(e);
+            }
+            last_query = q;
             state.set(s);
         }
 
@@ -334,7 +344,14 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
                     let name = name_of(shared, &id);
                     let tx = to_self.clone();
                     std::thread::spawn(move || {
-                        let r = launch::console(&id, token);
+                        // New workspace: made, then its terminal, on the same press.
+                        let r = match id.strip_prefix(forum_dock::NEW_WORKSPACE) {
+                            Some(ws) => launch::new_workspace(ws).and_then(|_| {
+                                eprintln!("forum-dock: workspace {ws} made");
+                                launch::console(&format!("{}{ws}", forum_dock::WORKSPACE), token)
+                            }),
+                            None => launch::console(&id, token),
+                        };
                         match &r {
                             Ok(title) => eprintln!("forum-dock: console in '{id}': {title}"),
                             Err(e) => eprintln!("forum-dock: console in '{id}': {e}"),
@@ -344,6 +361,11 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
                         }
                     });
                     // The terminal's window taking focus closes the view.
+                }
+                // Enter on a workspace: its terminal, on the key press.
+                Action::Launch(id) if forum_dock::is_workspace(&id) => {
+                    let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+                    actions.borrow_mut().push(Action::Console(id, token));
                 }
                 Action::Launch(id) => {
                     let mut s = state.get_cloned();

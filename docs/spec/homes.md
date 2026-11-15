@@ -161,6 +161,33 @@ quickly.
 - **`.atrium/devjail.toml`** in a project still reproduces a workspace from
   a repository (atrium-devjail.md §3); New workspace writes one.
 
+**As built (W3, 2026-11-15).** portcullisd keeps workspaces
+(`portcullisd/src/workspace.rs`). Each has a record and a writable root in
+`~/.atrium/workspaces/<name>/.state/` (root's, 0700) and its files in
+`~/.atrium/workspaces/<name>/work` (the person's, group `files-<person>`,
+2770). Its jail (`ws_<person>_<name>`) is created with `persist`: the base
+system read-only (`/bin`, `/lib`, `/libexec`, `/sbin`, `/usr/{bin,include,
+lib,libdata,libexec,sbin,share}`), its own `/etc` (its accounts, made with
+`pwd_mkdb`), `/tmp`, `/var`, `/usr/local` and `~/work` writable. It runs as
+its own uid, allocated per person and workspace like an app's (registered
+as `workspace/<name>`), which is in the person's files group, so the file
+manager and the workspace can hand each other files; consoles use umask
+002. Network `outbound` is a routed epair from jaild, `none` its own empty
+stack. The terminal is a console (§4) with target `workspace/<name>`,
+starting in `~/work`; Terminal starts a stopped workspace.
+- Toolchains: C and the shell come with the base system; Rust, Python, Go
+  and Node are listed but refused until their layers exist
+  (atrium-devjail.md §4, atrium-pkg).
+- Forum: the Applications grid shows each workspace as a tile that opens
+  its terminal; typing a name no workspace has offers **New workspace
+  "name"** (C, outbound), made and opened on the same press. Settings
+  (network, uses) are `portcullis workspace set` for now; a settings sheet
+  in Forum is still to do.
+- Scrinium: a **Workspaces** place (`~/.atrium/workspaces` mounted in the
+  file manager's jail); each folder shows its `work`, never `.state`.
+- The record carries a persona, `personal`; links across personas are
+  refused (personas.md, a proposal).
+
 ### 5.1 Several projects in one workspace
 
 A workspace is a jail, not a project. Projects that grow together can live
@@ -215,5 +242,6 @@ people ship without `sshd` on the host.
 3. **W3 workspaces.** New workspace and Scratch in Forum, on
    `atrium-devjail`; Scrinium's Workspaces place. Gate: `cc hello.c && ./a.out`
    in Scratch; a second workspace using the first links its library.
+   **Built 2026-11-15** (§5 "As built"); `scripts/vm-workspace-check.sh`.
 4. **W4** Scrinium's H2 and H3 (picker over home, bookmarks) on the new
    layout.

@@ -875,8 +875,9 @@ fn main() {
             Err((st, m)) => eprintln!("scrinium: no standing grant of the sticks: {m} (status {st})"),
         }
     }
-    // The person's folders first, then the folders it was given.
+    // The person's folders first, their workspaces, then the folders it was given.
     let mut configured = places::home();
+    configured.extend(places::workspaces());
     configured.extend(places::configured());
     let shared: SharedPlaces = Arc::new(Mutex::new(Places { list: configured.clone(), gen: 1 }));
     let (ptx, prx) = mpsc::channel();

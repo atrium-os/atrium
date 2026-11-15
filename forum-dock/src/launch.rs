@@ -154,3 +154,31 @@ pub fn console(app_id: &str, activation: [u8; 16]) -> Result<String, String> {
         other => Err(format!("unexpected reply: {other:?}")),
     }
 }
+
+fn portcullisd() -> Result<UnixStream, String> {
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not reachable")?;
+    let mut s = UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => Ok(s),
+        other => Err(format!("handshake: {other:?}")),
+    }
+}
+
+/// The person's workspaces (homes.md §5); Scratch is made at the first ask.
+pub fn workspaces() -> Result<Vec<portcullis_ipc::WorkspaceInfo>, String> {
+    workspace_request(&Request::Workspaces)
+}
+
+/// Make a workspace with the defaults (C, outbound network).
+pub fn new_workspace(name: &str) -> Result<Vec<portcullis_ipc::WorkspaceInfo>, String> {
+    workspace_request(&Request::WorkspaceNew { name: name.into(), toolchain: "c".into(), network: None, uses: vec![] })
+}
+
+fn workspace_request(req: &Request) -> Result<Vec<portcullis_ipc::WorkspaceInfo>, String> {
+    let mut s = portcullisd()?;
+    match round_trip(&mut s, req) {
+        Ok(Response::WorkspaceList { workspaces, .. }) => Ok(workspaces),
+        Ok(Response::Error { message }) => Err(message),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}

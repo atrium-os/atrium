@@ -261,3 +261,13 @@ pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32, limits
         other => Err(io::Error::other(format!("unexpected reply: {other:?}"))),
     }
 }
+
+/// Workspaces (homes.md §5): any workspace request; the list comes back.
+pub fn workspaces(req: Request) -> DaemonResult<(Vec<portcullis_ipc::WorkspaceInfo>, Vec<portcullis_ipc::Toolchain>)> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    match round_trip(&mut s, &req)? {
+        Response::WorkspaceList { workspaces, toolchains } => Ok(Some((workspaces, toolchains))),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected workspace reply: {other:?}"))),
+    }
+}

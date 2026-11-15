@@ -323,6 +323,32 @@ pub enum Request {
     /// asking for a restricted capability: only the system grants those.
     /// Answer: `Ok`.
     ApproveAccess { app_id: String, activation: [u8; 16] },
+
+    /// The person's workspaces (homes.md §5), Scratch made at the first
+    /// ask. Asked by a launcher or by the person (not an app). Answer:
+    /// `WorkspaceList`. A workspace's terminal is a `Console` whose
+    /// `app_id` is `workspace/<name>`.
+    Workspaces,
+    /// Make a workspace. `network`: "outbound" (the default) or "none".
+    WorkspaceNew {
+        name:      String,
+        toolchain: String,
+        #[serde(default)]
+        network:   Option<String>,
+        #[serde(default)]
+        uses:      Vec<String>,
+    },
+    /// Its settings: what it uses (read-only links, §5.2) and its network.
+    /// Takes effect at its next start; a running one is stopped.
+    WorkspaceSet {
+        name:    String,
+        #[serde(default)]
+        network: Option<String>,
+        #[serde(default)]
+        uses:    Option<Vec<String>>,
+    },
+    /// Stop its jail (its consoles end); its files stay.
+    WorkspaceStop { name: String },
 }
 
 /// Who allowed what an app has now (curia.md §13).
@@ -351,6 +377,28 @@ pub struct AccessEntry {
     /// The restricted capabilities it asks for: only the system grants
     /// these, so Settings can't approve it.
     pub restricted: Vec<String>,
+}
+
+
+/// A workspace, for Forum and Scrinium.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub name:      String,
+    pub toolchain: String,
+    /// "personal" until personas exist (personas.md, a proposal).
+    pub persona:   String,
+    pub network:   String,
+    pub uses:      Vec<String>,
+    pub running:   bool,
+}
+
+/// A toolchain New workspace offers; `available` false until its layer
+/// can be installed (atrium-devjail.md §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Toolchain {
+    pub id:        String,
+    pub name:      String,
+    pub available: bool,
 }
 
 /// An app that opens a type, for the Open with sheet.
@@ -451,6 +499,10 @@ pub enum Response {
     ConsoleOpened { title: String },
     /// Access → each installed app, by name.
     Access { apps: Vec<AccessEntry> },
+
+    /// Answer to `Workspaces` (and to `WorkspaceNew`/`WorkspaceSet`: the
+    /// list after the change).
+    WorkspaceList { workspaces: Vec<WorkspaceInfo>, toolchains: Vec<Toolchain> },
 
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable

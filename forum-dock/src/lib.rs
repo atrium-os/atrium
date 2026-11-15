@@ -41,6 +41,57 @@ pub struct AppEntry {
     pub console: bool,
 }
 
+/// A workspace's entry id (homes.md §5): `workspace/<name>`, the console
+/// target portcullisd knows it by. Its tile opens its terminal.
+pub const WORKSPACE: &str = "workspace/";
+/// The "New workspace" tile the filter offers for a name not in use.
+pub const NEW_WORKSPACE: &str = "workspace+new/";
+
+pub fn is_workspace(id: &str) -> bool { id.starts_with(WORKSPACE) || id.starts_with(NEW_WORKSPACE) }
+
+/// portcullisd's rule for a workspace name (up to 32 lowercase letters,
+/// digits and dashes, not starting with a dash).
+pub fn valid_workspace_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    !b.is_empty() && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// A workspace, as a tile.
+pub fn workspace_entry(w: &portcullis_ipc::WorkspaceInfo) -> AppEntry {
+    let tool = match w.toolchain.as_str() { "c" => "C", "shell" => "shell", t => t };
+    let net = if w.network == "none" { "no network" } else { "outbound network" };
+    let uses = if w.uses.is_empty() { String::new() } else { format!(", uses {}", w.uses.join(", ")) };
+    AppEntry {
+        id: format!("{WORKSPACE}{}", w.name),
+        name: if w.name == "scratch" { "Scratch".into() } else { w.name.clone() },
+        description: Some(format!("Workspace: {tool}, {net}{uses}")),
+        icon: Some("code".into()),
+        uid: None,
+        vector: None,
+        console: false,
+    }
+}
+
+/// The "New workspace" tile for what was typed, if it can name one and no
+/// workspace has that name.
+pub fn new_workspace_entry(apps: &[AppEntry], query: &str) -> Option<AppEntry> {
+    let q = query.trim();
+    if !valid_workspace_name(q) || apps.iter().any(|a| a.id == format!("{WORKSPACE}{q}")) {
+        return None;
+    }
+    Some(AppEntry {
+        id: format!("{NEW_WORKSPACE}{q}"),
+        name: format!("New workspace \u{201c}{q}\u{201d}"),
+        description: Some("A new workspace (C and the shell), with outbound network, and its terminal".into()),
+        icon: Some("plus".into()),
+        uid: None,
+        vector: None,
+        console: false,
+    })
+}
+
 /// Parse a bundle icon's SVG, saying why one is not drawn.
 pub fn vector_icon(id: &str, svg: Option<&str>) -> Option<std::sync::Arc<bundle_icon::VectorIcon>> {
     match bundle_icon::parse(svg?) {
@@ -188,5 +239,24 @@ graphics = "fresco"
     #[test]
     fn missing_apps_dir_yields_empty_catalog() {
         assert!(catalog(Path::new("/no/such/atrium/apps")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn new_workspace_tile_only_for_a_free_valid_name() {
+        let w = portcullis_ipc::WorkspaceInfo { name: "scratch".into(), toolchain: "c".into(), persona: "personal".into(),
+                                                network: "outbound".into(), uses: vec![], running: false };
+        let apps = vec![workspace_entry(&w)];
+        assert_eq!(apps[0].id, "workspace/scratch");
+        assert_eq!(apps[0].name, "Scratch");
+        assert!(new_workspace_entry(&apps, "scratch").is_none());
+        assert!(new_workspace_entry(&apps, "Has Caps").is_none());
+        assert!(new_workspace_entry(&apps, "").is_none());
+        assert_eq!(new_workspace_entry(&apps, "lib-a").unwrap().id, "workspace+new/lib-a");
+        assert!(is_workspace("workspace/x") && is_workspace("workspace+new/x") && !is_workspace("org.x"));
     }
 }

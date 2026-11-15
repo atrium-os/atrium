@@ -72,6 +72,13 @@ pub fn home_in(dir: &Path) -> Vec<Place> {
         .collect()
 }
 
+/// The person's workspaces (homes.md §5), one place: each workspace's
+/// folder holds its `work`. `SCRINIUM_WORKSPACES`, else `/atrium/workspaces`.
+pub fn workspaces() -> Option<Place> {
+    let dir = std::env::var_os("SCRINIUM_WORKSPACES").map(PathBuf::from).unwrap_or_else(|| "/atrium/workspaces".into());
+    dir.is_dir().then(|| Place { id: "home:workspaces".into(), label: "Workspaces".into(), root: dir, stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
+}
+
 /// `SCRINIUM_PLACES`.
 pub fn configured() -> Vec<Place> {
     let Ok(s) = std::env::var("SCRINIUM_PLACES") else { return Vec::new() };

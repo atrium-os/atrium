@@ -53,6 +53,7 @@ use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTE
 
 mod console;
 mod launch;
+mod workspace;
 use portcullisd::manifest_trust;
 #[cfg(feature = "pam")]
 mod pam;
@@ -432,6 +433,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
          * connection itself. */
         if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. }) {
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
+            continue;
+        }
+        /* ★ Workspaces (homes.md §5): a launcher, or the person. */
+        if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. }) {
+            let resp = handle_workspace(uid, &owner, req);
+            write_response(&mut writer, &resp)?;
             continue;
         }
         /* ★ App consoles (homes.md §4): gated on the PEER UID, a launcher. */
@@ -1169,6 +1176,53 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
 
 /// Console (homes.md §4). `uid` is the caller's peer uid; `owner` the
 /// person it belongs to, whose app instance the shell joins.
+/// Workspaces (homes.md §5). Asked by a launcher (Forum) for the person it
+/// runs for, or by the person themselves (the CLI), never from inside an
+/// app or a workspace: a workspace's settings aren't changed from inside it.
+fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
+    let allowed = match &caller {
+        Some(app) => launch::app_may_launch_apps(app),
+        // Not an app: a person, with a home, asking about their own.
+        None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
+    };
+    if !allowed {
+        eprintln!("portcullisd: workspaces REFUSED to uid {uid} ({})", caller.as_deref().unwrap_or("?"));
+        return Response::Error { message: format!("cap.workspace.denied: only a launcher or the person manages workspaces (caller {})",
+                                                   caller.as_deref().unwrap_or("unknown")) };
+    }
+    let done = match req {
+        Request::Workspaces => Ok(()),
+        Request::WorkspaceNew { name, toolchain, network, uses } => workspace::create(owner, workspace::Record {
+            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses,
+        }).map(|_| ()),
+        Request::WorkspaceSet { name, network, uses } => workspace::set(owner, &name, network, uses).map(|_| ()),
+        Request::WorkspaceStop { name } => {
+            if workspace::valid_name(&name) {
+                workspace::stop(owner, &name);
+            }
+            Ok(())
+        }
+        _ => Err("not a workspace request".into()),
+    };
+    if let Err(message) = done {
+        eprintln!("portcullisd: workspace request of {owner} refused: {message}");
+        return Response::Error { message };
+    }
+    match workspace::list(owner) {
+        Ok(l) => Response::WorkspaceList {
+            workspaces: l.into_iter().map(|(r, running)| portcullis_ipc::WorkspaceInfo {
+                name: r.name, toolchain: r.toolchain, persona: r.persona, network: r.network, uses: r.uses, running,
+            }).collect(),
+            toolchains: workspace::TOOLCHAINS.iter().map(|(id, name, available)| portcullis_ipc::Toolchain {
+                id: id.to_string(), name: name.to_string(), available: *available,
+            }).collect(),
+        },
+        Err(message) => Response::Error { message },
+    }
+}
+
 fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab_of: Option<String>, new_window: bool, shared: &Mutex<Tenants>) -> Response {
     use portcullisd::opens::{self, Delivery, Hub};
     let refuse = |why: String| {
@@ -1191,51 +1245,76 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         return refuse(format!("cap.console.denied: only a launcher opens consoles, and the terminal more of one it shows (caller {})",
                               caller.as_deref().unwrap_or("is not a launched app")));
     }
-    let Some(m) = launch::installed_manifest(app_id) else {
-        return refuse(format!("{app_id} is not installed"));
-    };
-    let name = if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() };
-    if let Some(why) = launch::no_console(&m) {
-        return refuse(why);
-    }
-    if let Err(why) = may_run_unasked(app_id, owner, shared) {
-        return refuse(why);
-    }
-    if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
-        return refuse(format!("the terminal: {why}"));
-    }
-    // Last of the checks: a refusal above doesn't spend the press.
-    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::CONSOLE) {
-        return refuse(why);
-    }
-    // The app's jail: joined if it runs, started if not.
-    start_for(app_id, owner, "a console");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let jid = loop {
-        if let Some(j) = launch::running_jid(app_id) {
-            break j;
+    // A workspace (homes.md §5) or an app (§4): where the shell goes.
+    let ws_groups: Vec<u32>;
+    let (jid, app_uid, gid, home, kind, title) = if let Some(ws) = app_id.strip_prefix(console::WORKSPACE_PREFIX) {
+        if !workspace::valid_name(ws) {
+            return refuse(format!("{ws:?} is not a workspace name"));
         }
-        if std::time::Instant::now() > deadline {
-            return refuse(format!("{name} did not start"));
+        // Its existence is checked before the press is spent.
+        if let Err(why) = workspace::list(owner).and_then(|l| l.iter().any(|(r, _)| r.name == ws).then_some(()).ok_or_else(|| format!("{owner} has no workspace {ws}"))) {
+            return refuse(why);
         }
-        thread::sleep(std::time::Duration::from_millis(100));
+        if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
+            return refuse(format!("the terminal: {why}"));
+        }
+        if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::CONSOLE) {
+            return refuse(why);
+        }
+        let r = match workspace::start(owner, ws) {
+            Ok(r) => r,
+            Err(why) => return refuse(why),
+        };
+        ws_groups = vec![r.files];
+        (r.jid, r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
+    } else {
+        let Some(m) = launch::installed_manifest(app_id) else {
+            return refuse(format!("{app_id} is not installed"));
+        };
+        let name = if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() };
+        if let Some(why) = launch::no_console(&m) {
+            return refuse(why);
+        }
+        if let Err(why) = may_run_unasked(app_id, owner, shared) {
+            return refuse(why);
+        }
+        if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
+            return refuse(format!("the terminal: {why}"));
+        }
+        // Last of the checks: a refusal above doesn't spend the press.
+        if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::CONSOLE) {
+            return refuse(why);
+        }
+        // The app's jail: joined if it runs, started if not.
+        start_for(app_id, owner, "a console");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let jid = loop {
+            if let Some(j) = launch::running_jid(app_id) {
+                break j;
+            }
+            if std::time::Instant::now() > deadline {
+                return refuse(format!("{name} did not start"));
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let Some(app_uid) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .unwrap_or_default().uid_for(owner, app_id) else {
+            return refuse(format!("{name} has no account for {owner}"));
+        };
+        // ★ Running, but for someone else: not this person's to enter.
+        if !console::jail_runs_as(jid, app_uid) {
+            return refuse(format!("{name} is open for another person"));
+        }
+        let Some(gid) = console::gid_of(app_uid) else {
+            return refuse(format!("no group for uid {app_uid}"));
+        };
+        if let Err(why) = console::mount_toolbox(&PathBuf::from(launch::JAILS_DIR).join(app_id)) {
+            return refuse(why);
+        }
+        ws_groups = Vec::new();
+        (jid, app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
     };
-    let Some(app_uid) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-        .unwrap_or_default().uid_for(owner, app_id) else {
-        return refuse(format!("{name} has no account for {owner}"));
-    };
-    // ★ Running, but for someone else: not this person's to enter.
-    if !console::jail_runs_as(jid, app_uid) {
-        return refuse(format!("{name} is open for another person"));
-    }
-    let Some(gid) = console::gid_of(app_uid) else {
-        return refuse(format!("no group for uid {app_uid}"));
-    };
-    if let Err(why) = console::mount_toolbox(&PathBuf::from(launch::JAILS_DIR).join(app_id)) {
-        return refuse(why);
-    }
-    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: "/nonexistent", app_id, cols: 80, rows: 24 };
-    let title = format!("Terminal: {name}");
+    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind };
     let hub = Hub::global();
     if let Err(e) = hub.listen(console::TERMINAL) {
         return refuse(format!("the terminal's channel: {e}"));
@@ -1814,6 +1893,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
+        },
+        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } => Response::Error {
+            message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {
             message: "internal: Console must go through handle_console".into(),

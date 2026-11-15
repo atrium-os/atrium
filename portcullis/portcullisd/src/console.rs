@@ -21,6 +21,9 @@ pub const TOOLBOX: &str = "/var/db/atrium/console";
 pub const IN_JAIL: &str = "atrium/console";
 /// The terminal app that shows consoles.
 pub const TERMINAL: &str = "org.atrium.terminal";
+/// A console's target names a workspace with this before its name
+/// (`workspace/<name>`): `/` is in no app id.
+pub const WORKSPACE_PREFIX: &str = "workspace/";
 /// What a console is on the document channel: `MIME; app=<id>`, the
 /// app the terminal may ask for more of (another window).
 pub const MIME: &str = "application/x-atrium-console";
@@ -137,6 +140,22 @@ pub struct Spec<'a> {
     pub app_id: &'a str,
     pub cols: u16,
     pub rows: u16,
+    /// Supplementary groups beyond `gid` (a workspace's: the person's
+    /// files group, so what the file manager hands in is readable).
+    pub groups: &'a [u32],
+    /// What runs where: the toolbox's shell in an app's jail, the base
+    /// system's in a workspace.
+    pub kind: Kind,
+}
+
+/// Where the shell and its tools come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An app's jail: the toolbox at /atrium/console, and its termcap.
+    App,
+    /// A workspace (homes.md §5): the base system, a umask the file manager
+    /// can share files under.
+    Workspace,
 }
 
 /// Start the shell. Returns the pty's master side; the shell's process is
@@ -172,26 +191,36 @@ pub fn spawn(s: &Spec) -> io::Result<OwnedFd> {
 pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
     let c = |v: &str| CString::new(v).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL"));
     // Everything the child needs, made before the fork.
-    let path = c(&format!("/{IN_JAIL}/sh"))?;
+    let ws = s.kind == Kind::Workspace;
+    let path = if ws { c("/bin/sh")? } else { c(&format!("/{IN_JAIL}/sh"))? };
     let argv = [c("sh")?, c("-i")?];
-    let env = [
-        c(&format!("PATH=/{IN_JAIL}"))?,
+    let mut env = vec![
         c(&format!("HOME={}", s.home))?,
         c("TERM=vt100")?,
-        // The jail has no terminal database: the toolbox carries the one
-        // entry, so the shell's line editing works and doesn't complain.
-        c(&format!("TERMCAP=/{IN_JAIL}/termcap"))?,
-        c(&format!("TERMINFO=/{IN_JAIL}/terminfo"))?,
-        c(&format!("PS1={} $ ", s.app_id))?,
         c("ENV=")?,
     ];
-    let home = c(s.home)?;
+    if ws {
+        env.push(c("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")?);
+        env.push(c(&format!("PS1={} $ ", s.app_id.strip_prefix(WORKSPACE_PREFIX).unwrap_or(s.app_id)))?);
+        env.push(c(&format!("USER={}", s.owner))?);
+    } else {
+        env.push(c(&format!("PATH=/{IN_JAIL}"))?);
+        // The jail has no terminal database: the toolbox carries the one
+        // entry, so the shell's line editing works and doesn't complain.
+        env.push(c(&format!("TERMCAP=/{IN_JAIL}/termcap"))?);
+        env.push(c(&format!("TERMINFO=/{IN_JAIL}/terminfo"))?);
+        env.push(c(&format!("PS1={} $ ", s.app_id))?);
+    }
+    // A workspace's shell starts in ~/work.
+    let home = if ws { c(&format!("{}/work", s.home))? } else { c(s.home)? };
     let root = c("/")?;
     let mut argp: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     argp.push(std::ptr::null());
     let mut envp: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
     envp.push(std::ptr::null());
 
+    let mut groups: Vec<libc::gid_t> = vec![s.gid as libc::gid_t];
+    groups.extend(s.groups.iter().map(|g| *g as libc::gid_t));
     let (master, slave) = jaild::ffi::openpty_pair(s.cols, s.rows)?;
     // SAFETY: both fds are fresh from openpty and owned here alone.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
@@ -204,13 +233,15 @@ pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
             if libc::login_tty(slave.as_raw_fd()) != 0 { libc::_exit(101) }
             if libc::jail_attach(s.jid) != 0 { libc::_exit(102) }
             if libc::chdir(home.as_ptr()) != 0 && libc::chdir(root.as_ptr()) != 0 { libc::_exit(103) }
-            let groups = [s.gid as libc::gid_t];
-            if libc::setgroups(1, groups.as_ptr()) != 0 || libc::setgid(s.gid) != 0 || libc::setuid(s.uid) != 0 {
+            if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 || libc::setgid(s.gid) != 0 || libc::setuid(s.uid) != 0 {
                 libc::_exit(104)
             }
             // A drop that didn't happen is fatal (jaild::ffi::verify_dropped).
             if libc::getuid() != s.uid || libc::geteuid() != s.uid || libc::getgid() != s.gid || libc::setuid(0) == 0 {
                 libc::_exit(105)
+            }
+            if ws {
+                libc::umask(0o002);
             }
             libc::execve(path.as_ptr(), argp.as_ptr(), envp.as_ptr());
             libc::_exit(106)

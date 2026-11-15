@@ -39,8 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let Some(t) = targets.get(next) else { continue };
-            next += 1;
-            eprintln!("console-probe: {t} -> {}", ask(t, activation));
+            let r = ask(t, activation);
+            // A click that only focused the window asks again.
+            if !r.contains("lost focus") {
+                next += 1;
+            }
+            eprintln!("console-probe: {t} -> {r}");
         }
     }
 }

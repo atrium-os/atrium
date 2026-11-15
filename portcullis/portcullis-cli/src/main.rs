@@ -99,6 +99,12 @@ usage:
         Grant ALL capabilities the app's manifest declares. Phase 4
         bootstrap: replaces the prompt UI until portcullisd lands.
 
+    portcullis workspace [list]
+    portcullis workspace new <name> [--toolchain c|shell] [--network outbound|none] [--uses a,b]
+    portcullis workspace set <name> [--network outbound|none] [--uses a,b | --no-uses]
+    portcullis workspace stop <name>
+        Your workspaces (homes.md §5). Their terminals open from Forum.
+
     portcullis policy revoke <app-id>
         Drop the grant record for an app id (next launch re-prompts).
 
@@ -176,6 +182,7 @@ fn main() -> ExitCode {
             let Some(id) = id else { usage() };
             cmd_remove(id, keep_overlay)
         }
+        "workspace" => cmd_workspace(&args[2..]),
         "--help" | "-h" => usage(),
         other => {
             eprintln!("portcullis: unknown subcommand {other:?}");
@@ -1350,4 +1357,45 @@ fn cmd_remove(app_id: &str, keep_overlay: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn cmd_workspace(args: &[String]) -> ExitCode {
+    use portcullis_ipc::Request;
+    let flag = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+    let uses = if args.iter().any(|a| a == "--no-uses") {
+        Some(Vec::new())
+    } else {
+        flag("--uses").map(|u| u.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
+    };
+    let name = args.get(1).cloned().unwrap_or_default();
+    let req = match args.first().map(String::as_str).unwrap_or("list") {
+        "list" => Request::Workspaces,
+        "new" => Request::WorkspaceNew {
+            name, toolchain: flag("--toolchain").unwrap_or_else(|| "c".into()),
+            network: flag("--network"), uses: uses.unwrap_or_default(),
+        },
+        "set" => Request::WorkspaceSet { name, network: flag("--network"), uses },
+        "stop" => Request::WorkspaceStop { name },
+        other => {
+            eprintln!("portcullis workspace: unknown {other:?}");
+            usage();
+        }
+    };
+    match daemon::workspaces(req) {
+        Ok(Some((list, _))) => {
+            for w in list {
+                println!("{}\t{}\t{}\t{}\tuses={}\t{}", w.name, w.toolchain, w.persona, w.network,
+                         w.uses.join(","), if w.running { "running" } else { "stopped" });
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("portcullis workspace: portcullisd is not running");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("portcullis workspace: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

@@ -274,7 +274,16 @@ impl View for AppsView {
             if let Some(Node::Rect { fill: f, .. }) = ctx.tree.get_mut(id) {
                 *f = fill;
             }
-            ctx.on_click(id, self.act(Action::Launch(app.id.clone())));
+            if crate::is_workspace(&app.id) {
+                // A workspace's tile opens its terminal: the press is the proof.
+                let (q, wid) = (self.actions.clone(), app.id.clone());
+                ctx.on_click(id, move || {
+                    let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+                    q.borrow_mut().push(Action::Console(wid.clone(), token));
+                });
+            } else {
+                ctx.on_click(id, self.act(Action::Launch(app.id.clone())));
+            }
             if let Some(d) = &app.description {
                 ctx.tooltip(id, d.clone());
             }
@@ -293,6 +302,9 @@ impl View for AppsView {
             text(ctx, cell.x() + (cell.w() - lw) / 2.0, py + p + em(18.0), &label, type_size::SM, Weight::Medium, if launching { t.text_secondary() } else { t.text_primary() });
             ctx.pop();
 
+            if crate::is_workspace(&app.id) {
+                continue;
+            }
             // Keep in Dock / Remove from Dock, on the hovered or selected tile.
             let pinned = s.pins.contains(&s.apps, &app.id);
             let b = em(28.0);
