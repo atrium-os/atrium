@@ -1,0 +1,12 @@
+[package]
+name = "mail-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's protocol codecs (docs/spec/mail.md §6.1): IMAP4rev1/rev2 responses and commands, SMTP submission, sans-I/O. Runs in mail-sync; has no login commands, since the Arca mail courier logs in (§5.2)."
+
+[dependencies]
+
+[profile.release]
+debug = 1

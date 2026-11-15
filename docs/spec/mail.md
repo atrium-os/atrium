@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). Building M0.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 codecs built; M0 rest and M1 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -211,6 +211,10 @@ spec proposes the courier learn the three mail protocols' login step (§17 D2):
    (SMTP). Refused means the connection ends and arcad logs it as an exact anomaly
    (arca.md §10).
 5. The session ends with the TCP connection. A new connection is a new login.
+6. **What mail-sync sees first** (fixed in M0): for IMAP, the courier sends
+   `* PREAUTH [CAPABILITY …] …` with the capabilities the server announced after login, so
+   the session looks pre-authenticated; for SMTP, the server's post-login `EHLO` reply.
+   `mail-proto` has no LOGIN, AUTHENTICATE, STARTTLS, COMPRESS, AUTH or EHLO of its own.
 
 What a compromised `mail-sync` gets: an authenticated session to its own account, which it
 already had. What it can't get: the password, a session for another account, or a login
@@ -950,6 +954,22 @@ Stalwart in the cloud VM, and later a real account):
 1. **M0** `mail-proto` and `mail-parse` on the host: IMAP/SMTP/JMAP codecs, MIME and the
    summary schema; fuzz targets; a corpus of real and hostile messages (the usual MIME
    torture tests, charset traps, header bombs).
+   *Built 2026-11-16 (host-tested):* `mail/mail-parse`: own RFC 5322/2045–2047/2231
+   parser into a bounded `Summary` (headers, encoded words, tolerant address lists with a
+   "display name looks like an address" flag, MIME tree with IMAP part paths and body
+   ranges, base64/QP, WHATWG charsets via `encoding_rs`, UTF-7 never decoded, dates,
+   list/unsubscribe/receipt/automated flags, previews without quotes and signatures;
+   bidi, zero-width and control characters dropped from every shown string; hard limits
+   refuse, soft limits cut); 20 tests, fuzz 1.3 M runs clean. `mail/mail-proto`: IMAP
+   decoder (literals across any split, typed responses and codes incl. QRESYNC
+   `VANISHED`, `THROTTLED`, Gmail `X-GM-*`, `EMAILID`, `PREVIEW`, modified UTF-7 names)
+   and typed command encoder (QRESYNC `SELECT`, `UID FETCH`/`STORE`/`MOVE`/`EXPUNGE`,
+   `APPEND` with LITERAL+ or synchronising literals, `SEARCH` whose text is always a
+   string or literal, flags validated), SMTP reply decoder, EHLO caps and a submission
+   state machine (SIZE, 8BITMIME, SMTPUTF8, FUTURERELEASE `HOLDFOR`, partial recipient
+   refusal, RSET on failure, dot-stuffing); 12 tests, fuzz IMAP 0.5 M and SMTP 0.7 M
+   runs clean. Still in M0: JMAP codecs (with M7), DKIM/DMARC, TNEF, iTIP, the HTML
+   path through navigator-normalize, the postcard summary schema.
 2. **M1** the mail courier in Arca (auth, relay, filter), against a local IMAP/SMTP server;
    test that `LOGIN` after auth kills the session and is logged.
 3. **M2** engine + sync: read-only IMAP sync into the store, the index, plain-text reading in
