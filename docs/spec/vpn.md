@@ -568,11 +568,18 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
 - **AnyConnect** against ocserv in the Ubuntu VM (GPL, a test tool only, never shipped;
   LICENSING-POLICY.md allows that): password, OTP, certificate (QEMU's emulated CCID card
   for the Sigillum path), session resume after roam, a gateway pushing hostile config.
-- **GlobalProtect:** no open server exists. A small Rust stand-in gateway (portal, gateway,
-  HIP and ESP endpoints) built from the protocol notes for the gate, plus a real PAN-OS
-  gateway when one is available (question for Shankar, §14).
-- **SAML** against a test IdP (a minimal SAML IdP stand-in in the Ubuntu VM), once
-  Navigator's live pages exist.
+- **GlobalProtect:** no open-source server exists, and PAN-OS VM-Series is paid. A small
+  Rust stand-in gateway (portal, gateway, HIP and ESP endpoints) built from the protocol
+  notes. So the stand-in is not just our own reading checked against itself, OpenConnect's
+  GlobalProtect client (`openconnect --protocol=gp`, a test tool only, never shipped) must
+  connect to it too: that client is proven against real gateways. The same cross-check
+  applies to ocserv with our AnyConnect engine.
+- **No real company gateway** (Shankar 2026-11-15): every gate runs on local servers.
+  Free public services only add value for WireGuard (for example Proton VPN's free
+  plan, which hands out WireGuard configs), as an optional real-internet check.
+- **SAML** against Keycloak (Apache-2.0) as the IdP in the Ubuntu VM, with the stand-in
+  GlobalProtect gateway and ocserv behind it, once Navigator's live pages exist.
+- **IKEv2** (when built) against strongSwan in the Ubuntu VM.
 - **Fuzzing:** every engine parser on the host (WireGuard messages, ESP, CSTP framing, the
   XML subset, HTTP heads), and cryptad's `.conf` importer.
 
@@ -635,7 +642,7 @@ tunnel, site-to-site, being a VPN server, multi-hop, post-quantum WireGuard (Ros
 | V2 | App scope: per-tunnel FIB, jaild epair FIB, helper inheritance, per-tunnel resolver | app scope gate (§11) passes |
 | V3 | `CLASS_VPN` + crypta-ctl, Curia VPN page (generate key, import file, apps list, block switch), Forum item | Curia frames of each; an app without `vpn-configure` is refused |
 | V4 | `crypta-ac` TLS-only: forms through Arca fields (`TAKE_VPN`), saved passwords, client certificates through Arca and Sigillum, posture answer without HostScan | ocserv gate: password, OTP and certificate sign-ins; roam resumes; hostile pushes refused |
-| V5 | `crypta-gp`: portal and gateway login, ESP in UDP, SSL fallback, HIP from true facts with the Curia report view | stand-in gateway gate; a real PAN-OS gateway if one is available |
+| V5 | `crypta-gp`: portal and gateway login, ESP in UDP, SSL fallback, HIP from true facts with the Curia report view | stand-in gateway gate, the stand-in also accepting OpenConnect's GP client |
 | V6 | SAML through a Navigator sign-in page and courier token capture | test IdP gate; needs the Navigator live-code lane |
 | V7 | On demand: AnyConnect DTLS, IKEv2, more vendors, the `if_wg` fast path | per need |
 
@@ -644,8 +651,5 @@ corporate VPNs in under the same walls.
 
 ### Questions for Shankar
 
-- Which corporate VPNs do you need to reach in practice (AnyConnect, GlobalProtect, both),
-  and does either sign in with SAML? Is there a real gateway we may test against, and does
-  it require HostScan or HIP?
-- Do you have a WireGuard server to use first (your own, or a provider), or should the
-  gates' Ubuntu VM be the only peer for now?
+- Which corporate VPN matters more, AnyConnect or GlobalProtect? That sets V4/V5 order.
+  (Answered 2026-11-15: no real company gateway; test locally, §11.)
