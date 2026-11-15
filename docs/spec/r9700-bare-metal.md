@@ -1581,3 +1581,29 @@ work (self-test, scrub).
   (likely the VRAM scrub). Kernel log for 21:13-22:00 and 08:00-10:00 lost
   to newsyslog rotation (keep 5): long runs should keep more. Logs:
   claude/project-thread-33aauq b6ce1c32 (docs/r9700-runs/fz24h-2963f5db/).
+  Correction (2026-11-15): the storms were not reset leftovers. Each was a
+  fuzzed ACQUIRE_MEM (w0 0xc0065802) whose GL2 range op covers the whole
+  VA; client page tables are empty by design, so every 4 KiB page raises
+  one fault IV. They looked post-reset only because the si-fuzz supervisor,
+  blocked in its canary run, missed "lost" and the blob kept going.
+- **2026-11-15 05:4x, 1 h fuzz diagnostic (5eff3373): per-VMID mute does not
+  work.** New si-client-test test 16 (that ACQUIRE_MEM) reproduces the
+  storm on demand: 3.8 M fault IVs, ~1865 IH overflows. Clearing the
+  CONTEXTn_CNTL fault-interrupt bits of the faulting VMID did not slow it.
+  5eff3373 also let a new queue inherit a muted CONTEXTn_CNTL through the
+  MES ADD_QUEUE template (fixed in 0069dc1f).
+- **2026-11-15 07:01 to 08:25, 1 h fuzz diagnostic (0069dc1f): PASS, storm
+  contained.** si-client-test 95/0 before and after, test 16 PASS both times
+  (+6161 fault IVs, +3 IH overflows, then one re-init, bystander VM clean).
+  si-fuzz RESULT: PASS (0 findings; 245790 calls, 13 re-inits, cap never
+  hit, 0 flush timeouts, 0 panics, card proven idle at detach). Findings
+  for the root fix: all 15 mute readbacks are CONTEXTn_CNTL 0x3aaa807, so
+  the seven interrupt-enable bits stay cleared (MES does not rewrite them),
+  yet GCR (client 0xf) no-retry faults keep raising IVs; every fault batch
+  of the run had 0 retry IVs. CONTEXTn_CNTL does not gate this source. The
+  containment is detection: >4096 IVs within 3 ms of the mute, then an
+  immediate mode 1 reset. Next candidate for a source-level stop:
+  GCVM_L2_PROTECTION_FAULT_CNTL.CLIENT_ID_NO_RETRY_FAULT_INTERRUPT for the
+  GCR client (global, not per VMID). The box's billing suspension during
+  the run cut only its network. Logs: claude/project-thread-33aauq ef569f1c
+  (docs/r9700-runs/fzdiag-0069dc1f/).
