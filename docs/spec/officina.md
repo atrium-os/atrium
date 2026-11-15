@@ -2542,6 +2542,53 @@ opens and draws its first slide reading one slide (debug build, well under 1 s).
   frame. Unit tests: monitor choice, letterboxing,
   transition and build tracks with their times, keys.
 
+### 16.38 Presenting speed on the CPU renderer (2026-11-15)
+
+The compute renderer (frescod in-process and `fresco-renderer` in split
+mode) now draws animated groups as **sprites** (`frescod/src/sprites.rs`,
+`pack.rs` promotion):
+
+- A group that an animation moves, fades, clips or uniformly scales becomes a
+  sprite: its content is rastered once into its own buffer at its own scale,
+  then each frame is composited (`fresco_compute::compose::over`, or
+  `over_scaled` bilinear for zooms). The window under the sprites is a
+  separate buffer. Each frame rebuilds only the rect that changed.
+- Slides stay sprites for 30 s after an animation. A hidden clipped group
+  (the next slide) is a sprite too. It is rastered ahead while nothing moves,
+  400 tiles per drawing, and frescod draws again every 8 ms until it is done.
+- The outgoing slide is taken from the window's last drawing (checked against
+  12 sample tiles), not rastered.
+- The window under a slide is rastered only where it shows. Tiles under an
+  opaque sprite wait for idle time.
+- Sprite tiles that no op touches are cleared, not rastered.
+- A packed part carries only the textures it draws.
+- A group whose content leaves the window in its own space is not a sprite;
+  it is drawn with the window, and the others stay sprites.
+- Screen compose copies opaque pixels on every thread and blends only where
+  needed.
+- An unchanged window is neither packed nor rastered.
+
+Mac VM (HVF, CPU renderer, 2×1280×720), the same show, worst frame gap:
+
+| | before | after |
+|---|---|---|
+| in-process | 130–136 ms, median frame ~60 ms | 84–99 ms, median render 1.6–2.2 ms |
+| split mode | — | 80–90 ms; 7 of 10 animations at 20–31 ms |
+
+Still **not 60 Hz** on that CPU. The frames that miss are:
+
+- the presenter window's slide change, which redraws the whole window
+  (45–59 ms) because two of its groups (the next-slide preview's items) draw
+  outside the window in their own space;
+- the first frame of some builds, which raster a new sprite of 1,600–2,000
+  tiles (17–47 ms) because a build item is not rastered ahead (only hidden
+  clipped groups are).
+
+Next steps: content buffers with a margin, so those groups can be sprites; and
+rastering ahead hidden build items. The GPU renderer figure is still to take.
+`FRESCOD_RENDER_TIMES=1` prints per-frame and per-sprite costs from both
+frescod and `fresco-renderer`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
