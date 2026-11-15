@@ -1,0 +1,21 @@
+[package]
+name = "folium-syntax"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Folium's PDF syntax layer (docs/spec/folium.md §5): lexer, objects, cross-reference tables and streams, object streams, a bounded repair scan, the standard filters and the standard security handler, every allocation under the budgets of §6. Reads hostile files; shared with Officina's export (§5.1)."
+
+[dependencies]
+# Pure-Rust deflate (no C zlib in a parser of hostile input).
+miniz_oxide = "0.8"
+# Primitives for the standard security handler only (D2).
+md-5 = "0.10"
+sha2 = "0.10"
+aes = "0.8"
+
+[dev-dependencies]
+miniz_oxide = "0.8"
+
+[profile.release]
+debug = 1

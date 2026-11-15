@@ -1,6 +1,7 @@
 # Folium: Atrium's own PDF reader
 
-Status: proposed 2026-11-15, for Shankar's review.
+Status: accepted 2026-11-15 as recommended (D1–D20); building. P1 built
+2026-11-15 (`folium-syntax`, `folium-doc`, `folium-dump`, fuzz target).
 Asked by Shankar (2026-11-15): after comparing an existing pure-Rust
 renderer with our own, "let's build our own... build the specs and let me
 review".
@@ -734,7 +735,7 @@ signature".
 
 | step | what | shows |
 |---|---|---|
-| **P1** | `folium-syntax` and `folium-doc`: objects, xref and recovery, all filters but JPX/JBIG2, decryption, page tree, outline, info; a host tool `folium-dump` (page count, objects, outline); budgets and fuzzing set up | page count and outline for the whole corpus with no panics; fuzz coverage reported |
+| **P1** | `folium-syntax` and `folium-doc`: objects, xref and recovery, all filters but the image codecs (DCT and CCITT go to the image layer with JPX/JBIG2, so they decode at the painted size, §7.1), decryption, page tree, outline, info; a host tool `folium-dump` (page count, objects, outline); budgets and fuzzing set up | page count and outline for the whole corpus with no panics; fuzz coverage reported |
 | **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1); `officina-pdf` moved onto the shared base (§5.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates; Officina's export gate unchanged and its output read back by Folium |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |

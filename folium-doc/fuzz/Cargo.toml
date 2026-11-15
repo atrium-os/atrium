@@ -1,0 +1,23 @@
+[package]
+name = "folium-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+folium-doc = { path = ".." }
+folium-syntax = { path = "../../folium-syntax" }
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -1,0 +1,13 @@
+[package]
+name = "folium-doc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Folium's document layer (docs/spec/folium.md §5): the page tree with inherited attributes, page boxes, outline, destinations, page labels and document info, over folium-syntax. Also the host tool folium-dump."
+
+[dependencies]
+folium-syntax = { path = "../folium-syntax" }
+
+[profile.release]
+debug = 1
