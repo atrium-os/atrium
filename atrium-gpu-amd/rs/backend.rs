@@ -19,6 +19,12 @@ use core::ffi::{c_int, c_void};
 use kpi::prelude::*;
 use kpi::ErrCode;
 
+/// A VM id's bit in the free rule's masks (si_client.c SI_VM_BIT): exact for ids below 64,
+/// shared above, where a shared bit only preempts more queues or waits longer (never less).
+pub fn vm_bit(id: u16) -> u64 {
+    1u64 << (id % 64)
+}
+
 /// A GPU device. The softc outlives every object made from it: module detach waits until the
 /// BO, VM and syncobj counts are zero and the cdevs are destroyed.
 #[derive(Copy, Clone)]
@@ -94,7 +100,7 @@ impl Dev {
     /// generation now (queue.rs). Busy queues hold up a BO's free.
     pub fn busy_snapshot(self, vmids: &[u16]) -> BusyAt {
         let mut at = self.state().queues.snapshot(self, Some(vmids));
-        let mine = vmids.iter().fold(0u32, |m, &v| if v < 32 { m | 1 << v } else { m });
+        let mine = vmids.iter().fold(0u64, |m, &v| m | vm_bit(v));
         at.uq = self.uq_vmids() & mine;
         at
     }
@@ -337,15 +343,15 @@ impl Dev {
         Ok(seqno)
     }
 
-    /// The free rule: preempt every user queue of the VMs in `mask` (kernel VMIDs) once.
-    /// Returns the VMIDs whose queues could not be (a BO of theirs waits for them to go).
+    /// The free rule: preempt every user queue of the VMs in `mask` (`vm_bit`s) once.
+    /// Returns the bits whose queues could not be (a BO of theirs waits for them to go).
     /// Sleeps (MES round trips).
-    pub fn uq_preempt(self, mask: u32) -> u32 {
+    pub fn uq_preempt(self, mask: u64) -> u64 {
         unsafe { sys::amd_si_uq_preempt(self.0, mask) }
     }
 
-    /// The kernel VMIDs (bit n = VMID n) whose VM has a user queue that may run.
-    pub fn uq_vmids(self) -> u32 {
+    /// The VMs (`vm_bit`s of their ids) that have a user queue that may run.
+    pub fn uq_vmids(self) -> u64 {
         unsafe { sys::amd_si_uq_vmids(self.0) }
     }
 

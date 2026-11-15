@@ -2417,7 +2417,13 @@ out:
  * The fence is in the client's own VM, so a client can lie about its own
  * queue's progress and nothing else's. Callers serialise per queue.
  */
-#define UQ2_GART_VA		0x00080000ull	/* after the kq's block */
+/* After MES's scratch (0x100000 + 2 x 0x40000): AMD_UQ_SLOTS blocks of
+ * UQ_G_SIZE (stage 6b; 8 slots used to fit at 0x80000). */
+#define UQ2_GART_VA		0x00200000ull
+CTASSERT(UQ2_GART_VA >= MES_SCRATCH_VA + 2 * MES_SCRATCH_SIZE);
+/* Kernel-mode doorbells stay inside the MEC range (db_mec_hi: 0x8a << 1). */
+CTASSERT(0x10u + AMD_UQ_SLOTS - 1 <= 0x8au);
+CTASSERT(UQ2_GART_VA + (uint64_t)AMD_UQ_SLOTS * UQ_G_SIZE <= (64ull << 20));
 #define UQ2_PAGES		3u
 #define UQ2_RING		0x0000u
 #define UQ2_WB			0x1000u
@@ -2703,9 +2709,9 @@ uq2_unmap_vm(struct amd_uq *q, u_int kvmid)
 		return;
 	for (i = 0; i < UQ2_PAGES; i++)
 		(void)amd_gmc12_vm_unmap(q->vm, q->va + i * PAGE_SIZE);
-	/* The kernel's VMID for the VM, and every MES VMID: any of them
-	 * may hold a translation of these pages. */
-	(void)amd_gmc12_vm_flush(q->m->gt, kvmid);
+	/* Every MES VMID may hold a translation of these pages (6b: the VM
+	 * is bound to no kernel VMID; `kvmid` is the driver's VM id). */
+	(void)kvmid;
 	for (vmid = 8; vmid < 16; vmid++)
 		(void)amd_gmc12_vm_flush(q->m->gt, vmid);
 	q->mapped_vm = false;
@@ -2792,8 +2798,11 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 		    AMD_VM_READ | AMD_VM_WRITE |
 		    ((m->sc->gpu_wx & AMD_WX_UQ) != 0 ? 0 : AMD_VM_EXEC))) != 0)
 			goto fail;
-	if ((err = amd_gmc12_vm_flush(gt, kvmid)) != 0)
-		goto fail;
+	/* A walk by another queue of the VM may have cached what these
+	 * pages replaced: flush every MES VMID (6b: no kernel VMID). */
+	for (i = 8; i < 16; i++)
+		if ((err = amd_gmc12_vm_flush(gt, i)) != 0)
+			goto fail;
 
 	uq_mqd_build(q->g + UQ_G_MQD, q->gva + UQ_G_MQD, va + UQ2_RING,
 	    va + UQ2_EOP, va + UQ2_WB, q->db);

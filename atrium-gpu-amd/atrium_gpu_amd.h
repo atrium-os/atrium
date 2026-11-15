@@ -950,7 +950,13 @@ int	amd_mes12_kq_fill(struct amd_kq *kq, uint64_t mc, uint64_t bytes,
 uint32_t amd_mes12_kq_gen(struct amd_kq *kq);
 uint32_t amd_mes12_kq_fence(struct amd_kq *kq);
 void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
-#define AMD_UQ_SLOTS	8	/* MES user queues for client queue fds */
+/*
+ * MES user queues for client queue fds, system-wide (stage 6b). Each is its
+ * own MES process; MES maps at most 8 of them onto VMIDs 8-15 at a time and
+ * time-shares the rest (oversubscription). Bounded by the doorbell BAR (one
+ * page per user-mode queue after pages 0-1) and the GART block range.
+ */
+#define AMD_UQ_SLOTS	64
 #define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
 /* A user-mode queue's doorbell: the first dword of its own doorbell BAR
  * page (2 + slot; page 0 is the kernel's, page 1 MES's aggregated ones). */

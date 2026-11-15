@@ -76,6 +76,14 @@
  *                writes go to the hub's one fault default page; the reader
  *                must not see the writer's pattern. With zero_va (default)
  *                empty VA reads as zeros without a fault.
+ *  18 scale      (stage 6b) SCALE_VMS VMs at once, each with a queue, and
+ *                SCALE_EXTRA more queues in the first VMs: far past the 7
+ *                VMs and 8 queues silicon used to have, and past the 8
+ *                VMIDs MES has, so MES time-shares them. Every queue runs
+ *                write_42 onto its own page, all submitted before any is
+ *                waited for, three rounds; every page must hold its own
+ *                64 x 42 and nothing else's. Raises isolation.queue_limit
+ *                for the run (root's queues count too) and puts it back.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -2120,6 +2128,138 @@ hostile_pm4(void)
 	job_close(&by);
 }
 
+/* 18: many VMs and queues at once (stage 6b). */
+#define SCALE_VMS	40
+#define SCALE_EXTRA	12
+#define QLIMIT_SYSCTL	"dev.atrium_gpu_amd.0.isolation.queue_limit"
+
+static void
+scale(void)
+{
+	static struct job j[SCALE_VMS];
+	int xq[SCALE_EXTRA], xso[SCALE_EXTRA], xout[SCALE_EXTRA];
+	uint64_t xva[SCALE_EXTRA], xval[SCALE_EXTRA];
+	int nv = 0, nx = 0, i, r, n, ms, round, bad, old, lim = 256;
+	size_t len = sizeof(old);
+	uint32_t first;
+	char name[16];
+
+	if (sysctlbyname(QLIMIT_SYSCTL, &old, &len, &lim, sizeof(lim)) != 0) {
+		check(0, "18 scale", "%s: %s", QLIMIT_SYSCTL, strerror(errno));
+		return;
+	}
+	for (i = 0; i < SCALE_VMS; i++) {
+		snprintf(name, sizeof(name), "18-%d", i);
+		if (job_open(&j[i], name) != 0) {
+			job_close(&j[i]);
+			break;
+		}
+		nv++;
+	}
+	check(nv == SCALE_VMS, "18 scale: VMs with a queue each open at once",
+	    "%d of %d (the 5c limit was 7 VMs, 8 queues)", nv, SCALE_VMS);
+	for (i = 0; i < SCALE_EXTRA && nv > 0; i++) {
+		struct job *h = &j[i % nv];
+
+		xq[i] = queue_create(h->vm);
+		xso[i] = syncobj();
+		xout[i] = bo_alloc(4096, 0);
+		xval[i] = 0;
+		if (xq[i] < 0 || xso[i] < 0 || xout[i] < 0 ||
+		    vm_bind(h->vm, xout[i], 0, &xva[i]) != 0) {
+			printf("18: extra queue %d: %s\n", i, strerror(errno));
+			if (xq[i] >= 0)
+				close(xq[i]);
+			if (xso[i] >= 0)
+				close(xso[i]);
+			if (xout[i] >= 0)
+				close(xout[i]);
+			break;
+		}
+		nx++;
+	}
+	check(nx == SCALE_EXTRA, "18 scale: more queues in the same VMs",
+	    "%d of %d (%d queues in all)", nx, SCALE_EXTRA, nv + nx);
+	for (round = 0; round < 3 && nv > 0; round++) {
+		bad = 0;
+		/* Everything goes before anything is waited for. Each job's
+		 * IB BO is its own, so a VM with an extra queue runs the IB
+		 * for the extra page from a second IB slot: the shared IB is
+		 * rewritten only once its first submit is done. */
+		for (i = 0; i < nv; i++)
+			if (poison(j[i].out, POISON_A + round + i) != 0 ||
+			    job_submit(&j[i], j[i].out_va) != 0) {
+				printf("18: round %d: submit %d: %s\n", round, i,
+				    strerror(errno));
+				bad++;
+			}
+		for (i = 0; i < nv; i++) {
+			r = job_wait(&j[i], 10000, &ms);
+			n = count(j[i].out, SIW42_OUT_VALUE, &first);
+			if (r != 0 || n != SIW42_OUT_DW) {
+				printf("18: round %d: VM %d: %s after %d ms, "
+				    "%d/64, out[0] %#x\n", round, i, r == 0 ?
+				    "ok" : strerror(r), ms, n, first);
+				bad++;
+			}
+		}
+		/* The extra queues: the same shader writing their own pages
+		 * (each VM's IB now free again), all at once, then checked. */
+		for (i = 0; i < nx; i++) {
+			struct job *h = &j[i % nv];
+
+			if (poison(xout[i], POISON_B + round + i) != 0 ||
+			    job_ib(h, xva[i]) != 0 ||
+			    queue_submit(xq[i], h->ib_va, SIW42_IB_DW, xso[i],
+			    ++xval[i], NULL) != 0) {
+				printf("18: round %d: extra %d: submit failed\n",
+				    round, i);
+				bad++;
+				continue;
+			}
+			/* One VM's IB holds one job's VAs: wait before the
+			 * next extra queue of the same VM rewrites it. */
+			{
+				struct job w = *h;
+
+				w.so = xso[i];
+				w.value = xval[i];
+				r = job_wait(&w, 10000, &ms);
+			}
+			n = count(xout[i], SIW42_OUT_VALUE, &first);
+			if (r != 0 || n != SIW42_OUT_DW) {
+				printf("18: round %d: extra queue %d: %s, %d/64, "
+				    "out[0] %#x\n", round, i, r == 0 ? "ok" :
+				    strerror(r), n, first);
+				bad++;
+			}
+		}
+		check(bad == 0, "18 scale: every queue writes 64 x 42 on its "
+		    "own page", "round %d: %d VMs, %d extra queues, %d bad",
+		    round, nv, nx, bad);
+	}
+	for (i = 0; i < nx; i++) {
+		close(xq[i]);
+		close(xso[i]);
+		close(xout[i]);
+	}
+	for (i = 0; i < nv; i++)
+		job_close(&j[i]);
+	(void)sysctlbyname(QLIMIT_SYSCTL, NULL, NULL, &old, sizeof(old));
+	/* Everything closed: a fresh VM and queue still work. */
+	{
+		struct job k;
+
+		if (job_open(&k, "18-after") == 0)
+			run_clean(&k, "18 scale: a fresh VM runs after they all "
+			    "closed");
+		else
+			check(0, "18 scale: a fresh VM after", "%s",
+			    strerror(errno));
+		job_close(&k);
+	}
+}
+
 int
 main(void)
 {
@@ -2426,6 +2566,10 @@ main(void)
 	/* 17: the shared fault default page (before 14 too). */
 	if (!skipped(17, "dummy page"))
 		dummy_page();
+
+	/* 18: many VMs and queues (6b; before 14's re-inits). */
+	if (!skipped(18, "scale"))
+		scale();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();

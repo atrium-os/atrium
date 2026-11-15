@@ -6,9 +6,12 @@
  * one gpusim runs under: VM, BO, queue and syncobj fds, quotas, deferred
  * frees, the hang watchdog. This file is what it reaches on silicon:
  *
- *   VMs     each VM fd gets one of the kernel's VMIDs (1-7; MES owns 8-15)
- *           and its own four-level GPUVM table (gmc12.c, 5b), so a VM's
- *           work can reach only what is bound in it.
+ *   VMs     each VM fd gets an id (1..SI_VM_IDS-1; stage 6b, it used to be
+ *           one of the kernel's VMIDs 1-7) and its own four-level GPUVM
+ *           table (gmc12.c, 5b), so a VM's work can reach only what is
+ *           bound in it. The hardware VMID is MES's to pick (8-15) when a
+ *           queue of the VM has work; the id names the VM to the driver
+ *           (lost-VM marks, the free rule's masks) and is no VMID.
  *   BOs     System memory (bus_dma pages, bo.c), or VRAM (5d) from the
  *           base's allocator (vram.c over the range amd_si_vram_init
  *           chose), mapped with VRAM PTEs. Freed VRAM is scrubbed before
@@ -52,8 +55,14 @@
 #include "atrium_gpu_amd_abi.h"
 #include "rs/glue.h"
 
-#define SI_KVMID_FIRST		1u
+#define SI_KVMID_FIRST		1u	/* the retired 5c-2a kernel-queue path */
 #define SI_KVMID_LAST		7u
+/* Client VM ids (stage 6b): 1..SI_VM_IDS-1, a bitmap of SI_VM_WORDS. */
+#define SI_VM_IDS		1024u
+#define SI_VM_WORDS		(SI_VM_IDS / 64)
+/* A VM id's bit in the free rule's masks (rs/bo.rs, rs/defer.rs): exact
+ * below 64, shared above (a shared bit only preempts or waits for more). */
+#define SI_VM_BIT(id)		(1ull << ((id) % 64))
 #define SI_STOP_WAIT_US		200000	/* fence after a wave kill (5b: ms) */
 #define IH_CLIENT_GFX		0x0au	/* SOC21: GFX (UTCL2 faults, SQ) */
 #define IH_CLIENT_GRBM_CP	0x14u
@@ -82,7 +91,7 @@ struct si_uq_owed {
 
 struct si_uq {
 	struct amd_uq *hw;		/* NULL: slot free */
-	uint16_t kvmid;			/* the VM's kernel VMID */
+	uint16_t kvmid;			/* the VM's id (not a VMID; 6b) */
 	bool	 busy;			/* slot taken (hw may still be NULL) */
 	bool	 seen_eop;		/* first routed EOP IV logged */
 	bool	 dead;			/* lost (fault, hang): work fails, EIO */
@@ -104,6 +113,9 @@ struct si_uq {
 /* The 5c-2a path (client SUBMIT on the kernel queue): off from 5c-2b. */
 static bool si_legacy_submit = false;
 
+/* b_uq is a 64-bit mask of slots. */
+CTASSERT(AMD_UQ_SLOTS <= 64);
+
 struct amd_si_client {
 	struct atrium_amd_softc *sc;
 	struct amd_gart *gt;
@@ -112,7 +124,8 @@ struct amd_si_client {
 	bool	 kq_held;		/* GfxOff hold for the queue's setup */
 
 	/* sc->lock */
-	uint32_t vmids;			/* kernel VMIDs in use, bit n = VMID n */
+	uint64_t vmids[SI_VM_WORDS];	/* VM ids in use */
+	u_int	 nvms;			/* ... how many */
 	uint64_t ring_va;		/* programmed: the next submit's ring */
 	uint16_t vmid;			/* ... and its VMID; 0 = none */
 	uint16_t last_vmid;		/* VMID of the last submit */
@@ -128,7 +141,7 @@ struct amd_si_client {
 	struct si_uq uq[AMD_UQ_SLOTS];
 	u_int	 uq_live;		/* slots taken, stale ones too */
 	u_int	 uq_cur;		/* ... of the current generation */
-	uint32_t vm_lost;		/* VMIDs of VMs a GPU re-init ended */
+	uint64_t vm_lost[SI_VM_WORDS];	/* ids of VMs a GPU re-init ended */
 	uint64_t reinits;		/* GPU re-inits that passed */
 	/* Reset blame (sc->lock): uids whose queue forced a whole-GPU reset
 	 * get no new queues until `until` (ticks). */
@@ -151,7 +164,7 @@ struct amd_si_client {
 	uint32_t b_cperr_hqd;		/* me1 pipe * 8 + queue that erred */
 	uint32_t b_cperr_iv0;		/* the first CP error's dword 0 */
 	uint32_t b_other_iv0, b_other_iv4;	/* the first unknown IV */
-	uint32_t b_uq;			/* user queues named by an EOP */
+	uint64_t b_uq;			/* user queues named by an EOP */
 	uint32_t b_fault_vmids;		/* every VMID that faulted */
 	uint32_t b_fault_retry;		/* of them, retry faults (data 1 bit 7) */
 	bool	 b_uq_scan;		/* an EOP named no queue: check all */
@@ -179,6 +192,33 @@ static bool
 fence_passed(uint32_t fence, uint32_t seq)
 {
 	return ((int32_t)(fence - seq) >= 0);
+}
+
+/* VM id bitmaps (6b). */
+static bool
+si_vm_has(const uint64_t *m, u_int id)
+{
+	return (id < SI_VM_IDS && (m[id / 64] & (1ull << (id % 64))) != 0);
+}
+
+static void
+si_vm_put(uint64_t *m, u_int id, bool on)
+{
+	if (on)
+		m[id / 64] |= 1ull << (id % 64);
+	else
+		m[id / 64] &= ~(1ull << (id % 64));
+}
+
+/* A VM of a generation a GPU re-init ended (lockless readers: a word
+ * read is atomic, and the bit only goes from 0 to 1 while the VM lives). */
+static bool
+si_vm_lost(struct amd_si_client *c, u_int id)
+{
+	if (id >= SI_VM_IDS)
+		return (true);
+	return ((atomic_load_64(&c->vm_lost[id / 64]) &
+	    (1ull << (id % 64))) != 0);
 }
 
 /* ---- the IV consumer (ih7.c), interrupt thread ---- */
@@ -479,7 +519,8 @@ si_recover(struct amd_si_client *c, const char *why, uid_t blamed)
 			c->uq[i].evict = false;
 		}
 	c->uq_cur = 0;
-	c->vm_lost |= c->vmids;
+	for (i = 0; i < SI_VM_WORDS; i++)
+		c->vm_lost[i] |= c->vmids[i];
 	c->vmid = 0;
 	c->last_seq = 0;
 	c->last_ndw = 0;
@@ -517,8 +558,8 @@ si_recover(struct amd_si_client *c, const char *why, uid_t blamed)
 		amd_vram_set_clear(sc, si_vram_clear);
 	c->reinits++;
 	device_printf(sc->dev, "si: GPU re-initialised (%ju so far): old "
-	    "VMs (%#x) and queues are lost (EIO) until closed; new ones run\n",
-	    (uintmax_t)c->reinits, c->vm_lost);
+	    "VMs (%u) and queues are lost (EIO) until closed; new ones run\n",
+	    (uintmax_t)c->reinits, c->nvms);
 }
 
 /*
@@ -639,7 +680,7 @@ si_iv_batch_end(struct amd_si_client *c)
 			    "retry), VMIDs %#x, first VMID %u at %#jx\n",
 			    c->b_fault, c->b_fault_retry, c->b_fault_vmids,
 			    c->b_fault_vmid, (uintmax_t)c->b_fault_addr);
-		if (c->vmids != 0 && amd_gmc12_fault_take(c->gt, &status,
+		if (c->nvms != 0 && amd_gmc12_fault_take(c->gt, &status,
 		    &addr) && flog)
 			amd_gmc12_fault_decode(c->gt, status, "client fault");
 		if (c->b_fault_vmid != 0 && c->b_fault_vmid == c->last_vmid &&
@@ -683,7 +724,7 @@ si_iv_batch_end(struct amd_si_client *c)
 	/* User queues: an EOP names its queue by doorbell (5c-2b). */
 	if (c->b_uq != 0 || c->b_uq_scan) {
 		for (i = 0; i < AMD_UQ_SLOTS; i++)
-			if (c->b_uq_scan || (c->b_uq & (1u << i)) != 0)
+			if (c->b_uq_scan || (c->b_uq & (1ull << i)) != 0)
 				c->uq_retired_iv += si_uq_retire(c, i);
 	}
 	sc->ih_eop_ring[q] = eop;
@@ -753,7 +794,7 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx, uint32_t ring)
 		db = ctx & 0x00ffffffu;
 		slot = si_db_slot(db);
 		if (slot < AMD_UQ_SLOTS) {
-			c->b_uq |= 1u << slot;
+			c->b_uq |= 1ull << slot;
 			c->uq_eop_routed++;
 			if (!c->uq[slot].seen_eop) {
 				c->uq[slot].seen_eop = true;
@@ -783,7 +824,7 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx, uint32_t ring)
 			db = ctx & 0x03ffffffu;
 			slot = si_db_slot(db);
 			if (slot < AMD_UQ_SLOTS)
-				c->b_uq |= 1u << slot;
+				c->b_uq |= 1ull << slot;
 			c->b_mes_q_db = db;
 		}
 		return;
@@ -1003,6 +1044,10 @@ amd_si_vm_unbind(struct atrium_amd_softc *sc, uint16_t vmid)
 	struct amd_si_client *c = sc->si_client;
 	int err;
 
+	/* 6b: client VMs are bound to no kernel VMID (MES binds them to
+	 * its own when a queue has work); only the retired 5c-2a path did. */
+	if (!si_legacy_submit)
+		return;
 	if (c == NULL || vmid < SI_KVMID_FIRST || vmid > SI_KVMID_LAST ||
 	    !amd_si_usable(sc))
 		return;
@@ -1013,24 +1058,36 @@ amd_si_vm_unbind(struct atrium_amd_softc *sc, uint16_t vmid)
 
 /* ---- client queue fds on MES user queues (5c-2b; rs/uqueue.rs) ---- */
 
-/* Kernel VMIDs whose VM has a live (or leaked) user queue. */
-static uint32_t
+/* The VMs (SI_VM_BIT of their ids) with a live (or leaked) user queue. */
+static uint64_t
 si_uq_vmids_locked(struct amd_si_client *c)
 {
-	uint32_t mask = 0;
+	uint64_t mask = 0;
 	u_int i;
 
 	for (i = 0; i < AMD_UQ_SLOTS; i++)
 		if (c->uq[i].busy && c->uq[i].kvmid != 0)
-			mask |= 1u << c->uq[i].kvmid;
+			mask |= SI_VM_BIT(c->uq[i].kvmid);
 	return (mask);
 }
 
-uint32_t
+/* Whether VM `id` has a live (or leaked) user queue: exact. */
+static bool
+si_vm_has_uq_locked(struct amd_si_client *c, u_int id)
+{
+	u_int i;
+
+	for (i = 0; i < AMD_UQ_SLOTS; i++)
+		if (c->uq[i].busy && c->uq[i].kvmid == id)
+			return (true);
+	return (false);
+}
+
+uint64_t
 amd_si_uq_vmids(struct atrium_amd_softc *sc)
 {
 	struct amd_si_client *c = sc->si_client;
-	uint32_t mask;
+	uint64_t mask;
 
 	if (!amd_is_si(sc) || c == NULL)
 		return (0);
@@ -1041,22 +1098,23 @@ amd_si_uq_vmids(struct atrium_amd_softc *sc)
 }
 
 /*
- * A PTE of the VM changed: flush its kernel VMID, and, while one of its
- * queues may run under a MES VMID (8-15), those too (MES does not tell us
- * which; the flush is per VMID, so flush them all).
+ * A PTE of VM `id` changed: while one of its queues may run under a MES
+ * VMID (8-15), flush those (MES does not tell us which; the flush is per
+ * VMID, so flush them all). With no queue nothing holds its translations:
+ * a queue's removal flushed them all (uq2_unmap_vm), and the VM is bound
+ * to no other context (6b).
  */
 static int
-si_vm_flush(struct amd_si_client *c, uint16_t kvmid)
+si_vm_flush(struct amd_si_client *c, uint16_t id)
 {
-	uint32_t mask;
 	u_int vmid;
-	int err;
+	bool has;
+	int err = 0;
 
-	err = amd_gmc12_vm_flush(c->gt, kvmid);
 	mtx_lock(&c->sc->lock);
-	mask = si_uq_vmids_locked(c);
+	has = si_vm_has_uq_locked(c, id);
 	mtx_unlock(&c->sc->lock);
-	if ((mask & (1u << kvmid)) != 0)
+	if (has)
 		for (vmid = 8; vmid < 16; vmid++)
 			if (amd_gmc12_vm_flush(c->gt, vmid) != 0)
 				err = ETIMEDOUT;
@@ -1081,12 +1139,11 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		return (EOPNOTSUPP);
 	if (c == NULL || !amd_si_usable(sc))
 		return (ENXIO);
-	if (vm->hw12 == NULL || vm->vmid < SI_KVMID_FIRST ||
-	    vm->vmid > SI_KVMID_LAST)
+	if (vm->hw12 == NULL || vm->vmid == 0 || vm->vmid >= SI_VM_IDS)
 		return (EINVAL);
 	sx_xlock(&c->uq_sx);
 	mtx_lock(&sc->lock);
-	if ((c->vm_lost & (1u << vm->vmid)) != 0) {
+	if (si_vm_lost(c, vm->vmid)) {
 		/* A VM of a generation a GPU re-init ended. */
 		mtx_unlock(&sc->lock);
 		sx_xunlock(&c->uq_sx);
@@ -1296,19 +1353,19 @@ amd_si_uq_submit(struct atrium_amd_softc *sc, int slot, uint64_t ib,
 }
 
 /*
- * The free rule (spec §4.5.1 step 4): a BO of the VMs in `mask` (kernel
- * VMIDs) lost its PTEs, flushed on every MES VMID. Preempt each of their
+ * The free rule (spec §4.5.1 step 4): a BO of the VMs in `mask` (SI_VM_BIT
+ * of their ids) lost its PTEs, flushed on every MES VMID. Preempt each of their
  * user queues once (MES SUSPEND to a kernel fence, then RESUME), so what
  * they had in flight is done with the old translations. Returns the VMIDs
  * not proven that way (a queue MES would not suspend, a lost queue, a
  * leaked one): the BO waits for their queues to go (defer.rs).
  */
-uint32_t
-amd_si_uq_preempt(struct atrium_amd_softc *sc, uint32_t mask)
+uint64_t
+amd_si_uq_preempt(struct atrium_amd_softc *sc, uint64_t mask)
 {
 	struct amd_si_client *c = sc->si_client;
 	struct amd_uq *hw;
-	uint32_t left = 0, bit;
+	uint64_t left = 0, bit;
 	u_int i;
 	bool busy, dead;
 	int err;
@@ -1318,7 +1375,7 @@ amd_si_uq_preempt(struct atrium_amd_softc *sc, uint32_t mask)
 	sx_xlock(&c->uq_sx);
 	for (i = 0; i < AMD_UQ_SLOTS; i++) {
 		mtx_lock(&sc->lock);
-		bit = c->uq[i].kvmid < 32 ? 1u << c->uq[i].kvmid : 0;
+		bit = c->uq[i].kvmid != 0 ? SI_VM_BIT(c->uq[i].kvmid) : 0;
 		busy = c->uq[i].busy && (mask & bit) != 0;
 		hw = c->uq[i].hw;
 		dead = c->uq[i].dead;
@@ -1422,7 +1479,7 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 {
 	struct amd_si_client *c = sc->si_client;
 	struct amd_vm12 *v;
-	uint16_t vmid;
+	u_int vmid;
 	int err;
 
 	if (c == NULL)
@@ -1440,15 +1497,18 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 		return (ENXIO);
 	}
 	mtx_lock(&sc->lock);
-	for (vmid = SI_KVMID_FIRST; vmid <= SI_KVMID_LAST; vmid++)
-		if ((c->vmids & (1u << vmid)) == 0)
+	/* The lowest free id: ids below 64 keep the free rule's masks exact. */
+	for (vmid = 1; vmid < SI_VM_IDS; vmid++)
+		if (!si_vm_has(c->vmids, vmid))
 			break;
-	if (vmid > SI_KVMID_LAST) {
+	if (vmid >= SI_VM_IDS) {
 		mtx_unlock(&sc->lock);
 		sx_sunlock(&c->uq_sx);
 		return (ENOSPC);
 	}
-	c->vmids |= 1u << vmid;
+	si_vm_put(c->vmids, vmid, true);
+	si_vm_put(c->vm_lost, vmid, false);
+	c->nvms++;
 	sc->vm_count++;
 	mtx_unlock(&sc->lock);
 
@@ -1461,11 +1521,8 @@ si_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 		goto fail;
 	if ((err = amd_si_gfx_hold(sc)) != 0)
 		goto fail;
-	if ((err = amd_gmc12_vm_bind(c->gt, vmid, v)) != 0) {
-		(void)amd_gmc12_vm_bind(c->gt, vmid, NULL);
-		amd_si_gfx_release(sc);
-		goto fail;
-	}
+	/* 6b: bound to no kernel VMID. Its queues give MES the tables'
+	 * base (ADD_QUEUE), and MES binds them to one of its VMIDs. */
 	vm->vmid = vmid;
 	vm->hw12 = v;
 	sx_sunlock(&c->uq_sx);
@@ -1475,7 +1532,8 @@ fail:
 		amd_gmc12_vm_fini(v);
 	free(v, M_DEVBUF);
 	mtx_lock(&sc->lock);
-	c->vmids &= ~(1u << vmid);
+	si_vm_put(c->vmids, vmid, false);
+	c->nvms--;
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
 	sx_sunlock(&c->uq_sx);
@@ -1499,8 +1557,9 @@ si_vm_teardown(struct atrium_amd_vm *vm)
 	}
 	amd_si_gfx_release(sc);
 	mtx_lock(&sc->lock);
-	c->vmids &= ~(1u << vm->vmid);
-	c->vm_lost &= ~(1u << vm->vmid);
+	si_vm_put(c->vmids, vm->vmid, false);
+	si_vm_put(c->vm_lost, vm->vmid, false);
+	c->nvms--;
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
 }
@@ -1538,7 +1597,7 @@ si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
 		return (EINVAL);
 	if (!amd_si_usable(vm->sc))
 		return (ENXIO);
-	if ((atomic_load_32(&c->vm_lost) & (1u << vm->vmid)) != 0)
+	if (si_vm_lost(c, vm->vmid))
 		return (EIO);	/* a VM a GPU re-init ended */
 	if (vram) {
 		/* A VRAM offset from the allocator: never outside its range
@@ -1788,7 +1847,7 @@ amd_si_client_down(struct atrium_amd_softc *sc)
 	} else
 		device_printf(sc->dev, "si: card not usable at client "
 		    "detach; the queue's block is leaked\n");
-	KASSERT(c->vmids == 0, ("si: VMs live at client detach"));
+	KASSERT(c->nvms == 0, ("si: VMs live at client detach"));
 	sc->si_client = NULL;
 	amd_si_client_attached(sc, false);
 	sx_destroy(&c->uq_sx);

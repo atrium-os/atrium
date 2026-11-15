@@ -35,10 +35,11 @@ const NHWQ: usize = sys::ATRIUM_AMD_NHWQ as usize;
 pub struct BusyAt {
     pub mask: u32,
     pub gens: [u64; NHWQ],
-    /// Kernel VMIDs of the BO's VMs whose user queues could not be preempted at the free
-    /// (spec §4.5.1 step 4: MES suspend/resume; bo.rs). The BO waits until those VMs have
-    /// none: a user queue's progress is only its own fence, which its client can write.
-    pub uq: u32,
+    /// The BO's VMs whose user queues could not be preempted at the free (spec §4.5.1
+    /// step 4: MES suspend/resume; bo.rs), as `vm_bit`s of their ids. The BO waits until
+    /// those VMs have none: a user queue's progress is only its own fence, which its client
+    /// can write.
+    pub uq: u64,
 }
 
 impl BusyAt {
