@@ -108,7 +108,9 @@ gets a path, a folder, the network, Arca or another file.
   masks, soft masks, transparency groups, blend modes, optional content
   (layers, with the default configuration).
 - Annotations drawn from their appearance streams (links, highlights,
-  notes, stamps, widgets).
+  notes, stamps, widgets), and **comments readable**: a comments pane
+  listing every markup annotation with its author, date, text, replies
+  and review state, in page order, each jumping to its place (§9.1).
 - Document: page labels, outline (bookmarks), named destinations, the
   document information and XMP title.
 - Text: extraction in reading order for find, copy and accessibility;
@@ -373,9 +375,9 @@ gets a separate binary and jail, and limend picks providers per role.
 
 ## 9. After reading
 
-- **P5 forms, annotations, save.** Filling AcroForm text, check, radio and
-  choice fields, regenerating appearance streams for the fields changed;
-  adding highlights, notes and ink. Saving is an **incremental update**
+- **P5 forms, comments and review, save.** Filling AcroForm text, check,
+  radio and choice fields, regenerating appearance streams for the fields
+  changed; adding, replying to and resolving comments (§9.1). Saving is an **incremental update**
   (a new revision appended, earlier bytes untouched, so earlier signatures
   stay valid), written with the object writer shared with `officina-pdf`.
   The app gets a read-write descriptor only when opened for edit
@@ -390,6 +392,46 @@ gets a separate binary and jail, and limend picks providers per role.
 - **P7 printing and accessibility.** The future print service takes PDF
   (officina.md §14); Folium renders pages for printers without PDF
   support. Tagged PDF structure feeds the accessibility outline.
+
+### 9.1 Annotations, comments and review (asked by Shankar, 2026-11-15)
+
+PDF's comments are markup annotations, and review is built from them:
+replies point at the comment they answer (`IRT`), and review states
+(Accepted, Rejected, Cancelled, Completed, and Marked) are small replies
+with a `State`. Folium uses exactly that, so a review done in Atrium PDF
+reads correctly in Acrobat, Preview or pdf.js, and theirs read in ours.
+
+- **Reading (P2–P3).** Every annotation is drawn from its appearance
+  stream; one without a stream (common in files from other tools) gets an
+  appearance made by us from its type, colour and rectangle. The comments
+  pane lists markup annotations (sticky notes, highlight, underline,
+  strike-out, squiggly, free text, ink, line, square, circle, polygon,
+  stamp, caret, file attachment) grouped into threads, with author, date,
+  the text, the review state per reviewer, and a filter by author, type
+  and state. Comment text is plain text to us: the rich-text form (`RC`,
+  an XHTML fragment) is reduced to text and paragraphs, never rendered as
+  HTML.
+- **Commenting (P5).** Select text and highlight, underline, strike out
+  or add a note; a sticky note anywhere; free text; ink with a pen or
+  finger; boxes, circles and arrows; stamps (Approved, Draft and so on,
+  drawn by us). Reply in the pane; set a state (Accepted, Rejected,
+  Completed); mark resolved. The author is the user's display name, from
+  their account. Each comment's appearance stream is written by us, so
+  other viewers show it as we do.
+- **Saving (P5).** Comments are saved as an incremental update, so the
+  original bytes and any earlier signatures stay intact. Comment-only
+  changes keep a signature valid where the signature's permissions allow
+  annotations (DocMDP level 3), and the viewer says when they don't.
+- **Comparing and summarizing (P5).** "Comments summary" makes a short
+  list (page, author, text, state) to copy or export as text. Comparing two
+  PDFs' text, as Write compares documents (officina.md §16.26), is later
+  work.
+- **With Officina.** Write's comments and tracked changes (officina.md
+  §16.21–16.27) go out in PDF export as markup annotations: a comment as a
+  note on its range with replies kept, and, when asked, insertions and
+  deletions as caret and strike-out marks. That export uses the same
+  annotation writer, and the round-trip gate (§5.1) checks Folium reads
+  them back.
 
 ## 10. Testing
 
@@ -433,7 +475,7 @@ gets a separate binary and jail, and limend picks providers per role.
 | **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1); `officina-pdf` moved onto the shared base (§5.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates; Officina's export gate unchanged and its output read back by Folium |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |
-| **P5** | forms, annotations, incremental save | edit gate |
+| **P5** | forms; comments and review (add, reply, state, resolve; Write's comments in its PDF export); incremental save | edit gate; a review done in Atrium PDF opens with the same threads and states in pdf.js and in a host-side reader |
 | **P6** | signature verification, PAdES signing via Sigillum | signs with the YubiKey and the InnaIT DSC token |
 | **P7** | print path, tagged PDF | with the print service |
 
@@ -457,3 +499,4 @@ several weeks and then ongoing as the corpus finds things.
 | D11 | Clip paths, which FILL can't express (its clip is a rectangle) | Add a path clip to Fresco's FILL (a clip path id the server rasterizes as a coverage mask), done by the Fresco thread during P2; until it lands, non-rectangular clips go through the CPU fallback |
 | D12 | Very detailed pages | Vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; the budget is tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
 | D13 | Folium and Officina | One base: `folium-syntax`, `folium-content`, `folium-font` (and later `folium-sign`) are used by both the reader and Officina's export; `officina-pdf` moves onto them in P2, its export gate unchanged before and after |
+| D14 | Comments and review | PDF's own markup annotations with replies (`IRT`) and review states, so reviews interoperate with other readers; read in P2–P3 (pane), written in P5 as incremental updates; Write's comments exported as annotations |
