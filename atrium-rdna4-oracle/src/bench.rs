@@ -68,6 +68,8 @@ pub struct Bench {
     pub inputs: Vec<(String, Vec<u8>)>,
     /// Output buffer both drivers must agree on (`kind == "files"`).
     pub compare: Option<&'static str>,
+    /// VGPR and SGPR compile caps it was built under (for `compile-time`).
+    pub caps: (u32, u32),
 }
 
 /// The glyph total `bench_tool gen glyph <nodes>` produces (same generator
@@ -161,6 +163,7 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
         stats: (bin.code.len(), bin.vgprs, bin.sgprs),
         inputs: vec![],
         compare: None,
+        caps: (crate::cases::cap(), crate::cases::scap()),
     })
 }
 
@@ -268,5 +271,47 @@ pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
         stats,
         inputs,
         compare: Some(if raster { "target" } else { "mask" }),
+        caps: (crate::cases::cap(), crate::cases::scap()),
     })
+}
+
+/// Wall time of `repeat` compiles of `spv` (entry 0) from SPIR-V to RDNA4
+/// machine code: frontend, GIR build, optimisation, verify and the backend,
+/// the same work RADV does in `vkCreateComputePipelines`. One thread, ns
+/// per compile, plus the code size of the last one (dwords).
+pub fn compile_ns(spv: &[u8], caps: (u32, u32), repeat: u32) -> Result<(Vec<u64>, usize), atrium_rdna4::Error> {
+    let opts = atrium_rdna4::Options { max_vgprs: Some(caps.0), max_sgprs: Some(caps.1), ..Default::default() };
+    let mut ns = vec![];
+    let mut dwords = 0;
+    for _ in 0..repeat.max(1) {
+        let t = std::time::Instant::now();
+        let k = std::hint::black_box(atrium_rdna4::Kernel::from_spirv(std::hint::black_box(spv), &opts)?);
+        ns.push(t.elapsed().as_nanos() as u64);
+        dwords = k.bin.code.len();
+    }
+    Ok((ns, dwords))
+}
+
+/// Where one compile's time goes, ns per stage: SPIR-V frontend, GIR build,
+/// GIR optimisation, GIR verify, RDNA4 backend (the same steps as
+/// `Kernel::from_spirv`).
+pub fn compile_stages(spv: &[u8], caps: (u32, u32)) -> [u64; 5] {
+    let mut t = std::time::Instant::now();
+    let mut lap = || {
+        let n = t.elapsed().as_nanos() as u64;
+        t = std::time::Instant::now();
+        n
+    };
+    let fo = atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() };
+    let m = atrium_spv_frontend::translate_with_options(spv, &fo).expect("frontend");
+    let a = lap();
+    let mut g = atrium_gir::build::build(&m, 0).expect("gir");
+    let b = lap();
+    atrium_gir::passes::optimize(&mut g);
+    let c = lap();
+    atrium_gir::verify::verify(&g).expect("verify");
+    let d = lap();
+    let co = atrium_rdna4_compiler::Options { max_vgprs: caps.0, max_sgprs: caps.1 };
+    std::hint::black_box(atrium_rdna4_compiler::compile_with(&g, &co).expect("backend"));
+    [a, b, c, d, lap()]
 }

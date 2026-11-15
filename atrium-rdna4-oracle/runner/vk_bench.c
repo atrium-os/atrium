@@ -12,11 +12,19 @@
  *   entry <name>                     entry point
  *   groups <x> <y> <z>               workgroups
  *   repeat <n>                       submissions (inits reloaded before each)
+ *   compile_repeat <n>               extra pipeline creations timed on the CPU
+ *                                    (each pipeline destroyed after); run with
+ *                                    RADV_DEBUG=nocache MESA_SHADER_CACHE_DISABLE=1
+ *                                    so every one really compiles
+ *   compile_only 1                   stop after the compile timing (no
+ *                                    dispatch; buffer inits may be "-")
  *   buf <binding> <size> <init|-> <name>
  *                                    storage buffer at set 0; written back to
  *                                    <name>.vk after the last run
  * Writes vk_result.txt: status, device, driver, gpu_ns (per run), gpu_ns_min,
- * gpu_ns_median.
+ * gpu_ns_median; compile_ns_first (the first vkCreateComputePipelines, CPU
+ * wall time) and, with compile_repeat, compile_ns (per creation),
+ * compile_ns_min, compile_ns_median and cache_env (the cache variables seen).
  *
  * SPDX-License-Identifier: MIT OR Apache-2.0
  */
@@ -24,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 
 #define MAXB 16
@@ -55,6 +64,14 @@ slurp(const char *name, size_t *n)
 	return b;
 }
 
+static uint64_t
+now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
 static int
 cmp_u64(const void *a, const void *b)
 {
@@ -77,7 +94,7 @@ int
 main(int argc, char **argv)
 {
 	char line[512], spv[256] = "", entry[64] = "main", p[4096];
-	uint32_t gx = 1, gy = 1, gz = 1, repeat = 1, nb = 0;
+	uint32_t gx = 1, gy = 1, gz = 1, repeat = 1, crepeat = 0, conly = 0, nb = 0;
 	struct buf bufs[MAXB];
 
 	if (argc != 2) { fprintf(stderr, "usage: vk_bench <dir>\n"); return 2; }
@@ -94,6 +111,8 @@ main(int argc, char **argv)
 		if (sscanf(line, "entry %63s", entry) == 1) continue;
 		if (sscanf(line, "groups %u %u %u", &gx, &gy, &gz) == 3) continue;
 		if (sscanf(line, "repeat %u", &repeat) == 1) continue;
+		if (sscanf(line, "compile_repeat %u", &crepeat) == 1) continue;
+		if (sscanf(line, "compile_only %u", &conly) == 1) continue;
 		if (nb < MAXB && sscanf(line, "buf %u %llu %255s %63s", &b->binding, &sz, b->init, b->name) == 4) {
 			b->size = sz;
 			nb++;
@@ -200,7 +219,31 @@ main(int argc, char **argv)
 			.stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = entry },
 		.layout = layout };
 	VkPipeline pipe;
+	uint64_t t0 = now_ns();
 	CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe));
+	fprintf(res, "compile_ns_first=%llu\n", (unsigned long long)(now_ns() - t0));
+	if (crepeat) {
+		/* Compile time: each creation from the same module, no pipeline cache. */
+		const char *rd = getenv("RADV_DEBUG"), *sc = getenv("MESA_SHADER_CACHE_DISABLE");
+		uint64_t *ct = calloc(crepeat, sizeof *ct);
+		for (uint32_t k = 0; k < crepeat; k++) {
+			VkPipeline p2;
+			t0 = now_ns();
+			CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &p2));
+			ct[k] = now_ns() - t0;
+			vkDestroyPipeline(dev, p2, NULL);
+		}
+		fprintf(res, "cache_env=RADV_DEBUG=%s MESA_SHADER_CACHE_DISABLE=%s\ncompile_ns=", rd ? rd : "", sc ? sc : "");
+		for (uint32_t k = 0; k < crepeat; k++) fprintf(res, "%s%llu", k ? "," : "", (unsigned long long)ct[k]);
+		qsort(ct, crepeat, sizeof *ct, cmp_u64);
+		fprintf(res, "\ncompile_ns_min=%llu\ncompile_ns_median=%llu\n", (unsigned long long)ct[0], (unsigned long long)ct[crepeat / 2]);
+		free(ct);
+	}
+	if (conly) {
+		fprintf(res, "status=ok\n");
+		fclose(res);
+		return 0;
+	}
 
 	VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nb ? nb : 1 };
 	VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
