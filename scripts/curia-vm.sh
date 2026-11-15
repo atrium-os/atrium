@@ -15,6 +15,8 @@
 #   sh scripts/curia-vm.sh status               # atrium-netctl status + list
 #   sh scripts/curia-vm.sh away                 # after `arca`: each service Settings talks to
 #                                               # dies or hangs and comes back; frames curia-away-*.png
+#   sh scripts/curia-vm.sh display              # forum-wm with its settings socket, then
+#                                               # Curia's Display page (C4a), one frame
 #   sh scripts/curia-vm.sh core [TEXT]          # Curia's core: TEXT (default the gate's
 #                                               # passphrase) must not be in it
 set -eu
@@ -36,7 +38,7 @@ frame() {
 }
 PUB=$(printf 'c%.0s' $(seq 64))
 AS=/atrium/sockets/arca/arcad.sock
-E2="FRESCO_SOCKET=$Sx/fresco.sock FRESCO_WM_SOCKET=$Sx/wm.sock FORUM_CTL_SOCKET=$Sx/ctl.sock"
+E2="FRESCO_SOCKET=$Sx/fresco.sock FRESCO_WM_SOCKET=$Sx/wm.sock FORUM_CTL_SOCKET=$Sx/ctl.sock DISPLAY_SETTINGS_SOCKET=$Sx/display.sock"
 case "${1:-}" in
 arca)
     for c in "limen --bin limend" "arca/arca-ui --bin arca-ui" "arca/arcad --bin arca-probe"; do
@@ -84,7 +86,7 @@ away)
     GAP=50 frame away-3-netconf-hung
     "$V" "pkill -CONT -x atrium-netconf"
     GAP=40 frame away-4-netconf-answers
-    inj "MOVE 70 149"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    inj "MOVE 70 187"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     "$V" "service atrium-dispensatord stop >/dev/null"
     GAP=10 frame away-5-devices-gone
     "$V" "service atrium-dispensatord start >/dev/null"
@@ -106,6 +108,14 @@ away)
     pid1=$("$V" "pgrep -x curia")
     [ "$pid0" = "$pid1" ] && echo "ok   Settings ran throughout (pid $pid0)" || echo "FAIL Settings restarted: $pid0 -> $pid1"
     "$V" "grep -E 'limend|frescod' $Sx/curia.log | tail -5" ;;
+display)
+    (cd "$ROOT/forum-wm" && RUSTFLAGS="$X" cargo build -q --release --target "$T" --bin forum-wm) || exit 1
+    "$V" "pkill -x forum-wm; sleep 2; true"
+    scp $K -P 2222 -q "$ROOT/forum-wm/target/$T/release/forum-wm" "root@localhost:$D/"
+    "$V" "cd $Sx && env $E2 daemon -f -o $Sx/wm.log $D/forum-wm </dev/null; sleep 4; chmod 666 $Sx/*.sock; ls -l $Sx/display.sock"
+    GAP=${GAP:-40} sh "$0" shot
+    inj "MOVE 70 149"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    GAP=8 frame display ;;
 core)
     t=${2:-correct horse battery staple}
     "$V" "rm -f $Sx/curia.core; gcore -c $Sx/curia.core \$(pgrep -x curia) >/dev/null 2>&1; ls -l $Sx/curia.core | awk '{print \"core:\", \$5, \"bytes\"}'

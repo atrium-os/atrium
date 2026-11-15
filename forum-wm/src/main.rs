@@ -276,6 +276,8 @@ fn main() -> io::Result<()> {
 
     spawn_status_server();
 
+    spawn_settings_server(Arc::clone(&core));
+
     let ctl = forum_ctl::default_socket_path();
     let ctl = ctl.to_string_lossy();
     eprintln!("forum-wm: serving forum-ctl at {ctl}");
@@ -751,6 +753,50 @@ fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
 /// named by the launch registry, so it cannot put an item up as another app.
 /// An unregistered peer is refused, unless `FORUM_STATUS_ANY=1` (development:
 /// it is named `uid:N`).
+/// Serve the settings socket (`display-settings`, Curia only; curia.md §11) on a
+/// thread of its own: the same core, but only `forum_ctl::settings_intent`s.
+/// Reaching it is the capability (Portcullis mounts the directory only into a
+/// jail holding `display-settings`). Each request has 5 s to arrive, so a stuck
+/// client cannot hold the core.
+fn spawn_settings_server(core: Core) {
+    use std::os::unix::net::UnixListener;
+    let path = forum_ctl::display_settings_socket_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => return eprintln!("forum-wm: settings: cannot bind {}: {e}", path.display()),
+    };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+    }
+    eprintln!("forum-wm: serving settings on {}", path.display());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let limit = Some(std::time::Duration::from_secs(5));
+            let _ = s.set_read_timeout(limit);
+            let _ = s.set_write_timeout(limit);
+            let Some(intent) = forum_ctl::read_frame(&mut s)
+                .ok()
+                .and_then(|b| forum_ctl::decode::<forum_ctl::Intent>(&b).ok())
+            else {
+                continue;
+            };
+            let reply = if forum_ctl::settings_intent(&intent) {
+                let mut g = core.lock().unwrap_or_else(|p| p.into_inner());
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                forum_wm::control::handle_intent(wm, conn, intent)
+            } else {
+                forum_ctl::Reply::Err { message: "not a settings request".into() }
+            };
+            if let Ok(bytes) = forum_ctl::encode(&reply) {
+                let _ = forum_ctl::write_frame(&mut s, &bytes);
+            }
+        }
+    });
+}
+
 fn spawn_status_server() {
     use std::os::unix::net::UnixListener;
     let path = forum_ctl::status_socket_path();

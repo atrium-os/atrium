@@ -2,7 +2,7 @@
 
 **Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
 to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
-passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9).
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -75,7 +75,7 @@ C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; si
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
 | C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
 | C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check. **Built 2026-11-15** (§9) |
-| C4 | further pages (Appearance, Sound, Displays, Apps' grants) | each with its own gate |
+| C4 | further pages: C4a Display (light/dark, text size, monitors), then Sound, Apps' grants | each with its own gate. **C4a built 2026-11-15** (§11) |
 
 ## 6. Decisions
 
@@ -191,3 +191,32 @@ one goes away, hangs, or comes back (Shankar, 2026-11-15).
   killed and back, stopped with SIGSTOP and continued, dispensatord stopped and started,
   arca-ui killed and back, limend killed and back. Each time the page showed the right
   notice and recovered without help, and Curia's pid never changed.
+
+## 11. C4a as built: the Display page (2026-11-15)
+
+- The settings are forum-wm's (it remembers them in forum-displays.state and tells
+  frescod), so the page asks forum-wm. Not over forum-ctl itself: that socket also
+  focuses windows, reserves the bar's and dock's space and takes back pads. forum-wm now
+  serves a second socket, `display-settings/display-settings.sock`, that takes only
+  `forum_ctl::settings_intent`s (modes, outputs, place, UI size, mirroring, light/dark,
+  text size, and the new read-only `GetAppearance` → `Reply::Appearance`) and answers
+  "not a settings request" to anything else. A request has 5 s to arrive. Reaching it is
+  the new restricted capability `display-settings` (Portcullis mounts the directory;
+  Curia only); `window-management` mounts it too, for forum-wm to serve it.
+- The page (`curia/src/display.rs`, `DispPage`): Appearance (Light, Dark), Text size (85% to
+  200%), then each monitor: its name ("Display 1 (built-in, 14″)"), size and scale, UI
+  size (Smaller, Default, Larger, 125%, 150%, 200%; a monitor's own default is sent as
+  "unset", so a laptop panel keeps starting at Smaller), the resolution of the main
+  monitor (forum-wm switches only that one's mode; one entry per size at its best
+  refresh), and for the others Place (left of, right of, above, below Display 1) and
+  mirroring. A new resolution goes back after 15 s unless "Keep" is pressed, since a
+  mode the monitor shows black can't be clicked away from. While the page shows, forum-wm
+  is asked again every 3 s (a monitor plugged in, the bar's light/dark switch). Without
+  forum-wm: "Display settings are not available / Forum is not running; trying again".
+- Live check in the cloud arm64 VM, 2026-11-15 (`curia-vm.sh display`): Dark and 130%
+  from the page change the whole session (the bar too); forum-wm killed, the page says
+  so, and after its restart comes back with 130% kept. `forum-ctl` pointed at the settings
+  socket gets `appearance`, `outputs` and `modes` answered and `surfaces`, `zoom` and
+  `take-back` refused. That VM's frescod is headless and lists no monitor ("No monitor is
+  connected"), so the monitor rows are checked only by the host tests so far; a run on
+  a machine with monitors (the Mac VM) is still to do.

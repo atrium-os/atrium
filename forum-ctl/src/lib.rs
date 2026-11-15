@@ -39,6 +39,43 @@ pub const JAILED_FORUM_CTL_SOCKET: &str = "/atrium/sockets/forum-ctl/forum-ctl.s
 /// Dev fallback when running bare (outside a jail).
 pub const DEV_FORUM_CTL_SOCKET: &str = "/tmp/forum-ctl.sock";
 
+/// The settings socket inside a jail (`display-settings`, Curia only): forum-wm
+/// serves only [`settings_intent`]s there, so the settings app can change
+/// displays, text size and light/dark but not focus, reserve space or take pads
+/// (curia.md §11).
+pub const JAILED_DISPLAY_SETTINGS_SOCKET: &str = "/atrium/sockets/display-settings/display-settings.sock";
+/// Dev fallback when running bare.
+pub const DEV_DISPLAY_SETTINGS_SOCKET: &str = "/tmp/display-settings.sock";
+
+/// `$DISPLAY_SETTINGS_SOCKET` → the in-jail path (if mounted) → the dev fallback.
+pub fn display_settings_socket_path() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("DISPLAY_SETTINGS_SOCKET") {
+        return std::path::PathBuf::from(s);
+    }
+    if std::path::Path::new("/atrium/sockets/display-settings").is_dir() {
+        return std::path::PathBuf::from(JAILED_DISPLAY_SETTINGS_SOCKET);
+    }
+    std::path::PathBuf::from(DEV_DISPLAY_SETTINGS_SOCKET)
+}
+
+/// The intents the settings socket takes: reading and changing the monitors,
+/// the system text size and light/dark. Nothing about windows, focus, the
+/// bar's or dock's space, pads or status items.
+pub fn settings_intent(i: &Intent) -> bool {
+    matches!(
+        i,
+        Intent::ListDisplayModes
+            | Intent::SetDisplayMode { .. }
+            | Intent::ListOutputs
+            | Intent::PlaceOutput { .. }
+            | Intent::SetOutputUiSize { .. }
+            | Intent::MirrorOutput { .. }
+            | Intent::SetAppearance { .. }
+            | Intent::SetTextSize { .. }
+            | Intent::GetAppearance
+    )
+}
+
 /// Resolve the forum-ctl socket path: `$FORUM_CTL_SOCKET` → the in-jail directory
 /// (if its mount is present) → the dev fallback. The same binary then works jailed
 /// and bare with no env wiring (the jail runs `exec.clean`, stripping env). forum-wm
@@ -148,6 +185,9 @@ pub enum Intent {
     /// opens or closes its Applications view on it. forum-wm keeps the
     /// connection and answers `Ack` at the next press; the dock asks again.
     WaitAppsKey,
+    /// "Light or dark, and how big is text?" Read-only; answered with
+    /// [`Reply::Appearance`].
+    GetAppearance,
 }
 
 /// The most a [`Intent::ReserveBottom`] may keep free, in points: a dock
@@ -509,6 +549,9 @@ pub enum Reply {
     /// The apps' bar items, in the order they were added — answer to
     /// `ListStatusItems`.
     StatusItems { items: Vec<StatusItem> },
+    /// The system appearance — answer to `GetAppearance`. `text_size_milli`
+    /// is one of `fresco_protocol::TEXT_SIZES` (1000 when never set).
+    Appearance { dark: bool, text_size_milli: u32 },
 }
 
 /// Encode a message for the wire.
@@ -577,6 +620,20 @@ mod tests {
         assert_eq!(decode::<Reply>(&encode(&Reply::Ack).unwrap()).unwrap(), Reply::Ack);
         let m = WmDisplayMode { width: 1920, height: 1080, refresh_mhz: 60000, preferred: true };
         let r = Reply::DisplayModes { modes: vec![m], current: 0 };
+        assert_eq!(decode::<Reply>(&encode(&r).unwrap()).unwrap(), r);
+    }
+
+    #[test]
+    fn the_settings_socket_takes_only_settings() {
+        assert!(settings_intent(&Intent::SetTextSize { text_size_milli: 1300 }));
+        assert!(settings_intent(&Intent::GetAppearance));
+        assert!(settings_intent(&Intent::SetOutputUiSize { output: 0, ui_size_milli: 1250 }));
+        for i in [Intent::ListSurfaces, Intent::Focus { surface_id: 1 }, Intent::ReserveTop { pt: 30 },
+                  Intent::ReserveBottom { pt: 200 }, Intent::TakeBackPad { device_id: 0 }, Intent::WaitAppsKey,
+                  Intent::ToggleZoom, Intent::MoveToNextMonitor] {
+            assert!(!settings_intent(&i), "{i:?}");
+        }
+        let r = Reply::Appearance { dark: true, text_size_milli: 1300 };
         assert_eq!(decode::<Reply>(&encode(&r).unwrap()).unwrap(), r);
     }
 }

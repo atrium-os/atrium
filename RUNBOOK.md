@@ -5596,6 +5596,7 @@ N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP
     sh scripts/curia-vm.sh arca          # after `bar`: Arca's passphrase field (alice unlocked, frescod with slots, limend, arca-ui), then Curia
     sh scripts/curia-vm.sh core          # the gate's passphrase must not be in a core of Curia
     sh scripts/curia-vm.sh away          # after `arca`: kill/hang atrium-netconf, dispensatord, arca-ui, limend; Curia must recover alone (frames scratch/curia-away-*.png)
+    sh scripts/curia-vm.sh display       # forum-wm with its settings socket ($Sx/display.sock), then Curia's Display page
     # Devices page: needs atrium-dispensatord with the devices socket on the VM (curia.md §9); then shot, click the sidebar's Devices
 
 - "The internet" sits beyond each network's router: lan.py answers HTTP for

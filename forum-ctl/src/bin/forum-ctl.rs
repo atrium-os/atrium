@@ -28,7 +28,7 @@ use forum_ctl::{default_socket_path, request, Intent, Reply};
 
 fn usage() -> ! {
     eprintln!("usage: forum-ctl surfaces | focus ID | modes | mode WxH[@Hz] | outputs \
-               | arrange A right-of|left-of|above|below B | move-monitor | ui-size N smaller|default|larger|F | text-size 85..200 | mirror A B|off \
+               | arrange A right-of|left-of|above|below B | move-monitor | ui-size N smaller|default|larger|F | text-size 85..200 | appearance | mirror A B|off \
                | zoom | span A [B..] [gap PX | bezel MM] | spans | span-app APP on|off \
                | pads | take-back [ID] | status | status-pick APP I | status-press APP ID");
     std::process::exit(2)
@@ -80,6 +80,7 @@ fn main() {
         ["text-size", p] => Intent::SetTextSize {
             text_size_milli: p.trim_end_matches('%').parse::<u32>().map(|p| p * 10).unwrap_or_else(|_| usage()),
         },
+        ["appearance"] => Intent::GetAppearance,
         ["zoom"] => Intent::ToggleZoom,
         ["spans"] => Intent::ListSpanGroups,
         ["span-app", app, on] => Intent::SetAppSpans {
@@ -152,6 +153,9 @@ fn main() {
             }
             if spanning != 0 { println!("window {spanning} spans"); }
             for a in no_span { println!("app {a} does not span"); }
+        }
+        Ok(Reply::Appearance { dark, text_size_milli }) => {
+            println!("{} text {}%", if dark { "dark" } else { "light" }, text_size_milli / 10);
         }
         Ok(Reply::StatusItems { items }) => {
             if items.is_empty() { println!("no status items"); }

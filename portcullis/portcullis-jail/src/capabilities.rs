@@ -63,6 +63,11 @@ pub fn apply_all(
         // dispensatord's device list (device-assignment.md §6.10).
         apply_socket("device-list.sock", jc, opts);
     }
+    if caps.display_settings == Some(true) {
+        // forum-wm's settings socket (curia.md §11): displays, text size,
+        // light/dark, and nothing else of forum-ctl.
+        apply_socket("display-settings.sock", jc, opts);
+    }
     // atrium-netconf's sockets (atrium-net.md §7.1): one per capability, so
     // the socket an app reaches is what it may do.
     if caps.network_read == Some(true) {
@@ -171,6 +176,8 @@ pub fn apply_window_management(jc: &mut JailConfig, opts: &BuildOpts) {
     // And the status-item socket apps with `status-item` reach it through
     // (forum-status-items.md).
     apply_socket("forum-status.sock", jc, opts);
+    // And the settings socket Curia reaches with `display-settings`.
+    apply_socket("display-settings.sock", jc, opts);
 }
 
 /// `forum-control` — a Forum chrome app (bar/dock/overview). It *connects* to the
@@ -400,12 +407,14 @@ mod tests {
         apply_window_management(&mut j, &opts());
         // Three per-service dir mounts: the dedicated wm socket (reachability =
         // the window-management grant), forum-ctl (which the WM serves to
-        // chrome) and forum-status (which the WM serves, so it must reach it).
-        assert_eq!(j.mounts.len(), 3);
+        // chrome), forum-status (which the WM serves, so it must reach it) and
+        // display-settings (which it serves to Curia).
+        assert_eq!(j.mounts.len(), 4);
         let srcs: Vec<_> = j.mounts.iter().map(|m| m.src.clone()).collect();
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/fresco-wm")));
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/forum-ctl")));
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/forum-status")));
+        assert!(srcs.contains(&PathBuf::from("/atrium/sockets/display-settings")));
     }
 
     #[test]

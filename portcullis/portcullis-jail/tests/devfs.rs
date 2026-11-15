@@ -91,6 +91,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         ("removable-media = true\n", ["removable-media"].as_slice()),
         ("session-lock = true\n", ["ostiarius-lock"].as_slice()),
         ("device-list = true\n", ["device-list"].as_slice()),
+        ("display-settings = true\n", ["display-settings"].as_slice()),
         ("network-read = true\n", ["network-read"].as_slice()),
         ("network-details = true\n", ["network-details"].as_slice()),
         ("network-wifi = true\n", ["network-wifi"].as_slice()),
@@ -106,13 +107,13 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         }
         let conf = jc.render_jail_conf();
         assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
-        for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
+        for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
             let n = sock(&jc, name);
             assert_eq!(n, want.contains(&name) as usize, "{caps}: {name} mounted {n} times");
         }
     }
     let jc = build(&manifest(""), &opts()).expect("builds");
-    for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
+    for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
         assert_eq!(sock(&jc, name), 0, "no capability, no {name} socket");
     }
 }

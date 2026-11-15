@@ -224,6 +224,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.device-list = true: restricted to Curia's Devices page (every device \
              and its hardware ids); requires explicit policy approval"));
     }
+    if c.display_settings == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.display-settings = true: restricted to the settings app (changes the \
+             monitors, the system text size and light/dark); requires explicit policy approval"));
+    }
     if c.network_configure == Some(true) {
         r.warnings.push(format!(
             "{ctx}.network-configure = true: restricted to the settings app (changes how \

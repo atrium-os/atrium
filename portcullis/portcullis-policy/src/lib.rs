@@ -196,6 +196,7 @@ pub struct CapabilityDelta {
     pub removable_media: bool,
     pub session_lock:    bool,
     pub device_list:     bool,
+    pub display_settings: bool,
     pub network_read: bool,
     pub network_details: bool,
     pub network_wifi: bool,
@@ -248,6 +249,7 @@ impl CapabilityDelta {
             && !self.removable_media
             && !self.session_lock
             && !self.device_list
+            && !self.display_settings
             && !self.network_read
             && !self.network_details
             && !self.network_wifi
@@ -296,6 +298,7 @@ impl CapabilityDelta {
         if self.removable_media { out.push("See the USB sticks plugged in and eject them".into()); }
         if self.session_lock    { out.push("Lock the screen".into()); }
         if self.device_list     { out.push("See every device in this machine and its hardware ids".into()); }
+        if self.display_settings { out.push("Change the displays, the text size and light or dark".into()); }
         if self.network_read { out.push("See whether you are online and how (Wi-Fi or cable, metered, signal)".into()); }
         if self.network_details { out.push("See the network interfaces, their addresses and routes".into()); }
         if self.network_wifi { out.push("Join and forget Wi-Fi networks, and see the name of the one in use".into()); }
@@ -395,6 +398,7 @@ pub fn compute_delta(
     bool_cap!(removable_media);
     bool_cap!(session_lock);
     bool_cap!(device_list);
+    bool_cap!(display_settings);
     bool_cap!(network_read);
     bool_cap!(network_details);
     bool_cap!(network_wifi);
@@ -599,6 +603,7 @@ mod tests {
             removable_media: None,
             session_lock: None,
             device_list: None,
+            display_settings: None,
             network_read: None,
             network_details: None,
             network_wifi: None,

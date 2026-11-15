@@ -1944,6 +1944,13 @@ pub mod control {
                     Err(e) => Reply::Err { message: e.to_string() },
                 }
             }
+            Intent::GetAppearance => match conn.appearance() {
+                Ok(a) => Reply::Appearance {
+                    dark: a.scheme == fresco_protocol::APPEARANCE_DARK,
+                    text_size_milli: if a.text_size_milli == 0 { 1000 } else { a.text_size_milli },
+                },
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
             Intent::SetTextSize { text_size_milli } => match wm.set_text_size(conn, text_size_milli) {
                 Ok(()) => Reply::Ack,
                 Err(e) => Reply::Err { message: e.to_string() },
@@ -3075,6 +3082,10 @@ mod tests {
         assert!(matches!(handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1234 }), Reply::Err { .. }));
         handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1000 });
         assert_eq!((conn.appearance.unwrap().text_size_milli, wm.displays.text_size_milli), (0, 0));
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::GetAppearance), Reply::Appearance { dark: false, text_size_milli: 1000 });
+        handle_intent(&mut wm, &mut conn, Intent::SetAppearance { dark: true });
+        handle_intent(&mut wm, &mut conn, Intent::SetTextSize { text_size_milli: 1500 });
+        assert_eq!(handle_intent(&mut wm, &mut conn, Intent::GetAppearance), Reply::Appearance { dark: true, text_size_milli: 1500 });
     }
 
     #[test]

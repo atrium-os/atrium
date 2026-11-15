@@ -212,6 +212,11 @@ pub struct Capabilities {
     /// restricted.
     #[serde(rename = "device-list")]
     pub device_list: Option<bool>,
+    /// The monitors (mode, UI size, arrangement, mirroring), the system text
+    /// size and light/dark, over forum-wm's `display-settings/` socket
+    /// (curia.md §11). Restricted to the settings app.
+    #[serde(rename = "display-settings")]
+    pub display_settings: Option<bool>,
     /// Whether the machine is online, over Wi-Fi or a cable, metered, and the
     /// Wi-Fi signal (atrium-net.md §7.1), over atrium-netconf's `network-read/`
     /// socket. No addresses and no network names.
@@ -474,6 +479,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         removable_media:  ovr.removable_media.or(base.removable_media),
         session_lock:     ovr.session_lock.or(base.session_lock),
         device_list:      ovr.device_list.or(base.device_list),
+        display_settings: ovr.display_settings.or(base.display_settings),
         network_read: ovr.network_read.or(base.network_read),
         network_details: ovr.network_details.or(base.network_details),
         network_wifi: ovr.network_wifi.or(base.network_wifi),

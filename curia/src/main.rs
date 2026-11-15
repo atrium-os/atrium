@@ -4,6 +4,8 @@
 //! Environment: `CURIA_NET_DIR` (atrium-netconf's sockets, /atrium/sockets),
 //! `CURIA_DEVICES_SOCK` (dispensatord's device list,
 //! /atrium/sockets/device-list/device-list.sock),
+//! `DISPLAY_SETTINGS_SOCKET` (forum-wm's settings socket,
+//! /atrium/sockets/display-settings/display-settings.sock),
 //! `CURIA_SIZE` (960x720), `CURIA_SECS` (quit after, for checks).
 
 use std::path::PathBuf;
@@ -91,6 +93,84 @@ fn follow_devices(tx: Sender<Result<Vec<atrium_devices::Device>, String>>) {
     });
 }
 
+/// One request to forum-wm's settings socket, 5 s at most.
+fn ask_wm(i: &forum_ctl::Intent) -> Result<forum_ctl::Reply, String> {
+    use std::os::unix::net::UnixStream;
+    let path = forum_ctl::display_settings_socket_path();
+    let io = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => "Forum is not running".to_string(),
+        std::io::ErrorKind::PermissionDenied => "Settings may not change the displays".to_string(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "Forum is not answering".to_string(),
+        _ => format!("Forum went away ({e})"),
+    };
+    let mut s = UnixStream::connect(&path).map_err(io)?;
+    let limit = Some(Duration::from_secs(5));
+    s.set_read_timeout(limit).and_then(|_| s.set_write_timeout(limit)).map_err(io)?;
+    let b = forum_ctl::encode(i).map_err(|e| e.to_string())?;
+    forum_ctl::write_frame(&mut s, &b).map_err(io)?;
+    let r = forum_ctl::read_frame(&mut s).map_err(io)?;
+    match forum_ctl::decode::<forum_ctl::Reply>(&r).map_err(|e| e.to_string())? {
+        forum_ctl::Reply::Err { message } => Err(message),
+        r => Ok(r),
+    }
+}
+
+/// The Display page's whole state.
+fn display_snapshot() -> Result<curia::display::Snapshot, String> {
+    use forum_ctl::{Intent, Reply};
+    let (dark, text_size) = match ask_wm(&Intent::GetAppearance)? {
+        Reply::Appearance { dark, text_size_milli } => (dark, text_size_milli),
+        r => return Err(format!("unexpected answer {r:?}")),
+    };
+    let outputs = match ask_wm(&Intent::ListOutputs)? {
+        Reply::Outputs { outputs } => outputs,
+        r => return Err(format!("unexpected answer {r:?}")),
+    };
+    // A machine with no monitor lit lists no modes; that is not an error.
+    let (modes, current) = match ask_wm(&Intent::ListDisplayModes) {
+        Ok(Reply::DisplayModes { modes, current }) => (modes, current),
+        _ => (Vec::new(), u32::MAX),
+    };
+    Ok(curia::display::Snapshot { dark, text_size, outputs, modes, current })
+}
+
+/// One Display page request on a thread of its own; one refresh at a time.
+fn display_work(w: curia::display::Want, tx: Sender<curia::display::Got>, refreshing: Arc<AtomicBool>) {
+    use curia::display::{Got as DGot, Place, Want as DWant};
+    use forum_ctl::{Intent, Side};
+    use std::sync::atomic::Ordering;
+    if w == DWant::Refresh && refreshing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let intent = match &w {
+            DWant::Refresh => {
+                let r = display_snapshot();
+                refreshing.store(false, Ordering::SeqCst);
+                let _ = tx.send(DGot::State(r));
+                return;
+            }
+            DWant::Dark(dark) => Intent::SetAppearance { dark: *dark },
+            DWant::TextSize(m) => Intent::SetTextSize { text_size_milli: *m },
+            DWant::UiSize { output, milli } => Intent::SetOutputUiSize { output: *output, ui_size_milli: *milli },
+            DWant::Mode { width, height, refresh_mhz } => Intent::SetDisplayMode { width: *width, height: *height, refresh_mhz: *refresh_mhz },
+            DWant::Place { output, place, of } => Intent::PlaceOutput {
+                output: *output,
+                side: match place {
+                    Place::LeftOf => Side::LeftOf,
+                    Place::RightOf => Side::RightOf,
+                    Place::Above => Side::Above,
+                    Place::Below => Side::Below,
+                },
+                of: *of,
+            },
+            DWant::Mirror { output, of } => Intent::MirrorOutput { output: *output, of: *of },
+        };
+        let result = ask_wm(&intent).map(|_| ());
+        let _ = tx.send(DGot::Done { what: w, result });
+    });
+}
+
 /// One request; joins can take up to a minute, so each runs on its own
 /// thread, and a second scan while one runs is dropped.
 fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
@@ -144,7 +224,11 @@ fn main() {
     let devs = Mutable::with_dirty(curia::devices::DevPage::default(), dirty.clone());
     let which = Mutable::with_dirty(curia::view::Which::default(), dirty.clone());
     let dev_scroll = Mutable::with_dirty(Default::default(), dirty.clone());
-    let view = CuriaView { which, page: page.clone(), devs: devs.clone(), dev_scroll, cred: cred.clone(), size: size.clone() };
+    let disp = Mutable::with_dirty(curia::display::DispPage::new(), dirty.clone());
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), cred: cred.clone(), size: size.clone() };
+    let (ptx, prx) = channel();
+    let refreshing = Arc::new(AtomicBool::new(false));
+    let mut next_disp = Instant::now();
     let (dtx, drx) = channel();
     follow_devices(dtx);
     // Arca's passphrase field comes through limend (curia.md §4). Without
@@ -191,6 +275,31 @@ fn main() {
         }
         while let Ok(r) = drx.try_recv() {
             curia::view::with_devs(&devs, |d| d.apply(r));
+        }
+        // The Display page: forum-wm is asked again every 3 s while it shows
+        // (a monitor plugged in, the bar's light/dark switch), and an unkept
+        // resolution goes back.
+        {
+            let mut d = disp.get_cloned();
+            let mut dch = false;
+            while let Ok(g) = prx.try_recv() {
+                d.apply(g);
+                dch = true;
+            }
+            if d.tick(Instant::now()) {
+                dch = true;
+            }
+            if which.get() == curia::view::Which::Display && Instant::now() >= next_disp {
+                next_disp = Instant::now() + Duration::from_secs(3);
+                d.wants.push(curia::display::Want::Refresh);
+            }
+            let wants = d.take_wants();
+            if dch || !wants.is_empty() {
+                disp.set(d);
+            }
+            for w in wants {
+                display_work(w, ptx.clone(), refreshing.clone());
+            }
         }
         let mut changed = false;
         let mut p = page.get_cloned();
