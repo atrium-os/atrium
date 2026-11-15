@@ -76,7 +76,8 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
     let (pw, ph) = (twips(g.width as i64), twips(g.height as i64));
 
     // Header and footer, in the margins.
-    for (hf, top) in [(&doc.header, true), (&doc.footer, false)] {
+    let (head, foot) = doc.margins_of(i);
+    for (hf, top) in [(head, true), (foot, false)] {
         let Some(hf) = hf else { continue };
         let from = twips(HEADER_FROM_EDGE as i64);
         let width = pw - mx - twips(g.margin_end as i64);
@@ -471,6 +472,29 @@ mod tests {
         let pic_y = items.iter().find_map(|i| if let Item::Image { y, h, .. } = i { Some(*y + *h) } else { None }).unwrap();
         // In the top margin.
         assert!(pic_y <= twips(d.page.margin_top as i64), "{pic_y}");
+    }
+
+    #[test]
+    fn first_and_even_pages_paint_their_own_footers() {
+        use crate::model::Margins;
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        for i in 0..150 {
+            d.push_para(&format!("Paragraph {i} of the body text."), 0, vec![]);
+        }
+        d.footer = Some(HeaderFooter::line("Odd {page}", Align::Center));
+        d.first_page = Some(Margins { header: None, footer: Some(HeaderFooter::line("Title", Align::Center)) });
+        d.even_pages = Some(Margins { header: None, footer: Some(HeaderFooter::line("Even {page}", Align::Center)) });
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        assert!(p.pages().len() >= 4);
+        let foot = |i: usize, cache: &mut LayoutCache| {
+            let items = paint_page(&d, p.pages(), i, p.width(), cache, &fonts, &Numbering::build(&d), "9");
+            items.iter().find_map(|x| if let Item::Glyphs(r) = x { Some(r.text.clone()) } else { None }).unwrap()
+        };
+        assert_eq!([foot(0, &mut cache), foot(1, &mut cache), foot(2, &mut cache), foot(3, &mut cache)], ["Title", "Even 2", "Odd 3", "Even 4"]);
     }
 
     #[test]

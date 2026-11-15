@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use officina_text::model::{Align, CharAttrs, HeaderFooter, ImageData, ObjectRef, Para, TextDoc};
+use officina_text::model::{Align, CharAttrs, HeaderFooter, ImageData, Margins, ObjectRef, Para, TextDoc};
 
 /// A 16 × 8 red PNG.
 pub const PNG: [u8; 76] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 16, 0, 0, 0, 8, 8, 2, 0, 0, 0, 127, 20, 232, 192, 0, 0, 0, 19, 73, 68, 65, 84, 120, 156, 99, 56, 33, 39, 71, 18, 98, 24, 213, 64, 11, 13, 0, 228, 85, 130, 1, 196, 74, 239, 141, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
@@ -12,7 +12,7 @@ pub const PNG: [u8; 76] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72,
 pub fn margins_doc() -> TextDoc {
     let mut d = TextDoc::new();
     d.blocks.remove(0);
-    for i in 0..60 {
+    for i in 0..120 {
         d.push_para(&format!("Body paragraph {i} with enough words to fill the line and run on."), 0, vec![]);
     }
     let img = d.images.add(ImageData { bytes: Arc::from(&PNG[..]), width: 16, height: 8 });
@@ -22,6 +22,11 @@ pub fn margins_doc() -> TextDoc {
     let num = Para { runs: vec![(0, 0), (5, bold), (11, 0)], ..Para::new(d.new_id(), "Page {page} of {pages}", 0) };
     d.header = Some(HeaderFooter { text: "Acme Ltd Quarterly report".into(), align: Align::Start, paras: vec![logo, Para::new(d.new_id(), "Quarterly report", 0)] });
     d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Start, paras: vec![num] });
+    // A title page with no header and a footer of its own; even pages
+    // with their own header and footer.
+    d.first_page = Some(Margins { header: None, footer: Some(HeaderFooter::line("Title page footer", Align::Center)) });
+    let even = Para::new(d.new_id(), "Even page {page}", 0);
+    d.even_pages = Some(Margins { header: Some(HeaderFooter::line("Even header", Align::End)), footer: Some(HeaderFooter { text: "Even page {page}".into(), align: Align::Start, paras: vec![even] }) });
     d
 }
 
@@ -53,6 +58,20 @@ pub fn check(r: &TextDoc) -> Vec<String> {
             }
         }
         p => bad.push(format!("footer {:?}", p.map(|p| &p.text))),
+    }
+    let line = |h: Option<&HeaderFooter>| h.map(|h| h.text.trim().to_string()).filter(|t| !t.is_empty());
+    match r.first_page.as_ref() {
+        Some(m) if line(m.header.as_ref()).is_none() && line(m.footer.as_ref()).as_deref() == Some("Title page footer") => {}
+        m => bad.push(format!("first page {m:?}")),
+    }
+    match r.even_pages.as_ref() {
+        Some(m) if line(m.header.as_ref()).as_deref() == Some("Even header") && line(m.footer.as_ref()).as_deref() == Some("Even page {page}") => {}
+        m => bad.push(format!("even pages {m:?}")),
+    }
+    // Which page shows which.
+    let shown = |i: usize| r.margins_of(i).1.map(|f| f.text.trim().to_string()).unwrap_or_default();
+    if [shown(0), shown(1), shown(2)] != ["Title page footer", "Even page {page}", "Page {page} of {pages}"] {
+        bad.push(format!("footers by page {:?}", [shown(0), shown(1), shown(2)]));
     }
     bad
 }

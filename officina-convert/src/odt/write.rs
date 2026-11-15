@@ -874,8 +874,12 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let page_layout = |name: &str, g: &officina_text::model::PageSetup| {
         let mut hf_styles = String::new();
         let mut margins = (g.margin_top, g.margin_bottom);
-        for (hf, tag, top) in [(&doc.header, "header-style", true), (&doc.footer, "footer-style", false)] {
-            if hf.is_some() {
+        let any = |top: bool| {
+            let pick = |m: &officina_text::model::Margins| if top { m.header.is_some() } else { m.footer.is_some() };
+            (if top { doc.header.is_some() } else { doc.footer.is_some() }) || doc.first_page.as_ref().is_some_and(pick) || doc.even_pages.as_ref().is_some_and(pick)
+        };
+        for (tag, top) in [("header-style", true), ("footer-style", false)] {
+            if any(top) {
                 let m = if top { g.margin_top } else { g.margin_bottom };
                 let edge = HEADER_FROM_EDGE.min(m);
                 let rest = (m - edge).max(0);
@@ -895,9 +899,32 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let mut layout = page_layout("pm1", &doc.page);
     let mut mp_styles = String::new();
     let mut master = String::from(r#"<style:master-page style:name="Standard" style:page-layout-name="pm1">"#);
-    for (i, (hf, tag)) in [(&doc.header, "header"), (&doc.footer, "footer")].into_iter().enumerate() {
-        if let Some(hf) = hf {
-            let sn = format!("MP{}", i + 1);
+    let mut mp = 0;
+    for (i, tag) in ["header", "footer"].into_iter().enumerate() {
+        fn pick(m: &officina_text::model::Margins, i: usize) -> Option<&HeaderFooter> {
+            if i == 0 { m.header.as_ref() } else { m.footer.as_ref() }
+        }
+        let main = if i == 0 { doc.header.as_ref() } else { doc.footer.as_ref() };
+        // ODF's order: the region, the left (even) pages', the first page's;
+        // a kind given with none shows nothing there.
+        let kinds = [("", Some(main)), ("-left", doc.even_pages.as_ref().map(|m| pick(m, i))), ("-first", doc.first_page.as_ref().map(|m| pick(m, i)))];
+        if kinds.iter().all(|k| k.1.flatten().is_none()) {
+            continue;
+        }
+        for (k, (suffix, hf)) in kinds.into_iter().enumerate() {
+            let el = format!("{tag}{suffix}");
+            let hf = match hf {
+                None => continue,
+                // Blank, as LibreOffice writes it (one shown off would turn
+                // the whole region off for it).
+                Some(None) => {
+                    let _ = write!(master, "<style:{el}><text:p/></style:{el}>");
+                    continue;
+                }
+                Some(Some(h)) => h,
+            };
+            mp += 1;
+            let sn = format!("MP{mp}");
             let align = match hf.align {
                 Align::Start => "start",
                 Align::Center => "center",
@@ -906,12 +933,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             };
             let _ = write!(mp_styles, r#"<style:style style:name="{sn}" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:text-align="{align}" fo:margin-top="0pt" fo:margin-bottom="0pt"/></style:style>"#);
             if hf.paras.is_empty() {
-                master += &margin(hf, tag, &sn);
+                master += &margin(hf, &el, &sn);
                 continue;
             }
             // Its own paragraphs: their automatic styles and pictures go
             // with the master page.
-            let mut ho = Out { prefix: if i == 0 { "MH" } else { "MF" }, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
+            let prefix = ["MH", "MHL", "MHF", "MF", "MFL", "MFF"][i * 3 + k];
+            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
             let mut x = String::new();
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -921,7 +949,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 ho.para_of(&q, &mut x);
             }
             let x = x.replace("{pages}", "<text:page-count>1</text:page-count>").replace("{page}", r#"<text:page-number text:select-page="current">1</text:page-number>"#);
-            let _ = write!(master, "<style:{tag}>{x}</style:{tag}>");
+            let _ = write!(master, "<style:{el}>{x}</style:{el}>");
             mp_styles += &ho.auto;
             for f in ho.fonts {
                 if !o.fonts.contains(&f) {

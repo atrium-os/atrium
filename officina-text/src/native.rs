@@ -14,7 +14,7 @@
 //! | 9 | REVISIONS | whether edits are tracked; revisions: id, author, date, change set, its name |
 //! | 10 | DELETIONS | tracked deletions a tombstone holds: id, revision, pieces (paragraph, text, runs) |
 //! | 11 | CONFLICTS | merge conflicts: id, then the other version as a deletion's encoding |
-//! | 12 | MARGINS | the header's then the footer's own paragraphs (count, blocks), when either has them |
+//! | 12 | MARGINS | the header's then the footer's own paragraphs (count, blocks); then the first page's and even pages' own header and footer, each absent (0) or present (1: both lines, then their paragraphs) |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -733,6 +733,34 @@ fn encode_hf(w: &mut Writer, hf: &Option<HeaderFooter>) {
     }
 }
 
+/// A header's and a footer's own paragraphs (a count each, then blocks).
+fn encode_margin_paras(w: &mut Writer, header: &Option<HeaderFooter>, footer: &Option<HeaderFooter>) {
+    for hf in [header, footer] {
+        let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
+        w.var(paras.len() as u64);
+        for p in paras {
+            encode_para(w, p);
+        }
+    }
+}
+
+fn decode_margin_paras(r: &mut Reader, attrs: usize, styles: usize, header: &mut Option<HeaderFooter>, footer: &mut Option<HeaderFooter>) -> Result<(), WireError> {
+    for hf in [header, footer] {
+        let k = r.count("margin paragraphs", MAX_MARGIN_PARAS as u64, 7)?;
+        let mut paras = Vec::with_capacity(k);
+        for _ in 0..k {
+            let Block::Para(p) = decode_block(r, attrs, styles)?;
+            paras.push(p);
+        }
+        match hf {
+            Some(h) => h.paras = paras,
+            None if paras.is_empty() => {}
+            None => return Err(WireError::Invalid("margin paragraphs without a header")),
+        }
+    }
+    Ok(())
+}
+
 fn decode_hf(r: &mut Reader) -> Result<Option<HeaderFooter>, WireError> {
     Ok(match r.u8()? {
         0 => None,
@@ -826,13 +854,7 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             encode_page(&mut w, page);
             encode_hf(&mut w, header);
             encode_hf(&mut w, footer);
-            for hf in [header, footer] {
-                let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
-                w.var(paras.len() as u64);
-                for p in paras {
-                    encode_para(&mut w, p);
-                }
-            }
+            encode_margin_paras(&mut w, header, footer);
         }
         TextOp::SetComment { id, comment } => {
             w.u8(10);
@@ -955,19 +977,7 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
             let mut footer = decode_hf(&mut r)?;
             // Their own paragraphs (absent in older journals).
             if !r.is_empty() {
-                for hf in [&mut header, &mut footer] {
-                    let k = r.count("margin paragraphs", MAX_MARGIN_PARAS as u64, 7)?;
-                    let mut paras = Vec::with_capacity(k);
-                    for _ in 0..k {
-                        let Block::Para(p) = decode_block(&mut r, attrs, styles)?;
-                        paras.push(p);
-                    }
-                    match hf {
-                        Some(h) => h.paras = paras,
-                        None if paras.is_empty() => {}
-                        None => return Err(WireError::Invalid("margin paragraphs without a header")),
-                    }
-                }
+                decode_margin_paras(&mut r, attrs, styles, &mut header, &mut footer)?;
             }
             TextOp::SetPage { page, header, footer }
         }
@@ -1165,13 +1175,18 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         c.add(CONFLICTS, &w.into_bytes())?;
     }
 
-    if [&doc.header, &doc.footer].iter().any(|h| h.as_ref().is_some_and(|h| !h.paras.is_empty())) {
+    if [&doc.header, &doc.footer].iter().any(|h| h.as_ref().is_some_and(|h| !h.paras.is_empty())) || doc.first_page.is_some() || doc.even_pages.is_some() {
         let mut w = Writer::new();
-        for hf in [&doc.header, &doc.footer] {
-            let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
-            w.var(paras.len() as u64);
-            for p in paras {
-                encode_para(&mut w, p);
+        encode_margin_paras(&mut w, &doc.header, &doc.footer);
+        for m in [&doc.first_page, &doc.even_pages] {
+            match m {
+                None => w.u8(0),
+                Some(m) => {
+                    w.u8(1);
+                    encode_hf(&mut w, &m.header);
+                    encode_hf(&mut w, &m.footer);
+                    encode_margin_paras(&mut w, &m.header, &m.footer);
+                }
             }
         }
         c.add(MARGINS, &w.into_bytes())?;
@@ -1426,21 +1441,36 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
     }
     if c.entries().iter().any(|e| e.kind == MARGINS) {
         let mut r = Reader::new(one(MARGINS, "MARGINS chunk")?);
-        for header in [true, false] {
-            let k = r.count("margin paragraphs", MAX_MARGIN_PARAS as u64, 7)?;
-            let mut paras = Vec::with_capacity(k);
-            for _ in 0..k {
-                let Block::Para(p) = decode_block(&mut r, attrs, styles)?;
+        let mut check = |hf: &Option<HeaderFooter>| -> Result<(), LoadError> {
+            for p in hf.iter().flat_map(|h| h.paras.iter()) {
                 if !ids.insert(p.id) || p.id >= watermark {
                     return Err(LoadError::Bad("block id"));
                 }
-                paras.push(p);
             }
-            let hf = if header { &mut doc.header } else { &mut doc.footer };
-            match hf {
-                Some(h) => h.paras = paras,
-                None if paras.is_empty() => {}
-                None => return Err(LoadError::Bad("margin paragraphs without a header")),
+            Ok(())
+        };
+        decode_margin_paras(&mut r, attrs, styles, &mut doc.header, &mut doc.footer)?;
+        check(&doc.header)?;
+        check(&doc.footer)?;
+        // The first page's and even pages' own (absent in older files).
+        if !r.is_empty() {
+            for first in [true, false] {
+                let m = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let (mut header, mut footer) = (decode_hf(&mut r)?, decode_hf(&mut r)?);
+                        decode_margin_paras(&mut r, attrs, styles, &mut header, &mut footer)?;
+                        check(&header)?;
+                        check(&footer)?;
+                        Some(crate::model::Margins { header, footer })
+                    }
+                    _ => return Err(LoadError::Bad("page margins")),
+                };
+                if first {
+                    doc.first_page = m;
+                } else {
+                    doc.even_pages = m;
+                }
             }
         }
     }
@@ -1509,6 +1539,10 @@ mod tests {
         // A header of its own paragraphs (with a picture).
         let hp = Para { runs: vec![(0, pic), (3, 0)], ..Para::new(d.new_id(), "\u{FFFC} Acme {page}", 0) };
         d.header = Some(HeaderFooter { text: "Acme {page}".into(), align: Align::Start, paras: vec![hp, Para::new(d.new_id(), "second", 0)] });
+        // A title page without a header; even pages with their own footer.
+        d.first_page = Some(crate::model::Margins { header: None, footer: Some(HeaderFooter::line("Title page", Align::Center)) });
+        let ep = Para::new(d.new_id(), "Even {page}", 0);
+        d.even_pages = Some(crate::model::Margins { header: d.header.clone().map(|mut h| { h.paras.clear(); h }), footer: Some(HeaderFooter { text: "Even {page}".into(), align: Align::End, paras: vec![ep] }) });
         d.take_changes();
         d
     }
@@ -1523,6 +1557,7 @@ mod tests {
         }
         assert_eq!(a.id_watermark(), b.id_watermark());
         assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
+        assert_eq!((&a.first_page, &a.even_pages), (&b.first_page, &b.even_pages));
         assert_eq!(a.images.iter().collect::<Vec<_>>(), b.images.iter().collect::<Vec<_>>());
         assert_eq!(a.notes.iter().collect::<Vec<_>>(), b.notes.iter().collect::<Vec<_>>());
         assert_eq!(a.note_numbers(), b.note_numbers());

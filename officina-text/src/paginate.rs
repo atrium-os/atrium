@@ -172,6 +172,10 @@ pub struct Paginator {
     /// new page to start where one of them did.
     old: Vec<Page>,
     old_at: usize,
+    /// The page number the first old page had.
+    old_base: usize,
+    /// Even pages have a header of their own.
+    even_parity: bool,
     settle: usize,
     delta: isize,
     /// Where pagination had got to when the edit came, in new block numbers:
@@ -197,13 +201,14 @@ pub struct Paginator {
     cur: PageSetup,
 }
 
-/// `g` with its top and bottom margins grown to hold a header or footer of
+/// `g` for page `page` (from 0) with its top and bottom margins grown to hold a header or footer of
 /// its own paragraphs taller than they leave (the text starts below the
 /// header, as Word and LibreOffice have it).
-pub fn grown(doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, mut g: PageSetup) -> PageSetup {
+pub fn grown(doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, mut g: PageSetup, page: usize) -> PageSetup {
     let w = content_width(&g).max(crate::LU);
-    for (hf, top) in [(&doc.header, true), (&doc.footer, false)] {
-        let Some(hf) = hf.as_ref().filter(|h| !h.paras.is_empty()) else { continue };
+    let (head, foot) = doc.margins_of(page);
+    for (hf, top) in [(head, true), (foot, false)] {
+        let Some(hf) = hf.filter(|h| !h.paras.is_empty()) else { continue };
         let h: i64 = hf.paras.iter().map(|p| cache.get(doc, p, w, fonts).height).sum();
         // Layout units to twips, rounded up; at most half the page.
         let need = (crate::model::HEADER_FROM_EDGE as i64 + (h * 20 + crate::LU - 1) / crate::LU).min(g.height as i64 / 2) as i32;
@@ -224,6 +229,7 @@ impl Paginator {
     /// Throws the pages away (page setup changed).
     pub fn reset(&mut self, doc: &TextDoc) {
         self.base = doc.page;
+        self.even_parity = doc.even_pages.is_some();
         self.set_page(doc.page);
         self.wraps.clear();
         self.sections = sections_of(doc);
@@ -362,7 +368,8 @@ impl Paginator {
             self.cursor = Some(from);
             return;
         }
-        self.old = self.pages.split_off(k.min(self.pages.len()));
+        self.old_base = k.min(self.pages.len());
+        self.old = self.pages.split_off(self.old_base);
         self.old_at = 0;
         self.settle = e.last.max(section_change);
         self.delta = e.delta;
@@ -400,7 +407,7 @@ impl Paginator {
             return false;
         }
         let g = self.setup_at(at.block.min(n_blocks.saturating_sub(1)));
-        self.set_page(grown(doc, cache, fonts, g));
+        self.set_page(grown(doc, cache, fonts, g, self.pages.len()));
         let (page, next) = self.page(doc, cache, fonts, at);
         for sl in &page.slices {
             let Some(id) = doc.blocks.get(sl.block).map(|b| b.id()) else { continue };
@@ -445,7 +452,10 @@ impl Paginator {
         while self.old_at < self.old.len() && self.old[self.old_at].start < want {
             self.old_at += 1;
         }
-        if self.old_at < self.old.len() && self.old[self.old_at].start == want {
+        // With even pages' own header, a page moved by one page number has
+        // another header (and may have other margins): lay on.
+        let parity = self.even_parity && (self.pages.len() + self.old_base + self.old_at) % 2 == 1;
+        if self.old_at < self.old.len() && self.old[self.old_at].start == want && !parity {
             let delta = self.delta;
             let mut rest = self.old.split_off(self.old_at);
             if delta != 0 {

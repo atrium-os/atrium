@@ -3146,8 +3146,23 @@ gate, which had fallen to 82/84 on a 30° turned box, is 84/84 again.
 - **Tables in headers**: headers lay out no tables, so each row becomes one
   line, its cells apart by tabs (a cell a paragraph stacked a three-column
   row three lines high and pushed the text far down).
-- **Not yet**: first-page and even-page headers (the default one is kept);
-  anchored pictures and drawn shapes in headers drawn in line or left out;
+- **First and even pages** (same day): `TextDoc.first_page` and
+  `even_pages` hold their own header and footer (either none: blank there);
+  `margins_of(page)` picks: the first page's on page 1, even pages' on even
+  pages, else the default. Pagination grows each page's margins for the
+  header it shows and won't take old pages whose number moved by one when
+  even pages differ. `.docx`: `w:titlePg` with the `first` references and
+  `w:evenAndOddHeaders` with the `even` ones, both ways (a kind with none
+  written as a blank part). `.odt`: `style:header-first` (and
+  `loext:header-first`) and `style:header-left`, both ways (a blank one as
+  an empty paragraph, as LibreOffice writes it; `style:display="false"`
+  there would turn the region off). Native file: after the MARGINS chunk's
+  paragraphs. Gates: LibreOffice both ways across formats 4/4 with a
+  blank-header title page and even pages' own; LibreOffice's PDF and ours
+  show the same header and footer on pages 1–3; 2,551 corpus documents, 149
+  with a first page's own, 34 with even pages' own, all through the native
+  file unchanged, no panics.
+- **Not yet**: anchored pictures and drawn shapes in headers drawn in line or left out;
   headers are not edited in Write beyond the page-number footer.
 
 Gates: our files through LibreOffice both ways across formats 4/4 (lines,

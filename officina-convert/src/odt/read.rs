@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, Margins, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -370,7 +370,7 @@ struct Reader<'a> {
     /// Reading a header or footer: page fields become placeholders.
     in_margin: bool,
     /// The header and footer, read for their paragraphs last.
-    margin_els: [Option<El>; 2],
+    margin_els: Vec<(usize, bool, El)>,
     /// Annotations by `office:name`, for their ends and replies.
     annotations: HashMap<String, CommentId>,
     /// Replies and the names of what they answer.
@@ -1310,8 +1310,7 @@ impl<'a> Reader<'a> {
     fn read_margins(&mut self) {
         self.in_note = true;
         self.in_margin = true;
-        for k in 0..2 {
-            let Some(h) = self.margin_els[k].take() else { continue };
+        for (kind, header, h) in std::mem::take(&mut self.margin_els) {
             let before = self.doc.blocks.len();
             self.box_content(&h, None);
             let mut paras = Vec::new();
@@ -1330,8 +1329,7 @@ impl<'a> Reader<'a> {
                 self.rep.note(Kind::Approximate, "very long headers and footers (cut)");
                 paras.truncate(MAX_MARGIN_PARAS);
             }
-            let hf = if k == 0 { &mut self.doc.header } else { &mut self.doc.footer };
-            if let Some(h) = hf {
+            if let Some(h) = self.margin_slot(kind, header) {
                 h.paras = paras;
             }
         }
@@ -1604,44 +1602,61 @@ impl<'a> Reader<'a> {
             }
         }
         for (tag, header) in [("style:header", true), ("style:footer", false)] {
-            let Some(h) = master.child(tag) else { continue };
-            if h.attr("style:display") == Some("false") {
+            let Some(main) = master.child(tag) else { continue };
+            if main.attr("style:display") == Some("false") {
                 continue;
             }
-            if master.child(&format!("{tag}-left")).is_some() || master.child(&format!("{tag}-first")).is_some() {
-                self.rep.note(Kind::Approximate, "first-page and even-page headers and footers (the default one kept)");
-            }
-            let mut text = String::new();
-            let mut align = Align::Start;
-            let mut first = true;
-            for p in h.els().filter(|x| x.name == "text:p" || x.name == "text:h") {
-                let mut q = Para::default();
-                self.inline(p, &mut q, &CharAttrs::default(), Where::Margin);
-                if q.text.trim().is_empty() {
+            // Left (even) pages' and the first page's own, where given;
+            // shown off, they are blank.
+            let local = &tag["style:".len()..];
+            let kinds = [(0usize, Some(main)), (2, master.child(&format!("{tag}-left"))), (1, master.child(&format!("{tag}-first")).or_else(|| master.child(&format!("loext:{local}-first"))))];
+            for (kind, h) in kinds {
+                let Some(h) = h else { continue };
+                if kind == 1 {
+                    self.doc.first_page.get_or_insert_with(Margins::default);
+                } else if kind == 2 {
+                    self.doc.even_pages.get_or_insert_with(Margins::default);
+                }
+                if h.attr("style:display") == Some("false") {
                     continue;
                 }
-                if first {
-                    align = self.para_style(p.attr("text:style-name")).1.align.or_else(|| {
-                        let (sid, _, _) = self.para_style(p.attr("text:style-name"));
-                        self.doc.styles.styles.get(sid as usize).and_then(|s| s.para.align)
-                    }).or_else(|| p.attr("text:style-name").and_then(|n| self.styles.get(n)).and_then(|o| o.parent.as_ref()).and_then(|pn| self.styles.get(pn)).and_then(|o| o.para.align)).unwrap_or(Align::Start);
-                    first = false;
-                } else {
-                    text.push(' ');
-                    self.rep.note(Kind::Approximate, "headers and footers of more than one line (joined)");
+                let mut text = String::new();
+                let mut align = Align::Start;
+                let mut first = true;
+                for p in h.els().filter(|x| x.name == "text:p" || x.name == "text:h") {
+                    let mut q = Para::default();
+                    self.inline(p, &mut q, &CharAttrs::default(), Where::Margin);
+                    if q.text.trim().is_empty() {
+                        continue;
+                    }
+                    if first {
+                        align = self.para_style(p.attr("text:style-name")).1.align.or_else(|| {
+                            let (sid, _, _) = self.para_style(p.attr("text:style-name"));
+                            self.doc.styles.styles.get(sid as usize).and_then(|s| s.para.align)
+                        }).or_else(|| p.attr("text:style-name").and_then(|n| self.styles.get(n)).and_then(|o| o.parent.as_ref()).and_then(|pn| self.styles.get(pn)).and_then(|o| o.para.align)).unwrap_or(Align::Start);
+                        first = false;
+                    } else {
+                        text.push(' ');
+                    }
+                    text.push_str(q.text.replace(['\t', '\u{2028}'], " ").trim());
                 }
-                text.push_str(q.text.replace(['\t', '\u{2028}'], " ").trim());
-            }
-            if !text.is_empty() || h.find("draw:frame").is_some() {
-                self.margin_els[!header as usize] = Some(h.clone());
-                let hf = HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() };
-                if header {
-                    self.doc.header = Some(hf);
-                } else {
-                    self.doc.footer = Some(hf);
+                if !text.is_empty() || h.find("draw:frame").is_some() {
+                    self.margin_els.push((kind, header, h.clone()));
+                    *self.margin_slot(kind, header) = Some(HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() });
                 }
             }
         }
+    }
+
+    /// Where the header (or footer) of a kind (0 default, 1 first page, 2
+    /// even pages) goes.
+    fn margin_slot(&mut self, kind: usize, header: bool) -> &mut Option<HeaderFooter> {
+        let m = match kind {
+            1 => self.doc.first_page.get_or_insert_with(Margins::default),
+            2 => self.doc.even_pages.get_or_insert_with(Margins::default),
+            _ => return if header { &mut self.doc.header } else { &mut self.doc.footer },
+        };
+        if header { &mut m.header } else { &mut m.footer }
     }
 }
 
@@ -1661,7 +1676,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, in_margin: false, margin_els: [None, None], annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

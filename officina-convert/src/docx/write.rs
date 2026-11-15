@@ -856,17 +856,32 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         comment_parts.push(("commentsExtended", "commentsExtended", ex));
     }
     let mut margin_rels: Vec<(String, String)> = Vec::new();
-    for (k, (hf, tag, kind)) in [(&doc.header, "hdr", "header"), (&doc.footer, "ftr", "footer")].into_iter().enumerate() {
-        if let Some(hf) = hf {
-            let name = format!("{kind}1.xml");
+    // Every header first, then every footer (the order sectPr wants); the
+    // default kind, the first page's, even pages'.
+    let kinds = [("default", Some((&doc.header, &doc.footer))), ("first", doc.first_page.as_ref().map(|m| (&m.header, &m.footer))), ("even", doc.even_pages.as_ref().map(|m| (&m.header, &m.footer)))];
+    let mut n = 0;
+    for (k, (tag, kind)) in [("hdr", "header"), ("ftr", "footer")].into_iter().enumerate() {
+        for (ty, pair) in kinds {
+            let Some(pair) = pair else { continue };
+            let hf = if k == 0 { pair.0 } else { pair.1 };
+            // A first or even kind with none: a blank part, so the default
+            // one doesn't show there.
+            let empty = HeaderFooter::line("", Align::Start);
+            let hf = match hf {
+                Some(h) => h,
+                None if ty != "default" => &empty,
+                None => continue,
+            };
+            n += 1;
+            let name = format!("{kind}{n}.xml");
             let r = o.rel(kind, name.clone(), false);
-            let _ = write!(sect, r#"<w:{kind}Reference w:type="default" r:id="{r}"/>"#);
+            let _ = write!(sect, r#"<w:{kind}Reference w:type="{ty}" r:id="{r}"/>"#);
             if hf.paras.is_empty() {
                 parts.push((format!("word/{name}"), margin_part(hf, tag)));
                 continue;
             }
             // Its own paragraphs, with their pictures beside the part.
-            let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 10_000 * (k as u32 + 1), notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
+            let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 10_000 * n, notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
             let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS} {DRAW_NS}>"#);
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -900,7 +915,9 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         };
         let cols = if x.columns > 1 || x.rule { format!(r#"<w:cols w:num="{}" w:space="{}"{}/>"#, x.columns, x.gap, if x.rule { r#" w:sep="1""# } else { "" }) } else { String::new() };
         let geo = geo(x.page.as_ref().unwrap_or(&doc.page));
-        format!("<w:sectPr>{sect}{ty}{geo}{cols}</w:sectPr>")
+        // The first page's own header: the first section's first page.
+        let title = if doc.first_page.is_some() && std::ptr::eq(x, &secs[0].1) { "<w:titlePg/>" } else { "" };
+        format!("<w:sectPr>{sect}{ty}{geo}{cols}{title}</w:sectPr>")
     };
     if secs.len() > 1 {
         // Text never holds U+0001 (escaped out), so the pieces alternate.
@@ -917,10 +934,12 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let sect = sect_pr(&secs[secs.len() - 1].1);
     let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}><w:body>{body}{sect}</w:body></w:document>"#);
 
-    // Settings: tracking on.
-    if doc.tracking {
+    // Settings: tracking on, even pages' own headers.
+    if doc.tracking || doc.even_pages.is_some() {
+        let even = if doc.even_pages.is_some() { "<w:evenAndOddHeaders/>" } else { "" };
+        let track = if doc.tracking { "<w:trackRevisions/>" } else { "" };
         o.rel("settings", "settings.xml".into(), false);
-        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}><w:trackRevisions/></w:settings>"#)));
+        parts.push(("word/settings.xml".into(), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings {W_NS}>{track}{even}</w:settings>"#)));
     }
     let mut z = ZipWriter::new(out);
     let mut types = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Default Extension="gif" ContentType="image/gif"/><Default Extension="webp" ContentType="image/webp"/><Default Extension="emf" ContentType="image/x-emf"/><Default Extension="wmf" ContentType="image/x-wmf"/><Default Extension="bmp" ContentType="image/bmp"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#);

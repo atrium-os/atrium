@@ -1100,6 +1100,13 @@ pub struct HeaderFooter {
     pub paras: Vec<Para>,
 }
 
+/// A header and footer pair for some pages (the first, or the even ones).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Margins {
+    pub header: Option<HeaderFooter>,
+    pub footer: Option<HeaderFooter>,
+}
+
 /// Most paragraphs a header or footer keeps.
 pub const MAX_MARGIN_PARAS: usize = 64;
 
@@ -1196,6 +1203,11 @@ pub struct TextDoc {
     /// Text in the top and bottom margins of every page.
     pub header: Option<HeaderFooter>,
     pub footer: Option<HeaderFooter>,
+    /// The first page's own header and footer (either may be none: a
+    /// title page without them), when it has its own.
+    pub first_page: Option<Margins>,
+    /// Even pages' own header and footer, when they differ from odd ones'.
+    pub even_pages: Option<Margins>,
     /// The pictures placed in the text.
     pub images: Images,
     /// Footnotes and endnotes, anchored in the text.
@@ -1250,7 +1262,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d
@@ -1270,6 +1282,21 @@ impl TextDoc {
     }
 
     /// A fresh block id.
+    /// The header and footer page `i` (from 0) shows.
+    pub fn margins_of(&self, i: usize) -> (Option<&HeaderFooter>, Option<&HeaderFooter>) {
+        let own = if i == 0 { self.first_page.as_ref() } else { None }.or(if i % 2 == 1 { self.even_pages.as_ref() } else { None });
+        match own {
+            Some(m) => (m.header.as_ref(), m.footer.as_ref()),
+            None => (self.header.as_ref(), self.footer.as_ref()),
+        }
+    }
+
+    /// Every header and footer the document has.
+    pub fn all_margins(&self) -> impl Iterator<Item = &HeaderFooter> {
+        let own = self.first_page.iter().chain(self.even_pages.iter()).flat_map(|m| m.header.iter().chain(m.footer.iter()));
+        self.header.iter().chain(self.footer.iter()).chain(own)
+    }
+
     pub fn new_id(&mut self) -> BlockId {
         let id = self.next_id;
         self.next_id += 1;
