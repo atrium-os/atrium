@@ -928,11 +928,15 @@ impl<'a> Scanout<'a> {
                 0,
             ]);
         } else {
-            // GFX12: 7 body dwords. No interrupt: the kernel ends every
-            // submit with its own RELEASE_MEM, which signals `signal`.
+            // GFX12: 7 body dwords, and a real end-of-pipe event
+            // (CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5, GL2 written back,
+            // as Linux's gfx_v12_0_ring_emit_fence): event type 0 never
+            // retires on silicon (R9700 run fc-cb77db65). No interrupt: the
+            // kernel ends every submit with its own RELEASE_MEM, which
+            // signals `signal`.
             words.extend([
                 pm4_type3(IT_RELEASE_MEM, 7),
-                5 << 8,
+                1 << 22 | 1 << 21 | 3 << 25 | 5 << 8 | 0x14,
                 2 << 29,                // 64-bit data, no interrupt
                 (fence & 0xffff_ffff) as u32,
                 (fence >> 32) as u32,

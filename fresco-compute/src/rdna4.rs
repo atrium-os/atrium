@@ -233,6 +233,9 @@ const DMA_CHUNK: u64 = 1 << 20;
 /// PM4 DMA_DATA (CP copy, memory to memory) and RELEASE_MEM.
 const IT_DMA_DATA: u32 = 0x50;
 const IT_RELEASE_MEM: u32 = 0x49;
+/// RELEASE_MEM DW1 on silicon: EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT
+/// (0x14), EVENT_INDEX 5 (end of pipe), GCR_SEQ, GL2_WB, cache policy 3.
+const EOP_FLUSH_TS: u32 = 1 << 22 | 1 << 21 | 3 << 25 | 5 << 8 | 0x14;
 
 impl crate::gpu::Arch for Rdna4Arch {
     fn name(&self) -> &'static str {
@@ -327,9 +330,13 @@ impl crate::gpu::Stream for Rdna4Stream<'_> {
             self.ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
         } else {
             // GFX12: 7 body dwords; one short wedges the CP before it reads
-            // anything (rptr 0; R9700 run fc-b1e2ef3). No interrupt: the
-            // kernel ends every submit with its own RELEASE_MEM.
-            self.ib.packet(IT_RELEASE_MEM, &[5 << 8, 2 << 29, fence as u32, (fence >> 32) as u32, 1, 0, 0]);
+            // anything (rptr 0; R9700 run fc-b1e2ef3). The event must be a
+            // real one: CACHE_FLUSH_AND_INV_TS_EVENT with GL2 written back,
+            // as Linux's gfx_v12_0_ring_emit_fence and si-client-test. Event
+            // type 0 (all gpusim needs) never retires on silicon: the EOP
+            // queue stays busy and the fence never lands (fc-cb77db65). No
+            // interrupt: the kernel ends every submit with its own RELEASE_MEM.
+            self.ib.packet(IT_RELEASE_MEM, &[EOP_FLUSH_TS, 2 << 29, fence as u32, (fence >> 32) as u32, 1, 0, 0]);
         }
     }
 
