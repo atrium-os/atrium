@@ -239,6 +239,11 @@ pub fn hairline(k: f32) -> f32 {
 struct Edges {
     /// The scale these were placed at; a new one starts over.
     k: f32,
+    /// The window's size in points; a new one starts over too, or edges
+    /// placed for the old size pull the new ones (a bar 38 pt tall drawn
+    /// again 38.4 pt tall ended a pixel past its window). The window's
+    /// own box is the `ROOT` group's bounds.
+    size: (f32, f32),
     /// Per group (`ROOT` for the window), per axis, a placed edge in points
     /// (in 1/64 pt) to its device position and how many nodes hold it.
     groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, (f32, u32)>; 2]>,
@@ -257,7 +262,24 @@ fn edge_key(e: f32) -> i32 { (e * 64.0).round() as i32 }
 impl Edges {
     fn reset_if(&mut self, k: f32) {
         if self.k != k {
-            *self = Edges { k, ..Default::default() };
+            *self = Edges { k, size: self.size, ..Default::default() };
+            self.root_bounds();
+        }
+    }
+
+    /// The window is `w` x `h` points: what is drawn at its top level is
+    /// placed from its edges, as a group's contents are from the group's.
+    fn window(&mut self, w: f32, h: f32) {
+        if self.size != (w, h) {
+            *self = Edges { k: self.k, size: (w, h), ..Default::default() };
+            self.root_bounds();
+        }
+    }
+
+    fn root_bounds(&mut self) {
+        let ((w, h), k) = (self.size, self.k);
+        if w > 0.0 && h > 0.0 && k > 0.0 {
+            self.bounds.insert(ROOT, [w, h, (w * k).round(), (h * k).round()]);
         }
     }
 
@@ -399,6 +421,12 @@ impl FrescoSurface {
     }
 
     pub fn window_id(&self) -> u32 { self.window_id }
+
+    /// The selected window is `w` x `h` points: its top-level edges are
+    /// placed from its own (resolution-independence.md §5).
+    pub fn set_window_size(&mut self, w: f32, h: f32) {
+        self.edges.window(w, h);
+    }
     pub fn connection(&mut self) -> &mut fresco_client::Connection { &mut self.conn }
 
     /// Resolve a family name to a server-side `font_id`, opening the
@@ -759,6 +787,36 @@ mod tests {
     }
 
     /// A node that moves lets go of where it was.
+    /// A window resized at the same scale starts its edges over, and what
+    /// it draws at its top level is placed from its own foot: forum-bar's
+    /// 38 pt bar given 48 px (38.4 pt) at 1.25 kept the 38 pt frame's
+    /// edges, its new background ended at 49 px and its hairline at 48,
+    /// outside the window.
+    #[test]
+    fn a_resized_window_places_from_its_own_edges() {
+        use super::{Edges, ROOT};
+        let mut e = Edges::default();
+        e.reset_if(1.25);
+        e.window(1536.0, 38.0);
+        let bg = e.span(ROOT, 1, 0.0, 38.0);
+        e.hold(1, ROOT, &[(1, 0.0, bg.0), (1, 38.0, bg.0 + bg.1)]);
+        let line = e.span(ROOT, 1, 37.0, 1.0);
+        e.hold(2, ROOT, &[(1, 37.0, line.0), (1, 38.0, line.0 + line.1)]);
+        assert_eq!((bg, line), ((0.0, 48.0), (47.0, 1.0)), "38 pt: 47.5 px, its foot at 48");
+        // forum-wm gives it 48 px: 38.4 pt.
+        e.window(1536.0, 38.4);
+        e.drop_node(1);
+        let bg = e.span(ROOT, 1, 0.0, 38.4);
+        e.hold(1, ROOT, &[(1, 0.0, bg.0), (1, 38.4, bg.0 + bg.1)]);
+        e.drop_node(2);
+        let line = e.span(ROOT, 1, 37.4, 1.0);
+        assert_eq!(bg, (0.0, 48.0), "to the window's foot, not past it");
+        assert_eq!(line, (47.0, 1.0), "the hairline on the last row");
+        // A new scale keeps the size.
+        e.reset_if(1.5);
+        assert_eq!(e.span(ROOT, 1, 0.0, 38.4), (0.0, (38.4f32 * 1.5).round()));
+    }
+
     #[test]
     fn a_moved_node_lets_go_of_its_old_edges() {
         use super::{Edges, ROOT};

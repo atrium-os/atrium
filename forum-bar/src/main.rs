@@ -69,6 +69,12 @@ struct BarView {
     /// The bar's width in points: the window's, which a live scale change
     /// (or a new mode) changes, so the main loop keeps it current.
     w: Rc<std::cell::Cell<f32>>,
+    /// The window's height in points. At a fractional scale forum-wm
+    /// rounds the bar's reserve up to whole pixels (38 pt at 1.25 is
+    /// 48 px, 38.4 pt), and the bar must fill it: drawn to 38 pt, its
+    /// last pixel row was left empty and the wallpaper showed between the
+    /// bar and the windows below.
+    h: Rc<std::cell::Cell<f32>>,
     chips: Mutable<Vec<ChipData>>,
     workspace: Mutable<(String, String)>,
     time: Mutable<String>,
@@ -336,6 +342,14 @@ impl BarView {
     /// What to leave out at the bar's width and text size: the row's
     /// pieces measured as Pergola lays them out (the root's 16 pt gaps and
     /// 14 pt padding, each group's own gaps), lowest priority first.
+    /// Where the bar's bottom edge goes: its window's foot when that is
+    /// the bar's height rounded up to whole pixels, else its own height
+    /// (before forum-wm has sized the window to a new text size).
+    fn bottom(&self) -> f32 {
+        let (h, b) = (self.h.get(), shell::bar_h());
+        if h >= b && h < b + 1.0 { h } else { b }
+    }
+
     fn shed(&self) -> Vec<Shed> {
         use pergola::theme::font;
         let glyph = |g: char, sz: f32| text_w(&g.to_string(), font::ICONS, sz, Weight::Regular);
@@ -404,9 +418,13 @@ impl View for BarView {
         // The bar body: full-width horizontal flex, 16px gaps, 14px
         // side padding, children vertically centered. The 1px bottom
         // hairline is a separate absolute rect below the fill.
+        // The whole window to its foot first, under the body and the
+        // hairline: at a fractional scale their snapped edges may stop a
+        // pixel row short of it, and that row must not show the wallpaper.
+        ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, self.w.get(), self.bottom()), fill: t.bg_surface(), radius: 0.0 });
         let root = ctx.push(Node::stack_filled(
             Axis::Horizontal,
-            Rect::new(0.0, 0.0, self.w.get(), shell::bar_h() - 1.0),
+            Rect::new(0.0, 0.0, self.w.get(), self.bottom() - 1.0),
             16.0,
             t.bg_surface(),
             0.0,
@@ -805,7 +823,7 @@ impl View for BarView {
 
         // Bottom hairline.
         ctx.add(Node::Rect {
-            rect: Rect::new(0.0, shell::bar_h() - 1.0, self.w.get(), 1.0),
+            rect: Rect::new(0.0, self.bottom() - 1.0, self.w.get(), 1.0),
             fill: t.border_default(),
             radius: 0.0,
         });
@@ -1120,6 +1138,7 @@ fn main() -> std::io::Result<()> {
     let mut window = Window::open(&desc)?;
     // Chrome claims the top strip only.
     let w = Rc::new(std::cell::Cell::new(window.width));
+    let h = Rc::new(std::cell::Cell::new(window.height));
 
     let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (chips0, ws0) = poll_status();
@@ -1170,6 +1189,7 @@ fn main() -> std::io::Result<()> {
         now: now.clone(),
         want_media: want_media.clone(),
         w: w.clone(),
+        h: h.clone(),
         chips: chips.clone(),
         workspace: workspace.clone(),
         time: time.clone(),
@@ -1209,8 +1229,9 @@ fn main() -> std::io::Result<()> {
         // mode): lay the bar out across it now, not one frame late. Without
         // this the bar kept its first width, and at 1.5 on a 1920 px screen
         // its right half (status icons, clock) fell outside the window.
-        if window.width != w.get() {
+        if window.width != w.get() || window.height != h.get() {
             w.set(window.width);
+            h.set(window.height);
             app.invalidate();
             window.paint(&mut app)?;
         }
@@ -1444,6 +1465,7 @@ mod tests {
         let (time, date) = clock_now();
         BarView {
             w: Rc::new(std::cell::Cell::new(1280.0)),
+            h: Rc::new(std::cell::Cell::new(0.0)),
             chips: Mutable::new(chips),
             workspace: Mutable::new(ws),
             time: Mutable::new(time),
@@ -1799,6 +1821,36 @@ mod tests {
         assert_eq!(shed_count(100.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 0);
         assert_eq!(shed_count(75.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 1);
         assert_eq!(shed_count(64.0, 50.0, &[10.0, 10.0, 10.0], 1, 5.0), 3, "dropping the second adds More");
+    }
+
+    /// At 1.25 forum-wm gives the 38 pt bar 48 px, 38.4 pt: the bar's fill
+    /// and its bottom hairline reach the window's foot, so no row of
+    /// wallpaper shows under it. A window not yet resized to a new text
+    /// size (much taller or shorter) doesn't move them.
+    #[test]
+    fn the_bar_fills_its_window_to_the_last_pixel_row() {
+        pergola::text::clear_measurer();
+        let hairline = |h: f32| {
+            let view = sample_view();
+            view.h.set(h);
+            let (tree, _) = render(&view, Semantic::LIGHT);
+            let y = tree.iter().find_map(|(_, n)| match n {
+                Node::Rect { rect, .. } if rect.h() == 1.0 && rect.w() == view.w.get() => Some(rect.y() + 1.0),
+                _ => None,
+            });
+            let under = tree.iter().find_map(|(_, n)| match n {
+                Node::Rect { rect, .. } if rect.y() == 0.0 && rect.w() == view.w.get() => Some(rect.h()),
+                _ => None,
+            });
+            let y = y.expect("a bottom hairline");
+            assert_eq!(under, Some(y), "the background reaches the same foot");
+            y
+        };
+        let b = shell::bar_h();
+        assert_eq!(hairline(b + 0.4), b + 0.4, "on the window's foot");
+        assert_eq!(hairline(b), b);
+        assert_eq!(hairline(0.0), b, "no window height yet");
+        assert_eq!(hairline(b * 2.0), b, "a window still at an old text size");
     }
 
     #[test]

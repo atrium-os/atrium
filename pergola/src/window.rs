@@ -317,6 +317,7 @@ impl Window {
                 app.popup_dismissed(root);
             }
             self.last_paint.popups_ms = t1.elapsed().as_secs_f64() * 1e3;
+            self.surface.set_window_size(self.width, self.height);
             for (win, batch) in self.popups.route(deltas, app.tree(), self.main) {
                 if batch.is_empty() {
                     continue;
