@@ -171,8 +171,15 @@ decision 14.
   failed why=wrong-passphrase` (the AP could not check our MIC); WPA3, the
   AP refusing our SAE confirm (hostapd answers status 1 at transaction 2),
   or leaving it unanswered after its retries, is the same, while a refused
-  or unanswered commit stays `auth-refused` / `auth-timeout`. atrium-netconf hands the reason on, and Curia says "the
-  passphrase is wrong".
+  or unanswered commit stays `auth-refused` / `auth-timeout`. atrium-netconf
+  hands the reason on, and Curia says "the passphrase is wrong".
+- A newly typed passphrase is on trial (2026-11-15): atrium-netconf's join
+  sends `wifi-remember ... trial=1`; aura-keys keeps it in memory for the
+  next `prepare` of that network only and stores it when that join is
+  authorized, and atrium-net saves the network's profile then too. A failed
+  join drops it, so a mistyped passphrase never replaces one that worked and
+  a new network that never joined is not saved. `atrium-netctl remember`
+  still stores at once.
 
 ### 3.5 atrium-net
 

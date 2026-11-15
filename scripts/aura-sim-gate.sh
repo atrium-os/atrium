@@ -640,11 +640,16 @@ n4() {
     t1=$(date +%s)
     # Said as a wrong passphrase, well before the 60 s join timeout.
     echo "$out" | grep -q '^refused: failed wrong-passphrase' && [ $((t1 - t0)) -lt 45 ] && ok "wrong passphrase: said as one in $((t1 - t0)) s ($out)" || fail "wrong passphrase: $out ($((t1 - t0)) s)"
-    out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "right passphrase again: joined" || fail "rejoin: $out"
+    # The mistyped passphrase did not replace the one that worked.
+    out=$("$V" "$APP network-wifi join aura-test --known" 2>&1) && [ "$out" = joined ] && ok "the saved passphrase still joins" || fail "rejoin with the saved passphrase: $out"
     app network-wifi leave
     app network-wifi forget aura-test
     app network-wifi list
     [ -z "$out" ] && ok "network-wifi forgets it" || fail "after forget: $out"
+    # A new network with a wrong passphrase is not saved at all.
+    out=$("$V" "echo 'not the passphrase' | $APP network-wifi join aura-test" 2>&1) || true
+    app network-wifi list
+    [ -z "$out" ] && ok "a new network whose join failed is not saved" || fail "saved after a failed join: $out"
     "$V" 'pkill -x atrium-netconf' || true
 }
 

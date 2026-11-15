@@ -10,7 +10,9 @@
 //!   `sae-done` or `sae-failed` (aura-mlme frames them, this side does the
 //!   crypto); `assoc ...` when associated (BSSID, RSNEs and RSNXEs, AKM),
 //!   `disassoc`; gets back `authorized [td=..]` or `failed why=..`.
-//! - atrium-net (`--ctl-uid`): `remember ssid=.. secret=..|handle=..` (a handle is redeemed at arcad, TAKE_WIFI), `forget
+//! - atrium-net (`--ctl-uid`): `remember ssid=.. secret=..|handle=.. [trial=1]` (a handle is redeemed at arcad, TAKE_WIFI;
+//!   `trial=1` keeps a newly typed passphrase in memory for the next join
+//!   only, and stores it once that join is authorized), `forget
 //!   ssid=..`, `prepare ssid=..` (release the credential for the next join;
 //!   Arca hands out one per join, never the list); gets `ok` or `error`.
 //!
@@ -108,6 +110,13 @@ struct Keys {
     verbose: bool,
     store: Box<dyn Store>,
     prepared: Option<(Vec<u8>, Secret)>,
+    /// A passphrase on trial (`remember trial=1`): used by the next
+    /// `prepare` of its network instead of the stored one, and stored only
+    /// when that join is authorized. A wrong one never replaces the
+    /// stored passphrase.
+    trial: Option<(Vec<u8>, Secret)>,
+    /// The prepared credential is the trial one: store it on success.
+    prepared_trial: bool,
     join: Option<Join>,
     /// EAPOL that arrived before aura-mlme's `assoc` (they race).
     pending: Vec<([u8; 6], Vec<u8>)>,
@@ -161,6 +170,14 @@ impl Keys {
                 Action::TransitionDisable(b) => self.td = *b,
                 Action::Authorized => {
                     self.send(&Msg::PortAuthorized(true));
+                    if std::mem::take(&mut self.prepared_trial) {
+                        if let Some((ssid, secret)) = &self.prepared {
+                            match self.store.remember(&creds::account(ssid), secret) {
+                                Ok(()) => eprintln!("aura-keys: the new passphrase worked; stored"),
+                                Err(e) => eprintln!("aura-keys: storing the new passphrase: {}", store_err(&e)),
+                            }
+                        }
+                    }
                     let mut l = Line::new("authorized");
                     if self.td != 0 {
                         l = l.with("td", self.td);
@@ -372,19 +389,34 @@ impl Keys {
                 if crypto::psk(&secret, &ssid).is_none() {
                     return err("bad-secret");
                 }
+                if l.get("trial") == Some("1") {
+                    self.trial = Some((ssid, secret));
+                    return Line::new("ok");
+                }
                 match self.store.remember(&creds::account(&ssid), &secret) {
                     Ok(()) => Line::new("ok"),
                     Err(e) => err(&store_err(&e)),
                 }
             }
-            "forget" => match self.store.forget(&creds::account(&ssid)) {
+            "forget" => match {
+                self.trial = self.trial.take().filter(|(s, _)| *s != ssid);
+                self.store.forget(&creds::account(&ssid))
+            } {
                 Ok(true) => Line::new("ok"),
                 Ok(false) => err("unknown"),
                 Err(e) => err(&store_err(&e)),
             },
+            "prepare" if self.trial.as_ref().is_some_and(|(s, _)| *s == ssid) => {
+                // Used once: a failed join leaves the stored one in place.
+                let (s, secret) = self.trial.take().expect("trial");
+                self.prepared = Some((s, secret));
+                self.prepared_trial = true;
+                Line::new("ok")
+            }
             "prepare" => match self.store.release(&creds::account(&ssid)) {
                 Ok(Some(s)) => {
                     self.prepared = Some((ssid, s));
+                    self.prepared_trial = false;
                     Line::new("ok")
                 }
                 Ok(None) => err("no-credential"),
@@ -439,7 +471,7 @@ fn main() {
             Box::new(creds::Memory::default())
         }
     };
-    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, join: None, pending: Vec::new() };
+    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, trial: None, prepared_trial: false, join: None, pending: Vec::new() };
     let listener = sock::listen(&o.sock, 0o666).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut buf = vec![0u8; HEADER_LEN + MAX_BODY];

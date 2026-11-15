@@ -213,6 +213,11 @@ impl Backend for Front {
             if let Some(h) = &j.handle {
                 r = r.with_hex("handle", h);
             }
+            if j.passphrase.is_some() || j.handle.is_some() {
+                // Saved only if this join works: a mistyped passphrase
+                // never replaces one that worked.
+                r = r.with("trial", 1);
+            }
             self.call(&r)?;
         }
         let rx = self.wait_lines();

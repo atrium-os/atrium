@@ -178,6 +178,9 @@ pub struct Wifi {
     nearby: Vec<(Vec<u8>, i32)>,
     good: Vec<(Vec<u8>, u32)>,
     last_move: Option<u64>,
+    /// A network remembered on trial (a newly typed passphrase): saved
+    /// only once its next join is authorized, dropped if it fails.
+    trial: Option<Profile>,
 }
 
 impl Wifi {
@@ -198,7 +201,15 @@ impl Wifi {
             nearby: Vec::new(),
             good: Vec::new(),
             last_move: None,
+            trial: None,
         }
+    }
+
+    /// Remember `p` only if the join that follows works (its passphrase
+    /// is on trial in aura-keys too); until then the saved list, and a
+    /// passphrase saved earlier, stay as they were.
+    pub fn remember_on_trial(&mut self, p: Profile) {
+        self.trial = Some(p);
     }
 
     pub fn state(&self) -> &'static str {
@@ -455,6 +466,10 @@ impl Wifi {
                     _ => None,
                 };
                 if let Some(ssid) = ssid {
+                    if self.trial.as_ref().is_some_and(|p| p.ssid == ssid) {
+                        let p = self.trial.take().expect("trial");
+                        a.extend(self.remember(p, now));
+                    }
                     if l.get("transition_disabled") == Some("1") {
                         if let Some(p) = self.saved.profiles.iter_mut().find(|p| p.ssid == ssid) {
                             if !p.wpa3_only {
@@ -475,6 +490,9 @@ impl Wifi {
             }
             ("state", Some("failed")) => {
                 if let St::Joining { ssid, rest } = std::mem::replace(&mut self.st, St::Idle) {
+                    if self.trial.as_ref().is_some_and(|p| p.ssid == ssid) {
+                        self.trial = None;
+                    }
                     a.push(Act::LeaseDown);
                     let n = match self.failures.iter_mut().find(|(s, _, _)| *s == ssid) {
                         Some(f) => {
@@ -545,6 +563,27 @@ mod tests {
 
     fn bss(ssid: &str, rssi: i32) -> Line {
         Line::new("bss").with_hex("ssid", ssid.as_bytes()).with("rssi", rssi).with("security", "psk")
+    }
+
+    #[test]
+    fn a_passphrase_on_trial_is_saved_only_when_it_works() {
+        let st = |w: &mut Wifi, state: &str, t| w.mlme_line(&Line::new("state").with("state", state).with("why", "wrong-passphrase"), t);
+        let mut w = Wifi::new(Saved { profiles: vec![prof("home", 5)], country: None });
+        let mut home = prof("home", 9);
+        home.metered = true;
+        w.remember_on_trial(home.clone());
+        w.join(b"home".to_vec(), None, None);
+        st(&mut w, "failed", 1);
+        assert_eq!(w.saved.get(b"home").unwrap().prio, 5, "a failed join keeps the network as it was");
+        w.join(b"home".to_vec(), None, None);
+        st(&mut w, "authorized", 2);
+        assert_eq!(w.saved.get(b"home").unwrap().prio, 5, "the trial was used up by the failed join");
+        // A new network on trial: saved once it works.
+        w.remember_on_trial(prof("cafe", 0));
+        assert!(w.saved.get(b"cafe").is_none());
+        w.join(b"cafe".to_vec(), None, None);
+        let a = st(&mut w, "authorized", 3);
+        assert!(w.saved.get(b"cafe").is_some() && a.contains(&Act::Save));
     }
 
     #[test]
