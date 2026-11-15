@@ -213,6 +213,57 @@ Links are mounts: free, and gone when removed. For services rather than
 files (a database in A that B talks to), B lists A's port and only that port
 is open between them (atrium-devjail.md §3.6, §7).
 
+### 5.3 Workspaces have no windows (proposal, 2026-11-15)
+
+Shankar, 2026-11-15: every app is isolated anyway, so nothing needs to run
+*in* a workspace to be safe. A workspace is a build box: compilers, sources,
+build output, a shell. It has no display socket and never will. What it
+builds runs as a regular app; the IDE that edits it is a regular app; the
+terminal is a regular app. Spaces (Forum's desktops) are not tied to
+workspaces.
+
+- **Run what you built (W5).** In a workspace's project, `atrium.toml`
+  sits beside the sources. **Run** (the Workspaces app, the IDE, or
+  `portcullis workspace run <ws> <path>` from its console) asks
+  portcullisd with a press. portcullisd reads the manifest and the binary
+  from the workspace's `work` (never from inside the jail: it opens them
+  from the host side, refuses links out of `work`), copies them into a
+  **dev bundle** at `~/.atrium/dev/<ws>/<id>/`, and launches it as the
+  app `dev.<ws>.<id>`: its own uid per (person, app) as for any app, its
+  own overlay, exactly the capabilities its manifest declares, through
+  the same prompts as an installed app. Differences from an installed
+  app:
+  - unsigned, never in the Applications grid, not started at login;
+  - no restricted capabilities (system-policy-only ones are refused, not
+    prompted), and no grant is remembered past the run unless the person
+    picks "keep" in the prompt;
+  - its windows carry a **dev** mark on their chip and frame, with the
+    workspace's name, so a dev build is never mistaken for the real app;
+  - Run again replaces the bundle; deleting the workspace deletes its dev
+    bundles and their data.
+  A dev bundle can be installed for real only through Opifex with a
+  signature, as today.
+- **The IDE is a regular app (W6).** It holds a new capability
+  `workspace-exec`: it may list the person's workspaces and, after the
+  person picks one in it (a press), get that workspace's `work` mounted
+  into its jail read-write at `/work/<name>` and ask portcullisd to run a
+  command in the workspace (`WorkspaceExec { name, argv, cwd }`): the
+  process runs in the workspace's jail as the workspace's uid, its output
+  comes back on a pipe, and it can be stopped. The IDE never gets a shell
+  of its own and never names a jail or a uid. Build, test and Run go
+  through this; a language server runs the same way and talks over its
+  pipe. The IDE only reaches the workspaces the person picked in it.
+- **Terminal is a regular app (W7).** Terminal appears in the Applications
+  grid. Opened on its own, a tab is a shell in an **empty jail**: the
+  read-only toolbox, a private `/tmp`, no home, no network, no app's files,
+  its own uid. A switcher at the top of the window ("Empty ▾") moves the
+  tab into a workspace or an app's console (§4): portcullisd asks for a
+  press and hands over a shell in that jail, as today. Open terminal in
+  the Workspaces app and Terminal on an app icon open it already
+  switched. Each tab names where it is; Stoa keeps them as today. This
+  replaces H6's "no general terminal": there is one, and it reaches
+  nothing until the person switches it.
+
 ## 6. The host shell
 
 Root's shell is for administration and recovery: Curia's Recovery page opens
@@ -229,6 +280,10 @@ people ship without `sshd` on the host.
 | H5 | which apps have a console | every third-party app; no system app or session component |
 | H6 | a general terminal | none; workspaces and app consoles instead, the host shell for administration only |
 | H7 | where per-app data lives | `/home/<person>/.atrium/apps/<id>`, one overlay volume per person and app |
+| H8 | where workspace output runs | as a regular dev app (§5.3), not in the workspace; workspaces have no windows (Shankar 2026-11-15) |
+| H9 | dev app grants | asked per run, restricted capabilities refused, "keep" to remember |
+| H10 | the IDE's reach | `workspace-exec`: only workspaces the person picked in it, commands run in the workspace's jail |
+| H11 | Terminal | a regular app; alone it is an empty jail, switched into a workspace or app console by a press (Shankar 2026-11-15) |
 
 (H1–H3 are scrinium.md §9's.)
 
@@ -253,3 +308,13 @@ people ship without `sshd` on the host.
    **Built 2026-11-15** (§5 "As built"); `scripts/vm-workspace-check.sh`.
 4. **W4** Scrinium's H2 and H3 (picker over home, bookmarks) on the new
    layout.
+5. **W5 Run.** Dev bundles, `dev.<ws>.<id>` launch, dev mark in frescod's
+   frame, Run in the Workspaces app. Gate: a hello-window app built with
+   `cc` in Scratch runs as its own uid, can't read the workspace, and a
+   manifest asking for a restricted capability is refused.
+6. **W6 `workspace-exec`.** The capability, `WorkspaceExec`, the pick.
+   Gate: a test app builds in a picked workspace and is refused for one it
+   didn't pick.
+7. **W7 Terminal app.** Empty-jail shell, the switcher, the grid entry.
+   Gate: an empty tab sees no home and no network; switching to Scratch
+   needs the press and lands in `~/work`.
