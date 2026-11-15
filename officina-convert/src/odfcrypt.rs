@@ -35,6 +35,8 @@ const SHA256_1K: &str = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#sha2
 const SHA1_1K: &str = "SHA1/1K";
 /// The most PBKDF2 iterations or Argon2 passes a file may ask for.
 const MAX_ITER: u32 = 10_000_000;
+/// The most Argon2 passes a file may ask for (LibreOffice uses 3).
+const MAX_ARGON_PASSES: u32 = 64;
 /// The most Argon2 memory (KiB) a file may ask for: 1 GiB.
 const MAX_ARGON_MEM: u32 = 1 << 20;
 pub const PBKDF2_ITER: u32 = 100_000;
@@ -126,7 +128,7 @@ fn key(e: &Enc, password: &str, keys: &mut Keys) -> Result<Vec<u8>, CryptError> 
         }
         ARGON2ID => {
             let (t, m, p) = e.argon;
-            if t == 0 || t > MAX_ITER || m > MAX_ARGON_MEM || p == 0 || p > 64 {
+            if t == 0 || t > MAX_ARGON_PASSES || m > MAX_ARGON_MEM || p == 0 || p > 64 {
                 return damaged("Argon2 parameters");
             }
             let params = argon2::Params::new(m, t, p, Some(e.key_size)).map_err(|_| CryptError::Damaged("Argon2 parameters".into()))?;
