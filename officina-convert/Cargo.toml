@@ -24,6 +24,15 @@ miniz_oxide = "0.8"
 # Streaming XML (MIT); bounded by our own limits on top.
 quick-xml = "0.37"
 libc = "0.2"
+# Password-protected documents (O7a): RustCrypto, MIT OR Apache-2.0.
+aes = "0.8"
+aes-gcm = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
 
 [profile.release]
 debug = 1

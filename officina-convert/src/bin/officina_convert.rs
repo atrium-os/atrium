@@ -4,6 +4,11 @@
 //!   officina-convert ods < book.ods > book.osheet 2> report
 //!   officina-convert pptx < talk.pptx > talk.oslides 2> report
 //!
+//! With `--password` after the kind, stdin starts with the password (its
+//! length as a little-endian u32, then UTF-8) and a protected file is
+//! decrypted inside the sandbox; a protected file without one, or with the
+//! wrong one, ends in `error\tneeds-password` or `error\twrong-password`.
+//!
 //! Reads the whole input, then (on FreeBSD) enters Capsicum capability mode, so the
 //! parser can open no file and no socket whatever the input does; CPU time and memory
 //! are capped with rlimits. Writes the native file on stdout. On stderr, one line per
@@ -42,12 +47,37 @@ fn sandbox() {
 
 fn main() {
     let what = std::env::args().nth(1).unwrap_or_default();
+    let with_password = std::env::args().nth(2).is_some_and(|a| a == "--password");
+    let mut stdin = std::io::stdin().lock();
+    let mut password = None;
+    if with_password {
+        let mut n = [0u8; 4];
+        let mut p = Vec::new();
+        let ok = stdin.read_exact(&mut n).is_ok() && {
+            let n = u32::from_le_bytes(n) as usize;
+            n <= officina_convert::launch::MAX_PASSWORD && { p.resize(n, 0); stdin.read_exact(&mut p).is_ok() }
+        };
+        match String::from_utf8(p) {
+            Ok(s) if ok => password = Some(s),
+            _ => {
+                eprintln!("error\tthe password didn't arrive");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut input = Vec::new();
-    if let Err(e) = std::io::stdin().take(2 << 30).read_to_end(&mut input) {
+    if let Err(e) = stdin.take(2 << 30).read_to_end(&mut input) {
         eprintln!("error\t{e}");
         std::process::exit(1);
     }
     sandbox();
+    let input = match officina_convert::launch::unprotect(&what, input, password.as_deref()) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error\t{e}");
+            std::process::exit(1);
+        }
+    };
     match what.as_str() {
         "xlsx" | "xlsm" | "ods" => match if what == "ods" { officina_convert::ods::read(&input).map_err(|e| e.to_string()) } else { officina_convert::xlsx::read(&input).map_err(|e| e.to_string()) } {
             Ok((wb, loaded)) => {
