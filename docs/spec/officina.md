@@ -2589,6 +2589,75 @@ rastering ahead hidden build items. The GPU renderer figure is still to take.
 `FRESCOD_RENDER_TIMES=1` prints per-frame and per-sprite costs from both
 frescod and `fresco-renderer`.
 
+### 16.39 O6e as built (2026-11-15): very large decks
+
+- **Previews in the file.** Each picture can carry a preview: a JPEG (quality
+  82), or a PNG when the picture has transparency, at most 512 px on its longer
+  side. Previews are stored as `PREVIEW` chunks plus an optional `PREVIEWS`
+  table, keyed by the picture's content hash. They are kept with their
+  pictures, dropped with them, and copied unread on save. A damaged table only
+  costs the previews.
+  - Slides makes previews on worker threads for pictures that lack one, a few
+    at a time, behind any decode for the screen. They go into the file at the
+    next save.
+- **Opening maps the file.** A native deck opens from its descriptor with
+  `mmap`, reading only the index, the deck and the masters. Slides and
+  pictures are paged in as they are drawn.
+  - Slides never writes over the file a deck is mapped from. A save streams
+    the deck to a new file in the autosave folder, maps the deck from it,
+    copies it over the target, and makes it the autosave base with an empty
+    journal (`Doc::spool`, `Doc::saved_as`). Save As copies the same way.
+  - The first autosave base is written on a thread. Until it is in place, a
+    crash loses the first edits.
+  - `.pptx` and `.odp` are still read and written in memory.
+- **Pictures decode off the window's thread** (`decode.rs`: up to 4 workers,
+  one core left for the window). A picture whose preview is big enough
+  (thumbnails, the sorter, the presenter's next slide) draws from the preview.
+  When the drawn size needs more, the preview shows at once and the full
+  decode, at the drawn size, comes back from a worker. The editor and the show
+  then paint again; the show waits until no animation runs. A picture with no
+  preview decodes as it is drawn, as before.
+- **Presenting.** The current, next and previous slides were already resident
+  (O6d). The next slide now appears from previews and sharpens within about
+  0.1 s.
+- **Rehearse Show** (Slide menu) runs on a copy of the deck on a thread. It
+  decodes every shown slide's pictures one at a time at 1920 × 1080, letting
+  slides go as it goes. It names the slides over 750 ms ("may not be ready if
+  you click through quickly") and the slowest picture's size.
+- **Reduce File Size…** (Slide menu) asks for a folder, then works on a copy of
+  the deck on a thread. Each picture is recompressed to the largest size it is
+  shown at on a 1920 px screen (JPEG 85, PNG with transparency), and the
+  smaller of the two is kept. SVG, GIF and pictures already near their shown
+  size are kept, and so are videos (trimming them is not done). The result is
+  saved as "Name (smaller).oslides" with a report of the saving.
+
+**Gates** (`atrium-slides/examples/big_deck.rs`). The test deck is generated:
+1,000 slides and 1,500 distinct 6 MP photos with their previews, 1.99 GB, kept
+in scratch. Run natively on the cloud container (4 cores):
+
+| gate | result |
+|---|---|
+| open and draw the first slide at 1920 × 1080 (under 1 s) | 188 ms cold, 23 ms warm |
+| every thumbnail as the strip scrolls (each under a 60 Hz frame) | median 1.7 ms, p99 3.1 ms, worst 3.8 ms |
+| presenter: next slide drawn from previews (under a frame) | median 7.0 ms, p99 11.0 ms, worst 14.8 ms |
+| presenter: the next slide sharp | median 88 ms, p99 132 ms, worst 172 ms |
+| Rehearse | 112 s; every slide ready in time (slowest 215 ms) |
+| memory (under 500 MB) | peak anonymous 464 MB |
+
+On memory: peak RSS is 2.3 GB once Rehearse has read every picture, but
+1.9 GB of that is the mapped file's pages. Those are shared page cache that
+the system takes back under pressure.
+
+The unit tests (21 in `atrium-slides`, plus `officina-slides`) cover:
+previews round trip and damage; save streaming then becoming the base and
+recovering after a crash; preview first, then sharp; preview sizes; Rehearse
+skipping hidden slides and letting slides go; Reduce shrinking to the shown
+size and doing nothing a second time.
+
+**Not yet.** Previews of the video poster are made like any picture, but video
+trimming is not done. Previews are made only while the editor runs, not during
+a show. The 60 Hz transition figure stays as in §16.38.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
