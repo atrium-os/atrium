@@ -6,7 +6,8 @@
 # the page's buttons would: find, pair answering the prompt, disconnect,
 # connect with the stored bond, forget after asking. Three peers, one per
 # prompt: a number to compare, a code Settings shows (the peer types it), a
-# code the peer shows (typed into Settings). Ends "curia-bt: N failed".
+# code the peer shows (typed into Settings); and a Classic-only keyboard
+# found by inquiry. Ends "curia-bt: N failed".
 #
 #   sh scripts/curia-bt-check.sh
 #
@@ -37,10 +38,11 @@ hci_pid=$!
 i=0; until [ -S "$work/hci.sock" ]; do i=$((i+1)); [ $i -gt 100 ] && { cat "$work/hci.log"; echo "curia-bt: 1 failed (vinculum-hci)"; exit 1; }; sleep 0.1; done
 
 fails=0
-run() { # name peer-iocap
-    name=$1 iocap=$2
+run() { # name peer-iocap [user to drive as [peer mode]]
+    name=$1 iocap=$2 as=${3:-} mode=${4:-} pname=CuriaPeer
+    [ "$mode" = classic ] && pname=CuriaKeys
     rm -f "$work/passkey"; : >"$work/peer.log"
-    "$venv/bin/python" "$H/peer_advertiser.py" "tcp-client:127.0.0.1:$port" CuriaPeer 90 "$iocap" "$work/passkey" >"$work/peer.log" 2>&1 &
+    "$venv/bin/python" "$H/peer_advertiser.py" "tcp-client:127.0.0.1:$port" "$pname" 90 "$iocap" "$work/passkey" $mode >"$work/peer.log" 2>&1 &
     peer_pid=$!
     i=0; until grep -q advertising "$work/peer.log" 2>/dev/null; do i=$((i+1)); [ $i -gt 200 ] && break; sleep 0.1; done
     if [ "$iocap" = display ]; then
@@ -50,10 +52,17 @@ run() { # name peer-iocap
         w_pid=$!
     fi
     rm -rf "$work/keys"; mkdir -p "$work/keys"
-    "$vbin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl.sock" --control-uid "$(id -u)" --keys "$work/keys" --machine-key "$work/machine.key" >"$work/svc.log" 2>&1 &
+    "$vbin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl.sock" --control-apps "$work/registry" "$work/apps" --keys "$work/keys" --machine-key "$work/machine.key" >"$work/svc.log" 2>&1 &
     d_pid=$!
     i=0; until [ -S "$work/ctl.sock" ]; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done
-    if timeout 180 "$drive" "$work/ctl.sock" CuriaPeer "$work/passkey" >"$work/drive.log" 2>&1 && grep -q "bt-drive: ok" "$work/drive.log"; then
+    chmod 666 "$work/ctl.sock" 2>/dev/null
+    if [ -n "$as" ]; then
+        cp "$drive" "$work/bt_drive"; chmod 755 "$work/bt_drive"
+        cmd="runuser -u $as -- $work/bt_drive"
+    else
+        cmd=$drive
+    fi
+    if timeout 180 $cmd "$work/ctl.sock" "$pname" "$work/passkey" >"$work/drive.log" 2>&1 && grep -q "bt-drive: ok" "$work/drive.log"; then
         echo "  ok $name"; sed -n 's/^step: /     /p' "$work/drive.log"
     else
         echo "  FAIL $name"; for f in drive svc peer; do echo "--- $f"; tail -15 "$work/$f.log"; done
@@ -62,7 +71,31 @@ run() { # name peer-iocap
     kill $d_pid $peer_pid $w_pid 2>/dev/null; wait $d_pid $peer_pid 2>/dev/null; d_pid= peer_pid= w_pid=
     rm -f "$work/ctl.sock"
 }
+# Settings as an Atrium app: the launch registry names the uid, and its
+# installed manifest holds bluetooth-control (vinculumd --control-apps).
+chmod 755 "$work"; : > "$work/passkey"; chmod 666 "$work/passkey"
+mkdir -p "$work/apps/org.atrium.curia" "$work/apps/org.example.game"
+printf '[app]\nid = "org.atrium.curia"\n\n[capabilities]\ngraphics = "fresco"\nbluetooth-control = true\n' > "$work/apps/org.atrium.curia/atrium.toml"
+printf '[app]\nid = "org.example.game"\n\n[capabilities]\ngraphics = "fresco"\n' > "$work/apps/org.example.game/atrium.toml"
+printf '%s alice org.atrium.curia\n' "$(id -u nobody)" > "$work/registry"
+run "numbers to compare, as an app the registry names (uid $(id -u nobody))" display-yes-no nobody
+# The same uid as an app without the capability: refused.
+printf '%s alice org.example.game\n' "$(id -u nobody)" > "$work/registry"
+"$vbin/vinculumd" --transport "unix:$work/hci.sock" --control "$work/ctl.sock" --control-apps "$work/registry" "$work/apps" --keys "$work/keys" --machine-key "$work/machine.key" >"$work/svc.log" 2>&1 &
+d_pid=$!
+i=0; until [ -S "$work/ctl.sock" ]; do i=$((i+1)); [ $i -gt 100 ] && break; sleep 0.1; done
+chmod 666 "$work/ctl.sock"
+timeout 20 runuser -u nobody -- "$work/bt_drive" "$work/ctl.sock" CuriaPeer >"$work/drive.log" 2>&1
+if grep -q "control client uid $(id -u nobody) refused" "$work/svc.log" && ! grep -q "bt-drive: ok" "$work/drive.log"; then
+    echo "  ok an app without bluetooth-control is refused"
+else
+    echo "  FAIL an app without bluetooth-control: $(tail -3 "$work/svc.log")"; fails=$((fails+1))
+fi
+kill $d_pid 2>/dev/null; wait $d_pid 2>/dev/null; d_pid=; rm -f "$work/ctl.sock"
 run "numbers to compare" display-yes-no
 run "a code Settings shows, typed on the device" keyboard
 run "a code the device shows, typed into Settings" display
+# A Classic keyboard: found by inquiry (no LE advertising), paired over
+# BR/EDR.
+run "a Classic keyboard found by inquiry, a code it types" keyboard "" classic
 echo "curia-bt: $fails failed"

@@ -92,7 +92,10 @@ fn die(why: &str) -> ! {
 
 fn print_event(e: &Event) {
     match e {
-        Event::Found { address, name, rssi } => println!("found {address} {} (rssi {rssi})", name.as_deref().unwrap_or("-")),
+        Event::Found { address, name, rssi, class_of_device } => {
+            let kind = class_of_device.map_or(String::new(), |c| format!(" classic {c:06x}"));
+            println!("found {address} {} (rssi {rssi}){kind}", name.as_deref().unwrap_or("-"))
+        }
         Event::Connected { address, encrypted } => println!("connected {address}{}", if *encrypted { " (encrypted)" } else { "" }),
         Event::Disconnected { address, reason } => println!("disconnected {address} ({reason})"),
         Event::Paired { address, authenticated, keyboard_allowed } => println!(

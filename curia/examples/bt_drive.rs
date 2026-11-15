@@ -84,7 +84,7 @@ fn main() {
     c.until(&mut p, 30, "the device in the scan", nop, move |p| p.found.iter().any(|f| f.name.as_deref() == Some(&n)));
     let f = p.found.iter().find(|f| f.name.as_deref() == Some(name)).unwrap().clone();
     let addr = f.address;
-    println!("step: found {} ({})", label(f.name.as_deref(), &addr), curia::bluetooth::signal(f.rssi));
+    println!("step: found {} ({}{})", label(f.name.as_deref(), &addr), curia::bluetooth::found_line(&f), if f.class.is_some() { ", Classic" } else { "" });
 
     p.pair(addr);
     c.send(&mut p);

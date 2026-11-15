@@ -118,7 +118,10 @@ pub enum Event {
     Ok,
     Error { why: String },
     Status { ready: bool, address: Option<Addr>, scanning: bool, pairable: bool, agents: u32, connections: u32 },
-    Found { address: Addr, name: Option<String>, rssi: i8 },
+    /// A device the scan saw. `class_of_device` is set for a Classic
+    /// (BR/EDR) device found by inquiry, to pair with `PairClassic`; it is
+    /// `None` for an LE advertiser (`Pair`).
+    Found { address: Addr, name: Option<String>, rssi: i8, class_of_device: Option<u32> },
     Devices { devices: Vec<DeviceInfo> },
     Prompt { address: Addr, prompt: Prompt },
     Paired { address: Addr, authenticated: bool, keyboard_allowed: bool },

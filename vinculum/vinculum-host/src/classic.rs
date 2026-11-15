@@ -147,6 +147,27 @@ impl Host {
     pub(crate) fn on_classic_event(&mut self, ev: hci::EventChild) {
         use hci::EventChild as E;
         match ev {
+            E::InquiryResult(r) => {
+                for x in r.responses {
+                    let peer = Peer::from_hci(x.bd_addr, hci::AddressType::PublicDeviceAddress);
+                    self.out_events.push_back(HostEvent::InquiryResult { peer, rssi: None, name: None, class_of_device: x.class_of_device });
+                }
+            }
+            E::InquiryResultWithRssi(r) => {
+                for x in r.responses {
+                    let peer = Peer::from_hci(x.address, hci::AddressType::PublicDeviceAddress);
+                    self.out_events.push_back(HostEvent::InquiryResult { peer, rssi: Some(x.rssi as i8), name: None, class_of_device: x.class_of_device });
+                }
+            }
+            E::ExtendedInquiryResult(r) => {
+                let peer = Peer::from_hci(r.address, hci::AddressType::PublicDeviceAddress);
+                // The EIR is advertising-data shaped, zero-padded to 240.
+                let eir = &r.extended_inquiry_response[..];
+                let end = eir.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                let name = vinculum_hci_proto::gap::parse(&eir[..end]).ok().and_then(|s| vinculum_hci_proto::gap::local_name(&s));
+                self.out_events.push_back(HostEvent::InquiryResult { peer, rssi: Some(r.rssi as i8), name, class_of_device: r.class_of_device });
+            }
+            E::InquiryComplete(_) => self.out_events.push_back(HostEvent::InquiryDone),
             E::LinkKeyRequest(r) => {
                 let key = self.classic_conn(r.bd_addr).and_then(|h| self.conns[&h].classic.as_ref()).and_then(|s| s.key);
                 match key {

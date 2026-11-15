@@ -109,6 +109,11 @@ pub enum HostEvent {
     /// The caller resets the transport and starts a new `Host`.
     Fatal(String),
     Advertisement { peer: Peer, rssi: i8, name: Option<String> },
+    /// A Classic (BR/EDR) device answered an inquiry (`inquiry`); `rssi`
+    /// and `name` when the controller reports them (extended results).
+    InquiryResult { peer: Peer, rssi: Option<i8>, name: Option<String>, class_of_device: u32 },
+    /// The inquiry ended (its time ran out, or it was cancelled).
+    InquiryDone,
     Connected { handle: u16, peer: Peer, transport: Transport, central: bool },
     ConnectFailed { peer: Option<Peer>, status: String },
     Disconnected { handle: u16, reason: String },
@@ -354,6 +359,22 @@ impl Host {
     /// Cancels a pending `le_connect`; it ends with `ConnectFailed`.
     pub fn le_connect_cancel(&mut self, now_ms: u64) {
         self.issue(to_cmd(hci::LeCreateConnectionCancel {}), Tag::Policy);
+        self.pump(now_ms);
+    }
+
+    /// Look for Classic (BR/EDR) devices that are discoverable (a device in
+    /// pairing mode), for about 10 s, or stop looking. Results arrive as
+    /// `InquiryResult`, the end as `InquiryDone`. We stay undiscoverable
+    /// ourselves: this only asks.
+    pub fn inquiry(&mut self, on: bool, now_ms: u64) {
+        if on {
+            // Extended results carry the name and the signal.
+            self.issue(to_cmd(hci::WriteInquiryMode { inquiry_mode: hci::InquiryMode::RssiOrExtended }), Tag::Policy);
+            // The General Inquiry Access Code, 0x9E8B33; 8 x 1.28 s.
+            self.issue(to_cmd(hci::Inquiry { lap: hci::Lap { lap: 0x33 }, inquiry_length: 8, num_responses: 0 }), Tag::User);
+        } else {
+            self.issue(to_cmd(hci::InquiryCancel {}), Tag::Policy);
+        }
         self.pump(now_ms);
     }
 

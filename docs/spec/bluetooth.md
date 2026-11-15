@@ -494,6 +494,13 @@ devices, toggle profiles per device, the app grants of §12, and the chooser. Pa
 request with no UI open is refused (§7). `vinculum-ctl` (CLI and agent) covers stock FreeBSD.
 Curia's Bluetooth page is built (2026-11-15, [curia.md](curia.md) §14) and the capability
 `bluetooth-control` exists in Portcullis; the Forum bar menu is still to come.
+Admission on Atrium: `vinculumd --control-apps REGISTRY APPS_DIR` lets in a uid that the
+launch registry names as an app whose installed manifest holds `bluetooth-control = true`
+(both read per connection; `vinculumd/src/apps.rs`, no Atrium crate). A user's scan
+(`Scan { on: true }`) runs a Classic inquiry beside the LE scan, restarted each time it
+ends and paused while a pairing pages its device; `Found` carries the Class of Device
+for inquiry results, which pair with `PairClassic`. We only ask: vinculumd never enables
+inquiry scan, so it stays undiscoverable (§7).
 
 ## 14. Tests
 

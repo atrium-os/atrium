@@ -349,17 +349,29 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
 - The connection (`follow_bt` in main.rs): every 5 s while vinculumd is away ("Bluetooth
   is not available / vinculumd is not running; trying again"); a quiet connection is
   asked for its status after 30 s and dropped as hung 10 s later.
-- Not yet: Classic devices (keyboards, headphones) are not found by vinculumd's LE scan;
-  `PairClassic` by address has no place on the page yet. Power on/off and per-device
-  profiles wait for vinculumd to offer them. Deploying vinculumd on Atrium, its
-  `--control-uid` must admit Settings' per-app uid (or vinculumd learns to check the
-  launch registry and manifest, as choragusd does for `audio-control`).
+- Classic devices (added the same day): Find devices also runs a Classic inquiry in
+  vinculumd, so keyboards, headsets and headphones that do not advertise over LE are
+  listed too. `Found` carries the Class of Device for those; the row says what the device
+  is ("Keyboard · Strong signal", "Headphones · Good signal"), and Pair sends
+  `PairClassic`. A dual-mode device heard both ways pairs over Classic.
+- Who may use the socket (added the same day): vinculumd `--control-apps REGISTRY
+  APPS_DIR` admits a client whose uid the launch registry names as an app whose installed
+  manifest holds `bluetooth-control = true`, read on each connection, as choragusd does for
+  `audio-control`; `--control-uid` stays for stock FreeBSD. vinculumd still uses no Atrium
+  crate.
+- Not yet: power on/off and per-device profiles wait for vinculumd to offer them. Names
+  of Classic devices come from their inquiry response only (no remote name request yet).
 - Live check on the Linux host, 2026-11-15 (`scripts/curia-bt-check.sh`): Rootcanal,
   vinculum-hci, vinculumd with its control socket, and a Bumble peer; the page model
   (`curia/examples/bt_drive.rs`) finds the peer, pairs it answering the prompt as the
   page's buttons would, sees it in the paired list connected, disconnects, connects
   again with the stored bond, and forgets it after asking. Three peers, one per prompt
   (numbers to compare; a code Settings shows, typed on the device; a code the device
-  shows, typed into Settings): 0 failed. The drawn page is checked by the host render
-  test; no VM run, as the cloud VM has no Bluetooth controller.
+  shows, typed into Settings), then the same run with vinculumd `--control-apps`: Settings
+  driven as uid 65534, which the registry names as `org.atrium.curia`, is admitted, and
+  the same uid named as an app without `bluetooth-control` is refused; and a Classic-only
+  keyboard (no LE advertising, Class of Device keyboard) found by inquiry, paired over
+  BR/EDR with the code it types (Rootcanal always gives 000000), reconnected and
+  forgotten: 0 failed. The drawn page is checked by the host render test; no VM run, as
+  the cloud VM has no Bluetooth controller.
 

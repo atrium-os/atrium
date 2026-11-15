@@ -22,6 +22,9 @@ pub struct Found {
     pub address: Addr,
     pub name: Option<String>,
     pub rssi: i8,
+    /// A Classic (BR/EDR) device found by inquiry, with its Class of
+    /// Device; it pairs over Classic. `None`: an LE advertiser.
+    pub class: Option<u32>,
 }
 
 /// What a request's `Ok` or `Error` answers (vinculumd answers each request
@@ -63,6 +66,37 @@ pub fn label(name: Option<&str>, a: &Addr) -> String {
 }
 
 /// "Strong", "Good", "Weak" from an RSSI in dBm.
+/// What kind of device a Class of Device names (its major class, and for
+/// a peripheral its minor bits), for the found list.
+pub fn kind(class: u32) -> Option<&'static str> {
+    Some(match (class >> 8) & 0x1f {
+        0x01 => "Computer",
+        0x02 => "Phone",
+        0x04 => match (class >> 2) & 0x3f {
+            0x01 | 0x02 => "Headset",
+            0x05 => "Speaker",
+            0x06 => "Headphones",
+            _ => "Audio device",
+        },
+        0x05 => match (class >> 6) & 0x3 {
+            0x1 => "Keyboard",
+            0x2 => "Mouse",
+            0x3 => "Keyboard and mouse",
+            _ => "Input device",
+        },
+        0x06 => "Printer or camera",
+        _ => return None,
+    })
+}
+
+/// A found device's second line: what it is, if it says, and its signal.
+pub fn found_line(f: &Found) -> String {
+    match f.class.and_then(kind) {
+        Some(k) => format!("{k} · {}", signal(f.rssi)),
+        None => signal(f.rssi).to_string(),
+    }
+}
+
 pub fn signal(rssi: i8) -> &'static str {
     match rssi {
         r if r >= -60 => "Strong signal",
@@ -164,7 +198,7 @@ impl BtPage {
                     self.confirm_forget = None;
                 }
             }
-            Event::Found { address, name, rssi } => {
+            Event::Found { address, name, rssi, class_of_device } => {
                 if self.bonded(&address) {
                     return;
                 }
@@ -175,8 +209,11 @@ impl BtPage {
                         if name.is_some() {
                             f.name = name;
                         }
+                        // A dual-mode device heard both ways pairs over
+                        // Classic, where its audio and keyboard live.
+                        f.class = f.class.or(class_of_device);
                     }
-                    None if n < MAX_FOUND => self.found.push(Found { address, name, rssi }),
+                    None if n < MAX_FOUND => self.found.push(Found { address, name, rssi, class: class_of_device }),
                     None => {}
                 }
             }
@@ -224,7 +261,8 @@ impl BtPage {
         }
         self.pairing = Some(a);
         self.note = None;
-        self.ask(Request::Pair { address: a });
+        let classic = self.found.iter().any(|f| f.address == a && f.class.is_some());
+        self.ask(if classic { Request::PairClassic { address: a } } else { Request::Pair { address: a } });
     }
 
     /// The person's answer to a Confirm prompt.
@@ -319,9 +357,9 @@ mod tests {
         assert_eq!(p.take_wants(), vec![Request::Scan { on: true }, Request::Status]);
         p.apply(Event::Ok);
         p.apply(Event::Status { ready: true, address: None, scanning: true, pairable: false, agents: 1, connections: 0 });
-        p.apply(Event::Found { address: a(1), name: Some("Dev1".into()), rssi: -40 });
-        p.apply(Event::Found { address: a(2), name: None, rssi: -80 });
-        p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -50 });
+        p.apply(Event::Found { address: a(1), name: Some("Dev1".into()), rssi: -40, class_of_device: None });
+        p.apply(Event::Found { address: a(2), name: None, rssi: -80, class_of_device: None });
+        p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -50, class_of_device: None });
         assert_eq!(p.found.len(), 1, "a paired device is not offered again");
         assert_eq!((label(p.found[0].name.as_deref(), &p.found[0].address), signal(p.found[0].rssi)), ("Mouse".into(), "Strong signal"));
         assert_eq!(label(None, &a(3)), "Unnamed device (C0:00:00:00:00:03)");
@@ -330,9 +368,23 @@ mod tests {
     }
 
     #[test]
+    fn a_classic_device_pairs_over_classic() {
+        let mut p = page();
+        // A keyboard heard by inquiry (peripheral, keyboard), then advertising too.
+        p.apply(Event::Found { address: a(4), name: None, rssi: -55, class_of_device: Some(0x002540) });
+        p.apply(Event::Found { address: a(4), name: Some("Keys".into()), rssi: -50, class_of_device: None });
+        assert_eq!(found_line(&p.found[0]), "Keyboard · Strong signal");
+        p.apply(Event::Found { address: a(5), name: Some("Cans".into()), rssi: -70, class_of_device: Some(0x240418) });
+        assert_eq!(found_line(&p.found[1]), "Headphones · Good signal");
+        p.pair(a(4));
+        assert_eq!(p.take_wants(), vec![Request::PairClassic { address: a(4) }]);
+        assert_eq!(kind(0x1f00), None, "uncategorized says nothing");
+    }
+
+    #[test]
     fn pairing_with_a_number_to_compare() {
         let mut p = page();
-        p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -50 });
+        p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -50, class_of_device: None });
         p.pair(a(2));
         p.pair(a(3));
         assert_eq!(p.take_wants(), vec![Request::Pair { address: a(2) }], "one at a time");

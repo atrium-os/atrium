@@ -47,6 +47,10 @@ pub struct Config {
     pub control_path: String,
     /// Uids allowed on the control socket, beyond our own.
     pub allowed_uids: Vec<u32>,
+    /// Atrium (bluetooth.md §13): the launch registry and the installed
+    /// apps' directory; an app whose manifest holds `bluetooth-control`
+    /// is allowed too (`crate::apps`).
+    pub allowed_apps: Option<(String, String)>,
     pub io_cap: IoCap,
     /// Our IRK (development: fixed; the real one lives in the key store).
     pub irk: [u8; 16],
@@ -68,6 +72,8 @@ struct Daemon {
     scanning: bool,
     /// A control client asked for a scan.
     user_scan: bool,
+    /// A Classic inquiry is running (alongside a user's scan only).
+    inquiring: bool,
     /// Our LE connection attempt in flight, and when we give up on it.
     le_connecting: Option<(Addr, Option<u64>)>,
     /// A device the user asked to pair, waiting for its connection.
@@ -341,6 +347,20 @@ impl Daemon {
             self.host.le_scan(want, now);
             self.scanning = want;
         }
+        self.update_inquiry();
+    }
+
+    /// A user's scan also asks for Classic devices (keyboards, headsets),
+    /// except while a pairing waits for its connection: paging and inquiry
+    /// share the radio. We only ask; we stay undiscoverable (§7).
+    fn update_inquiry(&mut self) {
+        let want = self.host.is_ready() && self.user_scan && self.pending_pair.is_none();
+        if want != self.inquiring {
+            let now = self.now();
+            self.host.inquiry(want, now);
+            // A cancelled inquiry sends no Inquiry Complete.
+            self.inquiring = want;
+        }
     }
 
     /// One LE connection attempt at a time; the scan pauses meanwhile.
@@ -376,11 +396,13 @@ impl Daemon {
             return Event::Error { why: "another pairing is in progress".into() };
         }
         self.pending_pair = Some(address);
+        self.update_inquiry();
         if classic {
             self.host.classic_connect(peer(address), now);
         } else {
             if self.le_connecting.is_some() {
                 self.pending_pair = None;
+                self.update_inquiry();
                 return Event::Error { why: "another connection is in progress; try again".into() };
             }
             self.le_connect(address);
@@ -409,7 +431,7 @@ impl Daemon {
                     self.names.insert(a, n.clone());
                 }
                 if self.user_scan {
-                    self.broadcast(&Event::Found { address: a, name, rssi });
+                    self.broadcast(&Event::Found { address: a, name, rssi, class_of_device: None });
                 }
                 // A bonded LE device that is away, advertising: reconnect.
                 let away = self.bond_for(a).is_some_and(|k| !self.bonds[k].1.classic) && self.handle_of(a).is_none();
@@ -429,6 +451,7 @@ impl Daemon {
                 self.broadcast(&Event::Connected { address: a, encrypted: false });
                 if self.pending_pair == Some(a) {
                     self.pending_pair = None;
+                    self.update_inquiry();
                     if let Err(why) = self.start_pair(handle) {
                         self.broadcast(&Event::PairingFailed { address: a, why });
                         self.host.disconnect(handle, now);
@@ -454,6 +477,7 @@ impl Daemon {
                 if let (Some(p), Some(pp)) = (peer, self.pending_pair) {
                     if addr(p) == pp {
                         self.pending_pair = None;
+                        self.update_inquiry();
                         self.broadcast(&Event::PairingFailed { address: pp, why: format!("connect failed: {status}") });
                     }
                 }
@@ -574,6 +598,21 @@ impl Daemon {
                     self.host.reject_connection(p, now);
                 }
             }
+            HostEvent::InquiryResult { peer, rssi, name, class_of_device } => {
+                let a = addr(peer);
+                if let Some(n) = &name {
+                    self.names.insert(a, n.clone());
+                }
+                if self.user_scan {
+                    let name = name.or_else(|| self.names.get(&a).cloned());
+                    self.broadcast(&Event::Found { address: a, name, rssi: rssi.unwrap_or(-127), class_of_device: Some(class_of_device) });
+                }
+            }
+            HostEvent::InquiryDone => {
+                // Its time ran out: ask again while the scan is on.
+                self.inquiring = false;
+                self.update_inquiry();
+            }
             HostEvent::SecurityRequest { handle, .. } => {
                 let Some(&a) = self.conns.get(&handle) else { return };
                 let bonded = self.bond_for(a);
@@ -595,7 +634,8 @@ impl Daemon {
     fn accept(&mut self, listener: &UnixListener) {
         let Ok((sock, _)) = listener.accept() else { return };
         let Some(uid) = peer_uid(&sock) else { return };
-        if uid != getuid() && !self.cfg.allowed_uids.contains(&uid) {
+        let app_ok = || self.cfg.allowed_apps.as_ref().is_some_and(|(r, d)| crate::apps::admits(r, d, uid));
+        if uid != getuid() && !self.cfg.allowed_uids.contains(&uid) && !app_ok() {
             eprintln!("vinculumd: control client uid {uid} refused");
             return;
         }
@@ -661,6 +701,7 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         clients: Vec::new(),
         scanning: false,
         user_scan: false,
+        inquiring: false,
         le_connecting: None,
         pending_pair: None,
         conns: HashMap::new(),

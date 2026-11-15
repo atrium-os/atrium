@@ -1076,7 +1076,7 @@ impl CuriaView {
                 }
                 for f in &p.found {
                     let a = f.address;
-                    row(ctx, y, &bt::label(f.name.as_deref(), &a), bt::signal(f.rssi));
+                    row(ctx, y, &bt::label(f.name.as_deref(), &a), &bt::found_line(f));
                     let pg = self.bt.clone();
                     let busy = p.pairing == Some(a);
                     buttons(ctx, y, vec![(if busy { "Pairing…".into() } else { "Pair".into() }, Look::Primary, !busy && p.pairing.is_none() && st.ready, Box::new(move || with_bt(&pg, |b| b.pair(a))))]);
@@ -1214,7 +1214,7 @@ mod tests {
             p.apply(Event::Ok);
             p.apply(Event::Status { ready: true, address: Some(Addr { bytes: [0, 0x1B, 0xDC, 1, 2, 3], random: false }), scanning: true, pairable: true, agents: 1, connections: 1 });
             p.apply(Event::Devices { devices: vec![DeviceInfo { address: a(1), identity: None, name: "Keys".into(), authenticated: true, secure_connections: true, keyboard_allowed: true, connected: true }] });
-            p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -70 });
+            p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -70, class_of_device: None });
             p.pair(a(2));
             p.apply(Event::Prompt { address: a(2), prompt: vinculum_control::Prompt::Confirm { number: Some(42) } });
         });
