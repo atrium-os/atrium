@@ -5,6 +5,7 @@
 //! nodes; [`frame`] edits the text of one frame; [`app`] is the window; [`present`] runs a slideshow.
 
 pub mod app;
+pub mod decode;
 pub mod doc;
 pub mod files;
 pub mod frame;

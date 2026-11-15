@@ -853,8 +853,16 @@ pub fn present(deck: Deck, deck_key: u64, fonts: Rc<dyn Fonts>, start: usize, em
             }
         }
         idle();
+        // Pictures decoded on the workers (a slide drawn from previews
+        // sharpens): painted again between animations.
+        if run.live.is_none() && crate::render::pump(crate::decode::take_decoded()) {
+            aud.paint()?;
+            if let Some(p) = pres.as_mut() {
+                p.paint()?;
+            }
+        }
         // Wait for either window, a timer or the next second.
-        let mut wait = Duration::from_millis(if run.players.is_empty() { 250 } else { 50 });
+        let mut wait = Duration::from_millis(if !run.players.is_empty() || crate::render::decoding() > 0 { 50 } else { 250 });
         for t in [run.auto, run.settle, press_at].into_iter().flatten() {
             wait = wait.min(t.saturating_duration_since(Instant::now()));
         }

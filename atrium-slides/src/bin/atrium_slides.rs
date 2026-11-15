@@ -306,9 +306,15 @@ fn main() {
     let mut want_picker: Option<Asking> = None;
     let mut last_sync = Instant::now();
     loop {
-        match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() { 20 } else { 250 }))) {
+        let busy = atrium_slides::render::decoding() + atrium_slides::render::previewing() > 0;
+        match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() || busy { 20 } else { 250 }))) {
             Ok(StepResult::Closed) | Err(_) => break,
             _ => {}
+        }
+        // Pictures decoded and previews made off this thread (§9.3).
+        let key = run.slides.deck_key();
+        if atrium_slides::render::tend(&mut run.slides.doc.borrow_mut().deck, key) {
+            app.invalidate();
         }
         if size.get() != (win.width, win.height) || run.slides.scale.get() != win.scale() as f64 {
             size.set((win.width, win.height));

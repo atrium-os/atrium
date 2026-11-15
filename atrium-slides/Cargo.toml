@@ -26,6 +26,8 @@ fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
 limen = { path = "../limen" }
 libc = "0.2"
+jpeg-encoder = "0.7.1"
+png = "0.17"
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch.
@@ -34,6 +36,3 @@ pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
 debug = 1
-
-[dev-dependencies]
-png = "0.17"

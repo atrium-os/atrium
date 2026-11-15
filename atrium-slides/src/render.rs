@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use navigator_image::image::{decode_unaddressed, Ceilings};
 use officina_slides::draw::{self, DrawItem, Paint as DPaint, Xform};
 use officina_slides::model::{Dash, Deck, MediaId};
 use officina_text::paint::Item;
@@ -110,12 +109,17 @@ fn paint(p: &DPaint, m: &Xform) -> Option<Paint> {
 #[derive(Default)]
 struct Cache {
     map: HashMap<(u64, MediaId, u32, u32), (Option<Image>, usize, u64)>,
+    /// Full decodes asked of the workers and not back yet.
+    asked: std::collections::HashSet<(u64, MediaId, u32, u32)>,
     bytes: usize,
     tick: u64,
 }
 
 /// Decoded bytes kept for pictures across the app.
 pub const BUDGET: usize = 256 << 20;
+
+/// The size key a preview's own decode is cached under.
+const PREVIEW_KEY: u32 = u32::MAX;
 
 thread_local! {
     static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
@@ -125,32 +129,148 @@ fn bucket(v: f64) -> u32 {
     (v.ceil().max(1.0) as u32).div_ceil(32) * 32
 }
 
+impl Cache {
+    fn get(&mut self, key: &(u64, MediaId, u32, u32)) -> Option<Option<Image>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|e| {
+            e.2 = tick;
+            e.0.clone()
+        })
+    }
+
+    fn put(&mut self, key: (u64, MediaId, u32, u32), image: Option<Image>) {
+        let n = image.as_ref().map_or(0, |i| i.data().rgba.len());
+        while self.bytes + n > BUDGET && !self.map.is_empty() {
+            let (&k, _) = self.map.iter().min_by_key(|(_, e)| e.2).expect("not empty");
+            let e = self.map.remove(&k).expect("present");
+            self.bytes -= e.1;
+        }
+        self.tick += 1;
+        self.bytes += n;
+        if let Some(old) = self.map.insert(key, (image, n, self.tick)) {
+            self.bytes -= old.1;
+        }
+    }
+}
+
+fn image_of(px: navigator_image::image::Pixels) -> Image {
+    Image::new(px.width, px.height, px.rgba)
+}
+
 /// `media` of `deck` (known to the app as `deck_key`) decoded for drawing at
 /// about `w` × `h` device px: decoded at that size, never bigger (§9.3).
+///
+/// A picture with a preview in the deck draws from it when the preview is
+/// big enough (thumbnails, the sorter); when it is not, the full decode goes
+/// to a worker ([`crate::decode`]) and the preview is drawn meanwhile: a
+/// slide shows at once and sharpens when [`pump`] brings the decode back.
+/// A picture without a preview decodes here, as it is drawn.
 pub fn picture(deck: &Deck, deck_key: u64, media: MediaId, w: f64, h: f64) -> Option<Image> {
     let (tw, th) = (bucket(w), bucket(h));
     let key = (deck_key, media, tw, th);
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        c.tick += 1;
-        let tick = c.tick;
-        if let Some(e) = c.map.get_mut(&key) {
-            e.2 = tick;
-            return e.0.clone();
+        if let Some(i) = c.get(&key) {
+            return i;
         }
-        let bytes = deck.media_bytes(media).ok()?;
-        let ceil = Ceilings { target: Some((tw, th)), ..Ceilings::default() };
-        let image = decode_unaddressed(&bytes, ceil).ok().map(|px| Image::new(px.width, px.height, px.rgba));
-        let n = image.as_ref().map_or(0, |i| i.data().rgba.len());
-        while c.bytes + n > BUDGET && !c.map.is_empty() {
-            let (&k, _) = c.map.iter().min_by_key(|(_, e)| e.2).expect("not empty");
-            let e = c.map.remove(&k).expect("present");
-            c.bytes -= e.1;
+        if let Some((pw, ph)) = deck.preview(media) {
+            let pkey = (deck_key, media, PREVIEW_KEY, PREVIEW_KEY);
+            let small = match c.get(&pkey) {
+                Some(i) => i,
+                None => {
+                    let i = deck.preview_bytes(media).and_then(|b| b.ok()).and_then(|b| crate::decode::decode(&b, pw, ph)).map(image_of);
+                    c.put(pkey, i.clone());
+                    i
+                }
+            };
+            // Big enough: the preview is what this size would decode to.
+            if small.is_some() && (pw >= tw || ph >= th) {
+                return small;
+            }
+            if small.is_some() {
+                if c.asked.insert(key) {
+                    match deck.media_bytes(media) {
+                        Ok(b) => crate::decode::want_decode(key, b),
+                        Err(_) => {
+                            c.asked.remove(&key);
+                            c.put(key, small.clone());
+                        }
+                    }
+                }
+                return small;
+            }
         }
-        c.bytes += n;
-        c.map.insert(key, (image.clone(), n, tick));
+        let image = deck.media_bytes(media).ok().and_then(|b| crate::decode::decode(&b, tw, th)).map(image_of);
+        c.put(key, image.clone());
         image
     })
+}
+
+/// Brings back the decodes the workers finished: true when any did (the
+/// window paints again to show them).
+pub fn pump(done: Vec<crate::decode::Done>) -> bool {
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let mut any = false;
+        for d in done {
+            if let crate::decode::Done::Decoded(key, px) = d {
+                if c.asked.remove(&key) {
+                    c.put(key, px.map(image_of));
+                    any = true;
+                }
+            }
+        }
+        any
+    })
+}
+
+thread_local! {
+    /// Previews asked for and not back: (deck key, media).
+    static PREVIEWS_ASKED: RefCell<std::collections::HashSet<(u64, MediaId)>> = RefCell::new(Default::default());
+}
+
+/// The window's idle work for `deck` (known as `deck_key`): brings back
+/// decodes and previews, and asks for previews of the pictures without one,
+/// a few at a time so decodes for the screen never wait long behind them.
+/// True when the window should paint again.
+pub fn tend(deck: &mut Deck, deck_key: u64) -> bool {
+    let mut decoded = Vec::new();
+    for d in crate::decode::take() {
+        match d {
+            crate::decode::Done::Preview(k, media, made) => {
+                PREVIEWS_ASKED.with(|a| a.borrow_mut().remove(&(k, media)));
+                if let (true, Some((mime, w, h, bytes))) = (k == deck_key, made) {
+                    deck.set_preview(media, mime, w, h, &bytes);
+                }
+            }
+            d => decoded.push(d),
+        }
+    }
+    let repaint = pump(decoded);
+    if crate::decode::pending().0 == 0 {
+        let want: Vec<MediaId> = PREVIEWS_ASKED.with(|a| {
+            let a = a.borrow();
+            deck.pictures_without_preview().into_iter().filter(|m| !a.contains(&(deck_key, *m))).take(8).collect()
+        });
+        for m in want {
+            if let Ok(b) = deck.media_bytes(m) {
+                PREVIEWS_ASKED.with(|a| a.borrow_mut().insert((deck_key, m)));
+                crate::decode::want_preview(deck_key, m, b);
+            }
+        }
+    }
+    repaint
+}
+
+/// Previews asked for and not back.
+pub fn previewing() -> usize {
+    PREVIEWS_ASKED.with(|a| a.borrow().len())
+}
+
+/// Full decodes asked for and not back.
+pub fn decoding() -> usize {
+    CACHE.with(|c| c.borrow().asked.len())
 }
 
 /// Pergola nodes for `items` placed at `at`; `scale` is the display's
@@ -251,5 +371,57 @@ fn picture_box(deck: &Deck, deck_key: u64, media: MediaId, m: &Xform, w: f64, h:
     match picture(deck, deck_key, media, r.w() as f64 * scale, r.h() as f64 * scale) {
         Some(image) => out.push(Node::Image { rect: r, image }),
         None => out.push(Node::Rect { rect: r, fill: Color::rgba(0.85, 0.86, 0.88, 1.0), radius: 0.0 }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(w: u32, h: u32, alpha: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut out, w, h);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            let px: Vec<u8> = (0..w * h).flat_map(|i| [(i % w) as u8, (i / w) as u8, 90, alpha]).collect();
+            e.write_header().unwrap().write_image_data(&px).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn previews_are_small_jpegs_or_pngs() {
+        let (mime, w, h, b) = crate::decode::make_preview(&png(2000, 1000, 255)).unwrap();
+        assert_eq!((mime, w, h), ("image/jpeg", 512, 256));
+        assert!(b.len() < 100_000, "{}", b.len());
+        let (mime, w, h, _) = crate::decode::make_preview(&png(150, 300, 128)).unwrap();
+        assert_eq!((mime, w, h), ("image/png", 150, 300), "never enlarged; transparency kept");
+        assert!(crate::decode::make_preview(b"not a picture").is_none());
+    }
+
+    #[test]
+    fn a_picture_shows_its_preview_and_sharpens() {
+        let mut deck = Deck::new();
+        let m = deck.add_media("image/png", &png(1600, 1000, 255));
+        let (mime, w, h, b) = crate::decode::make_preview(&deck.media_bytes(m).unwrap()).unwrap();
+        assert!(deck.set_preview(m, mime, w, h, &b));
+        let key = 0x7e57;
+        // A thumbnail draws from the preview, decoding nothing else.
+        let t = picture(&deck, key, m, 200.0, 125.0).unwrap();
+        assert_eq!((t.data().width, t.data().height), (512, 320));
+        assert_eq!(decoding(), 0);
+        // Full screen: the preview at once, the full decode on a worker.
+        let first = picture(&deck, key, m, 1280.0, 800.0).unwrap();
+        assert_eq!(first.data().width, 512);
+        assert_eq!(decoding(), 1);
+        let t0 = std::time::Instant::now();
+        while !pump(crate::decode::take_decoded()) {
+            assert!(t0.elapsed().as_secs() < 20, "the decode never came back");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let sharp = picture(&deck, key, m, 1280.0, 800.0).unwrap();
+        assert_eq!((sharp.data().width, sharp.data().height), (1280, 800));
+        assert_eq!(decoding(), 0);
     }
 }

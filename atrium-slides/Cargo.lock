@@ -93,6 +93,7 @@ version = "0.1.0"
 dependencies = [
  "fresco-client",
  "fresco-protocol",
+ "jpeg-encoder",
  "libc",
  "limen",
  "navigator-image",
@@ -842,6 +843,12 @@ name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"
