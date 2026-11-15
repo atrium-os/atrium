@@ -48,6 +48,10 @@ skip:
   s_cbranch_execz noprim
   export prim v0, off, off, off done
 noprim:
+  // exec back to every lane first: a v_cmp only writes VCC for active
+  // lanes, so comparing under the prim export's exec (lane 0) left lanes
+  // 1 and 2 without a position (run d7c6427b).
+  s_mov_b32 exec_lo, s13
   s_and_b32 s15, s3, 0xff
   v_cmp_gt_u32 vcc_lo, s15, v5
   s_and_b32 exec_lo, s13, vcc_lo
