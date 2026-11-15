@@ -2306,6 +2306,87 @@ value fields; counts without the grand total column): `.ods`→`.ods` and our
 cells; LibreOffice's own `.xlsx` export keeps 2/3 (it doesn't write
 `rowGrandTotals="0"`).
 
+### 16.33 O6 plan (2026-11-15): `atrium-slides`
+
+O6 builds the slides app (§9.1, §9.3) in steps, each ending with a gate:
+
+| step | what | gate |
+|---|---|---|
+| O6a | `officina-slides`, headless: a deck (slide size, theme, masters, layouts, slides), shapes (preset geometry, lines, pictures, groups, text frames on the `officina-text` engine), placeholders inherited slide → layout → master, notes, transitions and builds as data; ops with exact inverses; the `.oslides` native file with one chunk per slide and one content-addressed chunk per picture or video, read lazily; a slide drawn as a display list | random ops undo and redo to the same deck; native round trip; a 1,000-slide deck opens reading only the index, theme, masters, layouts and the first slide |
+| O6b | `atrium-slides`: the slide on a Pergola `Canvas` with selection, move and resize handles, snapping guides, align and group; text editing in frames with the rich-text editor; the slide strip as a `VirtualList` of thumbnails cached by content hash; new slide from a layout; picker open, Save As, autosave journal | VM screenshots; crash-recovery test |
+| O6c | `.pptx` and `.odp` read and write (masters, layouts, placeholders, theme colours and fonts, preset shapes, pictures, groups, tables as shapes, notes, transitions, simple builds; the rest kept or reported) | LibreOffice both ways on generated decks; the corpus's decks open with their slide count and text |
+| O6d | presenting: full screen on one monitor, presenter view (notes, next slide, timer, sorter) on another; transitions and builds as declarative animations run by frescod between resident scene groups; video through Limen's `media-player` | two-monitor VM gate; a transition with no missed frame at 60 Hz |
+| O6e | very large decks: thumbnails stored in the file, pictures decoded at the drawn size, current, next and previous slides resident while presenting, the rehearse pass, Reduce File Size | the §9.3 gates on a generated 1,000-slide, 2 GB deck with 1,500 photos |
+
+**O6a design.** Geometry is in EMU (914,400 to the inch, 12,700 to the point), the
+unit both formats can say exactly (ODF's centimetres are 360,000 EMU), so a round trip
+moves nothing; text inside a frame is laid out in `officina-text` layout units. A text
+frame holds a small `TextDoc`, so a frame's text has the same runs, styles, lists and
+layout cache as a page of Write, and editing it is a `TextOp` wrapped in a deck op
+naming the slide and shape. A placeholder on a slide names its kind and index; what it
+leaves unset (position, size, fill, text style) comes from the layout's placeholder of
+the same kind and index, then the master's, as both formats do. Colours are RGB or a
+theme slot with luminance changes, resolved when drawn, so changing the theme recolours
+the deck. Every slide, master and layout carries an id that never changes, so the op
+log, thumbnails and the native file's chunks name it across moves.
+
+### 16.34 O6a as built (2026-11-15): the deck model
+
+- **`officina-slides`** (headless, depends on `officina-core` and `officina-text`).
+  A deck is a slide size, a theme (twelve colour slots, heading and body fonts),
+  masters, layouts and slides. Shapes are preset geometry by OOXML name with its
+  adjust values (21 presets drawn; any other drawn as its box, reported, kept by
+  name), custom paths, pictures with crop, videos with a poster, and groups with
+  their own child coordinates. Fills are none, solid, linear or radial gradient,
+  or a picture; outlines have dash and arrow ends. Colours are RGB or a theme
+  slot with OOXML's changes (luminance, tint, shade, saturation, alpha), resolved
+  when drawn, so a theme change recolours the deck.
+- **Text frames** hold a small `TextDoc`: a paragraph's style id is its outline
+  level, runs carry direct formatting, `+mj-lt`/`+mn-lt` name the theme's fonts.
+  Level styles (character, paragraph, bullet: a character or a numbering scheme)
+  come from the master's title, body or other style, then each placeholder in the
+  chain, then the frame's own. Drawing turns them into the paragraphs' own
+  formatting and lays the frame out with `officina-text`'s paragraph layout, so a
+  frame shapes and breaks lines exactly as Write does; bullets sit in the hang,
+  numbers count by level, anchors top, middle or bottom, shrink-on-overflow
+  scales the text, and `‹#›` shows the slide's number.
+- **Placeholders.** A slide placeholder takes what it leaves unset (frame,
+  geometry, fill, outline, insets, anchor, autofit, wrap, level styles) from the
+  layout placeholder with its index, else its kind, and that one from the
+  master's of the same kind. New decks get PowerPoint's default 16:9 master and
+  six layouts (Title Slide, Title and Content, Section Header, Two Content, Title
+  Only, Blank); `new_slide` makes a slide with the layout's empty placeholders.
+- **Ops.** `DeckOp`: insert, remove and move slides; slide settings (layout,
+  background, notes, transition, builds, hidden); insert, remove, replace and
+  reorder shapes on a slide, layout or master, inside groups too; a `TextOp` on a
+  frame or the notes; theme, size, masters and layouts. Each returns its exact
+  inverse; ids are never reused while a deck is open.
+- **Drawing.** `draw_slide` gives a display list in EMU (background, master and
+  layout decorations unless hidden, the slide's shapes): paths with paint and
+  stroke, pictures, video posters and text items, each with the affine transform
+  that puts it on the slide (rotation about the middle, flips, group mapping).
+  Editing, thumbnails, presenting and PDF will all draw from it.
+- **Native `.oslides`.** One chunk per slide, media in pieces of at most 16 MiB
+  stored once whatever uses them (unused pieces are dropped on save), masters
+  and layouts in one chunk, and a deck chunk with the theme, the slide order and
+  the media table. Opening reads only the index, the deck and the masters;
+  slides and pictures are read when first needed, a slide read and unchanged can
+  be dropped back to the file, and saving copies unread slides and pieces
+  without decoding them. A damaged slide or piece fails alone. The journal
+  records each op; a text edit is recorded as the frame it left.
+- **Not yet:** tables (O6c reads them as groups of shapes), charts on slides,
+  connectors following their shapes, text on a path, 3-D and effects (shadows,
+  glow); slide-number and date fields are a text marker only.
+
+Gates (`officina-slides` `tests/deck.rs`): inheritance through layout and master;
+theme colours as PowerPoint shows them; drawing order, bullets and text placement;
+groups' mapping; 750 random ops over five seeds undo to the first deck and redo to
+the last; 200 random ops journaled and replayed on the file's copy give the same
+deck; native round trip byte for byte, with a picture used on 20 slides stored
+once and a 16 MiB + video in two pieces; one flipped byte in a slide fails that
+slide only, and truncated and corrupted files never panic; a 1,000-slide deck
+opens and draws its first slide reading one slide (debug build, well under 1 s).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

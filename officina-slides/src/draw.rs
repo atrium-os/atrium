@@ -1,0 +1,445 @@
+//! A slide as a display list (docs/spec/officina.md §9.1): paths, pictures,
+//! video posters and text, each with the transform that puts it on the
+//! slide. The editor's canvas, thumbnails, presenting and PDF all draw from
+//! it, so a slide looks the same in each.
+
+use std::sync::Arc;
+
+use officina_text::layout::{layout_para, Fonts};
+use officina_text::model::{CharAttrs, CharFormat, ListKind, ListRef, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc};
+use officina_text::paint::{paint_para, Item};
+
+use crate::geom;
+use crate::model::*;
+use crate::resolve::{self, color, Owner, Resolved, Rgba};
+
+/// An affine map `[a, b, c, d, e, f]`: x' = a·x + c·y + e, y' = b·x + d·y + f.
+pub type Xform = [f64; 6];
+
+pub const IDENTITY: Xform = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `m` after `n`: a point goes through `n`, then `m`.
+pub fn mul(m: &Xform, n: &Xform) -> Xform {
+    [
+        m[0] * n[0] + m[2] * n[1],
+        m[1] * n[0] + m[3] * n[1],
+        m[0] * n[2] + m[2] * n[3],
+        m[1] * n[2] + m[3] * n[3],
+        m[0] * n[4] + m[2] * n[5] + m[4],
+        m[1] * n[4] + m[3] * n[5] + m[5],
+    ]
+}
+
+pub fn apply(m: &Xform, x: f64, y: f64) -> (f64, f64) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Paint {
+    Solid(Rgba),
+    /// From `from` to `to` in the item's own coordinates; stops 0 to 1.
+    Linear { stops: Vec<(f32, Rgba)>, from: (f64, f64), to: (f64, f64) },
+    Radial { stops: Vec<(f32, Rgba)>, center: (f64, f64), radius: f64 },
+    /// A picture stretched over the item's box.
+    Picture(MediaId),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrokePaint {
+    pub color: Rgba,
+    /// EMU, in the item's own coordinates.
+    pub width: f64,
+    pub dash: Dash,
+    pub head: Arrow,
+    pub tail: Arrow,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DrawItem {
+    /// Paths in a `w` × `h` box (EMU), `xf` onto the slide.
+    Path { xf: Xform, w: f64, h: f64, paths: Vec<Path>, fill: Option<Paint>, stroke: Option<StrokePaint> },
+    /// A picture filling `0..w`, `0..h`, cropped (thousandths of a percent).
+    Picture { xf: Xform, w: f64, h: f64, media: MediaId, crop: [i32; 4] },
+    /// A video's place: its poster until the media player takes over.
+    Video { xf: Xform, w: f64, h: f64, media: MediaId, poster: Option<MediaId> },
+    /// Text in layout units, `xf` onto the slide; `shape` is the frame's shape.
+    Text { xf: Xform, shape: ShapeId, items: Vec<Item> },
+}
+
+/// What a drawing pass noticed (presets drawn as boxes, slides not readable).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Notes {
+    pub unknown_presets: Vec<Arc<str>>,
+}
+
+/// The map from a shape's own box (`0..w`, `0..h`) onto its parent's
+/// coordinates: rotated about its middle, flipped.
+pub fn shape_xform(f: Rect, rot: i32, flip_h: bool, flip_v: bool) -> Xform {
+    let (cx, cy) = (f.x as f64 + f.w as f64 / 2.0, f.y as f64 + f.h as f64 / 2.0);
+    let t = (rot as f64 / 60_000.0).to_radians();
+    let (s, c) = t.sin_cos();
+    let (fx, fy) = (if flip_h { -1.0 } else { 1.0 }, if flip_v { -1.0 } else { 1.0 });
+    let rs = [c * fx, s * fx, -s * fy, c * fy, cx, cy];
+    mul(&rs, &[1.0, 0.0, 0.0, 1.0, -(f.w as f64) / 2.0, -(f.h as f64) / 2.0])
+}
+
+fn stops(theme: &Theme, s: &[GradientStop]) -> Vec<(f32, Rgba)> {
+    s.iter().map(|g| (g.pos.min(100_000) as f32 / 100_000.0, color(theme, &g.color))).collect()
+}
+
+/// A fill as a paint over a `w` × `h` box.
+pub fn paint(theme: &Theme, f: &Fill, w: f64, h: f64) -> Option<Paint> {
+    match f {
+        Fill::None => None,
+        Fill::Solid(c) => Some(Paint::Solid(color(theme, c))),
+        Fill::Picture(m) => Some(Paint::Picture(*m)),
+        Fill::Gradient { stops: s, angle, radial } => {
+            let st = stops(theme, s);
+            if *radial {
+                return Some(Paint::Radial { stops: st, center: (w / 2.0, h / 2.0), radius: (w * w + h * h).sqrt() / 2.0 });
+            }
+            let t = (*angle as f64 / 60_000.0).to_radians();
+            let (dx, dy) = (t.cos(), t.sin());
+            let half = ((w * dx).abs() + (h * dy).abs()) / 2.0;
+            let (cx, cy) = (w / 2.0, h / 2.0);
+            Some(Paint::Linear { stops: st, from: (cx - dx * half, cy - dy * half), to: (cx + dx * half, cy + dy * half) })
+        }
+    }
+}
+
+fn stroke(theme: &Theme, s: &Stroke) -> Option<StrokePaint> {
+    let c = s.color.as_ref()?;
+    Some(StrokePaint { color: color(theme, c), width: s.width.max(0) as f64, dash: s.dash, head: s.head, tail: s.tail })
+}
+
+/// Slide `i`'s display list.
+pub fn draw_slide(deck: &mut Deck, i: usize, fonts: &dyn Fonts, notes: &mut Notes) -> Result<Vec<DrawItem>, Damaged> {
+    deck.load_slide(i)?;
+    let deck = &*deck;
+    let slide = deck.slide_if_loaded(i).ok_or_else(|| Damaged(format!("slide {i}")))?;
+    let layout = deck.layout(slide.layout);
+    let master = layout.and_then(|l| deck.master(l.master));
+    let mut out = Vec::new();
+    let bg = slide.background.as_ref().or(layout.and_then(|l| l.background.as_ref())).or(master.map(|m| &m.background));
+    background(deck, bg, &mut out);
+    let n = (i + 1).to_string();
+    if !slide.hide_layout_shapes {
+        if let (Some(m), Some(l)) = (master, layout) {
+            if !l.hide_master_shapes {
+                shapes(deck, Owner::Master, &m.shapes, &IDENTITY, false, &n, fonts, &mut out, notes);
+            }
+            shapes(deck, Owner::Layout(m.id), &l.shapes, &IDENTITY, false, &n, fonts, &mut out, notes);
+        }
+    }
+    shapes(deck, Owner::Slide(slide.layout), &slide.shapes, &IDENTITY, true, &n, fonts, &mut out, notes);
+    Ok(out)
+}
+
+/// A layout's display list, placeholders shown (for editing layouts).
+pub fn draw_layout(deck: &Deck, id: LayoutId, fonts: &dyn Fonts, notes: &mut Notes) -> Vec<DrawItem> {
+    let mut out = Vec::new();
+    let Some(l) = deck.layout(id) else { return out };
+    let m = deck.master(l.master);
+    background(deck, l.background.as_ref().or(m.map(|m| &m.background)), &mut out);
+    if let (Some(m), false) = (m, l.hide_master_shapes) {
+        shapes(deck, Owner::Master, &m.shapes, &IDENTITY, false, "‹#›", fonts, &mut out, notes);
+    }
+    shapes(deck, Owner::Layout(l.master), &l.shapes, &IDENTITY, true, "‹#›", fonts, &mut out, notes);
+    out
+}
+
+fn background(deck: &Deck, bg: Option<&Fill>, out: &mut Vec<DrawItem>) {
+    let (w, h) = (deck.size.0 as f64, deck.size.1 as f64);
+    let fill = bg.and_then(|f| paint(&deck.theme, f, w, h)).unwrap_or(Paint::Solid(0xFFFF_FFFF));
+    out.push(DrawItem::Path { xf: IDENTITY, w, h, paths: geom::paths(&Geom::preset("rect"), w as i64, h as i64).0, fill: Some(fill), stroke: None });
+}
+
+/// Draws `list`; placeholders only when `with_ph` (a slide's own, or a
+/// layout being edited), since a layout's placeholders are prompts.
+#[allow(clippy::too_many_arguments)]
+fn shapes(deck: &Deck, owner: Owner, list: &[Shape], base: &Xform, with_ph: bool, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>, notes: &mut Notes) {
+    for s in list {
+        if s.hidden || (!with_ph && s.ph.is_some()) {
+            continue;
+        }
+        shape(deck, owner, s, base, slide_no, fonts, out, notes);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape(deck: &Deck, owner: Owner, s: &Shape, base: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>, notes: &mut Notes) {
+    let r = resolve::resolve(deck, owner, s);
+    let f = r.frame;
+    let xf = mul(base, &shape_xform(f, s.rot, s.flip_h, s.flip_v));
+    let (w, h) = (f.w as f64, f.h as f64);
+    match &s.kind {
+        ShapeKind::Geom { text, .. } => {
+            let (paths, known) = geom::paths(&r.geom, f.w, f.h);
+            if !known {
+                if let Geom::Preset { name, .. } = &r.geom {
+                    if !notes.unknown_presets.contains(name) {
+                        notes.unknown_presets.push(name.clone());
+                    }
+                }
+            }
+            let fill = paint(&deck.theme, &r.fill, w, h);
+            let line = stroke(&deck.theme, &r.line);
+            if fill.is_some() || line.is_some() {
+                out.push(DrawItem::Path { xf, w, h, paths, fill, stroke: line });
+            }
+            if let Some(t) = text {
+                // Text turns with its shape but isn't mirrored.
+                let txf = mul(base, &shape_xform(f, s.rot, false, false));
+                frame_text(deck, &r, t, s.id, &txf, slide_no, fonts, out);
+            }
+        }
+        ShapeKind::Picture { media, crop, .. } => {
+            out.push(DrawItem::Picture { xf, w, h, media: *media, crop: *crop });
+            if let Some(line) = stroke(&deck.theme, &r.line) {
+                out.push(DrawItem::Path { xf, w, h, paths: geom::paths(&Geom::preset("rect"), f.w, f.h).0, fill: None, stroke: Some(line) });
+            }
+        }
+        ShapeKind::Video { media, poster } => out.push(DrawItem::Video { xf, w, h, media: *media, poster: *poster }),
+        ShapeKind::Group { child, shapes: kids } => {
+            let sx = if child.w > 0 { w / child.w as f64 } else { 1.0 };
+            let sy = if child.h > 0 { h / child.h as f64 } else { 1.0 };
+            let inner = mul(&xf, &[sx, 0.0, 0.0, sy, -(child.x as f64) * sx, -(child.y as f64) * sy]);
+            for k in kids {
+                if !k.hidden {
+                    shape(deck, owner, k, &inner, slide_no, fonts, out, notes);
+                }
+            }
+        }
+    }
+}
+
+/// The label of a numbered paragraph: `n` in OOXML scheme `scheme`.
+pub fn number_label(scheme: &str, n: u32) -> String {
+    let alpha = |n: u32, upper: bool| {
+        let mut s = String::new();
+        let mut n = n.max(1);
+        while n > 0 {
+            n -= 1;
+            s.insert(0, (if upper { b'A' } else { b'a' } + (n % 26) as u8) as char);
+            n /= 26;
+        }
+        s
+    };
+    let roman = |n: u32, upper: bool| {
+        let mut s = String::new();
+        let mut n = n.clamp(1, 3999);
+        for (v, r) in [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+            while n >= v {
+                s.push_str(r);
+                n -= v;
+            }
+        }
+        if upper {
+            s.to_uppercase()
+        } else {
+            s
+        }
+    };
+    let body = if scheme.starts_with("alphaLc") {
+        alpha(n, false)
+    } else if scheme.starts_with("alphaUc") {
+        alpha(n, true)
+    } else if scheme.starts_with("romanLc") {
+        roman(n, false)
+    } else if scheme.starts_with("romanUc") {
+        roman(n, true)
+    } else {
+        n.to_string()
+    };
+    if scheme.ends_with("ParenBoth") {
+        format!("({body})")
+    } else if scheme.ends_with("ParenR") {
+        format!("{body})")
+    } else if scheme.ends_with("Plain") {
+        body
+    } else {
+        format!("{body}.")
+    }
+}
+
+/// A frame's text as the layout engine sees it: the frame's document with
+/// its level styles made the paragraphs' own formatting, theme fonts and
+/// colours resolved, sizes scaled for shrink-to-fit.
+pub fn styled_doc(theme: &Theme, levels: &ListStyle, body: &TextDoc, scale: u32) -> TextDoc {
+    let mut d = body.clone();
+    let scale_size = |s: u16| ((s as u64 * scale as u64 / 100_000) as u16).max(2);
+    let fix = |a: &CharAttrs| {
+        let mut a = a.clone();
+        if let Some(f) = &a.family {
+            if f.starts_with('+') {
+                a.family = Some(resolve::font(theme, f));
+            }
+        }
+        if let (Some(s), true) = (a.size, scale != 100_000) {
+            a.size = Some(scale_size(s));
+        }
+        a
+    };
+    let mut styles = Vec::with_capacity(MAX_LEVELS);
+    for (i, l) in levels.iter().enumerate().take(MAX_LEVELS) {
+        let mut chars = fix(&l.chars);
+        if let Some(c) = &l.color {
+            if l.chars.color.is_none() {
+                chars.color = Some(color(theme, c) >> 8);
+            }
+        }
+        styles.push(Style { name: format!("Level {}", i + 1).into(), kind: StyleKind::Para, parent: None, next: Some(i as u16), para: ParaProps::default(), chars });
+    }
+    let mut def = CharFormat { family: theme.minor.clone(), size: scale_size(36), color: theme.colors[0], ..CharFormat::default() };
+    def.family = theme.minor.clone();
+    d.styles = StyleSheet { styles, default_char: def };
+    // Runs: theme fonts named, sizes scaled.
+    let mut table = officina_text::model::AttrTable::default();
+    let n = d.blocks.len();
+    for bi in 0..n {
+        let Some(p) = d.para(bi) else { continue };
+        let lvl = (p.style as usize).min(MAX_LEVELS - 1);
+        let runs: Vec<(u32, u32)> = p.runs.iter().map(|&(at, id)| (at, table.intern(fix(d.attrs.get(id))))).collect();
+        let lv = &levels[lvl];
+        let mut props = resolve::para_over(&p.props, &lv.para);
+        // The level's indents are the paragraph's own (the list hang must not
+        // move them).
+        props.indent_start.get_or_insert(0);
+        props.first_line.get_or_insert(0);
+        props.space_after.get_or_insert(0);
+        props.space_before.get_or_insert(0);
+        if props.line_spacing.is_none() {
+            props.line_spacing = Some(officina_text::model::LineSpacing::Multiple(100));
+        }
+        let bullet = match &lv.bullet {
+            Some(Bullet::Char { .. }) => Some(ListKind::Bullet),
+            Some(Bullet::Number { .. }) => Some(ListKind::Numbered),
+            _ => None,
+        };
+        // An empty paragraph shows no bullet.
+        props.list = Some(bullet.filter(|_| !p.text.is_empty()).map(|kind| ListRef { id: 1, kind, level: lvl as u8 }));
+        d.blocks.update(bi, |b| {
+            if let Some(p) = b.as_para_mut() {
+                p.runs = runs.into_iter().map(|(a, i)| (a, i as _)).collect();
+                p.props = props;
+                p.style = lvl as u16;
+            }
+        });
+    }
+    d.attrs = table;
+    d
+}
+
+/// A frame's paragraphs laid out at `width` (layout units): each paragraph's
+/// layout and its top.
+pub struct FrameLayout {
+    pub doc: TextDoc,
+    pub paras: Vec<(officina_text::layout::ParaLayout, i64)>,
+    pub height: i64,
+}
+
+pub fn layout_frame(doc: TextDoc, width: i64, fonts: &dyn Fonts) -> FrameLayout {
+    let mut paras = Vec::new();
+    let mut y = 0;
+    let n = doc.blocks.len();
+    for i in 0..n {
+        let Some(p) = doc.para(i) else { continue };
+        let l = layout_para(&doc, p, width.max(officina_text::LU), fonts);
+        if i > 0 {
+            y += l.space_before;
+        }
+        let top = y;
+        y += l.height;
+        if i + 1 < n {
+            y += l.space_after;
+        }
+        paras.push((l, top));
+    }
+    FrameLayout { doc, paras, height: y }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>) {
+    let scale = match r.autofit {
+        Autofit::Shrink { scale, .. } => scale.clamp(1_000, 100_000),
+        _ => 100_000,
+    };
+    let mut doc = styled_doc(&deck.theme, &r.levels, &body.doc, scale);
+    // The slide number field.
+    for i in 0..doc.blocks.len() {
+        if doc.para(i).is_some_and(|p| p.text.contains("‹#›")) {
+            doc.blocks.update(i, |b| {
+                if let Some(p) = b.as_para_mut() {
+                    replace_keep_runs(p, "‹#›", slide_no);
+                }
+            });
+        }
+    }
+    let [l, t, rt, b] = r.inset;
+    let width_emu = (r.frame.w - l - rt).max(0);
+    let width = if r.wrap { crate::emu_to_lu(width_emu) } else { i64::MAX / 4 };
+    let fl = layout_frame(doc, width, fonts);
+    let avail = crate::emu_to_lu((r.frame.h - t - b).max(0));
+    let dy = match r.anchor {
+        Anchor::Top => 0,
+        Anchor::Middle => (avail - fl.height) / 2,
+        Anchor::Bottom => avail - fl.height,
+    };
+    let mut items = Vec::new();
+    let mut counters = [0u32; MAX_LEVELS];
+    for (i, (pl, top)) in fl.paras.iter().enumerate() {
+        let Some(p) = fl.doc.para(i) else { continue };
+        let lvl = (p.style as usize).min(MAX_LEVELS - 1);
+        let label = match (&r.levels[lvl].bullet, p.text.is_empty()) {
+            (Some(Bullet::Char { ch, font, color: c, size_pct }), false) => {
+                counters = [0; MAX_LEVELS];
+                let mut f = pl.glyphs.first().map_or(&pl.formats[0], |g| &pl.formats[g.fmt as usize]).clone();
+                f.underline = false;
+                f.strike = false;
+                f.link = None;
+                if let Some(fam) = font {
+                    f.family = resolve::font(&deck.theme, fam);
+                }
+                if let Some(c) = c {
+                    f.color = color(&deck.theme, c) >> 8;
+                }
+                if let Some(pct) = size_pct {
+                    f.size = ((f.size as u64 * *pct as u64 / 100_000) as u16).max(2);
+                }
+                Some((ch.to_string(), Some(f)))
+            }
+            (Some(Bullet::Number { scheme, start }), false) => {
+                counters[lvl] += 1;
+                for c in counters.iter_mut().skip(lvl + 1) {
+                    *c = 0;
+                }
+                Some((number_label(scheme, start.saturating_add(counters[lvl] - 1)), None))
+            }
+            _ => None,
+        };
+        paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, dy + top, label.as_ref().map(|(s, f)| (s.as_str(), f.clone())));
+    }
+    if items.is_empty() {
+        return;
+    }
+    let k = crate::EMU_PER_PT as f64 / officina_text::LU as f64;
+    let local = [k, 0.0, 0.0, k, l as f64, t as f64];
+    out.push(DrawItem::Text { xf: mul(xf, &local), shape: id, items });
+}
+
+/// Replaces `from` with `to` in a paragraph, keeping the run each piece is in.
+fn replace_keep_runs(p: &mut Para, from: &str, to: &str) {
+    while let Some(at) = p.text.find(from) {
+        let (a, b) = (at as u32, (at + from.len()) as u32);
+        let delta = to.len() as i64 - from.len() as i64;
+        p.text.replace_range(at..at + from.len(), to);
+        for r in p.runs.iter_mut() {
+            if r.0 >= b {
+                r.0 = (r.0 as i64 + delta) as u32;
+            } else if r.0 > a {
+                r.0 = a;
+            }
+        }
+        p.runs.dedup_by(|x, y| x.0 == y.0);
+    }
+}

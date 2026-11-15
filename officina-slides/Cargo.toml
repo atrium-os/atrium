@@ -1,0 +1,18 @@
+[package]
+name = "officina-slides"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Officina's presentation engine (docs/spec/officina.md §9.1, §9.3, §16.33): decks of masters, layouts and slides of shapes and text frames, ops with inverses, the .oslides native file read lazily, and slides drawn as display lists. No UI."
+
+[lib]
+name = "officina_slides"
+path = "src/lib.rs"
+
+[dependencies]
+officina-core = { path = "../officina-core" }
+officina-text = { path = "../officina-text" }
+
+[profile.release]
+debug = 1

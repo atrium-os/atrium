@@ -343,6 +343,27 @@ fn runs(out: &mut Vec<Item>, fonts: &dyn Fonts, text: &str, fmt: &CharFormat, x:
     }
 }
 
+/// The items of laid-out paragraph `l` (text `text`) with its first line's
+/// top at `top` and its start edge at `left`, and `label` in its hang if it
+/// has one: a paragraph outside a page (a slide's text frame).
+#[allow(clippy::too_many_arguments)]
+pub fn paint_para(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, text: &str, left: i64, top: i64, label: Option<(&str, Option<CharFormat>)>) {
+    if let Some((label, fmt)) = label {
+        match fmt {
+            Some(f) if !l.lines.is_empty() => {
+                let x0 = twips((l.format.indent_start + l.format.first_line) as i64);
+                runs(out, fonts, label, &f, left + x0, baseline_of(l, 0, top));
+            }
+            _ => list_label(out, l, label, fonts, left, top),
+        }
+    }
+    let mut y = top;
+    for li in 0..l.lines.len() {
+        line(out, doc, fonts, l, li, text, left, y, None);
+        y += l.lines[li].height;
+    }
+}
+
 /// A list item's label in its hang, on the first line's baseline, in the
 /// format the item's text starts with.
 fn list_label(out: &mut Vec<Item>, l: &ParaLayout, label: &str, fonts: &dyn Fonts, left: i64, top: i64) {
