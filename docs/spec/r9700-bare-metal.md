@@ -1616,3 +1616,18 @@ work (self-test, scrub).
   claude/project-thread-33aauq f54f655c (docs/r9700-runs/fzdiag2-0069dc1f/).
   Decision (Shankar, 2026-11-15): 0069dc1f's detect-and-reset is the storm
   fix; no global GCR fault-interrupt mask.
+- **2026-11-15 11:23 to 12:46, 1 h fuzz diagnostic (5e11d762): PASS.**
+  si-client-test 97/0 before and after; test 16 as 0069dc1f (+6161 IVs,
+  +3 overflows, one re-init); si-fuzz 0 findings (249374 calls, 13
+  re-inits, cap never hit), 0 flush timeouts, 0 panics, card proven idle
+  at detach. EOP IVs from the MES pipe now decoded as MES host interrupts
+  (src_data[0] bits 31:26 = type): at the end type 1 x30 (a queue MES could
+  not preempt; doorbells 0x20-0x2c), type 6 x23 (once per (re-)init), type
+  8 x2320 (API fences); no unrouted EOPs left. New test 17 (fault default
+  page shared by all VMs) passed both times but is weak: the reader's
+  shader wave never got past its faulting load before the driver killed
+  it (~150 us), so its out page kept the poison and no data could cross
+  either way; a reader whose faulting read completes (CP DMA) is still to
+  test. First run with the runner's own kernel log (.kern, 9445 lines, no
+  gaps). Logs: claude/project-thread-33aauq d5089858
+  (docs/r9700-runs/fzdiag-5e11d762/).
