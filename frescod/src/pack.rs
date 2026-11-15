@@ -467,8 +467,21 @@ fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, 
     };
     let mut w = fresh();
     if state.has_groups() {
-        if promote.is_some_and(|k| !state.anim_now.is_empty() || !k.is_empty()) && grouped_frame(state, &mut w, promote) {
-            return Some(w);
+        if promote.is_some_and(|k| !state.anim_now.is_empty() || !k.is_empty()) {
+            // A group that cannot be a sprite is drawn with the window;
+            // the others still are.
+            let mut deny = std::collections::HashSet::new();
+            for _ in 0..4 {
+                let mut failed = None;
+                if grouped_frame_but(state, &mut w, promote, &deny, &mut failed) {
+                    return Some(w);
+                }
+                w = fresh();
+                match failed {
+                    Some(g) => deny.insert(g),
+                    None => break,
+                };
+            }
         }
         w = fresh();
         grouped_frame(state, &mut w, None);
@@ -826,6 +839,18 @@ pub(crate) fn grouped_frame(
     w: &mut WindowFrame,
     promote: Option<&std::collections::HashSet<u32>>,
 ) -> bool {
+    grouped_frame_but(state, w, promote, &Default::default(), &mut None)
+}
+
+/// [`grouped_frame`], promoting none of `deny`; when promotion fails
+/// because of one group, `failed` names it (build again without it).
+fn grouped_frame_but(
+    state: &fresco_scene_server::command::envelope_frontend::WindowSceneState,
+    w: &mut WindowFrame,
+    promote: Option<&std::collections::HashSet<u32>>,
+    deny: &std::collections::HashSet<u32>,
+    failed: &mut Option<u32>,
+) -> bool {
     use fresco_compute::Node as Item;
     let mut order: Vec<OrderItem> = Vec::new();
     let sorted = |keys: Vec<&u32>| { let mut k: Vec<u32> = keys.into_iter().copied().collect(); k.sort_unstable(); k };
@@ -954,7 +979,7 @@ pub(crate) fn grouped_frame(
                 state.group_nodes.get(&id).is_some_and(|b| a.transform[..4] == b.transform[..4])
             };
             let sprite = promote.is_some_and(|keep| {
-                !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still)
+                !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still) && !deny.contains(&id)
                     && (anim.is_some() || keep.contains(&id) || (hidden && g.clip.is_some()))
             });
             if !sprite && (empty(c) || hidden) {
@@ -1029,6 +1054,7 @@ pub(crate) fn grouped_frame(
                     let b = meet(Some(b), o.clip).unwrap();
                     if b[0] < b[2] && b[1] < b[3] {
                         if b[0] < -2.5 || b[1] < -2.5 || b[2] > sw || b[3] > sh {
+                            *failed = Some(s.group);
                             return why(&format!("group {} draws {b:?} outside the window in its own space", s.group));
                         }
                         bbox = [bbox[0].min(b[0]), bbox[1].min(b[1]), bbox[2].max(b[2]), bbox[3].max(b[3])];
@@ -1073,6 +1099,7 @@ pub(crate) fn grouped_frame(
                 };
                 let b = meet(Some(b), o.clip).unwrap();
                 if b[0] < c[2] && c[0] < b[2] && b[1] < c[3] && c[1] < b[3] {
+                    *failed = Some(s.group);
                     return why(&format!("node {} is drawn over group {} at {b:?}", o.node, s.group));
                 }
             }
