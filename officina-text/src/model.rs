@@ -1010,6 +1010,44 @@ impl Para {
     }
 
     /// Merges equal neighbours and drops empty runs (keeping one).
+    /// This paragraph with its text changed to `new`, keeping the format of
+    /// the unchanged start and end; new text takes the format before it
+    /// (`plain` when that is a picture or other object).
+    pub fn retext(&self, new: &str, attrs: &AttrTable, plain: AttrId) -> Para {
+        let old = self.text.as_str();
+        let mut pre = old.bytes().zip(new.bytes()).take_while(|(a, b)| a == b).count();
+        while !old.is_char_boundary(pre) || !new.is_char_boundary(pre) {
+            pre -= 1;
+        }
+        let room = old.len().min(new.len()) - pre;
+        let mut suf = old.bytes().rev().zip(new.bytes().rev()).take(room).take_while(|(a, b)| a == b).count();
+        while !old.is_char_boundary(old.len() - suf) || !new.is_char_boundary(new.len() - suf) {
+            suf -= 1;
+        }
+        let (old_end, new_end) = ((old.len() - suf) as u32, (new.len() - suf) as u32);
+        let delta = new_end as i64 - old_end as i64;
+        let mid = {
+            let a = self.attr_at((pre as u32).saturating_sub(1));
+            if attrs.get(a).object.is_some() || attrs.get(a).note.is_some() || attrs.get(a).field.is_some() { plain } else { a }
+        };
+        let mut runs = Vec::with_capacity(self.runs.len() + 2);
+        for &(at, a) in &self.runs {
+            if (at as usize) < pre {
+                runs.push((at, a));
+            }
+        }
+        runs.push((pre as u32, mid));
+        runs.push((new_end, self.attr_at(old_end)));
+        for &(at, a) in &self.runs {
+            if at > old_end {
+                runs.push(((at as i64 + delta) as u32, a));
+            }
+        }
+        let mut p = Para { text: new.to_string(), runs, ..self.clone() };
+        p.normalize();
+        p
+    }
+
     pub fn normalize(&mut self) {
         let n = self.text.len() as u32;
         let mut v: Vec<(u32, AttrId)> = Vec::with_capacity(self.runs.len());

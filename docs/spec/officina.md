@@ -3162,8 +3162,19 @@ gate, which had fallen to 82/84 on a 30° turned box, is 84/84 again.
   show the same header and footer on pages 1–3; 2,551 corpus documents, 149
   with a first page's own, 34 with even pages' own, all through the native
   file unchanged, no panics.
+- **Editing in Write** (same day): Insert ▸ Header and Footer… opens a
+  two-row bar: the header and footer as text (paragraphs marked ¶), All
+  Pages / First Page / Even Pages, Different first page and Different even
+  pages (starting blank, as Word does), a Page Number button and Done. Each
+  change is one undoable `SetMargins` operation (journal tag 15). An edit
+  keeps the format round the change (`Para::retext`: unchanged start and
+  end keep their runs, new text takes the format before it, never a
+  picture's or field's), new lines take the last line's; a header that was
+  one plain line stays one. Pagination now starts again when a header or
+  footer changes, not only the page setup.
 - **Not yet**: anchored pictures and drawn shapes in headers drawn in line or left out;
-  headers are not edited in Write beyond the page-number footer.
+  per-section headers (the first page's is the document's first page only);
+  formatting inside a header from the bar (it keeps what the file had).
 
 Gates: our files through LibreOffice both ways across formats 4/4 (lines,
 picture and its size, bold, page fields keeping their format); round trips

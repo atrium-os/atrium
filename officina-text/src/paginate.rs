@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::layout::{object_size, Band, Fonts, LayoutCache, ParaLayout};
-use crate::model::{BlockId, Float, HAlign, NoteId, NoteKind, ObjectRef, PageSetup, Rel, Section, SectionStart, TextDoc, Wrap, OBJECT_CHAR};
+use crate::model::{BlockId, Float, HAlign, HeaderFooter, Margins, NoteId, NoteKind, ObjectRef, PageSetup, Rel, Section, SectionStart, TextDoc, Wrap, OBJECT_CHAR};
 use std::collections::HashMap;
 use crate::twips;
 use std::rc::Rc;
@@ -176,6 +176,9 @@ pub struct Paginator {
     old_base: usize,
     /// Even pages have a header of their own.
     even_parity: bool,
+    /// The headers and footers the pages were laid out with (their height
+    /// grows margins).
+    margins: Option<MarginsKey>,
     settle: usize,
     delta: isize,
     /// Where pagination had got to when the edit came, in new block numbers:
@@ -199,6 +202,12 @@ pub struct Paginator {
     /// The document's page setup, and the one the page being laid out uses.
     base: PageSetup,
     cur: PageSetup,
+}
+
+type MarginsKey = (Option<HeaderFooter>, Option<HeaderFooter>, Option<Margins>, Option<Margins>);
+
+fn margins_key(doc: &TextDoc) -> MarginsKey {
+    (doc.header.clone(), doc.footer.clone(), doc.first_page.clone(), doc.even_pages.clone())
 }
 
 /// `g` for page `page` (from 0) with its top and bottom margins grown to hold a header or footer of
@@ -230,6 +239,7 @@ impl Paginator {
     pub fn reset(&mut self, doc: &TextDoc) {
         self.base = doc.page;
         self.even_parity = doc.even_pages.is_some();
+        self.margins = Some(margins_key(doc));
         self.set_page(doc.page);
         self.wraps.clear();
         self.sections = sections_of(doc);
@@ -250,7 +260,7 @@ impl Paginator {
 
     /// Whether the pages were laid out for `doc`'s page geometry.
     pub fn fits(&self, doc: &TextDoc) -> bool {
-        self.base == doc.page
+        self.base == doc.page && self.margins.as_ref().is_some_and(|m| m.0 == doc.header && m.1 == doc.footer && m.2 == doc.first_page && m.3 == doc.even_pages)
     }
 
     /// The document's content width in layout units (sections with a page

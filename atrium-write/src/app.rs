@@ -19,9 +19,9 @@ use officina_text::find::Query;
 use officina_text::merge::{MergeError, Take};
 use officina_text::track::EditKind;
 use officina_text::track::Resolve;
-use pergola_richtext::{Checker, Editor};
+use pergola_richtext::{Checker, Editor, MarginPages};
 use pergola::text_edit::TextEdit;
-use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, ScrollState, TextField};
+use pergola::widgets::{Button, Check, Checkbox, MenuButton, MenuItem, MenuState, ScrollState, Segmented, TextField};
 use pergola::{Color, Mutable, TextStyle};
 use pergola_richtext::editor::Toggle;
 use pergola_richtext::RichTextView;
@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 34] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins"];
+pub const INSERT: [&str; 35] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -133,6 +133,19 @@ pub enum Cmd {
     FloatAlign(HAlign),
     /// The caret's section's page: orientation, paper or margins.
     Page(PageCmd),
+    /// Insert ▸ Header and Footer…: the bar on every page's.
+    MarginOpen,
+    /// The bar on all pages' (0), the first page's (1) or even pages' (2),
+    /// keeping what the fields hold first.
+    MarginShow(usize),
+    /// The first page's own header and footer, on or off.
+    MarginFirst,
+    /// Even pages' own header and footer, on or off.
+    MarginEven,
+    /// The page number into the footer field.
+    MarginPageNumber,
+    MarginDone,
+    MarginClose,
 }
 
 /// A change to a section's page.
@@ -182,7 +195,7 @@ pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, Page
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5])][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -228,6 +241,27 @@ pub struct NoteBar {
     pub id: NoteId,
     /// "Footnote 3", "Endnote ii".
     pub title: String,
+}
+
+/// The header and footer bar: which pages' it shows (0 all, 1 the first,
+/// 2 even pages).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarginBar {
+    pub open: bool,
+    pub pages: usize,
+}
+
+/// The header and footer bar is two bars high.
+pub const MARGIN_H: f32 = FIND_H * 2.0;
+
+/// Which pages' header and footer the bar's segment `i` means.
+pub fn margin_pages(i: usize) -> MarginPages {
+    [MarginPages::All, MarginPages::First, MarginPages::Even][i.min(2)]
+}
+
+/// A field's text with its ¶ marks made paragraphs.
+fn unmark(t: &TextEdit) -> String {
+    t.text().split('¶').map(str::trim).collect::<Vec<_>>().join("\n")
 }
 
 /// The comment bar: the thread it is on, and whether its field holds the
@@ -308,6 +342,11 @@ pub struct Write {
     pub note_text: Mutable<TextEdit>,
     pub comment: Mutable<CommentBar>,
     pub comment_text: Mutable<TextEdit>,
+    pub margin: Mutable<MarginBar>,
+    pub margin_header: Mutable<TextEdit>,
+    pub margin_footer: Mutable<TextEdit>,
+    /// The bar's segmented control.
+    pub margin_seg: Mutable<usize>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
     pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -315,7 +354,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -357,7 +396,7 @@ impl Write {
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.margin.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -468,6 +507,71 @@ impl Write {
         }
         let (w, h) = self.size.get();
         RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+    }
+
+    /// The header and footer bar on `pages` (0 all, 1 first, 2 even).
+    fn margin_show(&self, pages: usize) {
+        let (h, f) = self.doc.borrow().ed.borrow().margins_text(margin_pages(pages));
+        self.margin_header.set(TextEdit::new(&h.replace('\n', NOTE_PARA_MARK)));
+        self.margin_footer.set(TextEdit::new(&f.replace('\n', NOTE_PARA_MARK)));
+        self.margin_seg.set(pages);
+        self.margin.set(MarginBar { open: true, pages });
+    }
+
+    /// Puts the bar's fields in the header and footer they show (the first
+    /// or even pages' not when they have none and the fields are empty).
+    fn margin_save(&self) {
+        let mb = self.margin.get_cloned();
+        if !mb.open {
+            return;
+        }
+        let ed = self.doc.borrow().ed.clone();
+        let (h, f) = (unmark(&self.margin_header.get_cloned()), unmark(&self.margin_footer.get_cloned()));
+        let (first, even) = ed.borrow().margin_pages();
+        let own = match mb.pages {
+            1 => first,
+            2 => even,
+            _ => true,
+        };
+        if own || !h.is_empty() || !f.is_empty() {
+            ed.borrow_mut().set_margins(margin_pages(mb.pages), &h, &f);
+        }
+    }
+
+    /// Runs a header and footer bar command.
+    fn margin_cmd(&self, c: Cmd) {
+        let ed = self.doc.borrow().ed.clone();
+        match c {
+            Cmd::MarginOpen => {
+                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                self.spell.set(SpellBar::default());
+                self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
+                self.margin_show(0);
+            }
+            Cmd::MarginShow(i) => {
+                self.margin_save();
+                self.margin_show(i.min(2));
+            }
+            Cmd::MarginFirst | Cmd::MarginEven => {
+                self.margin_save();
+                let (first, even) = ed.borrow().margin_pages();
+                let (first, even, show) = if c == Cmd::MarginFirst { (!first, even, if first { 0 } else { 1 }) } else { (first, !even, if even { 0 } else { 2 }) };
+                ed.borrow_mut().set_margin_pages(first, even);
+                self.margin_show(show);
+            }
+            Cmd::MarginPageNumber => {
+                let mut t = self.margin_footer.get_cloned();
+                t.insert("{page}");
+                self.margin_footer.set(t);
+            }
+            Cmd::MarginDone => {
+                self.margin_save();
+                self.margin.set(MarginBar::default());
+            }
+            Cmd::MarginClose => self.margin.set(MarginBar::default()),
+            _ => {}
+        }
     }
 
     /// Opens the comment bar on thread `root`: on its first comment's text,
@@ -696,11 +800,14 @@ impl Write {
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
                 // The bars share one place under the toolbar.
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen | Cmd::MarginOpen) {
                     e.review = false;
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::MarginOpen) {
                     self.xref.set(XrefBar::default());
+                }
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen) {
+                    self.margin.set(MarginBar::default());
                 }
                 match c {
                     Cmd::TrackToggle => {
@@ -868,6 +975,13 @@ impl Write {
                         self.changed();
                         return true;
                     }
+                    Cmd::MarginOpen | Cmd::MarginShow(_) | Cmd::MarginFirst | Cmd::MarginEven | Cmd::MarginPageNumber | Cmd::MarginDone | Cmd::MarginClose => {
+                        drop(e);
+                        drop(d);
+                        self.margin_cmd(c);
+                        self.changed();
+                        return false;
+                    }
                     Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::NoteDone | Cmd::NoteClose => {
                         drop(e);
                         drop(d);
@@ -993,6 +1107,7 @@ impl View for Write {
                     let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 25]));
                     if i == 25 { m.separated() } else { m }
                 }
+                34 => MenuItem::new(*s).separated(),
                 28..=33 => {
                     let m = MenuItem::new(*s).radio(PAGE_CMDS[i - 28].is(&page));
                     if i == 28 || i == 30 || i == 32 { m.separated() } else { m }
@@ -1158,6 +1273,39 @@ impl View for Write {
             Button::primary("Done").at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::NoteDone)).render(ctx);
             Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::NoteClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
+        // The header and footer bar: two fields (paragraphs marked ¶), which
+        // pages' they are, and whether the first and even pages have their own.
+        let mb = self.margin.get_cloned();
+        if mb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, MARGIN_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let (first, even) = ed.borrow().margin_pages();
+            let fw = (w - 84.0 - 500.0).max(160.0);
+            let rx = 84.0 + fw + 12.0;
+            for (row, (label, field)) in [("Header", &self.margin_header), ("Footer", &self.margin_footer)].into_iter().enumerate() {
+                let ry = y + row as f32 * FIND_H;
+                ctx.add(Node::Text { rect: Rect::new(12.0, ry + 14.0, 70.0, 20.0), content: label.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+                let cmds = self.cmds.clone();
+                TextField::new(field.clone()).placeholder(label).autofocus(row == 0).at(84.0, ry + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::MarginDone)).render(ctx);
+            }
+            let cmds = self.cmds.clone();
+            Segmented::new(self.margin_seg.clone(), ["All Pages", "First Page", "Even Pages"]).at(rx, y + 8.0).width(300.0).on_change(move |i| cmds.lock().unwrap().push(Cmd::MarginShow(i))).render(ctx);
+            Button::primary("Done").at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::MarginDone)).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::MarginClose)).render(ctx);
+            let ry = y + FIND_H;
+            Button::secondary("Page Number").at(rx, ry + 8.0).width(112.0).on_click(push(Cmd::MarginPageNumber)).render(ctx);
+            let check = |on: bool| Mutable::new(if on { Check::On } else { Check::Off });
+            let cmds = self.cmds.clone();
+            Checkbox::new(check(first), "Different first page").at(rx + 124.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginFirst)).render(ctx);
+            let cmds = self.cmds.clone();
+            Checkbox::new(check(even), "Different even pages").at(rx + 300.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginEven)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
         // The comment bar: the first comment's text (or a reply) on one line.
@@ -1397,6 +1545,51 @@ mod tests {
         run(Cmd::Undo);
         run(Cmd::Undo);
         assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "");
+    }
+
+    #[test]
+    fn header_and_footer_bar() {
+        let doc = Doc::from_text("h.txt", b"Some text here.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let ed = w.doc.borrow().ed.clone();
+        let footer = |i: usize| ed.borrow().doc.margins_of(i).1.map(|f| f.text.clone());
+        let top = w.pages_rect(1200.0, 800.0).origin.y;
+        run(Cmd::insert(34));
+        assert!(w.margin.get_cloned().open);
+        assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H, "the pages make room for both rows");
+        let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+        let texts: Vec<String> = tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        for want in ["Header", "Footer", "All Pages", "First Page", "Even Pages", "Page Number", "Different first page", "Different even pages", "Done"] {
+            assert!(texts.iter().any(|s| s == want), "{want} missing from {texts:?}");
+        }
+        w.margin_header.set(TextEdit::new("Acme ¶ Quarterly"));
+        w.margin_footer.set(TextEdit::new("Page "));
+        run(Cmd::MarginPageNumber);
+        run(Cmd::MarginFirst);
+        assert_eq!(w.margin.get_cloned().pages, 1, "turning the first page's on shows it");
+        assert_eq!(w.margin_header.get_cloned().text(), "");
+        w.margin_footer.set(TextEdit::new("Title page"));
+        run(Cmd::MarginShow(2));
+        assert_eq!(ed.borrow().margin_pages(), (true, false), "only looking at even pages turns nothing on");
+        run(Cmd::MarginShow(0));
+        assert_eq!(w.margin_header.get_cloned().text(), "Acme ¶ Quarterly");
+        run(Cmd::MarginDone);
+        assert!(!w.margin.get_cloned().open);
+        assert_eq!(ed.borrow().doc.header.as_ref().map(|h| h.paras.len()), Some(2));
+        assert_eq!(footer(0).as_deref(), Some("Title page"));
+        assert_eq!(footer(1).as_deref(), Some("Page {page}"));
+        run(Cmd::Undo);
+        assert_eq!(footer(0), None, "the first page's footer is undone, its own blank one stays");
+        run(Cmd::insert(34));
+        run(Cmd::MarginFirst);
+        assert_eq!(ed.borrow().margin_pages(), (false, false));
+        assert_eq!(footer(0).as_deref(), Some("Page {page}"));
+        run(Cmd::FindOpen);
+        assert!(!w.margin.get_cloned().open, "bars share one place");
     }
 
     #[test]

@@ -904,6 +904,23 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
                 }
             }
         }
+        TextOp::SetMargins { header, footer, first_page, even_pages } => {
+            w.u8(15);
+            encode_hf(&mut w, header);
+            encode_hf(&mut w, footer);
+            encode_margin_paras(&mut w, header, footer);
+            for m in [first_page, even_pages] {
+                match m {
+                    None => w.u8(0),
+                    Some(m) => {
+                        w.u8(1);
+                        encode_hf(&mut w, &m.header);
+                        encode_hf(&mut w, &m.footer);
+                        encode_margin_paras(&mut w, &m.header, &m.footer);
+                    }
+                }
+            }
+        }
         TextOp::SetNote { id, note } => {
             w.u8(9);
             w.var(*id as u64);
@@ -1025,6 +1042,24 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("conflict")),
             };
             TextOp::SetConflict { id, alt }
+        }
+        15 => {
+            let (mut header, mut footer) = (decode_hf(&mut r)?, decode_hf(&mut r)?);
+            decode_margin_paras(&mut r, attrs, styles, &mut header, &mut footer)?;
+            let mut kinds = [None, None];
+            for k in kinds.iter_mut() {
+                *k = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let (mut h, mut f) = (decode_hf(&mut r)?, decode_hf(&mut r)?);
+                        decode_margin_paras(&mut r, attrs, styles, &mut h, &mut f)?;
+                        Some(crate::model::Margins { header: h, footer: f })
+                    }
+                    _ => return Err(WireError::Invalid("page margins")),
+                };
+            }
+            let [first_page, even_pages] = kinds;
+            TextOp::SetMargins { header, footer, first_page, even_pages }
         }
         13 => TextOp::SetTracking {
             on: match r.u8()? {
@@ -1599,6 +1634,7 @@ mod tests {
             TextOp::Remove { at: 12, n: 3 },
             TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End, paras: Vec::new() }), footer: None },
             TextOp::SetPage { page: PageSetup::default(), header: None, footer: Some(HeaderFooter { text: "x".into(), align: Align::Start, paras: vec![Para::new(d.new_id(), "x {page}", 0)] }) },
+            TextOp::SetMargins { header: Some(HeaderFooter::line("H", Align::Center)), footer: None, first_page: Some(crate::model::Margins::default()), even_pages: Some(crate::model::Margins { header: None, footer: Some(HeaderFooter { text: "e".into(), align: Align::Start, paras: vec![Para::new(d.new_id(), "e {page}", 0)] }) }) },
             TextOp::SetNote { id: 5, note: Some(Note { kind: NoteKind::End, paras: vec![Para::new(d.new_id(), "note", 0)] }) },
             TextOp::SetNote { id: 5, note: None },
             TextOp::SetComment { id: 9, comment: Some(Comment { author: "A".into(), text: "c".into(), parent: Some(0), ..Default::default() }) },

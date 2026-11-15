@@ -498,6 +498,28 @@ mod tests {
     }
 
     #[test]
+    fn retext_keeps_the_format_round_the_change() {
+        use crate::model::Para;
+        let mut d = TextDoc::new();
+        let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
+        let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![1u8; 4]), width: 1, height: 1 });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 20, height: 20, float: None }), ..Default::default() });
+        let p = Para { runs: vec![(0, pic), (3, 0), (4, bold), (8, 0)], ..Para::new(1, "\u{FFFC} Acme Ltd", 0) };
+        // A word typed after the bold one: plain, as the space before it.
+        let q = p.retext("\u{FFFC} Acme Big Ltd", &d.attrs, 0);
+        assert_eq!(q.runs, [(0, pic), (3, 0), (4, bold), (8, 0)]);
+        // Typed inside the bold word: bold; the picture kept.
+        let q = p.retext("\u{FFFC} Acmes Ltd", &d.attrs, 0);
+        assert_eq!(q.runs, [(0, pic), (3, 0), (4, bold), (9, 0)]);
+        // Typed right after the picture: plain, not a second picture.
+        let q = p.retext("\u{FFFC}X Acme Ltd", &d.attrs, 0);
+        assert_eq!(q.runs, [(0, pic), (3, 0), (5, bold), (9, 0)]);
+        // Everything replaced.
+        assert_eq!(p.retext("New", &d.attrs, 0).runs, [(0, 0)]);
+        assert_eq!(p.retext("", &d.attrs, 0).text, "");
+    }
+
+    #[test]
     fn a_headers_table_rows_become_lines() {
         use crate::model::{rows_as_lines, CellRef, Para};
         let cell = |row, col| Some(CellRef { table: 1, row, col, width: 1000 });

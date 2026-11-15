@@ -36,6 +36,9 @@ pub enum TextOp {
     Remove { at: u32, n: u32 },
     /// Sets the page setup, header and footer.
     SetPage { page: crate::model::PageSetup, header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter> },
+    /// Sets the headers and footers: the default ones, the first page's and
+    /// even pages' own.
+    SetMargins { header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter>, first_page: Option<crate::model::Margins>, even_pages: Option<crate::model::Margins> },
     /// Sets note `id`'s text (None takes the note out of the store).
     SetNote { id: crate::model::NoteId, note: Option<crate::model::Note> },
     /// Sets comment `id` (None takes it out of the store).
@@ -141,7 +144,7 @@ impl TextOp {
             TextOp::Remove { at, n } => Edit { first: at as usize, last: (at + n) as usize, delta: n as isize },
             TextOp::Insert { at, ref blocks } => Edit { first: at as usize, last: at as usize, delta: -(blocks.len() as isize) },
             // Every page may change (the paginator resets on a new geometry).
-            TextOp::SetPage { .. } => Edit { first: 0, last: 0, delta: 0 },
+            TextOp::SetPage { .. } | TextOp::SetMargins { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } => return None,
             // Comments change no layout; the editor redraws on every action.
@@ -367,6 +370,12 @@ impl TextOp {
                 let old = std::mem::replace(&mut d.tracking, on);
                 TextOp::SetTracking { on: old }
             }
+            TextOp::SetMargins { header, footer, first_page, even_pages } => TextOp::SetMargins {
+                header: std::mem::replace(&mut d.header, header),
+                footer: std::mem::replace(&mut d.footer, footer),
+                first_page: std::mem::replace(&mut d.first_page, first_page),
+                even_pages: std::mem::replace(&mut d.even_pages, even_pages),
+            },
             TextOp::SetPage { page, header, footer } => {
                 let ok = |t: i32| (0..=63_360).contains(&t);
                 if !(page.width >= 1440 && page.height >= 1440 && [page.width, page.height, page.margin_top, page.margin_bottom, page.margin_start, page.margin_end].into_iter().all(ok)) || page.margin_start + page.margin_end + 720 > page.width || page.margin_top + page.margin_bottom + 720 > page.height {
@@ -505,6 +514,54 @@ impl TextDoc {
         }
         let paras = self.note_paras(text);
         vec![TextOp::SetNote { id, note: Some(crate::model::Note { kind, paras }) }]
+    }
+
+    /// A header or footer whose text is `text` (a paragraph a line), keeping
+    /// what it can of `old`'s format: a changed line keeps the format round
+    /// the change, a new line takes the last one's. None when `text` is
+    /// empty. One plain line on a header that was one line stays one line.
+    pub fn edit_margin(&mut self, old: Option<crate::model::HeaderFooter>, text: &str, footer: bool) -> Option<crate::model::HeaderFooter> {
+        use crate::model::{Align, HeaderFooter, Para, MAX_MARGIN_PARAS};
+        let text = text.trim_end_matches('\n');
+        if text.trim().is_empty() {
+            return None;
+        }
+        let align = old.as_ref().map_or(if footer { Align::Center } else { Align::Start }, |h| h.align);
+        let old_paras = old.map(|h| h.paras).unwrap_or_default();
+        if old_paras.is_empty() && !text.contains('\n') {
+            return Some(HeaderFooter::line(text, align));
+        }
+        let plain = self.attrs.intern(crate::model::CharAttrs::default());
+        let lines: Vec<&str> = text.split('\n').collect();
+        let keep = lines.len().min(MAX_MARGIN_PARAS);
+        let mut paras = Vec::with_capacity(keep);
+        for i in 0..keep {
+            let t = if i + 1 == keep && lines.len() > keep { lines[i..].join(" ") } else { lines[i].to_string() };
+            let p = match (old_paras.get(i), old_paras.last()) {
+                (Some(o), _) => o.retext(&t, &self.attrs, plain),
+                (None, Some(last)) => {
+                    let a = last.attr_at(last.text.len() as u32);
+                    let x = self.attrs.get(a);
+                    let a = if x.object.is_some() || x.note.is_some() || x.field.is_some() { plain } else { a };
+                    let mut p = Para::new(self.new_id(), &t, last.style);
+                    p.props = last.props.clone();
+                    p.runs = vec![(0, a)];
+                    p
+                }
+                (None, None) => {
+                    let mut p = Para::new(self.new_id(), &t, 0);
+                    p.runs = vec![(0, plain)];
+                    p.props.align = Some(align);
+                    p.props.space_before = Some(0);
+                    p.props.space_after = Some(0);
+                    p
+                }
+            };
+            paras.push(p);
+        }
+        let words: Vec<String> = paras.iter().map(|p| p.text.replace(crate::model::OBJECT_CHAR, "")).collect();
+        let text: String = words.iter().map(|w| w.trim()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+        Some(HeaderFooter { text: text.chars().take(1000).collect(), align, paras })
     }
 
     /// Ops that delete from (`b0`, `o0`) to (`b1`, `o1`), across paragraphs.

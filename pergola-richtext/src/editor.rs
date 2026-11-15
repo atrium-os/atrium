@@ -109,6 +109,17 @@ pub trait Checker {
     fn misspelled(&self, text: &str) -> Vec<(u32, u32)>;
 }
 
+/// Which pages' header and footer to edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginPages {
+    /// Every page without its own.
+    All,
+    /// The first page.
+    First,
+    /// The even pages.
+    Even,
+}
+
 pub struct Editor {
     pub doc: TextDoc,
     pub history: History<TextOp>,
@@ -1449,6 +1460,66 @@ impl Editor {
         self.apply(label, vec![TextOp::SetPage { page, header, footer }], Kind::Other);
     }
 
+    /// Which pages' header and footer `margins_text` and `set_margins` mean.
+    fn margins_for(&self, which: MarginPages) -> (Option<&officina_text::model::HeaderFooter>, Option<&officina_text::model::HeaderFooter>) {
+        let own = match which {
+            MarginPages::All => return (self.doc.header.as_ref(), self.doc.footer.as_ref()),
+            MarginPages::First => self.doc.first_page.as_ref(),
+            MarginPages::Even => self.doc.even_pages.as_ref(),
+        };
+        own.map_or((None, None), |m| (m.header.as_ref(), m.footer.as_ref()))
+    }
+
+    /// The header's and footer's text for `which` pages, a paragraph a line
+    /// (`{page}` and `{pages}` standing for the numbers).
+    pub fn margins_text(&self, which: MarginPages) -> (String, String) {
+        let text = |h: Option<&officina_text::model::HeaderFooter>| {
+            h.map_or(String::new(), |h| if h.paras.is_empty() { h.text.clone() } else { h.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n") })
+        };
+        let (h, f) = self.margins_for(which);
+        (text(h), text(f))
+    }
+
+    /// Whether the first page and the even pages have their own header and
+    /// footer.
+    pub fn margin_pages(&self) -> (bool, bool) {
+        (self.doc.first_page.is_some(), self.doc.even_pages.is_some())
+    }
+
+    /// Sets the header and footer of `which` pages from their text (one
+    /// undoable action; giving the first or even pages text turns their own
+    /// on); false if nothing changed.
+    pub fn set_margins(&mut self, which: MarginPages, header: &str, footer: &str) -> bool {
+        let (h, f) = self.margins_for(which);
+        let (h, f) = (h.cloned(), f.cloned());
+        let (old_h, old_f) = self.margins_text(which);
+        let h = if old_h == header { h } else { self.doc.edit_margin(h, header, false) };
+        let f = if old_f == footer { f } else { self.doc.edit_margin(f, footer, true) };
+        let (mut header, mut footer, mut first, mut even) = (self.doc.header.clone(), self.doc.footer.clone(), self.doc.first_page.clone(), self.doc.even_pages.clone());
+        match which {
+            MarginPages::All => (header, footer) = (h, f),
+            MarginPages::First => first = Some(officina_text::model::Margins { header: h, footer: f }),
+            MarginPages::Even => even = Some(officina_text::model::Margins { header: h, footer: f }),
+        }
+        self.apply_margins(header, footer, first, even)
+    }
+
+    /// Gives the first page and the even pages their own header and footer
+    /// (starting blank), or takes them away; false if nothing changed.
+    pub fn set_margin_pages(&mut self, first: bool, even: bool) -> bool {
+        let pick = |on: bool, m: &Option<officina_text::model::Margins>| if on { Some(m.clone().unwrap_or_default()) } else { None };
+        let (f, e) = (pick(first, &self.doc.first_page), pick(even, &self.doc.even_pages));
+        self.apply_margins(self.doc.header.clone(), self.doc.footer.clone(), f, e)
+    }
+
+    fn apply_margins(&mut self, header: Option<officina_text::model::HeaderFooter>, footer: Option<officina_text::model::HeaderFooter>, first_page: Option<officina_text::model::Margins>, even_pages: Option<officina_text::model::Margins>) -> bool {
+        if header == self.doc.header && footer == self.doc.footer && first_page == self.doc.first_page && even_pages == self.doc.even_pages {
+            return false;
+        }
+        self.apply("Header and Footer", vec![TextOp::SetMargins { header, footer, first_page, even_pages }], Kind::Other);
+        true
+    }
+
     /// Page numbers in the footer ("Page 3 of 12", centred), on or off.
     pub fn toggle_page_numbers(&mut self) {
         let on = self.doc.footer.as_ref().is_some_and(|f| f.text.contains("{page}"));
@@ -2735,6 +2806,43 @@ pub(crate) mod tests {
         assert_eq!(e.pages.pages().len(), a4);
         e.undo();
         assert!(e.doc.footer.is_none());
+    }
+
+    #[test]
+    fn headers_edit_as_text_and_keep_their_format() {
+        use officina_text::model::{Align, CharAttrs, HeaderFooter, Para};
+        let mut e = ed(&["Body"]);
+        assert!(!e.set_margins(MarginPages::All, "", ""), "nothing to change");
+        assert!(e.set_margins(MarginPages::All, "Acme", "Page {page}"));
+        assert_eq!(e.doc.header, Some(HeaderFooter::line("Acme", Align::Start)));
+        assert_eq!(e.doc.footer.as_ref().map(|f| f.align), Some(Align::Center));
+        // A bold logo line: the edit keeps the bold round the change.
+        let bold = e.doc.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
+        let mut p = Para::new(e.doc.new_id(), "Acme Ltd", 0);
+        p.runs = vec![(0, bold)];
+        e.doc.header = Some(HeaderFooter { text: "Acme Ltd".into(), align: Align::Start, paras: vec![p] });
+        assert!(e.set_margins(MarginPages::All, "Acme Group\nQuarterly", "Page {page}"));
+        let h = e.doc.header.clone().unwrap();
+        assert_eq!(h.paras.len(), 2);
+        assert_eq!(h.text, "Acme Group Quarterly");
+        assert!(h.paras.iter().all(|p| p.runs == vec![(0, bold)]), "{:?}", h.paras);
+        assert_eq!(e.margins_text(MarginPages::All), ("Acme Group\nQuarterly".into(), "Page {page}".into()));
+        // The first page's own, then the even pages'.
+        assert!(e.set_margin_pages(true, false));
+        assert_eq!(e.margins_text(MarginPages::First), (String::new(), String::new()));
+        assert!(e.set_margins(MarginPages::First, "", "Title page"));
+        assert!(e.set_margins(MarginPages::Even, "", "Even {page}"));
+        assert_eq!(e.margin_pages(), (true, true));
+        assert_eq!(e.doc.margins_of(0).1.map(|f| f.text.as_str()), Some("Title page"));
+        assert_eq!(e.doc.margins_of(1).1.map(|f| f.text.as_str()), Some("Even {page}"));
+        assert_eq!(e.doc.margins_of(2).1.map(|f| f.text.as_str()), Some("Page {page}"));
+        e.undo();
+        assert_eq!(e.margin_pages(), (true, false));
+        assert!(e.set_margin_pages(false, false));
+        assert_eq!(e.doc.margins_of(0).1.map(|f| f.text.as_str()), Some("Page {page}"));
+        // Clearing the text takes the header away.
+        assert!(e.set_margins(MarginPages::All, "", "Page {page}"));
+        assert!(e.doc.header.is_none());
     }
 
     /// A w x h PNG, one colour.
