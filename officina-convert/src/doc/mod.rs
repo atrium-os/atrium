@@ -10,17 +10,19 @@
 //! and character properties from their formatted disk pages and from fast
 //! saves' property lists, styles with inheritance and the default font,
 //! lists (`PlfLst`/`PlfLfo`), tables (rows and cells, widths, merges),
-//! inline pictures (PNG and JPEG from the Data stream), footnotes and
+//! inline pictures (from the Data stream) and floating ones (the OfficeArt
+//! drawing, `art`), footnotes and
 //! endnotes, the first section's header and footer, sections (page size,
 //! margins, columns, breaks), fields (as fields, so page numbers, tables of
 //! contents and cross-references work), bookmarks, tracked insertions and
 //! deletions with their authors. A document protected with a password (RC4
 //! or RC4 CryptoAPI) is decrypted here, inside the sandbox.
 //!
-//! Reported, not carried: comments, text boxes and floating shapes,
+//! Reported, not carried: drawn shapes and groups,
 //! embedded objects, pictures in other formats, nested tables (their text
 //! kept). Refused: Word 95 and older, XOR obfuscation.
 
+pub mod art;
 pub mod bin;
 pub mod props;
 #[doc(hidden)]
@@ -125,6 +127,37 @@ struct Doc<'a> {
     boxes: HashMap<u32, (u32, u32)>,
     /// Header and footer relationship ids, once made.
     hdr_refs: String,
+    /// The OfficeArt drawing, and the WordDocument stream its pictures lie in.
+    art: art::Art<'a>,
+    word: &'a [u8],
+    /// Floating shapes that aren't text boxes: anchor position → anchor.
+    floats: HashMap<u32, Spa>,
+}
+
+/// A floating shape's anchor (`SPA`): its shape, its box in twips, and how
+/// it is placed and wrapped.
+#[derive(Debug, Clone, Copy)]
+struct Spa {
+    id: u32,
+    rect: (i32, i32, i32, i32),
+    /// Across from: 0 the margin, 1 the page, 2 the column.
+    bx: u16,
+    /// Down from: 0 the margin, 1 the page, 2 the paragraph.
+    by: u16,
+    /// 1 top and bottom, 3 none (in front, or behind with `below`), 4
+    /// tight, 5 through, else square.
+    wr: u16,
+    below: bool,
+    /// In a header or footer (its shape is in their drawing).
+    hdr: bool,
+}
+
+impl Spa {
+    fn read(s: &[u8]) -> Spa {
+        let f = u16_at(s, 20);
+        let i = |o: usize| u32_at(s, o) as i32;
+        Spa { id: u32_at(s, 0), rect: (i(4), i(8), i(12), i(16)), bx: (f >> 1) & 3, by: (f >> 3) & 3, wr: (f >> 5) & 0xF, below: f & 0x4000 != 0, hdr: false }
+    }
 }
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -549,14 +582,73 @@ impl<'a> Doc<'a> {
                 return None;
             }
         };
+        let n = self.add_media(ext, bytes.to_vec())?;
+        let scale = |g: u64, m: u64| g * if m == 0 { 1000 } else { m } / 1000 * 635;
+        let (cx, cy) = (scale(dxa, mx), scale(dya, my));
+        Some(format!(r#"<w:drawing><wp:inline><wp:extent cx="{cx}" cy="{cy}"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rIdImg{n}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#))
+    }
+
+    /// A picture file as a part; its number (`rIdImg{n}`).
+    fn add_media(&mut self, ext: &str, bytes: Vec<u8>) -> Option<usize> {
         if self.media.len() >= MAX_PICTURES {
             return None;
         }
         let n = self.media.len() + 1;
-        self.media.push((format!("word/media/image{n}.{ext}"), bytes.to_vec()));
-        let scale = |g: u64, m: u64| g * if m == 0 { 1000 } else { m } / 1000 * 635;
-        let (cx, cy) = (scale(dxa, mx), scale(dya, my));
-        Some(format!(r#"<w:drawing><wp:inline><wp:extent cx="{cx}" cy="{cy}"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rIdImg{n}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#))
+        self.media.push((format!("word/media/image{n}.{ext}"), bytes));
+        Some(n)
+    }
+
+    /// A floating picture at its anchor, as `w:drawing` with `wp:anchor`.
+    /// `None` (and a note) for shapes that aren't pictures.
+    fn float_picture(&mut self, a: Spa) -> Option<String> {
+        let Some(shape) = (if a.hdr { &self.art.hdr } else { &self.art.main }).get(&a.id).copied() else {
+            self.rep.note(Kind::Dropped, "floating shapes (drawn shapes, WordArt)");
+            return None;
+        };
+        let pib = match shape.pib {
+            Some(p) if !shape.group => p,
+            _ => {
+                self.rep.note(Kind::Dropped, if shape.group { "grouped floating shapes" } else { "floating shapes (drawn shapes, WordArt)" });
+                return None;
+            }
+        };
+        let (ext, bytes) = match self.art.picture(pib, self.word) {
+            Ok((e, b)) => (e, b.into_owned()),
+            Err(other) => {
+                self.rep.note(Kind::Dropped, if other { "pictures in formats not shown (PICT, TIFF)" } else { "floating pictures whose picture is missing" });
+                return None;
+            }
+        };
+        let n = self.add_media(ext, bytes)?;
+        let emu = |t: i32| t as i64 * 635;
+        let (l, t, r, b) = a.rect;
+        let (cx, cy) = (emu((r - l).max(1)), emu((b - t).max(1)));
+        // The shape's own placing wins over the anchor's.
+        let h = match shape.posrelh {
+            Some(r) => ["margin", "page", "column", "character"].get(r as usize).copied().unwrap_or("column"),
+            None => ["margin", "page", "column", "column"][a.bx as usize & 3],
+        };
+        let v = match shape.posrelv {
+            Some(r) => ["margin", "page", "paragraph", "line"].get(r as usize).copied().unwrap_or("paragraph"),
+            None => ["margin", "page", "paragraph", "paragraph"][a.by as usize & 3],
+        };
+        let pos = |at: Option<u32>, off: i32, names: [&str; 5]| match at {
+            Some(k @ 1..=5) => format!("<wp:align>{}</wp:align>", names[k as usize - 1]),
+            _ => format!("<wp:posOffset>{}</wp:posOffset>", emu(off)),
+        };
+        let x = pos(shape.posh, l, ["left", "center", "right", "inside", "outside"]);
+        let y = pos(shape.posv, t, ["top", "center", "bottom", "inside", "outside"]);
+        let wrap = match a.wr {
+            1 => "<wp:wrapTopAndBottom/>",
+            3 => "<wp:wrapNone/>",
+            4 => r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="0"><wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/><wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#,
+            5 => r#"<wp:wrapThrough wrapText="bothSides"><wp:wrapPolygon edited="0"><wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/><wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapThrough>"#,
+            _ => r#"<wp:wrapSquare wrapText="bothSides"/>"#,
+        };
+        let behind = u8::from(a.wr == 3 && shape.behind.unwrap_or(a.below));
+        Some(format!(
+            r#"<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="{n}" behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{h}">{x}</wp:positionH><wp:positionV relativeFrom="{v}">{y}</wp:positionV><wp:extent cx="{cx}" cy="{cy}"/>{wrap}<wp:docPr id="{n}" name="Picture {n}"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rIdImg{n}"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing>"#
+        ))
     }
 
     /// A story's paragraphs and tables, `cp0..cp1`, as body XML.
@@ -765,7 +857,15 @@ impl<'a> Doc<'a> {
                                 items.push_str(&body);
                                 items.push_str("</w:txbxContent></v:textbox></v:shape></w:pict>");
                             }
-                            None => self.rep.note(Kind::Dropped, "floating pictures, shapes and text boxes"),
+                            None => match self.floats.remove(&k).filter(|_| kind != Story::Note) {
+                                Some(a) => {
+                                    if let Some(x) = self.float_picture(a) {
+                                        flush(&mut units, &mut items, instr);
+                                        items.push_str(&x);
+                                    }
+                                }
+                                None => self.rep.note(Kind::Dropped, "floating shapes and text boxes"),
+                            },
                         },
                         0x05 if chp.spec => {
                             if kind == Story::Main {
@@ -885,7 +985,7 @@ fn translate(data: &[u8], password: Option<&str>, rep: &mut Report) -> Result<Ve
         *cell = c;
     }
     let authors = bin::sttb(fib.part(fc::STTBF_RMARK, &table));
-    let mut d = Doc { data: &data_s, clx, text, papx, chpx, fonts, styles, style_chp, authors, ftn_refs: HashMap::new(), edn_refs: HashMap::new(), marks: Vec::new(), sed_ends: Vec::new(), seps: Vec::new(), media: Vec::new(), rep: Report::default(), next_rev: 0, hdr_refs: String::new(), boxes: HashMap::new(), atn_refs: HashMap::new() };
+    let mut d = Doc { data: &data_s, clx, text, papx, chpx, fonts, styles, style_chp, authors, ftn_refs: HashMap::new(), edn_refs: HashMap::new(), marks: Vec::new(), sed_ends: Vec::new(), seps: Vec::new(), media: Vec::new(), rep: Report::default(), next_rev: 0, hdr_refs: String::new(), boxes: HashMap::new(), atn_refs: HashMap::new(), art: art::Art::read(fib.part(fc::DGG_INFO, &table)), word: &word, floats: HashMap::new() };
     // Notes: their references and text ranges.
     let ftn_base = fib.ccp_text;
     let hdd_base = ftn_base + fib.ccp_ftn;
@@ -974,9 +1074,21 @@ fn translate(data: &[u8], password: Option<&str>, rep: &mut Report) -> Result<Ve
     }
     let (acps, spas) = bin::plc(fib.part(fc::PLC_SPA_MOM, &table), 26);
     for (i, s) in spas.iter().enumerate().take(1 << 14) {
-        if let (Some(&cp), Some(&r)) = (acps.get(i), by_spid.get(&u32_at(s, 0))) {
-            d.boxes.insert(cp, r);
+        let Some(&cp) = acps.get(i) else { break };
+        match by_spid.get(&u32_at(s, 0)) {
+            Some(&r) => {
+                d.boxes.insert(cp, r);
+            }
+            None => {
+                d.floats.insert(cp, Spa::read(s));
+            }
         }
+    }
+    // Floating shapes in headers and footers: positions from the header text's start.
+    let (hcps, hspas) = bin::plc(fib.part(fc::PLC_SPA_HDR, &table), 26);
+    for (i, s) in hspas.iter().enumerate().take(1 << 14) {
+        let Some(&cp) = hcps.get(i) else { break };
+        d.floats.insert(hdd_base.saturating_add(cp), Spa { hdr: true, ..Spa::read(s) });
     }
     if fib.ccp_hdr_txbx > 0 {
         d.rep.note(Kind::Dropped, "text boxes in headers and footers");

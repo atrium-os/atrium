@@ -52,6 +52,7 @@ pub mod fc {
     pub const GRP_XST_ATN_OWNERS: usize = 36;
     pub const STTBF_ATN_BKMK: usize = 37;
     pub const PLC_SPA_MOM: usize = 40;
+    pub const PLC_SPA_HDR: usize = 41;
     pub const PLCF_ATN_BKF: usize = 42;
     pub const PLCF_ATN_BKL: usize = 43;
     pub const PLCFEND_REF: usize = 46;
@@ -59,6 +60,7 @@ pub mod fc {
     pub const STTBF_RMARK: usize = 51;
     pub const PLCFTXBX_TXT: usize = 56;
     pub const ATRD_EXTRA: usize = 112;
+    pub const DGG_INFO: usize = 50;
     pub const PLF_LST: usize = 73;
     pub const PLF_LFO: usize = 74;
 }

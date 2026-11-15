@@ -2875,8 +2875,8 @@ seconds' worth of missing text, now cut at the end of the piece table). A 30,000
 byte, plain and RC4 CryptoAPI protected (`doc::sample`, which LibreOffice
 also reads), and Write opens both through the real converter.
 
-Open: floating pictures and shapes (OfficeArt drawing to anchors), EMF/WMF
-pictures, form fields' text and check boxes, legal and chapter list labels,
+Open: ~~floating pictures~~ (§16.46), drawn shapes and groups, ~~EMF/WMF
+pictures~~ (§16.45), form fields' text and check boxes, legal and chapter list labels,
 headers and footers per section, text boxes in headers.
 
 ### 16.44 O7d as built (2026-11-15): `.ppt` import
@@ -3022,6 +3022,35 @@ POI deck.
 
 Open: a CJK face, PICT and TIFF, SVM (LibreOffice's own metafile, in
 `.odp`), EMF+ drawing, glyph-index text (`ETO_GLYPH_INDEX`), embedded fonts.
+
+### 16.46 Floating pictures in `.doc` (2026-11-16)
+
+- **The drawing** (`officina-convert/src/doc/art.rs`). `fcDggInfo` in the
+  table stream holds the OfficeArt content: the drawing group with its
+  picture store (`0xF007` entries, each holding its picture or naming where
+  it lies in the WordDocument stream, `foDelay`), then a drawing for the main
+  document and one for the headers. Each drawing's shapes are read by id:
+  their picture (property `pib`), whether they are a group, and where the
+  shape itself says it goes (`posh`, `posrelh`, `posv`, `posrelv`,
+  `fBehindDocument`). Records, entries and shapes are bounded.
+- **Anchors.** Each `PlcSpaMom` (and `PlcSpaHdr`) entry that isn't a text box
+  becomes a `wp:anchor` at its `0x08` character: the box in twips from
+  `SPA`, measured from what the shape names (margin, page, column, character;
+  margin, page, paragraph, line) or else from `SPA`'s `bx`/`by`, aligned
+  when `posh`/`posv` say so; `wr` gives the wrap (top and bottom, none in
+  front or behind, tight, through, else square). The `.docx` reader then
+  places it like any floating picture (§16.30).
+- **Table cells grow** to hold the pictures their text wraps round
+  (`officina-text` row layout), as Word lays them out in the cell; pictures in
+  front of or behind the text don't. This applies to `.docx` and `.odt` too.
+- **Not yet**: drawn shapes, WordArt and groups (noted as dropped; Write has
+  no shapes yet), cropping, pictures in headers (Write's headers keep only
+  their text).
+
+Corpus: `.doc` pictures 193 → 246; LibreOffice's renders of the floating
+picture test files (POI 58804, Bug47731, LibreOffice tdf132094, tdf160049,
+tdf162541) place them the same. 20,000 mutated files with floats clean
+(slowest 12 ms). LibreOffice gate 31/31.
 
 ## 17. Decisions (accepted 2026-11-14)
 

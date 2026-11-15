@@ -456,6 +456,13 @@ impl Paginator {
             row_h = row_h.max(yy + pad - y);
             boxes.push(CellBox { x, y, w, h: 0 });
         }
+        // A cell grows to hold the pictures its text wraps round (Word lays
+        // them out in the cell); ones in front of or behind the text don't.
+        for p in &floats.floats {
+            if p.object.float.is_some_and(|fl| !matches!(fl.wrap, Wrap::InFront | Wrap::Behind)) && p.y >= y {
+                row_h = row_h.max(p.y + p.h + pad - y);
+            }
+        }
         for c in &mut boxes {
             c.h = row_h;
         }
@@ -1416,6 +1423,27 @@ mod tests {
                 _ => assert_eq!(shape(&p), shape(&p0), "{wrap:?}: the text runs on"),
             }
         }
+    }
+
+    /// A cell grows to hold a picture its text wraps round; one in front of
+    /// the text leaves the row as tall as its text.
+    #[test]
+    fn cells_grow_round_their_floating_pictures() {
+        use crate::model::{Float, HAlign, Wrap};
+        let row_h = |wrap: Option<Wrap>| {
+            let mut d = with_table(&[1, 1], 40, 1, 2, 2);
+            if let Some(wrap) = wrap {
+                float_op(&mut d, 1, Float { wrap, h_align: HAlign::Start, ..Float::default() }, 600, 3000).apply(&mut d);
+            }
+            let (p, _) = all(&d);
+            let pg = &p.pages()[0];
+            let y = |b: usize| pg.slices.iter().find(|s| s.block == b).unwrap().y;
+            y(3) - y(1)
+        };
+        let plain = row_h(None);
+        assert!(row_h(Some(Wrap::Square)) >= twips(3000), "the picture's row holds it");
+        assert_eq!(row_h(Some(Wrap::InFront)), plain);
+        assert_eq!(row_h(Some(Wrap::Behind)), plain);
     }
 
     /// A picture measured from the page sits there whatever paragraph anchors
