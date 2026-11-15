@@ -260,6 +260,22 @@ graphics stack (2D and 3D Vulkan, eventually AAA games) on this driver.
 | 6d | **GPU W^X on by default** (Shankar 2026-11-15). `isolation.gpu_wx` starts at 1 (client BOs X only where bound EXEC); the loader tunable `hw.atrium_gpu.gpu_wx` overrides it (0 = old mapping, X everywhere). Bit 2 stays off: gfx12 loses a queue without X on its writeback/EOP pages (05fdaebf), so those ~2 kernel-owned pages per queue keep W+X. Every client binds code and IBs READONLY\|EXEC: si-client-test (`BIND_CODE`), atrium-gpu-test (`bo_alloc_x`), test-gpu-isolation (`bo_ring`), atrium-gpu-app's device backend and app_path_e2e (ring split from its fence). **PASSED on silicon 2026-11-15 (Mac-built kmods 2c68d145/1281740f from 8d66380f; logs docs/r9700-runs/6d-8d66380f/):** gpu_wx=1 by default with no kenv; 5f: si-client-test 105/0, atrium-gpu-test ALL OK, isolation 1 FAIL = the known global scrub_failed counter (as 6b); fc with frescod 2cffd4bd: 8/8 bit-identical, no VM faults from frescod; idle at detach. Left installed on the box (old set in /root/pre-6d/). |
 | 6e | **VM unbind.** A binding holds its VM, and there was no way to drop one short of closing every fd of the BO, so a long-lived shared BO kept every VM it had been bound into alive. `VM_UNBIND` ('A',28, `struct atrium_gpu_vm_unbind`, ABI rev 5, `BIND_FEAT_UNBIND`; the implemented form of ABI v2 §5.4's `BIND_UNMAP`) clears the BO's PTEs in one VM (TLB flushed), frees its VA range and drops the binding's VM reference. Work still queued under that VM is handled by the free rule: the unbind snapshots the VM's busy queues and preempts its user queues once; what can't be shown done is kept on the BO (`stale`) and the BO's last close waits for it too (`BusyAt::then`). New sysctls `isolation.vms` / `isolation.bos`. atrium-gpu-rs: a BO from `Vm::share`/`Vm::import` keeps a dup of that VM's fd and unbinds on drop (frescod's shown surfaces). si-client-test 19 (refusals, shared BO in 4 VMs, control, unbind under work, fault on the unbound page, rebind at the same VA). Built; box run pending. |
 
+## 4.7 Stage 7 plan: graphics and Vulkan on silicon
+
+Shankar, 2026-11-15: carry on to Vulkan without a go per step; box runs and
+resets are covered (power-off, reinstall and boot-device changes are not).
+gpusim has no graphics pipeline, so every graphics step is proven on the
+R9700 only. Each step lands as a box run with logs in `docs/r9700-runs/`.
+
+| Step | What |
+|---|---|
+| 7a | **GFX user queues.** MES maps gfx queues as well as compute (`gfx_hqd_mask` 0xfe already). A v12 gfx MQD, `ADD_QUEUE` with queue type gfx, `QUEUE_CREATE` family GFX on silicon (today EINVAL). si-client-test: a gfx queue runs NOP + WRITE_DATA + the 7-dword RELEASE_MEM fence, kqueue completion, fault/hang lose only that queue. |
+| 7b | **First triangle by hand.** Hand-assembled NGG primitive shader (vertex-only, positions from a buffer) and pixel shader (constant colour, then an interpolated varying), the GFX12 context/SH register state from the generated GC 12 headers (`atrium-rdna4-cmd`), a linear VRAM colour target, DRAW_INDEX_AUTO. Pixel-compare against a CPU reference rasteriser with the Vulkan rules (top-left fill, pixel centres). |
+| 7c | **Compiler stages.** `atrium-rdna4-compiler` emits NGG vertex and pixel shaders from SPIR-V (GIR stage builtins, export/position/param, interpolation), `atrium-rdna4-cmd` grows a graphics pipeline builder (raster, viewport/scissor, blend, depth). 7b's triangle again from GLSL; then the `loader_graphics_*` scenes against Tier-2. |
+| 7d | **Vulkan compute (`tier3_rdna4`).** The aqueduct-gpu-host `Backend` over `atrium-gpu-rs`: buffers as BOs, compute pipelines through the GIR compiler, descriptors, dispatch, fences. The ICD compute examples on silicon match Tier-2. |
+| 7e | **Vulkan graphics.** 7c's pipeline builder behind `tier3_rdna4`: render passes, images (swizzle modes, no compression), samplers, depth, blending, present by fd. fresco-vulkan `HeadlessRenderer` and the ICD graphics examples match Tier-2; then vkcube-class apps on the display. |
+| 7f | **Toward games.** Texture formats and mips, MSAA, descriptor indexing, indirect draws, timestamps, pipeline cache, multi-queue; performance against RADV on the same box. |
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via
