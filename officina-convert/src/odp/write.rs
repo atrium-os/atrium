@@ -646,7 +646,7 @@ impl W<'_> {
                     return;
                 }
                 if let Some(class) = class {
-                    let mut g = self.fill(&r.fill);
+                    let mut g = self.fill(&page_gradient(&r.fill, sh.rot));
                     g.push_str(&self.stroke(&r.line));
                     g.push_str(&Self::frame_props(&r));
                     let st = a.style("presentation", "pr", &format!("<style:graphic-properties{g}/>"));
@@ -683,7 +683,7 @@ impl W<'_> {
                     let _ = write!(out, r#"<{tag} draw:style-name="{st}"{common}{ty} svg:x1="{}" svg:y1="{}" svg:x2="{}" svg:y2="{}">{desc}<text:p/></{tag}>"#, cm(x1), cm(y1), cm(x2), cm(y2));
                     return;
                 }
-                let mut g = self.fill(&r.fill);
+                let mut g = self.fill(&page_gradient(&r.fill, sh.rot));
                 g.push_str(&self.stroke(&r.line));
                 g.push_str(&Self::frame_props(&r));
                 let st = a.style("graphic", "gr", &format!("<style:graphic-properties{g}/>"));
@@ -941,4 +941,14 @@ pub fn write<O: Write>(deck: &mut Deck, out: O) -> io::Result<O> {
         z.add_stored(name, bytes)?;
     }
     z.finish()
+}
+
+/// A shape's gradient with its angle on the page: LibreOffice reads and
+/// writes `draw:angle` there, turning it as the shape turns, while ours
+/// turns with the shape.
+fn page_gradient(f: &Fill, rot: i32) -> Fill {
+    match f {
+        Fill::Gradient { stops, angle, radial: false } => Fill::Gradient { stops: stops.clone(), angle: (*angle as i64 + rot as i64).rem_euclid(21_600_000) as i32, radial: false },
+        f => f.clone(),
+    }
 }

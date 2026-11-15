@@ -285,8 +285,14 @@ impl<'a> Reader<'a> {
                     if f.child("a:path").is_some_and(|p| p.attr("path") != Some("circle")) {
                         self.rep.note(Kind::Approximate, "rectangular and shape gradients drawn as radial");
                     }
-                    let angle = f.child("a:lin").and_then(|l| num(l, "ang")).unwrap_or(0) as i32;
-                    Fill::Gradient { stops, angle, radial }
+                    let mut angle = f.child("a:lin").and_then(|l| num(l, "ang")).unwrap_or(0).rem_euclid(21_600_000);
+                    // A gradient that stays put on the page while the shape
+                    // turns: ours turns with the shape.
+                    if matches!(f.attr("rotWithShape"), Some("0") | Some("false")) {
+                        let rot = sp_pr.child("a:xfrm").and_then(|x| num(x, "rot")).unwrap_or(0);
+                        angle = (angle - rot).rem_euclid(21_600_000);
+                    }
+                    Fill::Gradient { stops, angle: angle as i32, radial }
                 }
                 "a:blipFill" => {
                     let rid = f.child("a:blip").and_then(|b| b.attr("r:embed")).map(str::to_string);

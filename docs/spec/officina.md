@@ -3111,9 +3111,14 @@ that drew as rectangles (flowchart collate, braces, arcs, striped and
 curved arrows, magnetic disks and others, 113 shapes) now draw as
 themselves; slides corpus 739 files, 0 panics, slide counts equal to
 LibreOffice's 666/666, 99.38 % of its words, round trips unchanged; `.ppt`
-LibreOffice gate 19/19. The slides LibreOffice gate is 82/84: the gradient
-angle check fails the same way without this change (LibreOffice writes our
-0° gradient back at 30°), left for its own look.
+LibreOffice gate 19/19.
+
+**Gradients on turned shapes** (same day): ours turn with the shape. A
+`.pptx` gradient with `rotWithShape="0"` (as LibreOffice writes them) is
+on the page, so the shape's turn is taken off its angle; `.odp`
+`draw:angle` is on the page too as LibreOffice reads and writes it, so the
+turn is added on writing and taken off on reading. The slides LibreOffice
+gate, which had fallen to 82/84 on a 30° turned box, is 84/84 again.
 
 ## 17. Decisions (accepted 2026-11-14)
 

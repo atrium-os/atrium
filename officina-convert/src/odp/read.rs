@@ -936,7 +936,12 @@ impl<'a> Reader<'a> {
             s.flip_h = m.contains("horizontal");
             s.flip_v = m.contains("vertical");
         }
-        let fill = self.fill(&chain, "style:graphic-properties");
+        // `draw:angle` is on the page (as LibreOffice has it); ours turns
+        // with the shape.
+        let fill = self.fill(&chain, "style:graphic-properties").map(|f| match f {
+            Fill::Gradient { stops, angle, radial: false } => Fill::Gradient { stops, angle: (angle as i64 - rot as i64).rem_euclid(21_600_000) as i32, radial: false },
+            f => f,
+        });
         let line = self.stroke(&chain);
         let text_style = e.attr("draw:text-style-name");
         match name {
