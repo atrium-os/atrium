@@ -25,7 +25,8 @@ use pergola::node::Node;
 use pergola::shape::{Paint, PathData, Shape as PShape, Stroke as PStroke};
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{Button, MenuButton, MenuItem, MenuState};
+use pergola::text_edit::TextEdit;
+use pergola::widgets::{Button, MenuButton, MenuItem, MenuState, TextField};
 use pergola::{Color, Mutable, TextStyle};
 
 use crate::doc::Doc;
@@ -45,6 +46,11 @@ pub const SNAP_PX: f32 = 6.0;
 /// What the toolbar asks the event loop for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
+    /// Slide ▸ Password…: set, change or remove the deck's password.
+    PasswordOpen,
+    /// The password bar's field submitted (to set, or to open a file).
+    PasswordDone,
+    PasswordClose,
     Open,
     Save,
     SaveAs,
@@ -132,8 +138,20 @@ struct Lists {
     map: HashMap<SlideId, Rc<Vec<DrawItem>>>,
 }
 
+/// The password bar: asking for a protected file's password, or for the
+/// deck's new one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PasswordBar {
+    pub open: bool,
+    pub prompt: String,
+    /// Setting the deck's password (else opening a file).
+    pub setting: bool,
+}
+
 #[derive(Clone)]
 pub struct Slides {
+    pub password: Mutable<PasswordBar>,
+    pub password_text: Mutable<TextEdit>,
     pub doc: Rc<RefCell<Doc>>,
     pub ui: Mutable<Ui>,
     pub rev: Mutable<u64>,
@@ -185,6 +203,8 @@ impl Slides {
             Err(_) => Rc::new(FixedFonts),
         };
         Slides {
+            password: Mutable::new(PasswordBar::default()),
+            password_text: Mutable::new(TextEdit::new("").secret(true)),
             doc: Rc::new(RefCell::new(doc)),
             ui,
             rev,
@@ -311,7 +331,40 @@ impl Slides {
     /// Runs a command that doesn't need the event loop; returns the rest.
     pub fn take_cmds(&self) -> Vec<Cmd> {
         let cmds = std::mem::take(&mut *self.cmds.lock().unwrap());
-        cmds.into_iter().filter(|&c| !self.run_cmd(c)).collect()
+        cmds.into_iter()
+            .filter(|&c| match c {
+                Cmd::PasswordOpen => {
+                    let protected = self.doc.borrow().protection.is_some();
+                    self.ask_password(if protected { "New password (empty removes it)" } else { "Password to protect this deck" }, true);
+                    false
+                }
+                Cmd::PasswordClose => {
+                    self.password.set(PasswordBar::default());
+                    self.password_text.set(TextEdit::new("").secret(true));
+                    self.changed();
+                    true
+                }
+                Cmd::PasswordDone => true,
+                c => !self.run_cmd(c),
+            })
+            .collect()
+    }
+
+    /// Shows the password bar with `prompt`, its field empty.
+    pub fn ask_password(&self, prompt: &str, setting: bool) {
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.password.set(PasswordBar { open: true, prompt: prompt.into(), setting });
+        self.changed();
+    }
+
+    /// The password bar's text, and the bar closed and emptied.
+    pub fn take_password(&self) -> (PasswordBar, String) {
+        let bar = self.password.get_cloned();
+        let text = self.password_text.get_cloned().text().to_string();
+        self.password.set(PasswordBar::default());
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.changed();
+        (bar, text)
     }
 
     fn run_cmd(&self, c: Cmd) -> bool {
@@ -514,7 +567,7 @@ impl Slides {
                 let to = if c == Cmd::BringForward { at + 1 } else { at.saturating_sub(1) };
                 d.run(if c == Cmd::BringForward { "Bring Forward" } else { "Send Backward" }, vec![DeckOp::MoveShape { target: Target::Slide(sid), id, to }]);
             }
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce => return false,
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce | Cmd::PasswordOpen | Cmd::PasswordDone | Cmd::PasswordClose => return false,
         }
         drop(d);
         self.changed();
@@ -1074,6 +1127,7 @@ impl View for Slides {
             items.push(MenuItem::new("Delete Slide"));
             items.push(MenuItem::new("Rehearse Show"));
             items.push(MenuItem::new("Reduce File Size…"));
+            items.push(MenuItem::new("Password…"));
             let n = layouts.len();
             let cmds = self.cmds.clone();
             MenuButton::new("Slide", self.new_menu.clone(), items, move |i| {
@@ -1082,7 +1136,8 @@ impl View for Slides {
                     0 => Cmd::DuplicateSlide,
                     1 => Cmd::DeleteSlide,
                     2 => Cmd::Rehearse,
-                    _ => Cmd::Reduce,
+                    3 => Cmd::Reduce,
+                    _ => Cmd::PasswordOpen,
                 };
                 cmds.lock().unwrap().push(c);
             })
@@ -1125,6 +1180,21 @@ impl View for Slides {
         ctx.add(Node::Rect { rect: PRect::new(0.0, sy, w, STATUS_H), fill: t.bg_surface(), radius: 0.0 });
         let line = if status.is_empty() { format!("Slide {} of {n}", cur + 1) } else { format!("Slide {} of {n} · {status}", cur + 1) };
         ctx.add(Node::Text { rect: PRect::new(12.0, sy + 4.0, (w - 24.0).max(0.0), 18.0), content: line, style: text_style(type_size::XS, Weight::Regular, t.text_secondary()) });
+
+        // The password bar, under the toolbar.
+        let pb = self.password.get_cloned();
+        if pb.open {
+            let (y, bh) = (TOOLBAR_H, 48.0);
+            ctx.add(Node::Rect { rect: PRect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            let lw = 300.0f32.min(w * 0.4);
+            ctx.add(Node::Text { rect: PRect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt.clone(), style: text_style(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 24.0 - lw - 160.0).max(120.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.password_text.clone()).placeholder("Password").autofocus(true).at(lw + 20.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
+            Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, y + 8.0).width(64.0).on_click(self.cmd(Cmd::PasswordDone)).render(ctx);
+            Button::secondary("Cancel").at(w - 76.0, y + 8.0).width(64.0).on_click(self.cmd(Cmd::PasswordClose)).render(ctx);
+            ctx.add(Node::Rect { rect: PRect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
 
         if self.ui.get_cloned().asking {
             let id = ctx.add(Node::Rect { rect: PRect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });

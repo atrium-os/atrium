@@ -7,10 +7,12 @@
 //! the base and replays the journal through the same history.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use officina_convert::crypt::CryptError;
+use officina_convert::sealed::{self, Protection, Sealer};
 use officina_core::history::{History, Op};
 use officina_core::journal::{self, JournalWriter};
 use officina_core::wire::{Reader, WireError, Writer};
@@ -128,6 +130,8 @@ impl Record {
 pub struct Autosave {
     dir: PathBuf,
     journal: JournalWriter<File>,
+    /// A protected deck's key: the base and each record are sealed.
+    sealer: Option<Sealer>,
     unsynced: usize,
     _lock: File,
     /// The generation of the base and journal in use.
@@ -161,7 +165,7 @@ impl Autosave {
     /// thread (copying a 2 GB deck takes seconds); the journal takes
     /// records at once, and the folder is found by [`pending`] once the
     /// base is in place.
-    pub fn start(dir: &Path, deck: &Deck, name: &str) -> io::Result<Self> {
+    pub fn start(dir: &Path, deck: &Deck, name: &str, sealer: Option<&Sealer>) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let l = lock(dir)?;
         let old = generation(dir).ok();
@@ -169,16 +173,23 @@ impl Autosave {
         let j = OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(format!("journal.{g}")))?;
         j.sync_all()?;
         fs::write(dir.join(META), name.as_bytes())?;
-        let (deck, d) = (deck.clone(), dir.to_path_buf());
+        let (deck, d, seal) = (deck.clone(), dir.to_path_buf(), sealer.cloned());
         let base = std::thread::Builder::new().name("autosave base".into()).spawn(move || {
             let tmp = d.join(".base.tmp");
             let f = File::create(&tmp)?;
-            let f = native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
+            let f = match seal {
+                Some(s) => {
+                    let mut f = f;
+                    f.write_all(&s.seal(&native::save_to_vec(&deck)))?;
+                    f
+                }
+                None => native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?,
+            };
             f.sync_all()?;
             fs::rename(&tmp, base_path(&d, g))?;
             commit(&d, g, old)
         })?;
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l, g, base: Some(base) })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer: sealer.cloned(), unsynced: 0, _lock: l, g, base: Some(base) })
     }
 
     /// Waits for the base to be written.
@@ -204,16 +215,20 @@ impl Autosave {
         Ok(())
     }
 
-    fn resume(dir: &Path, l: File, g: u64, good: u64) -> io::Result<Self> {
+    fn resume(dir: &Path, l: File, g: u64, good: u64, sealer: Option<Sealer>) -> io::Result<Self> {
         let mut j = OpenOptions::new().write(true).open(dir.join(format!("journal.{g}")))?;
         j.set_len(good)?;
         j.seek(io::SeekFrom::End(0))?;
         j.sync_all()?;
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l, g, base: None })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer, unsynced: 0, _lock: l, g, base: None })
     }
 
     fn append(&mut self, r: &Record) -> io::Result<()> {
-        self.journal.append(&r.encode())?;
+        let rec = r.encode();
+        match &self.sealer {
+            Some(s) => self.journal.append(&s.seal_small(&rec))?,
+            None => self.journal.append(&rec)?,
+        }
         self.unsynced += 1;
         Ok(())
     }
@@ -257,19 +272,48 @@ pub struct Recovered {
     pub torn_bytes: usize,
 }
 
+/// Whether the autosave folder `dir` is a protected deck's (its recovery
+/// needs the password).
+pub fn recovery_locked(dir: &Path) -> bool {
+    let Ok(g) = generation(dir) else { return false };
+    let mut head = [0u8; 128];
+    File::open(base_path(dir, g)).and_then(|mut f| f.read_exact(&mut head)).is_ok() && sealed::is_sealed(&head)
+}
+
 /// Rebuilds the deck an autosave folder describes.
 pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
+    recover_with(dir, None)
+}
+
+/// [`recover`], for a protected deck with its password. A wrong one is
+/// `PermissionDenied`.
+pub fn recover_with(dir: &Path, password: Option<&str>) -> io::Result<(Doc, Recovered)> {
     let l = lock(dir)?;
     let g = generation(dir)?;
-    let base = crate::mapped::Mapped::new(&File::open(base_path(dir, g))?)?;
-    let deck = native::load(Arc::new(base)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut protection = None;
+    let deck = if recovery_locked(dir) {
+        let Some(pw) = password else { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the deck is protected with a password")) };
+        let (plain, sealer) = sealed::unseal(&fs::read(base_path(dir, g))?, pw).map_err(|e| match e {
+            CryptError::WrongPassword => io::Error::new(io::ErrorKind::PermissionDenied, "that password doesn't open it"),
+            e => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+        })?;
+        protection = Some(Protection { password: pw.to_string(), sealer });
+        native::load(Arc::new(plain))
+    } else {
+        native::load(Arc::new(crate::mapped::Mapped::new(&File::open(base_path(dir, g))?)?))
+    };
+    let deck = deck.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let name = fs::read_to_string(dir.join(META)).unwrap_or_else(|_| "Recovered".into());
     let mut doc = Doc::from_deck(deck, &name);
     let data = fs::read(dir.join(format!("journal.{g}"))).unwrap_or_default();
     let replay = journal::read(&data);
     let (mut actions, mut since_save, mut torn) = (0, 0, replay.torn_bytes);
     for (i, rec) in replay.records.iter().enumerate() {
-        match Record::decode(rec).ok().filter(|r| doc.replay(r.clone())) {
+        let opened = match &protection {
+            Some(p) => p.sealer.open_small(rec),
+            None => Some(rec.to_vec()),
+        };
+        match opened.and_then(|rec| Record::decode(&rec).ok()).filter(|r| doc.replay(r.clone())) {
             Some(Record::Saved) => since_save = 0,
             Some(_) => {
                 actions += 1;
@@ -282,7 +326,8 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
         }
     }
     doc.dirty = since_save > 0;
-    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64)?);
+    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64, protection.as_ref().map(|p| p.sealer.clone()))?);
+    doc.protection = protection;
     Ok((doc, Recovered { actions, torn_bytes: torn }))
 }
 
@@ -304,6 +349,9 @@ pub struct Doc {
     pub touched: Vec<SlideId>,
     /// The run of typing the last action is: (label, slide, shape).
     typing: Option<(String, SlideId, u32)>,
+    /// The password, while a protected deck is open: saves and the journal
+    /// are encrypted with it.
+    pub protection: Option<Protection>,
 }
 
 impl Doc {
@@ -320,7 +368,7 @@ impl Doc {
     pub fn from_deck(deck: Deck, name: &str) -> Self {
         let mut history = History::new();
         history.limit = UNDO_LIMIT;
-        Doc { deck, history, name: name.into(), dirty: false, current: 0, autosave: None, status: String::new(), notes: Vec::new(), generation: 0, touched: Vec::new(), typing: None }
+        Doc { deck, history, name: name.into(), dirty: false, current: 0, autosave: None, status: String::new(), notes: Vec::new(), generation: 0, touched: Vec::new(), typing: None, protection: None }
     }
 
     /// Opens the `.oslides` in `f` mapped: only its index, deck and masters
@@ -335,8 +383,27 @@ impl Doc {
     /// the deck is held in memory) and maps the deck from it, so the file it
     /// came from can be written over. The caller copies `path` where the
     /// deck goes and then hands it to [`Doc::saved_as`].
+    ///
+    /// A protected deck's file is sealed: it is made in memory, and the deck
+    /// is held in memory from then on (never mapped from a file it may be
+    /// saved over).
     pub fn spool(&mut self, path: &Path) -> io::Result<File> {
         let f = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        if let Some(p) = &self.protection {
+            let plain = native::save_to_vec(&self.deck);
+            let r = (|| {
+                let mut f = f;
+                f.write_all(&p.sealer.seal(&plain))?;
+                f.sync_all()?;
+                Ok::<_, io::Error>(f)
+            })();
+            if r.is_err() {
+                let _ = fs::remove_file(path);
+            }
+            let f = r?;
+            self.deck = native::load(Arc::new(plain)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            return Ok(f);
+        }
         let r = (|| {
             let f = native::save(&self.deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
             f.sync_all()?;
@@ -386,7 +453,21 @@ impl Doc {
         if let Some(a) = self.autosave.take() {
             a.remove()?;
         }
-        self.autosave = Some(Autosave::start(dir, &self.deck, &self.name)?);
+        self.autosave = Some(Autosave::start(dir, &self.deck, &self.name, self.protection.as_ref().map(|p| &p.sealer))?);
+        Ok(())
+    }
+
+    /// Sets, changes (keeping the key) or removes the password; the
+    /// journal starts again, sealed or not, in place of the old one.
+    pub fn set_password(&mut self, password: Option<&str>) -> io::Result<()> {
+        match (password, &mut self.protection) {
+            (Some(pw), Some(p)) => p.change(pw),
+            (Some(pw), None) => self.protection = Some(Protection::new(pw)),
+            (None, _) => self.protection = None,
+        }
+        if let Some(dir) = self.autosave.as_ref().map(|a| a.dir.clone()) {
+            self.autosave_to(&dir)?;
+        }
         Ok(())
     }
 
@@ -636,6 +717,51 @@ mod tests {
         back.undo();
         assert_eq!(back.deck.slide(1).unwrap().shapes[0].text().unwrap().text(), "");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_protected_deck_keeps_nothing_in_the_clear() {
+        let dir = tmp("protected");
+        let src_path = dir.with_extension("plain.oslides");
+        let mut doc = Doc::new("Talk");
+        let media = doc.deck.add_media("image/png", b"PICTURE-BYTES-PICTURE-BYTES");
+        let pid = doc.deck.new_id();
+        doc.deck.slide_mut(0).unwrap().shapes.push(Shape::new(pid, Rect::new(0, 0, 10, 10), ShapeKind::Picture { media, crop: [0; 4], line: None }));
+        fs::write(&src_path, native::save_to_vec(&doc.deck)).unwrap();
+        // Opened mapped from a plain file, then given a password.
+        let mut doc = Doc::from_file("Talk.oslides", &File::open(&src_path).unwrap()).unwrap();
+        doc.autosave_to(&dir).unwrap();
+        doc.set_password(Some("pw")).unwrap();
+        let obj = doc.deck.layout_of_kind("obj").unwrap().id;
+        let s = new_slide(&mut doc.deck, obj);
+        doc.run("New Slide", vec![DeckOp::InsertSlide { at: 1, slide: Box::new(s) }]);
+        // Saved over the file it is mapped from: sealed, and the deck no
+        // longer reads that file.
+        let spool = doc.spool_path();
+        let src = doc.spool(&spool).unwrap();
+        crate::mapped::copy_file(&src, &mut OpenOptions::new().write(true).open(&src_path).unwrap()).unwrap();
+        doc.saved_as(&spool).unwrap();
+        assert_eq!(doc.deck.media_bytes(media).unwrap().as_ref(), b"PICTURE-BYTES-PICTURE-BYTES");
+        let saved = fs::read(&src_path).unwrap();
+        assert!(sealed::is_sealed(&saved));
+        assert_eq!(sealed::unseal(&saved, "pw").unwrap().0.len(), native::save_to_vec(&doc.deck).len());
+        let s = new_slide(&mut doc.deck, obj);
+        doc.run("New Slide", vec![DeckOp::InsertSlide { at: 0, slide: Box::new(s) }]);
+        doc.autosave().unwrap().settle().unwrap();
+        doc.autosave().unwrap().sync().unwrap();
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let b = fs::read(e.path()).unwrap();
+            assert!(!b.windows(13).any(|w| w == b"PICTURE-BYTES"), "{:?}", e.path());
+        }
+        drop(doc);
+        assert!(recovery_locked(&dir));
+        assert_eq!(recover(&dir).err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(recover_with(&dir, Some("PW")).err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        let (back, rec) = recover_with(&dir, Some("pw")).unwrap();
+        assert_eq!((rec.actions, back.deck.slide_count()), (1, 3));
+        assert!(back.protection.is_some());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&src_path);
     }
 
     #[test]

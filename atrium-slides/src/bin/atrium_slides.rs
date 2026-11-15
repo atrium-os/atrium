@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use atrium_slides::app::{Cmd, Slides, Ui, PICKER_SLOT};
 use atrium_slides::doc::{self, Doc};
-use atrium_slides::files::{encode, format_of, load_file, picture_mime, stem_of, Format};
+use atrium_slides::files::{encode, format_of, load_file_with, picture_mime, stem_of, Format};
+use officina_convert::launch::ConvertError;
 use atrium_slides::mapped::copy_file;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
@@ -123,9 +124,17 @@ fn write_new(dir: &Path, stem: &str, src: &File) -> io::Result<PathBuf> {
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "every name is taken"))
 }
 
+/// A protected file waiting for its password.
+enum Locked {
+    File { name: String, file: File, target: Option<Target>, read_only: bool },
+    /// A protected deck's autosave folder, to restore.
+    Recovery { dir: PathBuf, name: String },
+}
+
 struct Run {
     slides: Slides,
     target: Option<Target>,
+    locked: Option<Locked>,
     root: PathBuf,
     /// Rehearse or Reduce File Size running on its own copy of the deck.
     background: Option<Background>,
@@ -266,16 +275,24 @@ impl Run {
         if self.background.is_some() {
             return self.set_status("Wait for the work running to finish.");
         }
-        let (mut deck, stem) = {
+        let (mut deck, stem, sealer) = {
             let d = self.slides.doc.borrow();
-            (d.deck.clone(), format!("{} (smaller)", stem_of(&d.name)))
+            (d.deck.clone(), format!("{} (smaller)", stem_of(&d.name)), d.protection.as_ref().map(|p| p.sealer.clone()))
         };
         self.background = Some(Background::start("Making pictures smaller", move |progress| {
             let r = atrium_slides::tools::reduce(&mut deck, 1920, |a, b| progress(a, b));
             let tmp = dir.join(format!(".{}.reduce.tmp", std::process::id()));
             let written = (|| {
                 let f = OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
-                let f = officina_slides::native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
+                // A protected deck's copy is sealed with the same password.
+                let f = match &sealer {
+                    Some(s) => {
+                        let mut f = f;
+                        f.write_all(&s.seal(&officina_slides::native::save_to_vec(&deck)))?;
+                        f
+                    }
+                    None => officina_slides::native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?,
+                };
                 f.sync_all()?;
                 let p = write_new(&dir, &stem, &f);
                 let _ = fs::remove_file(&tmp);
@@ -293,18 +310,79 @@ impl Run {
 
     /// A picked deck arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
-        let mut f = File::from(fd);
-        match load_file(&name, &mut f, MAX_FILE) {
+        let f = File::from(fd);
+        let format = format_of(&name);
+        // Save writes the file in its own format; a file Slides can't write
+        // asks where to put an .oslides.
+        let target = (write && format != Format::Other).then(|| f.try_clone().ok().map(|file| Target::Picked { file, format })).flatten();
+        self.open_file(name, f, target, !write, None);
+    }
+
+    /// Opens `f` (named `name`), with `password` when it is protected;
+    /// without the right one, the password bar asks and the file waits.
+    fn open_file(&mut self, name: String, mut f: File, target: Option<Target>, read_only: bool, password: Option<&str>) {
+        match load_file_with(&name, &mut f, MAX_FILE, password) {
             Ok(mut d) => {
-                let format = format_of(&name);
-                if !write {
+                if read_only {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status).trim().to_string();
                 }
-                // Save writes the file in its own format; a file Slides can't
-                // write asks where to put an .oslides.
-                self.show(d, (write && format != Format::Other).then_some(Target::Picked { file: f, format }));
+                self.show(d, target);
             }
-            Err(e) => self.set_status(e),
+            Err(e @ (ConvertError::NeedsPassword | ConvertError::WrongPassword)) => {
+                let again = e == ConvertError::WrongPassword;
+                self.slides.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("“{name}” is protected. Its password") }, false);
+                self.locked = Some(Locked::File { name, file: f, target, read_only });
+            }
+            Err(ConvertError::Failed(e)) => self.set_status(e),
+        }
+    }
+
+    /// Restores a protected deck's autosave folder, asking for its password.
+    fn recover_locked(&mut self, dir: PathBuf, name: String, password: Option<&str>) {
+        match password.map(|pw| doc::recover_with(&dir, Some(pw))) {
+            Some(Ok((mut d, rec))) => {
+                d.status = format!("Restored “{name}” as it was before Slides last stopped ({} changes since its last save).", rec.actions);
+                self.show(d, None);
+            }
+            Some(Err(e)) if e.kind() != io::ErrorKind::PermissionDenied => self.set_status(format!("Couldn't restore “{name}”: {e}")),
+            r => {
+                let again = r.is_some();
+                self.slides.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("Restore “{name}”: its password") }, false);
+                self.locked = Some(Locked::Recovery { dir, name });
+            }
+        }
+    }
+
+    /// The password bar's answer: a waiting file opened, or the deck's
+    /// password set.
+    fn password_done(&mut self) {
+        let (bar, text) = self.slides.take_password();
+        if bar.setting {
+            let pw = (!text.is_empty()).then_some(text.as_str());
+            let r = self.slides.doc.borrow_mut().set_password(pw);
+            let mut d = self.slides.doc.borrow_mut();
+            d.dirty = true;
+            d.status = match (r, pw) {
+                (Err(e), _) => format!("The password is set, but autosave stopped: {e}."),
+                (Ok(()), Some(_)) => format!("“{}” is protected with a password from its next save.", d.name),
+                (Ok(()), None) => format!("“{}” has no password from its next save.", d.name),
+            };
+            drop(d);
+            self.slides.changed();
+            return;
+        }
+        match self.locked.take() {
+            Some(Locked::File { name, file, target, read_only }) => self.open_file(name, file, target, read_only, Some(&text)),
+            Some(Locked::Recovery { dir, name }) => self.recover_locked(dir, name, Some(&text)),
+            None => {}
+        }
+    }
+
+    fn password_cancelled(&mut self) {
+        match self.locked.take() {
+            Some(Locked::File { name, .. }) => self.set_status(format!("“{name}” stayed closed.")),
+            Some(Locked::Recovery { name, .. }) => self.set_status(format!("“{name}” wasn't restored; it comes back next time Slides starts.")),
+            None => {}
         }
     }
 
@@ -326,24 +404,32 @@ fn main() {
     let root = state_root();
     let _ = fs::create_dir_all(&root);
     let mut first: Option<(Doc, Option<Target>)> = None;
+    let mut locked: Option<(PathBuf, String)> = None;
+    let mut locked_file: Option<(String, File, Option<Target>)> = None;
     if let Some((dir, name)) = doc::pending(&root).pop() {
-        match doc::recover(&dir) {
-            Ok((mut d, rec)) => {
-                d.status = format!("Restored “{name}” as it was before Slides last stopped ({} changes since its last save).", rec.actions);
-                first = Some((d, None));
+        if doc::recovery_locked(&dir) {
+            locked = Some((dir, name));
+        } else {
+            match doc::recover(&dir) {
+                Ok((mut d, rec)) => {
+                    d.status = format!("Restored “{name}” as it was before Slides last stopped ({} changes since its last save).", rec.actions);
+                    first = Some((d, None));
+                }
+                Err(e) => eprintln!("atrium-slides: couldn't restore {}: {e}", dir.display()),
             }
-            Err(e) => eprintln!("atrium-slides: couldn't restore {}: {e}", dir.display()),
         }
     }
-    if first.is_none() {
+    if first.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-            match File::open(&p).map_err(|e| e.to_string()).and_then(|mut f| load_file(&name, &mut f, MAX_FILE)) {
-                Ok(d) => {
-                    let format = format_of(&name);
-                    first = Some((d, (format != Format::Other).then_some(Target::Path { path: p, format })));
-                }
+            let format = format_of(&name);
+            match File::open(&p) {
+                Ok(mut f) => match load_file_with(&name, &mut f, MAX_FILE, None) {
+                    Ok(d) => first = Some((d, (format != Format::Other).then_some(Target::Path { path: p, format }))),
+                    Err(ConvertError::Failed(e)) => eprintln!("atrium-slides: {e}"),
+                    Err(_) => locked_file = Some((name, f, (format != Format::Other).then_some(Target::Path { path: p.clone(), format }))),
+                },
                 Err(e) => eprintln!("atrium-slides: {e}"),
             }
         }
@@ -370,8 +456,13 @@ fn main() {
     let dirty = Arc::new(AtomicBool::new(true));
     let slides = Slides::new(Doc::from_deck(officina_slides::model::Deck::new(), ""), Mutable::with_dirty(Ui::default(), dirty.clone()), Mutable::with_dirty(0u64, dirty.clone()), (win.width, win.height));
     slides.scale.set(win.scale() as f64);
-    let mut run = Run { slides, target: None, root: root.clone(), background: None };
+    let mut run = Run { slides, target: None, locked: None, root: root.clone(), background: None };
     run.show(doc, target);
+    if let Some((dir, name)) = locked {
+        run.recover_locked(dir, name, None);
+    } else if let Some((name, f, t)) = locked_file {
+        run.open_file(name, f, t, false, None);
+    }
     // Development: start on slide N (screenshots).
     if let Some(n) = std::env::var("ATRIUM_SLIDES_SLIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
         run.slides.go(n.saturating_sub(1));
@@ -406,6 +497,8 @@ fn main() {
         for c in run.slides.take_cmds() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::PasswordDone => run.password_done(),
+                Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Picture => want_picker = Some(Asking::Picture),
                 Cmd::Present(cur) => present = Some(cur),

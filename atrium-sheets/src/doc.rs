@@ -278,7 +278,7 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
 /// recovery needs the password).
 pub fn recovery_locked(dir: &Path) -> bool {
     let Ok(g) = generation(dir) else { return false };
-    let mut head = [0u8; 160];
+    let mut head = [0u8; 128];
     File::open(base_path(dir, g)).and_then(|mut f| f.read_exact(&mut head)).is_ok() && sealed::is_sealed(&head)
 }
 
