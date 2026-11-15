@@ -1206,7 +1206,8 @@ Each step runs in the VM on headless frescod before the next.
      the new trail is shown. Live page children follow their pages (`Out::Moved`). Dragging a
      branch out is not built. Checked in `scripts/navigator-live-vm.sh` (Ctrl held in the chrome
      opens a link beside, then the button).
-     Not yet: consent buttons pressed in a page, named personas.
+     Consent buttons pressed in a page: built 2026-11-14/15 (§6.2, legacy-web §5.4.1e).
+     Not yet: named personas (D5: when someone asks).
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
    app hand-off. *Built 2026-11-14*:
    - **The prompt row's rules** (§6.4), in `navigator-ui/src/shell.rs`: a press counts only once
@@ -1254,8 +1255,10 @@ Each step runs in the VM on headless frescod before the next.
        popups, another window; not frescod's chrome), its frame is dashed and
        `Compositor::pointer_target` gives none of its clicks to it, wherever they land on
        the island. The cover takes its own.
-     - Not yet: keyboard focus already on an island when it becomes covered keeps it, and
-       nothing produces islands until the engine jail (legacy-web tier 4) exists, so the
+     - Keys too (2026-11-15): an island that has the keys loses them while it is covered
+       (`Compositor::island_held`); they go to its parent, and come back once it is clear
+       (`a_covered_island_takes_no_keys_even_with_the_focus`).
+     - Not yet: nothing produces islands until the engine jail (legacy-web tier 4) exists, so the
        Navigator has no `web-island` provider and draws no live parts in the tier chip.
      - Tests: `fresco-scene-server` (`a_covered_island_takes_no_pointer_input`), frescod's
        `chrome` tests (frame, tag, dashes, placement; 61/61 run in the VM), and

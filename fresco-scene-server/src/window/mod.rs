@@ -1177,7 +1177,13 @@ impl Compositor {
     /// it is shown in a slot of the focused window.
     pub fn embed_child_focused(&self) -> Option<WindowId> {
         let e = self.embed_focus?;
-        (self.lock.is_none() && self.key_popup().is_none() && self.embed_in(e, self.base_keyboard_window())).then_some(e)
+        (self.lock.is_none() && self.key_popup().is_none() && self.embed_in(e, self.base_keyboard_window()) && !self.island_held(e)).then_some(e)
+    }
+
+    /// Whether `e` is an island something is composed over: it takes no
+    /// input, pointer or keys, while it is.
+    pub fn island_held(&self, e: WindowId) -> bool {
+        self.is_island(e) && self.shown.as_ref().is_some_and(|s| island_covered(s.iter().map(|l| (l.id, l.rect)), e))
     }
 
     fn set_embed_focus(&mut self, to: Option<WindowId>) {
@@ -1515,7 +1521,9 @@ impl Compositor {
             return p as u32;
         }
         let base = self.base_keyboard_window();
-        match self.embed_focus.filter(|&e| self.embed_in(e, base)) {
+        // ★ A covered island takes no keys either, even one it already had
+        // (navigator-ui.md §6.3): they go to its parent until it is clear.
+        match self.embed_focus.filter(|&e| self.embed_in(e, base) && !self.island_held(e)) {
             Some(e) => e as u32,
             None => base as u32,
         }
@@ -2365,6 +2373,32 @@ mod notification_tests {
         // A plain slot in the same place is not held back.
         assert_eq!(c.bind_slot(island, p, kind::PLAIN, Some([100.0, 100.0, 200.0, 100.0]), 2), Ok(()));
         assert_eq!(c.pointer_target(150.0, 150.0).0, island);
+    }
+
+    #[test]
+    fn a_covered_island_takes_no_keys_even_with_the_focus() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (800, 600));
+        let island = c.create(2, (10, 10));
+        let over = c.create(3, (10, 10));
+        c.hide(island);
+        c.hide(over);
+        assert_eq!(c.bind_slot(island, p, kind::ISLAND, Some([100.0, 100.0, 200.0, 100.0]), 2), Ok(()));
+        c.focus = Some(p);
+        let layer = |id, rect| ShownLayer { id, rect, alpha: None };
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(island, [100, 100, 300, 200])]);
+        c.press_focus(island);
+        assert_eq!(c.keyboard_window(), island as u32, "a press gives the clear island the keys");
+        assert_eq!(c.embed_child_focused(), Some(island));
+        // Something drawn over it: its keys go to its parent, not to it.
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(island, [100, 100, 300, 200]), layer(over, [280, 180, 400, 260])]);
+        assert!(c.island_held(island));
+        assert_eq!(c.keyboard_window(), p as u32);
+        assert_eq!(c.embed_child_focused(), None);
+        // Clear again: it has them back.
+        c.shown = Some(vec![layer(p, [0, 0, 800, 600]), layer(island, [100, 100, 300, 200])]);
+        assert_eq!(c.keyboard_window(), island as u32);
     }
 
     #[test]
