@@ -147,6 +147,8 @@ pub type FillDrops = Vec<(u32, Vec<(u32, u8)>)>;
 
 /// The GPU's architecture: `FRESCOD_GPU_ARCH` if set, else the device's
 /// `CAP_ISA` family.
+pub mod gpu_check;
+
 fn gpu_arch(vm: &Vm<'_>) -> Result<Box<dyn fresco_compute::gpu::Arch>> {
     use fresco_compute::gpu;
     let name = match std::env::var("FRESCOD_GPU_ARCH") {

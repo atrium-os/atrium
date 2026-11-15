@@ -245,6 +245,19 @@ work (self-test, scrub).
   (2) faults/hangs per queue with MES queue reset. (3) user mode: fo_mmap of ring, wptr and
   doorbell, revocation. (4) the free rule. Each step is one box run.
 
+## 4.6 Stage 6 plan: real clients on silicon
+
+After the security gate (§10.5 fuzz, closed 2026-11-15) the driver serves the
+interface real clients use, but only tests have used it. Stage 6 puts the
+first real workload on it and sizes the driver for the end goal: the whole
+graphics stack (2D and 3D Vulkan, eventually AAA games) on this driver.
+
+| Step | What |
+|---|---|
+| 6a | **Fresco renderer on silicon** (chosen by Shankar 2026-11-15). frescod's `gpu` renderer draws headless: `FRESCOD_GPU_CHECK=<prefix>` (`frescod/src/render_backend/gpu_check.rs`) draws fixed scenes (rects opaque/translucent/rounded, paths, pixel windows, windows off screen, damage after a frame, four windows at once, a moved stack, a full-screen window) with the gpu and the compute (Tier-2) renderer, copies the GPU's VRAM target to a System BO and compares bit for bit (`FRESCOD_GPU_CHECK_TOL`). Each window is its own VM and queue fd, as in frescod. Silicon has no gfx queue family: `atrium-gpu-rs` falls back to a compute queue on EINVAL. Box: runner stage `fc`. |
+| 6b | **VMs and queues at scale.** Today a client VM takes one of the kernel's VMIDs 1-7 and a queue one of 8 user-queue slots, for the whole system: a desktop with a few windows (frescod uses a VM and a queue per window) or a game with several queues runs out. The hardware VMID is MES's to assign (8-15, per process, when it has work); the kernel's VMID per VM is only an identity (lost-VM masks, flushes, the retired kernel-queue path). Plan: VM identity by a generation and an index, not a VMID; hundreds of user-queue slots (doorbells, GART blocks, process ids), sized by MES's limits; tests with 64+ VMs and 128+ queues. |
+| 6c | **W^X for real clients.** frescod's ring BO holds the IB and its EOP fence, so it cannot be bound EXEC (which needs READ_ONLY); split them, bind code and IBs `BIND_EXEC`, and run 6a with `isolation.gpu_wx` = 1. |
+
 ## 5. Log
 
 - **2026-11-12, stage 1 done.** First bare-metal boot: bundle `03715a5` booted via

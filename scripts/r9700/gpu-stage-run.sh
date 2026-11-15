@@ -6,6 +6,7 @@
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> 5c2
 #   gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256>,<suite sha256>,<iso sha256> 5f
 #   FUZZ_SHA=<sha256> gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> fz:<seconds>:<seed>
+#   FRESCO_SHA=<sha256> gpu-stage-run.sh <sha256>,<gpu sha256>,<test sha256> fc
 #
 # The kmod must already be at /root/kmod/atrium_gpu_amd_pci.ko. Stage 5c2
 # (the client node on silicon) also needs the gpu module at
@@ -24,7 +25,12 @@
 # takes one temperature reading 30 s later. Stage fz is 5c2 plus the §10.5
 # fuzz gate after si-client-test: /root/si-fuzz (tests/si_fuzz.c, checked
 # against FUZZ_SHA) in mode "all" for <seconds> with <seed>, then
-# si-client-test once more as the health check. The kernel's messages over
+# si-client-test once more as the health check. Stage fc is 5c2 plus the
+# Fresco renderer check after si-client-test: /root/frescod (checked against
+# FRESCO_SHA) with FRESCOD_GPU_CHECK, which draws the same scenes with the
+# gpu and the compute renderer and compares the screens (§4.6); PNGs of
+# any scene that differs go to /root/runs/<stamp>-fc-*.png. Then
+# si-client-test once more. The kernel's messages over
 # the whole run are in /root/runs/<stamp>.kern (the buffer wraps). The whole report is printed and
 # kept in /root/runs/. It never sets keep_state, gfx_cg or mode1_reset.
 #
@@ -39,6 +45,7 @@ SUITE=/root/atrium-gpu-test
 ISO=/root/test-gpu-isolation
 PROBE=/root/atrium-gpu-probe
 FUZZ=/root/si-fuzz
+FRESCOD=/root/frescod
 GPU_SEL=pci0:3:0:0
 GPU_DEV=vgapci0
 KNOBS="psp_bootload psp_ipfw smu_init gc_up_ok gmc ih gfx mes dispatch attach mes_mscratch vm_test uq_test client"
@@ -59,6 +66,7 @@ hold=0
 client=0
 suites=0
 fuzz=""
+fcheck=0
 for s in "$@"; do
 	case $s in
 	3)  kenvs="$kenvs psp_bootload psp_ipfw smu_init gc_up_ok" ;;
@@ -73,6 +81,7 @@ for s in "$@"; do
 	5c2) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1 ;;
 	5f) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; suites=1 ;;
 	fz:*:*) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; fuzz=${s#fz:} ;;
+	fc) kenvs="$kenvs psp_bootload psp_ipfw gc_up_ok attach client"; hold=10; client=1; fcheck=1 ;;
 	*)  echo "unknown stage $s" >&2; exit 2 ;;
 	esac
 done
@@ -118,6 +127,14 @@ if [ -n "$fuzz" ]; then
 	fi
 	echo "sha256 ok: si-fuzz $f"
 fi
+if [ "$fcheck" = 1 ]; then
+	f=$(sha256 -q "$FRESCOD" 2>/dev/null)
+	if [ -z "${FRESCO_SHA:-}" ] || [ "$f" != "$FRESCO_SHA" ]; then
+		echo "REFUSED: $FRESCOD sha256 $f (want ${FRESCO_SHA:-unset})"
+		exit 1
+	fi
+	echo "sha256 ok: frescod $f"
+fi
 if kldstat -q -m atrium_gpu_amd_pci 2>/dev/null || kldstat | grep -q atrium_gpu_amd; then
 	echo "REFUSED: an atrium_gpu_amd module is already loaded"
 	exit 1
@@ -157,6 +174,15 @@ if [ "$hold" -gt 0 ]; then
 				sleep 610
 			fi
 			echo "== si-client-test after the fuzz"
+			timeout 600 "$TEST"; echo "si-client-test rc=$?"
+		fi
+		if [ "$fcheck" = 1 ]; then
+			echo "== frescod gpu renderer check"
+			mkdir -p /root/fresco-kernels
+			FRESCO_COMPUTE_CACHE=/root/fresco-kernels FRESCOD_GPU_CHECK="${out%.log}-fc" \
+			    timeout 900 "$FRESCOD"; echo "frescod check rc=$?"
+			sysctl dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | grep reinits
+			echo "== si-client-test after the check"
 			timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		fi
 		sysctl dev.atrium_gpu_amd.0.isolation 2>/dev/null

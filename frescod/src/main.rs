@@ -110,6 +110,13 @@ fn main() -> std::io::Result<()> {
     // Headless compositor mode: same multi-window pipeline, but read the composited
     // frame back to a PNG instead of scanning out — captures the assembled (jailed)
     // desktop with no GPU/display device. Used for the end-to-end jailed-desktop run.
+    // GPU renderer check (no display): both renderers draw the same
+    // scenes on the device and the screens are compared.
+    if let Ok(prefix) = std::env::var("FRESCOD_GPU_CHECK") {
+        let code = render_backend::gpu_check::run_check(&prefix).map_err(io_other)?;
+        std::process::exit(code);
+    }
+
     if let Ok(png) = std::env::var("FRESCOD_HEADLESS_PNG") {
         return run_headless(&png);
     }
