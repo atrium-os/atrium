@@ -1,6 +1,6 @@
 //! forum-bar — Forum's top bar, to the shell design handoff (§1):
 //! brand block, session line, surface chips with engine-state dots,
-//! the centered workspace chip, the right icon row, and the clock.
+//! the centered space chip, the right icon row, and the clock.
 //!
 //! An ordinary graphics-only app (no window-management cap): surface
 //! status comes over forum-ctl (`ListSurfaces`; a chip click sends
@@ -76,7 +76,7 @@ struct BarView {
     /// bar and the windows below.
     h: Rc<std::cell::Cell<f32>>,
     chips: Mutable<Vec<ChipData>>,
-    workspace: Mutable<(String, String)>,
+    space: Mutable<(String, String)>,
     time: Mutable<String>,
     date: Mutable<String>,
     /// Set by the light/dark switch; the main loop asks the WM to change
@@ -287,7 +287,7 @@ fn now_shown(np: &NowPlaying) -> Option<NowShown> {
 /// What the bar leaves out when its row doesn't fit, first to go first:
 /// what only informs before what can be pressed, and what can be pressed
 /// moves into the overflow menu rather than going away. The clock, the
-/// workspace, the status items and the system menus always stay.
+/// space, the status items and the system menus always stay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Shed {
     /// "seat0 · lucius · forum-wm".
@@ -356,9 +356,9 @@ impl BarView {
         let trig = trigger_w();
         let (gap, row_gap) = (16.0, 14.0);
         // Padding, the brand's mark, the divider, the spacers either side
-        // of the workspace, the right row and the clock, and a little slack.
+        // of the space, the right row and the clock, and a little slack.
         let mut base = 2.0 * 14.0 + 10.0 + (gap + 1.0) + 3.0 * gap + 2.0 * gap + 8.0;
-        let (ws_name, ws_hash) = self.workspace.get_cloned();
+        let (ws_name, ws_hash) = self.space.get_cloned();
         base += 2.0 * 10.0 + glyph(phosphor::STACK_SIMPLE, 13.0) + 7.0 + text_w(&ws_name, font::MONO, type_size::XS, Weight::Regular)
             + 7.0 + text_w(&format!("#{ws_hash}"), font::MONO, type_size::XS, Weight::Regular);
         let mut now_line = 0.0;
@@ -491,13 +491,13 @@ impl View for BarView {
         }
         ctx.pop();
 
-        // Center spacer | workspace chip | spacer.
+        // Center spacer | space chip | spacer.
         let sp = ctx.add(Node::hstack(Rect::ZERO_SIZED, 0.0));
         ctx.set_flex(sp, FlexStyle::grow(1.0));
 
-        let (ws_name, ws_hash) = self.workspace.get_cloned();
+        let (ws_name, ws_hash) = self.space.get_cloned();
         Chip::new(
-            shell::WORKSPACE_CHIP_H,
+            shell::SPACE_CHIP_H,
             Draw(move |ctx: &mut Ctx| {
                 let t = ctx.theme;
                 Glyph::new(phosphor::STACK_SIMPLE).size(13.0).color(t.accent_fg()).emit(ctx);
@@ -1144,7 +1144,7 @@ fn main() -> std::io::Result<()> {
     let (chips0, ws0) = poll_status();
     let (time0, date0) = clock_now();
     let chips = Mutable::with_dirty(chips0, dirty.clone());
-    let workspace = Mutable::with_dirty(ws0, dirty.clone());
+    let space = Mutable::with_dirty(ws0, dirty.clone());
     let time = Mutable::with_dirty(time0, dirty.clone());
     let date = Mutable::with_dirty(date0, dirty.clone());
     let want_dark = Mutable::with_dirty(None, dirty.clone());
@@ -1191,7 +1191,7 @@ fn main() -> std::io::Result<()> {
         w: w.clone(),
         h: h.clone(),
         chips: chips.clone(),
-        workspace: workspace.clone(),
+        space: space.clone(),
         time: time.clone(),
         date: date.clone(),
         want_dark: want_dark.clone(),
@@ -1272,8 +1272,8 @@ fn main() -> std::io::Result<()> {
                 if c_now != chips.get_cloned() {
                     chips.set(c_now);
                 }
-                if w_now != workspace.get_cloned() {
-                    workspace.set(w_now);
+                if w_now != space.get_cloned() {
+                    space.set(w_now);
                 }
                 pads_stale.store(true, Ordering::Relaxed);
                 status_stale.store(true, Ordering::Relaxed);
@@ -1467,7 +1467,7 @@ mod tests {
             w: Rc::new(std::cell::Cell::new(1280.0)),
             h: Rc::new(std::cell::Cell::new(0.0)),
             chips: Mutable::new(chips),
-            workspace: Mutable::new(ws),
+            space: Mutable::new(ws),
             time: Mutable::new(time),
             date: Mutable::new(date),
             want_dark: Mutable::new(None),

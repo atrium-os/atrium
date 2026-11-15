@@ -108,6 +108,13 @@ area focused; a `dialog` centers over its owner) so it Just Works, and the human
 reshapes by intent. This is neither floating nor tiling: it's **intent-managed
 placement** — the WM owns geometry, the human owns intent, the app owns content.
 
+**Spaces.** The screens you switch between (Super+1..4, three- and
+four-finger swipes, a window moved with Super+Shift+N) are **spaces**: four
+by default, named and counted in `forum.toml` (`spaces = 6`, `names = [...]`,
+`[assign]`). They were called workspaces until 2026-11-15; Shankar chose
+"Spaces" so that **workspaces** means only the dev jails of homes.md §5. The
+old key `workspaces =` is still read.
+
 ### 2.4 Layouts are content-addressed objects
 
 The current arrangement (surface roles + slots + focus, *not* the pixels) is a
@@ -179,7 +186,7 @@ the core over a small capability-gated protocol. Smallest powerful-cap surface.
         │  forum-dock    app launcher (→ Portcullis)        │
         │  forum-bar     statusbar / indicators             │
         │  forum-shelf   notification shelf                 │
-        │  forum-overview switcher / workspace overview     │
+        │  forum-overview switcher / space overview     │
         └───────────────────────────────────────────────────┘
 ```
 

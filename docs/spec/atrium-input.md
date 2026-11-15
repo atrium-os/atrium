@@ -538,7 +538,7 @@ table beyond Sony, rumble, wiring into Pergola's `SurfaceRenderer`.
    content following the fingers, latched to the window the scroll
    began over. Gestures routed 2026-11-11 (§5.3): pinch to apps as
    `EV_INPUT_POINTER_MAGNIFY`, swipes to Forum as `EV_INPUT_SWIPE`
-   (workspace switch); unit-tested, no touchpad in QEMU. Not yet: setting
+   (space switch); unit-tested, no touchpad in QEMU. Not yet: setting
    a pad's Input Mode feature report ourselves (today `hmt(4)` does it
    when it attaches), the replay source, and a laptop run.
 4. **T4 PS/2.** atkbd scancodes and psm packets (plain, Synaptics,

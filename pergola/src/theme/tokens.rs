@@ -490,7 +490,7 @@ pub mod shell {
     pub const DOCK_W: f32 = 56.0;
     pub const DOCK_TILE: f32 = 40.0;
     pub const SURFACE_CHIP_H: f32 = 24.0;
-    pub const WORKSPACE_CHIP_H: f32 = 26.0;
+    pub const SPACE_CHIP_H: f32 = 26.0;
     /// Dense-tier button inside shell popovers/dialogs.
     pub const BUTTON_H: f32 = 28.0;
 

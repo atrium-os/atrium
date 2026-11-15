@@ -35,13 +35,13 @@ type Core = Arc<Mutex<(Wm, ClientConn)>>;
 /// 0x08 | right 0x80). Super rather than Alt so it doesn't collide with app Tab.
 const KEY_TAB: u16 = 0x2B;
 const MOD_GUI: u8 = 0x08 | 0x80;
-/// Super+1..Super+N switches workspace. HID usages 0x1E..=0x27 are the digit
-/// row '1'..'9','0'; we map '1'.. to workspace 0.. up to the workspace count.
+/// Super+1..Super+N switches space. HID usages 0x1E..=0x27 are the digit
+/// row '1'..'9','0'; we map '1'.. to space 0.. up to the space count.
 const KEY_1: u16 = 0x1E;
 /// Either Shift modifier bit (left 0x02 | right 0x20). Super+Shift+N moves the
-/// focused window to workspace N (vs plain Super+N which switches to it).
+/// focused window to space N (vs plain Super+N which switches to it).
 const MOD_SHIFT: u8 = 0x02 | 0x20;
-/// Super+S toggles the split (tiled) layout for the active workspace. HID 0x16 = 'S'.
+/// Super+S toggles the split (tiled) layout for the active space. HID 0x16 = 'S'.
 const KEY_S: u16 = 0x16;
 /// Super+F toggles zoom (fullscreen) for the focused surface. HID 0x09 = 'F'.
 const KEY_F: u16 = 0x09;
@@ -201,10 +201,10 @@ fn main() -> io::Result<()> {
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut io_conn = ClientConn { conn };
 
-    // Per-user workspace config (count / names / app rules); defaults if absent.
+    // Per-user space config (count / names / app rules); defaults if absent.
     let cfg = config::ForumConfig::load();
     let mut wm = Wm::new(screen(&mut io_conn.conn));
-    wm.workspaces = cfg.workspaces;
+    wm.spaces = cfg.spaces;
     // The monitors (display 3.0); the first reconcile lays out on them.
     // and how the session last left them (arrangement per set, scales).
     let store = forum_wm::displays::default_path();
@@ -240,7 +240,7 @@ fn main() -> io::Result<()> {
         wm.assign_rules.insert(app, ws);
     }
     // The launch registry (uid → app-id) resolves a surface's owner_uid to its
-    // app-id so per-app workspace rules apply. Reloaded on each new window
+    // app-id so per-app space rules apply. Reloaded on each new window
     // (it's append-only) to pick up apps launched after startup.
     wm.registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_default();
@@ -365,8 +365,8 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::Key { hid_usage: KEY_TAB, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => cycle = true,
                         // (Held keys repeat: Super+Tab keeps cycling, but toggles,
-                        // snaps, workspace moves and media keys act once per press.)
-                        // Super+S: toggle split (tiled) layout for the active workspace.
+                        // snaps, space moves and media keys act once per press.)
+                        // Super+S: toggle split (tiled) layout for the active space.
                         Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => split = true,
                         // Super+A: the dock's Applications view. Answered right
@@ -393,19 +393,19 @@ fn spawn_input_poller(core: Core) {
                         // Super+Up: un-snap the focused document.
                         Ok(Some(Event::Key { hid_usage: KEY_UP, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => unsnap = true,
-                        // Super+Shift+1..N: MOVE the focused window to workspace N
+                        // Super+Shift+1..N: MOVE the focused window to space N
                         // (must precede the plain Super+N arm, which it also matches).
                         Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT != 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             move_ws = Some((hid_usage - KEY_1) as usize),
-                        // Super+1..N: switch the active workspace.
+                        // Super+1..N: switch the active space.
                         Ok(Some(Event::Key { hid_usage, pressed: true, repeat: false, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0
                                 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             switch_ws = Some((hid_usage - KEY_1) as usize),
                         // A three- or four-finger swipe sideways, when the
-                        // fingers lift: the next or previous workspace.
+                        // fingers lift: the next or previous space.
                         Ok(Some(Event::Swipe { fingers, dx, dy, phase: fresco_protocol::scroll_phase::END, .. }))
                             if fingers >= 3 => swipe = Some((dx, dy)),
                         // A media key: never the focused app's (§4.3).
@@ -476,14 +476,14 @@ fn spawn_input_poller(core: Core) {
             // window is placed (or the gone one's slot reclaimed). Do this
             // before applying any click, so focus-follows-click sees the
             // up-to-date surface set. A newly-created document opens focused on
-            // the active workspace.
+            // the active space.
             if surfaces_changed {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 let r = match created {
                     Some(id) => {
                         // Refresh the registry so an app launched since startup
-                        // resolves to its app-id (→ its configured workspace).
+                        // resolves to its app-id (→ its configured space).
                         wm.registry = portcullis_peer::AppRegistry::load(
                             portcullis_peer::DEFAULT_REGISTRY,
                         )
@@ -504,20 +504,20 @@ fn spawn_input_poller(core: Core) {
             if let Some(ws) = move_ws {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
-                match wm.move_focused_to_workspace(conn, ws) {
+                match wm.move_focused_to_space(conn, ws) {
                     Ok(Some(s)) => {
-                        eprintln!("forum-wm: moved surface {s} to {}", wm.workspace_label(ws));
+                        eprintln!("forum-wm: moved surface {s} to {}", wm.space_label(ws));
                         // Persist the learned per-app placement (survives reboot).
                         config::save_state(&wm.assign_rules);
                     }
                     Ok(None) => {}               // nothing focused / out of range
-                    Err(e) => eprintln!("forum-wm: move_focused_to_workspace error: {e}"),
+                    Err(e) => eprintln!("forum-wm: move_focused_to_space error: {e}"),
                 }
             }
 
             if let Some((dx, dy)) = swipe {
                 let g = core.lock().unwrap();
-                if let Some(ws) = forum_wm::swipe_workspace(g.0.active, g.0.workspaces, dx, dy) {
+                if let Some(ws) = forum_wm::swipe_space(g.0.active, g.0.spaces, dx, dy) {
                     switch_ws = Some(ws);
                 }
             }
@@ -525,10 +525,10 @@ fn spawn_input_poller(core: Core) {
             if let Some(ws) = switch_ws {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
-                match wm.switch_workspace(conn, ws) {
-                    Ok(Some(w)) => eprintln!("forum-wm: switched to {}", wm.workspace_label(w)),
+                match wm.switch_space(conn, ws) {
+                    Ok(Some(w)) => eprintln!("forum-wm: switched to {}", wm.space_label(w)),
                     Ok(None) => {}               // out of range or already active
-                    Err(e) => eprintln!("forum-wm: switch_workspace error: {e}"),
+                    Err(e) => eprintln!("forum-wm: switch_space error: {e}"),
                 }
             }
 
@@ -536,7 +536,7 @@ fn spawn_input_poller(core: Core) {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 match wm.toggle_split(conn) {
-                    Ok(t) => eprintln!("forum-wm: split {} for active workspace", if t { "ON (tiled)" } else { "OFF (stacked)" }),
+                    Ok(t) => eprintln!("forum-wm: split {} for active space", if t { "ON (tiled)" } else { "OFF (stacked)" }),
                     Err(e) => eprintln!("forum-wm: toggle_split error: {e}"),
                 }
             }

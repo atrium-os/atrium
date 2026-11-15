@@ -493,7 +493,7 @@ loaded at the same surface.
   (Plex Sans JP, KR, TC, SC) that we'll bring in when localization
   starts.
 - **Animation choreography for full screens** (login enter, app
-  launch, workspace switch) — these compose primitive motions and
+  launch, space switch) — these compose primitive motions and
   belong in the apps themselves, not the language doc.
 
 ---

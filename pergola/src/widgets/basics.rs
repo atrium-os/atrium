@@ -82,7 +82,7 @@ impl View for Dot {
 }
 
 /// Circle avatar with a single initial — accent-tinted (the
-/// vestibulum / workspace-owner look).
+/// vestibulum / space-owner look).
 #[derive(Clone)]
 pub struct Avatar {
     pub initial: char,

@@ -214,7 +214,7 @@ atrium-term Pergola rewrites remain D5 canaries per ROADMAP.
 | M2 | A5, B1, B2, B3 partial, B5 through `ListRow` | **forum-bar v2 pixel-matches the handoff** (both themes) |
 | M3 | A1–A4, C2, B4 | seams + drag-snap + springs; snap overlay + toast loop works end-to-end in-VM |
 | M4 | B5 overlays, C3, C5, C4-UI | launcher, overview, capability prompt render + drive intents |
-| M5 | C6, C7, C8 | workspace switch persists/restores through Tessera; shelf shows a live opifex install |
+| M5 | C6, C7, C8 | space switch persists/restores through Tessera; shelf shows a live opifex install |
 | M6 | C9 | boot → vestibulum → authenticate → shell, all styled |
 
 Sequencing rationale: C1's subscription stream and A1's fill op are the two

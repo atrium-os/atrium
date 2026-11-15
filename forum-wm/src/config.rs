@@ -1,6 +1,6 @@
-//! Per-user workspace config — the persistent preference layer (`forum.md`
+//! Per-user space config — the persistent preference layer (`forum.md`
 //! §2.4). A user who never writes one gets the default flow (4 unnamed
-//! workspaces, every window opening on the active one).
+//! spaces, every window opening on the active one).
 //!
 //! Location: `$FORUM_CONFIG` if set, else `/var/db/atrium/<user>/forum.toml`
 //! (the same per-user convention as portcullis `policy.toml`). A missing file
@@ -8,13 +8,13 @@
 //! defaults — config never takes the WM down.
 //!
 //! ```toml
-//! workspaces = 6
+//! spaces = 6
 //! names = ["main", "web", "comms", "media", "build", "scratch"]
 //!
-//! # Per-app landing rules: app-id → workspace index (0-based). These apply
+//! # Per-app landing rules: app-id → space index (0-based). These apply
 //! # once frescod reports real app-ids in WM_ENUMERATE (today owner_app is a
 //! # per-connection id, so rules stay inert and a new window opens on the
-//! # active workspace — the default). Forward-compatible: the rule plumbing is
+//! # active space — the default). Forward-compatible: the rule plumbing is
 //! # live, only the key isn't populated yet.
 //! [assign]
 //! "org.atrium.navigator" = 1
@@ -24,34 +24,35 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Hard ceiling on workspace count — a sanity clamp, not a design limit.
-const MAX_WORKSPACES: usize = 32;
-/// Default workspace count when unconfigured. Mirrors
-/// `forum_wm::daemon::DEFAULT_WORKSPACES`.
-const DEFAULT_WORKSPACES: usize = 4;
+/// Hard ceiling on space count — a sanity clamp, not a design limit.
+const MAX_SPACES: usize = 32;
+/// Default space count when unconfigured. Mirrors
+/// `forum_wm::daemon::DEFAULT_SPACES`.
+const DEFAULT_SPACES: usize = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForumConfig {
-    /// Number of workspaces (virtual desktops).
-    #[serde(default = "default_workspaces")]
-    pub workspaces: usize,
-    /// Optional workspace names, indexed `0..workspaces` (cosmetic — used in
-    /// logs / the overview). Extra names past `workspaces` are ignored.
+    /// Number of spaces (virtual desktops).
+    /// `workspaces` is the name it had before desktops became spaces.
+    #[serde(default = "default_spaces", alias = "workspaces")]
+    pub spaces: usize,
+    /// Optional space names, indexed `0..spaces` (cosmetic — used in
+    /// logs / the overview). Extra names past `spaces` are ignored.
     #[serde(default)]
     pub names: Vec<String>,
-    /// Per-app workspace assignment: app-id → workspace index (0-based).
+    /// Per-app space assignment: app-id → space index (0-based).
     #[serde(default)]
     pub assign: HashMap<String, usize>,
 }
 
-fn default_workspaces() -> usize {
-    DEFAULT_WORKSPACES
+fn default_spaces() -> usize {
+    DEFAULT_SPACES
 }
 
 impl Default for ForumConfig {
     fn default() -> Self {
-        Self { workspaces: DEFAULT_WORKSPACES, names: Vec::new(), assign: HashMap::new() }
+        Self { spaces: DEFAULT_SPACES, names: Vec::new(), assign: HashMap::new() }
     }
 }
 
@@ -64,8 +65,8 @@ impl ForumConfig {
                 Ok(cfg) => {
                     let cfg = cfg.sanitized();
                     eprintln!(
-                        "forum-wm: loaded config {path} — {} workspace(s), {} app rule(s)",
-                        cfg.workspaces,
+                        "forum-wm: loaded config {path} — {} space(s), {} app rule(s)",
+                        cfg.spaces,
                         cfg.assign.len(),
                     );
                     cfg
@@ -79,15 +80,15 @@ impl ForumConfig {
         }
     }
 
-    /// Clamp the workspace count into `[1, MAX_WORKSPACES]` and drop assignment
-    /// rules pointing past the workspace range.
+    /// Clamp the space count into `[1, MAX_SPACES]` and drop assignment
+    /// rules pointing past the space range.
     fn sanitized(mut self) -> Self {
-        self.workspaces = self.workspaces.clamp(1, MAX_WORKSPACES);
-        self.assign.retain(|_, ws| *ws < self.workspaces);
+        self.spaces = self.spaces.clamp(1, MAX_SPACES);
+        self.assign.retain(|_, ws| *ws < self.spaces);
         self
     }
 
-    /// The name of workspace `i`, if configured.
+    /// The name of space `i`, if configured.
     pub fn name(&self, i: usize) -> Option<&str> {
         self.names.get(i).map(|s| s.as_str())
     }
@@ -105,17 +106,17 @@ fn config_path() -> String {
 // ── Runtime state: learned per-app placements (persisted manual moves) ─────────
 //
 // Distinct from the hand-authored config: when the human *moves* a window to a
-// workspace, the WM remembers that app's placement here so it survives relaunch
+// space, the WM remembers that app's placement here so it survives relaunch
 // and reboot. Config `[assign]` seeds the placement; the state file overlays it
 // (a move wins over a config default). Delete the state file to forget moves.
 
-/// `$FORUM_STATE` → `/var/db/atrium/<user>/forum-workspaces.state`.
+/// `$FORUM_STATE` → `/var/db/atrium/<user>/forum-spaces.state`.
 fn state_path() -> String {
     if let Ok(p) = std::env::var("FORUM_STATE") {
         return p;
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
-    format!("/var/db/atrium/{user}/forum-workspaces.state")
+    format!("/var/db/atrium/{user}/forum-spaces.state")
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -124,16 +125,19 @@ struct State {
     assign: HashMap<String, usize>,
 }
 
-/// Load the learned app-id → workspace placements (empty if no state yet).
+/// Load the learned app-id → space placements (empty if no state yet).
 pub fn load_state() -> HashMap<String, usize> {
-    std::fs::read_to_string(state_path())
+    let path = state_path();
+    std::fs::read_to_string(&path)
+        // The file's name before desktops became spaces.
+        .or_else(|_| std::fs::read_to_string(path.replace("forum-spaces.state", "forum-workspaces.state")))
         .ok()
         .and_then(|t| toml::from_str::<State>(&t).ok())
         .map(|s| s.assign)
         .unwrap_or_default()
 }
 
-/// Persist the effective app-id → workspace map (best-effort; logs on failure).
+/// Persist the effective app-id → space map (best-effort; logs on failure).
 pub fn save_state(assign: &HashMap<String, usize>) {
     let path = state_path();
     let text = match toml::to_string(&State { assign: assign.clone() }) {
@@ -156,10 +160,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_workspaces_names_and_assign() {
+    fn parses_spaces_names_and_assign() {
         let cfg: ForumConfig = toml::from_str(
             r#"
-            workspaces = 3
+            spaces = 3
             names = ["main", "web", "comms"]
             [assign]
             "org.atrium.navigator" = 1
@@ -167,7 +171,7 @@ mod tests {
         )
         .unwrap();
         let cfg = cfg.sanitized();
-        assert_eq!(cfg.workspaces, 3);
+        assert_eq!(cfg.spaces, 3);
         assert_eq!(cfg.name(1), Some("web"));
         assert_eq!(cfg.assign.get("org.atrium.navigator"), Some(&1));
     }
@@ -185,17 +189,17 @@ mod tests {
     fn empty_config_is_defaults() {
         let cfg: ForumConfig = toml::from_str("").unwrap();
         let cfg = cfg.sanitized();
-        assert_eq!(cfg.workspaces, DEFAULT_WORKSPACES);
+        assert_eq!(cfg.spaces, DEFAULT_SPACES);
         assert!(cfg.names.is_empty() && cfg.assign.is_empty());
     }
 
     #[test]
     fn out_of_range_count_and_rules_are_clamped() {
-        let cfg = ForumConfig { workspaces: 999, names: vec![], assign: HashMap::new() }.sanitized();
-        assert_eq!(cfg.workspaces, MAX_WORKSPACES);
+        let cfg = ForumConfig { spaces: 999, names: vec![], assign: HashMap::new() }.sanitized();
+        assert_eq!(cfg.spaces, MAX_SPACES);
         // a rule pointing past the (clamped) range is dropped.
         let cfg = ForumConfig {
-            workspaces: 2,
+            spaces: 2,
             names: vec![],
             assign: HashMap::from([("a".into(), 5usize), ("b".into(), 1usize)]),
         }

@@ -259,7 +259,7 @@ pub fn arrange(
 }
 
 /// `arrange` with an explicit tiling mode. `tiled = true` is the split intent
-/// (forum.md §2.3): the workspace's documents are laid out side-by-side in equal
+/// (forum.md §2.3): the space's documents are laid out side-by-side in equal
 /// columns of the work area, all visible. `tiled = false` is the stacked default
 /// (one focused document fills the work area, the rest render-gated). Non-document
 /// roles (chrome/panel/dialog/background) place identically either way.
@@ -392,7 +392,7 @@ pub fn snap_region(wa: WmRect, snap: Snap) -> WmRect {
     }
 }
 
-/// Snap-mode layout: when any document is snapped, the workspace becomes a manual
+/// Snap-mode layout: when any document is snapped, the space becomes a manual
 /// tile — each snapped document occupies its half (all rendering); unsnapped
 /// documents are omitted (the caller render-gates anything not placed). Non-
 /// document roles (chrome/panel/dialog/background) place as usual. This is the
@@ -796,17 +796,17 @@ pub mod daemon {
         (f64::from(mm) * per_mm).round() as u32
     }
 
-    /// Default number of workspaces (virtual desktops) when no per-user config
-    /// overrides it. App surfaces live on one workspace each; the user switches
-    /// the active workspace (Super+1..N). Chrome + background are global.
-    pub const DEFAULT_WORKSPACES: usize = 4;
+    /// Default number of spaces (virtual desktops) when no per-user config
+    /// overrides it. App surfaces live on one space each; the user switches
+    /// the active space (Super+1..N). Chrome + background are global.
+    pub const DEFAULT_SPACES: usize = 4;
 
-    /// Whether surface `s` is visible on workspace `active`. Chrome, background,
-    /// and hud are *global* — Forum's shell + wallpaper show on every workspace.
-    /// App surfaces (document/panel/dialog) show only on the workspace they're
+    /// Whether surface `s` is visible on space `active`. Chrome, background,
+    /// and hud are *global* — Forum's shell + wallpaper show on every space.
+    /// App surfaces (document/panel/dialog) show only on the space they're
     /// assigned to; an unassigned surface is treated as the active one (a
     /// just-appeared surface is visible until it's explicitly placed elsewhere).
-    pub fn shown_in_workspace(
+    pub fn shown_in_space(
         s: &WmSurfaceInfo, assignment: &HashMap<u32, usize>, active: usize,
     ) -> bool {
         matches!(s.role, WmRole::Chrome | WmRole::Background | WmRole::Hud | WmRole::Notification)
@@ -896,42 +896,42 @@ pub mod daemon {
     }
 
     /// The WM core state: output geometry, the human's focus intent, and the
-    /// workspace model (N virtual desktops + which is active + each app
-    /// surface's workspace assignment).
+    /// space model (N virtual desktops + which is active + each app
+    /// surface's space assignment).
     pub struct Wm {
         pub screen: Screen,
         pub focus_intent: Option<u32>,
         /// What moved the focus since the last layout
         /// (`fresco_protocol::focus_cause`), declared with it.
         focus_cause: std::cell::Cell<u8>,
-        /// Number of workspaces (virtual desktops).
-        pub workspaces: usize,
-        /// The currently-visible workspace (0-based).
+        /// Number of spaces (virtual desktops).
+        pub spaces: usize,
+        /// The currently-visible space (0-based).
         pub active: usize,
-        /// surface_id → workspace. Unlisted surfaces default to the active
-        /// workspace (see [`shown_in_workspace`]); chrome/background ignore this.
+        /// surface_id → space. Unlisted surfaces default to the active
+        /// space (see [`shown_in_space`]); chrome/background ignore this.
         pub assignment: HashMap<u32, usize>,
-        /// Per-app landing rules from config: app-id → workspace. Applied to a
+        /// Per-app landing rules from config: app-id → space. Applied to a
         /// new surface by its `owner_app` (inert until frescod reports real
-        /// app-ids; then a configured app opens on its assigned workspace).
+        /// app-ids; then a configured app opens on its assigned space).
         pub assign_rules: HashMap<String, usize>,
-        /// Optional workspace names (cosmetic; from config). Indexed by workspace.
+        /// Optional space names (cosmetic; from config). Indexed by space.
         pub names: Vec<String>,
         /// The launch registry (uid → app-id), loaded by the binary from
         /// portcullis-peer. Used to resolve a surface's `owner_uid` to its
         /// app-id so [`assign_rules`](Self::assign_rules) (keyed by app-id) apply.
         pub registry: AppRegistry,
-        /// Workspaces currently in *split* (tiled) mode — the split intent
-        /// (forum.md §2.3). A tiled workspace lays its documents side-by-side in
+        /// Spaces currently in *split* (tiled) mode — the split intent
+        /// (forum.md §2.3). A tiled space lays its documents side-by-side in
         /// columns (all visible); a non-tiled one stacks them (one focused +
         /// fills, the rest render-gated — the default).
-        pub tiled_workspaces: HashSet<usize>,
+        pub tiled_spaces: HashSet<usize>,
         /// The surface currently *zoomed* to fill the whole screen (the zoom
         /// intent, forum.md §2.3) — a true fullscreen that even covers chrome;
         /// everything else render-gates. `None` = the normal arrangement.
         pub zoomed: Option<u32>,
         /// Documents snapped to a half of the work area (the snap intent). When
-        /// any document on the active workspace is snapped, it enters snap mode
+        /// any document on the active space is snapped, it enters snap mode
         /// (manual tile: snapped docs show in their halves, the rest gate).
         pub snapped: HashMap<u32, Snap>,
         /// Where the picture-in-picture window sits (`Intent::PipCorner`).
@@ -974,13 +974,13 @@ pub mod daemon {
                 screen,
                 focus_intent: None,
                 focus_cause: std::cell::Cell::new(0),
-                workspaces: DEFAULT_WORKSPACES,
+                spaces: DEFAULT_SPACES,
                 active: 0,
                 assignment: HashMap::new(),
                 assign_rules: HashMap::new(),
                 names: Vec::new(),
                 registry: AppRegistry::default(),
-                tiled_workspaces: HashSet::new(),
+                tiled_spaces: HashSet::new(),
                 zoomed: None,
                 snapped: HashMap::new(),
                 pip_corner: forum_ctl::Corner::default(),
@@ -1181,7 +1181,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let focus = resolve_focus(&active, self.focus_intent);
@@ -1262,10 +1262,10 @@ pub mod daemon {
             conn.arrange_outputs(vec![WmOutputPlacement { identity: a.identity, x, y }])
         }
 
-        /// A human-facing label for workspace `i`: its configured name, else
-        /// `"workspace N"`.
-        pub fn workspace_label(&self, i: usize) -> String {
-            self.names.get(i).cloned().unwrap_or_else(|| format!("workspace {i}"))
+        /// A human-facing label for space `i`: its configured name, else
+        /// `"Space N"`, counted from 1 like Super+1..4.
+        pub fn space_label(&self, i: usize) -> String {
+            self.names.get(i).cloned().unwrap_or_else(|| format!("Space {}", i + 1))
         }
 
         /// The human focuses a surface (an intent); the next reconcile applies it.
@@ -1273,47 +1273,47 @@ pub mod daemon {
             self.focus_intent = Some(surface_id);
         }
 
-        /// Assign a (new) surface to the active workspace — the default landing
-        /// rule: a window opens on the workspace you're looking at.
+        /// Assign a (new) surface to the active space — the default landing
+        /// rule: a window opens on the space you're looking at.
         pub fn assign_to_active(&mut self, surface_id: u32) {
             self.assignment.insert(surface_id, self.active);
         }
 
-        /// Switch the active workspace. The previous workspace's app surfaces
+        /// Switch the active space. The previous space's app surfaces
         /// fall out of the active set → render-gated (a whole desktop stops
-        /// compositing); the new workspace's surfaces are arranged + composited.
+        /// compositing); the new space's surfaces are arranged + composited.
         /// Focus resets so `arrange` picks the topmost document there. No-op
-        /// (returns `None`) for an out-of-range or already-active workspace.
-        pub fn switch_workspace(&mut self, conn: &mut impl FrescoConn, ws: usize)
+        /// (returns `None`) for an out-of-range or already-active space.
+        pub fn switch_space(&mut self, conn: &mut impl FrescoConn, ws: usize)
             -> io::Result<Option<usize>>
         {
-            if ws >= self.workspaces || ws == self.active {
+            if ws >= self.spaces || ws == self.active {
                 return Ok(None);
             }
             self.active = ws;
-            self.focus_intent = None; // resolve focus within the newly-active workspace
-            self.zoomed = None;       // a zoom belonged to the workspace we left
+            self.focus_intent = None; // resolve focus within the newly-active space
+            self.zoomed = None;       // a zoom belonged to the space we left
             let surfaces = conn.enumerate()?;
             self.declare(conn, &surfaces)?;
             Ok(Some(ws))
         }
 
-        /// Move the focused surface to another workspace (the "send to desktop"
-        /// intent) and re-declare, staying on the current workspace. The moved
+        /// Move the focused surface to another space (the "send to desktop"
+        /// intent) and re-declare, staying on the current space. The moved
         /// surface leaves the active set → render-gates; focus re-resolves among
         /// what remains. No-op (returns `None`) for an out-of-range / current
-        /// workspace or when nothing focusable is on screen. Returns the moved
+        /// space or when nothing focusable is on screen. Returns the moved
         /// surface id.
-        pub fn move_focused_to_workspace(&mut self, conn: &mut impl FrescoConn, ws: usize)
+        pub fn move_focused_to_space(&mut self, conn: &mut impl FrescoConn, ws: usize)
             -> io::Result<Option<u32>>
         {
-            if ws >= self.workspaces || ws == self.active {
+            if ws >= self.spaces || ws == self.active {
                 return Ok(None);
             }
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let focus = arrange(&self.screen, &active, self.focus_intent).focus;
@@ -1332,20 +1332,20 @@ pub mod daemon {
                 self.assign_rules.insert(app.to_string(), ws);
             }
             self.zoomed = self.zoomed.filter(|z| *z != focus); // a moved window can't stay zoomed here
-            self.focus_intent = None; // it left this workspace; re-resolve focus among the rest
+            self.focus_intent = None; // it left this space; re-resolve focus among the rest
             self.declare(conn, &surfaces)?;
             Ok(Some(focus))
         }
 
-        /// Toggle the split (tiled) intent for the active workspace and re-declare
+        /// Toggle the split (tiled) intent for the active space and re-declare
         /// (forum.md §2.3). Tiled → documents side-by-side in columns, all
         /// visible; un-tiled → back to the stacked default (one focused fills,
         /// the rest render-gated). Returns the new tiled state.
         pub fn toggle_split(&mut self, conn: &mut impl FrescoConn) -> io::Result<bool> {
-            let now_tiled = if self.tiled_workspaces.remove(&self.active) {
+            let now_tiled = if self.tiled_spaces.remove(&self.active) {
                 false
             } else {
-                self.tiled_workspaces.insert(self.active);
+                self.tiled_spaces.insert(self.active);
                 true
             };
             let surfaces = conn.enumerate()?;
@@ -1429,7 +1429,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let focus = arrange(&self.screen, &active, self.focus_intent).focus;
@@ -1624,7 +1624,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let focus = arrange(&self.screen, &active, self.focus_intent).focus;
@@ -1644,7 +1644,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let focus = arrange(&self.screen, &active, self.focus_intent).focus;
@@ -1653,9 +1653,9 @@ pub mod daemon {
             Ok(removed.then_some(focus))
         }
 
-        /// Pick the layout for the active workspace's visible surfaces, applying
+        /// Pick the layout for the active space's visible surfaces, applying
         /// the active intent: zoom (one surface fills the screen) > snap (manual
-        /// tile of the snapped docs) > the workspace's split/stacked arrangement.
+        /// tile of the snapped docs) > the space's split/stacked arrangement.
         ///
         /// With several monitors each one is laid out on its own, for the
         /// surfaces that show on it ([`Self::monitor_of`]): the intents apply
@@ -1742,22 +1742,22 @@ pub mod daemon {
             if active.iter().any(|s| s.role == WmRole::Document && self.snapped.contains_key(&s.surface_id)) {
                 return arrange_snapped(screen, active, focus_intent, &self.snapped);
             }
-            // Otherwise the workspace's split (tiled) or stacked arrangement.
-            let tiled = self.tiled_workspaces.contains(&self.active);
+            // Otherwise the space's split (tiled) or stacked arrangement.
+            let tiled = self.tiled_spaces.contains(&self.active);
             arrange_for(screen, active, focus_intent, tiled)
         }
 
-        /// The workspace-aware placement step shared by every reconcile path:
-        /// choose the active-workspace layout, declare it, then render-gate every
-        /// surface NOT placed in it — apps on inactive workspaces, and (in zoom /
-        /// snap mode) the active-workspace surfaces the intent excluded. So an
-        /// inactive workspace, or a hidden window, fully stops compositing.
+        /// The space-aware placement step shared by every reconcile path:
+        /// choose the active-space layout, declare it, then render-gate every
+        /// surface NOT placed in it — apps on inactive spaces, and (in zoom /
+        /// snap mode) the active-space surfaces the intent excluded. So an
+        /// inactive space, or a hidden window, fully stops compositing.
         fn declare(&self, conn: &mut impl FrescoConn, surfaces: &[WmSurfaceInfo])
             -> io::Result<WmDeclareLayoutPayload>
         {
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             self.sync_span(conn, &active)?;
@@ -1775,10 +1775,10 @@ pub mod daemon {
             Ok(layout)
         }
 
-        /// Re-derive and push the layout for the active workspace: enumerate,
+        /// Re-derive and push the layout for the active space: enumerate,
         /// arrange the visible surfaces, declare the atomic layout, gate the
-        /// occluded ones + every inactive-workspace surface. Returns the
-        /// declared (active-workspace) layout.
+        /// occluded ones + every inactive-space surface. Returns the
+        /// declared (active-space) layout.
         /// The output changed size (a mode switch or a monitor swap): adopt the
         /// new screen and re-lay out every surface for it. A screen of zero
         /// area (monitor unplugged) keeps the old layout: there is nothing to
@@ -1817,7 +1817,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let resolved = arrange(&self.screen, &active, self.focus_intent).focus;
@@ -1850,12 +1850,12 @@ pub mod daemon {
             if let Some(s) = surfaces.iter().find(|s| s.surface_id == new_id) {
                 // Land the newcomer: resolve its owning uid → app-id via the
                 // launch registry, and if config has a rule for that app-id use
-                // its workspace; else the active workspace (the default flow).
+                // its space; else the active space (the default flow).
                 let ws = self
                     .registry
                     .resolve(s.owner_uid)
                     .and_then(|(_user, app)| self.assign_rules.get(app).copied())
-                    .filter(|w| *w < self.workspaces)
+                    .filter(|w| *w < self.spaces)
                     .unwrap_or(self.active);
                 self.assignment.insert(new_id, ws);
                 // With several monitors a new window opens on the monitor of
@@ -1864,7 +1864,7 @@ pub mod daemon {
                 if mons.len() > 1 && !self.home.contains_key(&new_id) {
                     let shown: Vec<WmSurfaceInfo> = surfaces
                         .iter()
-                        .filter(|t| t.surface_id != new_id && shown_in_workspace(t, &self.assignment, self.active))
+                        .filter(|t| t.surface_id != new_id && shown_in_space(t, &self.assignment, self.active))
                         .cloned()
                         .collect();
                     let cur = resolve_focus(&shown, self.focus_intent);
@@ -1881,7 +1881,7 @@ pub mod daemon {
                     self.home.insert(new_id, at);
                 }
                 // A new document opens focused — but only if it landed on the
-                // workspace you're looking at (a rule may send it elsewhere).
+                // space you're looking at (a rule may send it elsewhere).
                 if s.role == WmRole::Document && ws == self.active {
                     self.focus_intent = Some(new_id);
                     self.focus_cause.set(fresco_protocol::focus_cause::PROGRAM);
@@ -1900,7 +1900,7 @@ pub mod daemon {
             let surfaces = conn.enumerate()?;
             let active: Vec<WmSurfaceInfo> = surfaces
                 .iter()
-                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .filter(|s| shown_in_space(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
             let mut docs: Vec<u32> = active
@@ -2318,23 +2318,23 @@ mod tests {
     }
 
     #[test]
-    fn workspaces_partition_apps_but_chrome_is_global() {
-        use super::daemon::shown_in_workspace;
+    fn spaces_partition_apps_but_chrome_is_global() {
+        use super::daemon::shown_in_space;
         use std::collections::HashMap;
         let mut a = HashMap::new();
-        a.insert(1u32, 0usize); // doc 1 on workspace 0
-        a.insert(2u32, 1usize); // doc 2 on workspace 1
+        a.insert(1u32, 0usize); // doc 1 on space 0
+        a.insert(2u32, 1usize); // doc 2 on space 1
         let (doc1, doc2, bar) = (surf(1, WmRole::Document), surf(2, WmRole::Document), surf(9, WmRole::Chrome));
         // active = 0: doc1 shown, doc2 hidden, chrome global.
-        assert!(shown_in_workspace(&doc1, &a, 0));
-        assert!(!shown_in_workspace(&doc2, &a, 0));
-        assert!(shown_in_workspace(&bar, &a, 0));
+        assert!(shown_in_space(&doc1, &a, 0));
+        assert!(!shown_in_space(&doc2, &a, 0));
+        assert!(shown_in_space(&bar, &a, 0));
         // active = 1: doc2 shown, doc1 hidden, chrome still global.
-        assert!(!shown_in_workspace(&doc1, &a, 1));
-        assert!(shown_in_workspace(&doc2, &a, 1));
-        assert!(shown_in_workspace(&bar, &a, 1));
-        // an unassigned app surface defaults to the active workspace (visible).
-        assert!(shown_in_workspace(&surf(5, WmRole::Document), &a, 0));
+        assert!(!shown_in_space(&doc1, &a, 1));
+        assert!(shown_in_space(&doc2, &a, 1));
+        assert!(shown_in_space(&bar, &a, 1));
+        // an unassigned app surface defaults to the active space (visible).
+        assert!(shown_in_space(&surf(5, WmRole::Document), &a, 0));
     }
 
     #[test]
@@ -2581,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_workspace_gates_the_other_apps_but_keeps_chrome() {
+    fn switching_space_gates_the_other_apps_but_keeps_chrome() {
         let mut conn = MockConn {
             surfaces: vec![
                 surf(1, WmRole::Document),
@@ -2591,35 +2591,35 @@ mod tests {
             ..Default::default()
         };
         let mut wm = Wm::new(screen());
-        wm.assign_to_active(1);                       // doc 1 → workspace 0
-        wm.switch_workspace(&mut conn, 1).unwrap();   // go to workspace 1
-        wm.assign_to_active(2);                        // doc 2 → workspace 1
+        wm.assign_to_active(1);                       // doc 1 → space 0
+        wm.switch_space(&mut conn, 1).unwrap();   // go to space 1
+        wm.assign_to_active(2);                        // doc 2 → space 1
         wm.reconcile(&mut conn).unwrap();
 
-        // On workspace 1: doc 2 + chrome are declared (active); doc 1 is gated.
+        // On space 1: doc 2 + chrome are declared (active); doc 1 is gated.
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
         assert!(declared.contains(&2) && declared.contains(&9), "active doc + chrome placed");
-        assert!(!declared.contains(&1), "the other workspace's doc isn't in the active layout");
+        assert!(!declared.contains(&1), "the other space's doc isn't in the active layout");
         let gated: Vec<u32> =
             conn.rendering.iter().filter(|r| !r.rendering).map(|r| r.surface_id).collect();
-        assert_eq!(gated, vec![1], "the inactive workspace's app is render-gated");
+        assert_eq!(gated, vec![1], "the inactive space's app is render-gated");
 
-        // Switch back to workspace 0 → doc 1 visible, doc 2 now gated, chrome stays.
-        wm.switch_workspace(&mut conn, 0).unwrap();
+        // Switch back to space 0 → doc 1 visible, doc 2 now gated, chrome stays.
+        wm.switch_space(&mut conn, 0).unwrap();
         let gated: Vec<u32> =
             conn.rendering.iter().filter(|r| !r.rendering).map(|r| r.surface_id).collect();
-        assert_eq!(gated, vec![2], "switching flips which workspace's apps are gated");
+        assert_eq!(gated, vec![2], "switching flips which space's apps are gated");
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
-        assert!(declared.contains(&9), "chrome is global — present on every workspace");
+        assert!(declared.contains(&9), "chrome is global — present on every space");
     }
 
     #[test]
-    fn config_rule_lands_a_known_app_on_its_workspace() {
+    fn config_rule_lands_a_known_app_on_its_space() {
         use portcullis_peer::AppRegistry;
         // A surface owned by uid 1001, which the launch registry maps to the
-        // navigator app; config assigns that app to workspace 1.
+        // navigator app; config assigns that app to space 1.
         let mut conn = MockConn {
             surfaces: vec![WmSurfaceInfo {
                 surface_id: 7,
@@ -2632,13 +2632,13 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut wm = Wm::new(screen()); // active workspace is 0
+        let mut wm = Wm::new(screen()); // active space is 0
         wm.registry = AppRegistry::parse("1001 alice org.atrium.navigator");
         wm.assign_rules.insert("org.atrium.navigator".into(), 1);
 
         wm.focus_new(&mut conn, 7).unwrap();
-        assert_eq!(wm.assignment.get(&7), Some(&1), "the app lands on its configured workspace");
-        // It didn't open on the active workspace, so it isn't auto-focused.
+        assert_eq!(wm.assignment.get(&7), Some(&1), "the app lands on its configured space");
+        // It didn't open on the active space, so it isn't auto-focused.
         assert_ne!(wm.focus_intent, Some(7));
         // An unknown uid (no registry entry / no rule) falls back to active.
         let mut conn2 = MockConn {
@@ -2646,7 +2646,7 @@ mod tests {
             ..Default::default()
         };
         wm.focus_new(&mut conn2, 8).unwrap();
-        assert_eq!(wm.assignment.get(&8), Some(&0), "unconfigured app opens on the active workspace");
+        assert_eq!(wm.assignment.get(&8), Some(&0), "unconfigured app opens on the active space");
     }
 
     #[test]
@@ -2694,28 +2694,28 @@ mod tests {
     }
 
     #[test]
-    fn move_sends_the_focused_window_to_another_workspace() {
+    fn move_sends_the_focused_window_to_another_space() {
         let mut conn = MockConn {
             surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
             ..Default::default()
         };
         let mut wm = Wm::new(screen());
-        wm.assign_to_active(1); // both docs created on workspace 0
+        wm.assign_to_active(1); // both docs created on space 0
         wm.assign_to_active(2);
-        wm.focus_intent = Some(2); // focus doc 2 on workspace 0
-        let moved = wm.move_focused_to_workspace(&mut conn, 1).unwrap();
+        wm.focus_intent = Some(2); // focus doc 2 on space 0
+        let moved = wm.move_focused_to_space(&mut conn, 1).unwrap();
         assert_eq!(moved, Some(2), "the focused doc moved");
-        assert_eq!(wm.assignment.get(&2), Some(&1), "doc 2 now belongs to workspace 1");
-        assert_eq!(wm.active, 0, "we stay on the current workspace");
-        // Doc 2 left workspace 0 → gated; only doc 1 is active.
+        assert_eq!(wm.assignment.get(&2), Some(&1), "doc 2 now belongs to space 1");
+        assert_eq!(wm.active, 0, "we stay on the current space");
+        // Doc 2 left space 0 → gated; only doc 1 is active.
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
-        assert_eq!(declared, vec![1], "only doc 1 remains on the active workspace");
-        // Following it to workspace 1 shows doc 2.
-        wm.switch_workspace(&mut conn, 1).unwrap();
+        assert_eq!(declared, vec![1], "only doc 1 remains on the active space");
+        // Following it to space 1 shows doc 2.
+        wm.switch_space(&mut conn, 1).unwrap();
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
-        assert_eq!(declared, vec![2], "doc 2 is on workspace 1");
+        assert_eq!(declared, vec![2], "doc 2 is on space 1");
     }
 
     #[test]
@@ -2769,7 +2769,7 @@ mod tests {
         wm.assign_to_active(5);
         wm.registry = AppRegistry::parse("1001 alice org.atrium.term");
         wm.focus_intent = Some(5);
-        wm.move_focused_to_workspace(&mut conn, 2).unwrap();
+        wm.move_focused_to_space(&mut conn, 2).unwrap();
         // The binary persists assign_rules to the state file → survives reboot.
         assert_eq!(
             wm.assign_rules.get("org.atrium.term"),
@@ -3241,14 +3241,14 @@ mod pip_tests {
 }
 
 /// How far (logical px) a three- or four-finger swipe must travel, mostly
-/// sideways, to switch workspace.
+/// sideways, to switch space.
 pub const SWIPE_SWITCH_PX: f32 = 120.0;
 
-/// The workspace a finished horizontal swipe switches to (atrium-input.md
-/// §5.3): fingers moving left bring in the workspace to the right, as
+/// The space a finished horizontal swipe switches to (atrium-input.md
+/// §5.3): fingers moving left bring in the space to the right, as
 /// content follows the fingers. `None` for a short or mostly vertical
 /// swipe, or past either end.
-pub fn swipe_workspace(active: usize, count: usize, dx: f32, dy: f32) -> Option<usize> {
+pub fn swipe_space(active: usize, count: usize, dx: f32, dy: f32) -> Option<usize> {
     if !(dx.abs() >= SWIPE_SWITCH_PX && dx.abs() > 2.0 * dy.abs()) {
         return None;
     }
@@ -3258,16 +3258,16 @@ pub fn swipe_workspace(active: usize, count: usize, dx: f32, dy: f32) -> Option<
 
 #[cfg(test)]
 mod swipe_tests {
-    use super::swipe_workspace;
+    use super::swipe_space;
 
     #[test]
-    fn swipes_switch_one_workspace() {
-        assert_eq!(swipe_workspace(1, 4, -200.0, 10.0), Some(2));
-        assert_eq!(swipe_workspace(1, 4, 200.0, 10.0), Some(0));
-        assert_eq!(swipe_workspace(0, 4, 200.0, 0.0), None);
-        assert_eq!(swipe_workspace(3, 4, -200.0, 0.0), None);
-        assert_eq!(swipe_workspace(1, 4, -60.0, 0.0), None);
-        assert_eq!(swipe_workspace(1, 4, -200.0, 150.0), None);
+    fn swipes_switch_one_space() {
+        assert_eq!(swipe_space(1, 4, -200.0, 10.0), Some(2));
+        assert_eq!(swipe_space(1, 4, 200.0, 10.0), Some(0));
+        assert_eq!(swipe_space(0, 4, 200.0, 0.0), None);
+        assert_eq!(swipe_space(3, 4, -200.0, 0.0), None);
+        assert_eq!(swipe_space(1, 4, -60.0, 0.0), None);
+        assert_eq!(swipe_space(1, 4, -200.0, 150.0), None);
     }
 }
 

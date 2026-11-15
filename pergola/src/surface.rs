@@ -1073,7 +1073,7 @@ mod tests {
     /// A group drawn a pixel wider or narrower after a move places its
     /// contents again, though their points did not change and so they were
     /// not in the frame. forum-bar's first frame is laid out 5546 pt wide;
-    /// at 1.5 its workspace chip (a 1 pt border box around its body) sat at
+    /// at 1.5 its space chip (a 1 pt border box around its body) sat at
     /// 2726 pt, 191 px wide, the body at 2..189. At the real 1280 pt the
     /// chip moved to 593 pt and drew 190 px wide, the body was not sent
     /// again, and its right border was 1 px where a fresh frame gives 2.

@@ -1,5 +1,5 @@
 //! `Chip` — the shell's small interactive container (surface chips,
-//! the workspace chip), and `ListRow` — its full-width sibling
+//! the space chip), and `ListRow` — its full-width sibling
 //! (launcher rows, popover rows).
 //!
 //! Both are a bordered, hoverable, clickable horizontal flex box over
@@ -25,7 +25,7 @@ pub struct Chip<C: View> {
     pub pad: f32,
     pub radius: f32,
     /// Active chips get `bg_canvas` + `border_strong` (the focused
-    /// surface chip / current workspace look).
+    /// surface chip / current space look).
     pub active: bool,
     /// Extra opacity-style muting for stashed chips is the caller's
     /// business (M3 alpha); structural look lives here.
