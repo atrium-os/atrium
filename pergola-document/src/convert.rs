@@ -289,7 +289,14 @@ pub fn scene_nodes(scene: &Scene, faces: &Faces, images: Images, out: &mut Vec<N
                 // Tiles and fit wait for a texture op with UVs: one tile.
                 match (images(&im.address), cut(rect, cx.clip(a))) {
                     (Some(image), Some(_)) => out.push(Node::Image { rect, image }),
-                    (None, Some(_)) => skipped.images += 1,
+                    (None, Some(_)) => {
+                        // Not here yet: its box, sized by the layout from
+                        // the declared size, holds the place so nothing
+                        // moves when it arrives (resolution-independence.md
+                        // §6.4).
+                        skipped.images += 1;
+                        out.push(Node::Rect { rect, fill: pergola::flow::placeholder_fill(cx.alpha(a)), radius: 0.0 });
+                    }
                     _ => {}
                 }
             }

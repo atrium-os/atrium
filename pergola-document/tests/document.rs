@@ -136,3 +136,22 @@ fn a_link_is_found_under_the_pointer_and_moves_with_the_scroll() {
     state.set(st);
     assert_eq!(at(y0 + 4.0 - 30.0).as_deref(), Some("https://atlas.example/two"), "scrolled 30 px up");
 }
+
+/// An image not here yet still holds its declared place, as a faint box,
+/// so nothing moves when it arrives (resolution-independence.md §6.4).
+#[test]
+fn an_image_not_here_yet_holds_its_place() {
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+    let more = Mutable::with_dirty(0u64, dirty.clone());
+    let page = r#"<html><body><p>Before</p><img src="https://example.com/a.png" width="120" height="80"><p>After</p></body></html>"#;
+    // Declared (as the converter does) at 240 x 160 px; its pixels aren't here.
+    let mut subs = navigator_render::Subresources::new();
+    subs.insert("https://example.com/a.png".into(), ("blake3:00".into(), 240 * 64, 160 * 64));
+    let doc = Rc::new(RefCell::new(Doc::html(page.into(), subs, 800.0, 600.0, false, |_| None).unwrap()));
+    let view = DocumentView::new(state, Rect::new(0.0, 0.0, 800.0, 600.0), doc, more);
+    let mut app = App::new_with_flag(Page { view }, dirty);
+    let first = app.tick();
+    let held = count(&first, |n| matches!(n, Node::Rect { rect, fill, .. } if (rect.w(), rect.h()) == (120.0, 80.0) && fill.a > 0.0 && fill.a < 0.3));
+    assert_eq!(held, 1, "one placeholder the image's size");
+}

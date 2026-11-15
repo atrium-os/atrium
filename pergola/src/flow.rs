@@ -83,6 +83,34 @@ impl Inline {
     }
 }
 
+/// The fill of an image's place before it arrives: a faint neutral tint,
+/// readable on light and dark alike. `alpha` is the image's own opacity.
+pub fn placeholder_fill(alpha: f32) -> Color {
+    Color::rgba(0.5, 0.5, 0.5, 0.16 * alpha.clamp(0.0, 1.0))
+}
+
+impl Inline {
+    /// An image at a declared size in points, before and after it arrives:
+    /// until `image` is `Some`, a placeholder of that size holds its place,
+    /// so nothing moves when it loads (resolution-independence.md §6.4).
+    /// The image is drawn at the declared size, not its own.
+    pub fn declared(size: Size, image: Option<Image>) -> Self {
+        Self { size: InlineSize::Intrinsic(size), align: InlineAlign::Baseline, content: placeholder_or(image) }
+    }
+    /// A figure `f` of the width across with a declared aspect (height over
+    /// width), placeholder until `image` arrives.
+    pub fn figure_declared(f: f32, aspect: f32, image: Option<Image>) -> Self {
+        Self { size: InlineSize::Fraction(f, aspect), align: InlineAlign::Baseline, content: placeholder_or(image) }
+    }
+}
+
+fn placeholder_or(image: Option<Image>) -> InlineContent {
+    match image {
+        Some(i) => InlineContent::Image(i),
+        None => InlineContent::Box { fill: placeholder_fill(1.0), radius: 0.0 },
+    }
+}
+
 /// A piece of a flow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Piece {
@@ -369,6 +397,27 @@ mod tests {
             let r = objects(&lay_out(&Flow::new().inline(fig.clone()), w))[0];
             assert_eq!((r.w(), r.h()), (w * 0.5, w * 0.5 * 0.75));
         }
+    }
+
+    /// An image with a declared size holds its place before it arrives:
+    /// the placeholder and the loaded image lay out the same, so nothing
+    /// on the page moves when it loads, even if its pixels are another size.
+    #[test]
+    fn a_declared_image_holds_its_place_until_it_arrives() {
+        let page = |i: Inline| Flow::new().text("Before ", body(14.0)).inline(i).text(" after the picture", body(14.0));
+        let size = Size::new(120.0, 80.0);
+        let before = lay_out(&page(Inline::declared(size, None)), 300.0);
+        let after = lay_out(&page(Inline::declared(size, Some(image(480, 320, 2.0)))), 300.0);
+        assert_eq!(objects(&before), objects(&after));
+        assert_eq!(before.size, after.size);
+        let texts = |l: &Laid| l.items.iter().filter_map(|p| if let Placed::Text { rect, .. } = p { Some(*rect) } else { None }).collect::<Vec<_>>();
+        assert_eq!(texts(&before), texts(&after), "the words don't move");
+        assert!(matches!(before.items.iter().find(|p| matches!(p, Placed::Object { .. })), Some(Placed::Object { content: InlineContent::Box { .. }, .. })));
+        let r = objects(&before)[0];
+        assert_eq!((r.w(), r.h()), (120.0, 80.0));
+
+        let fig = |i| lay_out(&Flow::new().inline(i), 400.0);
+        assert_eq!(objects(&fig(Inline::figure_declared(0.5, 0.75, None))), objects(&fig(Inline::figure_declared(0.5, 0.75, Some(image(10, 10, 1.0))))));
     }
 
     /// Objects break with the words around them; nothing passes the width

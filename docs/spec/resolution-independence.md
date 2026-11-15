@@ -341,8 +341,13 @@ Fraction, baseline }`) used by both widgets and DocumentView.
   (a wide figure, a zoomed document image) asks for denser pixels too. DocumentView images go
   through the same path, so a document image source that offers alternates (step 7, `srcset`)
   needs nothing more in Pergola.
-- Not yet: placeholders before an image arrives (the app gives the `Inline` its declared size
-  with a `Box` until then), and re-picking when only the scale changes is the window's full
+- Placeholders (built 2026-11-15): `Inline::declared(size, Option<Image>)` and
+  `Inline::figure_declared(f, aspect, Option<Image>)` lay out at the declared size whether or
+  not the image is there, drawing a faint neutral box (`flow::placeholder_fill`) until it is,
+  and the image at the declared size after, so the words around it don't move. Documents
+  (pergola-document, so the Navigator's pages) draw the same box in the place the layout gave
+  a declared image whose pixels haven't arrived, instead of leaving it blank.
+- Not yet: re-picking when only the scale changes is the window's full
   resend on a scale change (step 6 checks it live).
 
 ## 7. Moving windows between monitors
