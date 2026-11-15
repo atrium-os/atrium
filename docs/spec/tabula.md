@@ -123,10 +123,15 @@ unless `FRESCOD_INJECT_ACTIVATION=1`, which is for tests and logs a warning. The
 most 4096 live tokens (the oldest goes first) and drops expired ones on each mint.
 
 The socket is `FRESCOD_ACTIVATION_SOCK` (default `/var/run/atrium/fresco-activation.sock`).
-frescod checks each connection's peer uid. Consumers are `FRESCOD_ACTIVATION_UIDS`, or else the
-uids of `_tabula`, `_share` and `_praeco`; Forum is `FRESCOD_FORUM_UID`, or else `_forum`'s uid.
-Other uids are not served. A consumer may only `CONSUME` and Forum may only `GRANT`; anything
-else gets `Refused { NOT_ALLOWED }`. Replies carry `IS_RESPONSE` and the request's op.
+frescod checks each connection's peer uid. Each consumer may spend only its own purposes. The
+defaults are root (`OPEN`, `CONSOLE`, `APPROVE`), `_tabula` (`COPY`, `PASTE`, `DRAG`, `DROP`),
+`_share` (`SHARE`), `_praeco` (`ACTION`), `_arca-ui` (`FILL`), `_sigillum-ui` (`IDENTITY`) and
+`_navigatord` (`PROMPT`), for the users that exist. `FRESCOD_ACTIVATION_UIDS` replaces them:
+comma-separated `uid=purpose+purpose` entries, purposes by name or number (`0=open+console`,
+`1001=prompt`); a bare uid may spend any purpose and is logged as a warning (tests only). Forum is
+`FRESCOD_FORUM_UID`, or else `_forum`'s uid. Other uids are not served. A consumer may only
+`CONSUME`, and only for its purposes, and Forum may only `GRANT`; anything else gets
+`Refused { NOT_ALLOWED }`, and a refused consume leaves the token unspent. Replies carry `IS_RESPONSE` and the request's op.
 
 - "Focused" means the window keys go to: the focused one, else the topmost. `GRANTED` tokens
   skip the focus check.

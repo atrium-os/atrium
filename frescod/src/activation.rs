@@ -299,12 +299,12 @@ pub fn has_token(ev: &fresco_scene_server::window::DisplayEvent) -> bool {
     matches!(ev, E::InputKey { activation, .. } | E::InputPointerButton { activation, .. } if *activation != [0; 16])
 }
 
-/// The uids that may consume tokens: `FRESCOD_ACTIVATION_UIDS` (comma
-/// separated uids), else the users `_tabula`, `_share` and `_praeco`.
 /// Who may call the activation socket.
 #[derive(Debug)]
 pub struct Callers {
-    pub consumers: Vec<u32>,
+    /// Consumers and the purposes each may spend (`None`: any, a test
+    /// harness's bare uid in `FRESCOD_ACTIVATION_UIDS`).
+    pub consumers: Consumers,
     pub forum: Option<u32>,
     /// May bind slots (limen.md §5): FRESCOD_SLOT_UIDS, else `_limen`'s.
     pub binders: Vec<u32>,
@@ -372,13 +372,96 @@ pub fn forum_uid() -> Option<u32> {
     }
 }
 
-pub fn consumers() -> Vec<u32> {
-    if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
-        return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
+/// Consumer uids and what each may spend (`None`: any purpose).
+pub type Consumers = std::collections::BTreeMap<u32, Option<Vec<u8>>>;
+
+/// Each broker and the purposes it spends: a broker can't spend a press
+/// meant for another (a compromised navigatord can't paste or open a file).
+pub const DEFAULT_CONSUMERS: &[(&str, &[u8])] = &[
+    // portcullisd (opening-files.md §6.2, homes.md §4, curia.md §13).
+    ("root", &[purpose::OPEN, purpose::CONSOLE, purpose::APPROVE]),
+    ("_tabula", &[purpose::COPY, purpose::PASTE, purpose::DRAG, purpose::DROP]),
+    ("_share", &[purpose::SHARE]),
+    ("_praeco", &[purpose::ACTION]),
+    ("_arca-ui", &[purpose::FILL]),
+    ("_sigillum-ui", &[purpose::IDENTITY]),
+    // The Navigator's prompt row (navigator-ui.md §6.4).
+    ("_navigatord", &[purpose::PROMPT]),
+];
+
+/// A purpose by its name in `FRESCOD_ACTIVATION_UIDS`, or its number.
+fn purpose_named(n: &str) -> Option<u8> {
+    Some(match n.to_ascii_lowercase().as_str() {
+        "copy" => purpose::COPY,
+        "paste" => purpose::PASTE,
+        "drop" => purpose::DROP,
+        "drag" => purpose::DRAG,
+        "share" => purpose::SHARE,
+        "action" => purpose::ACTION,
+        "fill" => purpose::FILL,
+        "identity" => purpose::IDENTITY,
+        "open" => purpose::OPEN,
+        "console" => purpose::CONSOLE,
+        "approve" => purpose::APPROVE,
+        "prompt" => purpose::PROMPT,
+        n => return n.parse().ok(),
+    })
+}
+
+/// `FRESCOD_ACTIVATION_UIDS`: comma-separated `uid=purpose+purpose`
+/// (names or numbers), or a bare `uid` for any purpose (test harnesses).
+/// An entry that doesn't parse is dropped, whole.
+pub fn parse_consumers(s: &str) -> Consumers {
+    let mut out = Consumers::new();
+    for e in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (u, ps) = match e.split_once('=') {
+            Some((u, ps)) => (u, Some(ps)),
+            None => (e, None),
+        };
+        let Ok(uid) = u.trim().parse::<u32>() else { continue };
+        let ps = match ps {
+            None => None,
+            Some(ps) => match ps.split('+').map(|p| purpose_named(p.trim())).collect::<Option<Vec<u8>>>() {
+                Some(v) => Some(v),
+                None => continue,
+            },
+        };
+        merge(&mut out, uid, ps);
     }
-    // root: portcullisd, which spends OPEN (opening-files.md §6.2);
-    // _navigatord spends PROMPT (navigator-ui.md §6.4).
-    ["root", "_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui", "_navigatord"].iter().filter_map(|n| uid_of(n)).collect()
+    out
+}
+
+fn merge(out: &mut Consumers, uid: u32, ps: Option<Vec<u8>>) {
+    match (out.get_mut(&uid), ps) {
+        (None, ps) => {
+            out.insert(uid, ps);
+        }
+        (Some(have), None) => *have = None,
+        (Some(None), Some(_)) => {}
+        (Some(Some(have)), Some(more)) => have.extend(more.into_iter().filter(|p| !have.contains(p)).collect::<Vec<_>>()),
+    }
+}
+
+/// Whether a consumer with `may` may spend on `p`.
+pub fn may_spend(may: &Option<Vec<u8>>, p: u8) -> bool {
+    may.as_ref().is_none_or(|v| v.contains(&p))
+}
+
+pub fn consumers() -> Consumers {
+    if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
+        let c = parse_consumers(&s);
+        for (u, _) in c.iter().filter(|(_, p)| p.is_none()) {
+            eprintln!("frescod: WARNING: uid {u} may spend activation tokens on any purpose (FRESCOD_ACTIVATION_UIDS, testing)");
+        }
+        return c;
+    }
+    let mut c = Consumers::new();
+    for (name, ps) in DEFAULT_CONSUMERS {
+        if let Some(u) = uid_of(name) {
+            merge(&mut c, u, Some(ps.to_vec()));
+        }
+    }
+    c
 }
 
 /// The uids whose top-level windows are trusted sheets, watched for
@@ -443,11 +526,11 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     std::thread::Builder::new().name("frescod-activation".into()).spawn(move || {
         for s in listener.incoming().flatten() {
             let uid = crate::socket_server::peer_xucred(&s).map(|(_, u)| u);
-            let Some(uid) = uid.filter(|u| allowed.consumers.contains(u) || allowed.forum == Some(*u) || allowed.binders.contains(u)) else {
+            let Some(uid) = uid.filter(|u| allowed.consumers.contains_key(u) || allowed.forum == Some(*u) || allowed.binders.contains(u)) else {
                 eprintln!("frescod: activation socket: refused uid {uid:?}");
                 continue;
             };
-            let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.contains(&uid), allowed.forum == Some(uid));
+            let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.get(&uid).cloned(), allowed.forum == Some(uid));
             let binder = allowed.binders.contains(&uid).then(|| comp.clone());
             let binders = allowed.binders.clone();
             let _ = std::thread::Builder::new().name("frescod-activation-conn".into()).spawn(move || {
@@ -460,9 +543,9 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     Ok(())
 }
 
-/// One caller's requests: `CONSUME` if it is a consumer, `GRANT` (with
+/// One caller's requests: `CONSUME` on its purposes if it is a consumer, `GRANT` (with
 /// its own uid as the granter) if it is Forum; anything else is refused.
-fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>, binders: &[u32]) -> std::io::Result<()> {
+fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Option<Vec<u8>>>, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>, binders: &[u32]) -> std::io::Result<()> {
     use aqueduct::envelope::flag;
     use fresco_protocol::activation::{op, Consume, Grant};
     let raw = s.try_clone()?;
@@ -480,7 +563,9 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may
         }
         let payload = match msg.op {
             op::CONSUME => fresco_protocol::encode(&match fresco_protocol::decode::<Consume>(&msg.payload) {
-                Ok(c) if may_consume => {
+                // A consumer spends only its own purposes; the refusal
+                // spends nothing.
+                Ok(c) if may_consume.as_ref().is_some_and(|m| may_spend(m, c.purpose)) => {
                     let now = now_ns();
                     table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now))
                 }
@@ -606,6 +691,22 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::FILL, YES, |_, _| true)), 0);
         let typed = t.mint(key(0x04, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::FILL, YES, |_, _| true)), refusal::WRONG_KIND);
+    }
+
+    #[test]
+    fn consumers_name_their_purposes() {
+        let c = parse_consumers("0, 65021=prompt, 70=fill+paste, 71=nonsense, 70=12, x=fill");
+        assert_eq!(c.get(&0), Some(&None), "a bare uid: any purpose (tests)");
+        assert_eq!(c.get(&65021), Some(&Some(vec![purpose::PROMPT])));
+        assert_eq!(c.get(&70), Some(&Some(vec![purpose::FILL, purpose::PASTE, purpose::PROMPT])), "merged");
+        assert!(!c.contains_key(&71), "an entry that doesn't parse is dropped");
+        assert!(may_spend(&None, purpose::OPEN));
+        assert!(may_spend(&Some(vec![purpose::PROMPT]), purpose::PROMPT));
+        assert!(!may_spend(&Some(vec![purpose::PROMPT]), purpose::PASTE), "navigatord can't paste");
+        let named: Vec<u8> = DEFAULT_CONSUMERS.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE, purpose::PROMPT] {
+            assert_eq!(named.iter().filter(|&&q| q == p).count(), 1, "purpose {p}: exactly one default broker");
+        }
     }
 
     #[test]

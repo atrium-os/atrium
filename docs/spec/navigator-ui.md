@@ -1241,9 +1241,10 @@ Each step runs in the VM on headless frescod before the next.
      where Save, Open in Mail and Try it go through navigatord's spend. A toast-role window
      in the live script's harness made forum-wm stop composing the Navigator's window while
      it was up (only the page child showed), so the covered case is checked in the probe.
-     Open: frescod lets any consumer spend any purpose; navigatord should be limited to
-     `PROMPT` and run as its own user (`_navigatord`, a default consumer) rather than
-     the person's.
+     frescod lets each consumer spend only its own purposes (tabula.md), so navigatord's
+     uid spends `PROMPT` and nothing else (the live script runs it as root with
+     `FRESCOD_ACTIVATION_UIDS=0=prompt`). Open: navigatord should run as its own user
+     (`_navigatord`, a default `PROMPT` consumer) rather than the person's.
    - **Downloads.** navigatord decides from the fetched bytes, not from anything the site
      claims, whether an `Open` is a document or a file (`navigatord/src/files.rs`). The
      fetcher's reply carries no media type anyway. Markup and UTF-8 text are documents; a

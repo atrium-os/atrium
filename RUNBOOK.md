@@ -5738,8 +5738,8 @@ arguments to `$S/opener.log`). The script presses the fixture's PDF link, finds 
 the trail still on its page, and presses Save. It checks `survey.pdf` is 0644 with its address in
 `getextattr user atrium.origin`. Then the `mailto:` and `atrium-app:` links each ask and are handed on
 once (`open mailto:…`, `try atrium-app://…`). The prompt row's primary answer is pressed at the window's
-right edge (the trace's `w=`), at least 500 ms after the row appeared. navigatord gets `NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock` (as root, a default
-consumer) and spends each answer's press there; frescod runs with `FRESCOD_INJECT_ACTIVATION=1` (injected
+right edge (the trace's `w=`), at least 500 ms after the row appeared. navigatord gets `NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock` (as root, made a
+`PROMPT`-only consumer with `FRESCOD_ACTIVATION_UIDS=0=prompt`) and spends each answer's press there; frescod runs with `FRESCOD_INJECT_ACTIVATION=1` (injected
 presses mint tokens) and `FRESCOD_TOKEN_LIFE_MS=15000` (TCG takes over a second from press to spend; both
 testing only). Islands are checked by
 `atrium-activation-probe`, which binds an `ISLAND` slot, covers its corner with a plain slot, and checks

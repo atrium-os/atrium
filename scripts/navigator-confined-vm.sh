@@ -221,7 +221,7 @@ AS=$S/activation.sock
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute \
     FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock \
     FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$S/chrome.sock FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
-    FRESCOD_ACTIVATION_UIDS=\$(id -u navtest) daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
+    FRESCOD_ACTIVATION_UIDS=\$(id -u navtest)=prompt daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S $S/fresco.sock && test -S $AS"; do sleep 2; i=$((i+1)); done
 g "grep -q 'renderers are org.atrium.fresco.renderer jails' $S/frescod.log" && ok "frescod (as _frescod) starts renderers as jails" || bad "frescod: $(g "grep -i renderer $S/frescod.log | head -3 | tr '\n' ';'")"
 g "cd $S && env FRESCO_SOCKET=$S/fresco.sock FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
