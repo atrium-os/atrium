@@ -151,6 +151,23 @@ fn main() {
     c.until(&mut p, 30, "connect", nop, move |p| p.devices.as_ref().is_some_and(|v| v.iter().any(|x| x.address == da && x.connected)));
     println!("step: connected again (with the stored bond)");
 
+    // Turn Bluetooth off: the link drops and nothing connects; then on.
+    p.power(false);
+    c.send(&mut p);
+    c.until(&mut p, 20, "Bluetooth off", nop, move |p| {
+        p.status.as_ref().is_some_and(|s| !s.powered) && p.devices.as_ref().is_some_and(|v| v.iter().any(|x| x.address == da && !x.connected))
+    });
+    p.connect(da);
+    assert!(p.take_wants().is_empty(), "no Connect while off");
+    println!("step: turned off, the device dropped");
+    p.power(true);
+    c.send(&mut p);
+    c.until(&mut p, 20, "Bluetooth on", nop, |p| p.on());
+    p.connect(da);
+    c.send(&mut p);
+    c.until(&mut p, 30, "connect after turning on", nop, move |p| p.devices.as_ref().is_some_and(|v| v.iter().any(|x| x.address == da && x.connected)));
+    println!("step: turned on, connected again");
+
     p.forget(d.address);
     c.send(&mut p);
     assert_eq!(p.confirm_forget, Some(d.address), "forget asks first");

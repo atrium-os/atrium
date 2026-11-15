@@ -168,6 +168,16 @@ impl Host {
                 self.out_events.push_back(HostEvent::InquiryResult { peer, rssi: Some(r.rssi as i8), name, class_of_device: r.class_of_device });
             }
             E::InquiryComplete(_) => self.out_events.push_back(HostEvent::InquiryDone),
+            E::RemoteNameRequestComplete(r) => {
+                let peer = Peer::from_hci(r.bd_addr, hci::AddressType::PublicDeviceAddress);
+                let name = (r.status == hci::ErrorCode::Success)
+                    .then(|| {
+                        let end = r.remote_name.iter().position(|&b| b == 0).unwrap_or(r.remote_name.len());
+                        String::from_utf8_lossy(&r.remote_name[..end]).trim().to_string()
+                    })
+                    .filter(|n| !n.is_empty());
+                self.out_events.push_back(HostEvent::RemoteName { peer, name });
+            }
             E::LinkKeyRequest(r) => {
                 let key = self.classic_conn(r.bd_addr).and_then(|h| self.conns[&h].classic.as_ref()).and_then(|s| s.key);
                 match key {

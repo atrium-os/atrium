@@ -7,7 +7,8 @@
 # connect with the stored bond, forget after asking. Three peers, one per
 # prompt: a number to compare, a code Settings shows (the peer types it), a
 # code the peer shows (typed into Settings); and a Classic-only keyboard
-# found by inquiry. Ends "curia-bt: N failed".
+# found by inquiry (named in its answer, or asked). Each run also turns
+# Bluetooth off (the link drops) and on. Ends "curia-bt: N failed".
 #
 #   sh scripts/curia-bt-check.sh
 #
@@ -40,7 +41,7 @@ i=0; until [ -S "$work/hci.sock" ]; do i=$((i+1)); [ $i -gt 100 ] && { cat "$wor
 fails=0
 run() { # name peer-iocap [user to drive as [peer mode]]
     name=$1 iocap=$2 as=${3:-} mode=${4:-} pname=CuriaPeer
-    [ "$mode" = classic ] && pname=CuriaKeys
+    [ -n "$mode" ] && pname=CuriaKeys
     rm -f "$work/passkey"; : >"$work/peer.log"
     "$venv/bin/python" "$H/peer_advertiser.py" "tcp-client:127.0.0.1:$port" "$pname" 90 "$iocap" "$work/passkey" $mode >"$work/peer.log" 2>&1 &
     peer_pid=$!
@@ -98,4 +99,6 @@ run "a code the device shows, typed into Settings" display
 # A Classic keyboard: found by inquiry (no LE advertising), paired over
 # BR/EDR.
 run "a Classic keyboard found by inquiry, a code it types" keyboard "" classic
+# One that leaves its name out of the inquiry answer: asked for it.
+run "a Classic keyboard that is asked its name" display-yes-no "" classic-unnamed
 echo "curia-bt: $fails failed"

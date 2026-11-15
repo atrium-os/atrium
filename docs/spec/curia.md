@@ -359,8 +359,13 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   manifest holds `bluetooth-control = true`, read on each connection, as choragusd does for
   `audio-control`; `--control-uid` stays for stock FreeBSD. vinculumd still uses no Atrium
   crate.
-- Not yet: power on/off and per-device profiles wait for vinculumd to offer them. Names
-  of Classic devices come from their inquiry response only (no remote name request yet).
+- Names and power (added the same day): a Classic device whose inquiry answer has no
+  name is asked for it (Remote Name Request, one at a time with the inquiry paused), and
+  its row is named when the answer comes. Turn off / Turn on on the adapter card
+  (vinculumd `Power`): off drops every link, stops the search, and nothing pages,
+  reconnects or is let in; Find devices, Pair and Connect are gone until it is on.
+  vinculumd keeps "off" across restarts with `--power-file PATH`.
+- Not yet: per-device profiles wait for vinculumd to offer them.
 - Live check on the Linux host, 2026-11-15 (`scripts/curia-bt-check.sh`): Rootcanal,
   vinculum-hci, vinculumd with its control socket, and a Bumble peer; the page model
   (`curia/examples/bt_drive.rs`) finds the peer, pairs it answering the prompt as the
@@ -372,6 +377,8 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   the same uid named as an app without `bluetooth-control` is refused; and a Classic-only
   keyboard (no LE advertising, Class of Device keyboard) found by inquiry, paired over
   BR/EDR with the code it types (Rootcanal always gives 000000), reconnected and
-  forgotten: 0 failed. The drawn page is checked by the host render test; no VM run, as
+  forgotten; and one that leaves its name out, asked for it. Each run also turns Bluetooth
+  off (the device drops, Connect is not offered) and on, and connects again: 0 failed.
+  `vinculum-ctl power off`, a restart and `status` show off kept. The drawn page is checked by the host render test; no VM run, as
   the cloud VM has no Bluetooth controller.
 

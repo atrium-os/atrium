@@ -166,6 +166,15 @@ fn main() {
             let mut c = Conn::open(&socket, false);
             println!("{:?}", c.call(Request::Status));
         }
+        Some("power") => {
+            let on = match args.get(1).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => die("power on|off"),
+            };
+            let mut c = Conn::open(&socket, false);
+            c.ok(Request::Power { on });
+        }
         Some("devices") => {
             let mut c = Conn::open(&socket, false);
             if let Event::Devices { devices } = c.call(Request::Devices) {
@@ -265,6 +274,6 @@ fn main() {
                 }
             }
         }
-        _ => die("usage: vinculum-ctl [-s SOCKET] status|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|agent [--yes]"),
+        _ => die("usage: vinculum-ctl [-s SOCKET] status|power on|off|devices|scan [SECS]|pair NAME|ADDR [--classic] [--yes]|connect|disconnect|remove ADDR|agent [--yes]"),
     }
 }

@@ -88,6 +88,11 @@ pub enum Request {
     /// `Pair` for a Classic (BR/EDR) device, paged by address: Classic
     /// devices are not found by an LE scan.
     PairClassic { address: Addr },
+    /// Bluetooth on or off. Off: every link is dropped, nothing scans,
+    /// pages or is let in, and requests that would use the radio are
+    /// refused, until it is turned on again; kept across restarts when
+    /// vinculumd has a state file.
+    Power { on: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +122,8 @@ pub struct DeviceInfo {
 pub enum Event {
     Ok,
     Error { why: String },
-    Status { ready: bool, address: Option<Addr>, scanning: bool, pairable: bool, agents: u32, connections: u32 },
+    /// `powered`: Bluetooth is on (`Power`).
+    Status { ready: bool, powered: bool, address: Option<Addr>, scanning: bool, pairable: bool, agents: u32, connections: u32 },
     /// A device the scan saw. `class_of_device` is set for a Classic
     /// (BR/EDR) device found by inquiry, to pair with `PairClassic`; it is
     /// `None` for an LE advertiser (`Pair`).

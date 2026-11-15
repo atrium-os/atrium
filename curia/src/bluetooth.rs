@@ -12,6 +12,8 @@ use vinculum_control::{Addr, DeviceInfo, Event, Prompt, Request};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     pub ready: bool,
+    /// Bluetooth is turned on (vinculumd `Power`).
+    pub powered: bool,
     pub address: Option<Addr>,
     pub scanning: bool,
     pub pairable: bool,
@@ -132,10 +134,38 @@ impl BtPage {
         matches!(self.link, Some(Ok(()))) && self.status.as_ref().is_some_and(|s| s.ready)
     }
 
+    /// Ready and turned on: the radio may be used.
+    pub fn on(&self) -> bool {
+        self.ready() && self.status.as_ref().is_some_and(|s| s.powered)
+    }
+
+    /// Turn Bluetooth on or off. Off drops every connection and stops a
+    /// search; the paired list stays.
+    pub fn power(&mut self, on: bool) {
+        if !self.ready() || self.status.as_ref().is_some_and(|s| s.powered == on) {
+            return;
+        }
+        if let Some(s) = &mut self.status {
+            s.powered = on;
+            if !on {
+                s.scanning = false;
+            }
+        }
+        if !on {
+            self.found.clear();
+            self.pairing = None;
+            self.prompt = None;
+        }
+        self.note = None;
+        self.ask(Request::Power { on });
+        self.ask(Request::Status);
+        self.ask(Request::Devices);
+    }
+
     fn ask(&mut self, r: Request) {
         if matches!(self.link, Some(Ok(()))) {
             self.asked.push_back(match r {
-                Request::Pair { address } => Asked::Pair(address),
+                Request::Pair { address } | Request::PairClassic { address } => Asked::Pair(address),
                 _ => Asked::Other,
             });
             self.wants.push(r);
@@ -182,9 +212,9 @@ impl BtPage {
                 }
                 self.note = Some(why);
             }
-            Event::Status { ready, address, scanning, pairable, .. } => {
+            Event::Status { ready, powered, address, scanning, pairable, .. } => {
                 self.asked.pop_front();
-                self.status = Some(Status { ready, address, scanning, pairable });
+                self.status = Some(Status { ready, powered, address, scanning, pairable });
                 if !scanning {
                     self.found.retain(|f| Some(f.address) == self.pairing);
                 }
@@ -244,7 +274,7 @@ impl BtPage {
     }
 
     pub fn toggle_scan(&mut self) {
-        let Some(on) = self.status.as_ref().filter(|s| s.ready).map(|s| !s.scanning) else { return };
+        let Some(on) = self.status.as_ref().filter(|s| s.ready && s.powered).map(|s| !s.scanning) else { return };
         if let Some(s) = &mut self.status {
             s.scanning = on;
         }
@@ -256,7 +286,7 @@ impl BtPage {
     }
 
     pub fn pair(&mut self, a: Addr) {
-        if !self.ready() || self.pairing.is_some() || self.bonded(&a) {
+        if !self.on() || self.pairing.is_some() || self.bonded(&a) {
             return;
         }
         self.pairing = Some(a);
@@ -298,7 +328,7 @@ impl BtPage {
     }
 
     pub fn connect(&mut self, a: Addr) {
-        if self.ready() && self.bonded(&a) {
+        if self.on() && self.bonded(&a) {
             self.ask(Request::Connect { address: a });
         }
     }
@@ -345,9 +375,26 @@ mod tests {
         p.connected();
         assert_eq!(p.take_wants(), vec![Request::Status, Request::Devices]);
         p.apply(Event::Ok); // Hello
-        p.apply(Event::Status { ready: true, address: Some(a(0)), scanning: false, pairable: false, agents: 1, connections: 0 });
+        p.apply(Event::Status { ready: true, powered: true, address: Some(a(0)), scanning: false, pairable: false, agents: 1, connections: 0 });
         p.apply(Event::Devices { devices: vec![dev(1, false)] });
         p
+    }
+
+    #[test]
+    fn turning_bluetooth_off_and_on() {
+        let mut p = page();
+        p.toggle_scan();
+        p.take_wants();
+        p.apply(Event::Found { address: a(4), name: Some("Keys".into()), rssi: -50, class_of_device: None });
+        p.power(false);
+        assert_eq!(p.take_wants(), vec![Request::Power { on: false }, Request::Status, Request::Devices]);
+        assert!(p.found.is_empty() && !p.on());
+        p.pair(a(4));
+        p.toggle_scan();
+        assert!(p.take_wants().is_empty(), "nothing uses the radio while off");
+        p.power(true);
+        assert_eq!(p.take_wants(), vec![Request::Power { on: true }, Request::Status, Request::Devices]);
+        assert!(p.on());
     }
 
     #[test]
@@ -356,7 +403,7 @@ mod tests {
         p.toggle_scan();
         assert_eq!(p.take_wants(), vec![Request::Scan { on: true }, Request::Status]);
         p.apply(Event::Ok);
-        p.apply(Event::Status { ready: true, address: None, scanning: true, pairable: false, agents: 1, connections: 0 });
+        p.apply(Event::Status { ready: true, powered: true, address: None, scanning: true, pairable: false, agents: 1, connections: 0 });
         p.apply(Event::Found { address: a(1), name: Some("Dev1".into()), rssi: -40, class_of_device: None });
         p.apply(Event::Found { address: a(2), name: None, rssi: -80, class_of_device: None });
         p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -50, class_of_device: None });

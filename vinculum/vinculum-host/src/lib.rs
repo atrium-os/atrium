@@ -114,6 +114,9 @@ pub enum HostEvent {
     InquiryResult { peer: Peer, rssi: Option<i8>, name: Option<String>, class_of_device: u32 },
     /// The inquiry ended (its time ran out, or it was cancelled).
     InquiryDone,
+    /// The answer to `remote_name`: the device's name, or `None` if it did
+    /// not answer (a failed request comes as `CommandFailed` instead).
+    RemoteName { peer: Peer, name: Option<String> },
     Connected { handle: u16, peer: Peer, transport: Transport, central: bool },
     ConnectFailed { peer: Option<Peer>, status: String },
     Disconnected { handle: u16, reason: String },
@@ -219,11 +222,13 @@ pub struct Host {
     stats: Stats,
 }
 
-/// Event mask: the spec default plus Encryption Key Refresh (bit 47), the
+/// Event mask: the spec default (bits 0–44, which hold Inquiry Result with
+/// RSSI and Remote Name Request Complete) plus Extended Inquiry Result
+/// (bit 46, the name in an inquiry answer), Encryption Key Refresh (bit 47), the
 /// Secure Simple Pairing events (IO Capability Request/Response, User
 /// Confirmation/Passkey Request, Remote OOB, Simple Pairing Complete: bits
 /// 48–53; User Passkey Notification: bit 58) and LE Meta (bit 61).
-const EVENT_MASK: u64 = 0x0000_1FFF_FFFF_FFFF | (1 << 47) | (0x3F << 48) | (1 << 58) | (1 << 61);
+const EVENT_MASK: u64 = 0x0000_1FFF_FFFF_FFFF | (1 << 46) | (1 << 47) | (0x3F << 48) | (1 << 58) | (1 << 61);
 /// LE event mask: connection complete, advertising report, connection
 /// update, remote features, LTK request, remote connection parameter request,
 /// data length change, enhanced connection complete, extended advertising
@@ -375,6 +380,23 @@ impl Host {
         } else {
             self.issue(to_cmd(hci::InquiryCancel {}), Tag::Policy);
         }
+        self.pump(now_ms);
+    }
+
+    /// Ask a Classic device found by inquiry for its name (it pages the
+    /// device briefly; no connection is kept). The answer arrives as
+    /// `RemoteName`. Ask one at a time, with no inquiry running.
+    pub fn remote_name(&mut self, peer: Peer, now_ms: u64) {
+        let (bd_addr, _) = peer.to_hci();
+        self.issue(
+            to_cmd(hci::RemoteNameRequest {
+                bd_addr,
+                page_scan_repetition_mode: hci::PageScanRepetitionMode::R1,
+                clock_offset: 0,
+                clock_offset_valid: hci::ClockOffsetValid::Invalid,
+            }),
+            Tag::User,
+        );
         self.pump(now_ms);
     }
 

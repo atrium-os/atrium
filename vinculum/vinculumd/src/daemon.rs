@@ -12,7 +12,7 @@
 //! that sends a malformed message, or can't keep up with its events, is
 //! dropped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -58,6 +58,9 @@ pub struct Config {
     /// it beyond our own (`_tactus`).
     pub hid_path: Option<String>,
     pub hid_uids: Vec<u32>,
+    /// Where Bluetooth being off is kept across restarts (the file holds
+    /// `off`); without one, vinculumd starts on.
+    pub power_file: Option<String>,
 }
 
 struct Daemon {
@@ -74,6 +77,15 @@ struct Daemon {
     user_scan: bool,
     /// A Classic inquiry is running (alongside a user's scan only).
     inquiring: bool,
+    /// Bluetooth is turned off (`Request::Power`).
+    off: bool,
+    /// Classic devices found without a name, to ask for one (one at a
+    /// time, with the inquiry paused); those asked this scan; the one
+    /// being asked; what inquiry heard of each (signal, Class of Device).
+    names_wanted: VecDeque<Addr>,
+    names_asked: HashSet<Addr>,
+    naming: Option<Addr>,
+    inquired: HashMap<Addr, (i8, u32)>,
     /// Our LE connection attempt in flight, and when we give up on it.
     le_connecting: Option<(Addr, Option<u64>)>,
     /// A device the user asked to pair, waiting for its connection.
@@ -193,7 +205,7 @@ impl Daemon {
     /// Page scan while there are Classic bonds, so they can reconnect.
     fn update_page_scan(&mut self) {
         if self.host.is_ready() && self.hid.enabled() {
-            let on = self.bonds.iter().any(|(_, b)| b.classic);
+            let on = !self.off && self.bonds.iter().any(|(_, b)| b.classic);
             let now = self.now();
             self.host.page_scan(on, now);
         }
@@ -233,16 +245,27 @@ impl Daemon {
             }
             Request::Status => Event::Status {
                 ready: self.host.is_ready(),
+                powered: !self.off,
                 address: self.host.info().address.map(|a| Addr { bytes: a, random: false }),
                 scanning: self.user_scan,
                 pairable: self.pairable.is_open(now),
                 agents: self.agents() as u32,
                 connections: self.conns.len() as u32,
             },
+            Request::Power { on } => self.power(on),
             Request::Scan { on } => {
                 if !self.host.is_ready() {
                     Event::Error { why: "controller not ready".into() }
+                } else if on && self.off {
+                    Event::Error { why: "Bluetooth is off".into() }
                 } else {
+                    if on && !self.user_scan {
+                        // A new scan asks unnamed devices again.
+                        self.names_asked.clear();
+                    }
+                    if !on {
+                        self.names_wanted.clear();
+                    }
                     self.user_scan = on;
                     self.update_scan();
                     Event::Ok
@@ -251,7 +274,9 @@ impl Daemon {
             Request::Pair { address } => self.req_pair(address, false),
             Request::PairClassic { address } => self.req_pair(address, true),
             Request::Connect { address } => {
-                if self.bond_for(address).is_none() {
+                if self.off {
+                    Event::Error { why: "Bluetooth is off".into() }
+                } else if self.bond_for(address).is_none() {
                     Event::Error { why: "not a bonded device; pair it first".into() }
                 } else if self.handle_of(address).is_some() {
                     Event::Ok
@@ -341,7 +366,7 @@ impl Daemon {
     }
 
     fn update_scan(&mut self) {
-        let want = self.host.is_ready() && self.le_connecting.is_none() && (self.user_scan || self.background_scan_wanted());
+        let want = self.host.is_ready() && !self.off && self.le_connecting.is_none() && (self.user_scan || self.background_scan_wanted());
         if want != self.scanning {
             let now = self.now();
             self.host.le_scan(want, now);
@@ -353,13 +378,23 @@ impl Daemon {
     /// A user's scan also asks for Classic devices (keyboards, headsets),
     /// except while a pairing waits for its connection: paging and inquiry
     /// share the radio. We only ask; we stay undiscoverable (§7).
+    /// Names come first: a device found without one is asked (Remote Name
+    /// Request) with the inquiry paused, then the inquiry goes on.
     fn update_inquiry(&mut self) {
-        let want = self.host.is_ready() && self.user_scan && self.pending_pair.is_none();
+        let free = self.host.is_ready() && !self.off && self.user_scan && self.pending_pair.is_none() && self.naming.is_none();
+        let want = free && self.names_wanted.is_empty();
         if want != self.inquiring {
             let now = self.now();
             self.host.inquiry(want, now);
             // A cancelled inquiry sends no Inquiry Complete.
             self.inquiring = want;
+        }
+        if free && !self.inquiring {
+            if let Some(a) = self.names_wanted.pop_front() {
+                self.naming = Some(a);
+                let now = self.now();
+                self.host.remote_name(peer(a), now);
+            }
         }
     }
 
@@ -376,7 +411,41 @@ impl Daemon {
         self.update_scan();
     }
 
+    /// Bluetooth on or off (`Request::Power`); kept in the state file.
+    fn power(&mut self, on: bool) -> Event {
+        if let Some(path) = &self.cfg.power_file {
+            let r = if on { std::fs::remove_file(path).or_else(|e| if e.kind() == ErrorKind::NotFound { Ok(()) } else { Err(e) }) } else { std::fs::write(path, "off\n") };
+            if let Err(e) = r {
+                return Event::Error { why: format!("can't keep the setting: {e}") };
+            }
+        }
+        if self.off == !on {
+            return Event::Ok;
+        }
+        self.off = !on;
+        eprintln!("vinculumd: Bluetooth turned {}", if on { "on" } else { "off" });
+        let now = self.now();
+        if self.off {
+            self.user_scan = false;
+            self.names_wanted.clear();
+            self.pending_pair = None;
+            if self.le_connecting.take().is_some() {
+                self.host.le_connect_cancel(now);
+            }
+            let handles: Vec<u16> = self.conns.keys().copied().collect();
+            for h in handles {
+                self.host.disconnect(h, now);
+            }
+        }
+        self.update_scan();
+        self.update_page_scan();
+        Event::Ok
+    }
+
     fn req_pair(&mut self, address: Addr, classic: bool) -> Event {
+        if self.off {
+            return Event::Error { why: "Bluetooth is off".into() };
+        }
         if self.agents() == 0 {
             return Event::Error { why: "no pairing agent: open the pairing UI".into() };
         }
@@ -435,7 +504,7 @@ impl Daemon {
                 }
                 // A bonded LE device that is away, advertising: reconnect.
                 let away = self.bond_for(a).is_some_and(|k| !self.bonds[k].1.classic) && self.handle_of(a).is_none();
-                if away && self.le_connecting.is_none() && self.pending_pair.is_none() && self.hid.enabled() {
+                if away && !self.off && self.le_connecting.is_none() && self.pending_pair.is_none() && self.hid.enabled() {
                     self.le_connect(a);
                 }
             }
@@ -497,6 +566,12 @@ impl Daemon {
                 if cid == vinculum_gatt::ATT_CID {
                     self.hid.on_att(&mut self.host, handle, &payload, now);
                 }
+            }
+            HostEvent::CommandFailed { op, status } if op.contains("RemoteNameRequest") => {
+                // The device stays unnamed; the inquiry goes on.
+                eprintln!("vinculumd: {op} failed: {status}");
+                self.naming = None;
+                self.update_inquiry();
             }
             HostEvent::CommandFailed { op, status } => {
                 eprintln!("vinculumd: {op} failed: {status}");
@@ -591,7 +666,7 @@ impl Daemon {
                 // A Classic device paging us: only bonded devices get a
                 // link, and it is authenticated by us before use (§7).
                 let bonded = self.bond_for(addr(p)).is_some_and(|k| self.bonds[k].1.classic);
-                if bonded {
+                if bonded && !self.off {
                     self.paged_by.insert(addr(p));
                     self.host.accept_connection(p, now);
                 } else {
@@ -605,8 +680,27 @@ impl Daemon {
                 }
                 if self.user_scan {
                     let name = name.or_else(|| self.names.get(&a).cloned());
-                    self.broadcast(&Event::Found { address: a, name, rssi: rssi.unwrap_or(-127), class_of_device: Some(class_of_device) });
+                    let rssi = rssi.unwrap_or(-127);
+                    self.inquired.insert(a, (rssi, class_of_device));
+                    if name.is_none() && self.names_asked.len() < 64 && self.names_asked.insert(a) {
+                        self.names_wanted.push_back(a);
+                        self.update_inquiry();
+                    }
+                    self.broadcast(&Event::Found { address: a, name, rssi, class_of_device: Some(class_of_device) });
                 }
+            }
+            HostEvent::RemoteName { peer, name } => {
+                let a = addr(peer);
+                if self.naming == Some(a) {
+                    self.naming = None;
+                }
+                if let Some(n) = name {
+                    self.names.insert(a, n.clone());
+                    if let (true, Some(&(rssi, class))) = (self.user_scan, self.inquired.get(&a)) {
+                        self.broadcast(&Event::Found { address: a, name: Some(n), rssi, class_of_device: Some(class) });
+                    }
+                }
+                self.update_inquiry();
             }
             HostEvent::InquiryDone => {
                 // Its time ran out: ask again while the scan is on.
@@ -692,6 +786,10 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         host.register_psm(hid::PSM_CONTROL);
         host.register_psm(hid::PSM_INTERRUPT);
     }
+    let off = cfg.power_file.as_deref().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|t| t.trim() == "off");
+    if off {
+        eprintln!("vinculumd: Bluetooth is off (kept in the state file)");
+    }
     let mut d = Daemon {
         cfg,
         host,
@@ -702,6 +800,11 @@ pub fn run(cfg: Config, mut link: Link, store: Box<dyn KeyStore>, bonds: Vec<(Id
         scanning: false,
         user_scan: false,
         inquiring: false,
+        off,
+        names_wanted: VecDeque::new(),
+        names_asked: HashSet::new(),
+        naming: None,
+        inquired: HashMap::new(),
         le_connecting: None,
         pending_pair: None,
         conns: HashMap::new(),

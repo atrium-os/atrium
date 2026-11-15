@@ -11,7 +11,7 @@
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
 //!           [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR]
-//! vinculumd --transport ... --control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [key store]
+//! vinculumd --transport ... --control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [key store]
 //! ```
 //!
 //! With `--control` it runs as the service: the `bluetooth-control` socket
@@ -116,6 +116,7 @@ struct Opts {
     control: Option<String>,
     control_uids: Vec<u32>,
     control_apps: Option<(String, String)>,
+    power_file: Option<String>,
     hid: Option<String>,
     hid_uids: Vec<u32>,
     classic: Option<vinculum_control::Addr>,
@@ -123,7 +124,7 @@ struct Opts {
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--hid PATH [--hid-uid UID]...]]");
+        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]]");
         std::process::exit(2)
     };
     let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
@@ -135,6 +136,7 @@ fn opts() -> Opts {
         control: None,
         control_uids: Vec::new(),
         control_apps: None,
+        power_file: None,
         hid: None,
         hid_uids: Vec::new(),
         classic: None,
@@ -162,6 +164,7 @@ fn opts() -> Opts {
                 let d = a.next().unwrap_or_else(|| usage());
                 o.control_apps = Some((r, d));
             }
+            "--power-file" => o.power_file = Some(a.next().unwrap_or_else(|| usage())),
             "--control-uid" => o.control_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--timeout" => o.timeout_secs = a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             _ => usage(),
@@ -230,7 +233,7 @@ fn main() {
         std::process::exit(1)
     });
     if let Some(path) = o.control.clone() {
-        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone() };
+        let cfg = daemon::Config { control_path: path, allowed_uids: o.control_uids.clone(), allowed_apps: o.control_apps.clone(), io_cap: IoCap::KeyboardDisplay, irk: [0x5C; 16], hid_path: o.hid.clone(), hid_uids: o.hid_uids.clone(), power_file: o.power_file.clone() };
         daemon::run(cfg, link, store, bonds);
     }
     let t0 = Instant::now();
@@ -287,7 +290,7 @@ fn main() {
                     }
                 }
                 // The probe never asks for an inquiry.
-                HostEvent::InquiryResult { .. } | HostEvent::InquiryDone => {}
+                HostEvent::InquiryResult { .. } | HostEvent::InquiryDone | HostEvent::RemoteName { .. } => {}
                 HostEvent::Fatal(why) => {
                     eprintln!("vinculumd: controller unusable: {why} ({:?})", host.stats());
                     std::process::exit(1);

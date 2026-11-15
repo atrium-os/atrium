@@ -935,18 +935,28 @@ impl CuriaView {
             }
             _ => {}
         }
-        let st = p.status.clone().unwrap_or(bt::Status { ready: false, address: None, scanning: false, pairable: false });
-        let sub = match (&st.address, st.ready) {
-            (_, false) => "The Bluetooth adapter is starting or not plugged in".to_string(),
-            (Some(a), true) => format!("This computer is {a}"),
-            (None, true) => "Ready".to_string(),
+        let st = p.status.clone().unwrap_or(bt::Status { ready: false, powered: false, address: None, scanning: false, pairable: false });
+        let (head, sub) = match (&st.address, st.ready, st.powered) {
+            (_, false, _) => ("Bluetooth is not ready", "The Bluetooth adapter is starting or not plugged in".to_string()),
+            (_, true, false) => ("Bluetooth is off", "Paired devices can't connect until it is on".to_string()),
+            (Some(a), true, true) => ("Bluetooth is on", format!("This computer is {a}")),
+            (None, true, true) => ("Bluetooth is on", "Ready".to_string()),
         };
-        card(ctx, y, if st.ready { ph::BLUETOOTH } else { ph::BLUETOOTH_SLASH }, if st.ready { "Bluetooth is on" } else { "Bluetooth is not ready" }, &sub);
+        let on = st.ready && st.powered;
+        card(ctx, y, if on { ph::BLUETOOTH } else { ph::BLUETOOTH_SLASH }, head, &sub);
         if st.ready {
-            let l = if st.scanning { "Stop looking" } else { "Find devices" };
-            let bw = width(l, type_size::SM, Weight::Medium) + em(24.0);
-            let pg = self.bt.clone();
-            button(ctx, x0 + pw - bw - em(16.0), y + em(17.0), l, if st.scanning { Look::Secondary } else { Look::Primary }, true, move || with_bt(&pg, BtPage::toggle_scan));
+            // Right to left: Turn off/on, then Find devices while on.
+            let mut bx = x0 + pw - em(16.0);
+            let pl = if st.powered { "Turn off" } else { "Turn on" };
+            bx -= width(pl, type_size::SM, Weight::Medium) + em(24.0);
+            let (pg, want) = (self.bt.clone(), !st.powered);
+            button(ctx, bx, y + em(17.0), pl, if st.powered { Look::Ghost } else { Look::Primary }, true, move || with_bt(&pg, |b| b.power(want)));
+            if on {
+                let l = if st.scanning { "Stop looking" } else { "Find devices" };
+                bx -= width(l, type_size::SM, Weight::Medium) + em(32.0);
+                let pg = self.bt.clone();
+                button(ctx, bx, y + em(17.0), l, if st.scanning { Look::Secondary } else { Look::Primary }, true, move || with_bt(&pg, BtPage::toggle_scan));
+            }
         }
         y += em(76.0);
         let name_of = |a: &vinculum_control::Addr| {
@@ -1048,7 +1058,7 @@ impl CuriaView {
                             if d.connected {
                                 items.push(("Disconnect".into(), Look::Secondary, true, Box::new(move || with_bt(&pg, |b| b.disconnect(a)))));
                             } else {
-                                items.push(("Connect".into(), Look::Secondary, st.ready, Box::new(move || with_bt(&pg, |b| b.connect(a)))));
+                                items.push(("Connect".into(), Look::Secondary, on, Box::new(move || with_bt(&pg, |b| b.connect(a)))));
                             }
                         }
                         buttons(ctx, y, items);
@@ -1079,7 +1089,7 @@ impl CuriaView {
                     row(ctx, y, &bt::label(f.name.as_deref(), &a), &bt::found_line(f));
                     let pg = self.bt.clone();
                     let busy = p.pairing == Some(a);
-                    buttons(ctx, y, vec![(if busy { "Pairing…".into() } else { "Pair".into() }, Look::Primary, !busy && p.pairing.is_none() && st.ready, Box::new(move || with_bt(&pg, |b| b.pair(a))))]);
+                    buttons(ctx, y, vec![(if busy { "Pairing…".into() } else { "Pair".into() }, Look::Primary, !busy && p.pairing.is_none() && on, Box::new(move || with_bt(&pg, |b| b.pair(a))))]);
                     y += em(60.0);
                 }
             }
@@ -1212,14 +1222,14 @@ mod tests {
         with_bt(&v.bt, |p| {
             p.connected();
             p.apply(Event::Ok);
-            p.apply(Event::Status { ready: true, address: Some(Addr { bytes: [0, 0x1B, 0xDC, 1, 2, 3], random: false }), scanning: true, pairable: true, agents: 1, connections: 1 });
+            p.apply(Event::Status { ready: true, powered: true, address: Some(Addr { bytes: [0, 0x1B, 0xDC, 1, 2, 3], random: false }), scanning: true, pairable: true, agents: 1, connections: 1 });
             p.apply(Event::Devices { devices: vec![DeviceInfo { address: a(1), identity: None, name: "Keys".into(), authenticated: true, secure_connections: true, keyboard_allowed: true, connected: true }] });
             p.apply(Event::Found { address: a(2), name: Some("Mouse".into()), rssi: -70, class_of_device: None });
             p.pair(a(2));
             p.apply(Event::Prompt { address: a(2), prompt: vinculum_control::Prompt::Confirm { number: Some(42) } });
         });
         let all = texts(&v);
-        for want in ["Bluetooth", "Bluetooth is on", "This computer is 00:1B:DC:01:02:03", "Stop looking", "Does Mouse show 000 042?", "Pair only if the numbers match.", "Pair", "Cancel", "Paired devices", "Keys", "Connected", "Disconnect", "Forget", "Devices nearby", "Mouse", "Good signal", "Pairing…"] {
+        for want in ["Bluetooth", "Bluetooth is on", "This computer is 00:1B:DC:01:02:03", "Stop looking", "Turn off", "Does Mouse show 000 042?", "Pair only if the numbers match.", "Pair", "Cancel", "Paired devices", "Keys", "Connected", "Disconnect", "Forget", "Devices nearby", "Mouse", "Good signal", "Pairing…"] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
         }
     }

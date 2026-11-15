@@ -499,8 +499,11 @@ launch registry names as an app whose installed manifest holds `bluetooth-contro
 (both read per connection; `vinculumd/src/apps.rs`, no Atrium crate). A user's scan
 (`Scan { on: true }`) runs a Classic inquiry beside the LE scan, restarted each time it
 ends and paused while a pairing pages its device; `Found` carries the Class of Device
-for inquiry results, which pair with `PairClassic`. We only ask: vinculumd never enables
-inquiry scan, so it stays undiscoverable (§7).
+for inquiry results, which pair with `PairClassic`. A result with no name is asked for it
+(Remote Name Request, one at a time with the inquiry paused). We only ask: vinculumd never
+enables inquiry scan, so it stays undiscoverable (§7). `Power { on }` turns Bluetooth off
+or on: off drops every link and refuses scans, pairing, connects and incoming pages until
+it is on again, and `--power-file PATH` keeps it across restarts (`vinculum-ctl power`).
 
 ## 14. Tests
 

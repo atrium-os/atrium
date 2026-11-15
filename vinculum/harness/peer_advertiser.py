@@ -3,7 +3,7 @@ controller and advertises a name, so the host side (vinculum-probe, later
 vinculumd) has a real device to find. Later peers (keyboard, HOGP mouse,
 A2DP sink, hostile devices) follow the same shape (docs/spec/bluetooth.md §14).
 
-usage: python peer_advertiser.py HCI_TRANSPORT NAME SECONDS [IOCAP [PASSKEY_FILE [classic]]]
+usage: python peer_advertiser.py HCI_TRANSPORT NAME SECONDS [IOCAP [PASSKEY_FILE [classic|classic-unnamed]]]
        e.g. tcp-client:127.0.0.1:6402 VinculumPeer 30 display-yes-no
 
 IOCAP is the peer's pairing I/O capability (none, display, display-yes-no,
@@ -11,7 +11,9 @@ keyboard, keyboard-display); the peer accepts every pairing (B2, §15). A
 keyboard peer types the passkey the host displays, read from PASSKEY_FILE.
 With `classic` the peer is a Classic-only keyboard: it does not advertise
 over LE, but answers inquiry (discoverable, its name in the extended
-inquiry response, Class of Device peripheral/keyboard).
+inquiry response, Class of Device peripheral/keyboard); `classic-unnamed`
+leaves the name out of the inquiry response, so the host must ask for it
+(Remote Name Request).
 """
 import asyncio
 import sys
@@ -67,7 +69,7 @@ async def main(transport: str, name: str, seconds: float, iocap: str, passkey_fi
         # Classic too (page scan, SSP with Secure Connections), so the
         # BR/EDR scenarios can connect to the same peer by address.
         device.classic_enabled = True
-        if mode == "classic":
+        if mode in ("classic", "classic-unnamed"):
             device.class_of_device = 0x002540
         await device.power_on()
         device.keystore = MemoryKeyStore()
@@ -81,7 +83,9 @@ async def main(transport: str, name: str, seconds: float, iocap: str, passkey_fi
             conn.on("pairing_failure", lambda reason: print(f"peer pairing failed: {reason}", flush=True))
             conn.on("connection_encryption_change", lambda *a: print(f"peer encryption {conn.encryption}", flush=True))
 
-        if mode == "classic":
+        if mode in ("classic", "classic-unnamed"):
+            if mode == "classic-unnamed":
+                device.inquiry_response = bytes(240)
             await device.set_discoverable(True)
             print(f"advertising {name!r} (inquiry only)", flush=True)
             await asyncio.sleep(seconds)
