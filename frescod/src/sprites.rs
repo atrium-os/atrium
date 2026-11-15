@@ -58,6 +58,9 @@ pub struct Sprites {
     base: Vec<u32>,
     base_tiles: Option<Vec<u64>>,
     base_key: Option<u64>,
+    /// The window under, packed, while some of its tiles are not rastered.
+    base_frame: Option<fresco_compute::Frame>,
+    base_valid: Vec<bool>,
     content: Vec<Content>,
     shown: Option<Vec<Shown>>,
     draws: u64,
@@ -139,31 +142,31 @@ impl Sprites {
             *self = Sprites { size: (width, height), base: vec![0; n], prewarm: self.prewarm, ..Default::default() };
         }
         let mut damage = [0u32; 4];
-        // The window under the sprites.
+        // The window under the sprites: its changed tiles marked to
+        // raster, which happens below only where they show (an opaque
+        // slide usually covers it all) or ahead while nothing moves.
         let key = scene.base_key(f);
         if self.base_key != Some(key) {
             let (frame, _) = scene.pack_part(f, None, width, height);
             let sig = damage::tile_signatures(&frame);
             let h = &frame.header;
             match &self.base_tiles {
-                Some(held) if held.len() == sig.len() => {
+                Some(held) if held.len() == sig.len() && self.base_valid.len() == sig.len() => {
                     let dirty = damage::dirty(&sig, Some(held));
-                    let tiles = damage::rects(&dirty, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
-                    if !tiles.is_empty() {
-                        t2.render_tiles(&frame, &mut self.base, &tiles).map_err(|e| e.to_string())?;
-                    }
-                    for t in &tiles {
-                        cost.base_tiles += (t[2] - t[0]) * (t[3] - t[1]);
-                        damage = union(damage, [t[0] * TILE, t[1] * TILE, (t[2] * TILE).min(width), (t[3] * TILE).min(height)]);
+                    for (k, d) in dirty.iter().enumerate() {
+                        if *d {
+                            self.base_valid[k] = false;
+                            let (tx, ty) = (k as u32 % h.tiles_x, k as u32 / h.tiles_x);
+                            damage = union(damage, [tx * TILE, ty * TILE, ((tx + 1) * TILE).min(width), ((ty + 1) * TILE).min(height)]);
+                        }
                     }
                 }
                 _ => {
-                    self.base_tiles = None;
-                    t2.render(&frame, &mut self.base).map_err(|e| e.to_string())?;
-                    cost.base_tiles += h.tiles_x * h.tiles_y;
+                    self.base_valid = vec![false; sig.len()];
                     damage = whole;
                 }
             }
+            self.base_frame = Some(frame);
             self.base_tiles = Some(sig);
             self.base_key = Some(key);
         }
@@ -326,6 +329,50 @@ impl Sprites {
         self.shown = Some(shown);
         self.warming = warming;
         let damage = meet(damage, whole);
+        // The window under where it shows (a tile not wholly under an
+        // opaque sprite) and is not rastered yet; the rest of it too while
+        // nothing moves, within the budget left.
+        if let Some(frame) = &self.base_frame {
+            let h = &frame.header;
+            let covers: Vec<[u32; 4]> = f.sprites.iter().zip(self.shown.as_ref().unwrap())
+                .filter(|(s, sh)| s.opaque && s.opacity >= 1.0 && s.scale == 1.0 && !empty(sh.rect))
+                .map(|(_, sh)| sh.rect)
+                .collect();
+            let mut need = vec![false; self.base_valid.len()];
+            let mut any = false;
+            for k in 0..need.len() {
+                if self.base_valid[k] {
+                    continue;
+                }
+                let (tx, ty) = (k as u32 % h.tiles_x, k as u32 / h.tiles_x);
+                let tile = [tx * TILE, ty * TILE, ((tx + 1) * TILE).min(width), ((ty + 1) * TILE).min(height)];
+                let shows = !empty(meet(tile, damage)) && !covers.iter().any(|c| c[0] <= tile[0] && c[1] <= tile[1] && c[2] >= tile[2] && c[3] >= tile[3]);
+                if shows || (!moving && budget > 0) {
+                    if !shows {
+                        budget -= 1;
+                    }
+                    need[k] = true;
+                    any = true;
+                }
+            }
+            if any {
+                let tiles = damage::rects(&need, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
+                t2.render_tiles(frame, &mut self.base, &tiles).map_err(|e| e.to_string())?;
+                for t in &tiles {
+                    cost.base_tiles += (t[2] - t[0]) * (t[3] - t[1]);
+                    for ty in t[1]..t[3].min(h.tiles_y) {
+                        for tx in t[0]..t[2].min(h.tiles_x) {
+                            self.base_valid[(ty * h.tiles_x + tx) as usize] = true;
+                        }
+                    }
+                }
+            }
+            if self.base_valid.iter().all(|&v| v) {
+                self.base_frame = None;
+            } else if !moving {
+                self.warming = true;
+            }
+        }
         if empty(damage) {
             return Ok(None);
         }

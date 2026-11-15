@@ -1791,6 +1791,8 @@ mod tests {
                 sp.draw(&c.t2, &scene, &pw, &mut out, w, h, dx == 0.0, &mut cost).unwrap();
                 if dx == 0.0 {
                     assert_eq!(cost.grabbed > 0, want_taken, "taken: {}", cost.grabbed);
+                    // 48 tiles, 24 of them wholly under the opaque slide.
+                    assert_eq!(cost.base_tiles, 24, "the window under the slide rastered");
                 }
                 assert!(out == full(&s), "dx {dx}, taken {want_taken}: differs from a full raster");
             }
