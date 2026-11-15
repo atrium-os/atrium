@@ -247,6 +247,74 @@ pub fn render(c: &Compose, heap: &[u32]) -> Vec<u32> {
     out
 }
 
+/// [`over`] with `src` scaled by `k` about its (0, 0): dst pixel (x, y)
+/// takes src at ((x + 0.5 - at.0) / k - 0.5, (y + 0.5 - at.1) / k - 0.5),
+/// bilinear (in the surfaces' encoding; a zoom transition's frames, not
+/// exact), transparent past src's edges.
+#[allow(clippy::too_many_arguments)]
+pub fn over_scaled(dst: &mut [u32], dst_pitch: u32, src: &[u32], src_pitch: u32, src_size: (u32, u32), rect: [u32; 4], at: (f32, f32), k: f32, opacity: f32, threads: usize) {
+    let o = if opacity >= 0.0 { opacity.min(1.0) } else { 0.0 };
+    if o <= 0.0 || !(k > 1e-3) {
+        return;
+    }
+    let (sw, sh) = src_size;
+    // Where src lands, clipped.
+    let x0 = (rect[0] as f32).max(at.0).max(0.0) as u32;
+    let y0 = (rect[1] as f32).max(at.1).max(0.0) as u32;
+    let x1 = (rect[2] as f32).min((at.0 + sw as f32 * k).ceil()).max(0.0) as u32;
+    let y1 = (rect[3] as f32).min((at.1 + sh as f32 * k).ceil()).max(0.0) as u32;
+    let dp = dst_pitch as usize;
+    if x0 >= x1 || y0 >= y1 || x1 > dst_pitch || (y1 as usize - 1) * dp + x1 as usize > dst.len() || (src_pitch as usize) < sw as usize || src.len() < (sh as usize).saturating_sub(1) * src_pitch as usize + sw as usize {
+        return;
+    }
+    let t = tables();
+    let sp = src_pitch as usize;
+    let fetch = |x: i64, y: i64| -> u32 {
+        if x < 0 || y < 0 || x >= sw as i64 || y >= sh as i64 { 0 } else { src[y as usize * sp + x as usize] }
+    };
+    let lerp = |a: u32, b: u32, f: u32| -> u32 {
+        // Per byte, f in 0..=256.
+        let mut out = 0;
+        for sh in [0, 8, 16, 24] {
+            let (x, y) = ((a >> sh) & 255, (b >> sh) & 255);
+            out |= ((x * (256 - f) + y * f + 128) >> 8) << sh;
+        }
+        out
+    };
+    let inv = 1.0 / k;
+    let row = |y: u32, d: &mut [u32]| {
+        let fy = (y as f32 + 0.5 - at.1) * inv - 0.5;
+        let (iy, wy) = (fy.floor() as i64, ((fy - fy.floor()) * 256.0) as u32);
+        let mut line = Vec::with_capacity((x1 - x0) as usize);
+        for x in x0..x1 {
+            let fx = (x as f32 + 0.5 - at.0) * inv - 0.5;
+            let (ix, wx) = (fx.floor() as i64, ((fx - fx.floor()) * 256.0) as u32);
+            let top = lerp(fetch(ix, iy), fetch(ix + 1, iy), wx);
+            let bot = lerp(fetch(ix, iy + 1), fetch(ix + 1, iy + 1), wx);
+            line.push(lerp(top, bot, wy));
+        }
+        over_row(&mut d[x0 as usize..x1 as usize], &line, o, t);
+    };
+    let rows = (y1 - y0) as usize;
+    let dst = &mut dst[y0 as usize * dp..];
+    let n = if rows * ((x1 - x0) as usize) < 1 << 15 { 1 } else { threads.clamp(1, rows) };
+    let per = rows.div_ceil(n);
+    std::thread::scope(|s| {
+        for (k, band) in dst.chunks_mut(dp * per).enumerate() {
+            let first = k * per;
+            if first >= rows {
+                break;
+            }
+            let row = &row;
+            s.spawn(move || {
+                for (i, d) in band.chunks_mut(dp).take(rows - first).enumerate() {
+                    row(y0 + (first + i) as u32, d);
+                }
+            });
+        }
+    });
+}
+
 /// Decode and encode tables for [`over`]: the LUT's 256 decode values,
 /// and a 65536-step encode (within one step of [`crate::reference::encode`]).
 struct Tables {
@@ -407,5 +475,17 @@ mod tests {
                 assert_eq!(g >> 24, 255, "an opaque base stays opaque");
             }
         }
+    }
+
+    /// At scale 1 and whole-pixel offsets, `over_scaled` is `over`.
+    #[test]
+    fn over_scaled_at_one_is_over() {
+        let (w, h) = (37u32, 23u32);
+        let src: Vec<u32> = (0..w * h).map(|i| if i % 3 == 0 { 0 } else { 0xff00_0000 | i.wrapping_mul(2654435761) & 0xff_ffff }).collect();
+        let base: Vec<u32> = (0..w * h).map(|i| 0xff00_0000 | i * 77).collect();
+        let (mut a, mut b) = (base.clone(), base.clone());
+        over(&mut a, w, &src, w, (w, h), [0, 0, w, h], (4, 3), 0.75, 2);
+        over_scaled(&mut b, w, &src, w, (w, h), [0, 0, w, h], (4.0, 3.0), 1.0, 0.75, 2);
+        assert!(a == b);
     }
 }

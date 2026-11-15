@@ -39,7 +39,7 @@ pub const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 struct Shown {
     group: u32,
     rect: [u32; 4],
-    state: (u64, [i32; 2], u32, [i32; 4]),
+    state: (u64, [i32; 2], u32, [i32; 4], u32),
 }
 
 /// One window's sprite drawing. Its first drawing (and the first after
@@ -172,16 +172,27 @@ impl Sprites {
             let clip = s.clip.map(|v| v.clamp(0, i32::MAX) as u32);
             let off = [s.offset[0] as i64, s.offset[1] as i64];
             let ox = |v: i64, hi: u32| v.clamp(0, hi as i64) as u32;
-            let placed = [ox(off[0], width), ox(off[1], height), ox(off[0] + width as i64, width), ox(off[1] + height as i64, height)];
+            let k = s.scale as f64;
+            let (ew, eh) = ((width as f64 * k).ceil() as i64, (height as f64 * k).ceil() as i64);
+            let placed = [ox(off[0], width), ox(off[1], height), ox(off[0] + ew, width), ox(off[1] + eh, height)];
             let rect = meet(meet(clip, placed), whole);
             let rect = if empty(rect) || s.opacity <= 0.0 { [0; 4] } else { rect };
             // `rect` in the content's own pixels.
-            let local = [
-                (rect[0] as i64 - off[0]).clamp(0, width as i64) as u32,
-                (rect[1] as i64 - off[1]).clamp(0, height as i64) as u32,
-                (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
-                (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
-            ];
+            let back = |v: u32, o: i64, hi: u32, up: bool| {
+                let l = (v as i64 - o) as f64 / k;
+                (if up { l.ceil() + 1.0 } else { l.floor() - 1.0 }).clamp(0.0, hi as f64) as u32
+            };
+            let local = [back(rect[0], off[0], width, false), back(rect[1], off[1], height, false), back(rect[2], off[0], width, true), back(rect[3], off[1], height, true)];
+            let local = if k == 1.0 {
+                [
+                    (rect[0] as i64 - off[0]).clamp(0, width as i64) as u32,
+                    (rect[1] as i64 - off[1]).clamp(0, height as i64) as u32,
+                    (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
+                    (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
+                ]
+            } else {
+                local
+            };
             let found = self.content.iter().position(|c| c.key == key && c.px.len() == n);
             // Not held: the group's own content changed, drawn again by
             // the tiles whose signatures changed (unless that content is
@@ -224,7 +235,7 @@ impl Sprites {
                     if first && std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
                         eprintln!("frescod: sprite {} new: plain {plain} outgoing {} opaque {} rect {rect:?}", s.group, s.outgoing, s.opaque);
                     }
-                    if plain && first && s.outgoing && s.opaque && !empty(rect) {
+                    if plain && first && s.outgoing && s.opaque && k == 1.0 && !empty(rect) {
                         cost.grabbed += take_from_window(t2, &frame, c, out, width, local, (off[0] as i32, off[1] as i32))?;
                     }
                     c.frame = Some(frame);
@@ -271,7 +282,7 @@ impl Sprites {
                     c.frame = None;
                 }
             }
-            shown.push(Shown { group: s.group, rect, state: (key, s.offset, s.opacity.to_bits(), s.clip) });
+            shown.push(Shown { group: s.group, rect, state: (key, s.offset, s.opacity.to_bits(), s.clip, s.scale.to_bits()) });
         }
         match &self.shown {
             Some(prev) if prev.len() == shown.len() && prev.iter().zip(&shown).all(|(a, b)| a.group == b.group) => {
@@ -301,7 +312,12 @@ impl Sprites {
                 continue;
             }
             let c = &self.content[at];
-            fresco_compute::compose::over(out, width, &c.px, width, (width, height), r, (s.offset[0], s.offset[1]), s.opacity, threads());
+            if s.scale == 1.0 {
+                fresco_compute::compose::over(out, width, &c.px, width, (width, height), r, (s.offset[0], s.offset[1]), s.opacity, threads());
+            } else {
+                let at = (s.offset[0] as f32, s.offset[1] as f32);
+                fresco_compute::compose::over_scaled(out, width, &c.px, width, (width, height), r, at, s.scale, s.opacity, threads());
+            }
         }
         cost.composite += t.elapsed();
         Ok(Some(damage))

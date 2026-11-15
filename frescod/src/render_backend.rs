@@ -1827,7 +1827,7 @@ mod tests {
         let near = |a: &[u32], b: &[u32], tol: u32| a.iter().zip(b).all(|(x, y)| [0, 8, 16, 24].iter().all(|sh| ((x >> sh) & 255).abs_diff((y >> sh) & 255) <= tol));
         let mut sp = crate::sprites::Sprites::default();
         let mut out = vec![0u32; (w * h) as usize];
-        let mut draw = |s: &WindowSceneState, sp: &mut crate::sprites::Sprites, out: &mut Vec<u32>| {
+        let draw = |s: &WindowSceneState, sp: &mut crate::sprites::Sprites, out: &mut Vec<u32>| {
             let keep = sp.keep();
             let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
             assert!(grouped_frame(s, &mut pw, Some(&keep)), "promoted");
@@ -1849,6 +1849,11 @@ mod tests {
         s.anim_now.insert(20, GroupParams { opacity: 0.5, ..b });
         let (_, cost) = draw(&s, &mut sp, &mut out);
         assert_eq!((cost.content_tiles, cost.base_tiles), (0, 0), "rastered as it came in");
+        // Zooming in: composited scaled, nothing rastered.
+        s.anim_now.insert(20, GroupParams { transform: [0.5, 0.0, 0.0, 0.5, 40.0, 32.0], ..b });
+        let (n, cost) = draw(&s, &mut sp, &mut out);
+        assert_eq!(n, 2, "a zoom is a sprite");
+        assert_eq!((cost.content_tiles, cost.base_tiles), (0, 0), "rastered while zooming");
         // Ended: still sprites, nothing rastered, the same pixels.
         s.anim_now.clear();
         let (n, cost) = draw(&s, &mut sp, &mut out);

@@ -82,6 +82,9 @@ pub struct Sprite {
     pub outgoing: bool,
     /// An animation runs on it.
     pub animated: bool,
+    /// Its content is shown at this scale (about `offset`): 1 but while
+    /// an animation scales the group.
+    pub scale: f32,
 }
 
 /// A scroll viewport, for the pixel renderer's shift
@@ -667,7 +670,7 @@ impl SceneState {
             }
         }
         for s in &f.sprites {
-            (s.group, s.range.clone(), s.offset, s.opacity.to_bits(), s.clip).hash(&mut h);
+            (s.group, s.range.clone(), s.offset, s.opacity.to_bits(), s.clip, s.scale.to_bits()).hash(&mut h);
         }
         h.finish()
     }
@@ -975,8 +978,13 @@ fn grouped_frame_but(
             // with a clip (a slide kept resident for the next transition).
             let scroll = g.flags & fresco_protocol::group_flags::SCROLL != 0;
             let anim = state.anim_now.get(&id);
+            // A scale an animation runs is composited (a zoom): the content
+            // stays rastered at the group's own scale.
             let still = |a: &fresco_protocol::GroupParams| {
-                state.group_nodes.get(&id).is_some_and(|b| a.transform[..4] == b.transform[..4])
+                state.group_nodes.get(&id).is_some_and(|b| {
+                    let uniform = |t: &[f32; 6]| t[1] == 0.0 && t[2] == 0.0 && t[0] == t[3] && t[0] > 0.0;
+                    a.transform[..4] == b.transform[..4] || (uniform(&a.transform) && uniform(&b.transform))
+                })
             };
             let sprite = promote.is_some_and(|keep| {
                 !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still) && !deny.contains(&id)
@@ -989,7 +997,8 @@ fn grouped_frame_but(
             }
             if sprite {
                 let t = &g.transform;
-                let inner_x = x.then(&[t[0], t[1], t[2], t[3], 0.0, 0.0]);
+                let own_t = state.group_nodes.get(&id).map_or(*t, |o| o.transform);
+                let inner_x = x.then(&[own_t[0], own_t[1], own_t[2], own_t[3], 0.0, 0.0]);
                 let clip = c.map_or([i32::MIN, i32::MIN, i32::MAX, i32::MAX], |c| c.map(|v| v.round() as i32));
                 let own = state.group_nodes.get(&id);
                 let outgoing = op * g.opacity >= 1.0
@@ -1003,6 +1012,7 @@ fn grouped_frame_but(
                     opaque: false,
                     outgoing,
                     animated: anim.is_some(),
+                    scale: t[0] / own_t[0],
                 }));
                 push_kids(&mut stack, Some(id), At { x: inner_x, op: 1.0, seen: at.seen * g.opacity, clip: None, layers: 0, sprite: true });
                 continue;
@@ -1066,20 +1076,47 @@ fn grouped_frame_but(
             if s.opacity <= 0.0 {
                 bbox = [0.0; 4];
             }
-            covers.push([(bbox[0] + ox).max(c[0]), (bbox[1] + oy).max(c[1]), (bbox[2] + ox).min(c[2]), (bbox[3] + oy).min(c[3])]);
+            let k = s.scale;
+            covers.push([(bbox[0] * k + ox).max(c[0]), (bbox[1] * k + oy).max(c[1]), (bbox[2] * k + ox).min(c[2]), (bbox[3] * k + oy).min(c[3])]);
             // Its own pixels hide the window under it wherever it shows:
             // an opaque, square rect drawn before anything isolated,
             // covering its clip (in its own space, within the window).
-            let local = [c[0] - ox, c[1] - oy, c[2] - ox, c[3] - oy];
+            let k = s.scale;
+            let local = [(c[0] - ox) / k, (c[1] - oy) / k, (c[2] - ox) / k, (c[3] - oy) / k];
             let local = [local[0].max(0.0), local[1].max(0.0), local[2].min(w.size.0 as f32), local[3].min(w.size.1 as f32)];
             s.opaque = order[s.range.clone()]
                 .iter()
                 .take_while(|o| !matches!(o.item, Item::Push(_)))
                 .any(|o| {
-                    let Item::Rect(i) = o.item else { return false };
-                    let Some(r) = w.rects.get(i) else { return false };
-                    let b = meet(Some([r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]]), o.clip).unwrap();
-                    r.color[3] >= 1.0 && r.radius <= 0.0 && b[0] <= local[0] && b[1] <= local[1] && b[2] >= local[2] && b[3] >= local[3]
+                    let covers = |b: [f32; 4]| {
+                        let b = meet(Some(b), o.clip).unwrap();
+                        b[0] <= local[0] && b[1] <= local[1] && b[2] >= local[2] && b[3] >= local[3]
+                    };
+                    match o.item {
+                        Item::Rect(i) => w.rects.get(i).is_some_and(|r| {
+                            r.color[3] >= 1.0 && r.radius <= 0.0 && covers([r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]])
+                        }),
+                        // A slide's background: an opaque axis-aligned
+                        // rectangle path.
+                        Item::Fill(i) => w.fills.get(i).is_some_and(|f| {
+                            let t = f.transform;
+                            let solid = match &f.gradient {
+                                None => f.color[3] >= 1.0,
+                                Some(g) => f.color[3] >= 1.0 && g.stops.iter().all(|(_, c)| c[3] >= 1.0),
+                            };
+                            let (lo, hi) = f.points.iter().fold(([f32::MAX; 2], [f32::MIN; 2]), |(lo, hi), p| {
+                                ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])])
+                            });
+                            let corners = !f.points.is_empty() && f.points.len() <= 5
+                                && f.points.iter().all(|p| (p[0] == lo[0] || p[0] == hi[0]) && (p[1] == lo[1] || p[1] == hi[1]));
+                            let (x0, x1) = (t[0] * lo[0] + t[4], t[0] * hi[0] + t[4]);
+                            let (y0, y1) = (t[3] * lo[1] + t[5], t[3] * hi[1] + t[5]);
+                            let b = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+                            let b = f.clip.map_or(b, |c| [b[0].max(c[0]), b[1].max(c[1]), b[2].min(c[2]), b[3].min(c[3])]);
+                            solid && corners && t[1] == 0.0 && t[2] == 0.0 && covers(b)
+                        }),
+                        _ => false,
+                    }
                 });
         }
         // Whatever is drawn after a sprite and is not a sprite must miss
