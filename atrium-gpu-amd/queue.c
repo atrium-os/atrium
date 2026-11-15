@@ -403,6 +403,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_U64("reaped", reaped, "deferred BO frees completed");
 	AMD_ISO_U64("hangs", hangs, "queues the hang watchdog stopped");
 	AMD_ISO_U64("vm_faults", vm_faults, "GPU VM fault interrupts");
+	AMD_ISO_U64("dummy_dirty", dummy_dirty,
+	    "fault default page scrubs that found it written");
 	AMD_ISO_U64("fences_failed", fences_failed,
 	    "owed completions failed with EIO (queue stopped or reset)");
 	AMD_ISO_U64("quota_refused", quota_refused,

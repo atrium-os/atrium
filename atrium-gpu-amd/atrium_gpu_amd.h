@@ -712,6 +712,7 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 hangs;		/* queues the watchdog stopped */
 	uint64_t	 fences_failed;	/* completions failed with EIO */
 	uint64_t	 vm_faults;	/* VM fault interrupts */
+	uint64_t	 dummy_dirty;	/* scrubs that found the fault page written */
 	uint64_t	 quota_refused;	/* BO_ALLOCs refused with EDQUOT */
 	uint64_t	 cp_errors;	/* CP error IVs: bad opcode, priv reg/instr */
 	uint64_t	 resets_blamed;	/* GPU resets a client queue forced */

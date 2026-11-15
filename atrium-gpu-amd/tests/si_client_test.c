@@ -1899,6 +1899,7 @@ dummy_page(void)
 	struct job w, by;
 	uint32_t first = 0;
 	int cbo = -1, rw, rr, n0, n1, ri0 = -1, ri = -1;
+	int64_t d0, d1;
 
 	job_init(&w);
 	job_init(&by);
@@ -1906,6 +1907,7 @@ dummy_page(void)
 	n0 = dummy_read("17 reader before", &first, &rr);
 	printf("17: before any write: %d/64 pattern words, out[0] %#x (%s)\n",
 	    n0, first, rr == 0 ? "completed" : strerror(rr));
+	d0 = iso("dummy_dirty");
 	rw = dummy_job(&w, "17 writer", siops_fill, sizeof(siops_fill), 0,
 	    DUMMY_VA, DUMMY_PAT | 0x42, &cbo);
 	printf("17: writer's store to the unmapped VA: %s\n", rw == 0 ?
@@ -1913,6 +1915,16 @@ dummy_page(void)
 	if (cbo >= 0)
 		close(cbo);
 	job_close(&w);
+	usleep(200000);		/* the evict task scrubs after the kill */
+	d1 = iso("dummy_dirty");
+	/* The positive control: the writer's faulting stores reached the
+	 * shared fault page (the kernel found it written and zeroed it). */
+	printf("17: fault page scrubs that found it written: +%jd\n",
+	    (intmax_t)(d1 - d0));
+	if (d1 >= 0 && d0 >= 0)
+		check(d1 > d0, "17 dummy page: the writer's faulting stores "
+		    "reach the fault page, and the kernel zeroes it",
+		    "+%jd dirty scrubs", (intmax_t)(d1 - d0));
 	n1 = dummy_read("17 reader after", &first, &rr);
 	(void)preg_read(NULL, &ri);
 	printf("17: reader's load from the unmapped VA: %s; %d/64 pattern "

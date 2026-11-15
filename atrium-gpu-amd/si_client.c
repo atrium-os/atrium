@@ -388,6 +388,7 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 
 static int si_vram_clear(struct atrium_amd_softc *, uint64_t, uint64_t);
 static void si_iv(void *, const uint32_t *);
+static void si_dummy_scrub(struct amd_si_client *);
 
 /*
  * The last rung: a user queue that will not stop (its HQD stuck after a
@@ -552,8 +553,38 @@ si_uq_evict_task(void *arg, int pending __unused)
 			break;
 		}
 		device_printf(sc->dev, "si: uq%u evicted (lost)\n", i);
+		si_dummy_scrub(c);
 	}
 	sx_xunlock(&c->uq_sx);
+}
+
+/*
+ * After a queue lost to a fault: zero the hub's fault default page. Every
+ * VM's faulting accesses go there (one page per hub), so a faulting write
+ * of one VM would otherwise stay readable by another VM's faulting read.
+ * Counted when it was not zero: si-client-test 17's proof that a faulting
+ * write did land there.
+ */
+static void
+si_dummy_scrub(struct amd_si_client *c)
+{
+	struct amd_gart *gt = c->gt;
+	const volatile uint64_t *w;
+	u_int i;
+
+	if (gt == NULL || gt->dummy == NULL)
+		return;
+	w = gt->dummy;
+	for (i = 0; i < PAGE_SIZE / 8; i++)
+		if (w[i] != 0)
+			break;
+	if (i == PAGE_SIZE / 8)
+		return;
+	memset(gt->dummy, 0, PAGE_SIZE);
+	wmb();
+	mtx_lock(&c->sc->lock);
+	c->sc->iso.dummy_dirty++;
+	mtx_unlock(&c->sc->lock);
 }
 
 /*
