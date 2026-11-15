@@ -382,8 +382,9 @@ impl RichTextView {
                 }
                 // Spelling: a red dotted line under each misspelled word, but
                 // not the one being typed.
-                if ed.checker.is_some() {
-                    let page = ed.pages.pages()[i].clone();
+                // (Pages can be empty for a frame while pagination restarts at
+                // the top, e.g. when fields near the start change.)
+                if let (true, Some(page)) = (ed.checker.is_some(), ed.pages.pages().get(i).cloned()) {
                     let red = Color::from_srgb8(0xd0, 0x20, 0x20);
                     let caret = ed.caret;
                     for s in &page.slices {
@@ -730,6 +731,39 @@ mod tests {
         scroll.set(st);
         app.tick();
         assert_eq!(crate::pictures::decodes() - before, 1, "scrolling reuses the decode");
+    }
+
+    #[test]
+    fn contents_inserted_at_the_top_repaginate_without_a_gap() {
+        struct NoWords;
+        impl crate::editor::Checker for NoWords {
+            fn misspelled(&self, _: &str) -> Vec<(u32, u32)> {
+                Vec::new()
+            }
+        }
+        let (mut app, ed, _) = host(3000);
+        {
+            let mut e = ed.borrow_mut();
+            let h1 = e.doc.styles.by_name("Heading 1").unwrap();
+            for b in (0..3000).step_by(50) {
+                e.doc.blocks.update(b, |x| x.as_para_mut().unwrap().style = h1);
+            }
+            let d = e.doc.clone();
+            e.pages.reset(&d);
+            while !e.paginate(Duration::from_secs(5)) {}
+            e.checker = Some(Rc::new(NoWords));
+            e.set_caret(Pos::new(0, 0), false);
+            assert!(e.insert_toc());
+        }
+        // Frames while pagination and fields settle (the page list restarts
+        // at the top): every frame draws.
+        for _ in 0..200 {
+            app.tick();
+            if ed.borrow().pages.done() {
+                break;
+            }
+        }
+        assert!(ed.borrow().pages.done());
     }
 
     #[test]
