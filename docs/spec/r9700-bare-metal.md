@@ -1614,3 +1614,5 @@ work (self-test, scrub).
   readbacks all 0x3aaa807; 2 "still faulting after the mute" (+4114 IVs in
   3 ms), each followed at once by mode 1 reset. Logs:
   claude/project-thread-33aauq f54f655c (docs/r9700-runs/fzdiag2-0069dc1f/).
+  Decision (Shankar, 2026-11-15): 0069dc1f's detect-and-reset is the storm
+  fix; no global GCR fault-interrupt mask.
