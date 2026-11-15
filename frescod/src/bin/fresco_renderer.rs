@@ -477,7 +477,7 @@ fn main() {
             tex_gen += 1;
         }
         declare(&broker, &state, &comp, (sw, sh));
-        draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref());
+        draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref(), animating);
     }
 }
 
@@ -608,7 +608,7 @@ fn send_grants(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>) {
 }
 
 /// Pack every window whose scene changed into a free slot.
-fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>) {
+fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>, animating: bool) {
     let mut s = state.lock().unwrap();
     for (&id, w) in s.wins.iter_mut() {
         let (true, Some((width, height))) = (w.slots.is_some(), w.size) else { continue };
@@ -695,7 +695,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         }
         w.busy[i] = true;
         w.sig = Some(sig);
-        send(broker, &Msg::FrameReady { window: id, slot: i as u32, seq: w.seq });
+        send(broker, &Msg::FrameReady { window: id, slot: i as u32, seq: w.seq, animating });
     }
 }
 

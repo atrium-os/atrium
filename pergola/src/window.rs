@@ -126,8 +126,14 @@ fn thread_cpu() -> (f64, i64) {
     unsafe {
         let mut ts: libc::timespec = std::mem::zeroed();
         libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+        // Per-thread usage where the system has it (FreeBSD, Linux); macOS
+        // (host builds only) counts the process's.
+        #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+        let who = libc::RUSAGE_THREAD;
+        #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+        let who = libc::RUSAGE_SELF;
         let mut ru: libc::rusage = std::mem::zeroed();
-        libc::getrusage(libc::RUSAGE_THREAD, &mut ru);
+        libc::getrusage(who, &mut ru);
         (ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6, ru.ru_nivcsw as i64)
     }
 }

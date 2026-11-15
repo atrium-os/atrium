@@ -111,8 +111,10 @@ pub enum Msg {
     /// A window's minimum size, points (`WindowHints.min_size`; 0 = none),
     /// for the WM (resolution-independence.md §6.3).
     WindowMinSize { window: u32, width: u32, height: u32 },
-    /// `slot` (0 or 1) of `window` holds a new frame, sequence `seq`.
-    FrameReady { window: u32, slot: u32, seq: u32 },
+    /// `slot` (0 or 1) of `window` holds a new frame, sequence `seq`;
+    /// `animating`: a declarative animation runs in it, so another follows
+    /// at the next refresh (frescod composes at the display's rate).
+    FrameReady { window: u32, slot: u32, seq: u32, animating: bool },
     /// One MIME type of the drag the next [`Msg::DragBegin`] on `window`
     /// starts (at most `fresco_protocol::drag::MAX_FORMATS`).
     DragFormat { window: u32, format: String },
@@ -436,10 +438,11 @@ impl Msg {
                 r.title(title);
                 r
             }
-            Msg::FrameReady { window, slot, seq } => {
+            Msg::FrameReady { window, slot, seq, animating } => {
                 let mut r = Rec::new(FRAME_READY, *window);
                 r.put(2, *slot);
                 r.put(3, *seq);
+                r.put(4, *animating as u32);
                 r
             }
             Msg::Client { width, height, refresh_mhz, pixels, scale_milli } => {
@@ -767,7 +770,8 @@ impl Msg {
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE | FOCUS_PARENT | FOCUS_EMBED => (0, false),
             WINDOW_MIN_SIZE => (2, false),
-            FRAME_READY | GEOMETRY | MOTION => (2, false),
+            FRAME_READY => (3, false),
+            GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
             MAGNIFY => (4, false),
             SLOTS | FRAME_DONE => (1, false),
@@ -862,7 +866,7 @@ impl Msg {
             }
             FOCUS_EMBED => Msg::FocusEmbed { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
-            FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
+            FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3), animating: match r.get(4) { 0 => false, 1 => true, _ => return Err(Refused("flag not 0 or 1")) } },
             CLIENT => Msg::Client {
                 width: dim(r.get(2))?,
                 height: dim(r.get(3))?,

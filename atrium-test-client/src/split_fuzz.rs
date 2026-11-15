@@ -168,7 +168,7 @@ fn renderer(seed: u64) {
                         write_slot(&mut r, slots[s as usize].as_mut_slice(), w.size, pixels);
                     }
                 }
-                Msg::FrameReady { window, slot: s, seq: r.next() as u32 }.encode()
+                Msg::FrameReady { window, slot: s, seq: r.next() as u32, animating: r.next() & 1 == 1 }.encode()
             }
             55..=62 => {
                 let window = some_window(&mut r);
@@ -192,7 +192,7 @@ fn renderer(seed: u64) {
             }
             75..=89 => {
                 // A valid record, mutated.
-                let mut b = Msg::FrameReady { window: some_window(&mut r), slot: 0, seq: 1 }.encode();
+                let mut b = Msg::FrameReady { window: some_window(&mut r), slot: 0, seq: 1, animating: false }.encode();
                 if r.chance(50) {
                     b = Msg::WindowCreate { window: 3, width: 100, height: 100, role: Role::Document, pos: None, title: "t".into(), embed_pending: false }.encode();
                 }
@@ -266,7 +266,7 @@ fn flooder(r: &mut Rng, broker: &Chan, rx: &mpsc::Receiver<(Msg, Vec<OwnedFd>)>)
         let f = Frame::pack(&fuzz::scene(r, size.0, size.1), size.0, size.1, size.0);
         let k = (sent % 2) as usize;
         let _ = slot::write(s[k].as_mut_slice(), &f, sent);
-        if broker.send(&Msg::FrameReady { window: 1, slot: k as u32, seq: sent }, &[]).is_err() {
+        if broker.send(&Msg::FrameReady { window: 1, slot: k as u32, seq: sent, animating: false }, &[]).is_err() {
             break;
         }
         sent += 1;

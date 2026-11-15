@@ -1444,8 +1444,19 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 /// A declarative animation ran in the frame just drawn: draw the next.
 static ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Until when (monotonic ns) a split renderer said an animation runs in
+/// the frame it sent: frescod composes at the display's rate until then.
+static SPLIT_ANIMATING_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A split renderer's frame came with an animation running.
+pub(crate) fn split_animating_for(d: Duration) {
+    let until = video::monotonic_ns().saturating_add(d.as_nanos() as u64);
+    SPLIT_ANIMATING_UNTIL.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn animating() -> bool {
     ANIMATING.load(std::sync::atomic::Ordering::Relaxed)
+        || video::monotonic_ns() < SPLIT_ANIMATING_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn render_one_frame(

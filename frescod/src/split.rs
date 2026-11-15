@@ -657,7 +657,10 @@ impl Broker {
                     w.title = title;
                 }
             }
-            Msg::FrameReady { slot: s, .. } => {
+            Msg::FrameReady { slot: s, animating, .. } => {
+                if animating {
+                    crate::split_animating_for(std::time::Duration::from_millis(100));
+                }
                 if self.pixels {
                     let (global, (width, height)) = {
                         let wins = r.wins.lock().unwrap();
