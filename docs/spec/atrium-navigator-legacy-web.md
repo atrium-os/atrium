@@ -647,7 +647,10 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   (`button`, `a`, `input` button or submit, `role=button`) whose text, at most 40
   characters, says a consent word (accept, agree, allow, consent, continue, OK, got it,
   yes, understood, proceed). Each press is a probe: the document and the scratch jar are
-  put back after it. A press that wrote `document.cookie` makes the control a consent
+  put back after it, and, as in exploration, the page network is closed while the presses
+  run (fixed 2026-11-15: they had it open, so a press's own request, such as a consent
+  endpoint's GET, could reach the site; `the_converters_press_sends_nothing`). The
+  converter's press is never the reader's consent: nothing of it leaves the converter. A press that wrote `document.cookie` makes the control a consent
   control: at most 4, each turned into `<a href="atrium-consent:<n>">` keeping its text,
   with what it wrote reported as `CW <n> <line>` (at most 16 lines, 4 KiB each, no
   control characters).

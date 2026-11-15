@@ -79,3 +79,34 @@ fn a_consent_control_is_found_and_marked() {
         assert_eq!(c.html.matches("atrium-consent:").count(), 1, "{}", c.html);
     }
 }
+
+/// Every URL the page's network was asked for.
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+impl navigator_prerender::fetch::Fetcher for Logged {
+    fn get(&mut self, url: &str) -> Result<String, String> {
+        self.0.lock().unwrap().push(url.to_string());
+        Ok("{}".into())
+    }
+}
+
+/// ★ The converter's own press of a consent control is not the reader's
+/// consent: the page network is closed while it runs, so a request the
+/// press makes (a consent endpoint) never reaches the site.
+#[test]
+fn the_converters_press_sends_nothing() {
+    let html = r#"<html><body><div id=wall><button id=yes>Accept</button></div><script>
+        fetch('/api/at-load');
+        document.getElementById('yes').addEventListener('click', function () {
+          document.cookie = 'consent=yes; Path=/';
+          fetch('/api/consent?accept=1');
+          var i = new Image(); i.src = '/api/pixel?accept=1';
+        });
+      </script></body></html>"#;
+    let log = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let mut eng = BoaEngine { page_fetcher: Some(Box::new(Logged(log.clone()))), ..Default::default() };
+    let c = convert_with(html, Some("https://example.test/p.html"), &mut eng, &mut MapFetcher::default());
+    assert_eq!(c.consents.len(), 1, "{:?}", c.errors);
+    let asked = log.lock().unwrap().clone();
+    assert!(asked.iter().any(|u| u.contains("/api/at-load")), "the page network was not wired: {asked:?}");
+    assert!(!asked.iter().any(|u| u.contains("accept=1")), "the converter's press reached the site: {asked:?}");
+}

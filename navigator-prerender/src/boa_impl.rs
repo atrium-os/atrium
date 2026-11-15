@@ -3229,6 +3229,12 @@ fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<St
         v
     });
     let mut out = vec![];
+    // ★ As exploration's: the page network is closed while they run, so a
+    // press's own request (a consent endpoint, a beacon) never leaves.
+    let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
+    EXPLORING.with(|e| *e.borrow_mut() = true);
+    let saved_loop_limit = ctx.runtime_limits().loop_iteration_limit();
+    ctx.runtime_limits_mut().set_loop_iteration_limit(PROBE_LOOP_LIMIT);
     for h in cands {
         let p = Probe { target: h, gesture: Gesture::Click, key: 0, root: None, discover: None };
         let r = run_probe(ctx, &p, parser_nodes);
@@ -3236,6 +3242,9 @@ fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<St
             out.push((h, r.cookie_writes));
         }
     }
+    ctx.runtime_limits_mut().set_loop_iteration_limit(saved_loop_limit);
+    EXPLORING.with(|e| *e.borrow_mut() = false);
+    PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
     out
 }
 
