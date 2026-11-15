@@ -14,6 +14,7 @@
 //! library, suitable for the CLI, future portcullisd, and IDE
 //! tooling that wants to lint atrium.toml files.
 
+pub mod icon;
 pub mod network;
 pub mod schema;
 pub mod validate;

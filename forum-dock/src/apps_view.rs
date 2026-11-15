@@ -187,6 +187,13 @@ fn rect(ctx: &mut Ctx, r: Rect, fill: Color, radius: f32) -> NodeId {
 
 /// The icon of `app` on a `p`-sized plate at (`x`, `y`).
 pub fn draw_icon(ctx: &mut Ctx, app: &AppEntry, x: f32, y: f32, p: f32, plate: Color, ink: Color) {
+    // The app's own icon fills its plate's square: it is the whole tile.
+    if let Some(v) = &app.vector {
+        for f in v.placed(x, y, p) {
+            ctx.add(pergola::node::Node::Fill(std::sync::Arc::new(f)));
+        }
+        return;
+    }
     match icons::for_app(&app.id, &app.name, app.icon.as_deref()) {
         AppIcon::Glyph(g) => {
             rect(ctx, Rect::new(x, y, p, p), plate, radius::LG);

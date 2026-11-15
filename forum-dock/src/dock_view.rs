@@ -190,6 +190,9 @@ impl View for DockView {
 
 /// An app's icon on a `size` tile, with a dock-sized glyph.
 fn draw_icon_sized(ctx: &mut Ctx, app: &AppEntry, x: f32, y: f32, size: f32, plate: Color, ink: Color) {
+    if app.vector.is_some() {
+        return draw_icon(ctx, app, x, y, size, plate, ink);
+    }
     match crate::icons::for_app(&app.id, &app.name, app.icon.as_deref()) {
         crate::icons::AppIcon::Glyph(g) => {
             ctx.add(Node::Rect { rect: Rect::new(x, y, size, size), fill: plate, radius: radius::MD });
@@ -205,7 +208,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, uid: Option<u32>) -> AppEntry {
-        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid }
+        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid, vector: None }
     }
 
     #[test]

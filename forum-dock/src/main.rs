@@ -82,7 +82,7 @@ fn refresh_catalog(shared: &SharedRef) {
     let listed = apps::listed(&all);
     let mut s = shared.lock().unwrap();
     if s.apps != listed {
-        eprintln!("forum-dock: {} app(s) from {src:?}", listed.len());
+        eprintln!("forum-dock: {} app(s) from {src:?}, {} with their own icon", listed.len(), listed.iter().filter(|a| a.vector.is_some()).count());
         s.apps = listed;
         s.bump();
     }

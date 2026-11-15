@@ -675,6 +675,8 @@ pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
             description: m.app.description.clone(),
             icon:        m.app.icon.clone(),
             uid:         registry.as_ref().zip(user).and_then(|(r, u)| r.uid_for(u, &m.app.id)),
+            icon_svg:    m.app.icon.as_deref()
+                .and_then(|i| portcullis_toml::icon::read_bundle_svg(&e.path(), i)),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));

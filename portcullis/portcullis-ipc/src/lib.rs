@@ -317,6 +317,12 @@ pub struct CatalogEntry {
     /// §6.1) without reading the registry, which a jailed launcher cannot.
     #[serde(default)]
     pub uid:         Option<u32>,
+    /// The app's own icon when `icon` is a path in its bundle: the SVG's text
+    /// (at most `portcullis_toml::icon::MAX_ICON_BYTES`), read by the daemon
+    /// because a jailed launcher cannot see the bundle. The launcher parses it
+    /// under a strict profile; `None` → the system icon set or a letter tile.
+    #[serde(default)]
+    pub icon_svg:    Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -21,5 +21,7 @@ portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 pergola = { path = "../pergola" }
 fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
+# Apps' own SVG icons, under the Navigator's strict profile, as filled paths.
+navigator-svg = { path = "../navigator-svg" }
 # The dock asks forum-wm to raise an already-running app instead of erroring.
 forum-ctl = { path = "../forum-ctl" }

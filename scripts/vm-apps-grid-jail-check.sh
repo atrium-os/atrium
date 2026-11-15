@@ -24,7 +24,8 @@
 # login): it gets the person's state folder, read-write at /atrium/state;
 # Ctrl+D unpins the selected app, the pins land in
 # /var/db/atrium/state/<person>/org.atrium.forum-dock/pinned, and they are
-# read back after a teardown and a fresh launch.
+# read back after a teardown and a fresh launch. Alpha ships its own SVG icon,
+# which portcullisd reads from the bundle and the dock draws as filled paths.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/tmp/apps-grid-jail}
@@ -80,6 +81,14 @@ for b in frescod/target/$T/release/frescod frescod/target/$T/release/fresco-rend
   [ "$h" = "$gh" ] || die "$(basename "$b") hash mismatch"
 done
 put "$ROOT/forum-dock/atrium.toml" "$W/dock.toml"
+# Alpha ships its own icon (forum.md §6.1): an orange tile with a white "A".
+cat > "$OUT/alpha.svg" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <rect width="48" height="48" rx="11" fill="#f4511e"/>
+  <path d="M24 9 L37 39 H31 L28 31 H20 L17 39 H11 Z M22 26 H26 L24 20 Z" fill="#ffffff" fill-rule="evenodd"/>
+</svg>
+SVG
+put "$OUT/alpha.svg" "$W/alpha.svg"
 g "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
   g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
@@ -94,9 +103,10 @@ g "set -e
   B=$W/b-dock; mkdir -p \$B/bin; cp $W/forum-dock \$B/bin/; cp $W/dock.toml \$B/atrium.toml
   openssl dgst -sha256 -sign /root/e2e-key.pem -out \$B/atrium.toml.sig \$B/atrium.toml
   /usr/local/bin/opifex install \$B
-  for n in alpha:Alpha:compass beta:Beta:note-pencil; do
+  for n in alpha:Alpha:icons/alpha.svg beta:Beta:note-pencil; do
     id=\${n%%:*}; rest=\${n#*:}; name=\${rest%%:*}; icon=\${rest#*:}
     B=$W/b-\$id; mkdir -p \$B/bin; cp $W/sample_app \$B/bin/\$id
+    [ \$id = alpha ] && mkdir -p \$B/icons && cp $W/alpha.svg \$B/icons/
     printf '[app]\nid = \"org.example.%s\"\nname = \"%s\"\nversion = \"1.0.0\"\nentry = \"bin/%s\"\nicon = \"%s\"\n\n[capabilities]\ngraphics = \"fresco\"\nnetwork = \"none\"\n\n[supervision]\ninstances = \"single\"\n' \$id \$name \$id \$icon > \$B/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out \$B/atrium.toml.sig \$B/atrium.toml
     /usr/local/bin/opifex install \$B
@@ -131,6 +141,7 @@ has() { g "grep -q -- \"$1\" $S/dock.log"; }
 g "jls name | grep -q forum-dock" && ok "the dock runs in a jail" || bad "no forum-dock jail"
 has "app(s) from Daemon" && ok "catalog from portcullisd" || bad "the dock did not get the catalog from portcullisd"
 g "grep -q 'catalog -> org.atrium.forum-dock' $S/portcullisd.log" && ok "portcullisd served the dock's catalog" || bad "portcullisd log has no catalog for the dock"
+has "from Daemon, 1 with their own icon" && ok "Alpha's bundle icon came through the catalog and parsed" || bad "no bundle icon: $(g "grep -E 'icon is not drawn|from Daemon' $S/dock.log | tail -2")"
 shot 0-dock
 
 echo "== Super+A, type beta, Enter"

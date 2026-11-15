@@ -123,7 +123,8 @@ pub struct AppSection {
     pub description: Option<String>,
     /// Icon the shell shows for this app — a named icon (e.g. "terminal", resolved
     /// against the system icon set) or a path to an SVG the app bundles. `None` →
-    /// the shell falls back to a default.
+    /// the shell falls back to a default. A bundle path is a relative `.svg`
+    /// (see `icon::is_bundle_path`), read by `icon::read_bundle_svg`.
     pub icon:        Option<String>,
 }
 

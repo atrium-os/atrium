@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod apps;
 pub mod apps_view;
+pub mod bundle_icon;
 pub mod dock_view;
 pub mod icons;
 pub mod launch;
@@ -22,7 +23,7 @@ pub mod pins;
 pub const APPS_DIR: &str = "/var/lib/atrium/apps";
 
 /// One launchable app, as shown in the dock.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppEntry {
     pub id: String,
     pub name: String,
@@ -33,6 +34,20 @@ pub struct AppEntry {
     /// first ran, or when the catalog came off the filesystem): how the dock
     /// matches windows to apps (forum.md §6.1).
     pub uid: Option<u32>,
+    /// The app's own icon from its bundle, parsed (`bundle_icon`); `None`
+    /// when it has none or it was refused.
+    pub vector: Option<std::sync::Arc<bundle_icon::VectorIcon>>,
+}
+
+/// Parse a bundle icon's SVG, saying why one is not drawn.
+pub fn vector_icon(id: &str, svg: Option<&str>) -> Option<std::sync::Arc<bundle_icon::VectorIcon>> {
+    match bundle_icon::parse(svg?) {
+        Ok(v) => Some(std::sync::Arc::new(v)),
+        Err(why) => {
+            eprintln!("forum-dock: {id}: its icon is not drawn ({why})");
+            None
+        }
+    }
 }
 
 /// Parse one manifest's text into a catalog entry. `None` if it doesn't parse —
@@ -45,6 +60,7 @@ pub fn entry_from_manifest(text: &str) -> Option<AppEntry> {
         description: m.app.description,
         icon: m.app.icon,
         uid: None,
+        vector: None,
     })
 }
 
@@ -101,6 +117,7 @@ pub fn catalog_from_daemon() -> Option<Vec<AppEntry>> {
         Response::CatalogList { apps } => Some(
             apps.into_iter()
                 .map(|a| AppEntry {
+                    vector: vector_icon(&a.id, a.icon_svg.as_deref()),
                     id: a.id,
                     name: a.name,
                     description: a.description,
@@ -123,7 +140,9 @@ pub fn catalog(apps_dir: &Path) -> Vec<AppEntry> {
     for e in entries.flatten() {
         let manifest = e.path().join("atrium.toml");
         if let Ok(text) = std::fs::read_to_string(&manifest) {
-            if let Some(entry) = entry_from_manifest(&text) {
+            if let Some(mut entry) = entry_from_manifest(&text) {
+                let svg = entry.icon.as_deref().and_then(|i| portcullis_toml::icon::read_bundle_svg(&e.path(), i));
+                entry.vector = vector_icon(&entry.id, svg.as_deref());
                 out.push(entry);
             }
         }

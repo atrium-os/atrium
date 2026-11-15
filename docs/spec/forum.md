@@ -292,8 +292,20 @@ glyphs itself. The dock moves from Lucide to Phosphor with it: one icon family.
 Phosphor names, e.g. `"note-pencil"`, `"compass"`, plus a few short aliases:
 `files`, `settings`, `terminal`, `browser`, `editor`). An app with no icon, or a
 name not in the set, gets a tile with its name's first letter on a colour picked
-from its id. Icons shipped in the app's bundle (SVG, and bitmaps per §6.4 of
-resolution-independence.md) come later; they need the catalog to carry them.
+from its id.
+
+**Icons in the bundle** (built 2026-11-15). `icon` may instead be a relative path
+to an SVG in the app's bundle (`"icons/app.svg"`: plain names, no `..`, no dot
+files). portcullisd reads it when it builds the catalog (the jailed dock can't see
+bundles), refusing a file that resolves outside the bundle (symlinks), isn't a
+regular file, or is over 32 KB, and sends the text as `CatalogEntry::icon_svg`.
+The dock parses it under the Navigator's strict SVG profile (navigator-svg: no
+script, external references, text or filters; bounded size and work) into
+filled paths, at most 64 shapes and 8192 points, and draws them as Fresco FILL
+nodes filling the tile's square: the icon is the whole tile, plate included.
+What the vector path can't say exactly (masks, patterns, group opacity over
+several shapes) is refused and the app falls back to the system set or its
+letter tile; no rasteriser runs in the dock. Bitmap icons are not taken.
 
 **Launching.** Exactly the dock's path: `Launch { app_id }` to portcullisd, which
 checks policy, picks the app's uid and jails it. The dock does this on a thread
@@ -339,7 +351,8 @@ Vestibulum) are not listed: they are started by the session, not by the person
 (ids `org.atrium.forum-*` and `org.atrium.vestibulum`).
 
 Code: `forum-dock/src/{apps.rs, apps_view.rs, launch.rs, pins.rs, icons.rs}`,
-`forum-wm` (`WaitAppsKey`), `portcullis-ipc` (`CatalogEntry::uid`), portcullisd
+`forum-wm` (`WaitAppsKey`), `portcullis-ipc` (`CatalogEntry::uid`, `icon_svg`),
+`portcullis-toml/src/icon.rs`, `forum-dock/src/bundle_icon.rs`, portcullisd
 `prepare_state_dir`. Live checks: `scripts/vm-apps-grid-check.sh` (unjailed) and
 `scripts/vm-apps-grid-jail-check.sh` (jailed, through portcullisd, then as a
 session component with its state folder).
