@@ -2658,6 +2658,24 @@ size and doing nothing a second time.
 trimming is not done. Previews are made only while the editor runs, not during
 a show. The 60 Hz transition figure stays as in §16.38.
 
+### 16.40 O7 plan (2026-11-15)
+
+O7 is the features that lean on other parts of the system (§11, §17 D8, D10). The steps
+that need nothing new from elsewhere go first:
+
+| step | what | gate |
+|---|---|---|
+| O7a | password-protected documents: OOXML (the compound file, Agile and Standard encryption) and ODF (AES-CBC with PBKDF2, AES-GCM with Argon2id) opened in the converter jail and written with a password; the password asked for in the apps; native files encrypted with a random key wrapped by a password (Arca-wrapped keys once Arca offers `arca_decrypt` to apps) | LibreOffice both ways with passwords, all three apps' formats; wrong password refused; hostile containers |
+| O7b | `.xls` import (BIFF8 in a compound file: cells, formulas, shared strings, number formats, styles, names, several sheets) | LibreOffice's reading of generated and corpus files: values and formulas equal |
+| O7c | `.doc` import (Word 97–2003: text, paragraph and character formatting, lists, tables, pictures, notes, headers and footers) | LibreOffice's text and paragraph structure on corpus files |
+| O7d | `.ppt` import (PowerPoint 97–2003: slides, masters, text, shapes, pictures, notes) | LibreOffice's slide count and text on corpus files |
+| O7e | signatures: ODF and OOXML signatures verified and shown; signing through Sigillum | waits on Sigillum's signing API |
+| O7f | external data through Nuntius (`WEBSERVICE`, web queries, linked workbooks, remote pictures), off by default per document | waits on a per-document Nuntius instance |
+| O7g | IME-dependent scripts in the text engine | waits on the input-method framework (§17 D10, Tactus/Pergola) |
+
+Legacy formats are import only (D8): `.doc`, `.xls` and `.ppt` open through the
+converter and save as the current formats.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
