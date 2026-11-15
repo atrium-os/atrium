@@ -477,7 +477,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
          * settings app by its installed manifest (`app-grants`), and about
          * the person it belongs to (the registry's owner), never the
          * caller's own uid. Allow also needs a press frescod confirms. */
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. }) {
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. }) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1291,6 +1291,50 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
             match tp.policy.save(&tp.policy_path.clone()) {
                 Ok(()) => {
                     eprintln!("portcullisd: {owner} allowed {app_id} (from {caller})");
+                    Response::Ok
+                }
+                Err(e) => refuse(format!("save: {e}")),
+            }
+        }
+        Request::Links => {
+            use portcullis_policy::links::LinkDefaults;
+            let d = LinkDefaults::load(&LinkDefaults::user_path(&owner)).unwrap_or_default();
+            let schemes = launch::link_schemes().into_iter().map(|scheme| {
+                let apps = launch::apps_taking_link(&scheme);
+                let def = d.app_for(&scheme, |id| apps.iter().any(|(a, _)| a == id));
+                let yours = def.is_some() && d.chosen.get(&scheme) == def.as_ref();
+                let apps = apps.into_iter().map(|(id, name)| portcullis_ipc::LinkChoice { default: def.as_deref() == Some(id.as_str()), id, name }).collect();
+                portcullis_ipc::LinkScheme { scheme, apps, yours }
+            }).collect::<Vec<_>>();
+            eprintln!("portcullisd: links -> {caller} (uid {uid}) for {owner}: {} scheme(s)", schemes.len());
+            Response::Links { schemes }
+        }
+        Request::SetLinkDefault { scheme, app, activation } => {
+            use portcullis_policy::links::LinkDefaults;
+            if let Err(why) = atrium_links::declarable(&scheme) {
+                return refuse(why);
+            }
+            if let Some(a) = &app {
+                if !launch::apps_taking_link(&scheme).iter().any(|(id, _)| id == a) {
+                    return refuse(format!("{a} doesn't open {scheme} links"));
+                }
+            }
+            // Last of the checks: a refusal above doesn't spend the press.
+            if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+                return refuse(why);
+            }
+            let p = LinkDefaults::user_path(&owner);
+            let mut d = LinkDefaults::load(&p).unwrap_or_default();
+            let r = match &app {
+                Some(a) => d.choose(&scheme, a),
+                None => {
+                    d.chosen.remove(&scheme);
+                    Ok(())
+                }
+            };
+            match r.map_err(std::io::Error::other).and_then(|_| d.save(&p)) {
+                Ok(()) => {
+                    eprintln!("portcullisd: {owner}'s default for {scheme} links is now {} (from {caller})", app.as_deref().unwrap_or("ask each time"));
                     Response::Ok
                 }
                 Err(e) => refuse(format!("save: {e}")),
@@ -2194,7 +2238,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

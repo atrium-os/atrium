@@ -275,7 +275,7 @@ pub fn spend_press(sock: &Path, token: [u8; 16], presenter_uid: u32) -> Result<(
 
 /// [`spend_press`] for another purpose (an app's console: `CONSOLE`).
 pub fn spend_press_for(sock: &Path, token: [u8; 16], presenter_uid: u32, purpose_: u8) -> Result<(), String> {
-    use fresco_protocol::activation::{op, purpose, refusal, Consume, ConsumeResult};
+    use fresco_protocol::activation::{op, refusal, Consume, ConsumeResult};
     if token == fresco_protocol::activation::NONE {
         return Err("no press came with it".into());
     }

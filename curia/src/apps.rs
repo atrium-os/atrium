@@ -5,14 +5,20 @@
 //! What the system policy grants, and any app asking for a restricted
 //! capability, is not the person's to change here. Pure: `main.rs` asks
 //! portcullisd and hands back what it says.
+//!
+//! Its Links section (opening-links.md §4.4): each link scheme some app
+//! takes, the app that opens it, and a press to change that or to ask
+//! each time, as Monstrator's "Always use this app" would.
 
-use portcullis_ipc::{AccessBy, AccessEntry};
+use portcullis_ipc::{AccessBy, AccessEntry, LinkScheme};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Want {
     Refresh,
     Allow { app_id: String, activation: [u8; 16] },
     Remove { app_id: String },
+    /// Make `app` the default for `scheme` links; `None`: ask each time.
+    SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +26,9 @@ pub enum Got {
     List(Result<Vec<AccessEntry>, String>),
     /// An Allow or Remove came back.
     Done { app_id: String, result: Result<(), String> },
+    Links(Result<Vec<LinkScheme>, String>),
+    /// A SetLink came back.
+    LinkDone { scheme: String, result: Result<(), String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -34,7 +43,24 @@ pub struct AppsPage {
     pub note: Option<(String, String)>,
     /// Remove asks once more before it goes.
     pub confirm: Option<String>,
+    /// The Links section: None until portcullisd answers.
+    pub links: Option<Result<Vec<LinkScheme>, String>>,
+    /// The scheme whose apps are open.
+    pub link_open: Option<String>,
+    /// A SetLink on its way, for this scheme.
+    pub link_busy: Option<String>,
+    /// What went wrong for a scheme.
+    pub link_note: Option<(String, String)>,
     pub wants: Vec<Want>,
+}
+
+/// "Opens in Mail", "Asks each time".
+pub fn link_status(l: &LinkScheme) -> String {
+    match l.apps.iter().find(|c| c.default) {
+        Some(c) if l.yours => format!("Opens in {}", c.name),
+        Some(c) => format!("Opens in {} (the system's choice)", c.name),
+        None => "Asks which app each time".into(),
+    }
 }
 
 /// One line on what an app may do now.
@@ -110,7 +136,57 @@ impl AppsPage {
                 }
                 self.refresh();
             }
+            Got::Links(r) => {
+                self.links = Some(r);
+                if self.link_open.as_ref().is_some_and(|o| !self.schemes().iter().any(|l| &l.scheme == o)) {
+                    self.link_open = None;
+                }
+            }
+            Got::LinkDone { scheme, result } => {
+                if self.link_busy.as_deref() == Some(&scheme) {
+                    self.link_busy = None;
+                }
+                match result {
+                    Ok(()) => self.link_note = None,
+                    Err(why) => self.link_note = Some((scheme, why)),
+                }
+                self.refresh();
+            }
         }
+    }
+
+    pub fn schemes(&self) -> &[LinkScheme] {
+        match &self.links {
+            Some(Ok(v)) => v,
+            _ => &[],
+        }
+    }
+
+    pub fn toggle_link(&mut self, scheme: &str) {
+        self.link_open = if self.link_open.as_deref() == Some(scheme) { None } else { Some(scheme.into()) };
+        if self.link_note.as_ref().is_some_and(|(s, _)| s != scheme) {
+            self.link_note = None;
+        }
+    }
+
+    /// Choose `app` for `scheme` (`None`: ask each time), with the press
+    /// that made it; nothing is asked without one, or when it changes
+    /// nothing.
+    pub fn set_link(&mut self, scheme: &str, app: Option<&str>, activation: Option<[u8; 16]>) {
+        let Some(l) = self.schemes().iter().find(|l| l.scheme == scheme) else { return };
+        let now = l.apps.iter().find(|c| c.default).map(|c| c.id.as_str());
+        let known = app.is_none_or(|a| l.apps.iter().any(|c| c.id == a));
+        let same = if app.is_none() { !l.yours } else { l.yours && now == app };
+        if self.link_busy.is_some() || !known || same {
+            return;
+        }
+        let Some(activation) = activation else {
+            self.link_note = Some((scheme.into(), "Press with the pointer or Enter".into()));
+            return;
+        };
+        self.link_busy = Some(scheme.into());
+        self.link_note = None;
+        self.wants.push(Want::SetLink { scheme: scheme.into(), app: app.map(str::to_string), activation });
     }
 
     pub fn toggle_open(&mut self, id: &str) {
@@ -237,5 +313,36 @@ mod tests {
         p.toggle_open("mine");
         p.apply(Got::List(Ok(vec![e("new", None, &["Play audio"], false, &[])])));
         assert_eq!(p.open, None);
+    }
+
+    #[test]
+    fn links_change_with_a_press_and_only_to_an_app_that_takes_them() {
+        use portcullis_ipc::LinkChoice;
+        let c = |id: &str, default: bool| LinkChoice { id: id.into(), name: id.to_uppercase(), default };
+        let mut p = AppsPage::default();
+        p.apply(Got::Links(Ok(vec![
+            LinkScheme { scheme: "https".into(), apps: vec![c("nav", true)], yours: false },
+            LinkScheme { scheme: "mailto".into(), apps: vec![c("a", false), c("b", false)], yours: false },
+        ])));
+        let s: Vec<String> = p.schemes().iter().map(link_status).collect();
+        assert_eq!(s, ["Opens in NAV (the system's choice)", "Asks which app each time"]);
+        p.set_link("mailto", Some("a"), None);
+        assert!(p.take_wants().is_empty() && p.link_note.is_some(), "no press");
+        p.set_link("mailto", Some("zz"), Some([1; 16]));
+        p.set_link("mailto", None, Some([1; 16]));
+        p.set_link("ftp", Some("a"), Some([1; 16]));
+        assert!(p.take_wants().is_empty(), "not its app, nothing to change, no such scheme");
+        p.set_link("mailto", Some("b"), Some([2; 16]));
+        p.set_link("mailto", Some("a"), Some([3; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetLink { scheme: "mailto".into(), app: Some("b".into()), activation: [2; 16] }], "one at a time");
+        p.apply(Got::LinkDone { scheme: "mailto".into(), result: Ok(()) });
+        assert_eq!(p.link_busy, None);
+        assert_eq!(p.take_wants(), vec![Want::Refresh]);
+        p.apply(Got::Links(Ok(vec![LinkScheme { scheme: "mailto".into(), apps: vec![c("a", false), c("b", true)], yours: true }])));
+        assert_eq!(link_status(&p.schemes()[0]), "Opens in B");
+        p.set_link("mailto", Some("b"), Some([4; 16]));
+        assert!(p.take_wants().is_empty(), "already");
+        p.set_link("mailto", None, Some([5; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetLink { scheme: "mailto".into(), app: None, activation: [5; 16] }]);
     }
 }

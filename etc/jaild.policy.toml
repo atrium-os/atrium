@@ -123,6 +123,9 @@ rw_paths = [
     # portcullisd's own directory (its socket is world-connectable, peer uid
     # checked): monstratord asks it for link grants.
     "/atrium/sockets/portcullis",
+    # frescod's socket and its activation socket: monstratord's sheet.
+    "/atrium/sockets/fresco",
+    "/atrium/sockets/fresco-activation",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",

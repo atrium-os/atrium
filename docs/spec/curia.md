@@ -332,6 +332,17 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   New's Allow writes her grant and New then launches without asking; a click where
   Sys's Allow would be writes nothing; Remove access, then Remove, takes the grant
   away. 11 checks, 0 failed; frames in `scratch/apps-access/`.
+- **Links** (opening-links.md §4.4, L3, 2026-11-15): under the apps, a row per link scheme
+  some installed app takes (`atrium-app` left out), saying "Opens in Mail", "Opens in
+  Navigator (the system's choice)" or "Asks which app each time". A row opens to list the
+  apps that take it, each with Use (or "In use"), and Ask each time. portcullisd answers
+  `Links` and takes `SetLinkDefault { scheme, app, activation }` (`app: None` asks each
+  time) under the same rule as Allow: `app-grants` by peer uid, about the person the app
+  runs for, the app must take the scheme, and last the press is spent as `APPROVE`; it
+  writes `<user>/links.toml`. The live check now also installs New and Sys with
+  `[[links]] schemes = ["mailto"]` and sets other gates' apps aside while it runs: root is
+  refused `Links`; the section lists mailto; Use on New writes `mailto = "org.test.new"`;
+  Ask each time removes it. 17 checks, 0 failed.
 - Seen whole (Shankar, 2026-11-15: "add it for allow"): frescod now watches every
   top-level window as it watches credential slots and Sigillum's sheets (wholly on
   screen, nothing composed above it overlapping it, at least the minimum size, where it

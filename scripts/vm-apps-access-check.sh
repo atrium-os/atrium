@@ -21,6 +21,9 @@
 #   - a forged press (root's own token) can't allow anything;
 #   - org.test.sys has no Allow; nothing is written for it;
 #   - Remove access, then Remove: the grant is gone.
+#   - Links (opening-links.md §4.4): New and Sys both take mailto: links;
+#     the mailto row lists them, Use on one makes it alice's default
+#     (links.toml), Ask each time takes it away; root can't do either.
 # WX/WY: where frescod puts Curia's window (0 0 with no window manager).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -56,8 +59,12 @@ PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 POL=/var/db/atrium/alice/policy.toml
 NEW=org.test.new; SYS=org.test.sys; CURIA=org.atrium.curia
+# Other installed apps (other gates') are set aside while this runs, so the
+# page lists only these three, and put back at the end.
+ASIDE=/var/lib/atrium/apps-aside
 V 'sh -s' <<EOS
 set -e
+if [ -d $ASIDE ]; then mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null || true; rmdir $ASIDE; fi
 id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
 install -m 0755 $B/portcullis /usr/local/bin/portcullis
@@ -67,12 +74,15 @@ mkdir -p /etc/atrium/publishers; openssl ec -in /root/of-key.pem -pubout -out /e
 mk() { # id name binary-in-B entry-name capabilities
   opifex uninstall \$1 >/dev/null 2>&1 || true
   O=$B/b-\$1; rm -rf \$O; mkdir -p \$O/bin; cp $B/\$3 \$O/bin/\$4
-  printf '[app]\nid = "%s"\nname = "%s"\nversion = "1"\nentry = "bin/%s"\n\n[capabilities]\n%b\n' \$1 "\$2" \$4 "\$5" > \$O/atrium.toml
+  printf '[app]\nid = "%s"\nname = "%s"\nversion = "1"\nentry = "bin/%s"\n\n[capabilities]\n%b\n%b' \$1 "\$2" \$4 "\$5" "\${6:-}" > \$O/atrium.toml
   openssl dgst -sha256 -sign /root/of-key.pem -out \$O/atrium.toml.sig \$O/atrium.toml
   opifex install \$O >/dev/null
 }
-mk $NEW New home_probe stay_probe 'clipboard = true\nnotify = true'
-mk $SYS Sys home_probe stay_probe 'audio-control = true'
+mk $NEW New home_probe stay_probe 'clipboard = true\nnotify = true' '\n[[links]]\nschemes = ["mailto"]\n'
+mk $SYS Sys home_probe stay_probe 'audio-control = true' '\n[[links]]\nschemes = ["mailto"]\n'
+rm -f /var/db/atrium/alice/links.toml
+mkdir -p $ASIDE
+for d in /var/lib/atrium/apps/*; do case \${d##*/} in $NEW|$SYS|$CURIA) ;; *) mv \$d $ASIDE/ ;; esac; done
 mk $CURIA Settings curia curia 'graphics = "fresco"\napp-grants = true'
 rm -f $POL
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
@@ -140,5 +150,26 @@ i=0; while [ $i -lt 30 ] && [ "$(count "alice removed $NEW")" = 0 ]; do sleep 2;
 V "grep -q 'org.test.new' $POL" && bad "still in her policy" || ok "not in her policy"
 shot apps-5
 
+echo "=== Links"
+LT=/var/db/atrium/alice/links.toml
+R=$(V "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"links\"}\n' | nc -N -U $PSOCK")
+case "$R" in *"not a launched app"*) ok "root asking for the links: refused" ;; *) bad "root links: $R" ;; esac
+L=$(V "grep 'links -> $CURIA' $LOG | tail -1")
+case "$L" in *"for alice: 1 scheme(s)"*) ok "Curia's Links section: one scheme (mailto)" ;; *) bad "links: $L" ;; esac
+press 400 244                                    # close Sys's details
+press ${LX:-400} ${LY:-356}                      # the mailto row
+shot links-0
+press ${UX:-900} ${UY:-406}                      # Use, on New
+i=0; while [ $i -lt 30 ] && [ "$(count "default for mailto links is now $NEW")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "default for mailto links is now $NEW (from $CURIA)")" = 1 ] && ok "Use on New: alice's mailto: default" || bad "no default: $(V "grep -i 'link\|REFUSED' $LOG | tail -3")"
+V "grep -qx 'mailto = \"$NEW\"' $LT" && ok "written to her links.toml" || bad "links.toml: $(V "cat $LT 2>&1")"
+shot links-1
+press ${AX:-900} ${AY:-478}                      # Ask, for Ask each time
+i=0; while [ $i -lt 30 ] && [ "$(count "mailto links is now ask each time")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "default for mailto links is now ask each time")" = 1 ] && ok "Ask each time: the default is gone" || bad "not cleared: $(V "grep -i 'link\|REFUSED' $LOG | tail -3")"
+V "grep -q mailto $LT" && bad "still in links.toml" || ok "not in her links.toml"
+shot links-2
+
 V "pkill -x curia" >/dev/null 2>&1
+V "mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
 echo "apps-access: $fails failed"

@@ -16,5 +16,10 @@ portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+pergola = { path = "../pergola" }
+aqueduct = { path = "../aqueduct" }
+postcard = { version = "1", features = ["use-std"] }
 
 [workspace]

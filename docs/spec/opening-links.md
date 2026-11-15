@@ -185,7 +185,18 @@ new trail.
    `_monstrator` 65038, devfs ruleset 4, no network, only its own and portcullisd's socket
    directories); `open-uri` and `navigator-broker` now mount `/atrium/sockets/monstrator/`;
    atrium-open's `open-probe` prints the links it gets.
-3. **L3** the sheet and "Always use", Curia's Links section.
+3. **L3** the sheet and "Always use", Curia's Links section. *Built 2026-11-15:* with more
+   than one app and no default, monstratord opens its own Dialog window on frescod ("Open
+   this link in…", what the link shows, a row per app, "Always use this app for mailto
+   links", Cancel; `monstrator/src/sheet.rs`, `view.rs`, laid out in points), its rows the
+   window's guard. Up/Down/Tab move, Space ticks Always use, Enter or a click picks, Escape
+   cancels; a pick counts only once frescod counts the press as `PROMPT` for
+   `_monstrator` (a press that doesn't count says so under the text and asks again). One
+   sheet at a time, open at most 110 s (under the grant's two minutes); navigatord waits
+   130 s for the answer. Its jail mounts `fresco/` and `fresco-activation/`. Curia's Apps
+   page has the Links section (curia.md §13): `Links` and `SetLinkDefault` on a press.
+   `navigator-confined-vm.sh` 60/60 (two mail apps, pick by keys, Always use, the next link
+   goes straight to the default); `vm-apps-access-check.sh` 17/17.
 4. **L4** (= navigator-ui J4) navigatord's hand-offs through Monstrator, `NAVIGATORD_OPENER`
    removed; links into the Navigator open trails; `navigator-confined-vm.sh`. *Built
    2026-11-15 (before L3, which only adds the sheet):* navigatord sends a hand-off with its

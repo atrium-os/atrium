@@ -1025,6 +1025,67 @@ impl CuriaView {
                     y += em(8.0);
                 }
             }
+            // Links (opening-links.md §4.4): which app opens each scheme.
+            y += em(20.0);
+            text(ctx, 0.0, y + em(14.0), "Links", type_size::LG, Weight::Semibold, t.text_primary());
+            y += em(32.0);
+            match &p.links {
+                None => {
+                    text(ctx, 0.0, y + em(10.0), "Asking which apps open links…", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(28.0);
+                }
+                Some(Err(why)) => {
+                    text(ctx, 0.0, y + em(10.0), &format!("Links' apps are not available: {why}"), type_size::SM, Weight::Regular, t.text_secondary());
+                    y += em(28.0);
+                }
+                Some(Ok(v)) if v.is_empty() => {
+                    text(ctx, 0.0, y + em(10.0), "No app here opens links.", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(28.0);
+                }
+                Some(Ok(_)) => {}
+            }
+            for l in p.schemes() {
+                let open = p.link_open.as_deref() == Some(l.scheme.as_str());
+                let busy = p.link_busy.as_deref() == Some(l.scheme.as_str());
+                let rh = em(56.0);
+                let (pg, sc) = (self.apps.clone(), l.scheme.clone());
+                area(ctx, Rect::new(0.0, y, pw, rh), 8.0, t.bg_surface(), t.state_hover(), move || with_apps(&pg, |a| a.toggle_link(&sc)));
+                icon(ctx, em(14.0), y + em(19.0), if open { ph::CARET_DOWN } else { ph::CARET_RIGHT }, em(16.0), t.text_secondary());
+                text(ctx, em(40.0), y + em(20.0), &format!("{} links", l.scheme), type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, em(40.0), y + em(40.0), &if busy { "Changing…".to_string() } else { apps::link_status(l) }, type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+                y += rh + em(4.0);
+                if let Some((_, why)) = p.link_note.as_ref().filter(|(s, _)| *s == l.scheme) {
+                    text(ctx, em(40.0), y + em(12.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                    y += em(28.0);
+                }
+                if open {
+                    // Each app that takes it, and Ask each time; the press
+                    // goes with the ask, as Allow's does.
+                    let choices: Vec<(Option<String>, String, bool)> = l.apps.iter()
+                        .map(|c| (Some(c.id.clone()), c.name.clone(), l.yours && c.default))
+                        .chain([(None, "Ask each time".to_string(), !l.yours && !l.apps.iter().any(|c| c.default))])
+                        .collect();
+                    for (app, name, now) in choices {
+                        let bh = em(36.0);
+                        text(ctx, em(40.0), y + em(18.0), &name, type_size::SM, Weight::Regular, t.text_primary());
+                        if now {
+                            let l2 = "In use";
+                            text(ctx, pw - em(12.0) - width(l2, type_size::SM, Weight::Medium) - em(12.0), y + em(18.0), l2, type_size::SM, Weight::Medium, t.text_secondary());
+                        } else {
+                            let lab = if app.is_some() { "Use" } else { "Ask" };
+                            let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                            let (pg, sc) = (self.apps.clone(), l.scheme.clone());
+                            button(ctx, bx, y + em(3.0), lab, Look::Secondary, p.link_busy.is_none(), move || {
+                                let token = pergola::clipboard::current_activation();
+                                with_apps(&pg, |a| a.set_link(&sc, app.as_deref(), token))
+                            });
+                        }
+                        y += bh;
+                    }
+                    y += em(8.0);
+                }
+            }
             if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
                 rect.size.h = y;
             }

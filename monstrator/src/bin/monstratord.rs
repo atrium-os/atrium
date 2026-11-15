@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use monstrator::sheet::Outcome;
 use monstrator::{Answer, Ask, MAX_LINE};
 use portcullis_ipc::{round_trip, Request, Response};
 
@@ -58,14 +59,155 @@ fn open(asker: u32, url: &str, activation: [u8; 16]) -> Result<String, String> {
         Response::Error { message } => return Err(message),
         other => return Err(format!("portcullisd: {other:?}")),
     };
-    let Some(app) = monstrator::pick(&apps).map(str::to_string) else {
-        return Err(format!("{} apps open {} links; choosing one needs Monstrator's sheet, not built yet", apps.len(), link.scheme));
+    let (app, always) = match monstrator::pick(&apps) {
+        Some(a) => (a.to_string(), false),
+        // A choice: the person makes it in Monstrator's own sheet (§5).
+        None => match choose(&link.shown, &link.scheme, apps)? {
+            Outcome::Chose { app, always } => (app, always),
+            Outcome::Cancelled => return Err("cancelled".into()),
+        },
     };
-    match ask(&mut p, &Request::DeliverLink { grant, app: app.clone(), url: link.url, always: false })? {
+    match ask(&mut p, &Request::DeliverLink { grant, app: app.clone(), url: link.url, always })? {
         Response::LinkDelivered { .. } => Ok(link.scheme),
         Response::Error { message } => Err(message),
         other => Err(format!("portcullisd: {other:?}")),
     }
+}
+
+/// frescod's activation socket, where the sheet's presses are spent.
+const ACTIVATION: &str = "/atrium/sockets/fresco-activation/fresco-activation.sock";
+/// How long the sheet waits: under the grant's two minutes.
+const SHEET_FOR: Duration = Duration::from_secs(110);
+
+/// Spend `token`, a press in the sheet, as `PROMPT`: frescod
+/// counts it only if the window's guard (the rows) was seen whole,
+/// uncovered and still before it.
+fn counted(token: [u8; 16]) -> bool {
+    use fresco_protocol::activation::{op, purpose, Consume, ConsumeResult};
+    if token == fresco_protocol::activation::NONE {
+        return false;
+    }
+    let path = std::env::var("MONSTRATOR_ACTIVATION").unwrap_or_else(|_| ACTIVATION.into());
+    let ask = || -> std::io::Result<ConsumeResult> {
+        let bad = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let mut c = aqueduct::Connection::connect(&path)?;
+        // SAFETY: getuid cannot fail.
+        let me = unsafe { libc::getuid() };
+        let payload = postcard::to_stdvec(&Consume { token, presenter_uid: me, purpose: purpose::PROMPT }).map_err(|e| bad(e.to_string()))?;
+        c.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, aqueduct::flag::RESPONSE_EXPECTED, &payload)?;
+        c.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let m = c.recv_message()?;
+        postcard::from_bytes(&m.payload).map_err(|e| bad(e.to_string()))
+    };
+    match ask() {
+        // frescod counted it for our uid, in a window whose guard it saw
+        // whole: the sheet is monstratord's only window. (Window ids don't
+        // compare: with renderers split off, events carry the renderer's.)
+        Ok(ConsumeResult::Ok { .. }) => true,
+        Ok(r) => {
+            eprintln!("monstratord: a press in the sheet not counted: {r:?}");
+            false
+        }
+        Err(e) => {
+            eprintln!("monstratord: frescod's activation socket: {e}");
+            false
+        }
+    }
+}
+
+/// One sheet at a time, whoever asks.
+static SHEET: Mutex<()> = Mutex::new(());
+
+/// Ask the person which of `apps` opens the link (§5): Monstrator's own
+/// window on frescod, its rows the window's guard.
+fn choose(shown: &str, scheme: &str, apps: Vec<portcullis_ipc::LinkChoice>) -> Result<Outcome, String> {
+    use fresco_client::{Connection, Event};
+    use fresco_protocol::{WindowHints, WmRole};
+    use monstrator::sheet::{Do, Key, Sheet};
+    use monstrator::view;
+    let _one = SHEET.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Sheet::new(shown, scheme, apps);
+    let n = s.rows().len();
+    let fresco = fresco_client::default_socket_path();
+    let mut win = Connection::connect(&fresco).map_err(|e| format!("frescod ({}): {e}", fresco.display()))?;
+    let text = win.appearance().map(|a| a.text_scale()).unwrap_or(1.0);
+    let (w, h) = view::size(n, text);
+    let hints = |w: f32, h: f32| WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some((w.ceil() as u32, h.ceil() as u32)), ..Default::default() };
+    let id = win.window_create(w.ceil() as u32, h.ceil() as u32, "Open link", hints(w, h)).map_err(|e| format!("frescod: {e}"))?;
+    win.set_default_window(id as u16);
+    let font = view::Font::open(&mut win);
+    let (mut size, mut k) = ((w, h), win.window_scale(id));
+    let guard = |win: &mut Connection, size: (f32, f32), k: f32| {
+        let g = view::guard(n, size.0, text);
+        let r = [(g.x * k).ceil() as i32, (g.y * k).ceil() as i32, (g.w * k).floor() as i32, (g.h * k).floor() as i32];
+        if let Err(e) = win.window_guard(id, Some(r)) {
+            eprintln!("monstratord: frescod: guard: {e}");
+        }
+    };
+    guard(&mut win, size, k);
+    eprintln!("monstratord: asking which of {} apps opens a {scheme} link", n - 2);
+    let until = std::time::Instant::now() + SHEET_FOR;
+    let mut dirty = true;
+    let out = 'run: loop {
+        if std::time::Instant::now() > until {
+            eprintln!("monstratord: the sheet timed out");
+            break Outcome::Cancelled;
+        }
+        loop {
+            let ev = match win.poll_event() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("monstratord: frescod: {e}");
+                    break 'run Outcome::Cancelled;
+                }
+            };
+            let d = match ev {
+                Event::Resized { width, height, scale, .. } => {
+                    size = (width, height);
+                    if scale > 0.0 {
+                        k = scale;
+                    }
+                    guard(&mut win, size, k);
+                    Do::Redraw
+                }
+                Event::Key { hid_usage, pressed: true, repeat: false, activation, .. } => {
+                    let d = s.key(Key::from_hid(hid_usage), activation);
+                    eprintln!("monstratord: key {hid_usage:#x}: focus {}", s.focus);
+                    d
+                }
+                Event::PointerButton { x, y, pressed: true, activation, .. } => match view::hit(n, size.0, text, x, y) {
+                    Some(i) => {
+                            s.press(i, activation)
+                    }
+                    None => Do::Nothing,
+                },
+                Event::CloseRequested { .. } => {
+                    eprintln!("monstratord: the sheet was closed");
+                    Do::Done(Outcome::Cancelled)
+                }
+                _ => Do::Nothing,
+            };
+            let d = match d {
+                Do::Spend { row, token } => s.spent(row, counted(token)),
+                d => d,
+            };
+            match d {
+                Do::Done(o) => break 'run o,
+                Do::Redraw => dirty = true,
+                _ => {}
+            }
+        }
+        if dirty {
+            dirty = false;
+            if let Err(e) = view::draw(&mut win, font, &s, size.0, size.1, k, text) {
+                eprintln!("monstratord: draw: {e}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = win.window_destroy(id);
+    Ok(out)
 }
 
 fn serve(s: UnixStream, busy: Arc<Mutex<HashSet<u32>>>) {

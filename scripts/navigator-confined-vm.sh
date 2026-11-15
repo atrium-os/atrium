@@ -162,6 +162,7 @@ allow_rctl = true
     else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
     service atrium-jaild restart >/dev/null 2>&1; sleep 2
     pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
+    : > /var/log/atrium/portcullisd-navigator.log
     daemon -f -o /var/log/atrium/portcullisd-navigator.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
     pgrep -f atrium-jaild >/dev/null && test -S $PSOCK" || die "jaild restart / portcullisd start"
 echo "  jaild (rctl allowed) and portcullisd on $PSOCK"
@@ -234,10 +235,16 @@ g "set -e
     printf '[app]\nid = \"org.test.mail\"\nname = \"Test mail\"\nversion = \"1\"\nentry = \"bin/open-probe\"\n\n[[links]]\nschemes = [\"mailto\"]\n' > /root/mail-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/mail-bundle/atrium.toml.sig /root/mail-bundle/atrium.toml
     opifex install /root/mail-bundle
+    # A second one: with two and no default, Monstrator asks in its sheet.
+    rm -rf /root/mail2-bundle && cp -R /root/mail-bundle /root/mail2-bundle
+    printf '[app]\nid = \"org.test.mail2\"\nname = \"Test mail 2\"\nversion = \"1\"\nentry = \"bin/open-probe\"\n\n[[links]]\nschemes = [\"mailto\"]\n' > /root/mail2-bundle/atrium.toml
+    openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/mail2-bundle/atrium.toml.sig /root/mail2-bundle/atrium.toml
+    opifex install /root/mail2-bundle
+    rm -f /var/db/atrium/navtest/links.toml
     chmod +x $D/monstratord $D/monctl
     sh $D/monstrator-service.sh $D/monstratord $D/38-atrium-monstratord.toml" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
-for a in org.test.mail:open-probe org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
+for a in org.test.mail:open-probe org.test.mail2:open-probe org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
     g "test -x /var/lib/atrium/apps/${a%%:*}/bin/${a#*:}" && ok "${a%%:*} installed" || bad "${a%%:*} not installed"
 done
 g "grep -q 'workers.\"$PAGE_ID\"' /etc/atrium/policy.toml" && ok "worker rule: _limen starts the page as _navpage" || bad "no worker rule for $PAGE_ID"
@@ -247,36 +254,38 @@ echo "=== start"
 # the worker rule runs each as _fresco-render.
 # frescod's activation and chrome sockets and limend's are in directories of
 # their own under /atrium/sockets, which the Navigator's jail mounts.
+# frescod's own socket where jails find it (Monstrator's sheet, §6).
+FS=/atrium/sockets/fresco/fresco.sock
 AS=/atrium/sockets/fresco-activation/fresco-activation.sock
 CS=/atrium/sockets/fresco-chrome/fresco-chrome.sock
 LS=/atrium/sockets/limen/limend.sock
 NS=/atrium/sockets/navigator/navigator.sock
-g "mkdir -p /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome /atrium/sockets/limen /atrium/sockets/navigator \
+g "mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome /atrium/sockets/limen /atrium/sockets/navigator \
       /atrium/sockets/navigator-page /atrium/sockets/arca /atrium/sockets/arca-courier
-   chown _frescod /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome; chown _limen /atrium/sockets/limen
+   chown _frescod /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome; chown _limen /atrium/sockets/limen
    rm -f /atrium/sockets/navigator/*.sock /atrium/sockets/navigator-page/*.sock
    # Bound by the Navigator's per-app uid, which portcullisd allocates at its
    # first launch: open to it here (portcullisd making a served socket's
    # directory the app's own is a later step).
    chmod 1777 /atrium/sockets/navigator /atrium/sockets/navigator-page"
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute \
-    FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock \
+    FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$FS FRESCOD_WM_SOCK=$S/wm.sock \
     FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$CS FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
     daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
-i=0; while [ $i -lt 60 ] && ! g "test -S $S/fresco.sock && test -S $AS"; do sleep 2; i=$((i+1)); done
+i=0; while [ $i -lt 60 ] && ! g "test -S $FS && test -S $AS"; do sleep 2; i=$((i+1)); done
 # Monstrator, the link opener (opening-links.md §6), as the system service
 # it is: portcullisd's bootstrap starts it from its services.d manifest, the
 # only one in this run's services directory.
 MS=/atrium/sockets/monstrator/monstrator.sock
 g "pkill -f atrium-portcullisd-bootstrap; sleep 2; install -m 755 $D/atrium-portcullisd-bootstrap /usr/local/bin/atrium-portcullisd-bootstrap
-   rm -rf $S/svc && mkdir -p $S/svc && cp /etc/atrium/services.d/38-atrium-monstratord.toml $S/svc/ && rm -f $MS
+   rm -rf $S/svc && mkdir -p $S/svc && cp /etc/atrium/services.d/38-atrium-monstratord.toml $S/svc/ && rm -f $MS /var/log/atrium/atrium-monstratord.log
    daemon -f -o $S/bootstrap.log /usr/local/bin/atrium-portcullisd-bootstrap --services-dir $S/svc </dev/null"
 i=0; while [ $i -lt 30 ] && ! g "test -S $MS"; do sleep 2; i=$((i+1)); done
 MON=$(g "ps -o jid= -o uid= -p \$(pgrep -f atrium-monstratord | head -1)" | tr -d '\r' | awk '{print $1, $2}')
 MJID=${MON%% *}; MUID=${MON#* }
 [ -n "$MJID" ] && [ "$MJID" != 0 ] && [ "$MUID" = 65038 ] && ok "monstratord runs in a jail (jid $MJID) as _monstrator (65038)" || bad "monstratord: '$MON' $(g "tail -3 $S/bootstrap.log")"
 MM=$(g "mount -p | awk '{print \$2}' | grep '/jails/monstratord/atrium/sockets' | sed 's#.*/atrium/sockets/#sockets/#' | sort | tr '\n' ' '" | tr -d '\r')
-[ "$MM" = "sockets/monstrator sockets/portcullis " ] && ok "its jail reaches its own socket and portcullisd's, no other" || bad "monstratord's socket mounts: '$MM'"
+[ "$MM" = "sockets/fresco sockets/fresco-activation sockets/monstrator sockets/portcullis " ] && ok "its jail reaches its own socket, portcullisd's and frescod's two, no other" || bad "monstratord's socket mounts: '$MM'"
 # A services.d jail without network: no addresses at all (ip4 and ip6
 # disabled), or a stack of its own.
 MN=$(g "jls -n -j ${MJID:-0} ip4 ip6 vnet 2>&1" | tr -d '\r')
@@ -286,7 +295,7 @@ case "$r" in *"never opened in an app"*) ok "a javascript: link is refused befor
 r=$(g "MONSTRATOR_SOCKET=$MS $D/monctl 'mailto:a@b.example'")
 case "$r" in *"not a launched app"*) ok "portcullisd takes Monstrator's ask, and refuses an asker that is no app" ;; *) bad "root's mailto: $r" ;; esac
 g "grep -q 'renderers are org.atrium.fresco.renderer jails' $S/frescod.log" && ok "frescod (as _frescod) starts renderers as jails" || bad "frescod: $(g "grep -i renderer $S/frescod.log | head -3 | tr '\n' ';'")"
-g "cd $S && env FRESCO_SOCKET=$S/fresco.sock FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
+g "cd $S && env FRESCO_SOCKET=$FS FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
 # limend as _limen: the Navigator is navigatord, launched by navtest, so
 # portcullisd's launch registry names its per-app uid (navtest,
 # org.atrium.navigator); navigatord opens both the UI's frescod and limend
@@ -387,18 +396,43 @@ press 270 $((TOP + 20))     # the toolbar's Back
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "Back went to the parent page" || bad "back: $(last)"
 # A hand-off (opening-links.md §7, L4): the mailto: link asks in the prompt
 # row; Open sends it with the press to Monstrator, portcullisd spends the
-# press (purpose LINK, the row's guard seen clear) and hands the link to
-# the one app that takes mailto: on its document channel, starting it.
+# press (purpose LINK, the row's guard seen clear). Two apps take mailto:
+# and neither is the default, so Monstrator asks in its own sheet (L3):
+# keys only (the sheet has them as the new dialog), Always use ticked, the
+# first app picked with Enter, which frescod counts (PROMPT, its own
+# window, the rows its guard). portcullisd starts that app with the link
+# on its document channel and makes it the default; the next mailto: link
+# goes straight to it.
+ML=/var/log/atrium/atrium-monstratord.log
+PL=/var/log/atrium/portcullisd-navigator.log
+key() { inj "KEY $1 1 0"; sleep 1; inj "KEY $1 0 0"; sleep 3; }
+links() { g "grep -c 'open-probe: link url=mailto:curator@atlas.example\$' $PL" | tr -d '\r '; }
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 5 * 40))    # mailto:
 until_trace 'prompt=handoff' && ok "a mailto: link asked before going anywhere" || bad "mailto: $(last)"
 W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
 press $((W - 40)) $((TOP + 41 + 22))                   # Open
-i=0; while [ $i -lt 90 ] && ! g "grep -q 'open-probe: link url=' /var/log/atrium/portcullisd-navigator.log"; do sleep 3; i=$((i+3)); done
-g "grep -q 'open-probe: link url=mailto:curator@atlas.example\$' /var/log/atrium/portcullisd-navigator.log" && ok "…Open: the mail app got the link, through Monstrator and portcullisd" \
-    || bad "hand-off: $(g "grep -h -e 'not handed on' -e 'handed' $UL | tail -2; grep -h -e link -e LINK /var/log/atrium/portcullisd-navigator.log | tail -3; grep -h monstratord $S/bootstrap.log | tail -2" | tr '\n' ';')"
-g "grep -q 'a mailto link from org.atrium.navigator opened in org.test.mail for navtest' /var/log/atrium/portcullisd-navigator.log" && ok "…from the Navigator, for navtest, to org.test.mail" || bad "portcullisd: $(g "grep -h link /var/log/atrium/portcullisd-navigator.log | tail -3" | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'asking which of 2 apps' $ML"; do sleep 3; i=$((i+3)); done
+g "grep -q 'asking which of 2 apps opens a mailto link' $ML" && ok "two apps take mailto: and none is the default: Monstrator asks in its sheet" || bad "no sheet: $(g "tail -3 $ML")"
+sleep 3
+shot confined-4-sheet
+key 0x51; key 0x51        # Down, Down: Always use
+key 0x2c                  # Space: ticked
+key 0x52; key 0x52        # Up, Up: Test mail
+key 0x28                  # Enter
+i=0; while [ $i -lt 90 ] && [ "$(links)" != 1 ]; do sleep 3; i=$((i+3)); done
+[ "$(links)" = 1 ] && ok "…the pick counted: the mail app got the link, through Monstrator and portcullisd" \
+    || bad "hand-off: $(g "grep -h 'not handed on' $UL | tail -1; tail -3 $ML; grep -h -e link -e LINK $PL | tail -3" | tr '\n' ';')"
+g "grep -q 'a mailto link from org.atrium.navigator opened in org.test.mail for navtest' $PL" && ok "…from the Navigator, for navtest, to org.test.mail" || bad "portcullisd: $(g "grep -h link $PL | tail -3" | tr '\n' ';')"
 g "grep -q 'handed mailto:curator@atlas.example on' $UL" && ok "…and the Navigator was told it was opened" || bad "UI: $(g "grep -h 'handed on' $UL | tail -2")"
-g "grep -h monstratord $S/bootstrap.log /var/log/atrium/*.log 2>/dev/null | grep -q curator" && bad "monstratord logged the link itself" || ok "nothing logged the address but the app"
+g "grep -qx 'mailto = \"org.test.mail\"' /var/db/atrium/navtest/links.toml" && ok "Always use: org.test.mail is navtest's mailto: default" || bad "links.toml: $(g "cat /var/db/atrium/navtest/links.toml 2>&1")"
+until_trace 'prompt=- ' || bad "the row stayed: $(last)"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 5 * 40))    # mailto: again
+until_trace 'prompt=handoff' || bad "mailto again: $(last)"
+press $((W - 40)) $((TOP + 41 + 22))                   # Open
+i=0; while [ $i -lt 90 ] && [ "$(links)" != 2 ]; do sleep 3; i=$((i+3)); done
+[ "$(links)" = 2 ] && ok "the next mailto: link went straight to the default, no sheet" || bad "second hand-off: $(links) links; $(g "tail -3 $ML" | tr '\n' ';')"
+g "grep -c 'asking which' $ML" | grep -qx 1 && ok "…asked once" || bad "sheets: $(g "grep -c 'asking which' $ML")"
+g "grep -h -e monstratord $S/bootstrap.log $ML 2>/dev/null | grep -q curator" && bad "monstratord logged the link itself" || ok "nothing logged the address but the app"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "back on Atrium: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 120))

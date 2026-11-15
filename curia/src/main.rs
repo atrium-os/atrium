@@ -397,8 +397,23 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                     Ok(other) => Err(format!("unexpected reply: {other:?}")),
                     Err(e) => Err(e),
                 };
+                let _ = tx.send(Got::List(r));
+                let l = match ask(&Request::Links) {
+                    Ok(Response::Links { schemes }) => Ok(schemes),
+                    Ok(Response::Error { message }) => Err(message),
+                    Ok(other) => Err(format!("unexpected reply: {other:?}")),
+                    Err(e) => Err(e),
+                };
                 refreshing.store(false, Ordering::SeqCst);
-                Got::List(r)
+                Got::Links(l)
+            }
+            Want::SetLink { scheme, app, activation } => {
+                let r = done(ask(&Request::SetLinkDefault { scheme: scheme.clone(), app: app.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: {scheme} links: {}", app.as_deref().unwrap_or("ask each time")),
+                    Err(e) => eprintln!("curia: {scheme} links: {e}"),
+                }
+                Got::LinkDone { scheme, result: r }
             }
             Want::Allow { app_id, activation } => {
                 let r = done(ask(&Request::ApproveAccess { app_id: app_id.clone(), activation }));

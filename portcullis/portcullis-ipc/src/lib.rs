@@ -348,6 +348,21 @@ pub enum Request {
     /// asking for a restricted capability: only the system grants those.
     /// Answer: `Ok`.
     ApproveAccess { app_id: String, activation: [u8; 16] },
+    /// ★ Settings' Links section (opening-links.md §4.4): each link scheme
+    /// an installed app takes, those apps, and the person's default.
+    /// `app-grants` only, about the person that app belongs to. Answer:
+    /// `Links`.
+    Links,
+    /// ★ Make `app` the person's default for `scheme` links (it must take
+    /// them), or with `None` ask each time. `app-grants` only, and only
+    /// with `activation`, a press in the asking app's window that
+    /// portcullisd spends with frescod (purpose APPROVE). Answer: `Ok`.
+    SetLinkDefault {
+        scheme:     String,
+        #[serde(default)]
+        app:        Option<String>,
+        activation: [u8; 16],
+    },
 
     /// The person's workspaces (homes.md §5), Scratch made at the first
     /// ask. Asked by a launcher or by the person (not an app). Answer:
@@ -470,6 +485,17 @@ pub struct LinkChoice {
     pub default: bool,
 }
 
+/// A link scheme in Settings' Links section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkScheme {
+    pub scheme: String,
+    /// The apps that take it, by name; `default` marks the one that opens
+    /// it now (none: Monstrator asks).
+    pub apps:   Vec<LinkChoice>,
+    /// The default is the person's choice, not the system's.
+    pub yours:  bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenChoice {
     pub id:      String,
@@ -566,6 +592,8 @@ pub enum Response {
     LinkGranted { grant: [u8; 16], person: String, apps: Vec<LinkChoice> },
     /// DeliverLink → handed to `app` (its name).
     LinkDelivered { app: String },
+    /// Links → each scheme an app takes, by scheme.
+    Links { schemes: Vec<LinkScheme> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.

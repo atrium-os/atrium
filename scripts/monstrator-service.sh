@@ -20,5 +20,5 @@ install -d /etc/atrium/services.d
 M=${2:-$HERE/monstrator/etc/services.d/38-atrium-monstratord.toml}
 install -m 0644 "$M" /etc/atrium/services.d/38-atrium-monstratord.toml
 R=/var/lib/atrium/jails/monstratord
-for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/monstrator atrium/sockets/portcullis; do [ -d "$R/$d" ] || install -d "$R/$d"; done
+for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/monstrator atrium/sockets/portcullis atrium/sockets/fresco atrium/sockets/fresco-activation; do [ -d "$R/$d" ] || install -d "$R/$d"; done
 echo "monstrator-service: commissioned. Restart atrium-portcullisd-bootstrap (or run it) to start atrium-monstratord."

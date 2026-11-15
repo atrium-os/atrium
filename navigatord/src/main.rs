@@ -1288,7 +1288,7 @@ fn hand(cfg: &Config, url: &str, press: ctl::Press) -> Event {
     if !cfg.monstrator.exists() {
         return ev(false, Some("nothing here takes hand-offs yet".into()));
     }
-    match monstrator::open_link(&cfg.monstrator, url, press, std::time::Duration::from_secs(30)) {
+    match monstrator::open_link(&cfg.monstrator, url, press, std::time::Duration::from_secs(130)) {
         Ok(Ok(())) => {
             eprintln!("navigatord: a hand-off went to Monstrator and was opened");
             ev(true, None)

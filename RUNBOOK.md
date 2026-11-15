@@ -5601,7 +5601,7 @@ N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP
     sh scripts/curia-vm.sh away          # after `arca`: kill/hang atrium-netconf, dispensatord, arca-ui, limend; Curia must recover alone (frames scratch/curia-away-*.png)
     sh scripts/curia-vm.sh display       # forum-wm with its settings socket ($Sx/display.sock), then Curia's Display page
     sh scripts/curia-vm.sh sound         # VM booted with lyra-vm-check.sh qemu-args, after cloud-vm.sh lyra: lyrad, choragusd, a tone, Curia's Sound page
-    sh scripts/vm-apps-access-check.sh   # after cloud-vm.sh up: portcullisd, frescod headless, Curia's Apps page as alice; Allow (a real press), Remove; ends "apps-access: N failed"
+    sh scripts/vm-apps-access-check.sh   # after cloud-vm.sh up: portcullisd, frescod headless, Curia's Apps page as alice; Allow (a real press), Remove; the Links section (Use, Ask each time on mailto:); other gates' apps set aside meanwhile; ends "apps-access: N failed"
     sh scripts/curia-bt-check.sh         # Linux host: Rootcanal + vinculumd + Bumble peers; the Bluetooth page model pairs (3 prompt kinds, plus Classic keyboards found by inquiry, named or asked), reconnects, turns Bluetooth off and on, forgets; vinculumd --control-apps admits or refuses by registry + manifest; ends "curia-bt: N failed"
     # Devices page: needs atrium-dispensatord with the devices socket on the VM (curia.md §9); then shot, click the sidebar's Devices
 
@@ -5827,8 +5827,14 @@ root's `mailto:` by portcullisd ("not a launched app"); a press on the Atrium pa
 link asks, *Open* sends it with the press to Monstrator, and portcullisd (purpose `LINK`) starts
 the mail app with the link on its document channel (`open-probe: link url=mailto:…` in
 portcullisd's log, which carries the app's output), the UI is told it was opened, and no log of
-Monstrator's has the address; monstratord's jail ends with the bootstrap. 55/55 on 2026-11-15. jaild's policy needed
-`/atrium/sockets/monstrator` and `/atrium/sockets/portcullis` in `rw_paths`, and a services.d
+Monstrator's has the address; monstratord's jail ends with the bootstrap. L3 (the sheet): a second
+mail app, `org.test.mail2`, also takes `mailto:` and links.toml is removed first, so Monstrator asks
+in its own window (frescod's socket at `/atrium/sockets/fresco/`, which the jail mounts with
+`fresco-activation/`); keys Down, Down, Space (Always use), Up, Up, Enter pick Test mail, frescod counts
+the Enter (`PROMPT`, the rows its guard), the link reaches `org.test.mail`, navtest's links.toml
+says `mailto = "org.test.mail"`, and the next `mailto:` link goes there with no sheet. 60/60 on
+2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
+`/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds
 portcullisd's socket by its default path).
 

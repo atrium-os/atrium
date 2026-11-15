@@ -6,6 +6,9 @@
 //! token lives one second); portcullisd spends it, not Monstrator. The
 //! answer says only whether the link was opened (D6), never in what.
 
+pub mod sheet;
+pub mod view;
+
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

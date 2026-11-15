@@ -892,6 +892,27 @@ pub fn apps_taking_link(scheme: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Every link scheme an installed app takes (not `atrium-app`), sorted.
+pub fn link_schemes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
+        let Ok(m) = Manifest::from_str(&text) else { continue };
+        if e.file_name().to_str() != Some(m.app.id.as_str()) {
+            continue;
+        }
+        for s in m.links.iter().flat_map(|l| l.schemes.iter()) {
+            if s != atrium_links::APP && atrium_links::declarable(s).is_ok() && !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out.retain(|s| !apps_taking_link(s).is_empty());
+    out.sort();
+    out
+}
+
 /// Every installed app that opens `mime`: (id, name, mode), by name.
 pub fn apps_opening(mime: &str) -> Vec<(String, String, portcullis_toml::OpenMode)> {
     let mut out = Vec::new();
