@@ -20,3 +20,13 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "html"
+path = "fuzz_targets/html.rs"
+test = false
+doc = false
+bench = false
+
+[patch.crates-io]
+pathfinder_simd = { path = "../../../navigator-fonts/vendor/pathfinder_simd" }

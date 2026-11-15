@@ -10,6 +10,20 @@ description = "Mail's message parser (docs/spec/mail.md §7.1): RFC 5322 headers
 encoding_rs = "0.8"
 psl = "2"
 ring = "0.17"
+# HTML mail (§7.3): the Navigator's normalizer and DOM, in the same jail.
+navigator-dom = { path = "../../navigator-dom", optional = true }
+navigator-normalize = { path = "../../navigator-normalize", optional = true }
+navigator-render = { path = "../../navigator-render", optional = true }
+navigator-style = { path = "../../navigator-style", optional = true }
+
+[features]
+default = ["html"]
+html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", "dep:navigator-style"]
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
+# crate must repeat the patch, because [patch] only applies at the build root.
+[patch.crates-io]
+pathfinder_simd = { path = "../../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
 debug = 1

@@ -17,6 +17,8 @@ pub mod dkim;
 pub mod header;
 pub mod ical;
 pub mod tnef;
+#[cfg(feature = "html")]
+pub mod html;
 pub(crate) mod mime;
 
 pub use address::Address;
