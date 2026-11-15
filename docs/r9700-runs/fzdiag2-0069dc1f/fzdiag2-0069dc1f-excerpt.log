@@ -1,0 +1,256 @@
+== fzdiag2 0069dc1f excerpt (confirming rerun)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 0 -> 0)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 1 ms; fault IVs +6161, IH overflows +3
+PASS: 16 fault storm: the storm is cut short (+6161 fault IVs, re-inits 0 -> 1)
+PASS: 16 fault storm: the IH ring barely overflows (+3 overflows)
+16 bystander after the reset: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 16 fault storm: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+16: re-inits 0 -> 1
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 1)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 63681: Operation not permitted after 5033 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 2 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 63682: Operation not permitted after 5050 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 3 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 95 passed, 0 failed: PASS
+si-client-test rc=0
+== si-fuzz all 3600 0x24f00d
+  POWERGATE                0          0        332          0       1833       5426          0          0          0          0        116          0
+  old SUBMIT               0          0        358          0       7087          0          0          0          0          0        104          0
+si-fuzz: mmaps that succeeded 0, forks 237, blob VM reopens 12, queue renews 8
+RESULT: PASS (0 findings, seed 0x24f00d)
+si-fuzz rc=0
+reinits 13
+== re-inits during the fuzz (3 -> 13): waiting 610 s
+== si-client-test after the fuzz
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 13 -> 13)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 1 ms; fault IVs +6161, IH overflows +3
+PASS: 16 fault storm: the storm is cut short (+6161 fault IVs, re-inits 13 -> 14)
+PASS: 16 fault storm: the IH ring barely overflows (+3 overflows)
+16 bystander after the reset: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 16 fault storm: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+16: re-inits 13 -> 14
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 14)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 61931: Operation not permitted after 5038 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 15 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 61932: Operation not permitted after 5040 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 16 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 95 passed, 0 failed: PASS
+si-client-test rc=0
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 6
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+atrium_gpu_amd_pci0: smu: sample [detached] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #808: edge 30 C, hotspot 34 C, mem 30 C, VR 29 C; power 7 W of 300 W limit, board 7 W; fan 895 rpm (20%); gfx 5 MHz, mem 25 MHz, gfx busy 1%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: card proven idle at detach
+atrium_gpu_amd_pci0: si: stage 5a: detached
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+== done, log /root/runs/20261115T092449Z.log
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 3, pace 610 s, generations 60 s
+si-fuzz: 3 re-init(s) before the start: waiting 610 s for the driver's window to close
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz: re-init 3 -> 4; workers stopped for 610 s
+si-fuzz: canary slow once: completion Input/output error after 5000 ms, 0/64 words 42
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz: blob generation 4: uid 62004, seed 0x24f011
+si-fuzz: re-init 4 -> 5; workers stopped for 610 s
+si-fuzz: re-init 5 -> 6; workers stopped for 610 s
+si-fuzz: 1020 s: 223845 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 196, re-inits 6, cp_errors 4, vm_faults 6172, hangs 11, findings 0
+si-fuzz: 1080 s: 223845 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 208, re-inits 6, cp_errors 4, vm_faults 6172, hangs 11, findings 0
+si-fuzz: 1140 s: 223845 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 220, re-inits 6, cp_errors 4, vm_faults 6172, hangs 11, findings 0
+si-fuzz: 1200 s: 223845 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 232, re-inits 6, cp_errors 4, vm_faults 6172, hangs 11, findings 0
+si-fuzz: 1260 s: 223845 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 244, re-inits 6, cp_errors 4, vm_faults 6172, hangs 11, findings 0
+si-fuzz: ioctl generation 5: uid 61005, seed 0x24f012
+si-fuzz: blob generation 6: uid 62006, seed 0x24f013
+si-fuzz: re-init 6 -> 7; workers stopped for 610 s
+si-fuzz: re-init 7 -> 8; workers stopped for 610 s
+si-fuzz: 1320 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 252, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1380 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 264, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1440 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 276, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1500 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 288, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1560 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 300, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1620 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 312, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1680 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 324, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1740 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 336, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1801 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 348, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: 1861 s: 230102 calls, blob 8 jobs (1 ok, 4 failed, 1 clean after), canary 360, re-inits 8, cp_errors 6, vm_faults 6174, hangs 13, findings 0
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+si-fuzz: re-init 8 -> 9; workers stopped for 610 s
+si-fuzz: 1921 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 371, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 1981 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 383, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2041 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 395, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2101 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 407, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2161 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 419, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2221 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 431, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2281 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 443, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2341 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 455, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2401 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 467, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2461 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 479, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: 2521 s: 230241 calls, blob 11 jobs (1 ok, 6 failed, 2 clean after), canary 491, re-inits 9, cp_errors 7, vm_faults 6176, hangs 14, findings 0
+si-fuzz: ioctl generation 9: uid 61009, seed 0x24f016
+si-fuzz: blob generation 10: uid 62010, seed 0x24f017
+si-fuzz: re-init 9 -> 10; workers stopped for 610 s
+si-fuzz: re-init 10 -> 11; workers stopped for 610 s
+si-fuzz: 2581 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 499, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2641 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 511, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2701 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 523, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2761 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 535, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2821 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 547, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2881 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 559, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 2941 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 571, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 3001 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 583, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 3061 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 595, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: 3121 s: 238395 calls, blob 13 jobs (1 ok, 7 failed, 2 clean after), canary 607, re-inits 11, cp_errors 9, vm_faults 6178, hangs 16, findings 0
+si-fuzz: ioctl generation 11: uid 61011, seed 0x24f018
+si-fuzz: blob generation 12: uid 62012, seed 0x24f019
+si-fuzz: re-init 11 -> 12; workers stopped for 610 s
+si-fuzz: re-init 12 -> 13; workers stopped for 610 s
+si-fuzz: 3196 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 618, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3256 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 630, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3316 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 642, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3376 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 654, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3436 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 666, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3496 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 678, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3556 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 690, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: 3600 s: 249066 calls, blob 15 jobs (1 ok, 8 failed, 2 clean after), canary 698, re-inits 13, cp_errors 11, vm_faults 6180, hangs 19, findings 0
+si-fuzz: re-inits at the end 13
+si-fuzz: health: a new VM runs write_42 clean
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+si-fuzz: mmaps that succeeded 0, forks 237, blob VM reopens 12, queue renews 8
+RESULT: PASS (0 findings, seed 0x24f00d)
+== mute lines
+Nov 15 09:24:56 uq3: VMID 11's fault interrupts muted until the queue is removed (GFXHUB CONTEXT11_CNTL now 0x3aaa807)
+Nov 15 09:25:12 uq3: VMID 11's fault interrupts muted until the queue is removed (GFXHUB CONTEXT11_CNTL now 0x3aaa807)
+Nov 15 09:25:12 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 09:25:14 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 09:25:23 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 09:25:25 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:08:00 uq2: VMID 10's fault interrupts muted until the queue is removed (GFXHUB CONTEXT10_CNTL now 0x3aaa807)
+Nov 15 10:46:29 uq3: VMID 11's fault interrupts muted until the queue is removed (GFXHUB CONTEXT11_CNTL now 0x3aaa807)
+Nov 15 10:46:45 uq3: VMID 11's fault interrupts muted until the queue is removed (GFXHUB CONTEXT11_CNTL now 0x3aaa807)
+Nov 15 10:46:45 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:46:47 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:46:56 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:46:58 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+== still faulting
+Nov 15 09:25:25 uq4: VMID 12 still faulting after the mute (+4114 IVs in 3000 us): a fault storm only a GPU reset stops
+Nov 15 10:46:58 uq4: VMID 12 still faulting after the mute (+4114 IVs in 3000 us): a fault storm only a GPU reset stops
+== storm windows
+Nov 15 09:25:23 si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0
+Nov 15 09:25:23 gmc: client fault: fault status 0xc41050: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:23 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 09:25:25 si: VM fault: 20 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x1000
+Nov 15 09:25:25 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:25 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 09:25:25 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0xc60000
+Nov 15 09:25:25 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:25 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x1860000
+Nov 15 09:25:25 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:25 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x2457000
+Nov 15 09:25:25 uq4: VMID 12 still faulting after the mute (+4114 IVs in 3000 us): a fault storm only a GPU reset stops
+Nov 15 09:25:25 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 15 09:25:25 smu: mode 1 reset (card back to its post-POST state)
+Nov 15 09:25:25 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:28 si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 15 09:25:31 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 15 09:25:31 si: GPU re-initialised (1 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+Nov 15 09:25:39 si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1, first VMID 0 at 0
+Nov 15 09:25:39 gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSION_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 09:25:39 si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+Nov 15 10:46:56 si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0
+Nov 15 10:46:56 gmc: client fault: fault status 0xc41050: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x5, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+Nov 15 10:46:56 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:46:58 si: VM fault: 20 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x1000
+Nov 15 10:46:58 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 10:46:58 uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+Nov 15 10:46:58 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0xc81000
+Nov 15 10:46:58 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 10:46:58 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x187f000
+Nov 15 10:46:58 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 10:46:58 si: VM fault: 2047 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0x246a000
+Nov 15 10:46:58 uq4: VMID 12 still faulting after the mute (+4114 IVs in 3000 us): a fault storm only a GPU reset stops
+Nov 15 10:46:58 si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+Nov 15 10:46:58 smu: mode 1 reset (card back to its post-POST state)
+Nov 15 10:46:58 gmc: client fault: fault status 0xc01e31: client GCR (0xf), VMID 12, MORE_FAULTS 1, WALKER_ERROR 0, PERMISSION_FAULTS 0x3, MAPPING_ERROR 0, RW 0, ATOMIC 0, PRT 0, UCE 0
+Nov 15 10:47:02 si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+Nov 15 10:47:05 si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+Nov 15 10:47:05 si: GPU re-initialised (14 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
