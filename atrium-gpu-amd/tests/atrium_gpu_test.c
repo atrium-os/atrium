@@ -233,6 +233,32 @@ bo_alloc(int fd, int vm, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
 	return (0);
 }
 
+/*
+ * Allocate a code or IB BO: bound read-only and executable (VM_BIND2
+ * READONLY|EXEC), since GPU W^X is on by default on silicon. The CPU
+ * still fills it with bo_write.
+ */
+static int
+bo_alloc_x(int fd, int vm, uint64_t size, uint32_t *handle, uint64_t *gpu_va)
+{
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind2 b;
+
+	memset(&a, 0, sizeof(a));
+	a.size = size;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
+		return (-1);
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = (uint32_t)vm;
+	b.bo_fd = a.bo_fd;
+	b.flags = ATRIUM_GPU_BIND_READONLY | ATRIUM_GPU_BIND_EXEC;
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND2, &b) != 0)
+		return (-1);
+	*handle = a.bo_fd;
+	*gpu_va = b.va;
+	return (0);
+}
+
 static int
 bo_write(int fd, uint32_t handle, const void *src, uint64_t len)
 {
@@ -409,7 +435,7 @@ emit_inc(int fd, int vm, uint32_t *ring, uint64_t src, uint64_t dst,
 		return (k);
 	}
 	/* The code BO stays open (and bound) for the process: tests are short. */
-	if (bo_alloc(fd, vm, 4096, &code_h, &code_va) != 0 ||
+	if (bo_alloc_x(fd, vm, 4096, &code_h, &code_va) != 0 ||
 	    bo_write(fd, code_h, siops_inc, sizeof(siops_inc)) != 0)
 		return (-1);
 	prm[0] = code_va;
@@ -461,7 +487,7 @@ test_gfx_fence(int fd, int vm)
 	uint64_t ring_va, fence_va, fence = 0;
 	int n;
 
-	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	if (bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("gfx: BO alloc failed\n");
 		return (1);
@@ -496,7 +522,7 @@ test_compute(int fd, int vm)
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("compute: BO alloc failed\n");
 		return (1);
 	}
@@ -555,7 +581,7 @@ test_draw(int fd, int vm)
 
 	if (bo_alloc(fd, vm, sizeof(v), &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, sizeof(rt), &rt_h, &rt_va) != 0 ||
-	    bo_alloc(fd, vm, sizeof(ring), &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, sizeof(ring), &ring_h, &ring_va) != 0) {
 		printf("draw: BO alloc failed\n");
 		return (1);
 	}
@@ -610,7 +636,7 @@ test_irq(int fd, int vm)
 		printf("irq: MSI-X unavailable — poll mode (skipped)\n");
 		return (0);
 	}
-	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	if (bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("irq: BO alloc failed\n");
 		return (1);
@@ -666,7 +692,7 @@ test_syncobj(int fd, int vm)
 		return (1);
 	}
 
-	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	if (bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("syncobj: BO alloc failed\n");
 		return (1);
@@ -719,7 +745,7 @@ inc_one(int fd, int vm, uint32_t input)
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0)
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0)
 		return (-1);
 	if (bo_write(fd, src_h, &input, sizeof(input)) != 0)
 		return (-1);
@@ -891,7 +917,7 @@ test_umq(int fd, int vm)
 	void *map;
 	int qfd;
 
-	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	if (bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("umq: BO alloc failed\n");
 		return (1);
@@ -1041,8 +1067,8 @@ test_cross_queue(int fd, int vm)
 
 	if (bo_alloc(fd, vm, 4096, &addr_h, &addr_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ringa_h, &ringa_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ringb_h, &ringb_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ringa_h, &ringa_va) != 0 ||
+	    bo_alloc_x(fd, vm, 4096, &ringb_h, &ringb_va) != 0) {
 		printf("cross_queue: BO alloc failed\n");
 		return (1);
 	}
@@ -1149,7 +1175,7 @@ test_fault_reset(int fd, int vm)
 	so_fd = (int)cr.out_fd;
 
 	if (bo_alloc(fd, vm, 4096, &stuck_h, &stuck_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
 		printf("fault_reset: BO alloc failed\n");
 		return (1);
@@ -1271,7 +1297,7 @@ test_textured_draw(int fd, int vm)
 	if (bo_alloc(fd, vm, 4096, &tex_h, &tex_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("textured: BO alloc failed\n");
 		return (1);
 	}
@@ -1322,7 +1348,7 @@ test_blend(int fd, int vm)
 
 	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("blend: BO alloc failed\n");
 		return (1);
 	}
@@ -1384,7 +1410,7 @@ test_dma_copy(int fd, int vm)
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("dma_copy: BO alloc failed\n");
 		return (1);
 	}
@@ -1440,7 +1466,7 @@ test_depth(int fd, int vm)
 	if (bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dep_h, &dep_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("depth: BO alloc failed\n");
 		return (1);
 	}
@@ -1497,7 +1523,7 @@ test_bilinear(int fd, int vm)
 	if (bo_alloc(fd, vm, 4096, &tex_h, &tex_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &vtx_h, &vtx_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &rt_h, &rt_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("bilinear: BO alloc failed\n");
 		return (1);
 	}
@@ -1554,7 +1580,7 @@ test_multipage(int fd, int vm)
 	}
 	if (bo_alloc(fd, vm, BYTES, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, BYTES, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("multipage: multi-page BO alloc failed\n");
 		goto out;
 	}
@@ -1611,7 +1637,7 @@ test_doorbell_pages(int fd, int vm)
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("doorbell_pages: BO alloc failed\n");
 		return (1);
 	}
@@ -1739,7 +1765,7 @@ test_vram(int fd, int vm)
 	if (bo_alloc(fd, vm, sizeof(pat), &stg_h, &stg_va) != 0 ||
 	    bo_alloc_flags(fd, vm, sizeof(pat), ATRIUM_GPU_BO_VRAM, &vbo_h, &vbo_va) != 0 ||
 	    bo_alloc(fd, vm, sizeof(pat), &res_h, &res_va) != 0 ||
-	    bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0) {
+	    bo_alloc_x(fd, vm, 4096, &ring_h, &ring_va) != 0) {
 		printf("vram: BO alloc failed\n");
 		return (1);
 	}

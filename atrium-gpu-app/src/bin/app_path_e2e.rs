@@ -11,7 +11,6 @@ use atrium_gpu_app::{build, op, record, CodeBinding, CodeHeader};
 use atrium_rdna4_isa::encode;
 
 const IT_RELEASE_MEM: u32 = 0x49;
-const FENCE_OFFSET: u64 = 0x3000;
 
 fn inline_int(v: u32) -> u64 {
     128 + v as u64
@@ -43,13 +42,16 @@ fn run_app(vm: &Vm<'_>, so: &Syncobj<'_>, value: u64, slot: &[u8], records: &[u8
 /// Like `run_app`, with the records built once the code's VA is known.
 fn run_app_with(vm: &Vm<'_>, so: &Syncobj<'_>, value: u64, slot: &[u8], records: &dyn Fn(u64) -> Vec<u8>) -> Result<(), String> {
     let (header, code) = CodeHeader::parse(slot).map_err(|e| format!("code refused: {e:?}"))?;
-    let code_bo = vm.alloc_readonly(0x1000, 0).map_err(|e| format!("code BO: {e}"))?;
+    let code_bo = vm.alloc_exec(0x1000, 0).map_err(|e| format!("code BO: {e}"))?;
     code_bo.write(0, code).map_err(|e| format!("code upload: {e}"))?;
     let binding = CodeBinding { header, va: code_bo.gpu_va(), scratch: None };
     let records = records(code_bo.gpu_va());
     let mut blob = build(&records, &|id| (id == 0).then_some(binding)).map_err(|e| format!("work refused: {e:?}"))?;
-    let ring = vm.alloc(0x4000, 0).map_err(|e| format!("ring BO: {e}"))?;
-    let fence = ring.gpu_va() + FENCE_OFFSET;
+    // GPU W^X: the ring is read-only and executable, so the fence the
+    // end of pipe writes lives in its own data BO.
+    let ring = vm.alloc_exec(0x4000, 0).map_err(|e| format!("ring BO: {e}"))?;
+    let fence_bo = vm.alloc(0x1000, 0).map_err(|e| format!("fence BO: {e}"))?;
+    let fence = fence_bo.gpu_va();
     blob.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
     ring.write(0, &blob.bytes()).map_err(|e| format!("ring write: {e}"))?;
     vm.submit(&ring, blob.dw.len() as u32, ENGINE_COMPUTE, Some((so, value)))

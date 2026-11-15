@@ -1586,9 +1586,9 @@ si_map_page(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram,
 
 	/*
 	 * GPU W^X (ABI 2.3 §5.4): only pages bound EXEC (read-only shader
-	 * code) are executable. Until the box has shown which fetches need X
-	 * (IBs, a queue's writeback and EOP pages), isolation.gpu_wx = 0
-	 * keeps the old mapping, X on every page.
+	 * code) are executable. On by default since box stage 6c;
+	 * isolation.gpu_wx = 0 (or the hw.atrium_gpu.gpu_wx tunable) restores
+	 * the old mapping, X on every page.
 	 */
 	if ((atomic_load_int(&vm->sc->gpu_wx) & AMD_WX_BO) == 0)
 		prot |= AMD_VM_EXEC;

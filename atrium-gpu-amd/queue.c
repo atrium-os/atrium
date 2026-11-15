@@ -360,7 +360,12 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	sc->vram_limit_pct = ATRIUM_AMD_VRAM_LIMIT_PCT;
 	sc->sys_limit_pct = ATRIUM_AMD_SYS_LIMIT_PCT;
 	sc->queue_limit = ATRIUM_AMD_QUEUE_LIMIT;
-	sc->gpu_wx = 0;
+	/*
+	 * GPU W^X on by default (box stage 6c, 2cffd4bd: frescod clean under
+	 * it). hw.atrium_gpu.gpu_wx overrides at load, e.g. 0 to debug.
+	 */
+	sc->gpu_wx = AMD_WX_BO;
+	TUNABLE_INT_FETCH("hw.atrium_gpu.gpu_wx", &sc->gpu_wx);
 	sc->reset_lockout_s = ATRIUM_AMD_RESET_LOCKOUT_S;
 	sc->hwq_inited = 1;
 
@@ -447,7 +452,8 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    "reset (root exempt; 0 = off)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gpu_wx",
 	    CTLFLAG_RW, &sc->gpu_wx, 0,
-	    "GPU W^X bits (silicon; new mappings): 1 = client BOs executable "
+	    "GPU W^X bits (silicon; new mappings; default 1, tunable "
+	    "hw.atrium_gpu.gpu_wx): 1 = client BOs executable "
 	    "only where bound EXEC; 2 = also no X on a user queue's "
 	    "writeback/EOP pages (box 05fdaebf: a queue without it faulted)");
 	return (0);

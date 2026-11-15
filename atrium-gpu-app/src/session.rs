@@ -109,7 +109,9 @@ pub trait Backend {
     /// A buffer bound in the VM.
     type Buf;
     /// A buffer of `bytes` in the VM; `gpu_readonly` maps it so a GPU store
-    /// to it faults (the CPU side still fills it).
+    /// to it faults (the CPU side still fills it). Read-only buffers here are
+    /// code and rings, so the device backend also binds them executable
+    /// (GPU W^X, on by default on silicon).
     fn alloc(&mut self, bytes: u64, gpu_readonly: bool) -> io::Result<Self::Buf>;
     /// The buffer's GPU VA in the VM.
     fn va(&self, b: &Self::Buf) -> u64;
@@ -314,7 +316,7 @@ pub mod amd {
         type Buf = Bo<'static>;
 
         fn alloc(&mut self, bytes: u64, gpu_readonly: bool) -> io::Result<Bo<'static>> {
-            if gpu_readonly { self.vm.alloc_readonly(bytes, 0) } else { self.vm.alloc(bytes, 0) }
+            if gpu_readonly { self.vm.alloc_exec(bytes, 0) } else { self.vm.alloc(bytes, 0) }
         }
         fn va(&self, b: &Bo<'static>) -> u64 {
             b.gpu_va()

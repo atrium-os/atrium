@@ -177,6 +177,9 @@ bo_alloc(uint64_t size, uint32_t flags)
 	return ((int)a.bo_fd);
 }
 
+/* Code and IBs: read-only and executable (GPU W^X, on by default). */
+#define BIND_CODE	(ATRIUM_GPU_BIND_READONLY | ATRIUM_GPU_BIND_EXEC)
+
 static int
 vm_bind(int vm, int bo, uint32_t flags, uint64_t *va)
 {
@@ -332,8 +335,8 @@ job_open(struct job *j, const char *name)
 		printf("%s: setup failed: %s\n", name, strerror(errno));
 		return (-1);
 	}
-	if (vm_bind(j->vm, j->shader, ATRIUM_GPU_BIND_READONLY, &j->shader_va) ||
-	    vm_bind(j->vm, j->ib, ATRIUM_GPU_BIND_READONLY, &j->ib_va) ||
+	if (vm_bind(j->vm, j->shader, BIND_CODE, &j->shader_va) ||
+	    vm_bind(j->vm, j->ib, BIND_CODE, &j->ib_va) ||
 	    vm_bind(j->vm, j->out, 0, &j->out_va)) {
 		printf("%s: bind failed: %s\n", name, strerror(errno));
 		return (-1);
@@ -1172,7 +1175,7 @@ real_ops(struct job *a)
 	src = bo_alloc(4096, 0);
 	vsrc = bo_alloc(4096, ATRIUM_GPU_BO_VRAM);
 	if (code < 0 || src < 0 || vsrc < 0 ||
-	    vm_bind(a->vm, code, ATRIUM_GPU_BIND_READONLY, &code_va) != 0 ||
+	    vm_bind(a->vm, code, BIND_CODE, &code_va) != 0 ||
 	    vm_bind(a->vm, src, ATRIUM_GPU_BIND_READONLY, &src_va) != 0 ||
 	    vm_bind(a->vm, vsrc, 0, &vsrc_va) != 0) {
 		check(0, "12 real ops", "setup: %s", strerror(errno));
@@ -1225,8 +1228,8 @@ out:
 }
 
 /*
- * 13: GPU W^X (ABI 2.3 §5.4) with isolation.gpu_wx = 1 (client BOs only),
- * restored after: only pages bound EXEC (which needs READONLY) are
+ * 13: GPU W^X (ABI 2.3 §5.4) with isolation.gpu_wx = 1 (client BOs only;
+ * the driver default since 6c), restored after: only pages bound EXEC (which needs READONLY) are
  * executable. The queue's writeback/EOP pages keep X (gpu_wx bit 2: box run
  * 05fdaebf lost a queue without it, and MES would not remove it). No probe
  * of an IB without X: a CP-side fault can wedge the queue the same way.
@@ -1870,8 +1873,7 @@ dummy_job(struct job *j, const char *name, const uint32_t *code,
 	if (job_open(j, name) != 0)
 		return (errno);
 	*cbo = bo_alloc(4096, 0);
-	if (*cbo < 0 || vm_bind(j->vm, *cbo, ATRIUM_GPU_BIND_READONLY,
-	    &code_va) != 0)
+	if (*cbo < 0 || vm_bind(j->vm, *cbo, BIND_CODE, &code_va) != 0)
 		return (errno);
 	return (ops_run(j, *cbo, code_va, code, bytes, src, dst, value));
 }
@@ -1892,7 +1894,7 @@ dummy_read(const char *name, uint32_t *first, int *rr)
 	*rr = 0;
 	if (job_open(&r, name) != 0 || poison(r.out, POISON_A) != 0 ||
 	    (cbo = bo_alloc(4096, 0)) < 0 ||
-	    vm_bind(r.vm, cbo, ATRIUM_GPU_BIND_READONLY, &code_va) != 0) {
+	    vm_bind(r.vm, cbo, BIND_CODE, &code_va) != 0) {
 		*rr = errno;
 		goto out;
 	}

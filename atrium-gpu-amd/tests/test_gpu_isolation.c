@@ -137,6 +137,34 @@ bo_new(int fd, int vm, uint64_t size, uint32_t flags, uint64_t *va)
 	return ((int)a.bo_fd);
 }
 
+/*
+ * A ring (IB) BO: bound read-only and executable with VM_BIND2, since GPU
+ * W^X is on by default on silicon. The CPU still fills it with bo_write.
+ */
+static int
+bo_ring(int fd, int vm, uint64_t size, uint64_t *va)
+{
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind2 b;
+
+	memset(&a, 0, sizeof(a));
+	a.size = size;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0) {
+		perror("BO_ALLOC");
+		exit(2);
+	}
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = (uint32_t)vm;
+	b.bo_fd = a.bo_fd;
+	b.flags = ATRIUM_GPU_BIND_READONLY | ATRIUM_GPU_BIND_EXEC;
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND2, &b) != 0) {
+		perror("VM_BIND2 exec");
+		exit(2);
+	}
+	*va = b.va;
+	return ((int)a.bo_fd);
+}
+
 static int
 bo_write(int fd, int bo, const void *src, uint64_t len)
 {
@@ -395,7 +423,7 @@ kick(int fd, int vm)
 {
 	uint32_t r[2] = { type3(IT_NOP, 1), 0 };
 	uint64_t va;
-	int ring = bo_new(fd, vm, 4096, 0, &va), err;
+	int ring = bo_ring(fd, vm, 4096, &va), err;
 
 	bo_write(fd, ring, r, sizeof(r));
 	err = submit(fd, vm, va, 2, ATRIUM_GPU_ENGINE_COMPUTE);
@@ -425,7 +453,7 @@ park(struct parked *p, int fd, uint64_t extra_va, int extra_in_vm)
 		p->vm = vm_create(fd);
 	p->word = bo_new(fd, p->vm, 4096, 0, &p->word_va);
 	p->res = bo_new(fd, p->vm, 4096, 0, &p->res_va);
-	p->ring = bo_new(fd, p->vm, 4096, 0, &ring_va);
+	p->ring = bo_ring(fd, p->vm, 4096, &ring_va);
 	bo_write(fd, p->word, &zero, sizeof(zero));
 	bo_write(fd, p->res, &zero, sizeof(zero));
 	n += emit_wait(r + n, p->word_va);
@@ -482,7 +510,7 @@ part_a(void)
 	close(pfd[1]);
 
 	/* 4/5. B copies from A's VA in its own VM, where nothing is mapped. */
-	b[0] = bo_new(fdb, vmb, 4096, 0, &va_b[0]);	/* ring */
+	b[0] = bo_ring(fdb, vmb, 4096, &va_b[0]);	/* ring */
 	b[1] = bo_new(fdb, vmb, 4096, 0, &va_b[1]);	/* destination */
 	r[0] = type3(IT_DMA_DATA, 6);
 	r[1] = DMA_CTL_COPY;
@@ -546,7 +574,7 @@ break1(void)
 	CHECK(park(&p, fda, 0, 0) == 0, "A's gfx ring submitted and parked");
 
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
+	ringb = bo_ring(fdb, vmb, 4096, &rvb);
 	resb = bo_new(fdb, vmb, 4096, 0, &va);
 	n = emit_write(r, va, 0xb0b);
 	bo_write(fdb, ringb, r, n * 4);
@@ -658,7 +686,7 @@ break2(void)
 	/* The VMID is free and the queue idle: a new VM runs at once. */
 	fdd = xopen(GPU);
 	vmd = vm_create(fdd);
-	ringd = bo_new(fdd, vmd, 4096, 0, &rvd);
+	ringd = bo_ring(fdd, vmd, 4096, &rvd);
 	resd = bo_new(fdd, vmd, 4096, 0, &va);
 	n = emit_write(r, va, 0xd00d);
 	bo_write(fdd, ringd, r, n * 4);
@@ -690,11 +718,11 @@ break3(void)
 	fd2 = xopen(GPU);
 	vm1 = vm_create(fd1);
 	vm2 = vm_create(fd2);
-	ring1 = bo_new(fd1, vm1, 4096, 0, &va);
+	ring1 = bo_ring(fd1, vm1, 4096, &va);
 	res1 = bo_new(fd1, vm1, 4096, 0, &va);
 	n = emit_write(r, va, 0x1111);
 	bo_write(fd1, ring1, r, n * 4);
-	ring2 = bo_new(fd2, vm2, 4096, 0, &rv2);
+	ring2 = bo_ring(fd2, vm2, 4096, &rv2);
 	bo_write(fd2, ring2, r, n * 4);
 
 	/* Nobody owns compute yet: no one can map its doorbell. */
@@ -920,7 +948,7 @@ part_c(void)
 	so = syncobj_new(fda);
 	word = bo_new(fda, vma, 4096, 0, &word_va);
 	fence = bo_new(fda, vma, 4096, 0, &fence_va);
-	ring = bo_new(fda, vma, 4096, 0, &ring_va);
+	ring = bo_ring(fda, vma, 4096, &ring_va);
 	bo_write(fda, word, &zero, sizeof(zero));
 	n = emit_wait(r, word_va);
 	n += emit_eop(r + n, fence_va, 0xa);
@@ -932,7 +960,7 @@ part_c(void)
 	/* B: an end-of-pipe on gfx must not retire A's compute completion. */
 	fdb = xopen(GPU);
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
+	ringb = bo_ring(fdb, vmb, 4096, &rvb);
 	fenceb = bo_new(fdb, vmb, 4096, 0, &fence_va);
 	n = emit_eop(r, fence_va, 0xb);
 	bo_write(fdb, ringb, r, n * 4);
@@ -1019,7 +1047,7 @@ part_d(void)
 	printf("Part D: faults cost only the VM that made them (F6 G1)\n");
 	fda = xopen(GPU);
 	vma = vm_create(fda);
-	ringa = bo_new(fda, vma, 4096, 0, &rva);
+	ringa = bo_ring(fda, vma, 4096, &rva);
 	fence = bo_new(fda, vma, 4096, 0, &fva);
 	so = syncobj_new(fda);
 	faults0 = iso("vm_faults");
@@ -1035,7 +1063,7 @@ part_d(void)
 
 	fdb = xopen(GPU);
 	vmb = vm_create(fdb);
-	ringb = bo_new(fdb, vmb, 4096, 0, &rvb);
+	ringb = bo_ring(fdb, vmb, 4096, &rvb);
 	resb = bo_new(fdb, vmb, 4096, 0, &va);
 	n = emit_write(r, va, 0xd0d0);
 	bo_write(fdb, ringb, r, n * 4);
@@ -1173,7 +1201,7 @@ gpu_copy(int fd, int vm, uint64_t src_va, uint64_t dst_va, uint32_t bytes)
 {
 	uint32_t r[7];
 	uint64_t ring_va;
-	int ring = bo_new(fd, vm, 4096, 0, &ring_va), err;
+	int ring = bo_ring(fd, vm, 4096, &ring_va), err;
 
 	r[0] = type3(IT_DMA_DATA, 6);
 	r[1] = DMA_CTL_COPY;
