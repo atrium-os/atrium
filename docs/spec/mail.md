@@ -1,6 +1,7 @@
 # Mail: Atrium's email app
 
-**Status: proposed 2026-11-15**, for Shankar's review. Nothing here is built.
+**Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). Building M0.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"

@@ -58,6 +58,7 @@ User-facing apps don't take Latin names — they keep plain descriptive names wi
 - `atrium-files` — file browser (built atop Scrinium)
 - `atrium-image` — image viewer
 - `atrium-pdf` — PDF viewer
+- `atrium-mail` — email (Mail); see [`spec/mail.md`](spec/mail.md)
 - `atrium-doc` — document viewer (HTML/Markdown/PDF) — see [`spec/insula.md`](spec/insula.md) §10.6
 - `atrium-clock` — clock widget
 - ...
