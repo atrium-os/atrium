@@ -2702,11 +2702,12 @@ static const uint32_t tri_vs[] = {
 	0xbe8d007eu, 0x930eff03u, 0x00080008u, 0x7c980a0eu,
 	0x8b7e6a0du, 0xbfa50002u, 0xf8000941u, 0x00000000u,
 	0x8b0fff03u, 0x000000ffu, 0x7c980a0fu, 0x8b7e6a0du,
-	0xbfa50010u, 0x7e0c02f1u, 0x7e0e02f1u, 0x7e1002ffu,
+	0xbfa50016u, 0x7e0c02f1u, 0x7e0e02f1u, 0x7e1002ffu,
 	0x3e800000u, 0x7e1202ffu, 0x3f400000u, 0x7c940681u,
 	0xd5010006u, 0x01a9e106u, 0x7c940682u, 0x020c1106u,
-	0x020e1307u, 0x7e140280u, 0x7e1602f2u, 0xf80008cfu,
-	0x0b0a0706u, 0xbfb00000u,
+	0x020e1307u, 0x7e140280u, 0x7e1602f2u, 0xee068008u,
+	0x03000000u, 0x0000340cu, 0xee068008u, 0x03800000u,
+	0x0000380cu, 0xf80008cfu, 0x0b0a0706u, 0xbfb00000u,
 };
 /* si_tri_ps.s: count invocations at user SGPRs s[0:1] (the debug page +
  * TRI_PS_COUNT), export (1, 1, 0, 1) to MRT0. */
@@ -2719,6 +2720,7 @@ static const uint32_t tri_ps[] = {
 #define TRI_PS_COUNT	0x800u		/* PS invocation counter, debug page */
 #define TRI_STATS0	0x900u		/* 14 pipeline statistics, before */
 #define TRI_STATS1	0xa00u		/* and after the draw */
+#define TRI_STATS2	0xb00u		/* after the second, unclipped draw */
 
 /* Triangle in pixels (viewport 64 x 64, y down): the VS's NDC
  * (-0.5,-0.5), (0.5,-0.5), (0.25,0.75). */
@@ -2965,7 +2967,8 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	v[1] = TRI_W | TRI_H << 16;
 	tri_regs(&p, R_PA_SC_VPORT_SCISSOR_0_TL, v, 2);
 	tri_reg(&p, R_PA_SC_WINDOW_OFFSET, 0);
-	tri_reg(&p, R_PA_SC_WINDOW_SCISSOR_TL + 4, TRI_W | TRI_H << 16);
+	/* GFX12 window scissor BR is inclusive (radv_cmd_buffer.c). */
+	tri_reg(&p, R_PA_SC_WINDOW_SCISSOR_TL + 4, (TRI_W - 1) | (TRI_H - 1) << 16);
 	tri_reg(&p, R_PA_SC_CLIPRECT_RULE, 0xffff);
 
 	/* Rasteriser: one sample, no culling, binning off. */
@@ -3053,6 +3056,24 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	tri_put(&p, 30 | 2u << 8);			/* SAMPLE_PIPELINESTAT */
 	tri_put(&p, (uint32_t)(dbg_va + TRI_STATS1));
 	tri_put(&p, (uint32_t)((dbg_va + TRI_STATS1) >> 32));
+
+	/*
+	 * Diagnosis (run cd1aa333: clip inv 1, clip prims 0, PS never ran):
+	 * the same draw again with the clipper off (CLIP_DISABLE), its PS
+	 * counting into the next word. If this one lights pixels, what the
+	 * clipper saw (positions, W, clip setup) is what is wrong.
+	 */
+	tri_reg(&p, R_PA_CL_CLIP_CNTL, 1u << 16 | 1u << 19 | 1u << 24);
+	v[0] = (uint32_t)(dbg_va + TRI_PS_COUNT + 4);
+	v[1] = (uint32_t)((dbg_va + TRI_PS_COUNT + 4) >> 32);
+	tri_regs(&p, R_SPI_SHADER_USER_DATA_PS_0, v, 2);
+	tri_put(&p, PKT3_GFX(0x2du, 2));		/* DRAW_INDEX_AUTO */
+	tri_put(&p, 3);
+	tri_put(&p, 2);
+	tri_put(&p, PKT3_GFX(0x46u, 3));
+	tri_put(&p, 30 | 2u << 8);			/* SAMPLE_PIPELINESTAT */
+	tri_put(&p, (uint32_t)(dbg_va + TRI_STATS2));
+	tri_put(&p, (uint32_t)((dbg_va + TRI_STATS2) >> 32));
 	tri_put(&p, PKT3_GFX(0x46u, 1));
 	tri_put(&p, 26);				/* PIPELINESTAT_STOP */
 	return (p.n);
@@ -3167,9 +3188,10 @@ triangle(void)
 			if (l[15] == POISON_A)
 				continue;
 			printf("21: VS lane %u (tag %#x): s0..s7 %#x %#x %#x %#x "
-			    "%#x %#x %#x %#x; v0..v4 %#x %#x %#x %#x %#x\n", i,
+			    "%#x %#x %#x %#x; v0..v4 %#x %#x %#x %#x %#x; "
+			    "pos x %#x y %#x\n", i,
 			    l[15], l[0], l[1], l[2], l[3], l[9], l[10], l[11],
-			    l[12], l[4], l[5], l[6], l[7], l[8]);
+			    l[12], l[4], l[5], l[6], l[7], l[8], l[13], l[14]);
 		}
 		check(dbg[15] != POISON_A, "21 triangle: the vertex shader ran",
 		    "lane 0 %s", dbg[15] != POISON_A ? "wrote its record" :
@@ -3184,22 +3206,30 @@ triangle(void)
 			    "clip prims", "clip inv", "VS inv", "GS inv",
 			    "GS prims", "IA prims", "IA verts", "HS inv",
 			    "DS inv", "CS inv", "task", "mesh", "mesh prims" };
-			const uint32_t *a = dbg + TRI_STATS0 / 4,
-			    *b = dbg + TRI_STATS1 / 4;
+			for (u_int d = 0; d < 2; d++) {
+				const uint32_t *a = dbg + (d == 0 ? TRI_STATS0 :
+				    TRI_STATS1) / 4, *b = dbg + (d == 0 ?
+				    TRI_STATS1 : TRI_STATS2) / 4;
 
-			printf("21: pipeline statistics (after - before):");
-			for (i = 0; i < 14; i++) {
-				uint64_t x = a[2 * i] | (uint64_t)a[2 * i + 1] << 32,
-				    y = b[2 * i] | (uint64_t)b[2 * i + 1] << 32;
+				printf("21: pipeline statistics, draw %u (%s):", d,
+				    d == 0 ? "clipped" : "CLIP_DISABLE");
+				for (i = 0; i < 14; i++) {
+					uint64_t x = a[2 * i] |
+					    (uint64_t)a[2 * i + 1] << 32,
+					    y = b[2 * i] |
+					    (uint64_t)b[2 * i + 1] << 32;
 
-				printf(" %s %jd%s", nm[i], (intmax_t)(y - x),
-				    b[2 * i] == POISON_A ? " (unwritten)" : "");
+					printf(" %s %jd%s", nm[i],
+					    (intmax_t)(y - x), b[2 * i] ==
+					    POISON_A ? " (unwritten)" : "");
+				}
+				printf("\n");
 			}
-			printf("\n");
 		}
-		printf("21: PS invocations counted: %u (%#x; poison: none ran; "
-		    "about 600 expected)\n", dbg[TRI_PS_COUNT / 4] - POISON_A,
-		    dbg[TRI_PS_COUNT / 4]);
+		printf("21: PS invocations counted: draw 0 %u, draw 1 "
+		    "(CLIP_DISABLE) %u (0: none ran; about 600 each expected)\n",
+		    dbg[TRI_PS_COUNT / 4] - POISON_A,
+		    dbg[TRI_PS_COUNT / 4 + 1] - POISON_A);
 	}
 	if (bo_xfer(cb, pix, TRI_PITCH * TRI_H, 0) != 0) {
 		check(0, "21 triangle", "readback: %s", strerror(errno));

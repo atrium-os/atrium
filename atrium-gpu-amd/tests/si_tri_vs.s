@@ -63,6 +63,9 @@ noprim:
   v_cndmask_b32 v7, v7, v9, vcc_lo
   v_mov_b32 v10, 0
   v_mov_b32 v11, 1.0
+  // the position this lane exports (x, y), into its debug record
+  global_store_b32 v12, v6, s[8:9] offset:52
+  global_store_b32 v12, v7, s[8:9] offset:56
   export pos0 v6, v7, v10, v11 done
 end:
   s_endpgm
