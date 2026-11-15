@@ -256,7 +256,12 @@ pub fn run_check(prefix: &str) -> Result<i32> {
         cpu.render(f2)?;
         let cpx: Vec<u8> = cpu.target.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (n, worst, first) = compare(&cpx, &gpx);
-        let drops = (g.fill_drops.len(), cpu.fill_drops.len());
+        // Fills each renderer dropped (by window): the entries themselves
+        // differ (the gpu renderer repacks every window each frame, the
+        // compute one only changed ones, neither drops anything in pixel
+        // mode), so count the drops, not the entries (fc-89bae7ab).
+        let dropped = |d: &FillDrops| d.iter().map(|(_, v)| v.len()).sum::<usize>();
+        let drops = (dropped(&g.fill_drops), dropped(&cpu.fill_drops));
         if worst <= tol && drops.0 == drops.1 {
             eprintln!("frescod-gpu-check: {name}: PASS ({n} pixels differ, max {worst}; gpu {gpu_ms} ms)");
             pass += 1;
