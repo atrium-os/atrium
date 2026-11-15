@@ -110,3 +110,34 @@ fn the_converters_press_sends_nothing() {
     assert!(asked.iter().any(|u| u.contains("/api/at-load")), "the page network was not wired: {asked:?}");
     assert!(!asked.iter().any(|u| u.contains("accept=1")), "the converter's press reached the site: {asked:?}");
 }
+
+/// ★ Any language: a control in a consent platform's container is tried
+/// whatever it says, and every one whose press writes a cookie is marked,
+/// Reject as well as Accept. A control outside any wall that says no
+/// consent word is not pressed, even if it would write a cookie.
+#[test]
+fn a_wall_in_any_language_offers_both_answers() {
+    let html = r#"<html><body>
+      <div id="onetrust-banner-sdk"><p>Wir verwenden Cookies.</p>
+        <button id=ja>Alle zulassen</button><button id=nein>Nur notwendige</button><button id=info>Mehr</button>
+      </div>
+      <div role="dialog"><button id=hi>स्वीकार करें</button></div>
+      <main><button id=cart>In den Warenkorb</button></main>
+      <script>
+        function on(id, f) { document.getElementById(id).addEventListener('click', f); }
+        on('ja', function () { document.cookie = 'OptanonConsent=all; Path=/'; });
+        on('nein', function () { document.cookie = 'OptanonConsent=necessary; Path=/'; });
+        on('hi', function () { document.cookie = 'c=hi; Path=/'; });
+        on('cart', function () { document.cookie = 'cart=1; Path=/'; });
+      </script></body></html>"#;
+    let c = convert_with(html, Some("https://example.de/"), &mut BoaEngine::default(), &mut MapFetcher::default());
+    assert_eq!(c.consents, vec![
+        vec!["OptanonConsent=all; Path=/".to_string()],
+        vec!["OptanonConsent=necessary; Path=/".to_string()],
+        vec!["c=hi; Path=/".to_string()],
+    ], "{:?}", c.errors);
+    assert!(c.html.contains(r#"<a id="ja" href="atrium-consent:0">Alle zulassen</a>"#), "{}", c.html);
+    assert!(c.html.contains(r#"<a id="nein" href="atrium-consent:1">Nur notwendige</a>"#), "{}", c.html);
+    assert!(c.html.contains(r#"<button id="info">Mehr</button>"#), "{}", c.html);
+    assert!(c.html.contains(r#"<button id="cart">In den Warenkorb</button>"#), "{}", c.html);
+}

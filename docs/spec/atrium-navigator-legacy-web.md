@@ -643,15 +643,23 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   jar in the converter (deleted by `Max-Age=0` or a past `Expires`, at most 50), so nothing
   a conversion's script writes leaves it. An anonymous conversion's `document.cookie` is
   `""`, its writes dropped, and `navigator.cookieEnabled` is false; a cookied one's is true.
-- *Finding the control.* After the page settles, the converter presses up to 8 controls
-  (`button`, `a`, `input` button or submit, `role=button`) whose text, at most 40
-  characters, says a consent word (accept, agree, allow, consent, continue, OK, got it,
-  yes, understood, proceed). Each press is a probe: the document and the scratch jar are
+- *Finding the control.* After the page settles, the converter presses up to 16 controls
+  (`button`, `a`, `input` button or submit, `role=button`; text at most 40 characters).
+  Where a control sits decides, in any language: inside a `dialog`, `role=dialog` or
+  `alertdialog`, `aria-modal`, an inline `position: fixed` or `sticky` overlay, or a consent
+  platform's container by id or class (OneTrust, Didomi, Quantcast, Sourcepoint, TrustArc,
+  Cookiebot, Usercentrics, Osano, iubenda, Klaro, tarteaucitron, or `cookie`, `consent`,
+  `gdpr`, `cmp`), it is tried first; elsewhere only if it says a consent word, from a short
+  list in about fifteen languages (changed 2026-11-15, Shankar: "what if they are in another
+  language?"; it was English words only). The words only add candidates: a control is a
+  consent control because its press wrote `document.cookie`, and every such control is
+  marked, Reject as well as Accept, for the reader to choose by its own text. Each press is a
+  probe: the document and the scratch jar are
   put back after it, and, as in exploration, the page network is closed while the presses
   run (fixed 2026-11-15: they had it open, so a press's own request, such as a consent
   endpoint's GET, could reach the site; `the_converters_press_sends_nothing`). The
-  converter's press is never the reader's consent: nothing of it leaves the converter. A press that wrote `document.cookie` makes the control a consent
-  control: at most 4, each turned into `<a href="atrium-consent:<n>">` keeping its text,
+  converter's press is never the reader's consent: nothing of it leaves the converter.
+  At most 4 are marked, each turned into `<a href="atrium-consent:<n>">` keeping its text,
   with what it wrote reported as `CW <n> <line>` (at most 16 lines, 4 KiB each, no
   control characters).
 - *The reader's press.* navigatord keeps a page's consents in memory with the page (a page

@@ -3192,25 +3192,65 @@ struct Example {
     net: (u32, u32, u32),
 }
 
-/// The words a consent or interstitial wall's control says (legacy-web
-/// §5.4.1e case 2), lower case.
-const CONSENT_WORDS: &[&str] = &["accept", "agree", "allow", "consent", "continue", "ok", "okay", "got it", "yes", "understood", "understand", "proceed"];
+/// Words a consent wall's controls say, lower case, in a few languages.
+/// They only put a control earlier in the queue: whether it is a consent
+/// control is decided by its press writing `document.cookie`, which says
+/// the same thing in every language.
+const CONSENT_WORDS: &[&str] = &[
+    "accept", "agree", "allow", "consent", "continue", "ok", "okay", "got it", "yes", "understood", "proceed", "reject", "decline", "deny",
+    "akzeptieren", "zustimmen", "einverstanden", "ablehnen", "accepter", "accepte", "refuser", "continuer", "aceptar", "rechazar",
+    "accetta", "accetto", "rifiuta", "aceitar", "rejeitar", "accepteren", "akkoord", "weigeren", "zaakceptuj", "odrzuć", "принять",
+    "согласен", "отклонить", "同意", "接受", "拒绝", "同意する", "拒否", "동의", "स्वीकार", "सहमत", "अस्वीकार", "قبول", "موافق", "kabul",
+];
+/// What a consent platform's container is called (id or class, lower
+/// case): OneTrust, Didomi, Quantcast, Sourcepoint, TrustArc, Cookiebot,
+/// Usercentrics, Osano, iubenda, Klaro, tarteaucitron, and the generic.
+const CONSENT_CONTAINERS: &[&str] = &[
+    "onetrust", "didomi", "qc-cmp", "sp_message", "truste", "cookiebot", "cybotcookiebot", "usercentrics", "osano", "iubenda",
+    "klaro", "tarteaucitron", "cookie", "consent", "gdpr", "cmp", "privacy-banner",
+];
 /// The most controls a conversion presses looking for one, and the most
 /// it marks.
-const CONSENT_PROBES: usize = 8;
+const CONSENT_PROBES: usize = 16;
 pub const CONSENTS_MAX: usize = 4;
 
-/// ★ A consent wall's control (legacy-web §5.4.1e): an element the reader
-/// could press, saying one of [`CONSENT_WORDS`], whose press writes
-/// `document.cookie`. Each is pressed once, as a probe (the document and
-/// the jar are put back), and the ones that wrote are returned with what
-/// they wrote. Only the reader's own press of one ever reaches Arca.
+/// Where a control sits says more than its words: inside a dialog, a fixed
+/// overlay, or a consent platform's container is a wall's (2); a consent
+/// word says it might be (1); anything else is not tried (0).
+fn consent_rank(d: &Dom, h: Handle, text: &str) -> u8 {
+    let mut a = Some(h);
+    let mut depth = 0;
+    while let Some(x) = a {
+        if depth > 32 { break }
+        if let Some(tag) = d.tag(x) {
+            let marker = |k: &str| d.attr(x, k).map(str::to_ascii_lowercase).is_some_and(|v| CONSENT_CONTAINERS.iter().any(|c| v.contains(c)));
+            let overlay = tag.eq_ignore_ascii_case("dialog")
+                || matches!(d.attr(x, "role"), Some("dialog" | "alertdialog"))
+                || d.attr(x, "aria-modal") == Some("true")
+                || matches!(d.style_get(x, "position").as_str(), "fixed" | "sticky");
+            if overlay || marker("id") || marker("class") { return 2 }
+        }
+        a = d.get(x).and_then(|n| n.parent);
+        depth += 1;
+    }
+    let words: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let says = CONSENT_WORDS.iter().any(|c| if c.contains(' ') || !c.is_ascii() { text.contains(c) } else { words.contains(c) });
+    says as u8
+}
+
+/// ★ A consent wall's controls (legacy-web §5.4.1e): elements the reader
+/// could press, in a wall's container or saying a consent word, whose
+/// press writes `document.cookie`. Each is pressed once, as a probe (the
+/// document and the jar are put back, the page network closed), and every
+/// one that wrote is returned with what it wrote: Reject as well as
+/// Accept, for the reader to choose between by their own text. Only the
+/// reader's own press of one ever reaches Arca.
 fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<String>)> {
     let cands: Vec<Handle> = DOM.with(|d| {
         let d = d.borrow();
-        let mut v = vec![];
+        let mut v: Vec<(u8, Handle)> = vec![];
         for h in 0..d.nodes.len() as Handle {
-            if v.len() >= CONSENT_PROBES { break }
+            if v.len() >= 4 * CONSENT_PROBES { break }
             let Some(tag) = d.tag(h) else { continue };
             let tag = tag.to_ascii_lowercase();
             let pressable = match tag.as_str() {
@@ -3221,12 +3261,13 @@ fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<St
             if !pressable || !d.connected(h) { continue }
             let text = if tag == "input" { d.attr(h, "value").unwrap_or("").to_string() } else { d.visible_text(h) };
             let text = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-            if text.is_empty() || text.len() > 40 { continue }
-            let words: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-            let says = CONSENT_WORDS.iter().any(|c| if c.contains(' ') { text.contains(c) } else { words.contains(c) });
-            if says { v.push(h) }
+            if text.is_empty() || text.chars().count() > 40 { continue }
+            let r = consent_rank(&d, h, &text);
+            if r > 0 { v.push((r, h)) }
         }
-        v
+        // The wall's own first, each group in document order.
+        v.sort_by_key(|(r, h)| (std::cmp::Reverse(*r), *h));
+        v.into_iter().take(CONSENT_PROBES).map(|(_, h)| h).collect()
     });
     let mut out = vec![];
     // ★ As exploration's: the page network is closed while they run, so a
@@ -3245,6 +3286,7 @@ fn find_consents(ctx: &mut Context, parser_nodes: Handle) -> Vec<(Handle, Vec<St
     ctx.runtime_limits_mut().set_loop_iteration_limit(saved_loop_limit);
     EXPLORING.with(|e| *e.borrow_mut() = false);
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
+    out.sort_by_key(|(h, _)| *h);
     out
 }
 
