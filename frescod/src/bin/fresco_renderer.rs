@@ -502,7 +502,7 @@ fn role(r: WmRole) -> Role {
 /// Tell the broker about windows the client created, retitled or
 /// destroyed since the last pass.
 fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen: (u32, u32)) {
-    let mut live: Vec<(u32, Msg, Option<(Msg, u32)>, (u32, u32))> = {
+    let mut live: Vec<(u32, Msg, Option<(Msg, u32)>, ((u32, u32), Option<u64>))> = {
         let c = comp.lock().unwrap();
         c.windows
             .values()
