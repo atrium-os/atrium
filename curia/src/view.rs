@@ -523,7 +523,7 @@ impl CuriaView {
                 if d.picking_mode {
                     for m in d.mode_choices().into_iter().take(12) {
                         let pg = self.disp.clone();
-                        let on = d.current_mode().is_some_and(|c| (c.width, c.height) == (m.width, m.height));
+                        let on = d.current_mode().is_some_and(|c| (c.width, c.height, c.refresh_mhz) == (m.width, m.height, m.refresh_mhz));
                         let mut l = disp::mode_label(&m);
                         if m.preferred {
                             l.push_str(" (native)");

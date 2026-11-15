@@ -208,7 +208,7 @@ one goes away, hangs, or comes back (Shankar, 2026-11-15).
   size (Smaller, Default, Larger, 125%, 150%, 200%; a monitor's own default is sent as
   "unset", so a laptop panel keeps starting at Smaller), the resolution of the main
   monitor (forum-wm switches only that one's mode; one entry per size at its best
-  refresh), and for the others Place (left of, right of, above, below Display 1) and
+  refresh, and the monitor's native mode too when a faster refresh of its size would hide it), and for the others Place (left of, right of, above, below Display 1) and
   mirroring. A new resolution goes back after 15 s unless "Keep" is pressed, since a
   mode the monitor shows black can't be clicked away from. While the page shows, forum-wm
   is asked again every 3 s (a monitor plugged in, the bar's light/dark switch). Without

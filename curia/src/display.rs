@@ -196,15 +196,25 @@ impl DispPage {
         self.act(Want::UiSize { output, milli: m });
     }
 
-    /// The modes to offer: one per size (the best refresh), largest first.
+    /// The modes to offer: one per size (the best refresh), largest first,
+    /// and the monitor's native mode as well when a faster refresh of its
+    /// size hides it, so the page can always go back to it. Only the native
+    /// mode itself is marked `preferred`.
     pub fn mode_choices(&self) -> Vec<WmDisplayMode> {
         let Some(s) = self.snapshot() else { return Vec::new() };
         let mut v: Vec<WmDisplayMode> = Vec::new();
         for m in &s.modes {
-            match v.iter_mut().find(|x| (x.width, x.height) == (m.width, m.height)) {
-                Some(x) if m.refresh_mhz > x.refresh_mhz => x.refresh_mhz = m.refresh_mhz,
-                Some(x) => x.preferred |= m.preferred,
-                None => v.push(*m),
+            let best = WmDisplayMode { preferred: false, ..*m };
+            match v.iter_mut().find(|x| !x.preferred && (x.width, x.height) == (m.width, m.height)) {
+                Some(x) if m.refresh_mhz > x.refresh_mhz => *x = best,
+                Some(_) => {}
+                None => v.push(best),
+            }
+        }
+        if let Some(n) = s.modes.iter().find(|m| m.preferred) {
+            match v.iter_mut().find(|x| *x == &WmDisplayMode { preferred: false, ..*n }) {
+                Some(x) => x.preferred = true,
+                None => v.push(*n),
             }
         }
         v.sort_by(|a, b| (b.width * b.height, b.refresh_mhz).cmp(&(a.width * a.height, a.refresh_mhz)));
@@ -370,6 +380,38 @@ mod tests {
         let p = page();
         let c: Vec<_> = p.mode_choices().iter().map(mode_label).collect();
         assert_eq!(c, ["2560 × 1440 · 59.95 Hz", "1920 × 1080 · 60 Hz", "1280 × 720 · 60 Hz"]);
+    }
+
+    /// A monitor whose native mode is 1080p60 and that also takes 1080p120:
+    /// both are offered, and only the 60 Hz one is called native, so the page
+    /// can go back to it after a switch.
+    #[test]
+    fn the_native_mode_stays_on_offer() {
+        let mut p = page();
+        let native = WmDisplayMode { preferred: true, ..mode(1920, 1080, 60000) };
+        p.apply(Got::State(Ok(Snapshot {
+            dark: false,
+            text_size: 1000,
+            outputs: vec![out(0, 0, true)],
+            modes: vec![native, mode(1920, 1080, 120000), mode(1280, 720, 60000)],
+            current: 2,
+        })));
+        let c: Vec<_> = p.mode_choices().iter().map(|m| (mode_label(m), m.preferred)).collect();
+        assert_eq!(c, [
+            ("1920 × 1080 · 120 Hz".to_string(), false),
+            ("1920 × 1080 · 60 Hz".to_string(), true),
+            ("1280 × 720 · 60 Hz".to_string(), false),
+        ]);
+        // The native mode at its size's best refresh is one entry.
+        p.apply(Got::State(Ok(Snapshot {
+            dark: false,
+            text_size: 1000,
+            outputs: vec![out(0, 0, true)],
+            modes: vec![mode(1920, 1080, 59940), native, mode(1280, 720, 60000)],
+            current: 0,
+        })));
+        let c: Vec<_> = p.mode_choices().iter().map(|m| (mode_label(m), m.preferred)).collect();
+        assert_eq!(c, [("1920 × 1080 · 60 Hz".to_string(), true), ("1280 × 720 · 60 Hz".to_string(), false)]);
     }
 
     #[test]
