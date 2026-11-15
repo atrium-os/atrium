@@ -2,7 +2,7 @@
 
 **Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
 to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
-passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11).
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11), C4b the Sound page built 2026-11-15 (§12).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -75,7 +75,7 @@ C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; si
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
 | C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
 | C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check. **Built 2026-11-15** (§9) |
-| C4 | further pages: C4a Display (light/dark, text size, monitors), then Sound, Apps' grants | each with its own gate. **C4a built 2026-11-15** (§11) |
+| C4 | further pages: C4a Display (light/dark, text size, monitors), C4b Sound, then Apps' grants | each with its own gate. **C4a and C4b built 2026-11-15** (§11, §12) |
 
 ## 6. Decisions
 
@@ -235,3 +235,33 @@ one goes away, hangs, or comes back (Shankar, 2026-11-15).
 - Open: mirroring re-lays the other monitors from the remembered arrangement (a Left of
   done just before is lost), and the bar and dock follow the monitor at the desktop's
   origin, not Display 1. Both are forum-wm/frescod behaviour, not the page's.
+
+## 12. C4b as built: the Sound page (2026-11-15)
+
+- The settings are choragusd's (lyra-v1.md §7, lyra-spatial.md, lyra-hires.md §5), over its
+  volume-control socket `audio-control/audio-control.sock`. Curia's manifest now asks for
+  `audio-control` (restricted to Forum and Curia since A6). No new protocol: `List`,
+  `ListOutputs` and the `Set*` messages; `Apps` and `Outputs` arrive unasked on each change.
+- The page (`curia/src/sound.rs`, `SoundPage`): Volume (slider, percent, Mute; "Fixed"
+  and no slider while the output's volume is fixed), Output (one button per device), and
+  for the current output Balance (Left to Right, Centre), Speakers (Stereo, 5.1, 7.1),
+  Headphone surround (only on stereo), Volume control (Automatic, In the mix, Device's own
+  when it has a control, Fixed (line out)); then Apps: each app with a stream open, its
+  level, Mute, and Surround on/off while headphone surround is on. An app shows only while
+  it plays (that is what choragusd lists). Levels show at once and choragusd's next `Apps`
+  confirms them. The page scrolls below its title.
+- The connection (`follow_sound` in main.rs) has a 10 s limit on the hello; a quiet
+  connection is asked for its outputs every 30 s and dropped as hung after 10 s more. Gone:
+  "Sound settings are not available / choragusd is not running (or not answering, or went
+  away); trying again", every 5 s. `lyra_protocol::client::Control::connect_within` is new.
+- Found on the way, in Pergola: a `Slider` inside a group or scroll view read the drag's
+  window point as if it were in its own coordinates, so it jumped to an end or didn't
+  move. `Ctx::on_drag_local` now hands a handler points relative to the node's laid-out
+  top-left (scroll offset and zoom undone, `slot::window_origin`), and the slider uses it.
+- Live check in the cloud arm64 VM, 2026-11-15 (booted with `lyra-vm-check.sh qemu-args`,
+  `cloud-vm.sh lyra`, then `curia-vm.sh sound`): lyrad on QEMU's HDA codec, choragusd, a
+  tone from `lyra-play` as `org.test.a`, Curia as `org.test.ui`. Volume dragged to 49%,
+  the tone's level to 21% and muted, balance to 0.7 and back to the centre, and Fixed
+  (line out) on and off, each read back from `/var/db/choragus`; choragusd stopped (the
+  page says so), restarted (it comes back), stopped with SIGSTOP ("not answering" after
+  about 40 s) and continued (it comes back); Curia's pid unchanged.

@@ -194,7 +194,15 @@ impl Control {
     }
 
     pub fn connect(path: &str) -> io::Result<Control> {
+        Self::connect_within(path, None)
+    }
+
+    /// As [`Control::connect`], with a read and write timeout on the
+    /// connection (kept after the hello), so a choragusd that hangs is seen.
+    pub fn connect_within(path: &str, limit: Option<std::time::Duration>) -> io::Result<Control> {
         let mut sock = UnixStream::connect(path)?;
+        sock.set_read_timeout(limit)?;
+        sock.set_write_timeout(limit)?;
         wire::send(&mut sock, &ToControl::Hello { version: wire::VERSION })?;
         match wire::recv(&mut sock)? {
             FromControl::Welcome => Ok(Control { sock }),

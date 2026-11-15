@@ -79,6 +79,9 @@ pub struct Handlers {
     /// A press on this node, then every move until release, goes here (a
     /// slider's thumb follows the pointer even off the track).
     pub on_drag: Option<DragHandler>,
+    /// `on_drag` gets points relative to the node's own top-left, in its
+    /// layout units ([`crate::view::Ctx::on_drag_local`]), not window px.
+    pub drag_local: bool,
     /// This node is where another process's surface is embedded (a Limen
     /// slot, e.g. Arca's credential field): the App reports its window
     /// rect to the binder whenever it changes ([`crate::slot`]).

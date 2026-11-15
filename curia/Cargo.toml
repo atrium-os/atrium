@@ -22,3 +22,4 @@ fresco-protocol = { path = "../fresco-protocol" }
 atrium-netconf = { path = "../atrium-net/netconf" }
 atrium-devices = { path = "../dispensator/devices" }
 forum-ctl = { path = "../forum-ctl" }
+lyra-protocol = { path = "../lyra-protocol" }

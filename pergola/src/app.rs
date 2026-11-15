@@ -490,6 +490,18 @@ impl<V: View> App<V> {
         crate::clipboard::with_activation(activation, || self.handle_event(event));
     }
 
+    /// A drag's point as its handler wants it: window px, or relative to
+    /// the node's laid-out top-left for `on_drag_local`.
+    fn drag_point(&self, d: NodeId, at: crate::geom::Point) -> crate::geom::Point {
+        if !self.interactions.get(d).is_some_and(|h| h.drag_local) {
+            return at;
+        }
+        match crate::slot::window_origin(&self.prev_tree, d) {
+            Some((o, z)) if z > 0.0 => crate::geom::Point::new((at.x - o.x) / z, (at.y - o.y) / z),
+            _ => at,
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match &event {
             Event::PointerDown { at } => {
@@ -506,8 +518,10 @@ impl<V: View> App<V> {
                 self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
                 self.press_activation = crate::clipboard::current_activation();
                 self.dragging = hit.and_then(|id| self.bubble_to(id, |h| h.on_drag.is_some()));
-                if let Some(cb) = self.dragging.and_then(|d| self.interactions.get(d)).and_then(|h| h.on_drag.as_ref()) {
-                    cb(crate::interaction::DragPhase::Start, *at);
+                if let Some(d) = self.dragging {
+                    if let Some(cb) = self.interactions.get(d).and_then(|h| h.on_drag.as_ref()) {
+                        cb(crate::interaction::DragPhase::Start, self.drag_point(d, *at));
+                    }
                 }
                 let new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
                 if self.focused != new_focus || self.focus_visible {
@@ -524,7 +538,7 @@ impl<V: View> App<V> {
                 self.pointer = Some(*at);
                 if let Some(d) = self.dragging.take() {
                     if let Some(cb) = self.interactions.get(d).and_then(|h| h.on_drag.as_ref()) {
-                        cb(crate::interaction::DragPhase::End, *at);
+                        cb(crate::interaction::DragPhase::End, self.drag_point(d, *at));
                     }
                 }
                 let target = hit_test(&self.prev_tree, *at)
@@ -549,8 +563,10 @@ impl<V: View> App<V> {
             }
             Event::PointerMove { at } => {
                 self.pointer = Some(*at);
-                if let Some(cb) = self.dragging.and_then(|d| self.interactions.get(d)).and_then(|h| h.on_drag.as_ref()) {
-                    cb(crate::interaction::DragPhase::Move, *at);
+                if let Some(d) = self.dragging {
+                    if let Some(cb) = self.interactions.get(d).and_then(|h| h.on_drag.as_ref()) {
+                        cb(crate::interaction::DragPhase::Move, self.drag_point(d, *at));
+                    }
                 }
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.

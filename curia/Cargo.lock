@@ -178,6 +178,7 @@ dependencies = [
  "fresco-client",
  "fresco-protocol",
  "limen",
+ "lyra-protocol",
  "pergola",
 ]
 

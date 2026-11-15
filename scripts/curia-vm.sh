@@ -17,6 +17,10 @@
 #                                               # dies or hangs and comes back; frames curia-away-*.png
 #   sh scripts/curia-vm.sh display              # forum-wm with its settings socket, then
 #                                               # Curia's Display page (C4a), one frame
+#   sh scripts/curia-vm.sh sound                # after `cloud-vm.sh lyra` (VM booted with
+#                                               # lyra-vm-check.sh qemu-args): lyrad, choragusd
+#                                               # with the control socket, frescod, forum-wm,
+#                                               # a tone as org.test.a, Curia's Sound page
 #   sh scripts/curia-vm.sh core [TEXT]          # Curia's core: TEXT (default the gate's
 #                                               # passphrase) must not be in it
 set -eu
@@ -86,7 +90,7 @@ away)
     GAP=50 frame away-3-netconf-hung
     "$V" "pkill -CONT -x atrium-netconf"
     GAP=40 frame away-4-netconf-answers
-    inj "MOVE 70 187"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    inj "MOVE 70 225"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     "$V" "service atrium-dispensatord stop >/dev/null"
     GAP=10 frame away-5-devices-gone
     "$V" "service atrium-dispensatord start >/dev/null"
@@ -116,6 +120,31 @@ display)
     GAP=${GAP:-40} sh "$0" shot
     inj "MOVE 70 149"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
     GAP=8 frame display ;;
+sound)
+    for c in frescod forum-wm curia; do
+        (cd "$ROOT/$c" && RUSTFLAGS="$X" cargo build -q --release --target "$T" --bin $c) || exit 1
+    done
+    L=/var/run/lyra-test; AC=/atrium/sockets/audio-control/audio-control.sock
+    "$V" "for p in curia forum-bar forum-wm frescod lyra-play; do pkill -x \$p; done; pkill -f 'daemon.*lyra-test'; pkill lyrad; pkill choragusd; sleep 2
+        rm -rf $Sx; mkdir -p $D $Sx /usr/local/share/fonts/ibm-plex; chmod 777 $Sx; true"
+    for c in frescod forum-wm curia; do scp $K -P 2222 -q "$ROOT/$c/target/$T/release/$c" "root@localhost:$D/"; done
+    for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+        "$V" "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp $K -P 2222 -q "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
+    done
+    "$V" "set -e; kldload -n snd_hda; install -d -o _choragus -g _choragus -m 0755 /atrium/sockets/audio-control
+        daemon -r -R 1 -u _lyra -o $L/lyrad.log -t lyra-test-lyrad /usr/local/bin/lyrad --serve </dev/null >/dev/null 2>&1
+        daemon -r -R 1 -u _choragus -o $L/choragusd.log -t lyra-test-choragusd /usr/local/bin/choragusd --daemon $L/audio.sock /atrium/sockets/lyrad/lyrad.sock \
+            --grants $L/grants --app-registry $L/registry --control $AC --device $L/device.sock --state /var/db/choragus </dev/null >/dev/null 2>&1
+        for i in \$(seq 1 30); do [ -S $AC ] && break; sleep 1; done; ls -l $AC
+        cd $Sx && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$Sx/screen FRESCOD_SOCK=$Sx/fresco.sock FRESCOD_CHROME_UIDS=50004 FRESCOD_WM_SOCK=$Sx/wm.sock \
+            FRESCOD_INPUT_SOCK=$Sx/inject.sock daemon -f -o $Sx/frescod.log $D/frescod </dev/null
+        i=0; while [ \$i -lt 60 ] && ! test -S $Sx/fresco.sock; do sleep 2; i=\$((i+1)); done
+        env $E2 daemon -f -o $Sx/wm.log $D/forum-wm </dev/null; sleep 4; chmod 666 $Sx/*.sock
+        daemon -f -u appa -o $Sx/play.log /usr/local/bin/lyra-play $L/audio.sock media 900 </dev/null
+        env $E2 CURIA_AUDIO_SOCK=$AC CURIA_NET_DIR=/nonexistent CURIA_DEVICES_SOCK=/nonexistent daemon -f -u appui -o $Sx/curia.log $D/curia </dev/null"
+    sleep 60
+    inj "MOVE 70 187"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    GAP=10 frame sound ;;
 core)
     t=${2:-correct horse battery staple}
     "$V" "rm -f $Sx/curia.core; gcore -c $Sx/curia.core \$(pgrep -x curia) >/dev/null 2>&1; ls -l $Sx/curia.core | awk '{print \"core:\", \$5, \"bytes\"}'

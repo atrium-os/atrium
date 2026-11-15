@@ -165,6 +165,15 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).on_drag = Some(Box::new(handler));
     }
 
+    /// As [`Ctx::on_drag`], with each point relative to the node's own
+    /// laid-out top-left (scroll offsets and zoom undone), so a widget
+    /// inside groups and scroll views needn't know where it ended up.
+    pub fn on_drag_local<F: Fn(crate::interaction::DragPhase, crate::geom::Point) + 'static>(&mut self, id: NodeId, handler: F) {
+        let h = self.interactions.entry(id);
+        h.on_drag = Some(Box::new(handler));
+        h.drag_local = true;
+    }
+
     /// Receive wheel, navigation-key and press input for a scroll view.
     pub fn on_scroll<F: Fn(&crate::interaction::ScrollInput) + 'static>(&mut self, id: NodeId, handler: F) {
         self.interactions.entry(id).on_scroll = Some(Box::new(handler));

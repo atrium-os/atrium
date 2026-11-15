@@ -128,8 +128,10 @@ impl View for Slider {
             }
         };
         let s = set.clone();
-        let (x0, w) = (r.x() + em(THUMB) / 2.0, travel);
-        ctx.on_drag(target, move |_: DragPhase, p: Point| {
+        // Points relative to the slider itself: it may sit in groups and
+        // scroll views, so its own rect is not where it is in the window.
+        let (x0, w) = (em(THUMB) / 2.0, travel);
+        ctx.on_drag_local(target, move |_: DragPhase, p: Point| {
             let f = if w > 0.0 { ((p.x - x0) / w).clamp(0.0, 1.0) } else { 0.0 } as f64;
             s(min + f * (max - min));
         });
@@ -200,6 +202,39 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(900.0, 8.0) });
         app.handle_event(Event::PointerMove { at: Point::new(8.0, 8.0) });
         assert_eq!(v.get(), 100.0, "released: moves no longer drag");
+    }
+
+    /// In a scroll view, inside a group placed away from the window's
+    /// corner: a press still lands where the pointer is on the track.
+    struct Nested(Mutable<f64>, Mutable<crate::widgets::ScrollState>);
+    impl View for Nested {
+        fn render(&self, ctx: &mut Ctx) {
+            let v = self.0.clone();
+            let body = crate::view::Draw(move |ctx: &mut Ctx| {
+                let g = ctx.push(Node::stack(crate::geom::Axis::Vertical, Rect::new(0.0, 0.0, 400.0, 600.0), 0.0));
+                ctx.set_flex(g, crate::layout::FlexStyle { free: true, ..Default::default() });
+                Slider::new(v.clone(), 0.0, 100.0).width(216.0).at(30.0, 40.0).render(ctx);
+                ctx.pop();
+            });
+            crate::widgets::ScrollView::new(self.1.clone(), Rect::new(100.0, 50.0, 400.0, 300.0), body).emit(ctx);
+        }
+    }
+
+    #[test]
+    fn a_slider_in_a_scroll_view_follows_the_pointer() {
+        let d = Arc::new(AtomicBool::new(true));
+        let v = Mutable::with_dirty(0.0f64, d.clone());
+        let s = Mutable::with_dirty(Default::default(), d.clone());
+        let mut app = App::new_with_flag(Nested(v.clone(), s), d);
+        app.tick();
+        // The track starts at 100 + 30 = 130 in the window; its middle is
+        // 130 + 8 + 100 = 238, at y 50 + 40 + 8.
+        app.handle_event(Event::PointerDown { at: Point::new(238.0, 98.0) });
+        assert!((v.get() - 50.0).abs() < 1e-6, "{}", v.get());
+        app.tick();
+        app.handle_event(Event::PointerMove { at: Point::new(288.0, 98.0) });
+        assert!((v.get() - 75.0).abs() < 1e-6, "{}", v.get());
+        app.handle_event(Event::PointerUp { at: Point::new(288.0, 98.0) });
     }
 
     #[test]

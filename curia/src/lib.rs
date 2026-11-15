@@ -4,4 +4,5 @@
 pub mod devices;
 pub mod display;
 pub mod network;
+pub mod sound;
 pub mod view;

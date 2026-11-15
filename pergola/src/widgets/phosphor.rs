@@ -20,6 +20,8 @@ pub const SUN: char = '\u{e472}';
 pub const MOON: char = '\u{e330}';
 pub const SPEAKER_SIMPLE_HIGH: char = '\u{e450}';
 pub const SPEAKER_SIMPLE_X: char = '\u{e458}';
+pub const SPEAKER_HIGH: char = '\u{e44a}';
+pub const SPEAKER_X: char = '\u{e45c}';
 pub const BROADCAST: char = '\u{e0f2}';
 /// Network status (the bar, atrium-net.md §7.1).
 pub const WIFI_HIGH: char = '\u{e4ea}';

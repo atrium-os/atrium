@@ -93,6 +93,74 @@ fn follow_devices(tx: Sender<Result<Vec<atrium_devices::Device>, String>>) {
     });
 }
 
+/// What the Sound page's connection thread reports.
+enum SoundMsg {
+    Up,
+    Got(lyra_protocol::wire::FromControl),
+    Lost(String),
+}
+
+type SoundSend = Arc<std::sync::Mutex<Option<lyra_protocol::client::Control>>>;
+
+/// choragusd's volume-control socket (lyra-v1.md §7), followed on a thread:
+/// `Apps` and `Outputs` arrive unasked on every change. A quiet connection
+/// is asked for its outputs every 30 s; no answer in 10 s and it is dropped
+/// as hung. Gone: say why, try again every 5 s.
+fn follow_sound(tx: Sender<SoundMsg>, send: SoundSend) {
+    use lyra_protocol::wire::ToControl;
+    let path = std::env::var("CURIA_AUDIO_SOCK").unwrap_or_else(|_| "/atrium/sockets/audio-control/audio-control.sock".into());
+    std::thread::spawn(move || loop {
+        let why = match lyra_protocol::client::Control::connect_within(&path, Some(Duration::from_secs(10))) {
+            Ok(mut c) => {
+                *send.lock().unwrap_or_else(|p| p.into_inner()) = c.try_clone().ok();
+                let _ = c.socket().set_read_timeout(Some(Duration::from_secs(30)));
+                if tx.send(SoundMsg::Up).is_err() {
+                    return;
+                }
+                let mut probing = false;
+                let why = if c.send(&ToControl::List).and_then(|_| c.send(&ToControl::ListOutputs)).is_err() {
+                    "choragusd went away".to_string()
+                } else {
+                    loop {
+                        match c.recv() {
+                            Ok(m) => {
+                                if probing {
+                                    probing = false;
+                                    let _ = c.socket().set_read_timeout(Some(Duration::from_secs(30)));
+                                }
+                                if tx.send(SoundMsg::Got(m)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) && !probing => {
+                                probing = true;
+                                let _ = c.socket().set_read_timeout(Some(Duration::from_secs(10)));
+                                if c.send(&ToControl::ListOutputs).is_err() {
+                                    break "choragusd went away".to_string();
+                                }
+                            }
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break "choragusd is not answering".to_string(),
+                            Err(_) => break "choragusd went away".to_string(),
+                        }
+                    }
+                };
+                *send.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                why
+            }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => "choragusd is not running".to_string(),
+                std::io::ErrorKind::PermissionDenied => "Settings may not change the volume".to_string(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "choragusd is not answering".to_string(),
+                _ => format!("choragusd: {e}"),
+            },
+        };
+        if tx.send(SoundMsg::Lost(why)).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    });
+}
+
 /// One request to forum-wm's settings socket, 5 s at most.
 fn ask_wm(i: &forum_ctl::Intent) -> Result<forum_ctl::Reply, String> {
     use std::os::unix::net::UnixStream;
@@ -224,8 +292,12 @@ fn main() {
     let devs = Mutable::with_dirty(curia::devices::DevPage::default(), dirty.clone());
     let which = Mutable::with_dirty(curia::view::Which::default(), dirty.clone());
     let dev_scroll = Mutable::with_dirty(Default::default(), dirty.clone());
+    let sound = Mutable::with_dirty(curia::sound::SoundPage::default(), dirty.clone());
+    let (stx, srx) = channel();
+    let sound_send: SoundSend = Arc::new(std::sync::Mutex::new(None));
+    follow_sound(stx, sound_send.clone());
     let disp = Mutable::with_dirty(curia::display::DispPage::new(), dirty.clone());
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -236,14 +308,20 @@ fn main() {
     // a passphrase itself.
     // limend going away (or not there yet) is retried every 5 s; the field
     // is asked for again at most every 2 s.
-    let link_limend = |win: &mut Window| match Embeds::connect() {
+    // Said once per outage, not every 5 s.
+    let mut limend_said = false;
+    let mut link_limend = |win: &mut Window| match Embeds::connect() {
         Ok(e) => {
             win.set_slot_binder(Embeds::binder(&e));
             eprintln!("curia: limend: connected");
+            limend_said = false;
             Some(e)
         }
         Err(e) => {
-            eprintln!("curia: limend: {e:?}: no passphrase field for now");
+            if !limend_said {
+                eprintln!("curia: limend: {e:?}: no passphrase field for now");
+                limend_said = true;
+            }
             None
         }
     };
@@ -275,6 +353,31 @@ fn main() {
         }
         while let Ok(r) = drx.try_recv() {
             curia::view::with_devs(&devs, |d| d.apply(r));
+        }
+        // The Sound page: what choragusd says, and what the page asks.
+        {
+            let mut sp = sound.get_cloned();
+            let mut sch = false;
+            while let Ok(m) = srx.try_recv() {
+                match m {
+                    SoundMsg::Up => sp.connected(),
+                    SoundMsg::Got(m) => sp.apply(m),
+                    SoundMsg::Lost(why) => sp.lost(why),
+                }
+                sch = true;
+            }
+            let wants = sp.take_wants();
+            if !wants.is_empty() {
+                if let Some(c) = sound_send.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                    for w in &wants {
+                        let _ = c.send(w);
+                    }
+                }
+                sch = true;
+            }
+            if sch {
+                sound.set(sp);
+            }
         }
         // The Display page: forum-wm is asked again every 3 s while it shows
         // (a monitor plugged in, the bar's light/dark switch), and an unkept

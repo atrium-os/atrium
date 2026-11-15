@@ -14,6 +14,7 @@ use atrium_netconf::{Link, Online};
 
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
+use crate::sound::{self as snd, SoundPage};
 use crate::network::{headline, name, security_label, NetPage, MAC_POLICIES};
 
 fn em(pt: f32) -> f32 {
@@ -30,6 +31,7 @@ pub enum Which {
     #[default]
     Network,
     Display,
+    Sound,
     Devices,
 }
 
@@ -40,6 +42,8 @@ pub struct CuriaView {
     pub dev_scroll: Mutable<ScrollState>,
     pub disp: Mutable<DispPage>,
     pub disp_scroll: Mutable<ScrollState>,
+    pub sound: Mutable<SoundPage>,
+    pub sound_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -138,7 +142,7 @@ impl View for CuriaView {
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
         let now = self.which.get();
-        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Display, ph::MONITOR, "Display"), (Which::Devices, ph::USB, "Devices")].into_iter().enumerate() {
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices")].into_iter().enumerate() {
             let y = em(56.0) + i as f32 * em(38.0);
             let on = now == which;
             let sel = self.which.clone();
@@ -150,6 +154,7 @@ impl View for CuriaView {
         match now {
             Which::Network => self.network(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Display => self.display(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Sound => self.sound(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
         }
     }
@@ -597,6 +602,166 @@ impl CuriaView {
     }
 }
 
+pub fn with_sound(page: &Mutable<SoundPage>, f: impl FnOnce(&mut SoundPage)) {
+    let mut p = page.get_cloned();
+    f(&mut p);
+    page.set(p);
+}
+
+/// A level slider (0 to 1) that tells `f` each move.
+fn level(ctx: &mut Ctx, x: f32, y: f32, w: f32, v: f32, enabled: bool, f: impl Fn(f32) + 'static) {
+    pergola::widgets::Slider::new(Mutable::new(v as f64), 0.0, 1.0)
+        .step(0.01)
+        .at(x, y)
+        .width(w)
+        .enabled(enabled)
+        .on_change(move |v| f(v as f32))
+        .render(ctx);
+}
+
+impl CuriaView {
+    /// The Sound page (curia.md §12): the volume, each app playing, and the
+    /// outputs, over choragusd's volume-control socket.
+    fn sound(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
+        let p = self.sound.get_cloned();
+        let t = ctx.theme;
+        let mut y = em(20.0);
+        text(ctx, x0, y + em(16.0), "Sound", type_size::XL, Weight::Semibold, t.text_primary());
+        y += em(48.0);
+        match &p.link {
+            Some(Err(why)) => {
+                let ch = em(64.0);
+                rect(ctx, x0, y, pw, ch, t.bg_surface(), 8.0);
+                icon(ctx, x0 + em(16.0), y + em(20.0), ph::SPEAKER_X, em(24.0), t.text_secondary());
+                text(ctx, x0 + em(56.0), y + em(24.0), "Sound settings are not available", type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, x0 + em(56.0), y + em(44.0), &format!("{why}; trying again"), type_size::SM, Weight::Regular, t.text_secondary());
+                return;
+            }
+            _ if !p.ready() => {
+                text(ctx, x0, y + em(10.0), "Asking choragusd for the sound settings…", type_size::SM, Weight::Regular, t.text_tertiary());
+                return;
+            }
+            _ => {}
+        }
+        let top = y;
+        let sw = (pw - em(300.0)).clamp(em(120.0), em(360.0));
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let t = ctx.theme;
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+            ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+            let x0 = 0.0;
+            let lx = x0 + em(140.0);
+            let mut y = em(4.0);
+            let label = |ctx: &mut Ctx, y: f32, l: &str| {
+                text(ctx, x0, y + em(15.0), l, type_size::SM, Weight::Medium, ctx.theme.text_secondary());
+            };
+            fn choices(ctx: &mut Ctx, x: f32, y: f32, items: Vec<(String, bool, Box<dyn Fn()>)>) {
+                let mut x = x;
+                for (l, on, f) in items {
+                    x += button(ctx, x, y, &l, if on { Look::Primary } else { Look::Secondary }, true, f) + em(6.0);
+                }
+            }
+
+            // The volume.
+            label(ctx, y, "Volume");
+            let fixed = p.master_fixed();
+            let pg = self.sound.clone();
+            level(ctx, lx, y + em(7.0), sw, p.master, !fixed, move |v| with_sound(&pg, |s| s.set_master(v)));
+            let pct = if fixed { "Fixed".to_string() } else { snd::percent(p.master) };
+            text(ctx, lx + sw + em(12.0), y + em(15.0), &pct, type_size::SM, Weight::Regular, t.text_secondary());
+            let pg = self.sound.clone();
+            button(ctx, lx + sw + em(110.0), y, if p.master_muted { "Unmute" } else { "Mute" }, if p.master_muted { Look::Primary } else { Look::Secondary }, true, move || with_sound(&pg, SoundPage::toggle_master_mute));
+            y += em(48.0);
+
+            // The outputs.
+            label(ctx, y, "Output");
+            if p.outputs.is_empty() {
+                text(ctx, lx, y + em(15.0), "No output device", type_size::SM, Weight::Regular, t.text_tertiary());
+                y += em(42.0);
+            } else {
+                choices(ctx, lx, y, p.outputs.iter().map(|o| {
+                    let (pg, id) = (self.sound.clone(), o.id);
+                    (o.name.clone(), o.id == p.current, Box::new(move || with_sound(&pg, |s| s.pick_output(id))) as Box<dyn Fn()>)
+                }).collect());
+                y += em(42.0);
+            }
+            if let Some(o) = p.current_output() {
+                label(ctx, y, "Balance");
+                text(ctx, lx, y + em(15.0), "Left", type_size::XS, Weight::Regular, t.text_tertiary());
+                let bx = lx + em(36.0);
+                let pg = self.sound.clone();
+                pergola::widgets::Slider::new(Mutable::new(o.balance as f64), -1.0, 1.0)
+                    .step(0.05)
+                    .at(bx, y + em(7.0))
+                    .width(sw - em(72.0))
+                    .on_change(move |v| with_sound(&pg, |s| s.set_balance(v as f32)))
+                    .render(ctx);
+                text(ctx, bx + sw - em(72.0) + em(8.0), y + em(15.0), "Right", type_size::XS, Weight::Regular, t.text_tertiary());
+                if o.balance != 0.0 {
+                    let pg = self.sound.clone();
+                    button(ctx, lx + sw + em(12.0), y, "Centre", Look::Ghost, true, move || with_sound(&pg, |s| s.set_balance(0.0)));
+                }
+                y += em(42.0);
+                label(ctx, y, "Speakers");
+                choices(ctx, lx, y, snd::LAYOUTS.iter().map(|&(c, l)| {
+                    let pg = self.sound.clone();
+                    (l.to_string(), o.channels == c, Box::new(move || with_sound(&pg, |s| s.set_layout(c))) as Box<dyn Fn()>)
+                }).collect());
+                y += em(42.0);
+                if o.channels == 2 {
+                    label(ctx, y, "Headphone surround");
+                    let pg = self.sound.clone();
+                    choices(ctx, lx, y, vec![
+                        ("Off".to_string(), !o.spatial, Box::new({ let pg = pg.clone(); move || with_sound(&pg, |s| if s.current_output().is_some_and(|o| o.spatial) { s.toggle_spatial() }) }) as Box<dyn Fn()>),
+                        ("On".to_string(), o.spatial, Box::new(move || with_sound(&pg, |s| if s.current_output().is_some_and(|o| !o.spatial) { s.toggle_spatial() })) as Box<dyn Fn()>),
+                    ]);
+                    y += em(42.0);
+                }
+                label(ctx, y, "Volume control");
+                choices(ctx, lx, y, SoundPage::volume_modes(o).into_iter().map(|m| {
+                    let pg = self.sound.clone();
+                    (snd::volume_mode_label(m).to_string(), o.volume_setting == m, Box::new(move || with_sound(&pg, |s| s.set_volume_mode(m))) as Box<dyn Fn()>)
+                }).collect());
+                y += em(52.0);
+            }
+
+            // The apps playing now.
+            rect(ctx, x0, y, pw, 1.0, t.border_default(), 0.0);
+            y += em(12.0);
+            text(ctx, x0, y + em(10.0), "Apps", type_size::SM, Weight::Semibold, t.text_secondary());
+            y += em(30.0);
+            if p.apps.is_empty() {
+                text(ctx, x0, y + em(12.0), "No app is playing sound. Apps show here while they play.", type_size::SM, Weight::Regular, t.text_tertiary());
+                y += em(32.0);
+            }
+            let surround = p.current_output().is_some_and(|o| o.channels == 2 && o.spatial);
+            for a in &p.apps {
+                text(ctx, x0, y + em(15.0), &snd::app_name(a), type_size::SM, Weight::Medium, t.text_primary());
+                let id = a.app_id.clone();
+                let pg = self.sound.clone();
+                level(ctx, lx + em(60.0), y + em(7.0), sw - em(60.0), a.volume, true, move |v| with_sound(&pg, |s| s.set_app(&id, v)));
+                text(ctx, lx + sw + em(12.0), y + em(15.0), &snd::percent(a.volume), type_size::SM, Weight::Regular, t.text_secondary());
+                let (id, pg) = (a.app_id.clone(), self.sound.clone());
+                let mut bx = lx + sw + em(60.0);
+                bx += button(ctx, bx, y, if a.muted { "Unmute" } else { "Mute" }, if a.muted { Look::Primary } else { Look::Ghost }, true, move || with_sound(&pg, |s| s.toggle_app_mute(&id))) + em(6.0);
+                if surround {
+                    let (id, pg) = (a.app_id.clone(), self.sound.clone());
+                    button(ctx, bx, y, if a.spatial { "Surround: on" } else { "Surround: off" }, Look::Ghost, true, move || with_sound(&pg, |s| s.toggle_app_spatial(&id)));
+                }
+                y += em(40.0);
+            }
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = y;
+            }
+            ctx.pop();
+        });
+        ScrollView::new(self.sound_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
+            .key(93)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
+    }
+}
+
 pub fn with_devs(page: &Mutable<DevPage>, f: impl FnOnce(&mut DevPage)) {
     let mut p = page.get_cloned();
     f(&mut p);
@@ -620,7 +785,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -642,7 +807,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -658,10 +823,29 @@ mod tests {
     }
 
     #[test]
+    fn the_sound_page_shows_volume_outputs_and_apps() {
+        use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
+        with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
+        assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
+        with_sound(&v.sound, |p| {
+            p.connected();
+            p.apply(FromControl::Apps { master: 0.42, master_muted: false, apps: vec![AppEntry { app_id: "org.atrium.player".into(), label: "Video".into(), role: Role::Media, volume: 0.8, muted: false, streams: 1, spatial: true }] });
+            p.apply(FromControl::Outputs { current: 1, outputs: vec![Output { id: 1, name: "Speakers".into(), volume: VolumeMode::Digital, volume_setting: None, hw_volume: false, balance: 0.0, channels: 2, spatial: true }] });
+        });
+        let all = texts(&v);
+        for want in ["Sound", "Volume", "42%", "Mute", "Output", "Speakers", "Balance", "Stereo", "5.1", "Headphone surround", "On", "Volume control", "Automatic", "Fixed (line out)", "Apps", "Player · Video", "80%", "Surround: on"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
+    }
+
+    #[test]
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

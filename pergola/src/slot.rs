@@ -26,6 +26,24 @@ pub trait SlotBinder {
     fn place(&mut self, window_id: u32, key: SlotKey, rect: Option<[f32; 4]>);
 }
 
+/// Where `id`'s laid-out top-left is in the window, and the zoom of the
+/// scroll views it is in (1 outside any), clipped or not.
+pub fn window_origin(tree: &NodeTree, id: NodeId) -> Option<(Point, f32)> {
+    let r = tree.get(id)?.rect();
+    let (mut p, mut zoom) = (r.origin, 1.0f32);
+    let mut at = id;
+    while let Some(par) = tree.parent_of(at) {
+        if let Some(Node::Scroll { rect, offset, offset_x, zoom: zm, stretch, .. }) = tree.get(par) {
+            let z = zm * stretch;
+            let o = rect.origin;
+            p = Point::new(o.x + (p.x - offset_x - o.x) * z, o.y + (p.y - offset - o.y) * z);
+            zoom *= z;
+        }
+        at = par;
+    }
+    Some((p, zoom))
+}
+
 /// `id`'s rect in window coordinates, or `None` if a scroll view clips any
 /// of it or it is empty.
 pub fn window_rect(tree: &NodeTree, id: NodeId) -> Option<Rect> {
