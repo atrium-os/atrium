@@ -116,6 +116,9 @@ mod imp {
         probe_every: u64,
         probe_bin: String,
         netd: Option<String>,
+        /// Exit (status 75) when a port arrives or a managed one goes away,
+        /// so the service starts again with the ports there are now.
+        follow: bool,
     }
 
     /// The probe's target, from --probe http://HOST/PATH.
@@ -162,6 +165,7 @@ mod imp {
             probe_every: 300,
             probe_bin: "/usr/local/libexec/atrium-probe".into(),
             netd: None,
+            follow: false,
         };
         let mut a = std::env::args().skip(1);
         let val = |a: &mut std::iter::Skip<std::env::Args>, f: &str| a.next().unwrap_or_else(|| die(&format!("{f} needs a value")));
@@ -184,7 +188,8 @@ mod imp {
                 "--probe-every" => o.probe_every = val(&mut a, "--probe-every").parse().unwrap_or_else(|_| die("--probe-every SECS")),
                 "--probe-bin" => o.probe_bin = val(&mut a, "--probe-bin"),
                 "--netd-dir" => o.netd = Some(val(&mut a, "--netd-dir")),
-                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum] [--probe URL | --no-probe] [--probe-expect TEXT] [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR]"),
+                "--follow-ports" => o.follow = true,
+                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum] [--probe URL | --no-probe] [--probe-expect TEXT] [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR] [--follow-ports]"),
             }
         }
         if let Some(w) = &o.wifi {
@@ -1224,6 +1229,7 @@ mod imp {
 
     pub fn main() {
         let o = opts();
+        let follow = o.follow;
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
@@ -1352,7 +1358,22 @@ mod imp {
             let ready = poll_read(&fds, wait.max(10));
 
             if ready[0] {
-                for (idx, up) in net.rt.read_ifinfo() {
+                for ev in net.rt.read_ifinfo() {
+                    let (idx, up) = match ev {
+                        sys::IfEvent::Link(idx, up) => (idx, up),
+                        sys::IfEvent::Arrived(n) if follow && atrium_net::plan::is_port(&n) && !net.ifs.iter().any(|i| i.name == n) => {
+                            eprintln!("atrium-net: {n} arrived: exiting to start again with it");
+                            std::process::exit(75);
+                        }
+                        sys::IfEvent::Departed(n) if follow && net.ifs.iter().any(|i| i.name == n) => {
+                            eprintln!("atrium-net: {n} went away: exiting to start again without it");
+                            std::process::exit(75);
+                        }
+                        sys::IfEvent::Arrived(n) | sys::IfEvent::Departed(n) => {
+                            net.log(&format!("{n}: arrived or went away (not followed)"));
+                            continue;
+                        }
+                    };
                     let now = net.now();
                     if let Some(k) = net.ifs.iter().position(|i| i.index == idx && !i.wifi) {
                         if net.ifs[k].link && !up {

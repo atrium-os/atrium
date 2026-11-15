@@ -51,6 +51,8 @@ pidfile="/var/run/atrium/atrium-net.pid"
 start_cmd="atrium_net_start"
 stop_cmd="atrium_net_stop"
 status_cmd="atrium_net_status"
+run_cmd="atrium_net_run"
+extra_commands="run"
 
 # Ethernet ports rc.conf leaves to atrium-net: no ifconfig_<name> line (and
 # no ifconfig_DEFAULT), or one that only brings the port up.
@@ -62,6 +64,39 @@ atrium_net_auto_ifaces() {
     done
 }
 
+# The ports to manage now, as atrium-net arguments (empty: none).
+atrium_net_args() {
+    args=""
+    ifaces="${atrium_net_ifaces}"
+    [ "${ifaces}" = AUTO ] && ifaces=$(atrium_net_auto_ifaces)
+    for i in ${ifaces}; do
+        ifconfig "$i" >/dev/null 2>&1 && args="${args} --iface $i"
+    done
+    wifi="${atrium_net_wifi}"
+    if [ "${wifi}" = AUTO ]; then
+        wifi=NONE
+        ifconfig wlan0 >/dev/null 2>&1 && wifi=wlan0
+    fi
+    [ "${wifi}" != NONE ] && ifconfig "${wifi}" >/dev/null 2>&1 && args="${args} --wifi ${wifi}"
+    echo "${args}"
+}
+
+# What daemon(8) runs, at every start: the ports there are now. atrium-net
+# runs with --follow-ports, so it exits when a port arrives (a USB Wi-Fi or
+# Ethernet adapter) or a managed one goes away, and this picks again. With
+# no port yet, it waits for one.
+atrium_net_run() {
+    args=$(atrium_net_args)
+    while [ -z "${args}" ]; do
+        sleep 3
+        args=$(atrium_net_args)
+    done
+    unbound=""
+    [ -S /var/run/local_unbound.ctl ] || { unbound="--no-unbound"; echo "${name}: local-unbound is not running; DNS forwarders not set" >&2; }
+    echo "${name}: managing${args}" >&2
+    exec "${command}" ${args} --capsicum --follow-ports ${unbound} ${atrium_net_flags}
+}
+
 atrium_net_start() {
     if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
         echo "${name} already running."
@@ -69,26 +104,11 @@ atrium_net_start() {
     fi
     install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium /atrium/sockets
     install -d -m 0700 -o root -g wheel /var/db/atrium-net /atrium/sockets/atrium-net
-    args=""
-    ifaces="${atrium_net_ifaces}"
-    [ "${ifaces}" = AUTO ] && ifaces=$(atrium_net_auto_ifaces)
-    for i in ${ifaces}; do
-        ifconfig "$i" >/dev/null 2>&1 || { warn "${name}: no interface $i, skipped"; continue; }
-        args="${args} --iface $i"
-    done
-    wifi="${atrium_net_wifi}"
-    if [ "${wifi}" = AUTO ]; then
-        wifi=NONE
-        ifconfig wlan0 >/dev/null 2>&1 && wifi=wlan0
-    fi
-    [ "${wifi}" != NONE ] && args="${args} --wifi ${wifi}"
-    [ -n "${args}" ] || { warn "${name}: no interface to manage"; return 1; }
-    unbound=""
-    [ -S /var/run/local_unbound.ctl ] || { unbound="--no-unbound"; warn "${name}: local-unbound is not running; DNS forwarders not set"; }
-    echo "Starting ${name}:${args}."
+    args=$(atrium_net_args)
+    echo "Starting ${name}:${args:- no port yet (waiting for one)}."
     # -r -R 2: started again 2 s after any exit; -P: the supervisor's pid.
     /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_net_logfile}" -t "${name}" \
-        "${command}" ${args} --capsicum ${unbound} ${atrium_net_flags}
+        /bin/sh /usr/local/etc/rc.d/atrium-net onerun
 }
 
 atrium_net_stop() {

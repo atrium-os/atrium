@@ -493,5 +493,11 @@ before it drops to `_atrium-netconf` and enters capability mode.
   `local-unbound-setup`, and `atrium_net_enable`, `atrium_netconf_enable`,
   `local_unbound_enable`.
 - Gate: `aura-sim-gate.sh svc` (RUNBOOK §13.6e).
-- Not yet: a Wi-Fi interface that appears after boot (a USB dongle) needs a restart of
-  atrium-net to be taken; devd can do that once Wi-Fi hardware lands (W3).
+- Ports that come and go (2026-11-15): daemon(8) runs `atrium-net onerun`, which picks
+  the ports at every start (waiting while there is none) and execs atrium-net with
+  `--follow-ports`. atrium-net reads `RTM_IFANNOUNCE` on its routing socket: a port
+  arriving (not loopback, bridge, tap/tun, epair, vlan, wg and the like; `plan::is_port`)
+  or a managed one going away makes it exit with status 75, and the supervisor starts
+  it again 2 s later with the ports there are now. Addresses stay on a port across the
+  restart, so wired leases come back at once; atrium-netconf follows. No devd rule is
+  needed. Checked by unloading and loading the Wi-Fi driver in `aura-sim-gate.sh svc`.

@@ -269,6 +269,7 @@ pub const RTM_ADD: u8 = 1;
 pub const RTM_DELETE: u8 = 2;
 pub const RTM_CHANGE: u8 = 3;
 pub const RTM_IFINFO: u8 = 0xe;
+pub const RTM_IFANNOUNCE: u8 = 0x11;
 const RTF_UP: i32 = 0x1;
 const RTF_GATEWAY: i32 = 0x2;
 const RTF_STATIC: i32 = 0x800;
@@ -339,8 +340,9 @@ impl Rtsock {
         Ok(())
     }
 
-    /// Link-state changes from the kernel: (interface index, link up).
-    pub fn read_ifinfo(&self) -> Vec<(u16, bool)> {
+    /// What the kernel says about interfaces: link state, and interfaces
+    /// arriving or going away (a USB Wi-Fi or Ethernet adapter).
+    pub fn read_ifinfo(&self) -> Vec<IfEvent> {
         let mut out = Vec::new();
         let mut b = [0u8; 2048];
         loop {
@@ -349,18 +351,40 @@ impl Rtsock {
                 break;
             }
             let n = n as usize;
-            // if_msghdr: msglen u16, version u8, type u8, addrs i32, flags i32,
-            // index u16, spare u16, then if_data (type, physical, addrlen,
-            // hdrlen, link_state: its 5th byte).
-            if n >= 24 && b[2] == RTM_VERSION && b[3] == RTM_IFINFO {
-                let idx = u16::from_ne_bytes([b[12], b[13]]);
-                let link = b[16 + 4];
-                out.push((idx, link == 2));
+            if n < 4 || b[2] != RTM_VERSION {
+                continue;
+            }
+            match b[3] {
+                // if_msghdr: msglen u16, version u8, type u8, addrs i32, flags
+                // i32, index u16, spare u16, then if_data (type, physical,
+                // addrlen, hdrlen, link_state: its 5th byte).
+                RTM_IFINFO if n >= 24 => {
+                    let idx = u16::from_ne_bytes([b[12], b[13]]);
+                    out.push(IfEvent::Link(idx, b[16 + 4] == 2));
+                }
+                // if_announcemsghdr: msglen u16, version u8, type u8, index
+                // u16, name[16], what u16 (0 arrival, 1 departure).
+                RTM_IFANNOUNCE if n >= 24 => {
+                    let name = &b[6..22];
+                    let end = name.iter().position(|&c| c == 0).unwrap_or(16);
+                    let Ok(name) = std::str::from_utf8(&name[..end]) else { continue };
+                    let what = u16::from_ne_bytes([b[22], b[23]]);
+                    out.push(if what == 0 { IfEvent::Arrived(name.to_string()) } else { IfEvent::Departed(name.to_string()) });
+                }
+                _ => {}
             }
         }
         out
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IfEvent {
+    Link(u16, bool),
+    Arrived(String),
+    Departed(String),
+}
+
 
 // ---- bpf -----------------------------------------------------------------
 

@@ -801,6 +801,22 @@ svc() {
     "$V" "$APP network-details interfaces" | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.' || fail "vtnet1 after the restart"
     ok "after the restart: Wi-Fi auto-joined aura-test again, vtnet1 bound ($((i * 3)) s)"
 
+    # The Wi-Fi adapter goes away and comes back (a USB dongle): atrium-net
+    # starts again without it, then with it, and Wi-Fi joins by itself.
+    "$V" 'service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x aura-air; sleep 2; kldunload aura_sim && kldunload aura_wlan' || fail "unplug"
+    i=0; until a=$("$V" 'ps -o command= -p $(pgrep -x atrium-net) 2>/dev/null') && [ -n "$a" ] && ! echo "$a" | grep -q wlan0; do i=$((i + 1)); [ $i -lt 30 ] || fail "after unplug: '$a'"; sleep 1; done
+    "$V" 'grep -q "wlan0 went away" /var/log/atrium/atrium-net.log' && ok "Wi-Fi adapter gone: atrium-net started again without it ($a)" || fail "log: $("$V" 'tail -5 /var/log/atrium/atrium-net.log')"
+    i=0; until "$V" "$APP network-details interfaces" 2>/dev/null | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.'; do i=$((i + 1)); [ $i -lt 30 ] || fail "vtnet1 after unplug"; sleep 2; done
+    ok "vtnet1 still bound, settings sockets answer"
+    "$V" "set -e; cd /tmp/aura; kldload ./aura_wlan.ko; kldload ./aura_sim.ko; ifconfig wlan0 up
+        daemon -f -o /tmp/aura/air.log ./aura-air -v
+        daemon -f -o /tmp/aura/bootstrap.log service atrium-portcullisd-bootstrap onestart
+        i=0; until [ -S /atrium/sockets/aura/mlme.sock ]; do i=\$((i+1)); [ \$i -lt 60 ] || exit 1; sleep 2; done" || fail "plug"
+    i=0; until "$V" 'ps -o command= -p $(pgrep -x atrium-net) 2>/dev/null' | grep -q -- '--wifi wlan0'; do i=$((i + 1)); [ $i -lt 30 ] || fail "after plug: $("$V" 'tail -5 /var/log/atrium/atrium-net.log')"; sleep 1; done
+    "$V" 'grep -q "wlan0 arrived" /var/log/atrium/atrium-net.log' && ok "Wi-Fi adapter back: atrium-net started again with wlan0" || fail "no arrival logged"
+    i=0; until "$V" "$APP network-details interfaces" 2>/dev/null | grep -q '^iface name=wlan0 .*addr=10\.77\.0\.'; do i=$((i + 1)); [ $i -lt 60 ] || fail "wlan0 not rejoined: $("$V" "$APP network-details interfaces" 2>&1)"; sleep 3; done
+    ok "Wi-Fi joined aura-test again by itself ($((i * 3)) s)"
+
     "$V" 'service atrium-netconf stop >/dev/null; service atrium-net stop >/dev/null; sleep 5'
     p=$("$V" 'pgrep -lx "atrium-net|atrium-netconf|atrium-lease" | tr "\n" " "; pgrep -f "daemon: atrium_net" | tr "\n" " "' || true)
     [ -z "$p" ] && ok "service stop: nothing left running, nothing restarted" || fail "after stop: $p"

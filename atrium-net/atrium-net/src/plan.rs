@@ -70,8 +70,25 @@ impl Applied {
     }
 }
 
+/// An interface atrium-net could manage when it arrives: not loopback, a
+/// tunnel, a bridge, or a jail's or VPN's own virtual interface.
+pub fn is_port(name: &str) -> bool {
+    const VIRTUAL: [&str; 13] = ["lo", "bridge", "tap", "tun", "epair", "vlan", "gif", "gre", "pflog", "pfsync", "wg", "lagg", "enc"];
+    !name.is_empty() && !VIRTUAL.iter().any(|v| name.strip_prefix(v).is_some_and(|r| r.bytes().next().map_or(true, |c| c.is_ascii_digit())))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ports_and_virtual_interfaces() {
+        for p in ["wlan0", "em0", "ue0", "vtnet1", "igc0", "re0", "tapir0"] {
+            assert!(super::is_port(p), "{p}");
+        }
+        for v in ["lo0", "bridge0", "tap3", "tun0", "epair0a", "epair12b", "vlan100", "wg0", "pflog0", "enc0", ""] {
+            assert!(!super::is_port(v), "{v}");
+        }
+    }
+
     use super::*;
 
     fn l(addr: [u8; 4], dns: u8) -> LeaseV4 {
