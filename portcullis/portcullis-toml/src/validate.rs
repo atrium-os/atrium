@@ -264,6 +264,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.bluetooth-control = true: restricted to the settings app and Forum's bar \
              (pairs and forgets Bluetooth devices); requires explicit policy approval"));
     }
+    if c.workspaces == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.workspaces = true: restricted to the Workspaces app (makes, changes and \
+             deletes the person's workspaces, and opens their terminals); requires explicit policy approval"));
+    }
     if c.app_grants == Some(true) {
         r.warnings.push(format!(
             "{ctx}.app-grants = true: restricted to the settings app (sees and changes \

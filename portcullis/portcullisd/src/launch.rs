@@ -877,6 +877,11 @@ pub fn apps_opening(mime: &str) -> Vec<(String, String, portcullis_toml::OpenMod
 /// launch registry, so this reads the capability off the INSTALLED manifest, not
 /// off anything the caller sent. An app that is not in the registry at all (not
 /// Portcullis-launched) resolves to no app-id and is refused by the caller.
+/// Does this app's INSTALLED manifest hold `workspaces` (homes.md §5)?
+pub fn app_manages_workspaces(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.workspaces == Some(true))
+}
+
 pub fn app_may_launch_apps(app_id: &str) -> bool {
     let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
     let Ok(text) = fs::read_to_string(path) else { return false };

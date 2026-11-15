@@ -436,7 +436,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             continue;
         }
         /* ★ Workspaces (homes.md §5): a launcher, or the person. */
-        if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. }) {
+        if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. }) {
             let resp = handle_workspace(uid, &owner, req);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1183,7 +1183,7 @@ fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
-        Some(app) => launch::app_may_launch_apps(app),
+        Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_workspaces(app),
         // Not an app: a person, with a home, asking about their own.
         None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
     };
@@ -1204,6 +1204,12 @@ fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
             }
             Ok(())
         }
+        /* Deleting loses the person's files: a press on Delete, confirmed by
+         * frescod, as Settings' Allow is (purpose APPROVE). */
+        Request::WorkspaceDelete { name, activation } => workspace::check_delete(owner, &name)
+            .and_then(|_| portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
+                                                               fresco_protocol::activation::purpose::APPROVE))
+            .and_then(|_| workspace::delete(owner, &name)),
         _ => Err("not a workspace request".into()),
     };
     if let Err(message) = done {
@@ -1236,7 +1242,9 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
      * in one of the person's Stoa sessions for that app. */
     let stoa = console::stoad_up();
     let mine = if stoa { console::sessions(owner, app_id) } else { Vec::new() };
-    let launcher = caller.as_deref().is_some_and(launch::app_may_launch_apps) && tab_of.is_none();
+    // The Workspaces app opens workspaces' terminals as a launcher does.
+    let launcher = caller.as_deref().is_some_and(|c| launch::app_may_launch_apps(c)
+        || (app_id.starts_with(console::WORKSPACE_PREFIX) && launch::app_manages_workspaces(c))) && tab_of.is_none();
     let terminal = caller.as_deref().is_some_and(launch::app_shows_consoles) && match &tab_of {
         Some(t) => mine.iter().any(|(n, _)| n == t),
         None => new_window && (console::live(owner, app_id) || !mine.is_empty()),
@@ -1894,7 +1902,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
-        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } => Response::Error {
+        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

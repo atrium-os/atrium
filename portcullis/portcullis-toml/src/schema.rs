@@ -277,6 +277,10 @@ pub struct Capabilities {
     /// settings app.
     #[serde(rename = "app-grants")]
     pub app_grants: Option<bool>,
+    /// The person's workspaces (homes.md §5): list, make, change, stop and
+    /// delete them, and open their terminals, over portcullisd's socket.
+    /// Restricted to the Workspaces app.
+    pub workspaces: Option<bool>,
     /// Bluetooth's settings (bluetooth.md §13): power, scan, pair (drawing
     /// the pairing prompts), connect and forget devices, over vinculumd's
     /// `bluetooth-control/` socket. Restricted to the settings app and the
@@ -344,7 +348,7 @@ impl Capabilities {
             ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
-            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
             ("protected-media", self.protected_media),
         ];
@@ -558,6 +562,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         home_files:       ovr.home_files.or(base.home_files),
         consoles:         ovr.consoles.or(base.consoles),
         app_grants:       ovr.app_grants.or(base.app_grants),
+        workspaces:       ovr.workspaces.or(base.workspaces),
         bluetooth_control: ovr.bluetooth_control.or(base.bluetooth_control),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),

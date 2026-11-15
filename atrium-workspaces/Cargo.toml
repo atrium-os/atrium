@@ -1,0 +1,20 @@
+[package]
+name = "atrium-workspaces"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Workspaces, Atrium's workspace manager (docs/spec/homes.md §5): list, make, change, stop and delete the person's workspaces, and open their terminals, over portcullisd."
+
+[lib]
+name = "atrium_workspaces"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-workspaces"
+path = "src/main.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+fresco-protocol = { path = "../fresco-protocol" }
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }

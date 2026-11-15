@@ -266,6 +266,52 @@ pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<St
     Ok(r)
 }
 
+/// May `name` be deleted? Not while another workspace uses it.
+pub fn check_delete(owner: &str, name: &str) -> Result<(), String> {
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let list = list(owner)?;
+    if !list.iter().any(|(r, _)| r.name == name) {
+        return Err(format!("no workspace {name:?}"));
+    }
+    let users: Vec<&str> = list.iter().filter(|(r, _)| r.uses.iter().any(|u| u == name)).map(|(r, _)| r.name.as_str()).collect();
+    if !users.is_empty() {
+        return Err(format!("{} uses {name}: take that link away first", users.join(", ")));
+    }
+    Ok(())
+}
+
+/// Delete it: stopped, its mounts gone (checked), then its folder, work
+/// and all. Scratch comes back, empty, at the next list.
+pub fn delete(owner: &str, name: &str) -> Result<(), String> {
+    check_delete(owner, name)?;
+    stop(owner, name);
+    if running_jid(owner, name).is_some() {
+        return Err(format!("{name} is still running"));
+    }
+    let (home, gid) = person(owner)?;
+    let dir = root_dir(&home, gid)?.join(name);
+    // ★ Never remove through a mount: whatever is mounted under it would go too.
+    let jp = jail_path(owner, name);
+    let mounted = Command::new("mount").arg("-p").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+            let at = l.split_whitespace().nth(1).unwrap_or("");
+            Path::new(at).starts_with(&dir) || Path::new(at).starts_with(&jp)
+        }))
+        .unwrap_or(true);
+    if mounted {
+        return Err(format!("{name} still has something mounted; not deleted"));
+    }
+    if fs::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err(format!("{} is a link; not deleted", dir.display()));
+    }
+    fs::remove_dir_all(&dir).map_err(|e| format!("delete {}: {e}", dir.display()))?;
+    let _ = fs::remove_dir(&jp);
+    eprintln!("portcullisd: workspace {name} of {owner} deleted");
+    Ok(())
+}
+
 pub fn running_jid(owner: &str, name: &str) -> Option<i32> {
     let out = Command::new("jls").args(["-j", &jail_name(owner, name), "jid"]).output().ok()?;
     if !out.status.success() {

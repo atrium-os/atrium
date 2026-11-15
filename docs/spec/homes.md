@@ -180,9 +180,17 @@ starting in `~/work`; Terminal starts a stopped workspace.
   (atrium-devjail.md §4, atrium-pkg).
 - Forum: the Applications grid shows each workspace as a tile that opens
   its terminal; typing a name no workspace has offers **New workspace
-  "name"** (C, outbound), made and opened on the same press. Settings
-  (network, uses) are `portcullis workspace set` for now; a settings sheet
-  in Forum is still to do.
+  "name"** (C, outbound), made and opened on the same press.
+- **Workspaces app** (`atrium-workspaces`, org.atrium.workspaces, built
+  2026-11-15): the person's workspaces in a list; New workspace (name,
+  toolchain, network; Create and open on the same press); per workspace
+  Open terminal, Stop, Network, Uses and Delete. It holds the restricted
+  capability `workspaces` (system policy only), which lets it list, make,
+  change, stop and delete its owner's workspaces and open their terminals.
+  Delete asks first, then needs a press frescod confirms (activation
+  purpose APPROVE), and is refused while another workspace uses it or
+  anything is still mounted under it. Gate
+  `scripts/vm-workspaces-app-check.sh` (clicks in the headless VM).
 - Scrinium: a **Workspaces** place (`~/.atrium/workspaces` mounted in the
   file manager's jail); each folder shows its `work`, never `.state`.
 - The record carries a persona, `personal`; links across personas are

@@ -349,6 +349,11 @@ pub enum Request {
     },
     /// Stop its jail (its consoles end); its files stay.
     WorkspaceStop { name: String },
+    /// Delete it and everything in its `work`. Only with `activation`, a
+    /// press on Delete in the asking app's window that portcullisd spends
+    /// with frescod (purpose APPROVE). Refused while another workspace
+    /// uses it.
+    WorkspaceDelete { name: String, activation: [u8; 16] },
 }
 
 /// Who allowed what an app has now (curia.md §13).

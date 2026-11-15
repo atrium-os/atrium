@@ -1,0 +1,18 @@
+# Workspaces (docs/spec/homes.md §5): the person's workspaces, made and
+# changed from outside them. A system app: `workspaces` is restricted to it.
+[app]
+id          = "org.atrium.workspaces"
+name        = "Workspaces"
+version     = "0.1.0"
+entry       = "bin/atrium-workspaces"
+description = "Make, open, change and delete your workspaces."
+icon        = "code"
+
+[capabilities]
+graphics   = "fresco"
+workspaces = true   # make, change, delete workspaces; open their terminals (restricted)
+network    = "none"
+
+[supervision]
+restart   = "on-crash"
+instances = "single"

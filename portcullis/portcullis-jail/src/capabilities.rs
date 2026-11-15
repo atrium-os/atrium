@@ -137,7 +137,8 @@ pub fn apply_all(
     // The terminal asks for more consoles (Console, homes.md §4) the same way,
     // and Settings lists and changes apps' access (`app-grants`, curia.md §13).
     if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)
-        || caps.consoles == Some(true) || caps.app_grants == Some(true)) && caps.app_launch != Some(true) {
+        || caps.consoles == Some(true) || caps.app_grants == Some(true) || caps.workspaces == Some(true))
+        && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }
     Ok(())
