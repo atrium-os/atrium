@@ -733,9 +733,12 @@ Vacation replies through Sieve or JMAP `VacationResponse`.
 
 ## 12. Notifications
 
-- Through Praeco, drawn by Forum (tabula.md / praeco placement). Mail posts only sender
-  name, verified-domain mark and subject, never body text, on the lock screen unless the
-  person allows previews.
+- Through Praeco, drawn by Forum (tabula.md §5). A post is readable without opening Mail
+  (Shankar 2026-11-16, tabula.md §5.4): the whole subject as the title (wrapped, not cut),
+  sender and verified mark as the subtitle, and the first 2 KiB of the new text (quoted
+  text and signature removed, plain text from the parse jail) as the body, which the toast
+  expands to in place. Locked: "Mail · 3 new" only. Logged out or someone else's session:
+  nothing. Screen shared: no titles or bodies. Encrypted mail: "Encrypted message from …".
 - **Quiet by default** (E5): notify for mail from people (not lists, not automated
   senders) and for threads the person has written in; everything else is counted, and a
   digest notification comes at the person's chosen times.
@@ -785,12 +788,9 @@ cause is a client that notifies for everything it *learns about* rather than for
 - **Quiet hours win** (§12): what arrives inside them is in the next working period's
   summary, also silent.
 
-**Proposed for Praeco too, for every app**: the same rules belong in the notification
-service, not only in Mail, so a calendar app or chat app can't storm either: a notification
-carries the time its event happened; Praeco silently folds those older than the app's
-freshness window (default 10 minutes) into one per-app catch-up summary, collapses bursts
-(more than 2 in 30 s per app), caps sounds at one a minute per app, and drops reminders
-for events already past. Mail sets the event time on every post so it works either way.
+**For every app, in Praeco** (Shankar 2026-11-16: "Yes, system wide"): these rules are
+now tabula.md §5.3, so a calendar or chat app can't storm either. Mail sets the event time
+on every post.
 
 ## 13. Accounts across personas
 

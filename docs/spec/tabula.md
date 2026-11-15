@@ -349,6 +349,68 @@ Tests:
 
 forum-shelf asks for `Notification` and a band-sized window (Pergola thread, 2026-11-06).
 
+### 5.3 No storms: freshness, catch-up and bursts (Shankar 2026-11-16, system-wide)
+
+Proposed in [mail.md](mail.md) §12.1 and made a rule for every app by Shankar
+(2026-11-16: "Yes, system wide"). Not built.
+
+- **Event time.** A post carries `at`, when the thing it reports happened (mail received,
+  message sent, reminder due), and optionally `kind = reminder { starts, ends }`. A v0 post
+  without `at` counts as now.
+- **Freshness.** A post older than its app's freshness window (default 10 minutes; an app
+  may ask for less, not more) when praecod gets it is **folded**: never shown as its own
+  toast, never sounds. Folded posts make one **catch-up summary per app** ("Mail: while you
+  were away, 23 new, 4 from people"), silent, updated in place rather than stacked, built
+  from the posts' titles by praecod (an app may supply the summary line through a
+  `summary` field, still plain text and capped).
+- **Bursts.** More than 2 posts from one app within 30 s become one grouped toast that
+  updates in place ("5 new"), listing the latest titles. Today's limit (3 a burst, 5 a
+  minute) refuses the rest; with grouping they are folded into the group instead of lost.
+- **Sounds**: at most one a minute per app, whatever arrives.
+- **Reminders that are late**: a `reminder` whose `starts` is more than 5 minutes past, or
+  whose `ends` has passed, is history only, never a toast. Several late reminders are one
+  silent summary.
+- **Withdraw on read**: an app may withdraw its own posts (exists); Mail does so when a
+  message is read elsewhere.
+- **Quiet hours** (per persona, mail.md §12) and Do Not Disturb hold everything for the
+  next summary.
+
+### 5.4 Readable toasts, private when they must be (Shankar 2026-11-16)
+
+Shankar: "the email popup arrives as a notification but it is not enough to read even the
+title fully so have to click it to go to the email app to find out. Of course security
+matters so don't show if locked or logged out." Not built.
+
+- **Longer, still plain text.** Title up to 256 bytes (was 64), body up to 2 KiB (was
+  512), an optional `subtitle` line (Mail: the sender and verified domain) of 128 bytes.
+  Same rules as before: plain text, controls, bidi overrides and zero-width characters
+  dropped, no markup, no links, nothing parsed.
+- **Toasts wrap, they don't cut.** The title wraps to up to 3 lines and the body shows up
+  to 4 lines; only past that is it ended with "…". The app's name from its manifest stays
+  the first line (§5.1), so long text can't push it off.
+- **Expand in place.** A chevron on the toast (or Space while the shelf is the target of
+  a press, since keys never reach notifications by themselves) grows it to the whole body,
+  up to the band's height, scrollable, and stops its timeout. Expanded, it still shows only
+  the plain text the app posted: reading a whole short mail there needs no app switch, and
+  pressing the body opens it in the app as before. Actions (Archive, Reply) sit under it
+  when CLASS_BROKER delivery exists.
+- **History** in the shelf shows the same full text.
+- **When it shows less:**
+  - **Locked** (lock screen, tabula/lock-screen): app name and a count only ("Mail · 3
+    new"), no title, sender or body, unless the person allows titles for that app; bodies
+    never on the lock screen.
+  - **Logged out, at the login screen, or another person's session on the seat**: nothing
+    of this person's; Forum shows only its own user's notifications (§5.1), and the login
+    screen has no shelf.
+  - **Screen being shared or recorded** (once frescod has capture): titles and bodies
+    hidden, app name and count only, so a preview never appears in a meeting.
+  - **Per app**: the person can choose *full*, *title only* or *name only* per app (and per
+    persona); apps may also mark a post `private` (Mail does for encrypted mail: "Encrypted
+    message from Priya"), which shows name only.
+- **What Mail puts in a post**: subject as title, sender + verified mark as subtitle, the
+  first 2 KiB of the new text (quoted text and signature removed, from the parse jail's
+  plain-text summary, never HTML) as body.
+
 ## 6. Pergola's part
 
 - `TextField` and `DocumentView`: Ctrl-C/X/V and their menu items spend the activation token of
