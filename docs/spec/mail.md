@@ -186,7 +186,7 @@ person reads was never decoded next to another message.
    `submissions://smtp.example.org:465`, or `https://jmap.example.org`), under the
    instance's Arca persona. One item can be bound to both the IMAP and SMTP endpoints when
    they share a password; the binding list is shown in Arca's UI.
-5. The first sync starts (§6.5): the inbox is readable in seconds, and the rest fills
+5. The first sync starts (§6.4): the inbox is readable in seconds, and the rest fills
    in behind without slowing anything.
 
 ### 5.2 The mail courier (new Arca work)
@@ -275,7 +275,7 @@ mail (crypto-erase once Tessera keys exist per persona) and its Arca items, afte
 - **How much is kept offline**: by default, the list entry (headers, flags, preview) for
   every message, message text for the last 90 days, and attachments only once opened
   (then cached, within a per-account limit). *Keep everything offline* is a switch, and
-  then it fills in only under the §6.5 rules. See §6.5 for how a new account fills in.
+  then it fills in only under the §6.4 rules. See §6.4 for how a new account fills in.
 - **At rest**: in the persona's volume (personas.md §4), so a named persona's mail is
   encrypted with that persona's key once Tessera encrypts.
 
@@ -285,9 +285,9 @@ mail (crypto-erase once Tessera keys exist per persona) and its Arca items, afte
   opens under 100 ms, search results as you type under 50 ms for the first page.
 - First sync of any account, even 50 GB on the server: the inbox's newest messages
   listed within 5 s and readable as soon as opened, after under 5 MB of download; the
-  machine stays responsive throughout (§6.5).
+  machine stays responsive throughout (§6.4).
 
-### 6.5 First sync of a new account (Shankar 2026-11-16)
+### 6.4 First sync of a new account (Shankar 2026-11-16)
 
 Shankar: "Normal clients download gigabytes and slow to a crawl." They do because they
 treat a new account as a copy job: every folder, every message, every attachment, as fast
@@ -349,7 +349,7 @@ as **making the account usable first, then filling in what's worth having, polit
   March 2021 (12,400 of 48,000)", with *Pause*. No spinner blocks anything.
 - Opening an old message or attachment that isn't local fetches just that one, at once.
 
-### 6.4 Import and export
+### 6.5 Import and export
 
 - **Import** mbox and Maildir from a file the person picks (Scrinium picker, read-only
   descriptor), parsed in parse jails, written into a local folder or uploaded to an
