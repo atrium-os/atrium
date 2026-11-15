@@ -70,6 +70,8 @@
 #define SI_UQ_VA_STRIDE		0x10000ull
 #define SI_SCRUB_TIMEOUT_MS	2000	/* one fill of AMD_KQ_FILL_MAX */
 #define SI_UNROUTED_KEEP	4	/* distinct unrouted EOP values kept */
+#define SI_MES_INT_TYPES	16	/* MES host interrupt types counted */
+#define SI_MES_INT_QUEUE	1	/* type 1: payload is a queue's doorbell */
 
 /* One client queue fd's MES user queue (5c-2b). */
 struct si_uq_owed {
@@ -158,6 +160,12 @@ struct amd_si_client {
 	 * (the IV thread writes, the close log reads; diagnostic). */
 	uint32_t unr_val[SI_UNROUTED_KEEP];
 	uint64_t unr_cnt[SI_UNROUTED_KEEP];
+	uint8_t	 unr_ring[SI_UNROUTED_KEEP];	/* the IV ring of each */
+	/* MES host interrupts (an EOP from me 3 whose src_data[0] bits
+	 * 31:26 give a type, amdgpu_mes.h AMDGPU_MES_IH_INT_TYPE_*): counts
+	 * by type, and the doorbell of the last type 1. */
+	uint64_t mes_int[SI_MES_INT_TYPES];
+	uint32_t b_mes_q_db;		/* a type 1 named this doorbell */
 	uint64_t scrub_fills, scrub_busy_waits;
 	uint16_t b_fault_vmid;
 	uint64_t b_fault_addr;
@@ -672,6 +680,10 @@ si_iv_batch_end(struct amd_si_client *c)
 		device_printf(sc->dev, "si: EOP IV with src_data[0] %#x: no "
 		    "queue of ours; checked every user queue\n",
 		    c->b_unrouted_db);
+	if (c->b_mes_q_db != 0 && log)
+		device_printf(sc->dev, "si: MES queue notice (type 1) for "
+		    "doorbell %#x\n", c->b_mes_q_db);
+	c->b_mes_q_db = 0;
 	c->b_eop = c->b_fault = c->b_sq = c->b_other = c->b_cperr = 0;
 	c->b_cperr_hqd = 0;
 	c->b_fault_vmid = 0;
@@ -687,19 +699,28 @@ si_iv_batch_end(struct amd_si_client *c)
  * the raw value is not the doorbell unless the packet puts it there),
  * AMD_KQ_CTXID for the kernel queue. Anything else checks every queue.
  */
-static void
-si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
+/* A user queue's slot from its doorbell, or AMD_UQ_SLOTS. */
+static uint32_t
+si_db_slot(uint32_t db)
 {
-	uint32_t db, slot;
+	if ((db & 0x3ffu) == 0 && db >= AMD_UQ_DOORBELL_USER(0))
+		return ((db >> 10) - 2u);		/* user mode */
+	if (db >= AMD_UQ_DOORBELL(0) && (db & 1) == 0)
+		return ((db >> 1) - 0x10u);
+	return (AMD_UQ_SLOTS);
+}
+
+static void
+si_iv_eop_route(struct amd_si_client *c, uint32_t ctx, uint32_t ring)
+{
+	uint32_t db, slot, type;
 
 	if ((ctx & 0xff000000u) == AMD_UQ_CTXID_FLAG) {
+		/* A client's RELEASE_MEM can put any value here, another
+		 * queue's included: an EOP only makes us read that queue's
+		 * fence, so a forged one retires nothing early. */
 		db = ctx & 0x00ffffffu;
-		if ((db & 0x3ffu) == 0 && db >= AMD_UQ_DOORBELL_USER(0))
-			slot = (db >> 10) - 2u;		/* user mode */
-		else if (db >= AMD_UQ_DOORBELL(0) && (db & 1) == 0)
-			slot = (db >> 1) - 0x10u;
-		else
-			slot = AMD_UQ_SLOTS;
+		slot = si_db_slot(db);
 		if (slot < AMD_UQ_SLOTS) {
 			c->b_uq |= 1u << slot;
 			c->uq_eop_routed++;
@@ -713,6 +734,29 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 	}
 	if (ctx == AMD_KQ_CTXID)
 		return;
+	/*
+	 * An EOP from the MES pipe (me 3) is a MES host interrupt: bits
+	 * 31:26 a type, 25:0 a payload (amdgpu_mes.h; 7 = debug message,
+	 * 8 = API fence, AMD_MES_CTXID_FLAG). Seen on silicon: type 6,
+	 * payload 0, once after each (re-)init's first ADD_QUEUE; type 1
+	 * with a user queue's doorbell, when MES fails to preempt that queue
+	 * (a hung or faulted queue's SUSPEND/REMOVE). Neither is a queue's
+	 * own work; a type 1 makes us look at the queue it names. Type 0
+	 * (a bare doorbell) is MES's SUSPEND/RESUME EOP, below.
+	 */
+	type = ctx >> 26;
+	if (((ring >> 2) & 3) == 3 && type != 0) {
+		c->mes_int[type < SI_MES_INT_TYPES ? type :
+		    SI_MES_INT_TYPES - 1]++;
+		if (type == SI_MES_INT_QUEUE) {
+			db = ctx & 0x03ffffffu;
+			slot = si_db_slot(db);
+			if (slot < AMD_UQ_SLOTS)
+				c->b_uq |= 1u << slot;
+			c->b_mes_q_db = db;
+		}
+		return;
+	}
 	/* A bare doorbell (no AMD_UQ_CTXID_FLAG): MES's EOP for a SUSPEND or
 	 * RESUME of that queue (5d run: they track the free-rule preemptions
 	 * one for one). Nothing of the queue's own work to retire. */
@@ -736,6 +780,7 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx)
 		if (c->unr_cnt[slot] != 0 && c->unr_val[slot] != ctx)
 			continue;
 		c->unr_val[slot] = ctx;
+		c->unr_ring[slot] = ring;
 		c->unr_cnt[slot]++;
 		break;
 	}
@@ -755,7 +800,7 @@ si_iv(void *arg, const uint32_t *iv)
 	src = (iv[0] >> 8) & 0xff;
 	if (client == IH_CLIENT_GRBM_CP && src == IH_SRC_CP_EOP) {
 		c->b_eop++;
-		si_iv_eop_route(c, iv[4]);
+		si_iv_eop_route(c, iv[4], (iv[0] >> 16) & 0xff);
 	}
 	else if (client == IH_CLIENT_GFX && src == IH_SRC_UTCL2_FAULT) {
 		/* gmc_v12_0_process_interrupt: VMID in dword 0, the page in
@@ -1144,12 +1189,21 @@ amd_si_uq_destroy(struct atrium_amd_softc *sc, int slot)
 	    (uintmax_t)c->uq_hangs, (uintmax_t)c->uq_preempts,
 	    (uintmax_t)c->uq_preempt_fails);
 	if (c->unr_cnt[0] != 0)
-		device_printf(sc->dev, "si: unrouted EOP src_data[0]: %#x x%ju, "
-		    "%#x x%ju, %#x x%ju, %#x x%ju\n",
-		    c->unr_val[0], (uintmax_t)c->unr_cnt[0],
-		    c->unr_val[1], (uintmax_t)c->unr_cnt[1],
-		    c->unr_val[2], (uintmax_t)c->unr_cnt[2],
-		    c->unr_val[3], (uintmax_t)c->unr_cnt[3]);
+		device_printf(sc->dev, "si: unrouted EOP src_data[0] (ring): "
+		    "%#x (%#x) x%ju, %#x (%#x) x%ju, %#x (%#x) x%ju, "
+		    "%#x (%#x) x%ju\n",
+		    c->unr_val[0], c->unr_ring[0], (uintmax_t)c->unr_cnt[0],
+		    c->unr_val[1], c->unr_ring[1], (uintmax_t)c->unr_cnt[1],
+		    c->unr_val[2], c->unr_ring[2], (uintmax_t)c->unr_cnt[2],
+		    c->unr_val[3], c->unr_ring[3], (uintmax_t)c->unr_cnt[3]);
+	device_printf(sc->dev, "si: MES host interrupts by type: 1 x%ju, "
+	    "6 x%ju, 7 x%ju, 8 x%ju, other x%ju\n",
+	    (uintmax_t)c->mes_int[1], (uintmax_t)c->mes_int[6],
+	    (uintmax_t)c->mes_int[7], (uintmax_t)c->mes_int[8],
+	    (uintmax_t)(c->mes_int[2] + c->mes_int[3] +
+	    c->mes_int[4] + c->mes_int[5] + c->mes_int[9] + c->mes_int[10] +
+	    c->mes_int[11] + c->mes_int[12] + c->mes_int[13] +
+	    c->mes_int[14] + c->mes_int[15]));
 	if (err == 0) {
 		mtx_lock(&sc->lock);
 		u->busy = false;

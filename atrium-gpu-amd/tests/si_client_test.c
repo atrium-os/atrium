@@ -71,6 +71,10 @@
  *                QUEUE_CREATE is refused (EPERM, isolation.reset_lockout_s)
  *                while root's still works. Stops after 2 whole-GPU
  *                re-inits (cap 3 per 10 min).
+ *  17 dummy page one VM's shader stores a pattern to an unmapped VA; a
+ *                fresh VM's shader then loads from an unmapped VA. Faulting
+ *                accesses go to the hub's one fault default page, so the
+ *                reader must not see the writer's pattern.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1824,6 +1828,105 @@ out:
 	job_close(&by);
 }
 
+/*
+ * 17: the fault default page. A faulting access is sent to one default
+ * page (gmc12: the dummy page, GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR,
+ * shared by every VM). Writer VM W's FILL shader stores a pattern to an
+ * unmapped VA; reader VM R's COPY shader then loads from an unmapped VA
+ * into its own out page. Any pattern word in R's out page is data that
+ * crossed from one VM to another. Both queues are lost to their faults
+ * (shader faults, which recover without a GPU reset).
+ */
+#define DUMMY_VA	0xf00000000ull		/* unmapped in every VM */
+#define DUMMY_PAT	0x5ec2e700u
+
+static int
+dummy_job(struct job *j, const char *name, const uint32_t *code,
+    size_t bytes, uint64_t src, uint64_t dst, uint32_t value, int *cbo)
+{
+	uint64_t code_va;
+
+	if (job_open(j, name) != 0)
+		return (errno);
+	*cbo = bo_alloc(4096, 0);
+	if (*cbo < 0 || vm_bind(j->vm, *cbo, ATRIUM_GPU_BIND_READONLY,
+	    &code_va) != 0)
+		return (errno);
+	return (ops_run(j, *cbo, code_va, code, bytes, src, dst, value));
+}
+
+/* Copy the unmapped page into a fresh VM's out page: how many words carry
+ * the pattern (-1 if the reader could not be set up or read back), and
+ * the first word. */
+static int
+dummy_read(const char *name, uint32_t *first, int *rr)
+{
+	struct job r;
+	uint32_t out[SIOPS_N];
+	uint64_t code_va;
+	int cbo = -1, n = -1;
+	u_int i;
+
+	job_init(&r);
+	*rr = 0;
+	if (job_open(&r, name) != 0 || poison(r.out, POISON_A) != 0 ||
+	    (cbo = bo_alloc(4096, 0)) < 0 ||
+	    vm_bind(r.vm, cbo, ATRIUM_GPU_BIND_READONLY, &code_va) != 0) {
+		*rr = errno;
+		goto out;
+	}
+	*rr = ops_run(&r, cbo, code_va, siops_copy, sizeof(siops_copy),
+	    DUMMY_VA, r.out_va, 0);
+	if (bo_xfer(r.out, out, sizeof(out), 0) != 0)
+		goto out;
+	*first = out[0];
+	for (i = 0, n = 0; i < SIOPS_N; i++)
+		n += (out[i] & 0xffffff00u) == DUMMY_PAT;
+out:
+	if (cbo >= 0)
+		close(cbo);
+	job_close(&r);
+	return (n);
+}
+
+static void
+dummy_page(void)
+{
+	struct job w, by;
+	uint32_t first = 0;
+	int cbo = -1, rw, rr, n0, n1, ri0 = -1, ri = -1;
+
+	job_init(&w);
+	job_init(&by);
+	(void)preg_read(NULL, &ri0);
+	n0 = dummy_read("17 reader before", &first, &rr);
+	printf("17: before any write: %d/64 pattern words, out[0] %#x (%s)\n",
+	    n0, first, rr == 0 ? "completed" : strerror(rr));
+	rw = dummy_job(&w, "17 writer", siops_fill, sizeof(siops_fill), 0,
+	    DUMMY_VA, DUMMY_PAT | 0x42, &cbo);
+	printf("17: writer's store to the unmapped VA: %s\n", rw == 0 ?
+	    "completed" : strerror(rw));
+	if (cbo >= 0)
+		close(cbo);
+	job_close(&w);
+	n1 = dummy_read("17 reader after", &first, &rr);
+	(void)preg_read(NULL, &ri);
+	printf("17: reader's load from the unmapped VA: %s; %d/64 pattern "
+	    "words, out[0] %#x; re-inits %d -> %d\n", rr == 0 ? "completed" :
+	    strerror(rr), n1, first, ri0, ri);
+	if (n1 < 0)
+		check(0, "17 dummy page", "reader setup or readback: %s",
+		    strerror(errno));
+	else
+		check(n1 == 0, "17 dummy page: no VM reads another VM's "
+		    "faulting writes", "%d/64 words carried the writer's "
+		    "pattern (out[0] %#x)", n1, first);
+	if (job_open(&by, "17 bystander") == 0)
+		run_clean(&by, "17 dummy page: afterwards another VM runs "
+		    "clean");
+	job_close(&by);
+}
+
 static void
 hostile_pm4(void)
 {
@@ -2271,6 +2374,10 @@ main(void)
 
 	/* 16: a fault storm, muted (before 14 too). */
 	fault_storm();
+
+	/* 17: the shared fault default page (before 14 too). */
+	if (!skipped(17, "dummy page"))
+		dummy_page();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();
