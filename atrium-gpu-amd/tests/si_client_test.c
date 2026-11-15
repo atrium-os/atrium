@@ -104,6 +104,10 @@
  *                RGBA8 target, compared with a CPU rasterisation (pixels
  *                within half a pixel of an edge are not judged); the VS's
  *                system SGPRs/VGPRs are printed per lane. Runs after 20.
+ *  22 GLSL triangle (stage 7c) the same draw with both shaders compiled
+ *                from GLSL by our shader compiler (si_tri_glsl.h, from
+ *                atrium-rdna4-compiler/examples/si_tri_glsl.rs). Runs
+ *                after 21.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -2658,6 +2662,7 @@ out0:
  * so a first run on silicon shows the merged-shader ABI it really got.
  */
 #include "gfx12_regs.h"
+#include "si_tri_glsl.h"
 
 #define TRI_W		64
 #define TRI_H		64
@@ -2796,7 +2801,7 @@ tri_f(float f)
 /* The whole command stream: preamble, rings, target, state, one draw. */
 static u_int
 tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
-    uint64_t cb_va, uint64_t dbg_va, uint64_t rings_va)
+    uint64_t cb_va, uint64_t dbg_va, uint64_t rings_va, int glsl)
 {
 	struct tri_pm4 p = { w, 0, max };
 	uint32_t v[16];
@@ -3000,12 +3005,16 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	/* VS on the NGG stage: wave32, 24 VGPRs (v0..v16 used), 2 user
 	 * SGPRs (the debug VA, in s[8:9]). */
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_ES, (uint32_t)(vs_va >> 8));
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_GS, (24 - 1) / 8 | 0xc0u << 12);
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_GS, 2u << 1);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_GS, ((glsl ? GLSL_VS_VGPRS : 24) -
+	    1) / 8 | 0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_GS, (glsl ? GLSL_VS_USER_SGPRS :
+	    2u) << 1);
 	tri_reg(&p, R_SPI_SHADER_PGM_RSRC4_GS, 0x3ffu | 1u << 11 |
 	    127u << 16);
-	v[0] = (uint32_t)dbg_va;
-	v[1] = (uint32_t)(dbg_va >> 32);
+	/* 21: the debug VA; 22 (our compiler's ABI): first vertex, first
+	 * instance. */
+	v[0] = glsl ? 0 : (uint32_t)dbg_va;
+	v[1] = glsl ? 0 : (uint32_t)(dbg_va >> 32);
 	tri_regs(&p, R_SPI_SHADER_USER_DATA_GS_0, v, 2);
 	tri_reg(&p, R_PA_CL_VS_OUT_CNTL, 0);
 	tri_reg(&p, R_VGT_GS_INSTANCE_CNT, 1u << 2);
@@ -3022,13 +3031,15 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	 * one), no inputs, no parameters from the VS. */
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS, (uint32_t)(ps_va >> 8));
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS + 4, (uint32_t)(ps_va >> 40));
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, (8 - 1) / 8 | 0xc0u << 12);
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, 2u << 1);	/* 2 user SGPRs */
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, ((glsl ? GLSL_PS_VGPRS : 8) -
+	    1) / 8 | 0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, (glsl ? GLSL_PS_USER_SGPRS :
+	    2u) << 1);	/* 21: 2 user SGPRs */
 	v[0] = (uint32_t)(dbg_va + TRI_PS_COUNT);
 	v[1] = (uint32_t)((dbg_va + TRI_PS_COUNT) >> 32);
 	tri_regs(&p, R_SPI_SHADER_USER_DATA_PS_0, v, 2);
 	tri_reg(&p, R_SPI_SHADER_GS_OUT_CONFIG_PS, 1u << 10);	/* NO_PC_EXPORT */
-	v[0] = v[1] = 1u << 1;		/* PERSP_CENTER: ENA, ADDR */
+	v[0] = v[1] = glsl ? GLSL_PS_INPUT_ENA : 1u << 1; /* PERSP_CENTER */
 	tri_regs(&p, R_SPI_PS_INPUT_ENA, v, 2);
 	tri_reg(&p, R_SPI_PS_IN_CONTROL, 1u << 15);	/* PS_W32_EN */
 	tri_reg(&p, R_PA_SC_HISZ_CONTROL, 2);
@@ -3057,6 +3068,12 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	tri_put(&p, 30 | 2u << 8);			/* SAMPLE_PIPELINESTAT */
 	tri_put(&p, (uint32_t)(dbg_va + TRI_STATS1));
 	tri_put(&p, (uint32_t)((dbg_va + TRI_STATS1) >> 32));
+
+	if (glsl) {
+		tri_put(&p, PKT3_GFX(0x46u, 1));
+		tri_put(&p, 26);			/* PIPELINESTAT_STOP */
+		return (p.n);
+	}
 
 	/*
 	 * Diagnosis (run cd1aa333: clip inv 1, clip prims 0, PS never ran):
@@ -3109,8 +3126,10 @@ tri_cover(int px, int py)
 }
 
 static void
-triangle(void)
+triangle(int glsl)
 {
+	const char *t = glsl ? "22 GLSL triangle" : "21 triangle";
+	const char *tn = glsl ? "22" : "21";
 	struct job j;
 	uint32_t *ib = NULL, *pix = NULL, dbg[1024];
 	uint64_t cb_va, dbg_va;
@@ -3120,13 +3139,13 @@ triangle(void)
 
 	job_init(&j);
 	if (gfxq_set(1, &old) != 0) {
-		check(0, "21 triangle", "%s: %s", GFXQ_SYSCTL, strerror(errno));
+		check(0, t, "%s: %s", GFXQ_SYSCTL, strerror(errno));
 		return;
 	}
 	ib = calloc(4096, sizeof(*ib));
 	pix = malloc(TRI_PITCH * TRI_H);
-	if (ib == NULL || pix == NULL || job_open(&j, "21") != 0) {
-		check(0, "21 triangle", "setup failed");
+	if (ib == NULL || pix == NULL || job_open(&j, tn) != 0) {
+		check(0, t, "setup failed");
 		goto out;
 	}
 	q = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0, 0);
@@ -3135,15 +3154,20 @@ triangle(void)
 	dbgbo = bo_alloc(4096, 0);
 	rings = bo_alloc(TRI_RINGS, ATRIUM_GPU_BO_VRAM);
 	if (q < 0 || code < 0 || cb < 0 || dbgbo < 0 || rings < 0) {
-		check(0, "21 triangle", "queue/BOs: %s", strerror(errno));
+		check(0, t, "queue/BOs: %s", strerror(errno));
 		goto out;
 	}
 	{
 		uint8_t img[4096];
 
 		memset(img, 0, sizeof(img));
-		memcpy(img, tri_vs, sizeof(tri_vs));
-		memcpy(img + TRI_PS_OFF, tri_ps, sizeof(tri_ps));
+		if (glsl) {
+			memcpy(img, glsl_vs, sizeof(glsl_vs));
+			memcpy(img + TRI_PS_OFF, glsl_ps, sizeof(glsl_ps));
+		} else {
+			memcpy(img, tri_vs, sizeof(tri_vs));
+			memcpy(img + TRI_PS_OFF, tri_ps, sizeof(tri_ps));
+		}
 		for (i = 0; i < TRI_W * TRI_H; i++)
 			pix[i] = TRI_BG;
 		for (i = 0; i < 1024; i++)
@@ -3151,7 +3175,7 @@ triangle(void)
 		if (bo_xfer(code, img, sizeof(img), 1) != 0 ||
 		    bo_xfer(cb, pix, TRI_PITCH * TRI_H, 1) != 0 ||
 		    bo_xfer(dbgbo, dbg, sizeof(dbg), 1) != 0) {
-			check(0, "21 triangle", "fill: %s", strerror(errno));
+			check(0, t, "fill: %s", strerror(errno));
 			goto out;
 		}
 	}
@@ -3162,27 +3186,42 @@ triangle(void)
 		    vm_bind(j.vm, cb, 0, &cb_va) != 0 ||
 		    vm_bind(j.vm, dbgbo, 0, &dbg_va) != 0 ||
 		    (r = vm_bind_at(j.vm, rings, TRI_RINGS_VA)) != 0) {
-			check(0, "21 triangle", "bind: %s", strerror(errno));
+			check(0, t, "bind: %s", strerror(errno));
 			goto out;
 		}
 		dw = tri_build(ib, 4096, code_va, code_va + TRI_PS_OFF, cb_va,
-		    dbg_va, TRI_RINGS_VA);
-		printf("21: VS %#jx, PS %#jx, target %#jx, debug %#jx, rings "
-		    "%#jx (%u KiB); %u dwords of PM4\n", (uintmax_t)code_va,
+		    dbg_va, TRI_RINGS_VA, glsl);
+		printf("%s: VS %#jx, PS %#jx, target %#jx, debug %#jx, rings "
+		    "%#jx (%u KiB); %u dwords of PM4\n", tn, (uintmax_t)code_va,
 		    (uintmax_t)(code_va + TRI_PS_OFF), (uintmax_t)cb_va,
 		    (uintmax_t)dbg_va, (uintmax_t)TRI_RINGS_VA,
 		    (u_int)(TRI_RINGS >> 10), dw);
 	}
 	if (dw > 1024) {
-		check(0, "21 triangle", "%u dwords: more than the IB page", dw);
+		check(0, t, "%u dwords: more than the IB page", dw);
 		goto out;
 	}
 	r = gfxq_run(&j, q, ib, dw, &ms);
-	check(r == 0, "21 triangle: the draw completes on the gfx queue",
+	check(r == 0, glsl ? "22 GLSL triangle: the draw completes on the gfx "
+	    "queue" : "21 triangle: the draw completes on the gfx queue",
 	    "completion %s after %d ms", r == 0 ? "ok" : strerror(r), ms);
 
 	/* What the VS saw, per lane, whatever happened. */
-	if (bo_xfer(dbgbo, dbg, sizeof(dbg), 0) == 0) {
+	if (glsl && bo_xfer(dbgbo, dbg, sizeof(dbg), 0) == 0) {
+		static const char *const nm[14] = { "PS inv", "clip prims",
+		    "clip inv", "VS inv", "GS inv", "GS prims", "IA prims",
+		    "IA verts", "HS inv", "DS inv", "CS inv", "task", "mesh",
+		    "mesh prims" };
+		const uint32_t *a = dbg + TRI_STATS0 / 4, *b = dbg +
+		    TRI_STATS1 / 4;
+
+		printf("22: pipeline statistics:");
+		for (i = 0; i < 14; i++)
+			printf(" %s %jd", nm[i], (intmax_t)(((uint64_t)b[2 * i] |
+			    (uint64_t)b[2 * i + 1] << 32) - ((uint64_t)a[2 * i] |
+			    (uint64_t)a[2 * i + 1] << 32)));
+		printf("\n");
+	} else if (bo_xfer(dbgbo, dbg, sizeof(dbg), 0) == 0) {
 		for (i = 0; i < 8; i++) {
 			const uint32_t *l = dbg + 16 * i;
 
@@ -3233,7 +3272,7 @@ triangle(void)
 		    dbg[TRI_PS_COUNT / 4 + 1] - POISON_A);
 	}
 	if (bo_xfer(cb, pix, TRI_PITCH * TRI_H, 0) != 0) {
-		check(0, "21 triangle", "readback: %s", strerror(errno));
+		check(0, t, "readback: %s", strerror(errno));
 		goto out;
 	}
 	for (y = 0; y < TRI_H; y++) {
@@ -3263,10 +3302,12 @@ triangle(void)
 			row[x / 2] = p == TRI_FG ? '#' : p == TRI_BG ? '.' : '?';
 		}
 		row[TRI_W / 2] = '\0';
-		printf("21: |%s|\n", row);
+		printf("%s: |%s|\n", tn, row);
 	}
-	check(bad_in == 0 && bad_out == 0 && in > 0, "21 triangle: every "
-	    "pixel inside is the colour, every pixel outside untouched",
+	check(bad_in == 0 && bad_out == 0 && in > 0, glsl ? "22 GLSL triangle: "
+	    "every pixel inside is the colour, every pixel outside untouched" :
+	    "21 triangle: every pixel inside is the colour, every pixel "
+	    "outside untouched",
 	    "inside %d/%d wrong, outside %d/%d wrong, edge pixels lit %d, "
 	    "pixel (32,24) %#x", bad_in, in, bad_out, out, edge,
 	    pix[24 * TRI_W + 32]);
@@ -3285,7 +3326,7 @@ out:
 	free(ib);
 	free(pix);
 	if (gfxq_set(old, &tmp) != 0)
-		check(0, "21 triangle", "restore: %s", strerror(errno));
+		check(0, t, "restore: %s", strerror(errno));
 }
 
 int
@@ -3607,7 +3648,11 @@ main(void)
 	 * before 19 and 14, which may use up the re-inits (run 048af0f9:
 	 * three were gone before it got to run). */
 	if (!skipped(21, "triangle"))
-		triangle();
+		triangle(0);
+
+	/* 22: the same triangle from GLSL, through our compiler (7c). */
+	if (!skipped(22, "GLSL triangle"))
+		triangle(1);
 
 	/* 19: VM_UNBIND (before 14's re-inits). */
 	if (!skipped(19, "unbind"))
