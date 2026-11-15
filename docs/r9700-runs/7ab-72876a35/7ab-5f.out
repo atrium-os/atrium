@@ -1,0 +1,1599 @@
+== run Sun Nov 15 21:12:46 UTC 2026 stages: 5f kenvs: psp_bootload psp_ipfw gc_up_ok attach client
+sha256 ok: 4dc5d1eb88ed2ea4972aa71c523e46b718e8d387b44d6446dc3d5b8b7f4d3108
+sha256 ok: gpu module ff69c8fef6e9b9767085b579d7a0d31fe7e35773b91a65f277d1f5199d190746, test 34cbe05c4ee182c1e56c7ea2781e9c8be74ccf63471077a0778f306b59d94236
+sha256 ok: suite 86cc5cc5079412f068af3f277cc569448fc87ab8605f55ce48f5a23acf3adce8, isolation 68c910df9ee0519fc57a4f93058b0f33216408c6b1cbc5252962b6b25e352186
+== before
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== kldload
+kldload rc=0
+kldload gpu module rc=0
+attach rc=0 (0 expected: stays attached)
+crw-------  1 root wheel 0x81 Nov 15 21:12 /dev/atrium-gpu0
+crw-------  1 root wheel 0x82 Nov 15 21:12 /dev/atrium-gpu0ctl
+== si-client-test
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+PASS: 1 queue: a second job on the same queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+2b: VM fd 10, queue fd 15: shader 0x10000000, IB 0x10001000, out 0x10002000
+2c: VM fd 16, queue fd 21: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 2 same VAs in both VMs (out 0x10002000 / 0x10002000)
+PASS: 2 two VMs: each queue writes 64 x 42 on its own page (B No error: 0 64/64, C No error: 0 64/64)
+PASS: 3 two queues in one VM: the second runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 3 two queues in one VM: the first still runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+4: VM fd 23, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 4 queue fd over SCM_RIGHTS: the child's submit runs (child exit 0, completion ok, 64/64 words 42)
+PASS: 5 close in flight: the completion lands or is cancelled (Operation canceled after 0 ms)
+PASS: 5 close in flight: the VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 6 the retired ring SUBMIT ('A',4) is unknown (Inappropriate ioctl for device)
+PASS: 6 unknown queue family refused (Invalid argument)
+PASS: 6 priority other than 0 refused (Invalid argument)
+PASS: 6 QUEUE_CREATE on the client node refused (Inappropriate ioctl for device)
+PASS: 6 QUEUE_SUBMIT on a VM fd refused (Inappropriate ioctl for device)
+PASS: 6 in-dependencies refused (not yet) (Operation not supported)
+PASS: 6 a blob that is not whole dwords refused (Invalid argument)
+PASS: 6 an empty blob refused (Invalid argument)
+PASS: 6 the first queue still runs after the refusals (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+7: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 7 fault: the faulting queue's work fails with EIO (got Input/output error after 0 ms)
+PASS: 7 fault: the lost queue refuses new work (Input/output error)
+PASS: 7 fault: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 7 fault: the faulting VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung queue's work fails with EIO after hang_ms (got Input/output error after 5047 ms)
+PASS: 8 hang: the lost queue refuses new work (Input/output error)
+PASS: 8 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+9: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 9 user mode: QUEUE_MAP2 layout (ring 0+0x1000, wptr 0x1008, doorbell 0x2000+0x1000, fence VA 0x200061010)
+PASS: 9 user mode: write_42 rung from user space (fence 1 (want 1) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 12, wptr 12)
+PASS: 9 user mode: a second job on the same ring (fence 2 (want 2) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 24, wptr 24)
+PASS: 9 user mode: QUEUE_SUBMIT on it refused (Operation not supported)
+PASS: 9 user mode: QUEUE_MAP2 of a kernel-mode queue refused (Invalid argument)
+PASS: 9 user mode: mmap of a kernel-mode queue refused (Operation not supported by device)
+PASS: 9 user mode: a private mapping refused (Permission denied)
+PASS: 9 user mode: an executable mapping refused (Permission denied)
+PASS: 9 user mode: a mapping past the queue's pages refused (Invalid argument)
+PASS: 9 user mode: after close, the ring is gone (SIGBUS) (child status 0xa)
+PASS: 9 user mode: after close, the doorbell is gone (SIGBUS) (child status 0xa)
+PASS: 9 hang: a stuck user ring is lost after hang_ms (QUEUE_MAP2: EIO) (Input/output error after 5251 ms, fence 0)
+PASS: 9 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 9 user mode: the VM runs clean on a kernel-mode queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 10 free rule: a BO of a VM with a live queue is freed at its close (preempted, not deferred) (deferred 0 -> 0, now 0)
+PASS: 10 free rule: the queue runs on after the preemption (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+10: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+10: BO closed under a stuck queue: freed at once (deferred 0 -> 0)
+PASS: 10 free rule (stuck): the stuck queue is still lost after hang_ms (got Input/output error after 4835 ms)
+PASS: 10 free rule (stuck): nothing deferred is left once the queue is gone (deferred_now 0)
+PASS: 10 free rule (stuck): another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 11 VRAM: the allocator is up and its initial scrub finished (total 31980 MiB, base 0x8000000, clean after 20 ms, scrubbed 31980 MiB)
+11: VRAM BO of 1024 KiB at VA 0x10004000
+PASS: 11 VRAM: CPU read of a VRAM BO refused (Invalid argument)
+PASS: 11 VRAM: a new VRAM BO reads zero (64/64 words 0 (ok), first 0)
+PASS: 11 VRAM: a fill of the BO reads back (64/64 words 0xc0de1234 (ok), first 0xc0de1234)
+PASS: 11 VRAM: the freed BO is scrubbed (clean after 20 ms, scrubbed +1024 KiB)
+PASS: 11 VRAM: the next VRAM BO reads zero (no data from the freed one) (64/64 words 0 (ok), first 0)
+11: vram used 114688, dirty 1048576, allocs 66, frees 38, scrub jobs 69 (failed 0)
+PASS: 11 VRAM: the queue runs on after the VRAM work (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 12 real ops: COPY, System source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, System source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, System source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: COPY, VRAM source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, VRAM source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, VRAM source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: write_42 runs on after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: BIND_EXEC without READONLY is refused (Invalid argument)
+PASS: 13 W^X: code and IB bound EXEC run, data without X (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: a jump into a read-write data BO faults and fails the work (completion Input/output error after 0 ms, 0/64 words 42)
+PASS: 13 W^X: the VM runs clean on a new queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at a high VA (VA 0x7ffffff00000) is lost with EIO (got Input/output error after 0 ms)
+15: stores at a high VA: time to fail 0 ms
+PASS: 15 hostile ISA: stores at a high VA: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at a high VA: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at a high VA, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at a high VA, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores past its own buffer (VA 0x10003000) is lost with EIO (got Input/output error after 0 ms)
+15: stores past its own buffer: time to fail 0 ms
+PASS: 15 hostile ISA: stores past its own buffer: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores past its own buffer: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores past its own buffer, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores past its own buffer, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: a shader that never ends (VA 0x10002000) is lost with EIO (got Input/output error after 5035 ms)
+15: a shader that never ends: time to fail 5035 ms
+PASS: 15 hostile ISA: a shader that never ends: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: a shader that never ends: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after a shader that never ends, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after a shader that never ends, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at VA 0 (VA 0) is lost with EIO (got Input/output error after 0 ms)
+15: stores at VA 0: time to fail 0 ms
+PASS: 15 hostile ISA: stores at VA 0: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 0 -> 0)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 5037 ms; fault IVs +1, IH overflows +0
+PASS: 16 fault storm: the storm is cut short (+1 fault IVs, re-inits 0 -> 1)
+PASS: 16 fault storm: the IH ring barely overflows (+0 overflows)
+16 bystander after the reset: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 16 fault storm: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+16: re-inits 0 -> 1
+17 reader before: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: before any write: 0/64 pattern words, out[0] 0 (completed)
+17 writer: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: writer's store to the unmapped VA: Input/output error
+17: fault page scrubs that found it written: +0
+17 reader after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: a store to unmapped VA does not reach the fault page (+0 dirty scrubs)
+17: reader's load from the unmapped VA: completed; 0/64 pattern words, out[0] 0; re-inits 1 -> 1
+PASS: 17 dummy page: no VM reads another VM's faulting writes (0/64 words carried the writer's pattern (out[0] 0))
+PASS: 17 dummy page: unmapped VA reads as zeros (64/64 words 0)
+17 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+18-0: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-1: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-2: VM fd 34, queue fd 39: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-3: VM fd 40, queue fd 45: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-4: VM fd 46, queue fd 51: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-5: VM fd 52, queue fd 57: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-6: VM fd 58, queue fd 63: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-7: VM fd 64, queue fd 69: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-8: VM fd 70, queue fd 75: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-9: VM fd 76, queue fd 81: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-10: VM fd 82, queue fd 87: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-11: VM fd 88, queue fd 93: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-12: VM fd 94, queue fd 99: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-13: VM fd 100, queue fd 105: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-14: VM fd 106, queue fd 111: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-15: VM fd 112, queue fd 117: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-16: VM fd 118, queue fd 123: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-17: VM fd 124, queue fd 129: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-18: VM fd 130, queue fd 135: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-19: VM fd 136, queue fd 141: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-20: VM fd 142, queue fd 147: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-21: VM fd 148, queue fd 153: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-22: VM fd 154, queue fd 159: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-23: VM fd 160, queue fd 165: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-24: VM fd 166, queue fd 171: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-25: VM fd 172, queue fd 177: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-26: VM fd 178, queue fd 183: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-27: VM fd 184, queue fd 189: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-28: VM fd 190, queue fd 195: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-29: VM fd 196, queue fd 201: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-30: VM fd 202, queue fd 207: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-31: VM fd 208, queue fd 213: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-32: VM fd 214, queue fd 219: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-33: VM fd 220, queue fd 225: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-34: VM fd 226, queue fd 231: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-35: VM fd 232, queue fd 237: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-36: VM fd 238, queue fd 243: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-37: VM fd 244, queue fd 249: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-38: VM fd 250, queue fd 255: shader 0x10000000, IB 0x10001000, out 0x10002000
+18-39: VM fd 256, queue fd 261: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 18 scale: VMs with a queue each open at once (40 of 40 (the 5c limit was 7 VMs, 8 queues))
+PASS: 18 scale: more queues in the same VMs (12 of 12 (52 queues in all))
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 0: 40 VMs, 12 extra queues, 0 bad)
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 1: 40 VMs, 12 extra queues, 0 bad)
+PASS: 18 scale: every queue writes 64 x 42 on its own page (round 2: 40 VMs, 12 extra queues, 0 bad)
+18-after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 18 scale: a fresh VM runs after they all closed (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+20: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 20 gfx queue: refused while gfx_queues is 0 (Invalid argument)
+PASS: 20 gfx queue: QUEUE_CREATE of family GFX (ok)
+PASS: 20 gfx queue: a WRITE_DATA job runs and completes (completion ok after 0 ms, 8/8 words, out[0] 0x7a000000, out[8] 0xa5a5a5a5)
+PASS: 20 gfx queue: 32 jobs in a row (ok, 32/32 words)
+PASS: 20 gfx queue: the VM's compute queue runs beside it (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+INFO: 20 gfx queue: write_42's dispatch on the gfx queue: completion ok after 0 ms, 64/64 words 42
+FAIL: 20 gfx queue: a store to an unmapped VA fails the work (EIO) (got success after 0 ms)
+PASS: 20 gfx queue: the lost queue refuses new work (Input/output error)
+FAIL: 20 gfx queue: another VM's queue runs on (submit: Input/output error)
+PASS: 20 gfx queue: a new gfx queue in the same VM runs after (completion ok, 4/4 words)
+21: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+21: VS 0x10003000, PS 0x10003400, target 0x10004000, debug 0x10008000, rings 0x18000000 (10752 KiB); 661 dwords of PM4
+PASS: 21 triangle: the draw completes on the gfx queue (completion ok after 0 ms)
+21: VS lane 0 (tag 0x7b7b0000): s0..s7 0 0 0x403000 0x10000103 0xdd9d3845 0 0x501d6297 0x9d6a3a42; v0..v4 0x40a0300 0 0x2a 0 0xe0a466d3
+PASS: 21 triangle: the vertex shader ran (lane 0 wrote its record)
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+21: |................................|
+FAIL: 21 triangle: every pixel inside is the colour, every pixel outside untouched (inside 600/600 wrong, outside 0/3368 wrong, edge pixels lit 0, pixel (32,24) 0x5a5a5a5a)
+PASS: 19 unbind: unknown flags refused (Invalid argument)
+PASS: 19 unbind: a BO not bound in the VM refused (No such file or directory)
+PASS: 19 unbind: a VM fd as the BO refused (Invalid argument)
+PASS: 19 unbind: a shared BO unbinds from each of its VMs, once (4/4 unbound, again: No such file or directory)
+PASS: 19 unbind: unbound, the VMs go when their fds close (vms 3 -> 3)
+PASS: 19 unbind: a binding left in place holds its VM until the BO closes (bind ok, vms 3 -> 4 -> 3)
+19: VM fd 22, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+FAIL: 19 unbind: a BO unbound under work that may use it, then closed, leaves nothing deferred once that work's queue is done (unbind ok, the work Input/output error after 0 ms, deferred_now 1)
+PASS: 19 unbind: the VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 19 unbind: a store to the unbound page faults and fails the work, the BO untouched (completion Input/output error after 0 ms, 0/64 words 42)
+PASS: 19 unbind: the BO binds again at the same VA (ok)
+PASS: 19 unbind: and the VM runs clean on it (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 1)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 61001: Operation not permitted after 5011 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 2 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 61002: Operation not permitted after 5044 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 3 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 124 passed, 4 failed: FAIL
+si-client-test rc=1
+== atrium-gpu-test
+caps OK: "Atrium AMD (silicon)", features 0x1a (silicon: compute+syncobj+vm_bind), ISA family 1 gfx1201
+bo_fd OK: BO is an fd (rw at va 0x10000000, close reclaims, EBADF after)
+gfx OK: fence = 0xcafef00ddeadbeef
+compute OK: INC [10 20 30 40] -> [11 21 31 41]
+draw SKIP: gpusim only
+irq OK: interrupt delivered (count 29 -> 34)
+syncobj OK: submit signalled, kqueue EVFILT_READ fired, value=1
+vm_bind OK: create + bind are separate (va 0x10000000), double-bind rejected
+va_reuse OK: 10000 bind/close cycles in an 8192-page window (first va 0x10000000), overlap and misaligned binds refused
+isolation OK: same VA -> 100->101 in vmA, 200->201 in vmB (per-VMID page tables)
+umq (QUEUE_MAP) SKIP: gpusim only
+cross_queue OK: A parked (syncobj=0 at submit), B's write unblocked it, ISR signalled the deferred completion
+fault_reset (GPU_RESET) SKIP: gpusim only
+textured_draw SKIP: gpusim only
+blend SKIP: gpusim only
+dma_copy OK: GPU copied 256 bytes BO->BO (dst[0]=a5a50000)
+depth SKIP: gpusim only
+bilinear SKIP: gpusim only
+multipage OK: 3-page BO copied across page boundaries (bus_dma scatter-gather GPUVM)
+doorbell_pages (QUEUE_MAP) SKIP: gpusim only
+vram (GPU_RESET loses VRAM) SKIP: gpusim only
+display SKIP: gpusim only
+display_link SKIP: gpusim only
+display_usbc SKIP: gpusim only
+display_mst SKIP: gpusim only
+display_dptrain SKIP: gpusim only
+sched SKIP: gpusim only
+ALL OK
+atrium-gpu-test rc=0
+== test-gpu-isolation
+silicon: MES user queues, gfx work on compute (features 0x1a)
+Part A: gpu-isolation.md smoke steps
+  ok   1. two clients, one VM each
+  ok   2. A's BO holds the sentinel at VA 0x10002000
+  ok   3. a non-BO fd as a BO handle is refused (EINVAL)
+  ok   3. an fd number B does not hold is refused (EBADF)
+  ok   4/5. B's copy from A's VA did not return A's data (got 0x00000000)
+  ok   6. the same VA in B's VM resolves to B's own pages
+  ok   7. a fresh BO after A closed reads zero (0x00000000)
+Break 5: unprivileged reset, scheduler and power control
+  ok   GPU_RESET on the client node: EPERM
+  ok   SCHED on the client node: EPERM
+  ok   POWERGATE on the client node: EPERM
+  ok   /dev/atrium-gpu0ctl exists, root-only 0600
+  ok   a non-root process cannot open the control node
+  ok   SCHED on the control node reaches the driver (EOPNOTSUPP on silicon, not EPERM)
+break3 SKIP: gpusim only (QUEUE_MAP; silicon doorbells: si_client_test 9)
+Break 1: shared-queue reprogramming under another VMID
+  ok   A's gfx ring submitted and parked
+  ok   B's work runs at once on its own queue while A's is parked (No error: 0, 0.001 s)
+  ok   A's parked work has not run
+  ok   A's work ran to completion in A's VM once unblocked
+break2 SKIP: gpusim only (shared-queue deferral; silicon free rule: si_client_test 10)
+break4 SKIP: gpusim only (display)
+part_c SKIP: gpusim only (shared-queue watchdog; silicon hangs: si_client_test 8)
+part_d SKIP: gpusim only (shared-queue faults; silicon faults: si_client_test 7)
+part_e SKIP: gpusim only (display)
+Part F: freed VRAM is scrubbed before reuse
+  ok   a VRAM clear engine is registered
+       (VRAM 31980 MiB, 256 MiB CPU-visible)
+  ok   A's VRAM BO holds the sentinel (round trip through the GPU)
+  ok   VRAM in use grew by A's BO (and at most 1 MiB of its page tables: +100 KiB)
+  ok   A's freed VRAM was scrubbed (100 KiB) and is free again
+  ok   B's new VRAM BO reads zero (0 non-zero dwords, none may be A's sentinel)
+  ok   allocated and freed 32960 MiB of VRAM (1.0x the device) in 1.1 s with no ENOMEM
+  FAIL VRAM in use is back where it started; no scrub failed
+Part G: per-uid BO caps
+  ok   defaults: 75% of VRAM, 50% of RAM per uid
+  ok   vram_limit_pct set to 1% (319 MiB)
+  ok   VRAM: 319 one-MiB BOs, then EDQUOT (Disc quota exceeded)
+  ok   counted as one refusal
+  ok   VRAM: another uid can still allocate
+  ok   VRAM: freeing gives the charge back (No error: 0)
+  ok   sys_limit_pct set to 1% (653 MiB)
+  ok   System: 653 one-MiB BOs, then EDQUOT (Disc quota exceeded)
+  ok   counted as one refusal
+  ok   System: another uid can still allocate
+  ok   System: freeing gives the charge back (No error: 0)
+1 FAILURES
+test-gpu-isolation rc=1
+dev.atrium_gpu_amd_pci.0.vram.device: 34225520640
+dev.atrium_gpu_amd_pci.0.vram.base: 134217728
+dev.atrium_gpu_amd_pci.0.vram.clear_engine: 1
+dev.atrium_gpu_amd_pci.0.vram.enomem: 0
+dev.atrium_gpu_amd_pci.0.vram.alloc_waits: 2
+dev.atrium_gpu_amd_pci.0.vram.scrub_failed: 8
+dev.atrium_gpu_amd_pci.0.vram.scrub_jobs: 1780
+dev.atrium_gpu_amd_pci.0.vram.scrubbed: 68448038912
+dev.atrium_gpu_amd_pci.0.vram.frees: 1744
+dev.atrium_gpu_amd_pci.0.vram.allocs: 1744
+dev.atrium_gpu_amd_pci.0.vram.peak_used: 335544320
+dev.atrium_gpu_amd_pci.0.vram.free: 33533444096
+dev.atrium_gpu_amd_pci.0.vram.dirty: 16384
+dev.atrium_gpu_amd_pci.0.vram.used: 0
+dev.atrium_gpu_amd_pci.0.vram.visible: 268435456
+dev.atrium_gpu_amd_pci.0.vram.total: 33533460480
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 1
+dev.atrium_gpu_amd.0.isolation.gfx_queues: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 0
+dev.atrium_gpu_amd.0.isolation.bos: 0
+dev.atrium_gpu_amd.0.isolation.vms: 0
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 2
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 3
+dev.atrium_gpu_amd.0.isolation.cp_errors: 2
+dev.atrium_gpu_amd.0.isolation.quota_refused: 2
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.dummy_dirty: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 12
+dev.atrium_gpu_amd.0.isolation.hangs: 7
+dev.atrium_gpu_amd.0.isolation.reaped: 47
+dev.atrium_gpu_amd.0.isolation.deferred: 47
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 2
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 30.0C 
+detach + give-back rc=0 (try 1)
+== kernel log
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: ... 9 more IVs
+atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #21: edge 38 C, hotspot 43 C, mem 38 C, VR 38 C; power 23 W of 300 W limit, board 23 W; fan 946 rpm (20%); gfx 1402 MHz, mem 184 MHz, gfx busy 81%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1053: edge 38 C, hotspot 43 C, mem 38 C, VR 38 C; power 13 W of 300 W limit, board 13 W; fan 894 rpm (20%); gfx 6 MHz, mem 190 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: si: GPU re-init 3 of 3 in this window: PASS (MES up, kernel compute queue ready)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 220 us (status 0x1)
+atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+atrium_gpu_amd_pci0: si: GPU re-initialised (3 so far): old VMs (5) and queues are lost (EIO) until closed; new ones run
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: uq4: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 252, unrouted 0, MES own 0, MES preemption 196; retired by IV 241, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 196 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1186, other x0
+atrium_gpu_amd_pci0: smu: telemetry #2: edge 38 C, hotspot 43 C, mem 38 C, VR 38 C; power 17 W of 300 W limit, board 17 W; fan 807 rpm (20%); gfx 0 MHz, mem 193 MHz, gfx busy 0%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: uq3: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 252, unrouted 0, MES own 0, MES preemption 196; retired by IV 241, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 196 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1186, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8028001, queue pages at VA 0x200060000 (pa 0x3eee94000), MQD GART 0x20c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend ok, fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend ok, fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 120 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend ok, fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 253, unrouted 0, MES own 0, MES preemption 199; retired by IV 242, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1202, other x0
+atrium_gpu_amd_pci0: uq0: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq0 closed: 22 submits; EOP IVs routed 253, unrouted 0, MES own 0, MES preemption 199; retired by IV 242, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1202, other x0
+atrium_gpu_amd_pci0: uq1: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 253, unrouted 0, MES own 0, MES preemption 199; retired by IV 242, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1202, other x0
+atrium_gpu_amd_pci0: uq2: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 253, unrouted 0, MES own 0, MES preemption 199; retired by IV 242, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1202, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 254, unrouted 0, MES own 0, MES preemption 199; retired by IV 243, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1206, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 255, unrouted 0, MES own 0, MES preemption 199; retired by IV 244, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1210, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 256, unrouted 0, MES own 0, MES preemption 199; retired by IV 245, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1214, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 257, unrouted 0, MES own 0, MES preemption 199; retired by IV 246, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1218, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x803c001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 258, unrouted 0, MES own 0, MES preemption 199; retired by IV 247, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1222, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x8040001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 259, unrouted 0, MES own 0, MES preemption 199; retired by IV 248, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1226, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 220 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: added: VM base 0x801e001, queue pages at VA 0x200020000 (pa 0x3eee8c000), MQD GART 0x204000, doorbell 0x22
+atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 240 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 261, unrouted 0, MES own 0, MES preemption 199; retired by IV 249, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1232, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 261, unrouted 0, MES own 0, MES preemption 199; retired by IV 249, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1234, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x303c6f000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 270 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 262, unrouted 0, MES own 0, MES preemption 199; retired by IV 250, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1238, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x801e001, queue pages at VA 0x200000000 (pa 0x2f61d6000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 263, unrouted 0, MES own 0, MES preemption 199; retired by IV 251, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1242, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x8012001, queue pages at VA 0x200000000 (pa 0x3eee8c000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 270 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 264, unrouted 0, MES own 0, MES preemption 199; retired by IV 252, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1246, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x805d001, queue pages at VA 0x200000000 (pa 0x3eee8c000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: added: VM base 0x8065001, queue pages at VA 0x200020000 (pa 0x303c6f000), MQD GART 0x204000, doorbell 0x22
+atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 265, unrouted 0, MES own 0, MES preemption 199; retired by IV 253, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1252, other x0
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: added: VM base 0x805d001, queue pages at VA 0x200020000 (pa 0x303c6f000), MQD GART 0x204000, doorbell 0x22
+atrium_gpu_amd_pci0: si: uq1: first EOP IV, src_data[0] 0x1000022
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: uq1: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 267, unrouted 0, MES own 0, MES preemption 199; retired by IV 254, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 199 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1256, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: preempted for a free: suspend ok, fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 267, unrouted 0, MES own 0, MES preemption 200; retired by IV 254, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 200 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1262, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x8000001, queue pages at VA 0x200000000 (pa 0x3eee8c000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 268, unrouted 0, MES own 0, MES preemption 200; retired by IV 255, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 200 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1266, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x8000001, queue pages at VA 0x200000000 (pa 0x3eee8c000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 269, unrouted 0, MES own 0, MES preemption 200; retired by IV 256, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 200 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1270, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: added: VM base 0x8000001, queue pages at VA 0x200000000 (pa 0x3eee8c000), MQD GART 0x200000, doorbell 0x20
+atrium_gpu_amd_pci0: si: uq0: first EOP IV, src_data[0] 0x1000020
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 260 us (status 0x1)
+atrium_gpu_amd_pci0: uq0: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq0 closed: 1 submits; EOP IVs routed 270, unrouted 0, MES own 0, MES preemption 200; retired by IV 257, by poll 0; queues lost to faults 10, hangs 7; preempted for frees 200 (failed 0)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x3, 6 x4, 7 x0, 8 x1274, other x0
+atrium_gpu_amd_pci0: VRAM: scrubbed 2880 MiB in 95 ms (30315 MiB/s)
+atrium_gpu_amd_pci0: VRAM: scrubbed 29248 MiB in 975 ms (29997 MiB/s)
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4648: edge 38 C, hotspot 42 C, mem 38 C, VR 37 C; power 16 W of 300 W limit, board 16 W; fan 892 rpm (20%); gfx 293 MHz, mem 365 MHz, gfx busy 15%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: watch #12: telemetry ok
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4782: edge 37 C, hotspot 41 C, mem 36 C, VR 36 C; power 7 W of 300 W limit, board 7 W; fan 894 rpm (20%); gfx 0 MHz, mem 1 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: VRAM scrub: 1872 fills, 11271 waits for an idle queue
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 480 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd0: detached
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x3eee90000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 150 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 50 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: si: dispatch after 65 s attached: PASS
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 4 vmid 0 pasid 0 data 0 0 0 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: si: 7 CP EOP IV(s) since attach, 110 interrupt(s)
+atrium_gpu_amd_pci0: mes: MES running, no work: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: MES running: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0xdfc0000, CP_INT_CNTL_RING0 0xdfc0000
+atrium_gpu_amd_pci0: mes: pipe 1 REMOVE_QUEUE (scheduler): ok in 130 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 3 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: me 3 pipe 1 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: queues gone, MES still running: GRBM_STATUS 0xa800382c -> 0x382c, idle after 1 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: MES halted, CP still running: GRBM_STATUS 0x382c -> 0x382c, idle after 1 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: CP halted again: CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_STAT 0
+atrium_gpu_amd_pci0: mes: torn down: CP_MES_CNTL 0x40030000; pipe 0: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: torn down: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: gfx: MES torn down: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: MES halted: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: GC idle sequence again after MES: 0
+atrium_gpu_amd_pci0: gfx: 100 ms after the idle sequence: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: ih: disabled: RB_CNTL 0x4031011c, RPTR 0, WPTR 0 (writeback 0x1180), STATUS 0xc0847, MSI interrupts 111
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [detached] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #2882: edge 36 C, hotspot 40 C, mem 36 C, VR 36 C; power 7 W of 300 W limit, board 7 W; fan 893 rpm (20%); gfx 1 MHz, mem 8 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: card proven idle at detach
+atrium_gpu_amd_pci0: si: stage 5a: detached
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+== done, log /root/runs/20261115T211246Z.log
+kernel log for the run: /root/runs/20261115T211246Z.kern (    3447 lines)
