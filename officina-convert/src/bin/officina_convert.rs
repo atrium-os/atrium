@@ -5,6 +5,7 @@
 //!   officina-convert xls < book.xls > book.osheet 2> report
 //!   officina-convert doc < letter.doc > letter.owrite 2> report
 //!   officina-convert pptx < talk.pptx > talk.oslides 2> report
+//!   officina-convert ppt < talk.ppt > talk.oslides 2> report
 //!
 //! With `--password` after the kind, stdin starts with the password (its
 //! length as a little-endian u32, then UTF-8) and a protected file is
@@ -128,8 +129,13 @@ fn main() {
                 }
             }
         }
-        "pptx" | "odp" => {
-            let got = if what == "pptx" { officina_convert::pptx::read(&input).map_err(|e| e.to_string()) } else { officina_convert::odp::read(&input).map_err(|e| e.to_string()) };
+        "pptx" | "odp" | "ppt" => {
+            let got = match what.as_str() {
+                "pptx" => officina_convert::pptx::read(&input).map_err(|e| e.to_string()),
+                // A protected .ppt is decrypted by its reader.
+                "ppt" => officina_convert::ppt::read(&input, password.as_deref()).map_err(|e| e.to_string()),
+                _ => officina_convert::odp::read(&input).map_err(|e| e.to_string()),
+            };
             match got {
                 Ok((deck, loaded)) => {
                     let out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -149,7 +155,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx|xls|ods|docx|doc|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
+            eprintln!("error\tusage: officina-convert xlsx|xls|ods|docx|doc|odt|pptx|ppt|odp < in > out (.osheet, .owrite or .oslides)");
             std::process::exit(2);
         }
     }

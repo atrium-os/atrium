@@ -126,7 +126,7 @@ pub fn protect(kind: &str, file: &[u8], password: &str) -> Result<Vec<u8>, crate
 /// it has sandboxed itself. The error is the stderr line's text.
 pub fn unprotect(kind: &str, input: Vec<u8>, password: Option<&str>) -> Result<Vec<u8>, String> {
     use crate::crypt::CryptError;
-    if kind == "xls" || kind == "doc" {
+    if matches!(kind, "xls" | "doc" | "ppt") {
         // The binary formats encrypt in their own way: their readers decrypt.
         return Ok(input);
     }

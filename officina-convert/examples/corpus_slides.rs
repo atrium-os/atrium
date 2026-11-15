@@ -1,5 +1,5 @@
 //! The O6c corpus run (docs/spec/officina.md §9.2): every `.pptx` (or
-//! `.odp`) under the given directories is read by our reader and compared with
+//! `.odp`, or `.ppt` for O7d) under the given directories is read by our reader and compared with
 //! LibreOffice's reading of the same file: slide count and words.
 //!
 //! cargo run --release --example corpus_slides -- SRC[=LO] [SRC[=LO] ...]
@@ -109,7 +109,7 @@ fn main() {
         v.sort();
         for f in v {
             let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-            if ext == "pptx" || ext == "odp" {
+            if ext == "pptx" || ext == "odp" || ext == "ppt" {
                 let lo_file = lo.as_ref().map(|l| l.join(f.with_extension("odp").file_name().unwrap()));
                 files.push((f, lo_file));
             }
@@ -131,7 +131,16 @@ fn main() {
         let name = f.display().to_string();
         let odp = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("odp"));
         let t = Instant::now();
-        let got = std::panic::catch_unwind(|| if odp { officina_convert::odp::read(&data).map_err(|e| e.to_string()) } else { officina_convert::pptx::read(&data).map_err(|e| e.to_string()) });
+        let ppt = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("ppt"));
+        let got = std::panic::catch_unwind(|| {
+            if odp {
+                officina_convert::odp::read(&data).map_err(|e| e.to_string())
+            } else if ppt {
+                officina_convert::ppt::read(&data, None).map_err(|e| e.to_string())
+            } else {
+                officina_convert::pptx::read(&data).map_err(|e| e.to_string())
+            }
+        });
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if ms > slowest.0 {
             slowest = (ms, name.clone());

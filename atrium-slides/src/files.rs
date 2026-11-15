@@ -15,6 +15,8 @@ pub enum Format {
     Native,
     Pptx,
     Odp,
+    /// `.ppt`, PowerPoint 97–2003: read by the converter, never written.
+    Ppt,
     Other,
 }
 
@@ -26,6 +28,8 @@ pub fn format_of(name: &str) -> Format {
         Format::Pptx
     } else if n.ends_with(".odp") {
         Format::Odp
+    } else if n.ends_with(".ppt") || n.ends_with(".pps") || n.ends_with(".pot") {
+        Format::Ppt
     } else {
         Format::Other
     }
@@ -63,7 +67,8 @@ pub fn encode(d: &mut Doc, f: Format) -> std::io::Result<Vec<u8>> {
     let b = match f {
         Format::Pptx => officina_convert::pptx::write(&mut d.deck, Vec::new())?,
         Format::Odp => officina_convert::odp::write(&mut d.deck, Vec::new())?,
-        Format::Native | Format::Other => {
+        // Never a save target (Slides reads .ppt but doesn't write it): native.
+        Format::Native | Format::Other | Format::Ppt => {
             let b = d.write_native(Vec::new())?;
             return Ok(match &d.protection {
                 Some(p) => p.sealer.seal(&b),
@@ -143,8 +148,13 @@ pub fn load_with(name: &str, data: Vec<u8>, password: Option<&str>) -> Result<Do
     }
     match format_of(name) {
         Format::Native => Doc::from_native(name, data).map_err(|e| failed(format!("“{name}” didn't open: {e}"))),
-        f @ (Format::Pptx | Format::Odp) => {
-            let (native, notes) = officina_convert::launch::convert(if f == Format::Pptx { "pptx" } else { "odp" }, &data, password).map_err(|e| match e {
+        f @ (Format::Pptx | Format::Odp | Format::Ppt) => {
+            let kind = match f {
+                Format::Pptx => "pptx",
+                Format::Ppt => "ppt",
+                _ => "odp",
+            };
+            let (native, notes) = officina_convert::launch::convert(kind, &data, password).map_err(|e| match e {
                 ConvertError::Failed(w) => failed(format!("“{name}” couldn't be opened: {w}")),
                 e => e,
             })?;
@@ -179,6 +189,7 @@ mod tests {
         assert_eq!(format_of("Talk.OSLIDES"), Format::Native);
         assert_eq!(format_of("a.pptx"), Format::Pptx);
         assert_eq!(format_of("a.odp"), Format::Odp);
+        assert_eq!(format_of("Old.PPT"), Format::Ppt);
         assert_eq!(stem_of("Talk.oslides"), "Talk");
         assert_eq!(stem_of(".hidden"), ".hidden");
         assert_eq!(picture_mime(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use atrium_slides::doc::Doc;
-use atrium_slides::files::{encode, load_file_with, Format};
+use atrium_slides::files::{encode, load_file_with, load_with, Format};
 use officina_convert::launch::ConvertError;
 
 fn converter() -> PathBuf {
@@ -36,4 +36,28 @@ fn protected_decks_open_only_with_their_password() {
         assert_eq!(back.protection.as_ref().map(|p| p.password.as_str()), Some("deck pw"));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ppt_files_open_through_the_converter() {
+    std::env::set_var("OFFICINA_CONVERT", converter());
+    let text = |d: &mut Doc| {
+        let s = d.deck.slide(0).unwrap();
+        let mut t: String = s.shapes.iter().filter_map(|x| x.text()).map(|t| t.text()).collect();
+        t.push_str(&s.notes.as_ref().map(|n| n.text()).unwrap_or_default());
+        t
+    };
+    let plain = officina_convert::ppt::sample::deck(None);
+    let mut d = load_with("old.ppt", plain, None).unwrap();
+    let t = text(&mut d);
+    assert!(t.contains("Hello from PowerPoint 97") && t.contains("Speaker notes"), "{t:?}");
+    assert!(d.protection.is_none());
+    let locked = officina_convert::ppt::sample::deck(Some("pa55"));
+    assert!(!locked.windows(6).any(|w| w == b"Second"), "the protected file holds the text in the clear");
+    assert_eq!(load_with("old.ppt", locked.clone(), None).err(), Some(ConvertError::NeedsPassword));
+    assert_eq!(load_with("old.ppt", locked.clone(), Some("pass")).err(), Some(ConvertError::WrongPassword));
+    let mut back = load_with("old.ppt", locked, Some("pa55")).unwrap();
+    assert!(text(&mut back).contains("Second shape"));
+    assert!(back.protection.is_some());
+    assert_eq!(atrium_slides::files::format_of("Old.PPS"), Format::Ppt);
 }

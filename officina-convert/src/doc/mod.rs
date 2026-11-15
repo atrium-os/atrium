@@ -275,7 +275,7 @@ fn numbering_xml(lsts: &[(i32, Vec<Level>)], lfos: &[i32]) -> String {
 }
 
 /// The first PNG or JPEG in OfficeArt records (a picture's `BLIP`).
-fn find_blip(b: &[u8], depth: usize) -> Result<(&'static str, &[u8]), bool> {
+pub(crate) fn find_blip(b: &[u8], depth: usize) -> Result<(&'static str, &[u8]), bool> {
     let mut p = 0;
     let mut other = false;
     while p + 8 <= b.len() && depth < 8 {

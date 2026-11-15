@@ -9,6 +9,7 @@
 pub mod cfb;
 pub mod crypt;
 pub mod doc;
+pub mod ppt;
 pub mod docx;
 pub mod launch;
 pub mod odt;

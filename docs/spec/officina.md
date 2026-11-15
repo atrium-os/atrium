@@ -2879,6 +2879,75 @@ Open: floating pictures and shapes (OfficeArt drawing to anchors), EMF/WMF
 pictures, form fields' text and check boxes, legal and chapter list labels,
 headers and footers per section, text boxes in headers.
 
+### 16.44 O7d as built (2026-11-15): `.ppt` import
+
+- **Approach** (`officina-convert/src/ppt/`). As for `.doc`, the reader turns
+  a PowerPoint 97–2003 file into PresentationML parts (presentation, one
+  theme, a master and a blank layout per main master, slides, notes,
+  pictures) and the `.pptx` reader builds the deck from them, so both
+  formats share one reader and one set of fidelity notes.
+- **The file** (`ppt/rec.rs`, `ppt/file.rs`). Records with the shared
+  PowerPoint/OfficeArt header; the `Current User` stream points at the last
+  edit, edits chain back through their persist directories (newer entries
+  win). A chain pointing at itself, forward or at no edit goes on from the
+  edit before it in the stream. PowerPoint 95 and older files are refused in
+  words. Protected files (RC4 CryptoAPI, as PowerPoint and LibreOffice
+  write them) are decrypted in the converter's sandbox: each persist object
+  with its id as the block key, header included; pictures with block 0.
+- **Carried** (`ppt/mod.rs`, `ppt/text.rs`, `ppt/anim.rs`): slide size;
+  masters with their colour schemes and text styles by level
+  (`TextMasterStyleAtom`; spacing given as a share of the line turned into
+  points from the level's size); slides and their shapes (OfficeArt preset
+  types mapped to DrawingML presets, groups with child frames, rotation and
+  flips, solid and gradient fills with focus and angle, line colour, width,
+  dash and arrowheads, freeforms from their vertices and segments, text
+  insets, anchoring and wrap); placeholders, with their text from the slide
+  list (`OutlineTextRefAtom`) or the shape; text runs (alignment, indents,
+  spacing, bullets with character, font, size and colour, numbered
+  paragraphs from the `___PPT9` tag, bold, italic, underline, font, size,
+  colour, super/subscript, hyperlinks, slide number and date fields);
+  WordArt's text; pictures (PNG and JPEG from the BStore or the `Pictures`
+  stream, crops); solid backgrounds; speaker notes; hidden slides; slide
+  transitions (cut, fade, dissolve, push, wipe, cover, uncover, split, zoom
+  with speed and automatic advance); builds from PowerPoint 2002's timing
+  tree in the `___PPT10` tag (preset, class, trigger, delay, length, target)
+  or, without one, PowerPoint 97's per-shape `AnimationInfoAtom`.
+- **Reported, not carried:** pictures in EMF/WMF/PICT/BMP/TIFF (text drawn
+  inside metafiles too), pattern and texture fills (first colour), less
+  common preset types and formula-driven custom shapes (rectangles), WordArt
+  styling, transitions and effects outside the model's set (fades), emphasis
+  and motion paths, slide comments, the date a date field showed.
+- **Slides** opens `.ppt`, `.pps` and `.pot` through the converter
+  (`officina-convert ppt`, `--password` as for the others). It doesn't write
+  `.ppt` (§16.40, D8): a deck opened from one has no save target, so Save asks
+  where to keep a copy and says why.
+
+**Gates.** `officina-convert/examples/ppt_lo.rs`: slides_lo's sample deck
+saved as `.ppt` by LibreOffice 24.2; our reader meets slides_lo's checks on
+it (slide count, words, notes, pictures, hidden slide, transitions, builds,
+bullet levels and numbering, turned box, gradient direction and colours,
+dashed line with arrowhead, bold red run, group). LibreOffice writes the star
+as a formula-driven custom shape, which we draw as a rectangle and note; the
+gate checks for that note. LibreOffice's password on a `.ppt` save doesn't
+encrypt the file, so the gate checks that copy opens with the same text, and
+checks encryption on the sample deck (`ppt::sample`) and, given
+`PPT_PROTECTED=path:password`, on Apache POI's PowerPoint-saved protected
+deck: asks for the password, refuses a wrong one, opens with it: **22/22**.
+Corpus: Apache POI's 147 and LibreOffice's 73 `.ppt` test files
+(`sd/qa/unit/data/ppt`): 168 open, 52 refused in words (36 damaged fuzzer and
+crash files, 8 exploit samples that aren't PowerPoint files, 3 PowerPoint 95,
+5 needing a password; all 5 open with POI's known passwords); slide counts
+equal LibreOffice's on all 162 it opens, 99.50 % of the words its export
+shows (most of the rest is text inside WMF pictures); our writer then reader
+and the `.odp` route keep every deck the same. 20,000 decks mutated inside
+their container never panic; the slowest takes 82 ms. Unit tests build a deck
+record by record, plain and protected, and Slides opens both through the real
+converter.
+
+Open: EMF/WMF pictures, formula-driven custom shapes (guide formulas), more
+preset types, picture and pattern fills, tables (drawn as groups by
+PowerPoint), embedded objects and sounds, comments.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

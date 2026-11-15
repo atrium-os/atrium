@@ -575,7 +575,7 @@ impl W<'_> {
     }
 }
 
-fn transition(t: &Transition) -> String {
+pub(crate) fn transition(t: &Transition) -> String {
     let spd = if t.ms <= 500 { "fast" } else if t.ms <= 750 { "med" } else { "slow" };
     let dir = |d: Dir| match d {
         Dir::Left => "l",

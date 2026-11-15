@@ -185,7 +185,12 @@ impl Run {
     /// Puts `d` on screen with its own autosave folder. The deck it replaces
     /// closes cleanly if saved; unsaved changes stay in its folder and come
     /// back at the next start.
-    fn show(&mut self, mut d: Doc, target: Option<Target>) {
+    fn show(&mut self, mut d: Doc, mut target: Option<Target>) {
+        // Slides reads PowerPoint 97–2003 files but doesn't write them: Save asks where to keep a copy.
+        if matches!(target, Some(Target::Picked { format: Format::Ppt, .. } | Target::Path { format: Format::Ppt, .. })) {
+            d.status = format!("{} Slides reads PowerPoint 97–2003 files but doesn't write them: Save asks where to keep a copy.", d.status);
+            target = None;
+        }
         if d.autosave().is_none() {
             if let Err(e) = d.autosave_to(&new_autosave_dir(&self.root)) {
                 d.status = format!("{} Autosave is off: {e}.", d.status);
