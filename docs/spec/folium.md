@@ -382,13 +382,7 @@ gets a separate binary and jail, and limend picks providers per role.
   stay valid), written with the object writer shared with `officina-pdf`.
   The app gets a read-write descriptor only when opened for edit
   (opening-files D8).
-- **P6 signatures.** Verifying: the signer's certificate chain against the
-  system trust store plus India's CCA roots (for DSC tokens), the
-  signed byte ranges, what changed after each signature (§3). Signing:
-  PAdES-B-B, the app computes the digest, Sigillum signs with the user's
-  token after the PIN in its own sheet (officina.md §11.3, sigillum §10.2).
-  Timestamps (PAdES-B-T) need a TSA over the network, so they go through
-  Nuntius later.
+- **P6 signatures.** All the ways to sign, and verifying, are in §9.3.
 - **P7 printing and accessibility.** The future print service takes PDF
   (officina.md §14); Folium renders pages for printers without PDF
   support. Tagged PDF structure feeds the accessibility outline.
@@ -472,6 +466,103 @@ grouping move to a small crate both can use (`officina-diff`, depending on
 neither), and the annotation reader and writer are `folium-doc`'s, used by
 Write's export and import.
 
+### 9.3 Signing: drawn, certificate, and other ways (asked by Shankar, 2026-11-15)
+
+*"Signing by drawing the signature on the mouse or trackpad, digital
+certificate, or other ways?"* There are two different things people call
+"signing a PDF", and Atrium PDF offers both, together or apart, and says
+plainly which one a document has:
+
+- a **visible signature**: a mark on the page that looks like a signature
+  (drawn, typed or an image). It shows intent; it proves nothing about who
+  made it, and anyone can copy it.
+- a **digital signature**: a cryptographic signature over the file's bytes
+  with a certificate. It proves who signed (as far as the certificate's
+  issuer vouches) and that nothing changed since. It may have a visible
+  part, or none.
+
+**Ways to make the visible part (P5).**
+
+| way | how |
+|---|---|
+| Draw | a signing pad sheet: mouse, trackpad, pen (pressure from Tactus where the device gives it) or finger; strokes smoothed into curves, variable width; Clear and Done. Saved as vector ink, not a bitmap, so it stays sharp at any zoom |
+| Type | the name typed and set in one of a few signature-style OFL fonts, picked from a row of previews |
+| Image | a scan or photo of a signature, picked with the system picker; the background is taken out (threshold on paper colour) and it is kept as an image |
+| Initials | the same three ways, kept separately, for "initial every page" |
+
+Saved signatures and initials are the user's own and live in **Arca**
+(arca.md), not in the app or a file: an item kind `SignatureMark` that
+arcad releases only to an app that holds the new capability
+`identity.signature-mark` (Atrium PDF and Write), and only after a press in
+the sign sheet (frescod activation purpose `IDENTITY`, as Sigillum's sheets
+use). So a hostile PDF can't make the viewer stamp the user's signature,
+and no other app can read it.
+
+Placing it: into a signature field if the form has one (§4 forms), else
+anywhere the user drops it, sized by dragging. It is written as an
+annotation with our own appearance stream, so every reader shows it. On
+its own (no certificate) the status line and the signature panel say
+**"Signed with a drawn signature (not verified)"**, so nobody takes it for
+more than it is. Flattening it into the page content is an explicit
+choice in Save As, never the default.
+
+**Digital signatures with a certificate (P6).**
+
+- **Where the key is.** (a) A hardware token through Sigillum: a YubiKey or
+  other PIV card, an OpenPGP card, or an Indian **DSC** USB token (Class 3,
+  e.g. the InnaIT token through its jailed vendor module, sigillum §16.5).
+  (b) A software certificate (a `.p12`/`.pfx` the user imports), held in
+  Arca as today's software client certificates are (arca.md §8.5); the key
+  never leaves arcad, which signs the digest itself. In both cases the app
+  only ever sends a digest and gets a signature back, after the PIN or
+  password in Sigillum's or Arca's own sheet (sigillum §10.2), with the
+  chooser listing certificates that can sign documents (key usage
+  digitalSignature or nonRepudiation).
+- **What is written.** PAdES baseline: B-B with no network, B-T with a
+  timestamp from a TSA, B-LT with the certificate chain and revocation
+  answers (OCSP or CRL) embedded so it verifies years later, B-LTA with a
+  document timestamp on top. The network parts (TSA, OCSP, CRL) go out
+  through Nuntius from a small fetch the user's settings allow, never from
+  the viewer's jail. Default: B-T when online and a TSA is set, else B-B,
+  upgraded to B-LT when the file is next saved online.
+- **Kinds of signature.** *Approval* (the usual, any number of signers,
+  each an incremental update), and *certification* (the first signer
+  certifies the document and says what may change after: nothing, form
+  filling, or form filling and comments, PDF's DocMDP). Field locks (lock
+  these fields when signed) come with the form field.
+- **Visible appearance.** A digital signature can use the drawn, typed or
+  image mark from above as its appearance, with the signer's name, date
+  and "Digitally signed" written beside it by us; or be invisible (listed
+  in the signature panel only). This is the default when a certificate is
+  chosen: draw or pick your mark once, sign with the token.
+- **Several signers.** "Request signatures" adds signature fields, each
+  named for a person and in an order; each signer signs their field in
+  turn as an incremental update, so earlier signatures stay valid. Sending
+  it to them is the user's own business (mail, share); Atrium PDF only
+  shows whose turn it is.
+
+**Verifying (P6, reading starts in P3).** The signature panel lists each
+signature: signer, issuer, time (and whether the time is the signer's
+clock or a timestamp authority's), the PAdES level, and one of: valid,
+valid but changed after signing (with what changed: comments, form fields,
+or the content itself, by comparing revisions, §3), not trusted (chain
+doesn't reach a trusted root), or broken (bytes don't match). Trusted
+roots are the system's store plus India's CCA root for DSC certificates
+(so Class 3 signatures from Indian authorities verify) and the EU trusted
+lists later if asked. Revocation is checked online through Nuntius when
+the user opens the panel and the network is up; embedded answers (B-LT)
+are used offline. A drawn-only signature is listed as "not a digital
+signature".
+
+**Other ways, and what we'd need.**
+
+| way | what it is | recommendation |
+|---|---|---|
+| **Aadhaar eSign** (India) | an online signature from a licensed eSign service provider (eMudhra, NSDL, CDAC and others), OTP or biometric on Aadhaar, the certificate made per signature | later, as an option (D20): it needs a contract with a provider and their API over the network, and sends the document's hash and the user's Aadhaar number to them. Built as a separate signer behind the same "digest in, signature out" boundary, so the viewer doesn't change |
+| **Device key** ("signed on this computer") | a key in Arca or the TPM, self-issued | no: it proves only "this machine", which readers outside Atrium can't check, and it would look like more than it is |
+| **Passkey / FIDO2** | WebAuthn signatures | no for documents: they sign a challenge for a site, not a document format any reader verifies |
+| **Cloud signing services** (DocuSign and the like) | the document goes to their service | not built in; a user can still upload a PDF to one through the Navigator |
+
 ## 10. Testing
 
 - **Corpora**, kept outside the repo like Officina's (never committed):
@@ -514,8 +605,8 @@ Write's export and import.
 | **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1); `officina-pdf` moved onto the shared base (§5.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates; Officina's export gate unchanged and its output read back by Folium |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |
-| **P5** | forms; comments and review (add, reply, state, resolve, compare, merge); Write's export with comments and changes and its Import Review (§9.2); incremental save | edit gate; a review done in Atrium PDF opens with the same threads and states in pdf.js and in a host-side reader |
-| **P6** | signature verification, PAdES signing via Sigillum | signs with the YubiKey and the InnaIT DSC token |
+| **P5** | forms; visible signatures (draw, type, image, initials; kept in Arca); comments and review (add, reply, state, resolve, compare, merge); Write's export with comments and changes and its Import Review (§9.2); incremental save | edit gate; a review done in Atrium PDF opens with the same threads and states in pdf.js and in a host-side reader |
+| **P6** | §9.3: digital signatures (Sigillum tokens, Arca software certificates), PAdES B-B to B-LTA, certification, several signers, verification panel; drawn/typed/image marks move here from P5 if P5 is long | signs with the YubiKey and the InnaIT DSC token; Acrobat-equivalent verification of our signatures by a host-side checker (pyHanko or OpenSSL CMS) and of the corpus's signed files |
 | **P7** | print path, tagged PDF | with the print service |
 
 Rough sizes: P1 about a week, P2 one to two weeks, P3 about a week, P4
@@ -542,3 +633,6 @@ several weeks and then ongoing as the corpus finds things.
 | D15 | Write's PDF export of a reviewed document | Default *Clean* (proposed text, comments and edits as annotations, as Write's Reading view); *All markup* on request; annotations carry `/AtAnchor` so they can come back |
 | D16 | Bringing a PDF review back into Write | Yes: Write ▸ Import Review… turns comments into comments and text-edit marks into tracked changes by each reviewer, placed by anchor or by text, listing anything it can't place |
 | D17 | Sharing the review engine | Move Officina's word diff and edit grouping into `officina-diff`, used by Write and Atrium PDF; annotations read and written only by `folium-doc` |
+| D18 | Visible-only signatures | Offered (draw, type, image, initials), saved in Arca as `SignatureMark` released only after a press in the sign sheet, and always labelled "drawn signature (not verified)"; never flattened unless asked |
+| D19 | Digital signatures | PAdES through Sigillum tokens (PIV, OpenPGP, Indian DSC) and Arca-held software certificates; default B-T when online, B-B otherwise, B-LT on the next online save; network parts through Nuntius; trust roots the system store plus India's CCA |
+| D20 | Aadhaar eSign | Later, opt-in, as a separate signer behind the same digest boundary, once a provider contract exists; device-key and passkey document signatures not offered |
