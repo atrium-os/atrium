@@ -2717,6 +2717,8 @@ static const uint32_t tri_ps[] = {
 };
 #define TRI_PS_OFF	0x400u		/* 256-byte aligned (PGM_LO is >> 8) */
 #define TRI_PS_COUNT	0x800u		/* PS invocation counter, debug page */
+#define TRI_STATS0	0x900u		/* 14 pipeline statistics, before */
+#define TRI_STATS1	0xa00u		/* and after the draw */
 
 /* Triangle in pixels (viewport 64 x 64, y down): the VS's NDC
  * (-0.5,-0.5), (0.5,-0.5), (0.25,0.75). */
@@ -3029,6 +3031,15 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	tri_reg(&p, R_SPI_SHADER_Z_FORMAT, 0);
 	tri_reg(&p, R_SPI_SHADER_COL_FORMAT, 9);	/* SPI_SHADER_32_ABGR */
 
+	/* Pipeline statistics around the draw (radv_query.c): where the
+	 * triangle stops, if it does. */
+	tri_put(&p, PKT3_GFX(0x46u, 1));		/* EVENT_WRITE */
+	tri_put(&p, 25);				/* PIPELINESTAT_START */
+	tri_put(&p, PKT3_GFX(0x46u, 3));
+	tri_put(&p, 30 | 2u << 8);			/* SAMPLE_PIPELINESTAT */
+	tri_put(&p, (uint32_t)(dbg_va + TRI_STATS0));
+	tri_put(&p, (uint32_t)((dbg_va + TRI_STATS0) >> 32));
+
 	/* The draw: a triangle list, one instance, three auto-index vertices. */
 	tri_put(&p, PKT3_GFX(0x7au, 2));		/* SET_UCONFIG_REG_INDEX */
 	tri_put(&p, ((R_VGT_PRIMITIVE_TYPE - TRI_UC_BASE) >> 2) | 1u << 28);
@@ -3038,6 +3049,12 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	tri_put(&p, PKT3_GFX(0x2du, 2));		/* DRAW_INDEX_AUTO */
 	tri_put(&p, 3);
 	tri_put(&p, 2);					/* DI_SRC_SEL_AUTO_INDEX */
+	tri_put(&p, PKT3_GFX(0x46u, 3));
+	tri_put(&p, 30 | 2u << 8);			/* SAMPLE_PIPELINESTAT */
+	tri_put(&p, (uint32_t)(dbg_va + TRI_STATS1));
+	tri_put(&p, (uint32_t)((dbg_va + TRI_STATS1) >> 32));
+	tri_put(&p, PKT3_GFX(0x46u, 1));
+	tri_put(&p, 26);				/* PIPELINESTAT_STOP */
 	return (p.n);
 }
 
@@ -3161,6 +3178,25 @@ triangle(void)
 		    "the vertex shader ran for all three vertices", "lanes 1, 2 "
 		    "%s, %s", dbg[31] != POISON_A ? "ran" : "never ran",
 		    dbg[47] != POISON_A ? "ran" : "never ran");
+		{
+			/* Hardware order (radv_query.c's index table). */
+			static const char *const nm[14] = { "PS inv",
+			    "clip prims", "clip inv", "VS inv", "GS inv",
+			    "GS prims", "IA prims", "IA verts", "HS inv",
+			    "DS inv", "CS inv", "task", "mesh", "mesh prims" };
+			const uint32_t *a = dbg + TRI_STATS0 / 4,
+			    *b = dbg + TRI_STATS1 / 4;
+
+			printf("21: pipeline statistics (after - before):");
+			for (i = 0; i < 14; i++) {
+				uint64_t x = a[2 * i] | (uint64_t)a[2 * i + 1] << 32,
+				    y = b[2 * i] | (uint64_t)b[2 * i + 1] << 32;
+
+				printf(" %s %jd%s", nm[i], (intmax_t)(y - x),
+				    b[2 * i] == POISON_A ? " (unwritten)" : "");
+			}
+			printf("\n");
+		}
 		printf("21: PS invocations counted: %u (%#x; poison: none ran; "
 		    "about 600 expected)\n", dbg[TRI_PS_COUNT / 4] - POISON_A,
 		    dbg[TRI_PS_COUNT / 4]);
