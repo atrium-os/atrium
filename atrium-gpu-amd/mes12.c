@@ -33,6 +33,7 @@
  * Per version: mes_gens[] by GC version. Unknown: not touched (A3.10).
  */
 #include "atrium_gpu_amd.h"
+#include "gfx12_csb.h"
 
 #include <sys/firmware.h>
 #include <sys/rman.h>
@@ -84,6 +85,11 @@ struct mes_gen {
 	uint32_t cp_cpc_stall, cp_cpf_busy, cp_cpf_stall, cp_cpf_busy2;
 	/* ME pipe 0's interrupt enables (gfx queues' EOP and CP errors). */
 	uint32_t cp_int_cntl_ring0;
+	/* The graphics pipe's clear state and contexts (gfx_v12_0
+	 * init_csb, cp_gfx_start). */
+	uint32_t rlc_csib_lo, rlc_csib_hi, rlc_csib_len, cp_max_context,
+	    cp_device_id;
+	uint32_t max_hw_contexts;
 };
 
 static const struct mes_gen mes_gens[] = {
@@ -109,7 +115,9 @@ static const struct mes_gen mes_gens[] = {
 	  0x0b << 1, 0x0c << 1, 0x400,
 	  S0(0x1f73), S1(0x2900), S1(0x2908),
 	  S0(0x0e26), S0(0x0e28), S0(0x0e29), S0(0x0e33),
-	  S0(0x1e0a) },
+	  S0(0x1e0a),
+	  S1(0x0987), S1(0x0988), S1(0x0989), S0(0x1e4e), S0(0x1deb),
+	  8 },
 };
 
 /* CP_MES_CNTL */
@@ -137,7 +145,9 @@ static const struct mes_gen mes_gens[] = {
 #define BLK_HANG		0x4400u	/* MESAPI__RESET's hung-queue list */
 #define BLK_HANG_SIZE		0x0c00u	/* db offsets, then HQD ids */
 #define BLK_RES1(p)		(0x5000u + (p) * 0x1000u)
-#define BLK_SIZE		0x7000u
+#define BLK_CSB			0x7000u	/* RLC clear-state buffer */
+#define BLK_SIZE		0x8000u
+CTASSERT(MES_GART_VA + BLK_SIZE <= 0x00040000ull);	/* DISP_GART_VA */
 /*
  * Per-pipe MSCRATCH (amdgpu's event-log layout without the log part):
  * zeroed and programmed into CP_MES_MSCRATCH before every unhalt, as
@@ -559,6 +569,22 @@ cp_resume(struct mes *m)
 	const struct mes_gen *g = m->g;
 	uint32_t d;
 	int us;
+
+	/*
+	 * gfx_v12_0_rlc_resume (PSP branch) init_csb, and cp_gfx_start: the
+	 * clear state the graphics pipe loads its context registers from,
+	 * and its context count. Box run d371a1c9: without them a gfx user
+	 * queue's CPF sat busy in its first IB (ring and IB1 ROQ busy) and
+	 * no work retired.
+	 */
+	CTASSERT(sizeof(gfx12_csb) <= PAGE_SIZE);
+	memcpy(m->blk + BLK_CSB, gfx12_csb, sizeof(gfx12_csb));
+	wmb();
+	wr(m, g->rlc_csib_hi, (uint32_t)((m->va + BLK_CSB) >> 32));
+	wr(m, g->rlc_csib_lo, (uint32_t)(m->va + BLK_CSB) & 0xfffffffcu);
+	wr(m, g->rlc_csib_len, (uint32_t)nitems(gfx12_csb));
+	wr(m, g->cp_max_context, g->max_hw_contexts - 1);
+	wr(m, g->cp_device_id, 1);
 
 	wr(m, g->rb_db_lo, g->db_gfx_lo);
 	wr(m, g->rb_db_hi, g->db_gfx_hi);

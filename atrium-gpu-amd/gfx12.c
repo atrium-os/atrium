@@ -10,8 +10,8 @@
  * loading: wait for RLC autoload, golden registers, gb_addr_config,
  * config_gfx_rs64, gfxhub fault defaults, constants_init) and soc24.c
  * (soc24_grbm_select). Offsets gc_12_0_0_offset.h, fields
- * gc_12_0_0_sh_mask.h. The clear-state buffer (init_csb) is only used by the
- * graphics ring and comes with it, not here.
+ * gc_12_0_0_sh_mask.h. The clear-state buffer (init_csb) is programmed with
+ * the CP's start, in mes12.c cp_resume().
  *
  * Per version: gfx_gens[] by GC version. Unknown: not touched (A3.10).
  */
