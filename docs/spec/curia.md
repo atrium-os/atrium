@@ -317,9 +317,11 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   New's Allow writes her grant and New then launches without asking; a click where
   Sys's Allow would be writes nothing; Remove access, then Remove, takes the grant
   away. 11 checks, 0 failed; frames in `scratch/apps-access/`.
-- Open: frescod checks the press is in Curia's focused window, not that the window was
-  uncovered and still before it (`FILL` and `IDENTITY` do that for credential slots and
-  Sigillum's sheet). An overlay can't take the click (it would land on the overlay), but
-  if that check is wanted for `APPROVE` too, Curia's window has to be tracked as slots
-  are.
+- Seen whole (Shankar, 2026-11-15: "add it for allow"): frescod now watches every
+  top-level window as it watches credential slots and Sigillum's sheets (wholly on
+  screen, nothing composed above it overlapping it, at least the minimum size, where it
+  was last frame), and an `APPROVE` press counts only if Settings' window was so for
+  `credential::STILL_NS` (half a second) up to the press; otherwise `OBSCURED`, which
+  portcullisd words "the window was covered or had just moved; press again". Ordinary
+  windows count for `APPROVE` alone: `FILL` and `IDENTITY` still need a slot or a sheet.
 

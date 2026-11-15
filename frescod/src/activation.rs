@@ -122,9 +122,10 @@ impl Table {
 
     /// Spend `token` for `presenter_uid` on `purpose`; `focused(window)`
     /// says whether that window still has focus.
-    /// For `FILL` and `IDENTITY`, `visible(window, minted)` says whether that
-    /// credential slot or sheet was fully visible and still before the press
-    /// (arca-autofill.md §4, sigillum.md §7.2).
+    /// For `FILL`, `IDENTITY` and `APPROVE`, `visible(window, minted)` says
+    /// whether that credential slot, sheet or window was fully visible and
+    /// still before the press (arca-autofill.md §4, sigillum.md §7.2,
+    /// curia.md §13).
     pub fn consume(&mut self, now: u64, token: &Token, presenter_uid: u32, purpose: u8, focused: impl Fn(u32) -> bool, visible: impl Fn(u32, u64) -> bool) -> ConsumeResult {
         let Some(e) = self.live.get(token).copied() else { return refused(refusal::UNKNOWN) };
         if now.saturating_sub(e.minted_ns) >= LIFETIME_NS {
@@ -141,7 +142,7 @@ impl Table {
         }
         // Visibility first: a slot under a cover is OBSCURED whichever
         // window took focus.
-        if matches!(purpose, purpose::FILL | purpose::IDENTITY) && !visible(e.window_id, e.minted_ns) {
+        if matches!(purpose, purpose::FILL | purpose::IDENTITY | purpose::APPROVE) && !visible(e.window_id, e.minted_ns) {
             return refused(refusal::OBSCURED);
         }
         // A drop lands on whatever window is under the pointer, focused
@@ -455,7 +456,7 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: bool, may
             op::CONSUME => fresco_protocol::encode(&match fresco_protocol::decode::<Consume>(&msg.payload) {
                 Ok(c) if may_consume => {
                     let now = now_ns();
-                    table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for(w, minted, now))
+                    table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now))
                 }
                 Ok(_) => refused(refusal::NOT_ALLOWED),
                 Err(_) => refused(refusal::UNKNOWN),
@@ -611,17 +612,19 @@ mod tests {
     }
 
     #[test]
-    fn allowing_an_app_is_allow_pressed_in_the_settings_window() {
+    fn allowing_an_app_is_allow_pressed_in_the_settings_window_seen_whole() {
         let mut t = Table::default();
+        let vis = |_: u32, _: u64| true;
         let click = t.mint(button(0));
-        assert_eq!(why(t.consume(1, &click, 1002, purpose::APPROVE, YES, NOVIS)), refusal::WRONG_UID, "another app's press");
-        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, |_| false, NOVIS)), refusal::NOT_FOCUSED);
-        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, NOVIS)), 0);
-        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, NOVIS)), refusal::UNKNOWN, "spent once");
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::APPROVE, YES, vis)), refusal::WRONG_UID, "another app's press");
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, NOVIS)), refusal::OBSCURED, "covered, or just moved");
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, |_| false, vis)), refusal::NOT_FOCUSED);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, vis)), 0);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, vis)), refusal::UNKNOWN, "spent once");
         let enter = t.mint(key(HID_ENTER, 0, 0));
-        assert_eq!(why(t.consume(1, &enter, 1001, purpose::APPROVE, YES, NOVIS)), 0);
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::APPROVE, YES, vis)), 0);
         let typed = t.mint(key(0x04, MOD_CTRL, 0));
-        assert_eq!(why(t.consume(1, &typed, 1001, purpose::APPROVE, YES, NOVIS)), refusal::WRONG_KIND, "a shortcut allows nothing");
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::APPROVE, YES, vis)), refusal::WRONG_KIND, "a shortcut allows nothing");
     }
 
     #[test]

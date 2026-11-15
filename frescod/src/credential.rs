@@ -13,6 +13,11 @@
 //! top-level window of a sheet uid ([`crate::activation::sheet_uids`]) must
 //! be wholly on screen, nothing composed above it overlapping it, at least
 //! the minimum size and where it was last frame, for an `IDENTITY` press.
+//!
+//! Every other top-level window is watched the same way for presses that
+//! need only the asking app's own window seen whole and still: Allow on
+//! Settings' Apps page (`APPROVE`, curia.md §13). Those count for nothing
+//! else ([`visible_for`] is for slots and sheets alone).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -28,6 +33,8 @@ struct Rec {
     since: Option<u64>,
     /// The last run that ended: (start, end).
     last: Option<(u64, u64)>,
+    /// An ordinary window: neither a credential slot nor a sheet.
+    plain: bool,
 }
 
 static RECS: Mutex<Option<HashMap<u32, Rec>>> = Mutex::new(None);
@@ -46,28 +53,28 @@ pub fn observe_frame(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], scree
 
 /// [`observe_frame`] with the sheet uids given (tests).
 pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], screen: [i32; 4], now: u64, sheet_uids: &[u32]) -> Vec<[i32; 4]> {
-    let slots: Vec<(u32, bool)> = {
+    // (window, fits, plain)
+    let slots: Vec<(u32, bool, bool)> = {
         let c = comp.lock().unwrap();
         c.windows.iter().filter_map(|(&id, w)| {
-            if w.slot.is_none() && !sheet_uids.is_empty() {
+            if w.slot.is_none() {
                 let uid = crate::socket_server::client_uid(w.owner).unwrap_or(w.owner_uid);
-                if sheet_uids.contains(&uid) {
-                    let (sw, sh) = w.size;
-                    return Some((id as u32, !w.hidden && !w.embed_pending && sw >= MIN_W && sh >= MIN_H));
-                }
+                let (sw, sh) = w.size;
+                let fits = !w.hidden && !w.embed_pending && sw >= MIN_W && sh >= MIN_H;
+                return Some((id as u32, fits, !sheet_uids.contains(&uid)));
             }
             let s = w.slot.filter(|s| s.kind == fresco_protocol::slot::kind::CREDENTIAL)?;
             let p = c.windows.get(&s.parent)?;
             let [x, y, rw, rh] = s.rect;
             let inside = x >= 0.0 && y >= 0.0 && x + rw <= p.size.0 && y + rh <= p.size.1;
-            Some((id as u32, inside && rw >= MIN_W && rh >= MIN_H))
+            Some((id as u32, inside && rw >= MIN_W && rh >= MIN_H, false))
         }).collect()
     };
     let mut g = RECS.lock().unwrap();
     let recs = g.get_or_insert_with(HashMap::new);
-    recs.retain(|id, _| slots.iter().any(|(s, _)| s == id));
+    recs.retain(|id, _| slots.iter().any(|(s, _, _)| s == id));
     let mut shown = Vec::new();
-    for (id, fits) in slots {
+    for (id, fits, plain) in slots {
         let at = layers.iter().position(|(l, _)| *l == id);
         let r = at.map(|i| layers[i].1);
         let visible = match (at, r) {
@@ -79,6 +86,10 @@ pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], 
             _ => false,
         };
         let rec = recs.entry(id).or_default();
+        if rec.plain != plain {
+            // A window that changed kind starts over.
+            *rec = Rec { plain, ..Rec::default() };
+        }
         let moved = r != Some(rec.rect);
         if let Some(r) = r {
             rec.rect = r;
@@ -96,7 +107,7 @@ pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], 
         if visible && rec.since.is_none() {
             rec.since = Some(now);
         }
-        if visible {
+        if visible && !plain {
             shown.push(rec.rect);
         }
     }
@@ -106,8 +117,30 @@ pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], 
 /// Whether slot `window` was visible and still from `STILL_NS` before a
 /// press minted at `minted` up to that press, as of `now`.
 pub fn visible_for(window: u32, minted: u64, now: u64) -> bool {
+    seen_whole(window, minted, now, false)
+}
+
+/// [`visible_for`] for any top-level window (an `APPROVE` press in
+/// Settings' own window), slots and sheets too.
+pub fn window_visible_for(window: u32, minted: u64, now: u64) -> bool {
+    seen_whole(window, minted, now, true)
+}
+
+/// Which check a press for `purpose` takes.
+pub fn visible_for_purpose(purpose: u8, window: u32, minted: u64, now: u64) -> bool {
+    if purpose == fresco_protocol::activation::purpose::APPROVE {
+        window_visible_for(window, minted, now)
+    } else {
+        visible_for(window, minted, now)
+    }
+}
+
+fn seen_whole(window: u32, minted: u64, now: u64, any: bool) -> bool {
     let g = RECS.lock().unwrap();
     let Some(rec) = g.as_ref().and_then(|r| r.get(&window)) else { return false };
+    if rec.plain && !any {
+        return false;
+    }
     let from = minted.saturating_sub(STILL_NS);
     let covers = |s: u64, e: u64| s <= from && e >= minted;
     rec.since.is_some_and(|s| covers(s, now)) || rec.last.is_some_and(|(s, e)| covers(s, e))
@@ -185,11 +218,20 @@ mod tests {
         frame(false, t0 + 600 * ms);
         assert!(visible_for(sheet, t0 + 600 * ms, t0 + 600 * ms));
         assert!(!visible_for(app, t0 + 600 * ms, t0 + 600 * ms), "an app window is not a sheet");
+        // It is watched as a window, for Allow in Settings (APPROVE): the
+        // sheet over it covers it.
+        assert!(!window_visible_for(app, t0 + 600 * ms, t0 + 600 * ms), "the sheet covers it");
+        assert!(window_visible_for(sheet, t0 + 600 * ms, t0 + 600 * ms));
+        assert!(visible_for_purpose(fresco_protocol::activation::purpose::IDENTITY, sheet, t0 + 600 * ms, t0 + 600 * ms));
         frame(true, t0 + 700 * ms);
         assert!(!visible_for(sheet, t0 + 800 * ms, t0 + 800 * ms), "covered");
         // Not a sheet uid: never watched.
         observe_frame_with(&comp, &[(sheet, [430, 200, 850, 420])], screen, t0 + 2000 * ms, &[1]);
         observe_frame_with(&comp, &[(sheet, [430, 200, 850, 420])], screen, t0 + 3000 * ms, &[1]);
         assert!(!visible_for(sheet, t0 + 3000 * ms, t0 + 3000 * ms));
+        // ... except as an ordinary window, which counts for APPROVE alone.
+        assert!(window_visible_for(sheet, t0 + 3000 * ms, t0 + 3000 * ms));
+        assert!(!visible_for_purpose(fresco_protocol::activation::purpose::IDENTITY, sheet, t0 + 3000 * ms, t0 + 3000 * ms));
+        assert!(visible_for_purpose(fresco_protocol::activation::purpose::APPROVE, sheet, t0 + 3000 * ms, t0 + 3000 * ms));
     }
 }

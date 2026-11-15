@@ -278,6 +278,7 @@ pub fn spend_press_for(sock: &Path, token: [u8; 16], presenter_uid: u32, purpose
             refusal::NOT_FOCUSED => "the window lost focus; open it again",
             refusal::WRONG_UID => "the press wasn't in the asking app's window",
             refusal::WRONG_KIND => "that press can't do this",
+            refusal::OBSCURED => "the window was covered or had just moved; press again",
             _ => "frescod refused the press",
         }
         .into()),
