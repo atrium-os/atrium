@@ -51,7 +51,7 @@ out entirely: separate parser, separate threat surface"),
 
 | piece | where | use here |
 |---|---|---|
-| PDF writer (fonts subset, images, links, page streaming) | `officina-pdf` | the object writer is shared for incremental save (P5) |
+| PDF writer (fonts subset, images, links, page streaming) | `officina-pdf` | moves onto Folium's base crates (§5.1); its subsetter becomes `folium-font`'s |
 | Image decoders with ceilings: PNG, JPEG (zune-jpeg), GIF, WebP | `navigator-image` | DCT images (`zune-jpeg`), the `Ceilings` budget pattern |
 | A bounded parser profile (counts, depth, work) | `navigator-svg::profile` | the model for §6 |
 | Font reading and shaping: ttf-parser, rustybuzz, swash | `fresco-text`, `navigator-fonts` | TrueType and CFF outlines |
@@ -141,6 +141,43 @@ Ours: everything else, including LZW, CCITTFax, RunLength, the ASCII
 filters, decryption (with the `aes` and `md-5`/`sha2` RustCrypto crates for
 the primitives), Type 1, and CMaps (the predefined CMaps are data from
 Adobe's `cmap-resources`, BSD-3).
+
+### 5.1 One base for reading and writing, shared with Officina (asked by Shankar, 2026-11-15)
+
+*"Perhaps we should share the Folium crate with Officina so they share a
+common base?"* Yes. Today `officina-pdf` (about 700 lines) writes PDF with
+its own string formatting, number and string escaping, cross-reference
+table and TrueType subsetter. Folium needs all of that read the other way,
+and P5 needs it written again for incremental save. So the base is one set
+of crates that both sides use, with the dependency one way: Officina
+depends on Folium, never the reverse.
+
+| shared piece | crate | reader uses it for | Officina uses it for |
+|---|---|---|---|
+| objects, lexer, serializer, xref read and write, object streams | `folium-syntax` | parsing hostile files, under §6's budgets | writing export output (`officina-pdf` keeps only the walk from `officina_text::paint` items to pages) |
+| filters (Flate both ways, the rest decode-only) | `folium-syntax` | decoding streams | compressing content, images and fonts |
+| content operators as one typed `Op` enum | `folium-content` | the interpreter's input | the export's output, written by the serializer instead of format strings |
+| fonts: reading programs, and subsetting TrueType (moved from `officina-pdf/src/font.rs`), ToUnicode CMaps both ways | `folium-font` | drawing text, extraction | embedding subsets |
+| signatures: byte ranges, CMS/PAdES, verification | `folium-sign` (P6) | showing and checking signatures | "Export as signed PDF" from Write, Sheets and Slides (officina.md §11.3) |
+| PDF/A pieces: XMP metadata, output intent | `folium-doc` | showing PDF/A conformance | PDF/A-2b export, which officina.md §16.17 lists as not yet done |
+
+What this buys:
+
+- One escaping and serialization path, tested by both sides, instead of
+  two that can disagree.
+- **A free round-trip gate.** Officina already paints a page for the
+  screen and for PDF from the same items; Folium reading that PDF back and
+  drawing it must match Officina's own screen paint. Every Officina
+  export becomes a Folium test, and every Folium bug in reading what we
+  write shows up at once.
+- Slides and Sheets get PDF export from the same base when they need it.
+
+What it costs: `officina-pdf` is moved onto `folium-syntax`,
+`folium-content` and `folium-font` in P2 (when those crates exist), with
+the Officina export gate (1,474 pages, officina.md §16.17) run before and
+after to show nothing changed in the output's rendering or speed. The
+reader's budgets live in the reading functions only, so writing pays no
+cost for them.
 
 ## 6. Budgets
 
@@ -393,7 +430,7 @@ gets a separate binary and jail, and limend picks providers per role.
 | step | what | shows |
 |---|---|---|
 | **P1** | `folium-syntax` and `folium-doc`: objects, xref and recovery, all filters but JPX/JBIG2, decryption, page tree, outline, info; a host tool `folium-dump` (page count, objects, outline); budgets and fuzzing set up | page count and outline for the whole corpus with no panics; fuzz coverage reported |
-| **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates |
+| **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1); `officina-pdf` moved onto the shared base (§5.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates; Officina's export gate unchanged and its output read back by Folium |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |
 | **P5** | forms, annotations, incremental save | edit gate |
@@ -419,3 +456,4 @@ several weeks and then ongoing as the corpus finds things.
 | D10 | Order against other work | P1–P3 next (PDFs in quick look and in their own app), then back to opening-files T5 and Player end to end; P4 continues alongside |
 | D11 | Clip paths, which FILL can't express (its clip is a rectangle) | Add a path clip to Fresco's FILL (a clip path id the server rasterizes as a coverage mask), done by the Fresco thread during P2; until it lands, non-rectangular clips go through the CPU fallback |
 | D12 | Very detailed pages | Vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; the budget is tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
+| D13 | Folium and Officina | One base: `folium-syntax`, `folium-content`, `folium-font` (and later `folium-sign`) are used by both the reader and Officina's export; `officina-pdf` moves onto them in P2, its export gate unchanged before and after |
