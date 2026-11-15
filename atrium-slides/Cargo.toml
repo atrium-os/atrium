@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "atrium-slides, Atrium's presentation app (docs/spec/officina.md §9, O6b–O6c): officina-slides decks edited on a Pergola canvas, a slide strip of thumbnails, files through the system picker (.oslides, .pptx and .odp), an autosave journal for crash recovery."
+description = "atrium-slides, Atrium's presentation app (docs/spec/officina.md §9, O6b–O6d): officina-slides decks edited on a Pergola canvas, a slide strip of thumbnails, files through the system picker (.oslides, .pptx and .odp), an autosave journal for crash recovery, and presenting: the slideshow full screen with transitions and builds run by frescod, the presenter view on another monitor."
 
 [lib]
 name = "atrium_slides"
@@ -23,6 +23,7 @@ navigator-image = { path = "../navigator-image" }
 pergola = { path = "../pergola" }
 pergola-document = { path = "../pergola-document" }
 fresco-protocol = { path = "../fresco-protocol" }
+fresco-client = { path = "../fresco-client" }
 limen = { path = "../limen" }
 libc = "0.2"
 

@@ -4,6 +4,11 @@
 //!   atrium-slides FILE     open FILE by path (development; apps get files
 //!                          from the picker)
 //!
+//! F5 (or Present) shows the deck full screen from the first slide,
+//! Shift+F5 from the current one (`atrium_slides::present`). For tests,
+//! `ATRIUM_SLIDES_PRESENT=1` presents at once and quits when the show ends,
+//! and `ATRIUM_SLIDES_PRESS_MS=N` presses Next every N ms.
+//!
 //! Files come from the system picker (scrinium.md §4.1): Open asks for one
 //! file, read-write (`.oslides`, or `.pptx`/`.odp` through the sandboxed
 //! converter); Save writes back to it in its own format; Save As asks for a folder and
@@ -285,6 +290,9 @@ fn main() {
     let mut app = App::new_with_flag(run.slides.clone(), dirty);
     let _ = win.paint(&mut app);
 
+    let mut present: Option<bool> = std::env::var_os("ATRIUM_SLIDES_PRESENT").map(|_| false);
+    let quit_after_show = present.is_some();
+    let press_every = std::env::var("ATRIUM_SLIDES_PRESS_MS").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
     let mut asking: Option<Asking> = None;
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
@@ -304,12 +312,33 @@ fn main() {
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Picture => want_picker = Some(Asking::Picture),
+                Cmd::Present(cur) => present = Some(cur),
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
                     }
                 }
                 _ => {}
+            }
+        }
+        if let (Some(cur), None) = (present.take(), asking) {
+            let (deck, start) = {
+                let d = run.slides.doc.borrow();
+                (d.deck.clone(), if cur { d.current } else { 0 })
+            };
+            let shown = atrium_slides::present::present(deck, run.slides.deck_key(), run.slides.fonts(), start, embeds.clone(), press_every, || {
+                let _ = win.step(&mut app, Some(Duration::ZERO));
+            });
+            match shown {
+                Ok(r) => {
+                    if quit_after_show {
+                        let worst = r.animations.iter().map(|a| a.1).max().unwrap_or(0);
+                        eprintln!("atrium-slides: show over at slide {}; {} animations, worst gap {worst} us", r.last + 1, r.animations.len());
+                        break;
+                    }
+                    run.slides.go(r.last);
+                }
+                Err(e) => run.set_status(format!("The slide show didn't start: {e}")),
             }
         }
         if let (Some(what), None) = (want_picker.take(), asking) {

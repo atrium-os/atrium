@@ -2484,6 +2484,57 @@ opens and draws its first slide reading one slide (debug build, well under 1 s).
   `.odp`→`.pptx`→`.odp`, 3,000 mangled packages, looping equations and absurd
   geometry.
 
+### 16.37 O6d as built (2026-11-15): presenting
+
+- **Declarative animation in frescod** (pergola.md §4.2). `OP_ANIMATION_START`
+  takes up to 64 tracks on a window's groups (transform, opacity or clip, each
+  with a delay, a duration up to 60 s, an easing curve or `STEP`); while a track
+  runs its value stands in for the group's own, so the app sets every group to
+  its end state in the frame the tracks start with. `OP_ANIMATION_CANCEL` ends
+  one at once; `EV_ANIMATION_FINISHED` reports the frames composed and the worst
+  gap between them. frescod (and each split renderer, on its own clock) composes
+  at the display's rate while anything animates; a group at opacity 0 is skipped
+  in packing, so resident slides not showing cost nothing.
+- **Monitors.** `OP_DISPLAY_OUTPUTS` lists them (identity, desktop rect, scale,
+  refresh, internal, primary); `WindowHints.full_screen_on` puts a window full
+  screen on one, which forum-wm honours (a new window avoids a monitor so
+  taken). Headless frescod takes `FRESCOD_HEADLESS_OUTPUTS=WxH,WxH` side by side.
+- **The show** (`officina-slides::show`, `atrium-slides::present`). Builds fall
+  into steps (with-previous and after-previous timed from the step's start);
+  F5 presents from the first slide, Shift+F5 from the current one, the Present
+  button likewise. The slideshow goes full screen on an external monitor that is
+  not the first, the presenter view on the first (current slide as built, the
+  next press, notes, elapsed time, clock, buttons, a sorter to jump to any slide,
+  hidden ones marked); with one monitor, the slideshow alone. Right, Down,
+  Space, Page Down, N, Enter and a click move on; Left, Up, Page Up, P,
+  Backspace go back a step at once; a number and Enter jumps; Home, End; B and W
+  blank the screen; Esc ends. Hidden slides are skipped except by a jump; past
+  the last slide a black end screen.
+- **Transitions and builds as tracks.** The current, next and previous slides
+  are resident, each a group, each moved shape a group inside it. Fade,
+  dissolve, push, cover, uncover, wipe, split (in and out) and zoom (in and out)
+  are tracks on the two slides (the old one holds at full opacity under a `STEP`
+  track, then shows its own state, hidden); appear, fade, fly in, wipe, zoom,
+  disappear and fade out likewise on the shapes, the slide's first step after
+  the transition. A press during an animation cancels it to its end state. A
+  transition's `after_ms` moves on by itself.
+- **Video** through Limen's `media-player`: once the slide has arrived, up to
+  two players go over its videos' boxes, handed the file as an unlinked temp
+  file, and play; leaving the slide detaches them.
+- **Fixes the gate found.** Each Pergola surface takes its own glyph-atlas slot
+  (two windows of one app drew with each other's atlas); a text node taking over
+  an id a fill had drops the fill (frescod kept drawing it).
+- **Gate** (`scripts/slides-present-vm.sh`, deck from `examples/show_deck.rs`:
+  every transition, five build effects, notes, a hidden slide). Headless frescod
+  with two 1280×720 outputs at 60 Hz: the slideshow full screen on the second,
+  the presenter view on the first, the show pressed through every step to the
+  end screen with every build and transition drawn as specified and the
+  presenter view matching. Smoothness: under TCG in the cloud container a frame
+  takes about a second, so every animation shows 2–3 frames (worst gap 1.5 s);
+  that is the emulator. The 60 Hz figure (no gap over one period) waits for a
+  run on the Mac VM (HVF) or the box. Unit tests: monitor choice, letterboxing,
+  transition and build tracks with their times, keys.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

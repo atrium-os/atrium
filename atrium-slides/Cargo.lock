@@ -91,6 +91,7 @@ dependencies = [
 name = "atrium-slides"
 version = "0.1.0"
 dependencies = [
+ "fresco-client",
  "fresco-protocol",
  "libc",
  "limen",

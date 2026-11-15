@@ -67,6 +67,8 @@ pub enum Cmd {
     Group,
     Ungroup,
     SelectAll,
+    /// Present the deck: from the first slide, or (true) from the current.
+    Present(bool),
 }
 
 /// The Arrange menu: (label, command).
@@ -250,6 +252,16 @@ impl Slides {
         }
         l.map.insert(id, v.clone());
         v
+    }
+
+    /// The fonts slides are laid out with.
+    pub fn fonts(&self) -> Rc<dyn Fonts> {
+        self.fonts.clone()
+    }
+
+    /// What names this deck to the picture cache.
+    pub fn deck_key(&self) -> u64 {
+        self.deck_key.get()
     }
 
     fn cmd(&self, c: Cmd) -> impl Fn() + Send + Sync + 'static {
@@ -498,7 +510,7 @@ impl Slides {
                 let to = if c == Cmd::BringForward { at + 1 } else { at.saturating_sub(1) };
                 d.run(if c == Cmd::BringForward { "Bring Forward" } else { "Send Backward" }, vec![DeckOp::MoveShape { target: Target::Slide(sid), id, to }]);
             }
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture => return false,
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) => return false,
         }
         drop(d);
         self.changed();
@@ -856,6 +868,10 @@ impl Slides {
         if *kind == KeyEventKind::Up {
             return false;
         }
+        if *key == Key::F(5) {
+            self.cmds.lock().unwrap().push(Cmd::Present(m.shift));
+            return true;
+        }
         let cmd = m.ctrl || m.meta;
         let lower = chars.to_ascii_lowercase();
         if cmd && *key == Key::Char {
@@ -1085,6 +1101,8 @@ impl View for Slides {
             MenuButton::new("Arrange", self.arrange_menu.clone(), items, move |i| cmds.lock().unwrap().push(ARRANGE[i.min(ARRANGE.len() - 1)].1)).at(x, 8.0).width(92.0).render(ctx);
             x += 100.0;
         }
+        Button::primary("Present").at(x, 8.0).width(88.0).on_click(self.cmd(Cmd::Present(false))).render(ctx);
+        x += 96.0;
         let (name, dirty, status, n, cur) = {
             let d = self.doc.borrow();
             (d.name.clone(), d.dirty, d.status.clone(), d.deck.slide_count(), d.current)

@@ -1700,6 +1700,9 @@ impl EnvelopeFrontend {
         s.rect_nodes.remove(&p.node_id);
         s.texture_nodes.remove(&p.node_id);
         s.path_nodes.remove(&p.node_id);
+        // A fill this id was before goes too (a slide's shape whose id
+        // a line of text took over stayed drawn under it).
+        s.fill_nodes.remove(&p.node_id);
         s.node_writers.insert(p.node_id, writer);
         Ok(Vec::new())
     }

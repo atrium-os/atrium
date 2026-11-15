@@ -172,6 +172,8 @@ pub struct FrescoSurface {
     atlas_gen: u64,
     /// The version the current window's atlas slot holds.
     atlas_seen: Option<u64>,
+    /// The atlas's texture slot.
+    atlas_slot: u32,
     /// Images bound to texture slots, by image id.
     images: std::collections::HashSet<u32>,
     /// Where this window's drawn edges went.
@@ -202,8 +204,17 @@ struct WindowState {
 /// Image texture slots: this bit plus the image's id.
 pub const IMAGE_SLOT_BIT: u32 = 0x4000_0000;
 
-/// The window's glyph atlas texture slot.
+/// The first surface's glyph atlas texture slot; each further surface in
+/// the process takes the next ([`next_atlas_slot`]). frescod binds a slot's
+/// texture by its number, so two surfaces of one app (a slideshow and its
+/// presenter view) must not share one: each would draw with the other's
+/// atlas.
 pub const ATLAS_SLOT: u32 = 0x00A7_1A50;
+
+fn next_atlas_slot() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    ATLAS_SLOT + (NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFFF)
+}
 
 /// A span (`x`, `w` in points) in device pixels at scale `k`, snapped so
 /// its drawn edges fall on device pixels (resolution-independence.md §5):
@@ -540,7 +551,7 @@ impl FrescoSurface {
         let scale = conn.window_scale(window_id);
         Self {
             conn, window_id, fonts: std::collections::HashMap::new(), scale, scrolls: Default::default(),
-            atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, images: Default::default(),
+            atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, atlas_slot: next_atlas_slot(), images: Default::default(),
             edges: Default::default(),
             sent: Default::default(),
             others: Default::default(),
@@ -651,16 +662,16 @@ impl FrescoSurface {
                 self.atlas_gen += 1;
             }
             let hash = self.conn.upload_blob(self.atlas.pixels())?;
-            self.conn.slot_set_texture(ATLAS_SLOT, hash, ATLAS_W, ATLAS_H, fresco_protocol::TextureFormat::R8Unorm)?;
+            self.conn.slot_set_texture(self.atlas_slot, hash, ATLAS_W, ATLAS_H, fresco_protocol::TextureFormat::R8Unorm)?;
         } else if let Some((y, rows, px)) = self.atlas.take_dirty() {
             let px = px.to_vec();
-            self.conn.slot_update_region(ATLAS_SLOT, 0, y, ATLAS_W, rows, px)?;
+            self.conn.slot_update_region(self.atlas_slot, 0, y, ATLAS_W, rows, px)?;
             self.atlas_gen += 1;
         }
         self.atlas_seen = Some(self.atlas_gen);
         Ok(fresco_protocol::GlyphRunParams {
             x: (origin.x * k).round(), y: (origin.y * k).round(),
-            atlas_slot_id: ATLAS_SLOT, atlas_width: ATLAS_W, atlas_height: ATLAS_H,
+            atlas_slot_id: self.atlas_slot, atlas_width: ATLAS_W, atlas_height: ATLAS_H,
             r: color.r, g: color.g, b: color.b, a: color.a,
             glyphs: out,
         })
