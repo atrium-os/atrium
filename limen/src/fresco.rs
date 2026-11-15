@@ -54,8 +54,9 @@ impl Compositor for Frescod {
             SlotKind::Island => slot::kind::ISLAND,
             SlotKind::Sheet { .. } => slot::kind::SHEET,
         };
-        // A sheet's size is the role's, never the parent's (frescod
-        // places it).
+        // A sheet's size is the role's, never the parent's: frescod
+        // places it, growing it to the sheet's own minimum where that is
+        // larger (resolution-independence.md §7.1).
         let rect = match kind_of {
             SlotKind::Sheet { w, h } => rect.map(|_| [0.0, 0.0, w as f32, h as f32]),
             _ => rect,

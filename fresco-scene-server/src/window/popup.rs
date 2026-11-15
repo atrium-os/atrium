@@ -331,7 +331,7 @@ impl Compositor {
     /// app's pop-up (`trusted` false) is kept below the trusted strip and
     /// below the shell's bar at the monitor's top: the bar stacks above
     /// it (§2), so what went under the bar could not be seen or pressed.
-    fn bounds_at(&self, x: f32, y: f32, trusted: bool) -> Option<[f32; 4]> {
+    pub(super) fn bounds_at(&self, x: f32, y: f32, trusted: bool) -> Option<[f32; 4]> {
         let b = self.popup_bounds
             .iter()
             .find(|b| x >= b[0] && x < b[0] + b[2] && y >= b[1] && y < b[1] + b[3])

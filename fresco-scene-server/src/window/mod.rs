@@ -1254,6 +1254,10 @@ impl Compositor {
         if w.min_size != pt {
             w.min_size = pt;
             self.emit(DisplayEvent::WindowMinSize { window_id: id as u32 });
+            // A sheet is sized by frescod: it grows to its minimum.
+            if self.is_sheet(id) {
+                self.place_slots();
+            }
         }
     }
 
@@ -1713,7 +1717,14 @@ impl Compositor {
             };
             self.z_order.retain(|&w| w != id);
             let [x, y, w, h] = if c.kind == fresco_protocol::slot::kind::SHEET {
-                sheet_rect(psize, (c.rect[2], c.rect[3]), pscale)
+                // The larger of the role's size and the sheet's own
+                // minimum, capped to the parent's monitor below the bar,
+                // and kept on it (resolution-independence.md §7.1).
+                let min = self.windows[&id].min_size;
+                let want = (c.rect[2].max(min.0 as f32), c.rect[3].max(min.1 as f32));
+                let centre = (ppos.0 + psize.0 / 2.0, ppos.1 + psize.1 / 2.0);
+                let room = self.bounds_at(centre.0, centre.1, false).map(|b| [b[0] - ppos.0, b[1] - ppos.1, b[2], b[3]]);
+                sheet_rect_in(psize, want, pscale, room)
             } else {
                 c.rect
             };
@@ -1874,6 +1885,29 @@ pub fn sheet_rect(psize: (f32, f32), size: (f32, f32), scale_milli: u32) -> [f32
     let y = (SHEET_TOP * k).floor().min(((psize.1 - h) / 2.0).floor()).max(0.0);
     [x, y, w, h]
 }
+
+/// [`sheet_rect`], with the sheet kept inside `room` (parent coordinates,
+/// device pixels: the parent's monitor below the bar) when given: no
+/// larger than it, less [`SHEET_MARGIN`] points each side where it fits,
+/// and moved onto it where the parent hangs off it.
+pub fn sheet_rect_in(psize: (f32, f32), size: (f32, f32), scale_milli: u32, room: Option<[f32; 4]>) -> [f32; 4] {
+    let Some([rx, ry, rw, rh]) = room else { return sheet_rect(psize, size, scale_milli) };
+    let k = scale_milli as f32 / 1000.0;
+    let m = SHEET_MARGIN * k;
+    let cap = |want: f32, room: f32| (want * k).floor().min(if room > 2.0 * m + 1.0 { room - 2.0 * m } else { room }).max(1.0);
+    let (w, h) = (cap(size.0, rw), cap(size.1, rh));
+    let x = ((psize.0 - w) / 2.0).floor();
+    let y = (SHEET_TOP * k).floor().min(((psize.1 - h) / 2.0).floor()).max(0.0);
+    let fit = |v: f32, len: f32, lo: f32, room: f32| {
+        let (lo_m, hi_m) = if room >= len + 2.0 * m { (lo + m, lo + room - m) } else { (lo, lo + room) };
+        if v + len > hi_m { (hi_m - len).floor().max(lo) } else if v < lo_m { lo_m.ceil().min(lo + room - len) } else { v }
+    };
+    [fit(x, w, rx, rw), fit(y, h, ry, rh), w, h]
+}
+
+/// The least gap between a sheet and its monitor's edges, in points,
+/// where the monitor has room for it.
+pub const SHEET_MARGIN: f32 = 16.0;
 
 /// How far below its parent's top edge a sheet sits, in points.
 pub const SHEET_TOP: f32 = 48.0;
@@ -2351,6 +2385,31 @@ mod notification_tests {
         assert_eq!(c.sheet_of(p), None);
         assert_eq!(c.key_target(p), p);
         assert_eq!(c.keyboard_window(), p as u32);
+    }
+
+    #[test]
+    fn a_sheet_grows_to_its_own_minimum_but_stays_on_its_monitor() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        c.popup_bounds = vec![[0.0, 0.0, 1920.0, 1080.0]];
+        let p = c.create(1, (760, 540));
+        let s = c.create(2, (10, 10));
+        assert_eq!(c.bind_slot(s, p, kind::SHEET, Some([0.0, 0.0, 640.0, 440.0]), 0), Ok(()));
+        assert_eq!(c.windows[&s].size, (640.0, 440.0), "the role's size");
+        // Text size 200: the picker's minimum outgrows the role's size.
+        c.set_min_size(s, (900, 600));
+        assert_eq!(c.windows[&s].size, (900.0, 600.0), "grows to its minimum");
+        // Only where it is larger: a small minimum keeps the role's size.
+        c.set_min_size(s, (300, 700));
+        assert_eq!(c.windows[&s].size, (640.0, 700.0));
+        // Never past the monitor, less a margin each side, and kept on it.
+        c.set_min_size(s, (3000, 3000));
+        let (pos, size) = (c.windows[&s].pos, c.windows[&s].size);
+        let m = SHEET_MARGIN;
+        assert_eq!(size, (1920.0 - 2.0 * m, 1080.0 - 2.0 * m));
+        assert_eq!(pos, (m, m), "moved onto the monitor");
+        // At scale 2 the same minimum in points is twice the pixels, still capped.
+        assert_eq!(sheet_rect_in((760.0, 540.0), (900.0, 600.0), 2000, Some([-200.0, -100.0, 3840.0, 2160.0])), [-168.0, 0.0, 1800.0, 1200.0], "and kept a margin inside the monitor");
     }
 
     #[test]

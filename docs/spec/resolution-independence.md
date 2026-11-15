@@ -421,6 +421,10 @@ parent's scale, so it keeps its size and its place against the parent on any mon
   Its size is the larger of the catalogue size and the sheet's own natural minimum (so at
   text size 150% a picker grows rather than clipping), capped to the parent's monitor in pt.
   It stays centred across the parent and hangs past a smaller parent, as now.
+  **Built 2026-11-15:** frescod sizes a sheet to the larger of the role's size and the
+  sheet window's `WindowHints.min_size`, re-placing it when that changes, capped to the
+  parent's monitor below the bar less `SHEET_MARGIN` (16 pt) each side and moved onto it
+  (`sheet_rect_in`); the Scrinium picker states its minimum in em (`pick_min_size`).
 - **System dialogs** (WM role Dialog, e.g. Sigillum's sheets) get at least their minimum
   size in the work area; one whose minimum is taller than the work area grows down over the
   dock (dialogs are layered above it) to the screen's foot, never over the bar, so a sheet

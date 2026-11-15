@@ -60,10 +60,17 @@ pub fn compact(h: f32) -> bool {
 }
 pub fn pick_side_w() -> f32 { em(176.0) }
 /// The picker's places in a sheet `w` wide: [`pick_side_w`], but no more
-/// than three tenths of it, so names keep their room when the text grows
-/// and the sheet doesn't (its size is the catalogue's, limen.md §5.1).
+/// than three tenths of it, so names keep their room in a sheet held
+/// smaller than [`pick_min_size`] (by its monitor).
 pub fn pick_side_for(w: f32) -> f32 {
     pick_side_w().min(w * 0.3)
+}
+/// The picker's natural minimum, in em so it grows with the text size:
+/// its places, a name and a size column, its heading, path row, six rows
+/// and its buttons. At text size 100 it is inside the catalogue's 640 x
+/// 440, which frescod gives the sheet unless this is larger.
+pub fn pick_min_size() -> pergola::geom::Size {
+    pergola::geom::Size::new(pick_side_w() + em(420.0), pick_title_h() + pick_path_h() + 6.0 * row_h() + pick_foot_h())
 }
 pub fn toolbar_h() -> f32 { em(48.0) }
 pub fn actions_h() -> f32 { em(40.0) }
@@ -401,7 +408,12 @@ impl View for ScriniumView {
                     self.open_sheet(ctx, &b, w, h);
                 }
             }
-            Mode::Picker { .. } => self.picker(ctx, &b, w, h),
+            Mode::Picker { .. } => {
+                // The sheet grows to this when the text outgrows the
+                // catalogue's size (resolution-independence.md §7.1).
+                ctx.min_size(pick_min_size());
+                self.picker(ctx, &b, w, h)
+            }
         }
     }
 }
@@ -1277,6 +1289,10 @@ mod tests {
             assert!(tx.iter().any(|t| t == want), "{want} in {tx:?}");
         }
         assert!(!tx.iter().any(|t| t == "New folder"), "a picker changes nothing");
+        // It states a minimum for frescod to grow its sheet to, inside
+        // the catalogue's 640 x 440 at text size 100.
+        let m = app.tree().min_size().expect("the picker states its minimum");
+        assert!(m.w <= 640.0 && m.h <= 440.0 && m.w >= 500.0, "{m:?}");
         with(&state, |b| b.press(0, Mods::default(), 0.0));
         app.tick();
         assert!(texts(&app).iter().any(|t| t == "“hello.txt”"));
