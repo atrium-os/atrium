@@ -22,6 +22,13 @@
 //!
 //! Ctrl+Shift+N asks for a new console window in the same app. Every ask
 //! carries the key press that made it, which portcullisd spends.
+//!
+//! **On its own** (homes.md §5.3, W7): opened from the Applications grid,
+//! with no console on its way, it asks for the **empty** console, a shell
+//! that reaches nothing. A strip at the top names where each window's shell
+//! is; a click on it (or Ctrl+Shift+O) opens the switcher: Empty and the
+//! person's workspaces. Choosing one is a press that moves this window to
+//! a shell there (portcullisd starts or reattaches it).
 
 mod keymap;
 mod pty;
@@ -54,6 +61,14 @@ const HID_T: u16 = 0x17;
 const HID_N: u16 = 0x11;
 const HID_PAGE_UP: u16 = 0x4B;
 const HID_PAGE_DOWN: u16 = 0x4E;
+const HID_O: u16 = 0x12;
+const HID_ENTER: u16 = 0x28;
+const HID_ESC: u16 = 0x29;
+const HID_DOWN: u16 = 0x51;
+const HID_UP: u16 = 0x52;
+/// How long a terminal opened on its own waits for a console before it
+/// asks for the empty one.
+const ALONE_AFTER: Duration = Duration::from_millis(1500);
 
 /// Where a window's screen comes from.
 enum Io {
@@ -182,6 +197,65 @@ struct Session {
     dirty:    bool,
     /// What the trace last printed.
     traced:   String,
+    /// The strip and the switcher's state; the switcher's targets.
+    strip:    render::Strip,
+    targets:  Vec<String>,
+}
+
+/// What the strip calls a console target.
+fn place_name(app: Option<&str>) -> String {
+    match app {
+        None => "Terminal".into(),
+        Some("empty") => "Empty (reaches nothing)".into(),
+        Some(a) => match a.strip_prefix("workspace/") {
+            Some(w) => format!("Workspace: {w}"),
+            None => format!("App: {}", a.rsplit('.').next().unwrap_or(a)),
+        },
+    }
+}
+
+fn portcullisd() -> Result<std::os::unix::net::UnixStream, String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not reachable")?;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| e.to_string())?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { .. }) => Ok(s),
+        other => Err(format!("handshake: {other:?}")),
+    }
+}
+
+/// The person's workspaces, for the switcher.
+fn workspaces() -> Vec<String> {
+    use portcullis_ipc::{round_trip, Request, Response};
+    let Ok(mut s) = portcullisd() else { return Vec::new() };
+    match round_trip(&mut s, &Request::Workspaces) {
+        Ok(Response::WorkspaceList { workspaces, .. }) => workspaces.into_iter().map(|w| w.name).collect(),
+        other => {
+            eprintln!("atrium-term-socket: the workspaces: {other:?}");
+            Vec::new()
+        }
+    }
+}
+
+impl Session {
+    fn open_switcher(&mut self) {
+        let mut items = vec!["Empty".to_string()];
+        let mut targets = vec!["empty".to_string()];
+        for w in workspaces() {
+            items.push(format!("Workspace: {w}"));
+            targets.push(format!("workspace/{w}"));
+        }
+        let sel = targets.iter().position(|t| Some(t.as_str()) == self.app.as_deref()).unwrap_or(0);
+        self.strip.menu = Some((items, sel));
+        self.targets = targets;
+        self.dirty = true;
+    }
+
+    fn close_switcher(&mut self) {
+        self.strip.menu = None;
+        self.dirty = true;
+    }
 }
 
 struct Font { id: u32, size: f32, cell_w: f32, line_h: f32, ascent: f32 }
@@ -196,14 +270,19 @@ fn open_window(conn: &mut Connection, font: &Font, title: &str, mut io: Io, app:
     eprintln!("atrium-term-socket: window {win} “{title}”");
     // Stoa: grid diffs, at our size; the first datagram also tells stoad
     // where we are, and it answers with the whole screen.
+    if app.is_some() {
+        renderer.top = render::STRIP_H;
+    }
     io.control(Control::SyncMode);
     io.resize(COLS, ROWS);
-    Ok(Session { win, title: title.into(), app, io, keymap: keymap::Keymap::new(), renderer, dirty: true, traced: String::new() })
+    let strip = render::Strip { place: place_name(app.as_deref()), hint: "switch: click or Ctrl+Shift+O".into(), menu: None };
+    Ok(Session { win, title: title.into(), app, io, keymap: keymap::Keymap::new(), renderer, dirty: true, traced: String::new(),
+                 strip, targets: Vec::new() })
 }
 
 fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
     conn.set_default_window(s.win as u16);
-    s.renderer.render(conn, s.io.grid())?;
+    s.renderer.render(conn, s.io.grid(), &s.strip)?;
     s.dirty = false;
     if trace {
         let g = s.io.grid();
@@ -212,6 +291,10 @@ fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
             .filter(|l| !l.is_empty())
             .collect();
         let t = rows.join(" | ");
+        let t = match &s.strip.menu {
+            Some((items, sel)) => format!("[{}] menu={}@{sel} {t}", s.strip.place, items.join(",")),
+            None => format!("[{}] {t}", s.strip.place),
+        };
         if t != s.traced {
             eprintln!("atrium-term: screen “{}”: {t}", s.title);
             s.traced = t;
@@ -220,17 +303,13 @@ fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Ask portcullisd for more of `app`: a tab in Stoa session `tab_of`, or a
-/// new window. `activation` is the key press.
-fn ask_more(app: &str, tab_of: Option<String>, activation: [u8; 16]) -> Result<(), String> {
-    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
-    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not reachable")?;
-    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| e.to_string())?;
-    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
-        Ok(Response::Hello { .. }) => {}
-        other => return Err(format!("handshake: {other:?}")),
-    }
-    match round_trip(&mut s, &Request::Console { app_id: app.into(), activation, tab_of, new_window: true }) {
+/// Ask portcullisd for a console of `app`: a tab in Stoa session `tab_of`,
+/// a new window, or (neither) one this window switches to. `activation` is
+/// the press.
+fn ask(app: &str, tab_of: Option<String>, new_window: bool, activation: [u8; 16]) -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response};
+    let mut s = portcullisd()?;
+    match round_trip(&mut s, &Request::Console { app_id: app.into(), activation, tab_of, new_window }) {
         Ok(Response::ConsoleOpened { .. }) => Ok(()),
         Ok(Response::Error { message }) => Err(message),
         other => Err(format!("{other:?}")),
@@ -275,6 +354,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("atrium-term-socket: waiting for consoles");
     }
     let mut ever = !sessions.is_empty();
+    // On its own (no console on its way): the empty console, once.
+    let alone_at = channel.is_some().then(|| std::time::Instant::now() + ALONE_AFTER);
+    let mut asked_alone = false;
+    // A switch asked for: (window, target); its console replaces that
+    // window's shell when it comes.
+    let mut pending: Option<(u32, String)> = None;
+    let short = libc::timespec { tv_sec: 0, tv_nsec: 200_000_000 };
 
     let kq = unsafe { libc::kqueue() };
     if kq < 0 { return Err(io::Error::last_os_error().into()); }
@@ -299,7 +385,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idle = libc::timespec { tv_sec: 5, tv_nsec: 0 };
 
     loop {
-        let timeout = if ever && sessions.is_empty() { &idle as *const _ } else { ptr::null() };
+        let waiting_alone = !ever && !asked_alone && alone_at.is_some();
+        let timeout = if waiting_alone { &short as *const _ } else if ever && sessions.is_empty() { &idle as *const _ } else { ptr::null() };
         let n = unsafe {
             libc::kevent(kq, ptr::null(), 0,
                 events.as_mut_ptr() as *mut libc::kevent, events.len() as libc::c_int, timeout)
@@ -309,7 +396,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if e.kind() == io::ErrorKind::Interrupted { continue; }
             return Err(e.into());
         }
-        if n == 0 && sessions.is_empty() {
+        if waiting_alone && alone_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            asked_alone = true;
+            // Nothing to reach, so no press is needed.
+            match ask("empty", None, false, [0; 16]) {
+                Ok(()) => eprintln!("atrium-term-socket: on its own: the empty console"),
+                Err(e) => {
+                    // Nothing to show and nothing coming: don't linger unseen.
+                    eprintln!("atrium-term-socket: the empty console: {e}");
+                    if sessions.is_empty() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if n == 0 && sessions.is_empty() && !waiting_alone {
             break;
         }
 
@@ -338,6 +440,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("atrium-term-socket: “{}” ({}) is not a console; ignored", o.name, o.mime);
                             continue;
                         };
+                        // The console a switch asked for: this window's shell now.
+                        if let Some((w, _)) = pending.take_if(|(_, t)| Some(t.as_str()) == app.as_deref()) {
+                            if let Some(s) = sessions.iter_mut().find(|s| s.win == w) {
+                                let (cols, rows) = (s.io.grid().cols(), s.io.grid().rows());
+                                let _ = unregister(kq, s.io.fd());
+                                // The old one detaches (Stoa) or ends (a bare pty).
+                                let mut io = io;
+                                if let Io::Stoa { grid, .. } = &mut io {
+                                    grid.resize(cols, rows);
+                                }
+                                io.control(Control::SyncMode);
+                                io.resize(cols, rows);
+                                s.io = io;
+                                register_read(kq, s.io.fd())?;
+                                eprintln!("atrium-term-socket: window {} now “{}”", s.win, o.name);
+                                s.title = o.name.clone();
+                                s.app = app;
+                                s.strip.place = place_name(s.app.as_deref());
+                                s.close_switcher();
+                                draw(&mut conn, s, trace)?;
+                                continue;
+                            }
+                        }
                         let k = sessions.len() as i32;
                         let s = open_window(&mut conn, &font, &o.name, io, app, (200 + 32 * k, 160 + 32 * k))?;
                         register_read(kq, s.io.fd())?;
@@ -356,9 +481,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if fd == sock_fd {
                 while let Some(input) = conn.poll_event()? {
                     let Some(s) = sessions.iter_mut().find(|s| match &input {
-                        Event::Key { window_id, .. } | Event::Resized { window_id, .. } | Event::CloseRequested { window_id } => *window_id == s.win,
+                        Event::Key { window_id, .. } | Event::Resized { window_id, .. } | Event::CloseRequested { window_id }
+                        | Event::PointerButton { window_id, .. } => *window_id == s.win,
                         _ => false,
                     }) else { continue };
+                    // The switcher: a press on a row (or Enter) moves this
+                    // window there.
+                    let mut choose: Option<(usize, [u8; 16])> = None;
+                    // Modifiers always reach the keymap, or a Ctrl let go
+                    // while the switcher had the keys would stay held.
+                    if let Event::Key { hid_usage: h @ 0xe0..=0xe7, pressed, .. } = &input {
+                        if s.strip.menu.is_some() {
+                            let _ = s.keymap.handle(*h, *pressed);
+                            continue;
+                        }
+                    }
+                    let mut taken = false;
+                    match &input {
+                        Event::PointerButton { pressed: true, x, y, activation, .. } if s.app.is_some() => {
+                            let hit = s.strip.menu.as_ref().and_then(|(items, _)| (0..items.len()).find(|&i| {
+                                let (rx, ry, rw, rh) = s.renderer.menu_row(i);
+                                *x >= rx && *x < rx + rw && *y >= ry && *y < ry + rh
+                            }));
+                            if let Some(i) = hit {
+                                choose = Some((i, *activation));
+                            } else if *y < s.renderer.top && s.strip.menu.is_none() {
+                                s.open_switcher();
+                            } else if s.strip.menu.is_some() {
+                                s.close_switcher();
+                            }
+                        }
+                        Event::Key { hid_usage: HID_O, pressed: true, modifiers, repeat: false, .. }
+                            if modifiers & 0x11 != 0 && modifiers & 0x22 != 0 && s.app.is_some() =>
+                        {
+                            if s.strip.menu.is_some() { s.close_switcher() } else { s.open_switcher() }
+                            taken = true;
+                        }
+                        Event::Key { hid_usage, pressed: true, activation, repeat, .. } if s.strip.menu.is_some() => {
+                            let n = s.strip.menu.as_ref().map(|m| m.0.len()).unwrap_or(0);
+                            let sel = s.strip.menu.as_ref().map(|m| m.1).unwrap_or(0);
+                            match *hid_usage {
+                                HID_UP => { if let Some(m) = &mut s.strip.menu { m.1 = sel.saturating_sub(1) } s.dirty = true }
+                                HID_DOWN => { if let Some(m) = &mut s.strip.menu { m.1 = (sel + 1).min(n.saturating_sub(1)) } s.dirty = true }
+                                HID_ENTER if !*repeat => choose = Some((sel, *activation)),
+                                HID_ESC => s.close_switcher(),
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Some((i, activation)) = choose {
+                        let target = s.targets.get(i).cloned().unwrap_or_default();
+                        s.close_switcher();
+                        if target.is_empty() || Some(target.as_str()) == s.app.as_deref() {
+                            continue;
+                        }
+                        pending = Some((s.win, target.clone()));
+                        match ask(&target, None, false, activation) {
+                            Ok(()) => eprintln!("atrium-term-socket: window {} switching to {target}", s.win),
+                            Err(e) => {
+                                eprintln!("atrium-term-socket: switch to {target}: {e}");
+                                pending = None;
+                                s.strip.hint = format!("not switched: {e}");
+                                s.dirty = true;
+                            }
+                        }
+                        continue;
+                    }
+                    if taken || (s.strip.menu.is_some() && matches!(input, Event::Key { .. } | Event::PointerButton { .. })) {
+                        continue;
+                    }
                     match input {
                         Event::Key { hid_usage, pressed: true, modifiers, activation, repeat: false, .. }
                             if modifiers & 0x11 != 0 && modifiers & 0x22 != 0 && (hid_usage == HID_T || hid_usage == HID_N) && s.app.is_some() =>
@@ -370,7 +562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Io::Stoa { session, .. } if hid_usage == HID_T => Some(session.clone()),
                                 _ => None,
                             };
-                            if let Err(e) = ask_more(&app, tab_of, activation) {
+                            if let Err(e) = ask(&app, tab_of, true, activation) {
                                 eprintln!("atrium-term-socket: more of {app}: {e}");
                             }
                         }

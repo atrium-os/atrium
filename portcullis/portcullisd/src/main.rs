@@ -52,6 +52,7 @@ use portcullis_ipc::{
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod console;
+mod empty;
 mod launch;
 mod workspace;
 use portcullisd::manifest_trust;
@@ -1183,7 +1184,9 @@ fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
-        Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_workspaces(app),
+        // The terminal lists them only, for its switcher (homes.md §5.3).
+        Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_workspaces(app)
+            || (matches!(req, Request::Workspaces) && launch::app_shows_consoles(app)),
         // Not an app: a person, with a home, asking about their own.
         None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
     };
@@ -1245,17 +1248,35 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
     // The Workspaces app opens workspaces' terminals as a launcher does.
     let launcher = caller.as_deref().is_some_and(|c| launch::app_may_launch_apps(c)
         || (app_id.starts_with(console::WORKSPACE_PREFIX) && launch::app_manages_workspaces(c))) && tab_of.is_none();
-    let terminal = caller.as_deref().is_some_and(launch::app_shows_consoles) && match &tab_of {
+    let shows = caller.as_deref().is_some_and(launch::app_shows_consoles);
+    /* homes.md §5.3 (W7): the terminal may open the empty console at any
+     * time (it reaches nothing), and may switch one of its tabs into any
+     * other console (`tab_of` none, not a new window): that one takes the
+     * press like a launcher's. */
+    let to_empty = app_id == empty::TARGET;
+    let switch = shows && tab_of.is_none() && !new_window && !to_empty;
+    let terminal = shows && (to_empty || switch || match &tab_of {
         Some(t) => mine.iter().any(|(n, _)| n == t),
         None => new_window && (console::live(owner, app_id) || !mine.is_empty()),
-    };
+    });
     if !launcher && !terminal {
         return refuse(format!("cap.console.denied: only a launcher opens consoles, and the terminal more of one it shows (caller {})",
                               caller.as_deref().unwrap_or("is not a launched app")));
     }
     // A workspace (homes.md §5) or an app (§4): where the shell goes.
     let ws_groups: Vec<u32>;
-    let (jid, app_uid, gid, home, kind, title) = if let Some(ws) = app_id.strip_prefix(console::WORKSPACE_PREFIX) {
+    let (jid, app_uid, gid, home, kind, title) = if to_empty {
+        // Nothing to reach, so no press: a new tab or window of it is free.
+        if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
+            return refuse(format!("the terminal: {why}"));
+        }
+        let (jid, uid, gid) = match empty::start(owner) {
+            Ok(v) => v,
+            Err(why) => return refuse(why),
+        };
+        ws_groups = Vec::new();
+        (jid, uid, gid, "/tmp".to_string(), console::Kind::App, "Terminal".to_string())
+    } else if let Some(ws) = app_id.strip_prefix(console::WORKSPACE_PREFIX) {
         if !workspace::valid_name(ws) {
             return refuse(format!("{ws:?} is not a workspace name"));
         }
@@ -1331,7 +1352,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         /* Stoa: Terminal on the app comes back to a session left running
          * (the window was closed); otherwise a new shell, in a new session
          * or, for a tab, the terminal's. */
-        let back = (launcher && !new_window).then(|| mine.iter().find(|(_, att)| !att).map(|(n, _)| n.clone())).flatten();
+        let back = ((launcher || switch || to_empty) && !new_window).then(|| mine.iter().find(|(_, att)| !att).map(|(n, _)| n.clone())).flatten();
         let session = match back {
             Some(n) => {
                 eprintln!("portcullisd: console {n} reattached for {owner}");

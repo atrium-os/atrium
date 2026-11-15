@@ -346,6 +346,20 @@ people ship without `sshd` on the host.
 7. **W7 Terminal app.** Empty-jail shell, the switcher, the grid entry.
    Gate: an empty tab sees no home and no network; switching to Scratch
    needs the press and lands in `~/work`.
+   **Built 2026-11-15**: portcullisd's console target `empty`
+   (`portcullisd/src/empty.rs`): a persistent jail `empty_<person>` whose
+   root, made again at each start, holds only the toolbox, `/dev`, `/etc`
+   (its two accounts), `/root` and `/tmp`; vnet with nothing but `lo0`;
+   its own uid (registered `console/empty`). It needs no press, and the
+   terminal (`consoles`) may ask for it any time; Terminal opened alone
+   asks for it after 1.5 s with no console on its way. The strip at the
+   top of each window names where the shell is; a click on it or
+   Ctrl+Shift+O opens the switcher (Empty and the person's workspaces;
+   app consoles still come from an app's icon), and a press on a row or
+   Enter asks portcullisd for that console with `tab_of` none and not a
+   new window, which takes the press like a launcher's and reattaches a
+   detached session; it replaces the window's shell, the old one detaching.
+   Gate `scripts/vm-terminal-check.sh` 0 failed.
 8. **W8 download cache and Duplicate.** Gate: a crate fetched in one
    workspace is not fetched again in another; a duplicate builds without
    recompiling.
