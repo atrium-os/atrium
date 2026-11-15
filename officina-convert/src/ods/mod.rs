@@ -5,6 +5,7 @@ pub(crate) mod chart;
 pub(crate) mod condfmt;
 pub mod formula;
 pub(crate) mod macros;
+pub(crate) mod pivot;
 pub mod read;
 pub mod write;
 

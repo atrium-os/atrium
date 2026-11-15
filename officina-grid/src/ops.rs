@@ -53,6 +53,9 @@ pub enum GridOp {
     Tables(Vec<crate::tables::Table>),
     /// The workbook's charts, swapped in whole.
     Charts(Vec<crate::charts::Chart>),
+    /// The workbook's pivot tables with where their output is, swapped in whole
+    /// (their cells change by the `Replace`s beside it).
+    Pivots(Vec<(crate::pivot::Pivot, Option<Rect>)>),
 }
 
 impl GridOp {
@@ -145,6 +148,14 @@ impl GridOp {
                 }
                 return w.into_bytes();
             }
+            GridOp::Pivots(ps) => {
+                w.u8(7);
+                w.var(ps.len() as u64);
+                for (p, area) in ps {
+                    p.encode(&mut w, *area);
+                }
+                return w.into_bytes();
+            }
             GridOp::Batch(ops) => {
                 w.u8(3);
                 w.var(ops.len() as u64);
@@ -216,6 +227,17 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 7 {
+            let n = r.count("pivot tables", crate::pivot::MAX_PIVOTS as u64, 8)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(crate::pivot::Pivot::decode(&mut r)?);
+            }
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Pivots(v));
         }
         if kind == 4 {
             let f = crate::filter::FilterState::decode(&mut r)?;
@@ -299,6 +321,7 @@ impl Op<Workbook> for GridOp {
             GridOp::Filter(f) => GridOp::Filter(wb.replace_filter(f)),
             GridOp::Tables(ts) => GridOp::Tables(wb.replace_tables(ts)),
             GridOp::Charts(cs) => GridOp::Charts(wb.replace_charts(cs)),
+            GridOp::Pivots(ps) => GridOp::Pivots(wb.replace_pivots(ps)),
             GridOp::Batch(ops) => {
                 // The inverse undoes them in reverse order.
                 let mut inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(wb)).collect();

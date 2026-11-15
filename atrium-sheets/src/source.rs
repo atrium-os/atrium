@@ -113,6 +113,29 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
     Some(cv)
 }
 
+/// A pivot table's cell: header and total rows bold on a light band, page fields
+/// bold, as Excel's default pivot style shows them.
+pub fn pivot_view(cv: Option<CellView>, role: officina_grid::pivot::Role) -> Option<CellView> {
+    use officina_grid::pivot::Role;
+    let band = rgb(0xDDEBF7);
+    match role {
+        Role::Header | Role::Total => {
+            let mut cv = cv.unwrap_or_else(|| CellView::text(""));
+            cv.bold = true;
+            cv.fill = cv.fill.or(Some(band));
+            if role == Role::Total {
+                cv.borders[2] = Some((1.0, rgb(0x9BC2E6)));
+            }
+            Some(cv)
+        }
+        Role::Page => cv.map(|mut cv| {
+            cv.bold = true;
+            cv
+        }),
+        Role::Label | Role::Data => cv,
+    }
+}
+
 /// A cell's view under its conditional formats: their fill, colour scale, font
 /// colour, weight and number format, and the data bar under the text.
 pub fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value) -> Option<CellView> {
@@ -382,7 +405,12 @@ impl GridSource for SheetSource {
         let v = d.wb.value(d.sheet, r, c);
         let sh = d.wb.sheet(d.sheet);
         let id = sh.style_id(r, c);
-        let cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v) };
+        let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v) };
+        if !d.wb.pivots().is_empty() {
+            if let Some((_, role)) = d.wb.pivot_at(CellAddr::new(d.sheet, r, c)) {
+                cv = pivot_view(cv, role);
+            }
+        }
         if d.wb.cond_formats().is_empty() {
             return cv;
         }

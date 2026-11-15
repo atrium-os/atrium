@@ -158,6 +158,8 @@ pub struct Workbook {
     pub(crate) spill_out: Mutex<Vec<(CellAddr, Option<Arc<crate::eval::Array>>)>>,
     /// Conditional formats, in priority order ([`crate::condfmt`]).
     pub(crate) cond_formats: Vec<crate::condfmt::CondFormat>,
+    pub(crate) pivots: Vec<crate::pivot::Pivot>,
+    pub(crate) pivot_shapes: Vec<crate::pivot::Shape>,
     pub(crate) cond_stats: crate::condfmt::StatCache,
     /// Recalculations run (conditional formats' statistics are per recalculation).
     pub(crate) recalcs: u64,
@@ -193,6 +195,8 @@ impl Workbook {
             claims: HashMap::new(),
             spill_out: Mutex::new(Vec::new()),
             cond_formats: Vec::new(),
+            pivots: Vec::new(),
+            pivot_shapes: Vec::new(),
             cond_stats: Default::default(),
             recalcs: 0,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),

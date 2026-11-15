@@ -744,6 +744,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Conditional formats (LibreOffice's) and the one being read.
     let mut cf: Option<CfIn> = None;
     let mut cond_formats: Vec<CfIn> = Vec::new();
+    // Data pilots (pivot tables) and the one being read.
+    let mut pilot: Option<super::pivot::TableIn> = None;
+    let mut pilots: Vec<super::pivot::TableIn> = Vec::new();
     let mut filter_and = true;
     let mut in_set = false;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
@@ -970,6 +973,56 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             }
                         }
                     }
+                    b"table:data-pilot-table" => {
+                        let a = attrs(e);
+                        pilot = Some(super::pivot::TableIn {
+                            name: a.get("table:name").cloned().unwrap_or_default(),
+                            target: a.get("table:target-range-address").cloned().unwrap_or_default(),
+                            grand: a.get("table:grand-total").cloned().unwrap_or_default(),
+                            ..Default::default()
+                        });
+                    }
+                    b"table:source-cell-range" => {
+                        if let Some(t) = pilot.as_mut() {
+                            t.source = attrs(e).get("table:cell-range-address").cloned().unwrap_or_default();
+                        }
+                    }
+                    b"table:database-source-sql" | b"table:database-source-table" | b"table:database-source-query" | b"table:source-service" => {
+                        if let Some(t) = pilot.as_mut() {
+                            t.other_source = true;
+                        }
+                    }
+                    b"table:data-pilot-field" => {
+                        let a = attrs(e);
+                        if let Some(t) = pilot.as_mut().filter(|t| t.fields.len() < 16_384) {
+                            t.fields.push(super::pivot::FieldIn {
+                                name: a.get("table:source-field-name").cloned().unwrap_or_default(),
+                                orient: a.get("table:orientation").cloned().unwrap_or_default(),
+                                function: a.get("table:function").cloned().unwrap_or_default(),
+                                display: a.get("tableooo:display-name").cloned(),
+                                data_layout: a.get("table:is-data-layout-field").is_some_and(|v| v == "true"),
+                                selected: a.get("table:selected-page").cloned(),
+                                ignore_selected: a.get("loext:ignore-selected-page").is_some_and(|v| v == "true"),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    b"table:data-pilot-subtotal" => {
+                        if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            f.subtotals |= attrs(e).get("table:function").is_some_and(|v| v != "none");
+                        }
+                    }
+                    b"table:data-pilot-member" => {
+                        let a = attrs(e);
+                        if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            if a.get("table:display").is_some_and(|v| v == "false") && f.hidden.len() < officina_grid::pivot::MAX_ITEMS {
+                                f.hidden.push(a.get("table:name").cloned().unwrap_or_default());
+                            }
+                        }
+                    }
+                    b"table:data-pilot-group" | b"table:data-pilot-groups" | b"table:data-pilot-field-reference" => {
+                        rep.note(Kind::Approximate, "pivot table groups and values shown as (refreshing shows plain items and values)");
+                    }
                     b"calcext:conditional-format" => {
                         let a = attrs(e);
                         cf = Some(CfIn { target: a.get("calcext:target-range-address").cloned().unwrap_or_default(), entries: Vec::new() });
@@ -1104,6 +1157,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     continue;
                 }
                 match name {
+                    b"table:data-pilot-table" => {
+                        if pilots.len() < officina_grid::pivot::MAX_PIVOTS {
+                            pilots.extend(pilot.take());
+                        }
+                    }
                     b"calcext:conditional-format" => {
                         if cond_formats.len() < 4096 {
                             cond_formats.extend(cf.take());
@@ -1310,6 +1368,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             rep.note_at(Kind::Approximate, "formula results that differ from the file's saved results", || format!("{}: {} vs {}", officina_grid::addr::a1(a.row, a.col), got.display(), want.display()));
         }
     }
+    // Pivot tables, over the cells they wrote.
+    super::pivot::make(&mut wb, pilots, &mut rep);
     // Charts, once every sheet and its sizes exist.
     super::chart::read_frames(&mut wb, &z, frames, &mut rep);
     // Macros, kept inert.

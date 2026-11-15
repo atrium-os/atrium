@@ -4,6 +4,7 @@
 pub mod chart;
 pub mod condfmt;
 pub mod macros;
+pub mod pivot;
 pub mod read;
 pub mod styles;
 pub mod write;

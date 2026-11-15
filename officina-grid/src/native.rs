@@ -14,6 +14,7 @@
 //! | 11 | MACROS | macros kept inert: family, VBA code names (the parts follow) |
 //! | 12 | MACRO_PART | one macro part: path, media type, bytes, never parsed |
 //! | 13 | COND_FORMATS | conditional formats: ranges, rules (formulas as text), formats |
+//! | 14 | PIVOTS | pivot tables: source, place, fields on each axis with hidden items, value fields |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -48,6 +49,7 @@ pub const CHARTS: u16 = 10;
 pub const MACROS: u16 = 11;
 pub const MACRO_PART: u16 = 12;
 pub const COND_FORMATS: u16 = 13;
+pub const PIVOTS: u16 = 14;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -228,6 +230,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             f.encode(&mut w, wb);
         }
         c.add(COND_FORMATS, &w.into_bytes())?;
+    }
+    if !wb.pivots.is_empty() {
+        let mut w = Writer::new();
+        w.var(wb.pivots.len() as u64);
+        for (i, p) in wb.pivots.iter().enumerate() {
+            p.encode(&mut w, wb.pivot_shapes[i].area);
+        }
+        c.add(PIVOTS, &w.into_bytes())?;
     }
     if !wb.charts.is_empty() {
         let mut w = Writer::new();
@@ -652,6 +662,21 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         }
         wb.sheets[s].hidden = st.hidden;
         wb.sheets[s].filter = st.filter;
+    }
+
+    // Pivot tables: their output is in the cells already.
+    let mut it = of(PIVOTS);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two PIVOTS chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("pivot tables", crate::pivot::MAX_PIVOTS as u64, 8)?;
+        for _ in 0..k {
+            let (p, area) = crate::pivot::Pivot::decode(&mut r)?;
+            wb.add_pivot_as_is(p, area).map_err(LoadError::Bad)?;
+        }
+        done(&r)?;
     }
 
     // Stored results are current; only volatile formulas need a recalculation, and

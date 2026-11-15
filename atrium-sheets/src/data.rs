@@ -39,6 +39,16 @@ pub enum DataCmd {
     Chart(ChartKind),
     /// The chart over the cursor (or using its cell).
     DeleteChart,
+    /// A pivot table of the data: the cursor's column down the rows, its number
+    /// columns summed.
+    InsertPivot,
+    /// The pivot table at the cursor, recomputed from its source.
+    RefreshPivot,
+    RefreshAllPivots,
+    DeletePivot,
+    /// The cursor's column of the pivot's source as (or no longer as) a column
+    /// field of the pivot beside it.
+    PivotColumns,
 }
 
 /// The block of non-empty cells around (`row`, `col`), bounded by empty rows and
@@ -169,7 +179,55 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
     v.push((MenuItem::new("Insert Pie Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Pie))));
     v.push((MenuItem::new("Delete Chart").enabled(chart_at(wb, s, row, col).is_some()), Some(DataCmd::DeleteChart)));
+    let here = wb.pivot_at(CellAddr::new(s, row, col));
+    match here {
+        Some((i, _)) => {
+            let name = short(&wb.pivots()[i].name);
+            v.push((MenuItem::new(format!("Refresh “{name}”")).separated(), Some(DataCmd::RefreshPivot)));
+            v.push((MenuItem::new(format!("Delete “{name}”")), Some(DataCmd::DeletePivot)));
+        }
+        None => {
+            v.push((MenuItem::new("Insert Pivot Table").enabled(some).separated(), Some(DataCmd::InsertPivot)));
+            let src = pivot_of_source(wb, s, row, col);
+            let label = match src {
+                Some((i, f)) if wb.pivots()[i].cols.iter().any(|x| x.field == f) => format!("Take “{}” off the Pivot's Columns", short(&wb.pivot_field_name(&wb.pivots()[i], f))),
+                Some((i, f)) => format!("Pivot “{}” Across the Columns", short(&wb.pivot_field_name(&wb.pivots()[i], f))),
+                None => "Pivot This Column Across".to_string(),
+            };
+            v.push((MenuItem::new(label).enabled(src.is_some()), Some(DataCmd::PivotColumns)));
+        }
+    }
+    v.push((MenuItem::new("Refresh All Pivot Tables").enabled(!wb.pivots().is_empty()), Some(DataCmd::RefreshAllPivots)));
     v
+}
+
+/// The pivot whose source holds the cursor, and the cursor's field of it.
+fn pivot_of_source(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<(usize, u32)> {
+    wb.pivots().iter().position(|p| p.source.sheet == sheet && (p.source.r0..=p.source.r1).contains(&row) && (p.source.c0..=p.source.c1).contains(&col)).map(|i| (i, col - wb.pivots()[i].source.c0))
+}
+
+/// A first pivot of `t`: the cursor's column (or the first text column) down the
+/// rows, the other number columns summed (at most three), or a count when there
+/// are none.
+pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid::pivot::Pivot> {
+    use officina_grid::pivot::{Agg, DataField, Pivot, PivotField};
+    let r = t.rect;
+    if !t.header || r.r1 <= r.r0 {
+        return None;
+    }
+    let s = r.sheet;
+    let numeric = |c: u32| {
+        let n = (r.r0 + 1..=r.r1).filter(|&row| matches!(wb.get(CellAddr::new(s, row, c)), Value::Num(_))).count();
+        n * 2 > (r.r1 - r.r0) as usize
+    };
+    let cursor = (r.c0..=r.c1).contains(&t.col).then_some(t.col).filter(|&c| !numeric(c));
+    let rows = cursor.or_else(|| (r.c0..=r.c1).find(|&c| !numeric(c)))?;
+    let data: Vec<DataField> = (r.c0..=r.c1).filter(|&c| c != rows && numeric(c)).take(3).map(|c| DataField { field: c - r.c0, agg: Agg::Sum, name: None }).collect();
+    let data = if data.is_empty() { vec![DataField { field: rows - r.c0, agg: Agg::Count, name: None }] } else { data };
+    let mut p = Pivot::new(name, r, CellAddr::new(s, r.r0, (r.c1 + 2).min(officina_grid::addr::MAX_COLS - 1)));
+    p.rows = vec![PivotField::new(rows - r.c0)];
+    p.data = data;
+    Some(p)
 }
 
 /// Runs `cmd`; says what happened (or why nothing did) in the status line.
@@ -303,6 +361,68 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run("Insert Chart", vec![GridOp::Charts(all)]);
             Ok(format!("Chart of {} added to the right of the data.", range_text(&t.rect)))
         }
+        DataCmd::InsertPivot => {
+            let t = target(d, sel, cursor).ok_or_else(need)?;
+            let name = d.wb.new_pivot_name();
+            let p = pivot_for(&d.wb, &t, &name).ok_or("A pivot table needs a header row and a column of names or labels to group by.")?;
+            let field = d.wb.pivot_field_name(&p, p.rows[0].field);
+            let place = officina_grid::addr::a1(p.dest.row, p.dest.col);
+            let op = d.wb.pivot_op(None, Some(p)).map_err(|e| format!("Couldn't place the pivot table at {place}: {e}."))?;
+            d.run("Insert Pivot Table", vec![op]);
+            Ok(format!("{name} at {place}: {} by {field}. Put the cursor in the data and use Pivot Across to add a column field.", range_text(&t.rect)))
+        }
+        DataCmd::PivotColumns => {
+            let (i, f) = pivot_of_source(&d.wb, s, row, col).ok_or("Put the cursor in a pivot table's source data first.")?;
+            let mut p = d.wb.pivots()[i].clone();
+            let name = d.wb.pivot_field_name(&p, f);
+            let on = p.cols.iter().any(|x| x.field == f);
+            if on {
+                p.cols.retain(|x| x.field != f);
+            } else {
+                p.rows.retain(|x| x.field != f);
+                p.pages.retain(|x| x.field != f);
+                if p.rows.is_empty() {
+                    return Err(format!("{name} is the pivot's only row field; it stays down the rows."));
+                }
+                p.cols.push(officina_grid::pivot::PivotField::new(f));
+            }
+            let op = d.wb.pivot_op(Some(i), Some(p)).map_err(|e| format!("Couldn't change the pivot table: {e}."))?;
+            d.run("Change Pivot Table", vec![op]);
+            Ok(if on { format!("{name} taken off the columns.") } else { format!("{name} now runs across the columns.") })
+        }
+        DataCmd::RefreshPivot | DataCmd::DeletePivot => {
+            let (i, _) = d.wb.pivot_at(CellAddr::new(s, row, col)).ok_or("The cursor isn't in a pivot table.")?;
+            let p = d.wb.pivots()[i].clone();
+            let name = p.name.clone();
+            if cmd == DataCmd::DeletePivot {
+                let op = d.wb.pivot_op(Some(i), None).map_err(|e| e.to_string())?;
+                d.run("Delete Pivot Table", vec![op]);
+                return Ok(format!("{name} deleted."));
+            }
+            let op = d.wb.pivot_op(Some(i), Some(p)).map_err(|e| format!("Couldn't refresh {name}: {e}."))?;
+            d.run("Refresh Pivot Table", vec![op]);
+            Ok(format!("{name} refreshed from its data."))
+        }
+        DataCmd::RefreshAllPivots => {
+            // Each one after the last (one may grow into where another was).
+            let mut bad = Vec::new();
+            let mut n = 0;
+            for i in 0..d.wb.pivots().len() {
+                let p = d.wb.pivots()[i].clone();
+                match d.wb.pivot_op(Some(i), Some(p.clone())) {
+                    Ok(op) => {
+                        d.run("Refresh Pivot Table", vec![op]);
+                        n += 1;
+                    }
+                    Err(e) => bad.push(format!("{}: {e}", p.name)),
+                }
+            }
+            if bad.is_empty() {
+                Ok(format!("{n} pivot tables refreshed."))
+            } else {
+                Err(format!("{n} refreshed; couldn't refresh {}.", bad.join("; ")))
+            }
+        }
         DataCmd::DeleteChart => {
             let i = chart_at(&d.wb, s, row, col).ok_or("There is no chart here.")?;
             let mut all = d.wb.charts().to_vec();
@@ -423,6 +543,35 @@ mod tests {
         assert!(d.wb.sheet(0).filter.is_none());
         let labels: Vec<String> = menu(&d, one(1, 0), (1, 0)).into_iter().map(|(m, _)| m.label).collect();
         assert!(labels.contains(&"Show Only “pear”".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn pivot_insert_refresh_and_undo() {
+        let mut d = doc();
+        run(&mut d, one(1, 0), (1, 0), DataCmd::InsertPivot);
+        assert_eq!(d.status, "Couldn't place the pivot table at E1: there are cells in the way.");
+        d.type_into(5, 4, "");
+        run(&mut d, one(1, 0), (1, 0), DataCmd::InsertPivot);
+        assert!(d.status.starts_with("PivotTable1 at E1: A1:C5 by Fruit."), "{}", d.status);
+        let rows: Vec<String> = (0..6).map(|r| (4..7).map(|c| cell(&d, r, c)).collect::<Vec<_>>().join("|")).collect();
+        assert_eq!(rows, ["|Values|", "Fruit|Sum of Qty|Sum of Price", "apple|11|0.9", "fig|7|2", "pear|3|1.5", "Grand Total|21|4.4"]);
+        // The source changes; a refresh from inside the pivot follows it.
+        d.type_into(1, 1, "30");
+        assert_eq!(cell(&d, 4, 5), "3");
+        let labels: Vec<String> = menu(&d, one(4, 5), (4, 5)).into_iter().map(|(m, _)| m.label).collect();
+        assert!(labels.contains(&"Refresh “PivotTable1”".to_string()), "{labels:?}");
+        run(&mut d, one(4, 5), (4, 5), DataCmd::RefreshPivot);
+        assert_eq!(cell(&d, 4, 5), "30");
+        assert_eq!(d.wb.pivot_at(CellAddr::new(0, 5, 4)).map(|x| x.1), Some(officina_grid::pivot::Role::Total));
+        // The only row field can't go across.
+        run(&mut d, one(2, 0), (2, 0), DataCmd::PivotColumns);
+        assert!(d.status.contains("only row field"), "{}", d.status);
+        assert!(d.undo());
+        assert_eq!(cell(&d, 4, 5), "3");
+        run(&mut d, one(4, 5), (4, 5), DataCmd::DeletePivot);
+        assert!(d.wb.pivots().is_empty() && cell(&d, 1, 4).is_empty());
+        assert!(d.undo());
+        assert_eq!(cell(&d, 1, 4), "Fruit");
     }
 
     #[test]

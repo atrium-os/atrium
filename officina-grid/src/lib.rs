@@ -28,6 +28,7 @@ pub mod names;
 pub mod native;
 pub mod numfmt;
 pub mod ops;
+pub mod pivot;
 pub mod recalc;
 pub mod sort;
 pub mod spill;

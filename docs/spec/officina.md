@@ -2243,6 +2243,69 @@ through LibreOffice 24.2 and back 40/40 cells look the same; our `.xlsx`
 `com.microsoft.` form into `.xlsx`; we read it). The scale gate's full
 recalculation of 1 M formulas: 324 → 346 ms (within its noise).
 
+### 16.32 O5g as built (2026-11-15): pivot tables
+
+- **Model** (`officina-grid` `pivot`). A pivot has a source range whose first
+  row names its fields, a place for its output, fields down the rows, across
+  the columns and as page filters (each with the items it leaves out), value
+  fields (sum, count, average, max, min, product, count of numbers, standard
+  deviation and variance, sample and population; a caption of their own or
+  "Sum of Units"), grand totals for rows and columns and subtotals on or off.
+  Items group as Excel groups them: text in any case is one item, shown as first
+  met, in Excel's order (numbers, text, FALSE/TRUE, errors, "(blank)").
+- **Refresh.** The output is ordinary cells, written when the pivot is made,
+  changed or refreshed, as in Excel: editing the source doesn't move it until
+  a refresh. One scan of the source sums each row into its leaf (one hash
+  lookup a row), then leaves roll up into every subtotal they belong to: a
+  1,000,000-row source with two row fields and one column field refreshes in
+  337 ms (`examples/pivot_scale.rs`, release). The layout is Excel's tabular
+  form: a column per row field, outer items on the first row of their group,
+  "<item> Total" rows after each outer group, "Grand Total" row and column,
+  column fields as header rows (with a "Values" field innermost when there are
+  several value fields), page fields with "(All)", the item, or "(Multiple
+  Items)" above. A refresh that would cover cells it doesn't own, another
+  pivot or its own source is refused and the old output stays. Each pivot's
+  shape (header rows, label columns, total rows and columns) says what part a
+  cell is, for drawing.
+- **Editing.** `pivot_op` makes adding, changing, refreshing or removing a
+  pivot one undoable, journaled step (`GridOp::Pivots` beside the `Replace`s
+  of its cells). Sheets' Data menu: Insert Pivot Table (the cursor's column,
+  or the first text column, down the rows, up to three number columns summed,
+  placed two columns right of the data), "Pivot <field> Across the Columns"
+  and back from a cell of the source, Refresh, Delete, Refresh All. Header and
+  total rows draw bold on a light band, as Excel's default pivot style.
+- **Files.** `.xlsx`: a pivot cache definition per pivot (source range, each
+  field's items; no records, `saveData="0"` and `refreshOnLoad="1"` so Excel
+  rebuilds it on opening) and the pivot table definition in tabular form
+  (`compact="0" outline="0"`), with hidden items, page fields, value fields'
+  functions and captions, grand totals, subtotals; the workbook's
+  `pivotCaches`. Read: sources on a sheet or a table's name, whole columns
+  cut to the rows in use; compact-form pivots, values shown as percentages,
+  and values down the rows are noted (shown in tabular form, plain values,
+  across, once refreshed); calculated fields keep the pivot as values. The
+  cells a file holds stay as they are until a refresh. `.ods`: LibreOffice's
+  `table:data-pilot-tables` both ways (tabular layout, members shown or not,
+  selected page, data layout field, `tableooo:display-name`, grand totals);
+  groups and "show as" are noted, database and external sources keep the
+  cells only. Native file: its own block, with each output's place.
+- **Not yet:** a field-list pane (drag fields between axes, pick functions and
+  items); compact and outline layouts; grouping dates and numbers; values shown
+  as percentages; calculated fields; GETPIVOTDATA; pivots following inserted
+  rows and columns; pivot charts.
+
+Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows
+for two row fields and a column field, several value fields with and without
+column fields, page filters and hidden items, refresh after edits, refusals,
+undo and the journal, native round trip); `officina-convert` `tests/pivot.rs`
+(the parts as Excel writes them, both formats round trip with the same
+definitions, shapes and cells); `atrium-sheets` (insert, refresh, delete,
+undo from the Data menu). LibreOffice 24.2 both ways (`examples/pivot_lo.rs`,
+three pivots: rows and columns with a hidden item; a page filter with two
+value fields; counts without the grand total column): `.ods`→`.ods` and our
+`.xlsx`→LibreOffice's `.ods` 3/3 the same definitions and, refreshed, the same
+cells; LibreOffice's own `.xlsx` export keeps 2/3 (it doesn't write
+`rowGrandTotals="0"`).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

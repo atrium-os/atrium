@@ -1122,6 +1122,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
             i = j;
         }
     }
+    // Pivot tables, over the cells they wrote.
+    let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
+    super::pivot::read_all(&mut wb, &z, &parts, &mut rep)?;
     // Conditional formats, once formulas (and the names they use) can be read.
     for (s, raws) in &conds {
         super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);

@@ -42,6 +42,7 @@ const NS: &str = concat!(
     r#"xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" "#,
     r#"xmlns:calcext="urn:org:documentfoundation:names:experimental:calc:xmlns:calcext:1.0" "#,
     r#"xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" "#,
+    r#"xmlns:tableooo="http://openoffice.org/2009/table" "#,
     r#"office:version="1.3""#
 );
 
@@ -1248,6 +1249,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&tables);
     content.push_str(&names_xml(wb, None));
     content.push_str(&filters_xml(wb));
+    content.push_str(&super::pivot::tables_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/>{cf}</office:styles></office:document-styles>"#, cf = super::condfmt::styles_xml(&super::condfmt::dxfs(wb)));
     let macros = super::macros::writable(wb);
