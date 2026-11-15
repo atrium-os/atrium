@@ -89,6 +89,9 @@ struct VmBind { va: u64, vm_fd: u32, bo_fd: u32 }
 struct VmBind2 { va: u64, vm_fd: u32, bo_fd: u32, flags: u32, pad: u32 }
 /// `VM_BIND2` flag: map without GPU write access (driver ABI rev 3).
 pub const BIND_READONLY: u32 = 0x1;
+/// `VM_BIND2` flag (ABI 2.3, GPU W^X §5.4): executable PTEs; only with
+/// [`BIND_READONLY`].
+pub const BIND_EXEC: u32 = 0x4;
 /// `QUEUE_CREATE` (on a VM fd) and `QUEUE_SUBMIT` (on a queue fd): GPU ABI
 /// v2 §5.5/§5.9. The old ring `SUBMIT` ('A',4) is gone.
 #[repr(C)]
@@ -654,6 +657,37 @@ impl<'a> Vm<'a> {
         Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
     }
 
+    /// Allocate a BO the GPU may execute from in this VM and never write
+    /// (`BIND_READONLY | BIND_EXEC`, GPU W^X): shader code and IBs. The CPU
+    /// fills it through [`Bo::write`]. A driver without `BIND_FEAT_EXEC`
+    /// (EINVAL) gets a plain read-only bind, which it executes from anyway.
+    pub fn alloc_exec(&self, size: u64, flags: u32) -> io::Result<Bo<'a>> {
+        let mut a = BoAlloc { size, flags, ..Default::default() };
+        unsafe { call(self.gpu.fd, iowr(G, 0, std::mem::size_of::<BoAlloc>()), &mut a)? };
+        let mut va = 0;
+        let mut last = None;
+        for f in [BIND_READONLY | BIND_EXEC, BIND_READONLY] {
+            let mut b = VmBind2 { vm_fd: self.fd as u32, bo_fd: a.bo_fd, flags: f, ..Default::default() };
+            match unsafe { call(self.gpu.fd, iowr(G, 27, std::mem::size_of::<VmBind2>()), &mut b) } {
+                Ok(_) => {
+                    va = b.va;
+                    last = None;
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && f & BIND_EXEC != 0 => last = Some(e),
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = last {
+            unsafe { libc::close(a.bo_fd as RawFd) };
+            return Err(e);
+        }
+        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: va, size })
+    }
+
     /// Map `bo`, which another VM of the same device allocated, into this
     /// one as well: read-only to the GPU here if `readonly` (VM_BIND2,
     /// ABI rev 3). The returned [`Bo`] holds its own fd (a dup), so either
@@ -839,6 +873,9 @@ pub struct Scanout<'a> {
     staging: Bo<'a>,
     buffers: Vec<Bo<'a>>,
     ring: Bo<'a>,
+    /// The ring's end-of-pipe fence: its own BO, so the ring can be bound
+    /// read-only and executable (GPU W^X) and the fence never executable.
+    fence: Bo<'a>,
     size: u64,
     /// The device's RELEASE_MEM form ([`Gpu::is_gpusim`]).
     gpusim: bool,
@@ -857,9 +894,10 @@ impl<'a> Scanout<'a> {
         for _ in 0..n.max(1) {
             buffers.push(vm.alloc(size, BO_VRAM)?); // VRAM: scannable
         }
-        let ring = vm.alloc(4096, 0)?;
+        let ring = vm.alloc_exec(4096, 0)?;
+        let fence = vm.alloc(4096, 0)?;
         let gpusim = vm.gpu().is_gpusim();
-        Ok(Self { vm, staging, buffers, ring, size, gpusim })
+        Ok(Self { vm, staging, buffers, ring, fence, size, gpusim })
     }
 
     /// Buffer `i`, to name in a [`Display::commit`].
@@ -906,8 +944,7 @@ impl<'a> Scanout<'a> {
         self.staging.write(off, pixels)?;
         let src = self.staging.gpu_va() + off;
         let dst = self.buffers[i].gpu_va() + off;
-        // The EOP fence lands in the ring BO's second half (never executed).
-        let fence = self.ring.gpu_va() + 2048;
+        let fence = self.fence.gpu_va();
         let mut words: Vec<u32> = vec![
             pm4_type3(IT_DMA_DATA, 6),
             0,

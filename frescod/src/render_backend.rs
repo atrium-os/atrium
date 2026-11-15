@@ -777,9 +777,34 @@ impl Times {
         }
     }
 }
-/// A ring BO: the packets, then the end-of-pipe fence word.
+/// Bytes of a ring's packets.
 const RING_BYTES: u64 = 64 * 1024;
-const FENCE_OFFSET: u64 = RING_BYTES - 256;
+
+/// Where an IB goes and where its end-of-pipe fence lands: two BOs, so the
+/// packets can be bound read-only and executable and the fence writable
+/// and never executable (GPU W^X, ABI 2.3 §5.4; R9700 stage 6c).
+struct Ring<'a> {
+    cmds: Bo<'a>,
+    fence: Bo<'a>,
+}
+
+impl<'a> Ring<'a> {
+    fn new(vm: &Vm<'a>) -> std::io::Result<Self> {
+        Ok(Ring { cmds: vm.alloc_exec(RING_BYTES, 0)?, fence: vm.alloc(4096, 0)? })
+    }
+    fn fence_va(&self) -> u64 {
+        self.fence.gpu_va()
+    }
+}
+
+/// The kernels' code in `vm`: written by the CPU, bound read-only and
+/// executable (W^X), so no upload job and nothing on the GPU can change it.
+fn code_bo<'a>(vm: &Vm<'a>, arch: &dyn fresco_compute::gpu::Arch) -> std::io::Result<Bo<'a>> {
+    let bytes = arch.code();
+    let code = vm.alloc_exec((bytes.len() as u64).next_multiple_of(4096), 0)?;
+    code.write(0, &bytes)?;
+    Ok(code)
+}
 
 /// The compute renderer on the GPU: the kernels compiled for the device's
 /// architecture ([`fresco_compute::gpu::Arch`]; RDNA4 is the one built
@@ -817,7 +842,7 @@ pub struct GpuCompute<'a> {
     /// Compose's inputs, its staging, its ring (frescod's VM).
     data: Option<Bo<'a>>,
     staging: Bo<'a>,
-    ring: Bo<'a>,
+    ring: Ring<'a>,
     /// Each window's VM and what it holds, by window id.
     wins: HashMap<u32, WinVm<'a>>,
     /// Bumped each time a window's surface is redrawn.
@@ -938,7 +963,7 @@ struct WinVm<'a> {
     scratch: Option<Bo<'a>>,
     data: Option<Bo<'a>>,
     staging: Bo<'a>,
-    ring: Bo<'a>,
+    ring: Ring<'a>,
     sync: Syncobj<'a>,
     /// The last value `sync` will be signalled with.
     seq: u64,
@@ -956,19 +981,11 @@ impl<'a> WinVm<'a> {
         let vm = gpu.create_vm()?;
         let bytes = (w as u64 * h as u64 * 4).next_multiple_of(4096);
         let surfaces = [vm.alloc(bytes, BO_VRAM)?, vm.alloc(bytes, BO_VRAM)?];
-        let code_bytes = arch.code();
-        let code = vm.alloc((code_bytes.len() as u64).next_multiple_of(4096), BO_VRAM)?;
+        let code = code_bo(&vm, arch)?;
         // The CPU fills staging; the GPU only reads it.
-        let staging = vm.alloc_readonly((code_bytes.len() as u64).next_power_of_two().max(1 << 20), 0)?;
-        let ring = vm.alloc(RING_BYTES, 0)?;
+        let staging = vm.alloc_readonly(1 << 20, 0)?;
+        let ring = Ring::new(&vm)?;
         let sync = gpu.create_syncobj()?;
-        staging.write(0, &code_bytes)?;
-        let mut ib = arch.stream();
-        ib.copy(staging.gpu_va(), code.gpu_va(), code_bytes.len() as u64);
-        ib.end(ring.gpu_va() + FENCE_OFFSET);
-        run(&vm, &ring, &*ib, (&sync, 1), 0).map_err(|e| std::io::Error::other(e.to_string()))?;
-        drop(ib);
-        sync.wait(1, flip_wait_ms())?;
         Ok(WinVm {
             code,
             shown: [main.share(&surfaces[0], true)?, main.share(&surfaces[1], true)?],
@@ -984,7 +1001,7 @@ impl<'a> WinVm<'a> {
             staging,
             ring,
             sync,
-            seq: 1,
+            seq: 0,
             pixel_gen: None,
             vm,
         })
@@ -1071,32 +1088,23 @@ pub fn is_busy(e: &(dyn std::error::Error + 'static)) -> bool {
     e.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()) == Some(libc::EBUSY)
 }
 
-fn run<'a>(vm: &Vm<'a>, ring: &Bo<'a>, ib: &dyn fresco_compute::gpu::Stream, signal: (&Syncobj<'_>, u64), deadline_ns: u32) -> Result<()> {
+fn run<'a>(vm: &Vm<'a>, ring: &Ring<'a>, ib: &dyn fresco_compute::gpu::Stream, signal: (&Syncobj<'_>, u64), deadline_ns: u32) -> Result<()> {
     let bytes = ib.bytes();
-    if bytes.len() as u64 > FENCE_OFFSET {
+    if bytes.len() as u64 > RING_BYTES {
         return Err(format!("IB of {} bytes does not fit the ring", bytes.len()).into());
     }
-    ring.write(0, &bytes)?;
-    vm.submit_deadline(ring, ib.len_units(), ENGINE_GFX, Some(signal), deadline_ns)?;
+    ring.cmds.write(0, &bytes)?;
+    vm.submit_deadline(&ring.cmds, ib.len_units(), ENGINE_GFX, Some(signal), deadline_ns)?;
     Ok(())
 }
 
 impl<'a> GpuCompute<'a> {
     pub fn new(vm: &'a Vm<'a>, arch: Box<dyn fresco_compute::gpu::Arch>, width: u32, height: u32) -> Result<Self> {
-        // frescod's own copy of the code (compose, read-back); each window
-        // VM uploads its own (WinVm::new).
-        let code_bytes = arch.code();
-        let code = vm.alloc((code_bytes.len() as u64).next_multiple_of(4096), BO_VRAM)?;
-        let staging = vm.alloc_readonly((code_bytes.len() as u64).next_power_of_two().max(1 << 20), 0)?;
-        let ring = vm.alloc(RING_BYTES, 0)?;
-        staging.write(0, &code_bytes)?;
-        let mut ib = arch.stream();
-        ib.copy(staging.gpu_va(), code.gpu_va(), code_bytes.len() as u64);
-        ib.end(ring.gpu_va() + FENCE_OFFSET);
-        let done = vm.gpu().create_syncobj()?;
-        run(vm, &ring, &*ib, (&done, 1), 0)?;
-        drop(ib);
-        done.wait(1, flip_wait_ms())?;
+        // frescod's own copy of the code (compose); each window VM has its
+        // own (WinVm::new).
+        let code = code_bo(vm, &*arch)?;
+        let staging = vm.alloc_readonly(1 << 20, 0)?;
+        let ring = Ring::new(vm)?;
         Ok(Self {
             width,
             height,
@@ -1182,7 +1190,7 @@ impl<'a> GpuCompute<'a> {
             let mut ib = self.arch.stream();
             ib.frame_part(v.code.gpu_va(), &fl.va, &fl.frame, next.bin, &next.tiles)
                 .map_err(|e| format!("{} record: {e}", self.arch.name()))?;
-            ib.end(v.ring.gpu_va() + FENCE_OFFSET);
+            ib.end(v.ring.fence_va());
             if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq + 1), 0) {
                 if !is_busy(&*e) {
                     return Err(e);
@@ -1416,7 +1424,7 @@ impl<'a> GpuCompute<'a> {
             if let Some(sl) = &first {
                 ib.frame_part(v.code.gpu_va(), &va, f, sl.bin, &sl.tiles).map_err(|e| format!("{name} record: {e}"))?;
             }
-            ib.end(v.ring.gpu_va() + FENCE_OFFSET);
+            ib.end(v.ring.fence_va());
             v.seq += 1;
             if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns) {
                 // The GPU is busy with other work: this window keeps its last
@@ -1540,7 +1548,7 @@ impl<'a> GpuCompute<'a> {
         self.composed.insert(target.gpu_va(), (ids, layers, versions));
         self.last_target = Some(target.gpu_va());
         // End of pipe: the fence, then the interrupt that signals `signal`.
-        ib.end(self.ring.gpu_va() + FENCE_OFFSET);
+        ib.end(self.ring.fence_va());
         self.fg_submits += 1;
         if let Err(e) = run(self.vm, &self.ring, &*ib, signal, deadline_ns) {
             // EBUSY: a window's work kept the GPU past the driver's wait.
@@ -1590,7 +1598,7 @@ fn pixels_in(arch: &dyn fresco_compute::gpu::Arch, v: &mut WinVm<'_>, px: &crate
         v.staging.write(0, &rows)?;
         ib.copy(v.staging.gpu_va(), back + y0 as u64 * w as u64 * 4, rows.len() as u64);
     }
-    ib.end(v.ring.gpu_va() + FENCE_OFFSET);
+    ib.end(v.ring.fence_va());
     v.seq += 1;
     if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns) {
         v.seq -= 1;

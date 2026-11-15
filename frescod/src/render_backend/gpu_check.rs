@@ -183,12 +183,12 @@ impl ScreenInputKeep {
 fn read_back(g: &GpuCompute<'_>, target: &Bo<'_>, out: &mut [u8]) -> Result<()> {
     let vm = g.vm;
     let sys = vm.alloc(target.size(), 0)?;
-    let ring = vm.alloc(RING_BYTES, 0)?;
+    let ring = Ring::new(vm)?;
     let done = vm.gpu().create_syncobj()?;
     let mut ib = g.arch.stream();
     ib.barrier();
     ib.copy(target.gpu_va(), sys.gpu_va(), out.len() as u64);
-    ib.end(ring.gpu_va() + FENCE_OFFSET);
+    ib.end(ring.fence_va());
     run(vm, &ring, &*ib, (&done, 1), 0)?;
     done.wait(1, flip_wait_ms())?;
     sys.read(0, out)?;
