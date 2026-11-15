@@ -910,6 +910,7 @@ dependencies = [
  "aqueduct-gpu",
  "aqueduct-gpu-client",
  "aqueduct-gpu-host",
+ "ash",
  "atrium-devevents",
  "atrium-gpu-app",
  "atrium-gpu-rs",

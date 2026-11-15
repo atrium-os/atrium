@@ -204,15 +204,32 @@ impl<'a> Backend<'a> {
         if !matches!(self, Backend::Gpu(_)) {
             return Ok(false);
         }
-        *self = Backend::Compute(Box::new(Compute::new(width, height)?));
+        self.replace(Backend::Compute(Box::new(Compute::new(width, height)?)));
         Ok(true)
+    }
+
+    fn scene_mut(&mut self) -> Option<&mut SceneState> {
+        match self {
+            Backend::Compute(c) => Some(&mut c.scene),
+            Backend::Gpu(g) => Some(&mut g.scene),
+            Backend::Vulkan(_) => None,
+        }
+    }
+
+    /// Become `next`, keeping the textures this renderer was given (see
+    /// `SceneState::take_textures_from`).
+    fn replace(&mut self, mut next: Backend<'a>) {
+        if let (Some(old), Some(new)) = (self.scene_mut(), next.scene_mut()) {
+            new.take_textures_from(old);
+        }
+        *self = next;
     }
 
     /// Go back to the gpu renderer once the GPU has stayed up (see
     /// `fall_back_to_cpu`). A failure leaves Tier-2 in place.
     pub fn back_to_gpu(&mut self, vm: &'a Vm<'a>, width: u32, height: u32) -> Result<()> {
         let arch = gpu_arch(vm)?;
-        *self = Backend::Gpu(Box::new(GpuCompute::new(vm, arch, width, height)?));
+        self.replace(Backend::Gpu(Box::new(GpuCompute::new(vm, arch, width, height)?)));
         Ok(())
     }
 
@@ -226,7 +243,7 @@ impl<'a> Backend<'a> {
         load_bundles: impl FnOnce(&mut HeadlessRenderer) -> Result<()>,
     ) -> Result<()> {
         match self {
-            Backend::Compute(_) => *self = Backend::Compute(Box::new(Compute::new(width, height)?)),
+            Backend::Compute(_) => self.replace(Backend::Compute(Box::new(Compute::new(width, height)?))),
             Backend::Gpu(_) => self.back_to_gpu(vm, width, height)?,
             Backend::Vulkan(_) => {
                 let mut r = HeadlessRenderer::new(width, height)
@@ -1429,6 +1446,7 @@ fn flip_wait_ms() -> u32 {
 mod tests {
     use super::*;
     use crate::pack::Pixels;
+    use fresco_vulkan::UploadRequest;
 
     fn node(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> fresco_vulkan::SceneNode {
         fresco_vulkan::SceneNode { position: [x, y], size: [w, h], color, radius: 0.0, _pad: [0.0; 3] }
@@ -1479,6 +1497,27 @@ mod tests {
         assert_eq!(changed_on_screen(&l, None, 6, 7, w, h), whole);
         let off = Layer::at([0, 100, 100, 50], 1900, -20, 1.0);
         assert_eq!(changed_on_screen(&off, Some(&log), 4, 5, w, h), None, "changed part is off screen");
+    }
+
+    /// A renderer rebuilt for a new screen size keeps the textures it was
+    /// given: the text atlases are uploaded once, then only grown by region,
+    /// so losing them blanks every glyph on screen after a mode switch.
+    #[test]
+    fn a_rebuilt_renderer_keeps_its_textures() {
+        let slot = 0xF000_0003;
+        let mut b = Backend::Compute(Box::new(Compute::new(64, 48).expect("kernels")));
+        let tex = UploadRequest::Texture {
+            slot_id: slot, bytes: vec![0x80; 16 * 8], width: 16, height: 8,
+            format: ash::vk::Format::R8_UNORM,
+        };
+        b.render(ScreenInput { windows: Vec::new(), uploads: vec![tex], clears: Vec::new() }).unwrap();
+        b.replace(Backend::Compute(Box::new(Compute::new(32, 24).unwrap())));
+        let Backend::Compute(c) = &mut b else { unreachable!() };
+        assert!(c.scene.has_texture(slot), "the atlas is gone after the rebuild");
+        let grow = UploadRequest::TextureRegion { slot_id: slot, bytes: vec![0xff; 4], dst_x: 2, dst_y: 2, width: 2, height: 2 };
+        b.render(ScreenInput { windows: Vec::new(), uploads: vec![grow], clears: Vec::new() }).unwrap();
+        let Backend::Compute(c) = &b else { unreachable!() };
+        assert!(c.scene.has_texture(slot));
     }
 
     /// Drawing only what changed gives the same screen as drawing it all.

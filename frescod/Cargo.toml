@@ -95,3 +95,7 @@ log = "0.4"
 # The trusted chrome's glyphs, rasterized from IBM Plex Mono at build time:
 # frescod parses no font file at run time.
 swash = "0.1"
+
+[dev-dependencies]
+# UploadRequest::Texture names a vk::Format (tests only).
+ash = "0.38"

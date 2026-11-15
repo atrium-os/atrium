@@ -293,6 +293,22 @@ impl SceneState {
         }
     }
 
+    /// Move the textures `from` holds into this state. A renderer rebuilt
+    /// for a new screen size (a mode switch) or of another kind (a second
+    /// monitor, a GPU reset) must keep every slot it was given: clients and
+    /// the text atlases upload a slot once and later send only changed
+    /// regions, so a fresh renderer would draw no text or images again.
+    pub fn take_textures_from(&mut self, from: &mut SceneState) {
+        self.slots = std::mem::take(&mut from.slots);
+        self.gens = std::mem::take(&mut from.gens);
+        self.next_gen = self.next_gen.max(from.next_gen);
+    }
+
+    /// Whether a texture is bound to `slot`.
+    pub fn has_texture(&self, slot: u32) -> bool {
+        self.slots.contains_key(&slot)
+    }
+
     /// Apply a frame's texture slot changes.
     pub fn apply(&mut self, uploads: Vec<UploadRequest>, clears: Vec<u32>) {
         for s in clears {
