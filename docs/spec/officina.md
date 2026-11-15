@@ -2531,8 +2531,15 @@ opens and draws its first slide reading one slide (debug build, well under 1 s).
   end screen with every build and transition drawn as specified and the
   presenter view matching. Smoothness: under TCG in the cloud container a frame
   takes about a second, so every animation shows 2–3 frames (worst gap 1.5 s);
-  that is the emulator. The 60 Hz figure (no gap over one period) waits for a
-  run on the Mac VM (HVF) or the box. Unit tests: monitor choice, letterboxing,
+  that is the emulator. On the Mac VM (HVF, 4 CPUs, headless frescod with
+  its CPU renderer, both outputs 2560×720 in all) the show runs the same but
+  **fails 60 Hz**: frescod composes 8–13 frames a second through a transition
+  (about 60 ms of CPU a frame), worst gaps 50–130 ms; the app itself used
+  0.09 s of CPU in the whole show, so the motion never waits on it. Split mode
+  first showed about 5 Hz on screen because frescod did not know the renderer
+  was animating (fixed: `FrameReady` carries an animating flag). Still to do:
+  the figure on the GPU renderer, and the CPU renderer's cost per animated
+  frame. Unit tests: monitor choice, letterboxing,
   transition and build tracks with their times, keys.
 
 ## 17. Decisions (accepted 2026-11-14)
