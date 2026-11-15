@@ -207,7 +207,7 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   and the trail store, which navigatord keeps (`NAVIGATORD_TRAILS`, 0600, written whole, at most 4
   MiB in 48 KiB parts; `SaveTrails`). Run without a channel (the live script), the UI keeps its
   own file as before.
-- **J4.** hand-offs through `open-uri`: the link opener Monstrator (opening-links.md, proposed
+- **J4.** hand-offs through `open-uri`: the link opener Monstrator (opening-links.md, accepted
   2026-11-15, step L4).
 
 ### 2.4 Personas: what pages may share

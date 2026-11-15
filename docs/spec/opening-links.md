@@ -1,6 +1,6 @@
 # Opening links: Monstrator, the link opener
 
-Status: proposed 2026-11-15, awaiting Shankar's review. Nothing here is built.
+Status: accepted 2026-11-15 (Shankar: "accept as recommended", all of §9 D1–D8). Building L1–L4.
 Asked by Shankar (2026-11-15): the better long-term design for the Navigator's hand-offs
 (navigator-ui.md §2.3a J4). Chosen: a separate, unprivileged, jailed service rather than
 link handling inside portcullisd.
