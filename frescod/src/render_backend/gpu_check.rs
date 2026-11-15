@@ -166,15 +166,16 @@ fn gpu_frame(g: &mut GpuCompute<'_>, f: ScreenInput, target: &Bo<'_>, sync: &Syn
 struct ScreenInputKeep {
     frames: Vec<(u32, Arc<fresco_compute::Frame>)>,
     pos: HashMap<u32, (i32, i32)>,
+    pixels: HashMap<u32, Arc<crate::pack::Pixels>>,
 }
 
 impl ScreenInputKeep {
     fn from(p: &Pending) -> Self {
-        Self { frames: p.frames.clone(), pos: p.pos.clone() }
+        Self { frames: p.frames.clone(), pos: p.pos.clone(), pixels: p.pixels.clone() }
     }
     fn to_pending(&self) -> Pending {
         // Scroll viewports are not part of these scenes.
-        Pending { frames: self.frames.clone(), scrolls: HashMap::new(), pos: self.pos.clone() }
+        Pending { frames: self.frames.clone(), scrolls: HashMap::new(), pos: self.pos.clone(), pixels: self.pixels.clone() }
     }
 }
 

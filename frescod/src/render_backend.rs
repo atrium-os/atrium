@@ -888,6 +888,8 @@ struct Inflight {
     started: std::time::Instant,
     /// Logged as slow already.
     slow: bool,
+    /// A pixel-mode window's drawing being copied in (its `gen`).
+    pixel_gen: Option<u64>,
 }
 
 impl Inflight {
@@ -940,15 +942,35 @@ struct WinVm<'a> {
     sync: Syncobj<'a>,
     /// The last value `sync` will be signalled with.
     seq: u64,
+    /// The pixel-mode drawing (`Pixels::gen`) the front surface holds.
+    pixel_gen: Option<u64>,
 }
 
 impl<'a> WinVm<'a> {
-    fn new(gpu: &'a atrium_gpu::amd::Gpu, main: &Vm<'a>, code: &Bo<'a>, w: u32, h: u32) -> std::io::Result<Self> {
+    /// A window's VM with its own copy of the code, uploaded here (once per
+    /// window VM). Not a share of frescod's code BO: a binding holds its VM
+    /// until the BO goes, so sharing one long-lived BO into every window VM
+    /// kept each closed window's VM alive until exit (R9700 run fc-70bb02c3:
+    /// ENOSPC once the kernel's VMs ran out, and a BO binds into at most 8).
+    fn new(gpu: &'a atrium_gpu::amd::Gpu, main: &Vm<'a>, arch: &dyn fresco_compute::gpu::Arch, w: u32, h: u32) -> std::io::Result<Self> {
         let vm = gpu.create_vm()?;
         let bytes = (w as u64 * h as u64 * 4).next_multiple_of(4096);
         let surfaces = [vm.alloc(bytes, BO_VRAM)?, vm.alloc(bytes, BO_VRAM)?];
+        let code_bytes = arch.code();
+        let code = vm.alloc((code_bytes.len() as u64).next_multiple_of(4096), BO_VRAM)?;
+        // The CPU fills staging; the GPU only reads it.
+        let staging = vm.alloc_readonly((code_bytes.len() as u64).next_power_of_two().max(1 << 20), 0)?;
+        let ring = vm.alloc(RING_BYTES, 0)?;
+        let sync = gpu.create_syncobj()?;
+        staging.write(0, &code_bytes)?;
+        let mut ib = arch.stream();
+        ib.copy(staging.gpu_va(), code.gpu_va(), code_bytes.len() as u64);
+        ib.end(ring.gpu_va() + FENCE_OFFSET);
+        run(&vm, &ring, &*ib, (&sync, 1), 0).map_err(|e| std::io::Error::other(e.to_string()))?;
+        drop(ib);
+        sync.wait(1, flip_wait_ms())?;
         Ok(WinVm {
-            code: vm.share(code, true)?,
+            code,
             shown: [main.share(&surfaces[0], true)?, main.share(&surfaces[1], true)?],
             surfaces,
             front: 0,
@@ -959,11 +981,11 @@ impl<'a> WinVm<'a> {
             scrolls: Vec::new(),
             scratch: None,
             data: None,
-            // The CPU fills these; the GPU only reads them.
-            staging: vm.alloc_readonly(1 << 20, 0)?,
-            ring: vm.alloc(RING_BYTES, 0)?,
-            sync: gpu.create_syncobj()?,
-            seq: 0,
+            staging,
+            ring,
+            sync,
+            seq: 1,
+            pixel_gen: None,
             vm,
         })
     }
@@ -976,6 +998,8 @@ struct Pending {
     scrolls: HashMap<u32, Vec<(crate::pack::Scroll, u64)>>,
     /// Each window's screen position.
     pos: HashMap<u32, (i32, i32)>,
+    /// Windows drawn by their own renderer (pixel mode): copied in as is.
+    pixels: HashMap<u32, Arc<crate::pack::Pixels>>,
 }
 
 /// More dirty rectangles than this raster their bounding box instead.
@@ -1059,8 +1083,8 @@ fn run<'a>(vm: &Vm<'a>, ring: &Bo<'a>, ib: &dyn fresco_compute::gpu::Stream, sig
 
 impl<'a> GpuCompute<'a> {
     pub fn new(vm: &'a Vm<'a>, arch: Box<dyn fresco_compute::gpu::Arch>, width: u32, height: u32) -> Result<Self> {
-        // The code goes up once, here: every window's VM maps it read-only
-        // from its first frame on.
+        // frescod's own copy of the code (compose, read-back); each window
+        // VM uploads its own (WinVm::new).
         let code_bytes = arch.code();
         let code = vm.alloc((code_bytes.len() as u64).next_multiple_of(4096), BO_VRAM)?;
         let staging = vm.alloc_readonly((code_bytes.len() as u64).next_power_of_two().max(1 << 20), 0)?;
@@ -1193,12 +1217,16 @@ impl<'a> GpuCompute<'a> {
         let gpu = self.vm.gpu();
         let mut frames = Vec::with_capacity(f.windows.len());
         let mut scrolls = HashMap::new();
+        let mut pixels = HashMap::new();
         for w in &f.windows {
+            if let Some(px) = &w.pixels {
+                pixels.insert(w.id, px.clone());
+            }
             let (sw, sh) = surface_size(w);
             if self.wins.get(&w.id).is_none_or(|v| v.size != (sw, sh)) {
                 // New, or resized: a fresh VM and surface (its contents are gone).
                 self.wins.remove(&w.id);
-                self.wins.insert(w.id, WinVm::new(gpu, self.vm, &self.code, sw, sh)?);
+                self.wins.insert(w.id, WinVm::new(gpu, self.vm, &*self.arch, sw, sh)?);
                 *self.version.entry(w.id).or_insert(0) += 1;
                 self.changes.remove(&w.id);
                 self.composed.clear();
@@ -1208,7 +1236,7 @@ impl<'a> GpuCompute<'a> {
         }
         self.last = frames.clone();
         let pos = f.windows.iter().map(|w| (w.id, (w.pos.0.round() as i32, w.pos.1.round() as i32))).collect();
-        self.pending = Some(Pending { frames, scrolls, pos });
+        self.pending = Some(Pending { frames, scrolls, pos, pixels });
         Ok(())
     }
 
@@ -1270,6 +1298,18 @@ impl<'a> GpuCompute<'a> {
                 }
                 learn(&mut self.slice_budget, self.slice_us, fl, fl.slice_fg == self.fg_submits);
                 land(*id, v, &mut self.version, &mut self.changes);
+            }
+            if let Some(px) = p.pixels.get(id) {
+                match pixels_in(&*self.arch, v, px, deadline_ns, f) {
+                    Ok(true) => self.fg_submits += 1,
+                    Ok(false) => {}
+                    Err(e) if is_busy(&*e) => {
+                        log::debug!("gpu: window {id} pixels: GPU busy, later");
+                        self.retry = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
             }
             let sig = damage::tile_signatures(f);
             let (fw, fh) = (f.header.width, f.header.height);
@@ -1398,7 +1438,7 @@ impl<'a> GpuCompute<'a> {
                 seq: v.seq, frame: f.clone(), va, rest,
                 slice_cost, slice_at: std::time::Instant::now(), slice_full: slice_cost * 2 >= self.slice_budget, cut: self.slice_budget,
                 slice_fg: self.fg_submits,
-                sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false,
+                sig, scrolls: now, changed, started: std::time::Instant::now(), slow: false, pixel_gen: None,
             });
             if probe.is_some() && n > 0 {
                 let r = v.sync.wait(v.seq, flip_wait_ms());
@@ -1520,12 +1560,60 @@ impl<'a> GpuCompute<'a> {
 
 /// Window `id`'s finished raster becomes its front surface: a new version,
 /// changed where the raster drew.
+/// A pixel-mode window (drawn by its own renderer, in its jail): copy its
+/// drawing into the back surface as is, as the compute renderer copies it
+/// into its heap; only the rows that changed since the drawing the front
+/// holds, the rest from the front. Lands like a raster. Whether it
+/// submitted (false: the front already holds this drawing).
+fn pixels_in(arch: &dyn fresco_compute::gpu::Arch, v: &mut WinVm<'_>, px: &crate::pack::Pixels, deadline_ns: u32, f: &Arc<fresco_compute::Frame>) -> Result<bool> {
+    let (w, h) = v.size;
+    if (px.width, px.height) != (w, h) || px.px.len() != (w * h) as usize {
+        return Err(format!("pixel window {}x{} on a {w}x{h} surface", px.width, px.height).into());
+    }
+    let since = if v.landed { v.pixel_gen.and_then(|g| px.changed_since(g)) } else { None };
+    // Rows y0..y1, whole rows: one contiguous run of the drawing.
+    let (y0, y1, partial) = match since {
+        Some(None) => return Ok(false),
+        Some(Some(r)) => (r[1].min(h), r[3].min(h), true),
+        None => (0, h, false),
+    };
+    let back = v.surfaces[v.front ^ 1].gpu_va();
+    let mut ib = arch.stream();
+    if partial {
+        ib.copy(v.surfaces[v.front].gpu_va(), back, w as u64 * h as u64 * 4);
+    }
+    if y1 > y0 {
+        let rows = fresco_compute::bytes_of(&px.px[(y0 * w) as usize..(y1 * w) as usize]);
+        if v.staging.size() < rows.len() as u64 {
+            v.staging = v.vm.alloc_readonly((rows.len() as u64).next_power_of_two(), 0)?;
+        }
+        v.staging.write(0, &rows)?;
+        ib.copy(v.staging.gpu_va(), back + y0 as u64 * w as u64 * 4, rows.len() as u64);
+    }
+    ib.end(v.ring.gpu_va() + FENCE_OFFSET);
+    v.seq += 1;
+    if let Err(e) = run(&v.vm, &v.ring, &*ib, (&v.sync, v.seq), deadline_ns) {
+        v.seq -= 1;
+        return Err(e);
+    }
+    let now = std::time::Instant::now();
+    v.inflight = Some(Inflight {
+        seq: v.seq, frame: f.clone(), va: [0; fresco_compute::binding::COUNT], rest: Default::default(),
+        slice_cost: 0, slice_at: now, slice_full: false, cut: 0, slice_fg: 0,
+        // No tile signatures: a raster after this draws the whole window.
+        sig: Vec::new(), scrolls: Vec::new(), changed: [0, y0, w, y1], started: now, slow: false,
+        pixel_gen: Some(px.gen),
+    });
+    Ok(true)
+}
+
 fn land(id: u32, v: &mut WinVm<'_>, version: &mut HashMap<u32, u64>, changes: &mut HashMap<u32, Vec<(u64, [u32; 4])>>) {
     let Some(fl) = v.inflight.take() else { return };
     v.front ^= 1;
     v.landed = true;
     v.held = Some(fl.sig);
     v.scrolls = fl.scrolls;
+    v.pixel_gen = fl.pixel_gen;
     let ver = version.entry(id).or_insert(0);
     *ver += 1;
     let log = changes.entry(id).or_default();
