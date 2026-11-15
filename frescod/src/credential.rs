@@ -51,32 +51,48 @@ pub fn observe_frame(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], scree
     observe_frame_with(comp, layers, screen, now, crate::activation::sheet_uids())
 }
 
+/// A window's guard (`OP_WINDOW_GUARD`) is recorded under its window id
+/// with this bit set (window ids are 16 bits).
+pub const GUARD: u32 = 1 << 16;
+
 /// [`observe_frame`] with the sheet uids given (tests).
 pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], screen: [i32; 4], now: u64, sheet_uids: &[u32]) -> Vec<[i32; 4]> {
-    // (window, fits, plain)
-    let slots: Vec<(u32, bool, bool)> = {
+    // (record key, window, the part of the window watched, fits, plain).
+    let slots: Vec<(u32, u32, Option<[i32; 4]>, bool, bool)> = {
         let c = comp.lock().unwrap();
-        c.windows.iter().filter_map(|(&id, w)| {
+        let guards = c.windows.iter().filter_map(|(&id, w)| {
+            let g = w.guard?;
+            Some((id as u32 | GUARD, id as u32, Some(g), !w.hidden && g[2] as f32 >= MIN_W && g[3] as f32 >= MIN_H, false))
+        });
+        let slots = c.windows.iter().filter_map(|(&id, w)| {
             if w.slot.is_none() {
                 let uid = crate::socket_server::client_uid(w.owner).unwrap_or(w.owner_uid);
                 let (sw, sh) = w.size;
                 let fits = !w.hidden && !w.embed_pending && sw >= MIN_W && sh >= MIN_H;
-                return Some((id as u32, fits, !sheet_uids.contains(&uid)));
+                return Some((id as u32, id as u32, None, fits, !sheet_uids.contains(&uid)));
             }
             let s = w.slot.filter(|s| s.kind == fresco_protocol::slot::kind::CREDENTIAL)?;
             let p = c.windows.get(&s.parent)?;
             let [x, y, rw, rh] = s.rect;
             let inside = x >= 0.0 && y >= 0.0 && x + rw <= p.size.0 && y + rh <= p.size.1;
-            Some((id as u32, inside && rw >= MIN_W && rh >= MIN_H, false))
-        }).collect()
+            Some((id as u32, id as u32, None, inside && rw >= MIN_W && rh >= MIN_H, false))
+        });
+        slots.chain(guards).collect()
     };
     let mut g = RECS.lock().unwrap();
     let recs = g.get_or_insert_with(HashMap::new);
-    recs.retain(|id, _| slots.iter().any(|(s, _, _)| s == id));
+    recs.retain(|id, _| slots.iter().any(|(s, ..)| s == id));
     let mut shown = Vec::new();
-    for (id, fits, plain) in slots {
-        let at = layers.iter().position(|(l, _)| *l == id);
-        let r = at.map(|i| layers[i].1);
+    for (id, window, part, fits, plain) in slots {
+        let at = layers.iter().position(|(l, _)| *l == window);
+        // A guard is that part of its window's layer, and must lie in it.
+        let r = at.map(|i| layers[i].1).and_then(|l| match part {
+            None => Some(l),
+            Some([x, y, w, h]) => {
+                let r = [l[0].saturating_add(x), l[1].saturating_add(y), l[0].saturating_add(x).saturating_add(w), l[1].saturating_add(y).saturating_add(h)];
+                (r[2] <= l[2] && r[3] <= l[3]).then_some(r)
+            }
+        });
         let visible = match (at, r) {
             (Some(i), Some(r)) => {
                 fits
@@ -107,7 +123,9 @@ pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], 
         if visible && rec.since.is_none() {
             rec.since = Some(now);
         }
-        if visible && !plain {
+        // Credential slots and sheets get frescod's frame; plain windows
+        // and guards are their own.
+        if visible && !plain && part.is_none() {
             shown.push(rec.rect);
         }
     }
@@ -151,8 +169,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// The record is one static: these tests take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_slot_counts_only_after_half_a_second_clear_and_still() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let comp = Arc::new(Mutex::new(Compositor::new()));
         let (p, s) = {
             let mut c = comp.lock().unwrap();
@@ -195,6 +217,7 @@ mod tests {
 
     #[test]
     fn a_sheet_window_is_watched_like_a_slot() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let comp = Arc::new(Mutex::new(Compositor::new()));
         let (app, sheet) = {
             let mut c = comp.lock().unwrap();
@@ -233,5 +256,54 @@ mod tests {
         assert!(window_visible_for(sheet, t0 + 3000 * ms, t0 + 3000 * ms));
         assert!(!visible_for_purpose(fresco_protocol::activation::purpose::IDENTITY, sheet, t0 + 3000 * ms, t0 + 3000 * ms));
         assert!(visible_for_purpose(fresco_protocol::activation::purpose::APPROVE, sheet, t0 + 3000 * ms, t0 + 3000 * ms));
+    }
+
+    #[test]
+    fn a_windows_guard_is_watched_like_a_slot() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let comp = Arc::new(Mutex::new(Compositor::new()));
+        let (ui, other) = {
+            let mut c = comp.lock().unwrap();
+            let ui = c.create(1, (1000, 700));
+            let other = c.create(2, (300, 200));
+            (ui, other)
+        };
+        // The row: 1000 x 40 at y 80 of the window.
+        assert!(!comp.lock().unwrap().set_guard(ui, 2, Some([0, 80, 1000, 40])), "another client's window");
+        assert!(comp.lock().unwrap().set_guard(ui, 1, Some([0, 80, 1000, 40])));
+        let (ui, other) = (ui as u32, other as u32);
+        let g = ui | GUARD;
+        let screen = [0, 24, 1280, 800];
+        let ms = 1_000_000u64;
+        let t0 = 9000 * ms;
+        let win = (ui, [0, 62, 1000, 762]);
+        observe_frame(&comp, &[win], screen, t0);
+        observe_frame(&comp, &[win], screen, t0 + 600 * ms);
+        assert!(visible_for(g, t0 + 600 * ms, t0 + 600 * ms), "the row, clear for half a second");
+        // Another program's window over the page, not the row: still clear.
+        observe_frame(&comp, &[win, (other, [100, 300, 400, 500])], screen, t0 + 700 * ms);
+        assert!(visible_for(g, t0 + 800 * ms, t0 + 800 * ms));
+        // Over the row (y 142..182 on screen): not, and for half a second after.
+        observe_frame(&comp, &[win, (other, [100, 150, 400, 350])], screen, t0 + 900 * ms);
+        assert!(!visible_for(g, t0 + 1000 * ms, t0 + 1000 * ms), "covered");
+        observe_frame(&comp, &[win, (other, [100, 300, 400, 500])], screen, t0 + 1100 * ms);
+        assert!(!visible_for(g, t0 + 1300 * ms, t0 + 1300 * ms), "just uncovered");
+        assert!(visible_for(g, t0 + 1700 * ms, t0 + 1700 * ms));
+        // Its window moved: a new run.
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 1800 * ms);
+        assert!(!visible_for(g, t0 + 1900 * ms, t0 + 1900 * ms), "moved");
+        // Past the window's edge, or too small, or dropped: never.
+        assert!(comp.lock().unwrap().set_guard(ui as u16, 1, Some([0, 690, 1000, 40])));
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 3000 * ms);
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 4000 * ms);
+        assert!(!visible_for(g, t0 + 4000 * ms, t0 + 4000 * ms), "past the window");
+        assert!(comp.lock().unwrap().set_guard(ui as u16, 1, Some([0, 80, 100, 10])));
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 5000 * ms);
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 6000 * ms);
+        assert!(!visible_for(g, t0 + 6000 * ms, t0 + 6000 * ms), "too small");
+        assert!(comp.lock().unwrap().set_guard(ui as u16, 1, None));
+        observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 7000 * ms);
+        assert!(!visible_for(g, t0 + 7000 * ms, t0 + 7000 * ms), "no guard");
+        assert!(!comp.lock().unwrap().set_guard(ui as u16, 1, Some([-1, 0, 100, 40])), "outside the window");
     }
 }

@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod files;
+mod press;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
@@ -108,6 +109,10 @@ struct Config {
     /// Schemes handed on (`NAVIGATORD_SCHEMES`, comma-separated, e.g.
     /// `mailto,tel`); `atrium-app` always is (navigator.md §2.2).
     schemes: SchemeAllowlist,
+    /// frescod's activation socket (`NAVIGATORD_ACTIVATION`): Save and the
+    /// hand-offs act only on a press spent there (`press.rs`). Required
+    /// unless `--unconfined-for-testing`.
+    activation: Option<PathBuf>,
 }
 
 impl Config {
@@ -127,6 +132,7 @@ impl Config {
                 .or_else(|| var("HOME").map(|h| Path::new(&h).join("Downloads")))
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/Downloads")),
             opener: var("NAVIGATORD_OPENER").and_then(|v| words(&v)),
+            activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
             schemes: {
                 let mut a = SchemeAllowlist::default();
                 for sch in std::iter::once("atrium-app".to_string()).chain(var("NAVIGATORD_SCHEMES").unwrap_or_default().split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from)) {
@@ -136,6 +142,9 @@ impl Config {
             },
         };
         if !unconfined {
+            if c.activation.is_none() {
+                return Err("no NAVIGATORD_ACTIVATION: refusing to save or hand on without frescod's word on the press".into());
+            }
             if c.converter.is_none() {
                 return Err("no NAVIGATORD_CONVERTER: refusing to run page JavaScript unconfined".into());
             }
@@ -853,6 +862,17 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // connection only.
     let waiting = Arc::new(Mutex::new(files::Waiting::default()));
     let mut handed: Vec<String> = Vec::new();
+    // Save and hand-offs: the press, spent with frescod by the UI's uid.
+    let ui_uid = press::peer_uid(&s);
+    let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
+    let mut spend = move |p: ctl::Press| -> Result<(), String> {
+        match (&mut presses, ui_uid) {
+            (Some(f), Some(uid)) => f.spend(p, uid),
+            (Some(_), None) => Err("the UI's uid is unknown".into()),
+            // Testing only (Config refuses this otherwise).
+            (None, _) => Ok(()),
+        }
+    };
     let mut r = s;
     loop {
         let req: Request = match ctl::read_frame(&mut r) {
@@ -1123,11 +1143,19 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
                 send(&w, &Event::Link { id, action });
             }
-            Request::Save { id } => {
-                let Some(h) = waiting.lock().unwrap().take(id) else {
+            Request::Save { id, press } => {
+                if !waiting.lock().unwrap().holds(id) {
                     send(&w, &Event::NotSaved { id, why: "that file is no longer held".into() });
                     continue;
-                };
+                }
+                // A refused press leaves the file held: the person may press
+                // again once the row is clear.
+                if let Err(why) = spend(press) {
+                    eprintln!("navigatord: save {id} refused: {why}");
+                    send(&w, &Event::PressRefused { why });
+                    continue;
+                }
+                let Some(h) = waiting.lock().unwrap().take(id) else { continue };
                 match files::save(&cfg.downloads, &h) {
                     Ok(path) => {
                         eprintln!("navigatord: saved {} as {}", h.url, path.display());
@@ -1139,8 +1167,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             Request::Discard { id } => {
                 waiting.lock().unwrap().take(id);
             }
-            Request::Hand { url, how } => {
-                let ev = hand(&cfg, &mut handed, &url, how);
+            Request::Hand { url, how, press } => {
+                let ev = match spend(press) {
+                    Ok(()) => hand(&cfg, &mut handed, &url, how),
+                    Err(why) => {
+                        eprintln!("navigatord: hand-off of {url} refused: {why}");
+                        Event::PressRefused { why }
+                    }
+                };
                 send(&w, &ev);
             }
         }

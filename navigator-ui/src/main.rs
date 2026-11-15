@@ -168,6 +168,8 @@ fn main() -> std::io::Result<()> {
     // The trail store goes to disk (§4.5) in live mode: at most once a
     // second, and only when its records changed.
     let mut saver = live.as_ref().map(|_| Saver::new(trails_path, &state.get_cloned().store));
+    // The prompt row, guarded by frescod (§6.4): what it was last told.
+    let mut guarded: Option<Option<[i32; 4]>> = None;
     loop {
         match window.step(&mut app, Some(TICK))? {
             StepResult::Event(raw) => event(&raw, window.id(), &state),
@@ -192,8 +194,18 @@ fn main() -> std::io::Result<()> {
             }
             // F6 to the page: frescod hands it the keys, if this window has them.
             let to_page = std::mem::take(&mut s.focus_page);
+            // frescod watches the prompt row for other windows over it;
+            // navigatord spends an answer's press only if it saw it clear.
+            let row = s.geo().prompt.map(|r| [r.x().ceil() as i32, r.y().ceil() as i32, r.w().floor() as i32 - 1, r.h().floor() as i32 - 1]);
             if changed || to_page {
                 state.set(s);
+            }
+            if guarded != Some(row) {
+                guarded = Some(row);
+                let id = window.id();
+                if let Err(e) = window.connection().window_guard(id, row) {
+                    eprintln!("navigator-ui: frescod: guard: {e}");
+                }
             }
             if to_page {
                 let id = window.id();

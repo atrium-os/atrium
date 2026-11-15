@@ -118,6 +118,9 @@ pub struct Shell {
     /// (§7 "Jump to section"), and whether their list is open.
     pub sections: Vec<(String, String)>,
     pub sections_open: bool,
+    /// The last answer sent to navigatord with a press, and the page it
+    /// was on: put back if frescod didn't count the press.
+    pub answered: Option<((u64, PageId), Prompt)>,
     /// The Aa pop-up is open (§7).
     pub reading_open: bool,
     /// Ctrl-H (§5.5): drawn where the page is, the page's slot withdrawn.
@@ -165,10 +168,12 @@ pub enum Out {
     /// The person told a site to forget them in a jar (§6.2).
     Forget { jar: navigator_control::Jar, url: String },
     /// Save, or drop, the file navigatord holds under that `Open` (§6.4).
-    Save { id: u32 },
+    /// `press`: frescod's token for the press on the answer, which
+    /// navigatord spends (the row seen uncovered by other windows).
+    Save { id: u32, press: navigator_control::Press },
     Discard { id: u32 },
     /// Hand a link to its program (§6.4, threat model §2.10).
-    Hand { url: String, how: navigator_control::Hand },
+    Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// Find in the page on screen (§7; limen `ToChild::Find`).
     Find { query: String, step: i8 },
     /// The current version of the page `key`, fetched again (§5.5).
@@ -260,7 +265,7 @@ pub struct Geo {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -604,9 +609,17 @@ impl Shell {
     /// A press on a prompt's answer. It counts only once the row has been
     /// still and uncovered for 500 ms (§6.4); returns whether it counted.
     pub fn answer(&mut self, i: usize, now: f64) -> bool {
+        self.answer_pressed(i, now, None)
+    }
+
+    /// [`Shell::answer`] with frescod's token for the press, passed on
+    /// with what navigatord does.
+    pub fn answer_pressed(&mut self, i: usize, now: f64, press: Option<navigator_control::Press>) -> bool {
+        let press = press.unwrap_or_default();
         if self.prompt_obscured() {
             return false;
         }
+        let key = self.shown_key();
         let Some(page) = self.store.trail_mut().page_mut() else { return false };
         let Some(a) = &page.asked else { return false };
         if now - a.since_ms < PROMPT_STILL_MS {
@@ -621,20 +634,38 @@ impl Shell {
         }
         self.last_note = Some(format!("prompt answered: {what} ({prompt:?})"));
         let live = self.live.is_some();
+        let sent = self.outbox.len();
         match (&prompt, what) {
             (Prompt::NotPrivate { .. }, "Go back") => {
                 self.store.trail_mut().back();
             }
-            (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id }),
+            (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id, press }),
             (Prompt::Download { id, .. }, "Cancel") if live => self.outbox.push(Out::Discard { id: *id }),
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open" | "Open in Mail") if live => {
-                self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open })
+                self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
-            (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try }),
+            (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try, press }),
             (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
+        if matches!(self.outbox.last(), Some(Out::Save { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
+            self.answered = key.map(|k| (k, prompt));
+        }
         true
+    }
+
+    /// frescod didn't count the press on the last answer (something was
+    /// over the row, or it had just moved): the question comes back, in
+    /// front, with its own 500 ms.
+    pub fn press_refused(&mut self, why: &str, now: f64) {
+        self.last_note = Some(format!("the press didn't count: {why}"));
+        let Some((key, prompt)) = self.answered.take() else { return };
+        let Some(page) = self.store.page_by_key_mut(key.0, key.1) else { return };
+        if let Some(a) = page.asked.take() {
+            page.prompts.queued.insert(0, a.prompt);
+            page.prompts.queued.truncate(PROMPTS_QUEUED);
+        }
+        page.asked = Some(Asked { prompt, since_ms: now });
     }
 
     /// navigatord decided a link is for another program: ask first.
@@ -1625,6 +1656,30 @@ mod tests {
     }
 
     #[test]
+    fn a_press_frescod_did_not_count_brings_the_question_back() {
+        let mut s = shell();
+        s.live = Some(LivePage::Shown(String::new()));
+        let dl = |id: u32, f: &str| Prompt::Download { id, file: f.into(), size: "1 KB".into(), origin: "atlas.example".into(), kind: "PDF".into() };
+        assert!(s.ask(dl(7, "a.pdf"), 0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([5; 16])), "Save");
+        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 7, press: [5; 16] }), "the press goes with it");
+        assert!(s.store.trail().page().unwrap().asked.is_none());
+        // Something else asked meanwhile: the refused one goes in front.
+        assert!(s.ask(dl(8, "b.pdf"), 1700.0));
+        s.press_refused("something was over the question", 1800.0);
+        let page = s.store.trail().page().unwrap();
+        assert!(matches!(&page.asked, Some(a) if a.prompt.key().contains("a.pdf") && a.since_ms == 1800.0));
+        assert!(page.prompts.queued.iter().any(|p| p.key().contains("b.pdf")));
+        assert!(!s.answer(1, 2000.0), "its own 500 ms again");
+        assert!(s.answer_pressed(1, 2400.0, Some([6; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 7, press: [6; 16] }));
+        // Nothing sent with a press: nothing to put back.
+        s.answered = None;
+        s.press_refused("x", 3000.0);
+        assert!(s.last_note.as_deref().is_some_and(|n| n.contains("didn't count")));
+    }
+
+    #[test]
     fn the_prompt_row_waits_takes_turns_and_remembers_no() {
         let mut s = shell();
         s.live = Some(LivePage::Shown(String::new()));
@@ -1648,7 +1703,7 @@ mod tests {
         assert!(matches!(&s.store.trail().page().unwrap().asked, Some(a) if a.prompt.key().contains("b.pdf")));
         assert!(!s.answer(1, 2700.0));
         assert!(s.answer(1, 3200.0), "Save");
-        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 8 }));
+        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 8, press: [0; 16] }));
         assert!(s.geo().prompt.is_none());
         assert!(!s.ask(dl(9, "a.pdf"), 9000.0), "dismissed on this page: not asked again");
         // A row that moves starts again too.
@@ -1668,11 +1723,11 @@ mod tests {
         let a = s.store.trail().page().unwrap().asked.clone().unwrap();
         assert_eq!(a.prompt, Prompt::OpenApp { url: "atrium-app://example.com/photos?path=/x".into(), name: "example.com".into() });
         assert!(s.answer(2, 600.0), "Try it");
-        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try }));
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try, press: [0; 16] }));
         s.handoff("mailto:a@atlas.example", "mailto", 2000.0);
         assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open in Mail"]);
         assert!(s.answer(1, 2600.0));
-        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "mailto:a@atlas.example".into(), how: navigator_control::Hand::Open }));
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "mailto:a@atlas.example".into(), how: navigator_control::Hand::Open, press: [0; 16] }));
     }
 
     #[test]

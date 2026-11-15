@@ -16,6 +16,9 @@ navigator-cookies = { path = "../navigator-cookies" }
 navigator-backend = { path = "../navigator-backend" }
 navigator-prerender = { path = "../navigator-prerender" }
 fresco-split = { path = "../fresco-split" }
+fresco-protocol = { path = "../fresco-protocol" }
+aqueduct = { path = "../aqueduct" }
+postcard = { version = "1", features = ["use-std"] }
 url = "2"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

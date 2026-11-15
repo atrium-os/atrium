@@ -101,14 +101,21 @@ pub enum Request {
     /// (`File`, same `id`, navigator-ui.md §6.4). navigatord writes it to
     /// the downloads directory with its source origin recorded, never
     /// executable; answered by `Saved` or `NotSaved`.
-    Save { id: u32 },
+    /// `press`: frescod's activation token for the press on Save, which
+    /// navigatord spends with frescod (`purpose::PROMPT`) before acting:
+    /// the prompt row must have been whole, uncovered by any other window
+    /// and still for 500 ms before it.
+    Save { id: u32, press: Press },
     /// The person cancelled that file: navigatord drops the bytes.
     Discard { id: u32 },
     /// The person pressed a hand-off prompt's answer for a link navigatord
     /// decided as `Handoff` on this connection (threat model §2.10). Only
-    /// such a link is handed on; answered by `Handed`.
-    Hand { url: String, how: Hand },
+    /// such a link is handed on; answered by `Handed`. `press` as for `Save`.
+    Hand { url: String, how: Hand, press: Press },
 }
+
+/// frescod's activation token for a press (zero: none).
+pub type Press = [u8; 16];
 
 /// How a hand-off is taken (navigator-ui.md §6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +170,10 @@ pub enum Event {
     /// Written: `path` is where.
     Saved { id: u32, path: String },
     NotSaved { id: u32, why: String },
+    /// frescod didn't count the press that came with `Save` or `Hand`
+    /// (something was over the prompt row, or it had just moved): nothing
+    /// was done, and the file or hand-off is still held.
+    PressRefused { why: String },
     /// A hand-off was passed to its handler, or why not.
     Handed { url: String, ok: bool, why: Option<String> },
     /// `SignOut` done: how many session cookies ended, or why not.

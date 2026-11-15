@@ -277,6 +277,10 @@ pub type FocusParentFn = Box<dyn Fn(u8, u32) + Send + Sync>;
 pub static FOCUS_PARENT: std::sync::OnceLock<FocusParentFn> = std::sync::OnceLock::new();
 /// The same for `OP_WINDOW_FOCUS_EMBED`.
 pub static FOCUS_EMBED: std::sync::OnceLock<FocusParentFn> = std::sync::OnceLock::new();
+/// What `OP_WINDOW_GUARD` does in a renderer (split mode): it goes to
+/// frescod, which watches the screen.
+pub type GuardFn = Box<dyn Fn(u8, &fresco_protocol::WindowGuardPayload) + Send + Sync>;
+pub static GUARD: std::sync::OnceLock<GuardFn> = std::sync::OnceLock::new();
 
 /// Run after `OP_POPUP_GRANT` is dispatched and before its answer goes
 /// out: a renderer sends the grant on to frescod now, so it is there
@@ -741,6 +745,14 @@ pub fn reader_loop(
             if let Some(f) = focus_hook {
                 if let Ok(p) = fresco_protocol::decode::<fresco_protocol::WindowFocusParentPayload>(&msg.payload) {
                     f(client_id, p.window_id);
+                }
+                continue;
+            }
+        }
+        if msg.op == fresco_protocol::control::OP_WINDOW_GUARD {
+            if let Some(f) = GUARD.get() {
+                if let Ok(g) = fresco_protocol::decode::<fresco_protocol::WindowGuardPayload>(&msg.payload) {
+                    f(client_id, &g);
                 }
                 continue;
             }

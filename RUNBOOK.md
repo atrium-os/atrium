@@ -5738,10 +5738,15 @@ arguments to `$S/opener.log`). The script presses the fixture's PDF link, finds 
 the trail still on its page, and presses Save. It checks `survey.pdf` is 0644 with its address in
 `getextattr user atrium.origin`. Then the `mailto:` and `atrium-app:` links each ask and are handed on
 once (`open mailto:…`, `try atrium-app://…`). The prompt row's primary answer is pressed at the window's
-right edge (the trace's `w=`), at least 500 ms after the row appeared. Islands are checked by
+right edge (the trace's `w=`), at least 500 ms after the row appeared. navigatord gets `NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock` (as root, a default
+consumer) and spends each answer's press there; frescod runs with `FRESCOD_INJECT_ACTIVATION=1` (injected
+presses mint tokens) and `FRESCOD_TOKEN_LIFE_MS=15000` (TCG takes over a second from press to spend; both
+testing only). Islands are checked by
 `atrium-activation-probe`, which binds an `ISLAND` slot, covers its corner with a plain slot, and checks
-clicks. `scripts/island-probe-vm.sh` (logs in `$OUT`, default /tmp) deploys the probe and the current frescod and runs it in split mode with
-`PROBE_SLOTS_ONLY=1` (24/24 on 2026-11-14). The probe's other sections, clipboard, drag and toasts, need a
+clicks; it also guards a rect of a window (`OP_WINDOW_GUARD`) and spends presses on `PROMPT`: counted when
+clear, refused with another window over part of the rect, counted again once clear and still, refused with
+no guard. `scripts/island-probe-vm.sh` (logs in `$OUT`, default /tmp) deploys the probe and the current frescod and runs it in split mode with
+`PROBE_SLOTS_ONLY=1` (24/24 on 2026-11-14; 2026-11-15 with the guard checks 27/28: "a covered island takes no click, even away from the cover" fails, open). The probe's other sections, clipboard, drag and toasts, need a
 full session with Forum, and fail without one. frescod's unit tests run only on FreeBSD: cross-build
 them with `cargo test --release --target aarch64-unknown-freebsd --no-run`, then copy and run the binary
 in the VM (61/61).

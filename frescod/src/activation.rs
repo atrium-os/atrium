@@ -19,6 +19,23 @@ use fresco_protocol::activation::{kind, purpose, refusal, ConsumeResult, GrantRe
 /// A token lives this long, or until spent.
 pub const LIFETIME_NS: u64 = 1_000_000_000;
 
+/// The lifetime in force: [`LIFETIME_NS`], except that a VM under TCG
+/// (50-100x slow) that injects its presses (`FRESCOD_INJECT_ACTIVATION=1`,
+/// testing only) may stretch it with `FRESCOD_TOKEN_LIFE_MS` (at most 30 s).
+fn lifetime() -> u64 {
+    static L: OnceLock<u64> = OnceLock::new();
+    *L.get_or_init(|| {
+        let testing = std::env::var("FRESCOD_INJECT_ACTIVATION").as_deref() == Ok("1");
+        match std::env::var("FRESCOD_TOKEN_LIFE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            Some(ms) if testing => {
+                eprintln!("frescod: WARNING: activation tokens live {ms} ms (FRESCOD_TOKEN_LIFE_MS, testing only)");
+                ms.clamp(1, 30_000) * 1_000_000
+            }
+            _ => LIFETIME_NS,
+        }
+    })
+}
+
 /// HID usages and modifier bits the purposes look at.
 const HID_C: u16 = 0x06;
 const HID_V: u16 = 0x19;
@@ -96,6 +113,9 @@ fn fits(e: &Entry, p: u8) -> bool {
         // Allowing an app from Settings: Allow pressed, or Enter on it.
         (kind::BUTTON, purpose::APPROVE) => true,
         (kind::KEY, purpose::APPROVE) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
+        // A prompt's answer (navigator-ui.md §6.4): a click, or Enter.
+        (kind::BUTTON, purpose::PROMPT) => true,
+        (kind::KEY, purpose::PROMPT) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -104,7 +124,8 @@ impl Table {
     /// A fresh token for `e` (its `counter` is set here).
     pub fn mint(&mut self, mut e: Entry) -> [u8; 16] {
         let now = e.minted_ns;
-        self.live.retain(|_, v| now.saturating_sub(v.minted_ns) < LIFETIME_NS);
+        let life = if cfg!(test) { LIFETIME_NS } else { lifetime() };
+        self.live.retain(|_, v| now.saturating_sub(v.minted_ns) < life);
         if self.live.len() >= MAX_LIVE {
             if let Some(k) = self.live.iter().min_by_key(|(_, v)| v.counter).map(|(k, _)| *k) {
                 self.live.remove(&k);
@@ -125,11 +146,13 @@ impl Table {
     /// For `FILL`, `IDENTITY` and `APPROVE`, `visible(window, minted)` says
     /// whether that credential slot, sheet or window was fully visible and
     /// still before the press (arca-autofill.md §4, sigillum.md §7.2,
-    /// curia.md §13).
+    /// curia.md §13); for `PROMPT`, asked of `window | credential::GUARD`,
+    /// whether the window's guard was.
     pub fn consume(&mut self, now: u64, token: &Token, presenter_uid: u32, purpose: u8, focused: impl Fn(u32) -> bool, visible: impl Fn(u32, u64) -> bool) -> ConsumeResult {
         let Some(e) = self.live.get(token).copied() else { return refused(refusal::UNKNOWN) };
-        if now.saturating_sub(e.minted_ns) >= LIFETIME_NS {
+        if now.saturating_sub(e.minted_ns) >= if cfg!(test) { LIFETIME_NS } else { lifetime() } {
             self.live.remove(token);
+            eprintln!("frescod: activation: a token {} ms old refused", now.saturating_sub(e.minted_ns) / 1_000_000);
             return refused(refusal::EXPIRED);
         }
         // A failed check does not spend it: a wrong presenter cannot burn
@@ -142,7 +165,9 @@ impl Table {
         }
         // Visibility first: a slot under a cover is OBSCURED whichever
         // window took focus.
-        if matches!(purpose, purpose::FILL | purpose::IDENTITY | purpose::APPROVE) && !visible(e.window_id, e.minted_ns) {
+        // A prompt's answer: the window's guard, not the window.
+        let watched = if purpose == purpose::PROMPT { e.window_id | crate::credential::GUARD } else { e.window_id };
+        if matches!(purpose, purpose::FILL | purpose::IDENTITY | purpose::APPROVE | purpose::PROMPT) && !visible(watched, e.minted_ns) {
             return refused(refusal::OBSCURED);
         }
         // A drop lands on whatever window is under the pointer, focused
@@ -351,8 +376,9 @@ pub fn consumers() -> Vec<u32> {
     if let Ok(s) = std::env::var("FRESCOD_ACTIVATION_UIDS") {
         return s.split(',').filter_map(|u| u.trim().parse().ok()).collect();
     }
-    // root: portcullisd, which spends OPEN (opening-files.md §6.2).
-    ["root", "_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui"].iter().filter_map(|n| uid_of(n)).collect()
+    // root: portcullisd, which spends OPEN (opening-files.md §6.2);
+    // _navigatord spends PROMPT (navigator-ui.md §6.4).
+    ["root", "_tabula", "_share", "_praeco", "_arca-ui", "_sigillum-ui", "_navigatord"].iter().filter_map(|n| uid_of(n)).collect()
 }
 
 /// The uids whose top-level windows are trusted sheets, watched for
@@ -580,6 +606,22 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::FILL, YES, |_, _| true)), 0);
         let typed = t.mint(key(0x04, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::FILL, YES, |_, _| true)), refusal::WRONG_KIND);
+    }
+
+    #[test]
+    fn a_prompt_answer_needs_the_windows_guard_seen_whole() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        let guard = |w: u32, _| w == 5 | crate::credential::GUARD;
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::PROMPT, YES, |w, _| w == 5)), refusal::OBSCURED, "the window, not its guard");
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::PROMPT, YES, guard)), refusal::WRONG_UID);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::PROMPT, |_| false, guard)), refusal::NOT_FOCUSED);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::PROMPT, YES, guard)), 0);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::PROMPT, YES, guard)), refusal::UNKNOWN, "spent");
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::PROMPT, YES, guard)), 0);
+        let typed = t.mint(key(0x16, 0, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::PROMPT, YES, guard)), refusal::WRONG_KIND);
     }
 
     #[test]

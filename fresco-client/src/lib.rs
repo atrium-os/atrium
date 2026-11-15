@@ -778,6 +778,13 @@ impl Connection {
             &fresco_protocol::WindowFocusParentPayload { window_id })
     }
 
+    /// Guard `rect` (`[x, y, w, h]`, window pixels) of the window, or
+    /// drop its guard (`OP_WINDOW_GUARD`; the Navigator's prompt row).
+    pub fn window_guard(&mut self, window_id: u32, rect: Option<[i32; 4]>) -> io::Result<()> {
+        self.send_window_managed(control::OP_WINDOW_GUARD,
+            &fresco_protocol::WindowGuardPayload { window_id, rect })
+    }
+
     pub fn window_request_close(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_REQUEST_CLOSE,
             &WindowRequestClosePayload { window_id })

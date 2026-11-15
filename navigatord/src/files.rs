@@ -176,6 +176,11 @@ impl Waiting {
         Ok(())
     }
 
+    /// Whether `id` is held (and not past [`HELD_LIFE`]).
+    pub fn holds(&self, id: u32) -> bool {
+        self.0.get(&id).is_some_and(|h| h.since.elapsed() < HELD_LIFE)
+    }
+
     pub fn take(&mut self, id: u32) -> Option<Held> {
         self.0.remove(&id).filter(|h| h.since.elapsed() < HELD_LIFE)
     }

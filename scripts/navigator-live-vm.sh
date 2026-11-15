@@ -80,7 +80,7 @@ done
 echo "=== start"
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute FRESCOD_RENDERER_LAUNCHER=unconfined FRESCOD_RENDERER_BIN=$D/fresco-renderer \
     FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock \
-    FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_CHROME_SOCK=$S/chrome.sock FRESCOD_SLOT_UIDS=0 \
+    FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$S/chrome.sock FRESCOD_SLOT_UIDS=0 \
     daemon -f -o $S/frescod.log $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S $S/fresco.sock && test -S /var/run/atrium/fresco-activation.sock"; do sleep 2; i=$((i+1)); done
 g "cd $S && env FRESCO_SOCKET=$S/fresco.sock FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
@@ -93,6 +93,7 @@ g "cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_DEV_UID=50901 LIMEN_DEFAULTS=d
 # nd [log]: navigatord, its store of opened pages in $S/store.
 nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
     NAVIGATORD_STORE=$S/store NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock \
+    NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock \
     NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_OPENER='sh $S/opener.sh' \
     daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
 # The hand-off program: says what it was given.
@@ -245,6 +246,9 @@ until_trace 'prompt=download .*url=https://atlas.example/wiki/Atrium ' && ok "a 
 g "grep -q 'survey.pdf is a file (PDF' $S/navigatord*.log" && ok "…navigatord told it from a document by its bytes, and did not convert it" || bad "file: $(g "tail -3 $S/navigatord2.log")"
 last | grep -q 'pages=1 ' && ok "…and the file did not become a page of the trail" || bad "pages: $(last)"
 shot live-8-download
+# Save goes through navigatord, which spends the press with frescod
+# (purpose PROMPT: the row guarded, seen clear and still; island-probe-vm.sh
+# checks a covered row).
 answer
 sleep 3
 g "test -f $S/downloads/survey.pdf" && ok "Save wrote it to the downloads directory" || bad "not saved: $(g "grep -v trace $S/ui8.log | tail -3; ls -l $S/downloads")"

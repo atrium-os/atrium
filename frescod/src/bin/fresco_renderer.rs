@@ -432,6 +432,16 @@ fn main() {
             }
         }));
     }
+    // A guarded rect (the Navigator's prompt row) is watched by frescod.
+    {
+        let (broker, comp) = (broker.clone(), comp.clone());
+        let _ = socket_server::GUARD.set(Box::new(move |_, g| {
+            let known = u16::try_from(g.window_id).is_ok_and(|id| id != 0 && comp.lock().unwrap().windows.contains_key(&id));
+            if known {
+                send(&broker, &Msg::Guard { window: g.window_id, rect: g.rect });
+            }
+        }));
+    }
     // A gamepad claim goes to frescod, which holds the pads and decides.
     {
         let (broker, comp) = (broker.clone(), comp.clone());

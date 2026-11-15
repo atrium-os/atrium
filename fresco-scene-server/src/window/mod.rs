@@ -515,6 +515,9 @@ pub struct Window {
     pub min_size: (u32, u32),
     /// Full screen on this monitor (`WindowHints::full_screen_on`).
     pub full_screen_on: Option<u64>,
+    /// The rect of itself it guards (`OP_WINDOW_GUARD`, `[x, y, w, h]`
+    /// window pixels): frescod watches it for `purpose::PROMPT` presses.
+    pub guard: Option<[i32; 4]>,
 }
 
 impl Window {
@@ -537,6 +540,7 @@ impl Window {
             embed_token: [0; 16],
             min_size: (0, 0),
             full_screen_on: None,
+            guard: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -561,6 +565,7 @@ impl Window {
             embed_token: [0; 16],
             min_size: (0, 0),
             full_screen_on: None,
+            guard: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -1177,6 +1182,20 @@ impl Compositor {
         }
         self.set_focus_no_raise_by(Some(slot.parent), fresco_protocol::focus_cause::KEYBOARD);
         self.focus == Some(slot.parent)
+    }
+
+    /// `OP_WINDOW_GUARD`: `by`'s own window guards `rect` of itself, or
+    /// none. A rect must be non-empty and start inside the window (frescod
+    /// checks it fits each frame); refused (false) for another client's
+    /// window.
+    pub fn set_guard(&mut self, id: WindowId, by: ClientId, rect: Option<[i32; 4]>) -> bool {
+        let Some(w) = self.windows.get_mut(&id).filter(|w| w.owner == by) else { return false };
+        if rect.is_some_and(|[x, y, rw, rh]| x < 0 || y < 0 || rw <= 0 || rh <= 0) {
+            w.guard = None;
+            return false;
+        }
+        w.guard = rect;
+        true
     }
 
     /// `OP_WINDOW_FOCUS_EMBED`: `by`'s window `parent`, with the keys,

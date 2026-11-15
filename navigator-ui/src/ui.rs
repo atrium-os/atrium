@@ -1262,7 +1262,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
         rect(ctx, x, r.y() + em(6.0), w, em(32.0), edge, em(6.0));
         let st2 = st.clone();
         area(ctx, Rect::new(x + 1.0, r.y() + em(7.0), w - 2.0, em(30.0)), em(5.0), fill, hover, move || with(&st2, |s| {
-            if !s.answer(i, now_ms()) {
+            if !s.answer_pressed(i, now_ms(), pergola::clipboard::current_activation()) {
                 eprintln!("navigator-ui: a press within 500 ms of the prompt appearing doesn't count");
             }
         }));

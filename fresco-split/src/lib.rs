@@ -106,6 +106,9 @@ pub enum Msg {
     /// `OP_WINDOW_FOCUS_EMBED` from the client: its window gives the keys
     /// to the window in its topmost slot (frescod checks it has them).
     FocusEmbed { window: u32 },
+    /// `OP_WINDOW_GUARD` from the client: the rect of its window it guards
+    /// (`[x, y, w, h]`, window pixels), or none (navigator-ui.md §6.4).
+    Guard { window: u32, rect: Option<[i32; 4]> },
     /// A window's title changed.
     WindowTitle { window: u32, title: String },
     /// A window's minimum size, points (`WindowHints.min_size`; 0 = none),
@@ -268,6 +271,7 @@ mod kind {
     pub const FOCUS_PARENT: u32 = 16;
     pub const WINDOW_MIN_SIZE: u32 = 17;
     pub const FOCUS_EMBED: u32 = 18;
+    pub const GUARD: u32 = 20;
     pub const WINDOW_TITLE: u32 = 3;
     pub const FRAME_READY: u32 = 4;
     pub const CLIENT: u32 = 0x100;
@@ -364,6 +368,7 @@ impl Msg {
             | Msg::WindowDestroy { window }
             | Msg::FocusParent { window }
             | Msg::FocusEmbed { window }
+            | Msg::Guard { window, .. }
             | Msg::WindowTitle { window, .. }
             | Msg::WindowMinSize { window, .. }
             | Msg::FrameReady { window, .. }
@@ -433,6 +438,18 @@ impl Msg {
                 r
             }
             Msg::FocusEmbed { window } => Rec::new(FOCUS_EMBED, *window),
+            Msg::Guard { window, rect } => {
+                let mut r = Rec::new(GUARD, *window);
+                // Word 6: 1 when a rect follows.
+                if let Some([x, y, w, h]) = *rect {
+                    r.put(2, x as u32);
+                    r.put(3, y as u32);
+                    r.put(4, w as u32);
+                    r.put(5, h as u32);
+                    r.put(6, 1);
+                }
+                r
+            }
             Msg::WindowTitle { window, title } => {
                 let mut r = Rec::new(WINDOW_TITLE, *window);
                 r.title(title);
@@ -770,6 +787,7 @@ impl Msg {
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE | FOCUS_PARENT | FOCUS_EMBED => (0, false),
             WINDOW_MIN_SIZE => (2, false),
+            GUARD => (5, false),
             FRAME_READY => (3, false),
             GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
@@ -865,6 +883,14 @@ impl Msg {
                 Msg::WindowMinSize { window, width: side(r.get(2))?, height: side(r.get(3))? }
             }
             FOCUS_EMBED => Msg::FocusEmbed { window },
+            GUARD => Msg::Guard {
+                window,
+                rect: match flag(r.get(6))? {
+                    true => Some([r.get(2) as i32, r.get(3) as i32, dim(r.get(4))? as i32, dim(r.get(5))? as i32]),
+                    false if (2..6).all(|i| r.get(i) == 0) => None,
+                    false => return Err(Refused("guard rect without its flag")),
+                },
+            },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3), animating: match r.get(4) { 0 => false, 1 => true, _ => return Err(Refused("flag not 0 or 1")) } },
             CLIENT => Msg::Client {
@@ -1091,6 +1117,7 @@ impl Msg {
                 | Msg::WindowDestroy { .. }
                 | Msg::FocusParent { .. }
                 | Msg::FocusEmbed { .. }
+                | Msg::Guard { .. }
                 | Msg::WindowTitle { .. }
                 | Msg::WindowMinSize { .. }
                 | Msg::FrameReady { .. }

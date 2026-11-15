@@ -637,7 +637,9 @@ Rules:
   own slot can at most draw buttons that do nothing.
 - **A press counts only after the row has been still and unobscured for 500 ms**, the same rule
   as credential slots, so a page can't move something under the pointer just before it
-  appears.
+  appears. The UI checks its own popovers; frescod checks every other window (the row is
+  a guarded rect of the UI's window, and navigatord spends the press with frescod before
+  it saves or hands anything on).
 - **One prompt at a time per page**, newest last; a page can't queue prompts faster than one a
   second, and a dismissed prompt doesn't come back for that page until it is reloaded.
 - **Arca's save-password offer** and **Sigillum's sheet** are not in this row: they are Arca's
@@ -1221,8 +1223,27 @@ Each step runs in the VM on headless frescod before the next.
      time per page, with at most three waiting behind it, each getting its own 500 ms. A page
      can't ask more than once a second, the same question is never queued twice, and a prompt
      answered *Cancel* or *Not now* doesn't come back for that page while it stays loaded.
-     Other programs' windows over the row are not yet checked: frescod's visibility record
-     covers credential slots and sheets, not the UI's own row.
+     **Other programs' windows over the row** (built 2026-11-15): the UI tells frescod the
+     row's rect (`OP_WINDOW_GUARD`, passed on by the renderer in split mode as
+     `Msg::Guard`), and frescod watches it like a credential slot: whole on screen, inside
+     the window, at least 120 x 24, nothing composed above it overlapping it, still. Save,
+     Try it and Open go to navigatord with the press's activation token, and navigatord
+     (a consumer on frescod's activation socket, `NAVIGATORD_ACTIVATION`, required unless
+     testing) spends it with the new purpose `PROMPT`, which frescod grants only if the
+     row was so for 500 ms up to the press. A refused press does nothing (the file and
+     the hand-off stay held), navigatord answers `PressRefused`, and the question comes
+     back in front with its own 500 ms. Checked by frescod unit tests
+     (`a_windows_guard_is_watched_like_a_slot`,
+     `a_prompt_answer_needs_the_windows_guard_seen_whole`), navigator-ui
+     `a_press_frescod_did_not_count_brings_the_question_back`, `atrium-activation-probe`
+     in `scripts/island-probe-vm.sh` (another program's window over part of a guarded row:
+     refused; uncovered and still again: counted; no guard: refused), and the live script,
+     where Save, Open in Mail and Try it go through navigatord's spend. A toast-role window
+     in the live script's harness made forum-wm stop composing the Navigator's window while
+     it was up (only the page child showed), so the covered case is checked in the probe.
+     Open: frescod lets any consumer spend any purpose; navigatord should be limited to
+     `PROMPT` and run as its own user (`_navigatord`, a default consumer) rather than
+     the person's.
    - **Downloads.** navigatord decides from the fetched bytes, not from anything the site
      claims, whether an `Open` is a document or a file (`navigatord/src/files.rs`). The
      fetcher's reply carries no media type anyway. Markup and UTF-8 text are documents; a

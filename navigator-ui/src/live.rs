@@ -415,6 +415,7 @@ impl Live {
                 }
                 Event::Saved { path, .. } => s.last_note = Some(format!("saved as {path}")),
                 Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
+                Event::PressRefused { why } => s.press_refused(&why, crate::ui::now_ms()),
                 Event::Handed { url, ok, why } => {
                     s.last_note = Some(if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) })
                 }
@@ -591,9 +592,9 @@ impl Live {
                 }
                 Out::SignOut { jar, url } => send(&mut self.w, &Request::SignOut { jar, url }),
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
-                Out::Save { id } => send(&mut self.w, &Request::Save { id }),
+                Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
-                Out::Hand { url, how } => send(&mut self.w, &Request::Hand { url, how }),
+                Out::Hand { url, how, press } => send(&mut self.w, &Request::Hand { url, how, press }),
                 Out::Reload { key } => {
                     // Its child closes; the page opens again, fetched.
                     if let Some(i) = self.children.iter().position(|c| c.key == key) {

@@ -880,6 +880,7 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_REQUEST_CLOSE => self.handle_window_request_close(msg),
             control::OP_WINDOW_FOCUS_PARENT  => self.handle_window_focus_parent(msg),
             control::OP_WINDOW_FOCUS_EMBED   => self.handle_window_focus_embed(msg),
+            control::OP_WINDOW_GUARD         => self.handle_window_guard(msg),
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
             control::OP_POPUP_CREATE         => self.handle_popup_create(msg),
@@ -2163,6 +2164,18 @@ impl EnvelopeFrontend {
         let id = u16::try_from(p.window_id).map_err(|_| DispatchError::UnknownWindow)?;
         if !self.compositor.lock().unwrap().focus_embed(id, self.current_client as u32) {
             eprintln!("frescod: client {} may not give the keys to what window {} embeds", self.current_client, p.window_id);
+        }
+        Ok(Vec::new())
+    }
+
+    fn handle_window_guard(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        let p: fresco_protocol::WindowGuardPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let id = u16::try_from(p.window_id).map_err(|_| DispatchError::UnknownWindow)?;
+        if !self.compositor.lock().unwrap().set_guard(id, self.current_client as u32, p.rect) {
+            eprintln!("frescod: client {} may not guard window {}", self.current_client, p.window_id);
         }
         Ok(Vec::new())
     }

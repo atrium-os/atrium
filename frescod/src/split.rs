@@ -765,6 +765,12 @@ impl Broker {
                     log::debug!("frescod: client {}: window {local} has no keys to give", r.client_id);
                 }
             }
+            Msg::Guard { rect, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("guard on an unknown window")?;
+                if !self.comp.lock().unwrap().set_guard(global, r.client_id as u32, rect) {
+                    log::info!("frescod: client {}: window {local}: guard refused", r.client_id);
+                }
+            }
             Msg::FocusEmbed { .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("focus from an unknown window")?;
                 if !self.comp.lock().unwrap().focus_embed(global, r.client_id as u32) {

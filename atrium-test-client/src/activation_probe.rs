@@ -457,6 +457,43 @@ fn main() {
     let _ = bind_z(&mut p, iht, ist, sk::PLAIN, None, 1);
     drop((ihost, isl, over));
 
+    // A guarded rect (navigator-ui.md §6.4, the Navigator's prompt row): a
+    // press in its window is spent on PROMPT only while frescod sees the
+    // rect whole, uncovered and still for 500 ms, whoever's window covers it.
+    let (mut gw, gid) = window(sock, (100, 620), (500, 120), [0.85, 0.9, 0.95, 1.0]);
+    gw.window_guard(gid, Some([0, 20, 500, 44])).unwrap(); // screen (100, 640) to (600, 684)
+    let prompt = |p: &mut Probe, c: &mut Connection, x: i32, y: i32| -> u8 {
+        while let Ok(Some(_)) = c.wait_event(Some(Duration::from_millis(50))) {}
+        p.inject(&format!("MOVE {x} {y}"));
+        for _ in 0..200 {
+            p.inject("BTN 1 1");
+            p.inject("BTN 1 0");
+            let until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < until {
+                if let Ok(Some(Event::PointerButton { pressed: true, activation, .. })) = c.wait_event(Some(Duration::from_millis(20))) {
+                    return refused(p.consume(activation, p.uid, purpose::PROMPT));
+                }
+            }
+        }
+        255
+    };
+    still();
+    let r = prompt(&mut p, &mut gw, 560, 660);
+    p.check(r == 0, &format!("a guarded row seen whole and still: the press counts ({r})"));
+    let (mut gc, gcid) = window(sock, (110, 630), (200, 40), [0.3, 0.3, 0.3, 1.0]);
+    still();
+    let r = prompt(&mut p, &mut gw, 560, 660);
+    p.check(r == refusal::OBSCURED, &format!("another program's window over part of the row: refused ({r})"));
+    gc.window_destroy(gcid).unwrap();
+    still();
+    let r = prompt(&mut p, &mut gw, 560, 660);
+    p.check(r == 0, &format!("uncovered and still again: counts ({r})"));
+    gw.window_guard(gid, None).unwrap();
+    still();
+    let r = prompt(&mut p, &mut gw, 560, 660);
+    p.check(r == refusal::OBSCURED, &format!("no guard: nothing frescod saw ({r})"));
+    drop((gw, gc));
+
     // Embed-only connections (fresco-video.md §8, S1): limend turns a new
     // activation-socket stream into the child's frescod connection; every
     // window on it stays an embed, whatever its hints say.

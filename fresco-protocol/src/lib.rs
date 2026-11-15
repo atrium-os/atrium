@@ -163,6 +163,15 @@ pub mod control {
     /// parent's owner, only while it has the keys: it can hand them to
     /// what it embeds, never take them from another app.
     pub const OP_WINDOW_FOCUS_EMBED:    u16 = 0x050c;
+    /// A window guards one rect of itself (navigator-ui.md §6.4: the
+    /// Navigator's prompt row): `WindowGuardPayload`, no reply. frescod
+    /// watches it like a credential slot (whole on screen, nothing composed
+    /// above it overlapping it, at least `credential::MIN_W` x `MIN_H`,
+    /// still), and a press in that window is spent on
+    /// `activation::purpose::PROMPT` only if the guard was so for
+    /// `credential::STILL_NS` up to the press. Only the window's owner;
+    /// `rect: None` drops the guard.
+    pub const OP_WINDOW_GUARD:          u16 = 0x050d;
 
     /// Deadline-lane sponsorship request (scheduler federation §1.1,
     /// Laminar phase J): the client asks frescod — the vblank deadline
@@ -1120,6 +1129,14 @@ pub struct WindowRequestClosePayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowFocusParentPayload {
     pub window_id: u32,
+}
+
+/// `OP_WINDOW_GUARD`: the caller's window and the rect it guards
+/// (`[x, y, w, h]`, window pixels), or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowGuardPayload {
+    pub window_id: u32,
+    pub rect: Option<[i32; 4]>,
 }
 
 /// `OP_WINDOW_PRESENT` — per-window frame end (vs the global
@@ -2588,6 +2605,11 @@ pub mod activation {
         /// (curia.md §13): a click, or Enter, on Allow in the settings
         /// app's window, spent by portcullisd.
         pub const APPROVE: u8 = 11;
+        /// An answer in a guarded row (navigator-ui.md §6.4: Save, Try it,
+        /// Open), spent by navigatord: a click, or Enter, in a window whose
+        /// guard (`control::OP_WINDOW_GUARD`) frescod saw whole, uncovered
+        /// and still for `credential::STILL_NS` before the press.
+        pub const PROMPT: u8 = 12;
     }
 
     /// What minted a token.

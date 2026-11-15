@@ -1,0 +1,82 @@
+//! Spending the person's press with frescod (navigator-ui.md §6.4).
+//!
+//! Save and the hand-off answers act outside the page: a file written, a
+//! link handed to another program. navigatord acts only on a press frescod
+//! minted in the UI's window and spends here with `purpose::PROMPT`, which
+//! frescod grants only if the UI's guarded prompt row was whole, uncovered
+//! by any other window and still for 500 ms before the press. So another
+//! program can't slide a window over the row, or off it just before the
+//! press, to have the person agree to something they did not see.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use aqueduct::flag;
+use fresco_protocol::activation::{op, purpose, refusal, Consume, ConsumeResult, NONE};
+
+pub struct Frescod {
+    path: PathBuf,
+    conn: Option<aqueduct::Connection>,
+}
+
+impl Frescod {
+    pub fn new(path: impl Into<PathBuf>) -> Frescod {
+        Frescod { path: path.into(), conn: None }
+    }
+
+    fn ask(&mut self, c: Consume) -> std::io::Result<ConsumeResult> {
+        if self.conn.is_none() {
+            self.conn = Some(aqueduct::Connection::connect(&self.path)?);
+        }
+        let conn = self.conn.as_mut().unwrap();
+        let bad = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let payload = postcard::to_stdvec(&c).map_err(|e| bad(e.to_string()))?;
+        conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, flag::RESPONSE_EXPECTED, &payload)?;
+        conn.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let m = conn.recv_message()?;
+        if m.op != op::CONSUME || m.flags & flag::IS_RESPONSE == 0 {
+            return Err(bad("unexpected reply".into()));
+        }
+        postcard::from_bytes(&m.payload).map_err(|e| bad(e.to_string()))
+    }
+
+    /// Spend `press`, presented by the UI running as `uid`: `Ok` or why not,
+    /// in words for the UI.
+    pub fn spend(&mut self, press: [u8; 16], uid: u32) -> Result<(), String> {
+        if press == NONE {
+            return Err("no press from the screen came with it".into());
+        }
+        match self.ask(Consume { token: press, presenter_uid: uid, purpose: purpose::PROMPT }) {
+            Ok(ConsumeResult::Ok { .. }) => Ok(()),
+            Ok(ConsumeResult::Refused { reason }) => Err(match reason {
+                refusal::OBSCURED => "something was over the question, or it had just moved".into(),
+                refusal::EXPIRED => "the press was too long ago".into(),
+                refusal::NOT_FOCUSED => "the window lost the focus".into(),
+                r => format!("frescod refused the press ({r})"),
+            }),
+            Err(e) => {
+                self.conn = None;
+                Err(format!("frescod: {e}"))
+            }
+        }
+    }
+}
+
+/// The uid at the other end of `s`.
+pub fn peer_uid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: getpeereid on a connected socket we own, into two locals.
+        (unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
+    {
+        let mut c: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut n = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: SO_PEERCRED into a ucred of the size given.
+        let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut c as *mut libc::ucred).cast(), &mut n) };
+        (r == 0).then_some(c.uid)
+    }
+}
