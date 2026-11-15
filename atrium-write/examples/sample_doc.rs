@@ -64,7 +64,7 @@ fn main() {
         out
     };
     let img = d.images.add(ImageData { bytes: png.into(), width: 640, height: 160 });
-    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 5760, height: 1440 }), ..Default::default() });
+    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 5760, height: 1440, float: None }), ..Default::default() });
     d.push_para("A picture: \u{FFFC} sits on the baseline.", 0, vec![(0, 0), (11, pic), (14, 0)]);
 
     d.blocks.update(k, |b| b.as_para_mut().unwrap().props.align = Some(Align::End));

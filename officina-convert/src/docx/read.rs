@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -630,13 +630,79 @@ impl<'a> Reader<'a> {
         let emu = |k: &str| ext.and_then(|e| num(e.attr(k))).unwrap_or(0);
         let side = |v: i64| (v / 635).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
         let (w, h) = (emu("cx"), emu("cy"));
-        if drawing.child("wp:anchor").is_some() {
-            self.rep.note(Kind::Approximate, "floating pictures (kept in line)");
-        }
         let px = self.doc.images.get(image).map(|d| (d.width, d.height)).unwrap_or((96, 96));
         let (w, h) = if w > 0 && h > 0 { (side(w), side(h)) } else { (side(px.0 as i64 * 9525), side(px.1 as i64 * 9525)) };
         self.pictures += 1;
-        Some(ObjectRef { image, width: w, height: h })
+        // Notes have no page of their own to float on: in line there.
+        let float = drawing.child("wp:anchor").filter(|_| !self.in_note).map(|a| self.anchor(a, h));
+        Some(ObjectRef { image, width: w, height: h, float })
+    }
+
+    /// A `wp:anchor`'s position and wrap; `h` is the picture's height (twips).
+    fn anchor(&mut self, a: &El, h: u32) -> Float {
+        let off = |v: Option<i64>| (v.unwrap_or(0) / 635).clamp(-(MAX_FLOAT_OFFSET as i64), MAX_FLOAT_OFFSET as i64) as i32;
+        let gap = ["distL", "distR", "distT", "distB"].iter().filter_map(|k| num(a.attr(k))).max().map_or(DEFAULT_FLOAT_GAP, |v| (v / 635).clamp(0, 2880) as i32);
+        let wrap = if a.child("wp:wrapTopAndBottom").is_some() {
+            Wrap::TopBottom
+        } else if a.child("wp:wrapNone").is_some() || !["wp:wrapSquare", "wp:wrapTight", "wp:wrapThrough"].iter().any(|w| a.child(w).is_some()) {
+            if matches!(a.attr("behindDoc"), Some("1" | "true" | "on")) { Wrap::Behind } else { Wrap::InFront }
+        } else {
+            if a.child("wp:wrapSquare").is_none() {
+                self.rep.note(Kind::Approximate, "pictures wrapped tight to their outline (wrapped square)");
+            }
+            Wrap::Square
+        };
+        let mut f = Float { wrap, gap, ..Float::default() };
+        if matches!(a.attr("simplePos"), Some("1" | "true" | "on")) {
+            let sp = a.child("wp:simplePos");
+            (f.h_rel, f.h_align, f.x, f.v_rel, f.y) = (Rel::Page, HAlign::Offset, off(sp.and_then(|p| num(p.attr("x")))), Rel::Page, off(sp.and_then(|p| num(p.attr("y")))));
+            return f;
+        }
+        if let Some(p) = a.child("wp:positionH") {
+            f.h_rel = match p.attr("relativeFrom") {
+                Some("page") => Rel::Page,
+                Some("margin" | "leftMargin" | "rightMargin" | "insideMargin" | "outsideMargin") => Rel::Margin,
+                _ => Rel::Text,
+            };
+            match p.child("wp:align").map(|x| x.text()) {
+                Some(t) => {
+                    f.h_align = match t.trim() {
+                        "center" => HAlign::Center,
+                        "right" | "outside" => HAlign::End,
+                        _ => HAlign::Start,
+                    }
+                }
+                None => {
+                    f.h_align = HAlign::Offset;
+                    f.x = off(p.child("wp:posOffset").and_then(|x| x.text().trim().parse().ok()));
+                }
+            }
+        }
+        if let Some(p) = a.child("wp:positionV") {
+            f.v_rel = match p.attr("relativeFrom") {
+                Some("page" | "bottomMargin" | "insideMargin" | "outsideMargin") => Rel::Page,
+                Some("margin" | "topMargin") => Rel::Margin,
+                _ => Rel::Text,
+            };
+            match p.child("wp:align").map(|x| x.text()) {
+                // Down an area as tall as the page or its text (the page as read so far).
+                Some(t) => {
+                    let g = &self.doc.page;
+                    let area = match f.v_rel {
+                        Rel::Page => g.height,
+                        _ => g.height - g.margin_top - g.margin_bottom,
+                    };
+                    f.y = match t.trim() {
+                        "center" => (area - h as i32) / 2,
+                        "bottom" | "outside" => area - h as i32,
+                        _ => 0,
+                    }
+                    .max(0);
+                }
+                None => f.y = off(p.child("wp:posOffset").and_then(|x| x.text().trim().parse().ok())),
+            }
+        }
+        f
     }
 
     /// The runs of `e` (a paragraph or something inside one) into `p`.

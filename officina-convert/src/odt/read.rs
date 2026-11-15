@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -283,6 +283,8 @@ struct Reader<'a> {
     lists: HashMap<String, Vec<ListKind>>,
     /// Column widths by column style name.
     columns: HashMap<String, u32>,
+    /// Graphic styles: parent and graphic properties, by name.
+    graphic: HashMap<String, (Option<String>, Vec<(String, String)>)>,
     /// Columns of section styles by name.
     sec_styles: HashMap<String, Section>,
     /// The page's own columns, and section marks to make once all is read:
@@ -538,6 +540,10 @@ impl<'a> Reader<'a> {
                             };
                             self.styles.insert(name.to_string(), st);
                         }
+                        Some("graphic") => {
+                            let props = s.child("style:graphic-properties").map(|g| g.attrs.clone()).unwrap_or_default();
+                            self.graphic.insert(name.to_string(), (s.attr("style:parent-style-name").map(str::to_string), props));
+                        }
                         Some("section") => {
                             if let Some(c) = s.child("style:section-properties").and_then(|p| p.child("style:columns")) {
                                 self.sec_styles.insert(name.to_string(), odf_columns(c));
@@ -710,15 +716,70 @@ impl<'a> Reader<'a> {
                 i
             }
         };
-        if !matches!(frame.attr("text:anchor-type"), Some("as-char") | Some("char") | None) {
-            self.rep.note(Kind::Approximate, "pictures anchored to the paragraph or page (kept in line)");
-        }
         let px = self.doc.images.get(image).map(|d| (d.width, d.height)).unwrap_or((96, 96));
         let side = |v: i64| v.clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
         let w = frame.attr("svg:width").and_then(length).map(side).unwrap_or(side(px.0 as i64 * 15));
         let h = frame.attr("svg:height").and_then(length).map(side).unwrap_or(side(px.1 as i64 * 15));
         self.pictures += 1;
-        Some(ObjectRef { image, width: w, height: h })
+        let float = (!self.in_note && !matches!(frame.attr("text:anchor-type"), Some("as-char") | None)).then(|| self.frame_float(frame, h));
+        Some(ObjectRef { image, width: w, height: h, float })
+    }
+
+    /// A graphic property of `style`, through its parents.
+    fn graphic_prop(&self, style: Option<&str>, key: &str) -> Option<String> {
+        let mut cur = style.map(str::to_string);
+        for _ in 0..16 {
+            let (parent, props) = self.graphic.get(cur.as_deref()?)?;
+            if let Some((_, v)) = props.iter().find(|(k, _)| k == key) {
+                return Some(v.clone());
+            }
+            cur = parent.clone();
+        }
+        None
+    }
+
+    /// Where a frame anchored to its paragraph, a character or the page
+    /// floats, and how text goes round it; `h` is its height (twips).
+    fn frame_float(&mut self, frame: &El, h: u32) -> Float {
+        let st = frame.attr("draw:style-name");
+        let g = |k: &str| self.graphic_prop(st, k);
+        let off = |v: Option<&str>| v.and_then(length).unwrap_or(0).clamp(-(MAX_FLOAT_OFFSET as i64), MAX_FLOAT_OFFSET as i64) as i32;
+        let wrap = match g("style:wrap").as_deref() {
+            Some("none") => Wrap::TopBottom,
+            Some("run-through") => {
+                if g("style:run-through").as_deref() == Some("background") { Wrap::Behind } else { Wrap::InFront }
+            }
+            _ => Wrap::Square,
+        };
+        let gap = ["fo:margin-left", "fo:margin-right", "fo:margin-top", "fo:margin-bottom"].iter().filter_map(|k| g(k).and_then(|v| length(&v))).max().unwrap_or(0).clamp(0, 2880) as i32;
+        let page = frame.attr("text:anchor-type") == Some("page");
+        let rel = |v: Option<String>, default: Rel| match v.as_deref() {
+            Some("page") => Rel::Page,
+            Some("page-content") | Some("page-start-margin") | Some("page-end-margin") => Rel::Margin,
+            Some(_) => Rel::Text,
+            None => default,
+        };
+        let default = if page { Rel::Page } else { Rel::Text };
+        let mut f = Float { wrap, gap, h_rel: rel(g("style:horizontal-rel"), default), v_rel: rel(g("style:vertical-rel"), default), ..Float::default() };
+        f.h_align = match g("style:horizontal-pos").as_deref() {
+            Some("left") | Some("inside") => HAlign::Start,
+            Some("center") => HAlign::Center,
+            Some("right") | Some("outside") => HAlign::End,
+            _ => HAlign::Offset,
+        };
+        if f.h_align == HAlign::Offset {
+            f.x = off(frame.attr("svg:x"));
+        }
+        f.y = match g("style:vertical-pos").as_deref() {
+            Some(p @ ("middle" | "bottom")) => {
+                let pg = &self.doc.page;
+                let area = if f.v_rel == Rel::Page { pg.height } else { pg.height - pg.margin_top - pg.margin_bottom };
+                (if p == "middle" { (area - h as i32) / 2 } else { area - h as i32 }).max(0)
+            }
+            Some("top") => 0,
+            _ => off(frame.attr("svg:y")),
+        };
+        f
     }
 
     /// The inline content of `e` into `p`, under attributes `a`.
@@ -1482,7 +1543,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

@@ -21,8 +21,9 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use crate::layout::{Fonts, LayoutCache, ParaLayout};
-use crate::model::{NoteId, NoteKind, Section, SectionStart, TextDoc, OBJECT_CHAR};
+use crate::layout::{object_size, Band, Fonts, LayoutCache, ParaLayout};
+use crate::model::{BlockId, Float, HAlign, NoteId, NoteKind, ObjectRef, Rel, Section, SectionStart, TextDoc, Wrap, OBJECT_CHAR};
+use std::collections::HashMap;
 use crate::twips;
 use std::rc::Rc;
 
@@ -32,6 +33,15 @@ use std::rc::Rc;
 pub struct Checkpoint {
     pub block: usize,
     pub line: usize,
+    /// Mid-paragraph after floats on the page before: a hash of the room
+    /// they left (its lines were broken around them); 0 otherwise.
+    pub wrap: u64,
+}
+
+impl Checkpoint {
+    pub fn at(block: usize, line: usize) -> Checkpoint {
+        Checkpoint { block, line, wrap: 0 }
+    }
 }
 
 /// Lines `lines` of block `block`, the first line's top `y` below the page's
@@ -45,6 +55,36 @@ pub struct Slice {
     /// padding; 0 outside tables) and the width they were laid out in.
     pub x: i64,
     pub w: i64,
+    /// The room floating pictures left the paragraph (its lines were broken
+    /// around them); none for most.
+    pub wrap: Option<Rc<Vec<Band>>>,
+}
+
+/// A floating picture placed on a page: its anchor (block, byte), its frame
+/// from the content box's top left (layout units), how text goes round it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFloat {
+    pub block: usize,
+    pub at: u32,
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub object: ObjectRef,
+}
+
+impl PlacedFloat {
+    pub fn wrap(&self) -> Wrap {
+        self.object.float.map_or(Wrap::InFront, |f| f.wrap)
+    }
+}
+
+/// A hash of the room floats left, for checkpoints (never 0).
+fn wrap_hash(bands: &[Band]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bands.hash(&mut h);
+    h.finish() | 1
 }
 
 /// A table cell's border box on a page.
@@ -88,6 +128,8 @@ pub struct Page {
     pub end_rule: Option<i64>,
     /// Lines between columns: (x, top, bottom).
     pub rules: Vec<(i64, i64, i64)>,
+    /// Floating pictures anchored on the page.
+    pub floats: Vec<PlacedFloat>,
 }
 
 impl Page {
@@ -95,6 +137,9 @@ impl Page {
         self.start.block = (self.start.block as isize + delta) as usize;
         for s in &mut self.slices {
             s.block = (s.block as isize + delta) as usize;
+        }
+        for f in &mut self.floats {
+            f.block = (f.block as isize + delta) as usize;
         }
     }
 }
@@ -133,6 +178,13 @@ pub struct Paginator {
     sections: Vec<(usize, Section)>,
     /// Pages laid out since creation (for the gates).
     pub laid: u64,
+    /// The room floats left paragraphs whose lines were broken around them,
+    /// by paragraph (as their first page placed them).
+    wraps: HashMap<BlockId, Rc<Vec<Band>>>,
+    page_w: i64,
+    page_h: i64,
+    margin_start: i64,
+    margin_top: i64,
 }
 
 impl Paginator {
@@ -149,6 +201,8 @@ impl Paginator {
         self.width = twips((g.width - g.margin_start - g.margin_end).max(720) as i64);
         self.height = twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64);
         self.width_tw = (g.width - g.margin_start - g.margin_end).max(720);
+        (self.page_w, self.page_h, self.margin_start, self.margin_top) = (twips(g.width as i64), twips(g.height as i64), twips(g.margin_start as i64), twips(g.margin_top as i64));
+        self.wraps.clear();
         self.sections = sections_of(doc);
         self.pages.clear();
         self.old.clear();
@@ -165,6 +219,11 @@ impl Paginator {
     /// Column width in layout units, for laying paragraphs out.
     pub fn width(&self) -> i64 {
         self.width
+    }
+
+    /// The room floats left paragraph `id`, if its lines go round any.
+    pub fn wrap_of(&self, id: BlockId) -> Option<Rc<Vec<Band>>> {
+        self.wraps.get(&id).cloned()
     }
 
     /// The settings of the section block `b` is in.
@@ -207,7 +266,7 @@ impl Paginator {
     /// The page holding line `line` of block `block` (or the last page laid
     /// out, if pagination hasn't reached it).
     pub fn page_of(&self, block: usize, line: usize) -> usize {
-        let at = Checkpoint { block, line };
+        let at = Checkpoint::at(block, line);
         self.pages.partition_point(|p| p.start <= at).saturating_sub(1)
     }
 
@@ -239,7 +298,7 @@ impl Paginator {
         let mut k = self.page_of(c, 0);
         // A page that starts at the block may have ended the one before
         // because of it (orphan control, keeps), so that page goes too.
-        if k > 0 && self.pages.get(k).is_some_and(|p| p.start == Checkpoint { block: c, line: 0 }) {
+        if k > 0 && self.pages.get(k).is_some_and(|p| p.start == Checkpoint::at(c, 0)) {
             k -= 1;
         }
         let restart = self.pages.get(k).map(|p| p.start).unwrap_or_default();
@@ -261,7 +320,7 @@ impl Paginator {
         self.old_at = 0;
         self.settle = e.last.max(section_change);
         self.delta = e.delta;
-        self.resume = self.cursor.map(|c| Checkpoint { block: (c.block as isize + e.delta) as usize, line: c.line });
+        self.resume = self.cursor.map(|c| Checkpoint { block: (c.block as isize + e.delta) as usize, ..c });
         self.cursor = Some(restart);
     }
 
@@ -295,6 +354,18 @@ impl Paginator {
             return false;
         }
         let (page, next) = self.page(doc, cache, fonts, at);
+        for sl in &page.slices {
+            let Some(id) = doc.blocks.get(sl.block).map(|b| b.id()) else { continue };
+            match &sl.wrap {
+                Some(w) => {
+                    self.wraps.insert(id, w.clone());
+                }
+                None if sl.lines.start == 0 => {
+                    self.wraps.remove(&id);
+                }
+                None => {}
+            }
+        }
         self.pages.push(page);
         self.laid += 1;
         match next {
@@ -322,7 +393,7 @@ impl Paginator {
         if self.old.is_empty() || n.block < self.settle {
             return false;
         }
-        let want = Checkpoint { block: (n.block as isize - self.delta) as usize, line: n.line };
+        let want = Checkpoint { block: (n.block as isize - self.delta) as usize, ..n };
         while self.old_at < self.old.len() && self.old[self.old_at].start < want {
             self.old_at += 1;
         }
@@ -363,12 +434,13 @@ impl Paginator {
     /// Lays out the table row starting at block `b` at `y`; returns the slices,
     /// the cell boxes, the row's height and the block after it.
     #[allow(clippy::too_many_arguments)]
-    fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64, x0: i64, col_w: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize) {
+    fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64, x0: i64, col_w: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize, Vec<PlacedFloat>) {
         let row = doc.row_range(b);
         let row = b..row.end.max(b + 1);
         let pad = twips(crate::model::CELL_PAD as i64);
         let mut slices = Vec::new();
         let mut boxes = Vec::new();
+        let mut floats = Fill::default();
         let mut row_h = 0;
         for (blocks, x, w) in doc.row_cells(row.clone(), col_w) {
             let x = x + x0;
@@ -376,7 +448,9 @@ impl Paginator {
             let last = blocks.end - 1;
             for k in blocks {
                 let l = self.layout(doc, cache, fonts, k);
-                slices.push(Slice { block: k, lines: 0..l.lines.len(), y: yy, x: x + pad, w: (w - 2 * pad).max(crate::LU) });
+                // Floats in a cell are placed from it, but its text doesn't go round them.
+                self.anchor_floats(doc, &mut floats, k, x + pad, (w - 2 * pad).max(crate::LU), yy);
+                slices.push(Slice { block: k, lines: 0..l.lines.len(), y: yy, x: x + pad, w: (w - 2 * pad).max(crate::LU), wrap: None });
                 yy += l.height + if k < last { l.space_after } else { 0 };
             }
             row_h = row_h.max(yy + pad - y);
@@ -385,7 +459,7 @@ impl Paginator {
         for c in &mut boxes {
             c.h = row_h;
         }
-        (slices, boxes, row_h, row.end)
+        (slices, boxes, row_h, row.end, floats.floats)
     }
 
     /// Height that must fit for block `b` to start here, when it keeps with the
@@ -524,7 +598,7 @@ impl Paginator {
         let mut y = page.height;
         if from == 0 {
             if !empty && y + NOTE_RULE_SPACE + lines[0].3 > h {
-                return Some(Checkpoint { block: doc.blocks.len(), line: 0 });
+                return Some(Checkpoint::at(doc.blocks.len(), 0));
             }
             page.end_rule = Some(y);
             y += NOTE_RULE_SPACE;
@@ -540,7 +614,7 @@ impl Paginator {
             k += 1;
         }
         page.height = y;
-        (k < lines.len()).then_some(Checkpoint { block: doc.blocks.len(), line: k })
+        (k < lines.len()).then_some(Checkpoint::at(doc.blocks.len(), k))
     }
 
     /// Lays out the page starting at `start`; returns it and where the next starts.
@@ -551,11 +625,17 @@ impl Paginator {
     fn page(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, start: Checkpoint) -> (Page, Option<Checkpoint>) {
         let full_h = self.height;
         let mut f = Fill::default();
+        if start.wrap != 0 {
+            // A paragraph going on from the page before, broken around its floats.
+            if let Some(w) = doc.blocks.get(start.block).and_then(|b| self.wraps.get(&b.id())).filter(|w| wrap_hash(w) == start.wrap) {
+                f.carry = Some((start.block, w.clone()));
+            }
+        }
         let mut top = 0i64;
         let mut cur = start;
         let mut rules: Vec<(i64, i64, i64)> = Vec::new();
         let finish = |f: Fill, y: i64, rules: Vec<(i64, i64, i64)>, next: Option<Checkpoint>, cache: &mut LayoutCache| {
-            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules };
+            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats };
             self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
             (page, next)
         };
@@ -598,19 +678,93 @@ impl Paginator {
                 Stop::Section(b2) if self.section_at(b2).start == SectionStart::Continuous && bottom < full_h - f.foot_h => {
                     // The next section goes on under this one.
                     top = bottom;
-                    cur = Checkpoint { block: b2, line: 0 };
+                    cur = Checkpoint::at(b2, 0);
                 }
-                Stop::Section(b2) | Stop::Break(b2) => return finish(f, bottom, rules, Some(Checkpoint { block: b2, line: 0 }), cache),
+                Stop::Section(b2) | Stop::Break(b2) => return finish(f, bottom, rules, Some(Checkpoint::at(b2, 0)), cache),
                 Stop::Full(next) => return finish(f, bottom, rules, Some(next), cache),
                 Stop::End(line) => {
                     // The text has ended: endnotes, if any, follow it.
-                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules };
+                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats };
                     let next = self.place_endnotes(doc, cache, fonts, &mut page, line, full_h - f.foot_h);
                     self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
                     return (page, next);
                 }
             }
         }
+    }
+
+    /// Places the floating pictures paragraph `b` anchors, its first line's
+    /// top at `top` in the column at `x`, `w` wide.
+    #[allow(clippy::too_many_arguments)]
+    fn anchor_floats(&self, doc: &TextDoc, f: &mut Fill, b: usize, x: i64, w: i64, top: i64) {
+        let Some(p) = doc.para(b) else { return };
+        if !p.text.contains(OBJECT_CHAR) {
+            return;
+        }
+        for (s, e, a) in p.spans() {
+            let at = doc.attrs.get(a);
+            let Some((o, fl)) = at.object.and_then(|o| o.float.map(|fl| (o, fl))).filter(|_| at.deleted.is_none()) else { continue };
+            for (i, ch) in p.text[s as usize..e as usize].char_indices() {
+                if ch == OBJECT_CHAR {
+                    let (fx, fy, fw, fh) = self.float_frame(&o, &fl, x, w, top);
+                    f.floats.push(PlacedFloat { block: b, at: s + i as u32, x: fx, y: fy, w: fw, h: fh, object: o });
+                }
+            }
+        }
+    }
+
+    /// A floating picture's frame (layout units, from the content box's top
+    /// left), its paragraph's top at `top` in the column at `x`, `w` wide.
+    /// It stays on the page: inside the content box when measured from the
+    /// text or the margins, on the sheet when from the page.
+    fn float_frame(&self, o: &ObjectRef, fl: &Float, x: i64, w: i64, top: i64) -> (i64, i64, i64, i64) {
+        let (fw, fh) = object_size(o, self.width);
+        let (r0, rw) = match fl.h_rel {
+            Rel::Text => (x, w),
+            Rel::Margin => (0, self.width),
+            Rel::Page => (-self.margin_start, self.page_w),
+        };
+        let fx = match fl.h_align {
+            HAlign::Start => r0,
+            HAlign::Center => r0 + (rw - fw) / 2,
+            HAlign::End => r0 + rw - fw,
+            HAlign::Offset => r0 + twips(fl.x as i64),
+        };
+        let fx = fx.min(self.page_w - self.margin_start - fw).max(-self.margin_start);
+        let (fy, lo, hi) = match fl.v_rel {
+            Rel::Text => (top + twips(fl.y as i64), 0, self.height - fh),
+            Rel::Margin => (twips(fl.y as i64), 0, self.height - fh),
+            Rel::Page => (twips(fl.y as i64) - self.margin_top, -self.margin_top, self.page_h - self.margin_top - fh),
+        };
+        (fx, fy.min(hi).max(lo), fw, fh)
+    }
+
+    /// The room the page's floats leave a paragraph whose first line's top is
+    /// at `top` in the column at `x`, `w` wide.
+    fn bands(&self, f: &Fill, x: i64, w: i64, top: i64) -> Vec<Band> {
+        let mut v = Vec::new();
+        for p in &f.floats {
+            let wrap = p.wrap();
+            if !matches!(wrap, Wrap::Square | Wrap::TopBottom) {
+                continue;
+            }
+            let gap = twips(p.object.float.map_or(0, |fl| fl.gap) as i64);
+            let (fl, fr) = (p.x - gap, p.x + p.w + gap);
+            let (bt, bb) = (p.y - gap - top, p.y + p.h + gap - top);
+            if fr <= x || fl >= x + w || bb <= 0 {
+                continue;
+            }
+            let (left, right) = if wrap == Wrap::TopBottom {
+                (w, 0)
+            } else if fl - x >= x + w - fr {
+                // More room before it: the text goes there.
+                (0, (x + w - fl).clamp(0, w))
+            } else {
+                ((fr - x).clamp(0, w), 0)
+            };
+            v.push(Band { top: bt, bottom: bb, left, right });
+        }
+        v
     }
 
     /// One band: `n` columns `colw` wide, `gap` apart, from `top` down to
@@ -653,16 +807,17 @@ impl Paginator {
             }
             if doc.cell(b).is_some() {
                 // A table row: whole, in this column if it fits (with its notes).
-                let (s, c, h_row, next) = self.row(doc, cache, fonts, b, y, x, w);
+                let (s, c, h_row, next, fl) = self.row(doc, cache, fonts, b, y, x, w);
                 let new_notes: Vec<NoteId> = if has_notes { (b..next).flat_map(|k| self.footnotes_in(doc, k, None)).filter(|id| !f.foot.contains(id)).collect() } else { Vec::new() };
                 let add = self.notes_height(doc, cache, fonts, &new_notes, f.foot.is_empty());
                 if !empty && y + h_row + add > h {
-                    return (Stop::Full(Checkpoint { block: b, line: 0 }), y);
+                    return (Stop::Full(Checkpoint::at(b, 0)), y);
                 }
                 f.foot.extend(new_notes);
                 f.foot_h += add;
                 f.slices.extend(s);
                 f.cells.extend(c);
+                f.floats.extend(fl);
                 y += h_row;
                 b = next;
                 line = 0;
@@ -680,13 +835,31 @@ impl Paginator {
             if line == 0 && !empty {
                 if let Some(need) = self.keep_need(doc, cache, fonts, b) {
                     if y + l.space_before + need > h && need <= h - top {
-                        return (Stop::Full(Checkpoint { block: b, line: 0 }), y);
+                        return (Stop::Full(Checkpoint::at(b, 0)), y);
                     }
                 }
             }
             if line == 0 && !empty {
                 y += l.space_before;
             }
+            // Floating pictures: the paragraph anchoring them places them, and
+            // its lines and those after go round them.
+            let floats_before = f.floats.len();
+            let mut wrap: Option<Rc<Vec<Band>>> = None;
+            if line == 0 {
+                self.anchor_floats(doc, f, b, x, w, y);
+                let bands = self.bands(f, x, w, y);
+                if !bands.is_empty() {
+                    wrap = Some(Rc::new(bands));
+                }
+            } else if let Some((_, c)) = f.carry.as_ref().filter(|c| c.0 == b) {
+                wrap = Some(c.clone());
+            }
+            let l = match &wrap {
+                Some(bands) => cache.get_wrapped(doc, doc.para(b).expect("paragraph"), doc.block_box(b, self.col_width(b)).1, fonts, bands),
+                None => l,
+            };
+            let hash = wrap.as_deref().map_or(0, |w| wrap_hash(w));
             let total = l.lines.len();
             let l0 = line;
             let y0 = y;
@@ -713,7 +886,7 @@ impl Paginator {
                 li += 1;
             }
             if li == total {
-                f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w });
+                f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w, wrap });
                 y = yy + l.space_after;
                 b += 1;
                 line = 0;
@@ -738,13 +911,17 @@ impl Paginator {
                         f.foot.retain(|id| !moved.contains(id));
                         f.foot_h = if f.foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &f.foot, true) };
                     }
-                    return (Stop::Full(Checkpoint { block: b, line: l0 }), y - if l0 == 0 && !empty { l.space_before } else { 0 });
+                    f.floats.truncate(floats_before);
+                    return (Stop::Full(Checkpoint { block: b, line: l0, wrap: if l0 > 0 { hash } else { 0 } }), y - if l0 == 0 && !empty { l.space_before } else { 0 });
                 }
                 // Alone in an empty column it must break somewhere.
                 cut = li.max(l0 + 1);
             }
             let used: i64 = l.lines[l0..cut].iter().map(|x| x.height).sum();
-            f.slices.push(Slice { block: b, lines: l0..cut, y: y0, x, w });
+            if let Some(c) = &wrap {
+                f.carry = Some((b, c.clone()));
+            }
+            f.slices.push(Slice { block: b, lines: l0..cut, y: y0, x, w, wrap });
             // Notes of lines that moved to the next column go with them.
             if notes_here && cut < li {
                 let moved: Vec<NoteId> = (cut..li).flat_map(|k| self.footnotes_in(doc, b, Some(&l.lines[k]))).collect();
@@ -753,7 +930,7 @@ impl Paginator {
                     f.foot_h = if f.foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &f.foot, true) };
                 }
             }
-            return (Stop::Full(Checkpoint { block: b, line: cut }), y0 + used);
+            return (Stop::Full(Checkpoint { block: b, line: cut, wrap: hash }), y0 + used);
         }
     }
 }
@@ -766,6 +943,11 @@ struct Fill {
     /// Footnotes anchored on the page, and the height their area takes.
     foot: Vec<NoteId>,
     foot_h: i64,
+    /// Floating pictures placed so far.
+    floats: Vec<PlacedFloat>,
+    /// The paragraph broken at the end of the last column and the room its
+    /// floats left it.
+    carry: Option<(usize, Rc<Vec<Band>>)>,
 }
 
 /// Why a column stopped.
@@ -1124,7 +1306,7 @@ mod tests {
         // A next-page section starts a page.
         set_section(&mut d, 20, sec(2, SectionStart::NextPage));
         let (p, _) = all(&d);
-        assert_eq!(p.pages()[1].start, Checkpoint { block: 20, line: 0 });
+        assert_eq!(p.pages()[1].start, Checkpoint::at(20, 0));
     }
 
     #[test]
@@ -1165,6 +1347,150 @@ mod tests {
             }
         }
         assert!(p.pages().iter().any(|pg| pg.slices.iter().any(|s| s.x > 0)), "columns were used");
+    }
+
+    /// A floating picture `w`×`h` twips at the start of block `b`.
+    fn float_op(d: &mut TextDoc, b: usize, fl: crate::model::Float, w: u32, h: u32) -> TextOp {
+        let a = d.attrs.intern(crate::model::CharAttrs { object: Some(ObjectRef { image: 0, width: w, height: h, float: Some(fl) }), ..Default::default() });
+        let ins = crate::ops::Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, a)] };
+        TextOp::Splice { block: b as u32, at: 0, del: 0, ins }
+    }
+
+    fn content_tw(d: &TextDoc) -> u32 {
+        (d.page.width - d.page.margin_start - d.page.margin_end) as u32
+    }
+
+    /// Every line's text box on the page: (x, top, right, bottom), layout units.
+    fn line_boxes(d: &TextDoc, p: &Paginator, c: &mut LayoutCache, page: usize) -> Vec<(usize, i64, i64, i64, i64)> {
+        let mut v = Vec::new();
+        for s in &p.pages()[page].slices {
+            let l = c.get_wrapped(d, d.para(s.block).unwrap(), s.w, &FixedFonts, s.wrap.as_deref().map_or(&[], |w| w.as_slice()));
+            let mut y = s.y;
+            for li in s.lines.clone() {
+                let ln = &l.lines[li];
+                if ln.width > 0 {
+                    v.push((s.block, s.x + ln.x, y + ln.skip, s.x + ln.x + ln.width, y + ln.height));
+                }
+                y += ln.height;
+            }
+        }
+        v
+    }
+
+    fn overlaps(a: (i64, i64, i64, i64), f: &PlacedFloat) -> bool {
+        a.0 < f.x + f.w && a.2 > f.x && a.1 < f.y + f.h && a.3 > f.y
+    }
+
+    /// Square: the text beside the picture, on the side with room, and full
+    /// width below it; top and bottom: nothing beside it; behind and in
+    /// front: the text as if it weren't there.
+    #[test]
+    fn text_wraps_round_floating_pictures() {
+        use crate::model::{Float, HAlign, Wrap};
+        let base = doc_with(&[6, 6, 6], 40);
+        let (p0, _) = all(&base);
+        let half = content_tw(&base) / 2;
+        for wrap in [Wrap::Square, Wrap::TopBottom, Wrap::Behind, Wrap::InFront] {
+            let mut d = base.clone();
+            let fl = Float { wrap, h_align: HAlign::End, y: 400, ..Float::default() };
+            float_op(&mut d, 0, fl, half, 2000).apply(&mut d);
+            let (p, mut c) = all(&d);
+            let f = p.pages()[0].floats[0].clone();
+            assert_eq!((f.block, f.at), (0, 0));
+            assert_eq!(f.x + f.w, p.width(), "{wrap:?}: at the column's end");
+            assert_eq!(f.y, twips(400), "{wrap:?}: down from the paragraph's top");
+            let boxes = line_boxes(&d, &p, &mut c, 0);
+            let lines = |b: usize| boxes.iter().filter(|x| x.0 == b).count();
+            match wrap {
+                Wrap::Square => {
+                    assert!(boxes.iter().all(|x| !overlaps((x.1, x.2, x.3, x.4), &f)), "no text under it");
+                    let beside: Vec<_> = boxes.iter().filter(|x| x.2 < f.y + f.h && x.4 > f.y).collect();
+                    assert!(beside.len() >= 3 && beside.iter().all(|x| x.3 <= f.x - twips(180)), "lines beside it stop short of it: {beside:?}");
+                    assert!(boxes.iter().any(|x| x.2 >= f.y + f.h && x.3 > f.x), "full width below it");
+                    assert!(lines(0) + lines(1) > 12, "narrower lines, more of them");
+                }
+                Wrap::TopBottom => {
+                    assert!(boxes.iter().all(|x| x.4 <= f.y || x.2 >= f.y + f.h), "nothing beside it");
+                    assert!(boxes.iter().any(|x| x.2 >= f.y + f.h + twips(180) - LU && x.2 <= f.y + f.h + twips(180) + line_h()), "the text goes on just below it");
+                }
+                _ => assert_eq!(shape(&p), shape(&p0), "{wrap:?}: the text runs on"),
+            }
+        }
+    }
+
+    /// A picture measured from the page sits there whatever paragraph anchors
+    /// it; one that would run off the page's foot moves up to fit.
+    #[test]
+    fn floats_stay_on_the_page() {
+        use crate::model::{Float, HAlign, Rel};
+        let mut d = doc_with(&[6, 6, 6], 30);
+        let q = content_tw(&d) / 3;
+        float_op(&mut d, 2, Float { h_rel: Rel::Page, h_align: HAlign::Offset, x: 50, v_rel: Rel::Page, y: 300, ..Float::default() }, q, 600).apply(&mut d);
+        float_op(&mut d, 1, Float { h_align: HAlign::Start, y: 20000, ..Float::default() }, q, 1200).apply(&mut d);
+        let (p, _) = all(&d);
+        let fl = &p.pages()[0].floats;
+        let by_block = |b: usize| fl.iter().find(|f| f.block == b).unwrap();
+        assert_eq!((by_block(2).x, by_block(2).y), (twips(50 - 100), twips(300 - 100)), "from the page's corner");
+        assert_eq!(by_block(1).y + by_block(1).h, p.content_height(), "moved up to the foot");
+        assert_eq!(by_block(1).x, 0);
+    }
+
+    /// Random edits around floats (pictures in and out, wraps and places
+    /// changed, text typed, paragraphs split and joined) repaginate the same
+    /// as from scratch.
+    #[test]
+    fn random_edits_with_floats_match_full_pagination() {
+        use crate::model::{Float, HAlign, Rel, Wrap};
+        let paras: Vec<usize> = (0..60).map(|i| 1 + (i * 5) % 7).collect();
+        let mut d = doc_with(&paras, 14);
+        let (mut p, mut c) = all(&d);
+        let mut x: u64 = 0x0f1a_7e5d;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        let cw = content_tw(&d);
+        let mut placed = 0;
+        for _ in 0..300 {
+            let len = d.blocks.len();
+            let b = rnd(len as u64) as usize;
+            match rnd(6) {
+                0 | 1 => {
+                    let wrap = [Wrap::Square, Wrap::TopBottom, Wrap::Behind, Wrap::InFront][rnd(4) as usize];
+                    let rel = [Rel::Text, Rel::Margin, Rel::Page][rnd(3) as usize];
+                    let h_align = [HAlign::Start, HAlign::Center, HAlign::End, HAlign::Offset][rnd(4) as usize];
+                    let fl = Float { wrap, h_rel: rel, h_align, x: rnd(3000) as i32, v_rel: [Rel::Text, Rel::Margin, Rel::Page][rnd(3) as usize], y: rnd(4000) as i32, gap: rnd(300) as i32 };
+                    let op = float_op(&mut d, b, fl, 300 + rnd(cw as u64) as u32, 300 + rnd(3000) as u32);
+                    check_edit(&mut d, &mut p, &mut c, op, Edit { first: b, last: b + 1, delta: 0 });
+                    placed += 1;
+                }
+                2 => {
+                    let k = rnd(90) as usize;
+                    let ins = crate::ops::Fragment { text: "w ".repeat(k / 2) + "v", runs: vec![(0, 0)] };
+                    let at = d.para(b).unwrap().text.len() as u32;
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Splice { block: b as u32, at, del: 0, ins }, Edit { first: b, last: b + 1, delta: 0 });
+                }
+                3 => {
+                    let id = d.new_id();
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Split { block: b as u32, at: 0, id, style: 0, props: Default::default() }, Edit { first: b, last: b + 2, delta: 1 });
+                }
+                4 if b + 1 < len => {
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Join { block: b as u32 }, Edit { first: b, last: b + 1, delta: -1 });
+                }
+                _ => {
+                    // Take a picture out.
+                    let t = d.para(b).unwrap().text.clone();
+                    if let Some(i) = t.find(OBJECT_CHAR) {
+                        let ins = crate::ops::Fragment { text: String::new(), runs: vec![(0, 0)] };
+                        check_edit(&mut d, &mut p, &mut c, TextOp::Splice { block: b as u32, at: i as u32, del: OBJECT_CHAR.len_utf8() as u32, ins }, Edit { first: b, last: b + 1, delta: 0 });
+                    }
+                }
+            }
+        }
+        assert!(placed > 50);
+        assert!(p.pages().iter().any(|pg| pg.slices.iter().any(|s| s.wrap.is_some() && s.lines.start > 0)), "a wrapped paragraph went on to the next page");
     }
 
     /// Footnotes on the anchor's page, endnotes after the text, labels in

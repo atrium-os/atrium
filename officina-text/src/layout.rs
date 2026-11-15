@@ -70,7 +70,9 @@ fn shape_with_objects(fonts: &dyn Fonts, text: &str, f: &CharFormat, o: &ObjectR
             }));
         }
         if i < text.len() {
-            out.push(Glyph { face: OBJECT_FACE, id: 0, adv: w, dx: 0, dy: 0, cluster: i as u32, fmt: 0 });
+            // A floating picture takes no room in the line; the page places it.
+            let adv = if o.float.is_some() { 0 } else { w };
+            out.push(Glyph { face: OBJECT_FACE, id: 0, adv, dx: 0, dy: 0, cluster: i as u32, fmt: 0 });
         }
         from = i + ch.len_utf8();
     }
@@ -218,8 +220,10 @@ pub struct Line {
     pub space_extra: i64,
     pub ascent: i64,
     pub descent: i64,
-    /// Distance from this line's top to the next's.
+    /// Distance from this line's top to the next's (`skip` included).
     pub height: i64,
+    /// Room left above the line for floating pictures it goes below.
+    pub skip: i64,
     /// Space tabs took that a leader fills: from, to (from the paragraph's
     /// start edge, like `x`), and the leader.
     pub leaders: Vec<(i64, i64, Leader)>,
@@ -245,6 +249,37 @@ impl ParaLayout {
     }
 }
 
+/// A stretch of a paragraph's height where floating pictures take room: from
+/// `top` to `bottom` (layout units down from its first line's top), `left` and
+/// `right` cut from its column's start and end edges. Where too little is left
+/// between them a line goes below the band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Band {
+    pub top: i64,
+    pub bottom: i64,
+    pub left: i64,
+    pub right: i64,
+}
+
+/// Narrowest room beside a floating picture a line goes in (an inch).
+pub const MIN_WRAP: i64 = 1440 * crate::LU / 20;
+
+/// Where a line `h` tall whose top would be at `y` goes among `bands` in a
+/// column `width` wide: the room it skips first and what's cut from each side.
+fn place_line(bands: &[Band], width: i64, y: i64, h: i64) -> (i64, i64, i64) {
+    let mut at = y;
+    for _ in 0..=bands.len() {
+        let over = || bands.iter().filter(move |b| b.top < at + h.max(1) && b.bottom > at);
+        let (l, r) = over().fold((0, 0), |(l, r), b| (l.max(b.left), r.max(b.right)));
+        if width - l - r >= MIN_WRAP {
+            return (at - y, l, r);
+        }
+        let Some(below) = over().map(|b| b.bottom).max() else { break };
+        at = below;
+    }
+    (at - y, 0, 0)
+}
+
 /// Where a line can break: (byte, mandatory).
 fn opportunities(text: &str) -> Vec<(u32, bool)> {
     unicode_linebreak::linebreaks(text).map(|(i, o)| (i as u32, o == unicode_linebreak::BreakOpportunity::Mandatory)).collect()
@@ -252,6 +287,11 @@ fn opportunities(text: &str) -> Vec<(u32, bool)> {
 
 /// Lays out `p` (of `doc`) in a column `width` layout units wide.
 pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> ParaLayout {
+    layout_wrapped(doc, p, width, fonts, &[])
+}
+
+/// Lays out `p` in a column `width` wide around floating pictures' `bands`.
+pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, bands: &[Band]) -> ParaLayout {
     let (pf, cf) = doc.styles.para_format(p.style, &p.props);
     let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
     let mut formats: Vec<CharFormat> = Vec::new();
@@ -319,163 +359,212 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
     };
     // A list item's hang holds its label; its text starts at the indent.
     let first_line = if pf.list.is_some() { pf.first_line.max(0) } else { pf.first_line };
-    let avail = |first: bool| (full - if first { twips(first_line as i64) } else { 0 }).max(LU);
-    let ops = opportunities(&p.text);
-    let mut breaks: Vec<(u32, bool)> = Vec::new(); // (end byte, mandatory)
-    let mut start = 0u32;
-    let mut last_ok: Option<(u32, bool)> = None;
-    let mut k = 0;
-    while k < ops.len() {
-        let (b, mand) = ops[k];
-        if b <= start {
-            k += 1;
-            continue;
-        }
-        let first = breaks.is_empty();
-        let (w, _) = seg(start, b);
-        if w <= avail(first) {
-            if mand || b as usize == n {
-                breaks.push((b, mand && (b as usize) < n));
-                start = b;
-                last_ok = None;
-            } else {
-                last_ok = Some((b, false));
-            }
-            k += 1;
-            continue;
-        }
-        // Too wide: break at the last opportunity, or inside the word.
-        match last_ok.take() {
-            Some((lb, _)) => {
-                breaks.push((lb, false));
-                start = lb;
-            }
-            None => {
-                // Between characters: as many as fit (at least one).
-                let mut e = start;
-                for (i, ch) in p.text[start as usize..b as usize].char_indices() {
-                    let next = start + i as u32 + ch.len_utf8() as u32;
-                    if e > start && cum[next as usize] - cum[start as usize] > avail(first) {
-                        break;
-                    }
-                    e = next;
-                }
-                breaks.push((e, false));
-                start = e;
-            }
-        }
-    }
-    if breaks.is_empty() || (breaks.last().unwrap().0 as usize) < n {
-        breaks.push((n as u32, false));
-    }
-    // Lines.
-    let fmt_at = |b: u32| run_fmt[run_fmt.partition_point(|r| r.0 <= b).saturating_sub(1)].1;
-    let mut lines = Vec::with_capacity(breaks.len());
-    let mut s = 0u32;
-    let mut gi = 0usize;
-    let count = breaks.len();
-    for (li, &(e, mand)) in breaks.iter().enumerate() {
-        let g0 = gi;
-        while gi < glyphs.len() && glyphs[gi].cluster < e {
-            gi += 1;
-        }
-        let (mut w, content_end) = seg(s, e);
-        let first = li == 0;
-        let base = twips(pf.indent_start as i64) + if first { twips(first_line as i64) } else { 0 };
-        // Tabs: each takes the text after it to the next stop, measured from
-        // the column's start edge.
-        let mut leaders = Vec::new();
-        let tab = |g: &Glyph| p.text.as_bytes().get(g.cluster as usize) == Some(&b'\t');
-        if glyphs[g0..gi].iter().any(tab) {
-            let mut pen = base;
-            for k in g0..gi {
-                if tab(&glyphs[k]) {
-                    // The text up to the next tab (spaces at the line's end left out).
-                    let (mut after, mut point) = (0i64, None);
-                    for g in glyphs[k + 1..gi].iter().take_while(|g| !tab(g)) {
-                        if point.is_none() && p.text.as_bytes().get(g.cluster as usize) == Some(&b'.') {
-                            point = Some(after);
-                        }
-                        if g.cluster < content_end {
-                            after += g.adv;
-                        }
-                    }
-                    let custom = pf.tabs.iter().find(|t| twips(t.pos as i64) > pen);
-                    let (stop, align, leader) = match custom {
-                        Some(t) => (twips(t.pos as i64), t.align, t.leader),
-                        None => {
-                            let step = twips(DEFAULT_TAB as i64);
-                            let from = pf.tabs.last().map_or(0, |t| twips(t.pos as i64)).max(pen);
-                            ((from / step + 1) * step, TabAlign::Start, Leader::None)
-                        }
-                    };
-                    let to = match align {
-                        TabAlign::Start => stop,
-                        TabAlign::End => stop - after,
-                        TabAlign::Center => stop - after / 2,
-                        TabAlign::Decimal => stop - point.unwrap_or(after),
-                    };
-                    let adv = (to - pen).max(0);
-                    glyphs[k].adv = adv;
-                    if leader != Leader::None && adv > 0 {
-                        leaders.push((pen, pen + adv, leader));
-                    }
-                }
-                pen += glyphs[k].adv;
-            }
-            w = glyphs[g0..gi].iter().filter(|g| g.cluster < content_end).map(|g| g.adv).sum();
-            // Leaders are drawn from the line's start, like its glyphs.
-            for l in leaders.iter_mut() {
-                l.0 -= base;
-                l.1 -= base;
-            }
-        }
-        let mut used: Vec<u16> = glyphs[g0..gi].iter().map(|g| g.fmt).collect();
-        if used.is_empty() {
-            used.push(fmt_at(s));
-        }
-        used.sort_unstable();
-        used.dedup();
-        let (mut asc, mut desc, mut nat) = (0, 0, 0);
-        for &fi in &used {
-            let (a, d, h) = fonts.metrics(&formats[fi as usize]);
-            asc = asc.max(a);
-            desc = desc.max(d);
-            nat = nat.max(h);
-        }
-        // Pictures sit on the baseline and make the line as tall as they are.
-        for g in glyphs[g0..gi].iter().filter(|g| g.face == OBJECT_FACE) {
-            if let Some(o) = &formats[g.fmt as usize].object {
-                let h = object_height(o, g.adv);
-                if h > asc {
-                    nat += h - asc;
-                    asc = h;
-                }
-            }
-        }
-        let height = match pf.line_spacing {
-            LineSpacing::Multiple(m) => nat * m.clamp(25, 1000) as i64 / 100,
+    let (ind_s, ind_e) = (twips(pf.indent_start as i64), twips(pf.indent_end as i64));
+    // Around floats each line's room depends on where it falls: lines are
+    // broken with guessed heights, then again with the heights they got,
+    // until the room each was given holds (at most three times).
+    let nominal = {
+        let (_, _, h) = fonts.metrics(&formats[0]);
+        match pf.line_spacing {
+            LineSpacing::Multiple(m) => h * m.clamp(25, 1000) as i64 / 100,
             LineSpacing::Exact(t) => twips(t.clamp(20, 31680) as i64),
-            LineSpacing::AtLeast(t) => nat.max(twips(t.clamp(0, 31680) as i64)),
-        };
-        let room = avail(first);
-        let last = li + 1 == count || mand;
-        let (x, space_extra) = match pf.align {
-            Align::Start => (base, 0),
-            Align::Center => (base + (room - w).max(0) / 2, 0),
-            Align::End => (base + (room - w).max(0), 0),
-            Align::Justify if !last => {
-                let spaces = p.text[s as usize..content_end as usize].bytes().filter(|&c| c == b' ').count() as i64;
-                (base, if spaces > 0 { (room - w).max(0) / spaces } else { 0 })
-            }
-            Align::Justify => (base, 0),
-        };
-        for l in leaders.iter_mut() {
-            l.0 += x;
-            l.1 += x;
+            LineSpacing::AtLeast(t) => h.max(twips(t.clamp(0, 31680) as i64)),
         }
-        lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height, leaders });
-        s = e;
+    };
+    let ops = opportunities(&p.text);
+    let mut heights: Vec<i64> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
+    for pass in 0..3 {
+        // Room per line: (skip above, start edge from the column's, width).
+        let mut geo: Vec<(i64, i64, i64)> = Vec::new();
+        let mut top = 0i64;
+        let mut room_of = |li: usize, geo: &mut Vec<(i64, i64, i64)>| -> i64 {
+            while geo.len() <= li {
+                let k = geo.len();
+                let h = heights.get(k).copied().unwrap_or(nominal);
+                let (skip, l, r) = if bands.is_empty() { (0, 0, 0) } else { place_line(bands, width, top, h) };
+                let (st, en) = (ind_s.max(l), ind_e.max(r));
+                let fl = if k == 0 { twips(first_line as i64) } else { 0 };
+                geo.push((skip, st + fl, (width - st - en - fl).max(LU)));
+                top += skip + h;
+            }
+            geo[li].2
+        };
+        let mut breaks: Vec<(u32, bool)> = Vec::new(); // (end byte, mandatory)
+        let mut start = 0u32;
+        let mut last_ok: Option<(u32, bool)> = None;
+        let mut k = 0;
+        while k < ops.len() {
+            let (b, mand) = ops[k];
+            if b <= start {
+                k += 1;
+                continue;
+            }
+            let room = room_of(breaks.len(), &mut geo);
+            let (w, _) = seg(start, b);
+            if w <= room {
+                if mand || b as usize == n {
+                    breaks.push((b, mand && (b as usize) < n));
+                    start = b;
+                    last_ok = None;
+                } else {
+                    last_ok = Some((b, false));
+                }
+                k += 1;
+                continue;
+            }
+            // Too wide: break at the last opportunity, or inside the word.
+            match last_ok.take() {
+                Some((lb, _)) => {
+                    breaks.push((lb, false));
+                    start = lb;
+                }
+                None => {
+                    // Between characters: as many as fit (at least one).
+                    let mut e = start;
+                    for (i, ch) in p.text[start as usize..b as usize].char_indices() {
+                        let next = start + i as u32 + ch.len_utf8() as u32;
+                        if e > start && cum[next as usize] - cum[start as usize] > room {
+                            break;
+                        }
+                        e = next;
+                    }
+                    breaks.push((e, false));
+                    start = e;
+                }
+            }
+        }
+        if breaks.is_empty() || (breaks.last().unwrap().0 as usize) < n {
+            breaks.push((n as u32, false));
+        }
+        for li in 0..breaks.len() {
+            room_of(li, &mut geo);
+        }
+        // Lines.
+        let fmt_at = |b: u32| run_fmt[run_fmt.partition_point(|r| r.0 <= b).saturating_sub(1)].1;
+        lines = Vec::with_capacity(breaks.len());
+        let mut s = 0u32;
+        let mut gi = 0usize;
+        let count = breaks.len();
+        for (li, &(e, mand)) in breaks.iter().enumerate() {
+            let g0 = gi;
+            while gi < glyphs.len() && glyphs[gi].cluster < e {
+                gi += 1;
+            }
+            let (mut w, content_end) = seg(s, e);
+            let (skip, base, room) = geo[li];
+            // Tabs: each takes the text after it to the next stop, measured from
+            // the column's start edge.
+            let mut leaders = Vec::new();
+            let tab = |g: &Glyph| p.text.as_bytes().get(g.cluster as usize) == Some(&b'\t');
+            if glyphs[g0..gi].iter().any(tab) {
+                let mut pen = base;
+                for k in g0..gi {
+                    if tab(&glyphs[k]) {
+                        // The text up to the next tab (spaces at the line's end left out).
+                        let (mut after, mut point) = (0i64, None);
+                        for g in glyphs[k + 1..gi].iter().take_while(|g| !tab(g)) {
+                            if point.is_none() && p.text.as_bytes().get(g.cluster as usize) == Some(&b'.') {
+                                point = Some(after);
+                            }
+                            if g.cluster < content_end {
+                                after += g.adv;
+                            }
+                        }
+                        let custom = pf.tabs.iter().find(|t| twips(t.pos as i64) > pen);
+                        let (stop, align, leader) = match custom {
+                            Some(t) => (twips(t.pos as i64), t.align, t.leader),
+                            None => {
+                                let step = twips(DEFAULT_TAB as i64);
+                                let from = pf.tabs.last().map_or(0, |t| twips(t.pos as i64)).max(pen);
+                                ((from / step + 1) * step, TabAlign::Start, Leader::None)
+                            }
+                        };
+                        let to = match align {
+                            TabAlign::Start => stop,
+                            TabAlign::End => stop - after,
+                            TabAlign::Center => stop - after / 2,
+                            TabAlign::Decimal => stop - point.unwrap_or(after),
+                        };
+                        let adv = (to - pen).max(0);
+                        glyphs[k].adv = adv;
+                        if leader != Leader::None && adv > 0 {
+                            leaders.push((pen, pen + adv, leader));
+                        }
+                    }
+                    pen += glyphs[k].adv;
+                }
+                w = glyphs[g0..gi].iter().filter(|g| g.cluster < content_end).map(|g| g.adv).sum();
+                // Leaders are drawn from the line's start, like its glyphs.
+                for l in leaders.iter_mut() {
+                    l.0 -= base;
+                    l.1 -= base;
+                }
+            }
+            let mut used: Vec<u16> = glyphs[g0..gi].iter().map(|g| g.fmt).collect();
+            if used.is_empty() {
+                used.push(fmt_at(s));
+            }
+            used.sort_unstable();
+            used.dedup();
+            let (mut asc, mut desc, mut nat) = (0, 0, 0);
+            for &fi in &used {
+                let (a, d, h) = fonts.metrics(&formats[fi as usize]);
+                asc = asc.max(a);
+                desc = desc.max(d);
+                nat = nat.max(h);
+            }
+            // Pictures sit on the baseline and make the line as tall as they are.
+            for g in glyphs[g0..gi].iter().filter(|g| g.face == OBJECT_FACE) {
+                if let Some(o) = formats[g.fmt as usize].object.as_ref().filter(|o| o.float.is_none()) {
+                    let h = object_height(o, g.adv);
+                    if h > asc {
+                        nat += h - asc;
+                        asc = h;
+                    }
+                }
+            }
+            let height = match pf.line_spacing {
+                LineSpacing::Multiple(m) => nat * m.clamp(25, 1000) as i64 / 100,
+                LineSpacing::Exact(t) => twips(t.clamp(20, 31680) as i64),
+                LineSpacing::AtLeast(t) => nat.max(twips(t.clamp(0, 31680) as i64)),
+            };
+            let last = li + 1 == count || mand;
+            let (x, space_extra) = match pf.align {
+                Align::Start => (base, 0),
+                Align::Center => (base + (room - w).max(0) / 2, 0),
+                Align::End => (base + (room - w).max(0), 0),
+                Align::Justify if !last => {
+                    let spaces = p.text[s as usize..content_end as usize].bytes().filter(|&c| c == b' ').count() as i64;
+                    (base, if spaces > 0 { (room - w).max(0) / spaces } else { 0 })
+                }
+                Align::Justify => (base, 0),
+            };
+            for l in leaders.iter_mut() {
+                l.0 += x;
+                l.1 += x;
+            }
+            lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height: height + skip, skip, leaders });
+            s = e;
+        }
+        if bands.is_empty() || pass == 2 {
+            break;
+        }
+        // Did each line get the room it was broken for?
+        let got: Vec<i64> = lines.iter().map(|l| l.height - l.skip).collect();
+        let mut check = Vec::new();
+        let mut y = 0;
+        for (k, &h) in got.iter().enumerate() {
+            let (skip, l, r) = place_line(bands, width, y, h);
+            let (st, en) = (ind_s.max(l), ind_e.max(r));
+            let fl = if k == 0 { twips(first_line as i64) } else { 0 };
+            check.push((skip, st + fl, (width - st - en - fl).max(LU)));
+            y += skip + h;
+        }
+        if check == geo[..lines.len()] {
+            break;
+        }
+        heights = got;
     }
     let height = lines.iter().map(|l| l.height).sum();
     ParaLayout { space_before: twips(pf.space_before.max(0) as i64), space_after: twips(pf.space_after.max(0) as i64), format: pf, formats, glyphs, lines, height }
@@ -489,8 +578,9 @@ pub struct LayoutCache {
     pub misses: u64,
 }
 
-fn key(doc: &TextDoc, p: &Para, width: i64) -> u64 {
+fn key(doc: &TextDoc, p: &Para, width: i64, bands: &[Band]) -> u64 {
     let mut h = DefaultHasher::new();
+    bands.hash(&mut h);
     p.text.hash(&mut h);
     p.style.hash(&mut h);
     p.props.hash(&mut h);
@@ -515,7 +605,12 @@ fn key(doc: &TextDoc, p: &Para, width: i64) -> u64 {
 
 impl LayoutCache {
     pub fn get(&mut self, doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Rc<ParaLayout> {
-        let k = key(doc, p, width);
+        self.get_wrapped(doc, p, width, fonts, &[])
+    }
+
+    /// `p`'s layout around floating pictures' `bands` (see [`layout_wrapped`]).
+    pub fn get_wrapped(&mut self, doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, bands: &[Band]) -> Rc<ParaLayout> {
+        let k = key(doc, p, width, bands);
         if let Some((kk, l)) = self.map.get(&p.id) {
             if *kk == k {
                 self.hits += 1;
@@ -523,7 +618,7 @@ impl LayoutCache {
             }
         }
         self.misses += 1;
-        let l = Rc::new(layout_para(doc, p, width, fonts));
+        let l = Rc::new(layout_wrapped(doc, p, width, fonts, bands));
         self.map.insert(p.id, (k, l.clone()));
         l
     }
@@ -592,7 +687,7 @@ mod tests {
     fn a_picture_is_one_glyph_on_the_baseline_and_fits_the_column() {
         use crate::model::ObjectRef;
         let mut d = doc("ab\u{FFFC}cd");
-        let o = ObjectRef { image: 0, width: 2880, height: 1440 };
+        let o = ObjectRef { image: 0, width: 2880, height: 1440, float: None };
         let pic = d.attrs.intern(CharAttrs { object: Some(o), ..Default::default() });
         d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, 0), (2, pic), (5, 0)]);
         // A column 1 inch wide: the 2 x 1 inch frame scales to 1 x 0.5.

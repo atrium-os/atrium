@@ -15,7 +15,7 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::model::{RevId, Revision};
 use officina_text::track::{Change, ChangeKind, Edit, Resolve};
@@ -240,7 +240,11 @@ impl Editor {
     pub fn layout(&mut self, block: usize) -> Rc<ParaLayout> {
         let p = self.doc.para(block).expect("block in range");
         let w = self.doc.block_box(block, self.pages.col_width(block)).1;
-        self.cache.get(&self.doc, p, w, &*self.fonts)
+        // Round the floats pagination laid it out round, if any.
+        match self.pages.wrap_of(p.id) {
+            Some(bands) => self.cache.get_wrapped(&self.doc, p, w, &*self.fonts, &bands),
+            None => self.cache.get(&self.doc, p, w, &*self.fonts),
+        }
     }
 
     fn text(&self, block: usize) -> &str {
@@ -894,7 +898,7 @@ impl Editor {
             let before = self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1)));
             self.doc.attrs.get(before).clone()
         });
-        a.object = Some(ObjectRef { image, width: w.max(1) as u32, height: h.max(1) as u32 });
+        a.object = Some(ObjectRef { image, width: w.max(1) as u32, height: h.max(1) as u32, float: None });
         let attr = self.doc.attrs.intern(a);
         let ins = Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] };
         ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins });
@@ -1266,6 +1270,66 @@ impl Editor {
             }
         }
         self.apply(label, ops, Kind::Other);
+    }
+
+    /// The picture at the caret (just after it, else just before; or the one
+    /// selected): its block, byte and frame.
+    pub fn picture_at_caret(&self) -> Option<(usize, u32, ObjectRef)> {
+        let c = self.caret;
+        let p = self.doc.para(c.block)?;
+        let char_at = |at: u32| p.text.get(at as usize..).and_then(|t| t.chars().next()).filter(|&ch| ch == OBJECT_CHAR).map(|_| at);
+        let n = OBJECT_CHAR.len_utf8() as u32;
+        [char_at(c.at), c.at.checked_sub(n).and_then(char_at)].into_iter().flatten().find_map(|at| {
+            let a = self.doc.attrs.get(p.attr_at(at));
+            a.object.filter(|_| a.deleted.is_none()).map(|o| (c.block, at, o))
+        })
+    }
+
+    /// Changes the picture at the caret's frame through `f`; false if there's
+    /// no picture there or nothing changed.
+    fn reframe(&mut self, label: &str, f: impl Fn(&mut ObjectRef)) -> bool {
+        let Some((b, at, o)) = self.picture_at_caret() else { return false };
+        let mut new = o;
+        f(&mut new);
+        if new == o {
+            return false;
+        }
+        let set = |a: &mut CharAttrs| {
+            if let Some(x) = a.object.as_mut() {
+                f(x);
+            }
+        };
+        let end = at + OBJECT_CHAR.len_utf8() as u32;
+        let ops = match self.track() {
+            Some((rev, mut ops)) => {
+                ops.extend(self.doc.tracked_format_ops(b, at, end, rev, &set));
+                ops
+            }
+            None => self.doc.format_ops(b, at, end, &set),
+        };
+        self.apply(label, ops, Kind::Other);
+        true
+    }
+
+    /// Floats the picture at the caret with text going round it as `wrap`
+    /// says, or puts it back in line (None). A picture newly floated sits at
+    /// its paragraph's top, at the column's end.
+    pub fn set_wrap(&mut self, wrap: Option<Wrap>) -> bool {
+        self.reframe("Wrap Text", |o| {
+            o.float = wrap.map(|w| Float { wrap: w, ..o.float.unwrap_or_default() });
+        })
+    }
+
+    /// Moves the floating picture at the caret to the start, centre or end
+    /// of its column.
+    pub fn set_float_align(&mut self, align: HAlign) -> bool {
+        self.reframe("Position Picture", |o| {
+            if let Some(f) = o.float.as_mut() {
+                f.h_rel = Rel::Text;
+                f.h_align = align;
+                f.x = 0;
+            }
+        })
     }
 
     /// Bold, italic or underline on or off, by what the caret shows.
@@ -1962,7 +2026,7 @@ impl Editor {
             }
         }
         let line = &l.lines[li];
-        Spot { page, x: x0 + self.x_in_line(p.block, &l, line, p.at), y, h: line.height }
+        Spot { page, x: x0 + self.x_in_line(p.block, &l, line, p.at), y: y + line.skip, h: line.height - line.skip }
     }
 
     /// The position nearest (x, y) on page `page` (layout units from its
@@ -1972,6 +2036,10 @@ impl Editor {
             let k = self.blocks() - 1;
             return Pos::new(k, self.len(k));
         };
+        // A floating picture there (the topmost): its anchor.
+        if let Some(f) = pg.floats.iter().rev().filter(|f| f.wrap() != officina_text::model::Wrap::Behind).find(|f| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h) {
+            return Pos::new(f.block, f.at);
+        }
         // The slice and line at y (above the first: its first line; below
         // the last: the last line).
         let mut target = None;
@@ -2160,7 +2228,7 @@ pub(crate) mod tests {
         assert!(e.set_columns(2, true));
         assert!(e.paginate(Duration::from_secs(10)));
         let k = e.pages.page_of(10, 0);
-        assert_eq!(e.pages.pages()[k].start, officina_text::paginate::Checkpoint { block: 10, line: 0 });
+        assert_eq!(e.pages.pages()[k].start, officina_text::paginate::Checkpoint::at(10, 0));
         let pg = e.pages.pages()[k].clone();
         let right = pg.slices.iter().find(|s| s.x > 0).expect("a second column").clone();
         // A click in the second column lands there.
@@ -2640,6 +2708,53 @@ pub(crate) mod tests {
             wr.write_image_data(&[200, 40, 40, 255].repeat((w * h) as usize)).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn a_floating_picture_wraps_moves_hits_and_undoes() {
+        let paras: Vec<String> = (0..12).map(|i| format!("{i} {}", "words that wrap round a picture ".repeat(8))).collect();
+        let refs: Vec<&str> = paras.iter().map(|s| s.as_str()).collect();
+        let mut e = ed(&refs);
+        e.start_log();
+        e.set_caret(Pos::new(1, 0), false);
+        let bytes = png(200, 200);
+        assert!(e.insert_image(ImageData { bytes: bytes.into(), width: 200, height: 200 }));
+        assert!(e.paginate(Duration::from_secs(10)));
+        let inline_lines = e.layout(1).lines.len();
+        assert!(e.pages.pages()[0].floats.is_empty());
+        // The caret is just after it: Square.
+        assert!(e.set_wrap(Some(Wrap::Square)));
+        assert!(e.paginate(Duration::from_secs(10)));
+        let f = e.pages.pages()[0].floats[0].clone();
+        assert_eq!((f.block, f.at), (1, 0));
+        assert_eq!(f.x + f.w, e.pages.width(), "at the column's end");
+        let l = e.layout(1);
+        assert!(l.lines[0].width <= f.x, "the first line stops short of it");
+        assert!(l.lines.len() > inline_lines - 1, "the lines beside it are shorter");
+        // Clicking it puts the caret at its anchor; carets beside it follow the wrapped lines.
+        assert_eq!(e.hit(0, f.x + f.w / 2, f.y + f.h / 2), Pos::new(1, 0));
+        let sp = e.spot(Pos::new(1, 5));
+        assert!(sp.x < f.x);
+        // Start of the column, then top and bottom, then back in line.
+        e.set_caret(Pos::new(1, 0), false);
+        assert!(e.set_float_align(HAlign::Start));
+        assert!(e.paginate(Duration::from_secs(10)));
+        let f2 = e.pages.pages()[0].floats[0].clone();
+        assert_eq!(f2.x, 0);
+        assert!(e.layout(1).lines[0].x >= f2.w, "the text starts after it");
+        assert!(e.set_wrap(Some(Wrap::TopBottom)));
+        assert!(e.paginate(Duration::from_secs(10)));
+        assert!(e.layout(1).lines[0].skip >= f2.h, "the first line goes below it");
+        let sp = e.spot(Pos::new(1, 3));
+        assert!(sp.y >= f2.y + f2.h, "the caret too");
+        assert!(!e.set_wrap(Some(Wrap::TopBottom)), "no change, no step");
+        for _ in 0..3 {
+            e.undo();
+        }
+        assert!(e.paginate(Duration::from_secs(10)));
+        assert!(e.pages.pages()[0].floats.is_empty(), "back in line");
+        assert_eq!(e.layout(1).lines.len(), inline_lines);
+        assert_eq!(e.pages.wrap_of(e.doc.para(1).unwrap().id), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -182,6 +182,40 @@ fn ppr_body(p: &ParaProps) -> String {
     s
 }
 
+/// A floating picture's `wp:anchor` start, its position and wrap (the
+/// extent and the wrap element follow; see [`anchor_wrap`]).
+fn anchor_open(f: &Float, n: u32) -> String {
+    let gap = f.gap.max(0) as i64 * 635;
+    let behind = (f.wrap == Wrap::Behind) as u8;
+    let h_from = match f.h_rel {
+        Rel::Text => "column",
+        Rel::Margin => "margin",
+        Rel::Page => "page",
+    };
+    let h = match f.h_align {
+        HAlign::Start => "<wp:align>left</wp:align>".to_string(),
+        HAlign::Center => "<wp:align>center</wp:align>".to_string(),
+        HAlign::End => "<wp:align>right</wp:align>".to_string(),
+        HAlign::Offset => format!("<wp:posOffset>{}</wp:posOffset>", f.x as i64 * 635),
+    };
+    let v_from = match f.v_rel {
+        Rel::Text => "paragraph",
+        Rel::Margin => "margin",
+        Rel::Page => "page",
+    };
+    format!(r#"<wp:anchor distT="{gap}" distB="{gap}" distL="{gap}" distR="{gap}" simplePos="0" relativeHeight="{}" behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{h_from}">{h}</wp:positionH><wp:positionV relativeFrom="{v_from}"><wp:posOffset>{}</wp:posOffset></wp:positionV>"#, 251658240 + n, f.y as i64 * 635)
+}
+
+/// The wrap element of a floating picture's `wp:anchor` (after its extent).
+fn anchor_wrap(f: &Float) -> String {
+    match f.wrap {
+        Wrap::Square => r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapSquare wrapText="bothSides"/>"#,
+        Wrap::TopBottom => r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapTopAndBottom/>"#,
+        Wrap::Behind | Wrap::InFront => r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>"#,
+    }
+    .to_string()
+}
+
 struct Out {
     rels: Vec<(String, String, String, bool)>, // id, type, target, external
     media: Vec<(String, Vec<u8>)>,
@@ -338,7 +372,12 @@ impl Out {
                                 self.pic += 1;
                                 let (cx, cy) = (o.width as u64 * 635, o.height as u64 * 635);
                                 let n = self.pic;
-                                let _ = write!(body, r#"<w:r>{props}<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:docPr id="{n}" name="Picture {n}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="{n}" name="Picture {n}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#);
+                                let (open, close) = match o.float {
+                                    None => (r#"<wp:inline distT="0" distB="0" distL="0" distR="0">"#.to_string(), "</wp:inline>"),
+                                    Some(f) => (anchor_open(&f, n), "</wp:anchor>"),
+                                };
+                                let _ = write!(body, r#"<w:r>{props}<w:drawing>{open}<wp:extent cx="{cx}" cy="{cy}"/>{}<wp:docPr id="{n}" name="Picture {n}"/><a:graphic>"#, o.float.map_or(String::new(), |f| anchor_wrap(&f)));
+                                let _ = write!(body, r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="{n}" name="Picture {n}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic>{close}</w:drawing></w:r>"#);
                             }
                         }
                     }

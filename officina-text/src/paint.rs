@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::model::{Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
 use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
@@ -101,11 +101,20 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         }
     }
 
+    // Floating pictures behind the text first; the rest go over it.
+    let float = |out: &mut Vec<Item>, f: &crate::paginate::PlacedFloat| {
+        out.push(Item::Image { image: f.object.image, x: mx + f.x, y: my + f.y, w: f.w, h: f.h });
+    };
+    for f in page.floats.iter().filter(|f| f.wrap() == Wrap::Behind) {
+        float(&mut out, f);
+    }
+
     for s in &page.slices {
         let Some(p) = doc.para(s.block) else { continue };
-        // The width the slice was laid out in (its column's, a cell's inside).
+        // The width the slice was laid out in (its column's, a cell's inside),
+        // round the floats it was laid out round.
         let w = s.w;
-        let l = cache.get(doc, p, w, fonts);
+        let l = cache.get_wrapped(doc, p, w, fonts, s.wrap.as_deref().map_or(&[], |v| v.as_slice()));
         let left = mx + s.x;
         if s.lines.start == 0 {
             if let Some(label) = numbering.label(s.block) {
@@ -117,6 +126,10 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
             line(&mut out, doc, fonts, &l, li, &p.text, left, my + ly, Some(s.block));
             ly += l.lines[li].height;
         }
+    }
+
+    for f in page.floats.iter().filter(|f| f.wrap() != Wrap::Behind) {
+        float(&mut out, f);
     }
 
     // Lines between columns.
@@ -161,7 +174,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
 fn baseline_of(l: &ParaLayout, li: usize, top: i64) -> i64 {
     let line = &l.lines[li];
     let natural = line.ascent + line.descent;
-    top + line.ascent + (line.height - natural).max(0) / 2
+    top + line.skip + line.ascent + (line.height - line.skip - natural).max(0) / 2
 }
 
 /// The text a glyph shows: its cluster, up to the next cluster.
@@ -177,6 +190,9 @@ fn cluster_text(text: &str, start: u32, next: Option<u32>) -> &str {
 fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64, block: Option<usize>) {
     let line = &l.lines[li];
     let baseline = baseline_of(l, li, top);
+    // Room skipped for floats above the line isn't the line's.
+    let top = top + line.skip;
+    let lh = line.height - line.skip;
     let bytes = text.as_bytes();
     let gl = &l.glyphs[line.glyphs.clone()];
     let mut pen = line.x;
@@ -188,10 +204,10 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
             let g = gl[i];
             if let (Some(t), Some(b)) = (f.deleted, block) {
                 if let Some(d) = doc.deletions.get(t) {
-                    out.push(Item::Change { x: left + pen, y: top, w: 0, h: line.height, block: b, start: g.cluster, end: g.cluster + OBJECT_CHAR.len_utf8() as u32, rev: d.rev });
+                    out.push(Item::Change { x: left + pen, y: top, w: 0, h: lh, block: b, start: g.cluster, end: g.cluster + OBJECT_CHAR.len_utf8() as u32, rev: d.rev });
                 }
             }
-            if let Some(o) = &f.object {
+            if let Some(o) = f.object.as_ref().filter(|o| o.float.is_none()) {
                 let h = object_height(o, g.adv);
                 out.push(Item::Image { image: o.image, x: left + pen, y: baseline - h, w: g.adv, h });
                 if let Some(u) = &f.link {
@@ -243,13 +259,13 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
         if let (Some(rev), Some(b)) = (f.rev.or(f.fmt.map(|m| m.rev)), block) {
             let start = gl.get(first).map_or(line.start, |g| g.cluster);
             let end = gl.get(i).map_or(line.end, |g| g.cluster).max(start);
-            out.push(Item::Change { x: rx, y: top, w: rw, h: line.height, block: b, start, end, rev });
+            out.push(Item::Change { x: rx, y: top, w: rw, h: lh, block: b, start, end, rev });
         }
         if let Some(h) = f.highlight {
-            out.push(Item::Rect { x: rx, y: top, w: rw, h: line.height, color: h });
+            out.push(Item::Rect { x: rx, y: top, w: rw, h: lh, color: h });
         }
         if let Some(c) = &f.comments {
-            out.push(Item::Mark { x: rx, y: top, w: rw, h: line.height, comments: c.clone() });
+            out.push(Item::Mark { x: rx, y: top, w: rw, h: lh, comments: c.clone() });
         }
         let color = f.color;
         if !run.glyphs.is_empty() {
@@ -263,7 +279,7 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
             out.push(Item::Rect { x: rx, y: baseline - size * 28 / 100, w: rw, h: thick, color });
         }
         if let Some(u) = &f.link {
-            out.push(Item::Link { x: rx, y: top, w: rw, h: line.height, uri: u.to_string() });
+            out.push(Item::Link { x: rx, y: top, w: rw, h: lh, uri: u.to_string() });
         }
     }
     // Tab leaders, in the format of the text after the tab.
@@ -368,7 +384,7 @@ mod tests {
         let link = d.attrs.intern(CharAttrs { link: Some("https://example.org/".into()), ..Default::default() });
         d.push_para("Hello world", 0, vec![(0, 0), (6, link)]);
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 10, height: 10 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720 }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
         d.push_para("a\u{FFFC}b", 0, vec![(0, 0), (1, pic), (4, 0)]);
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         let fonts = FixedFonts;

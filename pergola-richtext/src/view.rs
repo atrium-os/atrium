@@ -397,7 +397,7 @@ impl RichTextView {
                         for li in s.lines.clone() {
                             let line = &l.lines[li];
                             let natural = line.ascent + line.descent;
-                            let base = top + line.ascent + (line.height - natural).max(0) / 2;
+                            let base = top + line.skip + line.ascent + (line.height - line.skip - natural).max(0) / 2;
                             for &(a, b) in bad.iter() {
                                 if b <= line.start || a >= line.end.max(line.start + 1) || (caret.block == s.block && caret.at == b) {
                                     continue;
@@ -650,7 +650,7 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
                         e.x_in_line(s.block, &l, line, to.at)
                     };
                     if x1 > x0 {
-                        out.push((pg, s.x + x0, y, x1 - x0, line.height));
+                        out.push((pg, s.x + x0, y + line.skip, x1 - x0, line.height - line.skip));
                     }
                 }
                 y += line.height;

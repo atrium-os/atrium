@@ -61,7 +61,7 @@ fn main() {
             d.push_para(&format!("Chapter {}", i / 40 + 1), h1, vec![]);
         }
         if i % 5 == 2 {
-            let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: pics[(i / 5) % pics.len()], width: 2880, height: 1800 }), ..Default::default() });
+            let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: pics[(i / 5) % pics.len()], width: 2880, height: 1800, float: None }), ..Default::default() });
             d.push_para("Figure \u{FFFC}", 0, vec![(0, 0), (7, pic)]);
             continue;
         }

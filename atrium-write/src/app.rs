@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::{SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
+use officina_text::model::{HAlign, Rel, Wrap, SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 6] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 20] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns"];
+pub const INSERT: [&str; 28] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -122,12 +122,16 @@ pub enum Cmd {
     Columns(u8),
     /// A line between the caret's section's columns, on or off.
     ColumnRule,
+    /// The picture at the caret floats with this wrap (none: in line).
+    Wrap(Option<Wrap>),
+    /// The floating picture at the caret to its column's start, centre or end.
+    FloatAlign(HAlign),
 }
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End)][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -695,6 +699,12 @@ impl Write {
                         let s = e.section();
                         e.set_columns(s.columns, !s.rule);
                     }
+                    Cmd::Wrap(w) => {
+                        e.set_wrap(w);
+                    }
+                    Cmd::FloatAlign(a) => {
+                        e.set_float_align(a);
+                    }
                     Cmd::Toc => {
                         if !e.insert_toc() {
                             drop(e);
@@ -871,7 +881,18 @@ impl View for Write {
             let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
             let has_toc = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
             let sec = self.doc.borrow().ed.borrow().section();
+            let pic = self.doc.borrow().ed.borrow().picture_at_caret().map(|x| x.2.float);
+            let wraps = [None, Some(Wrap::Square), Some(Wrap::TopBottom), Some(Wrap::Behind), Some(Wrap::InFront)];
+            let aligns = [HAlign::Start, HAlign::Center, HAlign::End];
             let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| match i {
+                20..=24 => {
+                    let m = MenuItem::new(*s).enabled(pic.is_some()).radio(pic.is_some_and(|f| f.map(|f| f.wrap) == wraps[i - 20]));
+                    if i == 20 { m.separated() } else { m }
+                }
+                25..=27 => {
+                    let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 25]));
+                    if i == 25 { m.separated() } else { m }
+                }
                 12 => MenuItem::new(if has_toc { "Update Table of Contents" } else { *s }).separated(),
                 14 => MenuItem::new(*s).enabled(!in_table).separated(),
                 15 => MenuItem::new(*s).enabled(!in_table),

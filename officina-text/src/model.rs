@@ -377,7 +377,70 @@ pub struct ObjectRef {
     pub image: u32,
     pub width: u32,
     pub height: u32,
+    /// Floating: placed by position near its anchor (this character) rather
+    /// than in the line, the text wrapping around it as `float.wrap` says.
+    pub float: Option<Float>,
 }
+
+/// How text goes around a floating picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Wrap {
+    /// Beside it, on the side with more room (Word's square).
+    #[default]
+    Square,
+    /// Above and below it, nothing beside.
+    TopBottom,
+    /// Over the text, which runs on as if it weren't there; drawn behind it.
+    Behind,
+    /// Over the text, drawn in front of it.
+    InFront,
+}
+
+/// What a floating picture's position is measured from: the text (its
+/// column across, its paragraph down), the margins or the page's edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Rel {
+    #[default]
+    Text,
+    Margin,
+    Page,
+}
+
+/// Across: at the start, centre or end of what it's measured from, or `x`
+/// from its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum HAlign {
+    Start,
+    Center,
+    End,
+    #[default]
+    Offset,
+}
+
+/// A floating picture's place and wrap (twips).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Float {
+    pub wrap: Wrap,
+    pub h_rel: Rel,
+    pub h_align: HAlign,
+    pub x: i32,
+    /// Down from the top of its paragraph, the top margin or the page.
+    pub v_rel: Rel,
+    pub y: i32,
+    /// Room kept between it and the text.
+    pub gap: i32,
+}
+
+impl Default for Float {
+    fn default() -> Self {
+        Float { wrap: Wrap::Square, h_rel: Rel::Text, h_align: HAlign::End, x: 0, v_rel: Rel::Text, y: 0, gap: DEFAULT_FLOAT_GAP }
+    }
+}
+
+/// Room between a floating picture and the text by default (an eighth of an inch).
+pub const DEFAULT_FLOAT_GAP: i32 = 180;
+/// Largest offset of a floating picture from what it's measured from (22 in).
+pub const MAX_FLOAT_OFFSET: i32 = 31680;
 
 /// Largest picture frame side, twips (22 in).
 pub const MAX_OBJECT_TWIPS: u32 = 31680;

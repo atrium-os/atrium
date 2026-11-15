@@ -1370,7 +1370,7 @@ pictures.
 
 Not yet: decoding off the UI thread (a large JPEG decodes in the frame that first
 shows it), resizing a picture by dragging its handles, floating pictures with wrap
-(O5), pictures dropped from the store when unused (they go on saving until reopened).
+(O5e, §16.30), pictures dropped from the store when unused (they go on saving until reopened).
 
 ### 16.15 O3d part 3 as built (2026-11-14): tables
 
@@ -2102,6 +2102,68 @@ section to three columns settles in 5 ms laying out its 25 paragraphs; a
 continuous break inside it with one column after settles in 5 ms laying out 9;
 undo returns the same pages; each time the pages equal a fresh pagination.
 Corpus: recall 99.51 %, merge 1,742 exact and 1,832 safe, unchanged.
+
+### 16.30 O5e as built (2026-11-15): floating pictures with wrap
+
+- **Model.** A picture's frame (`ObjectRef`) may carry a `Float`: how text goes
+  round it (square: beside it, on the side with more room; top and bottom;
+  behind the text; in front of it), where it sits across (start, centre or end
+  of, or an offset from, its column, the margins or the page) and down (an
+  offset from its paragraph's top, the top margin or the page's top), and the
+  room kept between it and the text. Its anchor is still the U+FFFC in the
+  text, so caret, find, undo and the journal treat it as one character; in the
+  line it takes no room. Native file: a character attribute extension bit.
+- **Layout.** A paragraph can be laid out round *bands* (stretches of its
+  height where floats cut room from either side). Each line gets the room at
+  its height; where less than an inch is left it goes below the band. Lines are
+  broken with guessed heights and again with the heights they got until the
+  room each was given holds (at most three passes). The cache key includes the
+  bands, so a paragraph no float touches lays out as before.
+- **Pagination.** The paragraph anchoring a float places it on the page where
+  the paragraph starts (kept inside the content box when measured from the
+  text or margins, on the sheet when from the page; one that would run off the
+  foot moves up). From then on every paragraph on that page whose lines meet
+  a float's frame (gap included) is laid out round it. A paragraph broken
+  round floats and carried on to the next column or page keeps the lines it
+  was broken into; its checkpoint carries a hash of the bands, so pages only
+  line up again when the room is the same. Floats in table cells are placed
+  from the cell but the cell's text doesn't go round them; pictures in notes
+  stay in line.
+- **Drawing and editing.** The page painter draws pictures behind the text
+  first and the others after it. A click on a picture puts the caret at its
+  anchor. Insert › In Line with Text, Wrap Square, Wrap Top and Bottom, Behind
+  Text, In Front of Text, and Picture Left, Centre, Right act on the picture
+  at the caret, undoably; a newly floated picture sits at its paragraph's top
+  at the column's end.
+- **Files.** `.docx`: `wp:anchor` with `wp:positionH`/`wp:positionV`
+  (`posOffset` or `align`; relative to column, margin, page or paragraph, with
+  the others mapped to the nearest), `wrapSquare`, `wrapTopAndBottom`,
+  `wrapNone` with `behindDoc`, `wrapTight`/`wrapThrough` read as square (with a
+  note), `simplePos`, the gap from `dist*`. `.odt`: a `draw:frame` anchored to
+  its paragraph, a character or the page with a graphic style: `style:wrap`
+  (none, run-through foreground or background, the rest square),
+  horizontal and vertical position and relation, `svg:x`/`svg:y`, the gap from
+  the frame's margins, through parent styles. Vertical alignments (centre,
+  bottom) become offsets.
+- **Not yet:** dragging a picture to move it or resizing it by its handles;
+  wrapping tight to a picture's outline; text in a cell going round a float;
+  a float placed above the paragraph that anchors it pushing earlier text on
+  its page aside; floats in headers, footers and notes.
+
+Gates: layout and paginate tests (square, top and bottom, behind and in front
+on one page; a page-relative picture where the page says and one moved up to
+fit; 300 random edits with pictures floated, moved and removed, text typed,
+paragraphs split and joined, the same as a fresh pagination, including a
+wrapped paragraph carried on to the next page), an editor test (wrap, move,
+click, caret beside it and below it, undo), native round trip, `tests/
+floats.rs` (five floats through `.docx` and `.odt`). LibreOffice both ways
+and across formats (`examples/floats_lo.rs`): every picture's paragraph,
+frame, wrap, place and gap within 2 twips, and the text: 8/8; the sample page
+(`atrium-write/examples/floats_docs.rs`) laid out by LibreOffice from our
+`.docx` puts each picture and the lines round it where we do. Corpus: 86
+files with floating pictures (133) paginate with every picture placed, the
+slowest in 21 ms; recall 99.51 % and merge 1,742 exact, 1,832 safe,
+unchanged.
 
 ## 17. Decisions (accepted 2026-11-14)
 

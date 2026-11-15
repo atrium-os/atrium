@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -199,6 +199,8 @@ struct Out<'a> {
     pending_end: Option<String>,
     /// Paragraphs fields refer to, by id: each gets a bookmark.
     targets: std::collections::HashSet<BlockId>,
+    /// Graphic styles of floating pictures, by placement.
+    graphic_styles: HashMap<Float, String>,
 }
 
 /// The name an annotation goes by.
@@ -268,6 +270,36 @@ impl Out<'_> {
         }
         self.auto += "</text:list-style>";
         self.list_styles.insert((id, kind), n.clone());
+        n
+    }
+
+    /// The automatic graphic style of a floating picture: its wrap, gap and
+    /// how its position is measured.
+    fn graphic_style(&mut self, f: &Float) -> String {
+        if let Some(n) = self.graphic_styles.get(f) {
+            return n.clone();
+        }
+        let n = format!("fr{}", self.graphic_styles.len() + 1);
+        let wrap = match f.wrap {
+            Wrap::Square => r#"style:wrap="parallel" style:number-wrapped-paragraphs="no-limit" style:wrap-contour="false""#,
+            Wrap::TopBottom => r#"style:wrap="none""#,
+            Wrap::Behind => r#"style:wrap="run-through" style:run-through="background""#,
+            Wrap::InFront => r#"style:wrap="run-through" style:run-through="foreground""#,
+        };
+        let hpos = match f.h_align {
+            HAlign::Start => "left",
+            HAlign::Center => "center",
+            HAlign::End => "right",
+            HAlign::Offset => "from-left",
+        };
+        let rel = |r: Rel| match r {
+            Rel::Text => "paragraph",
+            Rel::Margin => "page-content",
+            Rel::Page => "page",
+        };
+        let g = pt(f.gap as i64);
+        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="graphic"><style:graphic-properties {wrap} fo:margin-left="{g}" fo:margin-right="{g}" fo:margin-top="{g}" fo:margin-bottom="{g}" style:vertical-pos="from-top" style:vertical-rel="{}" style:horizontal-pos="{hpos}" style:horizontal-rel="{}"/></style:style>"#, rel(f.v_rel), rel(f.h_rel));
+        self.graphic_styles.insert(*f, n.clone());
         n
     }
 
@@ -520,7 +552,15 @@ impl Out<'_> {
                     if let Some(o) = attrs.object {
                         if let Some(href) = self.image(o.image) {
                             self.frames += 1;
-                            let _ = write!(inner, r#"<draw:frame draw:name="Picture {}" text:anchor-type="as-char" svg:width="{}" svg:height="{}" draw:z-index="0"><draw:image xlink:href="{}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#, self.frames, pt(o.width as i64), pt(o.height as i64), esc(&href));
+                            let place = match o.float {
+                                None => r#"text:anchor-type="as-char""#.to_string(),
+                                Some(f) => {
+                                    let st = self.graphic_style(&f);
+                                    let x = if f.h_align == HAlign::Offset { format!(r#" svg:x="{}""#, pt(f.x as i64)) } else { String::new() };
+                                    format!(r#"draw:style-name="{st}" text:anchor-type="char"{x} svg:y="{}""#, pt(f.y as i64))
+                                }
+                            };
+                            let _ = write!(inner, r#"<draw:frame draw:name="Picture {}" {place} svg:width="{}" svg:height="{}" draw:z-index="0"><draw:image xlink:href="{}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#, self.frames, pt(o.width as i64), pt(o.height as i64), esc(&href));
                         }
                     }
                 }
@@ -686,7 +726,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new() };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new() };
     for bl in doc.blocks.iter() {
         if let Some(p) = bl.as_para() {
             o.targets.extend(doc.fields_in(p).into_iter().map(|f| f.1.target()));

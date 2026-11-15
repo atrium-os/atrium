@@ -43,7 +43,7 @@ pub(crate) mod tests {
             v
         };
         let img = d.images.add(ImageData { bytes: Arc::from(png), width: 40, height: 20 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720 }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
         d.push_para("See \u{FFFC} here", 0, vec![(0, 0), (4, pic), (7, 0)]);
         let sup = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Super), ..Default::default() });
         let sub = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Sub), ..Default::default() });

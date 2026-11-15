@@ -29,7 +29,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -98,7 +98,8 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         }
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3;
+    let float = a.object.and_then(|o| o.float);
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -169,12 +170,21 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         w.u8(k);
         w.var(b);
     }
+    if let Some(f) = float {
+        w.u8(f.wrap as u8);
+        w.u8(f.h_rel as u8);
+        w.u8(f.h_align as u8);
+        w.ivar(f.x as i64);
+        w.u8(f.v_rel as u8);
+        w.ivar(f.y as i64);
+        w.ivar(f.gap as i64);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 4 != 0 || (m >> 15 != 0 && ext == 0) {
+    if ext >> 5 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 != 0 && m & (1 << 10) == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -218,7 +228,7 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         if image > u32::MAX as u64 || !side.contains(&w) || !side.contains(&h) {
             return Err(WireError::Invalid("picture frame"));
         }
-        a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32 });
+        a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32, float: None });
     }
     if on(11) {
         a.vert = Some(match r.u8()? {
@@ -264,6 +274,40 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
             1 => Field::TextRef(b),
             _ => return Err(WireError::Invalid("field")),
         });
+    }
+    if ext >> 4 & 1 != 0 {
+        let wrap = match r.u8()? {
+            0 => Wrap::Square,
+            1 => Wrap::TopBottom,
+            2 => Wrap::Behind,
+            3 => Wrap::InFront,
+            _ => return Err(WireError::Invalid("wrap")),
+        };
+        let rel = |v: u8| match v {
+            0 => Ok(Rel::Text),
+            1 => Ok(Rel::Margin),
+            2 => Ok(Rel::Page),
+            _ => Err(WireError::Invalid("float position")),
+        };
+        let h_rel = rel(r.u8()?)?;
+        let h_align = match r.u8()? {
+            0 => HAlign::Start,
+            1 => HAlign::Center,
+            2 => HAlign::End,
+            3 => HAlign::Offset,
+            _ => return Err(WireError::Invalid("float position")),
+        };
+        let off = |v: i64| if (-(MAX_FLOAT_OFFSET as i64)..=MAX_FLOAT_OFFSET as i64).contains(&v) { Ok(v as i32) } else { Err(WireError::Invalid("float offset")) };
+        let x = off(r.ivar()?)?;
+        let v_rel = rel(r.u8()?)?;
+        let y = off(r.ivar()?)?;
+        let gap = r.ivar()?;
+        if !(0..=2880).contains(&gap) {
+            return Err(WireError::Invalid("float gap"));
+        }
+        if let Some(o) = a.object.as_mut() {
+            o.float = Some(Float { wrap, h_rel, h_align, x, v_rel, y, gap: gap as i32 });
+        }
     }
     Ok(a)
 }
@@ -1346,7 +1390,7 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
         for _ in 0..n {
             let block = r.len("block", doc.blocks.len() as u64)?;
             let line = r.len("line", 1 << 24)?;
-            checkpoints.push(Checkpoint { block, line });
+            checkpoints.push(Checkpoint::at(block, line));
         }
     }
     doc.take_changes();
@@ -1375,7 +1419,7 @@ mod tests {
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });
         assert_eq!(d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 }), img, "the same bytes are stored once");
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300 }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300, float: None }), ..Default::default() });
         d.push_para("a \u{FFFC} b", 0, vec![(0, 0), (2, pic), (5, 0)]);
         let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
         d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);
@@ -1422,14 +1466,14 @@ mod tests {
     #[test]
     fn a_picture_reference_past_the_pictures_is_refused() {
         let mut d = TextDoc::new();
-        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 600, height: 300 }), ..Default::default() });
+        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 600, height: 300, float: None }), ..Default::default() });
         assert!(matches!(load(&save_to_vec(&d, &[])), Err(LoadError::Bad("picture reference"))));
     }
 
     #[test]
     fn round_trip() {
         let d = sample();
-        let cps = vec![Checkpoint { block: 0, line: 0 }, Checkpoint { block: 40, line: 2 }];
+        let cps = vec![Checkpoint::at(0, 0), Checkpoint::at(40, 2)];
         let bytes = save_to_vec(&d, &cps);
         let l = load(&bytes).unwrap();
         assert_eq!(d.comment_ranges().len(), 1);
@@ -1474,7 +1518,7 @@ mod tests {
 
     #[test]
     fn hostile_bytes_never_panic() {
-        let bytes = save_to_vec(&sample(), &[Checkpoint { block: 0, line: 0 }]);
+        let bytes = save_to_vec(&sample(), &[Checkpoint::at(0, 0)]);
         let mut x: u64 = 0x5eed;
         let mut rnd = |n: u64| {
             x ^= x << 13;
