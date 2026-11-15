@@ -564,7 +564,12 @@ impl Compute {
             self.sprites.clear();
             self.keys.clear();
         }
-        self.sprites.retain(|id, _| f.windows.iter().any(|w| w.id == *id && !w.sprites.is_empty()));
+        // A window's sprite drawing stays a while after its sprites end
+        // (crate::sprites::IDLE), for its next animation.
+        self.sprites.retain(|id, sp| match f.windows.iter().find(|w| w.id == *id) {
+            Some(w) => !w.sprites.is_empty() || !sp.pause(),
+            None => false,
+        });
         self.keys.retain(|id, _| f.windows.iter().any(|w| w.id == *id));
         self.last.clear();
         // Each surface's change this frame, in its own pixels.

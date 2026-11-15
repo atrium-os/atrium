@@ -658,7 +658,9 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             }
             continue;
         }
-        w.sprites = None;
+        if w.sprites.as_mut().is_some_and(|sp| sp.pause()) {
+            w.sprites = None;
+        }
         let (frame, drops) = scene.pack_report(&wf, width, height);
         let comp = fe.lock().unwrap().compositor_arc().clone();
         comp.lock().unwrap().set_fill_drops(id as u16, drops);
