@@ -348,6 +348,81 @@ page).
 
 Everything here is a target with a gate (§10).
 
+### 7.2 Measured: board schematics and layouts (asked by Shankar, 2026-11-15)
+
+*"Analyse a PDF with lots of vector shapes like a board schematic. This
+is one of the heavy examples."* Four PDFs were made with KiCad 7's
+`kicad-cli` from its own demo boards (`video`, an 8-sheet A3 design, and
+`kit-dev-coldfire-xilinx_5213`): the schematics, and each board's layout
+with all copper, silkscreen, fab and edge layers on one page, which is
+how boards are often shared for review. Counted from the decoded content
+streams; the reference times are PDFium, one thread, on the cloud
+container, for comparison only:
+
+| file | page content | operators | painted paths | segments | largest path | PDFium fit 1600 px / 400% / 1600% window |
+|---|---|---|---|---|---|---|
+| video layout (A3) | 9.5 MB | 476,401 | 47,508 | 304,228 | 93,788 segments | 220 / 64 / 10 ms |
+| coldfire layout (A4) | 4.3 MB | 235,959 | 33,731 | 137,596 | 28,441 | 126 / 124 / 38 ms |
+| video schematic, densest sheet | 2.4 MB | 192,276 | 55,064 | 55,455 | 37 | 129 / 25 / 12 ms (sheet 2) |
+| coldfire schematic, sheet 1 | 1.9 MB | 153,761 | 44,994 | 46,458 | 37 | 98 / 31 / 8 ms |
+
+What they look like inside, and what each means for Folium:
+
+1. **Many tiny paths, not a few big ones.** A schematic sheet is 20,000
+   to 55,000 separately stroked paths with a median of **one segment
+   each** (every wire piece, pin and glyph stroke is its own
+   `m l S`), each preceded by its own colour and often its own line
+   width. Drawn one path per scene node, a sheet at fit-page is
+   50,000 nodes: over the 8,000-node budget of §7.1 and close to
+   Fresco's 65,536-op frame ceiling. So the display list **coalesces runs
+   of paths with the same paint state** (stroke colour, width, cap, join,
+   dash; fill colour and rule), in drawing order, into one item, and
+   strokes are expanded into one fill per run. These files use a handful
+   of colours and widths, so a sheet becomes a few hundred items and
+   stays vector at every zoom. Order is kept: two runs merge only when
+   nothing painted between them overlaps (checked on bounding boxes), so
+   the stacking of a layout's layers comes out right.
+2. **Text is strokes; the searchable text is invisible.** KiCad draws
+   every label with its stroke font (lines), and writes the same text
+   again in render mode 3 (invisible) for search and copy (1,419 text
+   objects on the densest sheet, all `3 Tr`). So drawing never needs a
+   font here, and find, copy and the accessibility outline must read
+   invisible text, never skip it. Other tools (Altium, OrCAD) use real
+   fonts instead; both are common.
+3. **A few huge polygons.** A layout's copper pour is one path of up to
+   **94,000 segments** with thousands of holes, spanning the board. It
+   is inside the 262,144-verb limit of one Fresco FILL, but sent whole it
+   would be redrawn for every tile it touches. So paths above a size
+   (start at 4,096 segments) are **cut per tile** in the display list
+   (clipped to each 512 px tile at the zoom being drawn, and cached with
+   the tile), and below a zoom where its detail is under a device pixel,
+   **simplified** for that zoom (vertices closer than a quarter pixel
+   dropped; 17% of the video layout's line segments are under 0.5 pt, so
+   invisible at fit-page). The page's full detail is kept for zooming
+   in.
+4. **Zoom needs local coordinates.** At 6,400% an A3 page is about
+   100,000 px across, past FILL's ±32,768 coordinate range. Paths are
+   kept in page space as f64 and sent re-based to the tile's or view's
+   origin (§7.1 already keeps f64; this is the reason).
+5. **Simple structure.** No Form XObjects, no images, four fonts, `q`/`Q`
+   depth 1, no transparency. These pages are heavy only by count, so the
+   interpreter's per-operator cost matters most: 476,000 operators must
+   interpret in well under 100 ms (Rust, streaming from the decoder,
+   cancellable between operators), and the spatial grid makes 1,600%
+   cost a few milliseconds, as PDFium's culling shows.
+6. **First page.** PDFium needs 220 ms for the video layout at fit on one
+   thread; Folium's 150 ms first-page target (§10) therefore depends on
+   drawing tiles on the worker pool in parallel, and on coalescing
+   (fewer, larger fills raster faster in Fresco's compute renderer than
+   tens of thousands of small ones).
+
+These four files are generated from the `kicad-demos` package by a
+host-side script and are the "heavy vector" set in the corpus (they are
+not committed: KiCad's demos are GPL, which is fine for test input on the
+host, not for the repository). Vendor schematics from Altium, OrCAD and
+Cadence (real fonts, hatched fills, embedded logos) join them as they are
+found or supplied.
+
 ## 8. The app and the role
 
 **Atrium PDF** (`org.atrium.pdf`): a signed bundle with `[[opens]]` view
@@ -594,7 +669,8 @@ signature".
   | first page of a typical document | drawn under 150 ms after the descriptor arrives |
   | open a 20,000-page document | first page under 300 ms; memory for the document under 64 MB before any page is drawn |
   | scroll a 2,000-page book of 600 dpi scans at 4,000 px/s | no stall over 100 ms at 60 Hz, p99.9 frame work within two periods (ScrollView's gates); placeholders allowed; memory flat at the cache budgets |
-  | pinch from 25% to 6,400% on a map with 1 M path segments | every frame on time (scaled tiles); sharp within 300 ms after it settles |
+  | the §7.2 heavy set (KiCad schematics and layouts) | first page under 150 ms on 4 cores; fit-page scene under the node budget, vector; pinch 25% to 6,400% with every frame on time |
+| pinch from 25% to 6,400% on a map with 1 M path segments | every frame on time (scaled tiles); sharp within 300 ms after it settles |
   | scene per window | resident nodes and scene bytes under a fixed ceiling at any page count, page complexity and zoom |
   | after interaction stops | worker pool idle within 1 s; 0% CPU while nothing changes |
   | scroll or zoom away from a slow page | its work cancelled within 10 ms |
@@ -629,7 +705,7 @@ several weeks and then ongoing as the corpus finds things.
 | D9 | Fidelity target for v1 | 95% of the corpus's pages within the pixel threshold of the reference, every miss listed with its cause; 100% with no crash, hang or budget overrun outside the listed limits |
 | D10 | Order against other work | P1–P3 next (PDFs in quick look and in their own app), then back to opening-files T5 and Player end to end; P4 continues alongside |
 | D11 | Clip paths, which FILL can't express (its clip is a rectangle) | Add a path clip to Fresco's FILL (a clip path id the server rasterizes as a coverage mask), done by the Fresco thread during P2; until it lands, non-rectangular clips go through the CPU fallback |
-| D12 | Very detailed pages | Vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; the budget is tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
+| D12 | Very detailed pages | Coalesce runs of paths with the same paint state, cut paths over 4,096 segments per tile and simplify them below pixel size (§7.2); then vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
 | D13 | Folium and Officina | One base: `folium-syntax`, `folium-content`, `folium-font` (and later `folium-sign`) are used by both the reader and Officina's export; `officina-pdf` moves onto them in P2, its export gate unchanged before and after |
 | D14 | Comments and review | PDF's own markup annotations with replies (`IRT`) and review states, so reviews interoperate with other readers; read in P2–P3 (pane), written in P5 as incremental updates; Write's comments exported as annotations |
 | D15 | Write's PDF export of a reviewed document | Default *Clean* (proposed text, comments and edits as annotations, as Write's Reading view); *All markup* on request; annotations carry `/AtAnchor` so they can come back |
