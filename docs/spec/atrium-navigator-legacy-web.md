@@ -633,7 +633,7 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
 - *Step 7, the reader-facing UI:* the cookied mark, and "forget this site". (Built since
   in the Navigator UI, navigator-ui.md §6.2.)
 - *Refinement 2:* telling a banner, which should be a local transition, from a wall.
-  Today the reader's action is explicit.
+  Built 2026-11-15 (Shankar: "Hide it, site stays anonymous"): see "Banners" below.
 
 **Built 2026-11-14: step 6, `document.cookie`, and the reader's consent press.**
 - *Script cookies.* A cookied conversion's job header carries `cookies=<n=v; ...>`
@@ -676,6 +676,14 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   `a_taken_transitions_script_cookie_is_kept` and `a_scripts_cookies_leave_out_httponly_ones`,
   navigatord and navigator-ui unit tests, and `scripts/arca-vm-test.sh` §8 against the
   real Arca (the site's next page carries the answer).
+- *Banners (2026-11-15, decided by Shankar).* A consent control whose container (the
+  outermost dialog, fixed overlay or consent platform's id or class around it, never `body`)
+  leaves the page readable is a banner: at least 400 characters of visible text outside the
+  container, and more outside than in. A banner is taken out of the document the reader
+  sees, its controls are neither marked nor reported, and nothing is kept: an anonymous page
+  carries no cookies, so the banner's question has nothing to protect and answering it would
+  only make the site know you. The report says `CB <n>`. A wall (the content withheld until
+  the answer) keeps its marked controls. Test: `a_banner_is_hidden_and_a_wall_is_offered`.
 - *Inline handlers (2026-11-15):* the converter runs HTML's event handler content
   attributes (`onclick="..."` and the other names it exposes as slots): compiled as
   `function (event) { text }` the first time a dispatch or a read needs it, again when the

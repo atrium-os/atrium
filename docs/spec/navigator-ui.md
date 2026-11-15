@@ -547,7 +547,9 @@ it, and the rail row gains the person glyph, so the change is never silent.
 the press back) and marks it `atrium-consent:<n>`; the reader's press of it is a link press
 (`Activate` with the trail's jar), navigatord keeps what the control writes in Arca in that
 jar, answers `Consented`, and the UI lets the site know you there and opens the page again
-(legacy-web §5.4.1e, "Built 2026-11-14").
+(legacy-web §5.4.1e, "Built 2026-11-14"). A consent *banner* over a page that is readable
+without it is taken out of the page instead, and the site stays anonymous (decided by
+Shankar 2026-11-15; legacy-web §5.4.1e "Banners").
 
 This is the first-principles inversion of a browser's padlock and permission prompts: the
 question people actually have is "does this site know it's me?", and here it has a direct,

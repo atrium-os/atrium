@@ -231,6 +231,9 @@ pub struct RunReport {
     /// wrote to `document.cookie`, in the order the document marks them
     /// `atrium-consent:<n>`.
     pub consents: Vec<Vec<String>>,
+    /// Consent banners taken out of the document (the page readable
+    /// without their answer; navigator-ui.md §6.2).
+    pub banners_hidden: u32,
 }
 
 pub trait ScriptEngine {

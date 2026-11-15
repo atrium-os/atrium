@@ -141,3 +141,30 @@ fn a_wall_in_any_language_offers_both_answers() {
     assert!(c.html.contains(r#"<button id="info">Mehr</button>"#), "{}", c.html);
     assert!(c.html.contains(r#"<button id="cart">In den Warenkorb</button>"#), "{}", c.html);
 }
+
+/// ★ A banner, not a wall: the page is readable without its answer, so the
+/// banner is taken out of the document and nothing of it is offered or
+/// kept (navigator-ui.md §6.2). The same banner over a page with nothing
+/// else to read is a wall, and its controls are marked.
+#[test]
+fn a_banner_is_hidden_and_a_wall_is_offered() {
+    let banner = r#"<div id="onetrust-banner-sdk"><p>We use cookies to improve your experience.</p>
+        <button id=ok>Accept all</button><button id=no>Reject all</button></div>
+      <script>
+        document.getElementById('ok').addEventListener('click', function () { document.cookie = 'c=1; Path=/'; });
+        document.getElementById('no').addEventListener('click', function () { document.cookie = 'c=0; Path=/'; });
+      </script>"#;
+    let article = "<article><h1>The atrium</h1>".to_string() + &"<p>An atrium is an open central court in a house, around which the rooms are arranged.</p>".repeat(8) + "</article>";
+    let page = format!("<html><body>{article}{banner}</body></html>");
+    let c = convert_with(&page, Some("https://news.example/a"), &mut BoaEngine::default(), &mut MapFetcher::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.consents.is_empty(), "{:?}", c.consents);
+    assert_eq!(c.banners_hidden, 1);
+    assert!(!c.html.contains("onetrust-banner-sdk") && !c.html.contains("atrium-consent:"), "{}", c.html);
+    assert!(c.html.contains("open central court"), "{}", c.html);
+
+    let wall = format!("<html><body><p>Subscribe to read.</p>{banner}</body></html>");
+    let c = convert_with(&wall, Some("https://news.example/b"), &mut BoaEngine::default(), &mut MapFetcher::default());
+    assert_eq!(c.banners_hidden, 0);
+    assert_eq!(c.consents.len(), 2, "{:?}", c.consents);
+}

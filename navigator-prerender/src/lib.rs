@@ -113,6 +113,8 @@ pub struct Conversion {
     pub beacons_suppressed: u32,
     /// What pressing each consent control writes (`atrium-consent:<n>`).
     pub consents: Vec<Vec<String>>,
+    /// Consent banners taken out of the document.
+    pub banners_hidden: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -324,6 +326,7 @@ fn assemble(dom: &dom::Dom, rep: engine::RunReport, subresources: subresource::S
         },
         beacons_suppressed: rep.beacons_suppressed,
         consents: rep.consents,
+        banners_hidden: rep.banners_hidden,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,

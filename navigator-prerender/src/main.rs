@@ -103,6 +103,7 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     for (k, n) in c.blocked_hosts.iter() { let _ = writeln!(o, "B\t{n}\t{k}"); }
     // A consent control's writes (legacy-web §5.4.1e), for the parent to
     // keep until the reader presses it: `CW <n> <what it wrote>`.
+    if c.banners_hidden > 0 { let _ = writeln!(o, "CB\t{}", c.banners_hidden); }
     for (i, ws) in c.consents.iter().enumerate() {
         for w in ws { let _ = writeln!(o, "CW\t{i}\t{w}"); }
     }

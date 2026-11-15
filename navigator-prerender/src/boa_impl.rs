@@ -3288,6 +3288,45 @@ fn consent_rank(d: &Dom, h: Handle, text: &str) -> u8 {
     says as u8
 }
 
+/// The outermost consent container around `h` (a dialog, a fixed overlay,
+/// a consent platform's id or class), never `html` or `body`.
+fn consent_container(d: &Dom, h: Handle) -> Option<Handle> {
+    let mut a = d.get(h).and_then(|n| n.parent);
+    let mut found = None;
+    let mut depth = 0;
+    while let Some(x) = a {
+        if depth > 32 { break }
+        if let Some(tag) = d.tag(x) {
+            if tag.eq_ignore_ascii_case("body") || tag.eq_ignore_ascii_case("html") { break }
+            let marker = |k: &str| d.attr(x, k).map(str::to_ascii_lowercase).is_some_and(|v| CONSENT_CONTAINERS.iter().any(|c| v.contains(c)));
+            let overlay = tag.eq_ignore_ascii_case("dialog")
+                || matches!(d.attr(x, "role"), Some("dialog" | "alertdialog"))
+                || d.attr(x, "aria-modal") == Some("true")
+                || matches!(d.style_get(x, "position").as_str(), "fixed" | "sticky");
+            if overlay || marker("id") || marker("class") { found = Some(x) }
+        }
+        a = d.get(x).and_then(|n| n.parent);
+        depth += 1;
+    }
+    found
+}
+
+/// The readable text a page must have outside a consent container for the
+/// container to be a banner (the page readable without answering) rather
+/// than a wall, in characters; and more of it outside than inside.
+pub const BANNER_TEXT: usize = 400;
+
+/// ★ A banner, not a wall (navigator-ui.md §6.2, decided 2026-11-15): the
+/// document is readable without its answer. Measured as visible text
+/// outside the container against inside it.
+fn is_banner(d: &Dom, container: Handle) -> bool {
+    let count = |h: Handle| d.visible_text(h).split_whitespace().map(|w| w.chars().count()).sum::<usize>();
+    let all = count(d.root());
+    let inside = count(container);
+    let outside = all.saturating_sub(inside);
+    outside >= BANNER_TEXT && outside > inside
+}
+
 /// ★ A consent wall's controls (legacy-web §5.4.1e): elements the reader
 /// could press, in a wall's container or saying a consent word, whose
 /// press writes `document.cookie`. Each is pressed once, as a probe (the
@@ -6307,7 +6346,7 @@ impl BoaEngine {
         LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
-        let mut rep = RunReport { transitions: vec![], consents: vec![], templates: vec![], interactive_found: 0, coverage: vec![],
+        let mut rep = RunReport { transitions: vec![], consents: vec![], banners_hidden: 0, templates: vec![], interactive_found: 0, coverage: vec![],
             explore_stats: Default::default(),
             scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
@@ -6503,8 +6542,24 @@ impl BoaEngine {
         {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
             let found = find_consents(&mut ctx, parser_nodes);
-            mark_consents(&found);
-            rep.consents = found.into_iter().map(|(_, w)| w).collect();
+            // ★ A banner (the page readable without answering) is taken out
+            // of the document the reader sees, and nothing of it is kept or
+            // offered: an anonymous page has nothing for it to protect, and
+            // answering would only make the site know you. A wall's controls
+            // are marked for the reader's own press.
+            let (banners, walls): (Vec<_>, Vec<_>) = DOM.with(|d| {
+                let d = d.borrow();
+                found.into_iter().map(|(h, w)| (consent_container(&d, h).filter(|c| is_banner(&d, *c)), h, w))
+                    .partition(|(c, _, _)| c.is_some())
+            });
+            let mut gone: Vec<Handle> = banners.iter().filter_map(|(c, _, _)| *c).collect();
+            gone.sort();
+            gone.dedup();
+            DOM.with(|d| { let mut d = d.borrow_mut(); for c in &gone { d.detach(*c); } });
+            rep.banners_hidden = gone.len() as u32;
+            let walls: Vec<(Handle, Vec<String>)> = walls.into_iter().map(|(_, h, w)| (h, w)).collect();
+            mark_consents(&walls);
+            rep.consents = walls.into_iter().map(|(_, w)| w).collect();
         }
         if let Some(cb) = settled {
             DOM.with(|d| cb(&d.borrow(), &rep));
