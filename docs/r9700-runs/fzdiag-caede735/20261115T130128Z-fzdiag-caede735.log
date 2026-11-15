@@ -1,0 +1,1537 @@
+== run Sun Nov 15 13:01:28 UTC 2026 stages: fz:3600:0x24f00d kenvs: psp_bootload psp_ipfw gc_up_ok attach client
+sha256 ok: fcb9662bcfced21ee1903bd6010b91df55923009d3eaa38538d2ece3a8a6ee1e
+sha256 ok: gpu module 72fe50b23f86e4da23e0de3a88dfcd140059a84e349390d192e98719b5b7c931, test d3033e6b7781c158aed7c9863cd52c27a9abda6439252f7e50b06697dd4fb52e
+sha256 ok: si-fuzz 538f5aa6b86bf062144e86e86ad1f5c35a06edf1468130a57237478d7b5cf012
+== before
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 28.0C 
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== kldload
+kldload rc=0
+kldload gpu module rc=0
+attach rc=0 (0 expected: stays attached)
+crw-------  1 root wheel 0x81 Nov 15 13:01 /dev/atrium-gpu0
+crw-------  1 root wheel 0x82 Nov 15 13:01 /dev/atrium-gpu0ctl
+== si-client-test
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+PASS: 1 queue: a second job on the same queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+2b: VM fd 10, queue fd 15: shader 0x10000000, IB 0x10001000, out 0x10002000
+2c: VM fd 16, queue fd 21: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 2 same VAs in both VMs (out 0x10002000 / 0x10002000)
+PASS: 2 two VMs: each queue writes 64 x 42 on its own page (B No error: 0 64/64, C No error: 0 64/64)
+PASS: 3 two queues in one VM: the second runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 3 two queues in one VM: the first still runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+4: VM fd 23, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 4 queue fd over SCM_RIGHTS: the child's submit runs (child exit 0, completion ok, 64/64 words 42)
+PASS: 5 close in flight: the completion lands or is cancelled (Operation canceled after 0 ms)
+PASS: 5 close in flight: the VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 6 the retired ring SUBMIT ('A',4) is unknown (Inappropriate ioctl for device)
+PASS: 6 unknown queue family refused (Invalid argument)
+PASS: 6 priority other than 0 refused (Invalid argument)
+PASS: 6 QUEUE_CREATE on the client node refused (Inappropriate ioctl for device)
+PASS: 6 QUEUE_SUBMIT on a VM fd refused (Inappropriate ioctl for device)
+PASS: 6 in-dependencies refused (not yet) (Operation not supported)
+PASS: 6 a blob that is not whole dwords refused (Invalid argument)
+PASS: 6 an empty blob refused (Invalid argument)
+PASS: 6 the first queue still runs after the refusals (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+7: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 7 fault: the faulting queue's work fails with EIO (got Input/output error after 0 ms)
+PASS: 7 fault: the lost queue refuses new work (Input/output error)
+PASS: 7 fault: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 7 fault: the faulting VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung queue's work fails with EIO after hang_ms (got Input/output error after 5002 ms)
+PASS: 8 hang: the lost queue refuses new work (Input/output error)
+PASS: 8 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+9: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 9 user mode: QUEUE_MAP2 layout (ring 0+0x1000, wptr 0x1008, doorbell 0x2000+0x1000, fence VA 0x200031010)
+PASS: 9 user mode: write_42 rung from user space (fence 1 (want 1) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 12, wptr 12)
+PASS: 9 user mode: a second job on the same ring (fence 2 (want 2) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 24, wptr 24)
+PASS: 9 user mode: QUEUE_SUBMIT on it refused (Operation not supported)
+PASS: 9 user mode: QUEUE_MAP2 of a kernel-mode queue refused (Invalid argument)
+PASS: 9 user mode: mmap of a kernel-mode queue refused (Operation not supported by device)
+PASS: 9 user mode: a private mapping refused (Permission denied)
+PASS: 9 user mode: an executable mapping refused (Permission denied)
+PASS: 9 user mode: a mapping past the queue's pages refused (Invalid argument)
+PASS: 9 user mode: after close, the ring is gone (SIGBUS) (child status 0xa)
+PASS: 9 user mode: after close, the doorbell is gone (SIGBUS) (child status 0xa)
+PASS: 9 hang: a stuck user ring is lost after hang_ms (QUEUE_MAP2: EIO) (Input/output error after 5250 ms, fence 0)
+PASS: 9 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 9 user mode: the VM runs clean on a kernel-mode queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 10 free rule: a BO of a VM with a live queue is freed at its close (preempted, not deferred) (deferred 0 -> 0, now 0)
+PASS: 10 free rule: the queue runs on after the preemption (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+10: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+10: BO closed under a stuck queue: freed at once (deferred 0 -> 0)
+PASS: 10 free rule (stuck): the stuck queue is still lost after hang_ms (got Input/output error after 4839 ms)
+PASS: 10 free rule (stuck): nothing deferred is left once the queue is gone (deferred_now 0)
+PASS: 10 free rule (stuck): another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 11 VRAM: the allocator is up and its initial scrub finished (total 31980 MiB, base 0x8000000, clean after 20 ms, scrubbed 31980 MiB)
+11: VRAM BO of 1024 KiB at VA 0x10004000
+PASS: 11 VRAM: CPU read of a VRAM BO refused (Invalid argument)
+PASS: 11 VRAM: a new VRAM BO reads zero (64/64 words 0 (ok), first 0)
+PASS: 11 VRAM: a fill of the BO reads back (64/64 words 0xc0de1234 (ok), first 0xc0de1234)
+PASS: 11 VRAM: the freed BO is scrubbed (clean after 20 ms, scrubbed +1024 KiB)
+PASS: 11 VRAM: the next VRAM BO reads zero (no data from the freed one) (64/64 words 0 (ok), first 0)
+11: vram used 114688, dirty 1048576, allocs 66, frees 38, scrub jobs 69 (failed 0)
+PASS: 11 VRAM: the queue runs on after the VRAM work (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 12 real ops: COPY, System source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, System source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, System source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: COPY, VRAM source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, VRAM source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, VRAM source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: write_42 runs on after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: BIND_EXEC without READONLY is refused (Invalid argument)
+PASS: 13 W^X: code and IB bound EXEC run, data without X (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: a jump into a read-write data BO faults and fails the work (completion Input/output error after 0 ms, 0/64 words 42)
+PASS: 13 W^X: the VM runs clean on a new queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at a high VA (VA 0x7ffffff00000) is lost with EIO (got Input/output error after 0 ms)
+15: stores at a high VA: time to fail 0 ms
+PASS: 15 hostile ISA: stores at a high VA: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at a high VA: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at a high VA, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at a high VA, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores past its own buffer (VA 0x10003000) is lost with EIO (got Input/output error after 0 ms)
+15: stores past its own buffer: time to fail 0 ms
+PASS: 15 hostile ISA: stores past its own buffer: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores past its own buffer: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores past its own buffer, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores past its own buffer, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: a shader that never ends (VA 0x10002000) is lost with EIO (got Input/output error after 5039 ms)
+15: a shader that never ends: time to fail 5039 ms
+PASS: 15 hostile ISA: a shader that never ends: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: a shader that never ends: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after a shader that never ends, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after a shader that never ends, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at VA 0 (VA 0) is lost with EIO (got Input/output error after 0 ms)
+15: stores at VA 0: time to fail 0 ms
+PASS: 15 hostile ISA: stores at VA 0: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 0 -> 0)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 5036 ms; fault IVs +0, IH overflows +0
+PASS: 16 fault storm: the storm is cut short (+0 fault IVs, re-inits 0 -> 0)
+PASS: 16 fault storm: the IH ring barely overflows (+0 overflows)
+FAIL: 16 fault storm: afterwards another VM runs clean (submit: Input/output error)
+16: re-inits 0 -> 0
+17 reader before: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: before any write: 0/64 pattern words, out[0] 0 (completed)
+17 writer: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: writer's store to the unmapped VA: Input/output error
+17: fault page scrubs that found it written: +0
+FAIL: 17 dummy page: the writer's faulting stores reach the fault page, and the kernel zeroes it (+0 dirty scrubs)
+17 reader after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: reader's load from the unmapped VA: completed; 0/64 pattern words, out[0] 0; re-inits 1 -> 1
+PASS: 17 dummy page: no VM reads another VM's faulting writes (0/64 words carried the writer's pattern (out[0] 0))
+PASS: 17 dummy page: unmapped VA reads as zeros (64/64 words 0)
+17 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 1)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 61531: Operation not permitted after 5028 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 2 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 61532: Operation not permitted after 5039 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 3 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 97 passed, 2 failed: FAIL
+si-client-test rc=1
+== si-fuzz all 3600 0x24f00d
+si-fuzz: all for 3600 s, seed 0x24f00d, 6 ioctl threads, hang_ms 5000 (job wait 20000 ms), re-inits 3, pace 610 s, generations 60 s
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 3 re-init(s) before the start: waiting 610 s for the driver's window to close
+si-fuzz: ioctl generation 1: uid 61001, seed 0x24f00e
+si-fuzz: blob generation 2: uid 62002, seed 0x24f00f
+si-fuzz:    0 s: 0 calls, blob 0 jobs (0 ok, 0 failed, 0 clean after), canary 1, re-inits 3, cp_errors 2, vm_faults 9, hangs 7, findings 0
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 3 -> 4; workers stopped for 610 s
+  last op, slot 0 (35216 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 64 f1 f2 41 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 1 (34121 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 2 (35669 ops): ioctl VM_CREATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 3 (36549 ops): ioctl VM_BIND on fd 250 [00 00 00 00 00 00 00 00 7a 00 00 00 dc 55 ef d0 ...]
+  last op, slot 4 (36905 ops): ioctl VM_CREATE on fd 250 [5a aa c5 44 00 00 00 00 00 00 00 00 00 00 00 00 ...] [in the kernel]
+  last op, slot 5 (29495 ops): ioctl POWERGATE on fd 250 [00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ...]
+  last op, slot 16 (4 ops): blob packets: 98 dw, va 0x10001000 (IB 0x10001000) 392 bytes, w0 c0024900 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:   60 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 11, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  120 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 23, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  180 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 35, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  240 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 47, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  300 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 59, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  360 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 71, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  420 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 83, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  480 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 95, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  540 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 107, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz:  600 s: 207959 calls, blob 4 jobs (1 ok, 2 failed, 1 clean after), canary 119, re-inits 4, cp_errors 2, vm_faults 10, hangs 9, findings 0
+si-fuzz: ioctl generation 3: uid 61003, seed 0x24f010
+si-fuzz: blob generation 4: uid 62004, seed 0x24f011
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 4 -> 5; workers stopped for 610 s
+  last op, slot 0 (36558 ops): ioctl SYNCOBJ_WAIT on fd 250 [3e 00 00 00 00 00 00 00 25 00 00 00 4f 00 00 00 ...] [in the kernel]
+  last op, slot 1 (35264 ops): ioctl SYNCOBJ_WAIT on fd 250 [2d 00 00 00 00 00 00 00 77 00 00 00 5a 00 00 00 ...] [in the kernel]
+  last op, slot 2 (37935 ops): ioctl SYNCOBJ_WAIT on fd 250 [67 7e 9a 51 79 88 7c 17 5e 00 00 00 36 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39451 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 60 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 4 (41153 ops): ioctl SYNCOBJ_WAIT on fd 250 [26 00 00 00 00 00 00 00 5c 00 00 00 55 00 00 00 ...] [in the kernel]
+  last op, slot 5 (30272 ops): ioctl SYNCOBJ_WAIT on fd 250 [3f 00 00 00 00 00 00 00 53 00 00 00 5b 00 00 00 ...] [in the kernel]
+  last op, slot 16 (5 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 5 -> 6; workers stopped for 610 s
+  last op, slot 0 (36558 ops): ioctl SYNCOBJ_WAIT on fd 250 [3e 00 00 00 00 00 00 00 25 00 00 00 4f 00 00 00 ...] [in the kernel]
+  last op, slot 1 (35264 ops): ioctl SYNCOBJ_WAIT on fd 250 [2d 00 00 00 00 00 00 00 77 00 00 00 5a 00 00 00 ...] [in the kernel]
+  last op, slot 2 (37935 ops): ioctl SYNCOBJ_WAIT on fd 250 [67 7e 9a 51 79 88 7c 17 5e 00 00 00 36 00 00 00 ...] [in the kernel]
+  last op, slot 3 (39451 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 60 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 4 (41153 ops): ioctl SYNCOBJ_WAIT on fd 250 [26 00 00 00 00 00 00 00 5c 00 00 00 55 00 00 00 ...] [in the kernel]
+  last op, slot 5 (30328 ops): close 9
+  last op, slot 16 (5 ops): blob splice: 141 dw, va 0x10001000 (IB 0x10001000) 564 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz:  660 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 128, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz:  720 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 140, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz:  780 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 152, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz:  840 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 164, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz:  900 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 176, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz:  960 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 188, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1020 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 200, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1080 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 212, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1140 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 224, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1200 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 236, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: 1260 s: 220694 calls, blob 6 jobs (1 ok, 3 failed, 1 clean after), canary 248, re-inits 6, cp_errors 4, vm_faults 12, hangs 10, findings 0
+si-fuzz: ioctl generation 5: uid 61005, seed 0x24f012
+si-fuzz: blob generation 6: uid 62006, seed 0x24f013
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: setup failed: No space left on device
+si-fuzz: re-init 6 -> 7; workers stopped for 610 s
+  last op, slot 0 (38347 ops): ioctl SYNCOBJ_WAIT on fd 250 [22 00 00 00 00 00 00 00 6f 00 00 00 3c 00 00 00 ...] [in the kernel]
+  last op, slot 1 (36346 ops): ioctl SYNCOBJ_WAIT on fd 250 [3f 00 00 00 00 00 00 00 0d 00 00 00 40 00 00 00 ...] [in the kernel]
+  last op, slot 2 (38455 ops): ioctl BO_WRITE on fd 40 [b8 10 00 00 00 00 00 00 01 00 00 00 00 00 00 00 ...]
+  last op, slot 3 (41452 ops): kevent on fd 57 [in the kernel]
+  last op, slot 4 (42195 ops): ioctl SYNCOBJ_WAIT on fd 250 [d2 88 27 db f5 79 39 3e 31 00 00 00 4e 00 00 00 ...] [in the kernel]
+  last op, slot 5 (31229 ops): ioctl SYNCOBJ_WAIT on fd 250 [23 00 00 00 00 00 00 00 11 00 00 00 1b 00 00 00 ...] [in the kernel]
+  last op, slot 16 (6 ops): blob blob va/size: 56 dw, va 0x10000000 (IB 0x10001000) 224 bytes, w0 c0065802
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 1320 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 258, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1380 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 270, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1440 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 282, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1501 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 294, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1561 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 306, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1621 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 318, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1681 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 330, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1741 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 342, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1801 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 354, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: 1861 s: 228033 calls, blob 7 jobs (1 ok, 4 failed, 1 clean after), canary 366, re-inits 7, cp_errors 5, vm_faults 13, hangs 11, findings 0
+si-fuzz: ioctl generation 7: uid 61007, seed 0x24f014
+si-fuzz: blob generation 8: uid 62008, seed 0x24f015
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 7 -> 8; workers stopped for 610 s
+  last op, slot 0 (40844 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 74 00 00 00 40 00 00 00 ...] [in the kernel]
+  last op, slot 1 (37019 ops): ioctl SYNCOBJ_WAIT on fd 250 [10 00 00 00 00 00 00 00 6f 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 2 (39001 ops): ioctl SYNCOBJ_WAIT on fd 250 [31 00 00 00 00 00 00 00 30 00 00 00 40 00 00 00 ...] [in the kernel]
+  last op, slot 3 (43670 ops): ioctl SYNCOBJ_WAIT on fd 250 [0a 00 00 00 00 00 00 00 07 00 00 00 39 00 00 00 ...] [in the kernel]
+  last op, slot 4 (42910 ops): ioctl SYNCOBJ_WAIT on fd 250 [12 00 00 00 00 00 00 00 19 00 00 00 3c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (32682 ops): ioctl SYNCOBJ_WAIT on fd 250 [17 00 00 00 00 00 00 00 13 00 00 00 50 00 00 00 ...] [in the kernel]
+  last op, slot 16 (7 ops): blob packets: 1021 dw, va 0x10001000 (IB 0x10001000) 4084 bytes, w0 c0026801 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 8 -> 9; workers stopped for 610 s
+  last op, slot 0 (40844 ops): ioctl SYNCOBJ_WAIT on fd 250 [28 00 00 00 00 00 00 00 74 00 00 00 40 00 00 00 ...] [in the kernel]
+  last op, slot 1 (37019 ops): ioctl SYNCOBJ_WAIT on fd 250 [10 00 00 00 00 00 00 00 6f 00 00 00 5f 00 00 00 ...] [in the kernel]
+  last op, slot 2 (39001 ops): ioctl SYNCOBJ_WAIT on fd 250 [31 00 00 00 00 00 00 00 30 00 00 00 40 00 00 00 ...] [in the kernel]
+  last op, slot 3 (43670 ops): ioctl SYNCOBJ_WAIT on fd 250 [0a 00 00 00 00 00 00 00 07 00 00 00 39 00 00 00 ...] [in the kernel]
+  last op, slot 4 (42910 ops): ioctl SYNCOBJ_WAIT on fd 250 [12 00 00 00 00 00 00 00 19 00 00 00 3c 00 00 00 ...] [in the kernel]
+  last op, slot 5 (32692 ops): ioctl SCHED on fd 8 [00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 ...]
+  last op, slot 16 (7 ops): blob packets: 1021 dw, va 0x10001000 (IB 0x10001000) 4084 bytes, w0 c0026801 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 1921 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 375, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 1981 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 387, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2041 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 399, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2101 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 411, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2161 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 423, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2221 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 435, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2281 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 447, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2341 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 459, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2401 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 471, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2461 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 483, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: 2521 s: 236143 calls, blob 9 jobs (1 ok, 5 failed, 1 clean after), canary 495, re-inits 9, cp_errors 6, vm_faults 15, hangs 12, findings 0
+si-fuzz: ioctl generation 9: uid 61009, seed 0x24f016
+si-fuzz: blob generation 10: uid 62010, seed 0x24f017
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 9 -> 10; workers stopped for 610 s
+  last op, slot 0 (43450 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 2b 00 00 00 31 00 00 00 ...] [in the kernel]
+  last op, slot 1 (40156 ops): ioctl SYNCOBJ_WAIT on fd 250 [e2 74 8e 37 9c d6 ee ee 4d 00 00 00 39 00 00 00 ...] [in the kernel]
+  last op, slot 2 (39984 ops): ioctl VM_BIND2 on fd 250 [00 00 00 00 00 00 00 00 3f 00 00 00 0d 00 00 00 ...] [in the kernel]
+  last op, slot 3 (45031 ops): ioctl SYNCOBJ_WAIT on fd 250 [be 44 48 a8 5c 76 4b b9 61 00 00 00 4b 00 00 00 ...] [in the kernel]
+  last op, slot 4 (44616 ops): bind fd 47 into fd 48 [in the kernel]
+  last op, slot 5 (35490 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 3a 00 00 00 2b 00 00 00 ...] [in the kernel]
+  last op, slot 16 (8 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: re-init 10 -> 11; workers stopped for 610 s
+  last op, slot 0 (43450 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 2b 00 00 00 31 00 00 00 ...] [in the kernel]
+  last op, slot 1 (40156 ops): ioctl SYNCOBJ_WAIT on fd 250 [e2 74 8e 37 9c d6 ee ee 4d 00 00 00 39 00 00 00 ...] [in the kernel]
+  last op, slot 2 (39984 ops): ioctl VM_BIND2 on fd 250 [00 00 00 00 00 00 00 00 3f 00 00 00 0d 00 00 00 ...] [in the kernel]
+  last op, slot 3 (45031 ops): ioctl SYNCOBJ_WAIT on fd 250 [be 44 48 a8 5c 76 4b b9 61 00 00 00 4b 00 00 00 ...] [in the kernel]
+  last op, slot 4 (44616 ops): bind fd 47 into fd 48 [in the kernel]
+  last op, slot 5 (35490 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 3a 00 00 00 2b 00 00 00 ...] [in the kernel]
+  last op, slot 16 (8 ops): blob splice: 75 dw, va 0x10001000 (IB 0x10001000) 300 bytes, w0 c0065802 [in the kernel]
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 2581 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 503, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2641 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 515, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2701 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 527, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2761 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 539, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2821 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 551, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2881 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 563, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 2941 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 575, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 3001 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 587, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 3062 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 599, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: 3122 s: 248735 calls, blob 11 jobs (1 ok, 6 failed, 1 clean after), canary 611, re-inits 11, cp_errors 8, vm_faults 17, hangs 15, findings 0
+si-fuzz: ioctl generation 11: uid 61011, seed 0x24f018
+si-fuzz: blob generation 12: uid 62012, seed 0x24f019
+blob: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+blob: QUEUE_CREATE failed: Operation not permitted
+si-fuzz: blob worker's uid 62012 locked out (reset blame)
+si-fuzz: re-init 11 -> 12; workers stopped for 610 s
+  last op, slot 0 (44461 ops): ioctl SYNCOBJ_WAIT on fd 250 [3d 00 00 00 00 00 00 00 1e 00 00 00 5c 00 00 00 ...] [in the kernel]
+  last op, slot 1 (42591 ops): ioctl SYNCOBJ_WAIT on fd 250 [2e 00 00 00 00 00 00 00 22 00 00 00 28 00 00 00 ...] [in the kernel]
+  last op, slot 2 (41378 ops): ioctl SYNCOBJ_WAIT on fd 250 [01 00 00 00 00 00 00 00 34 00 00 00 39 00 00 00 ...] [in the kernel]
+  last op, slot 3 (46633 ops): ioctl SYNCOBJ_WAIT on fd 250 [36 00 00 00 00 00 00 00 06 00 00 00 37 00 00 00 ...] [in the kernel]
+  last op, slot 4 (46023 ops): ioctl SYNCOBJ_WAIT on fd 250 [ec 23 d1 90 58 28 7e 79 24 00 00 00 56 00 00 00 ...] [in the kernel]
+  last op, slot 5 (37453 ops): ioctl SYNCOBJ_WAIT on fd 250 [26 00 00 00 00 00 00 00 33 00 00 00 55 00 00 00 ...] [in the kernel]
+  last op, slot 16 (9 ops): blob splice: 27 dw, va 0x10001000 (IB 0x10001000) 108 bytes, w0 c0065802
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: 3182 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 621, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3242 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 633, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3302 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 645, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3362 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 657, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3422 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 669, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3482 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 681, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3542 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 693, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: 3600 s: 258599 calls, blob 12 jobs (1 ok, 7 failed, 1 clean after), canary 704, re-inits 12, cp_errors 9, vm_faults 18, hangs 17, findings 0
+si-fuzz: re-inits at the end 12
+canary: VM fd 3, queue fd 8: shader 0x10000000, IB 0x10001000, out 0x10002000
+si-fuzz: health: a new VM runs write_42 clean
+si-fuzz: errno per ioctl (calls by the ioctl workers)
+                          ok     EINVAL      EBADF     EFAULT     ENOTTY      EPERM     ENOMEM     ENOSPC        EIO      EBUSY EOPNOTSUPP      other
+  BO_ALLOC              4326       1300        330          0       1814          0          0          0          0          0        119          0
+  BO_WRITE               265       4375        921        305       1849          0          0          0          0          0        134          0
+  BO_READ                242       4439        963        369       1811          0          0          0          0          0        117          0
+  GET_IRQS              5515          0        383          0       1945          0          0          0          0          0        131          0
+  SYNCOBJ_CREATE        5572          0        378          0       1830          0          0          0          0          0        130          0
+  SYNCOBJ_SIGNAL        2338       2518       1020          0       1869          0          0          0          0          0        127          0
+  SYNCOBJ_QUERY         2327       2600        967          0       1908          0          0          0          0          0        135          0
+  SYNCOBJ_WAIT           285       2713        934          0       1870          0          0          0          0          0        119       2054
+  VM_CREATE              707          0        364          0       1852          0          0       4740          0          0        135          0
+  VM_BIND                113       4453       1262          0       1872          0          0          0          2          5        129         56
+  QUEUE_MAP                0       4670       1240          0       1898          0          0          0          0          0        162          0
+  QUERY_CAPS            1762          0        397       3162       1870          0        735          0          0          0        136          0
+  VM_BIND2                46       4685       1165          0       1881          0          0          0          2          0        131         21
+  QUEUE_CREATE             5        543       1172          0       5618          2          0          0          0          0        479          0
+  QUEUE_MAP2               0        143       1248          0       5986          0          0          0          0          0        414          0
+  QUEUE_SUBMIT             0        138       1220          0       6033          0          0          0          0          0        479          0
+  GPU_RESET                0          0        367          0       1917       5581          0          0          0          0        140          0
+  SCHED                    0          0        384          0       1915       5541          0          0          0          0        127          0
+  POWERGATE                0          0        375          0       1886       5506          0          0          0          0        126          0
+  old SUBMIT               0          0        363          0       7378          0          0          0          0          0        124          0
+si-fuzz: mmaps that succeeded 0, forks 253, blob VM reopens 12, queue renews 7
+RESULT: PASS (0 findings, seed 0x24f00d)
+si-fuzz rc=0
+reinits 12
+== re-inits during the fuzz (3 -> 12): waiting 610 s
+== si-client-test after the fuzz
+1: VM fd 4, queue fd 9: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 1 queue: write_42 on its own MES user queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 1 queue: out_seqno counts from 1 (1)
+PASS: 1 queue: a second job on the same queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+2b: VM fd 10, queue fd 15: shader 0x10000000, IB 0x10001000, out 0x10002000
+2c: VM fd 16, queue fd 21: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 2 same VAs in both VMs (out 0x10002000 / 0x10002000)
+PASS: 2 two VMs: each queue writes 64 x 42 on its own page (B No error: 0 64/64, C No error: 0 64/64)
+PASS: 3 two queues in one VM: the second runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 3 two queues in one VM: the first still runs (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+4: VM fd 23, queue fd 28: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 4 queue fd over SCM_RIGHTS: the child's submit runs (child exit 0, completion ok, 64/64 words 42)
+PASS: 5 close in flight: the completion lands or is cancelled (Operation canceled after 0 ms)
+PASS: 5 close in flight: the VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 6 the retired ring SUBMIT ('A',4) is unknown (Inappropriate ioctl for device)
+PASS: 6 unknown queue family refused (Invalid argument)
+PASS: 6 priority other than 0 refused (Invalid argument)
+PASS: 6 QUEUE_CREATE on the client node refused (Inappropriate ioctl for device)
+PASS: 6 QUEUE_SUBMIT on a VM fd refused (Inappropriate ioctl for device)
+PASS: 6 in-dependencies refused (not yet) (Operation not supported)
+PASS: 6 a blob that is not whole dwords refused (Invalid argument)
+PASS: 6 an empty blob refused (Invalid argument)
+PASS: 6 the first queue still runs after the refusals (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+7: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 7 fault: the faulting queue's work fails with EIO (got Input/output error after 0 ms)
+PASS: 7 fault: the lost queue refuses new work (Input/output error)
+PASS: 7 fault: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 7 fault: the faulting VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung queue's work fails with EIO after hang_ms (got Input/output error after 5015 ms)
+PASS: 8 hang: the lost queue refuses new work (Input/output error)
+PASS: 8 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 8 hang: the hung VM runs clean on a new queue (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+9: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 9 user mode: QUEUE_MAP2 layout (ring 0+0x1000, wptr 0x1008, doorbell 0x2000+0x1000, fence VA 0x200031010)
+PASS: 9 user mode: write_42 rung from user space (fence 1 (want 1) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 12, wptr 12)
+PASS: 9 user mode: a second job on the same ring (fence 2 (want 2) after 1 ms, 64/64 words 42, out[0] 0x2a, rptr report 24, wptr 24)
+PASS: 9 user mode: QUEUE_SUBMIT on it refused (Operation not supported)
+PASS: 9 user mode: QUEUE_MAP2 of a kernel-mode queue refused (Invalid argument)
+PASS: 9 user mode: mmap of a kernel-mode queue refused (Operation not supported by device)
+PASS: 9 user mode: a private mapping refused (Permission denied)
+PASS: 9 user mode: an executable mapping refused (Permission denied)
+PASS: 9 user mode: a mapping past the queue's pages refused (Invalid argument)
+PASS: 9 user mode: after close, the ring is gone (SIGBUS) (child status 0xa)
+PASS: 9 user mode: after close, the doorbell is gone (SIGBUS) (child status 0xa)
+PASS: 9 hang: a stuck user ring is lost after hang_ms (QUEUE_MAP2: EIO) (Input/output error after 5251 ms, fence 0)
+PASS: 9 hang: another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 9 user mode: the VM runs clean on a kernel-mode queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 10 free rule: a BO of a VM with a live queue is freed at its close (preempted, not deferred) (deferred 87 -> 87, now 0)
+PASS: 10 free rule: the queue runs on after the preemption (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+10: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+10: BO closed under a stuck queue: freed at once (deferred 87 -> 87)
+PASS: 10 free rule (stuck): the stuck queue is still lost after hang_ms (got Input/output error after 4836 ms)
+PASS: 10 free rule (stuck): nothing deferred is left once the queue is gone (deferred_now 0)
+PASS: 10 free rule (stuck): another VM's queue runs on (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 11 VRAM: the allocator is up and its initial scrub finished (total 31980 MiB, base 0x8000000, clean after 20 ms, scrubbed 32195 MiB)
+11: VRAM BO of 1024 KiB at VA 0x10004000
+PASS: 11 VRAM: CPU read of a VRAM BO refused (Invalid argument)
+PASS: 11 VRAM: a new VRAM BO reads zero (64/64 words 0 (ok), first 0)
+PASS: 11 VRAM: a fill of the BO reads back (64/64 words 0xc0de1234 (ok), first 0xc0de1234)
+PASS: 11 VRAM: the freed BO is scrubbed (clean after 20 ms, scrubbed +1024 KiB)
+PASS: 11 VRAM: the next VRAM BO reads zero (no data from the freed one) (64/64 words 0 (ok), first 0)
+11: vram used 114688, dirty 1048576, allocs 10019, frees 9991, scrub jobs 10030 (failed 8)
+PASS: 11 VRAM: the queue runs on after the VRAM work (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 12 real ops: COPY, System source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, System source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, System source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: COPY, VRAM source (ok, 0/64 wrong; out[0] 0x7 out[63] 0xc4)
+PASS: 12 real ops: INC, VRAM source (ok, 0/64 wrong; out[0] 0x8 out[63] 0xc5)
+PASS: 12 real ops: FILL, VRAM source (ok, 0/64 wrong; out[0] 0x600dbeef out[63] 0x600dbeef)
+PASS: 12 real ops: write_42 runs on after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: BIND_EXEC without READONLY is refused (Invalid argument)
+PASS: 13 W^X: code and IB bound EXEC run, data without X (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 13 W^X: a jump into a read-write data BO faults and fails the work (completion Input/output error after 0 ms, 0/64 words 42)
+PASS: 13 W^X: the VM runs clean on a new queue after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at a high VA (VA 0x7ffffff00000) is lost with EIO (got Input/output error after 0 ms)
+15: stores at a high VA: time to fail 0 ms
+PASS: 15 hostile ISA: stores at a high VA: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at a high VA: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at a high VA, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at a high VA, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores past its own buffer (VA 0x10003000) is lost with EIO (got Input/output error after 0 ms)
+15: stores past its own buffer: time to fail 0 ms
+PASS: 15 hostile ISA: stores past its own buffer: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores past its own buffer: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores past its own buffer, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores past its own buffer, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: a shader that never ends (VA 0x10002000) is lost with EIO (got Input/output error after 5040 ms)
+15: a shader that never ends: time to fail 5040 ms
+PASS: 15 hostile ISA: a shader that never ends: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: a shader that never ends: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after a shader that never ends, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after a shader that never ends, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 hostile: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: stores at VA 0 (VA 0) is lost with EIO (got Input/output error after 0 ms)
+15: stores at VA 0: time to fail 0 ms
+PASS: 15 hostile ISA: stores at VA 0: the bystander's memory is untouched (64/64 words intact, out[0] 0x5b5b5b5b)
+PASS: 15 hostile ISA: stores at VA 0: the lost queue refuses new work (Input/output error)
+PASS: 15 hostile ISA: after stores at VA 0, another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+15 health: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 15 hostile ISA: after stores at VA 0, a new VM can be set up and runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 15 hostile ISA: no GPU re-init was needed (re-inits 12 -> 12)
+16 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+16 storm: VM fd 28, queue fd 33: shader 0x10000000, IB 0x10001000, out 0x10002000
+16: range ACQUIRE_MEM: Input/output error after 5040 ms; fault IVs +0, IH overflows +0
+PASS: 16 fault storm: the storm is cut short (+0 fault IVs, re-inits 12 -> 12)
+PASS: 16 fault storm: the IH ring barely overflows (+0 overflows)
+FAIL: 16 fault storm: afterwards another VM runs clean (submit: Input/output error)
+16: re-inits 12 -> 12
+17 reader before: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: before any write: 0/64 pattern words, out[0] 0 (completed)
+17 writer: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: writer's store to the unmapped VA: Input/output error
+17: fault page scrubs that found it written: +0
+FAIL: 17 dummy page: the writer's faulting stores reach the fault page, and the kernel zeroes it (+0 dirty scrubs)
+17 reader after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+17: reader's load from the unmapped VA: completed; 0/64 pattern words, out[0] 0; re-inits 13 -> 13
+PASS: 17 dummy page: no VM reads another VM's faulting writes (0/64 words carried the writer's pattern (out[0] 0))
+PASS: 17 dummy page: unmapped VA reads as zeros (64/64 words 0)
+17 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 17 dummy page: afterwards another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+PASS: 14 hostile PM4: the target list (5 registers, re-inits so far 13)
+14: target ih_rb_base at dword 0x1123 = 0x10 (write same value)
+14: target cp_mes_cntl at dword 0xc807 = 0xc000000 (write same value)
+14: target gc_vm_ctx0_pt_base_lo at dword 0x28ef = 0x5800001 (write same value)
+14: target mm_vm_ctx0_pt_base_lo at dword 0x1a5cf = 0x5800001 (write same value)
+14: target smu_msg_arg at dword 0x16292 = 0 (read only)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA ih_rb_base as uid 64431: Operation not permitted after 5029 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0x10, re-inits 14 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to ih_rb_base: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to ih_rb_base: refused (refused, CP errors +1, register 0x10 -> 0x10)
+14 bystander: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 after WRITE_DATA to ih_rb_base: another VM runs clean (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+14: VM fd 28, queue fd 34: shader 0x10000000, IB 0x10001000, out 0x10002000
+14: WRITE_DATA cp_mes_cntl as uid 64432: Operation not permitted after 5037 ms, marker not written, CP errors +1, word 0x5b5b5b5b, register now 0xc000000, re-inits 15 (+1), the uid's next queue: Operation not permitted
+PASS: 14 after WRITE_DATA to cp_mes_cntl: the uid's next queue is refused (it forced a GPU reset) (Operation not permitted)
+PASS: 14 WRITE_DATA to cp_mes_cntl: refused (refused, CP errors +1, register 0xc000000 -> 0xc000000)
+14: 2 GPU re-init(s) since the start of 14 (cap 3 per 10 min): the rest is not run
+KNOWN: 14 hostile PM4: refused packets cost 2 whole-GPU re-init(s), stopped early; the uids that forced them were locked out (per-queue recovery still owed)
+14 after: VM fd 22, queue fd 27: shader 0x10000000, IB 0x10001000, out 0x10002000
+PASS: 14 hostile PM4: a new VM runs clean after (completion ok after 0 ms, 64/64 words 42, out[0] 0x2a)
+si_client_test: 97 passed, 2 failed: FAIL
+si-client-test rc=1
+dev.atrium_gpu_amd.0.isolation.gpu_wx: 0
+dev.atrium_gpu_amd.0.isolation.reset_lockout_s: 600
+dev.atrium_gpu_amd.0.isolation.queue_limit: 32
+dev.atrium_gpu_amd.0.isolation.sys_limit_pct: 50
+dev.atrium_gpu_amd.0.isolation.vram_limit_pct: 75
+dev.atrium_gpu_amd.0.isolation.hang_ms: 5000
+dev.atrium_gpu_amd.0.isolation.ih_overflows: 0
+dev.atrium_gpu_amd.0.isolation.grants_live: 0
+dev.atrium_gpu_amd.0.isolation.deferred_now: 0
+dev.atrium_gpu_amd.0.isolation.lockout_refused: 94
+dev.atrium_gpu_amd.0.isolation.resets_blamed: 15
+dev.atrium_gpu_amd.0.isolation.cp_errors: 11
+dev.atrium_gpu_amd.0.isolation.quota_refused: 0
+dev.atrium_gpu_amd.0.isolation.fences_failed: 0
+dev.atrium_gpu_amd.0.isolation.dummy_dirty: 0
+dev.atrium_gpu_amd.0.isolation.vm_faults: 27
+dev.atrium_gpu_amd.0.isolation.hangs: 24
+dev.atrium_gpu_amd.0.isolation.reaped: 130
+dev.atrium_gpu_amd.0.isolation.deferred: 130
+dev.atrium_gpu_amd.0.isolation.revokes: 0
+dev.atrium_gpu_amd.0.isolation.grants: 4
+dev.atrium_gpu_amd.0.isolation.dequeues: 0
+dev.atrium_gpu_amd.0.isolation.queue_refused: 0
+dev.atrium_gpu_amd.0.isolation.queue_waits: 0
+== attached, holding 10 s
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+== after 10 s attached
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+detach + give-back rc=0 (try 1)
+== kernel log
+atrium_gpu_amd_pci0: uq4: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 800, unrouted 0, MES own 0, MES preemption 147; retired by IV 786, by poll 0; queues lost to faults 10, hangs 21; preempted for frees 147 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x25, 6 x17, 7 x0, 8 x2236, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x802e001, queue pages at VA 0x200040000 (pa 0x3f49d0000), MQD GART 0x90000, doorbell 0x28
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1000, first VMID 12 at 0
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 5) started 500 us ago, ended 486 us ago
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0xc41040: client TCP (0x8), VMID 12, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x4, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: uq4: VMID 12's fault interrupts muted until the queue is removed (GFXHUB CONTEXT12_CNTL now 0x3aaa807)
+atrium_gpu_amd_pci0: si: uq4 faulted (VMID 12, 0): its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: IH: queue marked lost: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 75 us after the fault
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 88 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 109 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 12, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 130 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa0000001, CP_CPC_STATUS 0x80000001, CP_CPC_BUSY_STAT 0x810/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8028001, CP_CPC_STATUS 0xa0000000, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x3411c000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0x2001
+atrium_gpu_amd_pci0: si: uq4: first EOP IV, src_data[0] 0x1000028
+atrium_gpu_amd_pci0: uq4: VMID 12's waves killed (0); fence landed after 100 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4100000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq4 evicted (lost)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 802, unrouted 0, MES own 0, MES preemption 147; retired by IV 787, by poll 0; queues lost to faults 11, hangs 21; preempted for frees 147 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x25, 6 x17, 7 x0, 8 x2240, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x801c001, queue pages at VA 0x200040000 (pa 0x3f49d0000), MQD GART 0x90000, doorbell 0x28
+atrium_gpu_amd_pci0: si: uq4: first EOP IV, src_data[0] 0x1000028
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 240 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 803, unrouted 0, MES own 0, MES preemption 150; retired by IV 788, by poll 0; queues lost to faults 11, hangs 21; preempted for frees 150 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x25, 6 x17, 7 x0, 8 x2256, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 4, fence 4)
+atrium_gpu_amd_pci0: si: uq3 closed: 4 submits; EOP IVs routed 803, unrouted 0, MES own 0, MES preemption 153; retired by IV 788, by poll 0; queues lost to faults 11, hangs 21; preempted for frees 153 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x25, 6 x17, 7 x0, 8 x2270, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x801c001, queue pages at VA 0x200030000 (pa 0x303c5d000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8034001, queue pages at VA 0x200040000 (pa 0x3f49d0000), MQD GART 0x90000, doorbell 0x28
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4561: edge 26 C, hotspot 31 C, mem 26 C, VR 25 C; power 30 W of 300 W limit, board 30 W; fan 893 rpm (25%); gfx 1568 MHz, mem 93 MHz, gfx busy 49%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0x2001, CP_CPF_STATUS 0xa8008001, 7071980 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0x2001, CP_CPF_STATUS 0xa8008001, 7072064 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 12, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0x2001, CP_CPF_STATUS 0xa8008001, 7072152 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0008041, CP_CPC_BUSY_STAT 0x840/0, GRBM_STATUS2 0x3411c000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0x2001
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0008041, CP_CPC_BUSY_STAT 0x840/0, GRBM_STATUS2 0x3411c000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0x2001
+atrium_gpu_amd_pci0: uq4: VMID 12's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPF_BUSY_STAT 0xc8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x840/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x34118000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0008041, CP_CPC_BUSY_STAT 0x840/0, GRBM_STATUS2 0x34118000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0x2001
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0xa8008001); CP_CPF_BUSY_STAT 0xc8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x840/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0xa0008041, GRBM_STATUS2 0x34108000, RLC_GPM_STAT 0xc0036
+atrium_gpu_amd_pci0: si: MES queue notice (type 1) for doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xbc of 0xbc, status 0x8100030100000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1, first VMID 0 at 0
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xbd of 0xbd, status 0x8100030300000000, rptr 0)
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0x2001, after 1000 us 0x2001; last invalidation (context 15) started 200737 us ago, ended 200725 us ago
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSION_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+atrium_gpu_amd_pci0: mes: pipe 0 RESET (user compute queue): refused (fence 0xbe of 0xbe, status 0x8100080000000000, rptr 0)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xbf of 0xbf, status 0x8100030300000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: after MES RESET (5): REMOVE_QUEUE still refused
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE failed: seq 1, fence 0, wptr 12, rptr report 0; HQD not mapped (VMID 0)
+atrium_gpu_amd_pci0: uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+atrium_gpu_amd_pci0: si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: si: uid 0's queue forced a GPU reset (no lockout: root)
+atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0xdc653511
+atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+atrium_gpu_amd_pci0: si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+atrium_gpu_amd_pci0: smu: SMU 14.0.3, response register 0x1
+atrium_gpu_amd_pci0: smu: before: GB_ADDR_CONFIG 0, RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TestMessage                arg 0000000000: resp 0x1, out 0x1
+atrium_gpu_amd_pci0: smu: GetSmuVersion              arg 0000000000: resp 0x1, out 0x685000
+atrium_gpu_amd_pci0: smu: GetDriverIfVersion         arg 0000000000: resp 0x1, out 0x33
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrHigh      arg 0x00000080: resp 0x1
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrLow       arg 0x05400000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: running features 000000000000000000
+atrium_gpu_amd_pci0: smu: RunDcBtc                   arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: SetAllowedFeaturesMaskHigh arg 0xffffffff: resp 0xfd
+atrium_gpu_amd_pci0: smu: allowed mask refused: SCPM, the PSP owns it
+atrium_gpu_amd_pci0: smu: EnableAllSmuFeatures       arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0x38fffcfb
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0x488f19e
+atrium_gpu_amd_pci0: smu: running features 0x0488f19e38fffcfb
+atrium_gpu_amd_pci0: smu: protection features running (thermal trip, throttlers, fan, VR hot, memory temperature)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: RLC autoload complete after 0 us
+atrium_gpu_amd_pci0: smu: after: GB_ADDR_CONFIG 0x8200545, RLC bootload status 0x8000003f, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: metrics +  0: e8 03 00 00 24 02 00 00 60 00 00 00 54 04 00 00 19 00 00 00 19 00 00 00 58 02 00 00 58 02 00 00
+atrium_gpu_amd_pci0: smu: metrics + 32: cf 02 00 00 cf 02 00 00 cf 02 00 00 55 00 50 00 50 00 37 04 f7 03 72 01 82 01 19 00 19 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 64: 00 00 2b 00 2c 01 00 00 ae 05 5a 05 5a 05 37 04 25 04 65 00 86 00 18 00 18 00 61 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 96: 0c 00 00 00 42 00 00 00 06 00 00 00 23 02 4f 03 fe 01 b0 03 23 b4 91 0c 27 00 d0 0b 4c 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +128: 00 00 00 00 32 00 00 00 34 00 34 00 1c 00 22 00 22 00 20 00 01 00 14 00 14 00 12 00 15 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +160: 00 00 00 00 00 00 03 08 01 03 7b 03 00 24 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9f 6c ce 74
+atrium_gpu_amd_pci0: smu: metrics +256: e2 f1 df b8
+atrium_gpu_amd_pci0: smu: telemetry #6: edge 28 C, hotspot 34 C, mem 1 C, VR 20 C; power 52 W of 300 W limit, board 52 W; fan 891 rpm (1%); gfx 80 MHz, mem 386 MHz, gfx busy 76%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: sample [GC up, no idle setup] 1/1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #957: edge 29 C, hotspot 56 C, mem 28 C, VR 33 C; power 252 W of 300 W limit, board 252 W; fan 1024 rpm (20%); gfx 3130 MHz, mem 13 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x7ff, CGCG_CGLS 0x1003c, CGCG_CGLS_3D 0x3c, SRM 0x2, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [idle check] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #957: edge 29 C, hotspot 56 C, mem 28 C, VR 33 C; power 252 W of 300 W limit, board 252 W; fan 1024 rpm (20%); gfx 3130 MHz, mem 13 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [idle check] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #996: edge 29 C, hotspot 35 C, mem 28 C, VR 29 C; power 7 W of 300 W limit, board 7 W; fan 861 rpm (20%); gfx 10 MHz, mem 4 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: card proven idle
+atrium_gpu_amd_pci0: gfx: end: GRBM_STATUS 0, RLC_CNTL 0, RLC_STAT 0, MGCG_OVERRIDE 0, CGCG_CGLS 0, CGCG_CGLS_3D 0, SRM 0, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: gmc: VRAM 32640 MiB at MC 0x8000000000-0x87f7ffffff (FB offset 0); GART 512 MiB at 0, table at MC 0x8005800000
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x500, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: TLB flush on both hubs: acked
+atrium_gpu_amd_pci0: gfx12: before: GRBM_STATUS 0x800382c, CP_STAT 0, CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: halted: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: GB_ADDR_CONFIG 0x8200545 (address fields: pipes 32, se 16, rb/se 4, pkrs 32, interleave 256 B)
+atrium_gpu_amd_pci0: gfx12: active SAs 8 of 16 (mask 0xff)
+atrium_gpu_amd_pci0: gfx12: RB disable 0/0, SA disable 0xff0000/0xff0000, DB_RING_CONTROL 0x1
+atrium_gpu_amd_pci0: gfx12: RS64 start: PFP 0x7000000003000, ME 0x7000000003000, MEC 0x7000000003000
+atrium_gpu_amd_pci0: gfx12: SH_MEM VMID 1: config 0xc00c, bases 0x20001000; VMID 8: config 0xc00c, bases 0x10002
+atrium_gpu_amd_pci0: gfx12: after: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40000000, CP_DEBUG 0x20408000, GRBM_CNTL 0x3000ff
+atrium_gpu_amd_pci0: gfx12: stage 4c done; CP halted
+atrium_gpu_amd_pci0: ih: OSSSYS 7.0, ring 64 KiB at GART 0x1000 (pa 0x3f49c0000), wptr writeback at GART 0x11000
+atrium_gpu_amd_pci0: ih: before: RB_CNTL 0x40610000, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, no interrupts 0
+atrium_gpu_amd_pci0: ih: MSI, 1 vector, for every IH client
+atrium_gpu_amd_pci0: ih: enabled: RB_CNTL 0x4033011d, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, MSI interrupts 0
+atrium_gpu_amd_pci0: mes: MSCRATCH 2 x 256 KiB at GART 0x100000, zeroed before every start
+atrium_gpu_amd_pci0: mes: MES 12 (GC 12.0.0/1, unified), start 0xfffffffff0005000, block at GART 0x20000 (pa 0x303c3f000), doorbell BAR 2048 KiB
+atrium_gpu_amd_pci0: mes: before: CP_MES_CNTL 0x40000000; pipe 0: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: before: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: before start: pipe 0 IC_BASE 0x7f461d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5500000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: mes: before start: pipe 1 IC_BASE 0x7f469d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5580000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gfx: before MES: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: CP running before MES (as amdgpu): CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_STAT 0 after 2 us, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 0 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 1 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: started on attempt 1 of 3
+atrium_gpu_amd_pci0: mes: started: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: started: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 1 HQD by register: active 1, doorbell 0x18
+atrium_gpu_amd_pci0: mes: version (pipe 1) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES: ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: version (pipe 0) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES: ok in 320 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 QUERY_SCHEDULER_STATUS: ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: answered: CP_MES_CNTL 0xc000000; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: answered: GRBM_STATUS2 0x30110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110400, CP_CPC_BUSY_STAT 0/0x4480, CP_CPF_STATUS 0xa0000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x3f49d8000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: ... 9 more IVs
+atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #22: edge 29 C, hotspot 33 C, mem 28 C, VR 27 C; power 42 W of 300 W limit, board 42 W; fan 959 rpm (20%); gfx 2317 MHz, mem 180 MHz, gfx busy 84%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1053: edge 29 C, hotspot 33 C, mem 28 C, VR 27 C; power 13 W of 300 W limit, board 13 W; fan 889 rpm (20%); gfx 8 MHz, mem 190 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: si: GPU re-init 1 of 3 in this window: PASS (MES up, kernel compute queue ready)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+atrium_gpu_amd_pci0: si: GPU re-initialised (13 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: uq4: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 803, unrouted 0, MES own 0, MES preemption 153; retired by IV 788, by poll 0; queues lost to faults 11, hangs 22; preempted for frees 153 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2284, other x0
+atrium_gpu_amd_pci0: smu: telemetry #2: edge 28 C, hotspot 33 C, mem 28 C, VR 27 C; power 14 W of 300 W limit, board 14 W; fan 817 rpm (20%); gfx 0 MHz, mem 193 MHz, gfx busy 0%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: uq3: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 803, unrouted 0, MES own 0, MES preemption 153; retired by IV 788, by poll 0; queues lost to faults 11, hangs 22; preempted for frees 153 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2284, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x801f001, queue pages at VA 0x200030000 (pa 0x303d29000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 804, unrouted 0, MES own 0, MES preemption 157; retired by IV 789, by poll 0; queues lost to faults 11, hangs 22; preempted for frees 157 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2304, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 180 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8037001, queue pages at VA 0x200030000 (pa 0x303c5d000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x100, first VMID 8 at 0xf00000000
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 58 us ago, ended 46 us ago
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0x841040: client TCP (0x8), VMID 8, MORE_FAULTS 0, WALKER_ERROR 0, PERMISSION_FAULTS 0x4, MAPPING_ERROR 0, RW 1, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: uq3: VMID 8's fault interrupts muted until the queue is removed (GFXHUB CONTEXT8_CNTL now 0x3aaa807)
+atrium_gpu_amd_pci0: si: uq3 faulted (VMID 8, 0xf00000000): its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: IH: queue marked lost: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 68 us after the fault
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 99 us after the fault
+atrium_gpu_amd_pci0: uq3: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0xc; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 128 us after the fault
+atrium_gpu_amd_pci0: uq3: VMID 8, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa0000001, 155 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa800c001, CP_CPC_STATUS 0xa0200401, CP_CPC_BUSY_STAT 0xc90/0x40000, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8028001, CP_CPC_STATUS 0xa0200441, CP_CPC_BUSY_STAT 0x480atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+/0x40000, GRBM_STATUS2 0x34108000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq3: VMID 8's waves killed (0); fence landed after 0 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0, CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, GRBM_STATUS2 0x4100000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x140037, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0); CP_CPF_BUSY_STAT 0/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0/0, CP_CPC_STALLED_STAT1 0, CP_CPC_STATUS 0, GRBM_STATUS2 0x4100000, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 210 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 evicted (lost)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 805, unrouted 0, MES own 0, MES preemption 157; retired by IV 789, by poll 0; queues lost to faults 12, hangs 22; preempted for frees 157 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2308, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x801c001, queue pages at VA 0x200030000 (pa 0x303d29000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 120 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 806, unrouted 0, MES own 0, MES preemption 161; retired by IV 790, by poll 0; queues lost to faults 12, hangs 22; preempted for frees 161 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2328, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8025001, queue pages at VA 0x200030000 (pa 0x303c5d000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 807, unrouted 0, MES own 0, MES preemption 164; retired by IV 791, by poll 0; queues lost to faults 12, hangs 22; preempted for frees 164 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x26, 6 x18, 7 x0, 8 x2344, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 250 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x801e001, queue pages at VA 0x200030000 (pa 0x303d29000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x8030001, queue pages at VA 0x200040000 (pa 0x326be8000), MQD GART 0x90000, doorbell 0x28
+atrium_gpu_amd_pci0: si: 1 CP error IV(s) (privileged register, ring 0x14): me1 HQDs 0x2
+atrium_gpu_amd_pci0: si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4437: edge 29 C, hotspot 37 C, mem 28 C, VR 28 C; power 54 W of 300 W limit, board 54 W; fan 894 rpm (20%); gfx 3224 MHz, mem 11 MHz, gfx busy 96%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 5268552 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 5268636 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 9, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 5268746 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x30100000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x34114000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq4: VMID 9's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPF_BUSY_STAT 0xd8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x449/0, CP_CPC_STALLED_STAT1 0x410, GRBM_STATUS2 0x34110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0xa8008001); CP_CPF_BUSY_STAT 0xd8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x449/0, CP_CPC_STALLED_STAT1 0x410, CP_CPC_STATUS 0xa0000051, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0036
+atrium_gpu_amd_pci0: si: MES queue notice (type 1) for doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x27 of 0x27, status 0x8100030100000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1, first VMID 0 at 0
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 2201077 us ago, ended 2201063 us ago
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x28 of 0x28, status 0x8100030300000000, rptr 0)
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSION_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+atrium_gpu_amd_pci0: mes: pipe 0 RESET (user compute queue): refused (fence 0x29 of 0x29, status 0x8100080000000000, rptr 0)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x2a of 0x2a, status 0x8100030300000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: after MES RESET (5): REMOVE_QUEUE still refused
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE failed: seq 1, fence 0, wptr 12, rptr report 0; HQD not mapped (VMID 0)
+atrium_gpu_amd_pci0: uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+atrium_gpu_amd_pci0: si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: si: uid 64431's queue forced a GPU reset: no new queues for it for 600 s
+atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0xdd56d9e2
+atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+atrium_gpu_amd_pci0: si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+atrium_gpu_amd_pci0: smu: SMU 14.0.3, response register 0x1
+atrium_gpu_amd_pci0: smu: before: GB_ADDR_CONFIG 0, RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TestMessage                arg 0000000000: resp 0x1, out 0x1
+atrium_gpu_amd_pci0: smu: GetSmuVersion              arg 0000000000: resp 0x1, out 0x685000
+atrium_gpu_amd_pci0: smu: GetDriverIfVersion         arg 0000000000: resp 0x1, out 0x33
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrHigh      arg 0x00000080: resp 0x1
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrLow       arg 0x05400000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: running features 000000000000000000
+atrium_gpu_amd_pci0: smu: RunDcBtc                   arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: SetAllowedFeaturesMaskHigh arg 0xffffffff: resp 0xfd
+atrium_gpu_amd_pci0: smu: allowed mask refused: SCPM, the PSP owns it
+atrium_gpu_amd_pci0: smu: EnableAllSmuFeatures       arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0x38fffcfb
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0x488f19e
+atrium_gpu_amd_pci0: smu: running features 0x0488f19e38fffcfb
+atrium_gpu_amd_pci0: smu: protection features running (thermal trip, throttlers, fan, VR hot, memory temperature)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: RLC autoload complete after 0 us
+atrium_gpu_amd_pci0: smu: after: GB_ADDR_CONFIG 0x8200545, RLC bootload status 0x8000003f, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: metrics +  0: e8 03 00 00 24 02 00 00 60 00 00 00 54 04 00 00 19 00 00 00 19 00 00 00 58 02 00 00 58 02 00 00
+atrium_gpu_amd_pci0: smu: metrics + 32: cf 02 00 00 cf 02 00 00 cf 02 00 00 00 00 00 00 00 00 39 04 f6 03 78 01 76 01 19 00 19 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 64: 00 00 2b 00 2c 01 00 00 00 00 00 00 00 00 08 04 f5 03 71 00 70 00 17 00 17 00 57 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 96: 10 00 00 00 3a 00 00 00 04 00 00 00 1d 02 46 03 f8 01 a5 03 47 b2 96 0c 2c 00 a6 0b 4b 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +128: 00 00 00 00 2f 00 00 00 34 00 34 00 1e 00 25 00 25 00 22 00 01 00 16 00 15 00 13 00 16 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +160: 00 00 00 00 00 00 03 08 01 03 7f 03 00 27 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9f 6c ce 74
+atrium_gpu_amd_pci0: smu: metrics +256: e2 f1 df b8
+atrium_gpu_amd_pci0: smu: telemetry #4: edge 30 C, hotspot 37 C, mem 1 C, VR 22 C; power 52 W of 300 W limit, board 52 W; fan 895 rpm (1%); gfx 0 MHz, mem 374 MHz, gfx busy 75%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: sample [GC up, no idle setup] 1/1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #951: edge 31 C, hotspot 60 C, mem 30 C, VR 35 C; power 248 W of 300 W limit, board 248 W; fan 1037 rpm (20%); gfx 3106 MHz, mem 13 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x7ff, CGCG_CGLS 0x1003c, CGCG_CGLS_3D 0x3c, SRM 0x2, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [idle check] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1: edge 31 C, hotspot 68 C, mem 30 C, VR 38 C; power 279 W of 300 W limit, board 279 W; fan 960 rpm (20%); gfx 3246 MHz, mem 1 MHz, gfx busy 100%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [idle check] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #984: edge 31 C, hotspot 37 C, mem 30 C, VR 31 C; power 7 W of 300 W limit, board 7 W; fan 858 rpm (20%); gfx 5 MHz, mem 2 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: card proven idle
+atrium_gpu_amd_pci0: gfx: end: GRBM_STATUS 0, RLC_CNTL 0, RLC_STAT 0, MGCG_OVERRIDE 0, CGCG_CGLS 0, CGCG_CGLS_3D 0, SRM 0, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: gmc: VRAM 32640 MiB at MC 0x8000000000-0x87f7ffffff (FB offset 0); GART 512 MiB at 0, table at MC 0x8005800000
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x500, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: TLB flush on both hubs: acked
+atrium_gpu_amd_pci0: gfx12: before: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: halted: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: GB_ADDR_CONFIG 0x8200545 (address fields: pipes 32, se 16, rb/se 4, pkrs 32, interleave 256 B)
+atrium_gpu_amd_pci0: gfx12: active SAs 8 of 16 (mask 0xff)
+atrium_gpu_amd_pci0: gfx12: RB disable 0/0, SA disable 0xff0000/0xff0000, DB_RING_CONTROL 0x1
+atrium_gpu_amd_pci0: gfx12: RS64 start: PFP 0x7000000003000, ME 0x7000000003000, MEC 0x7000000003000
+atrium_gpu_amd_pci0: gfx12: SH_MEM VMID 1: config 0xc00c, bases 0x20001000; VMID 8: config 0xc00c, bases 0x10002
+atrium_gpu_amd_pci0: gfx12: after: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40000000, CP_DEBUG 0x20408000, GRBM_CNTL 0x3000ff
+atrium_gpu_amd_pci0: gfx12: stage 4c done; CP halted
+atrium_gpu_amd_pci0: ih: OSSSYS 7.0, ring 64 KiB at GART 0x1000 (pa 0x326bf0000), wptr writeback at GART 0x11000
+atrium_gpu_amd_pci0: ih: before: RB_CNTL 0x40610000, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, no interrupts 0
+atrium_gpu_amd_pci0: ih: MSI, 1 vector, for every IH client
+atrium_gpu_amd_pci0: ih: enabled: RB_CNTL 0x4033011d, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, MSI interrupts 0
+atrium_gpu_amd_pci0: mes: MSCRATCH 2 x 256 KiB at GART 0x100000, zeroed before every start
+atrium_gpu_amd_pci0: mes: MES 12 (GC 12.0.0/1, unified), start 0xfffffffff0005000, block at GART 0x20000 (pa 0x303c3f000), doorbell BAR 2048 KiB
+atrium_gpu_amd_pci0: mes: before: CP_MES_CNTL 0x40000000; pipe 0: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x800382c, CP_STAT 0, RLC_STAT 0x35
+atrium_gpu_amd_pci0: mes: before: GRBM_STATUS2 0x4110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: before start: pipe 0 IC_BASE 0x7f461d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5500000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: mes: before start: pipe 1 IC_BASE 0x7f469d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5580000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gfx: before MES: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: CP running before MES (as amdgpu): CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_STAT 0 after 2 us, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 0 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 1 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: started on attempt 1 of 3
+atrium_gpu_amd_pci0: mes: started: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: started: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 1 HQD by register: active 1, doorbell 0x18
+atrium_gpu_amd_pci0: mes: version (pipe 1) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES: ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: version (pipe 0) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES: ok in 320 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES_1: ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 QUERY_SCHEDULER_STATUS: ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: answered: CP_MES_CNTL 0xc000000; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: answered: GRBM_STATUS2 0x30110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110400, CP_CPC_BUSY_STAT 0/0x4480, CP_CPF_STATUS 0xa0000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140097
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x3f49c0000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x800382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: ... 9 more IVs
+atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #21: edge 31 C, hotspot 36 C, mem 30 C, VR 30 C; power 48 W of 300 W limit, board 48 W; fan 958 rpm (20%); gfx 2441 MHz, mem 182 MHz, gfx busy 83%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1055: edge 31 C, hotspot 35 C, mem 30 C, VR 29 C; power 13 W of 300 W limit, board 13 W; fan 896 rpm (20%); gfx 6 MHz, mem 190 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: si: GPU re-init 2 of 3 in this window: PASS (MES up, kernel compute queue ready)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 220 us (status 0x1)
+atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+atrium_gpu_amd_pci0: si: GPU re-initialised (14 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: uq4: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 807, unrouted 0, MES own 0, MES preemption 164; retired by IV 791, by poll 0; queues lost to faults 12, hangs 23; preempted for frees 164 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x27, 6 x19, 7 x0, 8 x2358, other x0
+atrium_gpu_amd_pci0: smu: telemetry #2: edge 31 C, hotspot 35 C, mem 30 C, VR 29 C; power 16 W of 300 W limit, board 16 W; fan 818 rpm (20%); gfx 0 MHz, mem 193 MHz, gfx busy 0%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: uq3: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq3 closed: 0 submits; EOP IVs routed 807, unrouted 0, MES own 0, MES preemption 164; retired by IV 791, by poll 0; queues lost to faults 12, hangs 23; preempted for frees 164 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x27, 6 x19, 7 x0, 8 x2358, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8025001, queue pages at VA 0x200030000 (pa 0x303c5d000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 200 us (status 0x1)
+atrium_gpu_amd_pci0: uq4: added: VM base 0x802b001, queue pages at VA 0x200040000 (pa 0x3f49c0000), MQD GART 0x90000, doorbell 0x28
+atrium_gpu_amd_pci0: si: 1 CP error IV(s) (privileged register, ring 0x14): me1 HQDs 0x2
+atrium_gpu_amd_pci0: si: CP error on me1 HQDs 0x2: no HQD scan while MES runs; the hang check takes the queue
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4476: edge 31 C, hotspot 38 C, mem 30 C, VR 30 C; power 52 W of 300 W limit, board 52 W; fan 894 rpm (20%); gfx 3029 MHz, mem 11 MHz, gfx busy 90%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: uq4 hung: fence 0, no progress for 5000 ms; its work fails, the queue is lost
+atrium_gpu_amd_pci0: gmc: evict task: start: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 15139646 us after the fault
+atrium_gpu_amd_pci0: uq4: destroy: work in flight: seq 1, fence 0, wptr 12, rptr report 0; HQD not looked up (MES owns it) (VMID 0)
+atrium_gpu_amd_pci0: gmc: evict: after the queue report: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 15139731 us after the fault
+atrium_gpu_amd_pci0: uq4: VMID 9, no HQD scan
+atrium_gpu_amd_pci0: gmc: evict: after the HQD lookup: GCVM_L2_STATUS 0, CP_CPF_STATUS 0xa8008001, 15139816 us after the fault
+atrium_gpu_amd_pci0: mes: before the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x34100000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: right after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x34114000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: uq4: VMID 9's waves killed (0); fence still behind after 200000 us
+atrium_gpu_amd_pci0: mes: after the wave kill: CP_CPF_STATUS 0xa8008001, CP_CPF_BUSY_STAT 0xd8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x449/0, CP_CPC_STALLED_STAT1 0x410, GRBM_STATUS2 0x34110000
+atrium_gpu_amd_pci0: mes: end of the CPF watch: CP_CPF_STATUS 0xa8008001, CP_CPC_STATUS 0xa0000051, CP_CPC_BUSY_STAT 0x449/0, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0016, GCVM_L2_STATUS 0
+atrium_gpu_amd_pci0: mes: after the wave kill: CPF bit 28 clear after 0 ms (CP_CPF_STATUS 0xa8008001); CP_CPF_BUSY_STAT 0xd8420000/0, CP_CPF_STALLED_STAT1 0, CP_CPC_BUSY_STAT 0x449/0, CP_CPC_STALLED_STAT1 0x410, CP_CPC_STATUS 0xa0000051, GRBM_STATUS2 0x34110000, RLC_GPM_STAT 0xc0016
+atrium_gpu_amd_pci0: si: MES queue notice (type 1) for doorbell 0x28
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0x9 of 0x9, status 0x8100030100000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE refused (5); HQD reset, trying once more
+atrium_gpu_amd_pci0: si: VM fault: 1 IV(s) (0 retry), VMIDs 0x1, first VMID 0 at 0
+atrium_gpu_amd_pci0: gmc: at the fault: GCVM_L2_STATUS 0, after 0 us 0; last invalidation (context 15) started 2201016 us ago, atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xa of 0xa, status 0x8100030300000000, rptr 0)
+ended 2201003 us ago
+atrium_gpu_amd_pci0: gmc: client fault: fault status 0xb3a: client CPC (0x5), VMID 0, MORE_FAULTS 0, WALKER_ERROR 0x5, PERMISSION_FAULTS 0x3, MAPPING_ERROR 1, RW 0, ATOMIC 0, PRT 0, UCE 0
+atrium_gpu_amd_pci0: si: VM fault on VMID 0 at 0, not the running submit's VMID 0
+atrium_gpu_amd_pci0: mes: pipe 0 RESET (user compute queue): refused (fence 0xb of 0xb, status 0x8100080000000000, rptr 0)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): refused (fence 0xc of 0xc, status 0x8100030300000000, rptr 0)
+atrium_gpu_amd_pci0: uq4: after MES RESET (5): REMOVE_QUEUE still refused
+atrium_gpu_amd_pci0: uq4: REMOVE_QUEUE failed: seq 1, fence 0, wptr 12, rptr report 0; HQD not mapped (VMID 0)
+atrium_gpu_amd_pci0: uq4: still mapped after REMOVE_QUEUE (5); its memory and VM are leaked
+atrium_gpu_amd_pci0: si: a lost user queue that will not stop; resetting the GPU, every client queue is lost
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: si: uid 64432's queue forced a GPU reset: no new queues for it for 600 s
+atrium_gpu_amd_pci0: VRAM scrub of 4 KiB at 0x802c000 failed (16): kept back
+atrium_gpu_amd_pci0: psp: amdgpu/psp_14_0_3_sos.bin, 9 pieces; buffer VRAM+0x4000000 = MC 0x8004000000
+atrium_gpu_amd_pci0: psp: [0] type 3 version 0x703b0001, 6816 bytes, cmd 0x80000
+atrium_gpu_amd_pci0: psp: [1] type 5 version 0x1003a00, 832 bytes, cmd 0x10000000
+atrium_gpu_amd_pci0: psp: [2] type 2 version 0x3a1214, 78272 bytes, cmd 0x10000
+atrium_gpu_amd_pci0: psp: [3] type 7 version 0x3a1214, 103792 bytes, cmd 0xb0000
+atrium_gpu_amd_pci0: psp: [4] type 8 version 0x3a1214, 37280 bytes, cmd 0xd0000
+atrium_gpu_amd_pci0: psp: [5] type 9 version 0x3a1214, 53344 bytes, cmd 0xc0000
+atrium_gpu_amd_pci0: psp: [6] type 10 version 0x3a1214, 12704 bytes, cmd 0xe0000
+atrium_gpu_amd_pci0: psp: [7] type 11 version 0x3a1214, 12848 bytes, cmd 0xf0000
+atrium_gpu_amd_pci0: psp: [8] type 1 version 0x3a1214, 125472 bytes, cmd 0x20000
+atrium_gpu_amd_pci0: psp: sOS up; C2PMSG_35 0, C2PMSG_81 0xde4c78b6
+atrium_gpu_amd_pci0: psp: KM ring created (C2PMSG_64 0x80c20000)
+atrium_gpu_amd_pci0: psp: fw reservation: status 0, VRAM 0x7f3e00000 + 0x3200000 (50 MiB)
+atrium_gpu_amd_pci0: psp: fw reservation (ext): status 0, VRAM 0x7d6c00000 + 0x400000 (4 MiB) NOT at the top of VRAM
+atrium_gpu_amd_pci0: psp: fence 0x3; resp 00000000 00000000 deadbeef deadbeef 00000000 deadbeef deadbeef deadbeef
+atrium_gpu_amd_pci0: psp: LOAD_TOC (2304 bytes): done, status 0, TMR size 0 (0 MiB)
+atrium_gpu_amd_pci0: psp: before: RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: 20 IP firmware images, 2020 KiB staged at VRAM+0x4400000
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 18, 327168 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 71, 46848 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 87, 92992 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 88, 201152 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 89, 193248 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 90, 66368 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 92, 66192 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 94, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 95, 66080 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 33, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 34, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 81, 217104 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 82, 82048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 68, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 69, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 20, 2560 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 21, 23616 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 26, 66048 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 48, 33280 bytes: status 0
+atrium_gpu_amd_pci0: psp: LOAD_IP_FW type 8, 25088 bytes: status 0
+atrium_gpu_amd_pci0: psp: AUTOLOAD_RLC: status 0
+atrium_gpu_amd_pci0: psp: RLC autoload NOT complete after 2000000 us: bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: psp: rings destroyed (C2PMSG_64 0x80c30000)
+atrium_gpu_amd_pci0: si: re-init: PSP load returned 60 (as at attach; the SMU start completes the RLC autoload)
+atrium_gpu_amd_pci0: smu: SMU 14.0.3, response register 0x1
+atrium_gpu_amd_pci0: smu: before: GB_ADDR_CONFIG 0, RLC bootload status 0, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TestMessage                arg 0000000000: resp 0x1, out 0x1
+atrium_gpu_amd_pci0: smu: GetSmuVersion              arg 0000000000: resp 0x1, out 0x685000
+atrium_gpu_amd_pci0: smu: GetDriverIfVersion         arg 0000000000: resp 0x1, out 0x33
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrHigh      arg 0x00000080: resp 0x1
+atrium_gpu_amd_pci0: smu: SetDriverDramAddrLow       arg 0x05400000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0
+atrium_gpu_amd_pci0: smu: running features 000000000000000000
+atrium_gpu_amd_pci0: smu: RunDcBtc                   arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: SetAllowedFeaturesMaskHigh arg 0xffffffff: resp 0xfd
+atrium_gpu_amd_pci0: smu: allowed mask refused: SCPM, the PSP owns it
+atrium_gpu_amd_pci0: smu: EnableAllSmuFeatures       arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesLow   arg 0000000000: resp 0x1, out 0x38fffcfb
+atrium_gpu_amd_pci0: smu: GetRunningSmuFeaturesHigh  arg 0000000000: resp 0x1, out 0x488f19e
+atrium_gpu_amd_pci0: smu: running features 0x0488f19e38fffcfb
+atrium_gpu_amd_pci0: smu: protection features running (thermal trip, throttlers, fan, VR hot, memory temperature)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: RLC autoload complete after 0 us
+atrium_gpu_amd_pci0: smu: after: GB_ADDR_CONFIG 0x8200545, RLC bootload status 0x8000003f, CP_STAT 0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: metrics +  0: e8 03 00 00 24 02 00 00 60 00 00 00 54 04 00 00 19 00 00 00 19 00 00 00 58 02 00 00 58 02 00 00
+atrium_gpu_amd_pci0: smu: metrics + 32: cf 02 00 00 cf 02 00 00 cf 02 00 00 00 00 00 00 00 00 37 04 f4 03 77 01 82 01 19 00 19 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 64: 00 00 2c 00 2c 01 00 00 00 00 00 00 00 00 fb 03 c0 03 71 00 9d 00 17 00 17 00 57 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics + 96: 12 00 00 00 3b 00 00 00 04 00 00 00 21 02 4d 03 f9 01 a6 03 52 b5 ce 0c 2c 00 b2 0b 4b 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +128: 00 00 00 00 30 00 00 00 35 00 35 00 20 00 27 00 27 00 24 00 01 00 16 00 16 00 14 00 18 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +160: 00 00 00 00 00 00 03 08 00 03 7c 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +192: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+atrium_gpu_amd_pci0: smu: metrics +224: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9f 6c ce 74
+atrium_gpu_amd_pci0: smu: metrics +256: e2 f1 df b8
+atrium_gpu_amd_pci0: smu: telemetry #4: edge 32 C, hotspot 39 C, mem 1 C, VR 22 C; power 53 W of 300 W limit, board 53 W; fan 892 rpm (0%); gfx 0 MHz, mem 386 MHz, gfx busy 75%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: smu: sample [GC up, no idle setup] 1/1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #897: edge 32 C, hotspot 60 C, mem 32 C, VR 36 C; power 245 W of 300 W limit, board 245 W; fan 1043 rpm (20%); gfx 3087 MHz, mem 15 MHz, gfx busy 100%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x7ff, CGCG_CGLS 0x1003c, CGCG_CGLS_3D 0x3c, SRM 0x2, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x800382c, RLC_CNTL 0x1, RLC_STAT 0x35, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [idle check] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1: edge 34 C, hotspot 70 C, mem 32 C, VR 39 C; power 280 W of 300 W limit, board 280 W; fan 970 rpm (20%); gfx 3251 MHz, mem 1 MHz, gfx busy 100%; throttle 0 (ids 0)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [idle check] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #939: edge 33 C, hotspot 39 C, mem 32 C, VR 32 C; power 7 W of 300 W limit, board 7 W; fan 856 rpm (20%); gfx 9 MHz, mem 1 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: card proven idle
+atrium_gpu_amd_pci0: gfx: end: GRBM_STATUS 0, RLC_CNTL 0, RLC_STAT 0, MGCG_OVERRIDE 0, CGCG_CGLS 0, CGCG_CGLS_3D 0, SRM 0, CP_INT_CNTL 0, CP_INT_CNTL_RING0 0
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: gmc: VRAM 32640 MiB at MC 0x8000000000-0x87f7ffffff (FB offset 0); GART 512 MiB at 0, table at MC 0x8005800000
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x500, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before: CONTEXT0_CNTL 0x3fffc00, PT base 000000000, L1_TLB 0x501, L2_CNTL 0x80602, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: TLB flush on both hubs: acked
+atrium_gpu_amd_pci0: gfx12: before: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: halted: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_DEBUG 0x20400000, GRBM_CNTL 0x300018
+atrium_gpu_amd_pci0: gfx12: GB_ADDR_CONFIG 0x8200545 (address fields: pipes 32, se 16, rb/se 4, pkrs 32, interleave 256 B)
+atrium_gpu_amd_pci0: gfx12: active SAs 8 of 16 (mask 0xff)
+atrium_gpu_amd_pci0: gfx12: RB disable 0/0, SA disable 0xff0000/0xff0000, DB_RING_CONTROL 0x1
+atrium_gpu_amd_pci0: gfx12: RS64 start: PFP 0x7000000003000, ME 0x7000000003000, MEC 0x7000000003000
+atrium_gpu_amd_pci0: gfx12: SH_MEM VMID 1: config 0xc00c, bases 0x20001000; VMID 8: config 0xc00c, bases 0x10002
+atrium_gpu_amd_pci0: gfx12: after: GRBM_STATUS 0x382c, CP_STAT 0, CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40000000, CP_DEBUG 0x20408000, GRBM_CNTL 0x3000ff
+atrium_gpu_amd_pci0: gfx12: stage 4c done; CP halted
+atrium_gpu_amd_pci0: ih: OSSSYS 7.0, ring 64 KiB at GART 0x1000 (pa 0x3f49d0000), wptr writeback at GART 0x11000
+atrium_gpu_amd_pci0: ih: before: RB_CNTL 0x40610000, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, no interrupts 0
+atrium_gpu_amd_pci0: ih: MSI, 1 vector, for every IH client
+atrium_gpu_amd_pci0: ih: enabled: RB_CNTL 0x4033011d, RPTR 0, WPTR 0 (writeback 0), STATUS 0xc0847, MSI interrupts 0
+atrium_gpu_amd_pci0: mes: MSCRATCH 2 x 256 KiB at GART 0x100000, zeroed before every start
+atrium_gpu_amd_pci0: mes: MES 12 (GC 12.0.0/1, unified), start 0xfffffffff0005000, block at GART 0x20000 (pa 0x303c3f000), doorbell BAR 2048 KiB
+atrium_gpu_amd_pci0: mes: before: CP_MES_CNTL 0x40000000; pipe 0: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x800, GP3 0, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x800382c, CP_STAT 0, RLC_STAT 0x35
+atrium_gpu_amd_pci0: mes: before: GRBM_STATUS2 0x4110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: before start: pipe 0 IC_BASE 0x7f461d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5500000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: mes: before start: pipe 1 IC_BASE 0x7f469d000 (cntl 0), MIBOUND 00007ffff, MDBASE 0x7f5580000, MDBOUND 00007ffff, MSCRATCH 000000000, LOCAL_BASE0 0
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) before MES: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gfx: before MES: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: CP running before MES (as amdgpu): CP_ME_CNTL 0xa000, CP_MEC_RS64_CNTL 0x3c000000, CP_STAT 0 after 4 us, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 0 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: attempt 1: pipe 1 firmware up (GP3 0x1029097) after 0 us
+atrium_gpu_amd_pci0: mes: started on attempt 1 of 3
+atrium_gpu_amd_pci0: mes: started: CP_MES_CNTL 0xc000000; pipe 0: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x7ec4, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x800382c, CP_STAT 0, RLC_STAT 0x35
+atrium_gpu_amd_pci0: mes: started: GRBM_STATUS2 0x4110000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: mes: pipe 1 HQD by register: active 1, doorbell 0x18
+atrium_gpu_amd_pci0: mes: version (pipe 1) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES: ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 SET_HW_RESOURCES_1: ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 1 ADD_QUEUE (scheduler): ok in 110 us (status 0x1)
+atrium_gpu_amd_pci0: mes: version (pipe 0) 0x1029097
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES: ok in 330 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 SET_HW_RESOURCES_1: ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 QUERY_SCHEDULER_STATUS: ok in 80 us (status 0x1)
+atrium_gpu_amd_pci0: mes: answered: CP_MES_CNTL 0xc000000; GRBM_STATUS 0xa800382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: answered: GRBM_STATUS2 0x30100000, GRBM_STATUS3 0x4000, CP_CPC_STATUS 0x80110400, CP_CPC_BUSY_STAT 0/0x4480, CP_CPF_STATUS 0xa0000001, CP_BUSY_STAT 0, RLC_GPM_STAT 0x1400b7
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x3f49c8000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80092000, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000013 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 13 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000000 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: ... 9 more IVs
+atrium_gpu_amd_pci0: si: dispatch at attach: PASS; 17 CP EOP IV(s)
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #23: edge 32 C, hotspot 38 C, mem 32 C, VR 31 C; power 23 W of 300 W limit, board 23 W; fan 905 rpm (20%); gfx 1591 MHz, mem 179 MHz, gfx busy 85%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: busy or at the power limit with no work queued
+atrium_gpu_amd_pci0: smu: sample [attached, MES up, no work] 2/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #1017: edge 32 C, hotspot 37 C, mem 32 C, VR 31 C; power 13 W of 300 W limit, board 13 W; fan 916 rpm (20%); gfx 3 MHz, mem 190 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: si: GPU re-init 3 of 3 in this window: PASS (MES up, kernel compute queue ready)
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 230 us (status 0x1)
+atrium_gpu_amd_pci0: kq: client queue up: MEC1 pipe 0 queue 0, block at GART 0x70000, doorbell 0x6
+atrium_gpu_amd_pci0: si: GPU re-initialised (15 so far): old VMs (0x3e) and queues are lost (EIO) until closed; new ones run
+atrium_gpu_amd_pci0: uq4: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq4 closed: 1 submits; EOP IVs routed 808, unrouted 0, MES own 0, MES preemption 164; retired by IV 792, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 164 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2372, other x0
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #2: edge 32 C, hotspot 37 C, mem 32 C, VR 31 C; power 14 W of 300 W limit, board 14 W; fan 790 rpm (20%); gfx 0 MHz, mem 193 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: watch #972: telemetry ok
+atrium_gpu_amd_pci0: uq3: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 808, unrouted 0, MES own 0, MES preemption 164; retired by IV 792, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 164 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2372, other x0
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (user compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: added: VM base 0x8024001, queue pages at VA 0x200030000 (pa 0x303d29000), MQD GART 0x8c000, doorbell 0x26
+atrium_gpu_amd_pci0: si: uq3: first EOP IV, src_data[0] 0x1000026
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 170 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 SUSPEND (user gang): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: pipe 0 RESUME (user gang): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: preempted for a free: suspend fence landed after 0 us, resume ok
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (user compute): ok in 160 us (status 0x1)
+atrium_gpu_amd_pci0: uq3: removed (seq 1, fence 1)
+atrium_gpu_amd_pci0: si: uq3 closed: 1 submits; EOP IVs routed 809, unrouted 0, MES own 0, MES preemption 167; retired by IV 793, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 167 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2388, other x0
+atrium_gpu_amd_pci0: uq0: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq0 closed: 22 submits; EOP IVs routed 809, unrouted 0, MES own 0, MES preemption 167; retired by IV 793, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 167 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2388, other x0
+atrium_gpu_amd_pci0: uq1: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq1 closed: 1 submits; EOP IVs routed 809, unrouted 0, MES own 0, MES preemption 167; retired by IV 793, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 167 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2388, other x0
+atrium_gpu_amd_pci0: uq2: freed after the GPU reset
+atrium_gpu_amd_pci0: si: uq2 closed: 1 submits; EOP IVs routed 809, unrouted 0, MES own 0, MES preemption 167; retired by IV 793, by poll 0; queues lost to faults 12, hangs 24; preempted for frees 167 (failed 13)
+atrium_gpu_amd_pci0: si: MES host interrupts by type: 1 x28, 6 x20, 7 x0, 8 x2388, other x0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4644: edge 32 C, hotspot 36 C, mem 32 C, VR 30 C; power 7 W of 300 W limit, board 7 W; fan 891 rpm (20%); gfx 8 MHz, mem 4 MHz, gfx busy 1%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #4765: edge 31 C, hotspot 35 C, mem 31 C, VR 30 C; power 6 W of 300 W limit, board 6 W; fan 893 rpm (20%); gfx 0 MHz, mem 3 MHz, gfx busy 0%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: VRAM scrub: 10347 fills, 22543 waits for an idle queue
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 420 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd0: detached
+atrium_gpu_amd_pci0: smu: DisallowGfxOff             arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: dispatch: block at GART 0x40000 (pa 0x326be8000), shader 0x43000, IB 0x44000 (56 dw), out 0x45000, doorbell 0x6
+atrium_gpu_amd_pci0: mes: pipe 0 ADD_QUEUE (compute): ok in 100 us (status 0x1)
+atrium_gpu_amd_pci0: dispatch: mapped: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0, fence 0; CP_STAT 0, CPC_STATUS 0x80110400, GRBM_STATUS 0xa800382c
+atrium_gpu_amd_pci0: dispatch: fence 0x4e000001 after 30 us
+atrium_gpu_amd_pci0: dispatch: fence: HQD active 0, rptr 0, wptr 0, doorbell 0; rptr report 0xc, fence 0x4e000001; CP_STAT 0, CPC_STATUS 0, GRBM_STATUS 0x382c
+atrium_gpu_amd_pci0: dispatch: out: all 64 words 0x2a, matches the oracle golden
+atrium_gpu_amd_pci0: gmc: MMHUB 4.1 after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: gmc: GFXHUB (GC 12.0) after dispatch: CONTEXT0_CNTL 0x3fffc01, PT base 005800001, L1_TLB 0x1859, L2_CNTL 0x80e01, fault status 0 (addr 000000000)
+atrium_gpu_amd_pci0: mes: pipe 0 REMOVE_QUEUE (compute): ok in 190 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 1 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: dispatch: stage 4e: write_42 PASS (matches the oracle)
+atrium_gpu_amd_pci0: si: dispatch after 4870 s attached: PASS
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000002 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 4 vmid 0 pasid 0 data 0 0 0 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x20000003 0 0xb1 0
+atrium_gpu_amd_pci0: ih: IV client 0x14 src 0xb5 ring 12 vmid 0 pasid 0 data 0x2000000b 0 0xb1 0
+atrium_gpu_amd_pci0: si: 7 CP EOP IV(s) since attach, 21 interrupt(s)
+atrium_gpu_amd_pci0: mes: MES running, no work: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: MES running: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: pipe 1 REMOVE_QUEUE (scheduler): ok in 90 us (status 0x1)
+atrium_gpu_amd_pci0: mes: me 3 pipe 0 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: me 3 pipe 1 HQD dequeued: active 0
+atrium_gpu_amd_pci0: mes: queues gone, MES still running: GRBM_STATUS 0xa800382c -> 0x382c, idle after 1 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: MES halted, CP still running: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: mes: CP halted again: CP_ME_CNTL 0x1400a000, CP_MEC_RS64_CNTL 0x40030000, CP_STAT 0
+atrium_gpu_amd_pci0: mes: torn down: CP_MES_CNTL 0x40030000; pipe 0: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; pipe 1: instr 0x1400, GP3 0x1029097, HQD active 0, rptr 0, wptr 0; GRBM_STATUS 0x382c, CP_STAT 0, RLC_STAT 0x25
+atrium_gpu_amd_pci0: mes: torn down: GRBM_STATUS2 0x100000, GRBM_STATUS3 0, CP_CPC_STATUS 0, CP_CPC_BUSY_STAT 0/0, CP_CPF_STATUS 0, CP_BUSY_STAT 0, RLC_GPM_STAT 0x140037
+atrium_gpu_amd_pci0: gfx: MES torn down: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: MES halted: GRBM_STATUS 0x382c -> 0x382c, idle after 0 ms; CP_CPC_STATUS 0, CP_CPF_STATUS 0
+atrium_gpu_amd_pci0: gfx: idle sequence GC 12.0.0/1: SRM, clock gating
+atrium_gpu_amd_pci0: gfx: before idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: gfx: after idle setup: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0x25, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: mes: GC idle sequence again after MES: 0
+atrium_gpu_amd_pci0: gfx: 100 ms after the idle sequence: GRBM_STATUS 0x382c, RLC_CNTL 0x1, RLC_STAT 0, MGCG_OVERRIDE 0x40, CGCG_CGLS 0x363f, CGCG_CGLS_3D 0x363f, SRM 0x3, CP_INT_CNTL 0x3c0000, CP_INT_CNTL_RING0 0x3c0000
+atrium_gpu_amd_pci0: ih: disabled: RB_CNTL 0x4031011c, RPTR 0, WPTR 0 (writeback 0x640), STATUS 0xc0847, MSI interrupts 22
+atrium_gpu_amd_pci0: smu: AllowGfxOff                arg 0000000000: resp 0x1
+atrium_gpu_amd_pci0: smu: sample [detached] 1/5
+atrium_gpu_amd_pci0: smu: TransferTableSmu2Dram      arg 0x00000005: resp 0x1
+atrium_gpu_amd_pci0: smu: telemetry #806: edge 31 C, hotspot 35 C, mem 30 C, VR 30 C; power 8 W of 300 W limit, board 8 W; fan 893 rpm (20%); gfx 7 MHz, mem 27 MHz, gfx busy 1%; throttle 0x1 (ids 0x2)
+atrium_gpu_amd_pci0: si: card proven idle at detach
+atrium_gpu_amd_pci0: si: stage 5a: detached
+atrium_gpu_amd_pci0: smu: mode 1 reset (card back to its post-POST state)
+atrium_gpu_amd_pci0: smu: after reset: PSP bootloader ready, card cold; sOS 0, memsize 32624 MiB, SMU response 0x1, GB_ADDR_CONFIG 0
+atrium_gpu_amd_pci0: detached
+vgapci0: <VGA-compatible display> port 0x6000-0x60ff mem 0x80000000-0x8fffffff,0x90000000-0x901fffff,0x98100000-0x9817ffff at device 0.0 on pci3
+stray lines: 0
+== cleanup
+give-back rc=0
+kenvs left: 0
+kldunload gpu module rc=0
+kldunload rc=0
+atrium modules loaded: 0
+== after
+vgapci0@pci0:3:0:0:	class=0x030000 rev=0xc0 hdr=0x00 vendor=0x1002 device=0x7551 subvendor=0x1da2 subdevice=0xe499
+    vendor     = 'Advanced Micro Devices, Inc. [AMD/ATI]'
+    device     = 'Navi 48 [Radeon AI PRO R9700]'
+    class      = display
+    subclass   = VGA
+    bar   [10] = type Prefetchable Memory, range 64, base 0x80000000, size 268435456, enabled
+    bar   [18] = type Prefetchable Memory, range 64, base 0x90000000, size 2097152, enabled
+    bar   [20] = type I/O Port, range 32, base 0x6000, size 256, enabled
+    bar   [24] = type Memory, range 32, base 0x98100000, size 524288, enabled
+
+BAR5 mapped 524288 bytes
+RCC_CONFIG_MEMSIZE = 0x7f70 (32624 MiB VRAM)
+(pass --vram-top, with no driver bound, to read the discovery table)
+== temps 30 s after
+hw.acpi.thermal.tz0.temperature: 27.9C dev.pchtherm.0.temperature: 29.0C 
+== done, log /root/runs/20261115T130128Z.log
+kernel log for the run: /root/runs/20261115T130128Z.kern (    9224 lines)
