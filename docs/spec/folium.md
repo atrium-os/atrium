@@ -416,12 +416,67 @@ What they look like inside, and what each means for Folium:
    (fewer, larger fills raster faster in Fresco's compute renderer than
    tens of thousands of small ones).
 
-These four files are generated from the `kicad-demos` package by a
+These four KiCad files are generated from the `kicad-demos` package by a
 host-side script and are the "heavy vector" set in the corpus (they are
 not committed: KiCad's demos are GPL, which is fine for test input on the
 host, not for the repository). Vendor schematics from Altium, OrCAD and
 Cadence (real fonts, hatched fills, embedded logos) join them as they are
 found or supplied.
+
+### 7.3 Measured: a vendor board guide from Word (2026-11-15)
+
+Shankar's copy of Lattice's CertusPro-NX Versa Evaluation Board user guide
+(75 pages, 10 MB, made by Microsoft Word 365, tagged, 10 subset fonts
+including CID TrueType, 154 images, 132 of them with soft masks, and the
+board's schematics in an appendix). It is kept outside the repository and
+the shared files, in the corpus on the host only. A different kind of
+heavy from KiCad's:
+
+| | content | PDFium, one page at fit 1,600 px |
+|---|---|---|
+| typical text page | a few thousand operators, a picture or two | 5 to 20 ms (median 8 ms) |
+| schematic page 39 | one Form XObject, 34,504 operators, 3,635 paths, 1,568 clips | **3,535 ms** |
+| schematic page 38 | one Form XObject (6.7 MB), 186,435 operators, 162,659 segments (138,831 curves) | 2,554 ms |
+| whole document | 228,000 page operators plus the forms | 26.8 s for all 75 pages, of which about 25 s is the 12 schematic pages |
+
+Poppler draws page 39 in 0.55 s and page 38 in 0.75 s: the content isn't
+large, it is drawn wastefully. What is inside, and what Folium does:
+
+1. **A clip per element, all the same.** Each schematic is an EMF or
+   Visio drawing Word converted into one Form XObject, and the conversion
+   wraps **every element** in `q`, a clip, the element and `Q`: page 39 has
+   1,526 clips, every one the same axis-aligned rectangle (written as a
+   four-point path, not `re`), slightly larger than the form's box. PDFium
+   builds a clip mask for each. Folium (a) recognises a clip path that is
+   an axis-aligned rectangle however it is written, and uses FILL's
+   rectangle clip for it; (b) drops a clip that contains the bounding box
+   of everything drawn under it, or equals the clip already in force; (c)
+   lets runs merge across `q`/`Q` when the clip and paint state come out
+   the same (§7.2 point 1). Page 39 then has no clips at all and becomes a
+   few hundred coalesced items.
+2. **Curves, many.** Symbols are drawn with Béziers (139,000 `c` on page
+   38). They are flattened once per zoom band into the display list's
+   cache, at a quarter-pixel tolerance, not per tile per frame.
+3. **A non-uniform form matrix** (x scaled 0.116, y 0.155). Strokes are
+   widened in the form's own space and then transformed, so a line keeps
+   its true (elliptical) pen, as the spec requires; the stroker takes the
+   full matrix, not a scalar width.
+4. **Text as many short runs.** 1,596 text objects on page 39, each with
+   its own `Tm` and one `TJ` (every label placed alone). Glyph runs with
+   the same font, size and colour on the page are coalesced into one
+   `Glyphs` item per run of drawing order, as paths are.
+5. **Images are not the problem here.** The largest is 1.3 MP; all 154
+   together are 12 MP. They exercise soft masks (alpha), the ordinary
+   case on any Word or PowerPoint export, so `SMask` images are drawn
+   straight as RGBA, without the group path of §7.
+6. **Tagged.** Word writes the structure tree and marked content around
+   everything (`BDC`/`EMC`, up to 294 on a page). The interpreter carries
+   them for text extraction and accessibility at no drawing cost.
+
+Gate: this file joins the heavy set. Every page under 150 ms on 4 cores,
+the twelve schematic pages included; scrolling through the appendix at
+4,000 px/s with ScrollView's gates; the whole document's text extracted
+in reading order matches the tagged structure's order.
 
 ## 8. The app and the role
 
@@ -669,7 +724,7 @@ signature".
   | first page of a typical document | drawn under 150 ms after the descriptor arrives |
   | open a 20,000-page document | first page under 300 ms; memory for the document under 64 MB before any page is drawn |
   | scroll a 2,000-page book of 600 dpi scans at 4,000 px/s | no stall over 100 ms at 60 Hz, p99.9 frame work within two periods (ScrollView's gates); placeholders allowed; memory flat at the cache budgets |
-  | the §7.2 heavy set (KiCad schematics and layouts) | first page under 150 ms on 4 cores; fit-page scene under the node budget, vector; pinch 25% to 6,400% with every frame on time |
+  | the §7.2 and §7.3 heavy set (KiCad schematics and layouts, the Word-made board guide) | first page under 150 ms on 4 cores; fit-page scene under the node budget, vector; pinch 25% to 6,400% with every frame on time |
 | pinch from 25% to 6,400% on a map with 1 M path segments | every frame on time (scaled tiles); sharp within 300 ms after it settles |
   | scene per window | resident nodes and scene bytes under a fixed ceiling at any page count, page complexity and zoom |
   | after interaction stops | worker pool idle within 1 s; 0% CPU while nothing changes |
