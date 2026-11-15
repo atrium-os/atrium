@@ -421,6 +421,12 @@ impl<'a> Backend<'a> {
         }
     }
 
+    /// A window's hidden sprite content is still being rastered a part at
+    /// a time (crate::sprites::Sprites::warming): render again soon.
+    pub fn sprites_warming(&self) -> bool {
+        matches!(self, Backend::Compute(c) if c.sprites.values().any(|s| s.warming()))
+    }
+
     pub fn frames(&self) -> &[(u32, Arc<fresco_compute::Frame>)] {
         match self {
             Backend::Vulkan(_) => &[],
@@ -1840,9 +1846,20 @@ mod tests {
         s.anim_now.insert(10, a);
         let (n, _) = draw(&s, &mut sp, &mut out);
         assert_eq!(n, 2, "the hidden slide is a sprite too");
+        // Drawn ahead while nothing moves, at most 10 tiles a drawing.
         s.anim_now.clear();
-        let (_, cost) = draw(&s, &mut sp, &mut out);
-        assert!(cost.content_tiles > 0, "drawn ahead while nothing moves");
+        sp.set_prewarm(10);
+        let mut draws = 0;
+        loop {
+            let (_, cost) = draw(&s, &mut sp, &mut out);
+            assert!(cost.content_tiles <= 24, "{} tiles in one drawing", cost.content_tiles);
+            draws += 1;
+            if !sp.warming() {
+                break;
+            }
+            assert!(draws < 20, "still warming");
+        }
+        assert!(draws > 2, "all in {draws} drawings");
         assert!(near(&out, &full(&s), 1));
         // 20 fades in over 10: nothing rastered.
         s.set_group(20, GroupParams { opacity: 1.0, ..b }, 1).unwrap();

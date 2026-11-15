@@ -30,6 +30,12 @@ struct Content {
 /// usually the last one's incoming, so it is not rastered again.
 const KEEP: usize = 4;
 
+/// Tiles of hidden sprite content rastered per drawing while nothing
+/// moves (about 6 ms on the Mac VM's CPU renderer): the rest goes
+/// in the drawings after, which the caller asks for ([`Sprites::warming`]).
+pub const PREWARM: u32 = 400;
+/// How soon to draw again while [`Sprites::warming`].
+pub const WARM_POLL: std::time::Duration = std::time::Duration::from_millis(8);
 /// How long a window's sprite drawing is kept after its last sprite.
 pub const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -58,6 +64,10 @@ pub struct Sprites {
     paused: Option<std::time::Instant>,
     /// When a sprite last animated.
     animated: Option<std::time::Instant>,
+    /// A hidden sprite's content is not all rastered yet ([`Sprites::warming`]).
+    warming: bool,
+    /// Tiles a drawing for hidden content; 0 means [`PREWARM`].
+    prewarm: u32,
 }
 
 fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
@@ -126,7 +136,7 @@ impl Sprites {
         }
         let whole = [0, 0, width, height];
         if self.size != (width, height) || self.base.len() != n {
-            *self = Sprites { size: (width, height), base: vec![0; n], ..Default::default() };
+            *self = Sprites { size: (width, height), base: vec![0; n], prewarm: self.prewarm, ..Default::default() };
         }
         let mut damage = [0u32; 4];
         // The window under the sprites.
@@ -167,6 +177,8 @@ impl Sprites {
         let mut shown = Vec::with_capacity(f.sprites.len());
         let mut using = Vec::with_capacity(f.sprites.len());
         let first = self.shown.is_none();
+        let mut budget = if self.prewarm == 0 { PREWARM } else { self.prewarm };
+        let mut warming = false;
         for (i, s) in f.sprites.iter().enumerate() {
             let key = scene.sprite_key(f, i);
             let clip = s.clip.map(|v| v.clamp(0, i32::MAX) as u32);
@@ -255,13 +267,28 @@ impl Sprites {
                 let h = &frame.header;
                 let mut need = vec![false; c.valid.len()];
                 let mut any = false;
-                let span = if all { [0, 0, width, height] } else { local };
-                for ty in span[1] / TILE..span[3].div_ceil(TILE).min(h.tiles_y) {
-                    for tx in span[0] / TILE..span[2].div_ceil(TILE).min(h.tiles_x) {
-                        let k = (ty * h.tiles_x + tx) as usize;
-                        if !c.valid[k] {
+                if !empty(rect) {
+                    for ty in local[1] / TILE..local[3].div_ceil(TILE).min(h.tiles_y) {
+                        for tx in local[0] / TILE..local[2].div_ceil(TILE).min(h.tiles_x) {
+                            let k = (ty * h.tiles_x + tx) as usize;
+                            if !c.valid[k] {
+                                need[k] = true;
+                                any = true;
+                            }
+                        }
+                    }
+                }
+                // The rest, at most `budget` tiles a drawing: a whole slide
+                // at once would be one long frame.
+                if all {
+                    for k in 0..need.len() {
+                        if budget == 0 {
+                            break;
+                        }
+                        if !c.valid[k] && !need[k] {
                             need[k] = true;
                             any = true;
+                            budget -= 1;
                         }
                     }
                 }
@@ -280,6 +307,8 @@ impl Sprites {
                 }
                 if c.valid.iter().all(|&v| v) {
                     c.frame = None;
+                } else if all {
+                    warming = true;
                 }
             }
             shown.push(Shown { group: s.group, rect, state: (key, s.offset, s.opacity.to_bits(), s.clip, s.scale.to_bits()) });
@@ -295,6 +324,7 @@ impl Sprites {
             _ => damage = whole,
         }
         self.shown = Some(shown);
+        self.warming = warming;
         let damage = meet(damage, whole);
         if empty(damage) {
             return Ok(None);
@@ -325,6 +355,18 @@ impl Sprites {
 
     /// The groups to keep as sprites ([`crate::pack::window_frame_promoted`]):
     /// those of the last drawing, while a sprite animated within [`IDLE`].
+    /// Hidden content is still being rastered, [`PREWARM`] tiles a
+    /// drawing: draw again (after [`WARM_POLL`]) even if nothing changed.
+    pub fn warming(&self) -> bool {
+        self.warming
+    }
+
+    /// Tiles a drawing for hidden content, in place of [`PREWARM`].
+    #[cfg(test)]
+    pub fn set_prewarm(&mut self, tiles: u32) {
+        self.prewarm = tiles;
+    }
+
     pub fn keep(&self) -> std::collections::HashSet<u32> {
         match (&self.shown, self.animated) {
             (Some(shown), Some(t)) if t.elapsed() < IDLE => shown.iter().map(|s| s.group).collect(),

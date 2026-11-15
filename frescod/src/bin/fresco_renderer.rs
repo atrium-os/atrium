@@ -474,6 +474,7 @@ fn main() {
     let mut last = 0;
     let mut animating = false;
     let mut ticked = 0u64;
+    let mut warming = false;
     loop {
         // While a declarative animation runs (pergola.md §4.2) a frame
         // goes every display refresh, whatever the client does; and no
@@ -483,6 +484,8 @@ fn main() {
         let period = 1_000_000_000_000 / refresh.max(24_000) as u64;
         let beat = if animating {
             Duration::from_nanos((ticked + period).saturating_sub(monotonic_ns()).max(1_000_000))
+        } else if warming {
+            sprites::WARM_POLL
         } else {
             Duration::from_secs(3600)
         };
@@ -498,7 +501,7 @@ fn main() {
             tex_gen += 1;
         }
         declare(&broker, &state, &comp, (sw, sh));
-        draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref(), animating);
+        warming = draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref(), animating);
     }
 }
 
@@ -629,8 +632,11 @@ fn send_grants(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>) {
 }
 
 /// Pack every window whose scene changed into a free slot.
-fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>, animating: bool) {
+/// Returns whether a window's hidden sprite content is still being
+/// rastered a part at a time (sprites::Sprites::warming): draw again soon.
+fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>, animating: bool) -> bool {
     let mut s = state.lock().unwrap();
+    let mut warming = false;
     for (&id, w) in s.wins.iter_mut() {
         let (true, Some((width, height))) = (w.slots.is_some(), w.size) else { continue };
         // Pixel mode draws animated groups as sprites (sprites.rs).
@@ -647,7 +653,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         let Some(wf) = wf else { continue };
         // An unchanged scene draws the same pixels: not packed again.
         let key = scene.window_key(&wf);
-        if w.key == Some(key) {
+        if w.key == Some(key) && !w.sprites.as_ref().is_some_and(|s| s.warming()) {
             continue;
         }
         if let (Some(t2), false) = (t2, wf.sprites.is_empty()) {
@@ -658,7 +664,9 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             }
             let mut cost = sprites::Cost::default();
             let plain = w.tiles.is_some();
-            let r = w.sprites.get_or_insert_with(Default::default).draw(t2, scene, &wf, &mut w.px, width, height, plain, &mut cost);
+            let sp = w.sprites.get_or_insert_with(Default::default);
+            let r = sp.draw(t2, scene, &wf, &mut w.px, width, height, plain, &mut cost);
+            warming |= sp.warming();
             // `px` no longer holds a plain drawing.
             w.tiles = None;
             w.scrolls.clear();
@@ -758,6 +766,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         w.key = Some(key);
         send(broker, &Msg::FrameReady { window: id, slot: i as u32, seq: w.seq, animating });
     }
+    warming
 }
 
 /// Pixel mode: send `w.px`, which differs from the last drawing inside

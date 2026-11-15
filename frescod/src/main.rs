@@ -613,7 +613,10 @@ fn main() -> std::io::Result<()> {
          * (compose showed its previous drawing meanwhile). */
         renderer.pump().map_err(io_other)?;
         let raster_due = renderer.raster_landed();
-        if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due && !raster_due {
+        /* Hidden sprite content (the next slide) rasters a part a drawing. */
+        let warming = renderer.sprites_warming();
+        let warm_due = warming && last_render.elapsed() >= sprites::WARM_POLL;
+        if cur == last_gen && !heartbeat_due && !reset_due && !video_due && !strip_end_due && !raster_due && !warm_due {
             /* Heads that missed the newest frame get it once they land. */
             let mut stale = false;
             if multi {
@@ -657,6 +660,9 @@ fn main() -> std::io::Result<()> {
             }
             if renderer.rasters_pending() {
                 until_beat = until_beat.min(RASTER_POLL);
+            }
+            if warming {
+                until_beat = until_beat.min(sprites::WARM_POLL.saturating_sub(last_render.elapsed()));
             }
             /* Video frames on screen once the flip carrying them lands. */
             if video::VIDEOS.awaiting() {
