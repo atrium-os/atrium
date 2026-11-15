@@ -90,12 +90,6 @@ const TICKET_LIFE: Duration = Duration::from_secs(60);
 /// closed, and then before it is killed (a kill leaks its jail).
 const GRACE: Duration = Duration::from_secs(10);
 
-fn words(v: &str) -> Option<(String, Vec<String>)> {
-    let w: Vec<String> = v.split_whitespace().map(String::from).collect();
-    let (p, a) = w.split_first()?;
-    Some((p.clone(), a.to_vec()))
-}
-
 struct Config {
     converter: Option<worker::Spec>,
     prerender: String,
@@ -120,10 +114,9 @@ struct Config {
     /// Where Save writes a file (`NAVIGATORD_DOWNLOADS`, default
     /// `$HOME/Downloads`).
     downloads: PathBuf,
-    /// The program a hand-off goes to (`NAVIGATORD_OPENER`), run as
-    /// `<opener…> open|try <url>` with no shell. Without one, nothing is
-    /// handed on and the UI is told so.
-    opener: Option<(String, Vec<String>)>,
+    /// Monstrator, the link opener, that hand-offs go to with their press
+    /// (`NAVIGATORD_MONSTRATOR`, default its socket; opening-links.md §7).
+    monstrator: PathBuf,
     /// Schemes handed on (`NAVIGATORD_SCHEMES`, comma-separated, e.g.
     /// `mailto,tel`); `atrium-app` always is (navigator.md §2.2).
     schemes: SchemeAllowlist,
@@ -152,7 +145,7 @@ impl Config {
             downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from)
                 .or_else(|| var("HOME").map(|h| Path::new(&h).join("Downloads")))
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/Downloads")),
-            opener: var("NAVIGATORD_OPENER").and_then(|v| words(&v)),
+            monstrator: var("NAVIGATORD_MONSTRATOR").map(PathBuf::from).unwrap_or_else(|| monstrator::SOCKET.into()),
             activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
             schemes: {
                 let mut a = SchemeAllowlist::default();
@@ -1263,39 +1256,48 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 waiting.lock().unwrap().take(id);
             }
             Request::Hand { url, how, press } => {
-                let ev = match spend(press) {
-                    Ok(()) => hand(&cfg, &mut handed, &url, how),
-                    Err(why) => {
-                        eprintln!("navigatord: hand-off of {url} refused: {why}");
-                        Event::PressRefused { why }
-                    }
-                };
-                send(&w, &ev);
+                // The press goes on with the link: portcullisd spends it
+                // (purpose LINK) for the app that asked, us (§2.3a, §7).
+                if let Some(no) = handed_once(&mut handed, &url, how) {
+                    send(&w, &no);
+                    continue;
+                }
+                let (cfg, w) = (cfg.clone(), w.clone());
+                std::thread::spawn(move || send(&w, &hand(&cfg, &url, press)));
             }
         }
     }
 }
 
-/// Hand `url` to the opener, once, if this connection was told it is a
-/// hand-off (threat model §2.10): the person pressed for it in the prompt
-/// row. `Try` is only for `atrium-app:` links.
-fn hand(cfg: &Config, handed: &mut Vec<String>, url: &str, how: ctl::Hand) -> Event {
-    let no = |why: &str| Event::Handed { url: url.to_string(), ok: false, why: Some(why.to_string()) };
+/// Take `url` as a hand-off once, if this connection was told it is one
+/// (threat model §2.10): `None` to go on, else the refusal. `Try` waits for
+/// the app catalog (opening-links.md §4.3).
+fn handed_once(handed: &mut Vec<String>, url: &str, how: ctl::Hand) -> Option<Event> {
+    let no = |why: &str| Some(Event::Handed { url: url.to_string(), ok: false, why: Some(why.to_string()) });
     let Some(i) = handed.iter().position(|u| u == url) else { return no("that link was not decided as a hand-off here") };
-    if how == ctl::Hand::Try && !url.starts_with("atrium-app:") {
-        return no("only an app can be tried");
-    }
     handed.remove(i);
-    let Some((p, a)) = &cfg.opener else { return no("nothing here takes hand-offs yet") };
-    let verb = match how { ctl::Hand::Open => "open", ctl::Hand::Try => "try" };
-    use std::process::Stdio;
-    match std::process::Command::new(p).args(a).arg(verb).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
-        Ok(mut ch) => {
-            std::thread::spawn(move || { let _ = ch.wait(); });
-            eprintln!("navigatord: handed {url} on ({verb})");
-            Event::Handed { url: url.to_string(), ok: true, why: None }
+    if how == ctl::Hand::Try {
+        return no("trying an app comes with the app catalog; Open opens an installed one");
+    }
+    None
+}
+
+/// Hand `url` to Monstrator with the person's press (opening-links.md §7).
+fn hand(cfg: &Config, url: &str, press: ctl::Press) -> Event {
+    let ev = |ok: bool, why: Option<String>| Event::Handed { url: url.to_string(), ok, why };
+    if !cfg.monstrator.exists() {
+        return ev(false, Some("nothing here takes hand-offs yet".into()));
+    }
+    match monstrator::open_link(&cfg.monstrator, url, press, std::time::Duration::from_secs(30)) {
+        Ok(Ok(())) => {
+            eprintln!("navigatord: a hand-off went to Monstrator and was opened");
+            ev(true, None)
         }
-        Err(e) => no(&format!("the opener: {e}")),
+        Ok(Err(why)) => {
+            eprintln!("navigatord: a hand-off was not opened: {why}");
+            ev(false, Some(why))
+        }
+        Err(e) => ev(false, Some(format!("the link opener: {e}"))),
     }
 }
 

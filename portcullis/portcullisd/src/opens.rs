@@ -25,7 +25,7 @@ pub const ROOT: &str = "/atrium/sockets/opens";
 /// Overrides [`ROOT`] (a gate that runs its own portcullisd).
 pub const ROOT_ENV: &str = "PORTCULLISD_OPENS_ROOT";
 /// frescod's activation socket.
-pub const ACTIVATION: &str = "/var/run/atrium/fresco-activation.sock";
+pub const ACTIVATION: &str = "/atrium/sockets/fresco-activation/fresco-activation.sock";
 pub const ACTIVATION_ENV: &str = "PORTCULLISD_FRESCO_ACTIVATION";
 /// How long a file waits for its app to connect.
 pub const PENDING_FOR: Duration = Duration::from_secs(60);

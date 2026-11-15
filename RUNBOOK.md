@@ -5735,11 +5735,13 @@ run it again with `BUILD=0`.
 Last (ui10.log, a fresh trail store `trails10.json`): Ctrl held in the chrome
 (`KEY 0xe0`) while a link in the page is pressed opens it beside as a branch, and the branch row's
 "Make its own trail" button (at 206, 62 + 135) makes it a trail of its own (`trails=2`). Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
-`NAVIGATORD_SCHEMES=mailto` and a stand-in `NAVIGATORD_OPENER` (`sh $S/opener.sh`, which appends its
-arguments to `$S/opener.log`). The script presses the fixture's PDF link, finds the download prompt with
+`NAVIGATORD_SCHEMES=mailto` and a stand-in Monstrator (`NAVIGATORD_MONSTRATOR=$S/mon.sock`, an
+`nc -lkU` that keeps what it is asked in `$S/mon.log` and never answers; the confined script runs
+the real one). The script presses the fixture's PDF link, finds the download prompt with
 the trail still on its page, and presses Save. It checks `survey.pdf` is 0644 with its address in
-`getextattr user atrium.origin`. Then the `mailto:` and `atrium-app:` links each ask and are handed on
-once (`open mailto:…`, `try atrium-app://…`). The prompt row's primary answer is pressed at the window's
+`getextattr user atrium.origin`. Then the `mailto:` and `atrium-app:` links each ask: *Open* sends the
+`mailto:` link with its press to the link opener (one `OpenLink` in `mon.log`), and *Try it* is
+refused (trying apps waits for the app catalog). The prompt row's primary answer is pressed at the window's
 right edge (the trace's `w=`), at least 500 ms after the row appeared. navigatord gets `NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock` (no consumer
 listing: frescod lets a uid spend `PROMPT` on presses of its own windows) and spends each answer's press there; frescod runs with `FRESCOD_INJECT_ACTIVATION=1` (injected
 presses mint tokens) and `FRESCOD_TOKEN_LIFE_MS=15000` (TCG takes over a second from press to spend; both
@@ -5813,7 +5815,21 @@ UI's lines are in navigatord.log, and its trails are kept in the Navigator's jai
 (not navtest's), the registry line, the jail's socket mounts (exactly the broker's eight
 directories) and its empty network stack; the UI's jail, uid 65037 and no socket mounts, its
 trails from and kept by navigatord (a second launch gets them back), and the Navigator ending
-with its UI; 43/43 on 2026-11-15.
+with its UI; 43/43 on 2026-11-15. The link opener (opening-links.md L4): the bundles step
+also commissions Monstrator (`scripts/monstrator-service.sh`: `_monstrator` 65038, its socket
+directory, `38-atrium-monstratord.toml`) and installs `org.test.mail` (atrium-open's `open-probe`,
+`[[links]] schemes = ["mailto"]`); navigatord's config allows `mailto`. portcullisd's bootstrap
+starts monstratord from a services directory holding only its manifest (`$S/svc`, log
+`bootstrap.log`). Checks: monstratord in a jail as 65038, mounting only `monstrator/` and
+`portcullis/` sockets, no network; `monctl` refused for `javascript:` by Monstrator and for
+root's `mailto:` by portcullisd ("not a launched app"); a press on the Atrium page's `mailto:`
+link asks, *Open* sends it with the press to Monstrator, and portcullisd (purpose `LINK`) starts
+the mail app with the link on its document channel (`open-probe: link url=mailto:…` in
+portcullisd's log, which carries the app's output), the UI is told it was opened, and no log of
+Monstrator's has the address; monstratord's jail ends with the bootstrap. 55/55 on 2026-11-15. jaild's policy needed
+`/atrium/sockets/monstrator` and `/atrium/sockets/portcullis` in `rw_paths`, and a services.d
+manifest may set no environment keys outside the policy's allow-list (monstratord finds
+portcullisd's socket by its default path).
 
 Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
 mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` only; its network

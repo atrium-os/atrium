@@ -51,7 +51,4 @@ path = "/usr/local/bin/atrium-monstratord"
 argv = ["atrium-monstratord"]
 uid  = 65038   # _monstrator
 gid  = 65038
-
-[[exec.env]]
-key   = "PORTCULLIS_SOCKET"
-value = "/atrium/sockets/portcullis/portcullis.sock"
+# portcullisd: /atrium/sockets/portcullis/portcullis.sock, the client's first choice.

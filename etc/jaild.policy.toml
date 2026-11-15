@@ -117,6 +117,12 @@ rw_paths = [
     # navigatord's ticket socket, the Navigator page jail's one capability
     # (`navigator-page`, navigator-ui.md §2.1).
     "/atrium/sockets/navigator-page",
+    # Monstrator, the link opener (opening-links.md §6): monstratord binds
+    # in it; apps with `open-uri` and the Navigator connect through it.
+    "/atrium/sockets/monstrator",
+    # portcullisd's own directory (its socket is world-connectable, peer uid
+    # checked): monstratord asks it for link grants.
+    "/atrium/sockets/portcullis",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",

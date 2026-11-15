@@ -124,7 +124,9 @@ most 4096 live tokens (the oldest goes first) and drops expired ones on each min
 
 The socket is `FRESCOD_ACTIVATION_SOCK` (default `/var/run/atrium/fresco-activation.sock`).
 frescod checks each connection's peer uid. Each consumer may spend only its own purposes. The
-defaults are root (`OPEN`, `CONSOLE`, `APPROVE`), `_tabula` (`COPY`, `PASTE`, `DRAG`, `DROP`),
+defaults are root (`OPEN`, `CONSOLE`, `APPROVE`, `LINK`: portcullisd; `LINK` is a link opened in
+another app, opening-links.md §5, and a press in a guarded window needs the guard seen as for
+`PROMPT`), `_tabula` (`COPY`, `PASTE`, `DRAG`, `DROP`),
 `_share` (`SHARE`), `_praeco` (`ACTION`), `_arca-ui` (`FILL`) and `_sigillum-ui` (`IDENTITY`),
 for the users that exist. `PROMPT` is self-spent: any uid may spend a press on its own window
 (`presenter_uid` equal to its own) for it, and no consumer is named for it; the person's own

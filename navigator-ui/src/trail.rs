@@ -180,7 +180,6 @@ impl Prompt {
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
-            Prompt::Handoff { scheme, .. } if scheme == "mailto" => &["Not now", "Open in Mail"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
             Prompt::OpenApp { .. } => &["Not now", "Open", "Try it"],
             Prompt::Stored { .. } => &["Not now", "Fetch the current version"],

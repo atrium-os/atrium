@@ -94,10 +94,11 @@ g "cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_DEV_UID=50901 LIMEN_DEFAULTS=d
 nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
     NAVIGATORD_STORE=$S/store NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock \
     NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock \
-    NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_OPENER='sh $S/opener.sh' \
+    NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_MONSTRATOR=$S/mon.sock \
     daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
-# The hand-off program: says what it was given.
-g "printf '%s\\n' 'echo \"\$@\" >> $S/opener.log' > $S/opener.sh; rm -rf $S/downloads $S/opener.log"
+# A stand-in for Monstrator, the link opener (opening-links.md): keeps what
+# it was asked and never answers (the confined script runs the real one).
+g "rm -rf $S/downloads $S/mon.log $S/mon.sock; daemon -f -o $S/mon.log nc -lkU $S/mon.sock </dev/null"
 nd
 sleep 10
 g "test -S $S/limend.sock && test -S $S/nav.sock" || { echo "ABORT: limend or navigatord did not start"; g "tail -5 $S/limend.log $S/navigatord.log"; exit 1; }
@@ -260,14 +261,14 @@ until_trace 'prompt=handoff' && ok "a mailto: link asked before going anywhere" 
 shot live-9-handoff
 answer
 sleep 3
-g "grep -qx 'open mailto:curator@atlas.example' $S/opener.log" && ok "…Open in Mail handed it on" || bad "opener: $(g "cat $S/opener.log; grep -v trace $S/ui8.log | tail -3")"
+g "grep -q '\"OpenLink\":{\"url\":\"mailto:curator@atlas.example\",\"activation\":\[' $S/mon.log" && ok "…Open handed it to the link opener, with the press" || bad "monstrator: $(g "cat $S/mon.log; grep -v trace $S/ui8.log | tail -3")"
 until_trace 'prompt=- ' || bad "the row stayed: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 6 * 40))    # atrium-app:
 until_trace 'prompt=app' && ok "an atrium-app: link asked to try or open the app" || bad "app: $(last)"
 answer
 sleep 3
-g "grep -qx 'try atrium-app://atlas.example/viewer' $S/opener.log" && ok "…Try it handed it on to be tried" || bad "opener: $(g "cat $S/opener.log; grep -v trace $S/ui8.log | tail -3")"
-g "grep -c . $S/opener.log" | grep -qx 2 && ok "nothing else was handed on" || bad "opener log: $(g "cat $S/opener.log")"
+g "grep -q 'trying an app comes with the app catalog' $S/ui8.log" && ok "…Try it waits for the app catalog" || bad "try: $(g "grep -v trace $S/ui8.log | tail -3")"
+g "grep -c OpenLink $S/mon.log" | grep -qx 1 && ok "nothing else was handed on" || bad "monstrator log: $(g "cat $S/mon.log")"
 echo "--- park and restore times (TCG)"
 g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
 g "pkill -x navigator-ui; sleep 2; true"

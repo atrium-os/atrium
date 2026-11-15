@@ -865,11 +865,6 @@ pub fn app_opens(app_id: &str, mime: &str) -> Option<(portcullis_toml::OpenMode,
     m.opens(mime).map(|mode| (mode, if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }))
 }
 
-/// `app_id`'s name, if its INSTALLED manifest takes links of `scheme`.
-pub fn app_takes_link(app_id: &str, scheme: &str) -> Option<String> {
-    let m = installed(app_id)?;
-    m.takes_link(scheme).then(|| if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() })
-}
 
 /// An installed app's name (for `atrium-app:` links).
 pub fn app_name(app_id: &str) -> Option<String> {

@@ -2,7 +2,7 @@
 # Commission Monstrator, the link opener (docs/spec/opening-links.md §6), as a
 # jailed, non-root service. Runs IN the FreeBSD guest, as root, once per host:
 #
-#   sh monstrator-service.sh <monstratord binary>
+#   sh monstrator-service.sh <monstratord binary> [services.d manifest]
 #
 # Creates the _monstrator user (65038), its socket directory, installs
 # atrium-monstratord with its services.d manifest, and prepares the jail
@@ -17,7 +17,8 @@ install -d -o _monstrator -g _monstrator -m 0755 /atrium/sockets/monstrator
 install -m 0755 "$D" /usr/local/bin/atrium-monstratord
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
-install -m 0644 "$HERE/monstrator/etc/services.d/38-atrium-monstratord.toml" /etc/atrium/services.d/
+M=${2:-$HERE/monstrator/etc/services.d/38-atrium-monstratord.toml}
+install -m 0644 "$M" /etc/atrium/services.d/38-atrium-monstratord.toml
 R=/var/lib/atrium/jails/monstratord
 for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/monstrator atrium/sockets/portcullis; do [ -d "$R/$d" ] || install -d "$R/$d"; done
 echo "monstrator-service: commissioned. Restart atrium-portcullisd-bootstrap (or run it) to start atrium-monstratord."

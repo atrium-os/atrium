@@ -208,7 +208,9 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   MiB in 48 KiB parts; `SaveTrails`). Run without a channel (the live script), the UI keeps its
   own file as before.
 - **J4.** hand-offs through `open-uri`: the link opener Monstrator (opening-links.md, accepted
-  2026-11-15, step L4).
+  2026-11-15, step L4). *Built 2026-11-15:* a hand-off goes with its press to Monstrator, which
+  has portcullisd spend it (`LINK`) and hand the link to the app that takes the scheme;
+  `NAVIGATORD_OPENER` is gone; confined script 55/55.
 
 ### 2.4 Personas: what pages may share
 
@@ -694,7 +696,7 @@ Questions that need the person, drawn by the UI in the prompt row between toolba
 | prompt | when | answers |
 |---|---|---|
 | open an app | an `atrium-app://` link (navigator.md §2.2) | *Try it* (ephemeral jail, insula trial-launch) · *Open* · *Not now*. Shows the publisher and the capabilities it will ask for |
-| hand off a link | an allowlisted scheme (`mailto:`), threat model §2.10 | *Open in Mail* · *Copy address* |
+| hand off a link | an allowlisted scheme (`mailto:`), threat model §2.10 | *Open* · *Not now*; names no app, since Monstrator chooses it (opening-links.md §7) |
 | save a download | a link to a file | *Save* · *Open in viewer* (a jailed viewer, threat model §2.10) · *Cancel*; the row shows the file's origin |
 | not private | a form on an `http:` page | *Go back* · *Continue* |
 | fetched again | a page that could not be restored (§4.4) | *Fetch now* |
@@ -1308,7 +1310,8 @@ Each step runs in the VM on headless frescod before the next.
      `a_press_frescod_did_not_count_brings_the_question_back`, `atrium-activation-probe`
      in `scripts/island-probe-vm.sh` (another program's window over part of a guarded row:
      refused; uncovered and still again: counted; no guard: refused), and the live script,
-     where Save, Open in Mail and Try it go through navigatord's spend. A toast-role window
+     where Save goes through navigatord's spend (hand-offs: portcullisd's, purpose `LINK`,
+     opening-links.md §7). A toast-role window
      in the live script's harness made forum-wm stop composing the Navigator's window while
      it was up (only the page child showed), so the covered case is checked in the probe.
      frescod lets each consumer spend only its own purposes (tabula.md). `PROMPT` is
@@ -1341,7 +1344,9 @@ Each step runs in the VM on headless frescod before the next.
      `Handoff` and asks first: *Not now* · *Open in Mail* for `mailto:`, *Not now* · *Open*
      · *Try it* for an app, named by its host part. The answer goes back as `Hand { url, how }`,
      and navigatord hands on only a link it decided as a hand-off on that same connection,
-     once, to `NAVIGATORD_OPENER` (`<opener…> open|try <url>`, no shell). Without an opener
+     once. *(As built since 2026-11-15, opening-links.md §7: to Monstrator with the press, which
+     portcullisd spends as `LINK`; the prompt names no app, and *Try it* waits for the app
+     catalog. Before that:)* to `NAVIGATORD_OPENER` (`<opener…> open|try <url>`, no shell). Without an opener
      it says nothing here takes hand-offs. The app's publisher and the capabilities it will
      ask for are not shown yet: that needs Nomenclator and Opifex.
    - **Islands** (§6.3). frescod has a third slot kind, `slot::kind::ISLAND` (2), and Limen

@@ -641,7 +641,7 @@ impl Shell {
             }
             (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id, press }),
             (Prompt::Download { id, .. }, "Cancel") if live => self.outbox.push(Out::Discard { id: *id }),
-            (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open" | "Open in Mail") if live => {
+            (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
             (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try, press }),
@@ -1725,7 +1725,7 @@ mod tests {
         assert!(s.answer(2, 600.0), "Try it");
         assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try, press: [0; 16] }));
         s.handoff("mailto:a@atlas.example", "mailto", 2000.0);
-        assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open in Mail"]);
+        assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open"]);
         assert!(s.answer(1, 2600.0));
         assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "mailto:a@atlas.example".into(), how: navigator_control::Hand::Open, press: [0; 16] }));
     }

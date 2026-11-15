@@ -478,7 +478,9 @@ impl Live {
                 Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
                 Event::PressRefused { why } => s.press_refused(&why, crate::ui::now_ms()),
                 Event::Handed { url, ok, why } => {
-                    s.last_note = Some(if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) })
+                    let note = if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) };
+                    eprintln!("navigator-ui: {note}");
+                    s.last_note = Some(note)
                 }
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();

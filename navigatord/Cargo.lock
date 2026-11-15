@@ -247,6 +247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-links"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "url",
+]
+
+[[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
 
@@ -2101,6 +2109,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "monstrator"
+version = "0.1.0"
+dependencies = [
+ "atrium-links",
+ "libc",
+ "portcullis-ipc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2268,6 +2287,7 @@ dependencies = [
  "fresco-protocol",
  "fresco-split",
  "libc",
+ "monstrator",
  "navigator-backend",
  "navigator-control",
  "navigator-cookies",
@@ -2756,6 +2776,7 @@ dependencies = [
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
  "atrium-types",
  "hex",
  "portcullis-toml",
@@ -2768,6 +2789,7 @@ dependencies = [
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
  "atrium-types",
  "serde",
  "thiserror 1.0.69",

@@ -187,7 +187,16 @@ new trail.
    atrium-open's `open-probe` prints the links it gets.
 3. **L3** the sheet and "Always use", Curia's Links section.
 4. **L4** (= navigator-ui J4) navigatord's hand-offs through Monstrator, `NAVIGATORD_OPENER`
-   removed; links into the Navigator open trails; `navigator-confined-vm.sh`.
+   removed; links into the Navigator open trails; `navigator-confined-vm.sh`. *Built
+   2026-11-15 (before L3, which only adds the sheet):* navigatord sends a hand-off with its
+   press to Monstrator (`NAVIGATORD_MONSTRATOR`, default its socket) instead of spending
+   `PROMPT`; the prompt names no app (*Not now* · *Open*); *Try it* answers that trying waits
+   for the app catalog. jaild's policy allows `monstrator/` and `portcullis/` socket
+   directories for services. `navigator-confined-vm.sh` 55/55: monstratord from the
+   bootstrap in its jail as 65038, a `mailto:` link pressed in the jailed Navigator reaches
+   `org.test.mail` (open-probe) on its document channel, started for navtest by portcullisd.
+   Not yet: links coming *into* the Navigator (`https:` from another app) open a trail; that
+   needs navigatord to read its document channel.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
 
 ## 9. Decisions, with recommendations
