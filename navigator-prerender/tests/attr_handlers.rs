@@ -46,3 +46,31 @@ fn a_wall_wired_by_attributes_is_found() {
     assert_eq!(c.consents, vec![vec!["ok=1; Path=/".to_string()], vec!["ok=0; Path=/".to_string()]]);
     assert!(c.html.contains(r#"<a href="atrium-consent:0">Accept</a>"#), "{}", c.html);
 }
+
+/// `click()` dispatches a bubbling click (not on a disabled control);
+/// `focus()` and `blur()` move `document.activeElement` with focus and
+/// blur events, in a browser's order.
+#[test]
+fn click_focus_and_blur_do_what_a_browser_does() {
+    let c = run(r#"<html><body><div id=box>
+      <button id=a onclick="this.setAttribute('ran', '1')">A</button>
+      <button id=off disabled onclick="this.setAttribute('ran', '1')">Off</button>
+      <input id=x><input id=y></div>
+      <script>
+        var log = [];
+        var box = document.getElementById('box');
+        box.addEventListener('click', function (e) { log.push('click:' + e.target.id + ':' + e.isTrusted); });
+        ['focusin', 'focusout'].forEach(function (t) { box.addEventListener(t, function (e) { log.push(t + ':' + e.target.id); }); });
+        document.getElementById('a').click();
+        document.getElementById('off').click();
+        var x = document.getElementById('x'), y = document.getElementById('y');
+        log.push('active:' + document.activeElement.tagName);
+        x.addEventListener('blur', function () { log.push('blur:x'); });
+        x.focus(); y.focus(); y.blur();
+        log.push('active:' + document.activeElement.tagName);
+        document.body.setAttribute('log', log.join(' '));
+      </script></body></html>"#);
+    assert!(c.html.contains(r#"id="a" onclick="this.setAttribute('ran', '1')" ran="1""#), "{}", c.html);
+    assert!(!c.html.contains(r#"disabled="" onclick="this.setAttribute('ran', '1')" ran"#), "{}", c.html);
+    assert!(c.html.contains(r#"log="click:a:false active:BODY focusin:x blur:x focusout:x focusin:y focusout:y active:BODY""#), "{}", c.html);
+}

@@ -778,11 +778,26 @@ fn install_tree(o: &JsObject, ctx: &mut Context) {
         ("insertAdjacentHTML", insert_adjacent_html),
         ("insertAdjacentText", insert_adjacent_text),
         ("removeAttribute", n_remove_attribute),
+        ("click", el_click), ("focus", el_focus), ("blur", el_blur),
     ] {
         let f = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
         let _ = o.set(js_string!(name.to_string()), f, false, ctx);
     }
 }
+
+/// `el.click()`, `el.focus()`, `el.blur()`: the JS shim's `__elClick`,
+/// `__elFocus`, `__elBlur`, which dispatch the events a browser does.
+fn el_call(helper: &str, this: &JsValue, ctx: &mut Context) -> JsResult<JsValue> {
+    let f = ctx.global_object().get(js_string!(helper.to_string()), ctx)?;
+    match f.as_callable() {
+        Some(c) => { c.call(&JsValue::undefined(), &[this.clone()], ctx)?; }
+        None => {}
+    }
+    Ok(JsValue::undefined())
+}
+fn el_click(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { el_call("__elClick", t, ctx) }
+fn el_focus(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { el_call("__elFocus", t, ctx) }
+fn el_blur(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> { el_call("__elBlur", t, ctx) }
 
 /// `document.implementation.createHTMLDocument(title)`.
 ///
@@ -5411,6 +5426,39 @@ const GLOBALS: &str = r#"
       this.initEvent(t, b, c); this.detail = d;
     };
   }
+  // `el.click()`: a click a script asked for (not trusted, as in a
+  // browser), nothing on a disabled control. `focus()`/`blur()`: one
+  // element has the focus (`document.activeElement`, else the body), and
+  // moving it fires blur/focusout then focus/focusin.
+  var __active = null;
+  globalThis.__elClick = function (el) {
+    if (!el || el.nodeType !== 1) return;
+    if (el.hasAttribute('disabled') && /^(BUTTON|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+    var E = globalThis.MouseEvent || Event;
+    el.dispatchEvent(new E('click', { bubbles: true, cancelable: true, composed: true }));
+  };
+  function __focusEv(el, type, bubbles) {
+    var E = globalThis.FocusEvent || Event;
+    el.dispatchEvent(new E(type, { bubbles: bubbles, cancelable: false, composed: true }));
+  }
+  globalThis.__elFocus = function (el) {
+    if (!el || el.nodeType !== 1 || __active === el) return;
+    var prev = __active;
+    if (prev) { __active = null; __focusEv(prev, 'blur', false); __focusEv(prev, 'focusout', true); }
+    __active = el;
+    __focusEv(el, 'focus', false); __focusEv(el, 'focusin', true);
+  };
+  globalThis.__elBlur = function (el) {
+    if (!el || __active !== el) return;
+    __active = null;
+    __focusEv(el, 'blur', false); __focusEv(el, 'focusout', true);
+  };
+  try {
+    Object.defineProperty(document, 'activeElement', {
+      get: function () { return (__active && __active.isConnected !== false) ? __active : (document.body || null); },
+      configurable: true
+    });
+  } catch (e) {}
   var __probeCtors = {};
   function Event(type, init) { __mkEvent.call(this, type, init); }
   function CustomEvent(type, init) { __mkEvent.call(this, type, init); }
@@ -5850,7 +5898,7 @@ const GLOBALS: &str = r#"
   ['__deliverMutations', '__upgradePending', '__drainTimers', '__timerStats',
    '__fire', '__fireExisting', '__rand_u32', '__take_mutations', '__is_ancestor',
    '__parse_url', '__fetch_sync', '__rtf', '__docLocale', '__probe', '__handlerKey',
-   '__docListeners'
+   '__docListeners', '__elClick', '__elFocus', '__elBlur'
   ].forEach(function (n) {
     var v = globalThis[n];
     if (v === undefined) return;

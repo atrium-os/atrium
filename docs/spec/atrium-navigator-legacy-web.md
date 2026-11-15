@@ -681,8 +681,12 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   not compile is no handler. Exploration and the consent search see them as listeners, so a
   wall wired only by attributes is found (tests/attr_handlers.rs).
 - *Not yet:* a wall built inside an iframe (normalized documents have none); a wall placed
-  only by a stylesheet whose controls say no consent word (no computed style here);
-  `element.click()` and `focus()` are not implemented.
+  only by a stylesheet whose controls say no consent word (no computed style here).
+- *`click()`, `focus()`, `blur()` (2026-11-15):* `click()` dispatches a bubbling,
+  cancelable, untrusted click (nothing on a disabled button, input, select or textarea);
+  `focus()` and `blur()` move `document.activeElement` (the body when nothing has it),
+  firing blur and focusout on the old element, then focus and focusin on the new. No default
+  actions follow (a link is not followed, a checkbox is not toggled).
 - *Session cookies dying with the view* (Arca §8.6).
 - *The EU-vantage measurement.*
 
