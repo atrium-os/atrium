@@ -108,6 +108,10 @@
  *                from GLSL by our shader compiler (si_tri_glsl.h, from
  *                atrium-rdna4-compiler/examples/si_tri_glsl.rs). Runs
  *                after 21.
+ *  23 colour triangle (stage 7c-2) varyings: the GLSL VS writes a colour
+ *                per vertex and a flat int through the GFX12 attribute
+ *                ring, the PS interpolates them; every inside pixel is
+ *                checked against CPU barycentrics (within 3/255).
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -2806,6 +2810,19 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	struct tri_pm4 p = { w, 0, max };
 	uint32_t v[16];
 	u_int i;
+	/* glsl: 0 hand-written (21), 1 GLSL (22), 2 GLSL with varyings (23). */
+	const u_int vs_vgprs = glsl == 2 ? COLOR_VS_VGPRS : glsl ?
+	    GLSL_VS_VGPRS : 24;
+	const u_int vs_user = glsl == 2 ? COLOR_VS_USER_SGPRS : glsl ?
+	    GLSL_VS_USER_SGPRS : 2;
+	const u_int ps_vgprs = glsl == 2 ? COLOR_PS_VGPRS : glsl ?
+	    GLSL_PS_VGPRS : 8;
+	const u_int ps_user = glsl == 2 ? COLOR_PS_USER_SGPRS : glsl ?
+	    GLSL_PS_USER_SGPRS : 2;
+	const uint32_t ps_ena = glsl == 2 ? COLOR_PS_INPUT_ENA : glsl ?
+	    GLSL_PS_INPUT_ENA : 1u << 1;	/* PERSP_CENTER */
+	const u_int params = glsl == 2 ? COLOR_VS_PARAMS : 0;
+	const u_int ps_inputs = glsl == 2 ? COLOR_PS_INPUTS : 0;
 
 	/* CONTEXT_CONTROL as radeonsi's user-queue register shadowing. */
 	tri_put(&p, PKT3_GFX(0x28u, 2));
@@ -3005,17 +3022,31 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	/* VS on the NGG stage: wave32, 24 VGPRs (v0..v16 used), 2 user
 	 * SGPRs (the debug VA, in s[8:9]). */
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_ES, (uint32_t)(vs_va >> 8));
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_GS, ((glsl ? GLSL_VS_VGPRS : 24) -
-	    1) / 8 | 0xc0u << 12);
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_GS, (glsl ? GLSL_VS_USER_SGPRS :
-	    2u) << 1);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_GS, (vs_vgprs - 1) / 8 |
+	    0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_GS, vs_user << 1);
 	tri_reg(&p, R_SPI_SHADER_PGM_RSRC4_GS, 0x3ffu | 1u << 11 |
 	    127u << 16);
 	/* 21: the debug VA; 22 (our compiler's ABI): first vertex, first
 	 * instance. */
-	v[0] = glsl ? 0 : (uint32_t)dbg_va;
-	v[1] = glsl ? 0 : (uint32_t)(dbg_va >> 32);
-	tri_regs(&p, R_SPI_SHADER_USER_DATA_GS_0, v, 2);
+	if (params != 0) {
+		/* 23: the attribute ring descriptor first (Mesa
+		 * ac_build_attr_ring_descriptor: R32G32B32A32_FLOAT, xyzw,
+		 * stride 16 x params, 16-byte swizzle, index stride 32,
+		 * structured-with-offset bounds), then first vertex and
+		 * first instance. */
+		v[0] = (uint32_t)rings_va;
+		v[1] = (uint32_t)(rings_va >> 32 & 0xffffu) |
+		    (16u * params) << 16 | 3u << 30;
+		v[2] = 0xffffffffu;
+		v[3] = 4u | 5u << 3 | 6u << 6 | 7u << 9 | 63u << 12 |
+		    2u << 21 | 3u << 28;
+		v[4] = v[5] = 0;
+	} else {
+		v[0] = glsl ? 0 : (uint32_t)dbg_va;
+		v[1] = glsl ? 0 : (uint32_t)(dbg_va >> 32);
+	}
+	tri_regs(&p, R_SPI_SHADER_USER_DATA_GS_0, v, vs_user);
 	tri_reg(&p, R_PA_CL_VS_OUT_CNTL, 0);
 	tri_reg(&p, R_VGT_GS_INSTANCE_CNT, 1u << 2);
 	v[0] = 1;			/* IDX0: SPI_SHADER_1COMP */
@@ -3031,16 +3062,20 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	 * one), no inputs, no parameters from the VS. */
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS, (uint32_t)(ps_va >> 8));
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS + 4, (uint32_t)(ps_va >> 40));
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, ((glsl ? GLSL_PS_VGPRS : 8) -
-	    1) / 8 | 0xc0u << 12);
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, (glsl ? GLSL_PS_USER_SGPRS :
-	    2u) << 1);	/* 21: 2 user SGPRs */
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, (ps_vgprs - 1) / 8 |
+	    0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, ps_user << 1);
 	v[0] = (uint32_t)(dbg_va + TRI_PS_COUNT);
 	v[1] = (uint32_t)((dbg_va + TRI_PS_COUNT) >> 32);
 	tri_regs(&p, R_SPI_SHADER_USER_DATA_PS_0, v, 2);
-	tri_reg(&p, R_SPI_SHADER_GS_OUT_CONFIG_PS, 1u << 10);	/* NO_PC_EXPORT */
-	v[0] = v[1] = glsl ? GLSL_PS_INPUT_ENA : 1u << 1; /* PERSP_CENTER */
+	/* VS_EXPORT_COUNT (params - 1) or NO_PC_EXPORT; NUM_INTERP. */
+	tri_reg(&p, R_SPI_SHADER_GS_OUT_CONFIG_PS, (params != 0 ? params - 1 :
+	    1u << 10) | ps_inputs << 11);
+	v[0] = v[1] = ps_ena;
 	tri_regs(&p, R_SPI_PS_INPUT_ENA, v, 2);
+	if (ps_inputs != 0)
+		tri_regs(&p, R_SPI_PS_INPUT_CNTL_0, color_ps_input_cntl,
+		    ps_inputs);
 	tri_reg(&p, R_SPI_PS_IN_CONTROL, 1u << 15);	/* PS_W32_EN */
 	tri_reg(&p, R_PA_SC_HISZ_CONTROL, 2);
 	tri_reg(&p, R_SPI_SHADER_Z_FORMAT, 0);
@@ -3125,11 +3160,53 @@ tri_cover(int px, int py)
 	return (near ? -1 : in);
 }
 
+/* 23: the colour the CPU expects at pixel (px, py): the barycentric
+ * weights of vertices 0, 1, 2 as red, green, blue (W is 1 everywhere, so
+ * perspective and linear agree), alpha 1 (the flat int arrived). */
+static uint32_t
+tri_colour(int px, int py)
+{
+	float x = px + 0.5f, y = py + 0.5f, l[3];
+	uint32_t c = 0xffu << 24;
+	int k;
+
+	for (k = 0; k < 3; k++) {
+		const float *a = tri_px[(k + 1) % 3], *b = tri_px[(k + 2) % 3];
+
+		l[k] = tri_edge(a, b, x, y) / tri_edge(a, b, tri_px[k][0],
+		    tri_px[k][1]);
+		if (l[k] < 0)
+			l[k] = 0;
+		if (l[k] > 1)
+			l[k] = 1;
+		c |= (uint32_t)(l[k] * 255.0f + 0.5f) << (8 * k);
+	}
+	return (c);
+}
+
+/* Pixel p matches want within tol per channel. */
+static int
+tri_near(uint32_t p, uint32_t want, int tol)
+{
+	int k, d;
+
+	for (k = 0; k < 4; k++) {
+		d = (int)(p >> (8 * k) & 0xff) - (int)(want >> (8 * k) & 0xff);
+		if (d > tol || d < -tol)
+			return (0);
+	}
+	return (1);
+}
+
 static void
 triangle(int glsl)
 {
-	const char *t = glsl ? "22 GLSL triangle" : "21 triangle";
-	const char *tn = glsl ? "22" : "21";
+	const char *t = glsl == 2 ? "23 colour triangle" : glsl ?
+	    "22 GLSL triangle" : "21 triangle";
+	const char *tn = glsl == 2 ? "23" : glsl ? "22" : "21";
+	char what[160];
+	uint32_t want, worst = 0, worst_want = 0;
+	int wx = -1, wy = -1;
 	struct job j;
 	uint32_t *ib = NULL, *pix = NULL, dbg[1024];
 	uint64_t cb_va, dbg_va;
@@ -3161,7 +3238,10 @@ triangle(int glsl)
 		uint8_t img[4096];
 
 		memset(img, 0, sizeof(img));
-		if (glsl) {
+		if (glsl == 2) {
+			memcpy(img, color_vs, sizeof(color_vs));
+			memcpy(img + TRI_PS_OFF, color_ps, sizeof(color_ps));
+		} else if (glsl) {
 			memcpy(img, glsl_vs, sizeof(glsl_vs));
 			memcpy(img + TRI_PS_OFF, glsl_ps, sizeof(glsl_ps));
 		} else {
@@ -3202,9 +3282,10 @@ triangle(int glsl)
 		goto out;
 	}
 	r = gfxq_run(&j, q, ib, dw, &ms);
-	check(r == 0, glsl ? "22 GLSL triangle: the draw completes on the gfx "
-	    "queue" : "21 triangle: the draw completes on the gfx queue",
-	    "completion %s after %d ms", r == 0 ? "ok" : strerror(r), ms);
+	snprintf(what, sizeof(what), "%s: the draw completes on the gfx queue",
+	    t);
+	check(r == 0, what, "completion %s after %d ms", r == 0 ? "ok" :
+	    strerror(r), ms);
 
 	/* What the VS saw, per lane, whatever happened. */
 	if (glsl && bo_xfer(dbgbo, dbg, sizeof(dbg), 0) == 0) {
@@ -3215,7 +3296,7 @@ triangle(int glsl)
 		const uint32_t *a = dbg + TRI_STATS0 / 4, *b = dbg +
 		    TRI_STATS1 / 4;
 
-		printf("22: pipeline statistics:");
+		printf("%s: pipeline statistics:", tn);
 		for (i = 0; i < 14; i++)
 			printf(" %s %jd", nm[i], (intmax_t)(((uint64_t)b[2 * i] |
 			    (uint64_t)b[2 * i + 1] << 32) - ((uint64_t)a[2 * i] |
@@ -3280,13 +3361,21 @@ triangle(int glsl)
 			uint32_t p = pix[y * TRI_W + x];
 
 			c = tri_cover(x, y);
+			want = glsl == 2 ? tri_colour(x, y) : TRI_FG;
 			if (c < 0) {
-				edge += p == TRI_FG;
+				edge += glsl == 2 ? p != TRI_BG : p == TRI_FG;
 				continue;
 			}
 			if (c) {
 				in++;
-				bad_in += p != TRI_FG;
+				if (!tri_near(p, want, glsl == 2 ? 3 : 0)) {
+					if (bad_in++ == 0) {
+						worst = p;
+						worst_want = want;
+						wx = x;
+						wy = y;
+					}
+				}
 			} else {
 				out++;
 				bad_out += p != TRI_BG;
@@ -3299,18 +3388,22 @@ triangle(int glsl)
 		for (x = 0; x < TRI_W; x += 2) {
 			uint32_t p = pix[y * TRI_W + x];
 
-			row[x / 2] = p == TRI_FG ? '#' : p == TRI_BG ? '.' : '?';
+			row[x / 2] = tri_near(p, glsl == 2 ? tri_colour(x, y) :
+			    TRI_FG, glsl == 2 ? 3 : 0) ? '#' : p == TRI_BG ?
+			    '.' : '?';
 		}
 		row[TRI_W / 2] = '\0';
 		printf("%s: |%s|\n", tn, row);
 	}
-	check(bad_in == 0 && bad_out == 0 && in > 0, glsl ? "22 GLSL triangle: "
-	    "every pixel inside is the colour, every pixel outside untouched" :
-	    "21 triangle: every pixel inside is the colour, every pixel "
-	    "outside untouched",
+	snprintf(what, sizeof(what), "%s: every pixel inside is the %s, every "
+	    "pixel outside untouched", t, glsl == 2 ? "interpolated colour "
+	    "(within 3/255)" : "colour");
+	check(bad_in == 0 && bad_out == 0 && in > 0, what,
 	    "inside %d/%d wrong, outside %d/%d wrong, edge pixels lit %d, "
-	    "pixel (32,24) %#x", bad_in, in, bad_out, out, edge,
-	    pix[24 * TRI_W + 32]);
+	    "pixel (32,24) %#x want %#x; first wrong (%d,%d) %#x want %#x",
+	    bad_in, in, bad_out, out, edge, pix[24 * TRI_W + 32],
+	    glsl == 2 ? tri_colour(32, 24) : TRI_FG, wx, wy, worst,
+	    worst_want);
 out:
 	if (q >= 0)
 		close(q);
@@ -3653,6 +3746,10 @@ main(void)
 	/* 22: the same triangle from GLSL, through our compiler (7c). */
 	if (!skipped(22, "GLSL triangle"))
 		triangle(1);
+
+	/* 23: varyings through the attribute ring (7c-2). */
+	if (!skipped(23, "colour triangle"))
+		triangle(2);
 
 	/* 19: VM_UNBIND (before 14's re-inits). */
 	if (!skipped(19, "unbind"))

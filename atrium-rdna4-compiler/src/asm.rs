@@ -60,6 +60,13 @@ impl Asm {
         self.words.extend(w);
     }
 
+    /// Emit one instruction in a non-base form of its encoding (`cond`, e.g.
+    /// "has_dpp16").
+    pub fn emit_cond(&mut self, inst: &str, enc: &str, cond: &str, fields: &[(&str, u64)]) {
+        let w = encode(inst, enc, cond, fields).unwrap_or_else(|e| panic!("encode {inst} {enc} {cond} {fields:?}: {e:?}"));
+        self.words.extend(w);
+    }
+
     /// `v_mov_b32 vdst, literal` (VOP1 with a trailing literal).
     pub fn v_mov_lit(&mut self, vdst: u8, bits: u32) {
         match inline_const(bits) {

@@ -33,3 +33,13 @@ fn triangle_fragment() {
     assert_eq!(b.exports, vec![(0, 0xf)]);
     assert_eq!(b.ps_input_ena, ps_input::PERSP_CENTER);
 }
+
+#[test]
+fn varyings() {
+    let vs = build("tri_color.vert.spv");
+    assert_eq!(vs.vs_params, vec![0, 1]);
+    assert_eq!(vs.abi.user_sgprs(), 6);
+    let ps = build("tri_color.frag.spv");
+    assert_eq!(ps.ps_inputs, vec![(0, atrium_gir::Interp::Smooth), (1, atrium_gir::Interp::Flat)]);
+    assert_eq!(ps.exports, vec![(0, 0xf)]);
+}

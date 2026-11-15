@@ -956,7 +956,13 @@ impl<'a> Builder<'a> {
                 return malformed(format!("input at byte offset {off} has no location"));
             };
             let ty = map_ty(&vi.ty)?;
-            let interp = if self.out.stage == Stage::Fragment && ty.scalar() == Scalar::I32 { Interp::Flat } else { Interp::Smooth };
+            let interp = if vi.flat || ty.scalar() != Scalar::F32 {
+                Interp::Flat
+            } else if vi.noperspective {
+                Interp::NoPerspective
+            } else {
+                Interp::Smooth
+            };
             self.out.inputs.push(Input { location: vi.location, ty, interp });
             self.vals.insert(*vid, Val::Ptr(Space::Input(self.out.inputs.len() as u32 - 1), zero));
         }

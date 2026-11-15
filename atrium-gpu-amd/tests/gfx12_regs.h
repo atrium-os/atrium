@@ -67,6 +67,7 @@
 #define R_SPI_SHADER_COL_FORMAT                    0x28654u
 #define R_SPI_BARYC_CNTL                           0x28658u
 #define R_SPI_PS_INPUT_ENA                         0x2865cu
+#define R_SPI_PS_INPUT_CNTL_0                      0x28664u
 #define R_SPI_BARYC_SSAA_CNTL                      0x286e4u
 #define R_SX_PS_DOWNCONVERT_CONTROL                0x28750u
 #define R_SX_PS_DOWNCONVERT                        0x28754u

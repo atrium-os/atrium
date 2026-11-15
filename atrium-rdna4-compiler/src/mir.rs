@@ -136,6 +136,48 @@ pub enum MI {
         /// Last export of the shader.
         done: bool,
     },
+    /// `buffer_store_b128` with an index (`idxen`): the attribute ring.
+    BufStore {
+        /// The 4 data VGPRs.
+        data: O,
+        /// Index VGPR.
+        vindex: O,
+        /// First SGPR of the buffer descriptor (4-aligned).
+        rsrc: u8,
+        /// Byte offset SGPR.
+        soff: O,
+        /// Immediate byte offset.
+        ioff: u32,
+    },
+    /// `ds_param_load`: attribute `attr`, channel `chan` of the primitive
+    /// (per quad: P0, P1−P0, P2−P0), `m0` holding the primitive mask.
+    /// Counted on EXPCNT.
+    ParamLoad {
+        /// Destination VGPR.
+        vdst: O,
+        /// Attribute index.
+        attr: u8,
+        /// Channel.
+        chan: u8,
+    },
+    /// `v_interp_p10_f32` / `v_interp_p2_f32` (VINTERP).
+    Interp {
+        /// Instruction name.
+        name: &'static str,
+        /// Destination.
+        vdst: O,
+        /// Sources.
+        src: [O; 3],
+    },
+    /// `v_mov_b32` with a DPP16 quad permutation.
+    MovDpp {
+        /// Destination.
+        vdst: O,
+        /// Source VGPR.
+        src: O,
+        /// `DPP_CTRL`.
+        ctrl: u16,
+    },
     /// SOPP with an immediate (`s_sendmsg`).
     Sopp {
         /// Instruction name.
@@ -229,6 +271,22 @@ impl MI {
                     r(x, false);
                 }
             }
+            MI::BufStore { data, vindex, soff, .. } => {
+                r(data, false);
+                r(vindex, false);
+                r(soff, false);
+            }
+            MI::ParamLoad { vdst, .. } => r(vdst, true),
+            MI::Interp { vdst, src, .. } => {
+                r(vdst, true);
+                for x in src {
+                    r(x, false);
+                }
+            }
+            MI::MovDpp { vdst, src, .. } => {
+                r(vdst, true);
+                r(src, false);
+            }
             _ => {}
         }
     }
@@ -307,6 +365,20 @@ impl MI {
             }
             MI::Export { src, .. } => {
                 v.extend(src.iter_mut().flatten().map(|x| (x, false, 1)));
+            }
+            MI::BufStore { data, vindex, soff, .. } => {
+                v.push((data, false, 4));
+                v.push((vindex, false, 1));
+                v.push((soff, false, 1));
+            }
+            MI::ParamLoad { vdst, .. } => v.push((vdst, true, 1)),
+            MI::Interp { vdst, src, .. } => {
+                v.push((vdst, true, 1));
+                v.extend(src.iter_mut().map(|x| (x, false, 1)));
+            }
+            MI::MovDpp { vdst, src, .. } => {
+                v.push((vdst, true, 1));
+                v.push((src, false, 1));
             }
             _ => {}
         }

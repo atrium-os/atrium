@@ -1535,6 +1535,10 @@ pub struct VertexInput {
     pub offset: u32,
     /// Type (one of the scalar / vector types).
     pub ty: Type,
+    /// Decorated `Flat` (fragment inputs).
+    pub flat: bool,
+    /// Decorated `NoPerspective` (fragment inputs).
+    pub noperspective: bool,
 }
 
 /// One inter-stage varying.

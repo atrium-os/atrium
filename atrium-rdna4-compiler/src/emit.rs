@@ -390,6 +390,63 @@ impl<'a> E<'a> {
                 f.push(("EN", en));
                 self.a.emit("EXPORT", "ENC_VEXPORT", &f);
             }
+            MI::BufStore { data, vindex, rsrc, soff, ioff } => {
+                let mut regs = self.regs(*data, 4);
+                regs.extend(self.regs(*vindex, 1));
+                self.wait_for(&regs);
+                let so = self.code(*soff);
+                self.sgpr_reads(&[so, *rsrc as u16, *rsrc as u16 + 1, *rsrc as u16 + 2, *rsrc as u16 + 3]);
+                self.flush_alu();
+                self.a.emit("BUFFER_STORE_B128", "ENC_VBUFFER", &[
+                    ("VDATA", (self.code(*data) - 256) as u64),
+                    ("VADDR", (self.code(*vindex) - 256) as u64),
+                    ("RSRC", *rsrc as u64),
+                    ("SOFFSET", so as u64),
+                    ("IOFFSET", *ioff as u64),
+                    ("IDXEN", 1),
+                    ("OFFEN", 0),
+                    ("FORMAT", 0),
+                    // Device scope, as Mesa's coherent attribute ring
+                    // stores: the SPI reads them back through GL2.
+                    ("SCOPE", 2),
+                    ("TH", 0),
+                ]);
+            }
+            MI::ParamLoad { vdst, attr, chan } => {
+                self.flush_alu();
+                self.a.emit("DS_PARAM_LOAD", "ENC_VDSDIR", &[
+                    ("VDST", (self.code(*vdst) - 256) as u64),
+                    ("ATTR", *attr as u64),
+                    ("ATTR_CHAN", *chan as u64),
+                    ("WAIT_VA_VDST", 0),
+                    ("WAIT_VM_VSRC", 1),
+                ]);
+            }
+            MI::Interp { name, vdst, src } => {
+                let regs: Vec<u16> = src.iter().flat_map(|x| self.regs(*x, 1)).collect();
+                self.wait_for(&regs);
+                self.flush_alu();
+                self.a.emit(name, "ENC_VINTERP", &[
+                    ("VDST", (self.code(*vdst) - 256) as u64),
+                    ("SRC0", self.code(src[0]) as u64),
+                    ("SRC1", self.code(src[1]) as u64),
+                    ("SRC2", self.code(src[2]) as u64),
+                    ("WAIT_EXP", 0),
+                ]);
+            }
+            MI::MovDpp { vdst, src, ctrl } => {
+                let regs = self.regs(*src, 1);
+                self.wait_for(&regs);
+                self.flush_alu();
+                self.a.emit_cond("V_MOV_B32", "VOP1_VOP_DPP16", "has_dpp16", &[
+                    ("VDST", (self.code(*vdst) - 256) as u64),
+                    ("SRC0", 250),
+                    ("VSRC0", (self.code(*src) - 256) as u64),
+                    ("DPP_CTRL", *ctrl as u64),
+                    ("ROW_MASK", 0xf),
+                    ("BANK_MASK", 0xf),
+                ]);
+            }
             MI::Sopp { name, imm } => {
                 self.drain();
                 self.a.sopp(name, *imm);

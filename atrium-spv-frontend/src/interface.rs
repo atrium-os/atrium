@@ -396,6 +396,8 @@ impl InterfaceContext {
                         d.location = Some(*v);
                     }
                 }
+                Decoration::Flat => d.flat = true,
+                Decoration::NoPerspective => d.noperspective = true,
                 Decoration::BuiltIn => {
                     if let Some(Operand::BuiltIn(b)) = inst.operands.get(2) {
                         use rspirv::spirv::BuiltIn as SpvBuiltIn;
@@ -506,6 +508,8 @@ impl InterfaceContext {
                             // that uses Input today).
                             ctx.vertex_inputs.push(VertexInput {
                                 location, offset: 0, ty,
+                                flat: d.flat,
+                                noperspective: d.noperspective,
                             });
                             // Stash (var_id, location, byte_size)
                             // so we can compute byte offsets in
@@ -634,6 +638,10 @@ struct VarDecorations {
     /// *output* the shader stores to (routed to `out_depth`),
     /// not a `LoadBuiltin` input.
     frag_depth: bool,
+    /// `Decoration::Flat`.
+    flat: bool,
+    /// `Decoration::NoPerspective`.
+    noperspective: bool,
 }
 
 fn read_execution_model(operands: &[Operand], i: usize) -> Result<ExecutionModel, FrontendError> {

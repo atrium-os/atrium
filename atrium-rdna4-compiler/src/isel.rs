@@ -69,6 +69,8 @@ pub(crate) struct Isel<'a> {
     pub exports: Vec<(u8, u8)>,
     /// Graphics: the registers holding each output's last exported value.
     exp_regs: Vec<VR>,
+    /// Fragment: each input's interpolated components, set at entry.
+    in_regs: Vec<VR>,
 }
 
 /// `s_sendmsg` id of GS_ALLOC_REQ (GFX11+).
@@ -266,6 +268,9 @@ impl<'a> Isel<'a> {
         let mut ps_input_ena = 0;
         if f.stage == Stage::Fragment {
             ps_input_ena = crate::ps_input::PERSP_CENTER;
+            if f.inputs.iter().any(|i| i.interp == Interp::NoPerspective) {
+                ps_input_ena |= crate::ps_input::LINEAR_CENTER;
+            }
             for i in &defs {
                 match (&i.op, i.result) {
                     (Op::Builtin(Builtin::FragCoord), Some(r)) => {
@@ -281,6 +286,7 @@ impl<'a> Isel<'a> {
             ps_input_ena,
             exports: vec![],
             exp_regs: vec![],
+            in_regs: vec![],
             addr_only,
             builtin_comps,
             f,
@@ -743,6 +749,16 @@ impl<'a> Isel<'a> {
                 }
             }
             Op::Builtin(b) => self.builtin(*b, res.unwrap())?,
+            Op::Load(Space::Input(k), off) => {
+                let Some(&o) = self.consts.get(off) else {
+                    return unsup("a stage input read at a dynamic offset");
+                };
+                if self.f.stage != Stage::Fragment {
+                    return unsup("vertex attributes (vertex buffers) come with stage 7e");
+                }
+                let r = self.in_regs[*k as usize];
+                self.map.insert(res.unwrap(), (r, (o / 4) as u8));
+            }
             Op::Load(Space::Workgroup, off) => {
                 let r = res.unwrap();
                 if self.ty(r) == Ty::BOOL {
@@ -1340,7 +1356,7 @@ impl<'a> Isel<'a> {
     fn graphics_builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
         let stage = self.f.stage;
         let need = |s: Stage| if stage == s { Ok(()) } else { unsup(format!("{b:?} in a {stage:?} shader")) };
-        let base = self.abi.user_base();
+        let base = self.abi.base_vertex_sgpr();
         match b {
             Builtin::VertexIndex | Builtin::InstanceIndex => {
                 need(Stage::Vertex)?;
@@ -1645,21 +1661,98 @@ impl<'a> Isel<'a> {
         Ok(())
     }
 
+    /// Fragment inputs, all at entry (in whole-quad mode, before any
+    /// control flow): `ds_param_load` per component, then interpolation
+    /// at the pixel centre, or the provoking vertex's value for flat ones.
+    fn ps_inputs(&mut self) -> Result<(), Error> {
+        let f = self.f;
+        let mask = O::PS(self.abi.user_base() + self.abi.user_sgprs());
+        self.salu("S_MOV_B32", O::PS(M0), vec![mask]);
+        let mut raw = vec![];
+        for (i, inp) in f.inputs.iter().enumerate() {
+            let n = inp.ty.comps() as u8;
+            let r = self.vreg(Class::V, n);
+            self.in_regs.push(r);
+            let mut ps = vec![];
+            for c in 0..n {
+                let p = O::R(self.vreg(Class::V, 1), 0);
+                self.mi.push(MI::ParamLoad { vdst: p, attr: i as u8, chan: c });
+                ps.push(p);
+            }
+            raw.push(ps);
+        }
+        self.mi.push(MI::Sopp { name: "S_WAIT_EXPCNT", imm: 0 });
+        for (i, inp) in f.inputs.iter().enumerate() {
+            let r = self.in_regs[i];
+            let bary = match inp.interp {
+                Interp::Smooth => Some(self.ps_vgpr(crate::ps_input::PERSP_CENTER)),
+                Interp::NoPerspective => Some(self.ps_vgpr(crate::ps_input::LINEAR_CENTER)),
+                Interp::Flat => None,
+            };
+            for (c, p) in raw[i].clone().into_iter().enumerate() {
+                let d = O::R(r, c as u8);
+                match bary {
+                    Some(b) => {
+                        let t = O::R(self.vreg(Class::V, 1), 0);
+                        self.mi.push(MI::Interp { name: "V_INTERP_P10_F32", vdst: t, src: [p, O::PV(b), p] });
+                        self.mi.push(MI::Interp { name: "V_INTERP_P2_F32", vdst: d, src: [p, O::PV(b + 1), t] });
+                    }
+                    // Lane 0 of each quad holds P0: the provoking vertex.
+                    None => self.mi.push(MI::MovDpp { vdst: d, src: p, ctrl: 0 }),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Vertex varyings to the attribute ring (GFX11+ has no parameter
+    /// exports): one 16-byte store per parameter at index = the vertex's
+    /// thread id in the group, offset by the wave's ring offset (`s5`).
+    fn attr_ring_stores(&mut self, lane: O) {
+        let f = self.f;
+        let mut params: Vec<(u32, usize)> = f.outputs.iter().enumerate().filter_map(|(i, o)| match o.kind {
+            OutputKind::Location(l) => Some((l, i)),
+            _ => None,
+        }).collect();
+        if params.is_empty() {
+            return;
+        }
+        params.sort();
+        let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        let (w, so) = (s(self), s(self));
+        self.salu("S_BFE_U32", w, vec![O::PS(3), O::Imm(0x40018)]);
+        self.salu("S_BFE_U32", so, vec![O::PS(5), O::Imm(0xf0000)]);
+        self.salu("S_LSHL_B32", so, vec![so, O::Imm(9)]);
+        let vi = O::R(self.vreg(Class::V, 1), 0);
+        self.valu("V_MAD_U32_U24", vi, vec![w, O::Imm(32), lane], 0);
+        for (k, (_, i)) in params.into_iter().enumerate() {
+            let data = O::R(self.exp_regs[i], 0);
+            self.mi.push(MI::BufStore { data, vindex: vi, rsrc: self.abi.user_base(), soff: so, ioff: 16 * k as u32 });
+        }
+    }
+
     /// A vertex (NGG) or fragment shader: the stage prologue, the body,
     /// then the exports of every invocation that ran.
     fn run_graphics(&mut self) -> Result<(), Error> {
         let f = self.f;
         for o in &f.outputs {
-            let r = self.vreg(Class::V, o.ty.comps() as u8);
+            // Attribute-ring stores write whole vec4s.
+            let n = if f.stage == Stage::Vertex && matches!(o.kind, OutputKind::Location(_)) { 4 } else { o.ty.comps() as u8 };
+            let r = self.vreg(Class::V, n);
             self.exp_regs.push(r);
         }
         let l_end = self.label();
+        if f.stage == Stage::Fragment && !f.inputs.is_empty() {
+            self.ps_inputs()?;
+        }
+        let mut lane_keep = None;
         if f.stage == Stage::Vertex {
             // NGG waves start with only some lanes in EXEC; ACO sets it all
             // for every NEXT_GEN_GEOMETRY shader. merged_wave_info (s3) then
             // says which lanes have a primitive ([15:8]) or a vertex ([7:0]).
             self.salu("S_MOV_B32", O::Exec, vec![O::Imm(u32::MAX)]);
             let lane = self.lane_id();
+            lane_keep = Some(lane);
             let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
             // Wave 0 of the group asks for export space: m0 = prims << 12 |
             // verts, from gs_tg_info (s2). S_BFE sets SCC when non-zero.
@@ -1704,7 +1797,7 @@ impl<'a> Isel<'a> {
             let o = f.outputs[i];
             let tgt = match (f.stage, o.kind) {
                 (Stage::Vertex, OutputKind::Position) => TGT_POS0,
-                (Stage::Vertex, OutputKind::Location(_)) => return unsup("vertex varyings (attribute ring) come with stage 7c-2"),
+                (Stage::Vertex, OutputKind::Location(_)) => continue,
                 (Stage::Fragment, OutputKind::Location(n)) if n < 8 => n as u8,
                 (Stage::Fragment, OutputKind::FragDepth) => TGT_MRTZ,
                 (st, k) => return unsup(format!("{k:?} output in a {st:?} shader")),
@@ -1727,6 +1820,9 @@ impl<'a> Isel<'a> {
             let mask = src.iter().enumerate().filter(|(_, x)| x.is_some()).fold(0u8, |m, (c, _)| m | 1 << c);
             self.exports.push((tgt, mask));
             self.mi.push(MI::Export { tgt, src, done: k + 1 == n });
+        }
+        if let (Stage::Vertex, Some(lane)) = (f.stage, lane_keep) {
+            self.attr_ring_stores(lane);
         }
         self.mi.push(MI::Label(l_end));
         self.mi.push(MI::Endpgm);
