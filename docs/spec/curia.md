@@ -218,5 +218,20 @@ one goes away, hangs, or comes back (Shankar, 2026-11-15).
   so, and after its restart comes back with 130% kept. `forum-ctl` pointed at the settings
   socket gets `appearance`, `outputs` and `modes` answered and `surfaces`, `zoom` and
   `take-back` refused. That VM's frescod is headless and lists no monitor ("No monitor is
-  connected"), so the monitor rows are checked only by the host tests so far; a run on
-  a machine with monitors (the Mac VM) is still to do.
+  connected").
+- Mac VM, 2026-11-15, four monitors (three 1080p, one 1440p; frescod on gpusim): every
+  monitor listed with name, diagonal, size and scale; UI size 125% and back; Change… to
+  1280×720 went back by itself after 15 s, and stayed with Keep; Left of; Mirror Display 1
+  and Stop mirroring; Light/Dark and text size reach Curia, the bar and the dock;
+  `surfaces` refused on the settings socket. Two bugs found and fixed there: a mode switch
+  dropped frescod's glyph atlases, so all text vanished (`3a32edc`: a rebuilt renderer keeps
+  its textures), and a 120 Hz mode of the native size hid the native 60 Hz one (`dd9f278`).
+- Fixed after that run: the page scrolls below its title (a `ScrollView`; at 720p or a
+  large text or UI size the last monitors' rows ran off the window). Place on a monitor in
+  the middle of a row (three or more in a line) used to move only that one, which frescod
+  refuses without an answer ("touches no other"), so nothing happened and no error showed;
+  forum-wm now puts the row (or column) in its new order and packs it again, and a move
+  elsewhere that would strand a monitor is refused with a reason the page shows.
+- Open: mirroring re-lays the other monitors from the remembered arrangement (a Left of
+  done just before is lost), and the bar and dock follow the monitor at the desktop's
+  origin, not Display 1. Both are forum-wm/frescod behaviour, not the page's.

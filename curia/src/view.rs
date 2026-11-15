@@ -7,7 +7,7 @@ use pergola::layout::FlexStyle;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{phosphor as ph, CredentialField, Glyph, ScrollState, VirtualList};
+use pergola::widgets::{phosphor as ph, CredentialField, Glyph, ScrollState, ScrollView, VirtualList};
 use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use atrium_netconf::{Link, Online};
@@ -39,6 +39,7 @@ pub struct CuriaView {
     pub devs: Mutable<DevPage>,
     pub dev_scroll: Mutable<ScrollState>,
     pub disp: Mutable<DispPage>,
+    pub disp_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -439,31 +440,6 @@ impl CuriaView {
             }
             Some(Ok(s)) => s.clone(),
         };
-        let lx = x0 + em(140.0);
-        let label = |ctx: &mut Ctx, y: f32, l: &str| {
-            text(ctx, x0, y + em(15.0), l, type_size::SM, Weight::Medium, ctx.theme.text_secondary());
-        };
-        // A row of choices; the chosen one is drawn as the primary button.
-        fn choices(ctx: &mut Ctx, x: f32, y: f32, items: Vec<(String, bool, Box<dyn Fn()>)>) {
-            let mut x = x;
-            for (l, on, f) in items {
-                x += button(ctx, x, y, &l, if on { Look::Primary } else { Look::Secondary }, true, f) + em(6.0);
-            }
-        }
-
-        label(ctx, y, "Appearance");
-        choices(ctx, lx, y, [(false, "Light"), (true, "Dark")].into_iter().map(|(dark, l)| {
-            let pg = self.disp.clone();
-            (l.to_string(), s.dark == dark, Box::new(move || with_disp(&pg, |p| p.set_dark(dark))) as Box<dyn Fn()>)
-        }).collect());
-        y += em(42.0);
-        label(ctx, y, "Text size");
-        choices(ctx, lx, y, fresco_protocol::TEXT_SIZES.iter().map(|&m| {
-            let pg = self.disp.clone();
-            (format!("{}%", m / 10), s.text_size == m, Box::new(move || with_disp(&pg, |p| p.set_text_size(m))) as Box<dyn Fn()>)
-        }).collect());
-        y += em(52.0);
-
         // The resolution waiting to be kept.
         if let Some(left) = d.trial_left(std::time::Instant::now()) {
             let ch = em(48.0);
@@ -477,96 +453,141 @@ impl CuriaView {
             y += ch + em(16.0);
         }
 
-        if s.outputs.is_empty() {
-            rect(ctx, x0, y, pw, 1.0, t.border_default(), 0.0);
-            text(ctx, x0, y + em(24.0), "No monitor is connected (this session draws off-screen)", type_size::SM, Weight::Regular, t.text_tertiary());
-        }
-        let first = s.outputs.first().map(|o| o.output);
-        for (i, o) in s.outputs.iter().enumerate() {
-            rect(ctx, x0, y, pw, 1.0, t.border_default(), 0.0);
-            y += em(12.0);
-            icon(ctx, x0, y + em(4.0), ph::MONITOR, em(18.0), t.text_secondary());
-            text(ctx, x0 + em(28.0), y + em(13.0), &disp::output_name(i, o), type_size::MD, Weight::Semibold, t.text_primary());
-            let right = if !o.present {
-                "Not connected".to_string()
-            } else if let Some(m) = d.mirrors(o) {
-                format!("Shows Display {}", s.outputs.iter().position(|x| x.output == m).map_or(0, |k| k + 1))
-            } else {
-                format!("{} × {} · scale {:.2}", o.rect.w, o.rect.h, o.scale_milli as f32 / 1000.0)
+        // The rest scrolls: at a large text or UI size, or on a small mode,
+        // the monitors' rows run past the window.
+        let foot = if d.notice.is_some() { em(52.0) } else { em(8.0) };
+        let top = y;
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+            ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+            let x0 = 0.0;
+            let mut y = em(4.0);
+            let lx = x0 + em(140.0);
+            let label = |ctx: &mut Ctx, y: f32, l: &str| {
+                text(ctx, x0, y + em(15.0), l, type_size::SM, Weight::Medium, ctx.theme.text_secondary());
             };
-            let rw = width(&right, type_size::SM, Weight::Regular);
-            text(ctx, x0 + pw - rw, y + em(13.0), &right, type_size::SM, Weight::Regular, t.text_secondary());
-            y += em(36.0);
-
-            label(ctx, y, "UI size");
-            let out = o.output;
-            let def = disp::default_ui_size(o);
-            choices(ctx, lx, y, fresco_protocol::UI_SIZES.iter().map(|&m| {
-                let pg = self.disp.clone();
-                let mut l = disp::ui_size_label(m);
-                if m == def && m != 1000 {
-                    l.push_str(" (default)");
+            // A row of choices; the chosen one is drawn as the primary button.
+            fn choices(ctx: &mut Ctx, x: f32, y: f32, items: Vec<(String, bool, Box<dyn Fn()>)>) {
+                let mut x = x;
+                for (l, on, f) in items {
+                    x += button(ctx, x, y, &l, if on { Look::Primary } else { Look::Secondary }, true, f) + em(6.0);
                 }
-                (l, o.ui_size_milli == m, Box::new(move || with_disp(&pg, |p| p.set_ui_size(out, m))) as Box<dyn Fn()>)
+            }
+
+            label(ctx, y, "Appearance");
+            choices(ctx, lx, y, [(false, "Light"), (true, "Dark")].into_iter().map(|(dark, l)| {
+                let pg = self.disp.clone();
+                (l.to_string(), s.dark == dark, Box::new(move || with_disp(&pg, |p| p.set_dark(dark))) as Box<dyn Fn()>)
             }).collect());
             y += em(42.0);
-
-            // The resolution: forum-wm switches the main monitor's mode only.
-            if i == 0 {
-                label(ctx, y, "Resolution");
-                let cur = d.current_mode().map(|m| disp::mode_label(&m)).unwrap_or_else(|| "unknown".into());
-                text(ctx, lx, y + em(15.0), &cur, type_size::SM, Weight::Regular, t.text_primary());
-                let cx = lx + width(&cur, type_size::SM, Weight::Regular) + em(16.0);
+            label(ctx, y, "Text size");
+            choices(ctx, lx, y, fresco_protocol::TEXT_SIZES.iter().map(|&m| {
                 let pg = self.disp.clone();
-                button(ctx, cx, y, if d.picking_mode { "Close" } else { "Change…" }, Look::Ghost, d.trial.is_none(), move || with_disp(&pg, DispPage::toggle_modes));
-                y += em(38.0);
-                if d.picking_mode {
-                    for m in d.mode_choices().into_iter().take(12) {
-                        let pg = self.disp.clone();
-                        let on = d.current_mode().is_some_and(|c| (c.width, c.height, c.refresh_mhz) == (m.width, m.height, m.refresh_mhz));
-                        let mut l = disp::mode_label(&m);
-                        if m.preferred {
-                            l.push_str(" (native)");
-                        }
-                        area(ctx, Rect::new(lx, y, em(320.0), em(30.0)), 6.0, if on { t.state_hover() } else { Color::TRANSPARENT }, t.state_hover(), move || {
-                            with_disp(&pg, |p| p.pick_mode(m, std::time::Instant::now()))
-                        });
-                        text(ctx, lx + em(12.0), y + em(15.0), &l, type_size::SM, if on { Weight::Semibold } else { Weight::Regular }, t.text_primary());
-                        ctx.pop();
-                        y += em(30.0);
-                    }
-                    y += em(8.0);
-                }
+                (format!("{}%", m / 10), s.text_size == m, Box::new(move || with_disp(&pg, |p| p.set_text_size(m))) as Box<dyn Fn()>)
+            }).collect());
+            y += em(52.0);
+
+            if s.outputs.is_empty() {
+                rect(ctx, x0, y, pw, 1.0, t.border_default(), 0.0);
+                text(ctx, x0, y + em(24.0), "No monitor is connected (this session draws off-screen)", type_size::SM, Weight::Regular, t.text_tertiary());
             }
-
-            // Where it sits, and mirroring, next to the first monitor.
-            if let (Some(f), true) = (first, i > 0) {
-                let main = &s.outputs[0];
-                let mirroring = d.mirrors(o).is_some();
-                label(ctx, y, "Place");
-                let now = DispPage::placed(o, main);
-                let mut items: Vec<(String, bool, Box<dyn Fn()>)> = Vec::new();
-                if !mirroring {
-                    for pl in Place::ALL {
-                        let pg = self.disp.clone();
-                        items.push((pl.label().to_string(), now == Some(pl), Box::new(move || with_disp(&pg, |p| p.place(out, pl, f)))));
-                    }
-                }
-                let pg = self.disp.clone();
-                if mirroring {
-                    items.push(("Stop mirroring".to_string(), false, Box::new(move || with_disp(&pg, |p| p.mirror(out, None)))));
+            let first = s.outputs.first().map(|o| o.output);
+            for (i, o) in s.outputs.iter().enumerate() {
+                rect(ctx, x0, y, pw, 1.0, t.border_default(), 0.0);
+                y += em(12.0);
+                icon(ctx, x0, y + em(4.0), ph::MONITOR, em(18.0), t.text_secondary());
+                text(ctx, x0 + em(28.0), y + em(13.0), &disp::output_name(i, o), type_size::MD, Weight::Semibold, t.text_primary());
+                let right = if !o.present {
+                    "Not connected".to_string()
+                } else if let Some(m) = d.mirrors(o) {
+                    format!("Shows Display {}", s.outputs.iter().position(|x| x.output == m).map_or(0, |k| k + 1))
                 } else {
-                    items.push(("Mirror Display 1".to_string(), false, Box::new(move || with_disp(&pg, |p| p.mirror(out, Some(f))))));
-                }
-                choices(ctx, lx, y, items);
-                if !mirroring {
-                    text(ctx, lx, y + em(44.0), "of Display 1", type_size::XS, Weight::Regular, t.text_tertiary());
-                    y += em(16.0);
-                }
+                    format!("{} × {} · scale {:.2}", o.rect.w, o.rect.h, o.scale_milli as f32 / 1000.0)
+                };
+                let rw = width(&right, type_size::SM, Weight::Regular);
+                text(ctx, x0 + pw - rw, y + em(13.0), &right, type_size::SM, Weight::Regular, t.text_secondary());
+                y += em(36.0);
+
+                label(ctx, y, "UI size");
+                let out = o.output;
+                let def = disp::default_ui_size(o);
+                choices(ctx, lx, y, fresco_protocol::UI_SIZES.iter().map(|&m| {
+                    let pg = self.disp.clone();
+                    let mut l = disp::ui_size_label(m);
+                    if m == def && m != 1000 {
+                        l.push_str(" (default)");
+                    }
+                    (l, o.ui_size_milli == m, Box::new(move || with_disp(&pg, |p| p.set_ui_size(out, m))) as Box<dyn Fn()>)
+                }).collect());
                 y += em(42.0);
+
+                // The resolution: forum-wm switches the main monitor's mode only.
+                if i == 0 {
+                    label(ctx, y, "Resolution");
+                    let cur = d.current_mode().map(|m| disp::mode_label(&m)).unwrap_or_else(|| "unknown".into());
+                    text(ctx, lx, y + em(15.0), &cur, type_size::SM, Weight::Regular, t.text_primary());
+                    let cx = lx + width(&cur, type_size::SM, Weight::Regular) + em(16.0);
+                    let pg = self.disp.clone();
+                    button(ctx, cx, y, if d.picking_mode { "Close" } else { "Change…" }, Look::Ghost, d.trial.is_none(), move || with_disp(&pg, DispPage::toggle_modes));
+                    y += em(38.0);
+                    if d.picking_mode {
+                        for m in d.mode_choices().into_iter().take(12) {
+                            let pg = self.disp.clone();
+                            let on = d.current_mode().is_some_and(|c| (c.width, c.height, c.refresh_mhz) == (m.width, m.height, m.refresh_mhz));
+                            let mut l = disp::mode_label(&m);
+                            if m.preferred {
+                                l.push_str(" (native)");
+                            }
+                            area(ctx, Rect::new(lx, y, em(320.0), em(30.0)), 6.0, if on { t.state_hover() } else { Color::TRANSPARENT }, t.state_hover(), move || {
+                                with_disp(&pg, |p| p.pick_mode(m, std::time::Instant::now()))
+                            });
+                            text(ctx, lx + em(12.0), y + em(15.0), &l, type_size::SM, if on { Weight::Semibold } else { Weight::Regular }, t.text_primary());
+                            ctx.pop();
+                            y += em(30.0);
+                        }
+                        y += em(8.0);
+                    }
+                }
+
+                // Where it sits, and mirroring, next to the first monitor.
+                if let (Some(f), true) = (first, i > 0) {
+                    let main = &s.outputs[0];
+                    let mirroring = d.mirrors(o).is_some();
+                    label(ctx, y, "Place");
+                    let now = DispPage::placed(o, main);
+                    let mut items: Vec<(String, bool, Box<dyn Fn()>)> = Vec::new();
+                    if !mirroring {
+                        for pl in Place::ALL {
+                            let pg = self.disp.clone();
+                            items.push((pl.label().to_string(), now == Some(pl), Box::new(move || with_disp(&pg, |p| p.place(out, pl, f)))));
+                        }
+                    }
+                    let pg = self.disp.clone();
+                    if mirroring {
+                        items.push(("Stop mirroring".to_string(), false, Box::new(move || with_disp(&pg, |p| p.mirror(out, None)))));
+                    } else {
+                        items.push(("Mirror Display 1".to_string(), false, Box::new(move || with_disp(&pg, |p| p.mirror(out, Some(f))))));
+                    }
+                    choices(ctx, lx, y, items);
+                    if !mirroring {
+                        text(ctx, lx, y + em(44.0), "of Display 1", type_size::XS, Weight::Regular, t.text_tertiary());
+                        y += em(16.0);
+                    }
+                    y += em(42.0);
+                }
+                y += em(8.0);
             }
-            y += em(8.0);
-        }
+
+
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = y;
+            }
+            ctx.pop();
+        });
+        ScrollView::new(self.disp_scroll.clone(), Rect::new(x0, top, pw, (h - top - foot).max(em(60.0))), content)
+            .key(92)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
 
         if let Some(n) = &d.notice {
             let ny = h - em(44.0);
@@ -599,7 +620,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -621,7 +642,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -629,6 +650,8 @@ mod tests {
         with_disp(&v.disp, |p| p.apply(Got::State(Ok(Snapshot { dark: true, text_size: 1300, outputs: vec![o(0, 0), o(1, 1920)], modes: vec![WmDisplayMode { width: 1920, height: 1080, refresh_mhz: 60000, preferred: true }], current: 0 }))));
         with_disp(&v.disp, DispPage::toggle_modes);
         let all = texts(&v);
+        let (tree, _) = pergola::view::render(&v, Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Scroll { .. })), "the settings scroll");
         for want in ["Display", "Appearance", "Light", "Dark", "Text size", "130%", "Display 1", "Display 2", "UI size", "Smaller", "Default", "150%", "Resolution", "1920 × 1080 · 60 Hz", "1920 × 1080 · 60 Hz (native)", "Place", "Right of", "Mirror Display 1"] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
         }
@@ -638,7 +661,7 @@ mod tests {
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

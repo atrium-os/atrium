@@ -1207,12 +1207,53 @@ pub mod daemon {
             if which == of {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "an output can't sit beside itself"));
             }
+            // The monitors with a place of their own (mirrors show another's).
+            let placed: Vec<WmOutput> = self.outputs.iter().filter(|o| o.mirror_of == 0).copied().collect();
+            // Monitors in one row (or one column): moving one in the middle
+            // would leave its neighbours touching nothing, which frescod
+            // refuses. So the row is put in its new order and packed again.
+            let horizontal = matches!(side, Side::LeftOf | Side::RightOf);
+            let in_line = placed.len() > 2
+                && placed.iter().all(|o| if horizontal { o.rect.y == b.rect.y } else { o.rect.x == b.rect.x });
+            if in_line {
+                let mut line: Vec<WmOutput> = placed.iter().filter(|o| o.output != which).copied().collect();
+                line.sort_by_key(|o| if horizontal { o.rect.x } else { o.rect.y });
+                let at = line.iter().position(|o| o.output == of).unwrap_or(0);
+                let at = if matches!(side, Side::RightOf | Side::Below) { at + 1 } else { at };
+                line.insert(at, a);
+                let mut edge = placed.iter().map(|o| if horizontal { o.rect.x } else { o.rect.y }).min().unwrap_or(0);
+                let mut v = Vec::new();
+                for o in &line {
+                    if horizontal {
+                        v.push(WmOutputPlacement { identity: o.identity, x: edge, y: o.rect.y });
+                        edge += o.rect.w;
+                    } else {
+                        v.push(WmOutputPlacement { identity: o.identity, x: o.rect.x, y: edge });
+                        edge += o.rect.h;
+                    }
+                }
+                return conn.arrange_outputs(v);
+            }
             let (x, y) = match side {
                 Side::RightOf => (b.rect.x + b.rect.w, b.rect.y),
                 Side::LeftOf => (b.rect.x - a.rect.w, b.rect.y),
                 Side::Above => (b.rect.x, b.rect.y - a.rect.h),
                 Side::Below => (b.rect.x, b.rect.y + b.rect.h),
             };
+            // frescod refuses (without an answer) an arrangement where a
+            // monitor touches no other; say so here instead.
+            let after: Vec<WmRect> = placed
+                .iter()
+                .map(|o| if o.output == which { WmRect { x, y, ..o.rect } } else { o.rect })
+                .collect();
+            let touch = |p: &WmRect, q: &WmRect| {
+                let ov_y = p.y < q.y + q.h && q.y < p.y + p.h;
+                let ov_x = p.x < q.x + q.w && q.x < p.x + p.w;
+                ((p.x + p.w == q.x || q.x + q.w == p.x) && ov_y) || ((p.y + p.h == q.y || q.y + q.h == p.y) && ov_x)
+            };
+            if after.len() > 1 && after.iter().enumerate().any(|(i, p)| !after.iter().enumerate().any(|(j, q)| i != j && touch(p, q))) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "that would leave a monitor touching no other; move the outer ones first"));
+            }
             conn.arrange_outputs(vec![WmOutputPlacement { identity: a.identity, x, y }])
         }
 
@@ -3008,6 +3049,26 @@ mod tests {
         assert_eq!(conn.arranged, Some(vec![fresco_protocol::WmOutputPlacement { identity: 20, x: 0, y: 1080 }]));
         assert!(wm.place_output(&mut conn, 1, Side::Below, 1).is_err());
         assert!(wm.place_output(&mut conn, 5, Side::Below, 0).is_err());
+    }
+
+    /// Three in a row: the middle one moved to the left end makes the row
+    /// again rather than leaving the right one touching nothing; elsewhere,
+    /// a move that would strand a monitor is refused with a reason.
+    #[test]
+    fn placing_a_middle_monitor_reorders_the_row() {
+        let (mut wm, mut conn) = two_monitors();
+        let mut third = wm.outputs[1];
+        third.output = 2;
+        third.identity = 30;
+        third.rect.x = wm.outputs[1].rect.x + wm.outputs[1].rect.w;
+        wm.outputs.push(third);
+        let (w0, w1) = (wm.outputs[0].rect.w, wm.outputs[1].rect.w);
+        wm.place_output(&mut conn, 1, Side::LeftOf, 0).unwrap();
+        let ids: Vec<(u64, i32)> = conn.arranged.clone().unwrap().iter().map(|p| (p.identity, p.x)).collect();
+        assert_eq!(ids, vec![(20, 0), (wm.outputs[0].identity, w1), (30, w1 + w0)]);
+        // Not a row any more: the middle one below the first would strand the third.
+        wm.outputs[2].rect.y = 50;
+        assert!(wm.place_output(&mut conn, 1, Side::Below, 0).is_err());
     }
 
     #[test]

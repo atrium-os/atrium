@@ -225,7 +225,7 @@ fn main() {
     let which = Mutable::with_dirty(curia::view::Which::default(), dirty.clone());
     let dev_scroll = Mutable::with_dirty(Default::default(), dirty.clone());
     let disp = Mutable::with_dirty(curia::display::DispPage::new(), dirty.clone());
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), cred: cred.clone(), size: size.clone() };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
