@@ -62,6 +62,7 @@ scratch/pjdfstest_*
 # milestone frame worth keeping goes in with `git add -f`.
 scratch/*.png
 scratch/*.ppm
+scratch/*/*.png
 
 # Salvage copies of VM disk images. `vm/*.img` / `vm/*.qcow2` are already
 # ignored above, but the suffixed rescue copies a debug session leaves
