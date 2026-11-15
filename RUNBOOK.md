@@ -5805,10 +5805,15 @@ frescod's activation and chrome sockets and limend's are in `/atrium/sockets/fre
 `fresco-chrome/` and `limen/`. navtest launches the Navigator (`portcullis launch --no-prompt`),
 so navigatord runs in its jail as the Navigator's per-app uid (50000+, in the launch registry as
 navtest's `org.atrium.navigator`, which limend reads), starts converter and fetcher jails itself
-(`jail:<app id>`), and opens the UI's frescod and limend connections; the UI runs as navtest,
-unjailed, on `/atrium/sockets/navigator/navigator.sock`. Extra checks: navigatord's jail, its uid
+(`jail:<app id>`), opens the UI's frescod and limend connections, and starts the UI itself
+(`org.atrium.navigator.ui`, `scripts/navigator-ui-bundle.sh`) as `_navui` (65037) in a jail with
+no sockets, its settings (`NAVIGATOR_UI_TRACE`, `_LIVE`, `_OPEN`) from navigatord's config; the
+UI's lines are in navigatord.log, and its trails are kept in the Navigator's jail
+(`/var/db/navigatord/trails.json`). Extra checks: navigatord's jail, its uid
 (not navtest's), the registry line, the jail's socket mounts (exactly the broker's eight
-directories) and its empty network stack; 36/36 on 2026-11-15.
+directories) and its empty network stack; the UI's jail, uid 65037 and no socket mounts, its
+trails from and kept by navigatord (a second launch gets them back), and the Navigator ending
+with its UI; 43/43 on 2026-11-15.
 
 Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
 mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` only; its network

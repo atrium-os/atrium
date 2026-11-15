@@ -171,7 +171,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/limen/target/$R/limend" "$ROOT/navigator-prerender/target/$R/prerender" \
          "$ROOT/navigator-fetch/target/$R/navigator-fetchd" "$ROOT/navigatord/target/$R/navigatord" \
          "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" \
-         "$ROOT/scripts/navigator-broker-bundle.sh" "$FIX/ca.pem"; do
+         "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem"; do
     h=$(sha256sum "$b" | cut -d' ' -f1)
     [ "$h" = "$(g "sha256 -q $D/$(basename "$b") 2>/dev/null || true")" ] && continue
     put "$b" "$D/"
@@ -214,11 +214,15 @@ g "set -e
         NAVIGATORD_ACTIVATION=/atrium/sockets/fresco-activation/fresco-activation.sock \
         NAVIGATORD_LIMEN=/atrium/sockets/limen/limend.sock PORTCULLIS_SOCKET=$PSOCK \
         NAVIGATORD_CONVERTER=jail:$CONV_ID NAVIGATORD_FETCHD=jail:$FETCH_ID \
-        NAVIGATORD_STORE=/var/db/navigatord/store NAVIGATORD_DOWNLOADS=/var/db/navigatord/downloads > /root/navigatord.conf
+        NAVIGATORD_STORE=/var/db/navigatord/store NAVIGATORD_DOWNLOADS=/var/db/navigatord/downloads \
+        NAVIGATORD_UI=jail:org.atrium.navigator.ui NAVIGATORD_TRAILS=/var/db/navigatord/trails.json \
+        NAVIGATOR_UI_TRACE=1 NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium > /root/navigatord.conf
+    chmod +x $D/navigator-ui
+    sh $D/navigator-ui-bundle.sh $D/navigator-ui /root/e2e-key.pem /usr/local/bin/opifex
     chmod +x $D/navigatord
     sh $D/navigator-broker-bundle.sh $D/navigatord /root/navigatord.conf /root/e2e-key.pem /usr/local/bin/opifex" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
-for a in org.atrium.navigator:navigatord $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
+for a in org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
     g "test -x /var/lib/atrium/apps/${a%%:*}/bin/${a#*:}" && ok "${a%%:*} installed" || bad "${a%%:*} not installed"
 done
 g "grep -q 'workers.\"$PAGE_ID\"' /etc/atrium/policy.toml" && ok "worker rule: _limen starts the page as _navpage" || bad "no worker rule for $PAGE_ID"
@@ -277,21 +281,30 @@ VN=$(g "jls -j $NJID vnet 2>&1" | tr -d '\r')
 case "$VN" in new|1) ok "no network: a network stack of its own with nothing in it (vnet $VN)" ;; *) bad "the Navigator's jail is on the host's network stack (vnet '$VN')" ;; esac
 g "grep -q UNCONFINED $S/navigatord.log" && bad "navigatord says it is unconfined" || ok "navigatord runs confined (no testing switch, no fixtures)"
 mkdir -p "$OUT"
+# The UI is navigatord's worker: what it says goes to navigatord's log.
+UL=$S/navigatord.log
 
 shot() { g "cp $S/screen.png $S/shot.png"; get $S/shot.png "$OUT/$1.png" && echo "  frame: $OUT/$1.png"; }
 inj() { g "printf '$1\\n' | nc -N -U $S/inject.sock"; }
 press() { inj "MOVE $1 $2"; sleep 1; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"; sleep "$GAP"; }
-last() { g "grep 'trace' $S/ui.log | tail -1"; }
+last() { g "grep 'trace' $UL | tail -1"; }
 until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 0; sleep 3; i=$((i+3)); done; return 1; }
 # The page jails and who runs in them.
 jails() { g "jls name | grep -c 'limen-' || true" | tr -d '\r'; }
 
 echo "=== drive"
-g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$NS NAVIGATOR_UI_TRACE=1 \
-    NAVIGATOR_TRAILS=$S/trails.json NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium daemon -f -o $S/ui.log -u navtest $D/navigator-ui --light </dev/null"
+# navigatord started the UI as its worker (navigator-ui.md §2.3a J3), with
+# its NAVIGATOR_UI_* settings from the bundle's config.
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first page opened over the network" || bad "first page: $(last)"
+UI=$(g "ps -o jid= -o uid= -p \$(pgrep -x navigator-ui | head -1)" | tr -d '\r' | awk '{print $1, $2}')
+UJID=${UI%% *}; UUID=${UI#* }
+[ -n "$UJID" ] && [ "$UJID" != 0 ] && [ "$UJID" != "$NJID" ] && ok "the UI runs in a jail of its own (jid $UJID)" || bad "the UI's jail: '$UI' (navigatord's $NJID)"
+[ "$UUID" = 65037 ] && ok "as _navui (65037), not the Navigator's uid" || bad "the UI's uid: '$UUID'"
+UM=$(g "mount -p | awk '{print \$2}' | grep -E \"/jails/[^/]*navigator[.-]ui[^/]*/\" | grep -c /atrium/sockets || true" | tr -d '\r')
+[ "${UM:-1}" = 0 ] && ok "and with no sockets: navigatord passes it what it reaches" || bad "the UI's jail mounts $UM socket directories"
+g "grep -q 'kept by navigatord' $UL" && ok "the UI's trails came from navigatord" || bad "trails: $(g "grep -h 'trail store' $UL | tail -2 | tr '\n' ';'")"
 sleep "$GAP"
-g "grep -q 'laid out \"Atrium (architecture)\"' $S/ui.log" && ok "the jailed child redeemed its ticket and laid the page out" \
+g "grep -q 'laid out \"Atrium (architecture)\"' $UL" && ok "the jailed child redeemed its ticket and laid the page out" \
     || bad "child: $(g "grep -h -e navigator-page -e limend $S/limend.log | tail -4 | tr '\n' ';'")"
 PS=$(g "ps -axo user,uid,jid,comm | awk '\$4==\"navigator-page\"'")
 echo "$PS" | sed 's/^/    /'
@@ -330,14 +343,14 @@ TOP=62
 press $((PX + 50)) $((TOP + PY + 64 + 20))
 until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' && ok "a link in the jailed page went through navigatord and followed" || bad "link: $(last)"
 sleep "$GAP"
-g "grep -q 'laid out \"Impluvium' $S/ui.log" && ok "the next page drew in a new jail" || bad "Impluvium: $(g "grep -h navigator-page $S/limend.log | tail -3 | tr '\n' ';'")"
+g "grep -q 'laid out \"Impluvium' $UL" && ok "the next page drew in a new jail" || bad "Impluvium: $(g "grep -h navigator-page $S/limend.log | tail -3 | tr '\n' ';'")"
 shot confined-2-impluvium
 # Back to Atrium, then its in-page link (the fourth nav line, #plan):
 # navigatord says it is in the page, the UI asks the page to scroll to it.
 press 270 $((TOP + 20))     # the toolbar's Back
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "Back went to the parent page" || bad "back: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 120))
-g "grep -q 'in-page link #plan' $S/ui.log" && ok "the in-page link stayed in the page" || bad "in-page: $(last)"
+g "grep -q 'in-page link #plan' $UL" && ok "the in-page link stayed in the page" || bad "in-page: $(last)"
 g "grep -q 'scrolled to #plan at y=' $S/limend.log" && ok "the page scrolled to #plan" || bad "no scroll: $(g "grep -h -e '#plan' -e anchor $S/limend.log | tail -2 | tr '\n' ';'")"
 shot confined-3-plan
 # Back on Atrium with a budget of one, Impluvium was parked: its jail
@@ -345,9 +358,14 @@ shot confined-3-plan
 N=$(jails)
 [ "${N:-0}" = 1 ] && ok "the parked page's jail ended: one live page, one page jail" || bad "$N page jails for one live page"
 
+sleep 3
+# From the host, through the jail's root (the jail has no test(1)).
+g "test -s \$(jls -j $NJID path)/var/db/navigatord/trails.json" && ok "navigatord keeps the trails in its jail" || bad "no trails.json in the Navigator's jail"
+
 echo "=== end"
 g "pkill -x navigator-ui"
 sleep 15
+g "pgrep -x navigatord >/dev/null" && bad "navigatord outlived its UI" || ok "the Navigator ended with its UI"
 N=$(jails)
 [ "${N:-0}" = 0 ] && ok "the page jails ended with the Navigator" || bad "$N page jails left"
 LEFT=$(g "jls name | grep -cE 'navigator[-_](converter|fetcher)' || true" | tr -d '\r')

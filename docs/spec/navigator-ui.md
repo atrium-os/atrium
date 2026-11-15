@@ -197,6 +197,16 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   portcullisd making a served socket's directory the app's own (the script opens `navigator/`
   and `navigator-page/` 1777), and Downloads in the person's folder (the jail's own for now).
 - **J3.** navigator-ui as navigatord's worker jail (`_navui`), trails kept by navigatord.
+  *Built 2026-11-15:* `NAVIGATORD_UI=jail:org.atrium.navigator.ui` makes navigatord start the UI
+  by `ExecInstance` on one end of a socket pair (its stdin), send it its `NAVIGATOR_UI_*`
+  settings first (`Event::Settings`; a jail gets no environment), and end when it does. Portcullis
+  worker rules may name their caller by app id (`caller_apps`, matched through the launch
+  registry), so `[workers."org.atrium.navigator.ui"]` runs it as `_navui` (65037) for the
+  Navigator only (`scripts/navigator-ui-bundle.sh`; jaild allows 65037). The UI has no
+  capabilities: `Hello { measure, trails }` brings a second frescod connection for measuring text
+  and the trail store, which navigatord keeps (`NAVIGATORD_TRAILS`, 0600, written whole, at most 4
+  MiB in 48 KiB parts; `SaveTrails`). Run without a channel (the live script), the UI keeps its
+  own file as before.
 - **J4.** hand-offs through `open-uri`.
 
 ### 2.4 Personas: what pages may share

@@ -41,6 +41,30 @@ pub type Ticket = [u8; 16];
 
 /// The most page records one `Clear` names.
 pub const CLEAR_MAX: usize = 512;
+/// The largest trail store navigatord keeps for the UI (navigator-ui.md
+/// §2.3a J3), sent in [`TRAILS_PART`]-byte parts.
+pub const TRAILS_MAX: usize = 4 << 20;
+/// The most of the trail store one frame carries.
+pub const TRAILS_PART: usize = 48 * 1024;
+/// The most settings navigatord passes a UI it started.
+pub const SETTINGS_MAX: usize = 32;
+
+/// `text` in parts of at most [`TRAILS_PART`] bytes, split between
+/// characters; at least one part.
+pub fn parts(text: &str) -> Vec<&str> {
+    let mut out = vec![];
+    let mut rest = text;
+    while rest.len() > TRAILS_PART {
+        let mut cut = TRAILS_PART;
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    out.push(rest);
+    out
+}
 
 /// UI → navigatord.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +74,13 @@ pub enum Request {
     /// the page's origin in frescod's strip. `limen`: send a limend
     /// connection opened for the UI (navigator-ui.md §2.3a), answered by
     /// `Limen` after `Chrome`.
-    Hello { chrome: bool, limen: bool },
+    /// `measure`: a second frescod connection, for measuring text, answered
+    /// by `Measure`; `trails`: the trail store navigatord keeps for the UI,
+    /// answered by `Trails` parts (navigator-ui.md §2.3a J3).
+    Hello { chrome: bool, limen: bool, measure: bool, trails: bool },
+    /// The UI's trail store, to keep: in [`parts`], the last with `last`;
+    /// at most [`TRAILS_MAX`] in all.
+    SaveTrails { part: String, last: bool },
     /// The UI's window on that connection (its local id), whose origin
     /// navigatord sets.
     Window { window: u32 },
@@ -158,6 +188,18 @@ pub enum Event {
     /// After `Chrome`, when `Hello` asked for it. With `fd`, a descriptor
     /// follows: a limend connection navigatord opened.
     Limen { fd: bool },
+    /// After `Limen`, when `Hello` asked. With `fd`, a descriptor follows: a
+    /// second frescod connection, for measuring text.
+    Measure { fd: bool },
+    /// After `Measure`, when `Hello` asked: the kept trail store in parts,
+    /// the last with `last`; `None` in every part when there is none.
+    Trails { part: Option<String>, last: bool },
+    /// The first frame to a UI navigatord started as its worker (its
+    /// channel is its stdin, and a jail has no environment of the
+    /// caller's): its `NAVIGATOR_UI_*` settings.
+    Settings { pairs: Vec<(String, String)> },
+    /// The answer to `SaveTrails`' last part when it could not be kept.
+    TrailsNotSaved { why: String },
     /// `saved`: the store address of this version of the page, for the
     /// UI's trail record; `from`: where it came from.
     /// `knows`: whether it was fetched with the site knowing you (false
@@ -401,5 +443,22 @@ mod tests {
         send_fd(&a, raw(&x)).unwrap();
         assert_eq!(read_frame::<Event>(&mut &b).unwrap(), Some(Event::Chrome { fd: true }));
         recv_fd(&b).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn parts_split_between_characters() {
+        assert_eq!(parts(""), vec![""]);
+        let t = "é".repeat(TRAILS_PART);
+        let p = parts(&t);
+        assert!(p.iter().all(|x| x.len() <= TRAILS_PART));
+        assert_eq!(p.concat(), t);
+        let mut buf = vec![];
+        write_frame(&mut buf, &Event::Trails { part: Some(p[0].to_string()), last: false }).unwrap();
+        write_frame(&mut buf, &Request::SaveTrails { part: p[0].to_string(), last: true }).unwrap();
     }
 }

@@ -203,6 +203,12 @@ impl WireMeasurer {
         })
     }
 
+    /// Measure on `conn`, a connection opened for us (a jailed client
+    /// reaches frescod only through what it is handed).
+    pub fn on(conn: fresco_client::Connection) -> Self {
+        Self { conn, fonts: HashMap::new(), cache: HashMap::new() }
+    }
+
     fn font_id(&mut self, family: &str) -> Option<u32> {
         if let Some(&id) = self.fonts.get(family) {
             return Some(id);

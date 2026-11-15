@@ -122,7 +122,28 @@ pub fn human(n: u64) -> String {
     }
 }
 
+/// What navigatord sent with its answer to `Hello`.
+pub struct Hello {
+    /// The window's frescod connection, opened over the chrome channel.
+    pub frescod: Option<OwnedFd>,
+    /// A limend connection navigatord opened for us.
+    pub limen: Option<OwnedFd>,
+    /// A second frescod connection, for measuring text.
+    pub measure: Option<OwnedFd>,
+    /// The trail store navigatord keeps, when asked and there is one.
+    pub trails: Option<String>,
+}
+
 impl Live {
+    /// Hand navigatord the trail store to keep, in parts.
+    pub fn save_trails(&mut self, text: &str) {
+        let ps = ctl::parts(text);
+        let n = ps.len();
+        for (i, p) in ps.into_iter().enumerate() {
+            send(&mut self.w, &Request::SaveTrails { part: p.to_string(), last: i + 1 == n });
+        }
+    }
+
     /// Connect to navigatord at `path` and say hello. With `chrome`,
     /// navigatord opens the window's frescod connection over the chrome
     /// channel and hands it back (so it can name the page's origin in
@@ -131,9 +152,15 @@ impl Live {
     /// The UI also asks for its limend connection: navigatord opens it when
     /// it is configured to (navigator-ui.md §2.3a), so limend's parent is the
     /// owner of the UI's windows; the second descriptor is that, if any.
-    pub fn connect(path: &str, chrome: bool) -> io::Result<(Live, Option<OwnedFd>, Option<OwnedFd>)> {
-        let mut s = UnixStream::connect(path)?;
-        ctl::write_frame(&mut s, &Request::Hello { chrome, limen: true })?;
+    pub fn connect(path: &str, chrome: bool) -> io::Result<(Live, Hello)> {
+        Self::on(UnixStream::connect(path)?, chrome, false)
+    }
+
+    /// Say hello on `s`, a connection to navigatord (or the channel it
+    /// started us on). With `trails`, navigatord keeps the trail store
+    /// and sends it back here (navigator-ui.md §2.3a J3).
+    pub fn on(mut s: UnixStream, chrome: bool, trails: bool) -> io::Result<(Live, Hello)> {
+        ctl::write_frame(&mut s, &Request::Hello { chrome, limen: true, measure: true, trails })?;
         let fd = match ctl::read_frame::<Event>(&mut s)? {
             Some(Event::Chrome { fd: true }) => Some(ctl::recv_fd(&s)?),
             Some(Event::Chrome { fd: false }) => None,
@@ -144,6 +171,31 @@ impl Live {
             Some(Event::Limen { fd: false }) => None,
             other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
         };
+        let measure = match ctl::read_frame::<Event>(&mut s)? {
+            Some(Event::Measure { fd: true }) => Some(ctl::recv_fd(&s)?),
+            Some(Event::Measure { fd: false }) => None,
+            other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
+        };
+        let mut kept: Option<String> = None;
+        if trails {
+            loop {
+                match ctl::read_frame::<Event>(&mut s)? {
+                    Some(Event::Trails { part, last }) => {
+                        if let Some(p) = part {
+                            let k = kept.get_or_insert_with(String::new);
+                            if k.len() + p.len() > ctl::TRAILS_MAX {
+                                return Err(io::Error::other("the kept trail store is over its bound"));
+                            }
+                            k.push_str(&p);
+                        }
+                        if last {
+                            break;
+                        }
+                    }
+                    other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
+                }
+            }
+        }
         let (tx, rx) = mpsc::channel();
         let mut r = s.try_clone()?;
         std::thread::spawn(move || loop {
@@ -184,8 +236,7 @@ impl Live {
                 fresh: HashSet::new(),
                 idle,
             },
-            fd,
-            limen,
+            Hello { frescod: fd, limen, measure, trails: kept },
         ))
     }
 
@@ -444,7 +495,8 @@ impl Live {
                     eprintln!("navigator-ui: Arca holds {} accounts for {}{}", accounts.len(), crate::trail::site(&url), why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
                     s.accounts_answer(&url, accounts, why);
                 }
-                Event::Chrome { .. } | Event::Limen { .. } => {}
+                Event::Chrome { .. } | Event::Limen { .. } | Event::Measure { .. } | Event::Trails { .. } | Event::Settings { .. } => {}
+                Event::TrailsNotSaved { why } => eprintln!("navigator-ui: trail store not kept: {why}"),
             }
         }
         // The page children.

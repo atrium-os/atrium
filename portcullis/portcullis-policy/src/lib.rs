@@ -59,7 +59,14 @@ pub struct Policy {
 /// window renderers parse hostile scene graphs; they must not be frescod.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WorkerRule {
+    /// Callers by user name (system services: `_limen`, `_frescod`).
+    #[serde(default)]
     pub callers: Vec<String>,
+    /// Callers by app id, for an app's own jail (its per-app uid, named by
+    /// the launch registry): the Navigator starts its UI as `_navui`
+    /// (navigator-ui.md §2.3a).
+    #[serde(default)]
+    pub caller_apps: Vec<String>,
     pub run_as: String,
     /// How many of these workers may run at once. They are counted on their
     /// own, not against the per-user and host one-shot limits: frescod runs
@@ -73,6 +80,15 @@ impl Policy {
     /// The delegation for `app_id` if `caller` is one of its callers.
     pub fn worker_rule(&self, app_id: &str, caller: &str) -> Option<&WorkerRule> {
         self.workers.get(app_id).filter(|r| r.callers.iter().any(|c| c == caller))
+    }
+
+    /// [`Self::worker_rule`], or the rule naming the caller's app, when the
+    /// caller is a launched app (`caller_app`, from the launch registry).
+    pub fn worker_rule_for(&self, app_id: &str, caller: &str, caller_app: Option<&str>) -> Option<&WorkerRule> {
+        self.worker_rule(app_id, caller).or_else(|| {
+            let a = caller_app?;
+            self.workers.get(app_id).filter(|r| r.caller_apps.iter().any(|c| c == a))
+        })
     }
 }
 
@@ -607,6 +623,25 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_rule_may_name_its_caller_by_app() {
+        let p: Policy = toml::from_str(r#"
+[workers."org.atrium.navigator.ui"]
+caller_apps = ["org.atrium.navigator"]
+run_as = "_navui"
+
+[workers."org.atrium.navigator.page"]
+callers = ["_limen"]
+run_as = "_navpage"
+"#).unwrap();
+        let ui = "org.atrium.navigator.ui";
+        assert_eq!(p.worker_rule_for(ui, "navtest", Some("org.atrium.navigator")).map(|r| r.run_as.as_str()), Some("_navui"));
+        assert!(p.worker_rule_for(ui, "navtest", Some("org.example.other")).is_none(), "another app of the same person");
+        assert!(p.worker_rule_for(ui, "navtest", None).is_none(), "not a launched app");
+        assert!(p.worker_rule_for(ui, "org.atrium.navigator", None).is_none(), "an app id is not a user name");
+        assert_eq!(p.worker_rule_for("org.atrium.navigator.page", "_limen", None).map(|r| r.run_as.as_str()), Some("_navpage"));
+    }
 
     fn caps_full() -> Capabilities {
         Capabilities {

@@ -333,7 +333,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             }
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
-                .and_then(|p| p.worker_rule(&app_id, &owner).cloned());
+                .and_then(|p| p.worker_rule_for(&app_id, &owner, registry.resolve(uid).map(|(_, a)| a)).cloned());
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
                                  &LIMITER, &mut writer, &reader, None)?;
             continue;

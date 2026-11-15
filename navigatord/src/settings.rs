@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 /// The keys the file may set.
 fn ours(k: &str) -> bool {
-    k.starts_with("NAVIGATORD_") || k == "FRESCOD_CHROME_SOCK" || k == "PORTCULLIS_SOCKET"
+    k.starts_with("NAVIGATORD_") || k.starts_with("NAVIGATOR_UI_") || k == "FRESCOD_CHROME_SOCK" || k == "PORTCULLIS_SOCKET"
 }
 
 /// `KEY=value` lines; later lines win.
@@ -68,6 +68,19 @@ fn loaded() -> &'static HashMap<String, String> {
 pub fn get(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.trim().is_empty())
         .or_else(|| loaded().get(k).cloned().filter(|v| !v.trim().is_empty()))
+}
+
+/// The `NAVIGATOR_UI_*` settings, for a UI navigatord starts (it gets no
+/// environment of ours in its jail): the environment's over the file's.
+pub fn ui_pairs() -> Vec<(String, String)> {
+    let mut m: std::collections::BTreeMap<String, String> = loaded().iter()
+        .filter(|(k, _)| k.starts_with("NAVIGATOR_UI_")).map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (k, v) in std::env::vars() {
+        if k.starts_with("NAVIGATOR_UI_") {
+            m.insert(k, v);
+        }
+    }
+    m.into_iter().take(navigator_control::SETTINGS_MAX).collect()
 }
 
 /// The path setting `k`, else `default`.

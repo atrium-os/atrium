@@ -84,7 +84,9 @@ impl Worker {
         }
     }
 
-    fn jailed(app: &str, instance: &str, capture_err: bool) -> io::Result<Worker> {
+    /// portcullisd's `ExecInstance` of `app` on `fds` (stdin, stdout,
+    /// stderr); the connection the worker lives by.
+    fn exec(app: &str, instance: &str, fds: &[std::os::fd::RawFd; 3]) -> io::Result<UnixStream> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         let mut s = portcullisd()?;
         s.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -108,6 +110,25 @@ impl Worker {
             Response::Error { message } => return Err(io::Error::other(format!("{app}: {message}"))),
             other => return Err(io::Error::other(format!("{app}: unexpected reply {other:?}"))),
         }
+        send_fds(&s, fds)?;
+        s.set_read_timeout(None)?;
+        Ok(s)
+    }
+
+    /// A jailed worker on connection `s`, its end over when the connection
+    /// says so.
+    fn watched(s: UnixStream, stdin: Option<Box<dyn Write + Send>>, stdout: Option<Box<dyn Read + Send>>, stderr: Option<Box<dyn Read + Send>>) -> io::Result<Worker> {
+        let (tx, exited) = mpsc::channel();
+        let mut r = s.try_clone()?;
+        std::thread::Builder::new().name("navigatord-worker".into()).spawn(move || {
+            // LaunchExit, an error or a hang-up: the worker is over either way.
+            let _ = portcullis_ipc::read_response(&mut r);
+            let _ = tx.send(());
+        })?;
+        Ok(Worker { kind: Kind::Jail { conn: s, exited, done: false }, stdin, stdout, stderr })
+    }
+
+    fn jailed(app: &str, instance: &str, capture_err: bool) -> io::Result<Worker> {
         let (in_r, in_w) = io::pipe()?;
         let (out_r, out_w) = io::pipe()?;
         let (err_r, err_w): (Option<io::PipeReader>, OwnedFd) = if capture_err {
@@ -116,23 +137,30 @@ impl Worker {
         } else {
             (None, std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?)
         };
-        send_fds(&s, &[in_r.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()])?;
+        let s = Self::exec(app, instance, &[in_r.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()])?;
         // Only the worker holds these ends now: its exit closes them.
         drop((in_r, out_w, err_w));
-        s.set_read_timeout(None)?;
-        let (tx, exited) = mpsc::channel();
-        let mut r = s.try_clone()?;
-        std::thread::Builder::new().name("navigatord-worker".into()).spawn(move || {
-            // LaunchExit, an error or a hang-up: the worker is over either way.
-            let _ = read_response(&mut r);
-            let _ = tx.send(());
-        })?;
-        Ok(Worker {
-            kind: Kind::Jail { conn: s, exited, done: false },
-            stdin: Some(Box::new(in_w)),
-            stdout: Some(Box::new(out_r)),
-            stderr: err_r.map(|r| Box::new(r) as Box<dyn Read + Send>),
-        })
+        Self::watched(s, Some(Box::new(in_w)), Some(Box::new(out_r)), err_r.map(|r| Box::new(r) as Box<dyn Read + Send>))
+    }
+
+    /// Start `spec` on `channel`, a socket that is its stdin (its stdout
+    /// and stderr are ours): a worker that talks both ways and is passed
+    /// descriptors, as the UI is (navigator-ui.md §2.3a J3).
+    pub fn start_on(spec: &Spec, instance: &str, channel: OwnedFd) -> io::Result<Worker> {
+        match spec {
+            Spec::Command(p, a) => {
+                use std::process::{Command, Stdio};
+                let ch = Command::new(p).args(a.iter().map(|x| x.replace("{instance}", instance)))
+                    .stdin(Stdio::from(channel)).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn()?;
+                Ok(Worker { kind: Kind::Proc(ch), stdin: None, stdout: None, stderr: None })
+            }
+            Spec::Jail(app) => {
+                let err = std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()?;
+                let s = Self::exec(app, instance, &[channel.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])?;
+                drop(channel);
+                Self::watched(s, None, None, None)
+            }
+        }
     }
 
     /// Whether it has ended.

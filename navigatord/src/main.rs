@@ -104,6 +104,12 @@ struct Config {
     unconfined: bool,
     deadline_s: u64,
     chrome: Option<PathBuf>,
+    /// The UI navigatord starts as its worker (`NAVIGATORD_UI`, e.g.
+    /// `jail:org.atrium.navigator.ui`; navigator-ui.md §2.3a J3): its
+    /// stdin is its control channel, and navigatord ends with it.
+    ui: Option<worker::Spec>,
+    /// Where the UI's trail store is kept (`NAVIGATORD_TRAILS`).
+    trails: Option<PathBuf>,
     /// limend's socket (`NAVIGATORD_LIMEN`): the UI's limend connection is
     /// opened here when it asks, as its frescod one is.
     limen: Option<PathBuf>,
@@ -139,6 +145,8 @@ impl Config {
             deadline_s: var("NAVIGATORD_DEADLINE").and_then(|v| v.parse().ok()).unwrap_or(30),
             chrome: var("FRESCOD_CHROME_SOCK").map(PathBuf::from),
             limen: var("NAVIGATORD_LIMEN").map(PathBuf::from),
+            ui: var("NAVIGATORD_UI").and_then(|v| worker::Spec::parse(&v)),
+            trails: var("NAVIGATORD_TRAILS").map(PathBuf::from),
             store: var("NAVIGATORD_STORE").map(PathBuf::from),
             arca: var("NAVIGATORD_ARCA").zip(var("NAVIGATORD_COURIERD")).map(|(a, c)| (PathBuf::from(a), c)),
             downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from)
@@ -891,6 +899,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             (None, _) => Ok(()),
         }
     };
+    let (mut trail_buf, mut trail_over): (Option<String>, bool) = (None, false);
     let mut r = s;
     loop {
         let req: Request = match ctl::read_frame(&mut r) {
@@ -902,7 +911,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             }
         };
         match req {
-            Request::Hello { chrome, limen } => {
+            Request::Hello { chrome, limen, measure, trails } => {
                 let opened = match (&cfg.chrome, chrome) {
                     (Some(p), true) => match open_chrome(p) {
                         Ok(o) => Some(o),
@@ -940,6 +949,57 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                             }
                         }
                         _ => send(&w, &Event::Limen { fd: false }),
+                    }
+                }
+                // A second frescod connection, for measuring text: a UI in
+                // its jail reaches frescod only through us.
+                if measure {
+                    let opened = cfg.chrome.as_ref().and_then(|p| open_chrome(p).map_err(|e| eprintln!("navigatord: measure connection: {e}")).ok());
+                    match opened {
+                        Some((_chan, _handle, fd)) => {
+                            let s = w.lock().unwrap();
+                            let ok = ctl::write_frame(&mut &*s, &Event::Measure { fd: true }).and_then(|_| ctl::send_fd(&s, fd.as_raw_fd()));
+                            if let Err(e) = ok {
+                                eprintln!("navigatord: UI: {e}");
+                                return;
+                            }
+                        }
+                        None => send(&w, &Event::Measure { fd: false }),
+                    }
+                }
+                if trails {
+                    let text = cfg.trails.as_ref().and_then(|p| read_trails(p));
+                    match &text {
+                        Some(t) => {
+                            let ps = ctl::parts(t);
+                            let n = ps.len();
+                            for (i, p) in ps.into_iter().enumerate() {
+                                send(&w, &Event::Trails { part: Some(p.to_string()), last: i + 1 == n });
+                            }
+                        }
+                        None => send(&w, &Event::Trails { part: None, last: true }),
+                    }
+                }
+            }
+            Request::SaveTrails { part, last } => {
+                // Kept whole or not at all: a store over its bound is refused
+                // rather than cut.
+                if trail_buf.as_ref().is_some_and(|b: &String| b.len() + part.len() > ctl::TRAILS_MAX) {
+                    trail_buf = None;
+                    trail_over = true;
+                } else if !trail_over {
+                    trail_buf.get_or_insert_with(String::new).push_str(&part);
+                }
+                if last {
+                    let why = match (trail_buf.take(), &cfg.trails) {
+                        _ if std::mem::take(&mut trail_over) => Some(format!("the trail store is over {} bytes", ctl::TRAILS_MAX)),
+                        (Some(t), Some(p)) => write_trails(p, &t).err().map(|e| format!("{}: {e}", p.display())),
+                        (None, Some(p)) => write_trails(p, "").err().map(|e| format!("{}: {e}", p.display())),
+                        (_, None) => Some("navigatord keeps no trail store (no NAVIGATORD_TRAILS)".into()),
+                    };
+                    if let Some(why) = why {
+                        eprintln!("navigatord: trails not saved: {why}");
+                        send(&w, &Event::TrailsNotSaved { why });
                     }
                 }
             }
@@ -1281,6 +1341,32 @@ fn serve_page(state: Arc<Mutex<State>>, mut s: UnixStream) {
     }
 }
 
+/// The kept trail store, if there is one within its bound.
+fn read_trails(p: &Path) -> Option<String> {
+    let m = std::fs::metadata(p).ok()?;
+    if m.len() as usize > ctl::TRAILS_MAX {
+        eprintln!("navigatord: {} is over its bound; not sent", p.display());
+        return None;
+    }
+    std::fs::read_to_string(p).ok().filter(|t| !t.is_empty())
+}
+
+/// Keep the UI's trail store at `p`: 0600 in a 0700 directory, written
+/// whole and then renamed into place.
+fn write_trails(p: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Some(d) = p.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(d)?;
+    }
+    let tmp = p.with_extension("tmp");
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, p)
+}
+
 fn listen(path: &str) -> UnixListener {
     let _ = std::fs::remove_file(path);
     let l = UnixListener::bind(path).unwrap_or_else(|e| {
@@ -1346,6 +1432,33 @@ fn main() {
     });
     let ui = listen(&ctl_path);
     eprintln!("navigatord: control on {ctl_path}, pages on {page_path}");
+    // The UI as our worker: its control channel is one end of a pair, and
+    // the Navigator ends when it does.
+    if let Some(spec) = cfg.ui.clone() {
+        let (ours, theirs) = UnixStream::pair().unwrap_or_else(|e| {
+            eprintln!("navigatord: UI channel: {e}");
+            std::process::exit(1)
+        });
+        let pairs = settings::ui_pairs();
+        if let Err(e) = ctl::write_frame(&mut &ours, &Event::Settings { pairs }) {
+            eprintln!("navigatord: UI settings: {e}");
+            std::process::exit(1);
+        }
+        let mut w = worker::Worker::start_on(&spec, &format!("ui{}", std::process::id()), theirs.into()).unwrap_or_else(|e| {
+            eprintln!("navigatord: the UI did not start: {e}");
+            std::process::exit(1)
+        });
+        eprintln!("navigatord: the UI started");
+        let (cfg, state, cookies) = (cfg.clone(), state.clone(), cookies.clone());
+        std::thread::spawn(move || serve_ui(cfg, state, cookies, ours));
+        std::thread::spawn(move || loop {
+            if w.try_wait().unwrap_or(true) {
+                eprintln!("navigatord: the UI ended; so does the Navigator");
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        });
+    }
     for s in ui.incoming().flatten() {
         let (cfg, state, cookies) = (cfg.clone(), state.clone(), cookies.clone());
         std::thread::spawn(move || serve_ui(cfg, state, cookies, s));

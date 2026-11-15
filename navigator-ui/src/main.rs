@@ -54,7 +54,33 @@ fn die(m: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+/// Started by navigatord as its worker (navigator-ui.md §2.3a J3), our
+/// stdin is the control channel and there is no environment of its: the
+/// channel's first frame is our `NAVIGATOR_UI_*` settings.
+fn worker_channel() -> Option<std::os::unix::net::UnixStream> {
+    if std::env::var_os("NAVIGATORD_SOCKET").is_some() {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(0, &mut st) } != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+        return None;
+    }
+    use std::os::fd::FromRawFd;
+    let mut s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(libc::dup(0)) };
+    match navigator_control::read_frame::<navigator_control::Event>(&mut s) {
+        Ok(Some(navigator_control::Event::Settings { pairs })) => {
+            for (k, v) in pairs.into_iter().filter(|(k, _)| k.starts_with("NAVIGATOR_UI_")) {
+                // Before any thread starts.
+                unsafe { std::env::set_var(k, v) };
+            }
+            Some(s)
+        }
+        other => die(format_args!("navigatord's channel began with {other:?}, not our settings")),
+    }
+}
+
 fn main() -> std::io::Result<()> {
+    let channel = worker_channel();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut scene = None;
     let mut theme = None;
@@ -92,17 +118,30 @@ fn main() -> std::io::Result<()> {
     // Live: navigatord first, since it may open the window's connection.
     let mut live = None;
     let mut limen_fd: Option<std::os::fd::OwnedFd> = None;
-    let mut window = match std::env::var("NAVIGATORD_SOCKET").ok().filter(|_| scene.is_none()) {
-        Some(path) => {
-            let (l, fd, lfd) = Live::connect(&path, true).unwrap_or_else(|e| die(format_args!("navigatord at {path}: {e}")));
+    // The trail store navigatord keeps for us, when we are its worker.
+    let mut kept_trails: Option<Option<String>> = None;
+    let hello = match (&channel, std::env::var("NAVIGATORD_SOCKET").ok()) {
+        _ if scene.is_some() => None,
+        (Some(c), _) => Some(Live::on(c.try_clone()?, true, true).unwrap_or_else(|e| die(format_args!("navigatord: {e}")))),
+        (None, Some(path)) => Some(Live::connect(&path, true).unwrap_or_else(|e| die(format_args!("navigatord at {path}: {e}")))),
+        (None, None) => None,
+    };
+    let mut window = match hello {
+        Some((l, h)) => {
             live = Some(l);
-            limen_fd = lfd;
-            match fd {
+            limen_fd = h.limen;
+            if channel.is_some() {
+                kept_trails = Some(h.trails);
+            }
+            match h.frescod {
                 Some(fd) => {
                     // Text is measured on a connection of its own, as
-                    // Window::open does.
-                    let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
-                    match pergola::text::WireMeasurer::connect(&sock) {
+                    // Window::open does: navigatord's second one, else ours.
+                    let m = match h.measure {
+                        Some(m) => fresco_client::Connection::wrap(std::os::unix::net::UnixStream::from(m)).map(pergola::text::WireMeasurer::on),
+                        None => pergola::text::WireMeasurer::connect(&std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into())),
+                    };
+                    match m {
                         Ok(m) => pergola::text::install_measurer(Box::new(m)),
                         Err(e) => eprintln!("navigator-ui: no text measurer ({e}); using estimates"),
                     }
@@ -123,7 +162,10 @@ fn main() -> std::io::Result<()> {
     let mut shell = match (scene, &live) {
         (Some(sc), _) => Shell::scene(sc, window.width, window.height),
         (None, Some(_)) => {
-            let store = restore(&trails_path);
+            let store = match &kept_trails {
+                Some(t) => restore_kept(t.as_deref()),
+                None => restore(&trails_path),
+            };
             let mut s = Shell::new(store, window.width, window.height);
             s.live = Some(navigator_ui::shell::LivePage::Loading(String::new()));
             if let Ok(u) = std::env::var("NAVIGATOR_UI_OPEN") {
@@ -175,15 +217,19 @@ fn main() -> std::io::Result<()> {
 
     // The trail store goes to disk (§4.5) in live mode: at most once a
     // second, and only when its records changed.
-    let mut saver = live.as_ref().map(|_| Saver::new(trails_path, &state.get_cloned().store));
+    let sink = match kept_trails {
+        Some(t) => Sink::Navigatord(t.unwrap_or_default()),
+        None => Sink::File(trails_path),
+    };
+    let mut saver = live.as_mut().map(|l| Saver::new(sink, &state.get_cloned().store, l));
     // The prompt row, guarded by frescod (§6.4): what it was last told.
     let mut guarded: Option<Option<[i32; 4]>> = None;
     loop {
         match window.step(&mut app, Some(TICK))? {
             StepResult::Event(raw) => event(&raw, window.id(), &state),
             StepResult::Closed => {
-                if let Some(sv) = &mut saver {
-                    sv.save(&state.get_cloned().store, true);
+                if let (Some(sv), Some(l)) = (&mut saver, &mut live) {
+                    sv.save(&state.get_cloned().store, true, l);
                 }
                 return Ok(());
             }
@@ -223,8 +269,8 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
-        if let Some(sv) = &mut saver {
-            sv.save(&state.get_cloned().store, false);
+        if let (Some(sv), Some(l)) = (&mut saver, &mut live) {
+            sv.save(&state.get_cloned().store, false, l);
         }
     }
 }
@@ -262,23 +308,63 @@ fn restore(p: &std::path::Path) -> TrailStore {
     store
 }
 
+/// The kept store navigatord sent, as [`restore`] reads one from disk.
+fn restore_kept(text: Option<&str>) -> TrailStore {
+    let mut store = match text.map(|t| disk::decode(t, &|u| navigator_ui::shell::live_spec(u).facts)) {
+        Some(Ok((s, dropped))) => {
+            for d in dropped {
+                eprintln!("navigator-ui: trail store: dropped {d}");
+            }
+            eprintln!("navigator-ui: trail store: {} trails, {} put away, kept by navigatord", s.trails.len(), s.earlier.len());
+            s
+        }
+        Some(Err(e)) => {
+            eprintln!("navigator-ui: trail store from navigatord: {e}; started afresh");
+            let mut s = TrailStore::empty();
+            s.new_trail(false);
+            s
+        }
+        None => {
+            eprintln!("navigator-ui: trail store: none yet kept by navigatord");
+            let mut s = TrailStore::empty();
+            s.new_trail(false);
+            s
+        }
+    };
+    let gone = store.expire(navigator_ui::clock::now_s());
+    if gone > 0 {
+        eprintln!("navigator-ui: trail store: {gone} put-away trails past 30 days forgotten");
+    }
+    store
+}
+
+/// Where the trail store goes: a file of ours, or navigatord, which keeps
+/// it for a UI in its jail (the text it last sent us).
+enum Sink {
+    File(std::path::PathBuf),
+    Navigatord(String),
+}
+
 struct Saver {
-    path: std::path::PathBuf,
+    sink: Sink,
     last: String,
     at: Instant,
 }
 
 impl Saver {
-    fn new(path: std::path::PathBuf, store: &TrailStore) -> Self {
-        // Unchanged from disk is not written, except that a store read
-        // with records dropped or expired is written back as it now is.
-        let last = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut sv = Saver { path, last, at: Instant::now() - Duration::from_secs(2) };
-        sv.save(store, true);
+    fn new(sink: Sink, store: &TrailStore, live: &mut Live) -> Self {
+        // Unchanged from what was kept is not written, except that a store
+        // read with records dropped or expired is written back as it now is.
+        let last = match &sink {
+            Sink::File(p) => std::fs::read_to_string(p).unwrap_or_default(),
+            Sink::Navigatord(t) => t.clone(),
+        };
+        let mut sv = Saver { sink, last, at: Instant::now() - Duration::from_secs(2) };
+        sv.save(store, true, live);
         sv
     }
 
-    fn save(&mut self, store: &TrailStore, now: bool) {
+    fn save(&mut self, store: &TrailStore, now: bool, live: &mut Live) {
         if !now && self.at.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -287,9 +373,15 @@ impl Saver {
             return;
         }
         self.at = Instant::now();
-        match disk::save(&self.path, &text) {
-            Ok(()) => self.last = text,
-            Err(e) => eprintln!("navigator-ui: trail store: {}: {e}", self.path.display()),
+        match &self.sink {
+            Sink::File(p) => match disk::save(p, &text) {
+                Ok(()) => self.last = text,
+                Err(e) => eprintln!("navigator-ui: trail store: {}: {e}", p.display()),
+            },
+            Sink::Navigatord(_) => {
+                live.save_trails(&text);
+                self.last = text;
+            }
         }
     }
 }
