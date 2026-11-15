@@ -2410,13 +2410,23 @@ gfx_queue(struct job *other)
 	if (q >= 0) {
 		r = gfxq_run(&j, q, w, gfxq_write(w, 0x7ff000000000ull,
 		    GFXQ_MARK, 1), &ms);
-		check(r == EIO, "20 gfx queue: a store to an unmapped VA fails "
-		    "the work (EIO)", "got %s after %d ms", r == 0 ? "success" :
-		    strerror(r), ms);
+		/*
+		 * A CP write (WRITE_DATA) that faults goes to the hub's
+		 * default page and the CP runs on: the job may fence before
+		 * the fault IV is handled (run 72876a35: fence 35 of 35),
+		 * so it can report success. Either way the queue is lost,
+		 * which the next check holds it to.
+		 */
+		check(r == EIO || r == 0, "20 gfx queue: a store to an "
+		    "unmapped VA by the CP finishes or fails (EIO)", "got %s "
+		    "after %d ms", r == 0 ? "success" : strerror(r), ms);
+		usleep(100000);		/* the fault IV */
 		r = queue_submit(q, j.ib_va, 5, -1, 0, NULL);
 		check(r == EIO, "20 gfx queue: the lost queue refuses new work",
 		    "%s", r == 0 ? "accepted" : strerror(r));
-		if (other != NULL && other->vm >= 0 && other->q >= 0)
+		/* On a new queue: test 16's GPU reset may have lost the
+		 * one `other` had (runs 048af0f9..72876a35: EIO). */
+		if (other != NULL && other->vm >= 0 && job_renew(other) == 0)
 			run_clean(other, "20 gfx queue: another VM's queue "
 			    "runs on");
 		close(q);
@@ -2570,11 +2580,13 @@ unbind(void)
 	/*
 	 * The work may store to the page after its PTEs went (box run 6e):
 	 * then it faults (EIO), its queue is lost, and a BO the driver could
-	 * not prove idle waits for that queue to close. So close it first.
+	 * not prove idle waits until that VM has no user queue (defer.rs:
+	 * BusyAt.uq), so a new queue made in the VM first would hold it
+	 * (run 72876a35). Close the lost queue, check, then make the new one.
 	 */
-	if (r != 0 && job_renew(&j) != 0) {
-		check(0, "19 unbind: renew", "%s", strerror(errno));
-		goto out;
+	if (r != 0) {
+		close(j.q);
+		j.q = -1;
 	}
 	for (i = 0; i < 100 && (now = iso("deferred_now")) != 0; i++)
 		usleep(20000);
@@ -2583,6 +2595,10 @@ unbind(void)
 	    "deferred once that work's queue is done", "unbind %s, the work "
 	    "%s after %d ms, deferred_now %jd", r2 == 0 ? "ok" : strerror(r2),
 	    r == 0 ? "landed" : strerror(r), ms, (intmax_t)now);
+	if (r != 0 && job_renew(&j) != 0) {
+		check(0, "19 unbind: renew", "%s", strerror(errno));
+		goto out;
+	}
 	if (j.out < 0 && ((j.out = bo_alloc(4096, 0)) < 0 ||
 	    vm_bind_at(j.vm, j.out, out_va) != 0)) {
 		check(0, "19 unbind: rebind", "%s", strerror(errno));
@@ -2666,38 +2682,41 @@ out0:
  * merged shaders have 8 system SGPRs, user SGPRs from s8); v0 the packed
  * primitive, v3 the vertex id. */
 static const uint32_t tri_vs[] = {
-	0xd71f0005u, 0x000100c1u, 0x30180a86u, 0x7e1a0200u,
-	0x7e1c0201u, 0x7e1e0202u, 0x7e200203u, 0xee068008u,
-	0x06800000u, 0x0000000cu, 0xee068008u, 0x07000000u,
-	0x0000040cu, 0xee068008u, 0x07800000u, 0x0000080cu,
-	0xee068008u, 0x08000000u, 0x00000c0cu, 0xee068008u,
-	0x00000000u, 0x0000100cu, 0xee068008u, 0x00800000u,
-	0x0000140cu, 0xee068008u, 0x01000000u, 0x0000180cu,
-	0xee068008u, 0x01800000u, 0x00001c0cu, 0xee068008u,
-	0x02000000u, 0x0000200cu, 0x7e1a0204u, 0x7e1c0205u,
-	0x7e1e0206u, 0x7e200207u, 0xee068008u, 0x06800000u,
-	0x0000240cu, 0xee068008u, 0x07000000u, 0x0000280cu,
-	0xee068008u, 0x07800000u, 0x00002c0cu, 0xee068008u,
-	0x08000000u, 0x0000300cu, 0x7e1a02ffu, 0x7b7b0000u,
-	0x381a0b0du, 0xee068008u, 0x06800000u, 0x00003c0cu,
-	0x930aff03u, 0x00040018u, 0xbf07800au, 0xbfa20007u,
-	0x930bff02u, 0x0009000cu, 0x930cff02u, 0x00090016u,
-	0x840c8c0cu, 0x8c7d0c0bu, 0xbfb60009u, 0xbe8d007eu,
-	0x930eff03u, 0x00080008u, 0x7c980a0eu, 0x8b7e6a0du,
-	0xbfa50002u, 0xf8000941u, 0x00000000u, 0x8b0fff03u,
-	0x000000ffu, 0x7c980a0fu, 0x8b7e6a0du, 0xbfa50010u,
-	0x7e0c02f1u, 0x7e0e02f1u, 0x7e1002ffu, 0x3e800000u,
-	0x7e1202ffu, 0x3f400000u, 0x7c940681u, 0xd5010006u,
-	0x01a9e106u, 0x7c940682u, 0x020c1106u, 0x020e1307u,
-	0x7e140280u, 0x7e1602f2u, 0xf80008cfu, 0x0b0a0706u,
-	0xbfb00000u,
+	0xbefe00c1u, 0xd71f0005u, 0x000100c1u, 0x30180a86u,
+	0x7e1a0200u, 0x7e1c0201u, 0x7e1e0202u, 0x7e200203u,
+	0xee068008u, 0x06800000u, 0x0000000cu, 0xee068008u,
+	0x07000000u, 0x0000040cu, 0xee068008u, 0x07800000u,
+	0x0000080cu, 0xee068008u, 0x08000000u, 0x00000c0cu,
+	0xee068008u, 0x00000000u, 0x0000100cu, 0xee068008u,
+	0x00800000u, 0x0000140cu, 0xee068008u, 0x01000000u,
+	0x0000180cu, 0xee068008u, 0x01800000u, 0x00001c0cu,
+	0xee068008u, 0x02000000u, 0x0000200cu, 0x7e1a0204u,
+	0x7e1c0205u, 0x7e1e0206u, 0x7e200207u, 0xee068008u,
+	0x06800000u, 0x0000240cu, 0xee068008u, 0x07000000u,
+	0x0000280cu, 0xee068008u, 0x07800000u, 0x00002c0cu,
+	0xee068008u, 0x08000000u, 0x0000300cu, 0x7e1a02ffu,
+	0x7b7b0000u, 0x381a0b0du, 0xee068008u, 0x06800000u,
+	0x00003c0cu, 0x930aff03u, 0x00040018u, 0xbf07800au,
+	0xbfa20007u, 0x930bff02u, 0x0009000cu, 0x930cff02u,
+	0x00090016u, 0x840c8c0cu, 0x8c7d0c0bu, 0xbfb60009u,
+	0xbe8d007eu, 0x930eff03u, 0x00080008u, 0x7c980a0eu,
+	0x8b7e6a0du, 0xbfa50002u, 0xf8000941u, 0x00000000u,
+	0x8b0fff03u, 0x000000ffu, 0x7c980a0fu, 0x8b7e6a0du,
+	0xbfa50010u, 0x7e0c02f1u, 0x7e0e02f1u, 0x7e1002ffu,
+	0x3e800000u, 0x7e1202ffu, 0x3f400000u, 0x7c940681u,
+	0xd5010006u, 0x01a9e106u, 0x7c940682u, 0x020c1106u,
+	0x020e1307u, 0x7e140280u, 0x7e1602f2u, 0xf80008cfu,
+	0x0b0a0706u, 0xbfb00000u,
 };
-/* si_tri_ps.s: export (1, 1, 0, 1) to MRT0. */
+/* si_tri_ps.s: count invocations at user SGPRs s[0:1] (the debug page +
+ * TRI_PS_COUNT), export (1, 1, 0, 1) to MRT0. */
 static const uint32_t tri_ps[] = {
-	0x7e0002f2u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
-	0xf800080fu, 0x03020100u, 0xbfb00000u,
+	0x7e080281u, 0x7e0a0280u, 0xee0d4000u, 0x02000000u,
+	0x00000005u, 0x7e0002f2u, 0x7e0202f2u, 0x7e040280u,
+	0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbfb00000u,
 };
 #define TRI_PS_OFF	0x400u		/* 256-byte aligned (PGM_LO is >> 8) */
+#define TRI_PS_COUNT	0x800u		/* PS invocation counter, debug page */
 
 /* Triangle in pixels (viewport 64 x 64, y down): the VS's NDC
  * (-0.5,-0.5), (0.5,-0.5), (0.25,0.75). */
@@ -2998,7 +3017,10 @@ tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS, (uint32_t)(ps_va >> 8));
 	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS + 4, (uint32_t)(ps_va >> 40));
 	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, (8 - 1) / 8 | 0xc0u << 12);
-	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, 0);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, 2u << 1);	/* 2 user SGPRs */
+	v[0] = (uint32_t)(dbg_va + TRI_PS_COUNT);
+	v[1] = (uint32_t)((dbg_va + TRI_PS_COUNT) >> 32);
+	tri_regs(&p, R_SPI_SHADER_USER_DATA_PS_0, v, 2);
 	tri_reg(&p, R_SPI_SHADER_GS_OUT_CONFIG_PS, 1u << 10);	/* NO_PC_EXPORT */
 	v[0] = v[1] = 1u << 1;		/* PERSP_CENTER: ENA, ADDR */
 	tri_regs(&p, R_SPI_PS_INPUT_ENA, v, 2);
@@ -3135,6 +3157,13 @@ triangle(void)
 		check(dbg[15] != POISON_A, "21 triangle: the vertex shader ran",
 		    "lane 0 %s", dbg[15] != POISON_A ? "wrote its record" :
 		    "never ran");
+		check(dbg[31] != POISON_A && dbg[47] != POISON_A, "21 triangle: "
+		    "the vertex shader ran for all three vertices", "lanes 1, 2 "
+		    "%s, %s", dbg[31] != POISON_A ? "ran" : "never ran",
+		    dbg[47] != POISON_A ? "ran" : "never ran");
+		printf("21: PS invocations counted: %u (%#x; poison: none ran; "
+		    "about 600 expected)\n", dbg[TRI_PS_COUNT / 4] - POISON_A,
+		    dbg[TRI_PS_COUNT / 4]);
 	}
 	if (bo_xfer(cb, pix, TRI_PITCH * TRI_H, 0) != 0) {
 		check(0, "21 triangle", "readback: %s", strerror(errno));

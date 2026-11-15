@@ -1,5 +1,9 @@
 // NGG VS, wave32, GFX12. s[0:1] ring offsets, s2 gs_tg_info, s3 merged_wave_info,
 // s[8:9] user data: debug buffer VA. v0 packed prim, v1 prim id, v2 -, v3 vertex id.
+  // NGG waves start with only some lanes in EXEC: set it all, as ACO
+  // does for every NEXT_GEN_GEOMETRY shader (aco_insert_exec_mask.cpp);
+  // merged_wave_info then says which lanes have a vertex or a primitive.
+  s_mov_b32 exec_lo, -1
   v_mbcnt_lo_u32_b32 v5, -1, 0
   // debug record per lane: 16 dwords at s[8:9] + lane*64
   v_lshlrev_b32 v12, 6, v5

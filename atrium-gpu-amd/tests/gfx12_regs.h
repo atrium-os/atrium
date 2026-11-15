@@ -8,6 +8,7 @@
 #define R_SPI_SHADER_PGM_LO_PS                     0x0b020u
 #define R_SPI_SHADER_PGM_RSRC1_PS                  0x0b028u
 #define R_SPI_SHADER_PGM_RSRC2_PS                  0x0b02cu
+#define R_SPI_SHADER_USER_DATA_PS_0                0x0b030u
 #define R_SPI_SHADER_REQ_CTRL_PS                   0x0b0c0u
 #define R_SPI_SHADER_GS_OUT_CONFIG_PS              0x0b0c4u
 #define R_SPI_SHADER_USER_ACCUM_PS_0               0x0b0c8u
