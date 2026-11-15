@@ -29,7 +29,7 @@ column. §17 D1 asks which go into the first release; my recommendation is the *
 |---|---|---|---|---|
 | E1 | **Undo send, send later, snooze, follow-up nudges** | a 10 s window to take a message back; send at 8:00 tomorrow; a thread disappears until Monday; "no reply in 3 days" brings it back | yes | §9.3, §11.4 |
 | E2 | **Instant search that finds things inside attachments** | type and see results as you type, across all accounts of a persona, including text in PDFs and office files; a saved search becomes a folder | yes | §11.2 |
-| E3 | **Conversations that read well** | quoted text and signatures folded, a "new since you last looked" line, every file in the thread in one strip at the top | yes | §11.1 |
+| E3 | **Conversations that read well, or a plain timeline** | per folder: threads or strictly chronological messages; quick filters (Unread, To me, Needs reply, Has attachment); optional grouping by date, sender or account; quoted text and signatures folded, a "new since you last looked" line, every file in the thread in one strip at the top | yes | §11.1, §11.7 |
 | E4 | **One-press unsubscribe and a newsletter lane** | a real unsubscribe button (RFC 8058) on every list mail, newsletters read with the Navigator's reading settings (text size, dark, comfortable) | yes | §11.3 |
 | E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); quiet hours per persona (no Work mail after 19:00); a sound per account | yes | §12 |
 | E6 | **Screener for first-time senders** | mail from someone new waits in a "New senders" list until you press Accept once; nothing from them bothers you before that | yes, off by default | §11.3 |
@@ -589,6 +589,32 @@ person turns that on. §17 D1 lists it as later.
 Local rules (from/to/subject/list → folder/flag/label/notify) in the engine, and
 **ManageSieve** (RFC 5804) for servers that have it, so rules run when the machine is off.
 Vacation replies through Sieve or JMAP `VacationResponse`.
+
+### 11.7 Views: conversations or messages, filters, grouping (Shankar 2026-11-16)
+
+- **Conversations or messages, per folder.** A toggle in the list header: *Conversations*
+  (one row per thread, sorted by its newest message, with a count and every participant)
+  or *Messages* (one row per message, strictly chronological). Default: Conversations for
+  the inbox and ordinary folders; Messages for Sent, Drafts, Trash, Junk and the
+  newsletter lane, where threads add nothing. The choice is remembered per folder and per
+  saved search. A conversation shows messages from every folder (Sent included) unless
+  "this folder only" is on.
+- **Sort**: newest first (default), oldest first, sender, subject, size; unread first as
+  an option.
+- **Quick filters**: chips above the list, combinable: *Unread*, *Flagged*, *To me*
+  (I'm in To, not Cc or a list), *From people* (not lists or automated senders), *VIPs*,
+  *Has attachment*, *Needs reply* (I was asked something in the last message and haven't
+  answered: a thread whose last message is to me and not from me), *Snoozed back*. Typing in
+  the search field narrows the same list; any filter set can be saved as a smart folder
+  (§11.2).
+- **Grouping** (optional, off by default): section headers by *Date* (Today, Yesterday,
+  This week, Earlier this month, by month after), *Sender* (all of one person's mail
+  together, newest sender first), *Account* (in the unified inbox), or *Lane* (People /
+  Updates / Newsletters, once lanes exist, E10). Sections fold, and a folded section keeps
+  its unread count.
+- **Everything is local**: filters, grouping and sort run in the engine's index, so they
+  are instant and work offline; nothing is written to the server except what the person
+  does to messages.
 
 ## 12. Notifications
 
