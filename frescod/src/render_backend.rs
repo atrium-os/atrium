@@ -160,7 +160,10 @@ fn gpu_arch(vm: &Vm<'_>) -> Result<Box<dyn fresco_compute::gpu::Arch>> {
                 c.vendor, c.isa_family, c.isa_name, gpu::names().join(", ")))?.to_string()
         }
     };
-    gpu::by_name(&name).map_err(|e| format!("{name}: {e}").into())
+    let mut arch = gpu::by_name(&name).map_err(|e| format!("{name}: {e}"))?;
+    // gpusim's packets differ from the silicon's (atrium_gpu::amd::Gpu::is_gpusim).
+    arch.set_gpusim(vm.gpu().is_gpusim());
+    Ok(arch)
 }
 
 pub enum Backend<'a> {

@@ -484,6 +484,14 @@ impl Gpu {
         Ok(Self { fd: open_rdwr("/dev/atrium-gpu0")? })
     }
 
+    /// Whether the device is the gpusim model, whose PM4 differs from the
+    /// silicon's in one place we use: its RELEASE_MEM takes 6 body dwords,
+    /// GFX12's takes 7 (the last INT_CTXID). A short packet on silicon wedges
+    /// the CP with rptr 0 (R9700 runs 2026-11-13 and fc-b1e2ef3).
+    pub fn is_gpusim(&self) -> bool {
+        self.caps().is_ok_and(|c| c.vendor.contains("gpusim"))
+    }
+
     /// Walk the QUERY_CAPS TLV (two-phase: size probe, then fill).
     pub fn caps(&self) -> io::Result<Caps> {
         // A size-probe (caps_size=0) is unusable here: the driver reports the
@@ -832,6 +840,8 @@ pub struct Scanout<'a> {
     buffers: Vec<Bo<'a>>,
     ring: Bo<'a>,
     size: u64,
+    /// The device's RELEASE_MEM form ([`Gpu::is_gpusim`]).
+    gpusim: bool,
 }
 
 impl<'a> Scanout<'a> {
@@ -848,7 +858,8 @@ impl<'a> Scanout<'a> {
             buffers.push(vm.alloc(size, BO_VRAM)?); // VRAM: scannable
         }
         let ring = vm.alloc(4096, 0)?;
-        Ok(Self { vm, staging, buffers, ring, size })
+        let gpusim = vm.gpu().is_gpusim();
+        Ok(Self { vm, staging, buffers, ring, size, gpusim })
     }
 
     /// Buffer `i`, to name in a [`Display::commit`].
@@ -897,7 +908,7 @@ impl<'a> Scanout<'a> {
         let dst = self.buffers[i].gpu_va() + off;
         // The EOP fence lands in the ring BO's second half (never executed).
         let fence = self.ring.gpu_va() + 2048;
-        let words: [u32; 14] = [
+        let mut words: Vec<u32> = vec![
             pm4_type3(IT_DMA_DATA, 6),
             0,
             (src & 0xffff_ffff) as u32,
@@ -905,16 +916,33 @@ impl<'a> Scanout<'a> {
             (dst & 0xffff_ffff) as u32,
             (dst >> 32) as u32,
             pixels.len() as u32,
-            pm4_type3(IT_RELEASE_MEM, 6),
-            5 << 8,                 // EOP event
-            (2 << 29) | (2 << 24),  // 64-bit data, interrupt after write
-            (fence & 0xffff_ffff) as u32,
-            (fence >> 32) as u32,
-            0x0000_0001,
-            0,
         ];
+        if self.gpusim {
+            words.extend([
+                pm4_type3(IT_RELEASE_MEM, 6),
+                5 << 8,                 // EOP event
+                (2 << 29) | (2 << 24),  // 64-bit data, interrupt after write
+                (fence & 0xffff_ffff) as u32,
+                (fence >> 32) as u32,
+                0x0000_0001,
+                0,
+            ]);
+        } else {
+            // GFX12: 7 body dwords. No interrupt: the kernel ends every
+            // submit with its own RELEASE_MEM, which signals `signal`.
+            words.extend([
+                pm4_type3(IT_RELEASE_MEM, 7),
+                5 << 8,
+                2 << 29,                // 64-bit data, no interrupt
+                (fence & 0xffff_ffff) as u32,
+                (fence >> 32) as u32,
+                0x0000_0001,
+                0,
+                0,                      // INT_CTXID
+            ]);
+        }
         let mut bytes = Vec::with_capacity(words.len() * 4);
-        for w in words {
+        for &w in &words {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
         self.ring.write(0, &bytes)?;

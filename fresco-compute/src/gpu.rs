@@ -35,6 +35,10 @@ pub trait Arch: Send {
 
     /// A new, empty command stream for one frame.
     fn stream(&self) -> Box<dyn Stream + '_>;
+
+    /// The device is a model (gpusim) whose packets differ from the
+    /// silicon's; streams are for silicon until this is called.
+    fn set_gpusim(&mut self, _on: bool) {}
 }
 
 /// One frame's commands, recorded in order.

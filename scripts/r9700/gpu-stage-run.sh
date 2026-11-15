@@ -26,11 +26,11 @@
 # fuzz gate after si-client-test: /root/si-fuzz (tests/si_fuzz.c, checked
 # against FUZZ_SHA) in mode "all" for <seconds> with <seed>, then
 # si-client-test once more as the health check. Stage fc is 5c2 plus the
-# Fresco renderer check after si-client-test: /root/frescod (checked against
+# Fresco renderer check instead of the first si-client-test: /root/frescod (checked against
 # FRESCO_SHA) with FRESCOD_GPU_CHECK, which draws the same scenes with the
 # gpu and the compute renderer and compares the screens (§4.6); PNGs of
 # any scene that differs go to /root/runs/<stamp>-fc-*.png. Then
-# si-client-test once more. The kernel's messages over
+# si-client-test as the health check. The kernel's messages over
 # the whole run are in /root/runs/<stamp>.kern (the buffer wraps). The whole report is printed and
 # kept in /root/runs/. It never sets keep_state, gfx_cg or mode1_reset.
 #
@@ -151,8 +151,12 @@ if [ "$hold" -gt 0 ]; then
 	devctl set driver -f "$GPU_DEV" atrium_gpu_amd_pci; echo "attach rc=$? (0 expected: stays attached)"
 	if [ "$client" = 1 ]; then
 		ls -l /dev/atrium-gpu0 /dev/atrium-gpu0ctl
-		echo "== si-client-test"
-		timeout 600 "$TEST"; echo "si-client-test rc=$?"
+		# fc: frescod first, on a card with its whole re-init budget
+		# (run fc-b1e2ef3: si-client-test 14 had spent it all).
+		if [ "$fcheck" != 1 ]; then
+			echo "== si-client-test"
+			timeout 600 "$TEST"; echo "si-client-test rc=$?"
+		fi
 		if [ "$suites" = 1 ]; then
 			echo "== atrium-gpu-test"
 			timeout 300 "$SUITE"; echo "atrium-gpu-test rc=$?"
@@ -182,7 +186,7 @@ if [ "$hold" -gt 0 ]; then
 			FRESCO_COMPUTE_CACHE=/root/fresco-kernels FRESCOD_GPU_CHECK="${out%.log}-fc" \
 			    timeout 900 "$FRESCOD"; echo "frescod check rc=$?"
 			sysctl dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | grep reinits
-			echo "== si-client-test after the check"
+			echo "== si-client-test after the check (its health check)"
 			timeout 600 "$TEST"; echo "si-client-test rc=$?"
 		fi
 		sysctl dev.atrium_gpu_amd.0.isolation 2>/dev/null

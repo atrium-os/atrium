@@ -213,6 +213,9 @@ pub struct Rdna4Arch {
     c: Compose,
     s: Shift,
     offsets: [u64; 4],
+    /// gpusim's RELEASE_MEM (6 body dwords, with the interrupt) instead of
+    /// GFX12's (7, the last INT_CTXID): see `Stream::end`.
+    gpusim: bool,
 }
 
 impl Rdna4Arch {
@@ -221,7 +224,7 @@ impl Rdna4Arch {
         let (raster_off, end) = k.code_layout();
         let compose_off = end.next_multiple_of(CODE_ALIGN);
         let shift_off = (compose_off + c.code().len() as u64).next_multiple_of(CODE_ALIGN);
-        Ok(Rdna4Arch { k, c, s, offsets: [0, raster_off, compose_off, shift_off] })
+        Ok(Rdna4Arch { k, c, s, offsets: [0, raster_off, compose_off, shift_off], gpusim: false })
     }
 }
 
@@ -259,6 +262,10 @@ impl crate::gpu::Arch for Rdna4Arch {
     fn stream(&self) -> Box<dyn crate::gpu::Stream + '_> {
         Box::new(Rdna4Stream { arch: self, ib: Blob::compute() })
     }
+
+    fn set_gpusim(&mut self, on: bool) {
+        self.gpusim = on;
+    }
 }
 
 struct Rdna4Stream<'a> {
@@ -272,8 +279,12 @@ impl crate::gpu::Stream for Rdna4Stream<'_> {
         while done < len {
             let n = (len - done).min(DMA_CHUNK);
             let (s, d) = (src + done, dst + done);
-            // CP_SYNC (bit 31): later packets wait for the copy.
-            self.ib.packet(IT_DMA_DATA, &[1 << 31, s as u32, (s >> 32) as u32, d as u32, (d >> 32) as u32, n as u32]);
+            // CP_SYNC (bit 31): later packets wait for the copy. On silicon
+            // both ends go through the L2 (SRC_SEL 3, DST_SEL 3), as the
+            // kernel's own copies and si-client-test's: DAS (0) is the
+            // legacy direct path. gpusim knows only 0.
+            let sel = if self.arch.gpusim { 0 } else { (3 << 29) | (3 << 20) };
+            self.ib.packet(IT_DMA_DATA, &[1 << 31 | sel, s as u32, (s >> 32) as u32, d as u32, (d >> 32) as u32, n as u32]);
             done += n;
         }
     }
@@ -310,8 +321,16 @@ impl crate::gpu::Stream for Rdna4Stream<'_> {
     }
 
     fn end(&mut self, fence: u64) {
-        // End of pipe: write the fence, then interrupt.
-        self.ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
+        if self.arch.gpusim {
+            // gpusim: write the fence, then interrupt (its kernel queue
+            // signals the submit from that interrupt).
+            self.ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);
+        } else {
+            // GFX12: 7 body dwords; one short wedges the CP before it reads
+            // anything (rptr 0; R9700 run fc-b1e2ef3). No interrupt: the
+            // kernel ends every submit with its own RELEASE_MEM.
+            self.ib.packet(IT_RELEASE_MEM, &[5 << 8, 2 << 29, fence as u32, (fence >> 32) as u32, 1, 0, 0]);
+        }
     }
 
     fn bytes(&self) -> Vec<u8> {
