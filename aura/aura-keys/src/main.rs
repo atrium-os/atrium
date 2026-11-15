@@ -84,6 +84,10 @@ struct Join {
     supp: Option<Supplicant>,
     /// The mlme connection to answer.
     mlme: usize,
+    /// aura-mlme was told we answered message 1 (a deauth after it means
+    /// a wrong passphrase); the pairwise key is set.
+    told_m2: bool,
+    ptk: bool,
 }
 
 /// An SAE exchange in progress, and its PMK once done (kept for the
@@ -138,8 +142,20 @@ impl Keys {
                 eprintln!("aura-keys: {a:?}");
             }
             match a {
-                Action::Send(body) => self.send(&Msg::TxEapol { dst: bssid, body }),
-                Action::SetPtk(tk) => self.set_key(KeyKind::Pairwise, 0, Cipher::Ccmp128, bssid, [0; 6], tk),
+                Action::Send(body) => {
+                    self.send(&Msg::TxEapol { dst: bssid, body });
+                    // Before the pairwise key, a send is message 2.
+                    if let Some(j) = self.join.as_mut().filter(|j| !j.ptk && !j.told_m2) {
+                        j.told_m2 = true;
+                        reply.get_or_insert(Line::new("handshake").with("what", "m2"));
+                    }
+                }
+                Action::SetPtk(tk) => {
+                    if let Some(j) = self.join.as_mut() {
+                        j.ptk = true;
+                    }
+                    self.set_key(KeyKind::Pairwise, 0, Cipher::Ccmp128, bssid, [0; 6], tk);
+                }
                 Action::SetGtk { idx, key, rsc } => self.set_key(KeyKind::Group, *idx, Cipher::Ccmp128, BROADCAST, *rsc, key),
                 Action::SetIgtk { idx, key, ipn } => self.set_key(KeyKind::Igtk, *idx, Cipher::BipCmac128, BROADCAST, *ipn, key),
                 Action::TransitionDisable(b) => self.td = *b,
@@ -188,7 +204,7 @@ impl Keys {
         self.join = None;
         if akm == 0 {
             // Open network: nothing to negotiate, open the port.
-            self.join = Some(Join { bssid, supp: None, mlme });
+            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false });
             self.pending.clear();
             self.send(&Msg::PortAuthorized(true));
             out.push(Line::new("authorized"));
@@ -225,7 +241,7 @@ impl Keys {
         }
         self.td = 0;
         let cfg = Config { akm, pmk, aa: bssid, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
-        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme });
+        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme, told_m2: false, ptk: false });
         for (src, body) in std::mem::take(&mut self.pending) {
             if let Some(r) = self.eapol(src, &body) {
                 out.push(r);

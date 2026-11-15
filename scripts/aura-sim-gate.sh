@@ -252,6 +252,12 @@ w2() {
     out=$("$V" "$CTL scan" 2>&1) || fail "scan: $out"
     echo "$out" | grep 'aura-test' | sed 's/^/    /'
     echo "$out" | grep -q 'ssid="aura-test".*security=sae$' && ok "scan: aura-test is WPA3-SAE" || fail "scan security"
+    # A wrong password: hostapd drops our confirm; said as such, at once.
+    r=$("$V" "echo 'not the passphrase' | $CTL remember aura-test --manual") || fail "remember wrong: $r"
+    out=$("$V" "$CTL join aura-test --wait 120" 2>&1) && fail "joined with a wrong password: $out"
+    echo "$out" | tail -n 2 | sed 's/^/    /'
+    echo "$out" | grep -q 'state=failed.*why=wrong-passphrase' && ok "WPA3: a wrong password is said as one ($(echo "$out" | grep wrong-passphrase | awk '{print $1}'))" || fail "wpa3 wrong password: $out"
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember: $r"
     join aura-test --dhcp wlan0
     MAC=$(mac_of "$out")
     st=$("$V" "$CTL wifi-status"); echo "    $st"
@@ -629,8 +635,11 @@ n4() {
     echo "$w" | head -n 1 | grep -q 'link=wifi' && echo "$w" | grep -q 'link=none' && ok "network-read subscriber heard Wi-Fi, then none" || fail "watch: $w"
     echo "$w" | grep -q ssid && fail "a network name reached a network-read subscriber" || ok "no network name in network-read events"
 
+    t0=$(date +%s)
     out=$("$V" "echo 'not the passphrase' | $APP network-wifi join aura-test" 2>&1) || true
-    echo "$out" | grep -q '^refused: failed' && ok "wrong passphrase: join refused ($out)" || fail "wrong passphrase: $out"
+    t1=$(date +%s)
+    # Said as a wrong passphrase, well before the 60 s join timeout.
+    echo "$out" | grep -q '^refused: failed wrong-passphrase' && [ $((t1 - t0)) -lt 45 ] && ok "wrong passphrase: said as one in $((t1 - t0)) s ($out)" || fail "wrong passphrase: $out ($((t1 - t0)) s)"
     out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "right passphrase again: joined" || fail "rejoin: $out"
     app network-wifi leave
     app network-wifi forget aura-test

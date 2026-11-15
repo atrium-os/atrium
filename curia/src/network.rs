@@ -306,7 +306,8 @@ impl NetPage {
                             self.reset_field = true;
                         }
                         let why = match e.as_str() {
-                            "timed out" => "no answer in time: a wrong passphrase, or out of range".to_string(),
+                            "wrong-passphrase" => "the passphrase is wrong".to_string(),
+                            "timed out" => "no answer in time: out of range, or the network is busy".to_string(),
                             "bad-secret" => "a Wi-Fi passphrase is 8 to 63 letters, digits or symbols".to_string(),
                             w => w.replace('-', " "),
                         };
@@ -362,8 +363,9 @@ mod tests {
         let mut p = page();
         p.pick(b"office");
         assert_eq!(p.take_wants(), vec![Want::Join { ssid: b"office".to_vec(), open: false }]);
-        p.apply(Got::Done { what: Want::Join { ssid: b"office".to_vec(), open: false }, result: Err("timed out".into()) });
+        p.apply(Got::Done { what: Want::Join { ssid: b"office".to_vec(), open: false }, result: Err("wrong-passphrase".into()) });
         assert!(p.notice.as_ref().unwrap().error && p.joining.is_none());
+        assert_eq!(p.notice.as_ref().unwrap().text, "Could not join office: the passphrase is wrong");
         p.take_wants();
         p.pick(b"neighbour");
         assert!(p.take_wants().is_empty());

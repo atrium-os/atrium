@@ -430,3 +430,70 @@ fn scan_during_a_scan_lists() {
     let i = c.iter().position(|v| v == "scan-done").expect("plain scan-done");
     assert!(c[..i].iter().any(|v| v == "bss") && c[i + 1] == "scan-done for=join", "{c:?}");
 }
+
+#[test]
+fn a_wrong_passphrase_is_said_at_once() {
+    let why = |o: &[Out]| o.iter().find_map(|x| if let Out::Ctl(l) = x { l.get("why").map(String::from) } else { None });
+    // WPA2: the AP gives up after our message 2 (its MIC did not check).
+    let (mut s, _) = joined(false);
+    s.keys_msg(&Line::new("handshake").with("what", "m2"), 5);
+    let o = s.mgmt_rx(2437, -40, 0, &reply(mgmt::DEAUTH, &[15, 0], false), 10);
+    assert_eq!(ctl_states(&o), vec!["failed"]);
+    assert_eq!(why(&o).as_deref(), Some("wrong-passphrase"));
+    assert!(kernel(&o).iter().any(|r| matches!(r, Req::Disconnect { .. })));
+    // Or it goes quiet until our handshake timeout.
+    let (mut s, _) = joined(false);
+    s.keys_msg(&Line::new("handshake").with("what", "m2"), 5);
+    assert_eq!(why(&s.tick(60_000)).as_deref(), Some("wrong-passphrase"));
+    // Another reason, or no message 2 yet: an ordinary disconnect.
+    let (mut s, _) = joined(false);
+    s.keys_msg(&Line::new("handshake").with("what", "m2"), 5);
+    assert_eq!(ctl_states(&s.mgmt_rx(2437, -40, 0, &reply(mgmt::DEAUTH, &[3, 0], false), 10)), vec!["disconnected"]);
+    let (mut s, _) = joined(false);
+    assert_eq!(ctl_states(&s.mgmt_rx(2437, -40, 0, &reply(mgmt::DEAUTH, &[15, 0], false), 10)), vec!["disconnected"]);
+
+    // WPA3: our confirm is never answered.
+    let mut s = Station::new(OWN, Box::new(|b: &mut [u8]| b.fill(3)));
+    s.cmd(&Line::new("join").with_hex("ssid", b"w3").with("security", "psk").with("mac", "device"), 0);
+    s.mgmt_rx(2437, -40, rx_flags::SCAN, &with_rsnxe(beacon(b"w3", Some(sae_rsne(false)), true, 6)), 1);
+    s.scan_done(0, 2);
+    s.keys_msg(&Line::new("sae-commit").with("status", 126).with_hex("body", &[19, 0, 1, 2]), 3);
+    s.mgmt_rx(2437, -40, 0, &reply(mgmt::AUTH, &[3, 0, 1, 0, 126, 0, 19, 0, 5, 5], false), 4);
+    s.keys_msg(&Line::new("sae-confirm").with("status", 0).with_hex("body", &[1, 0, 9, 9]), 5);
+    let mut t = 5;
+    let o = loop {
+        t += 2001;
+        let o = s.tick(t);
+        if !ctl_states(&o).is_empty() {
+            break o;
+        }
+        assert!(t < 20_000);
+    };
+    assert_eq!(why(&o).as_deref(), Some("wrong-passphrase"));
+    // Or refuses it, as hostapd does (status 1 at transaction 2).
+    let mut s = Station::new(OWN, Box::new(|b: &mut [u8]| b.fill(3)));
+    s.cmd(&Line::new("join").with_hex("ssid", b"w3").with("security", "psk").with("mac", "device"), 0);
+    s.mgmt_rx(2437, -40, rx_flags::SCAN, &with_rsnxe(beacon(b"w3", Some(sae_rsne(false)), true, 6)), 1);
+    s.scan_done(0, 2);
+    s.keys_msg(&Line::new("sae-commit").with("status", 126).with_hex("body", &[19, 0, 1, 2]), 3);
+    s.mgmt_rx(2437, -40, 0, &reply(mgmt::AUTH, &[3, 0, 1, 0, 126, 0, 19, 0, 5, 5], false), 4);
+    s.keys_msg(&Line::new("sae-confirm").with("status", 0).with_hex("body", &[1, 0, 9, 9]), 5);
+    let o = s.mgmt_rx(2437, -40, 0, &reply(mgmt::AUTH, &[3, 0, 2, 0, 1, 0], false), 6);
+    assert_eq!(why(&o).as_deref(), Some("wrong-passphrase"));
+    // A commit that goes unanswered is not a password matter.
+    let mut s = Station::new(OWN, Box::new(|b: &mut [u8]| b.fill(3)));
+    s.cmd(&Line::new("join").with_hex("ssid", b"w3").with("security", "psk").with("mac", "device"), 0);
+    s.mgmt_rx(2437, -40, rx_flags::SCAN, &with_rsnxe(beacon(b"w3", Some(sae_rsne(false)), true, 6)), 1);
+    s.scan_done(0, 2);
+    s.keys_msg(&Line::new("sae-commit").with("status", 126).with_hex("body", &[19, 0, 1, 2]), 3);
+    let mut t = 3;
+    let o = loop {
+        t += 2001;
+        let o = s.tick(t);
+        if !ctl_states(&o).is_empty() {
+            break o;
+        }
+        assert!(t < 20_000);
+    };
+    assert_eq!(why(&o).as_deref(), Some("auth-timeout"));
+}

@@ -112,8 +112,9 @@ All four accepted as recommended, 2026-11-15.
   the list shows aura-test while connected; Forget, Forget it; pick aura-test, type the
   passphrase, Enter: joined, DHCP bound, saved with auto-join (frames
   `scratch/curia-{start,forget2,typed,joined}.png`, not committed).
-- Not yet: a wrong passphrase reports only after the join's 60 s
-  timeout (aura-keys does not yet say "wrong passphrase" early).
+- A wrong passphrase is said as one in a few seconds (added 2026-11-15, wifi.md §3.4):
+  "Could not join office: the passphrase is wrong"; the 60 s timeout now means out of
+  range or a busy network.
 
 ## 8. C2 as built (2026-11-15)
 

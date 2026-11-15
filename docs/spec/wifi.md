@@ -164,6 +164,15 @@ decision 14.
   randomized MAC (stable per SSID, like Android/iOS "private address") and a
   random MAC for every scan; hidden-network directed probes only for networks
   the user marked hidden. Decision 8.
+- A wrong passphrase is said as one (2026-11-15), not left to a timeout:
+  WPA2, aura-keys tells aura-mlme `handshake what=m2` when it has answered
+  the AP's first message, and the AP then giving up (deauthentication or
+  disassociation with reason 15, or our handshake timeout) becomes `state
+  failed why=wrong-passphrase` (the AP could not check our MIC); WPA3, the
+  AP refusing our SAE confirm (hostapd answers status 1 at transaction 2),
+  or leaving it unanswered after its retries, is the same, while a refused
+  or unanswered commit stays `auth-refused` / `auth-timeout`. atrium-netconf hands the reason on, and Curia says "the
+  passphrase is wrong".
 
 ### 3.5 atrium-net
 

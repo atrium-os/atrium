@@ -77,8 +77,9 @@ enum State {
     /// to retransmit (none while waiting for aura-keys).
     Sae { t: Target, tries: u8, deadline: u64, last: Option<Vec<u8>> },
     Assoc { t: Target, tries: u8, deadline: u64 },
-    /// Associated; aura-keys runs the handshake.
-    Keys { t: Target, deadline: u64 },
+    /// Associated; aura-keys runs the handshake. `m2`: it answered the
+    /// AP's first message (so the AP has our MIC, made with the passphrase).
+    Keys { t: Target, deadline: u64, m2: bool },
     /// Port authorized.
     Up { t: Target },
 }
@@ -221,6 +222,12 @@ impl Station {
             return;
         };
         let associated = matches!(self.st, State::Keys { .. } | State::Up { .. });
+        // The AP gave up on the 4-way handshake after it had our answer to
+        // its first message: our MIC did not check, so the passphrase is
+        // wrong (as wpa_supplicant reads it). Said as the join failing.
+        let wrong = matches!(self.st, State::Keys { m2: true, .. })
+            && reason == REASON_4WAY_TIMEOUT
+            && matches!(why, "deauth" | "disassoc" | "handshake-timeout");
         if tell_ap {
             let protect = matches!(self.st, State::Up { .. }) && t.pmf;
             let s = self.seq();
@@ -237,7 +244,11 @@ impl Station {
         self.list_scan = false;
         self.st = State::Idle;
         self.unnarrow(out);
-        out.push(Out::Ctl(state_line("disconnected").with("reason", reason).with("why", why)));
+        if wrong {
+            out.push(Out::Ctl(state_line("failed").with("why", "wrong-passphrase").with("reason", reason)));
+        } else {
+            out.push(Out::Ctl(state_line("disconnected").with("reason", reason).with("why", why)));
+        }
     }
 
     fn own_rules(&self) -> Vec<aura_regdb::RegRule> {
@@ -658,7 +669,10 @@ impl Station {
                 if !usable {
                     out.push(Out::Keys(Line::new("sae-abort")));
                     self.st = State::Idle;
-                    out.push(Out::Ctl(state_line("failed").with("why", "auth-refused").with("status", status)));
+                    // A refused confirm: the AP could not verify ours, so
+                    // the password is wrong (hostapd answers so).
+                    let why = if tr == 2 { "wrong-passphrase" } else { "auth-refused" };
+                    out.push(Out::Ctl(state_line("failed").with("why", why).with("status", status)));
                     return out;
                 }
                 // The frame goes to aura-keys as is; it answers with the
@@ -730,7 +744,7 @@ impl Station {
                 }
                 out.push(Out::Keys(k));
                 out.push(Out::Ctl(state_line("associated").with("bssid", fmt_mac(&t.bss.bssid)).with("aid", aid).with("qos", qos as u8).with("pmf", t.pmf as u8)));
-                self.st = State::Keys { t, deadline: now + KEYS_TIMEOUT_MS };
+                self.st = State::Keys { t, deadline: now + KEYS_TIMEOUT_MS, m2: false };
             }
             (mgmt::DEAUTH | mgmt::DISASSOC, _) => {
                 let reason = mgmt::reason(f).unwrap_or(0);
@@ -782,6 +796,11 @@ impl Station {
                 self.st = State::Idle;
                 let why = format!("sae-{}", l.get("why").unwrap_or("failed"));
                 out.push(Out::Ctl(state_line("failed").with("why", &why)));
+            }
+            ("handshake", State::Keys { .. }) if l.get("what") == Some("m2") => {
+                if let State::Keys { m2, .. } = &mut self.st {
+                    *m2 = true;
+                }
             }
             ("authorized", State::Keys { t, .. }) => {
                 let t = t.clone();
@@ -901,9 +920,13 @@ impl Station {
                         out.push(Out::Kernel(Req::TxMgmt { freq, frame: f.clone() }));
                     }
                     _ => {
+                        // Our confirm went unanswered: the AP could not
+                        // check it, so the password is wrong (some APs
+                        // drop a confirm that does not verify).
+                        let confirm = last.as_deref().and_then(mgmt::parse_auth).is_some_and(|(_, tr, _)| tr == 2);
                         self.st = State::Idle;
                         out.push(Out::Keys(Line::new("sae-abort")));
-                        out.push(Out::Ctl(state_line("failed").with("why", "auth-timeout")));
+                        out.push(Out::Ctl(state_line("failed").with("why", if confirm { "wrong-passphrase" } else { "auth-timeout" })));
                     }
                 }
             }
