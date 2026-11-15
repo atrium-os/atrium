@@ -503,6 +503,10 @@ impl Browser {
         } else {
             self.select_only(i);
         }
+        // An open quick look follows a click, as it follows the arrows.
+        if self.look.is_some() {
+            self.look_at_cursor();
+        }
     }
 
     /// A press on the empty space below the rows.
@@ -1304,6 +1308,10 @@ mod tests {
         assert!(b.want_look.is_none());
         b.looked(&d.join("hello.txt"), Ok(LookBody::Info { words: "late".into(), why: None }));
         assert_ne!(b.look.as_ref().unwrap().body, Some(LookBody::Info { words: "late".into(), why: None }));
+        // A click on another row: it follows too.
+        b.press(at(&b, "hello.txt"), Mods::default(), 10_000.0);
+        assert_eq!(b.look.as_ref().unwrap().name, "hello.txt", "the pane follows a click");
+        assert_eq!(b.want_look.take(), Some(d.join("hello.txt")));
         // Space again closes it; a file that goes closes it too.
         b.toggle_look();
         assert!(b.look.is_none());

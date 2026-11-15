@@ -106,6 +106,9 @@ pub struct ScriniumView {
     pub cred_state: Mutable<CredentialState>,
     /// The actions row's "More" menu, where actions go that no longer fit.
     pub more: Mutable<pergola::widgets::MenuState>,
+    /// The cursor row last kept in view: a move of the cursor (the
+    /// arrows, Home, End) scrolls its row whole into the list.
+    shown_cursor: Arc<Mutex<Option<usize>>>,
 }
 
 impl ScriniumView {
@@ -115,7 +118,7 @@ impl ScriniumView {
         let cred_state = state.sibling(CredentialState::default());
         let cred = CredentialField::password(cred_state.clone());
         let more = state.sibling(Default::default());
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more }
+        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more, shown_cursor: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -848,6 +851,15 @@ impl ScriniumView {
             text(ctx, x0 + (lw - tw) / 2.0, top + lh.min(200.0) / 2.0, &msg, type_size::SM, Weight::Regular, t.text_tertiary());
             return;
         }
+        {
+            let mut shown = self.shown_cursor.lock().unwrap();
+            if b.cursor != *shown {
+                *shown = b.cursor;
+                if let Some(i) = b.cursor {
+                    VirtualList::reveal(&self.scroll, i, b.entries.len(), row_h(), lh);
+                }
+            }
+        }
         let entries = b.entries.clone();
         let selected = b.selected.clone();
         let handlers: Vec<_> = (0..entries.len()).map(|i| std::rc::Rc::new(self.press_handler(i))).collect();
@@ -1271,6 +1283,37 @@ mod tests {
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t == "Reconnecting…"), "{tx:?}");
         assert!(tx.iter().any(|t| t == "Connect at login"), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Moving the cursor with keys scrolls its row whole into the list.
+    #[test]
+    fn the_cursor_row_is_scrolled_whole_into_view() {
+        let d = std::env::temp_dir().join(format!("scrinium-view-reveal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..20 {
+            std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let mut b = Browser::new(Mode::Picker { filter: limen::picker::Filter::file(), app: "org.example.notes".into() });
+        b.set_places(vec![place(&d)]);
+        let h = pick_title_h() + pick_path_h() + header_h() + 1.5 * row_h() + pick_foot_h();
+        let lh = (1.5 * row_h()) as f64;
+        let dirty = Arc::new(AtomicBool::new(true));
+        let state = Mutable::with_dirty(b, dirty.clone());
+        let scroll = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+        let v = ScriniumView::new(state.clone(), Mutable::with_dirty(TextEdit::new(""), dirty.clone()), scroll.clone(), Mutable::with_dirty((640.0, h), dirty.clone()));
+        let mut app = App::new_with_flag(v, dirty);
+        app.tick();
+        for _ in 0..6 {
+            with(&state, |b| b.step(1, false));
+            app.tick();
+            let cur = state.get_cloned().cursor.unwrap() as f64;
+            let y = scroll.get().physics.y;
+            let (top, bottom) = (cur * row_h() as f64, (cur + 1.0) * row_h() as f64);
+            assert!(top >= y - 0.5 && bottom <= y + lh + 0.5, "row {cur} ({top}..{bottom}) in view {y}..{}", y + lh);
+        }
+        assert!(scroll.get().physics.y > 0.0, "it scrolled");
         let _ = std::fs::remove_dir_all(&d);
     }
 

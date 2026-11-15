@@ -66,9 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     renderer.k = conn.window_scale(win);
     // In points; the WM's size replaces it (resolution-independence.md §3).
     let mut viewport_rows = renderer.viewport_rows(WIN_H as f32);
+    let mut viewport_cols = renderer.viewport_cols(WIN_W as f32);
     let mut keymap = keymap::Keymap::new();
 
-    renderer.render(&mut conn, &buf, viewport_rows, /*cursor_visible=*/true)?;
+    renderer.render(&mut conn, &buf, viewport_rows, viewport_cols, /*cursor_visible=*/true)?;
     eprintln!("rendered initial view; now waiting for events");
 
     let mut alive = true;
@@ -82,11 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Event::CloseRequested { window_id }) if window_id == win => {
                     alive = false;
                 }
-                Some(Event::Resized { window_id, height, scale, .. }) if window_id == win => {
+                Some(Event::Resized { window_id, width, height, scale, .. }) if window_id == win => {
                     if scale > 0.0 {
                         renderer.k = scale;
                     }
                     viewport_rows = renderer.viewport_rows(height);
+                    viewport_cols = renderer.viewport_cols(width);
                     dirty = true;
                 }
                 Some(Event::Key { hid_usage, pressed, modifiers, window_id, .. })
@@ -110,7 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if dirty {
             buf.scroll_into_view(viewport_rows);
-            renderer.render(&mut conn, &buf, viewport_rows, /*cursor_visible=*/true)?;
+            buf.scroll_into_view_x(viewport_cols);
+            renderer.render(&mut conn, &buf, viewport_rows, viewport_cols, /*cursor_visible=*/true)?;
         }
     }
     eprintln!("exiting");

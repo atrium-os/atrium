@@ -50,6 +50,27 @@ impl VirtualList {
         self
     }
 
+    /// Scroll `state` the least so row `i` of `count` (rows `row_h` tall)
+    /// shows whole in a viewport `shown` tall: keyboard moves keep the
+    /// cursor's row in view. A row taller than the viewport shows its top.
+    pub fn reveal(state: &Mutable<ScrollState>, i: usize, count: usize, row_h: f32, shown: f32) {
+        let mut st = state.get();
+        let shown = shown as f64 / st.zoom.settled.max(0.01);
+        // The bounds as this list has them (a scroll view learns its own
+        // only on input).
+        st.physics.set_max((count as f64 * row_h as f64 - shown).max(0.0));
+        let (top, h, y) = (i as f64 * row_h as f64, row_h as f64, st.physics.y);
+        let to = if top < y || h > shown {
+            top
+        } else if top + h > y + shown {
+            top + h - shown
+        } else {
+            return;
+        };
+        st.physics.set_position(to);
+        state.set(st);
+    }
+
     /// The rows to emit for scroll position `y` (content px at zoom 1)
     /// over a viewport `shown` px tall.
     pub fn window(count: usize, row_h: f32, y: f64, shown: f64) -> std::ops::Range<usize> {
@@ -106,6 +127,21 @@ mod tests {
     use crate::view::View;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    #[test]
+    fn reveal_moves_the_least_to_show_a_row_whole() {
+        let state = Mutable::new(ScrollState::default());
+        // Rows 30 tall, 45 shown: row 1 is half shown at 0.
+        VirtualList::reveal(&state, 1, 100, 30.0, 45.0);
+        assert_eq!(state.get().physics.y, 15.0, "down just enough");
+        VirtualList::reveal(&state, 1, 100, 30.0, 45.0);
+        assert_eq!(state.get().physics.y, 15.0, "already whole: still");
+        VirtualList::reveal(&state, 0, 100, 30.0, 45.0);
+        assert_eq!(state.get().physics.y, 0.0, "up to its top");
+        // A viewport shorter than a row: the row's top.
+        VirtualList::reveal(&state, 3, 100, 30.0, 20.0);
+        assert_eq!(state.get().physics.y, 90.0);
+    }
 
     struct Big {
         state: Mutable<ScrollState>,

@@ -41,11 +41,19 @@ impl Renderer {
         (((h - 2.0 * self.pad_y) / self.line_h).floor() as isize - 1).max(1) as usize
     }
 
+    /// How many columns fit a window `w` pt wide.
+    pub fn viewport_cols(&self, w: f32) -> usize {
+        (((w - 2.0 * self.pad_x) / self.cell_w).floor() as isize).max(1) as usize
+    }
+
+    /// Draws `buf` from its `scroll_top` row and `scroll_left` column;
+    /// `viewport_cols` columns are drawn (and one partly cut).
     pub fn render(
         &self,
         conn: &mut Connection,
         buf: &Buffer,
         viewport_rows: usize,
+        viewport_cols: usize,
         cursor_visible: bool,
     ) -> std::io::Result<()> {
         let mut f = conn.frame()?;
@@ -53,7 +61,8 @@ impl Renderer {
         if cursor_visible {
             let cursor_row = buf.cursor_line as i64 - buf.scroll_top as i64;
             if cursor_row >= 0 && (cursor_row as usize) < viewport_rows {
-                let cx = self.pad_x + (buf.cursor_col as f32) * self.cell_w;
+                let cell = buf.cursor_cell().saturating_sub(buf.scroll_left);
+                let cx = self.pad_x + (cell as f32) * self.cell_w;
                 let cy = self.pad_y + (cursor_row as f32) * self.line_h;
                 let k = self.k;
                 let (x0, y0) = ((cx * k).round(), (cy * k).round());
@@ -66,14 +75,14 @@ impl Renderer {
 
         let last = (buf.scroll_top + viewport_rows).min(buf.lines.len());
         for (row_in_viewport, line_idx) in (buf.scroll_top..last).enumerate() {
-            let line = &buf.lines[line_idx];
+            let line: String = buf.lines[line_idx].chars().skip(buf.scroll_left).take(viewport_cols + 1).collect();
             if line.is_empty() { continue; }
             let y_base = ((self.pad_y + (row_in_viewport as f32) * self.line_h
                        + self.baseline) * self.k).round();
             f.text_run(self.font_id, self.size_px * self.k,
                        (self.pad_x * self.k).round(), y_base - self.baseline * self.k,
                        [0.95, 0.95, 0.95, 1.0],
-                       line)?;
+                       &line)?;
         }
 
         let status = format!(
@@ -109,5 +118,10 @@ mod tests {
         r.k = 2.0;
         assert_eq!(r.viewport_rows(900.0), tall);
         assert_eq!(r.viewport_rows(10.0), 1, "at least one");
+        // Columns too, in points.
+        assert_eq!(r.viewport_cols(720.0), ((720.0 - 32.0) / 10.8f32).floor() as usize);
+        r.k = 1.0;
+        assert_eq!(r.viewport_cols(720.0), 63);
+        assert_eq!(r.viewport_cols(5.0), 1);
     }
 }

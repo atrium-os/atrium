@@ -23,7 +23,7 @@ use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
 use pergola::geom::Rect;
 use pergola::node::Node;
-use pergola::theme::{font, type_size, Weight};
+use pergola::theme::{font, size::em, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::window::StepResult;
 use pergola::{App, Color, Mutable, SizeSpec, TextStyle, Window, WindowDesc};
@@ -50,22 +50,23 @@ impl View for Demo {
         // press reached the app while the picker's sheet held it.
         let bg = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
         ctx.on_click(bg, || eprintln!("pick-demo: the app got a press"));
+        // Lines placed in em, so they stay apart as the text grows.
         let st = |size, weight, color| TextStyle { family: font::SANS.into(), size, weight, color };
-        ctx.add(Node::Text { rect: Rect::new(24.0, 14.0, 0.0, 24.0), content: "Notes (a demo app)".into(), style: st(type_size::LG, Weight::Semibold, t.text_primary()) });
+        ctx.add(Node::Text { rect: Rect::new(24.0, em(14.0), 0.0, em(24.0)), content: "Notes (a demo app)".into(), style: st(type_size::LG, Weight::Semibold, t.text_primary()) });
         let what = if s.asking { "Asking the system picker. Only what you pick reaches this app." } else { "What the picker handed over:" };
-        ctx.add(Node::Text { rect: Rect::new(24.0, 44.0, 0.0, 20.0), content: what.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+        ctx.add(Node::Text { rect: Rect::new(24.0, em(44.0), 0.0, em(20.0)), content: what.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
         if s.asking {
             // The app's own content goes on as usual; the system places
             // the picker's sheet over it (scrinium.md §4.4), whatever rect
             // this slot has.
             for (i, l) in ["Monday: call the plumber", "Groceries: rice, lentils, coriander", "Read chapter 4"].iter().enumerate() {
-                ctx.add(Node::Text { rect: Rect::new(24.0, 80.0 + i as f32 * 22.0, 0.0, 20.0), content: (*l).into(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+                ctx.add(Node::Text { rect: Rect::new(24.0, em(80.0 + i as f32 * 22.0), 0.0, em(20.0)), content: (*l).into(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
             }
             let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 1.0, 1.0), fill: Color::TRANSPARENT, radius: 0.0 });
             ctx.slot(id, PICKER_SLOT);
         } else {
             for (i, l) in s.lines.iter().enumerate() {
-                ctx.add(Node::Text { rect: Rect::new(24.0, 80.0 + i as f32 * 22.0, 0.0, 20.0), content: l.clone(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+                ctx.add(Node::Text { rect: Rect::new(24.0, em(80.0 + i as f32 * 22.0), 0.0, em(20.0)), content: l.clone(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
             }
         }
         ctx.pop();

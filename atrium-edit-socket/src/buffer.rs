@@ -14,6 +14,8 @@ pub struct Buffer {
     pub cursor_line: usize,
     pub cursor_col:  usize,
     pub scroll_top:  usize,
+    /// The first column shown (chars), for lines wider than the window.
+    pub scroll_left: usize,
     pub modified:    bool,
     pub path:        Option<PathBuf>,
     pub status:      String,
@@ -26,6 +28,7 @@ impl Buffer {
             cursor_line: 0,
             cursor_col: 0,
             scroll_top: 0,
+            scroll_left: 0,
             modified: false,
             path: None,
             status: String::from("[new buffer]"),
@@ -48,6 +51,7 @@ impl Buffer {
             cursor_line: n - 1,
             cursor_col:  0,
             scroll_top:  0,
+            scroll_left: 0,
             modified:    false,
             path:        Some(p.to_path_buf()),
             status:      format!("[loaded {}]", p.display()),
@@ -138,6 +142,23 @@ impl Buffer {
         }
     }
 
+    /// The cursor's column in chars (`cursor_col` is a byte offset).
+    pub fn cursor_cell(&self) -> usize {
+        let line = &self.lines[self.cursor_line];
+        line[..self.cursor_col.min(line.len())].chars().count()
+    }
+
+    /// Scroll sideways so the cursor's cell shows inside `visible_cols`.
+    pub fn scroll_into_view_x(&mut self, visible_cols: usize) {
+        let c = self.cursor_cell();
+        let cols = visible_cols.max(1);
+        if c < self.scroll_left {
+            self.scroll_left = c;
+        } else if c >= self.scroll_left + cols {
+            self.scroll_left = c + 1 - cols;
+        }
+    }
+
     /// Adjust scroll so cursor is visible inside `visible_rows`.
     pub fn scroll_into_view(&mut self, visible_rows: usize) {
         if self.cursor_line < self.scroll_top {
@@ -145,5 +166,28 @@ impl Buffer {
         } else if self.cursor_line >= self.scroll_top + visible_rows.saturating_sub(1) {
             self.scroll_top = self.cursor_line + 1 - visible_rows.max(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Buffer;
+
+    /// A line wider than the window scrolls sideways with the cursor,
+    /// and back.
+    #[test]
+    fn a_long_line_scrolls_sideways_with_the_cursor() {
+        let mut b = Buffer::empty();
+        for c in "é".chars().chain(std::iter::repeat('x').take(99)) {
+            b.insert_char(c);
+        }
+        assert_eq!(b.cursor_cell(), 100, "chars, not bytes");
+        b.scroll_into_view_x(40);
+        assert_eq!(b.scroll_left, 61, "the cursor's cell is the last shown");
+        for _ in 0..100 {
+            b.move_left();
+        }
+        b.scroll_into_view_x(40);
+        assert_eq!(b.scroll_left, 0);
     }
 }
