@@ -7,7 +7,8 @@
 //! by [`Limits`]; anything over the hard limits is refused, anything over the
 //! soft ones is cut.
 //!
-//! Not here yet (later M0 steps): DKIM/DMARC checks, TNEF, iTIP, the HTML →
+//! Also: [`dkim`] (sender verification), [`ical`] (invites), [`tnef`]
+//! (winmail.dat). Not here yet: the HTML →
 //! document conversion (navigator-normalize) and the postcard wire schema.
 
 pub mod address;
@@ -15,6 +16,7 @@ pub mod decode;
 pub mod dkim;
 pub mod header;
 pub mod ical;
+pub mod tnef;
 pub(crate) mod mime;
 
 pub use address::Address;
