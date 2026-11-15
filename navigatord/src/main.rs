@@ -9,10 +9,13 @@
 //!   (navigator-page, Limen L6) redeems the ticket for the recording and
 //!   the address it was converted from.
 //! - **Each page** is fetched through a per-conversion fetcher
-//!   (`NAVIGATORD_FETCHD`, e.g. `portcullis exec --daemon --instance
-//!   f{instance} org.atrium.navigator.fetcher`) and converted in a one-shot
-//!   jail (`NAVIGATORD_CONVERTER`, e.g. `portcullis exec --daemon
-//!   --instance conv{instance} org.atrium.navigator.converter`), the fetches
+//!   (`NAVIGATORD_FETCHD`, e.g. `jail:org.atrium.navigator.fetcher`) and
+//!   converted in a one-shot jail (`NAVIGATORD_CONVERTER`, e.g.
+//!   `jail:org.atrium.navigator.converter`), both started by portcullisd's
+//!   `ExecInstance` on pipes navigatord passes (`worker.rs`; a command line
+//!   instead runs an ordinary child, for tests). Settings come from the
+//!   environment, else the bundle's `etc/navigatord.conf` (`settings.rs`),
+//!   since a jail gets no environment of its caller's. The fetches
 //!   relayed under the per-conversion byte budget, as the prerender driver
 //!   does (backend §4.7a).
 //! - **The origin** of the page the UI shows is set in frescod's strip over
@@ -43,6 +46,8 @@ use std::time::{Duration, Instant};
 
 mod files;
 mod press;
+mod settings;
+mod worker;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
@@ -88,9 +93,9 @@ fn words(v: &str) -> Option<(String, Vec<String>)> {
 }
 
 struct Config {
-    converter: Option<(String, Vec<String>)>,
+    converter: Option<worker::Spec>,
     prerender: String,
-    fetchd: Option<(String, Vec<String>)>,
+    fetchd: Option<worker::Spec>,
     fixtures: Option<PathBuf>,
     unconfined: bool,
     deadline_s: u64,
@@ -117,11 +122,11 @@ struct Config {
 
 impl Config {
     fn from_env(unconfined: bool) -> Result<Self, String> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let var = settings::get;
         let c = Config {
-            converter: var("NAVIGATORD_CONVERTER").and_then(|v| words(&v)),
+            converter: var("NAVIGATORD_CONVERTER").and_then(|v| worker::Spec::parse(&v)),
             prerender: var("NAVIGATORD_PRERENDER").unwrap_or_else(|| "prerender".into()),
-            fetchd: var("NAVIGATORD_FETCHD").and_then(|v| words(&v)),
+            fetchd: var("NAVIGATORD_FETCHD").and_then(|v| worker::Spec::parse(&v)),
             fixtures: var("NAVIGATORD_FIXTURES").map(PathBuf::from),
             unconfined,
             deadline_s: var("NAVIGATORD_DEADLINE").and_then(|v| v.parse().ok()).unwrap_or(30),
@@ -427,7 +432,9 @@ fn jar_id(jar: Jar) -> Option<u64> {
 static VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 enum Upstream {
-    Fetchd(FetchdFetcher),
+    /// A fetcher, and its jail's portcullisd connection when it is one
+    /// (dropped after the fetcher, so its input closes first).
+    Fetchd(FetchdFetcher, #[allow(dead_code)] Option<worker::Worker>),
     Fixtures(PathBuf),
     /// A page whose site knows you: its https requests through Arca's
     /// couriers with the broker's tickets; the rest the plain way.
@@ -457,7 +464,7 @@ impl Upstream {
         }
         match self {
             Upstream::Cookied { .. } => unreachable!(),
-            Upstream::Fetchd(f) => match ask {
+            Upstream::Fetchd(f, _) => match ask {
                 Ask::Fetch(u) => f.exchange(u).unwrap_or_else(Reply::Err),
                 Ask::Peek { url, start, len } => f.exchange_peek(url, start, len).unwrap_or_else(Reply::Err),
             },
@@ -485,7 +492,7 @@ impl Upstream {
     fn navigate(&mut self, url: &str) -> (Reply, Vec<navigator_cookies::Hop>) {
         let hop = |(status, set_cookie, url): (u16, bool, String)| navigator_cookies::Hop { url, status, set_cookie };
         match self {
-            Upstream::Fetchd(f) => match f.exchange_navigation(url) {
+            Upstream::Fetchd(f, _) => match f.exchange_navigation(url) {
                 Ok((r, hops)) => (r, hops.into_iter().map(hop).collect()),
                 Err(e) => (Reply::Err(e), vec![]),
             },
@@ -556,9 +563,17 @@ fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
     if let Some(d) = &cfg.fixtures {
         return Ok(Upstream::Fixtures(d.clone()));
     }
-    let (p, a) = cfg.fetchd.as_ref().ok_or("no fetcher")?;
-    let a: Vec<String> = a.iter().map(|x| x.replace("{instance}", inst)).collect();
-    FetchdFetcher::spawn(p, &a).map(Upstream::Fetchd).map_err(|e| format!("fetcher: {e}"))
+    match cfg.fetchd.as_ref().ok_or("no fetcher")? {
+        worker::Spec::Command(p, a) => {
+            let a: Vec<String> = a.iter().map(|x| x.replace("{instance}", inst)).collect();
+            FetchdFetcher::spawn(p, &a).map(|f| Upstream::Fetchd(f, None)).map_err(|e| format!("fetcher: {e}"))
+        }
+        spec => {
+            let mut w = worker::Worker::start(spec, &format!("f{inst}"), false).map_err(|e| format!("fetcher: {e}"))?;
+            let (i, o) = (w.stdin.take().expect("piped"), w.stdout.take().expect("piped"));
+            Ok(Upstream::Fetchd(FetchdFetcher::over(i, o, ""), Some(w)))
+        }
+    }
 }
 
 /// Fetch and convert `url`; through Arca as the jar's, with `cookies`.
@@ -625,20 +640,12 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         ..Job::default()
     };
     let header = job.header()?;
-    let mut cmd = match &cfg.converter {
-        Some((p, a)) => {
-            let mut c = std::process::Command::new(p);
-            c.args(a.iter().map(|x| x.replace("{instance}", &format!("conv{inst}"))));
-            c
-        }
-        None => std::process::Command::new(&cfg.prerender), // serve mode: no arguments
-    };
-    use std::process::Stdio;
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut ch = cmd.spawn().map_err(|e| format!("converter: {e}"))?;
-    let stdin: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(Some(Box::new(ch.stdin.take().expect("piped")))));
+    // Serve mode, no arguments, when there is no converter jail (testing).
+    let spec = cfg.converter.clone().unwrap_or_else(|| worker::Spec::Command(cfg.prerender.clone(), vec![]));
+    let mut ch = worker::Worker::start(&spec, &format!("conv{inst}"), true).map_err(|e| format!("converter: {e}"))?;
+    let stdin: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(ch.stdin.take()));
     let stdout = ch.stdout.take().expect("piped");
-    let mut stderr = ch.stderr.take().expect("piped");
+    let mut stderr = ch.stderr.take().expect("captured");
     // Drained while it runs: a chatty child must not block on a full pipe.
     let err_t = std::thread::spawn(move || {
         let mut v = vec![];
@@ -653,21 +660,20 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         let start = Instant::now();
         loop {
             match ch.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) if start.elapsed() > deadline + GRACE => {
+                Ok(true) => return true,
+                Ok(false) if start.elapsed() > deadline + GRACE => {
                     drop(stdin_w.lock().unwrap().take());
                     let t = Instant::now();
                     while t.elapsed() < GRACE {
-                        if let Ok(Some(_)) = ch.try_wait() {
+                        if let Ok(true) = ch.try_wait() {
                             return false;
                         }
                         std::thread::sleep(Duration::from_millis(20));
                     }
-                    let _ = ch.kill();
-                    let _ = ch.wait();
+                    ch.kill();
                     return false;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Ok(false) => std::thread::sleep(Duration::from_millis(5)),
                 Err(_) => return false,
             }
         }
@@ -1296,11 +1302,11 @@ fn main() {
     });
     // In a directory of its own: the page child's jail mounts that
     // directory (the `navigator-page` capability) and nothing else of ours.
-    let page_path = std::env::var("NAVIGATORD_PAGE_SOCKET").unwrap_or_else(|_| "/atrium/sockets/navigator-page/navigator-page.sock".into());
+    let page_path = settings::path("NAVIGATORD_PAGE_SOCKET", "/atrium/sockets/navigator-page/navigator-page.sock");
     if let Some(dir) = Path::new(&page_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let ctl_path = std::env::var("NAVIGATORD_SOCKET").unwrap_or_else(|_| "/var/run/atrium/navigatord.sock".into());
+    let ctl_path = settings::path("NAVIGATORD_SOCKET", "/var/run/atrium/navigatord.sock");
     let pages = listen(&page_path);
     let st = state.clone();
     std::thread::spawn(move || {

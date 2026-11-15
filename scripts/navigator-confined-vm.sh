@@ -238,8 +238,7 @@ g "printf '%s navtest org.atrium.navigator\n' \$(id -u navtest) > $S/registry; c
 g "mkdir -p /atrium/sockets/navigator-page && chown navtest /atrium/sockets/navigator-page && chmod 755 /atrium/sockets/navigator-page
    mkdir -p $S/store && chown navtest $S/store
    cd $S && env PORTCULLIS_SOCKET=$PSOCK NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_STORE=$S/store FRESCOD_CHROME_SOCK=$S/chrome.sock \
-    NAVIGATORD_CONVERTER='/usr/local/bin/portcullis exec --daemon --instance {instance} $CONV_ID' \
-    NAVIGATORD_FETCHD='/usr/local/bin/portcullis exec --daemon --instance f{instance} $FETCH_ID' \
+    NAVIGATORD_CONVERTER=jail:$CONV_ID NAVIGATORD_FETCHD=jail:$FETCH_ID \
     NAVIGATORD_ACTIVATION=$AS NAVIGATORD_DOWNLOADS=$S/downloads daemon -f -o $S/navigatord.log -u navtest $D/navigatord </dev/null"
 sleep 10
 g "test -S $S/limend.sock && test -S $S/nav.sock" || { g "tail -5 $S/limend.log $S/navigatord.log"; die "limend or navigatord did not start"; }

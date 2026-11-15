@@ -2272,6 +2272,7 @@ dependencies = [
  "navigator-control",
  "navigator-cookies",
  "navigator-prerender",
+ "portcullis-ipc",
  "postcard",
  "serde",
  "serde_json",

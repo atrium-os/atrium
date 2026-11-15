@@ -175,8 +175,12 @@ press's window owner and the spender are the same uid.
 
 Steps, each checked by `scripts/navigator-confined-vm.sh`:
 
-- **J1.** navigatord reads its bundle config, and starts converters, fetchers and couriers by
-  `ExecInstance` itself (no `portcullis` CLI).
+- **J1.** navigatord reads its bundle config, and starts converters and fetchers by
+  `ExecInstance` itself (no `portcullis` CLI). *Built 2026-11-15:* `NAVIGATORD_CONVERTER` /
+  `NAVIGATORD_FETCHD` take `jail:<app id>` (`navigatord/src/worker.rs`: three pipe ends to
+  portcullisd, the worker lives while that connection is open), settings from the environment
+  else `etc/navigatord.conf` beside `bin/` (only navigatord's own keys); the confined script
+  uses the jailed form, 30/30. Arca's couriers already come over courierd's socket.
 - **J2.** frescod's chrome and activation sockets in `/atrium/sockets/`; the `navigator-broker`
   capability; navigatord as the Navigator bundle in its jail (UI still a plain process).
 - **J3.** navigator-ui as navigatord's worker jail (`_navui`), trails kept by navigatord.

@@ -5798,7 +5798,8 @@ with `FRESCOD_ACTIVATION_SOCK` in the run dir, and each window's renderer is a j
 `_fresco-render`), `org.atrium.navigator.converter` (prerender, no capabilities) and `org.atrium.navigator.fetcher`
 (navigator-fetchd, `network = "full"`, its trust store plus the fixture CA). limend runs as
 `_limen` with a run registry naming navtest's uid as `org.atrium.navigator`; navigatord runs as
-navtest with `NAVIGATORD_CONVERTER`/`NAVIGATORD_FETCHD` set to `portcullis exec --daemon`, and
+navtest with `NAVIGATORD_CONVERTER`/`NAVIGATORD_FETCHD` set to `jail:<app id>` (navigatord asks portcullisd
+for each jail itself, no `portcullis` program; 30/30 on 2026-11-15), and
 the UI runs as navtest too (navigatord opens its frescod connection, so its windows are navtest's).
 
 Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
