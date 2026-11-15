@@ -131,7 +131,9 @@ case "$cur" in ""|/etc/pf.conf|/usr/local/etc/atrium/pf.conf) ;;
   *) echo "pf_rules is $cur — an operator ruleset; add the atrium rules to it by hand"; exit 1;;
 esac
 [ "$cur" = /etc/pf.conf ] && [ -s /etc/pf.conf ] && { echo "/etc/pf.conf exists — an operator ruleset; add the atrium rules to it by hand"; exit 1; }
-sed "s/EXT_IF/$E/" /root/atrium.pf > /usr/local/etc/atrium/pf.conf
+cp /root/atrium.pf /usr/local/etc/atrium/pf.conf
+ifconfig "$E" group atrium_egress
+printf "ifconfig %s group atrium_egress\\n" "$E" > "/etc/start_if.$E"
 sysrc -q pf_enable=YES pf_rules=/usr/local/etc/atrium/pf.conf gateway_enable=YES >/dev/null
 kldstat -q -m pf || kldload pf
 sysctl -q net.inet.ip.forwarding=1 >/dev/null

@@ -21,6 +21,9 @@ const SIOCGIFFLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 17, IFREQ);
 const SIOCDIFADDR: u64 = ioc(IOC_IN, b'i', 25, IFREQ);
 const SIOCAIFADDR: u64 = ioc(IOC_IN, b'i', 43, 68);
 const SIOCSIFMTU: u64 = ioc(IOC_IN, b'i', 52, IFREQ);
+const IFGROUPREQ: usize = 40;
+const SIOCAIFGROUP: u64 = ioc(IOC_IN, b'i', 135, IFGROUPREQ);
+const SIOCDIFGROUP: u64 = ioc(IOC_IN, b'i', 137, IFGROUPREQ);
 const IN6_IFREQ: usize = 288;
 const IN6_NDIREQ: usize = 72;
 const SIOCDIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 25, IN6_IFREQ);
@@ -165,6 +168,25 @@ impl Ifc {
         r[16..18].copy_from_slice(&f.to_ne_bytes());
         if unsafe { ioctl(self.s.as_raw_fd(), SIOCSIFFLAGS, r.as_mut_ptr()) } != 0 {
             return err("SIOCSIFFLAGS");
+        }
+        Ok(())
+    }
+
+    /// Put interface `name` in interface group `group`, or take it out (an
+    /// interface not in the group, or gone, is not an error).
+    pub fn group(&self, name: &str, group: &str, add: bool) -> io::Result<()> {
+        let mut r = [0u8; IFGROUPREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        let g = group.as_bytes();
+        r[24..24 + g.len().min(15)].copy_from_slice(&g[..g.len().min(15)]);
+        let req = if add { SIOCAIFGROUP } else { SIOCDIFGROUP };
+        if unsafe { ioctl(self.s.as_raw_fd(), req, r.as_mut_ptr()) } != 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::EEXIST) if add => Ok(()),
+                Some(libc::ENOENT) | Some(libc::ENXIO) if !add => Ok(()),
+                _ => Err(e),
+            };
         }
         Ok(())
     }

@@ -5592,6 +5592,7 @@ N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP
     sh scripts/aura-sim-gate.sh move     # weak-signal move alone: second AP aura-other (hostapd-other.conf), ~10 min
     sh scripts/aura-sim-gate.sh n4       # CLASS_NETCONF: atrium-netconf (uid 65036, capmode), one socket per capability, refusals,
                                          # a wrong passphrase, a fixed address on aura-test (10.77.0.200) and back to DHCP, own DNS servers
+    sh scripts/aura-sim-gate.sh nat      # apps' NAT follows the egress: etc/atrium.pf, a vnet jail on an epair, cable pulled -> out by Wi-Fi
     sh scripts/aura-sim-gate.sh svc      # atrium-net + atrium-netconf as rc.d services: commission, AUTO ports, unbound, crash restart, Wi-Fi driver unloaded and loaded again, stop
     sh scripts/aura-sim-gate.sh bar      # live UI: atrium-netconf + headless frescod, forum-wm, forum-bar; bar frame (VMs left up)
     sh scripts/curia-vm.sh shot          # after `bar`: Curia (Settings) as appui; then click X Y / type TEXT ('|' = Enter) / frame / status

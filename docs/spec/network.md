@@ -53,7 +53,7 @@ join one interface group, `atrium`, so the policy is written once against the gr
 
 ```pf
 set skip on lo0
-nat on <egress> inet from 100.64.0.0/16 to any -> (<egress>)
+nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)   # group kept by atrium-net
 block in quick on atrium inet from any to (self)           # an app never reaches the host
 block in quick on atrium inet from any to 100.64.0.0/16    # nor another app
 pass all

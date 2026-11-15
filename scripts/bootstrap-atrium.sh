@@ -807,7 +807,11 @@ if [ -z "$E" ]; then
 elif [ -n "$cur" ] && [ "$cur" != /usr/local/etc/atrium/pf.conf ] && [ -s "$cur" ]; then
     echo "  SKIPPED: pf_rules is $cur (an operator ruleset); add etc/atrium.pf's rules to it"
 else
-    sed "s/EXT_IF/$E/" "$D/etc/atrium.pf" > /usr/local/etc/atrium/pf.conf
+    cp "$D/etc/atrium.pf" /usr/local/etc/atrium/pf.conf
+    # NAT follows group atrium_egress (atrium-net moves it); until atrium-net
+    # runs, the default-route interface is in it, now and at every boot.
+    ifconfig "$E" group atrium_egress
+    printf 'ifconfig %s group atrium_egress\n' "$E" > "/etc/start_if.$E"
     sysrc -q pf_enable=YES pf_rules=/usr/local/etc/atrium/pf.conf gateway_enable=YES >/dev/null
     kldstat -q -m pf || kldload pf
     sysctl -q net.inet.ip.forwarding=1 >/dev/null
@@ -816,7 +820,7 @@ else
       pfctl -s rules | grep -q 'anchor "atrium/\*"' &&
       pfctl -s rules | grep -qx "block drop in quick on atrium all"; } \
         || { echo "  FATAL: the atrium isolation rules did not load"; exit 1; }
-    echo "  pf enabled with isolation rules, NAT via $E (and at every boot)"
+    echo "  pf enabled with isolation rules, NAT via group atrium_egress ($E until atrium-net moves it)"
 fi
 
 echo "== userspace =="

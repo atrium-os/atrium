@@ -1,8 +1,14 @@
 # Atrium pf base ruleset — per-app network isolation (docs/spec/network.md §0).
 #
-# Installed as /usr/local/etc/atrium/pf.conf with ext_if filled in from the
-# default route, and loaded at boot (pf_enable, pf_rules, gateway_enable) by
-# scripts/bootstrap-atrium.sh and scripts/deploy-portcullis.sh.
+# Installed as /usr/local/etc/atrium/pf.conf and loaded at boot (pf_enable,
+# pf_rules, gateway_enable) by scripts/bootstrap-atrium.sh and
+# scripts/deploy-portcullis.sh.
+#
+# NAT goes out whichever interface is in group `atrium_egress`: atrium-net
+# keeps the egress interface (the one with the default route) alone in it,
+# so apps follow a move from Ethernet to Wi-Fi with no pf reload
+# (atrium-net.md §7.2). Without atrium-net, the install scripts put the
+# default-route interface in the group at every boot (/etc/start_if.<if>).
 #
 # Every networked app sits on its own point-to-point /30 from 100.64.0.0/16;
 # the host end of each app's epair is in interface group `atrium`.
@@ -11,10 +17,8 @@
 # host's sshd through its own gateway address. jaild refuses to create a
 # networked jail unless the host block, the anchor point and the final block
 # are all loaded (jaild/src/routed.rs isolation_loaded).
-ext_if = "EXT_IF"
-
 set skip on lo0
-nat on $ext_if inet from 100.64.0.0/16 to any -> ($ext_if)
+nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)
 
 # An app never reaches the host itself — any of the host's addresses. First,
 # so no per-app grant can undo it.

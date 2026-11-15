@@ -282,6 +282,19 @@ One event, `egress-changed {iface}`, over atrium-netd's existing control socket;
 re-points the NAT rule. If atrium-netd is not running, nothing changes for apps
 (fail-closed already holds).
 
+As built (2026-11-15), without atrium-netd: apps' NAT names an interface group,
+`nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)`
+(etc/atrium.pf), and atrium-net keeps the egress interface alone in that group
+(`SIOCAIFGROUP`/`SIOCDIFGROUP` on its ioctl socket, in capability mode): at start, and
+whenever the egress changes, every other interface there was at start is taken out.
+pf follows group membership with no reload, so apps move with the default route.
+States made through the old interface die with its address, as for the host's own
+connections. With no egress the group is empty and apps have no way out. Until
+atrium-net runs, the install scripts put the default-route interface in the group (now
+and at every boot, `/etc/start_if.<if>`). `--egress-group NAME` / `--no-egress-group`.
+The `egress-changed` line to atrium-netd stays for when atrium-netd exists. Gate:
+`aura-sim-gate.sh nat`.
+
 ### 7.3 aura-ctl
 
 Stays as a test and debug tool. The gates switch to `atrium-net` once N1 lands.
@@ -432,8 +445,9 @@ VM from the Aura gates cover them.
   building it: after a same-network roam atrium-net never re-confirmed the lease (it now
   treats `disconnected why=roam` as a rejoin and sends LeaseUp on `authorized`), and the
   status line carried `link=` twice in the address grace period (now one: `lost`).
-- Not yet: real atrium-netd (NAT re-pointing); the Atrium-run probe endpoint (decided by Shankar
-  2026-11-14: probing stays off until Atrium hosts one; no third-party default).
+- Not yet: the Atrium-run probe endpoint (decided by Shankar 2026-11-14: probing stays
+  off until Atrium hosts one; no third-party default). NAT follows the egress since
+  2026-11-15 (§7.2).
 
 ### 10.5 N4 as built (2026-11-14)
 

@@ -21,6 +21,8 @@
 #                                     atrium-net/sim/lan.py) and Wi-Fi together:
 #                                     cable pulls and flaps, dead upstream,
 #                                     captive portal (docs/spec/atrium-net.md)
+#   sh scripts/aura-sim-gate.sh nat   apps' NAT follows Ethernet -> Wi-Fi
+#                                     (etc/atrium.pf, group atrium_egress)
 #   sh scripts/aura-sim-gate.sh svc   atrium-net and atrium-netconf as rc.d
 #                                     services (atrium-net-service.sh)
 #
@@ -823,6 +825,58 @@ svc() {
     "$V" 'service atrium-net status' >/dev/null 2>&1 && fail "status says running" || ok "service status: not running"
 }
 
+# nat: apps' NAT follows the egress (atrium-net.md §7.2). etc/atrium.pf as
+# installed, an app-style vnet jail on its own epair (100.64.9.2/30, host end
+# in group `atrium`, an anchor letting it out); Ethernet first, then the cable
+# pulled: the jail's traffic leaves by Wi-Fi with no pf reload.
+nat_cleanup() {
+    "$V" 'jail -r natprobe 2>/dev/null; ifconfig epair9a destroy 2>/dev/null
+        if [ -f /tmp/aura/pf.was ]; then pfctl -f "$(cat /tmp/aura/pf.was)" >/dev/null 2>&1; else pfctl -d >/dev/null 2>&1; fi
+        rm -f /tmp/aura/pf.was; true' || true
+    n3_cleanup
+}
+
+nat() {
+    gw() { "$V" 'route -n get default 2>/dev/null | awk "/gateway/{print \$2}"'; }
+    grp() { "$V" 'ifconfig -g atrium_egress 2>/dev/null | tr "\n" " "'; }
+    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    python3 "$ROOT/atrium-net/sim/lan.py" 600 > "$HOME/atrium-vm/lan.log" 2>&1 &
+    LANPID=$!
+    trap 'nat_cleanup; kill $LANPID 2>/dev/null || true' EXIT
+    "$V" 'cat > /tmp/aura/atrium.pf' < "$ROOT/etc/atrium.pf"
+    "$V" "set -e
+        g=\$(route -n get default 2>/dev/null | awk '/gateway/{print \$2}'); case \$g in 10.0.2.*) echo \$g > /tmp/aura/default.saved ;; esac
+        for a in \$(ifconfig vtnet1 inet | awk '/inet /{print \$2}'); do ifconfig vtnet1 inet \$a -alias; done
+        ifconfig vtnet1 up
+        kldstat -q -m pf || kldload pf
+        p=\$(sysrc -n pf_rules 2>/dev/null || true); if pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' && [ -s \"\$p\" ]; then echo \"\$p\" > /tmp/aura/pf.was; fi
+        sysctl -q net.inet.ip.forwarding=1 >/dev/null
+        ifconfig vtnet0 group atrium_egress
+        pfctl -f /tmp/aura/atrium.pf && pfctl -e >/dev/null 2>&1 || true
+        pfctl -s nat
+        ifconfig epair9 create >/dev/null 2>&1 || true
+        ifconfig epair9a inet 100.64.9.1/30 group atrium up
+        jail -c name=natprobe vnet persist path=/ host.hostname=natprobe
+        ifconfig epair9b vnet natprobe
+        jexec natprobe ifconfig epair9b inet 100.64.9.2/30 up
+        jexec natprobe route -q add default 100.64.9.1
+        printf 'pass in quick on atrium inet from 100.64.9.2 to ! 100.64.0.0/16\n' | pfctl -a atrium/natprobe -f -" | sed 's/^/    /' || fail "setup"
+    "$V" 'pfctl -s nat' | grep -q 'nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)' && ok "etc/atrium.pf loads: NAT on group atrium_egress" || fail "nat rule: $("$V" 'pfctl -s nat')"
+    cable on
+    NET_ARGS="--iface vtnet1 --wifi wlan0 --no-probe" start_net
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember: $r"
+    out=$("$V" "$CTL join aura-test --wait 240 --dhcp wlan0" 2>&1) || fail "join: $out"
+    i=0; until [ "$(gw)" = 10.88.0.1 ]; do i=$((i + 1)); [ $i -lt 60 ] || fail "default route: $(gw)"; sleep 2; done
+    i=0; until [ "$(grp)" = "vtnet1 " ]; do i=$((i + 1)); [ $i -lt 20 ] || fail "group: '$(grp)'"; sleep 1; done
+    ok "Ethernet is the egress: atrium_egress = vtnet1 alone (vtnet0, put there first, taken out)"
+    "$V" 'jexec natprobe ping -c 2 -t 8 10.88.0.1 >/dev/null' && ok "the app jail reaches the wired LAN's router through NAT" || fail "jail ping 10.88.0.1"
+    cable off
+    i=0; until [ "$(grp)" = "wlan0 " ]; do i=$((i + 1)); [ $i -lt 60 ] || fail "after cable off, group: '$(grp)'"; sleep 2; done
+    ok "cable pulled: atrium_egress = wlan0 ($((i * 2)) s), no pf reload"
+    "$V" 'jexec natprobe ping -c 2 -t 8 10.77.0.1 >/dev/null' && ok "the app jail reaches the Wi-Fi network's router through NAT" || fail "jail ping 10.77.0.1: $("$V" 'pfctl -ss | head; netstat -rn -f inet | head -12')"
+    cable on
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -861,6 +915,12 @@ n4)
     n4
     teardown
     echo "atrium-net N4 gate: $pass checks passed" ;;
+nat)
+    setup hostapd-wpa2.conf
+    nat
+    nat_cleanup
+    teardown
+    echo "apps' NAT follows the egress: $pass checks passed" ;;
 svc)
     setup hostapd-wpa2.conf
     svc

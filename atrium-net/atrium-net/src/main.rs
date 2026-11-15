@@ -116,6 +116,7 @@ mod imp {
         probe_every: u64,
         probe_bin: String,
         netd: Option<String>,
+        egress_group: Option<String>,
         /// Exit (status 75) when a port arrives or a managed one goes away,
         /// so the service starts again with the ports there are now.
         follow: bool,
@@ -165,6 +166,7 @@ mod imp {
             probe_every: 300,
             probe_bin: "/usr/local/libexec/atrium-probe".into(),
             netd: None,
+            egress_group: Some("atrium_egress".into()),
             follow: false,
         };
         let mut a = std::env::args().skip(1);
@@ -189,7 +191,9 @@ mod imp {
                 "--probe-bin" => o.probe_bin = val(&mut a, "--probe-bin"),
                 "--netd-dir" => o.netd = Some(val(&mut a, "--netd-dir")),
                 "--follow-ports" => o.follow = true,
-                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum] [--probe URL | --no-probe] [--probe-expect TEXT] [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR] [--follow-ports]"),
+                "--egress-group" => o.egress_group = Some(val(&mut a, "--egress-group")),
+                "--no-egress-group" => o.egress_group = None,
+                _ => die("usage: atrium-net [-v] --iface NAME ... [--wifi NAME] [--lease PATH] [--sock PATH] [--state-dir DIR] [--aura-dir DIR] [--keys-dir DIR] [--no-unbound] [--unbound-dir DIR] [--capsicum] [--probe URL | --no-probe] [--probe-expect TEXT] [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR] [--follow-ports] [--egress-group NAME | --no-egress-group]"),
             }
         }
         if let Some(w) = &o.wifi {
@@ -288,6 +292,12 @@ mod imp {
         announced: Option<usize>,
         prober: Option<Prober>,
         netd: Option<Dir>,
+        /// The interface group pf's NAT rule names (`nat on atrium_egress`):
+        /// the egress interface alone is in it. Every interface there was
+        /// at start, to take the others out.
+        egress_group: Option<String>,
+        ports_seen: Vec<String>,
+        group_synced: bool,
     }
 
     /// How long a Wi-Fi address outlives the link.
@@ -447,6 +457,9 @@ mod imp {
                     Err(e) => eprintln!("atrium-net: default route: {e}"),
                 }
             }
+            if cur != self.announced || !self.group_synced {
+                self.sync_egress_group(cur);
+            }
             if cur != self.announced {
                 self.announced = cur;
                 let name = cur.map_or("none".to_string(), |k| self.ifs[k].name.clone());
@@ -467,6 +480,31 @@ mod imp {
                     }
                 }
             }
+        }
+
+        /// Only the egress interface in the NAT group, so apps' traffic
+        /// (100.64.0.0/16, NAT'd by pf) leaves where the default route does.
+        fn sync_egress_group(&mut self, cur: Option<usize>) {
+            let Some(g) = self.egress_group.clone() else { return };
+            let keep = cur.map(|k| self.ifs[k].name.clone());
+            for n in self.ports_seen.iter().filter(|n| Some(*n) != keep.as_ref()) {
+                if let Err(e) = self.ifc.group(n, &g, false) {
+                    eprintln!("atrium-net: {n}: leaving group {g}: {e}");
+                }
+            }
+            if let Some(n) = &keep {
+                match self.ifc.group(n, &g, true) {
+                    Ok(()) => self.log(&format!("{n} is the only member of {g} (apps' NAT)")),
+                    Err(e) => {
+                        eprintln!("atrium-net: {n}: joining group {g}: {e}");
+                    }
+                }
+            } else {
+                self.log(&format!("{g} is empty: no egress"));
+            }
+            // Once at start, then on each change (an error is logged, not
+            // retried every second).
+            self.group_synced = true;
         }
 
         /// IPv6 follows: only the egress interface's RAs give default
@@ -1262,6 +1300,9 @@ mod imp {
             announced: None,
             prober: None,
             netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
+            egress_group: o.egress_group.clone(),
+            ports_seen: all.iter().map(|i| i.name.clone()).collect(),
+            group_synced: false,
         };
         // Temporary addresses (RFC 8981) preferred for outgoing connections;
         // stable-private (RFC 7217) for the rest. Before capability mode.
