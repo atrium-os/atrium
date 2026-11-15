@@ -76,7 +76,7 @@
 #define IH_SRC_CP_PRIV_INSTR	0xb9u
 #define SI_KCQ_DOORBELL		(0x03u << 1)	/* mes12.c KCQ_DOORBELL */
 #define SI_UQ_VA		0x200000000ull	/* above the BO window */
-#define SI_UQ_VA_STRIDE		0x10000ull
+#define SI_UQ_VA_STRIDE		0x20000ull	/* gfx: + shadow, CSA (7a) */
 #define SI_SCRUB_TIMEOUT_MS	2000	/* one fill of AMD_KQ_FILL_MAX */
 #define SI_UNROUTED_KEEP	4	/* distinct unrouted EOP values kept */
 #define SI_MES_INT_TYPES	16	/* MES host interrupt types counted */
@@ -1127,7 +1127,7 @@ si_vm_flush(struct amd_si_client *c, uint16_t id)
  */
 int
 amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
-    uint32_t prio, uint8_t *upg, uint64_t upa, int *slotp)
+    uint32_t prio, int gfx, uint8_t *upg, uint64_t upa, int *slotp)
 {
 	struct amd_si_client *c = sc->si_client;
 	struct amd_uq *hw;
@@ -1175,8 +1175,8 @@ amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
 		amd_mes12_uq_ints(amd_si_mes(sc), true, c->uq_int_saved);
 	/* MES priority: NORMAL (1) for every client in 5c-2b. */
 	err = amd_mes12_uq_create(amd_si_mes(sc), vm->hw12, vm->vmid, slot,
-	    SI_UQ_VA + slot * SI_UQ_VA_STRIDE, prio + 1, upg, (vm_paddr_t)upa,
-	    &hw);
+	    SI_UQ_VA + slot * SI_UQ_VA_STRIDE, prio + 1, gfx != 0, upg,
+	    (vm_paddr_t)upa, &hw);
 	mtx_lock(&sc->lock);
 	if (err != 0) {
 		u->busy = false;

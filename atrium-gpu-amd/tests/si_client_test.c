@@ -84,6 +84,13 @@
  *                waited for, three rounds; every page must hold its own
  *                64 x 42 and nothing else's. Raises isolation.queue_limit
  *                for the run (root's queues count too) and puts it back.
+ *  20 gfx queue  (stage 7a) with isolation.gfx_queues = 1 (refused while
+ *                0): a GFX-family queue fd on an MES gfx user queue runs
+ *                WRITE_DATA jobs with kqueue completion, many in a row,
+ *                beside the VM's compute queue; write_42's dispatch on it
+ *                is reported (INFO); a store to an unmapped VA loses only
+ *                that queue (EIO) while another VM runs on; a new gfx
+ *                queue in the same VM runs after.
  *  19 unbind     VM_UNBIND: flags and a BO not bound there are refused; a
  *                BO shared into four VMs and unbound from each no longer
  *                keeps them alive once their fds close (isolation.vms),
@@ -2270,6 +2277,173 @@ scale(void)
 	}
 }
 
+/* ---- 20: gfx queues (stage 7a) ---- */
+
+#define GFXQ_SYSCTL	"dev.atrium_gpu_amd.0.isolation.gfx_queues"
+#define GFXQ_MARK	0x7a000000u
+
+static int
+gfxq_set(int v, int *old)
+{
+	size_t len = sizeof(*old);
+
+	return (sysctlbyname(GFXQ_SYSCTL, old, &len, &v, sizeof(v)));
+}
+
+/* WRITE_DATA of n words v, v+1, ... at va; returns dwords. */
+static u_int
+gfxq_write(uint32_t *w, uint64_t va, uint32_t v, u_int n)
+{
+	u_int i;
+
+	w[0] = PKT3(0x37u, 3 + n - 1);
+	w[1] = 5u << 8 | 1u << 20;	/* DST_SEL memory, WR_CONFIRM, ME */
+	w[2] = (uint32_t)va;
+	w[3] = (uint32_t)(va >> 32);
+	for (i = 0; i < n; i++)
+		w[4 + i] = v + i;
+	return (4 + n);
+}
+
+/* Run `dw` dwords of j's IB on queue q; 0 or the completion error. */
+static int
+gfxq_run(struct job *j, int q, const uint32_t *w, u_int dw, int *ms)
+{
+	int r;
+
+	if (bo_xfer(j->ib, __DECONST(void *, w), dw * 4, 1) != 0)
+		return (errno);
+	r = queue_submit(q, j->ib_va, dw, j->so, ++j->value, NULL);
+	if (r != 0)
+		return (r);
+	return (job_wait(j, 4000, ms));
+}
+
+static void
+gfx_queue(struct job *other)
+{
+	struct job j;
+	uint32_t w[64], out[SIW42_OUT_DW], first;
+	int old = 0, tmp, q = -1, r, ms, n, i;
+
+	job_init(&j);
+	if (gfxq_set(0, &old) != 0) {
+		check(0, "20 gfx queue", "%s: %s", GFXQ_SYSCTL, strerror(errno));
+		return;
+	}
+	if (job_open(&j, "20") != 0) {
+		check(0, "20 gfx queue", "setup failed");
+		goto out;
+	}
+	r = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0, 0) >= 0 ? 0 :
+	    errno;
+	check(r == EINVAL, "20 gfx queue: refused while gfx_queues is 0",
+	    "%s", r == 0 ? "accepted" : strerror(r));
+	if (gfxq_set(1, &tmp) != 0) {
+		check(0, "20 gfx queue", "set: %s", strerror(errno));
+		goto out;
+	}
+	q = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0, 0);
+	check(q >= 0, "20 gfx queue: QUEUE_CREATE of family GFX", "%s",
+	    q >= 0 ? "ok" : strerror(errno));
+	if (q < 0)
+		goto out;
+
+	/* a: one WRITE_DATA job. */
+	(void)poison(j.out, POISON_A);
+	r = gfxq_run(&j, q, w, gfxq_write(w, j.out_va, GFXQ_MARK, 8), &ms);
+	n = bo_xfer(j.out, out, sizeof(out), 0) == 0 ? 0 : -1;
+	for (i = 0; n >= 0 && i < 8; i++)
+		n += out[i] == GFXQ_MARK + (uint32_t)i;
+	check(r == 0 && n == 8 && out[8] == POISON_A, "20 gfx queue: a "
+	    "WRITE_DATA job runs and completes", "completion %s after %d ms, "
+	    "%d/8 words, out[0] %#x, out[8] %#x", r == 0 ? "ok" : strerror(r),
+	    ms, n, out[0], out[8]);
+
+	/* b: 32 jobs in a row, each a word of its own. */
+	(void)poison(j.out, POISON_A);
+	for (i = 0, r = 0; i < 32 && r == 0; i++) {
+		u_int dw = gfxq_write(w, j.out_va + 4 * (uint64_t)i,
+		    GFXQ_MARK + 0x100 + (uint32_t)i, 1);
+
+		if (bo_xfer(j.ib, w, dw * 4, 1) != 0)
+			r = errno;
+		else
+			r = queue_submit(q, j.ib_va, dw, j.so, ++j.value,
+			    NULL);
+		if (r == 0)
+			r = job_wait(&j, 4000, &ms);
+	}
+	n = bo_xfer(j.out, out, sizeof(out), 0) == 0 ? 0 : -1;
+	for (i = 0; n >= 0 && i < 32; i++)
+		n += out[i] == GFXQ_MARK + 0x100 + (uint32_t)i;
+	check(r == 0 && n == 32, "20 gfx queue: 32 jobs in a row", "%s, "
+	    "%d/32 words", r == 0 ? "ok" : strerror(r), n);
+
+	/* c: the VM's compute queue runs beside it. */
+	run_clean(&j, "20 gfx queue: the VM's compute queue runs beside it");
+
+	/* d: write_42 (a compute dispatch) on the gfx queue: INFO only. */
+	if (poison(j.out, POISON_A) == 0 && job_submit_on(&j, q, j.out_va,
+	    NULL) == 0) {
+		r = job_wait(&j, 4000, &ms);
+		n = count(j.out, SIW42_OUT_VALUE, &first);
+		printf("INFO: 20 gfx queue: write_42's dispatch on the gfx "
+		    "queue: completion %s after %d ms, %d/64 words 42\n",
+		    r == 0 ? "ok" : strerror(r), ms, n);
+		if (r != 0) {
+			close(q);
+			close(j.so);
+			j.so = syncobj();
+			j.value = 0;
+			q = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0,
+			    0);
+		}
+	}
+
+	/* e: a store to an unmapped VA loses only this queue. */
+	if (q >= 0) {
+		r = gfxq_run(&j, q, w, gfxq_write(w, 0x7ff000000000ull,
+		    GFXQ_MARK, 1), &ms);
+		check(r == EIO, "20 gfx queue: a store to an unmapped VA fails "
+		    "the work (EIO)", "got %s after %d ms", r == 0 ? "success" :
+		    strerror(r), ms);
+		r = queue_submit(q, j.ib_va, 5, -1, 0, NULL);
+		check(r == EIO, "20 gfx queue: the lost queue refuses new work",
+		    "%s", r == 0 ? "accepted" : strerror(r));
+		if (other != NULL && other->vm >= 0 && other->q >= 0)
+			run_clean(other, "20 gfx queue: another VM's queue "
+			    "runs on");
+		close(q);
+		close(j.so);
+		j.so = syncobj();
+		j.value = 0;
+	}
+
+	/* f: a new gfx queue in the same VM. */
+	q = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0, 0);
+	if (q < 0) {
+		check(0, "20 gfx queue: a new gfx queue after", "%s",
+		    strerror(errno));
+		goto out;
+	}
+	(void)poison(j.out, POISON_A);
+	r = gfxq_run(&j, q, w, gfxq_write(w, j.out_va, GFXQ_MARK + 0x200, 4),
+	    &ms);
+	n = bo_xfer(j.out, out, sizeof(out), 0) == 0 ? 0 : -1;
+	for (i = 0; n >= 0 && i < 4; i++)
+		n += out[i] == GFXQ_MARK + 0x200 + (uint32_t)i;
+	check(r == 0 && n == 4, "20 gfx queue: a new gfx queue in the same VM "
+	    "runs after", "completion %s, %d/4 words", r == 0 ? "ok" :
+	    strerror(r), n);
+out:
+	if (q >= 0)
+		close(q);
+	job_close(&j);
+	if (gfxq_set(old, &tmp) != 0)
+		check(0, "20 gfx queue", "restore: %s", strerror(errno));
+}
+
 /* ---- 19: VM_UNBIND ---- */
 
 static int
@@ -2747,6 +2921,10 @@ main(void)
 	/* 18: many VMs and queues (6b; before 14's re-inits). */
 	if (!skipped(18, "scale"))
 		scale();
+
+	/* 20: gfx queues (stage 7a; before 14's re-inits). */
+	if (!skipped(20, "gfx queue"))
+		gfx_queue(&a);
 
 	/* 19: VM_UNBIND (before 14's re-inits). */
 	if (!skipped(19, "unbind"))

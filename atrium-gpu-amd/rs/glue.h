@@ -21,6 +21,7 @@ struct atrium_amd_softc *amd_rs_cdev_softc(struct cdev *cdev);
 uint32_t amd_rs_cur_ruid(void);
 uint64_t amd_rs_quota_limit(struct atrium_amd_softc *sc, int vram);
 uint64_t amd_rs_queue_limit(struct atrium_amd_softc *sc);
+int	amd_rs_gfx_queues(struct atrium_amd_softc *sc);
 void	amd_rs_quota_refused(struct atrium_amd_softc *sc);
 
 /* Rust, for C (rs/ioctl.rs): the cdevsw entry points. */
@@ -72,7 +73,7 @@ void	amd_rs_q_faulted_locked(struct atrium_amd_softc *sc, uint32_t qid);
 /* C, for Rust (rs/uqueue.rs; si_client.c): client queue fds on MES user
  * queues (5c-2b). EOPNOTSUPP/0 on a backend without them. */
 int	amd_si_uq_create(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm,
-	    uint32_t prio, uint8_t *upg, uint64_t upa, int *slot);
+	    uint32_t prio, int gfx, uint8_t *upg, uint64_t upa, int *slot);
 uint64_t amd_si_uq_doorbell_pa(struct atrium_amd_softc *sc, int slot);
 uint64_t amd_si_uq_fence_va(struct atrium_amd_softc *sc, int slot);
 int	amd_si_uq_alive(struct atrium_amd_softc *sc, int slot);

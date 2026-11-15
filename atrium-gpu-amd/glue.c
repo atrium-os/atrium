@@ -91,6 +91,12 @@ amd_rs_quota_limit(struct atrium_amd_softc *sc, int vram)
 	return (total / 100 * (uint64_t)pct);
 }
 
+int
+amd_rs_gfx_queues(struct atrium_amd_softc *sc)
+{
+	return (atomic_load_int(&sc->gfx_queues));
+}
+
 uint64_t
 amd_rs_queue_limit(struct atrium_amd_softc *sc)
 {

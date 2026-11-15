@@ -306,12 +306,19 @@ impl Dev {
     // --- queue fds on MES user queues (uqueue.rs; si_client.c, 5c-2b) ---
 
     /// Add a user queue running in `vm`. Returns its slot. EOPNOTSUPP on a backend without.
-    /// `user`: a user-mode queue on these pages (ring, writeback, EOP: kernel address and
-    /// physical address of three contiguous pages that outlive the queue).
-    pub fn uq_create(self, vm: *mut sys::atrium_amd_vm, prio: u32, user: Option<(*mut u8, u64)>) -> Result<c_int> {
+    /// `gfx`: a gfx queue (stage 7a; kernel mode only). `user`: a user-mode queue on these
+    /// pages (ring, writeback, EOP: kernel address and physical address of three contiguous
+    /// pages that outlive the queue).
+    pub fn uq_create(
+        self,
+        vm: *mut sys::atrium_amd_vm,
+        prio: u32,
+        gfx: bool,
+        user: Option<(*mut u8, u64)>,
+    ) -> Result<c_int> {
         let mut slot: c_int = -1;
         let (pg, pa) = user.unwrap_or((core::ptr::null_mut(), 0));
-        check(unsafe { sys::amd_si_uq_create(self.0, vm, prio, pg, pa, &mut slot) })?;
+        check(unsafe { sys::amd_si_uq_create(self.0, vm, prio, gfx as c_int, pg, pa, &mut slot) })?;
         Ok(slot)
     }
 

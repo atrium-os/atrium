@@ -82,6 +82,8 @@ struct mes_gen {
 	uint32_t spi_compute_queue_reset, mec_prgrm_start, mec_instr_pntr;
 	/* CP front-end/compute busy and stall detail (wedge diagnosis). */
 	uint32_t cp_cpc_stall, cp_cpf_busy, cp_cpf_stall, cp_cpf_busy2;
+	/* ME pipe 0's interrupt enables (gfx queues' EOP and CP errors). */
+	uint32_t cp_int_cntl_ring0;
 };
 
 static const struct mes_gen mes_gens[] = {
@@ -106,7 +108,8 @@ static const struct mes_gen mes_gens[] = {
 	  0x00c0, 0x01cb, 0x01ce,
 	  0x0b << 1, 0x0c << 1, 0x400,
 	  S0(0x1f73), S1(0x2900), S1(0x2908),
-	  S0(0x0e26), S0(0x0e28), S0(0x0e29), S0(0x0e33) },
+	  S0(0x0e26), S0(0x0e28), S0(0x0e29), S0(0x0e33),
+	  S0(0x1e0a) },
 };
 
 /* CP_MES_CNTL */
@@ -203,6 +206,7 @@ static const struct mes_gen mes_gens[] = {
 /* CP_ME1_PIPEn_INT_CNTL: PRIV_REG, OPCODE_ERROR, RESERVED_BIT_ERROR (as
  * gfx_v12_0_set_{priv_reg,bad_op}_fault_state; si_client.c handles). */
 #define CPC_CP_ERROR_INTS	0x09800000u
+#define GFX_PRIV_INSTR_INT	0x00400000u	/* CP_INT_CNTL_RING0 only */
 #define RST_FLAGS		4	/* bit 0 reset_queue_only */
 #define RST_GANG_CTX		8
 #define RST_DOORBELL		16
@@ -292,6 +296,7 @@ struct mes {
 	bool dispatch;			/* stage 4e: keep MEC1 queue 0 */
 	bool uq_ints_on;		/* MEC1 EOP/CP-error ints set at start */
 	uint32_t mec_int_cntl[4];	/* MEC1 pipes' INT_CNTL as found */
+	uint32_t gfx_int_cntl;		/* CP_INT_CNTL_RING0 as found */
 	uint16_t pci_cmd;		/* as found, restored on down */
 	uint8_t *scratch;		/* 2 x MES_SCRATCH_SIZE, or NULL */
 	vm_paddr_t scratch_pa;
@@ -977,6 +982,7 @@ mes_teardown(struct mes *m)
 	DELAY(100);
 	if (m->uq_ints_on) {		/* MES halted: selects are safe */
 		mec_ints(m, false, m->mec_int_cntl);
+		wr(m, g->cp_int_cntl_ring0, m->gfx_int_cntl);
 		m->uq_ints_on = false;
 	}
 	(void)grbm_watch(m, "MES halted, CP still running", 500);
@@ -1002,6 +1008,7 @@ mes_teardown(struct mes *m)
 #define DISP_SIZE		0x6000u
 #define DISP_EOP_SIZE		2048u
 #define KCQ_DOORBELL		(0x03u << 1)	/* NAVI10 MEC_RING0 << 1 */
+#define QUEUE_TYPE_GFX		0
 #define QUEUE_TYPE_COMPUTE	1
 #define DISP_SEQ		0x4e000001u
 #define DISP_POISON		0xdeadbeefu
@@ -2076,6 +2083,78 @@ uq_mqd_build(uint8_t *q, uint64_t mqd, uint64_t ring, uint64_t eop,
 	put32(q, MQD_HQD_ACTIVE, 0);
 }
 
+/* v12_gfx_mqd (v12_structs.h): dword offsets. */
+#define GMQD_SHADOW_LO		0
+#define GMQD_SHADOW_HI		1
+#define GMQD_FW_WORK_LO		4
+#define GMQD_FW_WORK_HI		5
+#define GMQD_MQD_BASE		128
+#define GMQD_MQD_BASE_HI	129
+#define GMQD_HQD_ACTIVE		130
+#define GMQD_HQD_VMID		131
+#define GMQD_QUEUE_PRIORITY	134
+#define GMQD_QUANTUM		135
+#define GMQD_HQD_BASE		136
+#define GMQD_HQD_BASE_HI	137
+#define GMQD_HQD_RPTR		138
+#define GMQD_RPTR_ADDR		139
+#define GMQD_RPTR_ADDR_HI	140
+#define GMQD_WPTR_POLL_LO	141
+#define GMQD_WPTR_POLL_HI	142
+#define GMQD_DOORBELL		143
+#define GMQD_HQD_CNTL		145
+#define GMQD_HQD_WPTR		149
+#define GMQD_HQD_WPTR_HI	150
+#define GMQD_MQD_CONTROL	162
+#define GMQD_FENCE_LO		510
+#define GMQD_FENCE_HI		511
+/* gfx_v12_0.c register defaults. */
+#define GFX_MQD_CONTROL_DEFAULT	0x00000100u
+#define GFX_HQD_QUANTUM_DEFAULT	0x00000a01u
+#define GFX_HQD_CNTL_DEFAULT	0x00f00000u
+
+/*
+ * gfx_v12_0_gfx_mqd_init for a user queue (not a kernel queue: no
+ * KMD_QUEUE, RB_NON_PRIV set): the MQD at GART `mqd`; ring, rptr/wptr,
+ * shadow and CSA at VAs of the process's VM; doorbell dword `db`.
+ */
+static void
+uq_gfx_mqd_build(uint8_t *q, uint64_t mqd, uint64_t ring, uint64_t wb,
+    uint64_t shadow, uint64_t csa, uint32_t db)
+{
+	uint32_t *d = (uint32_t *)q, bufsz;
+
+	memset(q, 0, MQD_SIZE);
+	d[GMQD_HQD_WPTR] = 0;
+	d[GMQD_HQD_WPTR_HI] = 0;
+	d[GMQD_MQD_BASE] = (uint32_t)mqd & 0xfffffffcu;
+	d[GMQD_MQD_BASE_HI] = (uint32_t)(mqd >> 32);
+	/* VMID 0, PRIV_STATE, CACHE_POLICY 0: the MQD is the kernel's. */
+	d[GMQD_MQD_CONTROL] = (GFX_MQD_CONTROL_DEFAULT & ~0xfu) | (1u << 8);
+	d[GMQD_HQD_VMID] = 0;				/* MES sets it */
+	d[GMQD_QUEUE_PRIORITY] = 0;
+	d[GMQD_QUANTUM] = GFX_HQD_QUANTUM_DEFAULT | 1u;	/* QUANTUM_EN */
+	d[GMQD_HQD_BASE] = (uint32_t)(ring >> 8);
+	d[GMQD_HQD_BASE_HI] = (uint32_t)(ring >> 40);
+	d[GMQD_RPTR_ADDR] = (uint32_t)wb & 0xfffffffcu;
+	d[GMQD_RPTR_ADDR_HI] = (uint32_t)(wb >> 32) & 0xffff;
+	d[GMQD_WPTR_POLL_LO] = (uint32_t)(wb + 8) & 0xfffffffcu;
+	d[GMQD_WPTR_POLL_HI] = (uint32_t)((wb + 8) >> 32) & 0xffff;
+	/* RB_BUFSZ = log2(dwords) - 1, RB_BLKSZ = that - 2, RB_NON_PRIV. */
+	bufsz = (uint32_t)(ffs(RING_DW) - 2);
+	d[GMQD_HQD_CNTL] = (GFX_HQD_CNTL_DEFAULT & ~(0x3fu | 0x3f00u)) |
+	    bufsz | (bufsz - 2) << 8 | 1u << 15;
+	d[GMQD_DOORBELL] = (db << 2) | (1u << 30);	/* OFFSET, EN */
+	d[GMQD_HQD_RPTR] = 0;
+	d[GMQD_HQD_ACTIVE] = 1;
+	d[GMQD_SHADOW_LO] = (uint32_t)shadow;
+	d[GMQD_SHADOW_HI] = (uint32_t)(shadow >> 32);
+	d[GMQD_FW_WORK_LO] = (uint32_t)csa;
+	d[GMQD_FW_WORK_HI] = (uint32_t)(csa >> 32);
+	d[GMQD_FENCE_LO] = 0;
+	d[GMQD_FENCE_HI] = 0;
+}
+
 static void
 uq_mqd_init(struct uqp *u, u_int p)
 {
@@ -2090,7 +2169,7 @@ uq_mqd_init(struct uqp *u, u_int p)
  */
 static int
 uq_add_raw(struct mes *m, struct amd_vm12 *vm, uint64_t gva, uint32_t pid,
-    uint32_t db, uint32_t prio)
+    uint32_t db, uint32_t prio, uint32_t qtype)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
@@ -2110,14 +2189,15 @@ uq_add_raw(struct mes *m, struct amd_vm12 *vm, uint64_t gva, uint32_t pid,
 	put32(b, AQ_DOORBELL, db);
 	put64(b, AQ_MQD_ADDR, gva + UQ_G_MQD);
 	put64(b, AQ_WPTR_ADDR, gva + UQ_G_WB + 8);
-	put32(b, AQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	put32(b, AQ_QUEUE_TYPE, qtype);
 	put32(b, AQ_GDS_SIZE, RING_DW);
 	put32(b, AQ_VM_CNTX_CNTL, amd_gmc12_ctx_cntl(m->gt, 8));
-	return (mes_api(m, 0, pkt, AQ_API_STATUS, "ADD_QUEUE (user compute)"));
+	return (mes_api(m, 0, pkt, AQ_API_STATUS, qtype == QUEUE_TYPE_GFX ?
+	    "ADD_QUEUE (user gfx)" : "ADD_QUEUE (user compute)"));
 }
 
 static int
-uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db)
+uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db, uint32_t qtype)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
@@ -2126,9 +2206,9 @@ uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db)
 	pkt[0] = HDR_REMOVE_QUEUE;
 	put32(b, RQ_DOORBELL, db);
 	put64(b, RQ_GANG_CTX, gva + UQ_G_GANG);
-	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
-	return (mes_api(m, 0, pkt, RQ_API_STATUS,
-	    "REMOVE_QUEUE (user compute)"));
+	put32(b, RQ_QUEUE_TYPE, qtype);
+	return (mes_api(m, 0, pkt, RQ_API_STATUS, qtype == QUEUE_TYPE_GFX ?
+	    "REMOVE_QUEUE (user gfx)" : "REMOVE_QUEUE (user compute)"));
 }
 
 /*
@@ -2137,7 +2217,7 @@ uq_remove_raw(struct mes *m, uint64_t gva, uint32_t db)
  * a direct reset did not stop and whose REMOVE_QUEUE MES refused.
  */
 static int
-uq_reset_raw(struct mes *m, uint64_t gva, uint32_t db)
+uq_reset_raw(struct mes *m, uint64_t gva, uint32_t db, uint32_t qtype)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
@@ -2147,21 +2227,22 @@ uq_reset_raw(struct mes *m, uint64_t gva, uint32_t db)
 	put32(b, RST_FLAGS, 1);
 	put64(b, RST_GANG_CTX, gva + UQ_G_GANG);
 	put32(b, RST_DOORBELL, db);
-	put32(b, RST_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
-	return (mes_api(m, 0, pkt, RST_API_STATUS,
-	    "RESET (user compute queue)"));
+	put32(b, RST_QUEUE_TYPE, qtype);
+	return (mes_api(m, 0, pkt, RST_API_STATUS, qtype == QUEUE_TYPE_GFX ?
+	    "RESET (user gfx queue)" : "RESET (user compute queue)"));
 }
 
 static int
 uq_add(struct mes *m, struct uqp *u, u_int p)
 {
-	return (uq_add_raw(m, &u->vm, u->gva, 0x100 + p, UQ_DOORBELL(p), 1));
+	return (uq_add_raw(m, &u->vm, u->gva, 0x100 + p, UQ_DOORBELL(p), 1,
+	    QUEUE_TYPE_COMPUTE));
 }
 
 static int
 uq_remove(struct mes *m, struct uqp *u, u_int p)
 {
-	return (uq_remove_raw(m, u->gva, UQ_DOORBELL(p)));
+	return (uq_remove_raw(m, u->gva, UQ_DOORBELL(p), QUEUE_TYPE_COMPUTE));
 }
 
 /*
@@ -2425,6 +2506,20 @@ CTASSERT(UQ2_GART_VA >= MES_SCRATCH_VA + 2 * MES_SCRATCH_SIZE);
 CTASSERT(0x10u + AMD_UQ_SLOTS - 1 <= 0x8au);
 CTASSERT(UQ2_GART_VA + (uint64_t)AMD_UQ_SLOTS * UQ_G_SIZE <= (64ull << 20));
 #define UQ2_PAGES		3u
+/*
+ * Stage 7a, gfx queues: after ring/WB/EOP (the EOP page is unused on the
+ * ME) the CP's register shadow (gfx_v12_0 MQD_SHADOW_BASE_SIZE, 72 KiB)
+ * and its firmware work area (CSA, 484 bytes) in the queue's VM, as
+ * amdgpu's gfx user queues get them from userspace. Kernel pages, mapped
+ * read-write without X: what the client can do to them it can do to its
+ * own context registers with SET_CONTEXT_REG anyway.
+ */
+#define UQ2_SHADOW		0x4000u
+#define UQ2_SHADOW_SIZE		0x12000u	/* 73728 */
+#define UQ2_CSA			(UQ2_SHADOW + UQ2_SHADOW_SIZE)
+#define UQ2_XPAGES		((UQ2_SHADOW_SIZE + PAGE_SIZE) / PAGE_SIZE)
+#define UQ2_SPAN		(UQ2_CSA + PAGE_SIZE)
+CTASSERT(UQ2_SPAN <= 0x20000);	/* si_client.c SI_UQ_VA_STRIDE */
 #define UQ2_RING		0x0000u
 #define UQ2_WB			0x1000u
 #define UQ2_EOP			0x2000u
@@ -2453,6 +2548,10 @@ struct amd_uq {
 	u_int	 fault_vmid;	/* VMID the IH found it on at its fault */
 	u_int	 muted_vmid;	/* its fault IVs muted on this VMID */
 	uint64_t mute_faults;	/* iso.vm_faults when it was muted */
+	bool	 gfx;		/* a gfx queue (stage 7a): ME, not MEC */
+	uint32_t qtype;		/* QUEUE_TYPE_GFX or _COMPUTE, for MES */
+	uint8_t	*xpg;		/* gfx: shadow + CSA pages, or NULL */
+	vm_paddr_t xpg_pa;
 };
 
 static bool
@@ -2643,6 +2742,8 @@ uq2_hqd_reset(struct amd_uq *q)
 	u_int vmid, pipe, qi, us = 0;
 	bool idle;
 
+	if (q->gfx)
+		return (false);		/* an ME queue: MES removes it */
 	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
 		return (true);
 	grbm_select_q(m, 1, pipe, qi);
@@ -2709,6 +2810,10 @@ uq2_unmap_vm(struct amd_uq *q, u_int kvmid)
 		return;
 	for (i = 0; i < UQ2_PAGES; i++)
 		(void)amd_gmc12_vm_unmap(q->vm, q->va + i * PAGE_SIZE);
+	if (q->xpg != NULL)
+		for (i = 0; i < UQ2_XPAGES; i++)
+			(void)amd_gmc12_vm_unmap(q->vm, q->va + UQ2_SHADOW +
+			    i * PAGE_SIZE);
 	/* Every MES VMID may hold a translation of these pages (6b: the VM
 	 * is bound to no kernel VMID; `kvmid` is the driver's VM id). */
 	(void)kvmid;
@@ -2724,6 +2829,8 @@ uq2_free(struct amd_uq *q, u_int kvmid)
 	gart_unmap_blk(q->m->gt, q->gva, UQ_G_SIZE);
 	if (!q->user)
 		contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	if (q->xpg != NULL)
+		contigfree(q->xpg, UQ2_XPAGES * PAGE_SIZE, M_DEVBUF);
 	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
 	free(q, M_DEVBUF);
 }
@@ -2737,8 +2844,8 @@ uq2_free(struct amd_uq *q, u_int kvmid)
  */
 int
 amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
-    u_int slot, uint64_t va, uint32_t prio, uint8_t *upg, vm_paddr_t upa,
-    struct amd_uq **out)
+    u_int slot, uint64_t va, uint32_t prio, bool gfx, uint8_t *upg,
+    vm_paddr_t upa, struct amd_uq **out)
 {
 	struct amd_gart *gt = m->gt;
 	struct amd_uq *q;
@@ -2750,10 +2857,14 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 		return (EINVAL);
 	if (upg != NULL && !m->udb_registered)
 		return (ENXIO);
+	if (gfx && upg != NULL)
+		return (EOPNOTSUPP);	/* user-mode gfx queues: not yet */
 	q = malloc(sizeof(*q), M_DEVBUF, M_WAITOK | M_ZERO);
 	q->m = m;
 	q->vm = vm;
 	q->slot = slot;
+	q->gfx = gfx;
+	q->qtype = gfx ? QUEUE_TYPE_GFX : QUEUE_TYPE_COMPUTE;
 	q->user = upg != NULL;
 	q->db = q->user ? AMD_UQ_DOORBELL_USER(slot) : AMD_UQ_DOORBELL(slot);
 	q->va = va;
@@ -2773,6 +2884,11 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	q->g = contigmalloc(UQ_G_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	q->g_pa = vtophys(q->g);
+	if (gfx) {
+		q->xpg = contigmalloc(UQ2_XPAGES * PAGE_SIZE, M_DEVBUF,
+		    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		q->xpg_pa = vtophys(q->xpg);
+	}
 
 	/* GART: MQD, process ctx, gang ctx, and the writeback alias. */
 	for (i = 0; i < 3; i++)
@@ -2798,21 +2914,32 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 		    AMD_VM_READ | AMD_VM_WRITE |
 		    ((m->sc->gpu_wx & AMD_WX_UQ) != 0 ? 0 : AMD_VM_EXEC))) != 0)
 			goto fail;
+	if (q->xpg != NULL)
+		for (i = 0; i < UQ2_XPAGES; i++)
+			if ((err = amd_gmc12_vm_map(vm, va + UQ2_SHADOW +
+			    i * PAGE_SIZE, q->xpg_pa + i * PAGE_SIZE,
+			    AMD_VM_READ | AMD_VM_WRITE)) != 0)
+				goto fail;
 	/* A walk by another queue of the VM may have cached what these
 	 * pages replaced: flush every MES VMID (6b: no kernel VMID). */
 	for (i = 8; i < 16; i++)
 		if ((err = amd_gmc12_vm_flush(gt, i)) != 0)
 			goto fail;
 
-	uq_mqd_build(q->g + UQ_G_MQD, q->gva + UQ_G_MQD, va + UQ2_RING,
-	    va + UQ2_EOP, va + UQ2_WB, q->db);
+	if (gfx)
+		uq_gfx_mqd_build(q->g + UQ_G_MQD, q->gva + UQ_G_MQD,
+		    va + UQ2_RING, va + UQ2_WB, va + UQ2_SHADOW, va + UQ2_CSA,
+		    q->db);
+	else
+		uq_mqd_build(q->g + UQ_G_MQD, q->gva + UQ_G_MQD,
+		    va + UQ2_RING, va + UQ2_EOP, va + UQ2_WB, q->db);
 	if ((err = uq_add_raw(m, vm, q->gva, UQ2_PID(slot), q->db,
-	    prio)) != 0)
+	    prio, q->qtype)) != 0)
 		goto fail;
 	q->added = true;
-	device_printf(m->sc->dev, "uq%u: added%s: VM base %#jx, queue pages at "
-	    "VA %#jx (pa %#jx), MQD GART %#jx, doorbell %#x\n", slot,
-	    q->user ? " (user mode)" : "",
+	device_printf(m->sc->dev, "uq%u: added%s%s: VM base %#jx, queue pages "
+	    "at VA %#jx (pa %#jx), MQD GART %#jx, doorbell %#x\n", slot,
+	    gfx ? " (gfx)" : "", q->user ? " (user mode)" : "",
 	    (uintmax_t)amd_gmc12_vm_pd_addr(vm), (uintmax_t)va,
 	    (uintmax_t)q->pg_pa, (uintmax_t)(q->gva + UQ_G_MQD), q->db);
 	*out = q;
@@ -2821,6 +2948,12 @@ fail:
 	/* Not added: MES never saw the block. */
 	uq2_free(q, kvmid);
 	return (err);
+}
+
+bool
+amd_mes12_uq_gfx(struct amd_uq *q)
+{
+	return (q->gfx);
 }
 
 uint32_t
@@ -2994,6 +3127,8 @@ amd_mes12_uq_free_lost(struct amd_uq *q, device_t dev)
 	device_printf(dev, "uq%u: freed after the GPU reset\n", q->slot);
 	if (!q->user)
 		contigfree(q->pg, UQ2_PAGES * PAGE_SIZE, M_DEVBUF);
+	if (q->xpg != NULL)
+		contigfree(q->xpg, UQ2_XPAGES * PAGE_SIZE, M_DEVBUF);
 	contigfree(q->g, UQ_G_SIZE, M_DEVBUF);
 	free(q, M_DEVBUF);
 }
@@ -3077,7 +3212,8 @@ uq_hang_reset(struct mes *m)
 }
 
 static int
-uq_remove_after_reset(struct mes *m, uint64_t gva, uint32_t db)
+uq_remove_after_reset(struct mes *m, uint64_t gva, uint32_t db,
+    uint32_t qtype)
 {
 	uint32_t pkt[API_DW];
 	uint8_t *b = (uint8_t *)pkt;
@@ -3087,7 +3223,7 @@ uq_remove_after_reset(struct mes *m, uint64_t gva, uint32_t db)
 	put32(b, RQ_DOORBELL, db);
 	put64(b, RQ_GANG_CTX, gva + UQ_G_GANG);
 	put32(b, RQ_FLAGS, RQ_AFTER_RESET);
-	put32(b, RQ_QUEUE_TYPE, QUEUE_TYPE_COMPUTE);
+	put32(b, RQ_QUEUE_TYPE, qtype);
 	return (mes_api(m, 0, pkt, RQ_API_STATUS,
 	    "REMOVE_QUEUE (user compute, after reset)"));
 }
@@ -3106,10 +3242,10 @@ uq2_recover(struct amd_uq *q)
 	serr = uq_suspend_all(m, &fenced);
 	if (serr != 0 || !fenced)
 		herr = uq_hang_reset(m);
-	rerr = uq_reset_raw(m, q->gva, q->db);
-	err = uq_remove_raw(m, q->gva, q->db);
+	rerr = uq_reset_raw(m, q->gva, q->db, q->qtype);
+	err = uq_remove_raw(m, q->gva, q->db, q->qtype);
 	if (err != 0)
-		err = uq_remove_after_reset(m, q->gva, q->db);
+		err = uq_remove_after_reset(m, q->gva, q->db, q->qtype);
 	gone = !uq2_hqd_find(m, q->db, &vmid);
 	aerr = uq_resume_all(m);
 	mes_report(m, "per-queue recovery: after");
@@ -3142,7 +3278,7 @@ uq2_pipe_reset(struct amd_uq *q)
 	int err, aerr = -1;
 	bool safe, gone;
 
-	if (!uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
+	if (q->gfx || !uq2_hqd_at(m, q->db, &vmid, &pipe, &qi))
 		return (false);
 	for (i = 0; i < 8; i++) {
 		if (i == qi)
@@ -3188,9 +3324,9 @@ uq2_pipe_reset(struct amd_uq *q)
 	grbm_select_q(m, 0, 0, 0);
 	if (safe)
 		(void)amd_gfx12_safe_mode(m->sc, false);
-	err = uq_remove_raw(m, q->gva, q->db);
+	err = uq_remove_raw(m, q->gva, q->db, q->qtype);
 	if (err != 0)
-		aerr = err = uq_remove_after_reset(m, q->gva, q->db);
+		aerr = err = uq_remove_after_reset(m, q->gva, q->db, q->qtype);
 	gone = !uq2_hqd_find(m, q->db, &vmid);
 	mes_report(m, "after pipe reset");
 	device_printf(m->sc->dev, "uq%u: after pipe reset: REMOVE_QUEUE %d%s, "
@@ -3304,19 +3440,19 @@ amd_mes12_uq_evict(struct amd_uq *q)
 		return (EBUSY);
 	}
 	if (q->added) {
-		err = uq_remove_raw(m, q->gva, q->db);
+		err = uq_remove_raw(m, q->gva, q->db, q->qtype);
 		if (err != 0 && uq2_hqd_reset(q)) {
 			device_printf(m->sc->dev, "uq%u: REMOVE_QUEUE refused "
 			    "(%d); HQD reset, trying once more\n", q->slot, err);
-			err = uq_remove_raw(m, q->gva, q->db);
+			err = uq_remove_raw(m, q->gva, q->db, q->qtype);
 		}
 		if (err != 0) {
 			/* Still refused: MES's own queue reset, then once
 			 * more. Only if that fails too does the caller reset
 			 * the GPU. */
-			int rerr = uq_reset_raw(m, q->gva, q->db);
+			int rerr = uq_reset_raw(m, q->gva, q->db, q->qtype);
 
-			err = uq_remove_raw(m, q->gva, q->db);
+			err = uq_remove_raw(m, q->gva, q->db, q->qtype);
 			device_printf(m->sc->dev, "uq%u: after MES RESET (%d): "
 			    "REMOVE_QUEUE %s\n", q->slot, rerr, err == 0 ?
 			    "ok" : "still refused");
@@ -3500,6 +3636,10 @@ mes_run(struct mes *m)
 	/* MEC1 EOP and CP-error interrupts for user queues, set now while
 	 * MES has nothing to schedule (amd_mes12_uq_ints). */
 	mec_ints(m, true, m->mec_int_cntl);
+	/* The same for gfx queues on ME pipe 0 (stage 7a; not GRBM-banked). */
+	m->gfx_int_cntl = rd(m, g->cp_int_cntl_ring0);
+	wr(m, g->cp_int_cntl_ring0, m->gfx_int_cntl | TIME_STAMP_INT_ENABLE |
+	    CPC_CP_ERROR_INTS | GFX_PRIV_INSTR_INT);
 	m->uq_ints_on = true;
 	amd_mes_live = 1;
 	return (query_status(m, 0));

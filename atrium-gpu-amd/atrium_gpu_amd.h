@@ -968,8 +968,9 @@ void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
 #define AMD_MES_CTXID_FLAG	0x20000000u	/* MES's own EOPs (silicon) */
 struct amd_uq;
 int	amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
-	    u_int slot, uint64_t va, uint32_t prio, uint8_t *upg,
+	    u_int slot, uint64_t va, uint32_t prio, bool gfx, uint8_t *upg,
 	    vm_paddr_t upa, struct amd_uq **out);
+bool	amd_mes12_uq_gfx(struct amd_uq *q);
 vm_paddr_t amd_mes12_uq_doorbell_pa(struct amd_uq *q);
 bool	amd_mes12_uq_user_busy(struct amd_uq *q, uint32_t *rptr,
 	    uint32_t *fence);
@@ -1153,6 +1154,7 @@ struct atrium_amd_softc {
 	int		 sys_limit_pct;	/* per-uid System BO cap, % of RAM */
 	int		 queue_limit;	/* per-uid live queue fds (rs/quota.rs) */
 	int		 gpu_wx;	/* AMD_WX_*: GPU W^X on silicon PTEs */
+	int		 gfx_queues;	/* silicon gfx queue fds allowed (7a) */
 	int		 reset_lockout_s; /* no new queues for a uid whose queue
 					   * forced a GPU reset; 0 = off */
 	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */

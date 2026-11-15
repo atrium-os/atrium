@@ -203,8 +203,9 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     let vm = unsafe { FileRef::<Vm>::from_file(vm_fp)? };
     let dev = vm.dev();
     let si = unsafe { sys::amd_rs_is_si(dev.raw()) } != 0;
-    // GFX queues: gpusim's rasterizer only (kernel-mode, on its GFX queue).
-    if gfx && (si || user) {
+    // GFX queues: kernel mode on both (gpusim's GFX queue; silicon's MES gfx user queues,
+    // stage 7a). User-mode gfx queues are not there yet.
+    if gfx && (user || (si && unsafe { sys::amd_rs_gfx_queues(dev.raw()) } == 0)) {
         return Err(EINVAL);
     }
     // One live queue more for the calling uid (quota.rs); given back when the queue goes.
@@ -214,7 +215,7 @@ fn create(vm_fp: *mut file, a: &mut sys::atrium_gpu_queue_create) -> Result<()> 
     let pages = map.as_ref().map(|m| (m.handle().ram.kva(), m.handle().ram.pa()));
     // On failure `map` drops: nothing mapped it yet, so its pages free.
     // No MES user queues (gpusim): a kernel-mode queue on the device's own queue.
-    let slot = if si { dev.uq_create(vm.as_c(), a.priority, pages)? } else if user {
+    let slot = if si { dev.uq_create(vm.as_c(), a.priority, gfx, pages)? } else if user {
         return Err(EOPNOTSUPP);
     } else {
         SIM_SLOT

@@ -366,6 +366,9 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	 */
 	sc->gpu_wx = AMD_WX_BO;
 	TUNABLE_INT_FETCH("hw.atrium_gpu.gpu_wx", &sc->gpu_wx);
+	/* Stage 7a: gfx queue fds on silicon, off until proven on the box. */
+	sc->gfx_queues = 0;
+	TUNABLE_INT_FETCH("hw.atrium_gpu.gfx_queues", &sc->gfx_queues);
 	sc->reset_lockout_s = ATRIUM_AMD_RESET_LOCKOUT_S;
 	sc->hwq_inited = 1;
 
@@ -455,6 +458,10 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	    CTLFLAG_RW, &sc->reset_lockout_s, 0,
 	    "seconds a uid gets no new queues after its queue forced a GPU "
 	    "reset (root exempt; 0 = off)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gfx_queues",
+	    CTLFLAG_RW, &sc->gfx_queues, 0,
+	    "silicon: QUEUE_CREATE of family GFX allowed (MES gfx user "
+	    "queues, stage 7a; tunable hw.atrium_gpu.gfx_queues)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "gpu_wx",
 	    CTLFLAG_RW, &sc->gpu_wx, 0,
 	    "GPU W^X bits (silicon; new mappings; default 1, tunable "
