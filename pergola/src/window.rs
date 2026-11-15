@@ -180,9 +180,13 @@ pub fn theme_for(a: &fresco_protocol::AppearancePayload) -> crate::theme::Semant
     if a.scheme == fresco_protocol::APPEARANCE_DARK { crate::theme::Semantic::DARK } else { crate::theme::Semantic::LIGHT }
 }
 
-/// Default socket path, overridable with `FRESCO_SOCKET`.
+/// frescod's socket: `$FRESCO_SOCKET`, else the in-jail path the
+/// `graphics` capability mounts, else the dev fallback. jail(8) carries no
+/// environment in, so a jailed app finds frescod only by the mounted path
+/// (this used to stop at the dev fallback, and a jailed app on
+/// `Window::open` could not connect).
 fn socket_path() -> String {
-    std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into())
+    fresco_client::default_socket_path().to_string_lossy().into_owned()
 }
 
 impl Window {

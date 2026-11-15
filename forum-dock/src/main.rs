@@ -430,6 +430,8 @@ fn poll_running(shared: &SharedRef) {
         if s.running != running {
             s.running = running.clone();
             s.bump();
+            let ids: Vec<&str> = s.apps.iter().filter(|a| a.uid.is_some_and(|u| running.contains(&u))).map(|a| a.id.as_str()).collect();
+            eprintln!("forum-dock: running: [{}]", ids.join(", "));
         }
         // A uid no app has yet: an app ran for the first time and the
         // registry has its uid now.
