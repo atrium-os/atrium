@@ -755,6 +755,28 @@ pub fn app_shows_consoles(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.consoles == Some(true))
 }
 
+/// Is this the settings app (its INSTALLED manifest holds `app-grants`,
+/// curia.md §13)? The only caller of Access, RemoveAccess, ApproveAccess.
+pub fn app_manages_grants(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.app_grants == Some(true))
+}
+
+/// Every installed app's tree and manifest text, for Settings' Apps page:
+/// trees whose manifest names another id are left out, as they can't be
+/// launched by it.
+pub fn installed_texts() -> Vec<(PathBuf, String, Manifest)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
+        let Ok(m) = Manifest::from_str(&text) else { continue };
+        if e.file_name().to_str() == Some(m.app.id.as_str()) {
+            out.push((e.path(), text, m));
+        }
+    }
+    out
+}
+
 pub fn app_is_file_manager(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.removable_files == Some(true))
 }

@@ -93,6 +93,9 @@ fn fits(e: &Entry, p: u8) -> bool {
             e.hid == HID_ENTER || e.hid == HID_KP_ENTER
                 || (ctrl && e.mods & MOD_SHIFT != 0 && (e.hid == HID_T || e.hid == HID_N))
         }
+        // Allowing an app from Settings: Allow pressed, or Enter on it.
+        (kind::BUTTON, purpose::APPROVE) => true,
+        (kind::KEY, purpose::APPROVE) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -605,6 +608,20 @@ mod tests {
         assert_eq!(why(t.consume(1, &tab, 1001, purpose::CONSOLE, YES, NOVIS)), 0, "Ctrl+Shift+T in the terminal");
         let plain_t = t.mint(key(HID_T, MOD_CTRL, 0));
         assert_eq!(why(t.consume(1, &plain_t, 1001, purpose::CONSOLE, YES, NOVIS)), refusal::WRONG_KIND, "Ctrl+T is the shell's");
+    }
+
+    #[test]
+    fn allowing_an_app_is_allow_pressed_in_the_settings_window() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::APPROVE, YES, NOVIS)), refusal::WRONG_UID, "another app's press");
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, |_| false, NOVIS)), refusal::NOT_FOCUSED);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, NOVIS)), 0);
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::APPROVE, YES, NOVIS)), refusal::UNKNOWN, "spent once");
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::APPROVE, YES, NOVIS)), 0);
+        let typed = t.mint(key(0x04, MOD_CTRL, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::APPROVE, YES, NOVIS)), refusal::WRONG_KIND, "a shortcut allows nothing");
     }
 
     #[test]

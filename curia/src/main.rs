@@ -6,6 +6,7 @@
 //! /atrium/sockets/device-list/device-list.sock),
 //! `DISPLAY_SETTINGS_SOCKET` (forum-wm's settings socket,
 //! /atrium/sockets/display-settings/display-settings.sock),
+//! portcullisd's socket (the Apps page; portcullis_ipc::resolve_socket_path),
 //! `CURIA_SIZE` (960x720), `CURIA_SECS` (quit after, for checks).
 
 use std::path::PathBuf;
@@ -272,6 +273,64 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
     });
 }
 
+/// One Apps page ask of portcullisd (curia.md §13), on a thread of its own.
+fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc<AtomicBool>) {
+    use curia::apps::{Got, Want};
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    use std::sync::atomic::Ordering;
+    if w == Want::Refresh && refreshing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let ask = |req: &Request| -> Result<Response, String> {
+            let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
+            let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+            s.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+            match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+                Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+                Ok(other) => return Err(format!("portcullisd: {other:?}")),
+                Err(e) => return Err(format!("portcullisd is not answering ({e})")),
+            }
+            round_trip(&mut s, req).map_err(|e| format!("portcullisd is not answering ({e})"))
+        };
+        let done = |r: Result<Response, String>| match r {
+            Ok(Response::Ok) => Ok(()),
+            Ok(Response::Error { message }) => Err(message),
+            Ok(other) => Err(format!("unexpected reply: {other:?}")),
+            Err(e) => Err(e),
+        };
+        let got = match w {
+            Want::Refresh => {
+                let r = match ask(&Request::Access) {
+                    Ok(Response::Access { apps }) => Ok(apps),
+                    Ok(Response::Error { message }) => Err(message),
+                    Ok(other) => Err(format!("unexpected reply: {other:?}")),
+                    Err(e) => Err(e),
+                };
+                refreshing.store(false, Ordering::SeqCst);
+                Got::List(r)
+            }
+            Want::Allow { app_id, activation } => {
+                let r = done(ask(&Request::ApproveAccess { app_id: app_id.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: allowed {app_id}"),
+                    Err(e) => eprintln!("curia: allowing {app_id}: {e}"),
+                }
+                Got::Done { app_id, result: r }
+            }
+            Want::Remove { app_id } => {
+                let r = done(ask(&Request::RemoveAccess { app_id: app_id.clone() }));
+                match &r {
+                    Ok(()) => eprintln!("curia: removed {app_id}'s access"),
+                    Err(e) => eprintln!("curia: removing {app_id}'s access: {e}"),
+                }
+                Got::Done { app_id, result: r }
+            }
+        };
+        let _ = tx.send(got);
+    });
+}
+
 fn main() {
     let (w, h) = std::env::var("CURIA_SIZE")
         .ok()
@@ -297,7 +356,11 @@ fn main() {
     let sound_send: SoundSend = Arc::new(std::sync::Mutex::new(None));
     follow_sound(stx, sound_send.clone());
     let disp = Mutable::with_dirty(curia::display::DispPage::new(), dirty.clone());
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let apps = Mutable::with_dirty(curia::apps::AppsPage::default(), dirty.clone());
+    let (atx, arx) = channel();
+    let apps_refreshing = Arc::new(AtomicBool::new(false));
+    let mut next_apps = Instant::now();
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -402,6 +465,30 @@ fn main() {
             }
             for w in wants {
                 display_work(w, ptx.clone(), refreshing.clone());
+            }
+        }
+        // The Apps page: asked again every 10 s while it shows (an app
+        // installed, or allowed at its launch), and after each change.
+        {
+            let mut a = apps.get_cloned();
+            let mut ach = false;
+            while let Ok(g) = arx.try_recv() {
+                a.apply(g);
+                ach = true;
+            }
+            if which.get() == curia::view::Which::Apps && Instant::now() >= next_apps {
+                next_apps = Instant::now() + Duration::from_secs(10);
+                a.refresh();
+            } else if which.get() != curia::view::Which::Apps {
+                // Shown again: asked at once.
+                next_apps = Instant::now();
+            }
+            let wants = a.take_wants();
+            if ach || !wants.is_empty() {
+                apps.set(a);
+            }
+            for w in wants {
+                apps_work(w, atx.clone(), apps_refreshing.clone());
             }
         }
         let mut changed = false;

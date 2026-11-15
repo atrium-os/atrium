@@ -2,7 +2,7 @@
 
 **Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
 to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
-passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11), C4b the Sound page built 2026-11-15 (§12).
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9), C4a the Display page built 2026-11-15 (§11), C4b the Sound page built 2026-11-15 (§12), C4c the Apps page built 2026-11-15 (§13).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -75,7 +75,7 @@ C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; si
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
 | C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
 | C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check. **Built 2026-11-15** (§9) |
-| C4 | further pages: C4a Display (light/dark, text size, monitors), C4b Sound, then Apps' grants | each with its own gate. **C4a and C4b built 2026-11-15** (§11, §12) |
+| C4 | further pages: C4a Display (light/dark, text size, monitors), C4b Sound, C4c Apps' grants | each with its own gate. **C4a, C4b and C4c built 2026-11-15** (§11, §12, §13) |
 
 ## 6. Decisions
 
@@ -265,3 +265,61 @@ one goes away, hangs, or comes back (Shankar, 2026-11-15).
   (line out) on and off, each read back from `/var/db/choragus`; choragusd stopped (the
   page says so), restarted (it comes back), stopped with SIGSTOP ("not answering" after
   about 40 s) and continued (it comes back); Curia's pid unchanged.
+
+## 13. C4c as built: the Apps page (2026-11-15)
+
+Shankar chose (2026-11-15) "Approve and remove": the page lets the person allow an app
+what it asks for, as the prompt at its first launch would, but only after a real press
+that frescod confirms; restricted capabilities stay the system policy's alone.
+
+- **Who may ask.** A new restricted capability, `app-grants` (Curia only), mounts
+  portcullisd's socket (as `app-launch` does). portcullisd gates the three new verbs on
+  the caller's peer uid: the launch registry names the app, and its INSTALLED manifest
+  must hold `app-grants`. They act on the person that app was launched for (the
+  registry's owner), never on the caller's own uid: Settings changes alice's policy
+  because it runs for alice. `Grant`/`Revoke` keep their old rule (the peer's own
+  policy), so no other app can reach a person's policy this way.
+- **`Access`** answers every installed app (trees whose manifest names another id are
+  left out): its name, everything it asks for in the launch prompt's words (with what it
+  opens), what is not allowed yet (`decide` against the person's and the system's policy,
+  so "Manifest has changed since last grant" after an update), who allowed it (`You`,
+  `System`, or nobody), when the person did, and the restricted capabilities it asks for
+  (`Capabilities::restricted()`: the system-only set less `net-fetch`,
+  `protected-media` and `status-item`, plus `tessera-cas-read`, `usb-hid`,
+  `audio-monitor`, `input.raw_hid`, `input.system_keys` and the `terminal` syscall class).
+- **`ApproveAccess { app_id, activation }`** writes the person's grant for the installed
+  manifest's capabilities and hash, exactly what the launch prompt's Allow Always writes.
+  Refused when the app asks for anything restricted, when it already has what it asks
+  for, or when the manifest fails the launch's trust check. Last, portcullisd spends the
+  press with frescod under a new purpose, `APPROVE` (11): a click, or Enter, in the asking
+  app's own focused window, minted by frescod from real input; a refusal above doesn't
+  spend it. Curia passes the token of the press on Allow
+  (`pergola::clipboard::current_activation()`), so nothing but a press on Allow allows.
+- **`RemoveAccess { app_id }`** removes the person's grant; the app asks again at its next
+  launch. The system's grants can't be removed from here. An uninstalled app's leftover
+  grant can be removed too.
+- **The page** (`curia/src/apps.rs`, `AppsPage`; sidebar after Devices): "N apps, M not
+  allowed yet", then a row per app with its status ("Allowed by you on 2026-11-15",
+  "Part of the system: allowed by the system", "Asks when it opens", "Updated: asks
+  again when it opens", "Needs the system's approval; it won't open"), Allow when the
+  person may allow it, and Remove access when they have a grant, which asks once more
+  ("Remove what you allowed Player? It asks again when it next opens."). A row opens to
+  list what the app asks for, marking what is not allowed yet, and what only the system
+  can allow. A refusal shows under the row in portcullisd's words. The list is asked for
+  when the page shows, every 10 s while it does, and after each change; portcullisd away
+  shows "The apps' settings are not available; trying again".
+- Live check in the cloud arm64 VM, 2026-11-15 (`vm-apps-access-check.sh` after
+  `cloud-vm.sh up`): portcullisd, headless frescod, three signed apps installed with
+  opifex (New asking for the clipboard and notifications, Sys asking for
+  `audio-control` and granted by the system, and Settings trimmed to `graphics` and
+  `app-grants`), Curia launched for alice. Root over the socket is refused `Access` and
+  `ApproveAccess` (not a launched app); the page lists the three for alice; a click on
+  New's Allow writes her grant and New then launches without asking; a click where
+  Sys's Allow would be writes nothing; Remove access, then Remove, takes the grant
+  away. 11 checks, 0 failed; frames in `scratch/apps-access/`.
+- Open: frescod checks the press is in Curia's focused window, not that the window was
+  uncovered and still before it (`FILL` and `IDENTITY` do that for credential slots and
+  Sigillum's sheet). An overlay can't take the click (it would land on the overlay), but
+  if that check is wanted for `APPROVE` too, Curia's window has to be tracked as slots
+  are.
+

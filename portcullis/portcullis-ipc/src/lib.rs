@@ -306,6 +306,51 @@ pub enum Request {
         #[serde(default)]
         new_window: bool,
     },
+
+    /// ★ Settings' Apps page (curia.md §13): every installed app, what it
+    /// asks for, and what the person has allowed. Only from an app whose
+    /// INSTALLED manifest holds `app-grants`; about the person that app
+    /// belongs to. Answer: `Access`.
+    Access,
+    /// ★ Take away what the person allowed `app_id` (their grant; the
+    /// system's can't be). It asks again at its next launch. `app-grants`
+    /// only. Answer: `Ok`.
+    RemoveAccess { app_id: String },
+    /// ★ Allow what `app_id`'s installed manifest asks for, as the person
+    /// would at its first launch. `app-grants` only, and only with
+    /// `activation`, a press on Allow in the asking app's window that
+    /// portcullisd spends with frescod (purpose APPROVE). Never for an app
+    /// asking for a restricted capability: only the system grants those.
+    /// Answer: `Ok`.
+    ApproveAccess { app_id: String, activation: [u8; 16] },
+}
+
+/// Who allowed what an app has now (curia.md §13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccessBy {
+    /// The person, at a launch or from Settings.
+    You,
+    /// The system policy (the installer): not the person's to change.
+    System,
+}
+
+/// One installed app on Settings' Apps page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessEntry {
+    pub id:   String,
+    pub name: String,
+    /// Who allowed it to run as it is; `None` when it would ask first.
+    pub by:   Option<AccessBy>,
+    /// Everything it asks for, one line each (the launch prompt's words).
+    pub asks: Vec<String>,
+    /// What it asks for and hasn't been allowed (empty when it runs
+    /// unasked). Starts "Manifest has changed …" after an update.
+    pub missing: Vec<String>,
+    /// The person has a grant for it (Remove takes it away), and when.
+    pub yours: Option<String>,
+    /// The restricted capabilities it asks for: only the system grants
+    /// these, so Settings can't approve it.
+    pub restricted: Vec<String>,
 }
 
 /// An app that opens a type, for the Open with sheet.
@@ -404,6 +449,8 @@ pub enum Response {
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
+    /// Access → each installed app, by name.
+    Access { apps: Vec<AccessEntry> },
 
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable

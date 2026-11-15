@@ -12,6 +12,7 @@ use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use atrium_netconf::{Link, Online};
 
+use crate::apps::{self, AppsPage};
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
 use crate::sound::{self as snd, SoundPage};
@@ -33,6 +34,7 @@ pub enum Which {
     Display,
     Sound,
     Devices,
+    Apps,
 }
 
 pub struct CuriaView {
@@ -44,6 +46,8 @@ pub struct CuriaView {
     pub disp_scroll: Mutable<ScrollState>,
     pub sound: Mutable<SoundPage>,
     pub sound_scroll: Mutable<ScrollState>,
+    pub apps: Mutable<AppsPage>,
+    pub apps_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -142,7 +146,7 @@ impl View for CuriaView {
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
         let now = self.which.get();
-        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices")].into_iter().enumerate() {
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps")].into_iter().enumerate() {
             let y = em(56.0) + i as f32 * em(38.0);
             let on = now == which;
             let sel = self.which.clone();
@@ -156,6 +160,7 @@ impl View for CuriaView {
             Which::Display => self.display(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Sound => self.sound(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Apps => self.apps(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
         }
     }
 }
@@ -762,6 +767,134 @@ impl CuriaView {
     }
 }
 
+pub fn with_apps(page: &Mutable<AppsPage>, f: impl FnOnce(&mut AppsPage)) {
+    let mut p = page.get_cloned();
+    f(&mut p);
+    page.set(p);
+}
+
+impl CuriaView {
+    /// The Apps page (curia.md §13): each installed app, who allowed it,
+    /// and what it asks for when opened up.
+    fn apps(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
+        let p = self.apps.get_cloned();
+        let t = ctx.theme;
+        let mut y = em(20.0);
+        text(ctx, x0, y + em(16.0), "Apps", type_size::XL, Weight::Semibold, t.text_primary());
+        y += em(48.0);
+        match &p.list {
+            None => {
+                text(ctx, x0, y + em(10.0), "Asking which apps are installed…", type_size::SM, Weight::Regular, t.text_tertiary());
+                return;
+            }
+            Some(Err(why)) => {
+                let ch = em(64.0);
+                rect(ctx, x0, y, pw, ch, t.bg_surface(), 8.0);
+                icon(ctx, x0 + em(16.0), y + em(20.0), ph::SQUARES_FOUR, em(24.0), t.text_secondary());
+                text(ctx, x0 + em(56.0), y + em(24.0), "The apps' settings are not available", type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, x0 + em(56.0), y + em(44.0), &format!("{why}; trying again"), type_size::SM, Weight::Regular, t.text_secondary());
+                return;
+            }
+            Some(Ok(_)) => {}
+        }
+        text(ctx, x0, y + em(8.0), &p.summary(), type_size::SM, Weight::Regular, t.text_secondary());
+        y += em(28.0);
+        let top = y;
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let t = ctx.theme;
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+            ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+            let mut y = 0.0;
+            for e in p.apps() {
+                let open = p.open.as_deref() == Some(e.id.as_str());
+                let busy = p.busy.as_deref() == Some(e.id.as_str());
+                let rh = em(56.0);
+                // The row: name and status; pressing it opens the details.
+                let (pg, id) = (self.apps.clone(), e.id.clone());
+                area(ctx, Rect::new(0.0, y, pw, rh), 8.0, t.bg_surface(), t.state_hover(), move || with_apps(&pg, |a| a.toggle_open(&id)));
+                icon(ctx, em(14.0), y + em(19.0), if open { ph::CARET_DOWN } else { ph::CARET_RIGHT }, em(16.0), t.text_secondary());
+                text(ctx, em(40.0), y + em(20.0), &e.name, type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, em(40.0), y + em(40.0), &apps::status(e), type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+                // Its buttons, from the right.
+                let mut bx = pw - em(12.0);
+                let by = y + (rh - em(30.0)) / 2.0;
+                let confirming = p.confirm.as_deref() == Some(e.id.as_str());
+                if apps::can_remove(e) && !confirming {
+                    let l = "Remove access";
+                    bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
+                    let (pg, id) = (self.apps.clone(), e.id.clone());
+                    button(ctx, bx, by, l, Look::Secondary, !busy && p.busy.is_none(), move || with_apps(&pg, |a| a.remove(&id)));
+                    bx -= em(8.0);
+                }
+                if apps::can_allow(e) {
+                    let l = if busy { "Allowing…" } else { "Allow" };
+                    bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
+                    let (pg, id) = (self.apps.clone(), e.id.clone());
+                    // The press itself goes with the ask: portcullisd spends it
+                    // with frescod, so only a real click or Enter here allows.
+                    button(ctx, bx, by, l, Look::Primary, p.busy.is_none(), move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.allow(&id, token))
+                    });
+                }
+                y += rh + em(4.0);
+                if confirming {
+                    let msg = format!("Remove what you allowed {}? It asks again when it next opens.", e.name);
+                    text(ctx, em(40.0), y + em(15.0), &msg, type_size::SM, Weight::Regular, t.text_primary());
+                    let mut bx = pw - em(12.0);
+                    let l = "Cancel";
+                    bx -= width(l, type_size::SM, Weight::Medium) + em(24.0);
+                    let pg = self.apps.clone();
+                    button(ctx, bx, y, l, Look::Ghost, true, move || with_apps(&pg, AppsPage::cancel_remove));
+                    let l = "Remove";
+                    bx -= width(l, type_size::SM, Weight::Medium) + em(24.0) + em(6.0);
+                    let (pg, id) = (self.apps.clone(), e.id.clone());
+                    button(ctx, bx, y, l, Look::Danger, true, move || with_apps(&pg, |a| a.remove(&id)));
+                    y += em(38.0);
+                }
+                if let Some((_, why)) = p.note.as_ref().filter(|(a, _)| *a == e.id) {
+                    text(ctx, em(40.0), y + em(12.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                    y += em(28.0);
+                }
+                if open {
+                    let line = |ctx: &mut Ctx, y: &mut f32, s: &str, c: Color| {
+                        text(ctx, em(40.0), *y + em(11.0), s, type_size::SM, Weight::Regular, c);
+                        *y += em(24.0);
+                    };
+                    y += em(4.0);
+                    if e.asks.is_empty() {
+                        line(ctx, &mut y, "It asks for nothing beyond its own window.", t.text_secondary());
+                    } else {
+                        text(ctx, em(40.0), y + em(11.0), "It asks to", type_size::SM, Weight::Semibold, t.text_secondary());
+                        y += em(24.0);
+                        for a in &e.asks {
+                            let waiting = e.by.is_none() && e.missing.contains(a);
+                            line(ctx, &mut y, &format!("•  {a}{}", if waiting { " (not allowed yet)" } else { "" }), t.text_primary());
+                        }
+                    }
+                    if e.missing.first().is_some_and(|m| m.starts_with("Manifest has changed")) {
+                        line(ctx, &mut y, "It changed since it was allowed, so it asks again.", t.text_secondary());
+                    }
+                    if !e.restricted.is_empty() {
+                        line(ctx, &mut y, &format!("Only the system can allow {}.", e.restricted.join(", ")), t.text_secondary());
+                    }
+                    line(ctx, &mut y, &e.id, t.text_tertiary());
+                    y += em(8.0);
+                }
+            }
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = y;
+            }
+            ctx.pop();
+        });
+        ScrollView::new(self.apps_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
+            .key(94)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
+    }
+}
+
 pub fn with_devs(page: &Mutable<DevPage>, f: impl FnOnce(&mut DevPage)) {
     let mut p = page.get_cloned();
     f(&mut p);
@@ -785,7 +918,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -807,7 +940,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -826,7 +959,7 @@ mod tests {
     fn the_sound_page_shows_volume_outputs_and_apps() {
         use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
         with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
@@ -842,10 +975,36 @@ mod tests {
     }
 
     #[test]
+    fn the_apps_page_shows_who_allowed_each_app() {
+        use crate::apps::Got;
+        use portcullis_ipc::{AccessBy, AccessEntry};
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
+        with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
+        assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
+        let e = |id: &str, name: &str, by, missing: Vec<String>, yours: Option<String>, restricted: Vec<String>| AccessEntry { id: id.into(), name: name.into(), by, asks: vec!["Play audio".into(), "Access the microphone".into()], missing, yours, restricted };
+        with_apps(&v.apps, |p| {
+            p.apply(Got::List(Ok(vec![
+                e("org.atrium.player", "Player", Some(AccessBy::You), vec![], Some("2026-11-15T09:00:00Z".into()), vec![]),
+                e("org.example.rec", "Recorder", None, vec!["Access the microphone".into()], None, vec![]),
+                e("org.atrium.curia", "Settings", Some(AccessBy::System), vec![], None, vec!["app-grants".into()]),
+            ])));
+            p.toggle_open("org.example.rec");
+            p.remove("org.atrium.player");
+        });
+        let all = texts(&v);
+        for want in ["Apps", "3 apps, 1 not allowed yet", "Player", "Allowed by you on 2026-11-15", "Recorder", "Asks when it opens", "Allow", "Settings", "Part of the system: allowed by the system", "It asks to", "•  Access the microphone (not allowed yet)", "•  Play audio", "Remove what you allowed Player? It asks again when it next opens.", "Remove", "Cancel"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
+        assert_eq!(all.iter().filter(|s| *s == "Allow").count(), 1, "Settings itself is the system's: no Allow");
+    }
+
+    #[test]
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

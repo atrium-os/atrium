@@ -2584,6 +2584,10 @@ pub mod activation {
         /// An app's console (homes.md §4): a click, or Enter, on Terminal
         /// in the launcher's window, spent by portcullisd.
         pub const CONSOLE: u8 = 10;
+        /// Allowing an app what it asks for, from Settings' Apps page
+        /// (curia.md §13): a click, or Enter, on Allow in the settings
+        /// app's window, spent by portcullisd.
+        pub const APPROVE: u8 = 11;
     }
 
     /// What minted a token.

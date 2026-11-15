@@ -14,6 +14,8 @@ pub mod home;
 pub mod host_mount;
 pub mod init_phase;
 pub mod jaild_client;
+/// Settings' Apps page (curia.md §13).
+pub mod access;
 /// Opening files in apps (opening-files.md §6.2).
 pub mod opens;
 /// The manifest trust gate, re-exported so existing call sites keep working.

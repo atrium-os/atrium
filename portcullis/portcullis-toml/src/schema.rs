@@ -271,6 +271,12 @@ pub struct Capabilities {
     /// portcullisd for another tab or window in an app it already has a
     /// console in. Restricted to the system terminal.
     pub consoles: Option<bool>,
+    /// The settings app's Apps page (curia.md §13): list each installed
+    /// app's access, remove a person's grant, and approve an app after a
+    /// press frescod confirms, over portcullisd's socket. Restricted to the
+    /// settings app.
+    #[serde(rename = "app-grants")]
+    pub app_grants: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -332,11 +338,33 @@ impl Capabilities {
             ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
-            ("home-files", self.home_files), ("consoles", self.consoles), ("status-item", self.status_item),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("status-item", self.status_item),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
             ("protected-media", self.protected_media),
         ];
         all.into_iter().filter(|(_, v)| *v == Some(true)).map(|(n, _)| n).collect()
+    }
+
+    /// The restricted capabilities this asks for (curia.md §13): only the
+    /// system policy grants them, never a person from Settings. The
+    /// system-only set less what a person may allow an ordinary app
+    /// (`net-fetch`, `protected-media`, `status-item`), plus the
+    /// validator's other restricted keys.
+    pub fn restricted(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = self.system_only().into_iter()
+            .filter(|n| !["net-fetch", "protected-media", "status-item"].contains(n))
+            .collect();
+        let more = [
+            ("tessera-cas-read", self.tessera_cas_read), ("usb-hid", self.usb_hid),
+            ("audio-monitor", self.audio_monitor),
+            ("input.raw_hid", self.input.and_then(|i| i.raw_hid)),
+            ("input.system_keys", self.input.and_then(|i| i.system_keys)),
+        ];
+        out.extend(more.into_iter().filter(|(_, v)| *v == Some(true)).map(|(n, _)| n));
+        if self.syscalls.as_deref() == Some("terminal") {
+            out.push("syscalls = terminal");
+        }
+        out
     }
 }
 
@@ -523,6 +551,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         file_picker:      ovr.file_picker.or(base.file_picker),
         home_files:       ovr.home_files.or(base.home_files),
         consoles:         ovr.consoles.or(base.consoles),
+        app_grants:       ovr.app_grants.or(base.app_grants),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

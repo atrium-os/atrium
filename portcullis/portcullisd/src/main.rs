@@ -440,6 +440,15 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
+        /* ★ Settings' Apps page (curia.md §13): gated on the PEER UID, the
+         * settings app by its installed manifest (`app-grants`), and about
+         * the person it belongs to (the registry's owner), never the
+         * caller's own uid. Allow also needs a press frescod confirms. */
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. }) {
+            let resp = handle_access(uid, req, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         if let Request::Launch { app_id, bypass_policy } = req {
             /* `owner`, not `user`: see the inheritance note above. This is both
              * whose policy authorizes the launch and who the launched app is
@@ -1070,6 +1079,92 @@ fn start_for(app: &str, owner: &str, why: &'static str) {
         }
         STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &a);
     });
+}
+
+/// Access, RemoveAccess and ApproveAccess (curia.md §13). `uid` is the
+/// caller's peer uid.
+fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::{access, opens};
+    let refuse = |why: String| {
+        eprintln!("portcullisd: app access REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let Some((owner, caller)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+        return refuse("cap.app_grants.denied: caller is not a launched app".into());
+    };
+    if !launch::app_manages_grants(&caller) {
+        return refuse(format!("cap.app_grants.denied: {caller} may not see or change apps' access"));
+    }
+    let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = match s.get_or_load(&owner) {
+        Ok(tp) => tp,
+        Err(e) => return refuse(format!("policy for {owner}: {e}")),
+    };
+    let row = |text: &str, m: &portcullis_toml::Manifest, user: &Policy| {
+        access::entry(m, &hash_manifest(text.as_bytes()), user, system.as_ref())
+    };
+    match req {
+        Request::Access => {
+            let mut apps: Vec<_> = launch::installed_texts().iter().map(|(_, t, m)| row(t, m, &tp.policy)).collect();
+            access::sort(&mut apps);
+            eprintln!("portcullisd: access -> {caller} (uid {uid}) for {owner}: {} app(s)", apps.len());
+            Response::Access { apps }
+        }
+        Request::RemoveAccess { app_id } => {
+            let Some((_, t, m)) = launch::installed_texts().into_iter().find(|(_, _, m)| m.app.id == app_id) else {
+                // Uninstalled: its grant can still go.
+                if tp.policy.grants.remove(&app_id).is_none() {
+                    return refuse(format!("{app_id} is not installed"));
+                }
+                return match tp.policy.save(&tp.policy_path.clone()) {
+                    Ok(()) => Response::Ok,
+                    Err(e) => refuse(format!("save: {e}")),
+                };
+            };
+            if let Some(why) = access::may_remove(&row(&t, &m, &tp.policy)) {
+                return refuse(why);
+            }
+            tp.policy.grants.remove(&app_id);
+            match tp.policy.save(&tp.policy_path.clone()) {
+                Ok(()) => {
+                    eprintln!("portcullisd: {owner} removed {app_id}'s access (from {caller})");
+                    Response::Ok
+                }
+                Err(e) => refuse(format!("save: {e}")),
+            }
+        }
+        Request::ApproveAccess { app_id, activation } => {
+            let Some((tree, t, m)) = launch::installed_texts().into_iter().find(|(_, _, m)| m.app.id == app_id) else {
+                return refuse(format!("{app_id} is not installed"));
+            };
+            if let Some(why) = access::may_approve(&row(&t, &m, &tp.policy)) {
+                return refuse(why);
+            }
+            // The launch's own trust gate: never allow a manifest it would refuse.
+            if let Err(why) = manifest_trust::verify(&tree, &t) {
+                return refuse(why);
+            }
+            // Last of the checks: a refusal above doesn't spend the press.
+            if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+                return refuse(why);
+            }
+            tp.policy.grants.insert(app_id.clone(), Grant {
+                manifest_hash: hash_manifest(t.as_bytes()),
+                granted_at: now_iso8601(),
+                capabilities: m.capabilities.clone(),
+            });
+            match tp.policy.save(&tp.policy_path.clone()) {
+                Ok(()) => {
+                    eprintln!("portcullisd: {owner} allowed {app_id} (from {caller})");
+                    Response::Ok
+                }
+                Err(e) => refuse(format!("save: {e}")),
+            }
+        }
+        _ => Response::Error { message: "not an access request".into() },
+    }
 }
 
 /// Console (homes.md §4). `uid` is the caller's peer uid; `owner` the
@@ -1716,6 +1811,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         | Request::TeardownSessionComponent { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
+        },
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
+            message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Console { .. } => Response::Error {
             message: "internal: Console must go through handle_console".into(),
