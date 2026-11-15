@@ -1368,6 +1368,22 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
         flag("--uses").map(|u| u.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
     };
     let name = args.get(1).cloned().unwrap_or_default();
+    if args.first().map(String::as_str) == Some("run") {
+        return match daemon::run(name, args.get(2).cloned().unwrap_or_default()) {
+            Ok(Some((id, caps))) => {
+                println!("{id}\t{}", caps.join(","));
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!("portcullis workspace: portcullisd is not running");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("portcullis workspace run: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let req = match args.first().map(String::as_str).unwrap_or("list") {
         "list" => Request::Workspaces,
         "new" => Request::WorkspaceNew {

@@ -162,3 +162,36 @@ mod tests {
         assert_eq!(verify_trusted(b"x", b"y", &[]), Err(SigError::Untrusted));
     }
 }
+
+/// Sign `manifest` with a PKCS#8 PEM private key: DER ECDSA over P-256 with
+/// the SHA-256 prehash, what [`verify_one`] checks. Used for the machine's
+/// own dev publisher (homes.md §5.3: what a workspace builds), never for a
+/// third party's.
+pub fn sign(manifest: &[u8], key_pem: &str) -> Result<Vec<u8>, SigError> {
+    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::pkcs8::DecodePrivateKey;
+    let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
+    let s: Signature = k.sign(manifest);
+    Ok(s.to_der().as_bytes().to_vec())
+}
+
+/// A key pair from 32 random bytes: (private PKCS#8 PEM, public SPKI PEM).
+pub fn new_key(seed: [u8; 32]) -> Result<(String, String), SigError> {
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    let k = SigningKey::from_bytes(&seed.into()).map_err(|_| SigError::BadKey)?;
+    let private = k.to_pkcs8_pem(LineEnding::LF).map_err(|_| SigError::BadKey)?.to_string();
+    let public = k.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|_| SigError::BadKey)?;
+    Ok((private, public))
+}
+
+#[cfg(test)]
+mod sign_tests {
+    #[test]
+    fn a_signature_of_ours_verifies_and_only_for_its_text() {
+        let (k, p) = super::new_key([7; 32]).unwrap();
+        let s = super::sign(b"[app]\nid = \"dev.scratch.hello\"\n", &k).unwrap();
+        super::verify_one(b"[app]\nid = \"dev.scratch.hello\"\n", &s, &p).unwrap();
+        assert!(super::verify_one(b"[app]\nid = \"dev.scratch.other\"\n", &s, &p).is_err());
+    }
+}

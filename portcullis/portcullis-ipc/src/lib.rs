@@ -354,6 +354,13 @@ pub enum Request {
     /// with frescod (purpose APPROVE). Refused while another workspace
     /// uses it.
     WorkspaceDelete { name: String, activation: [u8; 16] },
+    /// Run what the workspace built (homes.md §5.3, W5): `project` is a
+    /// folder in its `work` (empty: `work` itself) holding `atrium.toml`
+    /// and the entry it names. Installed as the dev app
+    /// `dev.<person>.<name>.<id>`, granted what it declares, and started.
+    /// From an app, only with `activation`, a press on Run (purpose
+    /// LAUNCH); the person's own CLI needs none. Answer: `WorkspaceRan`.
+    WorkspaceRun { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
 }
 
 /// Who allowed what an app has now (curia.md §13).
@@ -502,6 +509,8 @@ pub enum Response {
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
+    /// A Run started: the dev app's id and what it was granted.
+    WorkspaceRan { app_id: String, capabilities: Vec<String> },
     /// Access → each installed app, by name.
     Access { apps: Vec<AccessEntry> },
 

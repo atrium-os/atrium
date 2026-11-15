@@ -340,6 +340,33 @@ people ship without `sshd` on the host.
    frame, Run in the Workspaces app. Gate: a hello-window app built with
    `cc` in Scratch runs as its own uid, can't read the workspace, and a
    manifest asking for a restricted capability is refused.
+   **Built 2026-11-15** (`portcullisd/src/dev.rs`). Differences from the
+   proposal above: the id is `dev.<person>.<workspace>.<id>` (two people's
+   Scratch builds are two apps), and the bundle is installed with the
+   others under `/var/lib/atrium/apps` so every launch path applies, not
+   in the home. `WorkspaceRun { name, project, activation }`: the
+   manifest and entry are read through descriptors opened
+   `O_RESOLVE_BENEATH` the project folder, itself beneath `work` (a link
+   out is ENOTCAPABLE); system-only and restricted capabilities refuse
+   the Run before anything is installed; the entry's libraries and the
+   loader are copied from the base system (its ELF is parsed, never run;
+   a library from the workspace's `/usr/local` isn't carried yet); the
+   bundle is signed by this machine's **dev publisher**
+   (`/var/db/atrium/dev-publisher`, made at the first Run, private key
+   root's 0600), which portcullis-trust accepts for `dev.` ids alone and
+   for nothing else, so a publisher's signature doesn't make a dev build;
+   the Run press (APPROVE, from an app; none from the person's own CLI,
+   `portcullis workspace run <ws> [folder]`) grants what the manifest
+   declares, for that manifest's hash; the app starts. A running build is
+   not replaced (close it first). Dev ids are left out of the catalog.
+   frescod frames every window of a `dev.` app in amber with the tag "dev
+   build: <id> from <workspace>" (the sheets' frame code), and reads the
+   launch registry again for a uid it doesn't know yet. Deleting the
+   workspace removes its builds and their grants (refused while one
+   runs). The Workspaces app has a "Run a build" field and button. Gate
+   `scripts/vm-run-check.sh` 0 failed (cc -static build, uid and home
+   checks, refusals, forged dev id, Run on the button with the amber
+   frame, delete).
 6. **W6 `workspace-exec`.** The capability, `WorkspaceExec`, the pick.
    Gate: a test app builds in a picked workspace and is refused for one it
    didn't pick.

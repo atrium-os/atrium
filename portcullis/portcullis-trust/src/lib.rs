@@ -47,6 +47,18 @@ pub const PUBLISHERS_DIR: &str = "/etc/atrium/publishers";
 /// Operator trust settings.
 pub const TRUST_CONFIG: &str = "/etc/atrium/trust.toml";
 
+/// The machine's own **dev publisher** (homes.md §5.3, W5): portcullisd's
+/// key for what a person's workspace builds and Runs. It signs only app ids
+/// under [`DEV_PREFIX`], and only it may: a dev bundle is verified against
+/// this key alone, and this key verifies nothing else, so a third party's
+/// publisher can't pose as a dev build or the reverse.
+pub const DEV_PUBLISHER_DIR: &str = "/var/db/atrium/dev-publisher";
+/// App ids of dev bundles: `dev.<workspace>.<the manifest's id>`.
+pub const DEV_PREFIX: &str = "dev.";
+
+/// Is this app id a dev build's?
+pub fn is_dev(app_id: &str) -> bool { app_id.starts_with(DEV_PREFIX) }
+
 /// How badly the caller needs a signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Demand {
@@ -61,6 +73,7 @@ pub enum Demand {
 pub struct Trust {
     publishers_dir: PathBuf,
     require_signatures: bool,
+    dev_dir: PathBuf,
 }
 
 impl Default for Trust {
@@ -71,7 +84,13 @@ impl Trust {
     /// Explicit settings — the constructor tests use, and the one to reach for
     /// when a caller already knows its policy.
     pub fn new(publishers_dir: impl Into<PathBuf>, require_signatures: bool) -> Self {
-        Trust { publishers_dir: publishers_dir.into(), require_signatures }
+        Trust { publishers_dir: publishers_dir.into(), require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR) }
+    }
+
+    /// Where the dev publisher's key is (tests).
+    pub fn with_dev_dir(mut self, d: impl Into<PathBuf>) -> Self {
+        self.dev_dir = d.into();
+        self
     }
 
     /// Read the operator's settings from `TRUST_CONFIG`.
@@ -96,7 +115,7 @@ impl Trust {
                 }
             },
         };
-        Trust { publishers_dir, require_signatures }
+        Trust { publishers_dir, require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR) }
     }
 
     pub fn require_signatures(&self) -> bool { self.require_signatures }
@@ -119,6 +138,15 @@ impl Trust {
     pub fn verify_publisher(&self, tree: &Path, manifest_text: &str, demand: Demand)
         -> Result<Option<[u8; 32]>, String>
     {
+        // ★ A dev bundle: the machine's dev key alone, never unsigned.
+        if tree.file_name().and_then(|n| n.to_str()).is_some_and(is_dev) {
+            let key = std::fs::read_to_string(self.dev_dir.join("public.pem"))
+                .map_err(|_| "a dev build, and this machine has no dev publisher".to_string())?;
+            let sig = manifest_signature(&tree.join("atrium.toml.sig"));
+            return portcullis_sig::verify_trusted_publisher(manifest_text.as_bytes(), &sig, &[key])
+                .map(Some)
+                .map_err(|e| format!("a dev build not signed by this machine's dev publisher ({e:?})"));
+        }
         let publishers = load_trusted_publishers(
             self.publishers_dir.to_str().unwrap_or(PUBLISHERS_DIR));
         if publishers.is_empty() {
@@ -186,6 +214,31 @@ pub fn verify_publisher(tree: &Path, manifest_text: &str) -> Result<Option<[u8; 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_bundles_take_the_dev_key_alone() {
+        let d = tmp();
+        let (k, p) = portcullis_sig::new_key([3; 32]).unwrap();
+        let (k2, p2) = portcullis_sig::new_key([4; 32]).unwrap();
+        std::fs::create_dir_all(d.path().join("dev")).unwrap();
+        std::fs::write(d.path().join("dev/public.pem"), &p).unwrap();
+        std::fs::create_dir_all(d.path().join("pubs")).unwrap();
+        std::fs::write(d.path().join("pubs/a.pem"), &p2).unwrap();
+        let t = Trust::new(d.path().join("pubs"), false).with_dev_dir(d.path().join("dev"));
+        let text = "[app]\nid = \"dev.scratch.hello\"\n";
+        let tree = d.path().join("dev.scratch.hello");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("atrium.toml.sig"), portcullis_sig::sign(text.as_bytes(), &k).unwrap()).unwrap();
+        t.verify(&tree, text, Demand::PolicyDefault).expect("signed by the dev key");
+        // A publisher's signature doesn't make a dev build.
+        std::fs::write(tree.join("atrium.toml.sig"), portcullis_sig::sign(text.as_bytes(), &k2).unwrap()).unwrap();
+        assert!(t.verify(&tree, text, Demand::PolicyDefault).is_err());
+        // And the dev key signs nothing else.
+        let other = d.path().join("org.x.y");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("atrium.toml.sig"), portcullis_sig::sign(b"x", &k).unwrap()).unwrap();
+        assert!(t.verify(&other, "x", Demand::PolicyDefault).is_err());
+    }
 
     fn tmp() -> tempfile::TempDir { tempfile::tempdir().expect("tempdir") }
 

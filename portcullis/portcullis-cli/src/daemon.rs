@@ -263,6 +263,17 @@ pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32, limits
 }
 
 /// Workspaces (homes.md §5): any workspace request; the list comes back.
+/// Run what a workspace built (homes.md §5.3): the dev app's id and what
+/// it was granted.
+pub fn run(name: String, project: String) -> DaemonResult<(String, Vec<String>)> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    match round_trip(&mut s, &Request::WorkspaceRun { name, project, activation: [0; 16] })? {
+        Response::WorkspaceRan { app_id, capabilities } => Ok(Some((app_id, capabilities))),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected Run reply: {other:?}"))),
+    }
+}
+
 pub fn workspaces(req: Request) -> DaemonResult<(Vec<portcullis_ipc::WorkspaceInfo>, Vec<portcullis_ipc::Toolchain>)> {
     let Some(mut s) = opened()? else { return Ok(None) };
     match round_trip(&mut s, &req)? {

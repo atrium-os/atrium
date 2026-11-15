@@ -1598,7 +1598,21 @@ fn render_one_frame(
             if let Some(at) = windows.iter().position(|w| w.id == sheet) {
                 windows.insert(at, chrome::dim_layer(chrome::dim_id(sheet), pr));
             }
-            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid) });
+            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid), dev: false });
+        }
+        /* Dev builds (homes.md §5.3): every window of one framed in amber
+         * and tagged with the workspace it came from. */
+        let owners: Vec<(u32, u32)> = {
+            let c = comp.lock().unwrap();
+            rects.iter().filter_map(|&(id, _)| Some((id, c.windows.get(&u16::try_from(id).ok()?)?.owner_uid))).collect()
+        };
+        for (id, uid) in owners {
+            let app = chrome::app_label(uid);
+            if app.starts_with("dev.") {
+                if let Some(&(_, r)) = rects.iter().find(|(l, _)| *l == id) {
+                    out.push(chrome::Sheet { rect: r, app, dev: true });
+                }
+            }
         }
         out
     };

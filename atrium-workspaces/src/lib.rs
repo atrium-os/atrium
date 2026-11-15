@@ -41,6 +41,9 @@ pub enum Act {
     AskDelete,
     CancelDelete,
     Delete(String, [u8; 16]),
+    /// Run what the workspace built in a project folder of its `work`
+    /// (homes.md §5.3): installed as a dev app and started.
+    Run(String, [u8; 16]),
 }
 
 /// What the loop asks portcullisd.
@@ -53,6 +56,7 @@ pub enum Want {
     Stop(String),
     Delete(String, [u8; 16]),
     Open(String, [u8; 16]),
+    Run { name: String, project: String, activation: [u8; 16] },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -146,7 +150,9 @@ impl State {
     }
 
     /// What `a` comes to: the state's own part now, and what to ask.
-    pub fn act(&mut self, a: Act, new_name: &str) -> Option<Want> {
+    /// `text` is the form's field: the new name, or the project to Run.
+    pub fn act(&mut self, a: Act, text: &str) -> Option<Want> {
+        let new_name = text;
         match a {
             Act::Select(n) => {
                 self.selected = Some(n);
@@ -200,6 +206,15 @@ impl State {
                 self.busy = Some(format!("Deleting {}…", title(&n)));
                 Some(Want::Delete(n, token))
             }
+            Act::Run(n, token) => {
+                let project = text.trim().trim_matches('/').to_string();
+                if project.split('/').any(|c| c == "..") {
+                    self.note = Some(("A folder inside work".into(), true));
+                    return None;
+                }
+                self.busy = Some(format!("Running {}…", if project.is_empty() { "work" } else { &project }));
+                Some(Want::Run { name: n, project, activation: token })
+            }
         }
     }
 }
@@ -209,6 +224,8 @@ pub type Queue = Arc<Mutex<Vec<Act>>>;
 pub struct WorkspacesView {
     pub state: Mutable<State>,
     pub name: Mutable<TextEdit>,
+    /// The project folder to Run, in the shown workspace's `work`.
+    pub project: Mutable<TextEdit>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
 }
@@ -418,6 +435,22 @@ impl View for WorkspacesView {
                 ctx.key(502);
                 Button::secondary("Delete workspace…").at(x0, y).width(em(170.0)).on_click(plain(q, Act::AskDelete)).render(ctx);
             }
+            if s.confirm_delete {
+                y += em(40.0);
+            }
+            y += em(62.0);
+
+            // ── Run what it built (homes.md §5.3) ──
+            text(ctx, x0, y, "Run a build", type_size::MD, Weight::Medium, t.text_primary());
+            y += em(18.0);
+            ctx.key(600);
+            TextField::new(self.project.clone()).placeholder("folder in work with atrium.toml").at(x0, y).width(em(260.0)).render(ctx);
+            ctx.key(601);
+            let n = name.clone();
+            Button::primary("Run").at(x0 + em(272.0), y).width(em(90.0)).on_click(pressed(q, move |tok| Act::Run(n.clone(), tok))).render(ctx);
+            y += em(48.0);
+            text(ctx, x0, y, "It runs as its own app, with what its atrium.toml asks for; never anything system-only.",
+                 type_size::SM, Weight::Regular, t.text_tertiary());
         } else if s.loaded {
             text(ctx, x0, y + em(20.0), "No workspace chosen.", type_size::MD, Weight::Regular, t.text_secondary());
         }
@@ -489,5 +522,13 @@ mod tests {
         assert!(s.confirm_delete);
         assert_eq!(s.act(Act::Delete("scratch".into(), [7; 16]), ""), Some(Want::Delete("scratch".into(), [7; 16])));
         assert!(!s.confirm_delete);
+    }
+
+    #[test]
+    fn run_takes_a_folder_inside_work() {
+        let mut s = state();
+        assert!(s.act(Act::Run("scratch".into(), [2; 16]), "../x").is_none());
+        assert_eq!(s.act(Act::Run("scratch".into(), [2; 16]), " /hello/ "),
+                   Some(Want::Run { name: "scratch".into(), project: "hello".into(), activation: [2; 16] }));
     }
 }

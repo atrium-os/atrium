@@ -765,6 +765,10 @@ pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
     for e in entries.flatten() {
         let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
         let Ok(m) = Manifest::from_str(&text) else { continue };
+        // Dev builds are Run from their workspace, never from the grid.
+        if portcullisd::manifest_trust::is_dev(&m.app.id) {
+            continue;
+        }
         out.push(portcullis_ipc::CatalogEntry {
             id:          m.app.id.clone(),
             name:        m.app.name.clone(),

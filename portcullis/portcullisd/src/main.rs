@@ -52,6 +52,7 @@ use portcullis_ipc::{
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod console;
+mod dev;
 mod empty;
 mod launch;
 mod workspace;
@@ -437,8 +438,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             continue;
         }
         /* ★ Workspaces (homes.md §5): a launcher, or the person. */
+        if let Request::WorkspaceRun { name, project, activation } = req {
+            let resp = handle_run(uid, &owner, &name, &project, activation, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. }) {
-            let resp = handle_workspace(uid, &owner, req);
+            let resp = handle_workspace(uid, &owner, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
         }
@@ -1180,7 +1186,69 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
 /// Workspaces (homes.md §5). Asked by a launcher (Forum) for the person it
 /// runs for, or by the person themselves (the CLI), never from inside an
 /// app or a workspace: a workspace's settings aren't changed from inside it.
-fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
+/// Run (homes.md §5.3, W5): install what workspace `ws` built as a dev app
+/// and start it. Asked by the Workspaces app or a launcher (with a press) or
+/// by the person's own CLI.
+fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], shared: &Mutex<Tenants>) -> Response {
+    let refuse = |why: String| {
+        eprintln!("portcullisd: Run of {ws}/{project} for {owner} REFUSED: {why}");
+        Response::Error { message: why }
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    let app = match &caller {
+        Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) => true,
+        Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
+        None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
+        None => return refuse("cap.workspace.denied: not a person or a launcher".into()),
+    };
+    let p = match dev::prepare(owner, ws, project) {
+        Ok(p) => p,
+        Err(why) => return refuse(why),
+    };
+    if launch::running_jid(&p.id).is_some() {
+        return refuse(format!("{} is running: close it first", p.id));
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if app {
+        if let Err(why) = portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
+                                                              fresco_protocol::activation::purpose::APPROVE) {
+            return refuse(why);
+        }
+    }
+    if let Err(why) = dev::install(&p) {
+        return refuse(why);
+    }
+    let m = match portcullis_toml::Manifest::from_str(&p.manifest) {
+        Ok(m) => m,
+        Err(e) => return refuse(e.to_string()),
+    };
+    /* The Run press is the person's decision on what this manifest
+     * declares (nothing system-only: dev::prepare refused that). */
+    {
+        let mut t = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let tp = match t.get_or_load(owner) {
+            Ok(tp) => tp,
+            Err(e) => return refuse(format!("policy for {owner}: {e}")),
+        };
+        tp.policy.grants.insert(p.id.clone(), Grant {
+            manifest_hash: hash_manifest(p.manifest.as_bytes()),
+            granted_at: now_iso8601(),
+            capabilities: m.capabilities.clone(),
+        });
+        if let Err(e) = tp.policy.save(&tp.policy_path.clone()) {
+            return refuse(format!("save: {e}"));
+        }
+    }
+    let caps: Vec<String> = p.manifest.parse::<toml::Value>().ok()
+        .and_then(|v| v.get("capabilities").and_then(|c| c.as_table()).map(|t| t.keys().cloned().collect()))
+        .unwrap_or_default();
+    eprintln!("portcullisd: Run: {} for {owner} from {ws}/{project}, granted {caps:?}", p.id);
+    start_for(&p.id, owner, "a Run");
+    Response::WorkspaceRan { app_id: p.id, capabilities: caps }
+}
+
+fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
@@ -1210,9 +1278,27 @@ fn handle_workspace(uid: u32, owner: &str, req: Request) -> Response {
         /* Deleting loses the person's files: a press on Delete, confirmed by
          * frescod, as Settings' Allow is (purpose APPROVE). */
         Request::WorkspaceDelete { name, activation } => workspace::check_delete(owner, &name)
+            .and_then(|_| match dev::bundles_of(owner, &name).into_iter().find(|id| launch::running_jid(id).is_some()) {
+                Some(id) => Err(format!("{id} is running: close it first")),
+                None => Ok(()),
+            })
             .and_then(|_| portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
                                                                fresco_protocol::activation::purpose::APPROVE))
-            .and_then(|_| workspace::delete(owner, &name)),
+            .and_then(|_| workspace::delete(owner, &name))
+            .map(|_| {
+                // Its dev builds go with it, and their grants.
+                let ids = dev::bundles_of(owner, &name);
+                let mut t = shared.lock().unwrap_or_else(|e| e.into_inner());
+                if let Ok(tp) = t.get_or_load(owner) {
+                    for id in &ids {
+                        tp.policy.grants.remove(id);
+                    }
+                    let _ = tp.policy.save(&tp.policy_path.clone());
+                }
+                for id in &ids {
+                    dev::remove(id);
+                }
+            }),
         _ => Err("not a workspace request".into()),
     };
     if let Err(message) = done {
@@ -1923,7 +2009,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
-        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } => Response::Error {
+        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

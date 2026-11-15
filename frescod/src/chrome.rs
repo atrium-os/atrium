@@ -325,7 +325,12 @@ pub fn app_label(uid: u32) -> String {
     use std::time::{Duration, Instant};
     static REG: Mutex<Option<(Instant, portcullis_peer::AppRegistry)>> = Mutex::new(None);
     let mut g = REG.lock().unwrap();
-    if g.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(5)) {
+    /* Read again every 5 s, and sooner (at most every 200 ms) for a uid it
+     * doesn't know: a window composed once, just after its app was
+     * registered, must not keep the stale answer. */
+    let stale = g.as_ref().is_none_or(|(at, r)| at.elapsed() > Duration::from_secs(5)
+        || (r.resolve(uid).is_none() && at.elapsed() > Duration::from_millis(200)));
+    if stale {
         let path = std::env::var("FRESCOD_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
         *g = Some((Instant::now(), portcullis_peer::AppRegistry::load(&path).unwrap_or_default()));
     }
@@ -389,12 +394,28 @@ pub fn slot_frames(px: Px, slots: &[[i32; 4]], islands: &[Island]) -> Option<Win
 pub struct Sheet {
     pub rect: [i32; 4],
     pub app: String,
+    /// Not a sheet: a window of a dev build (homes.md §5.3, W5), framed
+    /// the same way in amber so it is never taken for the real app.
+    pub dev: bool,
 }
 
 impl Sheet {
     /// What its tag says, in the characters the chrome font draws.
     pub fn tag(&self) -> String {
-        format!("system: {}", self.app)
+        if self.dev {
+            // dev.<person>.<workspace>.<id>
+            let rest = self.app.strip_prefix("dev.").unwrap_or(&self.app);
+            match rest.splitn(3, '.').collect::<Vec<_>>()[..] {
+                [_, ws, id] => format!("dev build: {id} from {ws}"),
+                _ => format!("dev build: {rest}"),
+            }
+        } else {
+            format!("system: {}", self.app)
+        }
+    }
+
+    fn color(&self) -> [f32; 4] {
+        if self.dev { ISLAND_COLOR } else { SHEET_COLOR }
     }
 }
 
@@ -432,15 +453,16 @@ pub fn sheet_frames(c: &mut WindowFrame, px: Px, sheets: &[Sheet], top: i32) {
     for sh in sheets {
         let [x0, y0, x1, y1] = sh.rect;
         let (w, h) = (x1 - x0, y1 - y0);
-        c.rects.push(rect(x0 - ring, y0 - ring, w + 2 * ring, ring, SHEET_COLOR));
-        c.rects.push(rect(x0 - ring, y1, w + 2 * ring, ring, SHEET_COLOR));
-        c.rects.push(rect(x0 - ring, y0, ring, h, SHEET_COLOR));
-        c.rects.push(rect(x1, y0, ring, h, SHEET_COLOR));
+        let col = sh.color();
+        c.rects.push(rect(x0 - ring, y0 - ring, w + 2 * ring, ring, col));
+        c.rects.push(rect(x0 - ring, y1, w + 2 * ring, ring, col));
+        c.rects.push(rect(x0 - ring, y0, ring, h, col));
+        c.rects.push(rect(x1, y0, ring, h, col));
         let tag = sh.tag();
         let tw = text_width(px, &tag) + px.p(2 * PAD + 6);
         let above = y0 - ring - label_h;
         let y = if above >= top { above } else { y1 + ring };
-        let mut pill = rect(x0 - ring, y, tw, label_h, SHEET_COLOR);
+        let mut pill = rect(x0 - ring, y, tw, label_h, col);
         pill.radius = px.p(3) as f32;
         c.rects.push(pill);
         text(&mut c.rects, px, &tag, x0 - ring + px.p(PAD + 3), y + (label_h - line(px)) / 2, tw - px.p(2 * PAD));
@@ -453,6 +475,13 @@ pub fn sheet_frames(c: &mut WindowFrame, px: Px, sheets: &[Sheet], top: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dev_build_is_tagged_with_its_workspace() {
+        let d = Sheet { rect: [0, 40, 100, 100], app: "dev.alice.scratch.org.example.hello".into(), dev: true };
+        assert_eq!(d.tag(), "dev build: org.example.hello from scratch");
+        assert_eq!(d.color(), ISLAND_COLOR);
+    }
 
     #[test]
     fn the_ring_goes_under_the_shells_own_windows() {
@@ -559,7 +588,7 @@ mod tests {
 
     #[test]
     fn a_sheet_is_framed_and_tagged_above_and_its_parent_dimmed() {
-        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into() };
+        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false };
         assert_eq!(sh.tag(), "system: org.atrium.scrinium");
         let mut c = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[]);
         let before = c.rects.len();

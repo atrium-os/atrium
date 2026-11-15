@@ -76,6 +76,12 @@ fn run(w: Want, tx: Sender<Got>) {
                 listed(ask(&Request::WorkspaceDelete { name: name.clone(), activation }))
                     .map(|_| format!("{} deleted", title(&name)))),
             Want::Open(name, activation) => Some(open(&name, activation)),
+            Want::Run { name, project, activation } => Some(match ask(&Request::WorkspaceRun { name: name.clone(), project, activation }) {
+                Ok(Response::WorkspaceRan { app_id, capabilities }) => Ok(format!("Running {app_id}{}",
+                    if capabilities.is_empty() { String::new() } else { format!(" with {}", capabilities.join(", ")) })),
+                Ok(other) => Err(format!("unexpected answer: {other:?}")),
+                Err(e) => Err(e),
+            }),
         };
         if let Some(d) = done {
             let _ = tx.send(Got::Done(d));
@@ -98,9 +104,10 @@ fn main() {
     let dirty = Arc::new(AtomicBool::new(true));
     let state = Mutable::with_dirty(State::default(), dirty.clone());
     let name = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
+    let project = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
     let queue: Queue = Arc::new(Mutex::new(Vec::new()));
-    let view = WorkspacesView { state: state.clone(), name: name.clone(), size: size.clone(), queue: queue.clone() };
+    let view = WorkspacesView { state: state.clone(), name: name.clone(), project: project.clone(), size: size.clone(), queue: queue.clone() };
     let mut app = App::new_with_flag(view, dirty);
     let (tx, rx) = channel();
     run(Want::List, tx.clone());
@@ -126,7 +133,8 @@ fn main() {
         for a in acts {
             let mut s = state.get_cloned();
             let creating = matches!(a, atrium_workspaces::Act::Create(_));
-            let want = s.act(a, name.get_cloned().text());
+            let text = if matches!(a, atrium_workspaces::Act::Run(..)) { project.get_cloned().text().to_string() } else { name.get_cloned().text().to_string() };
+            let want = s.act(a, &text);
             if creating && want.is_some() {
                 s.creating = false;
                 s.selected = name.get_cloned().text().trim().to_string().into();
