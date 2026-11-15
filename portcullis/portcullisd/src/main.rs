@@ -443,7 +443,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. }) {
+        if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceDuplicate { .. }) {
             let resp = handle_workspace(uid, &owner, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1269,6 +1269,7 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
             name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses,
         }).map(|_| ()),
         Request::WorkspaceSet { name, network, uses } => workspace::set(owner, &name, network, uses).map(|_| ()),
+        Request::WorkspaceDuplicate { name, new_name } => workspace::duplicate(owner, &name, &new_name).map(|_| ()),
         Request::WorkspaceStop { name } => {
             if workspace::valid_name(&name) {
                 workspace::stop(owner, &name);
@@ -2009,7 +2010,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
-        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } => Response::Error {
+        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

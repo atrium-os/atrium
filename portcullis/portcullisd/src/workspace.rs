@@ -248,6 +248,63 @@ pub fn create(owner: &str, r: Record) -> Result<Record, String> {
     Ok(r)
 }
 
+/// Duplicate `from` as `to` (homes.md §5.4, W8): its record (named `to`),
+/// its `work` and its writable root, build output and all, so a project
+/// split out or a risky try costs no rebuild. The copy runs as its own uid:
+/// what `from`'s uid owned is re-owned as it is copied. A plain copy here;
+/// on a Tessera volume this becomes a clone (copy-on-write).
+pub fn duplicate(owner: &str, from: &str, to: &str) -> Result<Record, String> {
+    let (home, gid) = person(owner)?;
+    let root = root_dir(&home, gid)?;
+    let src = root.join(from);
+    let r = load(&src).filter(|_| valid_name(from)).ok_or_else(|| format!("no workspace {from:?}"))?;
+    let new = Record { name: to.to_string(), ..r };
+    check(owner, &home, &new)?;
+    if load(&root.join(to)).is_some() || fs::symlink_metadata(root.join(to)).is_ok() {
+        return Err(format!("{owner} has a workspace {to} already"));
+    }
+    let (old_uid, old_user) = launch::resolve_app_uid(owner, &reg_id(from), None).map_err(|e| format!("{e:?}"))?;
+    let (new_uid, new_user) = launch::resolve_app_uid(owner, &reg_id(to), None).map_err(|e| format!("{e:?}"))?;
+    let new_gid = crate::console::gid_of(new_uid).ok_or_else(|| format!("no group for uid {new_uid}"))?;
+    let old_gid = crate::console::gid_of(old_uid);
+    let dst = make_dirs(owner, &home, gid, to)?;
+    let fail = |m: String| {
+        let _ = fs::remove_dir_all(&dst);
+        m
+    };
+    // ★ Copied as links, never through one (cp -R without -L), owners kept.
+    for part in [WORK, ".state/root"] {
+        let (a, b) = (src.join(part), dst.join(part));
+        if fs::symlink_metadata(&a).map(|m| !m.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        fs::create_dir_all(&b).map_err(|e| fail(format!("{}: {e}", b.display())))?;
+        let st = Command::new("cp").arg("-Rp").arg(format!("{}/.", a.display())).arg(&b).status()
+            .map_err(|e| fail(format!("cp: {e}")))?;
+        if !st.success() {
+            return Err(fail(format!("copy {part}: {st}")));
+        }
+    }
+    // Its own account's home in its root.
+    let oh = dst.join(".state/root/home").join(&old_user);
+    if fs::symlink_metadata(&oh).is_ok_and(|m| m.is_dir()) {
+        let _ = fs::rename(&oh, dst.join(".state/root/home").join(&new_user));
+    }
+    // What the old uid owned is the new one's (links themselves, -h).
+    let mut find = Command::new("find");
+    find.arg(&dst).args(["-user", &old_uid.to_string(), "-exec", "chown", "-h", &format!("{new_uid}:{new_gid}"), "{}", "+"]);
+    let st = find.status().map_err(|e| fail(format!("find: {e}")))?;
+    if !st.success() {
+        return Err(fail(format!("re-own: {st}")));
+    }
+    if let Some(g) = old_gid {
+        let _ = Command::new("find").arg(&dst).args(["-group", &g.to_string(), "-exec", "chgrp", "-h", &new_gid.to_string(), "{}", "+"]).status();
+    }
+    save(&dst, &new).map_err(fail)?;
+    eprintln!("portcullisd: workspace {from} of {owner} duplicated as {to} (uid {old_uid} -> {new_uid})");
+    Ok(new)
+}
+
 /// Change its settings; a running one is stopped so the change applies.
 pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>) -> Result<Record, String> {
     let (home, gid) = person(owner)?;

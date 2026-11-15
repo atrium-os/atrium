@@ -76,6 +76,9 @@ fn run(w: Want, tx: Sender<Got>) {
                 listed(ask(&Request::WorkspaceDelete { name: name.clone(), activation }))
                     .map(|_| format!("{} deleted", title(&name)))),
             Want::Open(name, activation) => Some(open(&name, activation)),
+            Want::Duplicate { from, to } => Some(
+                listed(ask(&Request::WorkspaceDuplicate { name: from.clone(), new_name: to.clone() }))
+                    .map(|_| format!("{} copied as {}", title(&from), title(&to)))),
             Want::Run { name, project, activation } => Some(match ask(&Request::WorkspaceRun { name: name.clone(), project, activation }) {
                 Ok(Response::WorkspaceRan { app_id, capabilities }) => Ok(format!("Running {app_id}{}",
                     if capabilities.is_empty() { String::new() } else { format!(" with {}", capabilities.join(", ")) })),

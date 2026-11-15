@@ -271,14 +271,12 @@ workspace must not mean rebuilding from nothing.
 
 - **Uses links** (§5.2) already let B build against A's output where it
   is, read-only: A's `target/` or `build/` is never rebuilt in B.
-- **Download cache, per person, shared (W8).** Crates, Go modules, npm and
-  pip packages and git dependencies go in `~/.atrium/cache/downloads`,
-  mounted read-write at `/cache` in every workspace of that person and
-  persona, with the toolchains pointed at it (`CARGO_HOME`, `GOMODCACHE`,
-  `npm_config_cache`, `PIP_CACHE_DIR`). Sharing is safe because each tool
-  checks what it takes from there against its lockfile's hashes, so one
-  workspace can't hand another a changed package. A tool that doesn't
-  check hashes is not pointed at it.
+- **No shared download cache (Shankar, 2026-11-15).** Each workspace
+  downloads its own crates, modules, packages and distfiles into its own
+  root. Tessera dedups the copies on disk, so sharing would save only the
+  download itself, and a shared writable cache would let one workspace
+  hand another a changed package (cargo, Go and pip trust a cache once
+  it's filled; a port built from local or patched sources checks nothing).
 - **Compiled-output cache, by group, opt-in (W9).** ccache/sccache-style
   objects can't be checked by hash, so a compromised workspace could plant
   a bad object. They are shared only within a group of workspaces linked
@@ -311,7 +309,7 @@ people ship without `sshd` on the host.
 | H9 | dev app grants | asked per run, restricted capabilities refused, "keep" to remember |
 | H10 | the IDE's reach | `workspace-exec`: only workspaces the person picked in it, commands run in the workspace's jail |
 | H11 | Terminal | a regular app; alone it is an empty jail, switched into a workspace or app console by a press (Shankar 2026-11-15) |
-| H12 | caches across workspaces | shared download cache per person (hash-checked), compiled cache only within a uses group and opt-in, Duplicate workspace by copy-on-write (Shankar 2026-11-15) |
+| H12 | caches across workspaces | no shared download cache (Tessera dedups the copies), compiled cache only within a uses group and opt-in, Duplicate workspace by copy-on-write (Shankar 2026-11-15) |
 
 (H1–H3 are scrinium.md §9's.)
 
@@ -387,8 +385,12 @@ people ship without `sshd` on the host.
    new window, which takes the press like a launcher's and reattaches a
    detached session; it replaces the window's shell, the old one detaching.
    Gate `scripts/vm-terminal-check.sh` 0 failed.
-8. **W8 download cache and Duplicate.** Gate: a crate fetched in one
-   workspace is not fetched again in another; a duplicate builds without
-   recompiling.
+8. **W8 Duplicate.** Gate: a duplicate keeps the build output and the
+   root's tools, re-owned to its own uid; the original is unchanged. (The
+   shared download cache was dropped, Shankar 2026-11-15.)
+   Built 2026-11-15: `portcullis workspace duplicate <from> <to>` and the
+   Workspaces app's "Duplicate…"; `cp -Rp` of `work` and the root (links
+   as links), what the old uid or group owned re-owned to the new, the
+   home in the root renamed. Gate `scripts/vm-duplicate-check.sh` 0 failed.
 9. **W9 group object cache.** Gate: a workspace outside the group can't
    read or write the group's objects.

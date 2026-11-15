@@ -44,6 +44,8 @@ pub enum Act {
     /// Run what the workspace built in a project folder of its `work`
     /// (homes.md §5.3): installed as a dev app and started.
     Run(String, [u8; 16]),
+    /// The form, to copy this one (homes.md §5.4).
+    DuplicateForm(String),
 }
 
 /// What the loop asks portcullisd.
@@ -57,6 +59,7 @@ pub enum Want {
     Delete(String, [u8; 16]),
     Open(String, [u8; 16]),
     Run { name: String, project: String, activation: [u8; 16] },
+    Duplicate { from: String, to: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -71,6 +74,8 @@ pub struct State {
     /// Index into NETWORKS.
     pub new_net: usize,
     pub confirm_delete: bool,
+    /// The form copies this one rather than making a new one.
+    pub dup_from: Option<String>,
     /// What is being done now ("Starting scratch…").
     pub busy: Option<String>,
     /// A line at the bottom: (text, is an error).
@@ -161,6 +166,7 @@ impl State {
                 None
             }
             Act::NewForm => {
+                self.dup_from = None;
                 self.creating = true;
                 self.confirm_delete = false;
                 self.new_tool = 0;
@@ -169,6 +175,7 @@ impl State {
             }
             Act::CancelNew => {
                 self.creating = false;
+                self.dup_from = None;
                 None
             }
             Act::Create(token) => {
@@ -176,6 +183,10 @@ impl State {
                 if let Some(why) = self.name_problem(&name) {
                     self.note = Some((why, true));
                     return None;
+                }
+                if let Some(from) = self.dup_from.take() {
+                    self.busy = Some(format!("Copying {} as {}…", title(&from), title(&name)));
+                    return Some(Want::Duplicate { from, to: name });
                 }
                 let tool = self.available().get(self.new_tool).map(|t| t.id.clone()).unwrap_or_else(|| "c".into());
                 self.busy = Some(format!("Making {}…", title(&name)));
@@ -205,6 +216,12 @@ impl State {
                 self.confirm_delete = false;
                 self.busy = Some(format!("Deleting {}…", title(&n)));
                 Some(Want::Delete(n, token))
+            }
+            Act::DuplicateForm(n) => {
+                self.creating = true;
+                self.confirm_delete = false;
+                self.dup_from = Some(n);
+                None
             }
             Act::Run(n, token) => {
                 let project = text.trim().trim_matches('/').to_string();
@@ -311,7 +328,32 @@ impl View for WorkspacesView {
         let x0 = list_w() + em(32.0);
         let pw = (w - x0 - em(32.0)).max(em(200.0));
         let mut y = em(32.0);
-        if s.creating {
+        if s.creating && s.dup_from.is_some() {
+            let from = s.dup_from.clone().unwrap_or_default();
+            text(ctx, x0, y, &format!("Duplicate {}", title(&from)), type_size::LG, Weight::Semibold, t.text_primary());
+            y += em(40.0);
+            text(ctx, x0, y, "Name of the copy", type_size::SM, Weight::Medium, t.text_secondary());
+            y += em(16.0);
+            ctx.key(250);
+            TextField::new(self.name.clone()).placeholder("e.g. website-try").at(x0, y).width(pw.min(em(360.0))).render(ctx);
+            y += em(44.0);
+            let name = self.name.get_cloned().text().to_string();
+            let problem = s.name_problem(&name);
+            if let (Some(p), false) = (&problem, name.is_empty()) {
+                text(ctx, x0, y, p, type_size::SM, Weight::Regular, t.danger_fg());
+            }
+            y += em(32.0);
+            text(ctx, x0, y, "Its work, build output and settings are copied; the copy runs as its own.", type_size::SM, Weight::Regular, t.text_tertiary());
+            y += em(40.0);
+            ctx.key(251);
+            if problem.is_none() {
+                Button::primary("Duplicate").at(x0, y).width(em(160.0)).on_click(pressed(q, Act::Create)).render(ctx);
+            } else {
+                Button::secondary("Duplicate").at(x0, y).width(em(160.0)).render(ctx);
+            }
+            ctx.key(252);
+            Button::ghost("Cancel").at(x0 + em(172.0), y).width(em(90.0)).on_click(plain(q, Act::CancelNew)).render(ctx);
+        } else if s.creating {
             text(ctx, x0, y, "New workspace", type_size::LG, Weight::Semibold, t.text_primary());
             y += em(40.0);
             text(ctx, x0, y, "Name", type_size::SM, Weight::Medium, t.text_secondary());
@@ -435,6 +477,10 @@ impl View for WorkspacesView {
                 ctx.key(502);
                 Button::secondary("Delete workspace…").at(x0, y).width(em(170.0)).on_click(plain(q, Act::AskDelete)).render(ctx);
             }
+            if !s.confirm_delete {
+                ctx.key(503);
+                Button::secondary("Duplicate…").at(x0 + em(182.0), y).width(em(130.0)).on_click(plain(q, Act::DuplicateForm(name.clone()))).render(ctx);
+            }
             if s.confirm_delete {
                 y += em(40.0);
             }
@@ -522,6 +568,16 @@ mod tests {
         assert!(s.confirm_delete);
         assert_eq!(s.act(Act::Delete("scratch".into(), [7; 16]), ""), Some(Want::Delete("scratch".into(), [7; 16])));
         assert!(!s.confirm_delete);
+    }
+
+    #[test]
+    fn duplicate_names_the_copy() {
+        let mut s = state();
+        s.act(Act::DuplicateForm("liba".into()), "");
+        assert!(s.creating);
+        assert!(s.act(Act::Create([0; 16]), "appb").is_none(), "a name in use");
+        assert_eq!(s.act(Act::Create([0; 16]), "liba-try"), Some(Want::Duplicate { from: "liba".into(), to: "liba-try".into() }));
+        assert!(s.dup_from.is_none());
     }
 
     #[test]

@@ -354,6 +354,9 @@ pub enum Request {
     /// with frescod (purpose APPROVE). Refused while another workspace
     /// uses it.
     WorkspaceDelete { name: String, activation: [u8; 16] },
+    /// A copy of `name` as `new_name` (homes.md §5.4): its settings, its
+    /// `work` and its root, build output and all, under its own uid.
+    WorkspaceDuplicate { name: String, new_name: String },
     /// Run what the workspace built (homes.md §5.3, W5): `project` is a
     /// folder in its `work` (empty: `work` itself) holding `atrium.toml`
     /// and the entry it names. Installed as the dev app

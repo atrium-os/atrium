@@ -1392,6 +1392,7 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
         },
         "set" => Request::WorkspaceSet { name, network: flag("--network"), uses },
         "stop" => Request::WorkspaceStop { name },
+        "duplicate" => Request::WorkspaceDuplicate { name, new_name: args.get(2).cloned().unwrap_or_default() },
         other => {
             eprintln!("portcullis workspace: unknown {other:?}");
             usage();
