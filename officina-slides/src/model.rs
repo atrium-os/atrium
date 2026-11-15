@@ -266,11 +266,15 @@ pub struct TextBody {
     pub wrap: Option<bool>,
     /// The frame's own level styles, over its placeholder's.
     pub levels: ListStyle,
+    /// Bullets paragraphs set for themselves: a paragraph whose `list` is
+    /// `Some(Some(r))` shows `bullets[r.id - 1]`, `Some(None)` shows none, and
+    /// `None` takes its level's.
+    pub bullets: Vec<Bullet>,
 }
 
 impl PartialEq for TextBody {
     fn eq(&self, o: &TextBody) -> bool {
-        self.inset == o.inset && self.anchor == o.anchor && self.autofit == o.autofit && self.wrap == o.wrap && self.levels == o.levels && same_text(&self.doc, &o.doc)
+        self.bullets == o.bullets && self.inset == o.inset && self.anchor == o.anchor && self.autofit == o.autofit && self.wrap == o.wrap && self.levels == o.levels && same_text(&self.doc, &o.doc)
     }
 }
 
@@ -290,7 +294,7 @@ impl TextBody {
     pub fn plain(text: &str) -> TextBody {
         let mut doc = TextDoc::new();
         set_plain(&mut doc, text);
-        TextBody { doc, inset: None, anchor: None, autofit: None, wrap: None, levels: Vec::new() }
+        TextBody { doc, inset: None, anchor: None, autofit: None, wrap: None, levels: Vec::new(), bullets: Vec::new() }
     }
 
     /// The frame's text, paragraphs joined by `\n`.

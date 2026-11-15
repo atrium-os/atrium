@@ -36,7 +36,7 @@ fn style_name(name: &str, i: usize) -> (String, String) {
     }
 }
 
-fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
+pub(crate) fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
     let mut s = String::new();
     if let Some(b) = a.bold {
         let w = if b { "bold" } else { "normal" };
@@ -88,7 +88,7 @@ fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
 }
 
 /// `tab_base`: the start indent ODF measures the tab stops from.
-fn para_props(p: &ParaProps, tab_base: i32) -> String {
+pub(crate) fn para_props(p: &ParaProps, tab_base: i32) -> String {
     let mut s = String::new();
     if let Some(a) = p.align {
         let _ = write!(s, r#" fo:text-align="{}""#, match a {

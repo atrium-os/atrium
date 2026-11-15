@@ -99,7 +99,7 @@ fn color(s: Option<&str>) -> Option<u32> {
 }
 
 /// Text properties (`style:text-properties`).
-fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
+pub(crate) fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
     let mut a = CharAttrs::default();
     if let Some(w) = e.attr("fo:font-weight") {
         a.bold = Some(matches!(w, "bold" | "600" | "700" | "800" | "900"));
@@ -139,7 +139,7 @@ fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
 }
 
 /// Paragraph properties (`style:paragraph-properties`).
-fn para_props(e: &El) -> ParaProps {
+pub(crate) fn para_props(e: &El) -> ParaProps {
     let mut p = ParaProps::default();
     p.align = match e.attr("fo:text-align") {
         Some("start" | "left") => Some(Align::Start),

@@ -753,6 +753,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "officina-core",
  "officina-grid",
+ "officina-slides",
  "officina-text",
  "quick-xml",
 ]
@@ -766,6 +767,14 @@ name = "officina-grid"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+]
+
+[[package]]
+name = "officina-slides"
+version = "0.1.0"
+dependencies = [
+ "officina-core",
+ "officina-text",
 ]
 
 [[package]]

@@ -265,7 +265,7 @@ pub fn number_label(scheme: &str, n: u32) -> String {
 /// A frame's text as the layout engine sees it: the frame's document with
 /// its level styles made the paragraphs' own formatting, theme fonts and
 /// colours resolved, sizes scaled for shrink-to-fit.
-pub fn styled_doc(theme: &Theme, levels: &ListStyle, body: &TextDoc, scale: u32) -> TextDoc {
+pub fn styled_doc(theme: &Theme, levels: &ListStyle, bullets: &[Bullet], body: &TextDoc, scale: u32) -> TextDoc {
     let mut d = body.clone();
     let scale_size = |s: u16| ((s as u64 * scale as u64 / 100_000) as u16).max(2);
     let fix = |a: &CharAttrs| {
@@ -311,13 +311,20 @@ pub fn styled_doc(theme: &Theme, levels: &ListStyle, body: &TextDoc, scale: u32)
         if props.line_spacing.is_none() {
             props.line_spacing = Some(officina_text::model::LineSpacing::Multiple(100));
         }
-        let bullet = match &lv.bullet {
+        // The paragraph's own bullet (`bullets[id - 1]`), else its level's;
+        // the laid-out paragraph names it as list 1 (the level's) or 1 + n.
+        let (b, id) = match &p.props.list {
+            Some(Some(r)) if r.id >= 1 => (bullets.get(r.id as usize - 1), r.id + 1),
+            Some(_) => (None, 1),
+            None => (lv.bullet.as_ref(), 1),
+        };
+        let bullet = match b {
             Some(Bullet::Char { .. }) => Some(ListKind::Bullet),
             Some(Bullet::Number { .. }) => Some(ListKind::Numbered),
             _ => None,
         };
         // An empty paragraph shows no bullet.
-        props.list = Some(bullet.filter(|_| !p.text.is_empty()).map(|kind| ListRef { id: 1, kind, level: lvl as u8 }));
+        props.list = Some(bullet.filter(|_| !p.text.is_empty()).map(|kind| ListRef { id, kind, level: lvl as u8 }));
         d.blocks.update(bi, |b| {
             if let Some(p) = b.as_para_mut() {
                 p.runs = runs.into_iter().map(|(a, i)| (a, i as _)).collect();
@@ -380,7 +387,7 @@ fn frame_geom(deck: &Deck, r: Resolved, body: &TextBody, txf: &Xform, slide_no: 
         Autofit::Shrink { scale, .. } => scale.clamp(1_000, 100_000),
         _ => 100_000,
     };
-    let mut doc = styled_doc(&deck.theme, &r.levels, &body.doc, scale);
+    let mut doc = styled_doc(&deck.theme, &r.levels, &body.bullets, &body.doc, scale);
     if let Some(n) = slide_no {
         for i in 0..doc.blocks.len() {
             if doc.para(i).is_some_and(|p| p.text.contains("‹#›")) {
@@ -416,7 +423,13 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
     for (i, (pl, top)) in fl.paras.iter().enumerate() {
         let Some(p) = fl.doc.para(i) else { continue };
         let lvl = (p.style as usize).min(MAX_LEVELS - 1);
-        let label = match (&r.levels[lvl].bullet, p.text.is_empty()) {
+        // Which bullet: styled_doc named it in the paragraph's list.
+        let b = match &p.props.list {
+            Some(Some(lr)) if lr.id > 1 => body.bullets.get(lr.id as usize - 2),
+            Some(Some(_)) => r.levels[lvl].bullet.as_ref(),
+            _ => None,
+        };
+        let label = match (b, p.text.is_empty()) {
             (Some(Bullet::Char { ch, font, color: c, size_pct }), false) => {
                 counters = [0; MAX_LEVELS];
                 let mut f = pl.glyphs.first().map_or(&pl.formats[0], |g| &pl.formats[g.fmt as usize]).clone();

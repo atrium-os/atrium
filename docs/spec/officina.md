@@ -2432,6 +2432,58 @@ opens and draws its first slide reading one slide (debug build, well under 1 s).
   (fonts, sizes, colours), notes editing in the window, thumbnails stored in the
   file (O6e).
 
+### 16.36 O6c as built (2026-11-15): `.pptx` and `.odp`
+
+- **`.pptx` in** (`officina-convert::pptx`). Presentation, masters with their
+  colour maps and text styles, layouts, slides, notes slides, theme colours,
+  fonts and line styles. Shapes keep their preset name and adjust values, custom
+  outlines (arcs included) become paths, colours keep their theme slot and
+  changes, placeholders their kind and index; style references (`p:style`) are
+  resolved into fills, lines and text colour. Pictures and videos are read once
+  however many shapes use them; tables come in as groups of cells, SmartArt as
+  the shapes it was drawn with (or its text when the drawing is empty), charts
+  as their fallback picture. Paragraph bullets that differ from their level's
+  are a frame's own (`TextBody.bullets`, new in the model and the native file).
+  Transitions and the main sequence of builds map to the model's small sets.
+- **`.pptx` out.** Masters, layouts and slides keep their placeholders, level
+  styles, theme colours and presets by name; notes go in notes slides under one
+  notes master; builds as a timing tree; the first master's other style is the
+  presentation's default text style (so other readers draw shape text as we do).
+- **`.odp` in and out** (`officina-convert::odp`). ODF styles are followed
+  through their parents and family defaults, and text comes in with what its
+  styles give it made direct. Each master page is a master with one layout, its
+  `-title` and `-outline1…9` presentation styles its level styles. Custom shapes
+  LibreOffice writes for OOXML presets (`ooxml-…`) keep the preset, ODF's own
+  types map to presets where one exists, and other outlines are drawn from their
+  enhanced geometry (equations, modifiers, every path command); `svg:d` paths and
+  point lists likewise. Out, each layout becomes a master page holding its
+  master's shapes and its own; shapes are written resolved through their
+  placeholder chain (geometry, fill, line, insets, level styles), presets as
+  `ooxml-…` custom shapes with their outline drawn, lists nested by level with
+  their bullets and indents as LibreOffice writes them, transitions in the page
+  style, builds as an animation tree with LibreOffice's preset names.
+- **Not kept** (reported): charts and SmartArt as live objects, tables as tables,
+  emphasis and motion builds, hatches and tiled pictures (drawn solid and
+  stretched), connectors' bends, picture crops in `.odp`, comments, macros.
+- **Opening.** The converter process takes `pptx` and `odp` and writes
+  `.oslides`; Slides opens both through it with the fidelity notes on the status
+  line and saves back in the file's own format.
+- **Gates.** LibreOffice both ways (`examples/slides_lo.rs`): a deck with levels
+  and a numbered paragraph, a turned gradient box, an ellipse, a dashed arrow, a
+  star, a picture, a group, a custom outline, a bold coloured run, notes, a
+  hidden slide, transitions and builds, written as `.pptx` and `.odp`, through
+  LibreOffice to both formats and read back: 84/84 checks, and LibreOffice draws
+  our two files alike. Corpus (`examples/corpus_slides.rs`, files kept out of the
+  repository): 519 `.pptx` from LibreOffice's and POI's test data, 505 read, 14
+  refused (damaged ZIPs), 0 panics, slide count equal to LibreOffice's on all
+  504 compared, 99.17 % of LibreOffice's words; 178 `.odp`, 177 read, slide count
+  equal on 176/176, 97.04 % of the words (the rest: date and file-name fields
+  LibreOffice fills in when it opens a file, comments, text on a picture). Every
+  readable deck of both sets comes back from our own writer with the same slides
+  and words, and so does it through the other format. Unit tests: round trips,
+  `.odp`→`.pptx`→`.odp`, 3,000 mangled packages, looping equations and absurd
+  geometry.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

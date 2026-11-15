@@ -267,6 +267,10 @@ fn put_body(w: &mut Writer, t: &TextBody) {
     });
     put_opt(w, &t.wrap, |w, v| w.u8(*v as u8));
     put_levels(w, &t.levels);
+    w.var(t.bullets.len() as u64);
+    for b in &t.bullets {
+        put_bullet(w, b);
+    }
 }
 
 fn put_shape(w: &mut Writer, s: &Shape) {
@@ -593,7 +597,13 @@ fn body(r: &mut Reader) -> Result<TextBody, WireError> {
         })
     })?;
     let wrap = opt(r, |r| Ok(r.u8()? != 0))?;
-    Ok(TextBody { doc, inset, anchor, autofit, wrap, levels: levels(r)? })
+    let levels = levels(r)?;
+    let n = r.count("bullets", 4096, 1)?;
+    let mut bullets = Vec::with_capacity(n);
+    for _ in 0..n {
+        bullets.push(bullet(r)?);
+    }
+    Ok(TextBody { doc, inset, anchor, autofit, wrap, levels, bullets })
 }
 
 fn shape(r: &mut Reader, depth: usize, count: &mut usize) -> Result<Shape, WireError> {

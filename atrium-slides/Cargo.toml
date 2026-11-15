@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "atrium-slides, Atrium's presentation app (docs/spec/officina.md §9, O6b): officina-slides decks edited on a Pergola canvas, a slide strip of thumbnails, files through the system picker, an autosave journal for crash recovery."
+description = "atrium-slides, Atrium's presentation app (docs/spec/officina.md §9, O6b–O6c): officina-slides decks edited on a Pergola canvas, a slide strip of thumbnails, files through the system picker (.oslides, .pptx and .odp), an autosave journal for crash recovery."
 
 [lib]
 name = "atrium_slides"
@@ -16,6 +16,7 @@ path = "src/bin/atrium_slides.rs"
 
 [dependencies]
 officina-core = { path = "../officina-core" }
+officina-convert = { path = "../officina-convert" }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
 navigator-image = { path = "../navigator-image" }

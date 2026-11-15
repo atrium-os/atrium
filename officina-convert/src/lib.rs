@@ -8,7 +8,9 @@
 
 pub mod docx;
 pub mod odt;
+pub mod odp;
 pub mod ods;
+pub mod pptx;
 pub mod report;
 pub mod xlsx;
 pub mod xml;

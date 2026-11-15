@@ -5,7 +5,8 @@
 //!                          from the picker)
 //!
 //! Files come from the system picker (scrinium.md §4.1): Open asks for one
-//! file, read-write; Save writes back to it; Save As asks for a folder and
+//! file, read-write (`.oslides`, or `.pptx`/`.odp` through the sandboxed
+//! converter); Save writes back to it in its own format; Save As asks for a folder and
 //! writes `NAME.oslides` there (temp file, then a link that never replaces);
 //! Picture asks for one picture, read-only. Every change is journaled to a
 //! private autosave folder (`$XDG_STATE_HOME` or `~/.local/state`,
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use atrium_slides::app::{Cmd, Slides, Ui, PICKER_SLOT};
 use atrium_slides::doc::{self, Doc};
-use atrium_slides::files::{format_of, load, picture_mime, stem_of, Format};
+use atrium_slides::files::{encode, format_of, load, picture_mime, stem_of, Format};
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
@@ -36,9 +37,10 @@ const MAX_PICTURE: u64 = doc::MAX_MEDIA as u64;
 const SYNC_EVERY: Duration = Duration::from_secs(2);
 
 /// Where the user's file is, for Save.
+/// Where Save writes, and as what.
 enum Target {
-    Picked(File),
-    Path(PathBuf),
+    Picked { file: File, format: Format },
+    Path { path: PathBuf, format: Format },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,11 +152,14 @@ impl Run {
     /// Saves to the file the deck came from; false when there is none.
     fn save(&mut self) -> bool {
         let Some(t) = self.target.as_mut() else { return false };
+        let format = match t {
+            Target::Picked { format, .. } | Target::Path { format, .. } => *format,
+        };
         let r = {
-            let d = self.slides.doc.borrow();
-            d.write_native(Vec::new()).and_then(|bytes| match t {
-                Target::Picked(file) => write_over(file, &bytes),
-                Target::Path(path) => {
+            let mut d = self.slides.doc.borrow_mut();
+            encode(&mut d, format).and_then(|bytes| match t {
+                Target::Picked { file, .. } => write_over(file, &bytes),
+                Target::Path { path, .. } => {
                     let mut f = OpenOptions::new().write(true).open(&*path)?;
                     write_over(&mut f, &bytes)
                 }
@@ -184,7 +189,7 @@ impl Run {
                     let _ = d.saved();
                     d.status = format!("Saved as “{name}”.");
                 }
-                self.target = Some(Target::Path(path));
+                self.target = Some(Target::Path { path, format: Format::Native });
                 self.slides.changed();
             }
             Err(e) => self.set_status(format!("Couldn't save there: {e}.")),
@@ -196,12 +201,13 @@ impl Run {
         let mut f = File::from(fd);
         match read_all(&mut f, MAX_FILE).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, data)) {
             Ok(mut d) => {
-                let native = format_of(&name) == Format::Native;
+                let format = format_of(&name);
                 if !write {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status).trim().to_string();
                 }
-                // Save writes .oslides; over a file of another kind it asks where.
-                self.show(d, (write && native).then_some(Target::Picked(f)));
+                // Save writes the file in its own format; a file Slides can't
+                // write asks where to put an .oslides.
+                self.show(d, (write && format != Format::Other).then_some(Target::Picked { file: f, format }));
             }
             Err(e) => self.set_status(e),
         }
@@ -240,8 +246,8 @@ fn main() {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
             match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, data)) {
                 Ok(d) => {
-                    let native = format_of(&name) == Format::Native;
-                    first = Some((d, native.then_some(Target::Path(p))));
+                    let format = format_of(&name);
+                    first = Some((d, (format != Format::Other).then_some(Target::Path { path: p, format })));
                 }
                 Err(e) => eprintln!("atrium-slides: {e}"),
             }

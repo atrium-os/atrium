@@ -2,6 +2,7 @@
 //!
 //!   officina-convert xlsx < book.xlsx > book.osheet 2> report
 //!   officina-convert ods < book.ods > book.osheet 2> report
+//!   officina-convert pptx < talk.pptx > talk.oslides 2> report
 //!
 //! Reads the whole input, then (on FreeBSD) enters Capsicum capability mode, so the
 //! parser can open no file and no socket whatever the input does; CPU time and memory
@@ -85,8 +86,28 @@ fn main() {
                 }
             }
         }
+        "pptx" | "odp" => {
+            let got = if what == "pptx" { officina_convert::pptx::read(&input).map_err(|e| e.to_string()) } else { officina_convert::odp::read(&input).map_err(|e| e.to_string()) };
+            match got {
+                Ok((deck, loaded)) => {
+                    let out = std::io::BufWriter::new(std::io::stdout().lock());
+                    if let Err(e) = officina_slides::native::save(&deck, out).and_then(|mut o| o.flush()) {
+                        eprintln!("error\t{e}");
+                        std::process::exit(1);
+                    }
+                    for l in loaded.report.lines() {
+                        eprintln!("note\t{l}");
+                    }
+                    eprintln!("stats\tslides {}\tshapes {}\tpictures {}", loaded.slides, loaded.shapes, loaded.pictures);
+                }
+                Err(e) => {
+                    eprintln!("error\t{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx|ods|docx|odt < in > out (.osheet or .owrite)");
+            eprintln!("error\tusage: officina-convert xlsx|ods|docx|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
             std::process::exit(2);
         }
     }
