@@ -19,6 +19,8 @@ pub mod ical;
 pub mod tnef;
 #[cfg(feature = "html")]
 pub mod html;
+#[cfg(feature = "jail")]
+pub mod jail;
 pub(crate) mod mime;
 
 pub use address::Address;

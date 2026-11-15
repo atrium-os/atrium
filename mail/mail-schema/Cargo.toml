@@ -1,0 +1,11 @@
+[package]
+name = "mail-schema"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The fixed data format between Mail's engine and its parse jails (docs/spec/mail.md §7.1): postcard frames, bounded summaries, and the checks the engine runs on everything a jail sends back."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }

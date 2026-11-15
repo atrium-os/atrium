@@ -15,13 +15,24 @@ navigator-dom = { path = "../../navigator-dom", optional = true }
 navigator-normalize = { path = "../../navigator-normalize", optional = true }
 navigator-render = { path = "../../navigator-render", optional = true }
 navigator-style = { path = "../../navigator-style", optional = true }
+# The jail runner: the engine conversation's fixed format.
+mail-schema = { path = "../mail-schema", optional = true }
 
 [features]
-default = ["html"]
+default = ["html", "jail"]
+jail = ["html", "dep:mail-schema"]
 html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", "dep:navigator-style"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
 # crate must repeat the patch, because [patch] only applies at the build root.
+[dev-dependencies]
+mail-schema = { path = "../mail-schema" }
+
+[[bin]]
+name = "mail-parse-jail"
+path = "src/bin/mail-parse-jail.rs"
+required-features = ["jail"]
+
 [patch.crates-io]
 pathfinder_simd = { path = "../../navigator-fonts/vendor/pathfinder_simd" }
 

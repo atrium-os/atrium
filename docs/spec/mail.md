@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 codecs built; M0 rest and M1 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -968,8 +968,20 @@ Stalwart in the cloud VM, and later a real account):
    string or literal, flags validated), SMTP reply decoder, EHLO caps and a submission
    state machine (SIZE, 8BITMIME, SMTPUTF8, FUTURERELEASE `HOLDFOR`, partial recipient
    refusal, RSET on failure, dot-stuffing); 12 tests, fuzz IMAP 0.5 M and SMTP 0.7 M
-   runs clean. Still in M0: JMAP codecs (with M7), DKIM/DMARC, TNEF, iTIP, the HTML
-   path through navigator-normalize, the postcard summary schema.
+   runs clean. *Rest of M0 built 2026-11-16:* DKIM (rsa-sha256, ed25519-sha256; rsa-sha1
+   and `l=` partial bodies never verify), DMARC alignment by the PSL, the provider's
+   topmost `Authentication-Results`, verdict Verified/NotVerified/Pending; iTIP invitations;
+   TNEF unpacking; HTML through navigator-normalize (`mail-parse::html`: everything that
+   acts or fetches stripped, every picture and CSS `url()` an opaque resource id with its
+   source, hidden or tiny remote pictures found on the resolved cascade, removed and never
+   loadable, fonts never loadable; output renders with zero profile refusals); the fixed
+   engine ↔ jail format `mail/mail-schema` (postcard frames ≤ 65 MiB, batches ≤ 64
+   messages/32 MiB, `Query`/`Answer` for TXT lookups limited to `_domainkey`/`_dmarc` and
+   6 per message, and `check()` the engine runs on every frame: lengths, counts, part
+   ranges inside the message, a Verified domain that must be From's); the runner
+   `mail-parse-jail` (loads the pinned fonts, `cap_enter`, serves stdin/stdout). Tests:
+   lib 8, parse 20, DKIM 4, HTML 6, jail end to end 3; fuzz `html` clean. JMAP codecs
+   move to M7.
 2. **M1** the mail courier in Arca (auth, relay, filter), against a local IMAP/SMTP server;
    test that `LOGIN` after auth kills the session and is logged.
 3. **M2** engine + sync: read-only IMAP sync into the store, the index, plain-text reading in
