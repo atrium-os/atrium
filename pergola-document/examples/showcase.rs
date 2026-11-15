@@ -117,8 +117,11 @@ impl View for Show {
         let _ = col;
 
         if !self.text_demo {
-            heading(ctx, 24.0, 508.0, "Canvas");
-            Canvas::new(self.canvas.clone(), Rect::new(24.0, 532.0, 392.0, 248.0), Size::new(392.0, 400.0), self.items.clone())
+            // Below the column, which ends at 539 pt (the slider); the
+            // canvas draws at fixed coordinates, so it must not start
+            // higher (it overlapped the tabs and the slider at 508).
+            heading(ctx, 24.0, 560.0, "Canvas");
+            Canvas::new(self.canvas.clone(), Rect::new(24.0, 584.0, 392.0, 196.0), Size::new(392.0, 400.0), self.items.clone())
                 .on_pointer(|_| {})
                 .emit(ctx);
         }
