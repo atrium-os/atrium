@@ -14,6 +14,7 @@
 //! | 9 | REVISIONS | whether edits are tracked; revisions: id, author, date, change set, its name |
 //! | 10 | DELETIONS | tracked deletions a tombstone holds: id, revision, pieces (paragraph, text, runs) |
 //! | 11 | CONFLICTS | merge conflicts: id, then the other version as a deletion's encoding |
+//! | 12 | MARGINS | the header's then the footer's own paragraphs (count, blocks), when either has them |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
 //! reading position first (v0 loads them all). The same encodings serve the
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Float, Wrap, Rel, HAlign, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -44,6 +45,7 @@ pub const COMMENTS: u16 = 8;
 pub const REVISIONS: u16 = 9;
 pub const DELETIONS: u16 = 10;
 pub const CONFLICTS: u16 = 11;
+pub const MARGINS: u16 = 12;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -743,7 +745,7 @@ fn decode_hf(r: &mut Reader) -> Result<Option<HeaderFooter>, WireError> {
                 3 => Align::Justify,
                 _ => return Err(WireError::Invalid("alignment")),
             };
-            Some(HeaderFooter { text, align })
+            Some(HeaderFooter { text, align, paras: Vec::new() })
         }
         _ => return Err(WireError::Invalid("header")),
     })
@@ -824,6 +826,13 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
             encode_page(&mut w, page);
             encode_hf(&mut w, header);
             encode_hf(&mut w, footer);
+            for hf in [header, footer] {
+                let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
+                w.var(paras.len() as u64);
+                for p in paras {
+                    encode_para(&mut w, p);
+                }
+            }
         }
         TextOp::SetComment { id, comment } => {
             w.u8(10);
@@ -942,8 +951,25 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
         7 => TextOp::Remove { at: u32v(&mut r, "block")?, n: u32v(&mut r, "count")? },
         8 => {
             let page = decode_page(&mut r)?;
-            let header = decode_hf(&mut r)?;
-            TextOp::SetPage { page, header, footer: decode_hf(&mut r)? }
+            let mut header = decode_hf(&mut r)?;
+            let mut footer = decode_hf(&mut r)?;
+            // Their own paragraphs (absent in older journals).
+            if !r.is_empty() {
+                for hf in [&mut header, &mut footer] {
+                    let k = r.count("margin paragraphs", MAX_MARGIN_PARAS as u64, 7)?;
+                    let mut paras = Vec::with_capacity(k);
+                    for _ in 0..k {
+                        let Block::Para(p) = decode_block(&mut r, attrs, styles)?;
+                        paras.push(p);
+                    }
+                    match hf {
+                        Some(h) => h.paras = paras,
+                        None if paras.is_empty() => {}
+                        None => return Err(WireError::Invalid("margin paragraphs without a header")),
+                    }
+                }
+            }
+            TextOp::SetPage { page, header, footer }
         }
         10 => {
             let id = r.len("comment", MAX_COMMENTS as u64 - 1)? as CommentId;
@@ -1137,6 +1163,18 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
             encode_deletion(&mut w, doc.conflicts.get(id).expect("live conflicts exist"));
         }
         c.add(CONFLICTS, &w.into_bytes())?;
+    }
+
+    if [&doc.header, &doc.footer].iter().any(|h| h.as_ref().is_some_and(|h| !h.paras.is_empty())) {
+        let mut w = Writer::new();
+        for hf in [&doc.header, &doc.footer] {
+            let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
+            w.var(paras.len() as u64);
+            for p in paras {
+                encode_para(&mut w, p);
+            }
+        }
+        c.add(MARGINS, &w.into_bytes())?;
     }
 
     if !checkpoints.is_empty() {
@@ -1386,6 +1424,26 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
             doc.conflicts.set(id, Some(d));
         }
     }
+    if c.entries().iter().any(|e| e.kind == MARGINS) {
+        let mut r = Reader::new(one(MARGINS, "MARGINS chunk")?);
+        for header in [true, false] {
+            let k = r.count("margin paragraphs", MAX_MARGIN_PARAS as u64, 7)?;
+            let mut paras = Vec::with_capacity(k);
+            for _ in 0..k {
+                let Block::Para(p) = decode_block(&mut r, attrs, styles)?;
+                if !ids.insert(p.id) || p.id >= watermark {
+                    return Err(LoadError::Bad("block id"));
+                }
+                paras.push(p);
+            }
+            let hf = if header { &mut doc.header } else { &mut doc.footer };
+            match hf {
+                Some(h) => h.paras = paras,
+                None if paras.is_empty() => {}
+                None => return Err(LoadError::Bad("margin paragraphs without a header")),
+            }
+        }
+    }
     doc.raise_watermark(watermark);
 
     let mut checkpoints = Vec::new();
@@ -1422,7 +1480,7 @@ mod tests {
         d.blocks.update(9, |b| b.as_para_mut().unwrap().props.section = Some(Section { start: SectionStart::Continuous, columns: 3, gap: 400, rule: true, page: None }));
         d.blocks.update(10, |b| b.as_para_mut().unwrap().props.section = Some(Section { page: Some(PageSetup { width: 16838, height: 11906, ..PageSetup::default() }), ..Section::default() }));
         d.page.margin_start = 1000;
-        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });
         assert_eq!(d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 }), img, "the same bytes are stored once");
         let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300, float: None }), ..Default::default() });
@@ -1448,6 +1506,9 @@ mod tests {
         }
         let reply = Comment { author: "Bo".into(), text: "Checked.".into(), parent: Some(0), done: true, ..Default::default() };
         TextOp::SetComment { id: 1, comment: Some(reply) }.apply(&mut d);
+        // A header of its own paragraphs (with a picture).
+        let hp = Para { runs: vec![(0, pic), (3, 0)], ..Para::new(d.new_id(), "\u{FFFC} Acme {page}", 0) };
+        d.header = Some(HeaderFooter { text: "Acme {page}".into(), align: Align::Start, paras: vec![hp, Para::new(d.new_id(), "second", 0)] });
         d.take_changes();
         d
     }
@@ -1501,7 +1562,8 @@ mod tests {
             TextOp::SetPara { block: 7, style: 2, props: ParaProps::default() },
             TextOp::Insert { at: 9, blocks },
             TextOp::Remove { at: 12, n: 3 },
-            TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End }), footer: None },
+            TextOp::SetPage { page: PageSetup { width: 12240, height: 15840, ..PageSetup::default() }, header: Some(HeaderFooter { text: "Draft".into(), align: Align::End, paras: Vec::new() }), footer: None },
+            TextOp::SetPage { page: PageSetup::default(), header: None, footer: Some(HeaderFooter { text: "x".into(), align: Align::Start, paras: vec![Para::new(d.new_id(), "x {page}", 0)] }) },
             TextOp::SetNote { id: 5, note: Some(Note { kind: NoteKind::End, paras: vec![Para::new(d.new_id(), "note", 0)] }) },
             TextOp::SetNote { id: 5, note: None },
             TextOp::SetComment { id: 9, comment: Some(Comment { author: "A".into(), text: "c".into(), parent: Some(0), ..Default::default() }) },

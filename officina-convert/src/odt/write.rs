@@ -178,6 +178,9 @@ fn para_key(p: &ParaProps, first: bool, page_change: bool) -> ParaProps {
 
 struct Out<'a> {
     doc: &'a TextDoc,
+    /// Before its automatic style and picture names (`M` in the header and
+    /// footer, whose styles live in styles.xml).
+    prefix: &'static str,
     names: Vec<String>,
     fonts: Vec<String>,
     auto: String,
@@ -228,7 +231,7 @@ impl Out<'_> {
         if body.is_empty() && key.1.section.is_none() {
             return self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         }
-        let n = format!("P{}", self.para_styles.len() + 1);
+        let n = format!("{}P{}", self.prefix, self.para_styles.len() + 1);
         let parent = self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         let master = match key.1.section {
             Some(Section { page: Some(g), .. }) => {
@@ -263,7 +266,7 @@ impl Out<'_> {
         if let Some(n) = self.text_styles.get(&k) {
             return Some(n.clone());
         }
-        let n = format!("T{}", self.text_styles.len() + 1);
+        let n = format!("{}T{}", self.prefix, self.text_styles.len() + 1);
         let parent = k.style.and_then(|s| self.names.get(s as usize)).map(|p| format!(r#" style:parent-style-name="{}""#, esc(p))).unwrap_or_default();
         let props = text_props(&k, &mut self.fonts);
         let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="text"{parent}>{props}</style:style>"#);
@@ -301,7 +304,7 @@ impl Out<'_> {
         if let Some(n) = self.graphic_styles.get(f) {
             return n.clone();
         }
-        let n = format!("fr{}", self.graphic_styles.len() + 1);
+        let n = format!("{}fr{}", self.prefix, self.graphic_styles.len() + 1);
         let wrap = match f.wrap {
             Wrap::Square => r#"style:wrap="parallel" style:number-wrapped-paragraphs="no-limit" style:wrap-contour="false""#,
             Wrap::TopBottom => r#"style:wrap="none""#,
@@ -332,7 +335,7 @@ impl Out<'_> {
         let img = self.doc.images.get(i)?;
         let b = &img.bytes;
         let ext = if let Some(k) = officina_pict::sniff(b) { k.name() } else if b.starts_with(&[0xFF, 0xD8]) { "jpg" } else if b.starts_with(b"GIF8") { "gif" } else if b.starts_with(b"RIFF") { "webp" } else { "png" };
-        let n = format!("Pictures/image{}.{ext}", self.media.len() + 1);
+        let n = format!("Pictures/{}image{}.{ext}", self.prefix, self.media.len() + 1);
         self.media.push((n.clone(), b.to_vec()));
         self.image_names.insert(i, n.clone());
         Some(n)
@@ -748,7 +751,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
+    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
     let mut last_page = None;
     for k in 0..doc.blocks.len() {
         if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
@@ -863,7 +866,6 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             let _ = write!(styles, r#"<style:style style:name="Contents_20_{l}" style:display-name="Contents {l}" style:family="paragraph" style:parent-style-name="{}" style:class="index"/>"#, esc(&named[0].0));
         }
     }
-    let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let dc = &doc.styles.default_char;
     let defaults = format!(r#"<style:default-style style:family="paragraph"><style:paragraph-properties fo:margin-bottom="8pt" fo:line-height="115%"/><style:text-properties style:font-name="{}" fo:font-size="{}pt"/></style:default-style>"#, esc(&dc.family), dc.size as f64 / 2.0);
 
@@ -903,7 +905,30 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 Align::Justify => "justify",
             };
             let _ = write!(mp_styles, r#"<style:style style:name="{sn}" style:family="paragraph" style:parent-style-name="Standard"><style:paragraph-properties fo:text-align="{align}" fo:margin-top="0pt" fo:margin-bottom="0pt"/></style:style>"#);
-            master += &margin(hf, tag, &sn);
+            if hf.paras.is_empty() {
+                master += &margin(hf, tag, &sn);
+                continue;
+            }
+            // Its own paragraphs: their automatic styles and pictures go
+            // with the master page.
+            let mut ho = Out { prefix: if i == 0 { "MH" } else { "MF" }, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
+            let mut x = String::new();
+            for p in &hf.paras {
+                let mut q = p.clone();
+                q.props.list = None;
+                q.props.cell = None;
+                q.props.section = None;
+                ho.para_of(&q, &mut x);
+            }
+            let x = x.replace("{pages}", "<text:page-count>1</text:page-count>").replace("{page}", r#"<text:page-number text:select-page="current">1</text:page-number>"#);
+            let _ = write!(master, "<style:{tag}>{x}</style:{tag}>");
+            mp_styles += &ho.auto;
+            for f in ho.fonts {
+                if !o.fonts.contains(&f) {
+                    o.fonts.push(f);
+                }
+            }
+            o.media.extend(ho.media);
         }
     }
     master += "</style:master-page>";
@@ -920,7 +945,8 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         layout += &page_layout(&format!("pmS{n}"), g);
         master += &standard.replacen(r#"style:name="Standard" style:page-layout-name="pm1""#, &format!(r#"style:name="Section_20_Page_{n}" style:display-name="Section Page {n}" style:next-style-name="Section_20_Page_{n}" style:page-layout-name="pmS{n}""#), 1);
     }
-    let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
+    let sfonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
+    let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{sfonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let tracked = if o.regions.is_empty() && !doc.tracking {
         String::new()

@@ -80,7 +80,7 @@ fn main() {
         let b = s.find(' ').unwrap_or(0) as u32;
         d.push_para(&s, 0, vec![(0, bold), (b, 0)]);
     }
-    d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
+    d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
     let before = hwm();
     let t = Instant::now();
     let f = std::io::BufWriter::new(std::fs::File::create(&out).expect("create"));

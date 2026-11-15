@@ -197,6 +197,22 @@ pub struct Paginator {
     cur: PageSetup,
 }
 
+/// `g` with its top and bottom margins grown to hold a header or footer of
+/// its own paragraphs taller than they leave (the text starts below the
+/// header, as Word and LibreOffice have it).
+pub fn grown(doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, mut g: PageSetup) -> PageSetup {
+    let w = content_width(&g).max(crate::LU);
+    for (hf, top) in [(&doc.header, true), (&doc.footer, false)] {
+        let Some(hf) = hf.as_ref().filter(|h| !h.paras.is_empty()) else { continue };
+        let h: i64 = hf.paras.iter().map(|p| cache.get(doc, p, w, fonts).height).sum();
+        // Layout units to twips, rounded up; at most half the page.
+        let need = (crate::model::HEADER_FROM_EDGE as i64 + (h * 20 + crate::LU - 1) / crate::LU).min(g.height as i64 / 2) as i32;
+        let m = if top { &mut g.margin_top } else { &mut g.margin_bottom };
+        *m = (*m).max(need);
+    }
+    g
+}
+
 impl Paginator {
     /// Starts paginating `doc` from the beginning.
     pub fn new(doc: &TextDoc) -> Paginator {
@@ -383,7 +399,8 @@ impl Paginator {
             self.finish();
             return false;
         }
-        self.set_page(self.setup_at(at.block.min(n_blocks.saturating_sub(1))));
+        let g = self.setup_at(at.block.min(n_blocks.saturating_sub(1)));
+        self.set_page(grown(doc, cache, fonts, g));
         let (page, next) = self.page(doc, cache, fonts, at);
         for sl in &page.slices {
             let Some(id) = doc.blocks.get(sl.block).map(|b| b.id()) else { continue };

@@ -72,8 +72,8 @@ pub(crate) mod tests {
         d.push_para("Split here, please.", 0, vec![]);
         tracked(&mut d, k);
         d.take_changes();
-        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
-        d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
+        d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End, paras: Vec::new() });
         d.page.margin_start = 1000;
         d
     }
@@ -187,7 +187,10 @@ pub(crate) mod tests {
         assert_eq!(a.tracking, b.tracking);
         assert_eq!(a.visible_text(), b.visible_text());
         assert_eq!(a.page, b.page);
-        assert_eq!((&a.header, &a.footer), (&b.header, &b.footer));
+        // A header read back has its own paragraphs; its line is the same.
+        for (x, y) in [(&a.header, &b.header), (&a.footer, &b.footer)] {
+            assert_eq!(x.as_ref().map(|h| (&h.text, h.align)), y.as_ref().map(|h| (&h.text, h.align)));
+        }
         assert_eq!(a.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>(), b.images.iter().map(|i| i.bytes.clone()).collect::<Vec<_>>());
     }
 
@@ -202,6 +205,42 @@ pub(crate) mod tests {
         assert_eq!(sums(&d).len(), 5, "{:?}", sums(&d));
         assert_eq!(loaded.pictures, 1);
         assert!(loaded.report.is_empty(), "{:?}", loaded.report.lines());
+    }
+
+    /// A document whose header and footer have paragraphs of their own.
+    pub fn margin_sample() -> TextDoc {
+        use officina_text::model::Para;
+        let mut d = TextDoc::new();
+        d.push_para("Body", 0, vec![]);
+        let img = d.images.add(ImageData { bytes: std::sync::Arc::from(&b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x08\x08\x02\0\0\0"[..]), width: 16, height: 8 });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+        let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
+        let logo = Para { runs: vec![(0, pic), (3, bold)], ..Para::new(d.new_id(), "\u{FFFC} Acme Ltd", 0) };
+        let num = Para { runs: vec![(0, 0), (5, bold), (11, 0)], ..Para::new(d.new_id(), "Page {page} of {pages}", 0) };
+        d.header = Some(HeaderFooter { text: "Acme Ltd".into(), align: Align::Start, paras: vec![logo, Para::new(d.new_id(), "Second line", 0)] });
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Start, paras: vec![num] });
+        d
+    }
+
+    /// `r`, read back from [`margin_sample`], kept its header and footer.
+    pub fn margin_same(d: &TextDoc, r: &TextDoc) {
+        let h = r.header.as_ref().unwrap();
+        assert_eq!(h.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["\u{FFFC} Acme Ltd", "Second line"]);
+        let o = r.attrs.get(h.paras[0].attr_at(0)).object.clone().unwrap();
+        assert_eq!((o.width, o.height), (1440, 720));
+        assert_eq!(r.images.get(o.image).unwrap().bytes, d.images.get(0).unwrap().bytes);
+        assert!(r.attrs.get(h.paras[0].attr_at(5)).bold == Some(true));
+        let f = &r.footer.as_ref().unwrap().paras[0];
+        assert_eq!(f.text, "Page {page} of {pages}");
+        assert!(r.attrs.get(f.attr_at(6)).bold == Some(true) && r.attrs.get(f.attr_at(1)).bold != Some(true));
+        assert_eq!(r.visible_text(), d.visible_text());
+    }
+
+    #[test]
+    fn headers_keep_their_paragraphs_pictures_and_page_numbers() {
+        let d = margin_sample();
+        let (r, _) = super::read(&super::write(&d, Vec::new()).unwrap()).unwrap();
+        margin_same(&d, &r);
     }
 
     #[test]

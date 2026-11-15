@@ -1088,20 +1088,99 @@ impl Default for PageSetup {
     }
 }
 
-/// A page header or footer: one line of text, where `{page}` and `{pages}`
-/// stand for the page number and count, drawn in the margin, half an inch
-/// from the page's edge.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A page header or footer, drawn in the margin half an inch from the
+/// page's edge: one line of text (`text`, `align`), or its own paragraphs
+/// (`paras`: formatted, several lines, pictures in line), `text` then
+/// holding their words. In either, `{page}` and `{pages}` stand for the
+/// page number and count.
+#[derive(Debug, Clone, PartialEq)]
 pub struct HeaderFooter {
     pub text: String,
     pub align: Align,
+    pub paras: Vec<Para>,
 }
 
+/// Most paragraphs a header or footer keeps.
+pub const MAX_MARGIN_PARAS: usize = 64;
+
 impl HeaderFooter {
+    /// One line of text.
+    pub fn line(text: &str, align: Align) -> HeaderFooter {
+        HeaderFooter { text: text.into(), align, paras: Vec::new() }
+    }
+
     /// The text for page `page` (1-based) of `pages`.
     pub fn resolve(&self, page: usize, pages: &str) -> String {
         self.text.replace("{page}", &page.to_string()).replace("{pages}", pages)
     }
+}
+
+/// A header's or footer's paragraphs with each table row made one line, its
+/// cells apart by tabs (headers lay out no tables; a cell a paragraph would
+/// stack a three-column row three lines high).
+pub fn rows_as_lines(paras: Vec<Para>) -> Vec<Para> {
+    let mut out: Vec<Para> = Vec::with_capacity(paras.len());
+    let mut last: Option<CellRef> = None;
+    for mut p in paras {
+        let cell = p.props.cell.take();
+        match (cell, last, out.last_mut()) {
+            (Some(c), Some(l), Some(q)) if (c.table, c.row) == (l.table, l.row) => {
+                let gap = if c.col != l.col { '\t' } else { ' ' };
+                if !p.text.is_empty() {
+                    let base = q.text.len() as u32 + 1;
+                    let a = q.runs.last().map_or(0, |r| r.1);
+                    q.text.push(gap);
+                    q.runs.push((base - 1, a));
+                    q.text.push_str(&p.text);
+                    q.runs.extend(p.runs.iter().map(|&(at, a)| (at + base, a)));
+                    q.normalize();
+                }
+            }
+            _ => out.push(p),
+        }
+        last = cell;
+    }
+    out
+}
+
+/// `p` with `{page}` and `{pages}` filled in, its runs moved to match.
+pub fn resolve_para<'a>(p: &'a Para, page: usize, pages: &str) -> std::borrow::Cow<'a, Para> {
+    if !p.text.contains("{page") {
+        return std::borrow::Cow::Borrowed(p);
+    }
+    let page = page.to_string();
+    let mut q = p.clone();
+    q.text.clear();
+    // Each byte of the old text and where it lands.
+    let mut map = Vec::with_capacity(p.text.len() + 1);
+    let mut i = 0;
+    while i < p.text.len() {
+        let rest = &p.text[i..];
+        let (key, val) = if rest.starts_with("{pages}") {
+            ("{pages}", pages)
+        } else if rest.starts_with("{page}") {
+            ("{page}", page.as_str())
+        } else {
+            let n = rest.chars().next().map_or(1, char::len_utf8);
+            for _ in 0..n {
+                map.push(q.text.len() as u32);
+            }
+            q.text.push_str(&rest[..n]);
+            i += n;
+            continue;
+        };
+        for _ in 0..key.len() {
+            map.push(q.text.len() as u32);
+        }
+        q.text.push_str(val);
+        i += key.len();
+    }
+    map.push(q.text.len() as u32);
+    for r in q.runs.iter_mut() {
+        r.0 = map.get(r.0 as usize).copied().unwrap_or(q.text.len() as u32);
+    }
+    q.runs.dedup_by_key(|r| r.0);
+    std::borrow::Cow::Owned(q)
 }
 
 /// Distance of a header or footer's line from the page edge, twips.

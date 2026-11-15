@@ -94,8 +94,8 @@ pub fn sample() -> TextDoc {
     d.push_para("Split here, please.", 0, vec![]);
     tracked(&mut d, k);
     d.take_changes();
-    d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
-    d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End });
+    d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
+    d.header = Some(HeaderFooter { text: "Report".into(), align: Align::End, paras: Vec::new() });
     d
 }
 

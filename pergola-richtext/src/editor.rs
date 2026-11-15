@@ -1452,7 +1452,7 @@ impl Editor {
     /// Page numbers in the footer ("Page 3 of 12", centred), on or off.
     pub fn toggle_page_numbers(&mut self) {
         let on = self.doc.footer.as_ref().is_some_and(|f| f.text.contains("{page}"));
-        let footer = if on { None } else { Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center }) };
+        let footer = if on { None } else { Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() }) };
         let (page, header) = (self.doc.page, self.doc.header.clone());
         self.set_page("Page Numbers", page, header, footer);
     }

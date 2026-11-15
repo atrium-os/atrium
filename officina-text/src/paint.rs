@@ -78,12 +78,27 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
     // Header and footer, in the margins.
     for (hf, top) in [(&doc.header, true), (&doc.footer, false)] {
         let Some(hf) = hf else { continue };
-        let text = hf.resolve(i + 1, pages_text);
         let from = twips(HEADER_FROM_EDGE as i64);
+        let width = pw - mx - twips(g.margin_end as i64);
+        if !hf.paras.is_empty() {
+            // Its own paragraphs: the header down from its line, the
+            // footer up to its.
+            let paras: Vec<_> = hf.paras.iter().map(|p| crate::model::resolve_para(p, i + 1, pages_text)).collect();
+            let lays: Vec<_> = paras.iter().map(|p| cache.get(doc, p, width.max(crate::LU), fonts)).collect();
+            let total: i64 = lays.iter().map(|l| l.height).sum();
+            let mut y = if top { from } else { ph - from - total };
+            for (p, l) in paras.iter().zip(&lays) {
+                for li in 0..l.lines.len() {
+                    line(&mut out, doc, fonts, l, li, &p.text, mx, y, None);
+                    y += l.lines[li].height;
+                }
+            }
+            continue;
+        }
+        let text = hf.resolve(i + 1, pages_text);
         let fmt = CharFormat { size: HEADER_FORMAT_SIZE, color: HEADER_COLOR, ..Default::default() };
         let size = size_lu(&fmt);
         let baseline = if top { from + size * 4 / 5 } else { ph - from };
-        let width = pw - mx - twips(g.margin_end as i64);
         text_line(&mut out, fonts, &text, &fmt, hf.align, mx, width, baseline);
     }
 
@@ -409,7 +424,7 @@ mod tests {
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 10, height: 10 });
         let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
         d.push_para("a\u{FFFC}b", 0, vec![(0, 0), (1, pic), (4, 0)]);
-        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
         let fonts = FixedFonts;
         let mut cache = LayoutCache::default();
         let mut p = Paginator::new(&d);
@@ -428,6 +443,44 @@ mod tests {
                 assert_eq!(joined, r.text);
             }
         }
+    }
+
+    #[test]
+    fn headers_of_their_own_paragraphs_paint_pictures_and_page_numbers() {
+        use crate::model::Para;
+        let mut d = TextDoc::new();
+        d.push_para("Body", 0, vec![]);
+        let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 10, height: 10 });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 720, height: 360, float: None }), ..Default::default() });
+        let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
+        let mut logo = Para::new(d.new_id(), "\u{FFFC} Acme", 0);
+        logo.runs = vec![(0, pic), (3, bold)];
+        let mut num = Para::new(d.new_id(), "Page {page} of {pages}", 0);
+        num.runs = vec![(0, 0), (5, bold), (11, 0)];
+        d.header = Some(HeaderFooter { text: "Acme".into(), align: Align::Start, paras: vec![logo] });
+        d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Start, paras: vec![num] });
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "7");
+        let texts: Vec<String> = items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r.text.clone()) } else { None }).collect();
+        assert!(texts.iter().any(|t| t.contains("Acme")), "{texts:?}");
+        // The page number keeps the bold its placeholder had.
+        assert!(texts.windows(3).any(|w| w == ["Page ", "1", " of 7"]), "{texts:?}");
+        let pic_y = items.iter().find_map(|i| if let Item::Image { y, h, .. } = i { Some(*y + *h) } else { None }).unwrap();
+        // In the top margin.
+        assert!(pic_y <= twips(d.page.margin_top as i64), "{pic_y}");
+    }
+
+    #[test]
+    fn a_headers_table_rows_become_lines() {
+        use crate::model::{rows_as_lines, CellRef, Para};
+        let cell = |row, col| Some(CellRef { table: 1, row, col, width: 1000 });
+        let mk = |t: &str, c| Para { props: crate::model::ParaProps { cell: c, ..Default::default() }, ..Para::new(0, t, 0) };
+        let v = rows_as_lines(vec![mk("Title", None), mk("A", cell(0, 0)), mk("B", cell(0, 1)), mk("b2", cell(0, 1)), mk("C", cell(1, 0)), mk("", cell(1, 1)), mk("D", cell(1, 2))]);
+        assert_eq!(v.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Title", "A\tB b2", "C\tD"]);
+        assert!(v.iter().all(|p| p.props.cell.is_none() && p.runs.iter().all(|r| r.0 as usize <= p.text.len())));
     }
 
     #[test]

@@ -21,6 +21,13 @@ mod tests {
     }
 
     #[test]
+    fn headers_keep_their_paragraphs_pictures_and_page_numbers() {
+        let d = crate::docx::tests::margin_sample();
+        let (r, _) = super::read(&super::write(&d, Vec::new()).unwrap()).unwrap();
+        crate::docx::tests::margin_same(&d, &r);
+    }
+
+    #[test]
     fn hostile_packages_fail_cleanly() {
         let bytes = super::write(&sample(), Vec::new()).unwrap();
         let mut x: u64 = 0x0d7;

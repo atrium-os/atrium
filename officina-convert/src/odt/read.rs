@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -367,6 +367,10 @@ struct Reader<'a> {
     /// Notes anchored in the text, read after it.
     pending: Vec<(NoteId, NoteKind, El)>,
     in_note: bool,
+    /// Reading a header or footer: page fields become placeholders.
+    in_margin: bool,
+    /// The header and footer, read for their paragraphs last.
+    margin_els: [Option<El>; 2],
     /// Annotations by `office:name`, for their ends and replies.
     annotations: HashMap<String, CommentId>,
     /// Replies and the names of what they answer.
@@ -1192,7 +1196,8 @@ impl<'a> Reader<'a> {
             self.last_cell = Some(cell);
         }
         let outer = std::mem::take(&mut self.events);
-        self.inline(e, &mut p, &chars, Where::Body);
+        let at = if self.in_margin { Where::Margin } else { Where::Body };
+        self.inline(e, &mut p, &chars, at);
         let events = std::mem::replace(&mut self.events, outer);
         // Tab stops: ODF measures them from the start indent, we from the edge.
         let pf = self.doc.styles.para_format(style, &props).0;
@@ -1298,6 +1303,40 @@ impl<'a> Reader<'a> {
         }
         self.in_note = false;
         self.doc.notes.renumber();
+    }
+
+    /// The header's and footer's own paragraphs: formatted, pictures in
+    /// line, page fields as `{page}` and `{pages}`.
+    fn read_margins(&mut self) {
+        self.in_note = true;
+        self.in_margin = true;
+        for k in 0..2 {
+            let Some(h) = self.margin_els[k].take() else { continue };
+            let before = self.doc.blocks.len();
+            self.box_content(&h, None);
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.list = None;
+                    p.props.section = None;
+                    paras.push(p);
+                }
+            }
+            let mut paras = officina_text::model::rows_as_lines(paras);
+            while paras.len() > 1 && paras.last().is_some_and(|p| p.text.is_empty()) {
+                paras.pop();
+            }
+            if paras.len() > MAX_MARGIN_PARAS {
+                self.rep.note(Kind::Approximate, "very long headers and footers (cut)");
+                paras.truncate(MAX_MARGIN_PARAS);
+            }
+            let hf = if k == 0 { &mut self.doc.header } else { &mut self.doc.footer };
+            if let Some(h) = hf {
+                h.paras = paras;
+            }
+        }
+        self.in_margin = false;
+        self.in_note = false;
     }
 
     fn box_content(&mut self, b: &El, cell: Option<CellRef>) {
@@ -1593,8 +1632,9 @@ impl<'a> Reader<'a> {
                 }
                 text.push_str(q.text.replace(['\t', '\u{2028}'], " ").trim());
             }
-            if !text.is_empty() {
-                let hf = HeaderFooter { text: text.chars().take(1000).collect(), align };
+            if !text.is_empty() || h.find("draw:frame").is_some() {
+                self.margin_els[!header as usize] = Some(h.clone());
+                let hf = HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() };
                 if header {
                     self.doc.header = Some(hf);
                 } else {
@@ -1621,7 +1661,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, in_margin: false, margin_els: [None, None], annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {
@@ -1656,6 +1696,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
         });
     }
     r.read_notes();
+    r.read_margins();
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
     fields::relink_toc(&mut r.doc);
     if lost > 0 {

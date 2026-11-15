@@ -86,7 +86,7 @@ fn main() {
         }
         d.push_para(&format!("Paragraph {n}. The quick brown fox jumps over the lazy dog, and a naïve café owner counts façades while the paginator keeps up with every keystroke. Shaping handles ligatures such as fi and fl, accents and marks, and characters from the fallback face like ★ and ✓."), 0, vec![]);
     }
-    d.footer = Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: officina_text::model::Align::Center });
+    d.footer = Some(officina_text::model::HeaderFooter { text: "Page {page} of {pages}".into(), align: officina_text::model::Align::Center, paras: Vec::new() });
     // A footnote on the first body paragraph and an endnote on the justified one.
     let body = (0..d.blocks.len()).find(|&i| d.para(i).is_some_and(|p| p.text.starts_with("Text is shaped"))).unwrap();
     let at = d.para(body).unwrap().text.find(" then laid out").unwrap() as u32;

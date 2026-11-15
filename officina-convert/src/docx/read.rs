@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Float, HAlign, Rel, Wrap, DEFAULT_FLOAT_GAP, MAX_FLOAT_OFFSET, Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_MARGIN_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -400,6 +400,8 @@ struct Reader<'a> {
     /// Notes anchored in the text, read after it.
     pending: Vec<(NoteId, NoteKind, String)>,
     in_note: bool,
+    /// The header's and footer's parts, read for their paragraphs last.
+    margin_parts: [Option<String>; 2],
     /// Comments by their `w:id`, and (from commentsExtended.xml) the `w:id`
     /// each answers and whether it is resolved.
     comment_xml: HashMap<String, El>,
@@ -1207,6 +1209,44 @@ impl<'a> Reader<'a> {
         self.doc.notes.renumber();
     }
 
+    /// The header's and footer's own paragraphs: formatted, pictures in
+    /// line, page fields as `{page}` and `{pages}`.
+    fn read_margins(&mut self) {
+        self.in_note = true;
+        let main_rels = std::mem::take(&mut self.rels);
+        for k in 0..2 {
+            let Some(target) = self.margin_parts[k].clone() else { continue };
+            let Some(e) = part(self.archive, &target).ok().flatten() else { continue };
+            self.rels = rels(self.archive, &target).unwrap_or_default();
+            let before = self.doc.blocks.len();
+            let mut field = FieldState { in_margin: true, ..Default::default() };
+            self.box_blocks(&e, &mut field, 0);
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.section = None;
+                    p.props.list = None;
+                    paras.push(p);
+                }
+            }
+            let mut paras = officina_text::model::rows_as_lines(paras);
+            // Trailing empty paragraphs take room for nothing.
+            while paras.len() > 1 && paras.last().is_some_and(|p| p.text.is_empty()) {
+                paras.pop();
+            }
+            if paras.len() > MAX_MARGIN_PARAS {
+                self.rep.note(Kind::Approximate, "very long headers and footers (cut)");
+                paras.truncate(MAX_MARGIN_PARAS);
+            }
+            let hf = if k == 0 { &mut self.doc.header } else { &mut self.doc.footer };
+            if let Some(h) = hf {
+                h.paras = paras;
+            }
+        }
+        self.rels = main_rels;
+        self.in_note = false;
+    }
+
     /// A text box's paragraphs and tables, through content controls and the like.
     fn box_blocks(&mut self, b: &El, field: &mut FieldState, depth: usize) {
         for x in b.els() {
@@ -1369,6 +1409,7 @@ impl<'a> Reader<'a> {
             }
             let Some(target) = pick.and_then(|r| r.attr("r:id")).and_then(|id| self.rels.get(id)).map(|r| r.1.clone()) else { continue };
             if let Some(hf) = self.margin_text(&target) {
+                self.margin_parts[!header as usize] = Some(target.clone());
                 if header {
                     self.doc.header = Some(hf);
                 } else {
@@ -1400,10 +1441,10 @@ impl<'a> Reader<'a> {
             }
             text.push_str(q.text.replace(['\t', '\u{2028}'], " ").trim());
         }
-        if e.find("w:tbl").is_some() || e.find("w:drawing").is_some() {
-            self.rep.note(Kind::Approximate, "tables and pictures in headers and footers (their text kept)");
+        if e.find("w:tbl").is_some() {
+            self.rep.note(Kind::Approximate, "tables in headers and footers (their cells one under another)");
         }
-        (!text.is_empty()).then(|| HeaderFooter { text: text.chars().take(1000).collect(), align })
+        (!text.is_empty() || e.find("w:drawing").is_some()).then(|| HeaderFooter { text: text.chars().take(1000).collect(), align, paras: Vec::new() })
     }
 }
 
@@ -1584,7 +1625,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: [None, None], comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1642,6 +1683,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     }
     r.place_sections();
     r.read_notes();
+    r.read_margins();
     r.read_replies(&comment_order);
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
     fields::relink_toc(&mut r.doc);

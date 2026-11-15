@@ -3120,6 +3120,46 @@ on the page, so the shape's turn is taken off its angle; `.odp`
 turn is added on writing and taken off on reading. The slides LibreOffice
 gate, which had fallen to 82/84 on a 30° turned box, is 84/84 again.
 
+### 16.49 Headers and footers of their own paragraphs (2026-11-16)
+
+- **Model.** `HeaderFooter.paras`: a header's or footer's own paragraphs
+  (formatted text, several lines, pictures in line), at most 64; `text`
+  and `align` stay as its one-line form (the page-number footer Write makes
+  still uses it). `{page}` and `{pages}` stand for the page number and
+  count in either; filled in per page with the runs moved to match, so a
+  bold page number stays bold.
+- **Pages.** The header is laid out at the content width from half an inch
+  below the page's top edge down, the footer up to half an inch above its
+  bottom. One taller than its margin pushes the text down (or up), as
+  Word and LibreOffice do: the page's margin grows to hold it (at most half
+  the page). Painting, PDF export and the editor view all follow.
+- **Native file.** A MARGINS chunk (12) holds the paragraphs; the page
+  setup operation in the journal carries them too.
+- **Files.** `.docx`: the header and footer parts read with their own
+  relationships (pictures in line, anchored ones in line too), page fields
+  as placeholders; written as paragraphs with `PAGE`/`NUMPAGES` fields in
+  the run's own format and the pictures beside the part. `.odt`: the master
+  page's header and footer read the same way; written into the master page
+  with their automatic styles and pictures in `styles.xml` (names prefixed
+  `MH`/`MF` so they don't meet the body's). `.doc` gets them through
+  `.docx` (§16.43).
+- **Tables in headers**: headers lay out no tables, so each row becomes one
+  line, its cells apart by tabs (a cell a paragraph stacked a three-column
+  row three lines high and pushed the text far down).
+- **Not yet**: first-page and even-page headers (the default one is kept);
+  anchored pictures and drawn shapes in headers drawn in line or left out;
+  headers are not edited in Write beyond the page-number footer.
+
+Gates: our files through LibreOffice both ways across formats 4/4 (lines,
+picture and its size, bold, page fields keeping their format); round trips
+through `.docx`, `.odt`, both in turn and the native file; LibreOffice's PDF
+of a tall header matches our page (the text pushed down alike); Write's
+other LibreOffice gates unchanged (docx 26/26, odt 52/52, doc 31/31,
+sections 8/8, floats 8/8, contents 16/16); 2,551 corpus documents read,
+paginate and paint with no panic, 379 with headers or footers of their
+own paragraphs, 26 with pictures in them (checked against LibreOffice's
+renders on samples), 180 with margins grown for them.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

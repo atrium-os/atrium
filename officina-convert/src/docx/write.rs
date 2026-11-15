@@ -565,6 +565,31 @@ fn image_ext(b: &[u8]) -> &'static str {
     }
 }
 
+/// A header or footer part's `{page}` and `{pages}` as page fields in the
+/// run's own format.
+fn page_fields(x: &str) -> String {
+    let mut out = String::with_capacity(x.len());
+    let mut rest = x;
+    loop {
+        let next = [("{pages}", "NUMPAGES"), ("{page}", "PAGE")].iter().filter_map(|&(k, f)| rest.find(k).map(|i| (i, k, f))).min_by_key(|x| (x.0, std::cmp::Reverse(x.1.len())));
+        let Some((i, key, field)) = next else { break };
+        let (head, tail) = (&rest[..i], &rest[i + key.len()..]);
+        // Inside a run's text: close it, the field, open it again.
+        let run = head.rfind("<w:r>").map(|r| &head[r + 5..]).unwrap_or("");
+        let in_text = run.contains("<w:t") && !run.contains("</w:r>");
+        out.push_str(head);
+        if in_text {
+            let props = run.find("<w:rPr>").and_then(|a| run[a..].find("</w:rPr>").map(|b| &run[a..a + b + 8])).unwrap_or("");
+            let _ = write!(out, r#"</w:t></w:r><w:fldSimple w:instr=" {field} "><w:r>{props}<w:t>1</w:t></w:r></w:fldSimple><w:r>{props}<w:t xml:space="preserve">"#);
+        } else {
+            out.push_str(key);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn margin_part(hf: &HeaderFooter, tag: &str) -> String {
     let mut body = String::new();
     let mut rest = hf.text.as_str();
@@ -830,12 +855,36 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         comment_parts.push(("comments", "comments", x));
         comment_parts.push(("commentsExtended", "commentsExtended", ex));
     }
-    for (hf, tag, kind) in [(&doc.header, "hdr", "header"), (&doc.footer, "ftr", "footer")] {
+    let mut margin_rels: Vec<(String, String)> = Vec::new();
+    for (k, (hf, tag, kind)) in [(&doc.header, "hdr", "header"), (&doc.footer, "ftr", "footer")].into_iter().enumerate() {
         if let Some(hf) = hf {
             let name = format!("{kind}1.xml");
             let r = o.rel(kind, name.clone(), false);
             let _ = write!(sect, r#"<w:{kind}Reference w:type="default" r:id="{r}"/>"#);
-            parts.push((format!("word/{name}"), margin_part(hf, tag)));
+            if hf.paras.is_empty() {
+                parts.push((format!("word/{name}"), margin_part(hf, tag)));
+                continue;
+            }
+            // Its own paragraphs, with their pictures beside the part.
+            let mut ho = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 10_000 * (k as u32 + 1), notes: HashMap::new(), media_stem: if k == 0 { "hdr_image" } else { "ftr_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
+            let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} {W_NS} {DRAW_NS}>"#);
+            for p in &hf.paras {
+                let mut q = p.clone();
+                q.props.list = None;
+                q.props.cell = None;
+                q.props.section = None;
+                ho.para_of(doc, &q, &mut x, "", "");
+            }
+            let _ = write!(x, "</w:{tag}>");
+            parts.push((format!("word/{name}"), page_fields(&x)));
+            let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
+            for (id, k, target, external) in &ho.rels {
+                let mode = if *external { r#" TargetMode="External""# } else { "" };
+                let _ = write!(r, r#"<Relationship Id="{id}" Type="{REL}/{k}" Target="{}"{mode}/>"#, esc(target));
+            }
+            r += "</Relationships>";
+            margin_rels.push((format!("word/_rels/{name}.rels"), r));
+            note_media.extend(ho.media);
         }
     }
     // Each section's page: its own, else the document's.
@@ -913,6 +962,9 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     z.add("word/_rels/document.xml.rels", rels.as_bytes())?;
     for (name, xml) in &parts {
         z.add(name, xml.as_bytes())?;
+    }
+    for (name, r) in &margin_rels {
+        z.add(name, r.as_bytes())?;
     }
     for (part, _, xml) in &comment_parts {
         z.add(&format!("word/{part}.xml"), xml.as_bytes())?;
