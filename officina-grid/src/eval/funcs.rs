@@ -4,6 +4,7 @@
 
 use super::criteria::Criterion;
 use super::dates;
+use super::arrays::*;
 use super::{to_bool, to_num, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -134,6 +135,34 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("WEEKDAY", 1, 2, weekday),
     f!("TODAY", 0, 0, today, volatile),
     f!("NOW", 0, 0, now, volatile),
+    // dynamic arrays (arrays.rs)
+    f!("SEQUENCE", 1, 4, sequence),
+    f!("RANDARRAY", 0, 5, randarray, volatile),
+    f!("TRANSPOSE", 1, 1, transpose),
+    f!("FILTER", 2, 3, filter),
+    f!("SORT", 1, 4, sort),
+    f!("SORTBY", 2, N, sortby),
+    f!("UNIQUE", 1, 3, unique),
+    f!("VSTACK", 1, N, vstack),
+    f!("HSTACK", 1, N, hstack),
+    f!("TAKE", 2, 3, take),
+    f!("DROP", 2, 3, drop),
+    f!("CHOOSEROWS", 2, N, chooserows),
+    f!("CHOOSECOLS", 2, N, choosecols),
+    f!("TOCOL", 1, 3, tocol),
+    f!("TOROW", 1, 3, torow),
+    f!("WRAPROWS", 2, 3, wraprows),
+    f!("WRAPCOLS", 2, 3, wrapcols),
+    f!("EXPAND", 2, 4, expand),
+    f!("LET", 3, N, let_),
+    f!("LAMBDA", 1, N, lambda),
+    f!("MAP", 2, N, map),
+    f!("REDUCE", 2, 3, reduce),
+    f!("SCAN", 2, 3, scan),
+    f!("BYROW", 2, 2, byrow),
+    f!("BYCOL", 2, 2, bycol),
+    f!("MAKEARRAY", 3, 3, makearray),
+    f!("ISOMITTED", 1, 1, isomitted),
 ];
 
 /// The id of a function by its upper-case name.
@@ -198,6 +227,7 @@ fn each_num_slices(c: &Ctx, args: &[Expr], f: &mut dyn FnMut(&[f64])) -> Result<
             continue;
         }
         match c.eval(a) {
+            Ev::F(_) => return Err(ErrorKind::Calc),
             Ev::V(Value::Empty) => {}
             Ev::V(x) => f(&[to_num(&x)?]),
             Ev::R(r) => {
@@ -238,6 +268,7 @@ fn collect(c: &Ctx, args: &[Expr]) -> Result<Vec<f64>, ErrorKind> {
 fn each_value(c: &Ctx, args: &[Expr], f: &mut dyn FnMut(&Value)) {
     for a in args {
         match c.eval(a) {
+            Ev::F(_) => f(&Value::Err(ErrorKind::Calc)),
             Ev::V(x) => f(&x),
             Ev::R(r) => {
                 if let Some(cl) = c.clip(&r) {
@@ -291,6 +322,7 @@ fn count(c: &Ctx, a: &[Expr]) -> Ev {
     let mut k = 0u64;
     for x in a {
         match c.eval(x) {
+            Ev::F(_) => {}
             Ev::V(val) => {
                 if matches!(val, Value::Num(_) | Value::Bool(_)) || matches!(&val, Value::Str(s) if super::parse_number(s).is_some()) {
                     k += 1
@@ -317,6 +349,7 @@ fn counta(c: &Ctx, a: &[Expr]) -> Ev {
             continue;
         }
         match c.eval(x) {
+            Ev::F(_) => k += 1,
             Ev::V(_) => k += 1,
             Ev::R(r) => {
                 if let Some(cl) = c.clip(&r) {
@@ -648,7 +681,7 @@ fn averageif(c: &Ctx, a: &[Expr]) -> Ev {
     }
 }
 
-fn rng() -> f64 {
+pub(super) fn rng() -> f64 {
     use std::cell::Cell;
     thread_local! {
         static S: Cell<u64> = Cell::new({
@@ -771,6 +804,7 @@ fn truths(c: &Ctx, a: &[Expr]) -> Result<Vec<bool>, ErrorKind> {
                     _ => {}
                 };
                 match other {
+                    Ev::F(_) => {}
                     Ev::R(r) => {
                         if let Some(cl) = c.clip(&r) {
                             c.wb.each(&cl, &mut |_, _, val| f(&val))
@@ -842,6 +876,8 @@ fn row(c: &Ctx, a: &[Expr]) -> Ev {
     match a.first() {
         None => n(c.row as f64 + 1.0),
         Some(x) => match c.eval(x) {
+            // Several rows: their numbers, as a column (Excel 365).
+            Ev::R(r) if r.rows() > 1 && r.rows() <= super::MAX_ARRAY => Ev::A(Arc::new(Array { rows: r.rows() as usize, cols: 1, vals: (r.r0..=r.r1).map(|x| Value::Num(x as f64 + 1.0)).collect() })),
             Ev::R(r) => n(r.r0 as f64 + 1.0),
             _ => e(ErrorKind::Value),
         },
@@ -851,6 +887,7 @@ fn column(c: &Ctx, a: &[Expr]) -> Ev {
     match a.first() {
         None => n(c.col as f64 + 1.0),
         Some(x) => match c.eval(x) {
+            Ev::R(r) if r.cols() > 1 => Ev::A(Arc::new(Array { rows: 1, cols: r.cols() as usize, vals: (r.c0..=r.c1).map(|x| Value::Num(x as f64 + 1.0)).collect() })),
             Ev::R(r) => n(r.c0 as f64 + 1.0),
             _ => e(ErrorKind::Value),
         },
@@ -858,6 +895,7 @@ fn column(c: &Ctx, a: &[Expr]) -> Ev {
 }
 fn rows(c: &Ctx, a: &[Expr]) -> Ev {
     match c.eval(&a[0]) {
+        Ev::F(_) => e(ErrorKind::Calc),
         Ev::R(r) => n(r.rows() as f64),
         Ev::A(x) => n(x.rows as f64),
         Ev::V(Value::Err(k)) => e(k),
@@ -866,6 +904,7 @@ fn rows(c: &Ctx, a: &[Expr]) -> Ev {
 }
 fn columns(c: &Ctx, a: &[Expr]) -> Ev {
     match c.eval(&a[0]) {
+        Ev::F(_) => e(ErrorKind::Calc),
         Ev::R(r) => n(r.cols() as f64),
         Ev::A(x) => n(x.cols as f64),
         Ev::V(Value::Err(k)) => e(k),
@@ -1144,6 +1183,7 @@ fn index(c: &Ctx, a: &[Expr]) -> Ev {
         return e(ErrorKind::Value);
     }
     match c.eval(&a[0]) {
+        Ev::F(_) => e(ErrorKind::Value),
         Ev::R(rect) => {
             // A single row or column takes its one index from whichever is given.
             let (r, k) = if a.len() == 2 && rect.rows() == 1 { (1.0, r) } else { (r, k) };

@@ -241,6 +241,8 @@ struct Styles {
     row_height: HashMap<String, f64>,
     /// Font face name → family.
     faces: HashMap<String, String>,
+    /// Cell styles with `style:map` conditions.
+    cond_maps: bool,
 }
 
 impl Styles {
@@ -380,7 +382,9 @@ impl Styles {
                             if let (Some((_, d)), Some(c), Some(s)) = (cur_data.as_mut(), a.get("style:condition"), a.get("style:apply-style-name")) {
                                 d.maps.push((c.clone(), s.clone()));
                             } else if cur_cell.is_some() {
-                                rep.note(Kind::Dropped, "conditional formats");
+                                // LibreOffice writes these beside its own conditional
+                                // formats: noted only if the file has none of those.
+                                self.cond_maps = true;
                             }
                         }
                         "number:number" | "number:scientific-number" | "number:fraction" => {
@@ -574,6 +578,43 @@ impl Styles {
         Some(code)
     }
 
+    /// What a conditional format's cell style sets (not what it inherits from
+    /// `Default`).
+    fn dxf(&self, name: &str) -> Dxf {
+        let mut chain = Vec::new();
+        // LibreOffice names a condition's style by its display name.
+        let mut n = Some(if self.cells.contains_key(name) { name.to_string() } else { name.replace(' ', "_20_") });
+        while let Some(k) = n {
+            if chain.len() > 16 || k == "Default" {
+                break;
+            }
+            match self.cells.get(&k) {
+                Some(c) => {
+                    chain.push(c.clone());
+                    n = c.parent.clone();
+                }
+                None => break,
+            }
+        }
+        let mut d = Dxf::default();
+        for c in chain.iter().rev() {
+            if let Some(x) = &c.data {
+                if let Some(code) = self.code(x) {
+                    d.num_fmt = Some(Arc::from(code.as_str()));
+                }
+            }
+            d.bold = c.bold.or(d.bold);
+            d.italic = c.italic.or(d.italic);
+            d.underline = c.underline.or(d.underline);
+            d.strike = c.strike.or(d.strike);
+            d.color = c.color.or(d.color);
+            if let Some(f) = c.fill {
+                d.fill = f;
+            }
+        }
+        d
+    }
+
     /// The full style for a cell style name (its parents' look under its own).
     fn resolve(&self, name: &str) -> Style {
         let mut chain = Vec::new();
@@ -652,6 +693,9 @@ impl Styles {
     }
 }
 
+use super::condfmt::{EntryIn as CfEntry, FormatIn as CfIn};
+use officina_grid::condfmt::Dxf;
+
 /// A cell being read.
 #[derive(Default)]
 struct CellIn {
@@ -662,6 +706,8 @@ struct CellIn {
     repeat: u32,
     text: String,
     paras: u32,
+    /// A matrix (array) formula's rows and columns.
+    matrix: Option<(u32, u32)>,
 }
 
 /// Reads an `.ods` package into a workbook.
@@ -695,6 +741,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
     let mut db_tables: Vec<(String, String, bool)> = Vec::new();
+    // Conditional formats (LibreOffice's) and the one being read.
+    let mut cf: Option<CfIn> = None;
+    let mut cond_formats: Vec<CfIn> = Vec::new();
     let mut filter_and = true;
     let mut in_set = false;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
@@ -709,7 +758,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut cell: Option<CellIn> = None;
     let mut in_p = false;
     let mut row_cells: Vec<(u64, u32, CellIn)> = Vec::new();
-    let mut fcells: Vec<(u16, u32, u32, String, Value)> = Vec::new();
+    let mut fcells: Vec<(u16, u32, u32, String, Value, Option<(u32, u32)>)> = Vec::new();
     let mut runs: Vec<Vec<(u32, u32, StyleId)>> = Vec::new();
     let mut expanded: u64 = 0;
     let mut annotation_depth = 0u32;
@@ -844,7 +893,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             "string" => a.get("office:string-value").cloned(),
                             _ => None,
                         };
-                        let c = CellIn { vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0 };
+                        let span = |k: &str| a.get(k).and_then(|v| v.parse::<u32>().ok()).filter(|&n| n >= 1);
+                        let matrix = match (span("table:number-matrix-rows-spanned"), span("table:number-matrix-columns-spanned")) {
+                            (None, None) => None,
+                            (r, c) => Some((r.unwrap_or(1), c.unwrap_or(1))),
+                        };
+                        let c = CellIn { vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix };
                         if empty {
                             row_cells.push((col, repeat, c));
                             col += repeat as u64;
@@ -916,7 +970,48 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             }
                         }
                     }
-                    b"calcext:conditional-formats" => rep.note(Kind::Dropped, "conditional formats"),
+                    b"calcext:conditional-format" => {
+                        let a = attrs(e);
+                        cf = Some(CfIn { target: a.get("calcext:target-range-address").cloned().unwrap_or_default(), entries: Vec::new() });
+                    }
+                    b"calcext:condition" => {
+                        let a = attrs(e);
+                        if let Some(f) = cf.as_mut() {
+                            f.entries.push(CfEntry::Condition {
+                                style: a.get("calcext:apply-style-name").cloned().unwrap_or_default(),
+                                value: a.get("calcext:value").cloned().unwrap_or_default(),
+                                base: a.get("calcext:base-cell-address").cloned().unwrap_or_default(),
+                            });
+                        }
+                    }
+                    b"calcext:color-scale" => {
+                        if let Some(f) = cf.as_mut() {
+                            f.entries.push(CfEntry::Scale(Vec::new()));
+                        }
+                    }
+                    b"calcext:color-scale-entry" => {
+                        let a = attrs(e);
+                        if let Some(CfEntry::Scale(v)) = cf.as_mut().and_then(|f| f.entries.last_mut()) {
+                            v.push((a.get("calcext:type").cloned().unwrap_or_default(), a.get("calcext:value").cloned().unwrap_or_default(), a.get("calcext:color").cloned().unwrap_or_default()));
+                        }
+                    }
+                    b"calcext:data-bar" => {
+                        let a = attrs(e);
+                        if let Some(f) = cf.as_mut() {
+                            f.entries.push(CfEntry::Bar { color: a.get("calcext:positive-color").cloned().unwrap_or_default(), points: Vec::new() });
+                        }
+                    }
+                    b"calcext:formatting-entry" => {
+                        let a = attrs(e);
+                        if let Some(CfEntry::Bar { points, .. }) = cf.as_mut().and_then(|f| f.entries.last_mut()) {
+                            points.push((a.get("calcext:type").cloned().unwrap_or_default(), a.get("calcext:value").cloned().unwrap_or_default()));
+                        }
+                    }
+                    b"calcext:icon-set" | b"calcext:date-is" => {
+                        if let Some(f) = cf.as_mut() {
+                            f.entries.push(CfEntry::Other(String::from_utf8_lossy(name).into_owned()));
+                        }
+                    }
                     b"table:content-validations" => rep.note(Kind::Dropped, "data validation"),
                     b"table:database-range" => {
                         let a = attrs(e);
@@ -1009,6 +1104,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     continue;
                 }
                 match name {
+                    b"calcext:conditional-format" => {
+                        if cond_formats.len() < 4096 {
+                            cond_formats.extend(cf.take());
+                        }
+                    }
                     b"table:database-range" => filters.extend(db.take()),
                     b"text:p" | b"text:h" => in_p = false,
                     b"table:table-cell" | b"table:covered-table-cell" => {
@@ -1156,11 +1256,38 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
         }
     }
 
+    // Conditional formats, once every sheet exists.
+    if styles.cond_maps && cond_formats.is_empty() {
+        rep.note(Kind::Dropped, "conditional formats");
+    }
+    for f in cond_formats {
+        match super::condfmt::make(&wb, &f, &|n| styles.dxf(n)) {
+            Ok(c) => {
+                if wb.add_cond_format(c).is_err() {
+                    rep.note(Kind::Dropped, "conditional formats past the engine's limits");
+                }
+            }
+            Err(why) => rep.note_at(Kind::Dropped, "conditional formats this engine can't use", || format!("{}: {why}", f.target)),
+        }
+    }
+
     // Formulas, once every sheet exists.
     let mut cached = Vec::new();
-    for (s, rr, cc, src, v) in fcells {
+    for (s, rr, cc, src, v, matrix) in fcells {
+        // LibreOffice's formulas keep one value (`@` where they could spill); its
+        // matrix formulas spill, over the cells the file kept for them.
+        let text = |a1: &str| -> Option<String> {
+            let e = wb.parse(a1, s, rr, cc).ok()?;
+            let e = if matrix.is_some() { e } else { officina_grid::eval::arrays::legacy(e) };
+            Some(officina_grid::formula::to_a1(&e, rr, cc, &|i| wb.sheet_name(i)))
+        };
         match super::formula::from_of(&src) {
             Some(a1) => {
+                let a1 = text(&a1).unwrap_or(a1);
+                if let Some((nr, nc)) = matrix.filter(|&(r, c)| r * c > 1) {
+                    let (r1, c1) = (rr.saturating_add(nr - 1).min(MAX_ROWS - 1), cc.saturating_add(nc - 1).min(MAX_COLS - 1));
+                    wb.claim_spill(CellAddr::new(s, rr, cc), officina_grid::Rect { sheet: s, r0: rr, c0: cc, r1, c1 });
+                }
                 if wb.set_formula(CellAddr::new(s, rr, cc), &a1).is_ok() {
                     out.formulas += 1;
                     cached.push((CellAddr::new(s, rr, cc), v));
@@ -1243,10 +1370,10 @@ fn value_of(c: &CellIn, rep: &mut Report) -> Value {
     }
 }
 
-fn put_cell(wb: &mut Workbook, s: u16, r: u32, c: u32, cell: &CellIn, fcells: &mut Vec<(u16, u32, u32, String, Value)>, rep: &mut Report) {
+fn put_cell(wb: &mut Workbook, s: u16, r: u32, c: u32, cell: &CellIn, fcells: &mut Vec<(u16, u32, u32, String, Value, Option<(u32, u32)>)>, rep: &mut Report) {
     let v = value_of(cell, rep);
     match &cell.formula {
-        Some(f) => fcells.push((s, r, c, f.clone(), v)),
+        Some(f) => fcells.push((s, r, c, f.clone(), v, cell.matrix)),
         None => wb.set_value(CellAddr::new(s, r, c), v),
     }
 }
@@ -1272,7 +1399,7 @@ mod tests {
 }
 
 /// A database range's `target-range-address`: sheet and range.
-fn target_rect(wb: &Workbook, target: &str) -> Option<(u16, u32, u32, u32, u32)> {
+pub(super) fn target_rect(wb: &Workbook, target: &str) -> Option<(u16, u32, u32, u32, u32)> {
     let a1 = super::formula::from_of(&format!("of:=[{target}]"))?;
     let (sh, rf) = a1.trim_start_matches('=').rsplit_once('!')?;
     let sh = sh.trim_matches('\'').replace("''", "'");

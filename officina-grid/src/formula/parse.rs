@@ -137,7 +137,7 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
             b'#' => {
                 let rest = &s[i..];
                 let mut found = None;
-                for e in ["#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!", "#REF!", "#VALUE!", "#CIRC!", "#LIMIT!"] {
+                for e in ["#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!", "#REF!", "#VALUE!", "#CIRC!", "#LIMIT!", "#SPILL!", "#CALC!"] {
                     if rest.as_bytes().get(..e.len()).is_some_and(|p| p.eq_ignore_ascii_case(e.as_bytes())) {
                         found = Some((e.len(), ErrorKind::from_text(e).unwrap()));
                         break;
@@ -158,6 +158,7 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
                     let n = word_len(&s[i..]);
                     out.push((start, Tok::Word(s[i..i + n].to_string())));
                     i += n;
+                    spill_op(b, &mut i, &mut out);
                     continue;
                 }
                 let mut j = i;
@@ -218,7 +219,7 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
                     i += 1;
                 }
             }
-            b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'%' | b'(' | b')' | b',' | b';' | b':' | b'{' | b'}' => {
+            b'+' | b'-' | b'*' | b'/' | b'^' | b'&' | b'=' | b'%' | b'(' | b')' | b',' | b';' | b':' | b'{' | b'}' | b'@' => {
                 let op = match c {
                     b'+' => "+",
                     b'-' => "-",
@@ -234,6 +235,7 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
                     b';' => ";",
                     b':' => ":",
                     b'{' => "{",
+                    b'@' => "@",
                     _ => "}",
                 };
                 out.push((start, Tok::Op(op)));
@@ -256,6 +258,7 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
                     i = end;
                 } else {
                     out.push((start, Tok::Word(w.to_string())));
+                    spill_op(b, &mut i, &mut out);
                 }
             }
             b'[' => {
@@ -267,6 +270,14 @@ fn lex(s: &str) -> Result<Vec<(usize, Tok)>, ParseError> {
         }
     }
     Ok(out)
+}
+
+/// `#` right after a word (`A1#`) is the spill operator, not an error value.
+fn spill_op(b: &[u8], i: &mut usize, out: &mut Vec<(usize, Tok)>) {
+    if b.get(*i) == Some(&b'#') {
+        out.push((*i, Tok::Op("#")));
+        *i += 1;
+    }
 }
 
 fn word_len(s: &str) -> usize {
@@ -468,7 +479,22 @@ impl P<'_> {
             self.depth -= 1;
             return Ok(Expr::Plus(Box::new(e)));
         }
+        if self.eat("@") {
+            self.enter()?;
+            let e = self.unary()?;
+            self.depth -= 1;
+            return Ok(Expr::At(Box::new(e)));
+        }
         let mut e = self.primary()?;
+        // `LAMBDA(x, x+1)(2)`: a call's (or parenthesised) result called in turn.
+        while self.peek_op() == Some("(") && matches!(e, Expr::Call(..) | Expr::Paren(_) | Expr::Invoke(..)) {
+            let at = self.at();
+            self.pos += 1;
+            self.enter()?;
+            let args = self.args(at)?;
+            self.depth -= 1;
+            e = Expr::Invoke(Box::new(e), args);
+        }
         while self.eat("%") {
             e = Expr::Pct(Box::new(e));
         }
@@ -545,6 +571,9 @@ impl P<'_> {
                 self.pos += 1;
                 let (r2, c2) = self.cell(&w2).ok_or(ParseError { at: at2, msg: "bad end of range".into() })?;
                 return Ok(Expr::Range(RangeRef { sheet: sh, r0: r, c0: c, r1: r2, c1: c2, kind: RangeKind::Cells }));
+            }
+            if self.eat("#") {
+                return Ok(Expr::Spill(CellRef { sheet: sh, row: r, col: c }));
             }
             return Ok(Expr::Ref(CellRef { sheet: sh, row: r, col: c }));
         }
@@ -642,6 +671,42 @@ impl P<'_> {
                 u = r.to_string();
             }
         }
+        let args = self.args(at)?;
+        self.depth -= 1;
+        // How files spell `@` and `A1#`.
+        if u == "SINGLE" && args.len() == 1 {
+            return Ok(Expr::At(Box::new(args.into_iter().next().unwrap())));
+        }
+        if u == "ANCHORARRAY" && args.len() == 1 {
+            if let Expr::Ref(r) = &args[0] {
+                return Ok(Expr::Spill(*r));
+            }
+        }
+        let param = |e: &Expr| matches!(e, Expr::Name(n) if !n.is_empty() && !n.starts_with('\0'));
+        let f = match funcs::lookup(&u) {
+            Some(id) => {
+                let spec = &funcs::FUNCS[id as usize];
+                if args.len() < spec.min as usize || args.len() > spec.max as usize {
+                    return err(at, format!("{} takes {}{} arguments", spec.name, spec.min, if spec.max as usize == MAX_ARGS { " or more".to_string() } else if spec.max == spec.min { String::new() } else { format!(" to {}", spec.max) }));
+                }
+                // LET's names and LAMBDA's parameters must be names.
+                let names_ok = match spec.name {
+                    "LET" => args.len() % 2 == 1 && args.iter().step_by(2).take(args.len() / 2).all(param),
+                    "LAMBDA" => args[..args.len() - 1].iter().all(param),
+                    _ => true,
+                };
+                if !names_ok {
+                    return err(at, format!("{} takes names where its arguments are named", spec.name));
+                }
+                Func::Known(id)
+            }
+            None => Func::Unknown(Arc::from(u.as_str())),
+        };
+        Ok(Expr::Call(f, args))
+    }
+
+    /// Arguments up to and including the closing `)`.
+    fn args(&mut self, at: usize) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         if !self.eat(")") {
             loop {
@@ -661,18 +726,7 @@ impl P<'_> {
                 break;
             }
         }
-        self.depth -= 1;
-        let f = match funcs::lookup(&u) {
-            Some(id) => {
-                let spec = &funcs::FUNCS[id as usize];
-                if args.len() < spec.min as usize || args.len() > spec.max as usize {
-                    return err(at, format!("{} takes {}{} arguments", spec.name, spec.min, if spec.max as usize == MAX_ARGS { " or more".to_string() } else if spec.max == spec.min { String::new() } else { format!(" to {}", spec.max) }));
-                }
-                Func::Known(id)
-            }
-            None => Func::Unknown(Arc::from(u.as_str())),
-        };
-        Ok(Expr::Call(f, args))
+        Ok(args)
     }
 
     fn array(&mut self) -> Result<Expr, ParseError> {

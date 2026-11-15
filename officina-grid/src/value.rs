@@ -20,6 +20,11 @@ pub enum ErrorKind {
     Circ = 8,
     /// A formula or array over Officina's limits (too deep, too big).
     Limit = 9,
+    /// A dynamic array whose spill area is blocked (Excel's `#SPILL!`).
+    Spill = 10,
+    /// A calculation Excel refuses, such as an empty `FILTER` or a lambda left in a
+    /// cell (Excel's `#CALC!`).
+    Calc = 11,
 }
 
 impl ErrorKind {
@@ -34,6 +39,8 @@ impl ErrorKind {
             ErrorKind::NA => "#N/A",
             ErrorKind::Circ => "#CIRC!",
             ErrorKind::Limit => "#LIMIT!",
+            ErrorKind::Spill => "#SPILL!",
+            ErrorKind::Calc => "#CALC!",
         }
     }
     pub fn from_text(s: &str) -> Option<Self> {
@@ -48,6 +55,8 @@ impl ErrorKind {
             "#N/A" => ErrorKind::NA,
             "#CIRC!" => ErrorKind::Circ,
             "#LIMIT!" => ErrorKind::Limit,
+            "#SPILL!" => ErrorKind::Spill,
+            "#CALC!" => ErrorKind::Calc,
             _ => return None,
         })
     }
@@ -62,6 +71,8 @@ impl ErrorKind {
             7 => ErrorKind::NA,
             8 => ErrorKind::Circ,
             9 => ErrorKind::Limit,
+            10 => ErrorKind::Spill,
+            11 => ErrorKind::Calc,
             _ => return None,
         })
     }

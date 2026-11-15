@@ -113,6 +113,34 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
     Some(cv)
 }
 
+/// A cell's view under its conditional formats: their fill, colour scale, font
+/// colour, weight and number format, and the data bar under the text.
+pub fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value) -> Option<CellView> {
+    let d = &look.dxf;
+    if look.scale.is_none() && look.bar.is_none() && *d == officina_grid::condfmt::Dxf::default() {
+        return cv;
+    }
+    let mut cv = cv.unwrap_or_else(|| CellView::text(""));
+    if let (Some(code), Value::Num(_)) = (&d.num_fmt, v) {
+        let f = officina_grid::numfmt::NumFmt::parse(code).format(v);
+        cv.text = if f.hashes { "#".repeat(8) } else { f.text };
+        if let Some(c) = f.color {
+            cv.color = Some(rgb(c.rgb()));
+        }
+    }
+    if let Some(c) = look.scale.or(d.fill) {
+        cv.fill = Some(rgb(c));
+    }
+    if let Some(c) = d.color {
+        cv.color = Some(rgb(c));
+    }
+    if let Some(b) = d.bold {
+        cv.bold = b;
+    }
+    cv.bar = look.bar.map(|(share, c)| (share, rgb(c)));
+    Some(cv)
+}
+
 /// sRGB components to Pergola's linear colour.
 fn linear(c: [f32; 4]) -> Color {
     let l = |v: f32| if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
@@ -354,10 +382,11 @@ impl GridSource for SheetSource {
         let v = d.wb.value(d.sheet, r, c);
         let sh = d.wb.sheet(d.sheet);
         let id = sh.style_id(r, c);
-        if id == 0 {
-            return view_of(&v);
+        let cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v) };
+        if d.wb.cond_formats().is_empty() {
+            return cv;
         }
-        styled_view(&d.wb.styles, id, &v)
+        cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v)
     }
     fn edit_text(&self, r: u32, c: u32) -> String {
         let d = self.doc.borrow();
@@ -416,6 +445,21 @@ impl GridSource for SheetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_formats_show_over_the_cell() {
+        use officina_grid::condfmt::{Dxf, Look};
+        let look = Look { dxf: Dxf { fill: Some(0xFFC7CE), color: Some(0x9C0006), bold: Some(true), num_fmt: Some("0.0%".into()), ..Dxf::default() }, scale: None, bar: Some((0.5, 0x638EC6)) };
+        let v = Value::Num(0.25);
+        let cv = cond_view(view_of(&v), &look, &v).unwrap();
+        assert_eq!(cv.text, "25.0%");
+        assert_eq!((cv.fill, cv.color, cv.bold), (Some(rgb(0xFFC7CE)), Some(rgb(0x9C0006)), true));
+        assert_eq!(cv.bar, Some((0.5, rgb(0x638EC6))));
+        // A blank cell a rule fills; a colour scale over the fill.
+        let look = Look { dxf: Dxf { fill: Some(1), ..Dxf::default() }, scale: Some(0x63BE7B), bar: None };
+        assert_eq!(cond_view(None, &look, &Value::Empty).unwrap().fill, Some(rgb(0x63BE7B)));
+        assert!(cond_view(None, &Look::default(), &Value::Empty).is_none());
+    }
 
     #[test]
     fn styled_cells_show_their_format_and_look() {

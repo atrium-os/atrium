@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
+use officina_grid::eval::arrays;
 use officina_grid::formula;
 use officina_grid::filter::Cond;
 use officina_grid::{ErrorKind, Value, Workbook};
@@ -24,8 +25,14 @@ const MAX_EXTRA: usize = 4_000_000;
 
 /// Functions newer than Excel 2007 carry a prefix in files.
 const FUTURE: &[&str] = &[
-    "XLOOKUP", "XMATCH", "IFS", "SWITCH", "MAXIFS", "MINIFS", "CONCAT", "TEXTJOIN", "IFNA", "STDEV.S", "STDEV.P", "VAR.S", "VAR.P", "CEILING.MATH", "FLOOR.MATH", "DAYS", "ISOWEEKNUM", "SEQUENCE", "FILTER", "SORT", "SORTBY", "UNIQUE", "LET", "XOR", "IFERROR.X",
+    "XLOOKUP", "XMATCH", "IFS", "SWITCH", "MAXIFS", "MINIFS", "CONCAT", "TEXTJOIN", "IFNA", "STDEV.S", "STDEV.P", "VAR.S", "VAR.P", "CEILING.MATH", "FLOOR.MATH", "DAYS", "ISOWEEKNUM", "SEQUENCE", "SORTBY", "UNIQUE", "LET", "XOR", "IFERROR.X", "RANDARRAY", "TRANSPOSE.X", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "LAMBDA", "MAP", "REDUCE", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "ISOMITTED",
 ];
+
+/// Newer still: in the worksheet-function namespace too (`_xlfn._xlws.FILTER`).
+const FUTURE_WS: &[&str] = &["FILTER", "SORT"];
+
+/// The cell-metadata part dynamic array formulas point at (`cm="1"`).
+const METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#;
 
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
@@ -73,7 +80,9 @@ pub fn formula_out(f: &str) -> String {
                 i += 1;
             }
             let word = &body[start..i];
-            if i < b.len() && b[i] == b'(' && FUTURE.iter().any(|f| f.eq_ignore_ascii_case(word)) {
+            if i < b.len() && b[i] == b'(' && FUTURE_WS.iter().any(|f| f.eq_ignore_ascii_case(word)) {
+                out.push_str("_xlfn._xlws.");
+            } else if i < b.len() && b[i] == b'(' && FUTURE.iter().any(|f| f.eq_ignore_ascii_case(word)) {
                 out.push_str("_xlfn.");
             }
             out.push_str(word);
@@ -239,6 +248,8 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
     // Shared-formula ids: one per fill longer than a cell.
     let mut si: HashMap<u32, u32> = HashMap::new();
     let mut next_si = 0u32;
+    // Per formula group: the formula as files carry it, and whether it is dynamic.
+    let mut forms: HashMap<u32, (Arc<officina_grid::formula::Expr>, bool)> = HashMap::new();
     let rect = Rect { sheet: s, r0: 0, c0: 0, r1: rows.saturating_sub(1), c1: cols.saturating_sub(1) };
     let open_row = |o: &mut Vec<u8>, r: u32, cur: &mut Option<u32>, hi: &mut usize| {
         if *cur == Some(r) {
@@ -280,6 +291,10 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             };
             open_row(&mut o, r, &mut cur_row, &mut hi);
             let at = a1(r, c);
+            let form = g.map(|g| forms.entry(g).or_insert_with(|| {
+                let (e, d) = arrays::for_file(&wb.group(g).expr);
+                (Arc::new(e), d)
+            }).clone());
             let t = match &v {
                 Value::Num(_) | Value::Empty => "",
                 Value::Str(_) if g.is_some() => r#" t="str""#,
@@ -287,30 +302,38 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
                 Value::Bool(_) => r#" t="b""#,
                 Value::Err(_) => r#" t="e""#,
             };
+            let cm = if form.as_ref().is_some_and(|f| f.1) { r#" cm="1""# } else { "" };
             if xf != 0 || styled {
-                let _ = write!(o, r#"<c r="{at}" s="{xf}"{t}>"#);
+                let _ = write!(o, r#"<c r="{at}" s="{xf}"{t}{cm}>"#);
             } else {
-                let _ = write!(o, r#"<c r="{at}"{t}>"#);
+                let _ = write!(o, r#"<c r="{at}"{t}{cm}>"#);
             }
-            if let Some(g) = g {
+            if let (Some(g), Some((fe, dynamic))) = (g, form) {
                 let grp = wb.group(g);
-                if grp.r0 == grp.r1 {
+                let text = |r: u32| formula_out(&formula::to_a1_file(&fe, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone())));
+                if dynamic {
+                    // A dynamic array formula: its spill area as the ref.
+                    let area = wb.spill_area(officina_grid::CellAddr::new(s, r, c)).unwrap_or(Rect { sheet: s, r0: r, c0: c, r1: r, c1: c });
+                    let _ = write!(o, r#"<f t="array" ref="{}">"#, if area.cells() == 1 { at.clone() } else { format!("{}:{}", a1(area.r0, area.c0), a1(area.r1, area.c1)) });
+                    esc(&mut o, &text(r));
+                    o.extend_from_slice(b"</f>");
+                } else if grp.r0 == grp.r1 {
                     o.extend_from_slice(b"<f>");
-                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
+                    esc(&mut o, &text(r));
                     o.extend_from_slice(b"</f>");
                 } else if r == grp.r0 {
                     let id = next_si;
                     next_si += 1;
                     si.insert(g, id);
                     let _ = write!(o, r#"<f t="shared" ref="{}:{}" si="{id}">"#, a1(grp.r0, c), a1(grp.r1, c));
-                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
+                    esc(&mut o, &text(r));
                     o.extend_from_slice(b"</f>");
                 } else if let Some(id) = si.get(&g) {
                     let _ = write!(o, r#"<f t="shared" si="{id}"/>"#);
                 } else {
                     // A fill whose first row was cut off: write the cell's own text.
                     o.extend_from_slice(b"<f>");
-                    esc(&mut o, &formula_out(&formula::to_a1_file(&grp.expr, r, c, &|id| wb.sheet_name(id), &|rr, cc| wb.table_at(s, rr, cc).map(|t| t.name.clone()))));
+                    esc(&mut o, &text(r));
                     o.extend_from_slice(b"</f>");
                 }
             }
@@ -397,6 +420,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             }
         }
     }
+    super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb), &mut o);
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
     if wb.charts().iter().any(|c| c.anchor.sheet == s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
@@ -517,6 +541,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     for i in 0..wb.tables().len() {
         ct.push_str(&format!(r#"<Override PartName="/xl/tables/table{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#, i + 1));
     }
+    let dynamic = wb.groups().any(|(_, g)| arrays::for_file(&g.expr).1);
+    if dynamic {
+        ct.push_str(r#"<Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/>"#);
+    }
     ct.push_str("</Types>");
     z.add("[Content_Types].xml", ct.as_bytes())?;
     z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
@@ -567,6 +595,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if let Some(m) = macros {
         let vba = m.parts.iter().find(|p| &*p.media_type == super::macros::VBA).expect("writable checked");
         r.push_str(&format!(r#"<Relationship Id="rId{}" Type="{}" Target="{}"/>"#, n + 3, super::macros::VBA_REL, &vba.path[3..]));
+    }
+    if dynamic {
+        r.push_str(r#"<Relationship Id="rIdMeta" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/>"#);
+        z.add("xl/metadata.xml", METADATA.as_bytes())?;
     }
     r.push_str("</Relationships>");
     z.add("xl/_rels/workbook.xml.rels", r.as_bytes())?;

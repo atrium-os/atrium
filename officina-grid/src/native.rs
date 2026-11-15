@@ -13,6 +13,7 @@
 //! | 10 | CHARTS | charts: kind, grouping, legend, titles, anchor, series ranges |
 //! | 11 | MACROS | macros kept inert: family, VBA code names (the parts follow) |
 //! | 12 | MACRO_PART | one macro part: path, media type, bytes, never parsed |
+//! | 13 | COND_FORMATS | conditional formats: ranges, rules (formulas as text), formats |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -46,6 +47,7 @@ pub const TABLES: u16 = 9;
 pub const CHARTS: u16 = 10;
 pub const MACROS: u16 = 11;
 pub const MACRO_PART: u16 = 12;
+pub const COND_FORMATS: u16 = 13;
 const GLOBAL: u16 = 0xFFFF;
 
 const ENC_LIST: u8 = 0;
@@ -119,9 +121,45 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
         *m
     };
+    // Spilled cells are a formula's result, not the file's: they aren't saved.
+    let mut spilled: std::collections::HashMap<(u16, u32), Vec<(u32, u32)>> = std::collections::HashMap::new();
+    for (a, sp) in wb.spills() {
+        for c in sp.area.c0..=sp.area.c1 {
+            let rows = spilled.entry((a.sheet, c)).or_default();
+            if c == a.col {
+                if sp.area.r1 > a.row {
+                    rows.push((a.row + 1, sp.area.r1));
+                }
+            } else {
+                rows.push((sp.area.r0, sp.area.r1));
+            }
+        }
+    }
     for (si, s) in wb.sheets.iter().enumerate() {
         for (ci, col) in s.cols.iter().enumerate() {
+            let skip = spilled.get(&(si as u16, ci as u32));
+            let base_skip = |n: u32, off: usize| skip.is_some_and(|v| v.iter().any(|&(a, b)| (a..=b).contains(&(n * CHUNK_ROWS + off as u32))));
             for (n, chunk) in col.chunks() {
+                if skip.is_some() {
+                    // The general encoding, without the spilled cells.
+                    let mut cells = Vec::new();
+                    chunk.each(0, CHUNK_ROWS as usize - 1, &mut |off, cell| {
+                        if !base_skip(n, off) {
+                            cells.push((off, cell))
+                        }
+                    });
+                    if cells.is_empty() {
+                        continue;
+                    }
+                    let mut w = Writer::new();
+                    w.u16(si as u16);
+                    w.var(ci as u64);
+                    w.var(n as u64);
+                    w.u8(ENC_LIST);
+                    list(&mut w, cells, &mut id);
+                    c.add(COLUMN, &w.into_bytes())?;
+                    continue;
+                }
                 let mut w = Writer::new();
                 w.u16(si as u16);
                 w.var(ci as u64);
@@ -142,26 +180,7 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
                         w.u8(ENC_LIST);
                         let mut cells = Vec::new();
                         chunk.each(0, CHUNK_ROWS as usize - 1, &mut |off, cell| cells.push((off, cell)));
-                        w.var(cells.len() as u64);
-                        for (off, cell) in cells {
-                            w.var(off as u64);
-                            match cell {
-                                Cell::Empty => unreachable!("each skips empty cells"),
-                                Cell::Num(x) => {
-                                    w.u8(1);
-                                    w.f64(x);
-                                }
-                                Cell::Str(s) => {
-                                    w.u8(2);
-                                    w.var(id(s) as u64);
-                                }
-                                Cell::Bool(b) => w.u8(if b { 4 } else { 3 }),
-                                Cell::Err(e) => {
-                                    w.u8(5);
-                                    w.u8(e as u8);
-                                }
-                            }
-                        }
+                        list(&mut w, cells, &mut id);
                     }
                 }
                 c.add(COLUMN, &w.into_bytes())?;
@@ -201,6 +220,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.str(&wb.name_text(d));
         }
         c.add(NAMES, &w.into_bytes())?;
+    }
+    if !wb.cond_formats.is_empty() {
+        let mut w = Writer::new();
+        w.var(wb.cond_formats.len() as u64);
+        for f in &wb.cond_formats {
+            f.encode(&mut w, wb);
+        }
+        c.add(COND_FORMATS, &w.into_bytes())?;
     }
     if !wb.charts.is_empty() {
         let mut w = Writer::new();
@@ -266,6 +293,29 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
 }
 
 /// [`save`] into a byte vector.
+fn list(w: &mut Writer, cells: Vec<(usize, Cell)>, id: &mut dyn FnMut(StrId) -> u32) {
+    w.var(cells.len() as u64);
+    for (off, cell) in cells {
+        w.var(off as u64);
+        match cell {
+            Cell::Empty => unreachable!("each skips empty cells"),
+            Cell::Num(x) => {
+                w.u8(1);
+                w.f64(x);
+            }
+            Cell::Str(s) => {
+                w.u8(2);
+                w.var(id(s) as u64);
+            }
+            Cell::Bool(b) => w.u8(if b { 4 } else { 3 }),
+            Cell::Err(e) => {
+                w.u8(5);
+                w.u8(e as u8);
+            }
+        }
+    }
+}
+
 pub fn save_to_vec(wb: &Workbook) -> Vec<u8> {
     save(wb, Vec::new()).expect("writing to a Vec does not fail")
 }
@@ -366,6 +416,21 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         for _ in 0..k {
             let ch = crate::charts::Chart::decode(&mut r)?;
             wb.add_chart(ch).map_err(LoadError::Bad)?;
+        }
+        done(&r)?;
+    }
+
+    // Conditional formats.
+    let mut it = of(COND_FORMATS);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two COND_FORMATS chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let k = r.count("conditional formats", crate::condfmt::MAX_FORMATS as u64, 8)?;
+        for _ in 0..k {
+            let f = crate::condfmt::CondFormat::decode(&mut r, &wb)?;
+            wb.add_cond_format(f).map_err(LoadError::Bad)?;
         }
         done(&r)?;
     }
@@ -590,9 +655,14 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
     }
 
     // Stored results are current; only volatile formulas need a recalculation, and
-    // `recalc` always takes those.
+    // `recalc` always takes those. Spills aren't stored: formulas that may spill
+    // are evaluated again to write them.
     wb.changed.clear();
     wb.pending.clear();
+    let spilling: Vec<(crate::deps::GroupId, u32, u32)> = wb.groups().filter(|(_, g)| crate::eval::arrays::can_array(&g.expr)).map(|(id, g)| (id, g.r0, g.r1)).collect();
+    for (id, a, b) in spilling {
+        wb.pending.entry(id).or_default().add(a, b);
+    }
     Ok(wb)
 }
 

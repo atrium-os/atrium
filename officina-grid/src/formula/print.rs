@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// cross-sheet references (quoted when needed).
 pub fn to_a1(e: &Expr, row: u32, col: u32, sheet_name: &dyn Fn(u16) -> String) -> String {
     let mut s = String::from("=");
-    pr(e, row, col, &Out { sn: sheet_name, file: None }, &mut s);
+    pr(e, row, col, &Out { sn: sheet_name, file: None, params: Default::default() }, &mut s);
     s
 }
 
@@ -18,13 +18,27 @@ pub fn to_a1(e: &Expr, row: u32, col: u32, sheet_name: &dyn Fn(u16) -> String) -
 /// `[#This Row]`.
 pub fn to_a1_file(e: &Expr, row: u32, col: u32, sheet_name: &dyn Fn(u16) -> String, table_at: &dyn Fn(u32, u32) -> Option<Arc<str>>) -> String {
     let mut s = String::from("=");
-    pr(e, row, col, &Out { sn: sheet_name, file: Some(table_at) }, &mut s);
+    pr(e, row, col, &Out { sn: sheet_name, file: Some(table_at), params: Default::default() }, &mut s);
     s
 }
 
 struct Out<'a> {
     sn: &'a dyn Fn(u16) -> String,
     file: Option<&'a dyn Fn(u32, u32) -> Option<Arc<str>>>,
+    /// LET names and LAMBDA parameters in scope: files spell them `_xlpm.x`.
+    params: std::cell::RefCell<Vec<Arc<str>>>,
+}
+
+impl Out<'_> {
+    /// The LET name or LAMBDA parameter `n` is, as it was written.
+    fn param(&self, n: &str) -> Option<Arc<str>> {
+        self.params.borrow().iter().rev().find(|p| p.eq_ignore_ascii_case(n)).cloned()
+    }
+    fn prefix(&self, s: &mut String) {
+        if self.file.is_some() {
+            s.push_str("_xlpm.");
+        }
+    }
 }
 
 fn pr(e: &Expr, row: u32, col: u32, o: &Out, s: &mut String) {
@@ -37,7 +51,12 @@ fn pr(e: &Expr, row: u32, col: u32, o: &Out, s: &mut String) {
         }
         Expr::Bool(b) => s.push_str(if *b { "TRUE" } else { "FALSE" }),
         Expr::Err(k) => s.push_str(k.text()),
-        Expr::Name(n) => s.push_str(n),
+        Expr::Name(n) => {
+            if o.param(n).is_some() {
+                o.prefix(s);
+            }
+            s.push_str(n)
+        }
         Expr::Table(t) => {
             let named = match (o.file, t.table.is_empty()) {
                 (Some(at), true) => at(row, col),
@@ -95,10 +114,61 @@ fn pr(e: &Expr, row: u32, col: u32, o: &Out, s: &mut String) {
             pr(b, row, col, o, s);
         }
         Expr::Call(f, args) => {
-            match f {
-                Func::Known(id) => s.push_str(funcs::FUNCS[*id as usize].name),
-                Func::Unknown(n) => s.push_str(n),
+            let name: Arc<str> = match f {
+                Func::Known(id) => Arc::from(funcs::FUNCS[*id as usize].name),
+                Func::Unknown(n) => match o.param(n) {
+                    Some(p) => {
+                        o.prefix(s);
+                        p
+                    }
+                    None => n.clone(),
+                },
+            };
+            s.push_str(&name);
+            let name = &*name;
+            let scoped = o.params.borrow().len();
+            let (let_, lambda) = (name == "LET", name == "LAMBDA");
+            if lambda {
+                for a in &args[..args.len().saturating_sub(1)] {
+                    if let Expr::Name(n) = a {
+                        o.params.borrow_mut().push(n.clone());
+                    }
+                }
             }
+            s.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                if let (true, 0, Expr::Name(n)) = (let_ && i + 1 < args.len(), i % 2, a) {
+                    o.params.borrow_mut().push(n.clone());
+                }
+                pr(a, row, col, o, s);
+            }
+            s.push(')');
+            o.params.borrow_mut().truncate(scoped);
+        }
+        Expr::Spill(r) => {
+            if o.file.is_some() {
+                s.push_str("_xlfn.ANCHORARRAY(");
+            }
+            sheet(r.sheet, o.sn, s);
+            coord_col(r.col, col, s);
+            coord_row(r.row, row, s);
+            s.push(if o.file.is_some() { ')' } else { '#' });
+        }
+        Expr::At(a) => {
+            if o.file.is_some() {
+                s.push_str("_xlfn.SINGLE(");
+                pr(a, row, col, o, s);
+                s.push(')');
+            } else {
+                s.push('@');
+                pr(a, row, col, o, s);
+            }
+        }
+        Expr::Invoke(g, args) => {
+            pr(g, row, col, o, s);
             s.push('(');
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {

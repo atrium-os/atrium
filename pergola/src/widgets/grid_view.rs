@@ -85,11 +85,13 @@ pub struct CellView {
     pub fill: Option<Color>,
     /// Left, right, top, bottom: width in points and colour.
     pub borders: [Option<(f32, Color)>; 4],
+    /// A data bar: the share of the cell's width it fills (0–1) and its colour.
+    pub bar: Option<(f32, Color)>,
 }
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4] }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -391,6 +393,10 @@ impl GridView {
                                 let (cw, ch) = ((xr - xl) as f32, (yb - yt) as f32);
                                 if let Some(f) = cv.fill {
                                     ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: f, radius: 0.0 });
+                                }
+                                if let Some((share, c)) = cv.bar {
+                                    let w = ((cw - 4.0) * share.clamp(0.0, 1.0)).max(0.0);
+                                    ctx.add(Node::Rect { rect: Rect::new(cx + 2.0, cy + 2.0, q(w as f64), (ch - 5.0).max(0.0)), fill: c, radius: 0.0 });
                                 }
                                 for (k, b) in cv.borders.iter().enumerate() {
                                     let Some((w, c)) = *b else { continue };

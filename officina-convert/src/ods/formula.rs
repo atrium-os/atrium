@@ -186,6 +186,10 @@ fn looks_like_cell(s: &str) -> bool {
 }
 
 /// `=SUM(A1:A3)` → `of:=SUM([.A1:.A3])`.
+/// Functions Excel added that OpenFormula names in Microsoft's namespace (as
+/// LibreOffice writes them).
+const MICROSOFT: &[&str] = &["XLOOKUP", "XMATCH", "FILTER", "SORT", "SORTBY", "UNIQUE", "SEQUENCE", "RANDARRAY", "LET"];
+
 pub fn to_of(a1: &str) -> String {
     let body = a1.strip_prefix('=').unwrap_or(a1);
     let ch: Vec<char> = body.chars().collect();
@@ -198,7 +202,7 @@ pub fn to_of(a1: &str) -> String {
             '#' => {
                 // An error literal (#REF!, #N/A, #DIV/0!) as it is.
                 let rest: String = ch[i..].iter().collect();
-                let n = ["#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A"].iter().find(|e| rest.to_ascii_uppercase().starts_with(*e)).map_or(1, |e| e.len());
+                let n = ["#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A", "#SPILL!", "#CALC!"].iter().find(|e| rest.to_ascii_uppercase().starts_with(*e)).map_or(1, |e| e.len());
                 out.extend(&ch[i..i + n]);
                 i += n;
             }
@@ -277,6 +281,9 @@ pub fn to_of(a1: &str) -> String {
                     out.push_str(&of_ref(Some(&word), &r));
                     i = n;
                 } else if ch.get(j) == Some(&'(') {
+                    if MICROSOFT.iter().any(|f| f.eq_ignore_ascii_case(&word)) {
+                        out.push_str("COM.MICROSOFT.");
+                    }
                     out.push_str(&word);
                     i = j;
                 } else if is_ref_start(&word) || is_col(&word) && ch.get(j) == Some(&':') {

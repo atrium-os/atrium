@@ -7,6 +7,7 @@
 //! semantics); a cell's final result that is still a range is narrowed by implicit
 //! intersection.
 
+pub mod arrays;
 pub mod criteria;
 pub mod dates;
 pub mod funcs;
@@ -42,7 +43,37 @@ pub enum Ev {
     V(Value),
     R(Rect),
     A(Arc<Array>),
+    /// A function value: what `LAMBDA` makes.
+    F(Arc<Lambda>),
 }
+
+/// A `LAMBDA`: its parameters, its body and the names it saw where it was made.
+#[derive(Debug)]
+pub struct Lambda {
+    pub params: Vec<Arc<str>>,
+    pub body: Expr,
+    pub scope: Option<Arc<Scope>>,
+}
+
+/// Names bound by `LET` and lambda calls, innermost first.
+#[derive(Debug)]
+pub struct Scope {
+    pub name: Arc<str>,
+    pub val: Ev,
+    /// A lambda parameter its call left out (`ISOMITTED`).
+    pub omitted: bool,
+    pub next: Option<Arc<Scope>>,
+}
+
+/// How deeply lambdas may call each other (a recursive name's guard).
+pub const MAX_LAMBDA_DEPTH: u32 = 64;
+
+thread_local! {
+    static LAMBDA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The largest dynamic array a formula may spill.
+pub const MAX_SPILL: u64 = 1 << 22;
 
 impl Ev {
     pub fn err(e: ErrorKind) -> Ev {
@@ -56,20 +87,118 @@ pub struct Ctx<'a> {
     pub sheet: u16,
     pub row: u32,
     pub col: u32,
+    /// `LET` names and lambda parameters in scope.
+    pub scope: Option<Arc<Scope>>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(wb: &'a Workbook, sheet: u16, row: u32, col: u32) -> Self {
-        Ctx { wb, sheet, row, col }
+        Ctx { wb, sheet, row, col, scope: None }
     }
 
-    /// The value a formula leaves in its cell.
+    /// This place with other names in scope.
+    pub fn with(&self, scope: Option<Arc<Scope>>) -> Ctx<'a> {
+        Ctx { wb: self.wb, sheet: self.sheet, row: self.row, col: self.col, scope }
+    }
+
+    /// `name` bound to `val` on top of this scope.
+    pub fn bind(&self, name: Arc<str>, val: Ev, omitted: bool) -> Option<Arc<Scope>> {
+        Some(Arc::new(Scope { name, val, omitted, next: self.scope.clone() }))
+    }
+
+    /// A `LET` name or lambda parameter in scope.
+    pub fn local(&self, n: &str) -> Option<&Scope> {
+        let mut s = self.scope.as_deref();
+        while let Some(x) = s {
+            if x.name.eq_ignore_ascii_case(n) {
+                return Some(x);
+            }
+            s = x.next.as_deref();
+        }
+        None
+    }
+
+    /// The value a formula leaves in its cell, narrowed to one value (a formula that
+    /// can't spill).
     pub fn eval_cell(&self, e: &Expr) -> Value {
         match self.eval(e) {
             Ev::V(v) => fix(v),
             Ev::R(r) => fix(self.intersect(&r)),
             Ev::A(a) => fix(a.vals.first().cloned().unwrap_or(Value::Empty)),
+            Ev::F(_) => Value::Err(ErrorKind::Calc),
         }
+    }
+
+    /// A formula's result as a dynamic array: the anchor's value and, when the result
+    /// has more than one cell, the whole array to spill.
+    pub fn eval_spill(&self, e: &Expr) -> (Value, Option<Arc<Array>>) {
+        let arr = match self.eval(e) {
+            Ev::V(v) => return (fix(v), None),
+            Ev::F(_) => return (Value::Err(ErrorKind::Calc), None),
+            Ev::R(r) if r.cells() == 1 => return (fix(self.wb.value(r.sheet, r.r0, r.c0)), None),
+            Ev::R(r) => {
+                if r.cells() > MAX_SPILL {
+                    return (Value::Err(ErrorKind::Spill), None);
+                }
+                let (rows, cols) = (r.rows() as usize, r.cols() as usize);
+                let mut vals = vec![Value::Empty; rows * cols];
+                self.wb.each(&r, &mut |row, col, v| vals[(row - r.r0) as usize * cols + (col - r.c0) as usize] = v);
+                Arc::new(Array { rows, cols, vals })
+            }
+            Ev::A(a) => a,
+        };
+        let first = fix(arr.vals.first().cloned().unwrap_or(Value::Empty));
+        if arr.rows * arr.cols <= 1 {
+            return (first, None);
+        }
+        if (arr.rows * arr.cols) as u64 > MAX_SPILL {
+            return (Value::Err(ErrorKind::Spill), None);
+        }
+        (first, Some(arr))
+    }
+
+    /// Calls a lambda with argument expressions (evaluated here); a missing one is
+    /// an omitted parameter.
+    pub fn call(&self, l: &Lambda, args: &[Expr]) -> Ev {
+        if args.len() > l.params.len() {
+            return Ev::err(ErrorKind::Value);
+        }
+        let vals: Vec<Option<Ev>> = args.iter().map(|a| (!matches!(a, Expr::Name(n) if n.is_empty())).then(|| self.eval(a))).collect();
+        self.call_with(l, vals)
+    }
+
+    /// Calls a lambda with values; `None` (or too few) leaves parameters omitted.
+    pub fn call_with(&self, l: &Lambda, vals: Vec<Option<Ev>>) -> Ev {
+        if vals.len() > l.params.len() {
+            return Ev::err(ErrorKind::Value);
+        }
+        let mut scope = l.scope.clone();
+        let mut vals = vals.into_iter();
+        for p in &l.params {
+            let (val, omitted) = match vals.next().flatten() {
+                Some(v) => (v, false),
+                None => (Ev::V(Value::Empty), true),
+            };
+            scope = Some(Arc::new(Scope { name: p.clone(), val, omitted, next: scope }));
+        }
+        let d = LAMBDA_DEPTH.with(|d| d.get());
+        if d >= MAX_LAMBDA_DEPTH {
+            return Ev::err(ErrorKind::Limit);
+        }
+        LAMBDA_DEPTH.with(|x| x.set(d + 1));
+        let out = self.with(scope).eval(&l.body);
+        LAMBDA_DEPTH.with(|x| x.set(d));
+        out
+    }
+
+    /// What a name evaluates to when it is called as a function (`F(2)` with `F` a
+    /// `LET` name or a defined name bound to a `LAMBDA`).
+    fn callee(&self, n: &Arc<str>) -> Option<Ev> {
+        if let Some(x) = self.local(n) {
+            return Some(x.val.clone());
+        }
+        let x = self.wb.bound(self.sheet, self.row, self.col, &Expr::Name(n.clone()))?;
+        crate::names::deeper(|| self.with(None).eval(&x))
     }
 
     pub fn eval(&self, e: &Expr) -> Ev {
@@ -79,12 +208,13 @@ impl<'a> Ctx<'a> {
             Expr::Bool(b) => Ev::V(Value::Bool(*b)),
             Expr::Err(k) => Ev::err(*k),
             Expr::Name(n) if n.is_empty() => Ev::V(Value::Empty),
-            Expr::Name(n) => match self.wb.bound(self.sheet, self.row, self.col, e) {
-                Some(x) => crate::names::deeper(|| self.eval(&x)).unwrap_or(Ev::err(ErrorKind::Name)),
-                None => {
-                    let _ = n;
-                    Ev::err(ErrorKind::Name)
-                }
+            Expr::Name(n) => match self.local(n) {
+                Some(x) => x.val.clone(),
+                // A defined name means the same wherever it is used: no LET names.
+                None => match self.wb.bound(self.sheet, self.row, self.col, e) {
+                    Some(x) => crate::names::deeper(|| self.with(None).eval(&x)).unwrap_or(Ev::err(ErrorKind::Name)),
+                    None => Ev::err(ErrorKind::Name),
+                },
             },
             Expr::Table(t) => match self.wb.resolve_table(self.sheet, self.row, self.col, t) {
                 // `@` outside the table's data rows: Excel's #VALUE!.
@@ -119,8 +249,37 @@ impl<'a> Ctx<'a> {
                 let y = self.eval(b);
                 self.map2(x, y, |p, q| binop(*op, &p, &q))
             }
-            Expr::Call(Func::Known(id), args) => (funcs::FUNCS[*id as usize].f)(self, args),
-            Expr::Call(Func::Unknown(_), _) => Ev::err(ErrorKind::Name),
+            Expr::Call(Func::Known(id), args) => match arrays::lifted(*id, args) {
+                Some(mask) => self.lift(*id, mask, args),
+                None => (funcs::FUNCS[*id as usize].f)(self, args),
+            },
+            Expr::Call(Func::Unknown(n), args) => match self.callee(n) {
+                Some(Ev::F(l)) => self.call(&l, args),
+                Some(Ev::V(Value::Err(k))) if k != ErrorKind::Name => Ev::err(k),
+                Some(_) => Ev::err(ErrorKind::Value),
+                None => Ev::err(ErrorKind::Name),
+            },
+            Expr::Invoke(g, args) => match self.eval(g) {
+                Ev::F(l) => self.call(&l, args),
+                Ev::V(Value::Err(k)) => Ev::err(k),
+                _ => Ev::err(ErrorKind::Value),
+            },
+            Expr::At(a) => match self.eval(a) {
+                Ev::R(r) => Ev::V(self.intersect(&r)),
+                Ev::A(x) => Ev::V(x.vals.first().cloned().unwrap_or(Value::Empty)),
+                Ev::F(_) => Ev::err(ErrorKind::Calc),
+                v => v,
+            },
+            Expr::Spill(r) => {
+                let sheet = r.sheet.unwrap_or(self.sheet);
+                match (r.row.resolve(self.row, MAX_ROWS), r.col.resolve(self.col, MAX_COLS)) {
+                    (Some(row), Some(col)) if (sheet as usize) < self.wb.sheet_count() => match self.wb.spill_area(crate::addr::CellAddr::new(sheet, row, col)) {
+                        Some(area) => Ev::R(area),
+                        None => Ev::err(ErrorKind::Ref),
+                    },
+                    _ => Ev::err(ErrorKind::Ref),
+                }
+            }
             Expr::Array(rows) => {
                 let cols = rows.first().map_or(0, |r| r.len());
                 let vals = rows.iter().flatten().map(|e| self.scalar(e)).collect();
@@ -156,6 +315,7 @@ impl<'a> Ctx<'a> {
             Ev::V(v) => v,
             Ev::R(r) => self.intersect(&r),
             Ev::A(a) => a.vals.first().cloned().unwrap_or(Value::Empty),
+            Ev::F(_) => Value::Err(ErrorKind::Calc),
         }
     }
 
@@ -190,6 +350,7 @@ impl<'a> Ctx<'a> {
         match ev {
             Ev::A(a) => Ok(a),
             Ev::V(v) => Ok(Arc::new(Array { rows: 1, cols: 1, vals: vec![v] })),
+            Ev::F(_) => Err(ErrorKind::Calc),
             Ev::R(r) => {
                 let Some(c) = self.clip(&r) else {
                     return Ok(Arc::new(Array { rows: 1, cols: 1, vals: vec![Value::Empty] }));
@@ -207,7 +368,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn map1(&self, a: Ev, f: impl Fn(Value) -> Value) -> Ev {
+    pub(crate) fn map1(&self, a: Ev, f: impl Fn(Value) -> Value) -> Ev {
         match a {
             Ev::V(v) => Ev::V(f(v)),
             Ev::R(r) if r.cells() == 1 => Ev::V(f(self.wb.value(r.sheet, r.r0, r.c0))),
@@ -218,11 +379,12 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn map2(&self, a: Ev, b: Ev, f: impl Fn(Value, Value) -> Value) -> Ev {
+    pub(crate) fn map2(&self, a: Ev, b: Ev, f: impl Fn(Value, Value) -> Value) -> Ev {
         let single = |e: &Ev| match e {
             Ev::V(_) => true,
             Ev::R(r) => r.cells() == 1,
             Ev::A(a) => a.rows == 1 && a.cols == 1,
+            Ev::F(_) => true,
         };
         if single(&a) && single(&b) {
             return Ev::V(f(self.to_scalar(a), self.to_scalar(b)));

@@ -2165,6 +2165,84 @@ files with floating pictures (133) paginate with every picture placed, the
 slowest in 21 ms; recall 99.51 % and merge 1,742 exact, 1,832 safe,
 unchanged.
 
+### 16.31 O5f as built (2026-11-15): dynamic arrays, `LET`, `LAMBDA`, conditional formats
+
+- **Spill.** A formula whose result is an array spills it from its cell, as
+  Excel 365 does. After each recalculation pass the anchors that produced an
+  array claim their area; an area that meets a value, another formula or
+  another spill gives `#SPILL!` in the anchor and nothing outside it, and a
+  claim that frees up spills on the next round (at most eight rounds, so
+  chains of spills settle). Spilled cells are values the anchor owns: typing in
+  one blocks the spill, clearing it lets it back. `A1#` is the anchor's
+  current spill (`#REF!` if there is none); `@x` is the old implicit
+  intersection. New errors `#SPILL!` and `#CALC!` (an empty `FILTER`, a
+  lambda left in a cell).
+- **Old files, new meaning.** A formula from a file that predates spilling
+  (an `.xlsx` cell formula without `cm`, an OpenFormula cell that is not a
+  matrix) is read with `@` put on the references and calls that would spill
+  now (`=A1:A5*2` reads as `=@A1:A5*2`), so it shows what it showed; writing
+  takes the `@` back off where it was implied. A dynamic formula is written
+  as Excel writes it: `<f t="array" ref="area">` with `cm="1"` and the
+  `XLDAPR` cell metadata part, `_xlfn.ANCHORARRAY` for `A1#`,
+  `_xlfn.SINGLE` for an `@` Excel would keep, `_xlfn._xlws.` on `FILTER` and
+  `SORT`, `_xlpm.` on `LET` and `LAMBDA` names. In `.ods` it is a matrix
+  formula over its current spill, spill references become the range they
+  cover, and Excel's newer functions get `COM.MICROSOFT.` names.
+- **Functions.** `SEQUENCE`, `RANDARRAY`, `TRANSPOSE`, `FILTER`, `SORT`,
+  `SORTBY`, `UNIQUE`, `VSTACK`, `HSTACK`, `TAKE`, `DROP`, `CHOOSEROWS`,
+  `CHOOSECOLS`, `TOCOL`, `TOROW`, `WRAPROWS`, `WRAPCOLS`, `EXPAND`; `ROW` and
+  `COLUMN` of a range give arrays; scalar functions lift over array arguments
+  element by element (`#N/A` past the end of the shorter one). `LET` binds
+  names in order; `LAMBDA` makes a value that can be called in place
+  (`=LAMBDA(x,x*2)(5)`), named (a defined name holding one is called like a
+  function, recursion included, 64 calls deep before `#LIMIT!`) or passed to
+  `MAP`, `REDUCE`, `SCAN`, `BYROW`, `BYCOL`, `MAKEARRAY`; `ISOMITTED` tests a
+  parameter left out. A named lambda's reads are dependencies of the cells
+  calling it.
+- **Conditional formats** (`officina-grid` `condfmt`). A format covers ranges
+  on one sheet and holds rules in priority order: cell value compared
+  (between, equal, greater…), a formula true for the cell (written for the
+  first cell; relative references move), text contains / doesn't / begins /
+  ends (any case), blanks and non-blanks, errors and non-errors, top or bottom
+  N or N %, above or below the average (or N standard deviations from it),
+  duplicates or uniques, two- and three-colour scales, data bars. Each rule
+  that matches sets what its format sets (font colour, bold, italic,
+  underline, strike, fill, number format) unless an earlier one set it; a
+  rule with stop-if-true ends the list for that cell. Statistics (top N,
+  averages, duplicates, scale and bar ends) are worked out once per
+  recalculation. Sheets draws the fill or scale colour, font colour, weight
+  and number format, and the data bar under the text (a tenth of the cell at
+  the low end, as Excel 2007 draws it).
+- **Files.** `.xlsx`: `<conditionalFormatting>` with every `cfRule` type
+  above and its `dxf`s in the styles part, read in Excel's priority order
+  across formats; Excel 2010's `x14` extension (repeating data bars with
+  their newer options) is noted and the 2007 rule kept. `.ods`:
+  LibreOffice's `calcext:conditional-formats` (conditions naming generated
+  `CF` cell styles in `office:styles`, colour scales, data bars) both ways.
+  LibreOffice applies only the first condition of a format that matches, so
+  conditions read from `.ods` stop, and overlapping rules with different
+  formats lose the later ones there; blanks and standard-deviation rules go
+  as the formulas Excel itself uses. Icon sets and date rules are noted and
+  dropped. Native file: its own block.
+- **Not yet:** a dialog for making and editing rules (the engine and files
+  have them; the app only draws them); icon sets, date-occurring rules,
+  negative data bars and axes; spill outlines drawn on the grid.
+
+Gates: `officina-grid` `tests/arrays.rs` (80 Excel spill cases with the
+results Excel 365 shows, blocking and unblocking, chained spills, legacy
+reading, named and recursive lambdas, native round trip) and `tests/
+condfmt.rs` (each rule kind picks the cells Excel picks; stop; statistics
+follow edits; scales and bars; native round trip); `officina-convert`
+`tests/arrays.rs` (dynamic formulas written as Excel writes them, a sheet as
+Excel 365 saves it, `.ods` matrices) and `tests/condfmt.rs` (every rule kind
+through `.xlsx`, rules as Excel 2016 saves them showing what Excel shows,
+`.ods` round trip). LibreOffice (`examples/condfmt_lo.rs`): our `.ods`
+through LibreOffice 24.2 and back 40/40 cells look the same; our `.xlsx`
+37/40 (LibreOffice drops stop-if-true); `ods_lo` and `lo_check` unchanged at
+152/152 (LibreOffice 24.2 writes Excel's newer function names in lower-case
+`com.microsoft.` form into `.xlsx`; we read it). The scale gate's full
+recalculation of 1 M formulas: 324 → 346 ms (within its noise).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

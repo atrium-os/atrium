@@ -13,7 +13,7 @@
 //!    or groups reading each other) is evaluated cell by cell in the order of its cell
 //!    graph's strongly connected components; cells on a cycle get `#CIRC!`.
 
-use crate::addr::Rect;
+use crate::addr::{CellAddr, Rect};
 use crate::book::Workbook;
 use crate::deps::{GroupId, RowSet, Span};
 use crate::eval::Ctx;
@@ -41,10 +41,30 @@ const PAR_MIN: u64 = 8192;
 pub const MAX_DEMAND_EDGES: u64 = 64 << 20;
 
 impl Workbook {
-    /// Recalculates everything affected by changes since the last call.
+    /// Recalculates everything affected by changes since the last call: rounds of
+    /// [`Workbook::recalc_pass`] while dynamic arrays spill into cells others read.
     pub fn recalc(&mut self) -> RecalcStats {
         let t0 = Instant::now();
         let mut stats = RecalcStats::default();
+        self.recalcs += 1;
+        self.spill_edits();
+        for _ in 0..crate::spill::MAX_SPILL_ROUNDS {
+            self.recalc_pass(&mut stats);
+            if !self.apply_spills() {
+                break;
+            }
+        }
+        self.claims.clear();
+        // Past the last round: the last writes' readers once more, without spilling.
+        if !self.changed.is_empty() {
+            self.recalc_pass(&mut stats);
+            self.spill_out.lock().unwrap().clear();
+        }
+        stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
+        stats
+    }
+
+    fn recalc_pass(&mut self, stats: &mut RecalcStats) {
         let mut dirty: HashMap<GroupId, RowSet> = HashMap::new();
         let mut edges: HashSet<(GroupId, GroupId)> = HashSet::new();
         // Work list: (source group, rows newly dirty) or (None, changed rect).
@@ -105,18 +125,18 @@ impl Workbook {
                 let g = scc[0];
                 let rows = dirty.remove(&g).unwrap_or_default();
                 if !edges.contains(&(g, g)) {
-                    self.eval_parallel(g, &rows, &mut stats);
+                    self.eval_parallel(g, &rows, stats);
                     continue;
                 }
                 match self.self_order(g) {
                     Some(up) => {
-                        self.eval_sequential(g, &rows, up, &mut stats);
+                        self.eval_sequential(g, &rows, up, stats);
                         continue;
                     }
                     None => {
                         let mut m = HashMap::new();
                         m.insert(g, rows);
-                        self.eval_demand(&m, &mut stats);
+                        self.eval_demand(&m, stats);
                     }
                 }
             } else {
@@ -124,11 +144,9 @@ impl Workbook {
                 for g in scc {
                     m.insert(g, dirty.remove(&g).unwrap_or_default());
                 }
-                self.eval_demand(&m, &mut stats);
+                self.eval_demand(&m, stats);
             }
         }
-        stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
-        stats
     }
 
     /// For a group that reads itself: `Some(true)` if every self-reference is to rows
@@ -165,12 +183,21 @@ impl Workbook {
 
     fn eval_cell(&self, g: GroupId, row: u32, bound: Option<&[Option<&crate::column::Column>]>) -> (Value, bool) {
         let grp = self.group(g);
+        let at = CellAddr::new(grp.sheet, row, grp.col);
+        let known = self.spill_known(&at);
         if let (Some(f), Some(b)) = (&grp.fast, bound) {
             if let Some(x) = f.run(b, row) {
+                if known {
+                    self.spill_result(at, None);
+                }
                 return (Value::Num(x), true);
             }
         }
-        (Ctx::new(self, grp.sheet, row, grp.col).eval_cell(&grp.expr), false)
+        let (v, arr) = Ctx::new(self, grp.sheet, row, grp.col).eval_spill(&grp.expr);
+        if arr.is_some() || known {
+            self.spill_result(at, arr);
+        }
+        (v, false)
     }
 
     fn eval_parallel(&mut self, g: GroupId, rows: &RowSet, stats: &mut RecalcStats) {

@@ -567,6 +567,18 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
             xfs.push_str("/>");
         }
     }
+    // Conditional formats' formats; their number formats join the list.
+    let dxfs = super::condfmt::dxfs_xml(&super::condfmt::dxfs(wb), &mut |code| match numfmt::builtin_id(code) {
+        Some(id) => id,
+        None => match fmts.iter().find(|(_, c)| c == code) {
+            Some((id, _)) => *id,
+            None => {
+                let id = 164 + fmts.len() as u32;
+                fmts.push((id, code.to_string()));
+                id
+            }
+        },
+    });
     let mut o = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#);
     if !fmts.is_empty() {
         let _ = write!(o, r#"<numFmts count="{}">"#, fmts.len());
@@ -633,7 +645,9 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
     o.push_str("</borders>");
     o.push_str(r#"<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#);
     let _ = write!(o, r#"<cellXfs count="{n}">{xfs}</cellXfs>"#);
-    o.push_str(r#"<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#);
+    o.push_str(r#"<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>"#);
+    o.push_str(&dxfs);
+    o.push_str("</styleSheet>");
     o.into_bytes()
 }
 

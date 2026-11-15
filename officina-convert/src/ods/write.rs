@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 use officina_grid::addr::Rect;
 use officina_grid::eval::dates;
-use officina_grid::formula::{self, Expr};
+use officina_grid::formula::{self, Coord, Expr, RangeKind, RangeRef};
 use officina_grid::numfmt::PALETTE;
 use officina_grid::filter::Cond;
 use officina_grid::style::{HAlign, Line, Style, StyleId, VAlign};
@@ -45,7 +45,7 @@ const NS: &str = concat!(
     r#"office:version="1.3""#
 );
 
-fn esc(out: &mut String, s: &str) {
+pub(super) fn esc(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -60,7 +60,7 @@ fn esc(out: &mut String, s: &str) {
 }
 
 /// A number as `xsd:double`, shortest round trip.
-fn num(x: f64) -> String {
+pub(super) fn num(x: f64) -> String {
     if x == x.trunc() && x.abs() < 1e15 {
         format!("{}", x as i64)
     } else {
@@ -566,7 +566,7 @@ fn data_style(out: &mut String, name: &str, sec: &Section, volatile: bool, maps:
 
 /// The data style(s) for an Excel code, the main one named `name`. `None` for
 /// General (no data style).
-fn data_styles(code: &str, name: &str) -> Option<String> {
+pub(super) fn data_styles(code: &str, name: &str) -> Option<String> {
     if code.eq_ignore_ascii_case("General") || code.is_empty() {
         return None;
     }
@@ -790,10 +790,29 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
             inl = wb.inline_tables(&grp.expr, s, r, c);
             &inl
         };
-        let a1 = formula::to_a1(e, r, c, &|id| wb.sheet_name(id));
+        // No `@` or `A1#` in OpenFormula: a formula that may spill is a matrix
+        // formula over its spill, a spill reference the range it covers now.
+        let (fe, dynamic) = officina_grid::eval::arrays::for_file(e);
+        let fe = officina_grid::eval::arrays::plain(&fe, &|cr| {
+            let sheet = cr.sheet.unwrap_or(s);
+            let at = (cr.row.resolve(r, officina_grid::addr::MAX_ROWS), cr.col.resolve(c, officina_grid::addr::MAX_COLS));
+            match at {
+                (Some(rr), Some(cc)) => match wb.spill_area(officina_grid::CellAddr::new(sheet, rr, cc)) {
+                    Some(a) => Expr::Range(RangeRef { sheet: cr.sheet, r0: Coord::Abs(a.r0), c0: Coord::Abs(a.c0), r1: Coord::Abs(a.r1), c1: Coord::Abs(a.c1), kind: RangeKind::Cells }),
+                    None => Expr::Err(ErrorKind::Ref),
+                },
+                _ => Expr::Err(ErrorKind::Ref),
+            }
+        });
+        let a1 = formula::to_a1(&fe, r, c, &|id| wb.sheet_name(id));
         out.push_str(r#" table:formula=""#);
         esc(out, &super::formula::to_of(&a1));
         out.push('"');
+        if dynamic {
+            let area = wb.spill_area(officina_grid::CellAddr::new(s, r, c)).filter(|a| a.cells() > 1);
+            let (rows, cols) = area.map_or((1, 1), |a| (a.rows(), a.cols()));
+            let _ = write!(out, r#" table:number-matrix-columns-spanned="{cols}" table:number-matrix-rows-spanned="{rows}""#);
+        }
     } else if let Value::Err(e) = v {
         // A constant error: a formula of just the error.
         out.push_str(r#" table:formula="of:="#);
@@ -1045,6 +1064,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     } else if row == 0 {
         gap(out, 0, 1);
     }
+    out.push_str(&super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb)));
     out.push_str(&names_xml(wb, Some(s)));
     out.push_str("</table:table>");
     Ok(())
@@ -1229,7 +1249,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     content.push_str(&names_xml(wb, None));
     content.push_str(&filters_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
-    let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/></office:styles></office:document-styles>"#);
+    let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/>{cf}</office:styles></office:document-styles>"#, cf = super::condfmt::styles_xml(&super::condfmt::dxfs(wb)));
     let macros = super::macros::writable(wb);
     let mut objects = super::macros::manifest_xml(&macros);
     for i in 0..wb.charts().len() {

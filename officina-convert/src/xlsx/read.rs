@@ -23,6 +23,7 @@ use officina_grid::filter::{AutoFilter, Cond};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
+use officina_grid::eval::arrays;
 use officina_grid::formula::{self, Expr};
 use officina_grid::strings::MAX_TEXT;
 use officina_grid::style::{StyleId, StyleRuns};
@@ -255,9 +256,18 @@ fn shared_strings(z: &Archive, path: Option<&str>, rep: &mut Report) -> Result<V
 }
 
 /// Excel's formula text to ours: the `_xlfn.` and `_xlws.` prefixes newer functions
-/// carry in files are dropped.
+/// carry in files, and `_xlpm.` on LET names and LAMBDA parameters, are dropped.
 pub fn formula_in(f: &str) -> String {
-    let body = f.trim();
+    // LibreOffice before 24.8 copies OpenFormula's names for Excel's newer
+    // functions (`COM.MICROSOFT.XLOOKUP`) into the `.xlsx` it saves
+    let owned;
+    // (24.2 in lower case).
+    let body = if f.contains("COM.MICROSOFT.") || f.contains("com.microsoft.") {
+        owned = f.trim().replace("COM.MICROSOFT.", "").replace("com.microsoft.", "");
+        owned.as_str()
+    } else {
+        f.trim()
+    };
     let mut s = String::with_capacity(body.len() + 1);
     s.push('=');
     if !body.contains("_xl") {
@@ -268,7 +278,7 @@ pub fn formula_in(f: &str) -> String {
     while let Some(i) = rest.find("_xl") {
         s.push_str(&rest[..i]);
         let tail = &rest[i..];
-        if let Some(t) = tail.strip_prefix("_xlfn.").or_else(|| tail.strip_prefix("_xlws.")) {
+        if let Some(t) = tail.strip_prefix("_xlfn.").or_else(|| tail.strip_prefix("_xlws.")).or_else(|| tail.strip_prefix("_xlpm.")) {
             rest = t;
         } else {
             s.push_str("_xl");
@@ -315,6 +325,9 @@ impl Pending {
 enum Src {
     Text(String),
     Shared(u32),
+    /// An array formula (dynamic, or Ctrl+Shift+Enter): its text and the area its
+    /// result holds in the file.
+    Array(String, Option<(u32, u32, u32, u32)>),
 }
 
 struct FCell {
@@ -349,6 +362,8 @@ struct Seg {
     hidden: Vec<u32>,
     /// `<autoFilter ref>` and its columns' conditions.
     filter: Option<(String, Vec<(u32, Cond)>)>,
+    /// `<conditionalFormatting>`s, read once the workbook's formulas can be.
+    cond: Vec<super::condfmt::Raw>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -509,16 +524,17 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                             b"f" => {
                                 let ft = attr(&ce, b"t")?;
                                 let si = attr(&ce, b"si")?.and_then(|v| v.parse::<u32>().ok());
+                                let area = attr(&ce, b"ref")?.as_deref().and_then(parse_ref);
                                 let mut s = String::new();
                                 read_text(&mut r, b"f", &mut s)?;
-                                f = formula_src(ft.as_deref(), si, s, rr, cc, &mut seg.shared, &mut seg.rep);
+                                f = formula_src(ft.as_deref(), si, area, s, rr, cc, &mut seg.shared, &mut seg.rep);
                             }
                             _ => skip(&mut r, &ce)?,
                         },
                         Event::Empty(ce) if ce.local_name().as_ref() == b"f" => {
                             let ft = attr(&ce, b"t")?;
                             let si = attr(&ce, b"si")?.and_then(|v| v.parse::<u32>().ok());
-                            f = formula_src(ft.as_deref(), si, String::new(), rr, cc, &mut seg.shared, &mut seg.rep);
+                            f = formula_src(ft.as_deref(), si, None, String::new(), rr, cc, &mut seg.shared, &mut seg.rep);
                         }
                         Event::End(ce) if ce.local_name().as_ref() == b"c" => break,
                         Event::Eof => return Err(bad("cell ended early")),
@@ -562,7 +578,16 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
                 }
             }
             b"mergeCell" => seg.rep.note(Kind::Approximate, "merged cells shown unmerged"),
-            b"conditionalFormatting" => seg.rep.note(Kind::Dropped, "conditional formats (O4b)"),
+            b"conditionalFormatting" if !empty && e.name().as_ref() == b"conditionalFormatting" => {
+                let sqref = attr(&e, b"sqref")?.unwrap_or_default();
+                let end = e.name().as_ref().to_vec();
+                let span = r.read_to_end(quick_xml::name::QName(&end))?;
+                let inner = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
+                if seg.cond.len() < 1 << 16 {
+                    seg.cond.push(super::condfmt::Raw { sqref, inner });
+                }
+            }
+            b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
             b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules"),
             b"hyperlink" => seg.rep.note(Kind::Dropped, "hyperlinks"),
             b"legacyDrawing" => seg.rep.note(Kind::Dropped, "comments"),
@@ -627,7 +652,7 @@ const PIECE: usize = 8 << 20;
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>) -> Result<(), XlsxError> {
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -735,6 +760,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 heights.extend(seg.heights);
                 hidden.extend(seg.hidden);
                 filter = seg.filter.or(filter);
+                cond.extend(seg.cond);
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
                 out.cells += seg.cells;
@@ -857,7 +883,8 @@ fn memrchr_row_end(b: &[u8]) -> Option<usize> {
     None
 }
 
-fn formula_src(ft: Option<&str>, si: Option<u32>, text: String, row: u32, col: u32, shared: &mut HashMap<u32, (u32, u32, String)>, rep: &mut Report) -> Option<Src> {
+#[allow(clippy::too_many_arguments)]
+fn formula_src(ft: Option<&str>, si: Option<u32>, area: Option<(u32, u32, u32, u32)>, text: String, row: u32, col: u32, shared: &mut HashMap<u32, (u32, u32, String)>, rep: &mut Report) -> Option<Src> {
     match ft.unwrap_or("normal") {
         "normal" => (!text.trim().is_empty()).then_some(Src::Text(text)),
         "shared" => {
@@ -868,8 +895,8 @@ fn formula_src(ft: Option<&str>, si: Option<u32>, text: String, row: u32, col: u
             Some(Src::Shared(si))
         }
         "array" => {
-            rep.note_at(Kind::Approximate, "array formulas calculated in their first cell only", || a1(row, col));
-            (!text.trim().is_empty()).then_some(Src::Text(text))
+            let _ = (row, col);
+            (!text.trim().is_empty()).then_some(Src::Array(text, area))
         }
         _ => {
             rep.note(Kind::Approximate, "data tables kept as their values");
@@ -988,9 +1015,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         Some(p) => super::styles::theme_colors(&z.read_name(&p)?.unwrap_or_default()),
         None => super::styles::theme_colors(b""),
     };
+    let mut dxfs = Vec::new();
     let xf_ids: Vec<StyleId> = match wb_rels.values().find(|(t, _)| t.ends_with("/styles")).map(|(_, p)| p.clone()) {
         Some(p) => match z.read_name(&p)? {
-            Some(x) => super::styles::read(&x, &theme, &mut rep).into_iter().map(|st| wb.styles.intern(st)).collect(),
+            Some(x) => {
+                dxfs = super::condfmt::read_dxfs(&x, &theme);
+                super::styles::read(&x, &theme, &mut rep).into_iter().map(|st| wb.styles.intern(st)).collect()
+            }
             None => vec![0],
         },
         None => vec![0],
@@ -1007,12 +1038,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         }
     }
     let mut all_f: Vec<(u16, Vec<FCell>, HashMap<u32, (u32, u32, String)>)> = Vec::new();
+    let mut conds: Vec<(u16, Vec<super::condfmt::Raw>)> = Vec::new();
     for (i, (_, part)) in sheets.iter().enumerate() {
         let e = z.find(part).ok_or_else(|| bad(format!("missing {part}")))?.clone();
         let mut fcells = Vec::new();
         let mut shared = HashMap::new();
-        sheet(&mut wb, i as u16, &z, &e, &sst, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared)?;
+        let mut cond = Vec::new();
+        sheet(&mut wb, i as u16, &z, &e, &sst, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond)?;
         all_f.push((i as u16, fcells, shared));
+        conds.push((i as u16, cond));
     }
 
     // Tables, before the formulas that use them.
@@ -1039,12 +1073,22 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         let mut exprs: HashMap<u32, Option<Arc<Expr>>> = HashMap::new();
         let mut cells: Vec<(u32, u32, Arc<Expr>)> = Vec::with_capacity(fcells.len());
         for fc in fcells {
+            // Formulas from before dynamic arrays keep their one value (`@`); array
+            // formulas spill, over the area the file kept for them.
             let e = match &fc.src {
-                Src::Text(t) => wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new),
+                Src::Text(t) => wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(|e| Arc::new(arrays::legacy(e))),
                 Src::Shared(si) => exprs
                     .entry(*si)
-                    .or_insert_with(|| shared.get(si).and_then(|(r, c, t)| wb_parse(&wb, &formula_in(t), s, *r, *c)).map(Arc::new))
+                    .or_insert_with(|| shared.get(si).and_then(|(r, c, t)| wb_parse(&wb, &formula_in(t), s, *r, *c)).map(|e| Arc::new(arrays::legacy(e))))
                     .clone(),
+                Src::Array(t, area) => {
+                    if let Some((r0, c0, r1, c1)) = *area {
+                        if (r0, c0) == (fc.row, fc.col) && (r1, c1) != (r0, c0) {
+                            wb.claim_spill(CellAddr::new(s, r0, c0), officina_grid::Rect { sheet: s, r0, c0, r1, c1 });
+                        }
+                    }
+                    wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new)
+                }
             };
             match e {
                 Some(e) => {
@@ -1053,7 +1097,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                 }
                 None => {
                     let text = match &fc.src {
-                        Src::Text(t) => t.clone(),
+                        Src::Text(t) | Src::Array(t, _) => t.clone(),
                         Src::Shared(si) => shared.get(si).map(|x| x.2.clone()).unwrap_or_default(),
                     };
                     rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || format!("{}: ={}", a1(fc.row, fc.col), text.chars().take(60).collect::<String>()));
@@ -1077,6 +1121,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
             }
             i = j;
         }
+    }
+    // Conditional formats, once formulas (and the names they use) can be read.
+    for (s, raws) in &conds {
+        super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);
     }
     wb.recalc();
     // The differential: our results against the file's.

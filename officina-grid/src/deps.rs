@@ -97,6 +97,19 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
                 out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
             }
         }
+        // `A1#` reads the spill anchored there; a spill that changes re-dirties its
+        // anchor's readers (recalc.rs).
+        Expr::Spill(r) => {
+            if let Some(c) = r.col.resolve(col, MAX_COLS) {
+                out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+            }
+        }
+        // A function Officina doesn't have may be a name bound to a LAMBDA.
+        Expr::Call(crate::formula::Func::Unknown(x), _) if depth < crate::names::MAX_NAME_DEPTH => {
+            if let Some(x) = names(sheet, r0, col, &Expr::Name(x.clone())) {
+                named.push(x);
+            }
+        }
         Expr::Name(x) if x.is_empty() => {}
         Expr::Name(_) | Expr::Table(_) if depth < crate::names::MAX_NAME_DEPTH => {
             if let Some(x) = names(sheet, r0, col, n) {

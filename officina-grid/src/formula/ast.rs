@@ -155,6 +155,14 @@ pub enum Expr {
     Array(Vec<Vec<Expr>>),
     /// Parentheses as written, kept so printing gives back what the user typed.
     Paren(Box<Expr>),
+    /// `A1#`: the whole spill of the dynamic array anchored at a cell.
+    Spill(CellRef),
+    /// `@x`: implicit intersection (a range gives the cell in the formula's row or
+    /// column, an array its first value). Formulas from files written before dynamic
+    /// arrays carry one at the top when they could spill (Excel shows them so).
+    At(Box<Expr>),
+    /// `LAMBDA(x, x+1)(2)`: calling what an expression evaluates to.
+    Invoke(Box<Expr>, Vec<Expr>),
 }
 
 impl Expr {
@@ -162,7 +170,11 @@ impl Expr {
     pub fn walk(&self, f: &mut dyn FnMut(&Expr)) {
         f(self);
         match self {
-            Expr::Neg(e) | Expr::Plus(e) | Expr::Pct(e) | Expr::Paren(e) => e.walk(f),
+            Expr::Neg(e) | Expr::Plus(e) | Expr::Pct(e) | Expr::Paren(e) | Expr::At(e) => e.walk(f),
+            Expr::Invoke(g, args) => {
+                g.walk(f);
+                args.iter().for_each(|a| a.walk(f));
+            }
             Expr::Bin(_, a, b) => {
                 a.walk(f);
                 b.walk(f);

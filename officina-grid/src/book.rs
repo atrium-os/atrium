@@ -148,6 +148,19 @@ pub struct Workbook {
     pub(crate) pending: HashMap<GroupId, RowSet>,
     pub(crate) volatile: HashSet<GroupId>,
     lookup: Mutex<HashMap<LookupKey, (u64, Arc<LookupIndex>)>>,
+    /// Dynamic arrays spilled, by anchor ([`crate::spill`]).
+    pub(crate) spills: HashMap<CellAddr, crate::spill::Spill>,
+    /// Anchors whose spill is blocked, with the area they want.
+    pub(crate) blocked: HashMap<CellAddr, Rect>,
+    /// Areas a file says spills hold, adopted by the next recalculation.
+    pub(crate) claims: HashMap<CellAddr, Rect>,
+    /// Arrays the running recalculation produced, to spill between rounds.
+    pub(crate) spill_out: Mutex<Vec<(CellAddr, Option<Arc<crate::eval::Array>>)>>,
+    /// Conditional formats, in priority order ([`crate::condfmt`]).
+    pub(crate) cond_formats: Vec<crate::condfmt::CondFormat>,
+    pub(crate) cond_stats: crate::condfmt::StatCache,
+    /// Recalculations run (conditional formats' statistics are per recalculation).
+    pub(crate) recalcs: u64,
     /// Threads recalculation may use.
     pub threads: usize,
 }
@@ -175,6 +188,13 @@ impl Workbook {
             pending: HashMap::new(),
             volatile: HashSet::new(),
             lookup: Mutex::new(HashMap::new()),
+            spills: HashMap::new(),
+            blocked: HashMap::new(),
+            claims: HashMap::new(),
+            spill_out: Mutex::new(Vec::new()),
+            cond_formats: Vec::new(),
+            cond_stats: Default::default(),
+            recalcs: 0,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
@@ -703,7 +723,11 @@ fn check_depth(e: &Expr) -> Result<(), ParseError> {
             return Err(ParseError { at: 0, msg: "formula nested too deeply".into() });
         }
         match n {
-            Expr::Neg(a) | Expr::Plus(a) | Expr::Pct(a) | Expr::Paren(a) => stack.push((a, d + 1)),
+            Expr::Neg(a) | Expr::Plus(a) | Expr::Pct(a) | Expr::Paren(a) | Expr::At(a) => stack.push((a, d + 1)),
+            Expr::Invoke(g, args) => {
+                stack.push((g, d + 1));
+                args.iter().for_each(|a| stack.push((a, d + 1)));
+            }
             Expr::Bin(_, a, b) => {
                 stack.push((a, d + 1));
                 stack.push((b, d + 1));
