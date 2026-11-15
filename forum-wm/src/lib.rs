@@ -160,6 +160,21 @@ fn min_px(screen: &Screen, s: &WmSurfaceInfo) -> (i32, i32) {
     (screen.px(s.min_size.0.min(i32::MAX as u32) as i32), screen.px(s.min_size.1.min(i32::MAX as u32) as i32))
 }
 
+/// Where a dialog may grow: the work area, or, when its minimum height
+/// doesn't fit there, down over the dock to the screen's foot (a dialog is
+/// layered above the dock, and a prompt at full text size beats a dock in
+/// view while it is up: a sheet at UI size 2 and text 200 on a 1080p
+/// monitor). Never over the bar. A dialog asking for at least the whole
+/// screen (the Applications view) means "all you can": the work area, so
+/// the dock's strip stays.
+fn dialog_area(screen: &Screen, wa: WmRect, min: (i32, i32)) -> WmRect {
+    let whole_screen = min.0 >= screen.rect.w && min.1 >= screen.rect.h;
+    if min.1 <= wa.h || whole_screen {
+        return wa;
+    }
+    WmRect { h: screen.rect.y + screen.rect.h - wa.y, ..wa }
+}
+
 /// Give each dialog, panel and snapped document in `layout` at least its
 /// minimum size where the screen allows (resolution-independence.md §6.3):
 /// a dialog grows about its centre, a panel leftwards, and a snapped
@@ -174,7 +189,7 @@ pub fn fit_min_sizes(layout: &mut WmDeclareLayoutPayload, screen: &Screen, surfa
         // Points from frescod; device pixels on this monitor.
         let min = min_px(screen, s);
         slot.rect = match s.role {
-            WmRole::Dialog => grow_to_min(slot.rect, min, wa, false),
+            WmRole::Dialog => grow_to_min(slot.rect, min, dialog_area(screen, wa, min), false),
             WmRole::Panel => grow_to_min(slot.rect, min, wa, true),
             WmRole::Document if slot.rect.w < min.0 && slot.rect.w < wa.w => WmRect { x: wa.x, w: wa.w, ..slot.rect },
             _ => slot.rect,
@@ -2066,11 +2081,11 @@ mod tests {
         let l = arrange_for(&sc, &wide, Some(1), true);
         assert_eq!((rect(&l, 1), rect(&l, 2)), (wa, wa));
         // A dialog and a panel grow, inside the work area.
-        let others = [with_min(4, WmRole::Dialog, (900, 5000)), with_min(5, WmRole::Panel, (wa.w as u32 / 2, 0))];
+        let others = [with_min(4, WmRole::Dialog, (900, wa.h as u32)), with_min(5, WmRole::Panel, (wa.w as u32 / 2, 0))];
         let mut l = arrange_for(&sc, &others, None, false);
         fit_min_sizes(&mut l, &sc, &others);
         let d = rect(&l, 4);
-        assert_eq!((d.w, d.h), (900.max(sc.px(480)), wa.h), "as tall as the work area allows");
+        assert_eq!((d.w, d.h), (900.max(sc.px(480)), wa.h), "as tall as the work area");
         assert_eq!(d.x + d.w / 2, wa.x + wa.w / 2, "centred");
         let p = rect(&l, 5);
         assert_eq!((p.w, p.x + p.w), (wa.w / 2, wa.x + wa.w), "a panel keeps its right edge");
@@ -2080,6 +2095,27 @@ mod tests {
         let mut l = arrange_snapped(&sc, &one, Some(1), &snapped);
         fit_min_sizes(&mut l, &sc, &one);
         assert_eq!(rect(&l, 1), wa);
+    }
+
+    /// A dialog taller than the work area grows down over the dock (it is
+    /// layered above it) to the screen's foot, never over the bar; one
+    /// taller than that is cut to it.
+    #[test]
+    fn a_dialog_too_tall_for_the_work_area_grows_over_the_dock() {
+        // UI size 2 on 1080p: bar 38 pt, dock 64 pt; a sheet 840 x 460 pt.
+        let sc = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 38, dock_h: 64, scale_milli: 2000 };
+        let wa = sc.work_area();
+        let sheet = [WmSurfaceInfo { min_size: (840, 460), ..surf(4, WmRole::Dialog) }];
+        let mut l = arrange_for(&sc, &sheet, None, false);
+        fit_min_sizes(&mut l, &sc, &sheet);
+        let d = l.slots[0].rect;
+        assert!(920 > wa.h, "it doesn't fit the work area ({} px)", wa.h);
+        assert_eq!((d.w, d.h), (1680, 920), "its whole minimum");
+        assert!(d.y >= wa.y && d.y + d.h <= 1080, "below the bar, on screen: {d:?}");
+        let tall = [WmSurfaceInfo { min_size: (840, 2000), ..surf(4, WmRole::Dialog) }];
+        let mut l = arrange_for(&sc, &tall, None, false);
+        fit_min_sizes(&mut l, &sc, &tall);
+        assert_eq!(l.slots[0].rect, WmRect { x: 120, y: wa.y, w: 1680, h: 1080 - wa.y });
     }
 
     /// The dock's Applications view (forum.md §6.1) is a dialog whose

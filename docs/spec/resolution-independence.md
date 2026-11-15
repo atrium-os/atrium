@@ -411,6 +411,12 @@ parent's scale, so it keeps its size and its place against the parent on any mon
   Its size is the larger of the catalogue size and the sheet's own natural minimum (so at
   text size 150% a picker grows rather than clipping), capped to the parent's monitor in pt.
   It stays centred across the parent and hangs past a smaller parent, as now.
+- **System dialogs** (WM role Dialog, e.g. Sigillum's sheets) get at least their minimum
+  size in the work area; one whose minimum is taller than the work area grows down over the
+  dock (dialogs are layered above it) to the screen's foot, never over the bar, so a sheet
+  at UI size 2 and text 200 on a 1080p monitor keeps its text size instead of shrinking to
+  the space between bar and dock (forum-wm `dialog_area`, built 2026-11-15). A dialog asking
+  for at least the whole screen (the Applications view) still gets the work area.
 - **Modality is unchanged**: dimming, input routing and the focus-ring frame follow the
   sheet's rect, which frescod converts with the parent's scale. The frame and its
   `system:` tag are frescod chrome and scale per §8.
