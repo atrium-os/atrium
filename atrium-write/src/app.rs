@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 28] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right"];
+pub const INSERT: [&str; 34] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -131,12 +131,58 @@ pub enum Cmd {
     Wrap(Option<Wrap>),
     /// The floating picture at the caret to its column's start, centre or end.
     FloatAlign(HAlign),
+    /// The caret's section's page: orientation, paper or margins.
+    Page(PageCmd),
 }
+
+/// A change to a section's page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageCmd {
+    Portrait,
+    Landscape,
+    A4,
+    Letter,
+    /// Margins all round, twips (1440: normal; 720: narrow).
+    Margins(i32),
+}
+
+impl PageCmd {
+    /// `g` with this change: paper keeps the orientation, margins all round.
+    pub fn apply(self, g: officina_text::model::PageSetup) -> officina_text::model::PageSetup {
+        let land = g.width > g.height;
+        let paper = |w: i32, h: i32| if land { (h, w) } else { (w, h) };
+        let mut n = g;
+        match self {
+            PageCmd::Portrait if land => (n.width, n.height) = (g.height, g.width),
+            PageCmd::Landscape if !land => (n.width, n.height) = (g.height, g.width),
+            PageCmd::A4 => (n.width, n.height) = paper(11906, 16838),
+            PageCmd::Letter => (n.width, n.height) = paper(12240, 15840),
+            PageCmd::Margins(m) => (n.margin_top, n.margin_bottom, n.margin_start, n.margin_end) = (m, m, m, m),
+            _ => {}
+        }
+        n
+    }
+
+    /// Whether `g` is already so.
+    pub fn is(self, g: &officina_text::model::PageSetup) -> bool {
+        let (a, b) = (g.width.min(g.height), g.width.max(g.height));
+        match self {
+            PageCmd::Portrait => g.width <= g.height,
+            PageCmd::Landscape => g.width > g.height,
+            PageCmd::A4 => (a - 11906).abs() <= 20 && (b - 16838).abs() <= 20,
+            PageCmd::Letter => (a - 12240).abs() <= 20 && (b - 15840).abs() <= 20,
+            PageCmd::Margins(m) => [g.margin_top, g.margin_bottom, g.margin_start, g.margin_end].iter().all(|&x| x == m),
+        }
+    }
+}
+
+/// The page commands of Insert menu items 28 on.
+pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, PageCmd::A4, PageCmd::Letter, PageCmd::Margins(1440), PageCmd::Margins(720)];
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End)][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5])][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -736,6 +782,10 @@ impl Write {
                     Cmd::Wrap(w) => {
                         e.set_wrap(w);
                     }
+                    Cmd::Page(c) => {
+                        let label = INSERT[28 + PAGE_CMDS.iter().position(|x| *x == c).unwrap_or(0)];
+                        e.set_section_page(label, |g| c.apply(g));
+                    }
                     Cmd::FloatAlign(a) => {
                         e.set_float_align(a);
                     }
@@ -930,6 +980,7 @@ impl View for Write {
             let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
             let has_toc = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
             let sec = self.doc.borrow().ed.borrow().section();
+            let page = self.doc.borrow().ed.borrow().section_page();
             let pic = self.doc.borrow().ed.borrow().picture_at_caret().map(|x| x.2.float);
             let wraps = [None, Some(Wrap::Square), Some(Wrap::TopBottom), Some(Wrap::Behind), Some(Wrap::InFront)];
             let aligns = [HAlign::Start, HAlign::Center, HAlign::End];
@@ -941,6 +992,10 @@ impl View for Write {
                 25..=27 => {
                     let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 25]));
                     if i == 25 { m.separated() } else { m }
+                }
+                28..=33 => {
+                    let m = MenuItem::new(*s).radio(PAGE_CMDS[i - 28].is(&page));
+                    if i == 28 || i == 30 || i == 32 { m.separated() } else { m }
                 }
                 12 => MenuItem::new(if has_toc { "Update Table of Contents" } else { *s }).separated(),
                 14 => MenuItem::new(*s).enabled(!in_table).separated(),
@@ -1342,6 +1397,46 @@ mod tests {
         run(Cmd::Undo);
         run(Cmd::Undo);
         assert_eq!(w.doc.borrow().ed.borrow().note_text(nb.id).unwrap(), "");
+    }
+
+    #[test]
+    fn page_commands_change_the_carets_section() {
+        let doc = Doc::from_text("p.txt", b"One.\nTwo.\nThree.\nFour.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let page = || w.doc.borrow().ed.borrow().section_page();
+        let base = page();
+        assert!(base.width < base.height);
+        // One section: the document's page turns.
+        run(Cmd::insert(29));
+        assert!(page().width > page().height);
+        assert_eq!(w.doc.borrow().ed.borrow().doc.page, page());
+        run(Cmd::Undo);
+        assert_eq!(page(), base);
+        // Two sections: only the caret's.
+        w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(2, 0), false);
+        run(Cmd::insert(14));
+        run(Cmd::insert(29));
+        run(Cmd::insert(33));
+        let land = page();
+        assert!(land.width > land.height && land.margin_start == 720, "{land:?}");
+        assert_eq!(w.doc.borrow().ed.borrow().doc.page, base, "the document's page stays");
+        {
+            let d = w.doc.borrow();
+            let mut e = d.ed.borrow_mut();
+            while !e.paginate(std::time::Duration::from_secs(5)) {}
+            let sizes: Vec<i32> = e.pages.pages().iter().map(|p| p.setup.width).collect();
+            assert_eq!(sizes, vec![base.width, land.width]);
+        }
+        // Back to portrait and normal margins: the section's page goes.
+        run(Cmd::insert(28));
+        run(Cmd::insert(32));
+        assert_eq!(page(), base);
+        assert!(w.doc.borrow().ed.borrow().doc.para(2).unwrap().props.section.unwrap().page.is_none());
+        assert!(PAGE_CMDS[2].is(&base) || PAGE_CMDS[3].is(&base));
     }
 
     #[test]

@@ -3070,8 +3070,11 @@ tdf162541) place them the same. 20,000 mutated files with floats clean
   page layout and master page (`Section_20_Page_N`), the document's again
   where a section returns to it. The body's first paragraph is now found
   inside sections and lists too. `.doc` gets it through `.docx` (§16.43).
-- **Not yet**: Page Setup in Write changes the document's page, not the
-  section's; headers and footers stay the document's.
+- **In Write**: Insert menu Portrait, Landscape, A4 Paper, Letter Paper,
+  Normal and Narrow Margins act on the caret's section (one undo step): a
+  one-section document changes its own page; in one of several the section
+  gets a page of its own, dropped again when it matches the document's.
+- **Not yet**: headers and footers stay the document's.
 
 Gates: LibreOffice both ways across formats 8/8 with a landscape section;
 Write's other LibreOffice gates unchanged (docx 26/26, odt 52/52, doc 31/31,

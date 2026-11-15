@@ -1500,6 +1500,46 @@ impl Editor {
         true
     }
 
+    /// The page setup of the caret's section (its own, else the document's).
+    pub fn section_page(&self) -> officina_text::model::PageSetup {
+        self.pages.setup_at(self.section_start(self.caret.block))
+    }
+
+    /// Changes the caret's section's page (size, orientation, margins) with
+    /// `f`, one undo step. A document of one section changes its own page; in
+    /// one of several, the section gets a page of its own (none again when it
+    /// comes back to the document's).
+    pub fn set_section_page(&mut self, label: &str, f: impl FnOnce(officina_text::model::PageSetup) -> officina_text::model::PageSetup) -> bool {
+        let k = self.section_start(self.caret.block);
+        let cur = self.section_page();
+        let mut new = f(cur);
+        new.width = new.width.clamp(1440, 63360);
+        new.height = new.height.clamp(1440, 63360);
+        if new == cur {
+            return false;
+        }
+        // One section: the document's page (and the first paragraph's own, if
+        // any, goes).
+        let more = (1..self.blocks()).any(|j| self.doc.para(j).is_some_and(|p| p.props.cell.is_none() && p.props.section.is_some()));
+        if !more {
+            let mut ops = vec![TextOp::SetPage { page: new, header: self.doc.header.clone(), footer: self.doc.footer.clone() }];
+            if let Some(q) = self.doc.para(0).filter(|q| q.props.section.is_some_and(|s| s.page.is_some())) {
+                let mut props = q.props.clone();
+                props.section = props.section.map(|s| Section { page: None, ..s });
+                ops.push(TextOp::SetPara { block: 0, style: q.style, props });
+            }
+            self.apply(label, ops, Kind::Other);
+            return true;
+        }
+        let Some(q) = self.doc.para(k) else { return false };
+        let mut props = q.props.clone();
+        let base = props.section.unwrap_or_default();
+        props.section = Some(Section { page: (new != self.doc.page).then_some(new), ..base });
+        let op = TextOp::SetPara { block: k as u32, style: q.style, props };
+        self.apply(label, vec![op], Kind::Other);
+        true
+    }
+
     /// Sets the columns of the caret's section (`gap` twips, `rule` a line
     /// between). The first section gets its settings on the first paragraph.
     pub fn set_columns(&mut self, columns: u8, rule: bool) -> bool {
