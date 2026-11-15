@@ -676,6 +676,18 @@ amd_ih7_down(struct amd_ih7 *ih)
 	ih7_unmap_free(ih);
 }
 
+/*
+ * Hand what the ring holds to the consumer now (thread context, no locks
+ * of the consumer's held): a fault that landed a moment ago is then known
+ * before the caller acts on the queue it hit.
+ */
+void
+amd_ih7_consume_now(struct amd_ih7 *ih)
+{
+	if (ih != NULL)
+		ih7_consume(ih);
+}
+
 /* Drain the ring, counting CP end-of-pipe IVs (logs up to max_log). */
 int
 amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log)

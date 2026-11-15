@@ -917,6 +917,7 @@ int	amd_ih7_up(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    struct amd_ih7 **out);
 void	amd_ih7_down(struct amd_ih7 *ih);
 int	amd_ih7_drain_eop(struct amd_ih7 *ih, int max_log);
+void	amd_ih7_consume_now(struct amd_ih7 *ih);
 u_int	amd_ih7_nintr(struct amd_ih7 *ih);
 /* One IV (8 dwords), or NULL at the end of a batch (5c-2). */
 typedef void amd_ih7_consumer_fn(void *arg, const uint32_t *iv);
@@ -958,6 +959,13 @@ void	amd_mes12_kq_report(struct amd_kq *kq, const char *when);
  */
 #define AMD_UQ_SLOTS	64
 #define AMD_UQ_DOORBELL(slot)	((0x10u + (slot)) << 1)	/* userqueue range */
+/*
+ * A kernel-mode gfx queue's doorbell: in the ME's range (CP_RB_DOORBELL_
+ * RANGE, NAVI10 layout 0x8b..0xff; GFX_USERQUEUE_START 0x8d), not the
+ * MEC's. Box run 048af0f9: a gfx queue rung at 0x28, inside the MEC range,
+ * never fetched its ring (rptr 0) and MES could not reset or remove it.
+ */
+#define AMD_UQ_GFX_DOORBELL(slot)	((0x8du + (slot)) << 1)
 /* A user-mode queue's doorbell: the first dword of its own doorbell BAR
  * page (2 + slot; page 0 is the kernel's, page 1 MES's aggregated ones). */
 #define AMD_UQ_DOORBELL_USER(slot)	((2u + (slot)) << 10)

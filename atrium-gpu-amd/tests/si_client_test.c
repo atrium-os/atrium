@@ -103,7 +103,7 @@
  *                and a constant-colour pixel shader into a linear 64 x 64
  *                RGBA8 target, compared with a CPU rasterisation (pixels
  *                within half a pixel of an edge are not judged); the VS's
- *                system SGPRs/VGPRs are printed per lane. Last of all.
+ *                system SGPRs/VGPRs are printed per lane. Runs after 20.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -3507,17 +3507,18 @@ main(void)
 	if (!skipped(20, "gfx queue"))
 		gfx_queue(&a);
 
+	/* 21: the first triangle (stage 7b), right after the gfx queue and
+	 * before 19 and 14, which may use up the re-inits (run 048af0f9:
+	 * three were gone before it got to run). */
+	if (!skipped(21, "triangle"))
+		triangle();
+
 	/* 19: VM_UNBIND (before 14's re-inits). */
 	if (!skipped(19, "unbind"))
 		unbind();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();
-
-	/* 21: the first triangle (stage 7b). Last: a draw the hardware does
-	 * not like may hang the gfx queue and reset the GPU. */
-	if (!skipped(21, "triangle"))
-		triangle();
 
 out:
 	job_close(&a);

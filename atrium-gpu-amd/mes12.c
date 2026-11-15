@@ -2507,6 +2507,8 @@ out:
 CTASSERT(UQ2_GART_VA >= MES_SCRATCH_VA + 2 * MES_SCRATCH_SIZE);
 /* Kernel-mode doorbells stay inside the MEC range (db_mec_hi: 0x8a << 1). */
 CTASSERT(0x10u + AMD_UQ_SLOTS - 1 <= 0x8au);
+/* Kernel-mode gfx doorbells inside the ME range (db_gfx: 0x8b..0xff). */
+CTASSERT(0x8du + AMD_UQ_SLOTS - 1 <= 0xffu);
 CTASSERT(UQ2_GART_VA + (uint64_t)AMD_UQ_SLOTS * UQ_G_SIZE <= (64ull << 20));
 #define UQ2_PAGES		3u
 /*
@@ -2869,7 +2871,8 @@ amd_mes12_uq_create(struct mes *m, struct amd_vm12 *vm, u_int kvmid,
 	q->gfx = gfx;
 	q->qtype = gfx ? QUEUE_TYPE_GFX : QUEUE_TYPE_COMPUTE;
 	q->user = upg != NULL;
-	q->db = q->user ? AMD_UQ_DOORBELL_USER(slot) : AMD_UQ_DOORBELL(slot);
+	q->db = q->user ? AMD_UQ_DOORBELL_USER(slot) : gfx ?
+	    AMD_UQ_GFX_DOORBELL(slot) : AMD_UQ_DOORBELL(slot);
 	q->va = va;
 	q->gva = gt->gart_start + UQ2_GART_VA + (uint64_t)slot * UQ_G_SIZE;
 	if (q->gva + UQ_G_SIZE > gt->gart_end + 1) {

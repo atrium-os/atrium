@@ -55,6 +55,8 @@
 #include "atrium_gpu_amd_abi.h"
 #include "rs/glue.h"
 
+/* How long a fault IV may take to reach the IH ring (seen: 55-75 us). */
+#define SI_PREEMPT_IH_US	200
 #define SI_KVMID_FIRST		1u	/* the retired 5c-2a kernel-queue path */
 #define SI_KVMID_LAST		7u
 /* Client VM ids (stage 6b): 1..SI_VM_IDS-1, a bitmap of SI_VM_WORDS. */
@@ -796,10 +798,15 @@ si_iv_batch_end(struct amd_si_client *c)
 static uint32_t
 si_db_slot(uint32_t db)
 {
-	if ((db & 0x3ffu) == 0 && db >= AMD_UQ_DOORBELL_USER(0))
+	if ((db & 0x3ffu) == 0 && db >= AMD_UQ_DOORBELL_USER(0) &&
+	    db < AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS))
 		return ((db >> 10) - 2u);		/* user mode */
-	if (db >= AMD_UQ_DOORBELL(0) && (db & 1) == 0)
-		return ((db >> 1) - 0x10u);
+	if (db >= AMD_UQ_GFX_DOORBELL(0) &&
+	    db < AMD_UQ_GFX_DOORBELL(AMD_UQ_SLOTS) && (db & 1) == 0)
+		return ((db - AMD_UQ_GFX_DOORBELL(0)) >> 1);	/* gfx */
+	if (db >= AMD_UQ_DOORBELL(0) && db < AMD_UQ_DOORBELL(AMD_UQ_SLOTS) &&
+	    (db & 1) == 0)
+		return ((db - AMD_UQ_DOORBELL(0)) >> 1);
 	return (AMD_UQ_SLOTS);
 }
 
@@ -853,10 +860,7 @@ si_iv_eop_route(struct amd_si_client *c, uint32_t ctx, uint32_t ring)
 	/* A bare doorbell (no AMD_UQ_CTXID_FLAG): MES's EOP for a SUSPEND or
 	 * RESUME of that queue (5d run: they track the free-rule preemptions
 	 * one for one). Nothing of the queue's own work to retire. */
-	if ((ctx & 0xff000000u) == 0 && ((ctx >= AMD_UQ_DOORBELL(0) &&
-	    ctx < AMD_UQ_DOORBELL(AMD_UQ_SLOTS) && (ctx & 1) == 0) ||
-	    (ctx >= AMD_UQ_DOORBELL_USER(0) &&
-	    ctx < AMD_UQ_DOORBELL_USER(AMD_UQ_SLOTS) && (ctx & 0x3ffu) == 0))) {
+	if ((ctx & 0xff000000u) == 0 && si_db_slot(ctx) < AMD_UQ_SLOTS) {
 		c->uq_eop_preempt++;
 		return;
 	}
@@ -1393,7 +1397,17 @@ amd_si_uq_preempt(struct atrium_amd_softc *sc, uint64_t mask)
 
 	if (!amd_is_si(sc) || c == NULL)
 		return (mask);
-	sx_xlock(&c->uq_sx);
+	/*
+	 * Work the PTE change just cut off may have faulted a moment ago
+	 * (box run 048af0f9, test 19: the fault IV was handled 55 us after
+	 * the fault, after this loop had read the queue as alive). MES
+	 * refuses to SUSPEND a faulted queue, and the next queue on that
+	 * pipe then hung. So take what the IH holds first: a queue marked
+	 * dead here is not suspended, only left for its close.
+	 */
+	DELAY(SI_PREEMPT_IH_US);
+	sx_xlock(&c->uq_sx);		/* c->ih changes only under it */
+	amd_ih7_consume_now(c->ih);
 	for (i = 0; i < AMD_UQ_SLOTS; i++) {
 		mtx_lock(&sc->lock);
 		bit = c->uq[i].kvmid != 0 ? SI_VM_BIT(c->uq[i].kvmid) : 0;
@@ -1412,7 +1426,10 @@ amd_si_uq_preempt(struct atrium_amd_softc *sc, uint64_t mask)
 		if (err != 0) {
 			left |= bit;
 			c->uq_preempt_fails++;
-			c->mes_suspect = true;
+			/* Refused because the queue faulted meanwhile: known,
+			 * its close removes it. Otherwise MES is suspect. */
+			if (!c->uq[i].dead)
+				c->mes_suspect = true;
 		} else
 			c->uq_preempts++;
 		mtx_unlock(&sc->lock);
