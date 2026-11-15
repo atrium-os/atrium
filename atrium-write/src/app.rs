@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::{Align, CommentId, ListKind, NoteId, NoteKind};
+use officina_text::model::{SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 6] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 14] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…"];
+pub const INSERT: [&str; 20] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -116,12 +116,18 @@ pub enum Cmd {
     XrefMove(bool),
     /// Insert a reference to the bar's heading: its page (true) or its text.
     XrefInsert(bool),
+    /// A section break at the caret.
+    SectionBreak(SectionStart),
+    /// The caret's section in this many columns.
+    Columns(u8),
+    /// A line between the caret's section's columns, on or off.
+    ColumnRule,
 }
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -678,6 +684,17 @@ impl Write {
                     Cmd::Style(i) => e.style_named(STYLES[i.min(STYLES.len() - 1)]),
                     Cmd::List(k) => e.toggle_list(k),
                     Cmd::PageNumbers => e.toggle_page_numbers(),
+                    Cmd::SectionBreak(start) => {
+                        e.insert_section_break(start);
+                    }
+                    Cmd::Columns(n) => {
+                        let rule = e.section().rule;
+                        e.set_columns(n, rule);
+                    }
+                    Cmd::ColumnRule => {
+                        let s = e.section();
+                        e.set_columns(s.columns, !s.rule);
+                    }
                     Cmd::Toc => {
                         if !e.insert_toc() {
                             drop(e);
@@ -853,8 +870,14 @@ impl View for Write {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
             let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
             let has_toc = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
+            let sec = self.doc.borrow().ed.borrow().section();
             let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| match i {
                 12 => MenuItem::new(if has_toc { "Update Table of Contents" } else { *s }).separated(),
+                14 => MenuItem::new(*s).enabled(!in_table).separated(),
+                15 => MenuItem::new(*s).enabled(!in_table),
+                16 => MenuItem::new(*s).radio(sec.columns == 1).separated(),
+                17 | 18 => MenuItem::new(*s).radio(sec.columns as usize == i - 15),
+                19 => MenuItem::new(*s).checked(sec.rule).enabled(sec.columns > 1),
                 _ => MenuItem::new(*s).enabled(match i {
                     2..=5 => in_table,
                     9 => on_note,

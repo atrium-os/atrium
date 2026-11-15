@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -205,6 +205,9 @@ struct Out {
     /// Paragraphs fields refer to, by id: each gets a bookmark.
     targets: std::collections::HashSet<officina_text::model::BlockId>,
     bookmark: u32,
+    /// Paragraphs that end a section, by block: the section's number (its
+    /// `w:sectPr`, filled in once the body is written).
+    sect_end: HashMap<usize, usize>,
 }
 
 /// The bookmark name a field refers to paragraph `id` by.
@@ -434,6 +437,9 @@ impl Out {
         if !mark.is_empty() {
             let _ = write!(pp, "<w:rPr>{mark}</w:rPr>");
         }
+        if let Some(i) = self.cur.and_then(|b| self.sect_end.get(&b)) {
+            let _ = write!(pp, "\u{1}{i}\u{1}");
+        }
         out.push_str("<w:p>");
         if !pp.is_empty() {
             let _ = write!(out, "<w:pPr>{pp}</w:pPr>");
@@ -627,7 +633,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
     // Notes are numbered in the file in anchor order, each kind from 1.
     let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000, targets: HashSet::new(), bookmark: 0 };
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
     // Paragraphs that fields refer to get bookmarks.
     for bl in doc.blocks.iter() {
         if let Some(p) = bl.as_para() {
@@ -661,12 +667,38 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         // Ends before starts at the same place: ranges don't touch.
         v.sort_by_key(|&(at, end, _)| (at, !end));
     }
+    // Sections: where each starts and its settings; each but the last ends
+    // in its last paragraph's `w:sectPr`, the last in the body's.
+    let n = doc.blocks.len();
+    let mut secs: Vec<(usize, Section)> = vec![(0, Section::default())];
+    for k in 0..n {
+        if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
+            if k == 0 {
+                secs[0].1 = x;
+            } else {
+                secs.push((k, x));
+            }
+        }
+    }
+    let mut sect_after_table: HashMap<usize, usize> = HashMap::new();
+    for i in 1..secs.len() {
+        let end = secs[i].0 - 1;
+        if doc.cell(end).is_some() {
+            sect_after_table.insert(secs[i].0, i - 1);
+        } else {
+            o.sect_end.insert(end, i - 1);
+        }
+    }
     let mut body = String::new();
     let mut b = 0;
-    let n = doc.blocks.len();
     while b < n {
         if doc.cell(b).is_some() {
             b = o.table(doc, b, &mut body);
+            if let Some(i) = sect_after_table.get(&b) {
+                // A section break needs a paragraph to hold it.
+                let _ = write!(body, "<w:p><w:pPr>\u{1}{i}\u{1}</w:pPr></w:p>");
+                continue;
+            }
             // Word needs a paragraph between two tables and after a last one.
             if b >= n || doc.cell(b).is_some() {
                 body.push_str("<w:p/>");
@@ -676,7 +708,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             b += 1;
         }
     }
-    let mut sect = String::from("<w:sectPr>");
+    let mut sect = String::new();
     let mut parts: Vec<(String, String)> = Vec::new();
     // Footnotes and endnotes, each part with its own relationships.
     let mut note_parts: Vec<(&str, String, String)> = Vec::new();
@@ -687,7 +719,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             continue;
         }
         ours.sort_unstable();
-        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0 };
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0, sect_end: HashMap::new() };
         let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
         // Lists in notes come out as plain paragraphs (the numbering part is the body's).
         for (n, id) in ours {
@@ -766,7 +798,32 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         }
     }
     let g = &doc.page;
-    let _ = write!(sect, r#"<w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{h}" w:footer="{h}" w:gutter="0"/></w:sectPr>"#, g.width, g.height, g.margin_top, g.margin_end, g.margin_bottom, g.margin_start, h = HEADER_FROM_EDGE);
+    let geo = format!(r#"<w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{h}" w:footer="{h}" w:gutter="0"/>"#, g.width, g.height, g.margin_top, g.margin_end, g.margin_bottom, g.margin_start, h = HEADER_FROM_EDGE);
+    // Every section names the header and footer (a first one without would
+    // have none).
+    let sect_pr = |x: &Section| {
+        let ty = match x.start {
+            SectionStart::NextPage => "",
+            SectionStart::Continuous => r#"<w:type w:val="continuous"/>"#,
+            SectionStart::OddPage => r#"<w:type w:val="oddPage"/>"#,
+            SectionStart::EvenPage => r#"<w:type w:val="evenPage"/>"#,
+        };
+        let cols = if x.columns > 1 || x.rule { format!(r#"<w:cols w:num="{}" w:space="{}"{}/>"#, x.columns, x.gap, if x.rule { r#" w:sep="1""# } else { "" }) } else { String::new() };
+        format!("<w:sectPr>{sect}{ty}{geo}{cols}</w:sectPr>")
+    };
+    if secs.len() > 1 {
+        // Text never holds U+0001 (escaped out), so the pieces alternate.
+        let mut filled = String::with_capacity(body.len());
+        for (j, piece) in body.split('\u{1}').enumerate() {
+            if j % 2 == 0 {
+                filled.push_str(piece);
+            } else if let Some((_, x)) = piece.parse::<usize>().ok().and_then(|i| secs.get(i)) {
+                filled.push_str(&sect_pr(x));
+            }
+        }
+        body = filled;
+    }
+    let sect = sect_pr(&secs[secs.len() - 1].1);
     let document = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W_NS} {DRAW_NS}><w:body>{body}{sect}</w:body></w:document>"#);
 
     // Settings: tracking on.

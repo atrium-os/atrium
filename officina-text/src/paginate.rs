@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::layout::{Fonts, LayoutCache, ParaLayout};
-use crate::model::{NoteId, NoteKind, TextDoc, OBJECT_CHAR};
+use crate::model::{NoteId, NoteKind, Section, SectionStart, TextDoc, OBJECT_CHAR};
 use crate::twips;
 use std::rc::Rc;
 
@@ -86,6 +86,8 @@ pub struct Page {
     /// Where the rules above the footnotes and above the endnotes go.
     pub foot_rule: Option<i64>,
     pub end_rule: Option<i64>,
+    /// Lines between columns: (x, top, bottom).
+    pub rules: Vec<(i64, i64, i64)>,
 }
 
 impl Page {
@@ -98,6 +100,12 @@ impl Page {
 }
 
 pub use crate::model::Edit;
+
+/// Where sections start in `doc`: (block, settings), in order (marks in
+/// table cells don't count).
+fn sections_of(doc: &TextDoc) -> Vec<(usize, Section)> {
+    doc.blocks.iter().enumerate().filter_map(|(i, b)| b.as_para().and_then(|p| p.props.section.filter(|_| p.props.cell.is_none()).map(|s| (i, s)))).collect()
+}
 
 /// Longest keep-with-next chain looked at; longer chains don't keep.
 const MAX_CHAIN: usize = 64;
@@ -119,6 +127,10 @@ pub struct Paginator {
     resume: Option<Checkpoint>,
     width: i64,
     height: i64,
+    /// The content width in twips (columns are fitted to it).
+    width_tw: i32,
+    /// Where sections start: (block, settings), in order.
+    sections: Vec<(usize, Section)>,
     /// Pages laid out since creation (for the gates).
     pub laid: u64,
 }
@@ -136,6 +148,8 @@ impl Paginator {
         let g = &doc.page;
         self.width = twips((g.width - g.margin_start - g.margin_end).max(720) as i64);
         self.height = twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64);
+        self.width_tw = (g.width - g.margin_start - g.margin_end).max(720);
+        self.sections = sections_of(doc);
         self.pages.clear();
         self.old.clear();
         self.resume = None;
@@ -151,6 +165,33 @@ impl Paginator {
     /// Column width in layout units, for laying paragraphs out.
     pub fn width(&self) -> i64 {
         self.width
+    }
+
+    /// The settings of the section block `b` is in.
+    pub fn section_at(&self, b: usize) -> Section {
+        let k = self.sections.partition_point(|s| s.0 <= b);
+        if k == 0 {
+            Section::default()
+        } else {
+            self.sections[k - 1].1
+        }
+    }
+
+    /// Whether block `b` starts a section.
+    fn starts_section(&self, b: usize) -> bool {
+        self.sections.binary_search_by_key(&b, |s| s.0).is_ok_and(|_| b > 0)
+    }
+
+    /// A section's columns as laid out: count, column width and gap (layout units).
+    fn columns(&self, s: &Section) -> (u8, i64, i64) {
+        let (n, gap) = s.fitted(self.width_tw);
+        let gap = twips(gap as i64);
+        (n, ((self.width - gap * (n as i64 - 1)) / n as i64).max(crate::LU), gap)
+    }
+
+    /// The width of the column block `b` is laid out in (layout units).
+    pub fn col_width(&self, b: usize) -> i64 {
+        self.columns(&self.section_at(b)).1
     }
     pub fn content_height(&self) -> i64 {
         self.height
@@ -173,6 +214,20 @@ impl Paginator {
     /// Records an edit: drops the pages from the one the edit can first change,
     /// keeping the rest to compare against.
     pub fn edit(&mut self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, e: Edit) {
+        // Sections changed: pages can't line up again before the end of the
+        // last section whose start or settings changed.
+        let section_change = {
+            let new = sections_of(doc);
+            let old_last = e.last as isize - e.delta;
+            // Old starts in new numbering (one inside the edit stays where it was).
+            let moved: Vec<(usize, Section)> = self.sections.iter().filter(|s| (s.0 as isize) < old_last.max(e.last as isize)).map(|&(b, x)| (if b as isize >= old_last { (b as isize + e.delta) as usize } else { b }, x)).chain(self.sections.iter().filter(|s| s.0 as isize >= old_last.max(e.last as isize)).map(|&(b, x)| ((b as isize + e.delta) as usize, x))).collect();
+            let changed = moved.iter().filter(|x| !new.contains(x)).chain(new.iter().filter(|x| !moved.contains(x))).map(|x| x.0).max();
+            self.sections = new;
+            match changed {
+                Some(at) => self.sections.iter().map(|s| s.0).find(|&b| b > at).unwrap_or(doc.blocks.len() + 1),
+                None => 0,
+            }
+        };
         // A paragraph that keeps with the next one breaks according to it, so
         // start from the head of the chain that leads into the edit.
         let mut c = e.first.min(doc.blocks.len());
@@ -204,7 +259,7 @@ impl Paginator {
         }
         self.old = self.pages.split_off(k.min(self.pages.len()));
         self.old_at = 0;
-        self.settle = e.last;
+        self.settle = e.last.max(section_change);
         self.delta = e.delta;
         self.resume = self.cursor.map(|c| Checkpoint { block: (c.block as isize + e.delta) as usize, line: c.line });
         self.cursor = Some(restart);
@@ -302,19 +357,21 @@ impl Paginator {
 
     fn layout(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, i: usize) -> Rc<ParaLayout> {
         let p = doc.para(i).expect("paragraph");
-        cache.get(doc, p, doc.block_box(i, self.width).1, fonts)
+        cache.get(doc, p, doc.block_box(i, self.col_width(i)).1, fonts)
     }
 
     /// Lays out the table row starting at block `b` at `y`; returns the slices,
     /// the cell boxes, the row's height and the block after it.
-    fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn row(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, b: usize, y: i64, x0: i64, col_w: i64) -> (Vec<Slice>, Vec<CellBox>, i64, usize) {
         let row = doc.row_range(b);
         let row = b..row.end.max(b + 1);
         let pad = twips(crate::model::CELL_PAD as i64);
         let mut slices = Vec::new();
         let mut boxes = Vec::new();
         let mut row_h = 0;
-        for (blocks, x, w) in doc.row_cells(row.clone(), self.width) {
+        for (blocks, x, w) in doc.row_cells(row.clone(), col_w) {
+            let x = x + x0;
             let mut yy = y + pad;
             let last = blocks.end - 1;
             for k in blocks {
@@ -487,43 +544,125 @@ impl Paginator {
     }
 
     /// Lays out the page starting at `start`; returns it and where the next starts.
+    ///
+    /// The page is filled in bands: each band is one section's columns, filled
+    /// one after another. A section that starts on the same page (continuous)
+    /// ends the band above it, whose columns are balanced first.
     fn page(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, start: Checkpoint) -> (Page, Option<Checkpoint>) {
         let full_h = self.height;
-        let n = doc.blocks.len();
-        let mut slices: Vec<Slice> = Vec::new();
-        let mut y = 0i64;
-        let (mut b, mut line) = (start.block, start.line);
-        let mut cells: Vec<CellBox> = Vec::new();
-        // Footnotes anchored on this page, and the height their area takes.
-        let mut foot: Vec<NoteId> = Vec::new();
-        let mut foot_h = 0i64;
-        let has_notes = !doc.notes.is_empty();
-        let done = |slices: Vec<Slice>, cells: Vec<CellBox>, y: i64, next: Option<Checkpoint>, foot: Vec<NoteId>, foot_h: i64, cache: &mut LayoutCache| {
-            let mut page = Page { start, slices, cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None };
-            self.place_footnotes(doc, cache, fonts, &mut page, &foot, foot_h);
+        let mut f = Fill::default();
+        let mut top = 0i64;
+        let mut cur = start;
+        let mut rules: Vec<(i64, i64, i64)> = Vec::new();
+        let finish = |f: Fill, y: i64, rules: Vec<(i64, i64, i64)>, next: Option<Checkpoint>, cache: &mut LayoutCache| {
+            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules };
+            self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
             (page, next)
         };
         loop {
-            let h = full_h - foot_h;
+            let sec = self.section_at(cur.block);
+            let (n, colw, gap) = self.columns(&sec);
+            let snapshot = (n > 1).then(|| f.clone());
+            let (stop, bottom) = self.band(doc, cache, fonts, &mut f, cur, top, full_h, n, colw, gap);
+            let mut bottom = bottom;
+            if let (Stop::Section(b2), Some(snap)) = (stop, &snapshot) {
+                if self.section_at(b2).start == SectionStart::Continuous && bottom > top {
+                    // Balance: the least height the band fits in.
+                    let fits = |h: i64, cache: &mut LayoutCache| {
+                        let mut g = snap.clone();
+                        let (st, bt) = self.band(doc, cache, fonts, &mut g, cur, top, top + h, n, colw, gap);
+                        (matches!(st, Stop::Section(x) if x == b2), g, bt)
+                    };
+                    let (mut lo, mut hi) = ((bottom - top) / n as i64, bottom - top);
+                    while hi - lo > crate::LU {
+                        let mid = (lo + hi) / 2;
+                        if fits(mid, cache).0 {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+                    let (ok, g, bt) = fits(hi, cache);
+                    if ok {
+                        f = g;
+                        bottom = bt;
+                    }
+                }
+            }
+            if sec.rule && n > 1 && bottom > top {
+                for c in 1..n as i64 {
+                    rules.push((c * (colw + gap) - gap / 2, top, bottom));
+                }
+            }
+            match stop {
+                Stop::Section(b2) if self.section_at(b2).start == SectionStart::Continuous && bottom < full_h - f.foot_h => {
+                    // The next section goes on under this one.
+                    top = bottom;
+                    cur = Checkpoint { block: b2, line: 0 };
+                }
+                Stop::Section(b2) | Stop::Break(b2) => return finish(f, bottom, rules, Some(Checkpoint { block: b2, line: 0 }), cache),
+                Stop::Full(next) => return finish(f, bottom, rules, Some(next), cache),
+                Stop::End(line) => {
+                    // The text has ended: endnotes, if any, follow it.
+                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules };
+                    let next = self.place_endnotes(doc, cache, fonts, &mut page, line, full_h - f.foot_h);
+                    self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
+                    return (page, next);
+                }
+            }
+        }
+    }
+
+    /// One band: `n` columns `colw` wide, `gap` apart, from `top` down to
+    /// `limit` (less the footnotes). Returns why it stopped and its bottom.
+    #[allow(clippy::too_many_arguments)]
+    fn band(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, f: &mut Fill, from: Checkpoint, top: i64, limit: i64, n: u8, colw: i64, gap: i64) -> (Stop, i64) {
+        let mut cur = from;
+        let mut bottom = top;
+        for c in 0..n as i64 {
+            let (stop, y) = self.column(doc, cache, fonts, f, cur, c * (colw + gap), colw, top, limit, from);
+            bottom = bottom.max(y);
+            match stop {
+                Stop::Full(next) if c + 1 < n as i64 => cur = next,
+                _ => return (stop, bottom),
+            }
+        }
+        unreachable!("the last column returns")
+    }
+
+    /// Fills one column from `from`, at `x`, `w` wide, from `top` down to
+    /// `limit` (less the footnotes); `band_start` is where the band began (a
+    /// section starting there doesn't stop it). Returns why it stopped and
+    /// how far down it got.
+    #[allow(clippy::too_many_arguments)]
+    fn column(&self, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, f: &mut Fill, from: Checkpoint, x: i64, w: i64, top: i64, limit: i64, band_start: Checkpoint) -> (Stop, i64) {
+        let full_h = self.height;
+        let n = doc.blocks.len();
+        let mut y = top;
+        let (mut b, mut line) = (from.block, from.line);
+        let has_notes = !doc.notes.is_empty();
+        let first_slice = f.slices.len();
+        loop {
+            let h = limit.min(full_h - f.foot_h);
             if b >= n {
-                // The text has ended: endnotes, if any, follow it.
-                let mut page = Page { start, slices, cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None };
-                let next = self.place_endnotes(doc, cache, fonts, &mut page, line, h);
-                self.place_footnotes(doc, cache, fonts, &mut page, &foot, foot_h);
-                return (page, next);
+                return (Stop::End(line), y);
+            }
+            let empty = f.slices.len() == first_slice;
+            if line == 0 && b != band_start.block && self.starts_section(b) {
+                return (Stop::Section(b), y);
             }
             if doc.cell(b).is_some() {
-                // A table row: whole, on this page if it fits (with its notes).
-                let (s, c, h_row, next) = self.row(doc, cache, fonts, b, y);
-                let new_notes: Vec<NoteId> = if has_notes { (b..next).flat_map(|k| self.footnotes_in(doc, k, None)).filter(|id| !foot.contains(id)).collect() } else { Vec::new() };
-                let add = self.notes_height(doc, cache, fonts, &new_notes, foot.is_empty());
-                if !slices.is_empty() && y + h_row + add > h {
-                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
+                // A table row: whole, in this column if it fits (with its notes).
+                let (s, c, h_row, next) = self.row(doc, cache, fonts, b, y, x, w);
+                let new_notes: Vec<NoteId> = if has_notes { (b..next).flat_map(|k| self.footnotes_in(doc, k, None)).filter(|id| !f.foot.contains(id)).collect() } else { Vec::new() };
+                let add = self.notes_height(doc, cache, fonts, &new_notes, f.foot.is_empty());
+                if !empty && y + h_row + add > h {
+                    return (Stop::Full(Checkpoint { block: b, line: 0 }), y);
                 }
-                foot.extend(new_notes);
-                foot_h += add;
-                slices.extend(s);
-                cells.extend(c);
+                f.foot.extend(new_notes);
+                f.foot_h += add;
+                f.slices.extend(s);
+                f.cells.extend(c);
                 y += h_row;
                 b = next;
                 line = 0;
@@ -534,18 +673,18 @@ impl Paginator {
                 continue;
             }
             let l = self.layout(doc, cache, fonts, b);
-            let top = slices.is_empty();
-            if line == 0 && !top {
-                if l.format.page_break_before {
-                    return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
-                }
+            let page_empty = f.slices.is_empty();
+            if line == 0 && !page_empty && l.format.page_break_before {
+                return (Stop::Break(b), y);
+            }
+            if line == 0 && !empty {
                 if let Some(need) = self.keep_need(doc, cache, fonts, b) {
-                    if y + l.space_before + need > h && need <= h {
-                        return done(slices, cells, y, Some(Checkpoint { block: b, line: 0 }), foot, foot_h, cache);
+                    if y + l.space_before + need > h && need <= h - top {
+                        return (Stop::Full(Checkpoint { block: b, line: 0 }), y);
                     }
                 }
             }
-            if line == 0 && !top {
+            if line == 0 && !empty {
                 y += l.space_before;
             }
             let total = l.lines.len();
@@ -557,16 +696,16 @@ impl Paginator {
             let mut room = h;
             while li < total {
                 if notes_here {
-                    let new_notes: Vec<NoteId> = self.footnotes_in(doc, b, Some(&l.lines[li])).into_iter().filter(|id| !foot.contains(id)).collect();
-                    let add = self.notes_height(doc, cache, fonts, &new_notes, foot.is_empty());
+                    let new_notes: Vec<NoteId> = self.footnotes_in(doc, b, Some(&l.lines[li])).into_iter().filter(|id| !f.foot.contains(id)).collect();
+                    let add = self.notes_height(doc, cache, fonts, &new_notes, f.foot.is_empty());
                     // Alone on an empty page, a line goes with its notes even if they don't fit.
-                    let alone = slices.is_empty() && li == l0;
+                    let alone = page_empty && li == l0;
                     if yy + l.lines[li].height + add > room && !alone {
                         break;
                     }
-                    foot.extend(new_notes);
-                    foot_h += add;
-                    room = full_h - foot_h;
+                    f.foot.extend(new_notes);
+                    f.foot_h += add;
+                    room = limit.min(full_h - f.foot_h);
                 } else if yy + l.lines[li].height > room {
                     break;
                 }
@@ -574,7 +713,7 @@ impl Paginator {
                 li += 1;
             }
             if li == total {
-                slices.push(Slice { block: b, lines: l0..li, y: y0, x: 0, w: self.width });
+                f.slices.push(Slice { block: b, lines: l0..li, y: y0, x, w });
                 y = yy + l.space_after;
                 b += 1;
                 line = 0;
@@ -592,31 +731,54 @@ impl Paginator {
                 cut = cut.max(l0);
             }
             if cut == l0 {
-                if !top {
-                    // The paragraph starts on the next page, with its notes.
+                if !empty || (!page_empty && limit < full_h) {
+                    // The paragraph starts in the next column, with its notes.
                     if notes_here {
                         let moved: Vec<NoteId> = (l0..li).flat_map(|k| self.footnotes_in(doc, b, Some(&l.lines[k]))).collect();
-                        foot.retain(|id| !moved.contains(id));
-                        foot_h = if foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &foot, true) };
+                        f.foot.retain(|id| !moved.contains(id));
+                        f.foot_h = if f.foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &f.foot, true) };
                     }
-                    return done(slices, cells, y - if l0 == 0 { l.space_before } else { 0 }, Some(Checkpoint { block: b, line: l0 }), foot, foot_h, cache);
+                    return (Stop::Full(Checkpoint { block: b, line: l0 }), y - if l0 == 0 && !empty { l.space_before } else { 0 });
                 }
-                // Alone on an empty page it must break somewhere.
+                // Alone in an empty column it must break somewhere.
                 cut = li.max(l0 + 1);
             }
             let used: i64 = l.lines[l0..cut].iter().map(|x| x.height).sum();
-            slices.push(Slice { block: b, lines: l0..cut, y: y0, x: 0, w: self.width });
-            // Notes of lines that moved to the next page go with them.
+            f.slices.push(Slice { block: b, lines: l0..cut, y: y0, x, w });
+            // Notes of lines that moved to the next column go with them.
             if notes_here && cut < li {
                 let moved: Vec<NoteId> = (cut..li).flat_map(|k| self.footnotes_in(doc, b, Some(&l.lines[k]))).collect();
                 if !moved.is_empty() {
-                    foot.retain(|id| !moved.contains(id));
-                    foot_h = if foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &foot, true) };
+                    f.foot.retain(|id| !moved.contains(id));
+                    f.foot_h = if f.foot.is_empty() { 0 } else { self.notes_height(doc, cache, fonts, &f.foot, true) };
                 }
             }
-            return done(slices, cells, y0 + used, Some(Checkpoint { block: b, line: cut }), foot, foot_h, cache);
+            return (Stop::Full(Checkpoint { block: b, line: cut }), y0 + used);
         }
     }
+}
+
+/// What a page holds so far.
+#[derive(Clone, Default)]
+struct Fill {
+    slices: Vec<Slice>,
+    cells: Vec<CellBox>,
+    /// Footnotes anchored on the page, and the height their area takes.
+    foot: Vec<NoteId>,
+    foot_h: i64,
+}
+
+/// Why a column stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// Full: the next column (or page) starts here.
+    Full(Checkpoint),
+    /// Block `b` starts a section.
+    Section(usize),
+    /// Block `b` has a page break before it.
+    Break(usize),
+    /// The text has ended (endnote line to go on from).
+    End(usize),
 }
 
 #[cfg(test)]
@@ -900,6 +1062,109 @@ mod tests {
             }
             let _ = round;
         }
+    }
+
+    fn sec(columns: u8, start: SectionStart) -> Option<Section> {
+        Some(Section { start, columns, gap: 200, rule: true })
+    }
+
+    fn set_section(d: &mut TextDoc, b: usize, s: Option<Section>) {
+        d.blocks.update(b, |x| x.as_para_mut().unwrap().props.section = s);
+    }
+
+    #[test]
+    fn columns_fill_side_by_side_then_the_next_page() {
+        let mut d = doc_with(&[3; 20], 10);
+        set_section(&mut d, 0, sec(2, SectionStart::NextPage));
+        let (p, mut c) = all(&d);
+        let pg = &p.pages()[0];
+        let xs: Vec<i64> = pg.slices.iter().map(|s| s.x).collect();
+        assert!(xs[0] == 0 && xs.iter().any(|&x| x > 0), "{xs:?}");
+        // In order: column one then column two, each at most the page high.
+        let w = pg.slices[0].w;
+        assert!(w < p.width() / 2);
+        assert!(pg.slices.windows(2).all(|s| s[0].x <= s[1].x));
+        let lines: usize = pg.slices.iter().map(|s| s.lines.len()).sum();
+        assert!(lines > 10 && lines <= 20, "two columns of up to ten lines: {lines}");
+        assert_eq!(pg.rules.len(), 1);
+        // Every line of the document once, in order.
+        let mut seen = Vec::new();
+        for pg in p.pages() {
+            for s in &pg.slices {
+                for l in s.lines.clone() {
+                    seen.push((s.block, l));
+                }
+            }
+        }
+        let want: Vec<(usize, usize)> = (0..20).flat_map(|b| (0..p.layout(&d, &mut c, &FixedFonts, b).lines.len()).map(move |l| (b, l))).collect();
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn a_continuous_section_balances_the_columns_above_it() {
+        let mut d = doc_with(&[1; 30], 40);
+        set_section(&mut d, 0, sec(3, SectionStart::NextPage));
+        set_section(&mut d, 12, sec(1, SectionStart::Continuous));
+        let (p, _) = all(&d);
+        let pg = &p.pages()[0];
+        let band: Vec<&Slice> = pg.slices.iter().filter(|s| s.block < 12).collect();
+        let mut per_col: Vec<(i64, usize)> = Vec::new();
+        for s in &band {
+            match per_col.iter_mut().find(|c| c.0 == s.x) {
+                Some(c) => c.1 += s.lines.len(),
+                None => per_col.push((s.x, s.lines.len())),
+            }
+        }
+        let n: Vec<usize> = per_col.iter().map(|c| c.1).collect();
+        assert_eq!(n.len(), 3, "{n:?}");
+        assert!(n.iter().max().unwrap() - n.iter().min().unwrap() <= 2, "balanced: {n:?}");
+        let bottom = band.iter().map(|s| s.y + 809 * s.lines.len() as i64).max().unwrap();
+        let next = pg.slices.iter().find(|s| s.block == 12).unwrap();
+        assert!(next.x == 0 && next.y >= bottom && next.w == p.width(), "{next:?}");
+        // A next-page section starts a page.
+        set_section(&mut d, 20, sec(2, SectionStart::NextPage));
+        let (p, _) = all(&d);
+        assert_eq!(p.pages()[1].start, Checkpoint { block: 20, line: 0 });
+    }
+
+    #[test]
+    fn random_edits_with_sections_match_full_pagination() {
+        let paras: Vec<usize> = (0..90).map(|i| 1 + (i * 5) % 7).collect();
+        let mut d = doc_with(&paras, 12);
+        let (mut p, mut c) = all(&d);
+        let mut x: u64 = 0x51ce_7105;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for _ in 0..300 {
+            let len = d.blocks.len();
+            let b = rnd(len as u64) as usize;
+            match rnd(5) {
+                0 | 1 => {
+                    let k = rnd(90) as usize;
+                    let ins = crate::ops::Fragment { text: "w ".repeat(k / 2) + "v", runs: vec![(0, 0)] };
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Splice { block: b as u32, at: 0, del: 0, ins }, Edit { first: b, last: b + 1, delta: 0 });
+                }
+                2 => {
+                    let id = d.new_id();
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Split { block: b as u32, at: 0, id, style: 0, props: Default::default() }, Edit { first: b, last: b + 2, delta: 1 });
+                }
+                3 if b + 1 < len => {
+                    check_edit(&mut d, &mut p, &mut c, TextOp::Join { block: b as u32 }, Edit { first: b, last: b + 1, delta: -1 });
+                }
+                _ => {
+                    let mut props = d.para(b).unwrap().props.clone();
+                    let start = [SectionStart::NextPage, SectionStart::Continuous][rnd(2) as usize];
+                    props.section = if rnd(3) == 0 { None } else { sec(1 + rnd(3) as u8, start) };
+                    let style = d.para(b).unwrap().style;
+                    check_edit(&mut d, &mut p, &mut c, TextOp::SetPara { block: b as u32, style, props }, Edit { first: b, last: b + 1, delta: 0 });
+                }
+            }
+        }
+        assert!(p.pages().iter().any(|pg| pg.slices.iter().any(|s| s.x > 0)), "columns were used");
     }
 
     /// Footnotes on the anchor's page, endnotes after the text, labels in

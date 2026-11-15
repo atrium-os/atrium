@@ -15,7 +15,7 @@ use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Section, SectionStart, MAX_COLUMNS, Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::model::{RevId, Revision};
 use officina_text::track::{Change, ChangeKind, Edit, Resolve};
@@ -78,6 +78,10 @@ enum Kind {
 /// Time spent repaginating after an edit before handing back (the rest runs
 /// in later frames).
 pub const SETTLE: Duration = Duration::from_millis(4);
+
+/// How far beside a text column a click still lands in it (half the usual
+/// gap between columns, layout units).
+const COL_SLOP: i64 = officina_text::LU * 18;
 
 /// Where a position is drawn: the page, and its x, top and height in layout
 /// units from the page's content box.
@@ -235,7 +239,7 @@ impl Editor {
 
     pub fn layout(&mut self, block: usize) -> Rc<ParaLayout> {
         let p = self.doc.para(block).expect("block in range");
-        let w = self.doc.block_box(block, self.pages.width()).1;
+        let w = self.doc.block_box(block, self.pages.col_width(block)).1;
         self.cache.get(&self.doc, p, w, &*self.fonts)
     }
 
@@ -874,7 +878,7 @@ impl Editor {
         let (px_w, px_h) = (img.width as i64, img.height as i64);
         let mut w = px_w * 15;
         let mut h = px_h * 15;
-        let fit_w = (self.pages.width() * 20 / officina_text::LU).min(MAX_OBJECT_TWIPS as i64).max(20);
+        let fit_w = (self.pages.col_width(self.caret.block) * 20 / officina_text::LU).min(MAX_OBJECT_TWIPS as i64).max(20);
         let fit_h = (self.pages.content_height() * 20 / officina_text::LU * 9 / 10).min(MAX_OBJECT_TWIPS as i64).max(20);
         if w > fit_w {
             h = h * fit_w / w;
@@ -935,6 +939,7 @@ impl Editor {
             if i + 1 < parts.len() {
                 let (style, mut props) = self.doc.para(start.block).map(|q| (q.style, q.props.clone())).unwrap_or_default();
                 props.rev = rev;
+                props.section = None;
                 let id = self.doc.new_id();
                 ops.push(TextOp::Split { block: p.block as u32, at: p.at, id, style, props });
                 p = Pos::new(p.block + 1, 0);
@@ -966,6 +971,8 @@ impl Editor {
         let style = if at_end { self.doc.styles.styles.get(p.style as usize).and_then(|s| s.next).unwrap_or(p.style) } else { p.style };
         let mut props = if at_end && style != p.style { ParaProps::default() } else { p.props.clone() };
         props.rev = None;
+        // A section starts once: the new paragraph is inside it.
+        props.section = None;
         if let Some((rev, rops)) = track {
             props.rev = Some(rev);
             ops.extend(rops);
@@ -1386,6 +1393,67 @@ impl Editor {
         self.set_page("Page Numbers", page, header, footer);
     }
 
+    // ---- sections ----
+
+    /// The block starting the section the caret is in (0 for the first).
+    pub fn section_start(&self, b: usize) -> usize {
+        (0..=b.min(self.blocks().saturating_sub(1))).rev().find(|&k| self.doc.para(k).is_some_and(|p| p.props.section.is_some() && p.props.cell.is_none())).unwrap_or(0)
+    }
+
+    /// The settings of the section the caret is in.
+    pub fn section(&self) -> Section {
+        self.pages.section_at(self.caret.block)
+    }
+
+    /// Starts a new section at the caret: the paragraph splits there (unless
+    /// the caret is at its start, outside the first paragraph) and the second
+    /// part begins a section starting `start`, with the columns of the one
+    /// it was in. In a table, nothing.
+    pub fn insert_section_break(&mut self, start: SectionStart) -> bool {
+        if self.doc.cell(self.caret.block).is_some() {
+            return false;
+        }
+        let (mut ops, p) = self.delete_selection_ops();
+        let cur = Section { start, ..self.section() };
+        let at_start = p.at == 0 && p.block > 0 && self.doc.para(p.block).is_some_and(|q| q.props.section.is_none());
+        let b = if at_start {
+            let q = self.doc.para(p.block).expect("in range");
+            let mut props = q.props.clone();
+            props.section = Some(cur);
+            ops.push(TextOp::SetPara { block: p.block as u32, style: q.style, props });
+            p.block
+        } else {
+            let q = self.doc.para(p.block).expect("in range");
+            let (style, mut props) = (q.style, q.props.clone());
+            props.section = Some(cur);
+            props.rev = None;
+            let id = self.doc.new_id();
+            ops.push(TextOp::Split { block: p.block as u32, at: p.at, id, style, props });
+            p.block + 1
+        };
+        self.apply("Section Break", ops, Kind::Other);
+        self.set_caret(Pos::new(b, 0), false);
+        true
+    }
+
+    /// Sets the columns of the caret's section (`gap` twips, `rule` a line
+    /// between). The first section gets its settings on the first paragraph.
+    pub fn set_columns(&mut self, columns: u8, rule: bool) -> bool {
+        let k = self.section_start(self.caret.block);
+        let Some(q) = self.doc.para(k) else { return false };
+        let old = q.props.section;
+        let base = old.unwrap_or_default();
+        let new = Section { columns: columns.clamp(1, MAX_COLUMNS), rule, ..base };
+        if old == Some(new) || (old.is_none() && new == Section::default()) {
+            return false;
+        }
+        let mut props = q.props.clone();
+        props.section = Some(new);
+        let op = TextOp::SetPara { block: k as u32, style: q.style, props };
+        self.apply("Columns", vec![op], Kind::Other);
+        true
+    }
+
     // ---- tables ----
 
     /// The blocks of the table holding block `b`.
@@ -1418,7 +1486,7 @@ impl Editor {
 
     /// The cells of the row holding `b`, and which of them holds `b`.
     fn cells_of(&self, b: usize) -> (Vec<(std::ops::Range<usize>, i64, i64)>, usize) {
-        let cells = self.doc.row_cells(self.doc.row_range(b), self.pages.width());
+        let cells = self.doc.row_cells(self.doc.row_range(b), self.pages.col_width(b));
         let k = cells.iter().position(|c| c.0.contains(&b)).unwrap_or(0);
         (cells, k)
     }
@@ -1441,7 +1509,7 @@ impl Editor {
             return false;
         }
         let table = self.doc.blocks.iter().filter_map(|x| x.as_para().and_then(|p| p.props.cell)).map(|c| c.table).max().map_or(1, |t| t.wrapping_add(1).max(1));
-        let width = ((self.pages.width() * 20 / officina_text::LU) as u32 / cols as u32).clamp(1, MAX_OBJECT_TWIPS);
+        let width = ((self.pages.col_width(self.caret.block) * 20 / officina_text::LU) as u32 / cols as u32).clamp(1, MAX_OBJECT_TWIPS);
         let mut blocks = Vec::with_capacity(rows * cols + 1);
         for r in 0..rows {
             for c in 0..cols {
@@ -1489,7 +1557,7 @@ impl Editor {
         let mut caret = None;
         let mut shift = 0;
         for row in self.table_rows(b).into_iter().rev() {
-            let cells = self.doc.row_cells(row.clone(), self.pages.width());
+            let cells = self.doc.row_cells(row.clone(), self.pages.col_width(row.start));
             if cells.len() >= MAX_CELLS {
                 continue;
             }
@@ -1553,7 +1621,7 @@ impl Editor {
         let mut ops = Vec::new();
         let mut removed = 0;
         for row in self.table_rows(b).into_iter().rev() {
-            let cells = self.doc.row_cells(row.clone(), self.pages.width());
+            let cells = self.doc.row_cells(row.clone(), self.pages.col_width(row.start));
             if cells.len() == 1 {
                 ops.push(TextOp::Remove { at: row.start as u32, n: row.len() as u32 });
                 removed += row.len();
@@ -1846,20 +1914,20 @@ impl Editor {
             }
             if !down && self.doc.cell(near).is_some() {
                 // Into a table from below: its last row's first cell.
-                let cells = self.doc.row_cells(self.doc.row_range(near), self.pages.width());
+                let cells = self.doc.row_cells(self.doc.row_range(near), self.pages.col_width(near));
                 return Some(last_line(self, cells[0].0.end - 1));
             }
             return Some(if down { (near, 0) } else { last_line(self, near) });
         };
         let row = self.doc.row_range(blk);
-        let cells = self.doc.row_cells(row.clone(), self.pages.width());
+        let cells = self.doc.row_cells(row.clone(), self.pages.col_width(row.start));
         let k = cells.iter().position(|x| x.0.contains(&blk)).unwrap_or(0);
         let beyond = if down { row.end } else { row.start.wrapping_sub(1) };
         if beyond >= n {
             return None;
         }
         if self.doc.cell(beyond).is_some_and(|d| d.table == c.table) {
-            let other = self.doc.row_cells(self.doc.row_range(beyond), self.pages.width());
+            let other = self.doc.row_cells(self.doc.row_range(beyond), self.pages.col_width(beyond));
             let cell = other[k.min(other.len() - 1)].0.clone();
             return Some(if down { (cell.start, 0) } else { last_line(self, cell.end - 1) });
         }
@@ -1886,7 +1954,7 @@ impl Editor {
         self.ensure_paginated(p, li);
         let page = self.pages.page_of(p.block, li);
         let mut y = 0;
-        let mut x0 = self.doc.block_box(p.block, self.pages.width()).0;
+        let mut x0 = self.doc.block_box(p.block, self.pages.col_width(p.block)).0;
         if let Some(pg) = self.pages.pages().get(page) {
             if let Some(s) = pg.slices.iter().find(|s| s.block == p.block && s.lines.contains(&li)) {
                 y = s.y + l.lines[s.lines.start..li].iter().map(|x| x.height).sum::<i64>();
@@ -1911,6 +1979,10 @@ impl Editor {
         'outer: for s in &pg.slices {
             if self.doc.cell(s.block).is_some() && (x < s.x - pad || x >= s.x + s.w + pad) {
                 // Another column of the table.
+                continue;
+            }
+            if self.doc.cell(s.block).is_none() && (x < s.x - COL_SLOP || x >= s.x + s.w + COL_SLOP) && pg.slices.iter().any(|t| t.x != s.x && self.doc.cell(t.block).is_none() && x >= t.x - COL_SLOP && x < t.x + t.w + COL_SLOP) {
+                // Another text column holds x.
                 continue;
             }
             let l = self.layout(s.block);
@@ -2071,6 +2143,45 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn section_breaks_and_columns_undo_and_hit() {
+        let paras: Vec<String> = (0..60).map(|i| format!("{i} {}", "words in a column ".repeat(6))).collect();
+        let refs: Vec<&str> = paras.iter().map(|s| s.as_str()).collect();
+        let mut e = ed(&refs);
+        e.start_log();
+        assert!(e.paginate(Duration::from_secs(10)));
+        let before = e.pages.pages().len();
+        // Two columns from paragraph 10 on, starting on a new page.
+        e.set_caret(Pos::new(10, 0), false);
+        assert!(e.insert_section_break(SectionStart::NextPage));
+        assert_eq!(e.blocks(), 60, "at a paragraph's start it marks that paragraph");
+        assert!(e.set_columns(2, true));
+        assert!(e.paginate(Duration::from_secs(10)));
+        let k = e.pages.page_of(10, 0);
+        assert_eq!(e.pages.pages()[k].start, officina_text::paginate::Checkpoint { block: 10, line: 0 });
+        let pg = e.pages.pages()[k].clone();
+        let right = pg.slices.iter().find(|s| s.x > 0).expect("a second column").clone();
+        // A click in the second column lands there.
+        let hit = e.hit(k, right.x + 100, right.y + 10);
+        assert_eq!(hit.block, right.block);
+        // Enter inside the section doesn't start another.
+        e.set_caret(Pos::new(10, 3), false);
+        e.new_paragraph();
+        assert!(e.doc.para(11).unwrap().props.section.is_none());
+        // A break mid-paragraph splits it.
+        e.set_caret(Pos::new(30, 4), false);
+        assert!(e.insert_section_break(SectionStart::Continuous));
+        assert_eq!(e.doc.para(31).unwrap().props.section.map(|s| (s.start, s.columns)), Some((SectionStart::Continuous, 2)));
+        assert!(e.set_columns(1, false));
+        assert!(e.paginate(Duration::from_secs(10)));
+        for _ in 0..5 {
+            e.undo();
+        }
+        assert!(e.paginate(Duration::from_secs(10)));
+        assert!(e.doc.blocks.iter().all(|b| b.as_para().unwrap().props.section.is_none()));
+        assert_eq!(e.pages.pages().len(), before);
     }
 
     #[test]

@@ -634,6 +634,54 @@ pub struct ParaProps {
     /// An entry of a generated table of contents, for a heading of this level
     /// (Update Table of Contents replaces the run of them).
     pub toc: Option<u8>,
+    /// The paragraph starts a section with these settings (never from a
+    /// style). On the first paragraph it sets the first section's columns.
+    pub section: Option<Section>,
+}
+
+/// How a section begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SectionStart {
+    #[default]
+    NextPage,
+    /// On the same page, under the section before (whose columns are balanced).
+    Continuous,
+    /// On the next odd (or even) numbered page, leaving one blank if needed.
+    OddPage,
+    EvenPage,
+}
+
+/// A section's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Section {
+    pub start: SectionStart,
+    /// 1 to [`MAX_COLUMNS`] columns of equal width.
+    pub columns: u8,
+    /// Between columns, twips.
+    pub gap: i32,
+    /// A line between columns.
+    pub rule: bool,
+}
+
+impl Default for Section {
+    fn default() -> Self {
+        Section { start: SectionStart::NextPage, columns: 1, gap: 720, rule: false }
+    }
+}
+
+pub const MAX_COLUMNS: u8 = 16;
+
+impl Section {
+    /// Columns and gap as laid out: at least one, and each column at least
+    /// a quarter inch wide in `width` (twips).
+    pub fn fitted(&self, width: i32) -> (u8, i32) {
+        let gap = self.gap.clamp(0, 2880);
+        let mut n = self.columns.clamp(1, MAX_COLUMNS);
+        while n > 1 && (width - gap * (n as i32 - 1)) / (n as i32) < 360 {
+            n -= 1;
+        }
+        (n, if n == 1 { 0 } else { gap })
+    }
 }
 
 /// A tab stop.

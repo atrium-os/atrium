@@ -103,7 +103,8 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
 
     for s in &page.slices {
         let Some(p) = doc.para(s.block) else { continue };
-        let w = doc.block_box(s.block, col_w).1;
+        // The width the slice was laid out in (its column's, a cell's inside).
+        let w = s.w;
         let l = cache.get(doc, p, w, fonts);
         let left = mx + s.x;
         if s.lines.start == 0 {
@@ -116,6 +117,11 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
             line(&mut out, doc, fonts, &l, li, &p.text, left, my + ly, Some(s.block));
             ly += l.lines[li].height;
         }
+    }
+
+    // Lines between columns.
+    for &(x, top, bottom) in &page.rules {
+        out.push(Item::Rect { x: mx + x - RULE / 2, y: my + top, w: RULE, h: (bottom - top).max(RULE), color: RULE_COLOR });
     }
 
     // Footnotes at the foot, endnotes after the text: a short rule above

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Section, SectionStart, MAX_COLUMNS, Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -277,7 +277,7 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         }
     }
     // Bit 15: a second mask follows (tab stops, table of contents entry).
-    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1;
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -356,6 +356,17 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     if let Some(l) = p.toc {
         w.u8(l);
     }
+    if let Some(x) = p.section {
+        w.u8(match x.start {
+            SectionStart::NextPage => 0,
+            SectionStart::Continuous => 1,
+            SectionStart::OddPage => 2,
+            SectionStart::EvenPage => 3,
+        });
+        w.u8(x.columns);
+        w.ivar(x.gap as i64);
+        w.u8(x.rule as u8);
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -364,7 +375,7 @@ const MAX_TWIPS: i64 = 31_680;
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 2 != 0 || (m >> 15 != 0 && ext == 0) {
+    if ext >> 3 != 0 || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -470,6 +481,26 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     }
     if ext & 2 != 0 {
         p.toc = Some(r.u8()?.clamp(1, 9));
+    }
+    if ext & 4 != 0 {
+        let start = match r.u8()? {
+            0 => SectionStart::NextPage,
+            1 => SectionStart::Continuous,
+            2 => SectionStart::OddPage,
+            3 => SectionStart::EvenPage,
+            _ => return Err(WireError::Invalid("section start")),
+        };
+        let columns = r.u8()?;
+        if !(1..=MAX_COLUMNS).contains(&columns) {
+            return Err(WireError::Invalid("columns"));
+        }
+        let gap = r.ivar()?.clamp(0, 2880) as i32;
+        let rule = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::Invalid("flag")),
+        };
+        p.section = Some(Section { start, columns, gap, rule });
     }
     Ok(p)
 }
@@ -1339,6 +1370,7 @@ mod tests {
         }
         d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
         d.blocks.update(4, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 2, row: 7, col: 1, width: 2000 }));
+        d.blocks.update(9, |b| b.as_para_mut().unwrap().props.section = Some(Section { start: SectionStart::Continuous, columns: 3, gap: 400, rule: true }));
         d.page.margin_start = 1000;
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });

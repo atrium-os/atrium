@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -163,8 +163,12 @@ fn ref_name(id: BlockId) -> String {
 
 /// What a paragraph's automatic style holds: its direct properties and the
 /// formatting of an empty paragraph.
-fn para_key(p: &ParaProps) -> ParaProps {
-    ParaProps { list: None, cell: None, outline_level: None, ..p.clone() }
+/// A section starting on a new page (but the first) starts the master page
+/// again at its first paragraph, as LibreOffice has Word's section breaks
+/// (its columns go on the `text:section`); `section` stands for that.
+fn para_key(p: &ParaProps, first: bool) -> ParaProps {
+    let new_page = p.section.is_some_and(|s| s.start != SectionStart::Continuous) && !first;
+    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(Section::default), ..p.clone() }
 }
 
 struct Out<'a> {
@@ -204,18 +208,19 @@ fn annotation_name(id: CommentId) -> String {
 
 impl Out<'_> {
     fn para_style(&mut self, style: u16, p: &ParaProps) -> String {
-        let key = (style, para_key(p));
+        let key = (style, para_key(p, self.cur == Some(0)));
         if let Some(n) = self.para_styles.get(&key) {
             return n.clone();
         }
         let base = self.doc.styles.para_format(style, p).0.indent_start.max(0);
         let body = para_props(&key.1, base);
-        if body.is_empty() {
+        if body.is_empty() && key.1.section.is_none() {
             return self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         }
         let n = format!("P{}", self.para_styles.len() + 1);
         let parent = self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
-        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}">{body}</style:style>"#, esc(&parent));
+        let master = if key.1.section.is_some() { r#" style:master-page-name="Section_20_Page""# } else { "" };
+        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}"{master}>{body}</style:style>"#, esc(&parent));
         self.para_styles.insert(key, n.clone());
         n
     }
@@ -362,7 +367,7 @@ impl Out<'_> {
                 Some((_, s, p)) if k > 0 => (*s, p.clone()),
                 _ => (style, ParaProps::default()),
             };
-            let name = self.para_style(st, &para_key(&props));
+            let name = self.para_style(st, &para_key(&props, true));
             let _ = write!(content, r#"<text:p text:style-name="{}">"#, esc(&name));
             for (i, &(rs, ra)) in piece.runs.iter().enumerate() {
                 let re = piece.runs.get(i + 1).map_or(piece.text.len() as u32, |r| r.0);
@@ -713,29 +718,55 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     }
     let mut body = String::new();
     let n = doc.blocks.len();
-    let mut b = 0;
-    while b < n {
-        if doc.cell(b).is_some() {
-            b = o.table(b, &mut body);
-        } else if doc.para(b).and_then(|p| p.props.list.flatten()).is_some() {
-            b = o.list(b, n, &mut body);
-        } else if doc.para(b).is_some_and(|p| p.props.toc.is_some()) {
-            // A table of contents: its run of entries as the index body.
-            let mut end = b;
-            let mut depth = 3;
-            while let Some(l) = doc.para(end).filter(|p| p.props.cell.is_none() && p.props.list.flatten().is_none()).and_then(|p| p.props.toc) {
-                depth = depth.max(l.min(9));
-                end += 1;
+    // Sections with columns go out as `text:section`s; a section ends where
+    // the next starts (lists and contents break there too).
+    let mut secs: Vec<(usize, Section)> = vec![(0, Section::default())];
+    for k in 0..n {
+        if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
+            if k == 0 {
+                secs[0].1 = x;
+            } else {
+                secs.push((k, x));
             }
-            let _ = write!(body, r#"<text:table-of-content text:protected="true" text:name="Table of Contents{}"><text:table-of-content-source text:outline-level="{depth}" text:use-index-marks="false"/><text:index-body>"#, b + 1);
-            for k in b..end.max(b + 1) {
-                o.para(k, &mut body);
+        }
+    }
+    for (i, &(from, x)) in secs.iter().enumerate() {
+        let to = secs.get(i + 1).map_or(n, |s| s.0);
+        let next_continuous = secs.get(i + 1).is_some_and(|s| s.1.start == SectionStart::Continuous);
+        let wrap = x.columns > 1 || x.rule;
+        if wrap {
+            let sep = if x.rule { r##"<style:column-sep style:width="0.0071in" style:color="#000000" style:height="100%" style:vertical-align="top"/>"## } else { "" };
+            // Columns balance only above a continuous break, as on screen.
+            let _ = write!(o.auto, r#"<style:style style:name="Sect{i}" style:family="section"><style:section-properties text:dont-balance-text-columns="{}"><style:columns fo:column-count="{}" fo:column-gap="{}">{sep}</style:columns></style:section-properties></style:style>"#, !next_continuous, x.columns, pt(x.gap as i64));
+            let _ = write!(body, r#"<text:section text:style-name="Sect{i}" text:name="Section{}">"#, i + 1);
+        }
+        let mut b = from;
+        while b < to {
+            if doc.cell(b).is_some() {
+                b = o.table(b, &mut body);
+            } else if doc.para(b).and_then(|p| p.props.list.flatten()).is_some() {
+                b = o.list(b, to, &mut body);
+            } else if doc.para(b).is_some_and(|p| p.props.toc.is_some()) {
+                // A table of contents: its run of entries as the index body.
+                let mut end = b;
+                let mut depth = 3;
+                while let Some(l) = doc.para(end).filter(|p| end < to && p.props.cell.is_none() && p.props.list.flatten().is_none()).and_then(|p| p.props.toc) {
+                    depth = depth.max(l.min(9));
+                    end += 1;
+                }
+                let _ = write!(body, r#"<text:table-of-content text:protected="true" text:name="Table of Contents{}"><text:table-of-content-source text:outline-level="{depth}" text:use-index-marks="false"/><text:index-body>"#, b + 1);
+                for k in b..end.max(b + 1) {
+                    o.para(k, &mut body);
+                }
+                body += "</text:index-body></text:table-of-content>";
+                b = end.max(b + 1);
+            } else {
+                o.para(b, &mut body);
+                b += 1;
             }
-            body += "</text:index-body></text:table-of-content>";
-            b = end.max(b + 1);
-        } else {
-            o.para(b, &mut body);
-            b += 1;
+        }
+        if wrap {
+            body += "</text:section>";
         }
     }
     // Named styles.
@@ -803,6 +834,12 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         }
     }
     master += "</style:master-page>";
+    // The same page again for sections on a new page: LibreOffice keeps a
+    // change of master page as a section break, not a return to the same one.
+    if o.para_styles.keys().any(|k| k.1.section.is_some()) {
+        let again = master.replacen(r#"style:name="Standard""#, r#"style:name="Section_20_Page" style:display-name="Section Page" style:next-style-name="Section_20_Page""#, 1);
+        master += &again;
+    }
     let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let tracked = if o.regions.is_empty() && !doc.tracking {

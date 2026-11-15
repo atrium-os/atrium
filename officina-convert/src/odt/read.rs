@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -208,6 +208,22 @@ fn para_props(e: &El) -> ParaProps {
     p
 }
 
+/// A `style:columns`: count, gap and the line between. Columns of their own
+/// widths come out equal.
+fn odf_columns(c: &El) -> Section {
+    let n = c.attr("fo:column-count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(1).clamp(1, MAX_COLUMNS as i64) as u8;
+    let cols: Vec<&El> = c.children("style:column").collect();
+    let gap = c.attr("fo:column-gap").and_then(length).or_else(|| {
+        let a = cols.first()?.attr("fo:end-indent").and_then(length).unwrap_or(0);
+        let b = cols.get(1)?.attr("fo:start-indent").and_then(length).unwrap_or(0);
+        Some(a + b)
+    });
+    // LibreOffice writes a separator only when it draws one, and draws it
+    // even styled "none" (as it writes Word's).
+    let rule = c.child("style:column-sep").is_some_and(|s| s.attr("style:width").is_none_or(|w| w.trim_start().trim_start_matches(['0', '.']).starts_with(|c: char| c.is_ascii_digit())));
+    Section { start: SectionStart::Continuous, columns: n, gap: gap.unwrap_or(720).clamp(0, 2880) as i32, rule }
+}
+
 /// A style as the file has it.
 #[derive(Clone, Default)]
 struct OStyle {
@@ -237,6 +253,7 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         rev: over.rev.or(under.rev),
         tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
         toc: over.toc.or(under.toc),
+        section: over.section.or(under.section),
     }
 }
 
@@ -266,6 +283,13 @@ struct Reader<'a> {
     lists: HashMap<String, Vec<ListKind>>,
     /// Column widths by column style name.
     columns: HashMap<String, u32>,
+    /// Columns of section styles by name.
+    sec_styles: HashMap<String, Section>,
+    /// The page's own columns, and section marks to make once all is read:
+    /// (block, section, a start rather than a return to the enclosing one).
+    page_cols: Section,
+    sec_marks: Vec<(usize, Section, bool)>,
+    sec_stack: Vec<Section>,
     /// The last list id per list style, for continued lists.
     last_list: HashMap<String, u32>,
     next_list: u32,
@@ -500,12 +524,24 @@ impl<'a> Reader<'a> {
                         Some("paragraph") | Some("text") => {
                             let st = OStyle {
                                 parent: s.attr("style:parent-style-name").map(str::to_string),
-                                para: s.child("style:paragraph-properties").map(para_props).unwrap_or_default(),
+                                // A master page named here starts a page.
+                                para: {
+                                    let mut q = s.child("style:paragraph-properties").map(para_props).unwrap_or_default();
+                                    if s.attr("style:master-page-name").is_some_and(|m| !m.is_empty()) && s.attr("style:family") == Some("paragraph") {
+                                        q.page_break_before = Some(true);
+                                    }
+                                    q
+                                },
                                 chars: s.child("style:text-properties").map(|t| text_props(t, &self.fonts)).unwrap_or_default(),
                                 list_style: s.attr("style:list-style-name").map(str::to_string),
                                 outline: s.attr("style:default-outline-level").and_then(|v| v.parse::<u8>().ok()).filter(|v| (1..=9).contains(v)),
                             };
                             self.styles.insert(name.to_string(), st);
+                        }
+                        Some("section") => {
+                            if let Some(c) = s.child("style:section-properties").and_then(|p| p.child("style:columns")) {
+                                self.sec_styles.insert(name.to_string(), odf_columns(c));
+                            }
                         }
                         Some("table-column") => {
                             if let Some(w) = s.child("style:table-column-properties").and_then(|p| p.attr("style:column-width")).and_then(length) {
@@ -1267,8 +1303,18 @@ impl<'a> Reader<'a> {
                 "text:list" => self.list(x, 0, None, None, None),
                 "table:table" => self.table(x),
                 "text:section" => {
-                    self.rep.note(Kind::Approximate, "sections (their content kept)");
+                    // A section flows on in the page; its columns start with it
+                    // and the enclosing ones come back after it.
+                    let outer = self.sec_stack.last().copied().unwrap_or(self.page_cols);
+                    let mine = x.attr("text:style-name").and_then(|n| self.sec_styles.get(n)).copied().unwrap_or(Section { start: SectionStart::Continuous, ..Section::default() });
+                    let i = self.doc.blocks.len();
+                    self.sec_stack.push(mine);
                     self.body(x);
+                    self.sec_stack.pop();
+                    if !self.in_toc && self.doc.blocks.len() > i && (mine.columns, mine.gap, mine.rule) != (outer.columns, outer.gap, outer.rule) {
+                        self.sec_marks.push((i, mine, true));
+                        self.sec_marks.push((self.doc.blocks.len(), Section { start: SectionStart::Continuous, ..outer }, false));
+                    }
                 }
                 "text:table-of-content" => {
                     if let Some(b) = x.child("text:index-body") {
@@ -1304,6 +1350,41 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Section marks on the first body block (not in a cell) at or after each
+    /// place; a start wins over a return, the innermost start over an outer one.
+    fn place_sections(&mut self) {
+        let n = self.doc.blocks.len();
+        let mut at: HashMap<usize, (Section, bool)> = HashMap::new();
+        for &(i, sec, start) in &self.sec_marks {
+            let Some(k) = (i..n).find(|&k| self.doc.cell(k).is_none()) else { continue };
+            match at.get(&k) {
+                Some(&(_, true)) => {}
+                Some(&(_, false)) if !start => {}
+                _ => {
+                    at.insert(k, (sec, start));
+                }
+            }
+        }
+        if self.page_cols.columns > 1 && n > 0 {
+            at.entry(0).or_insert((self.page_cols, true));
+        }
+        for (k, (sec, _)) in at {
+            self.doc.blocks.update(k, |b| {
+                if let Some(q) = b.as_para_mut() {
+                    if q.props.section.is_none() {
+                        // A break before the first paragraph: the section starts a page.
+                        let mut sec = sec;
+                        if q.props.page_break_before == Some(true) && sec.start == SectionStart::Continuous && k > 0 {
+                            sec.start = SectionStart::NextPage;
+                            q.props.page_break_before = None;
+                        }
+                        q.props.section = Some(sec);
+                    }
+                }
+            });
+        }
+    }
+
     /// Page size, margins, header and footer from the master page the body uses.
     fn page(&mut self, styles: Option<&El>, first_master: Option<String>) {
         let Some(st) = styles else { return };
@@ -1325,8 +1406,8 @@ impl<'a> Reader<'a> {
             g.margin_bottom = t("fo:margin-bottom").unwrap_or(g.margin_bottom);
             g.margin_start = t("fo:margin-left").unwrap_or(g.margin_start);
             g.margin_end = t("fo:margin-right").unwrap_or(g.margin_end);
-            if pp.child("style:columns").and_then(|c| c.attr("fo:column-count")).and_then(|v| v.parse::<u32>().ok()).is_some_and(|n| n > 1) {
-                self.rep.note(Kind::Approximate, "columns (one column)");
+            if let Some(c) = pp.child("style:columns") {
+                self.page_cols = Section { start: SectionStart::NextPage, ..odf_columns(c) };
             }
             // ODF puts the header and footer inside the margins; their heights add to them.
             // With dynamic spacing (LibreOffice's import of Word files) the spacing lies
@@ -1401,7 +1482,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {
@@ -1425,6 +1506,15 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let first_master = text.els().find(|x| x.name == "text:p" || x.name == "text:h").and_then(|p| p.attr("text:style-name")).and_then(|n| content.child("office:automatic-styles").and_then(|a| a.children("style:style").find(|s| s.attr("style:name") == Some(n)))).and_then(|s| s.attr("style:master-page-name")).map(str::to_string);
     r.page(styles.as_ref(), first_master);
     r.body(text);
+    r.place_sections();
+    // The first page needs no break before it (a master page named there).
+    if r.doc.para(0).is_some_and(|p| p.props.page_break_before == Some(true)) {
+        r.doc.blocks.update(0, |b| {
+            if let Some(q) = b.as_para_mut() {
+                q.props.page_break_before = None;
+            }
+        });
+    }
     r.read_notes();
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
     fields::relink_toc(&mut r.doc);

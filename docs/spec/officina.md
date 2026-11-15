@@ -2031,7 +2031,7 @@ checks; most take milliseconds.
   give a contents entry whose page number arrived as plain text (LibreOffice
   flattens the field when it saves a `.docx`) a page reference to the heading
   with its text again. The file's results show until pagination works them out.
-- **Not yet:** sections and columns (O5d2); captions and figure lists; levels
+- **Not yet:** captions and figure lists; levels
   and styles chosen for the contents; clicking an entry to go to its heading;
   references to bookmarks inside a paragraph, to numbered items and to notes.
 
@@ -2048,6 +2048,60 @@ those 749 and the 12 pasted paragraphs again; a renamed heading updates its
 entry; the pages equal a fresh pagination. Corpus: text recall against
 LibreOffice 99.51 % with fields shown as their values, all 1,832 still round
 trip.
+
+### 16.29 O5d2 as built (2026-11-15): sections and columns
+
+- **Model.** A section starts at a paragraph marked `ParaProps.section`
+  (never from a style): how it starts (next page, continuous; odd and even
+  pages start on the next page for now), its columns (1–16), the gap between
+  them and whether a line runs between. A mark on the first paragraph sets the
+  first section's columns. Columns are equal; too narrow a page drops columns
+  until each is at least a quarter inch. Native file: a paragraph property
+  extension bit.
+- **Pagination.** A page fills in bands, one per section that runs on it, each
+  band column by column; a paragraph's lines wrap to its column's width. A
+  section followed by a continuous break balances its columns above the break
+  (the shortest band height that holds the text, by bisection); otherwise its
+  columns fill in turn, as Word does. A next-page section starts a page. Lines
+  between columns are page items the painter draws. An edit that adds, removes
+  or changes a mark lays out again only the paragraphs whose column width
+  changed, and pagination resumes as before (checkpoints, stopping when breaks
+  line up).
+- **Editor and Write.** Insert › Section Break and Continuous Section Break
+  (at the start of a paragraph they mark it; elsewhere they split it), and One,
+  Two, Three Columns and Line Between Columns for the caret's section, all
+  undoable; the caret and clicks move through columns. A split paragraph's
+  second half never carries the mark.
+- **Files.** `.docx`: a `w:sectPr` in the last paragraph of each section but the
+  last (an empty paragraph after a table), the last in the body; `w:type`,
+  `w:cols` (`num`, `space`, `sep`; columns of their own widths read as equal),
+  and every section names the header and footer. Sections with their own page
+  size keep the last one's, with a note. `.odt`: a section with columns is a
+  `text:section` whose style has `style:columns` (`fo:column-gap` or the
+  columns' indents, a `style:column-sep` as LibreOffice draws it), balanced only
+  above a continuous break; a next-page start is a paragraph naming a second
+  master page, as LibreOffice keeps Word's section breaks; columns of the page
+  layout become the first section's; a nested section's columns win and the
+  enclosing ones come back after it; a master page named mid-document reads as
+  a page break before, and a section that starts with one starts a page.
+- **Not yet:** a page size, margins, header and footer per section; blank pages
+  for odd and even starts; columns of their own widths; column breaks.
+
+Gates: paginate tests (columns fill side by side then the next page; a
+continuous section balances the columns above it; 300 random edits with
+section marks equal a fresh pagination), editor test (breaks, columns, undo,
+clicks in the second column), native round trip, `tests/sections.rs` (four
+sections through `.docx` and `.odt`). LibreOffice both ways and across formats
+(`examples/sections_lo.rs`): our `.docx` and `.odt`, saved by LibreOffice as
+`.docx` and `.odt`, read back with every section's first paragraph, start,
+columns, gap and line, and the text: 8/8. 1,500-page gate (`pergola-richtext/
+examples/sections_1500.rs`, pinned fonts, 1,510 pages, 751 sections, 1,310
+lines between columns): paginates in 1.7 s; a page pasted into a two-column
+section settles in 3 ms laying out the 6 pasted paragraphs; setting that
+section to three columns settles in 5 ms laying out its 25 paragraphs; a
+continuous break inside it with one column after settles in 5 ms laying out 9;
+undo returns the same pages; each time the pages equal a fresh pagination.
+Corpus: recall 99.51 %, merge 1,742 exact and 1,832 safe, unchanged.
 
 ## 17. Decisions (accepted 2026-11-14)
 

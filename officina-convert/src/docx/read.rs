@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use officina_text::fields;
-use officina_text::model::{BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::model::{Section, SectionStart, MAX_COLUMNS, BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -263,7 +263,27 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         rev: over.rev.or(under.rev),
         tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
         toc: over.toc.or(under.toc),
+        section: over.section.or(under.section),
     }
+}
+
+/// A `w:sectPr`'s columns and how its section starts.
+fn sect_settings(s: &El) -> Section {
+    let start = match s.child("w:type").and_then(val) {
+        Some("continuous") | Some("nextColumn") => SectionStart::Continuous,
+        Some("oddPage") => SectionStart::OddPage,
+        Some("evenPage") => SectionStart::EvenPage,
+        _ => SectionStart::NextPage,
+    };
+    let mut x = Section { start, ..Section::default() };
+    if let Some(c) = s.child("w:cols") {
+        // Columns of their own widths come out equal.
+        let n = num(c.attr("w:num")).or_else(|| Some(c.children("w:col").count() as i64).filter(|&n| n > 0)).unwrap_or(1);
+        x.columns = n.clamp(1, MAX_COLUMNS as i64) as u8;
+        x.gap = twips(c.attr("w:space")).unwrap_or(720).clamp(0, 2880);
+        x.rule = matches!(c.attr("w:sep"), Some("1" | "true" | "on"));
+    }
+    x
 }
 
 /// A `w:tabs`: its stops, in order, and the positions it clears.
@@ -387,6 +407,10 @@ struct Reader<'a> {
     ref_shown: HashMap<Field, String>,
     open_marks: Vec<String>,
     marks: HashMap<String, BlockId>,
+    /// Sections: the block the current one starts at, and the page sizes of
+    /// those before the last.
+    sec_from: usize,
+    sec_pages: Vec<Option<(Option<i32>, Option<i32>)>>,
 }
 
 /// A comment's text: a line a paragraph.
@@ -1191,10 +1215,11 @@ impl<'a> Reader<'a> {
         for x in body.els() {
             match x.name.as_str() {
                 "w:p" => {
-                    if x.child("w:pPr").and_then(|p| p.child("w:sectPr")).is_some() {
-                        self.rep.note(Kind::Approximate, "sections after the first (one page setup)");
-                    }
                     self.para(x, None, &mut field);
+                    if let Some(sp) = x.child("w:pPr").and_then(|p| p.child("w:sectPr")) {
+                        // The section ends with this paragraph.
+                        self.end_section(sp, false);
+                    }
                 }
                 "w:tbl" => self.table(x, 0, &mut field),
                 "w:sdt" => {
@@ -1202,12 +1227,41 @@ impl<'a> Reader<'a> {
                         self.body(c);
                     }
                 }
-                "w:sectPr" => self.section(x),
+                "w:sectPr" => {
+                    self.end_section(x, true);
+                    self.section(x);
+                }
                 "w:commentRangeStart" | "w:commentRangeEnd" => self.comment_mark(x),
                 "w:customXml" | "w:ins" | "w:moveTo" => self.body(x),
                 _ => {}
             }
         }
+    }
+
+    /// A section's `w:sectPr` read where it ends (the body's last one is the
+    /// document's last section): the section's first paragraph gets its
+    /// settings.
+    fn end_section(&mut self, s: &El, last: bool) {
+        let first = (self.sec_from..self.doc.blocks.len()).find(|&k| self.doc.cell(k).is_none());
+        let x = sect_settings(s);
+        if let Some(k) = first {
+            // The first section: only its columns matter.
+            if k > 0 || x.columns > 1 {
+                self.doc.blocks.update(k, |b| {
+                    if let Some(q) = b.as_para_mut() {
+                        q.props.section = Some(x);
+                    }
+                });
+            }
+        }
+        if !last {
+            let g = s.child("w:pgSz").map(|z| (twips(z.attr("w:w")), twips(z.attr("w:h"))));
+            self.sec_pages.push(g);
+        }
+        if x.start == SectionStart::OddPage || x.start == SectionStart::EvenPage {
+            self.rep.note(Kind::Approximate, "sections on odd or even pages (on the next page)");
+        }
+        self.sec_from = self.doc.blocks.len();
     }
 
     fn section(&mut self, s: &El) {
@@ -1223,10 +1277,12 @@ impl<'a> Reader<'a> {
             g.margin_start = t("w:left", g.margin_start);
             g.margin_end = t("w:right", g.margin_end);
         }
-        if s.child("w:cols").and_then(|c| num(c.attr("w:num"))).is_some_and(|n| n > 1) {
-            self.rep.note(Kind::Approximate, "columns (one column)");
-        }
         self.doc.page = PageSetup { ..g };
+        // Earlier sections with another page size keep the last one's.
+        let size = (Some(g.width), Some(g.height));
+        if self.sec_pages.iter().flatten().any(|&(w, h)| (w.unwrap_or(g.width), h.unwrap_or(g.height)) != (size.0.unwrap(), size.1.unwrap())) {
+            self.rep.note(Kind::Approximate, "sections with their own page size (the last section's kept)");
+        }
         for (tag, header) in [("w:headerReference", true), ("w:footerReference", false)] {
             let refs: Vec<&El> = s.children(tag).collect();
             let pick = refs.iter().find(|r| r.attr("w:type") == Some("default")).or(refs.first());
@@ -1415,7 +1471,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, sec_pages: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
