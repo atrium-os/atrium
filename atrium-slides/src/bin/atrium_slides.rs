@@ -249,7 +249,7 @@ fn main() {
     }
     let (doc, target) = first.unwrap_or_else(|| (Doc::new("Presentation"), None));
 
-    let mut win = match Window::open(&WindowDesc::new("Slides", SizeSpec::Fixed(1200, 760))) {
+    let mut win = match Window::open(&WindowDesc::new("Slides", SizeSpec::Fixed(1200, 720))) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("atrium-slides: frescod: {e}");
@@ -271,6 +271,10 @@ fn main() {
     slides.scale.set(win.scale() as f64);
     let mut run = Run { slides, target: None, root: root.clone() };
     run.show(doc, target);
+    // Development: start on slide N (screenshots).
+    if let Some(n) = std::env::var("ATRIUM_SLIDES_SLIDE").ok().and_then(|v| v.parse::<usize>().ok()) {
+        run.slides.go(n.saturating_sub(1));
+    }
     let size = run.slides.size.clone();
     let mut app = App::new_with_flag(run.slides.clone(), dirty);
     let _ = win.paint(&mut app);

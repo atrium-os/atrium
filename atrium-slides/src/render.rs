@@ -56,16 +56,17 @@ impl Place {
     }
 }
 
-fn f32x6(m: &Xform) -> [f32; 6] {
-    [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32]
-}
-
-fn path_data(p: &officina_slides::model::Path, w: f64, h: f64) -> PathData {
+/// A path's commands in window px: its own box mapped onto the shape's
+/// (`w` × `h`), then `m`. Fresco takes coordinates within ±32,768, so EMU
+/// never go on the wire; the path is placed here and drawn untransformed.
+fn path_data(p: &officina_slides::model::Path, w: f64, h: f64, m: &Xform) -> PathData {
     use officina_slides::model::PathCmd;
-    // A path's own box maps onto the shape's.
     let sx = if p.w > 0 { w / p.w as f64 } else { 1.0 };
     let sy = if p.h > 0 { h / p.h as f64 } else { 1.0 };
-    let pt = |x: i64, y: i64| ((x as f64 * sx) as f32, (y as f64 * sy) as f32);
+    let pt = |x: i64, y: i64| {
+        let (x, y) = draw::apply(m, x as f64 * sx, y as f64 * sy);
+        (x as f32, y as f32)
+    };
     let mut d = PathData::new();
     for c in &p.cmds {
         d = match *c {
@@ -89,12 +90,18 @@ fn path_data(p: &officina_slides::model::Path, w: f64, h: f64) -> PathData {
     d
 }
 
-fn paint(p: &DPaint) -> Option<Paint> {
+/// The paint in window px (gradient geometry through `m`).
+fn paint(p: &DPaint, m: &Xform) -> Option<Paint> {
     let stops = |s: &[(f32, u32)]| s.iter().map(|(o, c)| (*o, rgba(*c))).collect();
+    let pt = |x: f64, y: f64| {
+        let (x, y) = draw::apply(m, x, y);
+        Point::new(x as f32, y as f32)
+    };
+    let k = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
     Some(match p {
         DPaint::Solid(c) => Paint::Solid(rgba(*c)),
-        DPaint::Linear { stops: s, from, to } => Paint::Linear { from: Point::new(from.0 as f32, from.1 as f32), to: Point::new(to.0 as f32, to.1 as f32), stops: stops(s) },
-        DPaint::Radial { stops: s, center, radius } => Paint::Radial { center: Point::new(center.0 as f32, center.1 as f32), radius: *radius as f32, stops: stops(s) },
+        DPaint::Linear { stops: s, from, to } => Paint::Linear { from: pt(from.0, from.1), to: pt(to.0, to.1), stops: stops(s) },
+        DPaint::Radial { stops: s, center, radius } => Paint::Radial { center: pt(center.0, center.1), radius: (*radius * k) as f32, stops: stops(s) },
         DPaint::Picture(_) => return None,
     })
 }
@@ -154,15 +161,17 @@ pub fn nodes(deck: &Deck, deck_key: u64, items: &[DrawItem], at: Place, scale: f
     for it in items {
         match it {
             DrawItem::Path { xf, w, h, paths, fill, stroke } => {
-                let m = f32x6(&draw::mul(&base, xf));
+                let m = draw::mul(&base, xf);
+                // Window px per EMU along the shape (for stroke widths).
+                let k = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
                 for p in paths {
-                    let data = path_data(p, *w, *h);
-                    let mut sh = Shape::new(data).transform(m);
+                    let data = path_data(p, *w, *h, &m);
+                    let mut sh = Shape::new(data);
                     if p.filled {
                         match fill {
-                            Some(DPaint::Picture(media)) => picture_box(deck, deck_key, *media, &draw::mul(&base, xf), *w, *h, scale, out),
+                            Some(DPaint::Picture(media)) => picture_box(deck, deck_key, *media, &m, *w, *h, scale, out),
                             Some(f) => {
-                                if let Some(pt) = paint(f) {
+                                if let Some(pt) = paint(f, &m) {
                                     sh = sh.fill(pt);
                                 }
                             }
@@ -171,9 +180,8 @@ pub fn nodes(deck: &Deck, deck_key: u64, items: &[DrawItem], at: Place, scale: f
                     }
                     if let (Some(s), true) = (stroke, p.stroked) {
                         // Hairlines stay a device pixel wide.
-                        let min = 0.75 / (at.k * scale.max(1.0));
-                        let mut st = Stroke::new(Paint::Solid(rgba(s.color)), s.width.max(min) as f32);
-                        let wd = s.width.max(min) as f32;
+                        let wd = (s.width * k).max(0.75 / scale.max(1.0)) as f32;
+                        let mut st = Stroke::new(Paint::Solid(rgba(s.color)), wd);
                         st.dash = match s.dash {
                             Dash::Solid => None,
                             Dash::Dot => Some((vec![wd, wd], 0.0)),

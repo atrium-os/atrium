@@ -61,7 +61,29 @@ pub enum Cmd {
     DeleteShape,
     BringForward,
     SendBackward,
+    /// Align the selection: left, centre, right, top, middle, bottom (to the
+    /// slide for one shape, to their box for several).
+    Align(u8),
+    Group,
+    Ungroup,
+    SelectAll,
 }
+
+/// The Arrange menu: (label, command).
+pub const ARRANGE: [(&str, Cmd); 12] = [
+    ("Bring Forward", Cmd::BringForward),
+    ("Send Backward", Cmd::SendBackward),
+    ("Align Left", Cmd::Align(0)),
+    ("Align Center", Cmd::Align(1)),
+    ("Align Right", Cmd::Align(2)),
+    ("Align Top", Cmd::Align(3)),
+    ("Align Middle", Cmd::Align(4)),
+    ("Align Bottom", Cmd::Align(5)),
+    ("Group", Cmd::Group),
+    ("Ungroup", Cmd::Ungroup),
+    ("Select All", Cmd::SelectAll),
+    ("Delete", Cmd::DeleteShape),
+];
 
 /// The shapes the Shape menu offers: (label, preset).
 pub const SHAPES: [(&str, &str); 8] = [("Rectangle", "rect"), ("Rounded Rectangle", "roundRect"), ("Ellipse", "ellipse"), ("Triangle", "triangle"), ("Diamond", "diamond"), ("Right Arrow", "rightArrow"), ("Star", "star5"), ("Line", "line")];
@@ -74,8 +96,11 @@ pub struct Ui {
 /// A press held on the canvas.
 #[derive(Debug, Clone, PartialEq)]
 enum Drag {
-    /// Moving the selected shape: where the press began (EMU) and its frame then.
+    /// Moving the selection: where the press began (EMU) and the box round
+    /// it then.
     Move { from: (i64, i64), orig: Rect, moved: bool },
+    /// Sweeping a box on the slide to select what it holds.
+    Marquee { from: (i64, i64), to: (i64, i64) },
     /// Resizing by handle `h` (0..8 clockwise from top-left).
     Resize { h: u8, orig: Rect },
     /// Selecting text in the frame being edited.
@@ -86,6 +111,8 @@ enum Drag {
 #[derive(Debug, Default)]
 pub struct Sel {
     pub shape: Option<ShapeId>,
+    /// More shapes selected with it (a swept box, Select All).
+    pub more: Vec<ShapeId>,
     pub edit: Option<FrameEdit>,
     drag: Option<Drag>,
     last_press: Option<(Instant, Point)>,
@@ -118,6 +145,22 @@ pub struct Slides {
     arrange_menu: Mutable<MenuState>,
     /// Device px per point.
     pub scale: Rc<Cell<f64>>,
+}
+
+impl Sel {
+    /// Every selected shape, the first one first.
+    pub fn all(&self) -> Vec<ShapeId> {
+        self.shape.into_iter().chain(self.more.iter().copied()).collect()
+    }
+}
+
+/// The box round `rects`.
+fn union(rects: &[Rect]) -> Option<Rect> {
+    let x0 = rects.iter().map(|r| r.x).min()?;
+    let y0 = rects.iter().map(|r| r.y).min()?;
+    let x1 = rects.iter().map(|r| r.x + r.w).max()?;
+    let y1 = rects.iter().map(|r| r.y + r.h).max()?;
+    Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 fn prompt(k: PhKind) -> &'static str {
@@ -270,6 +313,7 @@ impl Slides {
             return matches!(c, Cmd::Undo | Cmd::Redo);
         };
         let shape = self.sel.borrow().shape;
+        let chosen = self.sel.borrow().all();
         match c {
             Cmd::Undo | Cmd::Redo => {
                 self.sel.borrow_mut().edit = None;
@@ -356,9 +400,95 @@ impl Slides {
                 sel.edit = if c == Cmd::TextBox { Some(FrameEdit::new(sid, id, Pos::default())) } else { None };
             }
             Cmd::DeleteShape => {
-                if let Some(id) = shape {
-                    d.run("Delete Shape", vec![DeckOp::RemoveShape { target: Target::Slide(sid), id }]);
+                if !chosen.is_empty() {
+                    let ops = chosen.iter().map(|&id| DeckOp::RemoveShape { target: Target::Slide(sid), id }).collect();
+                    d.run(if chosen.len() > 1 { "Delete Shapes" } else { "Delete Shape" }, ops);
                     *self.sel.borrow_mut() = Sel::default();
+                }
+            }
+            Cmd::SelectAll => {
+                let Ok(s) = d.deck.slide(cur) else { return true };
+                let ids: Vec<ShapeId> = s.shapes.iter().filter(|s| !s.hidden).map(|s| s.id).collect();
+                let mut sel = self.sel.borrow_mut();
+                *sel = Sel::default();
+                sel.shape = ids.first().copied();
+                sel.more = ids.into_iter().skip(1).collect();
+            }
+            Cmd::Align(how) => {
+                let Ok(s) = d.deck.slide(cur) else { return true };
+                let s = s.clone();
+                let owner = Owner::Slide(s.layout);
+                let shapes: Vec<Shape> = chosen.iter().filter_map(|&id| s.shapes.iter().find(|x| x.id == id).cloned()).collect();
+                let frames: Vec<Rect> = shapes.iter().map(|x| resolve::resolve(&d.deck, owner, x).frame).collect();
+                let Some(within) = (if shapes.len() == 1 { Some(Rect::new(0, 0, d.deck.size.0, d.deck.size.1)) } else { union(&frames) }) else { return true };
+                let mut ops = Vec::new();
+                for (mut x, f) in shapes.into_iter().zip(frames) {
+                    let n = aligned(f, within, how);
+                    if n != f {
+                        x.frame = Some(n);
+                        ops.push(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(x) });
+                    }
+                }
+                d.run("Align", ops);
+            }
+            Cmd::Group => {
+                let Ok(s) = d.deck.slide(cur) else { return true };
+                let s = s.clone();
+                let owner = Owner::Slide(s.layout);
+                // In slide order, so the stacking inside the group is the same.
+                let mut members: Vec<(usize, Shape)> = s.shapes.iter().enumerate().filter(|(_, x)| chosen.contains(&x.id)).map(|(i, x)| (i, x.clone())).collect();
+                if members.len() < 2 {
+                    d.status = "Select two or more shapes to group them.".into();
+                } else {
+                    for (_, m) in &mut members {
+                        // Placeholders keep their place once in a group.
+                        m.frame = Some(resolve::resolve(&d.deck, owner, m).frame);
+                    }
+                    let frames: Vec<Rect> = members.iter().map(|(_, m)| m.frame.unwrap_or_default()).collect();
+                    let b = union(&frames).unwrap_or_default();
+                    let at = members.last().map_or(0, |(i, _)| *i + 1 - members.len());
+                    let gid = d.deck.new_id();
+                    let mut g = Shape::new(gid, b, ShapeKind::Group { child: b, shapes: members.iter().map(|(_, m)| m.clone()).collect() });
+                    g.name = format!("Group {gid}").into();
+                    let mut ops: Vec<DeckOp> = members.iter().map(|(_, m)| DeckOp::RemoveShape { target: Target::Slide(sid), id: m.id }).collect();
+                    ops.push(DeckOp::InsertShape { target: Target::Slide(sid), group: None, at, shape: Box::new(g) });
+                    d.run("Group", ops);
+                    let mut sel = self.sel.borrow_mut();
+                    *sel = Sel::default();
+                    sel.shape = Some(gid);
+                }
+            }
+            Cmd::Ungroup => {
+                let Ok(s) = d.deck.slide(cur) else { return true };
+                let s = s.clone();
+                let owner = Owner::Slide(s.layout);
+                let mut ops = Vec::new();
+                let mut freed = Vec::new();
+                for &id in &chosen {
+                    let Some(at) = s.shapes.iter().position(|x| x.id == id) else { continue };
+                    let g = &s.shapes[at];
+                    let ShapeKind::Group { shapes: kids, .. } = &g.kind else { continue };
+                    let m = draw::group_xform(&d.deck, owner, g);
+                    ops.push(DeckOp::RemoveShape { target: Target::Slide(sid), id });
+                    for (k, kid) in kids.iter().enumerate() {
+                        let mut kid = kid.clone();
+                        let f = resolve::resolve(&d.deck, owner, &kid).frame;
+                        let (x0, y0) = draw::apply(&m, f.x as f64, f.y as f64);
+                        let (x1, y1) = draw::apply(&m, (f.x + f.w) as f64, (f.y + f.h) as f64);
+                        kid.frame = Some(Rect::new(x0.min(x1).round() as i64, y0.min(y1).round() as i64, (x1 - x0).abs().round() as i64, (y1 - y0).abs().round() as i64));
+                        kid.rot = (kid.rot + g.rot).rem_euclid(21_600_000);
+                        freed.push(kid.id);
+                        ops.push(DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: at + k, shape: Box::new(kid) });
+                    }
+                }
+                if ops.is_empty() {
+                    d.status = "Select a group to ungroup it.".into();
+                } else {
+                    d.run("Ungroup", ops);
+                    let mut sel = self.sel.borrow_mut();
+                    *sel = Sel::default();
+                    sel.shape = freed.first().copied();
+                    sel.more = freed.into_iter().skip(1).collect();
                 }
             }
             Cmd::BringForward | Cmd::SendBackward => {
@@ -504,6 +634,20 @@ pub fn snapped(r: Rect, deck_size: (i64, i64), others: &[Rect], snap: i64) -> (R
     (out, guides)
 }
 
+/// `r` aligned within `to`: left, centre, right, top, middle, bottom.
+pub fn aligned(r: Rect, to: Rect, how: u8) -> Rect {
+    let mut n = r;
+    match how {
+        0 => n.x = to.x,
+        1 => n.x = to.x + (to.w - r.w) / 2,
+        2 => n.x = to.x + to.w - r.w,
+        3 => n.y = to.y,
+        4 => n.y = to.y + (to.h - r.h) / 2,
+        _ => n.y = to.y + to.h - r.h,
+    }
+    n
+}
+
 impl Slides {
     fn press(&self, p: Point) {
         let mut d = self.doc.borrow_mut();
@@ -520,7 +664,7 @@ impl Slides {
         let slide = d.deck.slide_if_loaded(cur).expect("loaded").clone();
         let owner = Owner::Slide(slide.layout);
         // A handle of the selected shape first.
-        if let (Some(id), None) = (sel.shape, &sel.edit) {
+        if let (Some(id), None, true) = (sel.shape, &sel.edit, sel.more.is_empty()) {
             if let Some((m, w, h)) = draw::shape_box(&d.deck, owner, &slide.shapes, id) {
                 let b = render::bounds(&draw::mul(&place.xform(), &m), w, h);
                 for (i, (hx, hy)) in handles(b).into_iter().enumerate() {
@@ -567,12 +711,23 @@ impl Slides {
         }
         let hit = hit_shape(&d.deck, owner, &slide.shapes, ex as f64, ey as f64);
         let was = sel.shape;
-        sel.shape = hit;
         sel.guides.clear();
         let Some(id) = hit else {
-            sel.drag = None;
+            // On the empty slide: sweep a box.
+            sel.shape = None;
+            sel.more.clear();
+            sel.drag = Some(Drag::Marquee { from: (ex, ey), to: (ex, ey) });
             return;
         };
+        // A press on a shape of a several-shape selection moves them all.
+        if !sel.more.is_empty() && sel.all().contains(&id) {
+            let frames: Vec<Rect> = sel.all().iter().filter_map(|&i| find(&slide.shapes, i)).map(|x| resolve::resolve(&d.deck, owner, x).frame).collect();
+            let orig = union(&frames).unwrap_or_default();
+            sel.drag = Some(Drag::Move { from: (ex, ey), orig, moved: false });
+            return;
+        }
+        sel.shape = hit;
+        sel.more.clear();
         let s = find(&slide.shapes, id).expect("hit");
         // A second press on a text shape (or a double press, or an empty
         // placeholder) starts typing in it.
@@ -600,21 +755,7 @@ impl Slides {
         let (ex, ey) = place.to_emu(p.x, p.y);
         let mut sel = self.sel.borrow_mut();
         let Some(drag) = sel.drag.clone() else { return };
-        let Some(id) = sel.shape else {
-            if let (Drag::Text, Some(e)) = (&drag, sel.edit.as_mut()) {
-                if let Some(g) = e.geometry(&mut d.deck, &*self.fonts) {
-                    e.caret = frame::hit(&g, ex as f64, ey as f64);
-                }
-            }
-            return;
-        };
-        let Ok(slide) = d.deck.slide(cur) else { return };
-        let slide = slide.clone();
-        let owner = Owner::Slide(slide.layout);
-        let Some(shape) = find(&slide.shapes, id).cloned() else { return };
-        let snap = (SNAP_PX as f64 / place.k) as i64;
-        let others: Vec<Rect> = slide.shapes.iter().filter(|s| s.id != id && !s.hidden).map(|s| resolve::resolve(&d.deck, owner, s).frame).collect();
-        let (new, guides) = match drag {
+        match drag {
             Drag::Text => {
                 if let Some(e) = sel.edit.as_mut() {
                     if let Some(g) = e.geometry(&mut d.deck, &*self.fonts) {
@@ -623,6 +764,43 @@ impl Slides {
                 }
                 return;
             }
+            Drag::Marquee { from, .. } => {
+                if !end {
+                    sel.drag = Some(Drag::Marquee { from, to: (ex, ey) });
+                    return;
+                }
+                sel.drag = None;
+                let b = Rect::new(from.0.min(ex), from.1.min(ey), (ex - from.0).abs(), (ey - from.1).abs());
+                let Ok(slide) = d.deck.slide(cur) else { return };
+                let slide = slide.clone();
+                let owner = Owner::Slide(slide.layout);
+                // What lies wholly inside the box.
+                let inside: Vec<ShapeId> = slide.shapes.iter().filter(|x| !x.hidden).filter(|x| {
+                    let f = resolve::resolve(&d.deck, owner, x).frame;
+                    f.x >= b.x && f.y >= b.y && f.x + f.w <= b.x + b.w && f.y + f.h <= b.y + b.h
+                }).map(|x| x.id).collect();
+                sel.shape = inside.first().copied();
+                sel.more = inside.into_iter().skip(1).collect();
+                return;
+            }
+            _ => {}
+        }
+        let ids = sel.all();
+        if ids.is_empty() {
+            return;
+        }
+        let Ok(slide) = d.deck.slide(cur) else { return };
+        let slide = slide.clone();
+        let owner = Owner::Slide(slide.layout);
+        let shapes: Vec<Shape> = ids.iter().filter_map(|&i| find(&slide.shapes, i).cloned()).collect();
+        if shapes.is_empty() {
+            return;
+        }
+        let snap = (SNAP_PX as f64 / place.k) as i64;
+        let others: Vec<Rect> = slide.shapes.iter().filter(|s| !ids.contains(&s.id) && !s.hidden).map(|s| resolve::resolve(&d.deck, owner, s).frame).collect();
+        // Where each shape goes: a move shifts all by the same amount, a
+        // resize changes the one shape.
+        let (targets, guides): (Vec<Rect>, Vec<(bool, i64)>) = match drag {
             Drag::Move { from, orig, moved } => {
                 let (dx, dy) = (ex - from.0, ey - from.1);
                 // A press that hardly moved is a click, not a move.
@@ -633,31 +811,42 @@ impl Slides {
                     return;
                 }
                 sel.drag = Some(Drag::Move { from, orig, moved: true });
-                snapped(Rect::new(orig.x + dx, orig.y + dy, orig.w, orig.h), d.deck.size, &others, snap)
+                let (to, g) = snapped(Rect::new(orig.x + dx, orig.y + dy, orig.w, orig.h), d.deck.size, &others, snap);
+                let (sx, sy) = (to.x - orig.x, to.y - orig.y);
+                // From each shape's frame before the drag.
+                let before: Vec<Shape> = shapes.iter().map(|x| drag_orig(sid, x)).collect();
+                (before.iter().map(|x| {
+                    let f = resolve::resolve(&d.deck, owner, x).frame;
+                    Rect::new(f.x + sx, f.y + sy, f.w, f.h)
+                }).collect(), g)
             }
-            Drag::Resize { h, orig } => {
-                let r = resized(orig, h, ex, ey, (8.0 / place.k) as i64);
-                (r, Vec::new())
-            }
+            Drag::Resize { h, orig } => (vec![resized(orig, h, ex, ey, (8.0 / place.k) as i64)], Vec::new()),
+            _ => return,
         };
         sel.guides = if end { Vec::new() } else { guides };
-        // Shown as it goes (outside undo), made one step at the end.
-        let mut moved = shape.clone();
-        moved.frame = Some(new);
-        if let ShapeKind::Group { .. } = moved.kind {
-            // A group's children follow its frame through its child box.
-        }
+        let moved: Vec<Shape> = shapes.iter().zip(&targets).map(|(x, r)| {
+            let mut m = x.clone();
+            m.frame = Some(*r);
+            m
+        }).collect();
         if end {
             sel.drag = None;
-            // Put the original back, then the change as one undo step.
-            let orig_shape = d.history_shape(sid, id).unwrap_or(shape);
-            d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(orig_shape.clone()) });
-            if orig_shape.frame != moved.frame {
-                d.run(if matches!(drag, Drag::Resize { .. }) { "Resize" } else { "Move" }, vec![DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(moved) }]);
+            // Put the originals back, then the change as one undo step.
+            let mut ops = Vec::new();
+            for (x, m) in shapes.iter().zip(moved) {
+                let o = DRAG_ORIG.with(|o| o.borrow_mut().remove(&(sid, x.id))).unwrap_or_else(|| x.clone());
+                d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(o.clone()) });
+                if o.frame != m.frame {
+                    ops.push(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(m) });
+                }
             }
+            DRAG_ORIG.with(|o| o.borrow_mut().clear());
+            d.run(if matches!(drag, Drag::Resize { .. }) { "Resize" } else if ops.len() > 1 { "Move Shapes" } else { "Move" }, ops);
         } else {
-            d.remember_shape(sid, &shape);
-            d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(moved) });
+            for (x, m) in shapes.iter().zip(moved) {
+                DRAG_ORIG.with(|o| o.borrow_mut().entry((sid, x.id)).or_insert_with(|| x.clone()).clone());
+                d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(m) });
+            }
             d.touched.push(sid);
         }
     }
@@ -676,6 +865,9 @@ impl Slides {
                 "y" => return self.run_cmd(Cmd::Redo),
                 "m" => return self.run_cmd(Cmd::NewSlide(self.doc.borrow().deck.layouts.iter().position(|l| &*l.kind == "obj").unwrap_or(0))),
                 "d" => return self.run_cmd(Cmd::DuplicateSlide),
+                "g" if m.shift && self.sel.borrow().edit.is_none() => return self.run_cmd(Cmd::Ungroup),
+                "g" if self.sel.borrow().edit.is_none() => return self.run_cmd(Cmd::Group),
+                "a" if self.sel.borrow().edit.is_none() => return self.run_cmd(Cmd::SelectAll),
                 _ => {}
             }
         }
@@ -823,23 +1015,15 @@ fn word_at(t: &str, at: u32) -> (u32, u32) {
     (s as u32, e as u32)
 }
 
-impl Doc {
-    /// The shape as it was before a drag began moving it (outside undo).
-    fn remember_shape(&mut self, slide: SlideId, s: &Shape) {
-        DRAG_ORIG.with(|o| {
-            let mut o = o.borrow_mut();
-            if o.as_ref().is_none_or(|(sl, x)| *sl != slide || x.id != s.id) {
-                *o = Some((slide, s.clone()));
-            }
-        });
-    }
-    fn history_shape(&mut self, slide: SlideId, id: ShapeId) -> Option<Shape> {
-        DRAG_ORIG.with(|o| o.borrow_mut().take()).filter(|(sl, s)| *sl == slide && s.id == id).map(|(_, s)| s)
-    }
+/// A shape as it was before the drag now going on began moving it.
+fn drag_orig(slide: SlideId, s: &Shape) -> Shape {
+    DRAG_ORIG.with(|o| o.borrow().get(&(slide, s.id)).cloned()).unwrap_or_else(|| s.clone())
 }
 
 thread_local! {
-    static DRAG_ORIG: RefCell<Option<(SlideId, Shape)>> = const { RefCell::new(None) };
+    /// The shapes a drag moves, as they were before it (the drag shows its
+    /// changes outside undo and makes them one step at the end).
+    static DRAG_ORIG: RefCell<HashMap<(SlideId, ShapeId), Shape>> = RefCell::new(HashMap::new());
 }
 
 fn text_style(size: f32, weight: Weight, color: Color) -> TextStyle {
@@ -896,9 +1080,9 @@ impl View for Slides {
         Button::secondary("Picture…").at(x, 8.0).width(88.0).on_click(self.cmd(Cmd::Picture)).render(ctx);
         x += 96.0;
         {
-            let items = vec![MenuItem::new("Bring Forward"), MenuItem::new("Send Backward"), MenuItem::new("Delete Shape")];
+            let items: Vec<MenuItem> = ARRANGE.iter().map(|(l, _)| MenuItem::new(*l)).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Arrange", self.arrange_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::BringForward, Cmd::SendBackward, Cmd::DeleteShape][i.min(2)])).at(x, 8.0).width(92.0).render(ctx);
+            MenuButton::new("Arrange", self.arrange_menu.clone(), items, move |i| cmds.lock().unwrap().push(ARRANGE[i.min(ARRANGE.len() - 1)].1)).at(x, 8.0).width(92.0).render(ctx);
             x += 100.0;
         }
         let (name, dirty, status, n, cur) = {
@@ -1022,18 +1206,25 @@ impl Slides {
             // The selection: an outline with handles, or the caret and
             // selected text in the frame being edited.
             let sel = self.sel.borrow();
-            if let Some(id) = sel.shape {
+            for id in sel.all() {
                 if let Some((m, bw, bh)) = draw::shape_box(&d.deck, owner, &slide.shapes, id) {
                     let r = render::bounds(&draw::mul(&place.xform(), &m), bw, bh);
                     let acc = t.accent_fill();
                     out.extend(fills(PShape::new(PathData::rect(r)).stroke(PStroke::new(Paint::Solid(acc), 1.0))));
-                    if sel.edit.is_none() {
+                    if sel.edit.is_none() && sel.more.is_empty() {
                         for (hx, hy) in handles(r) {
                             out.push(Node::Rect { rect: PRect::new(hx - 4.5, hy - 4.5, 9.0, 9.0), fill: acc, radius: 2.0 });
                             out.push(Node::Rect { rect: PRect::new(hx - 3.0, hy - 3.0, 6.0, 6.0), fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 1.5 });
                         }
                     }
                 }
+            }
+            if let Some(Drag::Marquee { from, to }) = sel.drag {
+                let (ax, ay) = place.to_px(from.0 as f64, from.1 as f64);
+                let (bx, by) = place.to_px(to.0 as f64, to.1 as f64);
+                let r = PRect::new(ax.min(bx), ay.min(by), (bx - ax).abs(), (by - ay).abs());
+                out.push(Node::Rect { rect: r, fill: Color::rgba(0.25, 0.5, 1.0, 0.12), radius: 0.0 });
+                out.extend(fills(PShape::new(PathData::rect(r)).stroke(PStroke::new(Paint::Solid(t.accent_fill()), 1.0))));
             }
             for &(vertical, at) in &sel.guides {
                 let (gx, gy) = place.to_px(at as f64, at as f64);
@@ -1158,5 +1349,114 @@ mod tests {
         s.doc.borrow_mut().undo();
         let back = s.doc.borrow_mut().deck.slide(0).unwrap().shapes.last().unwrap().frame.unwrap();
         assert_eq!(back, before);
+    }
+
+    #[test]
+    fn sweep_align_group_and_ungroup() {
+        let ui = Mutable::new(Ui::default());
+        let s = Slides::new(Doc::new("t"), ui, Mutable::new(0), (1200.0, 800.0));
+        let blank = s.doc.borrow().deck.layouts.iter().position(|l| &*l.kind == "blank").unwrap();
+        s.cmds.lock().unwrap().extend([Cmd::NewSlide(blank)]);
+        s.take_cmds();
+        // Two shapes, the second moved down and right.
+        s.cmds.lock().unwrap().push(Cmd::Shape(0));
+        s.take_cmds();
+        s.cmds.lock().unwrap().push(Cmd::Shape(2));
+        s.take_cmds();
+        let (place, a, b) = {
+            let mut d = s.doc.borrow_mut();
+            let sid = d.current_id().unwrap();
+            let mut sh = d.deck.slide(1).unwrap().shapes[1].clone();
+            let f = sh.frame.unwrap();
+            sh.frame = Some(Rect::new(f.x + 1_000_000, f.y + 500_000, f.w / 2, f.h));
+            d.run("t", vec![DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(sh) }]);
+            let (a, b) = {
+                let sl = d.deck.slide(1).unwrap();
+                (sl.shapes[0].frame.unwrap(), sl.shapes[1].frame.unwrap())
+            };
+            (s.slide_place(&d.deck), a, b)
+        };
+        // Sweep a box round both from the empty top-left.
+        s.press(Point::new(place.x as f32 + 2.0, place.y as f32 + 2.0));
+        let (bx, by) = place.to_px((b.x + b.w + 10_000) as f64, (b.y + b.h + 10_000) as f64);
+        s.drag_to(Point::new(bx, by), false);
+        s.drag_to(Point::new(bx, by), true);
+        assert_eq!(s.sel.borrow().all().len(), 2);
+        // Align left: both at the leftmost edge, one undo step.
+        s.run_cmd(Cmd::Align(0));
+        {
+            let mut d = s.doc.borrow_mut();
+            let sl = d.deck.slide(1).unwrap();
+            assert_eq!(sl.shapes[0].frame.unwrap().x, a.x.min(b.x));
+            assert_eq!(sl.shapes[1].frame.unwrap().x, a.x.min(b.x));
+        }
+        // Moving the pair moves both by the same amount.
+        let (cx, cy) = place.to_px((a.x + a.w / 2) as f64, (a.y + a.h / 2) as f64);
+        s.press(Point::new(cx, cy));
+        s.drag_to(Point::new(cx + 30.0, cy), false);
+        s.drag_to(Point::new(cx + 31.0, cy), true);
+        let (a2, b2) = {
+            let mut d = s.doc.borrow_mut();
+            let sl = d.deck.slide(1).unwrap();
+            (sl.shapes[0].frame.unwrap(), sl.shapes[1].frame.unwrap())
+        };
+        assert!(a2.x > a.x.min(b.x));
+        assert_eq!(a2.x, b2.x);
+        // Group, then ungroup: the same shapes in the same places.
+        s.run_cmd(Cmd::Group);
+        {
+            let mut d = s.doc.borrow_mut();
+            let sl = d.deck.slide(1).unwrap();
+            assert_eq!(sl.shapes.len(), 1);
+            assert!(matches!(&sl.shapes[0].kind, ShapeKind::Group { shapes, .. } if shapes.len() == 2));
+        }
+        s.run_cmd(Cmd::Ungroup);
+        {
+            let mut d = s.doc.borrow_mut();
+            let sl = d.deck.slide(1).unwrap();
+            assert_eq!(sl.shapes.len(), 2);
+            assert_eq!(sl.shapes[0].frame.unwrap(), a2);
+            assert_eq!(sl.shapes[1].frame.unwrap(), b2);
+        }
+        // Each was one step: undo ungroup, group, move, align.
+        for _ in 0..4 {
+            s.run_cmd(Cmd::Undo);
+        }
+        let mut d = s.doc.borrow_mut();
+        let sl = d.deck.slide(1).unwrap();
+        assert_eq!((sl.shapes[0].frame.unwrap(), sl.shapes[1].frame.unwrap()), (a, b));
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_renders_a_deck() {
+        let ui = Mutable::new(Ui::default());
+        let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../scratch/sample.oslides")).unwrap();
+        let s = Slides::new(Doc::from_native("sample.oslides", data).unwrap(), ui, Mutable::new(0), (1200.0, 760.0));
+        let t = Instant::now();
+        let mut app = pergola::App::new(s.clone());
+        let deltas = app.tick().len();
+        let n = app.tree().len();
+        eprintln!("{deltas} deltas");
+        eprintln!("first frame: {n} nodes in {:?}", t.elapsed());
+        assert!(n > 20);
+        // Every slide's paths reach fresco as fills it takes (coordinates
+        // within its bound): background, star and arrow on slide 2.
+        let mut d = s.doc.borrow_mut();
+        for i in 0..d.deck.slide_count() {
+            let items = draw::draw_slide(&mut d.deck, i, &FixedFonts, &mut Notes::default()).unwrap();
+            let mut out = Vec::new();
+            render::nodes(&d.deck, 1, &items, Place { k: 1000.0 / 12_192_000.0, x: 100.0, y: 50.0 }, 2.0, &mut out);
+            let fills: Vec<_> = out.iter().filter_map(|n| if let Node::Fill(f) = n { Some(f.clone()) } else { None }).collect();
+            assert!(fills.len() >= if i == 1 { 3 } else { 1 }, "slide {i}: {} fills", fills.len());
+            for f in fills {
+                f.validate().unwrap();
+                assert!(f.points.iter().all(|p| p[0].abs() < 2000.0 && p[1].abs() < 2000.0), "slide {i}: placed in px");
+            }
+        }
     }
 }

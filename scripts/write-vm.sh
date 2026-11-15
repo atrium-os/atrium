@@ -47,7 +47,7 @@ start_frescod() {
 
 SHOW="/tmp/sh/$(basename "$OPEN")"
 put "$OPEN" "$SHOW"
-for f in $ALSO; do put "$f" "/tmp/sh/$(basename "$f")"; done
+for f in ${ALSO:-}; do put "$f" "/tmp/sh/$(basename "$f")"; done
 echo "=== the app on $(basename "$OPEN")"
 start_frescod
 g "cd /tmp/sh && env HOME=/tmp/sh FRESCO_SOCKET=/tmp/sh/fresco.sock ${BAR:+ATRIUM_WRITE_BAR=$BAR} daemon -f -o /tmp/sh/app.log $D/atrium-write $SHOW </dev/null"

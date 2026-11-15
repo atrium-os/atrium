@@ -2387,6 +2387,51 @@ once and a 16 MiB + video in two pieces; one flipped byte in a slide fails that
 slide only, and truncated and corrupted files never panic; a 1,000-slide deck
 opens and draws its first slide reading one slide (debug build, well under 1 s).
 
+### 16.35 O6b as built (2026-11-15): the `atrium-slides` app
+
+- **Window.** A toolbar (Open, Save, Save As, Undo, Redo; Slide menu with a new
+  slide on any of the deck's layouts, Duplicate, Delete; Text Box; Shape menu
+  with eight presets; Picture; Arrange menu), the slide strip at the left and the
+  slide fitted on the canvas, a status line. The canvas and the strip draw from
+  the same `officina-slides` display lists, cached per slide until an op touches
+  it; the strip draws only the thumbnails in view, so a 1,000-slide deck costs a
+  few, and slides more than 24 away from the one shown go back to the file.
+- **Shapes.** A press selects the topmost shape; handles resize it; dragging
+  moves it with snapping (6 px) to the slide's edges and middle and to the
+  other shapes' edges and middles, with the guides that held drawn. A drag on
+  the empty slide sweeps a box and selects what lies wholly inside; Select All
+  takes the slide. Several selected shapes move together, align (left, centre,
+  right, top, middle, bottom: to the slide for one shape, to their box for
+  several), group and ungroup (children keep their places), delete, and bring
+  forward or send back. Arrows nudge by a point, ten with Shift. A drag is shown
+  as it goes outside undo and becomes one undo step at the end.
+- **Text.** A second press, a double press or Enter on a text shape types into it;
+  an empty placeholder takes typing on the first press and shows its prompt
+  ("Click to add title") until then. Typing, Enter, Tab and Shift+Tab (outline
+  level), Backspace and Delete, arrows, Home and End, drag and double-press
+  selection, Ctrl+B/I/U, cut, copy and paste are frame ops on the `officina-text`
+  engine, grouped into one undo step per frame as in Write. Caret and selection
+  come from the frame's own layout, so they sit where the text is drawn.
+- **Files.** Picker Open (`.oslides`; PowerPoint and OpenDocument decks say they
+  come with O6c), Save over the picked file, Save As into a picked folder (a new
+  name, never replacing), Picture from the picker (PNG, JPEG, GIF, WebP, SVG; up
+  to 60 MB), sized to fit the slide. Pictures decode at their drawn size into a
+  256 MB cache shared by the canvas and the strip.
+- **Autosave.** As in Sheets: a base `.oslides` and a journal per document; every
+  action is a record of deck ops taken as they applied, plus undo, redo and saves;
+  a picture's bytes go in the journal before the shape that shows it. A deck that
+  did not close cleanly comes back at the next start with its undo steps.
+- **Gates.** The crash test (typing, shapes, a picture, undo, then the process
+  gone: the deck, its media and its undo history come back) and the app tests
+  (toolbar commands, select and drag as one undo step, sweep, align, move
+  together, group and ungroup and undo each) pass; `scripts/slides-vm.sh` takes a
+  screenshot of a deck on the cloud VM.
+- **Not yet.** Shift-click to add to a selection (pointer events carry no
+  modifiers yet), rotating by handle, turned text drawn turned (glyph runs are
+  placed upright at their turned origin), the rich-text toolbar for frames
+  (fonts, sizes, colours), notes editing in the window, thumbnails stored in the
+  file (O6e).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
