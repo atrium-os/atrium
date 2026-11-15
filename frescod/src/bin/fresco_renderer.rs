@@ -104,6 +104,8 @@ struct Win {
     /// Packed mode: its client was told its frame does not fit a slot
     /// (`budget::RASTER_TIME`); told again only after a frame fits.
     too_big: bool,
+    /// The monitor frescod was told to put it full screen on.
+    full_screen: Option<u64>,
 }
 
 impl Win {
@@ -462,8 +464,13 @@ fn main() {
     let mut scene_state = pack::SceneState::default();
     let mut tex_gen = 0u64;
     let mut last = 0;
+    let mut animating = false;
     loop {
-        last = redraw.wait_past(last, Duration::from_secs(3600));
+        // While a declarative animation runs (pergola.md §4.2) a frame
+        // goes every display refresh, whatever the client does.
+        let beat = if animating { Duration::from_nanos(1_000_000_000_000 / refresh.max(24_000) as u64) } else { Duration::from_secs(3600) };
+        last = redraw.wait_past(last, beat);
+        animating = frontend.lock().unwrap().tick_animations(monotonic_ns());
         let (uploads, clears) = frontend.lock().unwrap().take_pending_uploads();
         if !uploads.is_empty() || !clears.is_empty() {
             scene_state.apply(uploads, clears);
@@ -472,6 +479,13 @@ fn main() {
         declare(&broker, &state, &comp, (sw, sh));
         draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref());
     }
+}
+
+fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: one timespec of ours for the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    (t.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(t.tv_nsec as u64)
 }
 
 fn role(r: WmRole) -> Role {
@@ -522,7 +536,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
                     },
                 }, p.shown));
                 let min = (w.min_size.0.min(fresco_split::MAX_MIN_SIZE_PT), w.min_size.1.min(fresco_split::MAX_MIN_SIZE_PT));
-                (w.id as u32, m, place, min)
+                (w.id as u32, m, place, (min, w.full_screen_on))
             })
             .collect()
     };
@@ -534,7 +548,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
         s.wins.remove(&id);
         send(broker, &Msg::WindowDestroy { window: id });
     }
-    for (id, m, place, min) in live {
+    for (id, m, place, (min, full)) in live {
         let Msg::WindowCreate { title, .. } = &m else { unreachable!() };
         let room = s.wins.len() < MAX_WINDOWS as usize;
         match s.wins.get_mut(&id) {
@@ -557,6 +571,10 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
         if w.min_size != min {
             w.min_size = min;
             send(broker, &Msg::WindowMinSize { window: id, width: min.0, height: min.1 });
+        }
+        if let (Some(monitor), true) = (full, w.full_screen != full) {
+            w.full_screen = full;
+            send(broker, &Msg::WindowFullScreen { window: id, monitor });
         }
         // Not again after frescod dismissed it (the client's window stays
         // hidden here) until the client shows it again (`shown` moves).
@@ -698,6 +716,9 @@ fn from_broker(
     events: mpsc::Sender<DisplayEvent>,
     redraw: &redraw::Redraw,
 ) {
+    // The monitors as frescod last listed them (`Msg::Output`), for the
+    // client's OP_DISPLAY_OUTPUTS.
+    let mut outs: Vec<fresco_protocol::WmOutput> = Vec::new();
     loop {
         let (m, fds) = match broker.recv() {
             Ok(Recv::Msg(m, fds)) if !m.from_renderer() => (m, fds),
@@ -854,6 +875,24 @@ fn from_broker(
             }
             Msg::VideoPresented { layer, seq, vblank_ns, dropped, .. } => {
                 let _ = events.send(DisplayEvent::VideoPresented { window_id: local, layer, seq, vblank_ns, dropped });
+            }
+            Msg::Output { index, count, identity, rect, scale_milli, refresh_mhz, internal } => {
+                if index == 0 {
+                    outs.clear();
+                }
+                if index as usize != outs.len() {
+                    outs.clear();
+                    continue; // out of order: wait for the next full list
+                }
+                outs.push(fresco_protocol::WmOutput {
+                    output: index, identity,
+                    rect: fresco_protocol::WmRect { x: rect[0], y: rect[1], w: rect[2], h: rect[3] },
+                    refresh_mhz, present: true, scale_milli, auto_scale_milli: scale_milli, ui_size_milli: 1000,
+                    ui_size_set: false, internal, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+                });
+                if index + 1 == count {
+                    fe.lock().unwrap().set_outputs(std::mem::take(&mut outs));
+                }
             }
             Msg::Appearance { scheme, high_contrast, accent, text_size_milli } => {
                 fe.lock().unwrap().set_appearance(fresco_protocol::AppearancePayload { scheme, high_contrast, accent, text_size_milli });

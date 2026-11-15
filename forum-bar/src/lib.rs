@@ -33,6 +33,7 @@ mod tests {
             role: WmRole::Document,
             rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
             min_size: (0, 0),
+            full_screen_on: 0,
         }
     }
 

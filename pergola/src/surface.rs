@@ -182,6 +182,11 @@ pub struct FrescoSurface {
     /// The other windows' slot and scroll state (pop-ups,
     /// [`FrescoSurface::select`]): slots are per window.
     others: std::collections::HashMap<u32, WindowState>,
+    /// Each Stack's group origin as last sent, device px, by (window, node):
+    /// what an animation's offsets are from.
+    origins: std::collections::HashMap<(u32, u32), (f32, f32)>,
+    /// Animations to send with a window's next frame (`crate::anim`).
+    anims: Vec<(u32, u32, Vec<crate::anim::Track>)>,
 }
 
 /// What a window's scene holds that the surface must remember.
@@ -539,7 +544,34 @@ impl FrescoSurface {
             edges: Default::default(),
             sent: Default::default(),
             others: Default::default(),
+            origins: Default::default(),
+            anims: Vec::new(),
         }
+    }
+
+    /// Send animation `handle` of `window` with its next frame
+    /// ([`crate::anim`]).
+    pub fn queue_animation(&mut self, window: u32, handle: u32, tracks: Vec<crate::anim::Track>) {
+        self.anims.push((window, handle, tracks));
+    }
+
+    /// Whether animations wait for a frame of `window`.
+    pub fn animations_waiting(&self, window: u32) -> bool {
+        self.anims.iter().any(|a| a.0 == window)
+    }
+
+    /// The animations queued for the current window, out now (inside its
+    /// frame, after its groups).
+    fn send_animations(&mut self) -> io::Result<()> {
+        let win = self.window_id;
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.anims).into_iter().partition(|a| a.0 == win);
+        self.anims = rest;
+        for (_, handle, tracks) in mine {
+            let origins = &self.origins;
+            let wire = crate::anim::wire(&tracks, self.scale, |id| origins.get(&(win, id)).copied());
+            self.conn.animation_start(win, handle, wire)?;
+        }
+        Ok(())
     }
 
     /// Draw into `window` from now on (a pop-up of the same connection).
@@ -744,6 +776,7 @@ impl Surface for FrescoSurface {
 
     fn end_frame(&mut self) -> io::Result<()> {
         self.settle()?;
+        self.send_animations()?;
         self.conn.scene_frame_end()
     }
 
@@ -826,7 +859,7 @@ impl Surface for FrescoSurface {
         if let Node::Scroll { .. } = stack {
             return self.set_scroll(id, stack, group, order);
         }
-        let Node::Stack { rect, fill, radius, .. } = stack else {
+        let Node::Stack { rect, fill, radius, opacity, clip, .. } = stack else {
             return self.set_node(id, stack, group, order);
         };
         let k = self.scale;
@@ -835,7 +868,7 @@ impl Surface for FrescoSurface {
             order,
             transform: fresco_protocol::GroupParams::IDENTITY,
             clip: None,
-            opacity: 1.0,
+            opacity: opacity.clamp(0.0, 1.0),
             flags: 0,
         };
         // Whole device pixels, placed from the edges near it, so its
@@ -843,6 +876,10 @@ impl Surface for FrescoSurface {
         let (x, y, w, h) = self.place_rect(id.0, stack, group, order, *rect);
         g.transform[4] = x;
         g.transform[5] = y;
+        if *clip {
+            g.clip = Some([x, y, x + w, y + h]);
+        }
+        self.origins.insert((self.window_id, id.0), (x, y));
         self.conn.scene_group(id.0, g)?;
         let bg = background_id(id);
         match fill {
@@ -861,6 +898,7 @@ impl Surface for FrescoSurface {
 
     fn clear_node(&mut self, id: NodeId) -> io::Result<()> {
         self.scrolls.remove(&id.0);
+        self.origins.remove(&(self.window_id, id.0));
         for gone in self.edges.forget(id.0) {
             self.sent.remove(&gone);
         }

@@ -58,7 +58,7 @@ pub fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, CodecErro
 ///   0x0030..=0x003F    Scene frame boundaries (SCENE_FRAME_*).
 ///   0x0040..=0x004F    Scene node mutations (SCENE_NODE_*).
 ///   0x0500..=0x05FF    Window management (WINDOW_*).
-///   0x0600..=0x06FF    Reserved for D4.5 ANIMATION_* op family.
+///   0x0600..=0x06FF    Declarative animation (ANIMATION_*, pergola.md §4.2).
 ///   0x0700..=0x07FF    Input events (EV_INPUT_*).
 ///   0x0900..=0x09FF    Activation tokens (`activation`, tabula.md §2), broker socket only.
 /// ```
@@ -104,6 +104,22 @@ pub mod control {
     /// high contrast and the accent) → `AppearancePayload`. Changes come
     /// as `EV_APPEARANCE_CHANGED`.
     pub const OP_APPEARANCE:         u16 = 0x0055;
+    /// Synchronous query: the monitors of the desktop as an app may know
+    /// them (where each is, its scale, which is primary) →
+    /// `DisplayOutputsReply`. For an app that puts a window on a chosen
+    /// monitor (a slideshow on the projector, officina.md §9.1).
+    pub const OP_DISPLAY_OUTPUTS:    u16 = 0x0056;
+
+    // ── Declarative animation (pergola.md §4.2) ──
+    // frescod runs the animation on its own clock, frame by frame, so the
+    // app can stall without the animation stalling.
+    /// `AnimationStartPayload`: animate groups of a window.
+    pub const OP_ANIMATION_START:    u16 = 0x0600;
+    /// `AnimationCancelPayload`: stop an animation where it is.
+    pub const OP_ANIMATION_CANCEL:   u16 = 0x0601;
+    /// `AnimationFinishedEvent`, to the window's owner: every track of an
+    /// animation ended (or it was cancelled, or refused).
+    pub const EV_ANIMATION_FINISHED: u16 = 0x0680;
 
     // ── Window management (§3.8.1) ──
     // Control (client → server)
@@ -410,6 +426,10 @@ pub struct WmSurfaceInfo {
     /// §6.3, §7: a window moved to a monitor of another scale needs the
     /// same points, not the same pixels).
     pub min_size: (u32, u32),
+    /// The monitor (identity) the app asked to have the window full screen
+    /// on (`WindowHints::full_screen_on`), 0 for none: the WM lays it out
+    /// alone on that monitor's screen.
+    pub full_screen_on: u64,
 }
 
 /// Reply to `OP_WM_ENUMERATE` — every surface in the caller's session.
@@ -1079,6 +1099,11 @@ pub struct WindowHints {
     /// An embed child (limen.md §4): kept off screen, with no input or
     /// focus, until limend binds it into a slot.
     pub embed_pending: bool,
+    /// Full screen on this monitor (its identity, `DisplayOutput`), the
+    /// window alone there: a slideshow on the projector (officina.md
+    /// §9.1). The WM places it so; with no WM frescod puts it at the
+    /// monitor's origin. `None`: an ordinary window.
+    pub full_screen_on: Option<u64>,
 }
 
 /// `OP_WINDOW_REQUEST_CLOSE` — toolkit-initiated close. Server
@@ -1273,6 +1298,154 @@ pub struct DisplayInfoResponse {
     /// point on the monitor new windows land on. `width / scale` is the
     /// screen in points (resolution-independence.md §3).
     pub scale_milli: u32,
+}
+
+/// One monitor as `OP_DISPLAY_OUTPUTS` tells an app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayOutput {
+    /// The monitor's identity (`WmOutput::identity`): what
+    /// `WindowHints::full_screen_on` names.
+    pub identity: u64,
+    /// Its part of the desktop, desktop pixels.
+    pub rect: WmRect,
+    /// Device pixels per point there, thousandths.
+    pub scale_milli: u32,
+    pub refresh_mhz: u32,
+    /// A laptop's own panel.
+    pub internal: bool,
+    /// The first monitor (where the bar is).
+    pub primary: bool,
+}
+
+/// Reply to `OP_DISPLAY_OUTPUTS`: the monitors that show a part of the
+/// desktop of their own (mirrors and monitors gone for a moment left out).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayOutputsReply {
+    pub outputs: Vec<DisplayOutput>,
+}
+
+// ── Declarative animation (pergola.md §4.2) ─────────────────────────
+
+/// Easing curves frescod runs (`AnimTrack::curve`).
+pub mod anim_curve {
+    pub const LINEAR: u8 = 0;
+    pub const EASE_IN: u8 = 1;
+    pub const EASE_OUT: u8 = 2;
+    pub const EASE_IN_OUT: u8 = 3;
+    /// No motion: the `from` value until the track ends, then its group's
+    /// own (a build that appears, an instant cut).
+    pub const STEP: u8 = 4;
+}
+
+/// Most tracks in one animation.
+pub const ANIM_MAX_TRACKS: usize = 64;
+/// Most animations running in one window at once.
+pub const ANIM_MAX_LIVE: usize = 64;
+/// Longest delay or duration of a track, ms.
+pub const ANIM_MAX_MS: u32 = 60_000;
+
+/// What a track moves: one property of one group.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum AnimValue {
+    /// The group's transform (v1: translate and positive uniform scale,
+    /// as `GroupParams::transform`), interpolated element by element, so
+    /// a scale about a point stays about that point.
+    Transform { from: [f32; 6], to: [f32; 6] },
+    /// The group's opacity.
+    Opacity { from: f32, to: f32 },
+    /// The group's clip, in its parent's space, `[x0, y0, x1, y1)`.
+    Clip { from: [f32; 4], to: [f32; 4] },
+}
+
+/// One property of one group, from a value to another, after `delay_ms`
+/// for `duration_ms`. While it runs the value replaces the group's own;
+/// once it ends the group's own applies again, so a client sets the end
+/// state as the group's own params in the frame that starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AnimTrack {
+    /// A group of the window, written by the same client.
+    pub node: u32,
+    pub delay_ms: u32,
+    pub duration_ms: u32,
+    /// [`anim_curve`].
+    pub curve: u8,
+    /// The `from` value holds during the delay too (`hold_before`), or the
+    /// group's own does until the track begins.
+    pub hold_before: bool,
+    pub value: AnimValue,
+}
+
+/// `OP_ANIMATION_START`: tracks that start together, on the first frame
+/// frescod composes after the op (sent inside a scene frame, they start
+/// with it). A track on a group and property another track already moves
+/// replaces that one. The whole animation is refused (and finishes at
+/// once, `refused`) if any track is invalid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnimationStartPayload {
+    pub window_id: u32,
+    /// The client's name for it, in `AnimationFinishedEvent`.
+    pub handle: u32,
+    pub tracks: Vec<AnimTrack>,
+}
+
+/// `OP_ANIMATION_CANCEL`: every track of `handle` stops; its groups show
+/// their own params from the next frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnimationCancelPayload {
+    pub window_id: u32,
+    pub handle: u32,
+}
+
+/// `EV_ANIMATION_FINISHED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnimationFinishedEvent {
+    pub window_id: u32,
+    pub handle: u32,
+    /// Stopped by `OP_ANIMATION_CANCEL`, or by its groups going.
+    pub cancelled: bool,
+    /// Never started: a track was invalid, or too many run.
+    pub refused: bool,
+    /// Frames it was drawn in, and the longest gap between two of them
+    /// (µs): how smoothly it ran.
+    pub frames: u32,
+    pub worst_gap_us: u32,
+}
+
+impl AnimTrack {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.delay_ms > ANIM_MAX_MS || self.duration_ms > ANIM_MAX_MS {
+            return Err("animation track too long");
+        }
+        if self.curve > anim_curve::STEP {
+            return Err("unknown animation curve");
+        }
+        let probe = |t: [f32; 6], clip: Option<[f32; 4]>, opacity: f32| {
+            GroupParams { parent: None, order: 0, transform: t, clip, opacity, flags: 0 }.validate()
+        };
+        match self.value {
+            AnimValue::Transform { from, to } => probe(from, None, 1.0).and(probe(to, None, 1.0)),
+            AnimValue::Opacity { from, to } => probe(GroupParams::IDENTITY, None, from).and(probe(GroupParams::IDENTITY, None, to)),
+            AnimValue::Clip { from, to } => probe(GroupParams::IDENTITY, Some(from), 1.0).and(probe(GroupParams::IDENTITY, Some(to), 1.0)),
+        }
+    }
+}
+
+/// The eased progress of a track `t` (0..=1 of its duration) along `curve`.
+pub fn anim_ease(curve: u8, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    match curve {
+        anim_curve::EASE_IN => t * t * t,
+        anim_curve::EASE_OUT => 1.0 - (1.0 - t).powi(3),
+        anim_curve::EASE_IN_OUT => {
+            if t < 0.5 {
+                4.0 * t * t * t
+            } else {
+                1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+            }
+        }
+        anim_curve::STEP => 0.0,
+        _ => t,
+    }
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────
@@ -2586,6 +2759,7 @@ mod tests {
                 initial_position: None,
                 role: None,
                 embed_pending: false,
+                full_screen_on: None,
             },
             parent_window_id: 0,
         };
@@ -2788,6 +2962,10 @@ mod tests {
             control::OP_VIDEO_LAYER_COLOR,
             control::EV_VIDEO_PRESENTED,
             control::EV_VIDEO_RELEASED,
+            control::OP_DISPLAY_OUTPUTS,
+            control::OP_ANIMATION_START,
+            control::OP_ANIMATION_CANCEL,
+            control::EV_ANIMATION_FINISHED,
         ];
         let mut sorted = ops.to_vec();
         sorted.sort();
@@ -2816,6 +2994,7 @@ mod tests {
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 },
                 min_size: (640, 480),
+                full_screen_on: 0,
             }],
             embeds: vec![[7, 1]],
         };

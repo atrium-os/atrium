@@ -135,6 +135,51 @@ pub fn draw_slide(deck: &mut Deck, i: usize, fonts: &dyn Fonts, notes: &mut Note
     Ok(out)
 }
 
+/// A run of a slide's display list: what one shape a build moves draws
+/// (`shape`), or the shapes between such (`None`), in drawing order.
+#[derive(Debug, Clone)]
+pub struct Part {
+    pub shape: Option<ShapeId>,
+    pub items: Vec<DrawItem>,
+}
+
+/// Slide `i`'s display list cut into runs, each top-level shape of `apart`
+/// in a run of its own, so presenting can show, hide and move it alone
+/// (a build) while keeping the drawing order.
+pub fn draw_slide_parts(deck: &mut Deck, i: usize, apart: &[ShapeId], fonts: &dyn Fonts, notes: &mut Notes) -> Result<Vec<Part>, Damaged> {
+    deck.load_slide(i)?;
+    let deck = &*deck;
+    let slide = deck.slide_if_loaded(i).ok_or_else(|| Damaged(format!("slide {i}")))?;
+    let layout = deck.layout(slide.layout);
+    let master = layout.and_then(|l| deck.master(l.master));
+    let mut base = Vec::new();
+    let bg = slide.background.as_ref().or(layout.and_then(|l| l.background.as_ref())).or(master.map(|m| &m.background));
+    background(deck, bg, &mut base);
+    let n = (i + 1).to_string();
+    if !slide.hide_layout_shapes {
+        if let (Some(m), Some(l)) = (master, layout) {
+            if !l.hide_master_shapes {
+                shapes(deck, Owner::Master, &m.shapes, &IDENTITY, false, &n, fonts, &mut base, notes);
+            }
+            shapes(deck, Owner::Layout(m.id), &l.shapes, &IDENTITY, false, &n, fonts, &mut base, notes);
+        }
+    }
+    let mut parts = vec![Part { shape: None, items: base }];
+    for s in &slide.shapes {
+        if s.hidden {
+            continue;
+        }
+        let own = apart.contains(&s.id);
+        if own || parts.last().is_some_and(|p| p.shape.is_some()) {
+            parts.push(Part { shape: own.then_some(s.id), items: Vec::new() });
+        }
+        let last = parts.last_mut().expect("a part");
+        shape(deck, Owner::Slide(slide.layout), s, &IDENTITY, &n, fonts, &mut last.items, notes);
+    }
+    parts.retain(|p| p.shape.is_some() || !p.items.is_empty());
+    Ok(parts)
+}
+
 /// A layout's display list, placeholders shown (for editing layouts).
 pub fn draw_layout(deck: &Deck, id: LayoutId, fonts: &dyn Fonts, notes: &mut Notes) -> Vec<DrawItem> {
     let mut out = Vec::new();

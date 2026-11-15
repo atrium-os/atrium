@@ -83,6 +83,9 @@ pub enum Event {
     /// when that set changes, so an empty list means all of them draw
     /// again. Draw a dropped one some other way (a bitmap), or send less.
     FillsDropped   { window_id: u32, dropped: Vec<fresco_protocol::FillDrop> },
+    /// A declarative animation ended, was cancelled or was refused
+    /// (`Connection::animation_start`).
+    AnimationFinished(fresco_protocol::AnimationFinishedEvent),
     /// An op was refused because it would pass one of the client's
     /// budgets (`fresco_protocol::budget`), or a frame was too costly to
     /// raster. Evict (clear nodes or slots) and send again.
@@ -1043,6 +1046,33 @@ impl Connection {
         }
     }
 
+    /// The monitors (`OP_DISPLAY_OUTPUTS`), the primary first: where a
+    /// window can be put full screen (`WindowHints::full_screen_on`).
+    pub fn display_outputs(&mut self) -> io::Result<Vec<fresco_protocol::DisplayOutput>> {
+        self.send_payload(control::OP_DISPLAY_OUTPUTS, 0, &())?;
+        loop {
+            let m = self.recv_reply()?;
+            if m.opcode_class == CLASS_DISPLAY && m.op == control::OP_DISPLAY_OUTPUTS && m.flags & flag::IS_RESPONSE != 0 {
+                return decode::<fresco_protocol::DisplayOutputsReply>(&m.payload)
+                    .map(|r| r.outputs)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode DISPLAY_OUTPUTS reply: {e}")));
+            }
+        }
+    }
+
+    /// Start a declarative animation of `window`'s groups (pergola.md
+    /// §4.2): frescod runs it frame by frame on its own clock and sends
+    /// [`Event::AnimationFinished`] with `handle` when it ends. Sent inside
+    /// a scene frame, it starts with that frame.
+    pub fn animation_start(&mut self, window: u32, handle: u32, tracks: Vec<fresco_protocol::AnimTrack>) -> io::Result<()> {
+        self.send_payload(control::OP_ANIMATION_START, 0, &fresco_protocol::AnimationStartPayload { window_id: window, handle, tracks })
+    }
+
+    /// Stop animation `handle` where it is.
+    pub fn animation_cancel(&mut self, window: u32, handle: u32) -> io::Result<()> {
+        self.send_payload(control::OP_ANIMATION_CANCEL, 0, &fresco_protocol::AnimationCancelPayload { window_id: window, handle })
+    }
+
     pub fn display_info(&mut self) -> io::Result<DisplayInfoResponse> {
         self.send_payload(control::OP_DISPLAY_INFO, 0, &())?;
         loop {
@@ -1343,6 +1373,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_FILLS_DROPPED => match decode::<WindowFillsDroppedEvent>(payload) {
             Ok(p) => Event::FillsDropped { window_id: p.window_id, dropped: p.dropped },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_ANIMATION_FINISHED => match decode::<fresco_protocol::AnimationFinishedEvent>(payload) {
+            Ok(p) => Event::AnimationFinished(p),
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_WINDOW_EMBED_TOKEN => match decode::<fresco_protocol::EmbedTokenEvent>(payload) {

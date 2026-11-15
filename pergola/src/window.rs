@@ -332,6 +332,12 @@ impl Window {
             self.last_paint.send_cpu_ms = cpu1 - cpu0;
             self.last_paint.send_preempted = sw1 - sw0;
         }
+        // Animations queued with no change to draw go in a frame of their own.
+        if self.surface.animations_waiting(self.main) {
+            self.surface.select(self.main);
+            commit(&mut self.surface, &[])?;
+            self.surface.present()?;
+        }
         // After the present, so a slot never sits over a frame that does
         // not yet show the space for it.
         let changes = app.take_slot_changes();
@@ -366,6 +372,13 @@ impl Window {
     /// `limen::client::Child::ready` (as a child). `None` until frescod
     /// has sent it, shortly after the window opens.
     pub fn embed_token(&self) -> Option<[u8; 16]> { self.embed_token }
+
+    /// Animate Stacks of this window (`crate::anim`): sent with the next
+    /// frame, so they start with what it shows. `handle` comes back in
+    /// `fresco_client::Event::AnimationFinished`.
+    pub fn animate(&mut self, handle: u32, tracks: Vec<crate::anim::Track>) {
+        self.surface.queue_animation(self.main, handle, tracks);
+    }
 
     /// The window's id on the connection (for ops the loop does not
     /// cover, such as `popup_grant`).

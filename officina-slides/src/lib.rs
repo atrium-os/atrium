@@ -19,6 +19,7 @@ pub mod model;
 pub mod native;
 pub mod ops;
 pub mod resolve;
+pub mod show;
 
 /// EMU to the inch, point and centimetre.
 pub const EMU_PER_INCH: i64 = 914_400;

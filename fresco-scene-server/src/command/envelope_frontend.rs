@@ -103,6 +103,13 @@ pub struct WindowSceneState {
     /// What each node and bound slot costs, by writer (`crate::budget`).
     pub node_ledger: crate::budget::Ledger,
     pub slot_ledger: crate::budget::Ledger,
+
+    /// Declarative animations running on this window's groups
+    /// (`command::anims`), the groups' values for the frame being packed,
+    /// and the finished ones not yet told to their client.
+    pub anims: Vec<super::anims::Anim>,
+    pub anim_now: HashMap<u32, fresco_protocol::GroupParams>,
+    pub anim_done: Vec<fresco_protocol::AnimationFinishedEvent>,
 }
 
 impl WindowSceneState {
@@ -854,6 +861,12 @@ impl EnvelopeFrontend {
             control::OP_TEXT_RUN_INSTALL   => self.handle_text_run_install(msg),
             control::OP_TEXT_MEASURE       => self.handle_text_measure(msg),
             control::OP_DISPLAY_INFO       => self.handle_display_info(),
+            control::OP_DISPLAY_OUTPUTS    => {
+                let payload = encode(&self.display_outputs()).map_err(|_| DispatchError::BadPayload)?;
+                Ok(vec![Outbound { op: control::OP_DISPLAY_OUTPUTS, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
+            }
+            control::OP_ANIMATION_START    => self.handle_animation_start(msg),
+            control::OP_ANIMATION_CANCEL   => self.handle_animation_cancel(msg),
             control::OP_APPEARANCE         => {
                 let payload = encode(&self.appearance).map_err(|_| DispatchError::BadPayload)?;
                 Ok(vec![Outbound { op: control::OP_APPEARANCE, flags: flag::IS_RESPONSE, payload, fds: Vec::new() }])
@@ -1127,6 +1140,69 @@ impl EnvelopeFrontend {
             return Err(DispatchError::NotOwner);
         }
         Ok(win_id)
+    }
+
+    /// The monitors an app may know of (`OP_DISPLAY_OUTPUTS`): those that
+    /// show a part of the desktop of their own.
+    pub fn display_outputs(&self) -> fresco_protocol::DisplayOutputsReply {
+        let first = self.outputs.outputs.iter().find(|o| o.present && o.mirror_of == 0).map(|o| o.identity);
+        fresco_protocol::DisplayOutputsReply {
+            outputs: self.outputs.outputs.iter().filter(|o| o.present && o.mirror_of == 0).map(|o| fresco_protocol::DisplayOutput {
+                identity: o.identity,
+                rect: o.rect,
+                scale_milli: o.scale_milli,
+                refresh_mhz: o.refresh_mhz,
+                internal: o.internal,
+                primary: Some(o.identity) == first,
+            }).collect(),
+        }
+    }
+
+    /// `OP_ANIMATION_START` (pergola.md §4.2): checked and refused in
+    /// `command::anims`, reported by `EV_ANIMATION_FINISHED`.
+    fn handle_animation_start(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::AnimationStartPayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        self.my_window(p.window_id)?;
+        let writer = self.current_client;
+        self.ensure_window_state(p.window_id).start_animation(p.window_id, writer, p.handle, p.tracks);
+        Ok(Vec::new())
+    }
+
+    fn handle_animation_cancel(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        let p: fresco_protocol::AnimationCancelPayload = decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        self.my_window(p.window_id)?;
+        let writer = self.current_client;
+        self.ensure_window_state(p.window_id).cancel_animation(p.window_id, writer, p.handle);
+        Ok(Vec::new())
+    }
+
+    /// Window `id` is the calling client's.
+    fn my_window(&self, id: u32) -> Result<(), DispatchError> {
+        let comp = self.compositor.lock().unwrap();
+        let win = u16::try_from(id).ok().and_then(|w| comp.windows.get(&w)).ok_or(DispatchError::UnknownWindow)?;
+        if win.owner != self.current_client as u32 {
+            return Err(DispatchError::NotOwner);
+        }
+        Ok(())
+    }
+
+    /// Run every window's animations to `now_ns` (monotonic) before a
+    /// frame is packed, and tell the clients of the ones that ended.
+    /// Returns whether any still runs (the next frame must be drawn).
+    pub fn tick_animations(&mut self, now_ns: u64) -> bool {
+        let mut live = false;
+        let mut done = Vec::new();
+        for (&id, s) in self.per_window.iter_mut() {
+            live |= s.tick_animations(id, now_ns);
+            done.append(&mut s.anim_done);
+        }
+        if !done.is_empty() {
+            let comp = self.compositor.lock().unwrap();
+            for e in done {
+                comp.emit(crate::window::DisplayEvent::AnimationFinished(e));
+            }
+        }
+        live
     }
 
     /// Get-or-create per-window state map entry for `window_id`.
@@ -1738,6 +1814,14 @@ impl EnvelopeFrontend {
             if let Some((x, y)) = p.hints.initial_position {
                 win.pos = (x as f32, y as f32);
             }
+            /* Full screen on a monitor (a slideshow): at its origin until
+             * a WM lays it out alone there. */
+            if let Some(m) = p.hints.full_screen_on {
+                win.full_screen_on = Some(m);
+                if let Some(o) = self.outputs.outputs.iter().find(|o| o.identity == m) {
+                    win.pos = (o.rect.x as f32, o.rect.y as f32);
+                }
+            }
             if let Some((w, h)) = p.hints.min_size {
                 win.min_size = (w.min(crate::window::MAX_MIN_SIZE_PT), h.min(crate::window::MAX_MIN_SIZE_PT));
             }
@@ -1834,6 +1918,7 @@ impl EnvelopeFrontend {
                     h: w.size.1 as i32,
                 },
                 min_size: w.min_size,
+                full_screen_on: w.full_screen_on.unwrap_or(0),
             })
             .collect();
         // Stable order (by surface id) so the WM sees a deterministic set.
@@ -2560,6 +2645,51 @@ mod tests {
         let c = comp.lock().unwrap();
         assert_eq!(c.popup_top, 48.0);
         assert_eq!((c.scale_at(100.0, 100.0), c.scale_at(2000.0, 100.0), c.scale_at(5000.0, 0.0)), (2000, 1000, 2000));
+    }
+
+    /// A slideshow (officina.md §9.1): an app lists the monitors, opens
+    /// a window full screen on the second, and animates its groups; frescod
+    /// moves them frame by frame and tells the app when they end.
+    #[test]
+    fn full_screen_on_a_monitor_and_animations() {
+        use fresco_protocol::{AnimTrack, AnimValue, AnimationStartPayload, DisplayOutputsReply, GroupParams, WmOutput, WmRect};
+        let mut f = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.compositor_arc().lock().unwrap().set_event_sink(tx);
+        let out = |output, identity, x, mirror_of| WmOutput {
+            output, identity, rect: WmRect { x, y: 0, w: 1920, h: 1080 },
+            refresh_mhz: 60000, present: true, scale_milli: 1000, auto_scale_milli: 1000, ui_size_milli: 1000, ui_size_set: false, internal: false, mirror_of, width_mm: 0, height_mm: 0, flapping: false,
+        };
+        f.set_outputs(vec![out(0, 10, 0, 0), out(1, 20, 1920, 0), out(2, 30, 0, 10)]);
+        let r = f.dispatch(&msg(control::OP_DISPLAY_OUTPUTS, 0, Vec::new()), 1).unwrap();
+        let mons: DisplayOutputsReply = decode(&r[0].payload).unwrap();
+        assert_eq!(mons.outputs.iter().map(|o| (o.identity, o.primary)).collect::<Vec<_>>(), vec![(10, true), (20, false)], "the mirror is no place of its own");
+        let p = WindowCreatePayload {
+            width: 1920, height: 1080, title: "show".into(),
+            hints: WindowHints { full_screen_on: Some(20), server_decorations: Some(false), ..Default::default() },
+            parent_window_id: 0,
+        };
+        let id: u32 = decode(&f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1).unwrap()[0].payload).unwrap();
+        assert_eq!(f.compositor_arc().lock().unwrap().windows[&(id as u16)].pos, (1920.0, 0.0));
+        f.grant_window_management(1);
+        let r = f.dispatch(&msg(control::OP_WM_ENUMERATE, 0, Vec::new()), 1).unwrap();
+        let e: WmEnumerateReply = decode(&r[0].payload).unwrap();
+        assert_eq!(e.surfaces.iter().find(|s| s.surface_id == id).unwrap().full_screen_on, 20);
+
+        let g = GroupParams { parent: None, order: 0, transform: GroupParams::IDENTITY, clip: None, opacity: 1.0, flags: 0 };
+        let set = SceneNodeSetPayload { node_id: 5, op_id: scene_ops::ATRIUM_CORE_GROUP, params: encode(&g).unwrap() };
+        f.dispatch(&msg(control::OP_SCENE_NODE_SET, id as u16, encode(&set).unwrap()), 1).unwrap();
+        let track = AnimTrack { node: 5, delay_ms: 0, duration_ms: 100, curve: fresco_protocol::anim_curve::LINEAR, hold_before: true, value: AnimValue::Opacity { from: 0.0, to: 1.0 } };
+        let start = AnimationStartPayload { window_id: id, handle: 3, tracks: vec![track] };
+        assert!(f.dispatch(&msg(control::OP_ANIMATION_START, 0, encode(&start).unwrap()), 2).is_err(), "not the owner's window");
+        f.dispatch(&msg(control::OP_ANIMATION_START, 0, encode(&start).unwrap()), 1).unwrap();
+        assert!(f.tick_animations(0));
+        assert_eq!(f.window_state(id).unwrap().group_now(5).unwrap().opacity, 0.0);
+        assert!(f.tick_animations(40_000_000));
+        assert!((f.window_state(id).unwrap().group_now(5).unwrap().opacity - 0.4).abs() < 1e-6);
+        assert!(!f.tick_animations(100_000_000));
+        let ended = rx.try_iter().find_map(|e| match e { crate::window::DisplayEvent::AnimationFinished(a) => Some(a), _ => None }).expect("told");
+        assert_eq!((ended.window_id, ended.handle, ended.cancelled, ended.frames), (id, 3, false, 3));
     }
 
     #[test]

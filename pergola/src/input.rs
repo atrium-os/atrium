@@ -67,6 +67,7 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::PopupHosted { .. }
         // Pergola draws no filled paths yet, so it has none to fall back for.
         | fresco_client::Event::FillsDropped { .. }
+        | fresco_client::Event::AnimationFinished(_)
         // Over a renderer budget: the embedder evicts (a DocumentView drops
         // bands far from the viewport), at the loop level.
         | fresco_client::Event::BudgetRefused { .. }

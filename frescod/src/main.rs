@@ -719,6 +719,9 @@ fn main() -> std::io::Result<()> {
         if compose {
             render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), dw, dh)
                 .map_err(io_other)?;
+            if animating() {
+                redraw.wake(); // the next frame, once this one's flip lands
+            }
             let damage = renderer.damage();
             for h in heads.iter_mut() {
                 h.dirty.add(damage);
@@ -1187,7 +1190,9 @@ fn publish_outputs(frontend: &Arc<Mutex<EnvelopeFrontend>>, heads: &[heads::Head
             }
         })
         .collect();
-    frontend.lock().unwrap().set_outputs(list);
+    let mut fe = frontend.lock().unwrap();
+    fe.set_outputs(list);
+    screen::set_outputs(fe.display_outputs().outputs);
 }
 
 /// Move monitors on the desktop (a WM's OP_WM_ARRANGE_OUTPUTS): the named
@@ -1243,9 +1248,40 @@ fn publish_output0(frontend: &Arc<Mutex<EnvelopeFrontend>>, dpy: &Display, heads
 /// as the display path, but reads the composited screen back to a PNG each frame
 /// instead of scanning out. No GPU/display device needed — so the full jailed
 /// desktop (forum-wm + jailed chrome) can be composited and captured anywhere.
+/// `FRESCOD_HEADLESS_OUTPUTS=1280x720,1920x1080`: the headless desktop as
+/// monitors side by side (for two-monitor gates: a slideshow on one, its
+/// presenter view on the other). One 1280x720 monitor when unset.
+fn headless_outputs() -> Vec<fresco_protocol::WmOutput> {
+    let spec = std::env::var("FRESCOD_HEADLESS_OUTPUTS").unwrap_or_default();
+    let mut x = 0;
+    let mut out = Vec::new();
+    for (i, m) in spec.split(',').enumerate() {
+        let Some((w, h)) = m.trim().split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) else { continue };
+        if !(64..=8192).contains(&w) || !(64..=8192).contains(&h) || out.len() >= 4 {
+            continue;
+        }
+        out.push(fresco_protocol::WmOutput {
+            output: i as u32, identity: 0x4845_0000 + i as u64,
+            rect: fresco_protocol::WmRect { x, y: 0, w: w as i32, h: h as i32 },
+            refresh_mhz: 60_000, present: true, scale_milli: 1000, auto_scale_milli: 1000, ui_size_milli: 1000,
+            ui_size_set: false, internal: i == 0, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+        });
+        x += w as i32;
+    }
+    if out.is_empty() {
+        out.push(fresco_protocol::WmOutput {
+            output: 0, identity: 0x4845_0000, rect: fresco_protocol::WmRect { x: 0, y: 0, w: 1280, h: 720 },
+            refresh_mhz: 60_000, present: true, scale_milli: 1000, auto_scale_milli: 1000, ui_size_milli: 1000,
+            ui_size_set: false, internal: true, mirror_of: 0, width_mm: 0, height_mm: 0, flapping: false,
+        });
+    }
+    out
+}
+
 fn run_headless(png: &str) -> std::io::Result<()> {
-    const W: u32 = 1280;
-    const H: u32 = 720;
+    let outs = headless_outputs();
+    let W: u32 = outs.iter().map(|o| (o.rect.x + o.rect.w) as u32).max().unwrap_or(1280);
+    let H: u32 = outs.iter().map(|o| o.rect.h as u32).max().unwrap_or(720);
 
     let mut renderer = Backend::from_env(W, H, None, load_bundles).map_err(io_other)?;
     eprintln!("frescod-headless: renderer {}", renderer.name());
@@ -1271,6 +1307,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     /* Headless has no connector, but clients still need an answer — the surface
      * it renders into IS the screen here. Refresh 0 says "no real mode". */
     frontend.lock().unwrap().set_display_mode(W, H, 0);
+    {
+        let mut fe = frontend.lock().unwrap();
+        fe.set_outputs(outs.clone());
+        screen::set_outputs(fe.display_outputs().outputs);
+    }
+    screen::set(W, H, 60_000);
 
     let sock = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
@@ -1328,6 +1370,16 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     const HEADLESS_HEARTBEAT: Duration = Duration::from_secs(60);
     const HEADLESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
     let out = format!("{png}.png");
+    /* While an animation runs, frames go at FRESCOD_HEADLESS_HZ (60) as a
+     * display's would, and are not each saved (a PNG encode costs far more
+     * than a frame); the screen is saved once it ends.
+     * FRESCOD_HEADLESS_EVERY_FRAME=1 saves each, numbered, to look at a
+     * transition frame by frame. */
+    let hz: u32 = std::env::var("FRESCOD_HEADLESS_HZ").ok().and_then(|v| v.parse().ok()).filter(|v| (1..=240).contains(v)).unwrap_or(60);
+    let frame_period = Duration::from_nanos(1_000_000_000 / hz as u64);
+    let every_frame = std::env::var_os("FRESCOD_HEADLESS_EVERY_FRAME").is_some();
+    let mut frame_no: u64 = 0;
+    let mut was_animating = false;
     let mut heartbeat = HEADLESS_HEARTBEAT;
     let mut last_gen: u64 = 0;
     let mut last_render = Instant::now()
@@ -1345,10 +1397,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             redraw2.wait_past(last_gen, until_beat);
             continue;
         }
-        /* Coalesce bursts: floor the interval between captures. */
+        /* Coalesce bursts: floor the interval between captures (a frame
+         * period while animating). */
+        let floor = if was_animating { frame_period } else { HEADLESS_MIN_INTERVAL };
         let since = last_render.elapsed();
-        if since < HEADLESS_MIN_INTERVAL {
-            std::thread::sleep(HEADLESS_MIN_INTERVAL - since);
+        if since < floor {
+            std::thread::sleep(floor - since);
         }
 
         last_gen = redraw2.current();
@@ -1356,6 +1410,18 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), W, H).map_err(io_other)?;
         /* No flip here: on screen once captured. */
         video::VIDEOS.landed(video::monotonic_ns(), &comp);
+        frame_no += 1;
+        let now_animating = animating();
+        if now_animating {
+            redraw2.wake();
+        }
+        let saving = !now_animating || every_frame;
+        was_animating = now_animating;
+        if !saving {
+            last_render = Instant::now();
+            continue;
+        }
+        let out = if every_frame && now_animating { format!("{png}-{frame_no:06}.png") } else { out.clone() };
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
@@ -1375,6 +1441,13 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 /// the screen with the selected backend. The compute and gpu backends draw
 /// each window into its own surface and compose them (threat model
 /// §2.5.2); Vulkan merges them into one scene.
+/// A declarative animation ran in the frame just drawn: draw the next.
+static ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn animating() -> bool {
+    ANIMATING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn render_one_frame(
     renderer: &mut Backend<'_>,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
@@ -1428,7 +1501,12 @@ fn render_one_frame(
      * how long packing holds it is how long frescod stops reading them. */
     let t_pack = Instant::now();
     {
-        let fe = frontend.lock().unwrap();
+        let mut fe = frontend.lock().unwrap();
+        /* Declarative animations (pergola.md §4.2) to this frame's time:
+         * while any runs, the loop draws again at the next frame. */
+        let live = fe.tick_animations(video::monotonic_ns());
+        ANIMATING.store(live, std::sync::atomic::Ordering::Relaxed);
+        let fe = &*fe;
         for (win_id, pos, size) in &layers {
             /* A window a renderer draws (split mode) comes as its last
              * checked frame, at the size the broker gave it. */

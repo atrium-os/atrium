@@ -22,6 +22,7 @@
 //! stdout. Wire-protocol emission (the actual `fresco-client` calls)
 //! lands in phase 4 alongside the `Window` API.
 
+pub mod anim;
 pub mod app;
 pub mod clipboard;
 pub mod color;

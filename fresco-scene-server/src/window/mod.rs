@@ -120,6 +120,9 @@ pub enum DisplayEvent {
     /// reason. Sent whenever the set changes, so an empty list says every
     /// node draws again.
     WindowFillsDropped { window_id: u32, dropped: Vec<(u32, u8)> },
+    /// To the window's owner: a declarative animation ended
+    /// (`EV_ANIMATION_FINISHED`).
+    AnimationFinished(fresco_protocol::AnimationFinishedEvent),
     /// To the window's owner: something of it was refused for a budget
     /// (`fresco_protocol::BudgetRefusedEvent`; frescod sends
     /// `budget::RASTER_TIME` when a frame is far too costly to raster).
@@ -374,6 +377,7 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
             };
             Ok((control::EV_WINDOW_FILLS_DROPPED, encode(&p)?))
         }
+        DisplayEvent::AnimationFinished(e) => Ok((control::EV_ANIMATION_FINISHED, encode(e)?)),
         DisplayEvent::BudgetRefused { window_id, resource, id, used, limit } => {
             let p = fresco_protocol::BudgetRefusedEvent { window_id: *window_id, resource: *resource, id: *id, used: *used, limit: *limit };
             Ok((control::EV_BUDGET_REFUSED, encode(&p)?))
@@ -509,6 +513,8 @@ pub struct Window {
     /// (`WindowHints.min_size`; 0 = none), reported to the WM at the
     /// window's scale (resolution-independence.md §6.3).
     pub min_size: (u32, u32),
+    /// Full screen on this monitor (`WindowHints::full_screen_on`).
+    pub full_screen_on: Option<u64>,
 }
 
 impl Window {
@@ -530,6 +536,7 @@ impl Window {
             kept_by: None,
             embed_token: [0; 16],
             min_size: (0, 0),
+            full_screen_on: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,
@@ -553,6 +560,7 @@ impl Window {
             kept_by: None,
             embed_token: [0; 16],
             min_size: (0, 0),
+            full_screen_on: None,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
             owner_uid: 0,

@@ -95,6 +95,9 @@ pub enum Msg {
     /// `embed_pending`: an embed child (limen.md §4), kept off screen until
     /// limend binds it.
     WindowCreate { window: u32, width: u32, height: u32, role: Role, pos: Option<(i32, i32)>, title: String, embed_pending: bool },
+    /// The window is to be full screen on monitor `monitor` (its identity,
+    /// `WindowHints::full_screen_on`): a slideshow on the projector.
+    WindowFullScreen { window: u32, monitor: u64 },
     /// A client destroyed a window.
     WindowDestroy { window: u32 },
     /// `OP_WINDOW_FOCUS_PARENT` from the client: its embedded window gives
@@ -222,6 +225,10 @@ pub enum Msg {
     /// The system appearance (window 0): sent after [`Msg::Client`] and on
     /// every change. `scheme` 0 light, 1 dark.
     Appearance { scheme: u32, high_contrast: bool, accent: u32, text_size_milli: u32 },
+    /// Monitor `index` of `count` (window 0), the first the primary: what
+    /// the renderer answers `OP_DISPLAY_OUTPUTS` with. Sent after
+    /// [`Msg::Client`] and whenever the display changes.
+    Output { index: u32, count: u32, identity: u64, rect: [i32; 4], scale_milli: u32, refresh_mhz: u32, internal: bool },
     /// One tile of `window`'s span (fresco-span.md), `[x, y, w, h]` in
     /// window pixels; the tiles and hidden strips of one update precede
     /// its [`Msg::SpanDone`].
@@ -302,6 +309,8 @@ mod kind {
     pub const VIDEO_DONE: u32 = 0x131;
     pub const VIDEO_PRESENTED: u32 = 0x132;
     pub const APPEARANCE: u32 = 0x140;
+    pub const OUTPUT: u32 = 0x144;
+    pub const WINDOW_FULL_SCREEN: u32 = 19;
     pub const SPAN_TILE: u32 = 0x141;
     pub const SPAN_HIDDEN: u32 = 0x142;
     pub const SPAN_DONE: u32 = 0x143;
@@ -390,8 +399,9 @@ impl Msg {
             | Msg::VideoPresented { window, .. }
             | Msg::SpanTile { window, .. }
             | Msg::SpanHidden { window, .. }
-            | Msg::SpanDone { window } => window,
-            Msg::Client { .. } | Msg::Appearance { .. } => 0,
+            | Msg::SpanDone { window }
+            | Msg::WindowFullScreen { window, .. } => window,
+            Msg::Client { .. } | Msg::Appearance { .. } | Msg::Output { .. } => 0,
         }
     }
 
@@ -716,6 +726,26 @@ impl Msg {
                 r
             }
             Msg::SpanDone { window } => Rec::new(SPAN_DONE, *window),
+            Msg::WindowFullScreen { window, monitor } => {
+                let mut r = Rec::new(WINDOW_FULL_SCREEN, *window);
+                r.put(2, *monitor as u32);
+                r.put(3, (*monitor >> 32) as u32);
+                r
+            }
+            Msg::Output { index, count, identity, rect, scale_milli, refresh_mhz, internal } => {
+                let mut r = Rec::new(OUTPUT, 0);
+                r.put(2, *identity as u32);
+                r.put(3, (*identity >> 32) as u32);
+                for (i, v) in rect.iter().enumerate() {
+                    r.put(4 + i, *v as u32);
+                }
+                r.put(8, *index);
+                r.put(9, *count);
+                r.put(10, *scale_milli);
+                r.put(11, *refresh_mhz);
+                r.put(12, *internal as u32);
+                r
+            }
         };
         r.0
     }
@@ -728,7 +758,7 @@ impl Msg {
         let b: [u8; MSG_BYTES] = bytes.try_into().map_err(|_| Refused("record size"))?;
         let r = Rec(b);
         let (k, window) = (r.get(0), r.get(1));
-        if matches!(k, CLIENT | APPEARANCE) != (window == 0) || window > u16::MAX as u32 {
+        if matches!(k, CLIENT | APPEARANCE | OUTPUT) != (window == 0) || window > u16::MAX as u32 {
             return Err(Refused("window id out of range"));
         }
         // Words 2.. this kind uses, and whether it carries a title.
@@ -768,6 +798,8 @@ impl Msg {
             VIDEO_RATE => (2, false),
             VIDEO_SLOTS | VIDEO_DONE => (2, false),
             APPEARANCE => (4, false),
+            OUTPUT => (6, false),
+            WINDOW_FULL_SCREEN => (2, false),
             SPAN_TILE => (5, false),
             SPAN_HIDDEN => (4, false),
             SPAN_DONE => (0, false),
@@ -794,6 +826,8 @@ impl Msg {
             // their token.
             let tail = if k == POPUP_GRANT {
                 64
+            } else if k == OUTPUT {
+                52
             } else if matches!(k, KEY | BUTTON | DRAG_BEGIN | DROP | EMBED_TOKEN | POPUP_PLACE | POPUP_CLAIM | POPUP_HOSTED) {
                 48
             } else {
@@ -962,6 +996,22 @@ impl Msg {
                 }
             }
             SPAN_DONE => Msg::SpanDone { window },
+            WINDOW_FULL_SCREEN => Msg::WindowFullScreen { window, monitor: r.get(2) as u64 | (r.get(3) as u64) << 32 },
+            OUTPUT => {
+                let (index, count) = (r.get(8), r.get(9));
+                if count == 0 || count > 16 || index >= count {
+                    return Err(Refused("output index"));
+                }
+                let rect = [r.get(4) as i32, r.get(5) as i32, r.get(6) as i32, r.get(7) as i32];
+                if rect[2] <= 0 || rect[3] <= 0 || rect[2] as u32 > MAX_WINDOW_DIM * 4 || rect[3] as u32 > MAX_WINDOW_DIM * 4 {
+                    return Err(Refused("output rect"));
+                }
+                let scale_milli = match r.get(10) {
+                    s @ SCALE_MIN..=SCALE_MAX => s,
+                    _ => return Err(Refused("scale out of range")),
+                };
+                Msg::Output { index, count, identity: r.get(2) as u64 | (r.get(3) as u64) << 32, rect, scale_milli, refresh_mhz: r.get(11), internal: flag(r.get(12))? }
+            }
             PAD_CONNECT => Msg::PadConnect {
                 window,
                 device: r.get(2),
@@ -1033,6 +1083,7 @@ impl Msg {
         matches!(
             self,
             Msg::WindowCreate { .. }
+                | Msg::WindowFullScreen { .. }
                 | Msg::WindowDestroy { .. }
                 | Msg::FocusParent { .. }
                 | Msg::FocusEmbed { .. }

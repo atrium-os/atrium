@@ -65,6 +65,9 @@ fn samples() -> Vec<Msg> {
         Msg::PopupHosted { window: 2, token: [9; 16], open: false },
         Msg::Appearance { scheme: 1, high_contrast: true, accent: 3, text_size_milli: 0 },
         Msg::Appearance { scheme: 0, high_contrast: false, accent: 0, text_size_milli: 1500 },
+        Msg::WindowFullScreen { window: 4, monitor: 0xfeed_beef_0000_0011 },
+        Msg::Output { index: 0, count: 2, identity: 0x1234_5678_9abc_def0, rect: [0, 0, 1920, 1080], scale_milli: 1000, refresh_mhz: 60000, internal: true },
+        Msg::Output { index: 1, count: 2, identity: 7, rect: [-1280, 0, 1280, 720], scale_milli: 1500, refresh_mhz: 59940, internal: false },
     ]
 }
 

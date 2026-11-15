@@ -469,6 +469,9 @@ impl Broker {
         let screen = self.screen();
         let scale_milli = self.comp.lock().unwrap().new_scale_milli.clamp(fresco_split::SCALE_MIN, fresco_split::SCALE_MAX);
         ours.send(&Msg::Client { width: screen.0, height: screen.1, refresh_mhz: screen.2, pixels: self.pixels, scale_milli }, &[stream.as_raw_fd()])?;
+        for m in crate::screen::output_records() {
+            ours.send(&m, &[])?;
+        }
         // The broker keeps a copy of the client's socket, never read, only
         // to see the client hang up: a renderer that ignores its client's
         // hang-up must not keep its client id and windows forever.
@@ -632,6 +635,17 @@ impl Broker {
                 let w = r.wins.lock().unwrap().remove(&local).ok_or_else(|| format!("destroy of unknown window {local}"))?;
                 r.videos.lock().unwrap().retain(|&(win, _), _| win != local);
                 self.drop_window(r, w.global);
+            }
+            Msg::WindowFullScreen { monitor, .. } => {
+                let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("full screen of unknown window")?;
+                let at = crate::screen::outputs().into_iter().find(|o| o.identity == monitor).map(|o| (o.rect.x as f32, o.rect.y as f32));
+                if let Some(w) = self.comp.lock().unwrap().windows.get_mut(&global) {
+                    w.full_screen_on = Some(monitor);
+                    if let Some(p) = at {
+                        w.pos = p;
+                    }
+                }
+                self.redraw.wake();
             }
             Msg::WindowMinSize { width, height, .. } => {
                 let global = r.wins.lock().unwrap().get(&local).map(|w| w.global).ok_or("minimum size of unknown window")?;
@@ -1081,6 +1095,7 @@ fn event_records(r: &Renderer, ev: &DisplayEvent) -> Vec<Msg> {
         E::DragEnd { window_id, drag_id, dropped } => {
             r.local_of(*window_id).map(|window| Msg::DragEnd { window, drag_id: *drag_id, dropped: *dropped }).into_iter().collect()
         }
+        E::DisplayChanged { .. } => crate::screen::output_records(),
         E::AppearanceChanged(a) => vec![Msg::Appearance { scheme: a.scheme, high_contrast: a.high_contrast, accent: a.accent, text_size_milli: a.text_size_milli }],
         E::WindowSpan { window_id, tiles, hidden } => {
             let Some(window) = r.local_of(*window_id) else { return Vec::new() };

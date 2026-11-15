@@ -716,11 +716,16 @@ fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::Window
             }
         };
         let At { x, op, clip, .. } = at;
-        if let Some(g) = state.group_nodes.get(&id) {
+        // A group as this frame draws it: moved by a declarative animation
+        // (pergola.md §4.2) while one runs, else its own params.
+        if let Some(g) = state.group_now(id) {
             // The group's clip is in its parent's space: map it with `x`.
             let c = meet(clip, g.clip.map(|c| x.rect(c)));
-            if empty(c) {
-                continue; // nothing of it can show: skip the subtree
+            if empty(c) || at.seen * g.opacity <= 0.0 {
+                // Nothing of it can show (clipped away, or wholly
+                // transparent: a slide kept resident for the next
+                // transition): skip the subtree.
+                continue;
             }
             if g.flags & fresco_protocol::group_flags::SCROLL != 0 {
                 if let Some(v) = viewport(state, &kids, id, g, x, at.seen, c, w.size) {

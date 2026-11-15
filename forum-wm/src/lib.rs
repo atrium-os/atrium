@@ -1014,6 +1014,11 @@ pub mod daemon {
             if matches!(s.role, WmRole::Chrome | WmRole::Hud | WmRole::Background | WmRole::Notification) {
                 return primary;
             }
+            // Full screen on a monitor the app named (a slideshow on the
+            // projector), while that monitor is there.
+            if s.full_screen_on != 0 && mons.iter().any(|m| m.identity == s.full_screen_on) {
+                return s.full_screen_on;
+            }
             self.home
                 .get(&s.surface_id)
                 .copied()
@@ -1720,6 +1725,11 @@ pub mod daemon {
         fn layout_on_roles(&self, screen: &Screen, active: &[WmSurfaceInfo], focus_intent: Option<u32>)
             -> WmDeclareLayoutPayload
         {
+            // A window the app put full screen (a slideshow) fills its
+            // monitor alone, as a zoom does.
+            if let Some(f) = active.iter().filter(|s| s.full_screen_on != 0 && s.role == WmRole::Document).map(|s| s.surface_id).max() {
+                return WmDeclareLayoutPayload { slots: vec![WmSlot { surface_id: f, rect: screen.rect, layer: 0 }], focus: f, focus_cause: 0 };
+            }
             // Zoom wins: the zoomed surface alone fills the whole screen.
             if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
                 return WmDeclareLayoutPayload {
@@ -1858,10 +1868,16 @@ pub mod daemon {
                         .cloned()
                         .collect();
                     let cur = resolve_focus(&shown, self.focus_intent);
-                    let at = shown
+                    let mut at = shown
                         .iter()
                         .find(|t| t.surface_id == cur)
                         .map_or(mons[0].identity, |t| self.monitor_of(t, &mons));
+                    // Not behind a window full screen there (a slideshow's
+                    // presenter view opens beside the show, not under it).
+                    let taken = |m: u64| shown.iter().any(|t| t.full_screen_on == m);
+                    if s.full_screen_on == 0 && taken(at) {
+                        at = mons.iter().map(|m| m.identity).find(|&m| !taken(m)).unwrap_or(at);
+                    }
                     self.home.insert(new_id, at);
                 }
                 // A new document opens focused — but only if it landed on the
@@ -2183,7 +2199,7 @@ mod tests {
     }
 
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
-        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, min_size: (0, 0) }
+        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 }, min_size: (0, 0), full_screen_on: 0 }
     }
 
     #[test]
@@ -2612,6 +2628,7 @@ mod tests {
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
                 min_size: (0, 0),
+                full_screen_on: 0,
             }],
             ..Default::default()
         };
@@ -2744,6 +2761,7 @@ mod tests {
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
                 min_size: (0, 0),
+                full_screen_on: 0,
             }],
             ..Default::default()
         };
@@ -2963,6 +2981,27 @@ mod tests {
         wm.toggle_zoom(&mut conn).unwrap();
         let l = conn.declared.clone().unwrap();
         assert_eq!(slot(&l, 1), Some(WmRect { x: 1920, y: 0, w: 2560, h: 1440 }));
+    }
+
+    /// A slideshow (officina.md §9.1): the show asks to be full screen on
+    /// the second monitor and fills it alone; the presenter view stays an
+    /// ordinary window on the first, with the focus.
+    #[test]
+    fn a_window_full_screen_on_a_monitor_fills_it_alone() {
+        let (mut wm, mut conn) = two_monitors();
+        conn.surfaces.push(WmSurfaceInfo { full_screen_on: 20, ..surf(2, WmRole::Document) });
+        conn.surfaces.push(surf(3, WmRole::Document));
+        wm.focus_new(&mut conn, 2).unwrap();
+        wm.focus_new(&mut conn, 3).unwrap();
+        let l = conn.declared.clone().unwrap();
+        assert_eq!(slot(&l, 2), Some(WmRect { x: 1920, y: 0, w: 2560, h: 1440 }), "the whole second monitor");
+        assert!(slot(&l, 3).is_some_and(|r| r.x < 1920), "the presenter view on the first: {l:?}");
+        assert_eq!(l.focus, 3);
+        // A monitor that is not there: an ordinary window.
+        conn.surfaces[1].full_screen_on = 99;
+        wm.focus_new(&mut conn, 2).unwrap();
+        let l = conn.declared.clone().unwrap();
+        assert!(slot(&l, 2).is_some_and(|r| r.x < 1920));
     }
 
     #[test]
@@ -3185,7 +3224,7 @@ mod pip_tests {
     #[test]
     fn a_pip_surface_is_placed_at_the_users_corner_and_never_focused() {
         let screen = Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48, scale_milli: 1000 };
-        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h }, min_size: (0, 0) };
+        let surf = |id, role, w, h| WmSurfaceInfo { surface_id: id, owner_app: String::new(), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w, h }, min_size: (0, 0), full_screen_on: 0 };
         let active = [surf(1, WmRole::Document, 0, 0), surf(7, WmRole::Pip, 640, 480)];
         let mut l = arrange(&screen, &active, None);
         place_pip(&mut l, &screen, &active, Corner::TopLeft);

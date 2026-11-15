@@ -84,6 +84,12 @@ pub enum Node {
         spacing: f32,
         fill: Option<Color>,
         radius: f32,
+        /// Multiplies everything in it (1: as drawn). A Stack at 0 draws
+        /// nothing but stays in the scene, ready to be shown or animated
+        /// in (`crate::anim`) with no new content sent.
+        opacity: f32,
+        /// Its children are cut to its box.
+        clip: bool,
     },
     /// A scrolling viewport (`ScrollView`, pergola.md §10): on the wire a
     /// `SCROLL` group clipped to `rect`, an optional opaque `backdrop`
@@ -274,7 +280,14 @@ pub fn fill_to(p: &fresco_protocol::FillParams, origin: crate::geom::Point, scal
 impl Node {
     /// Layout-only stack (no paint).
     pub fn stack(axis: Axis, rect: Rect, spacing: f32) -> Self {
-        Node::Stack { rect, axis, spacing, fill: None, radius: 0.0 }
+        Node::Stack { rect, axis, spacing, fill: None, radius: 0.0, opacity: 1.0, clip: false }
+    }
+
+    /// A layout-only Stack drawn at `opacity`, its children cut to its box
+    /// when `clip`: a layer to show, hide and animate as one
+    /// (`crate::anim`), such as a slide.
+    pub fn layer(rect: Rect, opacity: f32, clip: bool) -> Self {
+        Node::Stack { rect, axis: Axis::Vertical, spacing: 0.0, fill: None, radius: 0.0, opacity, clip }
     }
 
     pub fn vstack(rect: Rect, spacing: f32) -> Self {
@@ -287,7 +300,7 @@ impl Node {
 
     /// Stack that paints a rounded rect behind its children.
     pub fn stack_filled(axis: Axis, rect: Rect, spacing: f32, fill: Color, radius: f32) -> Self {
-        Node::Stack { rect, axis, spacing, fill: Some(fill), radius }
+        Node::Stack { rect, axis, spacing, fill: Some(fill), radius, opacity: 1.0, clip: false }
     }
 
     /// Logical bounds in this node's own (parent-relative) coordinate
@@ -806,6 +819,8 @@ mod diff_tests {
             spacing: 0.0,
             fill: None,
             radius: 0.0,
+            opacity: 1.0,
+            clip: false,
         }
     }
 
