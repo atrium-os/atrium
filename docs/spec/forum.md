@@ -305,7 +305,8 @@ filled paths, at most 64 shapes and 8192 points, and draws them as Fresco FILL
 nodes filling the tile's square: the icon is the whole tile, plate included.
 What the vector path can't say exactly (masks, patterns, group opacity over
 several shapes) is refused and the app falls back to the system set or its
-letter tile; no rasteriser runs in the dock. Bitmap icons are not taken.
+letter tile; no rasteriser runs in the dock. Only SVG icons are supported
+(decided 2026-11-15): bitmap icons are not taken.
 
 **Launching.** Exactly the dock's path: `Launch { app_id }` to portcullisd, which
 checks policy, picks the app's uid and jails it. The dock does this on a thread
