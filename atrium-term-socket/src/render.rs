@@ -15,6 +15,8 @@ pub struct Renderer {
     size_px:  f32,
     cell_w:   f32,
     line_h:   f32,
+    /// The ascent: a text run's y on the wire is the top of its em box
+    /// (fresco-protocol), one ascent above the baseline.
     baseline: f32,
     pad_x:    f32,
     pad_y:    f32,
@@ -49,7 +51,7 @@ impl Renderer {
             if trimmed.is_empty() { continue; }
             let y_base = self.pad_y + (row as f32) * self.line_h + self.baseline;
             f.text_run(self.font_id, self.size_px,
-                       self.pad_x, y_base,
+                       self.pad_x, y_base - self.baseline,
                        [0.95, 0.95, 0.95, 1.0],
                        trimmed)?;
         }

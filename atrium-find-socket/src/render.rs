@@ -14,6 +14,8 @@ pub struct Renderer {
     size_px:  f32,
     cell_w:   f32,
     line_h:   f32,
+    /// The ascent: a text run's y on the wire is the top of its em box
+    /// (fresco-protocol), one ascent above the baseline.
     baseline: f32,
     pad_x:    f32,
     pad_y:    f32,
@@ -56,7 +58,7 @@ impl Renderer {
             let bar_w = (left_cols as f32) * self.cell_w;
             f.rect(RectParams {
                 x: self.pad_x, y: row_top, w: bar_w, h: self.line_h,
-                r: 0.27, g: 0.30, b: 0.50, a: 0.5,
+                r: 0.27, g: 0.30, b: 0.50, a: 0.5, radius: 0.0,
             })?;
         }
 
@@ -100,7 +102,7 @@ impl Renderer {
         if text.is_empty() { return Ok(()); }
         let x = self.pad_x + (col0 as f32) * self.cell_w;
         let y_base = self.pad_y + (row as f32) * self.line_h + self.baseline;
-        f.text_run(self.font_id, self.size_px, x, y_base,
+        f.text_run(self.font_id, self.size_px, x, y_base - self.baseline,
                    [0.95, 0.95, 0.95, 1.0], text)?;
         Ok(())
     }
