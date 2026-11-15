@@ -34,7 +34,7 @@ column. §17 D1 asks which go into the first release; my recommendation is the *
 | E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); quiet hours per persona (no Work mail after 19:00); a sound per account | yes | §12 |
 | E6 | **Screener for first-time senders** | mail from someone new waits in a "New senders" list until you press Accept once; nothing from them bothers you before that | yes, off by default | §11.3 |
 | E7 | **Attachments as first-class things** | quick look without opening an app; "every file from Priya"; save straight into the right persona's folder; big files sent as a share link instead of 25 MB of base64 | yes (share links later) | §8 |
-| E8 | **Setup with just an address** | type your address, sign in, done: servers found by autodiscovery; import mbox/Maildir; export everything any time | yes | §5.1, §6.4 |
+| E8 | **Setup with just an address, usable in seconds** | type your address, sign in, done: servers found by autodiscovery; the inbox usable in seconds while the rest fills in politely, no gigabyte downloads; import mbox/Maildir; export everything any time | yes | §5.1, §6.4, §6.5 |
 | E9 | **Keyboard-first, offline-first, fast at a million messages** | every action has a key and a command palette; everything works on a plane; lists scroll smoothly at any size | yes | §15, §6 |
 | E10 | **Lanes computed on the machine** | People / Updates (receipts, shipping, travel) / Newsletters, sorted by rules you can read and change, never by a cloud | later | §11.3 |
 | E11 | **Cards for invites, receipts and trips** | a calendar invite shows Accept / Maybe / Decline in the message; flights and orders become a short card | invites v1, cards later | §14 |
@@ -186,7 +186,8 @@ person reads was never decoded next to another message.
    `submissions://smtp.example.org:465`, or `https://jmap.example.org`), under the
    instance's Arca persona. One item can be bound to both the IMAP and SMTP endpoints when
    they share a password; the binding list is shown in Arca's UI.
-5. The first sync starts (§6.1), newest first, so the inbox is readable in seconds.
+5. The first sync starts (§6.5): the inbox is readable in seconds, and the rest fills
+   in behind without slowing anything.
 
 ### 5.2 The mail courier (new Arca work)
 
@@ -247,7 +248,8 @@ mail (crypto-erase once Tessera keys exist per persona) and its Arca items, afte
 
 - **IMAP**: IMAP4rev2 (RFC 9051) or rev1 with `CONDSTORE`/`QRESYNC` (RFC 7162) for cheap
   resync, `IDLE` for push, `UIDPLUS`, `MOVE`, `SPECIAL-USE`, `LITERAL+`, `OBJECTID` where
-  offered. Without QRESYNC it falls back to UID ranges and flags diffs. `COMPRESS` not used.
+  offered. Without QRESYNC it falls back to UID ranges and flags diffs. `COMPRESS` is not
+  used: the courier's command filter (§5.2) must read every command.
 - **JMAP** (RFC 8620, 8621): `Email/changes`, `Mailbox/changes`, push via EventSource;
   `EmailSubmission` with `FUTURERELEASE`-style holds where the server has them.
 - **SMTP** submission (RFC 6409, RFC 8314): 465 implicit TLS preferred, 587 only with
@@ -270,8 +272,10 @@ mail (crypto-erase once Tessera keys exist per persona) and its Arca items, afte
   folder, flags, dates, from/to/cc as parsed addresses, subject, a preview, the part tree,
   thread ids, authentication results, list headers, and the extracted text for search.
   Rebuilt from the raw blobs at any time by re-parsing in jails.
-- **How much is kept offline**: everything by default; a per-account window (last year,
-  last 3 months) for small disks, with headers for the rest and bodies fetched on open.
+- **How much is kept offline**: by default, the list entry (headers, flags, preview) for
+  every message, message text for the last 90 days, and attachments only once opened
+  (then cached, within a per-account limit). *Keep everything offline* is a switch, and
+  then it fills in only under the §6.5 rules. See §6.5 for how a new account fills in.
 - **At rest**: in the persona's volume (personas.md §4), so a named persona's mail is
   encrypted with that persona's key once Tessera encrypts.
 
@@ -279,8 +283,71 @@ mail (crypto-erase once Tessera keys exist per persona) and its Arca items, afte
 
 - 1,000,000 messages in one account: list scroll at the display rate, a folder of 200,000
   opens under 100 ms, search results as you type under 50 ms for the first page.
-- First sync of a 50,000 message account: the newest 500 readable within 10 s on a fast
-  link; the rest in the background without making the UI wait.
+- First sync of any account, even 50 GB on the server: the inbox's newest messages
+  listed within 5 s and readable as soon as opened, after under 5 MB of download; the
+  machine stays responsive throughout (§6.5).
+
+### 6.5 First sync of a new account (Shankar 2026-11-16)
+
+Shankar: "Normal clients download gigabytes and slow to a crawl." They do because they
+treat a new account as a copy job: every folder, every message, every attachment, as fast
+as possible, with the UI waiting behind it and the index rebuilt as it goes. Mail treats it
+as **making the account usable first, then filling in what's worth having, politely**.
+
+**Stage 1: usable in seconds (foreground, small).**
+- Folder list, then the **inbox only**: for the newest 200 messages, flags, envelope,
+  structure and size (IMAP `FETCH (FLAGS ENVELOPE BODYSTRUCTURE RFC822.SIZE)`, plus the
+  server's `PREVIEW` (RFC 8970) where offered; JMAP `Email/query` + `Email/get` with
+  `preview`). About 1–2 KB a message, so well under 1 MB.
+- These go through a parse jail like everything else (envelopes are hostile text too).
+- The list shows at once; opening a message fetches its text parts (not attachments) on a
+  connection kept free for the foreground, so a click is never queued behind bulk work.
+
+**Stage 2: headers for everything (background, light).**
+- List entries for the rest of the inbox, then Sent, then other folders by recent
+  activity, newest first, in pages of 500. A message's headers are a few KB; 100,000
+  messages is a few hundred MB at most, usually far less.
+- **Each message once**: where the server gives stable ids (IMAP `OBJECTID` `EMAILID`,
+  Gmail `X-GM-MSGID`, JMAP ids), a message in several folders or labels is fetched once.
+  On Gmail, Mail syncs *All Mail* once and reads labels (`X-GM-LABELS`), instead of
+  downloading every message again for each label, which is where most of the gigabytes
+  in other clients come from.
+- Search works from the start: on local headers, plus server-side search
+  (IMAP `SEARCH`, JMAP `Email/query`) merged into the results for anything not yet local,
+  marked "on server".
+
+**Stage 3: message text for the recent window (background, idle-time).**
+- Text parts only (`BINARY.PEEK[part]` / `BODY.PEEK[part]` for text parts, JMAP
+  `bodyValues`), last 90 days, newest first. Attachments are not fetched. Text is usually
+  a few percent of an account's size; attachments are most of it.
+- Indexed for search in small batches as it arrives.
+
+**Stage 4 (only with *Keep everything offline*): the rest.**
+- Older text, then attachments, only on mains power, on a network atrium-net doesn't mark
+  metered, while the machine is idle; paused otherwise.
+
+**Being polite to the machine and the network:**
+- **The UI never waits on sync.** The engine serves the window from what is stored; sync
+  writes in small transactions; index updates are batched and incremental.
+- **Low priority everywhere**: sync and its parse jails run in the low-weight background
+  class (insula.md §11), so typing, scrolling and other apps win. Bulk downloads use at
+  most 2 connections (plus one for the inbox's IDLE and one kept for the foreground),
+  well under provider caps (Gmail allows 15), and back off on `[THROTTLED]`, `[LIMIT]` or
+  slow responses.
+- **Bandwidth**: background sync yields when anything in the foreground is using the
+  network, and has a ceiling (default: half of measured throughput); on a metered network
+  only stages 1 and 2 run.
+- **Battery**: stages 3 and 4 wait for mains unless the person says otherwise.
+- **Resumable**: progress is saved per folder (UID or state checkpoints), so sleep, a
+  dropped network or a restart continues where it stopped.
+
+**What the person sees:**
+- Before anything big: "This account has 48 GB on the server. Mail will keep about
+  1.2 GB here: everything listed, the last 3 months' text, attachments when you open them."
+  with *Change* (window, keep everything) and nothing to confirm otherwise.
+- A quiet line under the folder list while it fills in: "Getting older mail: back to
+  March 2021 (12,400 of 48,000)", with *Pause*. No spinner blocks anything.
+- Opening an old message or attachment that isn't local fetches just that one, at once.
 
 ### 6.4 Import and export
 
