@@ -31,7 +31,7 @@ column. §17 D1 asks which go into the first release; my recommendation is the *
 | E2 | **Instant search that finds things inside attachments** | type and see results as you type, across all accounts of a persona, including text in PDFs and office files; a saved search becomes a folder | yes | §11.2 |
 | E3 | **Conversations that read well** | quoted text and signatures folded, a "new since you last looked" line, every file in the thread in one strip at the top | yes | §11.1 |
 | E4 | **One-press unsubscribe and a newsletter lane** | a real unsubscribe button (RFC 8058) on every list mail, newsletters read with the Navigator's reading settings (text size, dark, comfortable) | yes | §11.3 |
-| E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); per persona | yes | §12 |
+| E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); quiet hours per persona (no Work mail after 19:00); a sound per account | yes | §12 |
 | E6 | **Screener for first-time senders** | mail from someone new waits in a "New senders" list until you press Accept once; nothing from them bothers you before that | yes, off by default | §11.3 |
 | E7 | **Attachments as first-class things** | quick look without opening an app; "every file from Priya"; save straight into the right persona's folder; big files sent as a share link instead of 25 MB of base64 | yes (share links later) | §8 |
 | E8 | **Setup with just an address** | type your address, sign in, done: servers found by autodiscovery; import mbox/Maildir; export everything any time | yes | §5.1, §6.4 |
@@ -598,7 +598,18 @@ Vacation replies through Sieve or JMAP `VacationResponse`.
 - **Quiet by default** (E5): notify for mail from people (not lists, not automated
   senders) and for threads the person has written in; everything else is counted, and a
   digest notification comes at the person's chosen times.
-- **VIPs**: always notify.
+- **VIPs**: always notify (except in quiet hours, below, unless the person lets them through).
+- **Sounds per account** (Shankar 2026-11-16): each account, and VIPs, can have its own
+  sound, chosen from the system's set of notification sounds (or none). Mail names the sound
+  in the Praeco post; Praeco/Forum play it through Lyra at the notification volume. Mail
+  never ships or plays a sound file of its own, and a message can't pick one.
+- **Quiet hours per persona** (Shankar 2026-11-16): a schedule per persona, for example
+  Work: weekdays 9:00–19:00, so no Work mail notifies in the evening or at weekends.
+  Outside the schedule mail still syncs and the badge count still updates, but nothing
+  pops up or sounds; what arrived is in one summary at the start of the next working
+  period. Switches: "let VIPs through" (off by default) and "let replies in my threads
+  through" (off). The schedule is kept in the instance's settings and shown in Curia's
+  notification page beside Atrium-wide Do Not Disturb, which always wins.
 - **Actions** (Archive, Mark read, Reply) when Praeco notification actions exist
   (CLASS_BROKER delivery, not built); a press on the notification gives the press Mail needs.
 - Per persona; the persona badge comes from Forum (personas.md §7), not from Mail.
