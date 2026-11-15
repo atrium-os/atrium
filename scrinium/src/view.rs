@@ -66,6 +66,9 @@ pub fn header_h() -> f32 { em(28.0) }
 pub fn status_h() -> f32 { em(28.0) }
 pub fn row_h() -> f32 { em(30.0) }
 pub fn place_h() -> f32 { em(44.0) }
+
+/// Quick look's viewer slot (an embed's place in the window).
+pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4c4f_4f4b;
 /// Where a row's text starts: after its 16 px inset and its icon.
 fn text_x() -> f32 { 16.0 + em(28.0) }
 pub fn pick_title_h() -> f32 { em(52.0) }
@@ -179,6 +182,7 @@ pub fn on_key(state: &Mutable<Browser>, field: &Mutable<TextEdit>, ev: &Event) -
             b.notice = None;
         }),
         (Key::Delete, false, false) if !picker => with(state, Browser::ask_delete),
+        (Key::Char, false, false) if chars == " " && !picker => with(state, Browser::toggle_look),
         (Key::Char, true, false) => match (c.as_str(), m.shift) {
             ("a", false) => with(state, Browser::select_all),
             ("c", false) if !picker => with(state, |b| b.copy(false)),
@@ -231,6 +235,21 @@ pub fn delete_question(names: &[String], room: f32) -> String {
 }
 
 /// `s`, cut with an ellipsis to fit `max` px.
+/// `s` cut with an ellipsis to fit `max` pt in a monospace style.
+fn fit_mono(s: &str, style: &TextStyle, max: f32) -> String {
+    if Node::measure_text(s, style).w <= max {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let t: String = chars[..mid].iter().collect::<String>() + "…";
+        if Node::measure_text(&t, style).w <= max { lo = mid } else { hi = mid - 1 }
+    }
+    chars[..lo].iter().collect::<String>() + "…"
+}
+
 fn fit(s: &str, size: f32, weight: Weight, max: f32) -> String {
     if max <= 0.0 {
         return String::new();
@@ -845,6 +864,56 @@ impl ScriniumView {
         .emit(ctx);
     }
 
+    /// The quick look pane: the file's name, kind and size, then its text
+    /// (drawn here, never interpreted), its viewer's slot, or why there is
+    /// nothing to show.
+    fn look_pane(&self, ctx: &mut Ctx, l: &crate::browser::Look, x0: f32, y0: f32, x1: f32, y1: f32) {
+        use crate::browser::LookBody;
+        let t = ctx.theme;
+        let (w, pad) = (x1 - x0, em(14.0));
+        rect(ctx, x0, y0, w, y1 - y0, t.bg_surface(), 0.0);
+        rect(ctx, x0, y0, 1.0, y1 - y0, t.border_default(), 0.0);
+        let inner = (w - 2.0 * pad).max(0.0);
+        text(ctx, x0 + pad, y0 + em(22.0), &fit(&l.name, type_size::MD, Weight::Medium, inner), type_size::MD, Weight::Medium, t.text_primary());
+        let words = match &l.body {
+            Some(LookBody::Text { words, .. } | LookBody::Embed { words, .. } | LookBody::Info { words, .. }) => words.clone(),
+            None => "Reading…".into(),
+        };
+        let sub = format!("{words} · {}", fs::size_text(l.size));
+        text(ctx, x0 + pad, y0 + em(44.0), &fit(&sub, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_secondary());
+        let by = y0 + em(62.0);
+        rect(ctx, x0 + pad, by, inner, 1.0, t.border_default(), 0.0);
+        let (top, bottom) = (by + em(10.0), y1 - pad);
+        match &l.body {
+            Some(LookBody::Text { text: body, cut, .. }) => {
+                let lh = em(18.0);
+                let style = TextStyle { family: font::MONO.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_primary() };
+                let room = ((bottom - top) / lh).floor().max(0.0) as usize;
+                let lines: Vec<&str> = body.lines().collect();
+                let shown = lines.len().min(room.saturating_sub(usize::from(*cut || lines.len() > room)));
+                for (i, line) in lines.iter().take(shown).enumerate() {
+                    let line = line.replace('\t', "    ");
+                    let fitted = fit_mono(&line, &style, inner);
+                    ctx.add(Node::Text { rect: Rect::new(x0 + pad, top + i as f32 * lh, 0.0, lh), content: fitted, style: style.clone() });
+                }
+                if *cut || lines.len() > shown {
+                    text(ctx, x0 + pad, top + shown as f32 * lh + lh / 2.0, "…", type_size::SM, Weight::Regular, t.text_tertiary());
+                }
+            }
+            Some(LookBody::Embed { .. }) => {
+                let id = ctx.add(Node::Rect { rect: Rect::new(x0 + pad, top, inner, (bottom - top).max(0.0)), fill: t.bg_canvas(), radius: 6.0 });
+                ctx.slot(id, LOOK_SLOT);
+            }
+            Some(LookBody::Info { why, .. }) => {
+                icon(ctx, x0 + pad, top + em(4.0), ph::FILE_TEXT, 32.0, t.text_tertiary());
+                if let Some(why) = why {
+                    text(ctx, x0 + pad, top + em(56.0), &fit(why, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_secondary());
+                }
+            }
+            None => {}
+        }
+    }
+
     fn manager(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
         let x0 = side_for(w);
@@ -946,8 +1015,13 @@ impl ScriniumView {
             y += strip_h();
         }
 
+        // Quick look takes the right of the list (opening-files.md §7).
+        let lw = if b.look.is_some() { ((w - x0) * 0.45).clamp(em(260.0), em(480.0)).min((w - x0) * 0.6) } else { 0.0 };
         // Room for the Kind and Modified columns (em-sized) beside a useful name.
-        self.list(ctx, b, x0, w, y, h - status_h(), w - x0 > em(620.0));
+        self.list(ctx, b, x0, w - lw, y, h - status_h(), w - lw - x0 > em(620.0));
+        if let Some(l) = &b.look {
+            self.look_pane(ctx, l, w - lw, y, w, h - status_h());
+        }
 
         // The status line.
         let sy = h - status_h();

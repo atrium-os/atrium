@@ -87,6 +87,13 @@ impl Embeds {
         self.parent.send(embed, bytes)
     }
 
+    /// A role message with one descriptor, for a role that takes one
+    /// (a viewer's file, opening-files.md §7). limend refuses it for any
+    /// other role.
+    pub fn send_fd(&mut self, embed: EmbedId, bytes: Vec<u8>, fd: std::os::fd::BorrowedFd<'_>) -> Result<(), Error> {
+        self.parent.send_fd(embed, bytes, fd)
+    }
+
     pub fn detach(&mut self, slot: SlotKey) -> Result<(), Error> {
         match self.by_slot.remove(&slot) {
             Some(e) => self.parent.detach(e),

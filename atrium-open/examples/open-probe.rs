@@ -1,6 +1,8 @@
 //! A test app for the opening-files gate (scripts/vm-open-files.sh): takes
 //! files from its document channel and says, for each, what it got and
-//! what it can do with it. Exits when the channel closes or after five
+//! what it can do with it. With each new file it reads the earlier ones
+//! again (`again name=… read=ok|E5`), so the gate sees a disconnected
+//! share or an ejected stick end them. Exits when the channel closes or after five
 //! idle minutes.
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -24,6 +26,7 @@ fn main() {
         }
     };
     println!("open-probe: up, pid {}", std::process::id());
+    let mut kept: Vec<(String, std::fs::File)> = Vec::new();
     loop {
         let mut o = match ch.recv(Some(Duration::from_secs(300))) {
             Ok(Some(o)) => o,
@@ -69,5 +72,12 @@ fn main() {
             "open-probe: got name={} type={} write={} head={head} wrote={wrote} chmod={chmod} mmap={mmap} kinfo={path} media={media}",
             o.name, o.mime, o.write as u8
         );
+        for (name, f) in &kept {
+            let mut b = [0u8; 1];
+            // SAFETY: a one-byte buffer we own; the fd is ours.
+            let r = unsafe { libc::pread(f.as_raw_fd(), b.as_mut_ptr().cast(), 1, 0) };
+            println!("open-probe: again name={name} read={}", if r == 1 { "ok".to_string() } else { err() });
+        }
+        kept.push((o.name, o.file));
     }
 }

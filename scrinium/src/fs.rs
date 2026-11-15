@@ -294,6 +294,37 @@ pub fn open_for_app(p: &Path, write: bool) -> io::Result<(std::fs::File, bool)> 
     Ok((f, w))
 }
 
+/// Quick look's read (opening-files.md §7), off the window's thread: the
+/// file opened read-only, what to show, and for a viewer the file to hand
+/// it. Text is read here, at most [`crate::browser::LOOK_TEXT`] bytes.
+pub fn look(p: &Path, name: &str) -> io::Result<(crate::browser::LookBody, Option<std::fs::File>)> {
+    use crate::browser::{look_kind, look_text, LookBody, LOOK_TEXT};
+    use std::io::{Read, Seek};
+    let (mut f, _) = open_for_app(p, false)?;
+    let mut head = Vec::with_capacity(4096);
+    (&mut f).take(4096).read_to_end(&mut head)?;
+    match look_kind(name, &head) {
+        LookBody::Text { words, .. } => {
+            f.seek(io::SeekFrom::Start(0))?;
+            let mut buf = Vec::with_capacity(LOOK_TEXT.min(f.metadata()?.len() as usize) + 1);
+            (&mut f).take(LOOK_TEXT as u64 + 1).read_to_end(&mut buf)?;
+            let more = buf.len() > LOOK_TEXT;
+            buf.truncate(LOOK_TEXT);
+            let (text, cut) = look_text(&buf, more);
+            Ok((LookBody::Text { text, words, cut }, None))
+        }
+        // Read-only here; limend checks that and narrows it to read, seek
+        // and fstat as it passes it on (limen fdpass), so the viewer can't
+        // write, chmod, map it or learn its path. (Narrowed here first,
+        // limend's own check, which needs F_GETFL, would refuse it.)
+        b @ LookBody::Embed { .. } => {
+            f.seek(io::SeekFrom::Start(0))?;
+            Ok((b, Some(f)))
+        }
+        b => Ok((b, None)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

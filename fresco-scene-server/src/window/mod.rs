@@ -1526,8 +1526,10 @@ impl Compositor {
     fn base_keyboard_window(&self) -> WindowId {
         let w = match self.focus.unwrap_or(0) {
             // Not a pop-up: one that grabs was taken above, a tooltip takes no keys.
+            // Nor a slot's child: it sits right above its parent, but has
+            // the keys only once a press (or its parent) gives them.
             0 => self.z_order.iter().rev()
-                .find(|&&id| id != 0 && !self.is_notification(id) && self.windows.get(&id).is_some_and(|w| w.popup.is_none()))
+                .find(|&&id| id != 0 && !self.is_notification(id) && self.windows.get(&id).is_some_and(|w| w.popup.is_none() && w.slot.is_none()))
                 .copied().unwrap_or(0),
             f => f,
         };
@@ -2281,6 +2283,19 @@ mod notification_tests {
         assert!(!c.focus_parent(p, 1), "a parent is in no slot");
         assert!(c.focus_parent(e, 2));
         assert_eq!(c.focus, Some(p));
+    }
+
+    #[test]
+    fn a_new_slot_child_takes_no_keys_by_being_on_top() {
+        use fresco_protocol::slot::kind;
+        let mut c = Compositor::new();
+        let p = c.create(1, (400, 300));
+        let e = c.create(2, (10, 10));
+        assert_eq!(c.bind_slot(e, p, kind::PLAIN, Some([0.0, 40.0, 400.0, 260.0]), 0), Ok(()));
+        c.set_focus_no_raise(None);
+        assert_eq!(c.keyboard_window(), p as u32, "no focus: the topmost window, not its viewer");
+        c.press_focus(e);
+        assert_eq!(c.keyboard_window(), e as u32, "a press in the viewer gives it the keys");
     }
 
     #[test]

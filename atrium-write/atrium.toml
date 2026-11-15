@@ -1,0 +1,23 @@
+# Atrium Write — Officina's word processor (docs/spec/officina.md §16.12).
+# It draws through Fresco and gets documents only as descriptors: from the
+# picker, or handed over by portcullisd when the user opens one in Scrinium
+# (opening-files.md §6.2). It reads no folder by itself and has no network.
+[app]
+id          = "org.atrium.write"
+name        = "Write"
+version     = "0.1.0"
+entry       = "bin/atrium-write"
+description = "Write and edit documents."
+icon        = "files"
+
+[capabilities]
+graphics = "fresco"
+network  = "none"
+
+[[opens]]
+types = [
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+]
+mode = "edit"

@@ -129,7 +129,7 @@ impl Pane {
         if self.trace.is_some() {
             let b = self.state.get_cloned();
             let line = format!(
-                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} open={}",
+                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} look={} open={}",
                 b.place().map_or("-", |p| p.id.as_str()),
                 b.path.join("/"),
                 b.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
@@ -139,6 +139,7 @@ impl Pane {
                 b.saved.iter().map(|s| s.addr.text()).collect::<Vec<_>>().join(","),
                 b.places.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(","),
                 b.unreadable.as_deref().unwrap_or("-"),
+                look_trace(&b),
                 open_trace(&b),
             );
             if self.trace.as_deref() != Some(&line) {
@@ -147,6 +148,19 @@ impl Pane {
             }
         }
         true
+    }
+}
+
+/// Quick look, for the trace: `NAME:text:LINES[+]`, `NAME:embed:ROLE`,
+/// `NAME:info[:WHY]` or `NAME:reading`.
+fn look_trace(b: &scrinium::browser::Browser) -> String {
+    use scrinium::browser::LookBody;
+    let Some(l) = &b.look else { return "-".into() };
+    match &l.body {
+        None => format!("{}:reading", l.name),
+        Some(LookBody::Text { text, cut, .. }) => format!("{}:text:{}{}", l.name, text.lines().count(), if *cut { "+" } else { "" }),
+        Some(LookBody::Embed { role, .. }) => format!("{}:embed:{role}", l.name),
+        Some(LookBody::Info { why, .. }) => format!("{}:info{}", l.name, why.as_ref().map_or(String::new(), |w| format!(":{w}"))),
     }
 }
 
@@ -400,6 +414,8 @@ enum Job {
     Apps(scrinium::browser::OpenReq, Result<Vec<scrinium::browser::Choice>, String>),
     /// How handing it to its app went.
     Handed(scrinium::browser::OpenReq, Result<String, String>),
+    /// Quick look's read: what to show, and the file for a viewer.
+    Looked(std::path::PathBuf, std::io::Result<(scrinium::browser::LookBody, Option<std::fs::File>)>),
     /// A share's "connect at login", as dispensatord answered.
     /// `true`: the user asked to change it (a failure is shown).
     AtLogin(String, Result<bool, String>, bool),
@@ -418,6 +434,10 @@ struct Network {
     embeds: Option<std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>>,
     /// Arca's password field, while the form shows it.
     cred_embed: Option<EmbedId>,
+    /// Quick look's viewer (opening-files.md §7), for this file.
+    look_embed: Option<(std::path::PathBuf, EmbedId)>,
+    /// The file read for the viewer, until it is handed over.
+    look_file: Option<(std::path::PathBuf, std::fs::File)>,
     tx: Sender<Job>,
     rx: Receiver<Job>,
     /// Shares connected without "remember": their item goes at disconnect.
@@ -447,9 +467,77 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, look_embed: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
+    }
+
+    /// Quick look's viewer: the pane's embed for the file it shows, asked
+    /// for when a file for one has been read, let go when the pane moves
+    /// on or closes. The viewer gets the file narrowed to reading.
+    fn look_viewer(&mut self, pane: &mut Pane, b: &mut Browser) -> bool {
+        use scrinium::browser::LookBody;
+        let Some(embeds) = self.embeds.clone() else {
+            if let Some((p, _)) = self.look_file.take() {
+                b.looked(&p, Ok(LookBody::Info { words: look_words(b), why: Some("Quick look needs Limen, which isn't running".into()) }));
+                return true;
+            }
+            return false;
+        };
+        let want = b.look.as_ref().filter(|l| matches!(l.body, Some(LookBody::Embed { .. }))).map(|l| l.path.clone());
+        if let Some((p, e)) = &self.look_embed {
+            if want.as_ref() != Some(p) {
+                let _ = embeds.borrow_mut().detach_embed(*e);
+                self.look_embed = None;
+            }
+        }
+        let Some((path, f)) = self.look_file.take() else { return false };
+        if want.as_ref() != Some(&path) || self.look_embed.is_some() {
+            return false;
+        }
+        let Some(LookBody::Embed { role, mime, .. }) = b.look.as_ref().and_then(|l| l.body.clone()) else { return false };
+        let Some(token) = pane.win.embed_token() else {
+            self.look_file = Some((path, f));
+            return false;
+        };
+        let msg = if role == "doc-viewer" {
+            limen::doc_viewer::ToChild::Load { kind: limen::doc_viewer::DocKind::Html, base: String::new(), dark: false }.encode()
+        } else {
+            limen::media_player::ToChild::Load { source: limen::media_player::Source::Fd, mime, growing: false }.encode()
+        };
+        use std::os::fd::AsFd;
+        // One borrow at a time: the request's borrow must end before the send's.
+        let asked = embeds.borrow_mut().request(role, token, scrinium::view::LOOK_SLOT);
+        let r = match asked {
+            Ok(e) => {
+                let sent = embeds.borrow_mut().send_fd(e, msg, f.as_fd());
+                match sent {
+                    Ok(()) => Ok(e),
+                    Err(err) => {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        };
+        match r {
+            Ok(e) => {
+                eprintln!("scrinium: quick look: {} in {role}", path.display());
+                self.look_embed = Some((path, e));
+            }
+            Err(e) => {
+                let why = match e {
+                    limen::client::Error::Refused(limen::proto::refusal::NO_PROVIDER) => "No app is set to show these".to_string(),
+                    limen::client::Error::Refused(limen::proto::refusal::LAUNCH_FAILED) => "The viewer didn't start".to_string(),
+                    limen::client::Error::Refused(n) => format!("The viewer was refused (Limen {n})"),
+                    limen::client::Error::Io(e) => format!("Limen: {e}"),
+                };
+                eprintln!("scrinium: quick look: {role}: {why}");
+                b.looked(&path, Ok(LookBody::Info { words: look_words(b), why: Some(why) }));
+            }
+        }
+        true
     }
 
     fn refresh_saved(&self) {
@@ -596,6 +684,12 @@ impl Network {
                         }
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.cred_embed => self.cred_embed = None,
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if self.look_embed.as_ref().is_some_and(|(_, e)| *e == embed) => {
+                        let (p, _) = self.look_embed.take().unwrap();
+                        let words = look_words(&b);
+                        b.looked(&p, Ok(scrinium::browser::LookBody::Info { words, why: Some("The viewer stopped".into()) }));
+                        changed = true;
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(e) => {
@@ -651,6 +745,18 @@ impl Network {
                 }
             });
         }
+        // Quick look: read off this thread; a viewer gets the file.
+        if let Some(path) = b.want_look.take() {
+            changed = true;
+            self.look_file = None;
+            let name = b.look.as_ref().map(|l| l.name.clone()).unwrap_or_default();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let r = scrinium::fs::look(&path, &name);
+                let _ = tx.send(Job::Looked(path, r));
+            });
+        }
+        changed |= self.look_viewer(pane, &mut b);
         // Shares' sizes: asked now and then, each on its own thread.
         for p in b.places.iter().filter(|p| p.network) {
             let every = if self.offline.contains(&p.id) { SHARE_OFFLINE_EVERY } else { SHARE_SPACE_EVERY };
@@ -690,6 +796,15 @@ impl Network {
                 Job::Typed(req, r) => b.typed(req, r),
                 Job::Apps(req, r) => b.apps(req, r),
                 Job::Handed(req, r) => b.handed(&req, r),
+                Job::Looked(path, r) => match r {
+                    Ok((body, file)) => {
+                        b.looked(&path, Ok(body));
+                        if let (Some(f), true) = (file, b.look.as_ref().is_some_and(|l| l.path == path)) {
+                            self.look_file = Some((path, f));
+                        }
+                    }
+                    Err(e) => b.looked(&path, Err(e)),
+                },
                 Job::AtLogin(part, r, set) => match r {
                     Ok(on) => {
                         b.at_login.insert(part, on);
@@ -846,5 +961,13 @@ fn main() {
         if until.is_some_and(|u| Instant::now() >= u) {
             break;
         }
+    }
+}
+
+/// The words for the file in the quick look pane.
+fn look_words(b: &Browser) -> String {
+    match b.look.as_ref().and_then(|l| l.body.as_ref()) {
+        Some(scrinium::browser::LookBody::Embed { words, .. } | scrinium::browser::LookBody::Text { words, .. } | scrinium::browser::LookBody::Info { words, .. }) => words.clone(),
+        None => String::new(),
     }
 }

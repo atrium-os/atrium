@@ -1,0 +1,19 @@
+# Atrium Player (docs/spec/atrium-player.md): plays what the user opens in
+# Scrinium, handed over by portcullisd as a read-only descriptor
+# (opening-files.md §6.2). Decoding happens in its jailed worker.
+[app]
+id          = "org.atrium.player"
+name        = "Player"
+version     = "0.1.0"
+entry       = "bin/atrium-player"
+description = "Play audio and video."
+icon        = "media"
+
+[capabilities]
+graphics = "fresco"
+audio    = true
+network  = "none"
+
+[[opens]]
+types = ["audio/flac", "audio/mpeg", "audio/ogg", "audio/wav", "audio/aac", "audio/mp4",
+         "video/mp4", "video/webm", "video/x-matroska", "video/quicktime"]

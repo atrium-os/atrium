@@ -127,6 +127,82 @@ pub struct Browser {
     /// or [`Browser::handed`].
     pub want_open: Option<OpenStep>,
     pub open_sheet: Option<OpenSheet>,
+    /// Quick look (opening-files.md §7): Space shows the file under the
+    /// cursor in a pane; the app reads it off the window's thread and
+    /// answers [`Browser::looked`].
+    pub look: Option<Look>,
+    pub want_look: Option<PathBuf>,
+}
+
+/// The quick look pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Look {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    /// `None` while it is being read.
+    pub body: Option<LookBody>,
+}
+
+/// What the pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookBody {
+    /// Text, drawn by Scrinium itself: the first [`LOOK_TEXT`] bytes,
+    /// `cut` if there is more.
+    Text { text: String, words: String, cut: bool },
+    /// A viewer embedded through Limen (`doc-viewer`, `media-player`),
+    /// in its own jail, given the file read-only; the app holds the file
+    /// until the embed takes it.
+    Embed { role: &'static str, mime: String, words: String },
+    /// No viewer: what it is, and why not when it says.
+    Info { words: String, why: Option<String> },
+}
+
+/// How much text quick look reads and shows.
+pub const LOOK_TEXT: usize = 64 * 1024;
+pub const LOOK_LINES: usize = 400;
+
+/// What quick look does with a file, from its name and first bytes (§7,
+/// §8): text Scrinium draws; Web pages, audio and video go to a viewer;
+/// programs and anything whose name lies get no viewer, only words.
+pub fn look_kind(name: &str, head: &[u8]) -> LookBody {
+    use atrium_types::{Detected, Family};
+    let d = atrium_types::detect(name, head);
+    let text = atrium_types::is_text(head);
+    match d {
+        _ if d.is_program() => LookBody::Info { words: "Program".into(), why: d.question() },
+        Detected::Known(t) if t.family == Family::WebPage => LookBody::Embed { role: "doc-viewer", mime: t.mime.into(), words: t.words.into() },
+        Detected::Known(t) if matches!(t.family, Family::Audio | Family::Video) => LookBody::Embed { role: "media-player", mime: t.mime.into(), words: t.words.into() },
+        Detected::Known(t) if text && matches!(t.family, Family::Text | Family::Link) => LookBody::Text { text: String::new(), words: t.words.into(), cut: false },
+        Detected::Known(t) => LookBody::Info { words: t.words.into(), why: None },
+        // A name that lies is shown for what it is, and only as text.
+        Detected::Mismatch { named, .. } if text => LookBody::Text { text: String::new(), words: format!("Text (named as {})", named.words), cut: false },
+        Detected::Mismatch { named, .. } => LookBody::Info { words: named.words.into(), why: d.question() },
+        Detected::Unknown { text: true } => LookBody::Text { text: String::new(), words: "Text".into(), cut: false },
+        Detected::Unknown { text: false } => LookBody::Info { words: "Unknown kind of file".into(), why: None },
+    }
+}
+
+/// Text for the pane: lossy UTF-8, control characters but tab and newline
+/// dropped, at most [`LOOK_LINES`] lines.
+pub fn look_text(bytes: &[u8], more: bool) -> (String, bool) {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(s.len());
+    let mut lines = 0;
+    let mut cut = more;
+    for c in s.chars() {
+        if c == '\n' {
+            lines += 1;
+            if lines >= LOOK_LINES {
+                cut = true;
+                break;
+            }
+        }
+        if c == '\n' || c == '\t' || !c.is_control() {
+            out.push(c);
+        }
+    }
+    (out, cut)
 }
 
 /// A press's activation token (frescod's proof the user pressed).
@@ -219,6 +295,8 @@ impl Browser {
             want_at_login: None,
             want_open: None,
             open_sheet: None,
+            look: None,
+            want_look: None,
         }
     }
 
@@ -277,6 +355,7 @@ impl Browser {
             self.selected.clear();
             self.cursor = None;
             self.unreadable = None;
+            self.look = None;
             return;
         };
         match fs::list(&dir, self.show_hidden) {
@@ -303,6 +382,7 @@ impl Browser {
         self.selected = self.entries.iter().enumerate().filter(|(_, e)| keep.contains(&e.name)).map(|(i, _)| i).collect();
         self.cursor = self.cursor.filter(|&c| c < self.entries.len());
         self.anchor = self.anchor.filter(|&c| c < self.entries.len());
+        self.keep_look();
     }
 
     fn go(&mut self, place: usize, path: Vec<String>, remember: bool) {
@@ -552,11 +632,73 @@ impl Browser {
         }
     }
 
+    /// Space: show the file under the cursor in the quick look pane, or
+    /// close the pane.
+    pub fn toggle_look(&mut self) {
+        if self.look.is_some() {
+            self.look = None;
+            self.want_look = None;
+        } else {
+            self.look_at_cursor();
+        }
+    }
+
+    fn look_at_cursor(&mut self) {
+        let Some(i) = self.cursor.or(self.selected.first().copied()) else { return };
+        let Some(e) = self.entries.get(i).cloned() else { return };
+        let Some(d) = self.dir() else { return };
+        if !matches!(self.mode, Mode::Manager) {
+            return;
+        }
+        let path = d.join(&e.name);
+        if self.look.as_ref().is_some_and(|l| l.path == path) {
+            return;
+        }
+        if e.dir || e.link {
+            let words = if e.dir { "Folder" } else { "Link" };
+            self.look = Some(Look { path, name: e.name, size: e.size, body: Some(LookBody::Info { words: words.into(), why: None }) });
+            self.want_look = None;
+            return;
+        }
+        self.look = Some(Look { path: path.clone(), name: e.name, size: e.size, body: None });
+        self.want_look = Some(path);
+    }
+
+    /// What the app read for the pane (dropped if the pane moved on).
+    pub fn looked(&mut self, path: &std::path::Path, r: std::io::Result<LookBody>) {
+        let Some(l) = self.look.as_mut().filter(|l| l.path == path) else { return };
+        l.body = Some(match r {
+            Ok(b) => b,
+            Err(e) => LookBody::Info { words: "Can't be read".into(), why: Some(err_text(&e)) },
+        });
+    }
+
+    /// The pane's file is no longer listed: close it.
+    fn keep_look(&mut self) {
+        let Some(d) = self.dir() else {
+            self.look = None;
+            return;
+        };
+        if let Some(l) = &self.look {
+            if !self.entries.iter().any(|e| d.join(&e.name) == l.path) {
+                self.look = None;
+                self.want_look = None;
+            }
+        }
+    }
+
     /// The arrow keys: move the cursor `by` rows; with Shift, extend.
     pub fn step(&mut self, by: isize, shift: bool) {
         if self.entries.is_empty() {
             return;
         }
+        self.step_cursor(by, shift);
+        if self.look.is_some() {
+            self.look_at_cursor();
+        }
+    }
+
+    fn step_cursor(&mut self, by: isize, shift: bool) {
         let n = self.entries.len() as isize;
         let to = match self.cursor {
             Some(c) => (c as isize + by).clamp(0, n - 1),
@@ -1110,6 +1252,53 @@ mod tests {
         b.press(2, Mods::default(), 0.0);
         assert!(b.pick().is_err());
         assert!(Path::new(&d).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn quick_look_shows_text_itself_and_hands_media_to_a_viewer() {
+        assert!(matches!(look_kind("song.flac", b"fLaC\0\0\0\x22"), LookBody::Embed { role: "media-player", .. }));
+        assert!(matches!(look_kind("page.html", b"<!DOCTYPE html><p>hi"), LookBody::Embed { role: "doc-viewer", .. }));
+        assert!(matches!(look_kind("notes.txt", b"plain words\n"), LookBody::Text { .. }));
+        // A Web page named as a PDF: no viewer, only its text.
+        let LookBody::Text { words, .. } = look_kind("invoice.pdf", b"<!DOCTYPE html><script>steal()</script>") else { panic!() };
+        assert!(words.contains("PDF"), "{words}");
+        // Programs never reach a viewer, whatever they are called.
+        assert!(matches!(look_kind("setup.mp3", b"\x7fELF\x02\x01\x01"), LookBody::Info { .. }));
+        assert!(matches!(look_kind("run.sh", b"#!/bin/sh\necho hi\n"), LookBody::Info { .. }));
+        // Text is cleaned and cut.
+        let (t, cut) = look_text(b"a\x1b[31mred\tb\n", false);
+        assert_eq!((t.as_str(), cut), ("a[31mred\tb\n", false));
+        let many = "x\n".repeat(LOOK_LINES + 5);
+        let (t, cut) = look_text(many.as_bytes(), false);
+        assert!(cut && t.lines().count() <= LOOK_LINES);
+
+        let (d, p) = stick("look");
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![p]);
+        let at = |b: &Browser, n: &str| b.entries.iter().position(|e| e.name == n).unwrap();
+        let i = at(&b, "hello.txt");
+        b.select_only(i);
+        b.toggle_look();
+        assert_eq!(b.want_look.take(), Some(d.join("hello.txt")));
+        assert!(b.look.as_ref().unwrap().body.is_none(), "reading");
+        b.looked(&d.join("hello.txt"), Ok(LookBody::Text { text: "hello".into(), words: "Plain text".into(), cut: false }));
+        assert!(matches!(b.look.as_ref().unwrap().body, Some(LookBody::Text { .. })));
+        // The cursor moves: the pane follows; an old answer is dropped.
+        b.step(-1, false);
+        let l = b.look.clone().unwrap();
+        assert_eq!((l.name.as_str(), l.body), ("Photos", Some(LookBody::Info { words: "Folder".into(), why: None })), "a folder is only named");
+        assert!(b.want_look.is_none());
+        b.looked(&d.join("hello.txt"), Ok(LookBody::Info { words: "late".into(), why: None }));
+        assert_ne!(b.look.as_ref().unwrap().body, Some(LookBody::Info { words: "late".into(), why: None }));
+        // Space again closes it; a file that goes closes it too.
+        b.toggle_look();
+        assert!(b.look.is_none());
+        b.select_only(at(&b, "hello.txt"));
+        b.toggle_look();
+        std::fs::remove_file(d.join("hello.txt")).unwrap();
+        b.reload();
+        assert!(b.look.is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

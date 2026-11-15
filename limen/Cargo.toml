@@ -41,3 +41,7 @@ path = "examples/arca_fill_probe.rs"
 [[example]]
 name = "limend-dev"
 path = "examples/limend_dev.rs"
+
+[[example]]
+name = "limen-view-probe"
+path = "examples/view_probe.rs"

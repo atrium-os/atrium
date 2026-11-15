@@ -66,7 +66,7 @@ Related: [scrinium.md](scrinium.md) (the file manager and the picker),
 | Running a program from a stick, share or download | never; `noexec` mounts, no "run" action anywhere (§8) |
 | A shortcut or link file that points elsewhere (`.desktop`, `.url`, `.lnk`, `.webloc`) | shown as a file; never followed, never run (§8) |
 | A write through a viewer | read-only descriptor unless the app declares *edit* for that type |
-| The app keeps the file after it closes it | it has the descriptor only; a stick's eject or a share's disconnect ends it with `EIO` |
+| The app keeps the file after it closes it | it has the descriptor only; a stick's eject or a share's disconnect ends it (reads fail: `ENXIO` from a share, checked in the gate) |
 
 ## 4. File types
 
@@ -193,8 +193,8 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
 ### 6.3 What the app can do with it
 
 Read it, and change it if it edits that type, for as long as it holds the
-descriptor. Ejecting the stick or disconnecting the share ends that with
-`EIO`. An editor's autosave writes through the same descriptor;
+descriptor. Ejecting the stick or disconnecting the share ends that: its
+reads fail (`ENXIO` once a share is disconnected). An editor's autosave writes through the same descriptor;
 renaming or moving the file needs the picker.
 
 ## 7. Quick look
@@ -299,10 +299,43 @@ and type. D6 asks whether quick look comes in the first build.
    default saved, the next double-click goes straight to the running
    app; an HTML `.pdf` stops at the question and opens as text,
    read-only; a script gets no Open; the app, alice, and the file
-   manager without a real press are refused. Not yet: from a share (same
-   path as a stick, gate pending), and the Player and Write end to end
-   in the VM.
+   manager without a real press are refused.
+   *Then, 2026-11-15:* the same gate opens files from an SFTP share (an
+   ODT to its default for changes, written through the share; a FLAC
+   read-only), and disconnecting the share ends both descriptors (the
+   app's next read fails, `ENXIO`). Write ships a manifest
+   (`atrium-write/atrium.toml`: graphics, and `[[opens]]` ODT, DOCX and
+   plain text to edit) and Player one (`atrium-player/atrium.toml`:
+   audio and video to view); in the gate Write, installed and approved
+   once, gets a `.docx` as the system's default, in its own jail and
+   uid, and its Save writes the typing back as `.docx` through the
+   descriptor. Pergola's default frescod socket is now the jailed one
+   when it is there (it was always `/tmp/frescod.sock`), so a Pergola
+   app portcullisd starts with `graphics` finds frescod. Player end to
+   end in the VM waits for its FFmpeg cross-build there.
 4. **T4** quick look (D6).
+   *Built 2026-11-15:* Space in Scrinium opens a pane at the right of
+   the list, and the arrow keys move it with the cursor; Space again or
+   leaving the folder closes it. What it shows comes from the name and
+   the first 4 KiB, read off the window's thread: text (and a file
+   whose name lies but whose bytes are text, said as such) is drawn by
+   Scrinium itself, monospaced, at most 64 KiB and 400 lines, control
+   characters dropped; Web pages go to Limen's `doc-viewer` and audio
+   and video to `media-player`, each embedded in the pane through the
+   existing `SEND_FD` (the "`ToChild::OpenFd`" of §7: limend already
+   checks a passed descriptor is a read-only regular file and narrows
+   it to read, seek and fstat), with the role's own `Load`; programs,
+   and types with no viewer yet (pictures, PDFs, office files), show
+   only what they are and their size. The viewer goes when the pane
+   moves on or closes. frescod no longer gives the keys to a slot's
+   child just because it sits on top with no window focused (a press,
+   or the parent, still gives them). Gate: `vm-open-files.sh`'s quick
+   look part, with a stand-in viewer (`limen-view-probe`, both roles)
+   that limend starts through portcullisd as its own user in its own
+   jail: it gets the FLAC and the page read-only, can't write, chmod,
+   map it or learn its path, sees no `/media`. Not yet: a picture
+   viewer and PDFs (no viewer role takes them), the real viewers in the
+   gate (Navigator's page for HTML, Player for media).
 5. **T5** bundles open the installer.
 
 ## 11. Decisions, with recommendations
