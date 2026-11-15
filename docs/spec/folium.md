@@ -514,8 +514,10 @@ choice in Save As, never the default.
   (b) A software certificate (a `.p12`/`.pfx` the user imports), held in
   Arca as today's software client certificates are (arca.md §8.5); the key
   never leaves arcad, which signs the digest itself. In both cases the app
-  only ever sends a digest and gets a signature back, after the PIN or
-  password in Sigillum's or Arca's own sheet (sigillum §10.2), with the
+  only ever sends a digest and gets a signature back; how the user
+  approves it (PIN, password, a fingerprint, whatever Arca and Sigillum
+  allow for that key) is entirely theirs and not Folium's concern
+  (sigillum §10.2), with the
   chooser listing certificates that can sign documents (key usage
   digitalSignature or nonRepudiation).
 - **What is written.** PAdES baseline: B-B with no network, B-T with a
