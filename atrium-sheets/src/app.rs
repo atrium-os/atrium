@@ -13,7 +13,8 @@ use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::widgets::grid_view::col_name;
-use pergola::widgets::{Button, CellRange, GridAction, GridState, GridView, MenuButton, MenuState, ScrollState};
+use pergola::text_edit::TextEdit;
+use pergola::widgets::{Button, CellRange, GridAction, GridState, GridView, MenuButton, MenuState, ScrollState, TextField};
 use pergola::{clipboard, Color, Mutable, TextStyle};
 
 use crate::doc::Doc;
@@ -28,6 +29,11 @@ pub const STATUS_H: f32 = 26.0;
 /// What the toolbar asks the event loop for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
+    /// Set, change or remove the document's password.
+    PasswordOpen,
+    /// The password bar's field submitted (to set, or to open a file).
+    PasswordDone,
+    PasswordClose,
     Open,
     Save,
     SaveAs,
@@ -37,6 +43,16 @@ pub enum Cmd {
     RemoveMacros,
     /// A Data menu command, on the selection.
     Data(crate::data::DataCmd),
+}
+
+/// The password bar: asking for a protected file's password, or for the
+/// document's new one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PasswordBar {
+    pub open: bool,
+    pub prompt: String,
+    /// Setting the document's password (else opening a file).
+    pub setting: bool,
 }
 
 /// What the view shows besides the document.
@@ -61,13 +77,32 @@ pub struct Sheets {
     pub size: Rc<Cell<(f32, f32)>>,
     /// The Data menu's open state.
     pub data_menu: Mutable<MenuState>,
+    pub password: Mutable<PasswordBar>,
+    pub password_text: Mutable<TextEdit>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)) }
+    }
+
+    /// Shows the password bar with `prompt`, its field empty.
+    pub fn ask_password(&self, prompt: &str, setting: bool) {
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.password.set(PasswordBar { open: true, prompt: prompt.into(), setting });
+        self.changed();
+    }
+
+    /// The password bar's text, and the bar closed and emptied.
+    pub fn take_password(&self) -> (PasswordBar, String) {
+        let bar = self.password.get_cloned();
+        let text = self.password_text.get_cloned().text().to_string();
+        self.password.set(PasswordBar::default());
+        self.password_text.set(TextEdit::new("").secret(true));
+        self.changed();
+        (bar, text)
     }
 
     /// The document changed outside the grid (opened, saved, recovered).
@@ -195,6 +230,11 @@ impl View for Sheets {
             .render(ctx);
             x += 84.0;
         }
+        {
+            let cmds = self.cmds.clone();
+            Button::secondary("Password…").at(x, 8.0).width(100.0).on_click(move || cmds.lock().unwrap().push(Cmd::PasswordOpen)).render(ctx);
+            x += 108.0;
+        }
         let (name, dirty, status, macros) = {
             let d = self.doc.borrow();
             (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some())
@@ -240,6 +280,25 @@ impl View for Sheets {
         };
         ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
 
+        // The password bar, over the formula bar and the grid's top.
+        let pb = self.password.get_cloned();
+        if pb.open {
+            let (y, bh) = (TOOLBAR_H, 48.0);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let lw = 300.0f32.min(w * 0.4);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 24.0 - lw - 160.0).max(120.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.password_text.clone()).placeholder("Password").autofocus(true).at(lw + 20.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
+            Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordDone)).render(ctx);
+            Button::secondary("Cancel").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         if self.ui.get_cloned().asking {
             // The system places the picker's sheet over the window.
             let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
@@ -268,6 +327,17 @@ impl Sheets {
                     crate::data::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, dc);
                     self.rev.set(self.rev.get().wrapping_add(1));
                     false
+                }
+                Cmd::PasswordOpen => {
+                    let protected = self.doc.borrow().protection.is_some();
+                    self.ask_password(if protected { "New password (empty removes it)" } else { "Password to protect this sheet" }, true);
+                    false
+                }
+                Cmd::PasswordClose => {
+                    self.password.set(PasswordBar::default());
+                    self.password_text.set(TextEdit::new("").secret(true));
+                    self.changed();
+                    true
                 }
                 Cmd::RemoveMacros => {
                     let mut d = self.doc.borrow_mut();

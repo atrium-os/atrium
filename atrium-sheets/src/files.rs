@@ -1,10 +1,10 @@
 //! Files: what a name says a file is, and opening a foreign one through the converter
 //! process.
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
-
 use crate::doc::Doc;
+use officina_convert::crypt::CryptError;
+use officina_convert::launch::ConvertError;
+use officina_convert::sealed::{self, Protection};
 
 /// What a file is, by its name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,56 +40,34 @@ pub fn is_native(name: &str) -> bool {
 /// file is parsed there, sandboxed, never here. Returns the native file and the
 /// fidelity notes.
 pub fn convert(kind: &str, data: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
-    use std::process::{Command, Stdio};
-    let exe = std::env::var_os("OFFICINA_CONVERT").map(PathBuf::from).unwrap_or_else(|| {
-        let here = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("officina-convert")));
-        here.filter(|p| p.exists()).unwrap_or_else(|| PathBuf::from("officina-convert"))
-    });
-    let mut child = Command::new(&exe)
-        .arg(kind)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("the converter ({}) didn't start: {e}", exe.display()))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    std::thread::scope(|sc| {
-        sc.spawn(move || {
-            let _ = stdin.write_all(data);
-        });
-        let e = sc.spawn(move || {
-            let mut s = String::new();
-            let _ = err.read_to_string(&mut s);
-            s
-        });
-        let mut out = Vec::new();
-        let r = child.stdout.take().unwrap().read_to_end(&mut out);
-        let status = child.wait();
-        let errs = e.join().unwrap_or_default();
-        let mut notes = Vec::new();
-        let mut failure = None;
-        for l in errs.lines() {
-            if let Some(n) = l.strip_prefix("note\t") {
-                if let Some((kind, count, what, ex)) = officina_convert::report::Report::parse_line(n) {
-                    let ex = if ex.is_empty() { String::new() } else { format!(" (e.g. {ex})") };
-                    notes.push(if count == 1 { format!("{}: {what}{ex}", kind.word()) } else { format!("{}: {count} × {what}{ex}", kind.word()) });
-                }
-            } else if let Some(w) = l.strip_prefix("error\t") {
-                failure = Some(w.to_string());
-            }
-        }
-        match (r, status) {
-            (Ok(_), Ok(st)) if st.success() => Ok((out, notes)),
-            _ => Err(failure.unwrap_or_else(|| "the converter stopped".into())),
-        }
-    })
+    officina_convert::launch::convert(kind, data, None).map_err(|e| e.to_string())
 }
 
 /// A document from a file's bytes, by its name's extension.
 pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
+    load_with(name, data, None).map_err(|e| match e {
+        ConvertError::Failed(w) => w,
+        e => format!("“{name}” couldn't be opened: {e}."),
+    })
+}
+
+/// [`load`] with the password of a protected file. `NeedsPassword` and
+/// `WrongPassword` say to ask (again); anything else is in words.
+pub fn load_with(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc, ConvertError> {
+    let failed = ConvertError::Failed;
+    if is_native(name) && sealed::is_sealed(data) {
+        let Some(pw) = password else { return Err(ConvertError::NeedsPassword) };
+        let (plain, sealer) = sealed::unseal(data, pw).map_err(|e| match e {
+            CryptError::WrongPassword => ConvertError::WrongPassword,
+            e => failed(format!("“{name}” couldn't be opened: {e}")),
+        })?;
+        let mut d = Doc::from_native(name, &plain).map_err(|e| failed(format!("“{name}” isn't a sheet this app can read: {e}")))?;
+        d.protection = Some(Protection { password: pw.to_string(), sealer });
+        d.status = format!("Opened “{name}”, protected with a password.");
+        return Ok(d);
+    }
     if is_native(name) {
-        return Doc::from_native(name, data).map_err(|e| format!("“{name}” isn't a sheet this app can read: {e}"));
+        return Doc::from_native(name, data).map_err(|e| failed(format!("“{name}” isn't a sheet this app can read: {e}")));
     }
     let foreign = match format_of(name) {
         Format::Xlsx | Format::Xlsm => Some("xlsx"),
@@ -97,8 +75,14 @@ pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
         _ => None,
     };
     if let Some(kind) = foreign {
-        let (native, notes) = convert(kind, data).map_err(|e| format!("“{name}” couldn't be opened: {e}"))?;
-        let mut d = Doc::from_native(name, &native).map_err(|e| format!("“{name}”: the converter's output didn't load: {e}"))?;
+        let (native, notes) = officina_convert::launch::convert(kind, data, password).map_err(|e| match e {
+            ConvertError::Failed(w) => failed(format!("“{name}” couldn't be opened: {w}")),
+            e => e,
+        })?;
+        let mut d = Doc::from_native(name, &native).map_err(|e| failed(format!("“{name}”: the converter's output didn't load: {e}")))?;
+        if let Some(pw) = password {
+            d.protection = Some(Protection::new(pw));
+        }
         d.status = match notes.len() {
             0 => format!("Opened “{name}”."),
             1 => format!("Opened “{name}”. {}", notes[0]),
@@ -110,7 +94,7 @@ pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
         d.notes = notes;
         return Ok(d);
     }
-    let (mut d, st) = Doc::from_csv(name, data).map_err(|e| format!("“{name}” couldn't be read as CSV: {e:?}"))?;
+    let (mut d, st) = Doc::from_csv(name, data).map_err(|e| failed(format!("“{name}” couldn't be read as CSV: {e:?}")))?;
     let mut notes = vec![format!("Opened “{name}”: {} rows × {} columns", st.rows, st.cols)];
     if st.latin {
         notes.push("read as Windows-1252 (not UTF-8)".into());

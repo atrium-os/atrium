@@ -11,9 +11,11 @@
 //! file without Save (D9).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use officina_convert::crypt::CryptError;
+use officina_convert::sealed::{self, Protection, Sealer};
 use officina_core::history::History;
 use officina_core::journal::{self, JournalWriter};
 use officina_core::wire::{Reader, WireError, Writer};
@@ -142,6 +144,8 @@ impl Record {
 pub struct Autosave {
     dir: PathBuf,
     journal: JournalWriter<File>,
+    /// A protected document's key: the base and each record are sealed.
+    sealer: Option<Sealer>,
     /// Records appended since the last [`Autosave::sync`].
     unsynced: usize,
     _lock: File,
@@ -149,19 +153,26 @@ pub struct Autosave {
 
 impl Autosave {
     /// Starts autosaving `wb` into `dir` (created). Fails if another window holds it.
-    pub fn start(dir: &Path, wb: &Workbook, name: &str) -> io::Result<Self> {
+    pub fn start(dir: &Path, wb: &Workbook, name: &str, sealer: Option<&Sealer>) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let l = lock(dir)?;
         let g = generation(dir).map(|g| g + 1).unwrap_or(1);
-        Self::begin(dir, l, g, wb, name)
+        Self::begin(dir, l, g, wb, name, sealer)
     }
 
     /// Writes generation `g` (base and empty journal) and switches to it.
-    fn begin(dir: &Path, l: File, g: u64, wb: &Workbook, name: &str) -> io::Result<Self> {
+    fn begin(dir: &Path, l: File, g: u64, wb: &Workbook, name: &str, sealer: Option<&Sealer>) -> io::Result<Self> {
         let old = generation(dir).ok();
         let tmp = dir.join(".base.tmp");
         let f = File::create(&tmp)?;
-        let f = native::save(wb, io::BufWriter::new(f))?.into_inner().map_err(|e| e.into_error())?;
+        let f = match sealer {
+            Some(s) => {
+                let mut f = f;
+                f.write_all(&s.seal(&native::save_to_vec(wb)))?;
+                f
+            }
+            None => native::save(wb, io::BufWriter::new(f))?.into_inner().map_err(|e| e.into_error())?,
+        };
         f.sync_all()?;
         fs::rename(&tmp, base_path(dir, g))?;
         let j = OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(format!("journal.{g}")))?;
@@ -181,21 +192,25 @@ impl Autosave {
             let _ = fs::remove_file(base_path(dir, o));
             let _ = fs::remove_file(dir.join(format!("journal.{o}")));
         }
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer: sealer.cloned(), unsynced: 0, _lock: l })
     }
 
     /// Goes on appending to generation `g`'s journal after its first `good` bytes
     /// (what a torn last record left is cut off first).
-    fn resume(dir: &Path, l: File, g: u64, good: u64) -> io::Result<Self> {
+    fn resume(dir: &Path, l: File, g: u64, good: u64, sealer: Option<Sealer>) -> io::Result<Self> {
         let mut j = OpenOptions::new().write(true).open(dir.join(format!("journal.{g}")))?;
         j.set_len(good)?;
         j.seek(io::SeekFrom::End(0))?;
         j.sync_all()?;
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), sealer, unsynced: 0, _lock: l })
     }
 
     fn append(&mut self, r: &Record) -> io::Result<()> {
-        self.journal.append(&r.encode())?;
+        let rec = r.encode();
+        match &self.sealer {
+            Some(s) => self.journal.append(&s.seal_small(&rec))?,
+            None => self.journal.append(&rec)?,
+        }
         self.unsynced += 1;
         Ok(())
     }
@@ -256,9 +271,33 @@ pub struct Recovered {
 /// action replayed through the same history. The document keeps autosaving to the
 /// same folder, from a new base.
 pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
+    recover_with(dir, None)
+}
+
+/// Whether the autosave folder `dir` is a protected document's (its
+/// recovery needs the password).
+pub fn recovery_locked(dir: &Path) -> bool {
+    let Ok(g) = generation(dir) else { return false };
+    let mut head = [0u8; 160];
+    File::open(base_path(dir, g)).and_then(|mut f| f.read_exact(&mut head)).is_ok() && sealed::is_sealed(&head)
+}
+
+/// [`recover`], for a protected document with its password. A wrong one is
+/// `PermissionDenied`.
+pub fn recover_with(dir: &Path, password: Option<&str>) -> io::Result<(Doc, Recovered)> {
     let l = lock(dir)?;
     let g = generation(dir)?;
-    let base = fs::read(base_path(dir, g))?;
+    let mut base = fs::read(base_path(dir, g))?;
+    let mut protection = None;
+    if sealed::is_sealed(&base) {
+        let Some(pw) = password else { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the document is protected with a password")) };
+        let (plain, sealer) = sealed::unseal(&base, pw).map_err(|e| match e {
+            CryptError::WrongPassword => io::Error::new(io::ErrorKind::PermissionDenied, "that password doesn't open it"),
+            e => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+        })?;
+        base = plain;
+        protection = Some(Protection { password: pw.to_string(), sealer });
+    }
     let wb = native::load(&base).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let name = fs::read_to_string(dir.join(META)).unwrap_or_else(|_| "Recovered".into());
     let mut doc = Doc::from_workbook(wb, &name);
@@ -268,6 +307,17 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
     let mut since_save = 0;
     let mut torn = replay.torn_bytes;
     for (i, rec) in replay.records.iter().enumerate() {
+        let opened;
+        let rec: &[u8] = match &protection {
+            Some(p) => match p.sealer.open_small(rec) {
+                Some(r) => {
+                    opened = r;
+                    &opened
+                }
+                None => &[0xFF],
+            },
+            None => rec,
+        };
         match Record::decode(rec) {
             Ok(Record::Saved) => since_save = 0,
             Ok(r) => {
@@ -284,7 +334,8 @@ pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
     }
     doc.wb.recalc();
     doc.dirty = since_save > 0;
-    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64)?);
+    doc.autosave = Some(Autosave::resume(dir, l, g, (data.len() - torn) as u64, protection.as_ref().map(|p| p.sealer.clone()))?);
+    doc.protection = protection;
     Ok((doc, Recovered { actions, torn_bytes: torn }))
 }
 
@@ -306,6 +357,9 @@ pub struct Doc {
     /// The fidelity report of the import that made this document (docs/spec/officina.md
     /// §5.2), one line per note.
     pub notes: Vec<String>,
+    /// The password, while a protected document is open: saves and the
+    /// journal are encrypted with it.
+    pub protection: Option<Protection>,
 }
 
 impl Doc {
@@ -316,7 +370,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new() }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -340,7 +394,21 @@ impl Doc {
         if let Some(a) = self.autosave.take() {
             a.remove()?;
         }
-        self.autosave = Some(Autosave::start(dir, &self.wb, &self.name)?);
+        self.autosave = Some(Autosave::start(dir, &self.wb, &self.name, self.protection.as_ref().map(|p| &p.sealer))?);
+        Ok(())
+    }
+
+    /// Sets, changes (keeping the key) or removes the password; the
+    /// journal starts again, sealed or not, in place of the old one.
+    pub fn set_password(&mut self, password: Option<&str>) -> io::Result<()> {
+        match (password, &mut self.protection) {
+            (Some(pw), Some(p)) => p.change(pw),
+            (Some(pw), None) => self.protection = Some(Protection::new(pw)),
+            (None, _) => self.protection = None,
+        }
+        if let Some(dir) = self.autosave.as_ref().map(|a| a.dir.clone()) {
+            self.autosave_to(&dir)?;
+        }
         Ok(())
     }
 
@@ -500,6 +568,15 @@ impl Doc {
     /// Writes the native file to `out`.
     pub fn write_native<W: Write>(&self, out: W) -> io::Result<W> {
         native::save(&self.wb, out)
+    }
+
+    /// The native file's bytes as saved: sealed when protected.
+    pub fn stored_native(&self) -> io::Result<Vec<u8>> {
+        let b = self.write_native(Vec::new())?;
+        Ok(match &self.protection {
+            Some(p) => p.sealer.seal(&b),
+            None => b,
+        })
     }
 
     /// Writes the current sheet as CSV to `out`.

@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use atrium_sheets::app::{Cmd, Sheets, Ui, PICKER_SLOT};
 use atrium_sheets::bench::{self, Frame, Pattern, Report};
 use atrium_sheets::doc::{self, Doc};
-use atrium_sheets::files::{format_of, load, stem_of, Format};
+use atrium_sheets::files::{format_of, load_with, stem_of, Format};
+use officina_convert::launch::ConvertError;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
@@ -81,13 +82,19 @@ fn read_all(f: &mut File) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// The file's bytes in `format`; a protected document's encrypted with its
+/// password (CSV has no way to carry one and is written as is).
 fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
+    let protect = |kind: &str, b: Vec<u8>| match &d.protection {
+        Some(p) => officina_convert::launch::protect(kind, &b, &p.password).map_err(|e| io::Error::other(e.to_string())),
+        None => Ok(b),
+    };
     match format {
-        Format::Native => d.write_native(Vec::new()),
+        Format::Native => d.stored_native(),
         Format::Csv => d.write_csv(Vec::new()),
-        Format::Xlsx => officina_convert::xlsx::write(&d.wb, Vec::new()),
-        Format::Xlsm => officina_convert::xlsx::write_xlsm(&d.wb, Vec::new()),
-        Format::Ods => officina_convert::ods::write(&d.wb, Vec::new()),
+        Format::Xlsx => protect("xlsx", officina_convert::xlsx::write(&d.wb, Vec::new())?),
+        Format::Xlsm => protect("xlsm", officina_convert::xlsx::write_xlsm(&d.wb, Vec::new())?),
+        Format::Ods => protect("ods", officina_convert::ods::write(&d.wb, Vec::new())?),
     }
 }
 
@@ -133,9 +140,17 @@ fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
 }
 
 
+/// A protected file waiting for its password.
+enum Locked {
+    File { name: String, data: Vec<u8>, target: Option<Target> },
+    /// A protected document's autosave folder, to restore.
+    Recovery { dir: PathBuf, name: String },
+}
+
 struct Run {
     sheets: Sheets,
     target: Option<Target>,
+    locked: Option<Locked>,
     root: PathBuf,
 }
 
@@ -236,15 +251,79 @@ impl Run {
     /// A picked file arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
-        match read_all(&mut f).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, &data)) {
+        let format = format_of(&name);
+        match read_all(&mut f) {
+            Ok(data) => self.open_bytes(name, data, write.then_some(Target::Picked { file: f, format }), !write, None),
+            Err(e) => self.set_status(format!("Couldn't read “{name}”: {e}")),
+        }
+    }
+
+    /// Opens `data` (named `name`), with `password` when it is protected;
+    /// without the right one, the password bar asks and the file waits.
+    fn open_bytes(&mut self, name: String, data: Vec<u8>, target: Option<Target>, read_only: bool, password: Option<&str>) {
+        match load_with(&name, &data, password) {
             Ok(mut d) => {
-                let format = format_of(&name);
-                if !write {
+                if read_only {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
                 }
-                self.show(d, write.then_some(Target::Picked { file: f, format }));
+                self.show(d, target);
             }
-            Err(e) => self.set_status(e),
+            Err(e @ (ConvertError::NeedsPassword | ConvertError::WrongPassword)) => {
+                let again = e == ConvertError::WrongPassword;
+                self.sheets.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("“{name}” is protected. Its password") }, false);
+                self.locked = Some(Locked::File { name, data, target });
+            }
+            Err(ConvertError::Failed(e)) => self.set_status(e),
+        }
+    }
+
+    /// Restores a protected document's autosave folder, asking for its
+    /// password.
+    fn recover_locked(&mut self, dir: PathBuf, name: String, password: Option<&str>) {
+        match password.map(|pw| doc::recover_with(&dir, Some(pw))) {
+            Some(Ok((mut d, rec))) => {
+                d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
+                self.show(d, None);
+            }
+            Some(Err(e)) if e.kind() != io::ErrorKind::PermissionDenied => self.set_status(format!("Couldn't restore “{name}”: {e}")),
+            r => {
+                let again = r.is_some();
+                self.sheets.ask_password(&if again { format!("Wrong password for “{name}”. Try again") } else { format!("Restore “{name}”: its password") }, false);
+                self.locked = Some(Locked::Recovery { dir, name });
+            }
+        }
+    }
+
+    /// The password bar's answer: a waiting file opened, or the document's
+    /// password set.
+    fn password_done(&mut self) {
+        let (bar, text) = self.sheets.take_password();
+        if bar.setting {
+            let pw = (!text.is_empty()).then_some(text.as_str());
+            let r = self.sheets.doc.borrow_mut().set_password(pw);
+            let mut d = self.sheets.doc.borrow_mut();
+            d.dirty = true;
+            d.status = match (r, pw) {
+                (Err(e), _) => format!("The password is set, but autosave stopped: {e}."),
+                (Ok(()), Some(_)) => format!("“{}” is protected with a password from its next save. CSV files can't carry one.", d.name),
+                (Ok(()), None) => format!("“{}” has no password from its next save.", d.name),
+            };
+            drop(d);
+            self.sheets.changed();
+            return;
+        }
+        match self.locked.take() {
+            Some(Locked::File { name, data, target }) => self.open_bytes(name, data, target, false, Some(&text)),
+            Some(Locked::Recovery { dir, name }) => self.recover_locked(dir, name, Some(&text)),
+            None => {}
+        }
+    }
+
+    fn password_cancelled(&mut self) {
+        match self.locked.take() {
+            Some(Locked::File { name, .. }) => self.set_status(format!("“{name}” stayed closed.")),
+            Some(Locked::Recovery { name, .. }) => self.set_status(format!("“{name}” wasn't restored; it comes back next time Sheets starts.")),
+            None => {}
         }
     }
 }
@@ -259,21 +338,31 @@ fn main() {
     let _ = fs::create_dir_all(&root);
     // A document a crash left comes back first.
     let mut first: Option<(Doc, Option<Target>)> = None;
+    let mut locked: Option<(PathBuf, String)> = None;
+    let mut locked_file: Option<(String, Vec<u8>, Target)> = None;
     if let Some((dir, name)) = doc::pending(&root).pop() {
-        match doc::recover(&dir) {
-            Ok((mut d, rec)) => {
-                d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
-                first = Some((d, None));
+        if doc::recovery_locked(&dir) {
+            locked = Some((dir, name));
+        } else {
+            match doc::recover(&dir) {
+                Ok((mut d, rec)) => {
+                    d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
+                    first = Some((d, None));
+                }
+                Err(e) => eprintln!("atrium-sheets: couldn't restore {}: {e}", dir.display()),
             }
-            Err(e) => eprintln!("atrium-sheets: couldn't restore {}: {e}", dir.display()),
         }
     }
-    if first.is_none() {
+    if first.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-            match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, &data)) {
-                Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
+            match fs::read(&p) {
+                Ok(data) => match load_with(&name, &data, None) {
+                    Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
+                    Err(ConvertError::Failed(e)) => eprintln!("atrium-sheets: {e}"),
+                    Err(_) => locked_file = Some((name.clone(), data, Target::Path { path: p.clone(), format: format_of(&name) })),
+                },
                 Err(e) => eprintln!("atrium-sheets: {e}"),
             }
         }
@@ -306,8 +395,13 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
-    let mut run = Run { sheets, target: None, root: root.clone() };
+    let mut run = Run { sheets, target: None, locked: None, root: root.clone() };
     run.show(doc, target);
+    if let Some((dir, name)) = locked {
+        run.recover_locked(dir, name, None);
+    } else if let Some((name, data, t)) = locked_file {
+        run.open_bytes(name, data, Some(t), false, None);
+    }
     let size = run.sheets.size.clone();
     let mut app = App::new_with_flag(run.sheets.clone(), dirty);
     let _ = win.paint(&mut app);
@@ -328,13 +422,15 @@ fn main() {
         for c in run.sheets.take_cmds() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::PasswordDone => run.password_done(),
+                Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
                     }
                 }
-                Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) => {}
+                Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen => {}
             }
         }
         if let (Some(what), None) = (want_picker.take(), asking) {
