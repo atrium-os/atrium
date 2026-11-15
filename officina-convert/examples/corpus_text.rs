@@ -40,7 +40,8 @@ fn words(t: &str) -> HashMap<String, usize> {
     m
 }
 
-/// Our text with each note anchor shown as its number (as LibreOffice's text has it).
+/// Our text with each note anchor shown as its number and each field as its
+/// value (as LibreOffice's text has it).
 fn labelled(d: &TextDoc) -> String {
     let mut out = String::new();
     for (i, b) in d.blocks.iter().enumerate() {
@@ -52,6 +53,8 @@ fn labelled(d: &TextDoc) -> String {
             let a = d.attrs.get(p.attr_at(at as u32));
             match a.note {
                 Some(n) if ch == '\u{FFFC}' => out.push_str(&d.note_label(n)),
+                // A field shows its value (the file's, until pages are laid out).
+                _ if ch == '\u{FFFC}' && a.field.is_some() => out.push_str(&d.field_text(a.field.unwrap())),
                 // A tracked deletion's tombstone takes no room.
                 _ if ch == '\u{FFFC}' && a.deleted.is_some() => {}
                 _ => out.push(ch),

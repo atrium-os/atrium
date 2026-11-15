@@ -201,12 +201,13 @@ impl TextDoc {
     /// `a` without a picture, note anchor or tracking mark in it.
     pub fn plain_attr(&mut self, a: crate::model::AttrId) -> crate::model::AttrId {
         let x = self.attrs.get(a);
-        if x.object.is_none() && x.note.is_none() && x.deleted.is_none() && x.conflict.is_none() && x.rev.is_none() && x.fmt.is_none() {
+        if x.object.is_none() && x.note.is_none() && x.field.is_none() && x.deleted.is_none() && x.conflict.is_none() && x.rev.is_none() && x.fmt.is_none() {
             return a;
         }
         let mut c = self.attrs.get(a).clone();
         c.object = None;
         c.note = None;
+        c.field = None;
         c.deleted = None;
         c.conflict = None;
         c.rev = None;

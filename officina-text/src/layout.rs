@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::model::{Align, BlockId, CharFormat, LineSpacing, ObjectRef, Para, ParaFormat, TextDoc, VertAlign, OBJECT_CHAR};
+use crate::model::{Align, BlockId, CharFormat, Leader, LineSpacing, TabAlign, DEFAULT_TAB, ObjectRef, Para, ParaFormat, TextDoc, VertAlign, OBJECT_CHAR};
 use crate::{twips, LU};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +220,9 @@ pub struct Line {
     pub descent: i64,
     /// Distance from this line's top to the next's.
     pub height: i64,
+    /// Space tabs took that a leader fills: from, to (from the paragraph's
+    /// start edge, like `x`), and the leader.
+    pub leaders: Vec<(i64, i64, Leader)>,
 }
 
 /// A paragraph laid out.
@@ -272,7 +275,10 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
             _ if f.deleted.is_some() || f.conflict.is_some() => text.char_indices().map(|(i, _)| Glyph { face: OBJECT_FACE, id: 0, adv: 0, dx: 0, dy: 0, cluster: i as u32, fmt: 0 }).collect(),
             (Some(o), _) => shape_with_objects(fonts, text, &f, o, full.max(LU)),
             (None, Some(n)) => shape_with_label(fonts, text, &f, &doc.note_label(n)),
-            (None, None) => fonts.shape(text, &f),
+            (None, None) => match f.field {
+                Some(x) => shape_with_label(fonts, text, &f, &doc.field_text(x)),
+                None => fonts.shape(text, &f),
+            },
         };
         let space = if text.contains('\t') { fonts.shape(" ", &f).first().map_or(0, |g| g.adv) } else { 0 };
         for x in g.iter_mut() {
@@ -373,7 +379,57 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
         while gi < glyphs.len() && glyphs[gi].cluster < e {
             gi += 1;
         }
-        let (w, content_end) = seg(s, e);
+        let (mut w, content_end) = seg(s, e);
+        let first = li == 0;
+        let base = twips(pf.indent_start as i64) + if first { twips(first_line as i64) } else { 0 };
+        // Tabs: each takes the text after it to the next stop, measured from
+        // the column's start edge.
+        let mut leaders = Vec::new();
+        let tab = |g: &Glyph| p.text.as_bytes().get(g.cluster as usize) == Some(&b'\t');
+        if glyphs[g0..gi].iter().any(tab) {
+            let mut pen = base;
+            for k in g0..gi {
+                if tab(&glyphs[k]) {
+                    // The text up to the next tab (spaces at the line's end left out).
+                    let (mut after, mut point) = (0i64, None);
+                    for g in glyphs[k + 1..gi].iter().take_while(|g| !tab(g)) {
+                        if point.is_none() && p.text.as_bytes().get(g.cluster as usize) == Some(&b'.') {
+                            point = Some(after);
+                        }
+                        if g.cluster < content_end {
+                            after += g.adv;
+                        }
+                    }
+                    let custom = pf.tabs.iter().find(|t| twips(t.pos as i64) > pen);
+                    let (stop, align, leader) = match custom {
+                        Some(t) => (twips(t.pos as i64), t.align, t.leader),
+                        None => {
+                            let step = twips(DEFAULT_TAB as i64);
+                            let from = pf.tabs.last().map_or(0, |t| twips(t.pos as i64)).max(pen);
+                            ((from / step + 1) * step, TabAlign::Start, Leader::None)
+                        }
+                    };
+                    let to = match align {
+                        TabAlign::Start => stop,
+                        TabAlign::End => stop - after,
+                        TabAlign::Center => stop - after / 2,
+                        TabAlign::Decimal => stop - point.unwrap_or(after),
+                    };
+                    let adv = (to - pen).max(0);
+                    glyphs[k].adv = adv;
+                    if leader != Leader::None && adv > 0 {
+                        leaders.push((pen, pen + adv, leader));
+                    }
+                }
+                pen += glyphs[k].adv;
+            }
+            w = glyphs[g0..gi].iter().filter(|g| g.cluster < content_end).map(|g| g.adv).sum();
+            // Leaders are drawn from the line's start, like its glyphs.
+            for l in leaders.iter_mut() {
+                l.0 -= base;
+                l.1 -= base;
+            }
+        }
         let mut used: Vec<u16> = glyphs[g0..gi].iter().map(|g| g.fmt).collect();
         if used.is_empty() {
             used.push(fmt_at(s));
@@ -402,9 +458,7 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
             LineSpacing::Exact(t) => twips(t.clamp(20, 31680) as i64),
             LineSpacing::AtLeast(t) => nat.max(twips(t.clamp(0, 31680) as i64)),
         };
-        let first = li == 0;
         let room = avail(first);
-        let base = twips(pf.indent_start as i64) + if first { twips(first_line as i64) } else { 0 };
         let last = li + 1 == count || mand;
         let (x, space_extra) = match pf.align {
             Align::Start => (base, 0),
@@ -416,7 +470,11 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
             }
             Align::Justify => (base, 0),
         };
-        lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height });
+        for l in leaders.iter_mut() {
+            l.0 += x;
+            l.1 += x;
+        }
+        lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height, leaders });
         s = e;
     }
     let height = lines.iter().map(|l| l.height).sum();
@@ -444,6 +502,9 @@ fn key(doc: &TextDoc, p: &Para, width: i64) -> u64 {
         // A note anchor shows its number, which other anchors move.
         if let Some(n) = at.note {
             doc.note_label(n).hash(&mut h);
+        }
+        if let Some(x) = at.field {
+            doc.field_text(x).hash(&mut h);
         }
     }
     // Styles change rarely; their identity is part of the key through the
@@ -506,6 +567,25 @@ mod tests {
         let mut d = TextDoc::new();
         d.blocks.update(0, |b| b.as_para_mut().unwrap().text = text.to_string());
         d
+    }
+
+    #[test]
+    fn tabs_go_to_their_stops() {
+        use crate::model::{Leader, TabAlign, TabStop};
+        let mut d = doc("Intro\t12\tx\ty");
+        let tabs = vec![TabStop { pos: 7200, align: TabAlign::End, leader: Leader::Dots }, TabStop { pos: 8000, align: TabAlign::Start, leader: Leader::None }];
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().props.tabs = Some(tabs));
+        let l = layout_para(&d, d.para(0).unwrap(), twips(9360), &FixedFonts);
+        assert_eq!(l.lines.len(), 1);
+        let pen = |at: u32| l.glyphs.iter().take_while(|g| g.cluster < at).map(|g| g.adv).sum::<i64>();
+        // "12" ends at the right stop, with dots before it; "x" starts at 8000.
+        assert_eq!(pen(8), twips(7200));
+        assert_eq!(l.lines[0].leaders.len(), 1);
+        assert_eq!(l.lines[0].leaders[0].1, pen(6));
+        assert_eq!(pen(9), twips(8000));
+        // Past the stops, every half inch.
+        assert_eq!(pen(11) % twips(720), 0);
+        assert!(pen(11) > twips(8000));
     }
 
     #[test]

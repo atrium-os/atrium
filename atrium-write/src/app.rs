@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 6] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 12] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment"];
+pub const INSERT: [&str; 14] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…"];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -108,12 +108,20 @@ pub enum Cmd {
     MergeWith,
     /// Settle the picked conflict.
     ReviewTake(Take),
+    /// Insert the table of contents, or bring it up to date.
+    Toc,
+    XrefOpen,
+    XrefClose,
+    /// The previous or next heading in the cross-reference bar.
+    XrefMove(bool),
+    /// Insert a reference to the bar's heading: its page (true) or its text.
+    XrefInsert(bool),
 }
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -164,6 +172,26 @@ pub struct CommentBar {
     pub done: bool,
 }
 
+/// The cross-reference bar: which heading it points at.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct XrefBar {
+    pub open: bool,
+    /// Index into the editor's [`Editor::ref_targets`].
+    pub at: usize,
+}
+
+/// `s` cut with an ellipsis to fit `room` wide in `style`.
+pub fn fit_text(s: &str, room: f32, style: &pergola::node::TextStyle) -> String {
+    if Node::measure_text(s, style).w <= room {
+        return s.to_string();
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    while !chars.is_empty() && Node::measure_text(&format!("{}…", chars.iter().collect::<String>()), style).w > room {
+        chars.truncate(chars.len().saturating_sub(4.max(chars.len() / 16)));
+    }
+    format!("{}…", chars.iter().collect::<String>().trim_end())
+}
+
 /// Who the app writes comments as: `$USER` (else "Me") and its initials.
 pub fn comment_author() -> (String, String) {
     let name = std::env::var("USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "Me".into());
@@ -202,6 +230,7 @@ pub struct Write {
     pub replace_text: Mutable<TextEdit>,
     pub tools_menu: Mutable<MenuState>,
     pub spell: Mutable<SpellBar>,
+    pub xref: Mutable<XrefBar>,
     pub note: Mutable<NoteBar>,
     pub note_text: Mutable<TextEdit>,
     pub comment: Mutable<CommentBar>,
@@ -213,7 +242,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -255,7 +284,7 @@ impl Write {
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -577,8 +606,11 @@ impl Write {
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
                 // The bars share one place under the toolbar.
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_)) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen) {
                     e.review = false;
+                }
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen) {
+                    self.xref.set(XrefBar::default());
                 }
                 match c {
                     Cmd::TrackToggle => {
@@ -646,6 +678,48 @@ impl Write {
                     Cmd::Style(i) => e.style_named(STYLES[i.min(STYLES.len() - 1)]),
                     Cmd::List(k) => e.toggle_list(k),
                     Cmd::PageNumbers => e.toggle_page_numbers(),
+                    Cmd::Toc => {
+                        if !e.insert_toc() {
+                            drop(e);
+                            drop(d);
+                            let had = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
+                            self.doc.borrow_mut().status = if had { "The table of contents is up to date".into() } else { "No headings to list: use the Heading styles".into() };
+                            self.changed();
+                            return false;
+                        }
+                    }
+                    Cmd::XrefOpen | Cmd::XrefClose | Cmd::XrefMove(_) | Cmd::XrefInsert(_) => {
+                        let n = e.ref_targets().len();
+                        let mut xb = self.xref.get_cloned();
+                        match c {
+                            Cmd::XrefOpen => {
+                                drop(e);
+                                drop(d);
+                                if n == 0 {
+                                    self.doc.borrow_mut().status = "No headings to refer to: use the Heading styles".into();
+                                    self.changed();
+                                    return false;
+                                }
+                                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                                self.spell.set(SpellBar::default());
+                                self.note.set(NoteBar::default());
+                                self.comment.set(CommentBar::default());
+                                self.xref.set(XrefBar { open: true, at: xb.at.min(n - 1) });
+                                self.changed();
+                                return false;
+                            }
+                            Cmd::XrefClose => xb = XrefBar::default(),
+                            Cmd::XrefMove(fwd) if n > 0 => xb.at = if fwd { (xb.at + 1) % n } else { (xb.at + n - 1) % n },
+                            Cmd::XrefInsert(page) => {
+                                if let Some(t) = e.ref_targets().get(xb.at) {
+                                    let f = if page { officina_text::model::Field::PageRef(t.0) } else { officina_text::model::Field::TextRef(t.0) };
+                                    e.insert_field(f);
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.xref.set(xb);
+                    }
                     Cmd::Table => {
                         e.insert_table(3, 3);
                     }
@@ -778,11 +852,15 @@ impl View for Write {
         {
             let in_table = self.doc.borrow().ed.borrow().doc.cell(self.doc.borrow().ed.borrow().caret.block).is_some();
             let on_note = self.doc.borrow().ed.borrow().note_at_caret().is_some();
-            let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| MenuItem::new(*s).enabled(match i {
-                2..=5 => in_table,
-                9 => on_note,
-                _ => true,
-            })).collect();
+            let has_toc = officina_text::fields::toc_range(&self.doc.borrow().ed.borrow().doc, None).is_some();
+            let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| match i {
+                12 => MenuItem::new(if has_toc { "Update Table of Contents" } else { *s }).separated(),
+                _ => MenuItem::new(*s).enabled(match i {
+                    2..=5 => in_table,
+                    9 => on_note,
+                    _ => true,
+                }),
+            }).collect();
             let cmds = self.cmds.clone();
             MenuButton::new("Insert".to_string(), self.insert_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::insert(i))).at(x, 8.0).width(96.0).render(ctx);
             x += 100.0;
@@ -886,6 +964,36 @@ impl View for Write {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // The cross-reference bar: a heading, and what of it to show.
+        let xb = self.xref.get_cloned();
+        if xb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let targets = ed.borrow().ref_targets();
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 120.0, 20.0), content: "Refer to".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let mut x = 96.0;
+            Button::secondary("‹").at(x, y + 8.0).width(32.0).on_click(push(Cmd::XrefMove(false))).render(ctx);
+            x += 36.0;
+            let nw = (w - x - 36.0 - 380.0).max(120.0);
+            let name = targets.get(xb.at).map_or(String::new(), |(_, lvl, text)| format!("{}{}", "  ".repeat(lvl.saturating_sub(1) as usize), text));
+            ctx.add(Node::Rect { rect: Rect::new(x, y + 8.0, nw, 32.0), fill: t.bg_canvas(), radius: 6.0 });
+            ctx.add(Node::Text { rect: Rect::new(x + 10.0, y + 15.0, nw - 20.0, 18.0), content: fit_text(&name, nw - 20.0, &st(type_size::MD, Weight::Regular, t.text_primary())), style: st(type_size::MD, Weight::Regular, t.text_primary()) });
+            x += nw + 4.0;
+            Button::secondary("›").at(x, y + 8.0).width(32.0).on_click(push(Cmd::XrefMove(true))).render(ctx);
+            x += 44.0;
+            ctx.add(Node::Text { rect: Rect::new(x, y + 15.0, 60.0, 18.0), content: format!("{} of {}", xb.at + 1, targets.len()), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            x += 64.0;
+            Button::primary("Page Number").at(x, y + 8.0).width(112.0).on_click(push(Cmd::XrefInsert(true))).render(ctx);
+            x += 116.0;
+            Button::secondary("Heading Text").at(x, y + 8.0).width(112.0).on_click(push(Cmd::XrefInsert(false))).render(ctx);
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::XrefClose)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // The note bar: the note's text on one line, paragraphs marked ¶.
         let nb = self.note.get_cloned();
         if nb.open {
@@ -954,14 +1062,7 @@ impl View for Write {
             // As much of the line as fits before the buttons.
             let style = st(type_size::MD, Weight::Semibold, t.text_primary());
             let room = (bx - 24.0).max(0.0);
-            let mut line = line;
-            if Node::measure_text(&line, &style).w > room {
-                let mut chars: Vec<char> = line.chars().collect();
-                while !chars.is_empty() && Node::measure_text(&format!("{}…", chars.iter().collect::<String>()), &style).w > room {
-                    chars.truncate(chars.len().saturating_sub(4.max(chars.len() / 16)));
-                }
-                line = format!("{}…", chars.iter().collect::<String>().trim_end());
-            }
+            let line = fit_text(&line, room, &style);
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, room, 20.0), content: line, style });
             Button::secondary("‹").at(bx, y + 8.0).width(32.0).on_click(push(Cmd::ReviewPrevious)).render(ctx);
             Button::secondary("›").at(bx + 36.0, y + 8.0).width(32.0).on_click(push(Cmd::ReviewNext)).render(ctx);
@@ -1044,6 +1145,43 @@ impl View for Write {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contents_and_cross_reference_commands() {
+        let mut d = officina_text::model::TextDoc::new();
+        d.blocks.remove(0);
+        let h1 = d.styles.by_name("Heading 1").unwrap();
+        d.push_para("Intro", 0, vec![]);
+        d.push_para("Alpha", h1, vec![]);
+        d.push_para("Body.", 0, vec![]);
+        d.push_para("Beta", h1, vec![]);
+        let doc = Doc::from_text_doc(d, "t.owrite");
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let ed = w.doc.borrow().ed.clone();
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
+        run(Cmd::insert(12));
+        assert_eq!(officina_text::fields::toc_range(&ed.borrow().doc, None), Some((1, 3)));
+        run(Cmd::insert(12));
+        assert_eq!(w.doc.borrow().status, "The table of contents is up to date");
+        // Refer to Beta's page from the end of Body.
+        let n = ed.borrow().doc.para(4).unwrap().text.len() as u32;
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(4, n), false);
+        run(Cmd::insert(13));
+        assert!(w.xref.get_cloned().open);
+        assert!(w.pages_rect(1200.0, 800.0).y() > TOOLBAR_H);
+        run(Cmd::XrefMove(true));
+        run(Cmd::XrefInsert(false));
+        let e = ed.borrow();
+        let p = e.doc.para(4).unwrap();
+        assert_eq!(e.doc.field_text(e.doc.fields_in(p)[0].1), "Beta");
+        drop(e);
+        run(Cmd::XrefClose);
+        assert!(!w.xref.get_cloned().open);
+    }
 
     #[test]
     fn note_bar_commands() {

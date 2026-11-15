@@ -6,11 +6,11 @@
 //! (one per list), tables with their column grid, inline pictures, page size and
 //! margins, and a header and footer with page number fields.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -108,6 +108,25 @@ fn ppr_body(p: &ParaProps) -> String {
     if let Some(v) = p.widows {
         s += &on("widowControl", v);
     }
+    if let Some(tabs) = &p.tabs {
+        s += "<w:tabs>";
+        for t in tabs {
+            let val = match t.align {
+                TabAlign::Start => "left",
+                TabAlign::Center => "center",
+                TabAlign::End => "right",
+                TabAlign::Decimal => "decimal",
+            };
+            let leader = match t.leader {
+                Leader::None => "",
+                Leader::Dots => r#" w:leader="dot""#,
+                Leader::Dashes => r#" w:leader="hyphen""#,
+                Leader::Line => r#" w:leader="underscore""#,
+            };
+            let _ = write!(s, r#"<w:tab w:val="{val}"{leader} w:pos="{}"/>"#, t.pos);
+        }
+        s += "</w:tabs>";
+    }
     if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
         s += "<w:spacing";
         if let Some(v) = p.space_before {
@@ -183,6 +202,19 @@ struct Out {
     /// the last change id given.
     del_breaks: HashMap<officina_text::model::BlockId, RevId>,
     change: u32,
+    /// Paragraphs fields refer to, by id: each gets a bookmark.
+    targets: std::collections::HashSet<officina_text::model::BlockId>,
+    bookmark: u32,
+}
+
+/// The bookmark name a field refers to paragraph `id` by.
+pub fn ref_name(id: officina_text::model::BlockId) -> String {
+    format!("_Ref{id}")
+}
+
+/// A complex field: `instr`, then `result` as it was last worked out.
+fn field_runs(out: &mut String, props: &str, instr: &str, result: &str) {
+    let _ = write!(out, r#"<w:r>{props}<w:fldChar w:fldCharType="begin"/></w:r><w:r>{props}<w:instrText xml:space="preserve"> {} </w:instrText></w:r><w:r>{props}<w:fldChar w:fldCharType="separate"/></w:r><w:r>{props}<w:t xml:space="preserve">{}</w:t></w:r><w:r>{props}<w:fldChar w:fldCharType="end"/></w:r>"#, esc(instr), esc(result));
 }
 
 /// A comment range's start or its end and reference.
@@ -279,6 +311,15 @@ impl Out {
                         flush(&mut text, &mut body);
                         let _ = write!(body, "<w:r>{props}<w:br/></w:r>");
                     }
+                    OBJECT_CHAR if attrs.field.is_some() => {
+                        flush(&mut text, &mut body);
+                        let f = attrs.field.expect("checked");
+                        let instr = match f {
+                            Field::PageRef(t) => format!("PAGEREF {} \\h", ref_name(t)),
+                            Field::TextRef(t) => format!("REF {} \\h", ref_name(t)),
+                        };
+                        field_runs(&mut body, &props, &instr, &doc.field_text(f));
+                    }
                     OBJECT_CHAR if attrs.note.is_some() => {
                         flush(&mut text, &mut body);
                         let id = attrs.note.expect("checked");
@@ -331,14 +372,34 @@ impl Out {
     fn para(&mut self, doc: &TextDoc, b: usize, out: &mut String) {
         let Some(p) = doc.para(b) else { return };
         self.cur = Some(b);
-        self.para_of(doc, p, out, "");
+        // A table of contents is a TOC field over its run of entries.
+        let toc = |i: usize| doc.para(i).is_some_and(|q| q.props.toc.is_some() && q.props.cell.is_none());
+        let mut lead = String::new();
+        if toc(b) && (b == 0 || !toc(b - 1)) {
+            let _ = write!(lead, r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-{}" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>"#, toc_depth(doc, b));
+        }
+        if self.targets.contains(&p.id) {
+            self.bookmark += 1;
+            let _ = write!(lead, r#"<w:bookmarkStart w:id="{}" w:name="{}"/>"#, self.bookmark, ref_name(p.id));
+        }
+        let mut tail = String::new();
+        if self.targets.contains(&p.id) {
+            let _ = write!(tail, r#"<w:bookmarkEnd w:id="{}"/>"#, self.bookmark);
+        }
+        if toc(b) && !toc(b + 1) {
+            tail += r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+        }
+        self.para_of(doc, p, out, &lead, &tail);
         self.cur = None;
     }
 
     /// Paragraph `p`; `lead` goes before its runs (a note's number).
-    fn para_of(&mut self, doc: &TextDoc, p: &Para, out: &mut String, lead: &str) {
+    fn para_of(&mut self, doc: &TextDoc, p: &Para, out: &mut String, lead: &str, tail: &str) {
         let mut pp = String::new();
-        if p.style != 0 {
+        // A contents entry in Normal goes out in Word's TOC style of its level.
+        if let (0, Some(l)) = (p.style, p.props.toc.filter(|_| self.cur.is_some())) {
+            let _ = write!(pp, r#"<w:pStyle w:val="TOC{}"/>"#, l.clamp(1, 9));
+        } else if p.style != 0 {
             if let Some(id) = self.styles.get(p.style as usize) {
                 let _ = write!(pp, r#"<w:pStyle w:val="{}"/>"#, esc(id));
             }
@@ -379,6 +440,7 @@ impl Out {
         }
         out.push_str(lead);
         self.runs(doc, p, out);
+        out.push_str(tail);
         out.push_str("</w:p>");
     }
 
@@ -419,6 +481,17 @@ impl Out {
         out.push_str("</w:tbl>");
         end
     }
+}
+
+/// The deepest heading level the table of contents starting at `b` lists (at least 3).
+fn toc_depth(doc: &TextDoc, b: usize) -> u8 {
+    let mut d = 3;
+    let mut i = b;
+    while let Some(l) = doc.para(i).and_then(|q| q.props.toc) {
+        d = d.max(l.min(9));
+        i += 1;
+    }
+    d
 }
 
 /// The cells of a row as block ranges.
@@ -474,6 +547,22 @@ fn margin_part(hf: &HeaderFooter, tag: &str) -> String {
 }
 
 fn styles_part(doc: &TextDoc, ids: &[String]) -> String {
+    let mut s = styles_part_ours(doc, ids);
+    // Word's TOC styles for the entries' levels (based on Normal, the
+    // entries' own properties direct).
+    let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter(|p| p.style == 0).filter_map(|p| p.props.toc).map(|l| l.clamp(1, 9)).collect();
+    levels.sort_unstable();
+    levels.dedup();
+    let tail = s.split_off(s.len() - "</w:styles>".len());
+    for l in levels {
+        if !ids.iter().any(|i| *i == format!("TOC{l}")) {
+            let _ = write!(s, r#"<w:style w:type="paragraph" w:styleId="TOC{l}"><w:name w:val="toc {l}"/><w:basedOn w:val="{}"/><w:next w:val="{}"/><w:uiPriority w:val="39"/><w:unhideWhenUsed/></w:style>"#, esc(&ids[0]), esc(&ids[0]));
+        }
+    }
+    s + &tail
+}
+
+fn styles_part_ours(doc: &TextDoc, ids: &[String]) -> String {
     let mut s = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles {W_NS}><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="{f}" w:hAnsi="{f}" w:cs="{f}"/><w:sz w:val="{z}"/><w:szCs w:val="{z}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>"#, f = esc(&doc.styles.default_char.family), z = doc.styles.default_char.size);
     for (i, st) in doc.styles.styles.iter().enumerate() {
         let kind = if st.kind == StyleKind::Para { "paragraph" } else { "character" };
@@ -538,7 +627,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     let ids: Vec<String> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_id(&s.name, i)).collect();
     // Notes are numbered in the file in anchor order, each kind from 1.
     let notes: HashMap<NoteId, (NoteKind, u32)> = doc.note_numbers().iter().map(|(&id, &k)| (id, k)).collect();
-    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000 };
+    let mut o = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 0, notes: notes.clone(), media_stem: "image", marks: HashMap::new(), cur: None, del_breaks, change: 1_000_000, targets: HashSet::new(), bookmark: 0 };
+    // Paragraphs that fields refer to get bookmarks.
+    for bl in doc.blocks.iter() {
+        if let Some(p) = bl.as_para() {
+            o.targets.extend(doc.fields_in(p).into_iter().map(|f| f.1.target()));
+        }
+    }
     // Comments: a reply's range is the comment it answers.
     let live = doc.live_comments();
     let ranges = doc.comment_ranges();
@@ -592,7 +687,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             continue;
         }
         ours.sort_unstable();
-        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0 };
+        let mut no = Out { rels: Vec::new(), media: Vec::new(), image_rel: HashMap::new(), link_rel: HashMap::new(), lists: HashMap::new(), styles: ids.clone(), pic: 1000 * (note_parts.len() as u32 + 1), notes: HashMap::new(), media_stem: if kind == NoteKind::Foot { "fn_image" } else { "en_image" }, marks: HashMap::new(), cur: None, del_breaks: HashMap::new(), change: 0, targets: HashSet::new(), bookmark: 0 };
         let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{part} {W_NS} {DRAW_NS}><w:{tag} w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:{tag}><w:{tag} w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:{tag}>"#);
         // Lists in notes come out as plain paragraphs (the numbering part is the body's).
         for (n, id) in ours {
@@ -603,7 +698,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 let mut q = p.clone();
                 q.props.list = None;
                 q.props.cell = None;
-                no.para_of(doc, &q, &mut x, &lead);
+                no.para_of(doc, &q, &mut x, &lead, "");
             }
             let _ = write!(x, "</w:{tag}>");
         }

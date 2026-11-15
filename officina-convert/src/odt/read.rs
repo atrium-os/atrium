@@ -26,7 +26,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::fields;
+use officina_text::model::{BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, DelPiece, Deletion, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::docx::read::pixel_size;
 use crate::report::{Kind, Report};
@@ -172,6 +173,38 @@ fn para_props(e: &El) -> ParaProps {
     if let Some(w) = e.attr("fo:widows").or_else(|| e.attr("fo:orphans")) {
         p.widows = Some(w.trim().parse::<i32>().unwrap_or(0) > 0);
     }
+    // Positions from the paragraph's start indent, as ODF has them (made
+    // ours, from the column's edge, when a paragraph is read).
+    if let Some(t) = e.child("style:tab-stops") {
+        let mut v: Vec<TabStop> = Vec::new();
+        for x in t.children("style:tab-stop") {
+            let Some(pos) = tw(x.attr("style:position")) else { continue };
+            let align = match x.attr("style:type") {
+                Some("center") => TabAlign::Center,
+                Some("right") => TabAlign::End,
+                Some("char") => TabAlign::Decimal,
+                _ => TabAlign::Start,
+            };
+            // The text drawn wins over the line style (LibreOffice writes "-"
+            // over a solid style for dashes).
+            let leader = match (x.attr("style:leader-text").and_then(|t| t.chars().next()), x.attr("style:leader-style")) {
+                (_, Some("none")) => Leader::None,
+                (Some('.' | '·' | '…'), _) => Leader::Dots,
+                (Some('-' | '–'), _) => Leader::Dashes,
+                (Some('_'), _) => Leader::Line,
+                (_, Some("dotted" | "dot-dash" | "dot-dot-dash")) => Leader::Dots,
+                (_, Some("dash" | "long-dash")) => Leader::Dashes,
+                (_, Some("solid" | "wave")) => Leader::Line,
+                _ => Leader::None,
+            };
+            if v.len() < MAX_TABS {
+                v.push(TabStop { pos, align, leader });
+            }
+        }
+        v.sort_by_key(|s| s.pos);
+        v.dedup_by_key(|s| s.pos);
+        p.tabs = Some(v);
+    }
     p
 }
 
@@ -202,6 +235,8 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         list: over.list.or(under.list),
         cell: over.cell.or(under.cell),
         rev: over.rev.or(under.rev),
+        tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
+        toc: over.toc.or(under.toc),
     }
 }
 
@@ -209,6 +244,19 @@ struct Reader<'a> {
     archive: &'a Archive<'a>,
     doc: TextDoc,
     rep: Report,
+    /// Cross-references: bookmark names fields refer to (by index, see
+    /// [`fields::UNBOUND`]), what each showed, bookmarks in the paragraph
+    /// being read, the paragraph each bookmark is on; reading a table of
+    /// contents' body.
+    ref_names: Vec<String>,
+    ref_index: HashMap<String, u64>,
+    ref_shown: HashMap<Field, String>,
+    open_marks: Vec<String>,
+    marks: HashMap<String, BlockId>,
+    in_toc: bool,
+    /// Tab stops count from the start indent (ODF's way; LibreOffice turns it
+    /// off for documents from Word).
+    tabs_from_indent: bool,
     fonts: HashMap<String, String>,
     /// Paragraph and text styles by name, named and automatic.
     styles: HashMap<String, OStyle>,
@@ -724,6 +772,18 @@ impl<'a> Reader<'a> {
                     "office:annotation" | "office:annotation-end" => self.rep.note(Kind::Dropped, "comments in notes, headers and footers"),
                     "text:change" | "text:change-start" | "text:change-end" if at == Where::Body && !self.in_note => self.change_mark(x, p, a),
                     "text:change" | "text:change-start" | "text:change-end" => self.rep.note(Kind::Approximate, "tracked changes in notes, headers and footers (shown as they stand)"),
+                    "text:bookmark" | "text:bookmark-start" if at == Where::Body && !self.in_note => {
+                        if let Some(n) = x.attr("text:name").filter(|n| !n.is_empty() && n.len() <= 256) {
+                            if self.open_marks.len() < 64 {
+                                self.open_marks.push(n.to_string());
+                            }
+                        }
+                    }
+                    "text:bookmark-ref" if at == Where::Body && !self.in_note && matches!(x.attr("text:reference-format"), Some("page" | "text")) && x.attr("text:ref-name").is_some_and(|n| !n.is_empty()) => {
+                        let page = x.attr("text:reference-format") == Some("page");
+                        let shown = x.text();
+                        self.push_ref(p, a, page, x.attr("text:ref-name").unwrap_or(""), &shown);
+                    }
                     "text:bookmark" | "text:bookmark-start" | "text:bookmark-end" | "text:soft-page-break" | "text:reference-mark" | "text:reference-mark-start" | "text:reference-mark-end" | "text:alphabetical-index-mark" | "text:toc-mark" | "text:sequence-ref" => {}
                     "text:ruby" => {
                         if let Some(b) = x.child("text:ruby-base") {
@@ -899,6 +959,28 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A reference field read: a U+FFFC whose field names its bookmark
+    /// (bound once the document is read); `shown` is what the file showed.
+    fn push_ref(&mut self, p: &mut Para, a: &CharAttrs, page: bool, name: &str, shown: &str) {
+        let k = match self.ref_index.get(name) {
+            Some(&k) => k,
+            None if self.ref_names.len() < 1 << 20 => {
+                let k = self.ref_names.len() as u64;
+                self.ref_names.push(name.to_string());
+                self.ref_index.insert(name.to_string(), k);
+                k
+            }
+            None => return,
+        };
+        let f = if page { Field::PageRef(fields::UNBOUND | k) } else { Field::TextRef(fields::UNBOUND | k) };
+        self.ref_shown.entry(f).or_insert_with(|| shown.to_string());
+        let mut fa = a.clone();
+        fa.field = Some(f);
+        fa.object = None;
+        fa.note = None;
+        p.push(&OBJECT_CHAR.to_string(), &fa);
+    }
+
     /// A `text:p` or `text:h` into the document.
     fn para(&mut self, e: &El, cell: Option<CellRef>, list: Option<Option<ListRef>>) {
         let (style, mut props, chars) = self.para_style(e.attr("text:style-name"));
@@ -947,6 +1029,34 @@ impl<'a> Reader<'a> {
         let outer = std::mem::take(&mut self.events);
         self.inline(e, &mut p, &chars, Where::Body);
         let events = std::mem::replace(&mut self.events, outer);
+        // Tab stops: ODF measures them from the start indent, we from the edge.
+        let pf = self.doc.styles.para_format(style, &props).0;
+        if !pf.tabs.is_empty() {
+            let ind = if self.tabs_from_indent { pf.indent_start.max(0) } else { 0 };
+            props.tabs = Some(pf.tabs.iter().map(|t| TabStop { pos: (t.pos + ind).max(0), ..*t }).collect());
+        }
+        if self.in_toc && cell.is_none() && !self.in_note && !p.text.is_empty() {
+            let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
+            let level = name.strip_prefix("contents").or_else(|| name.strip_prefix("toc")).and_then(|n| n.trim().parse::<u8>().ok()).filter(|l| (1..=9).contains(l)).unwrap_or(1);
+            props.toc = Some(level);
+            // An entry LibreOffice wrote: a link to the heading's bookmark, the
+            // page number as text after the tab; the number becomes a field.
+            if !p.text.contains(OBJECT_CHAR) {
+                if let Some(tab) = p.text.rfind('\t') {
+                    let num = p.text[tab + 1..].trim().to_string();
+                    let link = p.runs.iter().rev().find(|r| (r.0 as usize) <= tab).and_then(|r| r.1.link.clone());
+                    if !num.is_empty() && num.len() <= 12 && num.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        if let Some(name) = link.as_deref().and_then(|l| l.strip_prefix('#')).filter(|n| !n.is_empty()).map(str::to_string) {
+                            let at = (tab + 1) as u32;
+                            let a = p.runs.iter().rev().find(|r| r.0 <= at).map(|r| r.1.clone()).unwrap_or_default();
+                            p.text.truncate(tab + 1);
+                            p.runs.retain(|r| r.0 < at);
+                            self.push_ref(&mut p, &a, true, &name, &num);
+                        }
+                    }
+                }
+            }
+        }
         apply_comments(&mut p, &mut self.active, events);
         // Formatting changes: the attributes before, interned first.
         let olds: Vec<u32> = p.olds.iter().map(|o| self.doc.attrs.intern(o.clone())).collect();
@@ -972,6 +1082,12 @@ impl<'a> Reader<'a> {
                 q.props = props;
             }
         });
+        if !self.open_marks.is_empty() && !self.in_note {
+            let id = self.doc.para(k).map_or(0, |q| q.id);
+            for n in std::mem::take(&mut self.open_marks) {
+                self.marks.entry(n).or_insert(id);
+            }
+        }
         self.flush_boxes(cell);
     }
 
@@ -1154,7 +1270,18 @@ impl<'a> Reader<'a> {
                     self.rep.note(Kind::Approximate, "sections (their content kept)");
                     self.body(x);
                 }
-                "text:table-of-content" | "text:alphabetical-index" | "text:illustration-index" | "text:table-index" | "text:bibliography" | "text:user-index" | "text:object-index" => {
+                "text:table-of-content" => {
+                    if let Some(b) = x.child("text:index-body") {
+                        let was = self.in_toc;
+                        for y in b.els() {
+                            // The title isn't an entry.
+                            self.in_toc = y.name != "text:index-title";
+                            self.body(&El { name: "x".into(), attrs: vec![], kids: vec![Node::El(y.clone())] });
+                        }
+                        self.in_toc = was;
+                    }
+                }
+                "text:alphabetical-index" | "text:illustration-index" | "text:table-index" | "text:bibliography" | "text:user-index" | "text:object-index" => {
                     self.rep.note(Kind::Approximate, "tables of contents and indexes (their text kept)");
                     if let Some(b) = x.child("text:index-body") {
                         self.body(b);
@@ -1274,7 +1401,18 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    if let Some(st) = part(&archive, "settings.xml")? {
+        fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
+            if e.name == "config:config-item" && e.attr("config:name") == Some(name) {
+                return Some(e);
+            }
+            e.els().find_map(|x| item(x, name))
+        }
+        if item(&st, "TabsRelativeToIndent").is_some_and(|x| x.text().trim() == "false") {
+            r.tabs_from_indent = false;
+        }
+    }
     r.font_decls(styles.as_ref());
     r.font_decls(Some(&content));
     for s in [styles.as_ref().and_then(|s| s.child("office:styles")), styles.as_ref().and_then(|s| s.child("office:automatic-styles")), content.child("office:automatic-styles")].into_iter().flatten() {
@@ -1288,6 +1426,11 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     r.page(styles.as_ref(), first_master);
     r.body(text);
     r.read_notes();
+    let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
+    fields::relink_toc(&mut r.doc);
+    if lost > 0 {
+        r.rep.note(Kind::Approximate, "cross-references to missing bookmarks (kept as text)");
+    }
     r.tie_replies();
     if r.doc.blocks.is_empty() {
         r.doc.push_para("", 0, vec![]);

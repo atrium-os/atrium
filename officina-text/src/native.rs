@@ -29,7 +29,7 @@ use std::sync::Arc;
 use officina_core::container::{ContainerError, ContainerReader, ContainerWriter, DocKind, Limits};
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::model::{Comment, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
+use crate::model::{Comment, Field, CommentId, DelId, DelPiece, Deletion, FmtChange, RevId, Revision, MAX_DELETIONS, MAX_DELETION_TEXT, MAX_CONFLICTS, ConflictId, TabStop, TabAlign, Leader, MAX_TABS, MAX_REVISIONS, MAX_COMMENTS, MAX_COMMENT_TEXT, Note, NoteId, NoteKind, VertAlign, MAX_NOTES, MAX_NOTE_PARAS, Align, AttrId, CellRef, HeaderFooter, ImageData, ObjectRef, MAX_OBJECT_TWIPS, ListKind, ListRef, MAX_LIST_LEVEL, Block, CharAttrs, LineSpacing, PageSetup, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc, MAX_STYLES};
 use crate::ops::{Fragment, TextOp};
 use crate::paginate::Checkpoint;
 
@@ -98,7 +98,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         }
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -161,12 +161,20 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     if let Some(c) = a.conflict {
         w.var(c as u64);
     }
+    if let Some(f) = a.field {
+        let (k, b) = match f {
+            Field::PageRef(b) => (0, b),
+            Field::TextRef(b) => (1, b),
+        };
+        w.u8(k);
+        w.var(b);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 3 != 0 || (m >> 15 != 0 && ext == 0) {
+    if ext >> 4 != 0 || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -248,6 +256,15 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     if ext & 4 != 0 {
         a.conflict = Some(r.len("conflict", MAX_CONFLICTS as u64 - 1)? as ConflictId);
     }
+    if ext & 8 != 0 {
+        let k = r.u8()?;
+        let b = r.var()?;
+        a.field = Some(match k {
+            0 => Field::PageRef(b),
+            1 => Field::TextRef(b),
+            _ => return Err(WireError::Invalid("field")),
+        });
+    }
     Ok(a)
 }
 
@@ -259,7 +276,15 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
             m |= 1 << i;
         }
     }
+    // Bit 15: a second mask follows (tab stops, table of contents entry).
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1;
+    if ext != 0 {
+        m |= 1 << 15;
+    }
     w.u16(m);
+    if ext != 0 {
+        w.u16(ext);
+    }
     if let Some(a) = p.align {
         w.u8(a as u8);
     }
@@ -310,6 +335,27 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
     if let Some(v) = p.rev {
         w.var(v as u64);
     }
+    if let Some(t) = &p.tabs {
+        w.var(t.len() as u64);
+        for s in t {
+            w.ivar(s.pos as i64);
+            w.u8(match s.align {
+                TabAlign::Start => 0,
+                TabAlign::Center => 1,
+                TabAlign::End => 2,
+                TabAlign::Decimal => 3,
+            });
+            w.u8(match s.leader {
+                Leader::None => 0,
+                Leader::Dots => 1,
+                Leader::Dashes => 2,
+                Leader::Line => 3,
+            });
+        }
+    }
+    if let Some(l) = p.toc {
+        w.u8(l);
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -317,7 +363,8 @@ const MAX_TWIPS: i64 = 31_680;
 
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
-    if m >> 15 != 0 {
+    let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
+    if ext >> 2 != 0 || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -394,6 +441,35 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     }
     if on(14) {
         p.rev = Some(r.len("revision", MAX_REVISIONS as u64 - 1)? as RevId);
+    }
+    if ext & 1 != 0 {
+        let n = r.count("tab stops", MAX_TABS as u64, 3)?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let pos = r.ivar()?;
+            if pos.abs() > MAX_TWIPS {
+                return Err(WireError::Invalid("tab stop"));
+            }
+            let align = match r.u8()? {
+                0 => TabAlign::Start,
+                1 => TabAlign::Center,
+                2 => TabAlign::End,
+                3 => TabAlign::Decimal,
+                _ => return Err(WireError::Invalid("tab alignment")),
+            };
+            let leader = match r.u8()? {
+                0 => Leader::None,
+                1 => Leader::Dots,
+                2 => Leader::Dashes,
+                3 => Leader::Line,
+                _ => return Err(WireError::Invalid("tab leader")),
+            };
+            v.push(TabStop { pos: pos as i32, align, leader });
+        }
+        p.tabs = Some(v);
+    }
+    if ext & 2 != 0 {
+        p.toc = Some(r.u8()?.clamp(1, 9));
     }
     Ok(p)
 }
@@ -1271,6 +1347,12 @@ mod tests {
         d.push_para("a \u{FFFC} b", 0, vec![(0, 0), (2, pic), (5, 0)]);
         let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
         d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);
+        // A contents entry (tab stop, field) and a text reference.
+        let target = d.para(1).unwrap().id;
+        let pr = d.attrs.intern(CharAttrs { field: Some(crate::model::Field::PageRef(target)), ..Default::default() });
+        let tr = d.attrs.intern(CharAttrs { field: Some(crate::model::Field::TextRef(target)), bold: Some(true), ..Default::default() });
+        let k = d.push_para("Entry\t\u{FFFC} see \u{FFFC}", 0, vec![(0, 0), (6, pr), (9, 0), (14, tr)]);
+        d.blocks.update(k, |b| b.as_para_mut().unwrap().props = crate::fields::entry_props(2, 9000));
         for (b, kind, text) in [(10, NoteKind::Foot, "A footnote."), (20, NoteKind::End, "An endnote\nin two paragraphs.")] {
             for op in d.insert_note_ops(b, 2, kind, text, 0) {
                 op.apply(&mut d);

@@ -54,7 +54,29 @@ pub struct CharAttrs {
     /// document's [`Conflicts`] (the first marker starts it, the second ends
     /// it); it takes no room on the page.
     pub conflict: Option<ConflictId>,
+    /// The character (U+FFFC) is a field: it shows a value worked out from
+    /// the rest of the document (see [`TextDoc::field_text`]).
+    pub field: Option<Field>,
 }
+
+/// A value shown in the text and worked out after pagination: a reference
+/// to a paragraph (by its id), showing its page number or its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Field {
+    PageRef(BlockId),
+    TextRef(BlockId),
+}
+
+impl Field {
+    pub fn target(self) -> BlockId {
+        match self {
+            Field::PageRef(b) | Field::TextRef(b) => b,
+        }
+    }
+}
+
+/// Longest text a text reference shows, in chars.
+pub const MAX_REF_TEXT: usize = 120;
 
 /// A formatting change: its revision and the attributes before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -431,6 +453,7 @@ impl CharAttrs {
             deleted: self.deleted.or(under.deleted),
             fmt: self.fmt.or(under.fmt),
             conflict: self.conflict.or(under.conflict),
+            field: self.field.or(under.field),
         }
     }
 }
@@ -457,11 +480,12 @@ pub struct CharFormat {
     pub deleted: Option<DelId>,
     pub fmt: Option<FmtChange>,
     pub conflict: Option<ConflictId>,
+    pub field: Option<Field>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None }
     }
 }
 
@@ -511,6 +535,9 @@ impl CharFormat {
         }
         if a.conflict.is_some() {
             self.conflict = a.conflict;
+        }
+        if a.field.is_some() {
+            self.field = a.field;
         }
         if let Some(v) = &a.family {
             self.family = v.clone();
@@ -601,7 +628,48 @@ pub struct ParaProps {
     /// Tracked: the paragraph break before this paragraph was inserted under
     /// this revision (never from a style).
     pub rev: Option<RevId>,
+    /// Tab stops, in order (they replace the style's); positions from the
+    /// column's start edge, twips. Past the last, a stop every half inch.
+    pub tabs: Option<Vec<TabStop>>,
+    /// An entry of a generated table of contents, for a heading of this level
+    /// (Update Table of Contents replaces the run of them).
+    pub toc: Option<u8>,
 }
+
+/// A tab stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TabStop {
+    /// From the column's start edge, twips.
+    pub pos: i32,
+    pub align: TabAlign,
+    pub leader: Leader,
+}
+
+/// Where text after a tab goes against its stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabAlign {
+    /// Starts at the stop.
+    Start,
+    Center,
+    /// Ends at the stop.
+    End,
+    /// The decimal point (or the end, without one) at the stop.
+    Decimal,
+}
+
+/// What fills the space a tab takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Leader {
+    None,
+    Dots,
+    Dashes,
+    Line,
+}
+
+/// Default tab stops: every half inch, twips.
+pub const DEFAULT_TAB: i32 = 720;
+/// Most tab stops a paragraph keeps.
+pub const MAX_TABS: usize = 64;
 
 /// A paragraph's place in a table. Consecutive paragraphs with the same
 /// `table` and `row` are a row; within it, consecutive ones with the same
@@ -662,11 +730,12 @@ pub struct ParaFormat {
     pub widows: bool,
     pub outline_level: Option<u8>,
     pub list: Option<ListRef>,
+    pub tabs: Vec<TabStop>,
 }
 
 impl Default for ParaFormat {
     fn default() -> Self {
-        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None }
+        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None, tabs: Vec::new() }
     }
 }
 
@@ -678,6 +747,9 @@ impl ParaFormat {
         set!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows);
         if p.outline_level.is_some() {
             self.outline_level = p.outline_level.filter(|l| (1..=9).contains(l));
+        }
+        if let Some(t) = &p.tabs {
+            self.tabs = t.iter().take(MAX_TABS).copied().collect();
         }
         if let Some(l) = p.list {
             self.list = l.map(|mut l| {
@@ -944,6 +1016,9 @@ pub struct TextDoc {
     pub conflicts: Conflicts,
     /// Edits are tracked (a setting the file keeps).
     pub tracking: bool,
+    /// What each field shows, as last worked out (derived: not saved, not
+    /// part of undo); see [`crate::fields`].
+    pub field_values: HashMap<Field, Arc<str>>,
     next_id: BlockId,
     /// What ops changed since [`TextDoc::take_changes`] last ran.
     changes: Option<Edit>,
@@ -982,7 +1057,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

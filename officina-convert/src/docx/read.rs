@@ -25,7 +25,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use officina_text::model::{FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
+use officina_text::fields;
+use officina_text::model::{BlockId, Field, Leader, TabAlign, TabStop, MAX_TABS, FmtChange, RevId, Revision, Align, Block, CellRef, CharAttrs, Comment, CommentId, MAX_COMMENTS, MAX_COMMENT_TEXT, HeaderFooter, ImageData, LineSpacing, ListKind, ListRef, Note, NoteId, NoteKind, ObjectRef, PageSetup, ParaProps, Style, StyleId, StyleKind, TextDoc, VertAlign, MAX_LIST_LEVEL, MAX_NOTES, MAX_NOTE_PARAS, MAX_OBJECT_TWIPS, MAX_STYLES, OBJECT_CHAR};
 
 use crate::report::{Kind, Report};
 use crate::xml::{self, El};
@@ -232,7 +233,7 @@ fn ppr(e: &El, rep: &mut Report) -> ParaProps {
             "w:widowControl" => p.widows = Some(on(x)),
             "w:outlineLvl" => p.outline_level = num(val(x)).filter(|v| (0..9).contains(v)).map(|v| v as u8 + 1),
             "w:pStyle" | "w:numPr" | "w:sectPr" | "w:rPr" | "w:contextualSpacing" | "w:snapToGrid" | "w:suppressAutoHyphens" | "w:autoSpaceDE" | "w:autoSpaceDN" | "w:adjustRightInd" | "w:bidi" | "w:textAlignment" | "w:kinsoku" | "w:wordWrap" | "w:overflowPunct" | "w:topLinePunct" | "w:suppressLineNumbers" => {}
-            "w:tabs" => rep.note(Kind::Approximate, "tab stops (tabs are four spaces wide)"),
+            "w:tabs" => p.tabs = Some(tab_stops(x).0),
             "w:pBdr" => rep.note(Kind::Approximate, "paragraph borders (dropped)"),
             "w:shd" => rep.note(Kind::Approximate, "paragraph shading (dropped)"),
             "w:framePr" => rep.note(Kind::Approximate, "frames and drop caps (kept in line)"),
@@ -260,7 +261,41 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         list: over.list.or(under.list),
         cell: over.cell.or(under.cell),
         rev: over.rev.or(under.rev),
+        tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
+        toc: over.toc.or(under.toc),
     }
+}
+
+/// A `w:tabs`: its stops, in order, and the positions it clears.
+fn tab_stops(e: &El) -> (Vec<TabStop>, Vec<i32>) {
+    let mut v = Vec::new();
+    let mut clears = Vec::new();
+    for t in e.children("w:tab") {
+        let Some(pos) = twips(t.attr("w:pos")) else { continue };
+        let align = match t.attr("w:val") {
+            Some("clear") => {
+                clears.push(pos);
+                continue;
+            }
+            Some("center") => TabAlign::Center,
+            Some("right" | "end") => TabAlign::End,
+            Some("decimal") => TabAlign::Decimal,
+            // A bar tab draws a line; kept as a plain stop.
+            _ => TabAlign::Start,
+        };
+        let leader = match t.attr("w:leader") {
+            Some("dot" | "middleDot") => Leader::Dots,
+            Some("hyphen") => Leader::Dashes,
+            Some("underscore" | "heavy") => Leader::Line,
+            _ => Leader::None,
+        };
+        if pos >= 0 && v.len() < MAX_TABS {
+            v.push(TabStop { pos, align, leader });
+        }
+    }
+    v.sort_by_key(|s: &TabStop| s.pos);
+    v.dedup_by_key(|s| s.pos);
+    (v, clears)
 }
 
 /// List kinds by numbering id and level.
@@ -344,6 +379,14 @@ struct Reader<'a> {
     break_rev: Option<(RevId, Option<CellRef>)>,
     dels: Vec<((usize, u32), (usize, u32), RevId)>,
     del_marks: Vec<(usize, RevId)>,
+    /// Cross-references: bookmark names fields refer to (by index, see
+    /// [`fields::UNBOUND`]), what each showed, bookmarks met and not yet
+    /// on a paragraph, and the paragraph each bookmark is on.
+    ref_names: Vec<String>,
+    ref_index: HashMap<String, u64>,
+    ref_shown: HashMap<Field, String>,
+    open_marks: Vec<String>,
+    marks: HashMap<String, BlockId>,
 }
 
 /// A comment's text: a line a paragraph.
@@ -629,33 +672,47 @@ impl<'a> Reader<'a> {
                         match k.name.as_str() {
                             "w:fldChar" => match k.attr("w:fldCharType") {
                                 Some("begin") => {
-                                    field.stage = Stage::Instr;
-                                    field.instr.clear();
+                                    if field.stack.len() < MAX_FIELD_DEPTH {
+                                        field.stack.push(Frame { stage: Stage::Instr, ..Default::default() });
+                                    }
                                 }
-                                Some("separate") if field.stage == Stage::Instr => field.stage = Stage::Result,
+                                Some("separate") => {
+                                    if let Some(f) = field.stack.last_mut().filter(|f| f.stage == Stage::Instr) {
+                                        f.stage = Stage::Result;
+                                    }
+                                }
                                 Some("end") => {
-                                    if field.stage != Stage::Outside && field.in_margin {
-                                        if let Some(s) = page_field(&field.instr) {
-                                            p.push(s, &a);
+                                    if let Some(f) = field.stack.pop() {
+                                        if field.in_margin {
+                                            if let Some(s) = page_field(&f.instr) {
+                                                p.push(s, &a);
+                                            }
+                                        }
+                                        if field.live_ref(&f.instr) && field.shows_result() {
+                                            self.push_ref(p, &a, &f.instr, &f.result);
                                         }
                                     }
-                                    field.stage = Stage::Outside;
                                 }
                                 _ => {}
                             },
                             "w:instrText" => {
-                                if field.stage == Stage::Instr && field.instr.len() < 4096 {
-                                    field.instr.push_str(&k.text());
+                                if let Some(f) = field.stack.last_mut().filter(|f| f.stage == Stage::Instr && f.instr.len() < 4096) {
+                                    f.instr.push_str(&k.text());
                                 }
                             }
                             "w:t" | "w:delText" if k.name == "w:t" || p.del.is_some() => {
+                                // Without xml:space="preserve" the ends' white space is
+                                // layout of the XML; a line end inside is a space.
+                                let t = k.text();
+                                let t = if k.attr("xml:space") == Some("preserve") { t.as_str() } else { t.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\r' | '\t')) };
+                                let t: String = t.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
                                 if field.shows_result() {
-                                    // Without xml:space="preserve" the ends' white space is
-                                    // layout of the XML; a line end inside is a space.
-                                    let t = k.text();
-                                    let t = if k.attr("xml:space") == Some("preserve") { t.as_str() } else { t.trim_matches(|c: char| matches!(c, ' ' | '\n' | '\r' | '\t')) };
-                                    let t: String = t.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
                                     p.push(&t, &a);
+                                } else if let Some(i) = field.stack.iter().rposition(|f| f.stage == Stage::Result && field.live_ref(&f.instr)) {
+                                    // A reference's result, kept to show until pages are laid out.
+                                    if field.stack[i + 1..].iter().all(|f| f.stage == Stage::Result) && field.stack[i].result.len() < 1024 {
+                                        field.stack[i].result.push_str(&t);
+                                    }
                                 }
                             }
                             "w:tab" | "w:ptab" => p.push("\t", &a),
@@ -729,7 +786,22 @@ impl<'a> Reader<'a> {
                             let a = x.find("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
                             p.push(s, &a);
                         }
+                        _ if field.live_ref(instr) && field.shows_result() => {
+                            let mut a = x.find("w:rPr").map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
+                            if let Some(l) = link {
+                                a.link = Some(l.clone());
+                            }
+                            let shown: String = x.children("w:r").flat_map(|r| r.children("w:t")).map(|t| t.text()).collect();
+                            self.push_ref(p, &a, instr, &shown);
+                        }
                         _ => self.runs(x, p, link, field),
+                    }
+                }
+                "w:bookmarkStart" if !self.in_note && !field.in_margin => {
+                    if let Some(n) = x.attr("w:name").filter(|n| !n.is_empty() && n.len() <= 256 && *n != "_GoBack") {
+                        if self.open_marks.len() < 64 {
+                            self.open_marks.push(n.to_string());
+                        }
                     }
                 }
                 "w:ruby" => {
@@ -862,8 +934,32 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A reference field read: a U+FFFC whose field names its bookmark (bound
+    /// once the document is read); `shown` is what the file showed.
+    fn push_ref(&mut self, p: &mut Para, a: &CharAttrs, instr: &str, shown: &str) {
+        let Some((page, name)) = ref_field(instr) else { return };
+        let k = match self.ref_index.get(name) {
+            Some(&k) => k,
+            None if self.ref_names.len() < 1 << 20 => {
+                let k = self.ref_names.len() as u64;
+                self.ref_names.push(name.to_string());
+                self.ref_index.insert(name.to_string(), k);
+                k
+            }
+            None => return,
+        };
+        let f = if page { Field::PageRef(fields::UNBOUND | k) } else { Field::TextRef(fields::UNBOUND | k) };
+        self.ref_shown.entry(f).or_insert_with(|| shown.to_string());
+        let mut fa = a.clone();
+        fa.field = Some(f);
+        fa.object = None;
+        fa.note = None;
+        p.push(&OBJECT_CHAR.to_string(), &fa);
+    }
+
     /// One `w:p` into the document; returns its block.
     fn para(&mut self, e: &El, cell: Option<CellRef>, field: &mut FieldState) -> usize {
+        let toc_before = field.in_toc();
         let pp = e.child("w:pPr");
         let mut props = pp.map(|p| ppr(p, &mut self.rep)).unwrap_or_default();
         let style = pp.and_then(|p| p.child("w:pStyle")).and_then(val).and_then(|s| self.styles.get(s).copied()).filter(|&s| self.doc.styles.styles[s as usize].kind == StyleKind::Para).unwrap_or(0);
@@ -888,10 +984,26 @@ impl<'a> Reader<'a> {
         let mut p = Para::default();
         // The paragraph mark's formatting is its typing format when it is empty.
         let mark = pp.and_then(|p| p.child("w:rPr")).map(|r| rpr(r, &mut self.rep)).unwrap_or_default();
+        field.in_note = self.in_note;
         self.runs(e, &mut p, None, field);
+        // A table of contents' entries: from its field's start to its end.
+        if (toc_before || field.in_toc()) && cell.is_none() && !self.in_note && !field.in_margin && !p.text.is_empty() {
+            let name = self.doc.styles.styles[style as usize].name.to_ascii_lowercase();
+            let level = name.strip_prefix("toc").or_else(|| name.strip_prefix("contents")).and_then(|n| n.trim().parse::<u8>().ok()).filter(|l| (1..=9).contains(l)).unwrap_or(1);
+            props.toc = Some(level);
+        }
         let mut runs: Vec<(u32, u32)> = p.runs.into_iter().map(|(at, a)| (at, self.doc.attrs.intern(a))).collect();
         if runs.is_empty() {
             runs.push((0, self.doc.attrs.intern(mark)));
+        }
+        // Tab stops add to the style's (Word's rule); ours replace them.
+        if let Some(t) = pp.and_then(|p| p.child("w:tabs")) {
+            let (mine, clears) = tab_stops(t);
+            let mut all: Vec<TabStop> = self.doc.styles.para_format(style, &ParaProps::default()).0.tabs.into_iter().filter(|s| !clears.contains(&s.pos) && !mine.iter().any(|m| m.pos == s.pos)).collect();
+            all.extend(mine);
+            all.sort_by_key(|s| s.pos);
+            all.truncate(MAX_TABS);
+            props.tabs = Some(all);
         }
         let k = self.doc.push_para(&p.text, style, runs);
         self.doc.blocks.update(k, |b| {
@@ -899,6 +1011,12 @@ impl<'a> Reader<'a> {
                 q.props = props;
             }
         });
+        if !self.open_marks.is_empty() && !self.in_note && !field.in_margin {
+            let id = self.doc.para(k).map_or(0, |q| q.id);
+            for n in std::mem::take(&mut self.open_marks) {
+                self.marks.entry(n).or_insert(id);
+            }
+        }
         if tracked {
             self.dels.extend(p.dels.iter().map(|&(s, e, r)| ((k, s), (k, e), r)));
             // The paragraph mark inserted: the break after it; deleted: it
@@ -1166,23 +1284,61 @@ enum Stage {
     Result,
 }
 
-/// Where a complex field (`w:fldChar`) is: its instruction, then its result.
+/// One complex field (`w:fldChar`) being read: its instruction, then its
+/// result (fields nest: a table of contents holds page references).
 #[derive(Default)]
-struct FieldState {
+struct Frame {
     stage: Stage,
     instr: String,
+    /// A reference's result, as the file shows it.
+    result: String,
+}
+
+/// The complex fields open where the reader is.
+#[derive(Default)]
+struct FieldState {
+    stack: Vec<Frame>,
     /// Reading a header or footer: page number fields become placeholders.
     in_margin: bool,
+    /// Reading a note: references stay text.
+    in_note: bool,
 }
+
+/// Deepest nesting of complex fields read.
+const MAX_FIELD_DEPTH: usize = 16;
 
 impl FieldState {
     fn shows_result(&self) -> bool {
-        match self.stage {
+        self.stack.iter().all(|f| match f.stage {
             Stage::Outside => true,
             Stage::Instr => false,
-            Stage::Result => !(self.in_margin && page_field(&self.instr).is_some()),
-        }
+            Stage::Result => !(self.in_margin && page_field(&f.instr).is_some()) && !(self.live_ref(&f.instr)),
+        })
     }
+    /// A reference this reader makes a field of (not in margins or notes).
+    fn live_ref(&self, instr: &str) -> bool {
+        !self.in_margin && !self.in_note && ref_field(instr).is_some()
+    }
+    /// Inside a table of contents' result.
+    fn in_toc(&self) -> bool {
+        self.stack.iter().any(|f| f.stage == Stage::Result && is_toc(&f.instr))
+    }
+}
+
+/// A reference field's kind and bookmark: `PAGEREF name` (true) or `REF name`.
+fn ref_field(instr: &str) -> Option<(bool, &str)> {
+    let mut w = instr.split_whitespace();
+    let page = match w.next()?.to_ascii_uppercase().as_str() {
+        "PAGEREF" => true,
+        "REF" => false,
+        _ => return None,
+    };
+    let name = w.next()?.trim_matches('"');
+    (!name.is_empty() && !name.starts_with('\\')).then_some((page, name))
+}
+
+fn is_toc(instr: &str) -> bool {
+    instr.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("TOC"))
 }
 
 /// `{page}` or `{pages}` for a page number field's instruction.
@@ -1259,7 +1415,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1317,6 +1473,11 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     }
     r.read_notes();
     r.read_replies(&comment_order);
+    let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
+    fields::relink_toc(&mut r.doc);
+    if lost > 0 {
+        r.rep.note(Kind::Approximate, "cross-references to missing bookmarks (kept as text)");
+    }
     // Deleted text and paragraph marks become tombstones; a mark is only
     // taken between paragraphs of one cell (or outside tables).
     let mut dels = std::mem::take(&mut r.dels);

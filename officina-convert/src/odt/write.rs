@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -87,7 +87,8 @@ fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
     }
 }
 
-fn para_props(p: &ParaProps) -> String {
+/// `tab_base`: the start indent ODF measures the tab stops from.
+fn para_props(p: &ParaProps, tab_base: i32) -> String {
     let mut s = String::new();
     if let Some(a) = p.align {
         let _ = write!(s, r#" fo:text-align="{}""#, match a {
@@ -127,11 +128,37 @@ fn para_props(p: &ParaProps) -> String {
         let n = if v { 2 } else { 0 };
         let _ = write!(s, r#" fo:widows="{n}" fo:orphans="{n}""#);
     }
-    if s.is_empty() {
-        s
-    } else {
-        format!("<style:paragraph-properties{s}/>")
+    let mut tabs = String::new();
+    if let Some(t) = &p.tabs {
+        tabs += "<style:tab-stops>";
+        for x in t {
+            let ty = match x.align {
+                TabAlign::Start => "left",
+                TabAlign::Center => "center",
+                TabAlign::End => "right",
+                TabAlign::Decimal => "char",
+            };
+            let ch = if x.align == TabAlign::Decimal { r#" style:char=".""# } else { "" };
+            let leader = match x.leader {
+                Leader::None => "",
+                Leader::Dots => r#" style:leader-style="dotted" style:leader-text=".""#,
+                Leader::Dashes => r#" style:leader-style="dash" style:leader-text="-""#,
+                Leader::Line => r#" style:leader-style="solid" style:leader-text="_""#,
+            };
+            let _ = write!(tabs, r#"<style:tab-stop style:position="{}" style:type="{ty}"{ch}{leader}/>"#, pt((x.pos - tab_base) as i64));
+        }
+        tabs += "</style:tab-stops>";
     }
+    match (s.is_empty(), tabs.is_empty()) {
+        (true, true) => s,
+        (_, true) => format!("<style:paragraph-properties{s}/>"),
+        _ => format!("<style:paragraph-properties{s}>{tabs}</style:paragraph-properties>"),
+    }
+}
+
+/// The bookmark name a field refers to paragraph `id` by.
+fn ref_name(id: BlockId) -> String {
+    format!("_Ref{id}")
 }
 
 /// What a paragraph's automatic style holds: its direct properties and the
@@ -166,6 +193,8 @@ struct Out<'a> {
     nchange: u32,
     ins_open: Option<(RevId, String)>,
     pending_end: Option<String>,
+    /// Paragraphs fields refer to, by id: each gets a bookmark.
+    targets: std::collections::HashSet<BlockId>,
 }
 
 /// The name an annotation goes by.
@@ -179,7 +208,8 @@ impl Out<'_> {
         if let Some(n) = self.para_styles.get(&key) {
             return n.clone();
         }
-        let body = para_props(&key.1);
+        let base = self.doc.styles.para_format(style, p).0.indent_start.max(0);
+        let body = para_props(&key.1, base);
         if body.is_empty() {
             return self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
         }
@@ -395,11 +425,25 @@ impl Out<'_> {
             // An empty paragraph's formatting rides on its paragraph style.
             props = props.clone();
         }
-        let st = self.para_style(p.style, &props);
+        let mut st = self.para_style(p.style, &props);
+        // A contents entry in the default style: LibreOffice's Contents style of its level.
+        if let (0, Some(l), None, 0) = (p.style, p.props.toc, p.props.cell, self.in_note) {
+            st = if st == self.names[0] { format!("Contents_20_{}", l.clamp(1, 9)) } else { st };
+            let (auto, lvl) = (st.starts_with('P'), l.clamp(1, 9));
+            if auto {
+                // Its automatic style's parent is the Contents style.
+                let from = format!(r#"<style:style style:name="{st}" style:family="paragraph" style:parent-style-name="{}">"#, esc(&self.names[0]));
+                let to = format!(r#"<style:style style:name="{st}" style:family="paragraph" style:parent-style-name="Contents_20_{lvl}">"#);
+                self.auto = self.auto.replacen(&from, &to, 1);
+            }
+        }
         let level = doc.styles.para_format(p.style, &p.props).0.outline_level.filter(|_| doc.styles.styles.get(p.style as usize).is_some_and(|s| s.name.starts_with("Heading")));
         let tag = if level.is_some() { "text:h" } else { "text:p" };
         let lvl = level.map(|l| format!(r#" text:outline-level="{l}""#)).unwrap_or_default();
         let _ = write!(out, r#"<{tag} text:style-name="{}"{lvl}>"#, esc(&st));
+        if self.in_note == 0 && self.cur.is_some() && self.targets.contains(&p.id) {
+            let _ = write!(out, r#"<text:bookmark text:name="{}"/>"#, ref_name(p.id));
+        }
         let marks = if self.in_note == 0 { self.cur.and_then(|b| self.marks.get(&b)).cloned().unwrap_or_default() } else { Vec::new() };
         let mut m = 0;
         for (s, e, a) in p.spans() {
@@ -439,6 +483,15 @@ impl Out<'_> {
                     continue;
                 }
                 Self::text(&piece[from..i], &mut inner);
+                if let (true, Some(f)) = (i < piece.len(), attrs.field) {
+                    let (fmt, t) = match f {
+                        Field::PageRef(t) => ("page", t),
+                        Field::TextRef(t) => ("text", t),
+                    };
+                    let _ = write!(inner, r#"<text:bookmark-ref text:reference-format="{fmt}" text:ref-name="{}">"#, ref_name(t));
+                    Self::text(&doc.field_text(f), &mut inner);
+                    inner += "</text:bookmark-ref>";
+                }
                 if i < piece.len() && attrs.object.is_none() {
                     // A note: its number and text, in place.
                     if let (Some(id), 0) = (attrs.note, self.in_note) {
@@ -628,7 +681,12 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new() };
+    for bl in doc.blocks.iter() {
+        if let Some(p) = bl.as_para() {
+            o.targets.extend(doc.fields_in(p).into_iter().map(|f| f.1.target()));
+        }
+    }
     // Comments: each anchored one's start and end; its replies right after its start.
     let ranges = doc.comment_ranges();
     let live: std::collections::HashSet<CommentId> = doc.live_comments().into_iter().collect();
@@ -661,6 +719,20 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             b = o.table(b, &mut body);
         } else if doc.para(b).and_then(|p| p.props.list.flatten()).is_some() {
             b = o.list(b, n, &mut body);
+        } else if doc.para(b).is_some_and(|p| p.props.toc.is_some()) {
+            // A table of contents: its run of entries as the index body.
+            let mut end = b;
+            let mut depth = 3;
+            while let Some(l) = doc.para(end).filter(|p| p.props.cell.is_none() && p.props.list.flatten().is_none()).and_then(|p| p.props.toc) {
+                depth = depth.max(l.min(9));
+                end += 1;
+            }
+            let _ = write!(body, r#"<text:table-of-content text:protected="true" text:name="Table of Contents{}"><text:table-of-content-source text:outline-level="{depth}" text:use-index-marks="false"/><text:index-body>"#, b + 1);
+            for k in b..end.max(b + 1) {
+                o.para(k, &mut body);
+            }
+            body += "</text:index-body></text:table-of-content>";
+            b = end.max(b + 1);
         } else {
             o.para(b, &mut body);
             b += 1;
@@ -674,11 +746,20 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         let parent = st.parent.and_then(|p| named.get(p as usize)).map(|p| format!(r#" style:parent-style-name="{}""#, esc(&p.0))).unwrap_or_default();
         let next = st.next.and_then(|p| named.get(p as usize)).filter(|_| st.kind == StyleKind::Para).map(|p| format!(r#" style:next-style-name="{}""#, esc(&p.0))).unwrap_or_default();
         let outline = st.para.outline_level.filter(|_| st.kind == StyleKind::Para).map(|l| format!(r#" style:default-outline-level="{l}""#)).unwrap_or_default();
-        let pp = if st.kind == StyleKind::Para { para_props(&st.para) } else { String::new() };
+        let pp = if st.kind == StyleKind::Para { para_props(&st.para, 0) } else { String::new() };
         let mut chars = st.chars.clone();
         chars.style = None;
         let tp = text_props(&chars, &mut o.fonts);
         let _ = write!(styles, r#"<style:style style:name="{}" style:display-name="{}" style:family="{family}"{parent}{next}{outline}>{pp}{tp}</style:style>"#, esc(name), esc(display));
+    }
+    // LibreOffice's Contents styles for the entries' levels.
+    let mut levels: Vec<u8> = doc.blocks.iter().filter_map(|b| b.as_para()).filter(|p| p.style == 0).filter_map(|p| p.props.toc).map(|l| l.clamp(1, 9)).collect();
+    levels.sort_unstable();
+    levels.dedup();
+    for l in levels {
+        if !named.iter().any(|n| n.0 == format!("Contents_20_{l}")) {
+            let _ = write!(styles, r#"<style:style style:name="Contents_20_{l}" style:display-name="Contents {l}" style:family="paragraph" style:parent-style-name="{}" style:class="index"/>"#, esc(&named[0].0));
+        }
     }
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let dc = &doc.styles.default_char;

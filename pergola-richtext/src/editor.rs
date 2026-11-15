@@ -11,10 +11,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use officina_core::history::History;
+use officina_text::fields;
 use officina_text::find::{count, Counts, Matcher, Query, WordCounter};
 use officina_text::layout::{Fonts, LayoutCache, Line, ParaLayout};
 use officina_text::lists::Numbering;
-use officina_text::model::{Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
+use officina_text::model::{Field, Align, AttrId, Block, CellRef, CharAttrs, CharFormat, Comment, CommentId, ImageData, NoteId, NoteKind, Para, MAX_CELLS, ListKind, ListRef, ObjectRef, ParaProps, StyleId, TextDoc, MAX_LIST_LEVEL, MAX_OBJECT_TWIPS, OBJECT_CHAR};
 use officina_text::ops::{Fragment, TextOp};
 use officina_text::model::{RevId, Revision};
 use officina_text::track::{Change, ChangeKind, Edit, Resolve};
@@ -119,6 +120,8 @@ pub struct Editor {
     last: Kind,
     /// Bumped on every change to the text (for saving and redraws).
     pub revision: u64,
+    /// Field resolution rounds since the last change.
+    field_rounds: u32,
     /// Actions since [`Editor::take_log`], when journaling.
     log: Option<Vec<Logged>>,
     attrs_logged: usize,
@@ -146,7 +149,7 @@ pub struct Editor {
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -203,8 +206,31 @@ impl Editor {
     }
 
     /// Paginates for up to `budget`; returns whether pagination is done.
+    /// When pages are done, fields are worked out again (§7.4); any that
+    /// now show something else are laid out and paginated again, at most
+    /// [`fields::MAX_ROUNDS`] rounds per change.
     pub fn paginate(&mut self, budget: Duration) -> bool {
-        self.pages.run_for(&self.doc, &mut self.cache, &*self.fonts, budget)
+        let t = std::time::Instant::now();
+        loop {
+            let left = budget.saturating_sub(t.elapsed());
+            if !self.pages.run_for(&self.doc, &mut self.cache, &*self.fonts, left) {
+                return false;
+            }
+            if self.field_rounds >= fields::MAX_ROUNDS {
+                return true;
+            }
+            self.field_rounds += 1;
+            let changed = fields::resolve(&mut self.doc, self.pages.pages());
+            let (Some(&first), Some(&last)) = (changed.first(), changed.last()) else {
+                self.field_rounds = fields::MAX_ROUNDS;
+                return true;
+            };
+            self.revision += 1;
+            self.pages.edit(&self.doc, &mut self.cache, &*self.fonts, officina_text::model::Edit { first, last: last + 1, delta: 0 });
+            if t.elapsed() >= budget {
+                return false;
+            }
+        }
     }
 
     pub fn layout(&mut self, block: usize) -> Rc<ParaLayout> {
@@ -329,6 +355,7 @@ impl Editor {
         self.revision += 1;
         if let Some(e) = self.doc.take_changes() {
             self.words.edit(&self.doc, e);
+            self.field_rounds = 0;
             if !self.pages.fits(&self.doc) {
                 // New page geometry: every line may break differently.
                 self.pages.reset(&self.doc);
@@ -433,7 +460,7 @@ impl Editor {
         }
         let before = para.attr_at(k.saturating_sub(1));
         let mut base = self.doc.attrs.get(before).clone();
-        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.deleted.take().is_some() | base.conflict.take().is_some() | (k != p.at);
+        let mut pic = base.object.take().is_some() | base.note.take().is_some() | base.field.take().is_some() | base.deleted.take().is_some() | base.conflict.take().is_some() | (k != p.at);
         // Tracking marks are the typing's own, never inherited.
         pic |= base.rev.take().is_some() | base.fmt.take().is_some();
         // Typing inside commented text stays in the comment; at its end it doesn't.
@@ -754,6 +781,63 @@ impl Editor {
         self.anchor = p;
         self.goal_x = None;
         Some(id)
+    }
+
+    /// Inserts a table of contents (headings 1 to 3) before the caret's
+    /// paragraph, or brings the document's one up to date. False when there
+    /// is nothing to do (no headings, or it is current: page numbers are
+    /// fields and keep themselves current).
+    pub fn insert_toc(&mut self) -> bool {
+        let had = fields::toc_range(&self.doc, None);
+        let at = self.caret.block;
+        let ops = fields::toc_ops(&mut self.doc, at, 3);
+        if ops.is_empty() {
+            return false;
+        }
+        self.apply(if had.is_some() { "Update Table of Contents" } else { "Insert Table of Contents" }, ops, Kind::Other);
+        let end = fields::toc_range(&self.doc, None).map_or(0, |r| r.1);
+        match had {
+            // An update: text past the contents keeps its place.
+            Some((_, old_end)) if self.caret.block >= old_end && self.anchor.block >= old_end => {
+                let d = end as isize - old_end as isize;
+                self.caret.block = (self.caret.block as isize + d) as usize;
+                self.anchor.block = (self.anchor.block as isize + d) as usize;
+            }
+            _ => {
+                let p = Pos::new(end.min(self.blocks().saturating_sub(1)), 0);
+                self.caret = p;
+                self.anchor = p;
+            }
+        }
+        self.clamp_caret();
+        self.goal_x = None;
+        true
+    }
+
+    /// The headings a cross-reference can point to: (id, level, text).
+    pub fn ref_targets(&self) -> Vec<(u64, u8, String)> {
+        fields::toc_entries(&self.doc, 9).into_iter().map(|e| (e.target, e.level, e.text)).collect()
+    }
+
+    /// Inserts a field at the caret (replacing the selection): a reference
+    /// to paragraph `target`'s page or text.
+    pub fn insert_field(&mut self, field: Field) -> bool {
+        if self.doc.index_of(field.target()).is_none() {
+            return false;
+        }
+        let (mut ops, start) = self.delete_selection_ops();
+        let base = self.typing_attr(start).unwrap_or_else(|| self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1))));
+        let base = self.doc.plain_attr(base);
+        let mut a = self.doc.attrs.get(base).clone();
+        a.field = Some(field);
+        let fa = self.doc.attrs.intern(a);
+        ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins: Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, fa)] } });
+        self.apply("Insert Cross-reference", ops, Kind::Other);
+        let p = Pos::new(start.block, start.at + OBJECT_CHAR.len_utf8() as u32);
+        self.caret = p;
+        self.anchor = p;
+        self.goal_x = None;
+        true
     }
 
     /// The note whose anchor is just before the caret (or just after it).
@@ -1987,6 +2071,55 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn toc_and_cross_references_keep_current() {
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        let h1 = d.styles.by_name("Heading 1").unwrap();
+        d.push_para("Intro text.", 0, vec![]);
+        for c in 1..=3 {
+            d.push_para(&format!("Chapter {c}"), h1, vec![]);
+            for _ in 0..30 {
+                d.push_para(&"filler words go here ".repeat(8), 0, vec![]);
+            }
+        }
+        let mut e = Editor::new(d, Rc::new(FixedFonts));
+        e.start_log();
+        assert!(e.paginate(Duration::from_secs(10)));
+        e.set_caret(Pos::new(0, 0), false);
+        assert!(e.insert_toc());
+        assert!(e.paginate(Duration::from_secs(10)));
+        let shown = |e: &Editor| -> Vec<String> { (0..3).map(|i| { let p = e.doc.para(i).unwrap(); e.doc.field_text(e.doc.fields_in(p)[0].1) }).collect() };
+        let page = |e: &Editor, c: usize| (e.pages.page_of(e.doc.index_of(e.ref_targets()[c].0).unwrap(), 0) + 1).to_string();
+        assert_eq!(shown(&e), (0..3).map(|c| page(&e, c)).collect::<Vec<_>>());
+        assert_eq!(e.caret, Pos::new(3, 0), "after the contents");
+        assert!(!e.insert_toc(), "current");
+        // A cross-reference to chapter 3's page.
+        let target = e.ref_targets()[2].0;
+        e.set_caret(Pos::new(3, 6), false);
+        assert!(e.insert_field(Field::PageRef(target)));
+        // Pages shift: fields follow without an update.
+        let before = shown(&e);
+        e.set_caret(Pos::new(3, 0), false);
+        for _ in 0..80 {
+            e.key(Key::Enter, NO, "", 0);
+        }
+        assert!(e.paginate(Duration::from_secs(10)));
+        let after = shown(&e);
+        assert_ne!(before, after);
+        assert_eq!(after, (0..3).map(|c| page(&e, c)).collect::<Vec<_>>());
+        let p = e.doc.para(83).unwrap();
+        assert_eq!(e.doc.field_text(e.doc.fields_in(p)[0].1), page(&e, 2));
+        // A retitled heading: Update changes that entry.
+        let ch2 = e.doc.index_of(e.ref_targets()[1].0).unwrap();
+        e.set_caret(Pos::new(ch2, 0), false);
+        typ(&mut e, "New ");
+        assert!(e.insert_toc());
+        assert!(e.doc.para(1).unwrap().text.starts_with("New Chapter 2\t"));
+        e.undo();
+        assert!(e.doc.para(1).unwrap().text.starts_with("Chapter 2\t"));
     }
 
     #[test]

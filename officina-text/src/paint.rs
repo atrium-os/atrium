@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{Align, CharFormat, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::model::{Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
 use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
@@ -113,7 +113,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
         }
         let mut ly = s.y;
         for li in s.lines.clone() {
-            line(&mut out, doc, &l, li, &p.text, left, my + ly, Some(s.block));
+            line(&mut out, doc, fonts, &l, li, &p.text, left, my + ly, Some(s.block));
             ly += l.lines[li].height;
         }
     }
@@ -144,7 +144,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
             if li >= l.lines.len() {
                 break;
             }
-            line(&mut out, doc, &l, li, &p.text, left, my + ly, None);
+            line(&mut out, doc, fonts, &l, li, &p.text, left, my + ly, None);
             ly += l.lines[li].height;
         }
     }
@@ -167,7 +167,8 @@ fn cluster_text(text: &str, start: u32, next: Option<u32>) -> &str {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64, block: Option<usize>) {
+#[allow(clippy::too_many_arguments)]
+fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, li: usize, text: &str, left: i64, top: i64, block: Option<usize>) {
     let line = &l.lines[li];
     let baseline = baseline_of(l, li, top);
     let bytes = text.as_bytes();
@@ -215,7 +216,10 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
                     // A note anchor's glyphs show its label.
                     match f.note {
                         Some(id) if ch == OBJECT_CHAR => run.text.push_str(&doc.note_label(id)),
-                        _ => run.text.push_str(t),
+                        _ => match f.field {
+                            Some(x) if ch == OBJECT_CHAR => run.text.push_str(&doc.field_text(x)),
+                            _ => run.text.push_str(t),
+                        },
                     }
                     n..run.text.len() as u32
                 };
@@ -254,6 +258,35 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, l: &ParaLayout, li: usize, text: &st
         }
         if let Some(u) = &f.link {
             out.push(Item::Link { x: rx, y: top, w: rw, h: line.height, uri: u.to_string() });
+        }
+    }
+    // Tab leaders, in the format of the text after the tab.
+    for &(a, b, leader) in &line.leaders {
+        let fi = gl.iter().find(|g| bytes.get(g.cluster as usize) == Some(&b'\t')).map_or(0, |g| g.fmt);
+        let f = &l.formats[fi as usize];
+        let size = size_lu(f);
+        let thick = (size / 14).max(crate::LU / 2);
+        match leader {
+            Leader::None => {}
+            Leader::Line => out.push(Item::Rect { x: left + a, y: baseline + size * 12 / 100, w: b - a, h: thick, color: f.color }),
+            Leader::Dots | Leader::Dashes => {
+                let mark = if leader == Leader::Dots { "." } else { "-" };
+                let Some(g) = fonts.shape(mark, f).first().copied() else { continue };
+                // On a grid from the paragraph's edge, so leaders line up.
+                let pitch = (g.adv * 2).max(crate::LU);
+                let mut x = (a + pitch / 2 + pitch - 1) / pitch * pitch;
+                let mut run = GlyphRun { face: g.face, size, color: f.color, x: left + x, y: baseline, glyphs: Vec::new(), text: String::new() };
+                let origin = x;
+                while x + g.adv <= b - pitch / 2 {
+                    let n = run.text.len() as u32;
+                    run.text.push_str(mark);
+                    run.glyphs.push(PaintGlyph { id: g.id, x: x - origin + g.dx, dy: g.dy, text: n..n + 1 });
+                    x += pitch;
+                }
+                if !run.glyphs.is_empty() {
+                    out.push(Item::Glyphs(run));
+                }
+            }
         }
     }
 }

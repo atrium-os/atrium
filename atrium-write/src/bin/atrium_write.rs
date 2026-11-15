@@ -349,7 +349,7 @@ fn main() {
     write.keep_words(root.join("words"));
     let mut run = Run { write, target: None, root: root.clone(), export: None };
     run.show(doc, target);
-    // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, comment, or find:TEXT).
+    // For screenshots: start with a bar open (ATRIUM_WRITE_BAR=spell, comment, xref:N, or find:TEXT).
     match std::env::var("ATRIUM_WRITE_BAR").ok().as_deref() {
         Some("spell") => run.write.cmds.lock().unwrap().push(Cmd::SpellOpen),
         Some(f) if f.starts_with("review") => {
@@ -378,6 +378,13 @@ fn main() {
             }
         }
         Some("comment") => run.write.cmds.lock().unwrap().push(Cmd::CommentOpen(0)),
+        // BAR=xref:N opens the cross-reference bar on heading N (from 0).
+        Some(f) if f.starts_with("xref") => {
+            let n: usize = f.strip_prefix("xref:").and_then(|n| n.parse().ok()).unwrap_or(0);
+            let mut q = run.write.cmds.lock().unwrap();
+            q.push(Cmd::XrefOpen);
+            q.extend(std::iter::repeat_n(Cmd::XrefMove(true), n));
+        }
         Some(f) if f.starts_with("find:") => {
             run.write.find_text.set(pergola::text_edit::TextEdit::new(&f[5..]));
             run.write.cmds.lock().unwrap().extend([Cmd::FindOpen, Cmd::FindNext]);

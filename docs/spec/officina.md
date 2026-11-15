@@ -1995,6 +1995,60 @@ is ambiguous, and there the merge shows a conflict instead of guessing. The
 largest (15,935 paragraphs) takes 10 s for both compares, the merge and the
 checks; most take milliseconds.
 
+### 16.28 O5d1 as built (2026-11-15): contents, cross-references, tab stops
+
+- **Tab stops** (`ParaProps.tabs`): position from the column's start edge,
+  alignment (start, centre, end, decimal) and leader (none, dots, dashes, line);
+  past the last stop, one every half inch. A paragraph's stops replace its
+  style's. Layout gives each tab its advance per line (end, centre and decimal
+  stops measure the text after the tab) and records leaders, which the page
+  painter draws as glyphs on a grid (dots, dashes) or a rule. Native file:
+  paragraph property extension bits.
+- **Fields** (`officina-text::fields`). A field is one U+FFFC with
+  `CharAttrs.field`: a page reference or a text reference to a paragraph by its
+  id, shown as a label the way a note anchor shows its number. What each shows
+  is derived (`TextDoc::field_values`, never saved, not in undo). When
+  pagination is done the editor resolves every field; paragraphs whose fields
+  now show something else are laid out and paginated again, at most three
+  rounds per change (§7.4), so a page number that moves its own paragraph can't
+  loop. A reference whose paragraph is gone shows "?".
+- **Table of contents.** Insert › Table of Contents lists Heading 1–3 before
+  the caret's paragraph as ordinary paragraphs marked `toc` (level), each the
+  heading's text, a tab to an end stop with dots, and a page reference; the
+  menu item becomes Update Table of Contents, which rebuilds the entries only
+  when the headings changed (page numbers keep themselves current) and keeps
+  the entries' ids. Insert › Cross-reference… opens a bar to step through the
+  headings and insert the page number or the heading text. All undoable.
+- **Files.** `.docx`: a TOC field (`TOC \o "1-N" \h \z \u`) over the
+  entries in Word's TOC N styles, `PAGEREF`/`REF` fields with their results,
+  bookmarks `_Ref<id>` on referenced paragraphs, `w:tabs` (a paragraph's stops
+  added to its style's, `clear` honoured, as Word does). `.odt`:
+  `text:table-of-content` with the entries in Contents N styles,
+  `text:bookmark-ref` (page or text), `text:bookmark`, `style:tab-stops`
+  (positions from the start indent unless the file's settings say otherwise).
+  Readers keep nested fields, bind references to bookmarks once the document
+  is read (a reference to a missing bookmark keeps its text, with a note), and
+  give a contents entry whose page number arrived as plain text (LibreOffice
+  flattens the field when it saves a `.docx`) a page reference to the heading
+  with its text again. The file's results show until pagination works them out.
+- **Not yet:** sections and columns (O5d2); captions and figure lists; levels
+  and styles chosen for the contents; clicking an entry to go to its heading;
+  references to bookmarks inside a paragraph, to numbered items and to notes.
+
+Gates: `fields::tests` (contents with the right pages, references following
+their target, rounds bounded), editor and app tests with undo. LibreOffice both
+ways and across formats (`examples/toc_lo.rs`): our `.docx` and `.odt`, saved
+by LibreOffice as `.docx` and as `.odt`, read back with every entry's level,
+text and heading, both references and the tab stops, and Update finds the
+contents current: 16/16. 1,500-page gate (`pergola-richtext/examples/
+toc_1500.rs`, pinned fonts, 1,484 pages): inserting a contents of 750 entries
+(22 pages) settles in 28 ms with every entry on its heading's page; pasting a
+page of text after it moves 749 entries, settles in 21 ms and lays out only
+those 749 and the 12 pasted paragraphs again; a renamed heading updates its
+entry; the pages equal a fresh pagination. Corpus: text recall against
+LibreOffice 99.51 % with fields shown as their values, all 1,832 still round
+trip.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

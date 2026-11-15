@@ -14,6 +14,7 @@
 //! and the same on every machine.
 
 pub mod compare;
+pub mod fields;
 pub mod find;
 pub mod layout;
 pub mod lists;
