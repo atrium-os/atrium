@@ -122,12 +122,15 @@ pub struct MenuState {
     /// The first item shown, when frescod gave the menu less height than
     /// all its items need and it scrolls ([`Ctx::popup_room`]).
     pub first: usize,
+    /// The item the pointer was last over: moving onto another moves the
+    /// highlight there, so the keys and the pointer share one highlight.
+    pub hover: Option<usize>,
 }
 
 impl MenuState {
     /// Open with `highlight` on an item (keyboard opening: the first or the
     /// current one), or none (pointer opening).
-    pub fn opened(highlight: Option<usize>) -> Self { Self { open: true, highlight, first: 0 } }
+    pub fn opened(highlight: Option<usize>) -> Self { Self { open: true, highlight, first: 0, hover: None } }
 }
 
 pub struct Menu {
@@ -300,6 +303,8 @@ impl Menu {
         // Marks get a gutter; then every label starts after it.
         let gutter = if self.items.iter().any(|i| i.mark != Mark::None) { MARK_GUTTER } else { 0.0 };
         let mut y = r.y() + MENU_INSET - shift;
+        let mut hits: Vec<(NodeId, usize)> = Vec::with_capacity(shown);
+        let mut hovered = None;
         for (i, item) in self.items.iter().enumerate() {
             if i < first || i >= first + shown {
                 // Scrolled out of what frescod gave it.
@@ -319,12 +324,10 @@ impl Menu {
             }
             let row = Rect::new(r.x() + MENU_INSET, y, r.w() - 2.0 * MENU_INSET, size::menu_item());
             let hit = ctx.tree.insert(Some(body), Node::Rect { rect: row, fill: Color::TRANSPARENT, radius: radius::XS });
-            let lit = item.enabled && (st.highlight == Some(i) || ctx.is_hovered(hit));
-            if lit {
-                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(hit) {
-                    *fill = t.selection_bg();
-                }
+            if item.enabled && ctx.is_hovered(hit) {
+                hovered = Some(i);
             }
+            hits.push((hit, i));
             let color = if item.enabled { t.text_primary() } else { t.text_disabled() };
             let ls = Node::measure_text(&item.label, &text(color, type_size::MD, font::SANS, Weight::Regular));
             let lx = row.x() + space::SM + gutter;
@@ -380,6 +383,23 @@ impl Menu {
             }
             y += size::menu_item();
         }
+        // One highlight: the pointer's when it has just moved onto an item,
+        // else the keys'.
+        let lit = match hovered {
+            Some(h) if Some(h) != st.hover => Some(h),
+            _ => st.highlight,
+        };
+        if hovered != st.hover {
+            // Remembered for the keys; the next frame draws the same.
+            self.state.set(MenuState { hover: hovered, highlight: lit, ..st });
+        }
+        for (hit, i) in hits {
+            if lit == Some(i) && self.items[i].enabled {
+                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(hit) {
+                    *fill = t.selection_bg();
+                }
+            }
+        }
         // Presses on the body between items close nothing.
         ctx.on_click(body, || {});
         let scrolls = shown < n;
@@ -431,6 +451,14 @@ impl Menu {
                         } else {
                             first
                         };
+                        // At the first or last item that can be chosen, show
+                        // the ones beyond it too (a heading, a greyed item).
+                        let enabled: Vec<usize> = items.iter().enumerate().filter(|(_, i)| i.enabled).map(|(k, _)| k).collect();
+                        if enabled.first() == Some(&h) && h < shown {
+                            st.first = 0;
+                        } else if enabled.last() == Some(&h) && items.len() - h <= shown {
+                            st.first = items.len() - shown;
+                        }
                     }
                 }
                 Key::Escape => st = MenuState::default(),
@@ -1222,6 +1250,66 @@ mod tests {
         app.tick();
         assert_eq!(shown(&app).len(), 10);
         let _ = value;
+    }
+
+    /// The pointer and the keys share one highlight: moving onto an item
+    /// moves it there, and the arrows go on from it.
+    #[test]
+    fn the_pointer_and_the_arrows_share_one_highlight() {
+        let (mut app, _value, menu) = form();
+        click(&mut app, 20.0, 20.0);
+        let lit = |app: &App<Form>| {
+            let sel = crate::theme::Semantic::LIGHT.selection_bg();
+            app.tree().iter().filter(|(_, n)| matches!(n, Node::Rect { fill, .. } if *fill == sel)).count()
+        };
+        let y0 = 10.0 + size::button_height() + MENU_GAP + MENU_INSET;
+        app.handle_event(Event::PointerMove { at: Point::new(30.0, y0 + size::menu_item() * 0.5) });
+        app.tick();
+        app.tick();
+        assert_eq!(menu.get().highlight, Some(0), "the pointer moved it");
+        assert_eq!(lit(&app), 1);
+        key(&mut app, Key::Down);
+        assert_eq!(menu.get().highlight, Some(1), "the arrow goes on from it");
+        assert_eq!(lit(&app), 1, "one highlight, though the pointer is still over the first");
+    }
+
+    struct Headed {
+        menu: Mutable<MenuState>,
+    }
+    impl View for Headed {
+        fn render(&self, ctx: &mut Ctx) {
+            let mut items = vec![MenuItem::new("Heading").enabled(false)];
+            items.extend((1..10).map(|i| MenuItem::new(format!("Item {i}"))));
+            MenuButton::new("Menu", self.menu.clone(), items, |_| {}).at(10.0, 10.0).render(ctx);
+        }
+    }
+
+    /// Scrolled to the bottom, Up wraps back past the top: the greyed
+    /// heading above the first item shows again.
+    #[test]
+    fn up_to_the_first_item_shows_what_is_above_it() {
+        let d = Arc::new(AtomicBool::new(true));
+        let menu = Mutable::with_dirty(MenuState::default(), d.clone());
+        let mut app = App::new_with_flag(Headed { menu: menu.clone() }, d);
+        app.set_popups(true);
+        app.tick();
+        key(&mut app, Key::Tab);
+        key(&mut app, Key::Down);
+        let root = app.tree().popups().next().unwrap().0;
+        app.popup_placed(root, Some(MENU_INSET * 2.0 + 4.0 * size::menu_item() + 3.0));
+        app.tick();
+        let heading = |app: &App<Headed>| app.tree().iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Heading"));
+        assert!(heading(&app));
+        // Down to the last item, then on round to the first.
+        for _ in 0..9 {
+            key(&mut app, Key::Down);
+        }
+        assert_eq!(menu.get().highlight, Some(9));
+        assert!(!heading(&app), "scrolled away");
+        key(&mut app, Key::Down);
+        assert_eq!(menu.get().highlight, Some(1));
+        assert!(heading(&app), "the heading above the first item shows again");
+        assert_eq!(menu.get().first, 0);
     }
 
     struct Bar {
