@@ -1,0 +1,13 @@
+[package]
+name = "mail-parse"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's message parser (docs/spec/mail.md §7.1): RFC 5322 headers, RFC 2047/2231 encodings, addresses, the MIME tree, transfer and charset decoding, into a bounded summary. Runs only in a parse jail; no I/O."
+
+[dependencies]
+encoding_rs = "0.8"
+
+[profile.release]
+debug = 1
