@@ -1205,6 +1205,12 @@ impl EnvelopeFrontend {
         live
     }
 
+    /// An animation was started that no frame has drawn yet: the next
+    /// draw must tick (its groups are at their end states until then).
+    pub fn animations_waiting(&self) -> bool {
+        self.per_window.values().any(|s| s.anims.iter().any(|a| a.start_ns.is_none()))
+    }
+
     /// Get-or-create per-window state map entry for `window_id`.
     fn ensure_window_state(&mut self, window_id: u32) -> &mut WindowSceneState {
         self.per_window.entry(window_id).or_default()

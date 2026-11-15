@@ -473,12 +473,25 @@ fn main() {
     let mut tex_gen = 0u64;
     let mut last = 0;
     let mut animating = false;
+    let mut ticked = 0u64;
     loop {
         // While a declarative animation runs (pergola.md §4.2) a frame
-        // goes every display refresh, whatever the client does.
-        let beat = if animating { Duration::from_nanos(1_000_000_000_000 / refresh.max(24_000) as u64) } else { Duration::from_secs(3600) };
+        // goes every display refresh, whatever the client does; and no
+        // more often: a wake for anything else (a slot given back, a
+        // client's op) inside the same refresh draws the same animation
+        // time, so the window is not drawn again for nothing.
+        let period = 1_000_000_000_000 / refresh.max(24_000) as u64;
+        let beat = if animating {
+            Duration::from_nanos((ticked + period).saturating_sub(monotonic_ns()).max(1_000_000))
+        } else {
+            Duration::from_secs(3600)
+        };
         last = redraw.wait_past(last, beat);
-        animating = frontend.lock().unwrap().tick_animations(monotonic_ns());
+        let now = monotonic_ns();
+        if !animating || now >= ticked + period * 9 / 10 || frontend.lock().unwrap().animations_waiting() {
+            animating = frontend.lock().unwrap().tick_animations(now);
+            ticked = now;
+        }
         let (uploads, clears) = frontend.lock().unwrap().take_pending_uploads();
         if !uploads.is_empty() || !clears.is_empty() {
             scene_state.apply(uploads, clears);
@@ -639,7 +652,8 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
                 w.px = vec![0; n];
             }
             let mut cost = sprites::Cost::default();
-            let r = w.sprites.get_or_insert_with(Default::default).draw(t2, scene, &wf, &mut w.px, width, height, &mut cost);
+            let plain = w.tiles.is_some();
+            let r = w.sprites.get_or_insert_with(Default::default).draw(t2, scene, &wf, &mut w.px, width, height, plain, &mut cost);
             // `px` no longer holds a plain drawing.
             w.tiles = None;
             w.scrolls.clear();

@@ -90,13 +90,17 @@ pub struct Cost {
     pub sprites_rastered: u32,
     /// Tiles of sprite content rastered.
     pub content_tiles: u32,
+    /// Tiles of sprite content taken from the window's last drawing.
+    pub grabbed: u32,
     pub composite: std::time::Duration,
 }
 
 impl Sprites {
     /// Draw `f` (which has sprites) into `out` (`width` x `height`, pitch
     /// `width`): `Ok(Some(rect))`, what changed since the last drawing;
-    /// `Ok(None)`, nothing did.
+    /// `Ok(None)`, nothing did. `plain`: `out` holds the window's last
+    /// drawing, made without sprites (an outgoing sprite's pixels are then
+    /// taken from it rather than rastered).
     pub fn draw(
         &mut self,
         t2: &fresco_compute::tier2::Tier2,
@@ -105,6 +109,7 @@ impl Sprites {
         out: &mut [u32],
         width: u32,
         height: u32,
+        plain: bool,
         cost: &mut Cost,
     ) -> Result<Option<[u32; 4]>, String> {
         use fresco_compute::{damage, TILE};
@@ -150,8 +155,22 @@ impl Sprites {
         self.draws += 1;
         let mut shown = Vec::with_capacity(f.sprites.len());
         let mut using = Vec::with_capacity(f.sprites.len());
+        let first = self.shown.is_none();
         for (i, s) in f.sprites.iter().enumerate() {
             let key = scene.sprite_key(f, i);
+            let clip = s.clip.map(|v| v.clamp(0, i32::MAX) as u32);
+            let off = [s.offset[0] as i64, s.offset[1] as i64];
+            let ox = |v: i64, hi: u32| v.clamp(0, hi as i64) as u32;
+            let placed = [ox(off[0], width), ox(off[1], height), ox(off[0] + width as i64, width), ox(off[1] + height as i64, height)];
+            let rect = meet(meet(clip, placed), whole);
+            let rect = if empty(rect) || s.opacity <= 0.0 { [0; 4] } else { rect };
+            // `rect` in the content's own pixels.
+            let local = [
+                (rect[0] as i64 - off[0]).clamp(0, width as i64) as u32,
+                (rect[1] as i64 - off[1]).clamp(0, height as i64) as u32,
+                (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
+                (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
+            ];
             let at = match self.content.iter().position(|c| c.key == key && c.px.len() == n) {
                 Some(at) => at,
                 None => {
@@ -168,6 +187,9 @@ impl Sprites {
                     let c = &mut self.content[at];
                     c.px.resize(n, 0);
                     c.valid = vec![false; (frame.header.tiles_x * frame.header.tiles_y) as usize];
+                    if plain && first && s.outgoing && s.opaque && !empty(rect) {
+                        cost.grabbed += take_from_window(t2, &frame, c, out, width, local, (off[0] as i32, off[1] as i32))?;
+                    }
                     c.frame = Some(frame);
                     c.key = key;
                     cost.sprites_rastered += 1;
@@ -176,21 +198,9 @@ impl Sprites {
             };
             self.content[at].used = self.draws;
             using.push(at);
-            let clip = s.clip.map(|v| v.clamp(0, i32::MAX) as u32);
-            let off = [s.offset[0] as i64, s.offset[1] as i64];
-            let ox = |v: i64, hi: u32| v.clamp(0, hi as i64) as u32;
-            let placed = [ox(off[0], width), ox(off[1], height), ox(off[0] + width as i64, width), ox(off[1] + height as i64, height)];
-            let rect = meet(meet(clip, placed), whole);
-            let rect = if empty(rect) || s.opacity <= 0.0 { [0; 4] } else { rect };
             // The tiles of the content that show now, rastered if not yet.
             let c = &mut self.content[at];
             if let (Some(frame), false) = (&c.frame, empty(rect)) {
-                let local = [
-                    (rect[0] as i64 - off[0]).clamp(0, width as i64) as u32,
-                    (rect[1] as i64 - off[1]).clamp(0, height as i64) as u32,
-                    (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
-                    (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
-                ];
                 let h = &frame.header;
                 let mut need = vec![false; c.valid.len()];
                 let mut any = false;
@@ -264,4 +274,57 @@ impl Sprites {
         let since = *self.paused.get_or_insert_with(std::time::Instant::now);
         since.elapsed() >= IDLE
     }
+}
+
+/// An outgoing sprite's content (`c`, packed as `frame`) where it shows
+/// now (`local`, its own pixels; at `off` in the window), taken from the
+/// window's last drawing `out`: the group was drawn there just so, and
+/// its pixels hide the window under it. A few tiles are rastered to check
+/// that; if any differs nothing is taken. Returns the tiles taken (each
+/// wholly inside `local`, now valid).
+fn take_from_window(
+    t2: &fresco_compute::tier2::Tier2,
+    frame: &fresco_compute::Frame,
+    c: &mut Content,
+    out: &[u32],
+    width: u32,
+    local: [u32; 4],
+    off: (i32, i32),
+) -> Result<u32, String> {
+    use fresco_compute::TILE;
+    let h = &frame.header;
+    let w = width as usize;
+    let (tx0, ty0) = (local[0].div_ceil(TILE), local[1].div_ceil(TILE));
+    let (tx1, ty1) = ((local[2] / TILE).min(h.tiles_x), (local[3] / TILE).min(h.tiles_y));
+    if tx0 >= tx1 || ty0 >= ty1 {
+        return Ok(0);
+    }
+    for y in local[1] as usize..local[3] as usize {
+        let sy = (y as i64 + off.1 as i64) as usize;
+        let (a, b) = (local[0] as usize, local[2] as usize);
+        let sx = (a as i64 + off.0 as i64) as usize;
+        c.px[y * w + a..y * w + b].copy_from_slice(&out[sy * w + sx..sy * w + sx + (b - a)]);
+    }
+    // Check: a few tiles spread over it, rastered over what was taken.
+    let all: Vec<(u32, u32)> = (ty0..ty1).flat_map(|ty| (tx0..tx1).map(move |tx| (tx, ty))).collect();
+    let step = all.len().div_ceil(12).max(1);
+    let sample: Vec<(u32, u32)> = all.iter().copied().step_by(step).collect();
+    let tile_px = |px: &[u32], (tx, ty): (u32, u32)| -> Vec<u32> {
+        (ty * TILE..((ty + 1) * TILE).min(h.height))
+            .flat_map(|y| px[(y * width + tx * TILE) as usize..(y * width + ((tx + 1) * TILE).min(width)) as usize].to_vec())
+            .collect()
+    };
+    let taken: Vec<Vec<u32>> = sample.iter().map(|&t| tile_px(&c.px, t)).collect();
+    let rects: Vec<[u32; 4]> = sample.iter().map(|&(tx, ty)| [tx, ty, tx + 1, ty + 1]).collect();
+    t2.render_tiles(frame, &mut c.px, &rects).map_err(|e| e.to_string())?;
+    for (k, &t) in sample.iter().enumerate() {
+        c.valid[(t.1 * h.tiles_x + t.0) as usize] = true;
+        if tile_px(&c.px, t) != taken[k] {
+            return Ok(0);
+        }
+    }
+    for &(tx, ty) in &all {
+        c.valid[(ty * h.tiles_x + tx) as usize] = true;
+    }
+    Ok(all.len() as u32)
 }

@@ -604,10 +604,12 @@ impl Compute {
                 let t = std::time::Instant::now();
                 let (off, len) = (s[0] as usize, (s[1] * s[3]) as usize);
                 let mut cost = crate::sprites::Cost::default();
+                let plain = self.held.contains_key(&w.id);
                 let sp = self.sprites.entry(w.id).or_default();
-                let r = sp.draw(&self.t2, &self.scene, w, &mut self.heap[off..off + len], s[2], s[3], &mut cost);
+                let r = sp.draw(&self.t2, &self.scene, w, &mut self.heap[off..off + len], s[2], s[3], plain, &mut cost);
                 times.raster += t.elapsed();
                 times.tiles += cost.base_tiles + cost.content_tiles;
+                times.grabbed += cost.grabbed;
                 times.sprites += cost.sprites_rastered;
                 times.composite += cost.composite;
                 match r {
@@ -728,6 +730,8 @@ struct Times {
     /// Sprites rastered, and the time compositing them.
     sprites: u32,
     composite: std::time::Duration,
+    /// Sprite tiles taken from the window's own last drawing.
+    grabbed: u32,
     /// Per window packed: id, time, ops.
     per: Vec<(u32, std::time::Duration, u32)>,
 }
@@ -737,14 +741,14 @@ impl Times {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let on = *ON.get_or_init(|| std::env::var_os("FRESCOD_RENDER_TIMES").is_some());
         let z = std::time::Duration::ZERO;
-        Times { on, begun: std::time::Instant::now(), pack: z, sig: z, raster: z, tiles: 0, compose: z, sprites: 0, composite: z, per: Vec::new() }
+        Times { on, begun: std::time::Instant::now(), pack: z, sig: z, raster: z, tiles: 0, compose: z, sprites: 0, composite: z, grabbed: 0, per: Vec::new() }
     }
     fn report(&self) {
         if self.on {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "frescod: render {:.1} ms: pack {:.1}, signatures {:.1}, raster {:.1} ({} tiles, {} sprites, composite {:.1}), compose {:.1}",
-                ms(self.begun.elapsed()), ms(self.pack), ms(self.sig), ms(self.raster), self.tiles, self.sprites, ms(self.composite), ms(self.compose)
+                "frescod: render {:.1} ms: pack {:.1}, signatures {:.1}, raster {:.1} ({} tiles, {} sprites, {} tiles taken, composite {:.1}), compose {:.1}",
+                ms(self.begun.elapsed()), ms(self.pack), ms(self.sig), ms(self.raster), self.tiles, self.sprites, self.grabbed, ms(self.composite), ms(self.compose)
             );
             for (id, d, ops) in &self.per {
                 eprintln!("frescod:   window {id}: packed {ops} ops in {:.1} ms", ms(*d));
@@ -1698,7 +1702,7 @@ mod tests {
             assert!(grouped_frame(s, &mut pw, true), "promoted");
             assert_eq!(pw.sprites.len(), 1);
             let mut cost = crate::sprites::Cost::default();
-            let d = sp.draw(&c.t2, &scene, &pw, &mut out, w, h, &mut cost).unwrap();
+            let d = sp.draw(&c.t2, &scene, &pw, &mut out, w, h, false, &mut cost).unwrap();
             // The same frame, rastered whole (the group isolated).
             let mut iso = s.anim_now[&10];
             iso.flags = group_flags::ISOLATE;
@@ -1726,5 +1730,56 @@ mod tests {
         step(&mut s, 50.0, 1.0, 0);
         step(&mut s, 30.0, 1.0, 0);
         step(&mut s, 0.0, 1.0, 0);
+    }
+
+    /// An outgoing group's sprite takes its pixels from the window's last
+    /// drawing, once sample tiles agree; a drawing that does not hold it
+    /// is not taken from.
+    #[test]
+    fn an_outgoing_sprite_is_taken_from_the_window() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (128u32, 96u32);
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 128.0, 96.0, [0.2, 0.3, 0.4, 1.0], None);
+        let slide = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 16.0, 16.0], clip: Some([16.0, 16.0, 112.0, 80.0]), opacity: 1.0, flags: 0 };
+        s.set_group(10, slide, 1).unwrap();
+        rect(&mut s, 11, 0.0, 0.0, 96.0, 64.0, [1.0, 1.0, 1.0, 1.0], Some(10));
+        rect(&mut s, 12, 10.5, 10.0, 40.0, 20.0, [0.0, 0.0, 1.0, 0.5], Some(10));
+        let c = Compute::new(w, h).expect("kernels");
+        let scene = SceneState::default();
+        let full = |s: &WindowSceneState| {
+            let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            grouped_frame(s, &mut fw, false);
+            let mut px = vec![0u32; (w * h) as usize];
+            c.t2.render(&scene.pack(&fw, w, h), &mut px).unwrap();
+            px
+        };
+        let before = full(&s);
+        // The app sets the end state (gone) and holds it with a track.
+        s.set_group(10, GroupParams { opacity: 0.0, ..slide }, 1).unwrap();
+        for (held, want_taken) in [(before.clone(), true), (vec![0xff00_ff00; (w * h) as usize], false)] {
+            let mut out = held;
+            let mut sp = crate::sprites::Sprites::default();
+            for dx in [0.0f32, 24.0] {
+                s.anim_now.insert(10, GroupParams { transform: [1.0, 0.0, 0.0, 1.0, 16.0 + dx, 16.0], ..slide });
+                let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+                assert!(grouped_frame(&s, &mut pw, true));
+                assert!(pw.sprites[0].opaque && pw.sprites[0].outgoing == (dx == 0.0));
+                let mut cost = crate::sprites::Cost::default();
+                sp.draw(&c.t2, &scene, &pw, &mut out, w, h, dx == 0.0, &mut cost).unwrap();
+                if dx == 0.0 {
+                    assert_eq!(cost.grabbed > 0, want_taken, "taken: {}", cost.grabbed);
+                }
+                assert!(out == full(&s), "dx {dx}, taken {want_taken}: differs from a full raster");
+            }
+        }
     }
 }

@@ -48,9 +48,9 @@ pub struct WindowFrame {
     /// shifts), in paint order.
     pub scrolls: Vec<Scroll>,
     /// Groups an animation moves, fades or clips, drawn as sprites (see
-    /// [`Sprite`]); only from [`window_frame_promoted`]. When there are
-    /// any, they are the end of `order`: the window is `order` up to the
-    /// first, then each sprite over it.
+    /// [`Sprite`]); only from [`window_frame_promoted`]. The window is
+    /// `order` without them, then each sprite over it (nothing else in
+    /// `order` is drawn over a sprite).
     pub sprites: Vec<Sprite>,
 }
 
@@ -73,6 +73,13 @@ pub struct Sprite {
     /// Window pixels `[x0, y0, x1, y1)` it shows in (the group's and its
     /// ancestors' clips).
     pub clip: [i32; 4],
+    /// Its content hides the window wherever it shows (see
+    /// [`crate::sprites`]: its pixels may then be taken from the window).
+    pub opaque: bool,
+    /// Drawn as the group stood before its animation: at its own place
+    /// and clip, wholly opaque, though its own opacity is now 0 (a slide
+    /// held while the next comes in; pergola.md §4.2 sets end states).
+    pub outgoing: bool,
 }
 
 /// A scroll viewport, for the pixel renderer's shift
@@ -655,13 +662,18 @@ impl SceneState {
         h.finish()
     }
 
+    /// What `f` draws apart from its sprites.
+    fn base_items(&self, f: &WindowFrame, order: &[OrderItem]) -> Vec<OrderItem> {
+        order.iter().enumerate().filter(|(i, _)| !f.sprites.iter().any(|s| s.range.contains(i))).map(|(_, o)| *o).collect()
+    }
+
     /// The key of what `f` draws under its sprites.
     pub fn base_key(&self, f: &WindowFrame) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let Some(order) = &f.order else { return self.window_key(f) };
         (f.id != 0, f.size).hash(&mut h);
-        self.items_hash(&mut h, f, &order[..f.sprites.first().map_or(order.len(), |s| s.range.start)]);
+        self.items_hash(&mut h, f, &self.base_items(f, order));
         h.finish()
     }
 
@@ -671,9 +683,9 @@ impl SceneState {
     pub fn pack_part(&self, f: &WindowFrame, sprite: Option<usize>, width: u32, height: u32) -> (fresco_compute::Frame, Vec<(u32, u8)>) {
         use fresco_compute as fc;
         let Some(order) = &f.order else { return self.pack_report(f, width, height) };
-        let range = match sprite {
-            None => 0..f.sprites.first().map_or(order.len(), |s| s.range.start),
-            Some(i) => f.sprites.get(i).map_or(0..0, |s| s.range.clone()),
+        let items = match sprite {
+            None => self.base_items(f, order),
+            Some(i) => f.sprites.get(i).map_or(Vec::new(), |s| order[s.range.clone()].to_vec()),
         };
         let scene = fc::Scene {
             rects: f.rects.iter().map(|n| fc::Rect { position: n.position, size: n.size, color: n.color, radius: n.radius }).collect(),
@@ -681,7 +693,7 @@ impl SceneState {
             fills: f.fills.clone(),
             ..Default::default()
         };
-        let (mut frame, drops) = self.pack_grouped(f, &order[range], scene, width, height);
+        let (mut frame, drops) = self.pack_grouped(f, &items, scene, width, height);
         if sprite.is_some() {
             frame.header.clear = fc::TRANSPARENT;
         }
@@ -936,12 +948,17 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
                 let t = &g.transform;
                 let inner_x = x.then(&[t[0], t[1], t[2], t[3], 0.0, 0.0]);
                 let clip = c.map_or([i32::MIN, i32::MIN, i32::MAX, i32::MAX], |c| c.map(|v| v.round() as i32));
+                let own = state.group_nodes.get(&id);
+                let outgoing = op * g.opacity >= 1.0
+                    && own.is_some_and(|o| o.opacity <= 0.0 && o.transform == g.transform && o.clip == g.clip);
                 stack.push(Walk::SpriteEnd(Sprite {
                     group: id,
                     range: order.len()..order.len(),
                     offset: [(x.s * t[4] as f64).round() as i32, (x.s * t[5] as f64).round() as i32],
                     opacity: op * g.opacity,
                     clip,
+                    opaque: false,
+                    outgoing,
                 }));
                 push_kids(&mut stack, Some(id), At { x: inner_x, op: 1.0, seen: at.seen * g.opacity, clip: None, layers: 0, sprite: true });
                 continue;
@@ -968,39 +985,75 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
         }
     }
     if promote {
-        // The sprites must end the order, back to back, each within the
-        // window's size in its own space.
+        // Each sprite within the window's size in its own space, and
+        // nothing that is not a sprite drawn over one.
         let why = |r: &str| {
             if std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
                 eprintln!("frescod: window {}: no sprites: {r}", w.id);
             }
             false
         };
-        let Some(first) = sprites.first().map(|s| s.range.start) else {
+        if sprites.is_empty() {
             let seen: Vec<String> = state.anim_now.iter().map(|(id, a)| format!("{id}: now {:?} op {} / own {:?}", a.transform, a.opacity, state.group_nodes.get(id).map(|g| (g.transform, g.opacity, g.parent)))).collect();
             return why(&format!("no animated group promoted: {seen:?}"));
-        };
-        let mut at = first;
-        for s in &sprites {
-            if s.range.start != at {
-                return why(&format!("group {} is not right after the last sprite (order {} vs {at})", s.group, s.range.start));
-            }
-            at = s.range.end;
+        }
+        // Window pixels each sprite may cover this frame.
+        let mut covers: Vec<[f32; 4]> = Vec::with_capacity(sprites.len());
+        for s in sprites.iter_mut() {
             // Boxes are conservative (a fill's reaches a pixel past its
             // path, for its antialiasing): a little past the edge is not
             // content lost.
             let (sw, sh) = (w.size.0 as f32 + 2.5, w.size.1 as f32 + 2.5);
+            let mut bbox = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
             for o in &order[s.range.clone()] {
                 if let Some(b) = item_box(w, o.item) {
                     let b = meet(Some(b), o.clip).unwrap();
-                    if b[0] < b[2] && b[1] < b[3] && (b[0] < -2.5 || b[1] < -2.5 || b[2] > sw || b[3] > sh) {
-                        return why(&format!("group {} draws {b:?} outside the window in its own space", s.group));
+                    if b[0] < b[2] && b[1] < b[3] {
+                        if b[0] < -2.5 || b[1] < -2.5 || b[2] > sw || b[3] > sh {
+                            return why(&format!("group {} draws {b:?} outside the window in its own space", s.group));
+                        }
+                        bbox = [bbox[0].min(b[0]), bbox[1].min(b[1]), bbox[2].max(b[2]), bbox[3].max(b[3])];
                     }
                 }
             }
+            let (ox, oy) = (s.offset[0] as f32, s.offset[1] as f32);
+            let c = s.clip.map(|v| v as f32);
+            covers.push([(bbox[0] + ox).max(c[0]), (bbox[1] + oy).max(c[1]), (bbox[2] + ox).min(c[2]), (bbox[3] + oy).min(c[3])]);
+            // Its own pixels hide the window under it wherever it shows:
+            // an opaque, square rect drawn before anything isolated,
+            // covering its clip (in its own space, within the window).
+            let local = [c[0] - ox, c[1] - oy, c[2] - ox, c[3] - oy];
+            let local = [local[0].max(0.0), local[1].max(0.0), local[2].min(w.size.0 as f32), local[3].min(w.size.1 as f32)];
+            s.opaque = order[s.range.clone()]
+                .iter()
+                .take_while(|o| !matches!(o.item, Item::Push(_)))
+                .any(|o| {
+                    let Item::Rect(i) = o.item else { return false };
+                    let Some(r) = w.rects.get(i) else { return false };
+                    let b = meet(Some([r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]]), o.clip).unwrap();
+                    r.color[3] >= 1.0 && r.radius <= 0.0 && b[0] <= local[0] && b[1] <= local[1] && b[2] >= local[2] && b[3] >= local[3]
+                });
         }
-        if at != order.len() {
-            return why(&format!("{} items after the sprites (node {})", order.len() - at, order[at].node));
+        // Whatever is drawn after a sprite and is not a sprite must miss
+        // it: the window under the sprites is drawn first, then they.
+        let in_sprite = |i: usize| sprites.iter().any(|s| s.range.contains(&i));
+        for (k, s) in sprites.iter().enumerate() {
+            let c = covers[k];
+            if c[0] >= c[2] || c[1] >= c[3] {
+                continue;
+            }
+            for (i, o) in order.iter().enumerate().skip(s.range.end) {
+                if in_sprite(i) {
+                    continue;
+                }
+                let Some(b) = item_box(w, o.item) else {
+                    continue;
+                };
+                let b = meet(Some(b), o.clip).unwrap();
+                if b[0] < c[2] && c[0] < b[2] && b[1] < c[3] && c[1] < b[3] {
+                    return why(&format!("node {} is drawn over group {} at {b:?}", o.node, s.group));
+                }
+            }
         }
         // The window under the sprites is rastered by tiles only.
         w.sprites = sprites;
