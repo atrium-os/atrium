@@ -425,7 +425,7 @@ fn u32v(r: &mut Reader, what: &'static str) -> Result<u32, WireError> {
 }
 
 fn bad(what: &'static str) -> WireError {
-    WireError::TooLong { what, len: 0, max: 0 }
+    WireError::Invalid(what)
 }
 
 fn opt<T>(r: &mut Reader, f: impl FnOnce(&mut Reader) -> Result<T, WireError>) -> Result<Option<T>, WireError> {

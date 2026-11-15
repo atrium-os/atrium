@@ -67,7 +67,7 @@ fn deletion_ok(d: &TextDoc, x: &crate::model::Deletion) -> bool {
 
 impl TextDoc {
     /// The runs of `start..end` in paragraph `block`, clipped and absolute.
-    fn runs_in(&self, block: usize, start: u32, end: u32) -> Vec<(u32, AttrId)> {
+    pub fn runs_in(&self, block: usize, start: u32, end: u32) -> Vec<(u32, AttrId)> {
         let p = self.para(block).expect("checked");
         let mut v = Vec::new();
         for (s, e, a) in p.spans() {

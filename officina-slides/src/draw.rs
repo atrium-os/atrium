@@ -358,21 +358,38 @@ pub fn layout_frame(doc: TextDoc, width: i64, fonts: &dyn Fonts) -> FrameLayout 
     FrameLayout { doc, paras, height: y }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>) {
+/// A frame's text laid out as drawn: the layout, and the map from its layout
+/// units onto the slide (insets and vertical anchoring included).
+pub struct FrameGeom {
+    pub layout: FrameLayout,
+    pub xf: Xform,
+    pub resolved: Resolved,
+}
+
+/// The geometry of `shape`'s text frame (owned as `owner`, inside groups
+/// mapped by `base`); `None` if it has no frame.
+pub fn frame_geometry(deck: &Deck, owner: Owner, shape: &Shape, base: &Xform, fonts: &dyn Fonts) -> Option<FrameGeom> {
+    let body = shape.text()?;
+    let r = resolve::resolve(deck, owner, shape);
+    let txf = mul(base, &shape_xform(r.frame, shape.rot, false, false));
+    Some(frame_geom(deck, r, body, &txf, None, fonts))
+}
+
+fn frame_geom(deck: &Deck, r: Resolved, body: &TextBody, txf: &Xform, slide_no: Option<&str>, fonts: &dyn Fonts) -> FrameGeom {
     let scale = match r.autofit {
         Autofit::Shrink { scale, .. } => scale.clamp(1_000, 100_000),
         _ => 100_000,
     };
     let mut doc = styled_doc(&deck.theme, &r.levels, &body.doc, scale);
-    // The slide number field.
-    for i in 0..doc.blocks.len() {
-        if doc.para(i).is_some_and(|p| p.text.contains("‹#›")) {
-            doc.blocks.update(i, |b| {
-                if let Some(p) = b.as_para_mut() {
-                    replace_keep_runs(p, "‹#›", slide_no);
-                }
-            });
+    if let Some(n) = slide_no {
+        for i in 0..doc.blocks.len() {
+            if doc.para(i).is_some_and(|p| p.text.contains("‹#›")) {
+                doc.blocks.update(i, |b| {
+                    if let Some(p) = b.as_para_mut() {
+                        replace_keep_runs(p, "‹#›", n);
+                    }
+                });
+            }
         }
     }
     let [l, t, rt, b] = r.inset;
@@ -385,6 +402,15 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
         Anchor::Middle => (avail - fl.height) / 2,
         Anchor::Bottom => avail - fl.height,
     };
+    let k = crate::EMU_PER_PT as f64 / officina_text::LU as f64;
+    let local = [k, 0.0, 0.0, k, l as f64, t as f64 + dy as f64 * k];
+    FrameGeom { layout: fl, xf: mul(txf, &local), resolved: r }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>) {
+    let g = frame_geom(deck, r.clone(), body, xf, Some(slide_no), fonts);
+    let fl = &g.layout;
     let mut items = Vec::new();
     let mut counters = [0u32; MAX_LEVELS];
     for (i, (pl, top)) in fl.paras.iter().enumerate() {
@@ -417,14 +443,12 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
             }
             _ => None,
         };
-        paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, dy + top, label.as_ref().map(|(s, f)| (s.as_str(), f.clone())));
+        paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, *top, label.as_ref().map(|(s, f)| (s.as_str(), f.clone())));
     }
     if items.is_empty() {
         return;
     }
-    let k = crate::EMU_PER_PT as f64 / officina_text::LU as f64;
-    let local = [k, 0.0, 0.0, k, l as f64, t as f64];
-    out.push(DrawItem::Text { xf: mul(xf, &local), shape: id, items });
+    out.push(DrawItem::Text { xf: g.xf, shape: id, items });
 }
 
 /// Replaces `from` with `to` in a paragraph, keeping the run each piece is in.
@@ -442,4 +466,41 @@ fn replace_keep_runs(p: &mut Para, from: &str, to: &str) {
         }
         p.runs.dedup_by(|x, y| x.0 == y.0);
     }
+}
+
+/// The map from a group's child coordinates onto its parent's.
+pub fn group_xform(deck: &Deck, owner: Owner, g: &Shape) -> Xform {
+    let ShapeKind::Group { child, .. } = &g.kind else { return IDENTITY };
+    let f = resolve::resolve(deck, owner, g).frame;
+    let sx = if child.w > 0 { f.w as f64 / child.w as f64 } else { 1.0 };
+    let sy = if child.h > 0 { f.h as f64 / child.h as f64 } else { 1.0 };
+    mul(&shape_xform(f, g.rot, g.flip_h, g.flip_v), &[sx, 0.0, 0.0, sy, -(child.x as f64) * sx, -(child.y as f64) * sy])
+}
+
+/// The map from the coordinates shape `id` sits in (the slide's, or its
+/// group's) onto the slide.
+pub fn parent_xform(deck: &Deck, owner: Owner, shapes: &[Shape], id: ShapeId) -> Option<Xform> {
+    fn go(deck: &Deck, owner: Owner, shapes: &[Shape], id: ShapeId, base: Xform) -> Option<Xform> {
+        for s in shapes {
+            if s.id == id {
+                return Some(base);
+            }
+            if let ShapeKind::Group { shapes: kids, .. } = &s.kind {
+                if let Some(x) = go(deck, owner, kids, id, mul(&base, &group_xform(deck, owner, s))) {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+    go(deck, owner, shapes, id, IDENTITY)
+}
+
+/// The map from shape `id`'s own box (`0..w`, `0..h`, rotated and flipped)
+/// onto the slide, and its box size.
+pub fn shape_box(deck: &Deck, owner: Owner, shapes: &[Shape], id: ShapeId) -> Option<(Xform, f64, f64)> {
+    let s = find(shapes, id)?;
+    let base = parent_xform(deck, owner, shapes, id)?;
+    let f = resolve::resolve(deck, owner, s).frame;
+    Some((mul(&base, &shape_xform(f, s.rot, s.flip_h, s.flip_v)), f.w as f64, f.h as f64))
 }
