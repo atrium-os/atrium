@@ -1323,14 +1323,14 @@ mod tests {
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         let page = m!(p.clone());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
+        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
         let mut app = pergola::App::new_with_flag(v, dirty.clone());
         let mut s = Model::default();
         let labels = |s: &Model| s.0.values().filter_map(|v| v.0.clone()).filter(|t| t.ends_with(" details")).collect::<Vec<_>>();
         pergola::commit(&mut s, &app.tick()).unwrap();
         assert_eq!(labels(&s), vec!["Show details".to_string()]);
         // The saved networks arrive: the label moves down.
-        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false }])));
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }])));
         page.set(p.clone());
         pergola::commit(&mut s, &app.tick()).unwrap();
         assert_eq!(labels(&s), vec!["Show details".to_string()], "after the list came");

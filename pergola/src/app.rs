@@ -301,7 +301,15 @@ impl<V: View> App<V> {
         }
         // The render pass laid it out (`Ctx::flush_overlays`).
         let deltas = if std::mem::take(&mut self.resend) {
-            diff(&NodeTree::new(), &next)
+            // Every node again, but what the last frame sent and this one
+            // lacks still goes: a resize and a change in one tick (Curia's
+            // saved networks arriving as the WM sized the window) left the
+            // old "Show details" drawn under the new one.
+            let mut d: Vec<_> = diff(&self.prev_tree, &next).into_iter()
+                .filter(|d| matches!(d, NodeDelta::Removed { .. }))
+                .collect();
+            d.extend(diff(&NodeTree::new(), &next));
+            d
         } else {
             diff(&self.prev_tree, &next)
         };
@@ -825,6 +833,38 @@ mod tests {
         assert!(app.focus_visible, "Tab shows it");
         app.handle_event(Event::PointerDown { at: crate::geom::Point::new(10.0, 10.0) });
         assert!(!app.focus_visible, "and the pointer hides it again");
+    }
+
+    /// A node gone in a tick that also resends everything (a resize) is
+    /// still removed: frescod would otherwise keep drawing it.
+    #[test]
+    fn a_resend_still_removes_what_went() {
+        struct Two(Mutable<bool>);
+        impl View for Two {
+            fn render(&self, ctx: &mut crate::view::Ctx) {
+                let y = if self.0.get() { 40.0 } else { 0.0 };
+                if !self.0.get() {
+                    ctx.add(crate::Node::Rect { rect: crate::Rect::new(0.0, 0.0, 5.0, 5.0), fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0 });
+                }
+                ctx.add(crate::Node::Rect { rect: crate::Rect::new(0.0, y, 10.0, 10.0), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 });
+            }
+        }
+        let dirty = Arc::new(AtomicBool::new(true));
+        let moved = Mutable::with_dirty(false, Arc::clone(&dirty));
+        let mut app = App::new_with_flag(Two(moved.clone()), dirty);
+        let first = app.tick();
+        assert_eq!(first.len(), 2);
+        moved.set(true);
+        app.resend_all();
+        let d = app.tick();
+        let added: Vec<NodeId> = d.iter().filter_map(|d| match d { NodeDelta::Added { id, .. } => Some(*id), _ => None }).collect();
+        let removed: Vec<NodeId> = d.iter().filter_map(|d| match d { NodeDelta::Removed { id } => Some(*id), _ => None }).collect();
+        assert_eq!(added.len(), 1, "{d:?}");
+        let before: Vec<NodeId> = first.iter().filter_map(|d| match d { NodeDelta::Added { id, .. } => Some(*id), _ => None }).collect();
+        let gone: Vec<NodeId> = before.into_iter().filter(|id| !added.contains(id)).collect();
+        assert!(!gone.is_empty(), "something went: {first:?} -> {d:?}");
+        assert_eq!(removed, gone, "what went is removed");
+        assert!(matches!(d[0], NodeDelta::Removed { .. }), "removals first");
     }
 
     #[test]
