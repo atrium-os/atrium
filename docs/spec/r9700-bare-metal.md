@@ -1607,3 +1607,10 @@ work (self-test, scrub).
   GCR client (global, not per VMID). The box's billing suspension during
   the run cut only its network. Logs: claude/project-thread-33aauq ef569f1c
   (docs/r9700-runs/fzdiag-0069dc1f/).
+- **2026-11-15 09:24 to 10:48, confirming 1 h run (0069dc1f): PASS, same
+  as 07:01.** si-client-test 95/0 before and after, test 16 PASS both times
+  (+6161 fault IVs, +3 IH overflows each); si-fuzz 0 findings (249066
+  calls); 16 re-inits, cap never hit; 12348 fault IVs, 0 retry; 13 mute
+  readbacks all 0x3aaa807; 2 "still faulting after the mute" (+4114 IVs in
+  3 ms), each followed at once by mode 1 reset. Logs:
+  claude/project-thread-33aauq f54f655c (docs/r9700-runs/fzdiag2-0069dc1f/).
