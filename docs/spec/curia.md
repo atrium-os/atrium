@@ -2,7 +2,7 @@
 
 **Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
 to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
-passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 built 2026-11-15 (§8).
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 and C3 built 2026-11-15 (§8, §9).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -74,7 +74,7 @@ C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; si
 |---|---|---|
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
 | C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
-| C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check |
+| C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check. **Built 2026-11-15** (§9) |
 | C4 | further pages (Appearance, Sound, Displays, Apps' grants) | each with its own gate |
 
 ## 6. Decisions
@@ -141,3 +141,30 @@ All four accepted as recommended, 2026-11-15.
   `service:aura-keys op=0x000a`. `curia-vm.sh core` finds the passphrase 0 times in a core of
   Curia (and 0 in arca-ui's), while the same check finds the page's own "Connected to
   aura-test" text (frames `scratch/curia-{pick,typed,joined}.png`, not committed).
+
+## 9. C3 as built: the Devices page (2026-11-15)
+
+- What dispensatord decided for every device (device-assignment.md §6.10), read-only:
+  `curia/src/devices.rs` (`DevPage`) follows `CLASS_DEVICES` (`SUBSCRIBE`, then `LIST` on
+  each new generation) at `CURIA_DEVICES_SOCK` (default
+  `/atrium/sockets/device-list/device-list.sock`).
+- Groups, in this order: **Not in use** (nobody's: no driver and no rule; what someone
+  opening the page is after), **Atrium drivers** (a rule's jailed driver, running or not),
+  **System services** (a rule's nodes in a service's devfs), then two folded ones:
+  **FreeBSD drivers** and **Firmware entries with no driver** (ACPI children nobody took:
+  a QEMU arm64 machine lists 33 virtio-mmio placeholders, a real one dozens of stubs).
+  A row is the kind in words when the name or USB interface class says it ("Smart card
+  reader", "Camera or phone (MTP/PTP)", "Disk"), the device's name, and who has it. A press
+  opens the kernel's ids, where it sits, and the rule or reason behind its owner. The list
+  scrolls (Pergola `VirtualList`). Without the service, the page says why ("dispensatord is
+  not running", "only the person using this machine may see it").
+- Sidebar: Network and Devices.
+- dispensatord: the list was for root, the session's user and its session components.
+  Now an app of the session's user whose installed manifest holds the restricted
+  `device-list` may read it too (`DevicesHost::allowed`, as `removable-files` works for the
+  file manager). Curia's manifest asks for it.
+- Live check in the cloud arm64 VM, 2026-11-15, with the new dispensatord: Curia as `appui`
+  (registry `org.atrium.curia` of alice, the active session) lists the machine's 68 devices.
+  35 FreeBSD drives and 33 are firmware placeholders, both folded. Unfolding, scrolling and
+  opening `pci0` work (frames `scratch/curia-{devices,scrolled,opened}.png`, not
+  committed). `nobody` is refused (status 2).

@@ -714,11 +714,20 @@ mod run {
     struct DevicesHost {
         session: Arc<Mutex<Session>>,
         registry: String,
+        apps_dir: String,
     }
 
     impl dserver::Host for DevicesHost {
+        /// The session's user and components, and an app of that user whose
+        /// manifest holds the restricted `device-list` (Curia's Devices page,
+        /// curia.md §3a).
         fn allowed(&self, uid: u32) -> bool {
-            session_allowed(&self.session, &self.registry, uid)
+            if session_allowed(&self.session, &self.registry, uid) {
+                return true;
+            }
+            let Session::Active { user, .. } = self.session.lock().unwrap().clone() else { return false };
+            let Ok(reg) = portcullis_peer::AppRegistry::load(&self.registry) else { return false };
+            reg.resolve(uid).is_some_and(|(owner, app)| owner == user && has_cap(&self.apps_dir, app, "device-list"))
         }
     }
 
@@ -1480,7 +1489,11 @@ mod run {
 
         fn start_devices_service(&mut self, sock: &Path) {
             let Some(l) = socket_listener(sock) else { return };
-            let host = DevicesHost { session: self.session_shared.clone(), registry: portcullis_peer::DEFAULT_REGISTRY.into() };
+            let host = DevicesHost {
+                session: self.session_shared.clone(),
+                registry: portcullis_peer::DEFAULT_REGISTRY.into(),
+                apps_dir: std::env::var("DISPENSATOR_APPS_DIR").unwrap_or_else(|_| "/var/lib/atrium/apps".into()),
+            };
             let shared = dserver::Shared::new(Box::new(host));
             let sh = shared.clone();
             std::thread::spawn(move || {

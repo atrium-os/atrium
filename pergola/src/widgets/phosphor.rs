@@ -59,3 +59,5 @@ pub const SLIDERS: char = '\u{e432}';
 pub const GAME_CONTROLLER: char = '\u{e26e}';
 pub const USB: char = '\u{e956}';
 pub const EJECT: char = '\u{e212}';
+pub const CARET_DOWN: char = '\u{e136}';
+pub const CARET_RIGHT: char = '\u{e13a}';

@@ -856,7 +856,7 @@ generation number (list again). The socket is
 that user's session components may ask (as for `media`), checked on every
 request and change. A jailed app reaches it only with the new restricted
 capability `device-list`, meant for Curia's Devices page: hardware ids
-identify the machine, so no op sends the list anywhere. Until Curia exists,
+identify the machine, so no op sends the list anywhere. Since 2026-11-15 dispensatord also answers an app of the session's user whose installed manifest holds `device-list`: Curia's Devices page ([curia.md](curia.md) §9). Before Curia,
 `atrium-dispensatord --devices` prints it (and `--plan … --devices` prints
 the planner's list for recorded events).
 

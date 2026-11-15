@@ -5,7 +5,7 @@ id          = "org.atrium.curia"
 name        = "Settings"
 version     = "0.1.0"
 entry       = "bin/curia"
-description = "Settings: network and Wi-Fi first."
+description = "Settings: network and Wi-Fi, devices."
 icon        = "settings"
 
 [capabilities]
@@ -15,6 +15,7 @@ network-details   = true   # interfaces, addresses, routes
 network-wifi      = true   # join, forget, saved networks' settings
 wifi-nearby       = true   # the networks around (tells where you are)
 network-configure = true   # the Wi-Fi country (restricted: Curia only)
+device-list       = true   # every device and its owner (restricted: Curia only)
 network           = "none"
 
 [supervision]

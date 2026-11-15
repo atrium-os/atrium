@@ -3,14 +3,16 @@
 //! with the system text size.
 
 use pergola::geom::Rect;
+use pergola::layout::FlexStyle;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{phosphor as ph, CredentialField, Glyph};
+use pergola::widgets::{phosphor as ph, CredentialField, Glyph, ScrollState, VirtualList};
 use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use atrium_netconf::{Link, Online};
 
+use crate::devices::{self, DevPage, Group, Row};
 use crate::network::{headline, name, security_label, NetPage, MAC_POLICIES};
 
 fn em(pt: f32) -> f32 {
@@ -21,8 +23,19 @@ pub fn side_w() -> f32 {
     em(200.0)
 }
 
+/// The sidebar's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Which {
+    #[default]
+    Network,
+    Devices,
+}
+
 pub struct CuriaView {
+    pub which: Mutable<Which>,
     pub page: Mutable<NetPage>,
+    pub devs: Mutable<DevPage>,
+    pub dev_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -117,14 +130,23 @@ impl View for CuriaView {
         let t = ctx.theme;
         ctx.min_size(pergola::geom::Size::new(side_w() + em(560.0), em(420.0)));
         rect(ctx, 0.0, 0.0, w, h, t.bg_canvas(), 0.0);
-        // The sidebar: one page so far.
+        // The sidebar.
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
-        let sel = Rect::new(em(10.0), em(56.0), side_w() - em(20.0), em(34.0));
-        rect(ctx, sel.origin.x, sel.origin.y, sel.size.w, sel.size.h, t.state_hover(), 6.0);
-        icon(ctx, em(20.0), em(63.0), ph::WIFI_HIGH, em(18.0), t.accent_fg());
-        text(ctx, em(48.0), em(73.0), "Network", type_size::SM, Weight::Medium, t.text_primary());
-        self.network(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h);
+        let now = self.which.get();
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Devices, ph::USB, "Devices")].into_iter().enumerate() {
+            let y = em(56.0) + i as f32 * em(38.0);
+            let on = now == which;
+            let sel = self.which.clone();
+            area(ctx, Rect::new(em(10.0), y, side_w() - em(20.0), em(34.0)), 6.0, if on { t.state_hover() } else { Color::TRANSPARENT }, t.state_hover(), move || sel.set(which));
+            icon(ctx, em(20.0), y + em(7.0), glyph, em(18.0), if on { t.accent_fg() } else { t.text_secondary() });
+            text(ctx, em(48.0), y + em(17.0), label, type_size::SM, Weight::Medium, t.text_primary());
+            ctx.pop();
+        }
+        match now {
+            Which::Network => self.network(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+        }
     }
 }
 
@@ -302,6 +324,86 @@ impl CuriaView {
     }
 }
 
+impl CuriaView {
+    /// The Devices page (curia.md §3a): what dispensatord decided for each
+    /// device. Read-only.
+    fn devices(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
+        let d = self.devs.get_cloned();
+        let t = ctx.theme;
+        let mut y = em(20.0);
+        text(ctx, x0, y + em(16.0), "Devices", type_size::XL, Weight::Semibold, t.text_primary());
+        y += em(40.0);
+        text(ctx, x0, y + em(10.0), &d.summary(), type_size::SM, Weight::Regular, t.text_secondary());
+        y += em(32.0);
+        let rows = d.rows();
+        if rows.is_empty() {
+            return;
+        }
+        let rh = em(36.0);
+        let devs = self.devs.clone();
+        let list = d.devices().to_vec();
+        VirtualList::new(self.dev_scroll.clone(), Rect::new(x0, y, pw, (h - y - em(16.0)).max(rh)), rows.len(), rh, move |i, ctx| {
+            let t = ctx.theme;
+            let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, rh), 0.0));
+            ctx.set_flex(row, FlexStyle { free: true, ..FlexStyle::default() });
+            match &rows[i] {
+                Row::Header { group, count } => {
+                    text(ctx, 0.0, rh * 0.6, &format!("{} · {count}", group.title()), type_size::SM, Weight::Semibold, t.text_secondary());
+                }
+                Row::Device(k) => {
+                    let dev = &list[*k];
+                    let (dv, k2) = (devs.clone(), *k);
+                    let open = d.is_open(dev);
+                    area(ctx, Rect::new(0.0, 1.0, pw, rh - 2.0), 6.0, if open { t.state_hover() } else { Color::TRANSPARENT }, t.state_hover(), move || with_devs(&dv, |p| p.toggle(k2)));
+                    let warn = Group::of(dev) == Group::Nobody;
+                    icon(ctx, em(12.0), (rh - em(16.0)) / 2.0, if open { ph::CARET_DOWN } else { ph::CARET_RIGHT }, em(14.0), t.text_tertiary());
+                    let mut x = em(34.0);
+                    if let Some(k) = devices::kind(dev) {
+                        text(ctx, x, rh / 2.0, k, type_size::SM, Weight::Medium, t.text_primary());
+                        x += width(k, type_size::SM, Weight::Medium) + em(8.0);
+                    }
+                    text(ctx, x, rh / 2.0, &dev.name, type_size::SM, Weight::Regular, t.text_secondary());
+                    let right = devices::owner_line(&dev.owner);
+                    let rw = width(&right, type_size::SM, Weight::Regular);
+                    text(ctx, pw - rw - em(12.0), rh / 2.0, &right, type_size::SM, Weight::Regular, if warn { t.warning_fg() } else { t.text_secondary() });
+                    ctx.pop();
+                }
+                Row::Detail(s) => {
+                    text(ctx, em(34.0), rh / 2.0, s, type_size::XS, Weight::Regular, t.text_tertiary());
+                }
+                Row::Toggle { group, count, shown } => {
+                    let label = match (group, *shown, *count) {
+                        (Group::Kernel, true, _) => "Hide FreeBSD's devices".to_string(),
+                        (Group::Kernel, false, 1) => "Show the device FreeBSD drives".to_string(),
+                        (Group::Kernel, false, n) => format!("Show the {n} devices FreeBSD drives"),
+                        (_, true, _) => "Hide them".to_string(),
+                        (_, false, 1) => "Show it".to_string(),
+                        (_, false, n) => format!("Show all {n}"),
+                    };
+                    let (dv, g) = (devs.clone(), *group);
+                    let w = width(&label, type_size::SM, Weight::Medium) + em(24.0);
+                    area(ctx, Rect::new(0.0, 3.0, w, rh - 6.0), 6.0, Color::TRANSPARENT, t.state_hover(), move || with_devs(&dv, |p| p.toggle_group(g)));
+                    text(ctx, em(12.0), rh / 2.0, &label, type_size::SM, Weight::Medium, t.accent_fg());
+                    ctx.pop();
+                }
+                Row::Message(m) => {
+                    text(ctx, em(12.0), rh / 2.0, m, type_size::SM, Weight::Regular, t.text_tertiary());
+                }
+            }
+            ctx.pop();
+        })
+        .key(91)
+        .backdrop(t.bg_canvas())
+        .emit(ctx);
+    }
+}
+
+pub fn with_devs(page: &Mutable<DevPage>, f: impl FnOnce(&mut DevPage)) {
+    let mut p = page.get_cloned();
+    f(&mut p);
+    page.set(p);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +421,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { page: Mutable::new(p.clone()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -334,5 +436,22 @@ mod tests {
         let (tree, _) = pergola::view::render(&v, Semantic::LIGHT);
         assert!(!tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Passphrase")));
         assert!(all.iter().any(|s| s == "Cancel"));
+    }
+
+    #[test]
+    fn the_devices_page_shows_nobodys_first() {
+        use atrium_devices::{Device, Owner};
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
+        let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
+        with_devs(&v.devs, |p| p.apply(Ok(vec![
+            d("uhub0", "", Owner::Kernel { driver: "uhub".into(), note: None }),
+            d("ugen0.3:0", "intclass=0x06", Owner::Nobody { why: "no driver and no rule".into() }),
+        ])));
+        let all = texts(&v);
+        for want in ["Devices", "Network", "2 devices, 1 not in use", "Not in use · 1", "Camera or phone (MTP/PTP)", "ugen0.3:0", "no driver and no rule", "FreeBSD drivers · 1", "Show the device FreeBSD drives"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
     }
 }

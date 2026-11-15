@@ -32,6 +32,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-devices"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "atrium-netconf"
 version = "0.1.0"
 dependencies = [
@@ -163,6 +172,7 @@ dependencies = [
 name = "curia"
 version = "0.1.0"
 dependencies = [
+ "atrium-devices",
  "atrium-netconf",
  "fresco-client",
  "fresco-protocol",

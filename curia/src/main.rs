@@ -2,6 +2,8 @@
 //! Network page's calls to atrium-netconf on threads of their own.
 //!
 //! Environment: `CURIA_NET_DIR` (atrium-netconf's sockets, /atrium/sockets),
+//! `CURIA_DEVICES_SOCK` (dispensatord's device list,
+//! /atrium/sockets/device-list/device-list.sock),
 //! `CURIA_SIZE` (960x720), `CURIA_SECS` (quit after, for checks).
 
 use std::path::PathBuf;
@@ -41,6 +43,34 @@ fn follow(tx: Sender<Got>) {
             return;
         }
         std::thread::sleep(Duration::from_secs(3));
+    });
+}
+
+/// The device list now and on every change (device-assignment.md §6.10).
+fn follow_devices(tx: Sender<Result<Vec<atrium_devices::Device>, String>>) {
+    let sock = std::env::var_os("CURIA_DEVICES_SOCK").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/atrium/sockets/device-list/device-list.sock"));
+    std::thread::spawn(move || loop {
+        let why = match atrium_devices::client::Changes::open(&sock) {
+            Ok(mut ch) => loop {
+                if let Err(e) = ch.next() {
+                    break e;
+                }
+                let r = atrium_devices::client::list(&sock).map_err(|e| e.to_string());
+                if tx.send(r).is_err() {
+                    return;
+                }
+            },
+            Err(e) => e,
+        };
+        let msg = match why.kind() {
+            std::io::ErrorKind::PermissionDenied => "only the person using this machine may see it".to_string(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => "dispensatord is not running".to_string(),
+            _ => why.to_string(),
+        };
+        if tx.send(Err(msg)).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(5));
     });
 }
 
@@ -94,7 +124,12 @@ fn main() {
     let cred_state = Mutable::with_dirty(CredentialState::default(), dirty.clone());
     let cred = CredentialField::wifi_passphrase(cred_state.clone());
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
-    let view = CuriaView { page: page.clone(), cred: cred.clone(), size: size.clone() };
+    let devs = Mutable::with_dirty(curia::devices::DevPage::default(), dirty.clone());
+    let which = Mutable::with_dirty(curia::view::Which::default(), dirty.clone());
+    let dev_scroll = Mutable::with_dirty(Default::default(), dirty.clone());
+    let view = CuriaView { which, page: page.clone(), devs: devs.clone(), dev_scroll, cred: cred.clone(), size: size.clone() };
+    let (dtx, drx) = channel();
+    follow_devices(dtx);
     // Arca's passphrase field comes through limend (curia.md §4). Without
     // it the row shows a field that can't be typed into: Curia never takes
     // a passphrase itself.
@@ -127,6 +162,9 @@ fn main() {
         }
         if size.get() != (win.width, win.height) {
             size.set((win.width, win.height));
+        }
+        while let Ok(r) = drx.try_recv() {
+            curia::view::with_devs(&devs, |d| d.apply(r));
         }
         let mut changed = false;
         let mut p = page.get_cloned();
