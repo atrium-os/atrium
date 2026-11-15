@@ -64,6 +64,10 @@ struct Builder<'a> {
     /// Blocks of a loop's continue construct: reached from every
     /// `continue` path, so they are duplicated per path.
     dup_ok: HashSet<B>,
+    /// Immediate post-dominators per region (keyed by loop header; `None`
+    /// for the whole function), computed on first use: `succ` and `loops`
+    /// are fixed once the CFG is analysed.
+    ipdoms: std::cell::RefCell<HashMap<Option<B>, std::rc::Rc<HashMap<B, Option<B>>>>>,
 }
 
 fn terminator(b: &spv::Block) -> Option<&spv::Op> {
@@ -206,6 +210,22 @@ impl<'a> Builder<'a> {
     /// function), treating the loop's back and exit edges and returns as
     /// edges to a virtual sink. `None` means the sink.
     fn merge_of(&self, b: B, lp: Option<&LoopInfo>) -> Option<B> {
+        let key = lp.map(|l| l.header);
+        let cached = self.ipdoms.borrow().get(&key).cloned();
+        let map = match cached {
+            Some(m) => m,
+            None => {
+                let m = std::rc::Rc::new(self.ipdoms_of(lp));
+                self.ipdoms.borrow_mut().insert(key, m.clone());
+                m
+            }
+        };
+        map[&b]
+    }
+
+    /// Immediate post-dominator of every block of the region (see
+    /// [`Self::merge_of`]).
+    fn ipdoms_of(&self, lp: Option<&LoopInfo>) -> HashMap<B, Option<B>> {
         let nodes: Vec<B> = match lp {
             Some(l) => l.body.iter().copied().collect(),
             None => self.succ.keys().copied().collect(),
@@ -242,11 +262,13 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        let me = idx[&b];
-        let count = |i: usize| pdom[i].iter().filter(|x| **x).count();
-        let mine = count(me);
-        let ipdom = (0..=n).find(|&d| d != me && pdom[me][d] && count(d) == mine - 1)?;
-        if ipdom == sink { None } else { Some(nodes[ipdom]) }
+        let counts: Vec<usize> = pdom.iter().map(|p| p.iter().filter(|x| **x).count()).collect();
+        (0..n)
+            .map(|me| {
+                let ipdom = (0..=n).find(|&d| d != me && pdom[me][d] && counts[d] == counts[me] - 1);
+                (nodes[me], ipdom.filter(|&d| d != sink).map(|d| nodes[d]))
+            })
+            .collect()
     }
 
     // ── Values ──────────────────────────────────────────────────
@@ -900,6 +922,7 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
             body: vec![],
         },
         succ: HashMap::new(),
+        ipdoms: Default::default(),
         loops: BTreeMap::new(),
         vals: HashMap::new(),
         prelude: vec![],
