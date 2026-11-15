@@ -273,7 +273,7 @@ Stays as a test and debug tool. The gates switch to `atrium-net` once N1 lands.
 
 ## 8. Not in v1
 
-VPN tunnels (WireGuard first, later), DHCPv6, captive portal sign-in (v1 only detects
+VPN tunnels (designed in [vpn.md](vpn.md): atrium-net applies checked tunnel proposals and owns the `atrium/vpn` pf anchor), DHCPv6, captive portal sign-in (v1 only detects
 it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 
 ## 9. Decisions
