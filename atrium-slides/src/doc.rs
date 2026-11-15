@@ -14,7 +14,7 @@ use std::sync::Arc;
 use officina_core::history::{History, Op};
 use officina_core::journal::{self, JournalWriter};
 use officina_core::wire::{Reader, WireError, Writer};
-use officina_slides::model::{Deck, SlideId};
+use officina_slides::model::{Deck, MediaId, SlideId};
 use officina_slides::native;
 use officina_slides::ops::DeckOp;
 
@@ -52,7 +52,12 @@ enum Record {
     Undo,
     Redo,
     Saved,
+    /// A picture or video added to the deck's media, under its id.
+    Media { id: u32, mime: String, bytes: Vec<u8> },
 }
+
+/// The largest media item a journal record holds.
+pub const MAX_MEDIA: usize = 60 << 20;
 
 impl Record {
     fn encode(&self) -> Vec<u8> {
@@ -76,6 +81,12 @@ impl Record {
             Record::Undo => w.u8(2),
             Record::Redo => w.u8(3),
             Record::Saved => w.u8(4),
+            Record::Media { id, mime, bytes } => {
+                w.u8(6);
+                w.var(*id as u64);
+                w.str(mime);
+                w.bytes(bytes);
+            }
         }
         w.into_bytes()
     }
@@ -99,6 +110,11 @@ impl Record {
             2 => Record::Undo,
             3 => Record::Redo,
             4 => Record::Saved,
+            6 => {
+                let id = u32::try_from(r.var()?).map_err(|_| WireError::Invalid("media id"))?;
+                let mime = r.str("mime", 256)?.to_string();
+                Record::Media { id, mime, bytes: r.bytes("media", MAX_MEDIA as u64)?.to_vec() }
+            }
             _ => return Err(WireError::Invalid("record")),
         };
         if !r.is_empty() {
@@ -338,6 +354,10 @@ impl Doc {
                 true
             }
             Record::Saved => true,
+            Record::Media { id, mime, bytes } => {
+                self.deck.put_media(id, &mime, &bytes);
+                true
+            }
         }
     }
 
@@ -352,6 +372,20 @@ impl Doc {
             }
         }
         true
+    }
+
+    /// Adds media to the deck (journaled, so a crash keeps it) and returns its
+    /// id; the same bytes again give the same id.
+    pub fn add_media(&mut self, mime: &str, bytes: &[u8]) -> Result<MediaId, String> {
+        if bytes.len() > MAX_MEDIA {
+            return Err(format!("It is over {} MB, more than a slide takes.", MAX_MEDIA >> 20));
+        }
+        let before = self.deck.media_count();
+        let id = self.deck.add_media(mime, bytes);
+        if self.deck.media_count() != before {
+            self.journal(&Record::Media { id, mime: mime.into(), bytes: bytes.to_vec() });
+        }
+        Ok(id)
     }
 
     /// Runs `ops` as one undo step: applied and journaled.
@@ -481,6 +515,11 @@ mod tests {
         let id2 = doc.deck.new_id();
         doc.run("Rectangle", vec![DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: 9, shape: Box::new(Shape::rect(id2, Rect::new(0, 0, 10, 10), Fill::Solid(Color::rgb(0xff0000)))) }]);
         doc.undo();
+        // A picture: its bytes are journaled before the shape that shows it.
+        let media = doc.add_media("image/png", b"not really a png, but bytes").unwrap();
+        assert_eq!(doc.add_media("image/png", b"not really a png, but bytes").unwrap(), media);
+        let pid = doc.deck.new_id();
+        doc.run("Insert Picture", vec![DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: 0, shape: Box::new(Shape::new(pid, Rect::new(0, 0, 10, 10), ShapeKind::Picture { media, crop: [0; 4], line: None })) }]);
         doc.autosave().unwrap().sync().unwrap();
         let want = content(&mut doc.deck);
         drop(doc); // a crash: the folder stays
@@ -488,10 +527,13 @@ mod tests {
         assert_eq!(rec.torn_bytes, 0);
         assert!(back.dirty);
         assert!(content(&mut back.deck) == want);
-        assert_eq!(back.deck.slide(1).unwrap().shapes[0].text().unwrap().text(), "Hi!");
-        // The undo steps came back too: redo the rectangle, undo the typing as one.
+        assert_eq!(&back.deck.media_bytes(media).unwrap()[..], &b"not really a png, but bytes"[..]);
+        assert_eq!(back.deck.slide(1).unwrap().shapes[1].text().unwrap().text(), "Hi!");
+        // The undo steps came back too: undo and redo the picture, then undo
+        // it and the typing (one step).
+        assert!(back.undo());
         assert!(back.redo());
-        assert_eq!(back.deck.slide(1).unwrap().shapes.len(), want[1].shapes.len() + 1);
+        assert_eq!(back.deck.slide(1).unwrap().shapes.len(), want[1].shapes.len());
         back.undo();
         back.undo();
         assert_eq!(back.deck.slide(1).unwrap().shapes[0].text().unwrap().text(), "");

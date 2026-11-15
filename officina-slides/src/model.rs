@@ -906,6 +906,18 @@ impl Deck {
         id
     }
 
+    /// Puts media under a known id (a journal replaying an insert).
+    pub fn put_media(&mut self, id: MediaId, mime: &str, bytes: &[u8]) {
+        self.see_id(id);
+        let hash = content_hash(bytes);
+        self.media.insert(id, MediaItem { mime: mime.into(), hash, len: bytes.len() as u64, bytes: MediaBytes::Loaded(bytes.into()) });
+        self.by_hash.entry(hash).or_insert(id);
+    }
+
+    pub fn media_count(&self) -> usize {
+        self.media.len()
+    }
+
     pub fn media(&self, id: MediaId) -> Option<&MediaItem> {
         self.media.get(&id)
     }

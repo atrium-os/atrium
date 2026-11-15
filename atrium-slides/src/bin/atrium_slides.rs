@@ -1,1 +1,389 @@
-fn main() {}
+//! atrium-slides: the presentation app (docs/spec/officina.md §9, O6).
+//!
+//!   atrium-slides          a new deck (or the one a crash left, restored)
+//!   atrium-slides FILE     open FILE by path (development; apps get files
+//!                          from the picker)
+//!
+//! Files come from the system picker (scrinium.md §4.1): Open asks for one
+//! file, read-write; Save writes back to it; Save As asks for a folder and
+//! writes `NAME.oslides` there (temp file, then a link that never replaces);
+//! Picture asks for one picture, read-only. Every change is journaled to a
+//! private autosave folder (`$XDG_STATE_HOME` or `~/.local/state`,
+//! `atrium-slides/autosave/`); a deck that did not close cleanly is restored
+//! at the next start.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use atrium_slides::app::{Cmd, Slides, Ui, PICKER_SLOT};
+use atrium_slides::doc::{self, Doc};
+use atrium_slides::files::{format_of, load, picture_mime, stem_of, Format};
+use limen::picker::{Filter, Kind, ToChild, ToParent};
+use limen::proto::ParentEvent;
+use pergola::embed::Embeds;
+use pergola::window::StepResult;
+use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
+
+/// The largest file Open reads.
+const MAX_FILE: u64 = 4 << 30;
+/// The largest picture Picture reads.
+const MAX_PICTURE: u64 = doc::MAX_MEDIA as u64;
+/// How often the journal is made durable.
+const SYNC_EVERY: Duration = Duration::from_secs(2);
+
+/// Where the user's file is, for Save.
+enum Target {
+    Picked(File),
+    Path(PathBuf),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    Open,
+    SaveAs,
+    Picture,
+}
+
+fn state_root() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("atrium-slides/autosave")
+}
+
+fn new_autosave_dir(root: &Path) -> PathBuf {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    root.join(format!("{}-{n}", std::process::id()))
+}
+
+fn read_all(f: &mut File, max: u64) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    f.seek(SeekFrom::Start(0))?;
+    f.take(max + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the file is over {} MB", max >> 20)));
+    }
+    Ok(data)
+}
+
+/// Writes the deck over a picked file. The autosave folder still holds it
+/// until this returns, so a crash halfway loses nothing.
+fn write_over(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Writes `bytes` to `dir` as `stem.oslides` through a temp file and a hard
+/// link; never replaces a file already there (`stem 2.oslides` and so on).
+fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let stem: String = stem.chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
+    let stem = stem.trim_start_matches('.');
+    let stem = if stem.is_empty() { "Presentation" } else { stem };
+    let tmp = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
+    {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    for n in 1..1000 {
+        let name = if n == 1 { format!("{stem}.oslides") } else { format!("{stem} {n}.oslides") };
+        let path = dir.join(&name);
+        match fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp);
+                return Ok(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "every name is taken"))
+}
+
+struct Run {
+    slides: Slides,
+    target: Option<Target>,
+    root: PathBuf,
+}
+
+impl Run {
+    fn set_status(&self, s: impl Into<String>) {
+        self.slides.doc.borrow_mut().status = s.into();
+        self.slides.changed();
+    }
+
+    /// Puts `d` on screen with its own autosave folder. The deck it replaces
+    /// closes cleanly if saved; unsaved changes stay in its folder and come
+    /// back at the next start.
+    fn show(&mut self, mut d: Doc, target: Option<Target>) {
+        if d.autosave().is_none() {
+            if let Err(e) = d.autosave_to(&new_autosave_dir(&self.root)) {
+                d.status = format!("{} Autosave is off: {e}.", d.status);
+            }
+        }
+        let mut old = self.slides.replace(d);
+        self.target = target;
+        if old.dirty {
+            let name = old.name.clone();
+            if let Some(a) = old.autosave() {
+                let _ = a.sync();
+            }
+            drop(old);
+            let s = self.slides.doc.borrow().status.clone();
+            self.set_status(format!("{s} Unsaved changes to “{name}” are kept and come back next time Slides starts.").trim().to_string());
+        } else {
+            let _ = old.close();
+        }
+    }
+
+    /// Saves to the file the deck came from; false when there is none.
+    fn save(&mut self) -> bool {
+        let Some(t) = self.target.as_mut() else { return false };
+        let r = {
+            let d = self.slides.doc.borrow();
+            d.write_native(Vec::new()).and_then(|bytes| match t {
+                Target::Picked(file) => write_over(file, &bytes),
+                Target::Path(path) => {
+                    let mut f = OpenOptions::new().write(true).open(&*path)?;
+                    write_over(&mut f, &bytes)
+                }
+            })
+        };
+        let mut d = self.slides.doc.borrow_mut();
+        match r.and_then(|_| d.saved()) {
+            Ok(()) => d.status = format!("Saved “{}”.", d.name),
+            Err(e) => d.status = format!("Couldn't save “{}”: {e}. Your changes are still here and in the autosave.", d.name),
+        }
+        drop(d);
+        self.slides.changed();
+        true
+    }
+
+    fn save_into(&mut self, dir: &Path) {
+        let (stem, bytes) = {
+            let d = self.slides.doc.borrow();
+            (stem_of(&d.name).to_string(), d.write_native(Vec::new()))
+        };
+        match bytes.and_then(|b| write_new(dir, &stem, &b)) {
+            Ok(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                {
+                    let mut d = self.slides.doc.borrow_mut();
+                    d.name = name.clone();
+                    let _ = d.saved();
+                    d.status = format!("Saved as “{name}”.");
+                }
+                self.target = Some(Target::Path(path));
+                self.slides.changed();
+            }
+            Err(e) => self.set_status(format!("Couldn't save there: {e}.")),
+        }
+    }
+
+    /// A picked deck arrived.
+    fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
+        let mut f = File::from(fd);
+        match read_all(&mut f, MAX_FILE).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, data)) {
+            Ok(mut d) => {
+                let native = format_of(&name) == Format::Native;
+                if !write {
+                    d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status).trim().to_string();
+                }
+                // Save writes .oslides; over a file of another kind it asks where.
+                self.show(d, (write && native).then_some(Target::Picked(f)));
+            }
+            Err(e) => self.set_status(e),
+        }
+    }
+
+    /// A picked picture arrived.
+    fn picture(&mut self, name: String, fd: std::os::fd::OwnedFd) {
+        let mut f = File::from(fd);
+        let r = read_all(&mut f, MAX_PICTURE).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| {
+            let mime = picture_mime(&data).ok_or_else(|| format!("“{name}” isn't a picture Slides can show."))?;
+            self.slides.insert_picture(mime, &data)
+        });
+        if let Err(e) = r {
+            self.set_status(e);
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let root = state_root();
+    let _ = fs::create_dir_all(&root);
+    let mut first: Option<(Doc, Option<Target>)> = None;
+    if let Some((dir, name)) = doc::pending(&root).pop() {
+        match doc::recover(&dir) {
+            Ok((mut d, rec)) => {
+                d.status = format!("Restored “{name}” as it was before Slides last stopped ({} changes since its last save).", rec.actions);
+                first = Some((d, None));
+            }
+            Err(e) => eprintln!("atrium-slides: couldn't restore {}: {e}", dir.display()),
+        }
+    }
+    if first.is_none() {
+        if let Some(path) = args.get(1) {
+            let p = PathBuf::from(path);
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+            match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, data)) {
+                Ok(d) => {
+                    let native = format_of(&name) == Format::Native;
+                    first = Some((d, native.then_some(Target::Path(p))));
+                }
+                Err(e) => eprintln!("atrium-slides: {e}"),
+            }
+        }
+    }
+    let (doc, target) = first.unwrap_or_else(|| (Doc::new("Presentation"), None));
+
+    let mut win = match Window::open(&WindowDesc::new("Slides", SizeSpec::Fixed(1200, 760))) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("atrium-slides: frescod: {e}");
+            std::process::exit(1);
+        }
+    };
+    let embeds = match Embeds::connect() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("atrium-slides: no limend ({e:?}); the picker is not available");
+            None
+        }
+    };
+    if let Some(e) = &embeds {
+        win.set_slot_binder(Embeds::binder(e));
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let slides = Slides::new(Doc::from_deck(officina_slides::model::Deck::new(), ""), Mutable::with_dirty(Ui::default(), dirty.clone()), Mutable::with_dirty(0u64, dirty.clone()), (win.width, win.height));
+    slides.scale.set(win.scale() as f64);
+    let mut run = Run { slides, target: None, root: root.clone() };
+    run.show(doc, target);
+    let size = run.slides.size.clone();
+    let mut app = App::new_with_flag(run.slides.clone(), dirty);
+    let _ = win.paint(&mut app);
+
+    let mut asking: Option<Asking> = None;
+    let mut embed = None;
+    let mut want_picker: Option<Asking> = None;
+    let mut last_sync = Instant::now();
+    loop {
+        match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() { 20 } else { 250 }))) {
+            Ok(StepResult::Closed) | Err(_) => break,
+            _ => {}
+        }
+        if size.get() != (win.width, win.height) || run.slides.scale.get() != win.scale() as f64 {
+            size.set((win.width, win.height));
+            run.slides.scale.set(win.scale() as f64);
+            app.invalidate();
+        }
+        for c in run.slides.take_cmds() {
+            match c {
+                Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
+                Cmd::Picture => want_picker = Some(Asking::Picture),
+                Cmd::Save => {
+                    if !run.save() {
+                        want_picker = Some(Asking::SaveAs);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(what), None) = (want_picker.take(), asking) {
+            match (&embeds, win.embed_token()) {
+                (Some(e), Some(token)) => {
+                    let name = run.slides.doc.borrow().name.clone();
+                    let filter = match what {
+                        Asking::Open => Filter { kind: Kind::File, extensions: ["oslides", "pptx", "odp"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a presentation".into() },
+                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
+                        Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
+                    };
+                    let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
+                    match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
+                        Ok(id) => {
+                            embed = Some(id);
+                            asking = Some(what);
+                            run.slides.ui.set(Ui { asking: true });
+                        }
+                        Err(err) => run.set_status(format!("The picker didn't open: {err:?}")),
+                    }
+                }
+                _ => run.set_status("The system picker isn't available here."),
+            }
+        }
+        if let Some(e) = &embeds {
+            let ev = e.borrow_mut().poll(Duration::from_millis(0));
+            let mut finish = false;
+            match ev {
+                Ok(Some(ParentEvent::MessageFd { bytes, .. })) => {
+                    let fd = e.borrow_mut().take_fd();
+                    match (ToParent::decode(&bytes), fd) {
+                        (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
+                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Picture) => run.picture(name, fd),
+                        _ => eprintln!("atrium-slides: an odd message with a descriptor from the picker"),
+                    }
+                }
+                Ok(Some(ParentEvent::Message { bytes, .. })) => match ToParent::decode(&bytes) {
+                    Some(ToParent::Folder { at, read_only, name }) if asking == Some(Asking::SaveAs) => {
+                        if read_only {
+                            run.set_status(format!("“{name}” is read-only; choose another folder."));
+                        } else {
+                            run.save_into(Path::new(&at));
+                        }
+                    }
+                    Some(ToParent::Done { .. }) | Some(ToParent::Cancelled) => finish = true,
+                    Some(ToParent::Failed { why }) => {
+                        run.set_status(format!("The picker couldn't hand that over: {why}"));
+                        finish = true;
+                    }
+                    _ => {}
+                },
+                Ok(Some(ParentEvent::ChildLost { .. })) => finish = true,
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("atrium-slides: limend: {err:?}");
+                    finish = asking.is_some();
+                }
+            }
+            if finish {
+                if let Some(id) = embed.take() {
+                    let _ = e.borrow_mut().detach_embed(id);
+                }
+                asking = None;
+                run.slides.ui.set(Ui { asking: false });
+            }
+        }
+        if last_sync.elapsed() >= SYNC_EVERY {
+            last_sync = Instant::now();
+            let mut d = run.slides.doc.borrow_mut();
+            if let Some(a) = d.autosave() {
+                if let Err(e) = a.sync() {
+                    d.status = format!("Autosave failed: {e}");
+                }
+            }
+        }
+    }
+    // Closing: a saved deck leaves nothing behind; unsaved changes stay in the
+    // autosave folder and come back at the next start.
+    let mut d = std::mem::replace(&mut *run.slides.doc.borrow_mut(), Doc::from_deck(officina_slides::model::Deck::new(), ""));
+    if d.dirty {
+        if let Some(a) = d.autosave() {
+            let _ = a.sync();
+        }
+    } else {
+        let _ = d.close();
+    }
+}
