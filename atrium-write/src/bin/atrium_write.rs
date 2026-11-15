@@ -152,7 +152,12 @@ impl Run {
     /// Puts `d` on screen with its own autosave folder (a restored one keeps its own). The document it replaces
     /// closes cleanly if saved; with unsaved changes its autosave folder stays, and
     /// it comes back at the next start.
-    fn show(&mut self, mut d: Doc, target: Option<Target>) {
+    fn show(&mut self, mut d: Doc, mut target: Option<Target>) {
+        // Write reads Word 97–2003 files but doesn't write them: Save asks where to keep a copy.
+        if matches!(target, Some(Target::Picked { format: Format::Doc, .. } | Target::Path { format: Format::Doc, .. })) {
+            d.status = format!("{} Write reads Word 97–2003 files but doesn't write them: Save asks where to keep a copy.", d.status);
+            target = None;
+        }
         if d.autosave().is_none() {
             if let Err(e) = d.autosave_to(&new_autosave_dir(&self.root)) {
                 d.status = format!("{} Autosave is off: {e}.", d.status);

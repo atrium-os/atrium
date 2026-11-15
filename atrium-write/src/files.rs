@@ -13,6 +13,8 @@ pub enum Format {
     Docx,
     /// OpenDocument `.odt`: likewise.
     Odt,
+    /// `.doc`, Word 97–2003: read by the converter process, never written.
+    Doc,
     /// Anything else: plain text, a paragraph per line.
     Text,
 }
@@ -25,6 +27,8 @@ pub fn format_of(name: &str) -> Format {
         Format::Docx
     } else if n.ends_with(".odt") {
         Format::Odt
+    } else if n.ends_with(".doc") || n.ends_with(".dot") {
+        Format::Doc
     } else {
         Format::Text
     }
@@ -62,8 +66,13 @@ pub fn load_with(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc,
             Ok(d)
         }
         Format::Native => Doc::from_native(name, data).map_err(|e| failed(format!("“{name}” isn't a document this app can read: {e}"))),
-        f @ (Format::Docx | Format::Odt) => {
-            let (native, notes) = officina_convert::launch::convert(if f == Format::Docx { "docx" } else { "odt" }, data, password).map_err(|e| match e {
+        f @ (Format::Docx | Format::Odt | Format::Doc) => {
+            let kind = match f {
+                Format::Docx => "docx",
+                Format::Doc => "doc",
+                _ => "odt",
+            };
+            let (native, notes) = officina_convert::launch::convert(kind, data, password).map_err(|e| match e {
                 ConvertError::Failed(w) => failed(format!("“{name}” couldn't be opened: {w}")),
                 e => e,
             })?;
@@ -101,6 +110,8 @@ pub fn encode(d: &Doc, f: Format) -> Vec<u8> {
         Format::Native => d.stored_native(),
         Format::Docx => protect("docx", officina_convert::docx::write(&d.ed.borrow().doc, Vec::new()).unwrap_or_default()),
         Format::Odt => protect("odt", officina_convert::odt::write(&d.ed.borrow().doc, Vec::new()).unwrap_or_default()),
+        // Never a save target (Write reads .doc but doesn't write it): the native file.
+        Format::Doc => d.stored_native(),
         Format::Text => d.plain_text().into_bytes(),
     }
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use atrium_write::doc::Doc;
-use atrium_write::files::{encode, load_with, Format};
+use atrium_write::files::{encode, format_of, load_with, Format};
 use officina_convert::launch::ConvertError;
 
 fn converter() -> PathBuf {
@@ -35,4 +35,22 @@ fn protected_files_open_only_with_their_password() {
     d.set_password(None).unwrap();
     let file = encode(&d, Format::Docx);
     assert!(load_with("plan.docx", &file, None).unwrap().protection.is_none());
+}
+
+#[test]
+fn doc_files_open_through_the_converter() {
+    std::env::set_var("OFFICINA_CONVERT", converter());
+    let plain = officina_convert::doc::sample::document(None);
+    let d = load_with("old.doc", &plain, None).unwrap();
+    assert!(d.plain_text().contains("Hello from Word 97"));
+    assert!(d.protection.is_none());
+    let locked = officina_convert::doc::sample::document(Some("pa55"));
+    assert!(!locked.windows(6).any(|w| w == b"Second"), "the protected file holds the text in the clear");
+    assert_eq!(load_with("old.doc", &locked, None).err(), Some(ConvertError::NeedsPassword));
+    assert_eq!(load_with("old.doc", &locked, Some("pass")).err(), Some(ConvertError::WrongPassword));
+    let back = load_with("old.doc", &locked, Some("pa55")).unwrap();
+    assert!(back.plain_text().contains("Second paragraph"));
+    assert!(back.protection.is_some());
+    assert_eq!(format_of("Old.DOC"), Format::Doc);
+    assert_eq!(format_of("letter.docx"), Format::Docx);
 }

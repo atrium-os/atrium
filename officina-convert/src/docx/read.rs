@@ -716,6 +716,9 @@ impl<'a> Reader<'a> {
                     }
                     if let Some(l) = link {
                         a.link = Some(l.clone());
+                    } else if let Some(l) = field.stack.iter().rev().filter(|f| f.stage == Stage::Result).find_map(|f| hyperlink_field(&f.instr)) {
+                        // A complex HYPERLINK field: its result is the link.
+                        a.link = Some(l);
                     }
                     if !self.active.is_empty() && !self.in_note && !field.in_margin {
                         a.comments = Some(self.active.as_slice().into());
@@ -1447,6 +1450,43 @@ impl FieldState {
     }
 }
 
+/// A `HYPERLINK "target"` or `HYPERLINK \l "bookmark"` field's link.
+pub(crate) fn hyperlink_field(instr: &str) -> Option<Arc<str>> {
+    let rest = instr.trim_start();
+    let head = rest.get(..9)?;
+    if !head.eq_ignore_ascii_case("HYPERLINK") {
+        return None;
+    }
+    let mut rest = rest[9..].trim_start();
+    let mut anchor = false;
+    let mut target: Option<String> = None;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('"') {
+            let end = r.find('"').unwrap_or(r.len());
+            if target.is_none() {
+                target = Some(r[..end].to_string());
+            } else if anchor {
+                target = Some(format!("{}#{}", target.unwrap_or_default(), &r[..end]));
+                anchor = false;
+            }
+            rest = r.get(end + 1..).unwrap_or("").trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let w = &rest[..end];
+            if w == "\\l" {
+                anchor = true;
+            } else if !w.starts_with('\\') && target.is_none() {
+                target = Some(w.to_string());
+            }
+            rest = rest[end..].trim_start();
+        }
+    }
+    let t = target.filter(|t| !t.is_empty())?;
+    // A bookmark alone is "\l name": "#name"; the target given first otherwise.
+    let t = if instr.contains("\\l") && !t.contains('#') && !t.contains(':') { format!("#{t}") } else { t };
+    Some(Arc::from(&t[..t.len().min(8192)]))
+}
+
 /// A reference field's kind and bookmark: `PAGEREF name` (true) or `REF name`.
 fn ref_field(instr: &str) -> Option<(bool, &str)> {
     let mut w = instr.split_whitespace();
@@ -1621,4 +1661,20 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     let mut doc = r.doc;
     doc.take_changes();
     Ok((doc, Loaded { report: r.rep, paragraphs, pictures }))
+}
+
+#[cfg(test)]
+mod field_tests {
+    use super::hyperlink_field;
+
+    #[test]
+    fn hyperlink_fields() {
+        let l = |s: &str| hyperlink_field(s).map(|a| a.to_string());
+        assert_eq!(l(r#" HYPERLINK "https://example.org/" "#).as_deref(), Some("https://example.org/"));
+        assert_eq!(l(r#"HYPERLINK \l "_Toc1" \h"#).as_deref(), Some("#_Toc1"));
+        assert_eq!(l(r#"HYPERLINK "https://x.org/a" \l "part" \o "tip""#).as_deref(), Some("https://x.org/a#part"));
+        assert_eq!(l("hyperlink mailto:a@b.c").as_deref(), Some("mailto:a@b.c"));
+        assert_eq!(l("PAGEREF x"), None);
+        assert_eq!(l("HYPERLINK"), None);
+    }
 }

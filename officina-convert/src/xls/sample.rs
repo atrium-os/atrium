@@ -20,35 +20,43 @@ fn bof(dt: u16) -> Vec<u8> {
     d
 }
 
+/// An RC4 CryptoAPI cipher for `pw` and its encryption header as BIFF8's
+/// FILEPASS and Word's table stream carry it (from the version on).
+pub fn crypto_api(pw: &str) -> (Cipher, Vec<u8>) {
+    let salt = [7u8; 16];
+    let verifier = [0x5Au8; 16];
+    let mut m = Sha1::new();
+    m.update(salt);
+    m.update(pw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>());
+    let cipher = Cipher::CryptoApi { h: m.finalize().into(), key_len: 16 };
+    let mut v = verifier.to_vec();
+    v.extend_from_slice(&Sha1::digest(verifier));
+    Rc4::new(&cipher.block_key(0)).apply(&mut v);
+    let mut d = Vec::new();
+    d.extend_from_slice(&4u16.to_le_bytes());
+    d.extend_from_slice(&2u16.to_le_bytes());
+    d.extend_from_slice(&0u32.to_le_bytes());
+    // EncryptionHeader: flags, extra, RC4, SHA-1, 128 bits, provider,
+    // reserved, no CSP name.
+    let header: Vec<u8> = [0x04u32, 0, 0x6801, 0x8004, 128, 1, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    d.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    d.extend_from_slice(&header);
+    d.extend_from_slice(&16u32.to_le_bytes());
+    d.extend_from_slice(&salt);
+    d.extend_from_slice(&v[..16]);
+    d.extend_from_slice(&20u32.to_le_bytes());
+    d.extend_from_slice(&v[16..]);
+    (cipher, d)
+}
+
 /// The workbook as a `.xls` file.
 pub fn workbook(password: Option<&str>) -> Vec<u8> {
     let mut s = Vec::new();
     rec(&mut s, biff::BOF, &bof(0x0005));
     let cipher = password.map(|pw| {
-        let salt = [7u8; 16];
-        let verifier = [0x5Au8; 16];
-        let mut m = Sha1::new();
-        m.update(salt);
-        m.update(pw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>());
-        let cipher = Cipher::CryptoApi { h: m.finalize().into(), key_len: 16 };
-        let mut v = verifier.to_vec();
-        v.extend_from_slice(&Sha1::digest(verifier));
-        Rc4::new(&cipher.block_key(0)).apply(&mut v);
-        let mut d = Vec::new();
-        d.extend_from_slice(&1u16.to_le_bytes());
-        d.extend_from_slice(&4u16.to_le_bytes());
-        d.extend_from_slice(&2u16.to_le_bytes());
-        d.extend_from_slice(&0u32.to_le_bytes());
-        // EncryptionHeader: flags, extra, RC4, SHA-1, 128 bits, provider,
-        // reserved, no CSP name.
-        let header: Vec<u8> = [0x04u32, 0, 0x6801, 0x8004, 128, 1, 0, 0].iter().flat_map(|x| x.to_le_bytes()).collect();
-        d.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        let (cipher, header) = crypto_api(pw);
+        let mut d = 1u16.to_le_bytes().to_vec();
         d.extend_from_slice(&header);
-        d.extend_from_slice(&16u32.to_le_bytes());
-        d.extend_from_slice(&salt);
-        d.extend_from_slice(&v[..16]);
-        d.extend_from_slice(&20u32.to_le_bytes());
-        d.extend_from_slice(&v[16..]);
         rec(&mut s, biff::FILEPASS, &d);
         (s.len(), cipher)
     });

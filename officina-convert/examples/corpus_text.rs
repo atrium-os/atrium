@@ -1,5 +1,5 @@
-//! The O3 real-world corpus run (docs/spec/officina.md §7.6): every `.docx` and
-//! `.odt` under the given directories is read by our reader and compared with
+//! The O3 real-world corpus run (docs/spec/officina.md §7.6): every `.docx`,
+//! `.odt` and `.doc` under the given directories is read by our reader and compared with
 //! LibreOffice's reading of the same file, as text.
 //!
 //! cargo run --release --example corpus_text -- SRC=TXT [SRC=TXT ...]
@@ -139,6 +139,8 @@ fn read(path: &Path, data: &[u8]) -> Result<(TextDoc, Vec<String>), String> {
     let r = std::panic::catch_unwind(|| {
         if odt {
             odt::read(data).map(|(d, l)| (d, l.report.lines())).map_err(|e| e.to_string())
+        } else if path.extension().is_some_and(|e| e == "doc") {
+            officina_convert::doc::read(data, None).map(|(d, l)| (d, l.report.lines())).map_err(|e| e.to_string())
         } else {
             docx::read(data).map(|(d, l)| (d, l.report.lines())).map_err(|e| e.to_string())
         }
@@ -152,7 +154,7 @@ fn main() {
     let mut notes: BTreeMap<String, usize> = BTreeMap::new();
     for arg in std::env::args().skip(1) {
         let (src, txt) = arg.split_once('=').expect("SRC=TXT");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(src).expect("src").flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "docx" || e == "odt")).collect();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(src).expect("src").flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "docx" || e == "odt" || e == "doc")).collect();
         files.sort();
         for p in files {
             let data = std::fs::read(&p).unwrap_or_default();

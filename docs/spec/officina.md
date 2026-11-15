@@ -2804,6 +2804,81 @@ opens both through the real converter.
 Open: the missing functions above; merged cells and comments once the grid
 has them; `.xls` charts and pictures; Excel 4 macro sheets.
 
+### 16.43 O7c as built (2026-11-15): `.doc` import
+
+- **Approach** (`officina-convert/src/doc/`). The reader turns a Word 97–2003
+  file into WordprocessingML parts (document, styles, numbering, notes,
+  comments, header and footer, settings, pictures) and hands them to the
+  `.docx` reader, so one reader builds the model and gives the fidelity
+  notes for both formats.
+- **The binary file** (`doc/bin.rs`). The FIB (Word 97 to 2007 sizes; Word 95
+  and older and Word 2 refused in words, as are RTF and HTML files named
+  `.doc`), the piece table (compressed cp1252 pieces and UTF-16 ones, fast
+  saves' property lists), the paragraph and character property pages, sprms
+  by their size codes (incl. the long `sprmTDefTable` and `sprmPChgTabs`),
+  string tables, the font table, PLCs. Every read is checked; the text is
+  capped at 2^28 characters.
+- **Protected files** are decrypted by the reader in the converter's sandbox:
+  RC4 (Word 97/2000) and RC4 CryptoAPI (Word 2002 on, LibreOffice), on
+  512-byte blocks, the FIB's first 68 bytes and the encryption header left in
+  the clear, the `Data` stream all encrypted (keys shared with `.xls`). XOR
+  obfuscation (Word 95 style) is refused.
+- **Carried** (`doc/props.rs`, `doc/mod.rs`): styles with their bases and
+  toggles, character formatting (fonts, size, bold, italic, underline,
+  strike, colour by index or RGB, highlight, super/subscript, small caps,
+  hidden, symbols), paragraph formatting (alignment, indents, spacing, line
+  spacing, keep, page break before, tabs), lists (`PlfLst`/`PlfLfo` to
+  numbering with level texts and starts), tables (rows from `sprmTDefTable`,
+  widths, merged cells across, nested tables' text), sections (page size,
+  margins, columns, breaks), the first section's header and footer (default
+  and first page), footnotes and endnotes, bookmarks, fields (incl.
+  `HYPERLINK`, which the `.docx` reader now also turns into links in Word's
+  own complex-field form), inline pictures (PNG and JPEG from the `Data`
+  stream's OfficeArt), text boxes anchored in the main text (their text kept
+  after the paragraph, by shape id from `PlcSpaMom` to `PlcftxbxTxt`),
+  comments (author, initials, range from the annotation bookmarks, date from
+  `AtrdExtra`, replies where the file has them), and tracked changes
+  (insertions and deletions with their own authors and dates, paragraph
+  marks inserted or deleted, formatting changes; tracking on from the DOP).
+- **Reported, not carried:** floating pictures and shapes, pictures in
+  EMF/WMF/PICT/BMP/TIFF, embedded objects (their picture kept), text boxes in
+  headers and footers, and whatever the `.docx` reader reports for the
+  translated parts (paragraph borders and shading, frames, more than one
+  header per section, and so on). A formatting change's old formatting isn't
+  in the file: it comes back as the style's.
+- **Write** opens `.doc` (and `.dot`) through the converter (`officina-convert
+  doc`, `--password` as for the others). It doesn't write `.doc` (§16.40,
+  D8): a document opened from one has no save target, so Save asks where to
+  keep a copy and says why; a protected one's copy keeps its password.
+
+**Gates.** `officina-convert/examples/doc_lo.rs`: docx_lo's sample (everything
+the model has) saved as `.doc` by LibreOffice 24.2, plain and with a password;
+our `.doc` reader meets docx_lo's checks on it (texts, styles, runs, link,
+spacing, lists, table and widths, picture, header and footer, notes,
+comments, superscript, tracked edits by author with accept and reject,
+tracking on, page), the protected copy has no text in the clear, asks for
+its password, refuses a wrong one and opens with it: **31/31** (LibreOffice's
+`.doc` keeps no comment threads or resolved state, so the gate expects the
+reply as a comment of its own). Corpus: Apache POI's 159 and LibreOffice's
+180 `.doc` test files (`sw/qa/extras/ww8*`): 311 open, 28 refused in words
+(13 Word 95 or older, 1 Word 2, 9 damaged fuzzer files, 3 needing a password
+we don't have, 2 not Word); 98.3 % of the words LibreOffice's text export
+shows, median file 100 %, 228 files at 99 % or more both ways. Most of the
+rest is tracked deletions (LibreOffice's text export includes deleted text),
+text-box text (which its export leaves out and we show), and list labels and
+form fields not yet derived; our writer then reader keeps the text and notes
+of all 311, compare and merge are safe on all. 81,000 randomly mutated copies
+of those files (half with a password) never panic; the slowest takes 23 ms
+(found on the way: a damaged FIB's story lengths made the reader fill
+seconds' worth of missing text, now cut at the end of the piece table). A 30,000-paragraph (8 MB)
+`.doc` from LibreOffice reads in 0.18 s. Unit tests build a document byte by
+byte, plain and RC4 CryptoAPI protected (`doc::sample`, which LibreOffice
+also reads), and Write opens both through the real converter.
+
+Open: floating pictures and shapes (OfficeArt drawing to anchors), EMF/WMF
+pictures, form fields' text and check boxes, legal and chapter list labels,
+headers and footers per section, text boxes in headers.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

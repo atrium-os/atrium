@@ -3,6 +3,7 @@
 //!   officina-convert xlsx < book.xlsx > book.osheet 2> report
 //!   officina-convert ods < book.ods > book.osheet 2> report
 //!   officina-convert xls < book.xls > book.osheet 2> report
+//!   officina-convert doc < letter.doc > letter.owrite 2> report
 //!   officina-convert pptx < talk.pptx > talk.oslides 2> report
 //!
 //! With `--password` after the kind, stdin starts with the password (its
@@ -102,8 +103,13 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        "docx" | "odt" => {
-            let got = if what == "docx" { officina_convert::docx::read(&input).map_err(|e| e.to_string()) } else { officina_convert::odt::read(&input).map_err(|e| e.to_string()) };
+        "docx" | "odt" | "doc" => {
+            let got = match what.as_str() {
+                "docx" => officina_convert::docx::read(&input).map_err(|e| e.to_string()),
+                // A protected .doc is decrypted by its reader.
+                "doc" => officina_convert::doc::read(&input, password.as_deref()).map_err(|e| e.to_string()),
+                _ => officina_convert::odt::read(&input).map_err(|e| e.to_string()),
+            };
             match got {
                 Ok((doc, loaded)) => {
                     let out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -143,7 +149,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx|xls|ods|docx|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
+            eprintln!("error\tusage: officina-convert xlsx|xls|ods|docx|doc|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
             std::process::exit(2);
         }
     }

@@ -271,6 +271,14 @@ pub fn filepass(data: &[u8], password: &str) -> Result<Cipher, CryptError> {
         1 => {}
         t => return Err(CryptError::Unsupported(format!("encryption type {t}"))),
     }
+    rc4_info(&mut c, password)
+}
+
+/// The RC4 encryption header that follows the version (MS-OFFCRYPTO
+/// §2.3.6.1 and §2.3.5.1), as `FILEPASS` and Word's table stream hold it,
+/// checked against `password`.
+pub fn rc4_info(c: &mut Cur, password: &str) -> Result<Cipher, CryptError> {
+    let short = |_| CryptError::Damaged("encryption header".into());
     let (major, minor) = (c.u16().map_err(short)?, c.u16().map_err(short)?);
     match (major, minor) {
         (1, 1) => {

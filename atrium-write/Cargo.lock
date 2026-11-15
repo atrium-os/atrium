@@ -1254,6 +1254,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "libc",
+ "md-5",
  "miniz_oxide 0.8.9",
  "officina-core",
  "officina-grid",

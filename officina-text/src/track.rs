@@ -335,9 +335,21 @@ impl TextDoc {
         if (b1, o1) <= (b0, o0) || self.para(b0).is_none() || self.para(b1).is_none() {
             return (Vec::new(), None);
         }
+        // Ends inside a character move out to its edges.
+        if let Some(p) = self.para(b0) {
+            while o0 > 0 && !p.text.is_char_boundary(o0 as usize) {
+                o0 -= 1;
+            }
+        }
+        if let Some(p) = self.para(b1) {
+            o1 = o1.min(p.text.len() as u32);
+            while !p.text.is_char_boundary(o1 as usize) {
+                o1 += 1;
+            }
+        }
         // Take in tombstones of the same revision either side, so deletions join.
         let tomb_of = |d: &TextDoc, b: usize, at: u32| -> bool {
-            d.para(b).is_some_and(|p| p.text[at as usize..].starts_with(OBJECT_CHAR) && d.attrs.get(p.attr_at(at)).deleted.and_then(|t| d.deletions.get(t)).is_some_and(|x| x.rev == rev))
+            d.para(b).is_some_and(|p| p.text.get(at as usize..).is_some_and(|t| t.starts_with(OBJECT_CHAR)) && d.attrs.get(p.attr_at(at)).deleted.and_then(|t| d.deletions.get(t)).is_some_and(|x| x.rev == rev))
         };
         while o0 >= TOMB && self.para(b0).is_some_and(|p| p.text.is_char_boundary((o0 - TOMB) as usize)) && tomb_of(self, b0, o0 - TOMB) {
             o0 -= TOMB;
