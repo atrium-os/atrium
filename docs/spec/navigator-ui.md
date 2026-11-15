@@ -1241,10 +1241,15 @@ Each step runs in the VM on headless frescod before the next.
      where Save, Open in Mail and Try it go through navigatord's spend. A toast-role window
      in the live script's harness made forum-wm stop composing the Navigator's window while
      it was up (only the page child showed), so the covered case is checked in the probe.
-     frescod lets each consumer spend only its own purposes (tabula.md), so navigatord's
-     uid spends `PROMPT` and nothing else (the live script runs it as root with
-     `FRESCOD_ACTIVATION_UIDS=0=prompt`). Open: navigatord should run as its own user
-     (`_navigatord`, a default `PROMPT` consumer) rather than the person's.
+     frescod lets each consumer spend only its own purposes (tabula.md). `PROMPT` is
+     self-spent: a uid may spend it only on presses of its own windows, so the person's
+     navigatord needs no listing, and a listed consumer of another purpose can't spend it.
+     Decided 2026-11-15 (Shankar): navigatord runs once per person, as that person, in its
+     own jail, not as one shared `_navigatord` broker (which would hold everyone's pages and
+     Arca tickets in one process and act for each person). Open: the jail (a
+     `org.atrium.navigator.broker` bundle whose restricted capability mounts its UI and ticket
+     sockets, frescod's chrome and activation sockets, portcullisd's and arcad's, with its
+     store and Downloads; no network).
    - **Downloads.** navigatord decides from the fetched bytes, not from anything the site
      claims, whether an `Open` is a document or a file (`navigatord/src/files.rs`). The
      fetcher's reply carries no media type anyway. Markup and UTF-8 text are documents; a

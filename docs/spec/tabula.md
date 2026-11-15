@@ -125,8 +125,11 @@ most 4096 live tokens (the oldest goes first) and drops expired ones on each min
 The socket is `FRESCOD_ACTIVATION_SOCK` (default `/var/run/atrium/fresco-activation.sock`).
 frescod checks each connection's peer uid. Each consumer may spend only its own purposes. The
 defaults are root (`OPEN`, `CONSOLE`, `APPROVE`), `_tabula` (`COPY`, `PASTE`, `DRAG`, `DROP`),
-`_share` (`SHARE`), `_praeco` (`ACTION`), `_arca-ui` (`FILL`), `_sigillum-ui` (`IDENTITY`) and
-`_navigatord` (`PROMPT`), for the users that exist. `FRESCOD_ACTIVATION_UIDS` replaces them:
+`_share` (`SHARE`), `_praeco` (`ACTION`), `_arca-ui` (`FILL`) and `_sigillum-ui` (`IDENTITY`),
+for the users that exist. `PROMPT` is self-spent: any uid may spend a press on its own window
+(`presenter_uid` equal to its own) for it, and no consumer is named for it; the person's own
+navigatord answers the Navigator's prompt row (navigator-ui.md §6.4), and frescod's checks
+(the guard seen whole and still, focus, the window's owner) are the same. `FRESCOD_ACTIVATION_UIDS` replaces them:
 comma-separated `uid=purpose+purpose` entries, purposes by name or number (`0=open+console`,
 `1001=prompt`); a bare uid may spend any purpose and is logged as a warning (tests only). Forum is
 `FRESCOD_FORUM_UID`, or else `_forum`'s uid. Other uids are not served. A consumer may only

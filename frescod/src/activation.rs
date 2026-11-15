@@ -385,8 +385,6 @@ pub const DEFAULT_CONSUMERS: &[(&str, &[u8])] = &[
     ("_praeco", &[purpose::ACTION]),
     ("_arca-ui", &[purpose::FILL]),
     ("_sigillum-ui", &[purpose::IDENTITY]),
-    // The Navigator's prompt row (navigator-ui.md §6.4).
-    ("_navigatord", &[purpose::PROMPT]),
 ];
 
 /// A purpose by its name in `FRESCOD_ACTIVATION_UIDS`, or its number.
@@ -443,6 +441,17 @@ fn merge(out: &mut Consumers, uid: u32, ps: Option<Vec<u8>>) {
 }
 
 /// Whether a consumer with `may` may spend on `p`.
+/// Purposes a program may spend on its own windows' presses without being
+/// a consumer: the press is still checked here (guard, stillness, focus),
+/// and only the window's owner can spend it. The Navigator's prompt row is
+/// answered by the person's own navigatord (navigator-ui.md §6.4).
+pub const SELF_SPENT: &[u8] = &[purpose::PROMPT];
+
+/// `uid` spends a press of its own window on a self-spent purpose.
+pub fn self_spend(uid: u32, c: &fresco_protocol::activation::Consume) -> bool {
+    c.presenter_uid == uid && SELF_SPENT.contains(&c.purpose)
+}
+
 pub fn may_spend(may: &Option<Vec<u8>>, p: u8) -> bool {
     may.as_ref().is_none_or(|v| v.contains(&p))
 }
@@ -526,8 +535,10 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     std::thread::Builder::new().name("frescod-activation".into()).spawn(move || {
         for s in listener.incoming().flatten() {
             let uid = crate::socket_server::peer_xucred(&s).map(|(_, u)| u);
-            let Some(uid) = uid.filter(|u| allowed.consumers.contains_key(u) || allowed.forum == Some(*u) || allowed.binders.contains(u)) else {
-                eprintln!("frescod: activation socket: refused uid {uid:?}");
+            // Any uid may connect: one that is no consumer may still spend
+            // presses on its own windows for a self-spent purpose (`PROMPT`).
+            let Some(uid) = uid else {
+                eprintln!("frescod: activation socket: no peer uid");
                 continue;
             };
             let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.get(&uid).cloned(), allowed.forum == Some(uid));
@@ -565,7 +576,7 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
             op::CONSUME => fresco_protocol::encode(&match fresco_protocol::decode::<Consume>(&msg.payload) {
                 // A consumer spends only its own purposes; the refusal
                 // spends nothing.
-                Ok(c) if may_consume.as_ref().is_some_and(|m| may_spend(m, c.purpose)) => {
+                Ok(c) if may_consume.as_ref().is_some_and(|m| may_spend(m, c.purpose)) || self_spend(uid, &c) => {
                     let now = now_ns();
                     table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now))
                 }
@@ -704,9 +715,22 @@ mod tests {
         assert!(may_spend(&Some(vec![purpose::PROMPT]), purpose::PROMPT));
         assert!(!may_spend(&Some(vec![purpose::PROMPT]), purpose::PASTE), "navigatord can't paste");
         let named: Vec<u8> = DEFAULT_CONSUMERS.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE, purpose::PROMPT] {
+        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE] {
             assert_eq!(named.iter().filter(|&&q| q == p).count(), 1, "purpose {p}: exactly one default broker");
         }
+        for p in SELF_SPENT {
+            assert!(!named.contains(p), "purpose {p} is self-spent, no broker's");
+        }
+    }
+
+    #[test]
+    fn a_prompt_press_is_spent_only_by_its_windows_owner() {
+        use fresco_protocol::activation::Consume;
+        let c = |presenter_uid, purpose| Consume { token: [1; 16], presenter_uid, purpose };
+        assert!(self_spend(1001, &c(1001, purpose::PROMPT)));
+        assert!(!self_spend(1002, &c(1001, purpose::PROMPT)), "another uid's window");
+        assert!(!self_spend(1001, &c(1001, purpose::PASTE)), "not self-spent");
+        assert!(!self_spend(1001, &c(1001, purpose::APPROVE)), "not self-spent");
     }
 
     #[test]
