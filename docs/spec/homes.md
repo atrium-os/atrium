@@ -1,6 +1,6 @@
 # Homes, workspaces and consoles
 
-Status: proposed 2026-11-15, from a discussion with Shankar ("you work in an
+Status: accepted 2026-11-15 (Shankar: "accept as recommended", H4–H7 as recommended), from a discussion with Shankar ("you work in an
 app context, not a user context"; "a standard terminal defeats the purpose of
 jailed apps"; per-app data under the person's home: yes).
 
