@@ -970,25 +970,37 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
     if promote {
         // The sprites must end the order, back to back, each within the
         // window's size in its own space.
-        let Some(first) = sprites.first().map(|s| s.range.start) else { return false };
+        let why = |r: &str| {
+            if std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
+                eprintln!("frescod: window {}: no sprites: {r}", w.id);
+            }
+            false
+        };
+        let Some(first) = sprites.first().map(|s| s.range.start) else {
+            let seen: Vec<String> = state.anim_now.iter().map(|(id, a)| format!("{id}: now {:?} op {} / own {:?}", a.transform, a.opacity, state.group_nodes.get(id).map(|g| (g.transform, g.opacity, g.parent)))).collect();
+            return why(&format!("no animated group promoted: {seen:?}"));
+        };
         let mut at = first;
         for s in &sprites {
             if s.range.start != at {
-                return false;
+                return why(&format!("group {} is not right after the last sprite (order {} vs {at})", s.group, s.range.start));
             }
             at = s.range.end;
-            let (sw, sh) = (w.size.0 as f32 + 0.5, w.size.1 as f32 + 0.5);
+            // Boxes are conservative (a fill's reaches a pixel past its
+            // path, for its antialiasing): a little past the edge is not
+            // content lost.
+            let (sw, sh) = (w.size.0 as f32 + 2.5, w.size.1 as f32 + 2.5);
             for o in &order[s.range.clone()] {
                 if let Some(b) = item_box(w, o.item) {
                     let b = meet(Some(b), o.clip).unwrap();
-                    if b[0] < b[2] && b[1] < b[3] && (b[0] < -0.5 || b[1] < -0.5 || b[2] > sw || b[3] > sh) {
-                        return false;
+                    if b[0] < b[2] && b[1] < b[3] && (b[0] < -2.5 || b[1] < -2.5 || b[2] > sw || b[3] > sh) {
+                        return why(&format!("group {} draws {b:?} outside the window in its own space", s.group));
                     }
                 }
             }
         }
         if at != order.len() {
-            return false;
+            return why(&format!("{} items after the sprites (node {})", order.len() - at, order[at].node));
         }
         // The window under the sprites is rastered by tiles only.
         w.sprites = sprites;

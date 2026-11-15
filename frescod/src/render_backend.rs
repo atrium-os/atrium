@@ -607,7 +607,7 @@ impl Compute {
                 let sp = self.sprites.entry(w.id).or_default();
                 let r = sp.draw(&self.t2, &self.scene, w, &mut self.heap[off..off + len], s[2], s[3], &mut cost);
                 times.raster += t.elapsed();
-                times.tiles += cost.base_tiles;
+                times.tiles += cost.base_tiles + cost.content_tiles;
                 times.sprites += cost.sprites_rastered;
                 times.composite += cost.composite;
                 match r {
@@ -1721,5 +1721,10 @@ mod tests {
         // clip ends at 72).
         assert_eq!(step(&mut s, 20.0, 1.0, 0), Some([8, 8, 72, 56]));
         assert_eq!(step(&mut s, 20.0, 0.5, 2), Some([28, 8, 72, 56]));
+        // New content coming in from the right: rastered as it shows.
+        s.rect_nodes.get_mut(&11).unwrap().g = 0.8;
+        step(&mut s, 50.0, 1.0, 0);
+        step(&mut s, 30.0, 1.0, 0);
+        step(&mut s, 0.0, 1.0, 0);
     }
 }

@@ -14,6 +14,11 @@ struct Content {
     key: u64,
     px: Vec<u32>,
     used: u64,
+    /// Rastered lazily: its packed frame while tiles are left to draw,
+    /// and which tiles hold the content (a push reveals a slide a strip a
+    /// frame, so its first frame rasters only that strip).
+    frame: Option<fresco_compute::Frame>,
+    valid: Vec<bool>,
 }
 
 /// Contents kept beyond those in use: a transition's outgoing slide is
@@ -83,6 +88,8 @@ fn threads() -> usize {
 pub struct Cost {
     pub base_tiles: u32,
     pub sprites_rastered: u32,
+    /// Tiles of sprite content rastered.
+    pub content_tiles: u32,
     pub composite: std::time::Duration,
 }
 
@@ -154,13 +161,14 @@ impl Sprites {
                         .then(|| (0..self.content.len()).filter(|j| !using.contains(j)).min_by_key(|&j| self.content[j].used))
                         .flatten();
                     let at = spare.unwrap_or_else(|| {
-                        self.content.push(Content { key: !key, px: Vec::new(), used: 0 });
+                        self.content.push(Content { key: !key, px: Vec::new(), used: 0, frame: None, valid: Vec::new() });
                         self.content.len() - 1
                     });
                     let (frame, _) = scene.pack_part(f, Some(i), width, height);
                     let c = &mut self.content[at];
                     c.px.resize(n, 0);
-                    t2.render(&frame, &mut c.px).map_err(|e| e.to_string())?;
+                    c.valid = vec![false; (frame.header.tiles_x * frame.header.tiles_y) as usize];
+                    c.frame = Some(frame);
                     c.key = key;
                     cost.sprites_rastered += 1;
                     at
@@ -169,11 +177,49 @@ impl Sprites {
             self.content[at].used = self.draws;
             using.push(at);
             let clip = s.clip.map(|v| v.clamp(0, i32::MAX) as u32);
-            let at = [s.offset[0] as i64, s.offset[1] as i64];
+            let off = [s.offset[0] as i64, s.offset[1] as i64];
             let ox = |v: i64, hi: u32| v.clamp(0, hi as i64) as u32;
-            let placed = [ox(at[0], width), ox(at[1], height), ox(at[0] + width as i64, width), ox(at[1] + height as i64, height)];
+            let placed = [ox(off[0], width), ox(off[1], height), ox(off[0] + width as i64, width), ox(off[1] + height as i64, height)];
             let rect = meet(meet(clip, placed), whole);
             let rect = if empty(rect) || s.opacity <= 0.0 { [0; 4] } else { rect };
+            // The tiles of the content that show now, rastered if not yet.
+            let c = &mut self.content[at];
+            if let (Some(frame), false) = (&c.frame, empty(rect)) {
+                let local = [
+                    (rect[0] as i64 - off[0]).clamp(0, width as i64) as u32,
+                    (rect[1] as i64 - off[1]).clamp(0, height as i64) as u32,
+                    (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
+                    (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
+                ];
+                let h = &frame.header;
+                let mut need = vec![false; c.valid.len()];
+                let mut any = false;
+                for ty in local[1] / TILE..local[3].div_ceil(TILE).min(h.tiles_y) {
+                    for tx in local[0] / TILE..local[2].div_ceil(TILE).min(h.tiles_x) {
+                        let k = (ty * h.tiles_x + tx) as usize;
+                        if !c.valid[k] {
+                            need[k] = true;
+                            any = true;
+                        }
+                    }
+                }
+                if any {
+                    let tiles = damage::rects(&need, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
+                    t2.render_tiles(frame, &mut c.px, &tiles).map_err(|e| e.to_string())?;
+                    // What a rect list covers (it may round up past `need`).
+                    for t in &tiles {
+                        for ty in t[1]..t[3].min(h.tiles_y) {
+                            for tx in t[0]..t[2].min(h.tiles_x) {
+                                c.valid[(ty * h.tiles_x + tx) as usize] = true;
+                            }
+                        }
+                    }
+                    cost.content_tiles += tiles.iter().map(|t| (t[2] - t[0]) * (t[3] - t[1])).sum::<u32>();
+                }
+                if c.valid.iter().all(|&v| v) {
+                    c.frame = None;
+                }
+            }
             shown.push(Shown { group: s.group, rect, state: (key, s.offset, s.opacity.to_bits(), s.clip) });
         }
         match &self.shown {
