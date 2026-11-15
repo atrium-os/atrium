@@ -7,3 +7,5 @@ nui*
 nconf*
 navigator-confined
 fuse-fuzz
+open-files
+scrinium-connect
