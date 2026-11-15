@@ -460,8 +460,7 @@ VM from the Aura gates cover them.
   passphrase, so they are left to Settings. Manifest gains `network-read`,
   `network-wifi`, `wifi-nearby`.
 - Gate: `aura-sim-gate.sh n4` (RUNBOOK §13.6e).
-- Not yet: service manifests for atrium-net and atrium-netconf. (`SET_STATIC`/`SET_DNS`
-  built 2026-11-15, §5.1 and §6.)
+- Since: `SET_STATIC`/`SET_DNS` built 2026-11-15 (§5.1 and §6); rc.d services (§10.6).
 - Since (2026-11-14): the bar checked live under Forum (`aura-sim-gate.sh bar`, icon and
   menu frames); the Settings page is Curia's Network page ([curia.md](curia.md) §7).
   aura-mlme answers `scan` while connected with a scan on the association's address
@@ -470,3 +469,29 @@ VM from the Aura gates cover them.
   ends, never refused (2026-11-15); atrium-netconf answers a busy radio (a handshake
   running) at once.
 
+
+### 10.6 Services (2026-11-15)
+
+atrium-net and atrium-netconf start with the system as rc.d services, not as
+Portcullis-jailed services: atrium-net must be the host to change the host's
+interfaces (§3), and atrium-netconf must open atrium-net's root-only control socket
+before it drops to `_atrium-netconf` and enters capability mode.
+
+- `atrium-net/etc/atrium-net` (`atrium_net`): after `netif` and `local_unbound`, before
+  `atrium_netconf` and Portcullis. Supervised by `daemon -r -R 2`: started again 2 s
+  after any exit; `service atrium-net stop` ends it for good. Ports: `atrium_net_ifaces`
+  (default `AUTO`: every Ethernet port rc.conf does not configure, that is no
+  `ifconfig_<name>` and no `ifconfig_DEFAULT`, or `ifconfig_<name>="up"`; a port left to
+  rc.conf or dhclient is never taken) and `atrium_net_wifi` (default `AUTO`: `wlan0`
+  if it exists). Without local-unbound running it starts with `--no-unbound` and says
+  so. Logs to `/var/log/atrium/atrium-net.log`.
+- `atrium-net/etc/atrium-netconf` (`atrium_netconf`): after `atrium_net`; waits up to
+  20 s for its control socket, then the same supervision. It exits when atrium-net goes
+  away and is started again, so a crash of atrium-net is survived by both.
+- `scripts/atrium-net-service.sh DIR` (in the guest, once): the three users (65034–36),
+  binaries in `/usr/local/bin` and `/usr/local/libexec`, the two scripts,
+  `local-unbound-setup`, and `atrium_net_enable`, `atrium_netconf_enable`,
+  `local_unbound_enable`.
+- Gate: `aura-sim-gate.sh svc` (RUNBOOK §13.6e).
+- Not yet: a Wi-Fi interface that appears after boot (a USB dongle) needs a restart of
+  atrium-net to be taken; devd can do that once Wi-Fi hardware lands (W3).

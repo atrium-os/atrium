@@ -21,6 +21,8 @@
 #                                     atrium-net/sim/lan.py) and Wi-Fi together:
 #                                     cable pulls and flaps, dead upstream,
 #                                     captive portal (docs/spec/atrium-net.md)
+#   sh scripts/aura-sim-gate.sh svc   atrium-net and atrium-netconf as rc.d
+#                                     services (atrium-net-service.sh)
 #
 # AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
 # memory store. The FreeBSD VM must have been started with
@@ -726,6 +728,85 @@ bar() {
     "$V" "tail -n 20 $Sx/bar.log; tail -n 20 /tmp/aura/netconf.log"
 }
 
+# svc: atrium-net and atrium-netconf as system services (atrium-net.md
+# §10.6): commissioned by scripts/atrium-net-service.sh, started by rc.d with
+# AUTO port choice (vtnet1 handed over with ifconfig_vtnet1="up"; vtnet0
+# stays on rc.conf's DHCP), Wi-Fi on wlan0, local-unbound; a crash of
+# atrium-net is survived by both; stop leaves nothing running.
+svc_cleanup() {
+    "$V" 'service atrium-netconf onestop >/dev/null 2>&1; service atrium-net onestop >/dev/null 2>&1
+        sysrc atrium_net_enable=NO atrium_netconf_enable=NO >/dev/null 2>&1; sysrc -x ifconfig_vtnet1 atrium_net_flags atrium_netconf_flags >/dev/null 2>&1
+        rm -rf /var/db/atrium-net
+        for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
+        ifconfig vtnet1 inet6 -accept_rtadv
+        for a in $(ifconfig vtnet1 inet6 | awk "/inet6 fd77:/{print \$2}"); do ifconfig vtnet1 inet6 $a -alias; done
+        g=$(cat /tmp/aura/default.saved 2>/dev/null); [ -n "$g" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default $g; }
+        [ -f /tmp/aura/resolv.conf.saved ] && cp /tmp/aura/resolv.conf.saved /etc/resolv.conf
+        true' || true
+}
+
+svc() {
+    APP="/usr/local/bin/atrium-netctl --app"
+    "$V" 'pkill -x atrium-net; pkill -x atrium-netconf; sleep 1; true'
+    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    python3 "$ROOT/atrium-net/sim/lan.py" 600 > "$HOME/atrium-vm/lan.log" 2>&1 &
+    LANPID=$!
+    trap 'svc_cleanup; kill $LANPID 2>/dev/null || true' EXIT
+    "$V" 'mkdir -p /tmp/aura/rc.d' && for f in atrium-net atrium-netconf; do "$V" "cat > /tmp/aura/rc.d/$f" < "$ROOT/atrium-net/etc/$f"; done
+    "$V" 'cat > /tmp/aura/atrium-net-service.sh' < "$ROOT/scripts/atrium-net-service.sh"
+    out=$("$V" "set -e
+        g=\$(route -n get default 2>/dev/null | awk '/gateway/{print \$2}'); case \$g in 10.0.2.*) echo \$g > /tmp/aura/default.saved ;; esac
+        cp /etc/resolv.conf /tmp/aura/resolv.conf.saved
+        for a in \$(ifconfig vtnet1 inet | awk '/inet /{print \$2}'); do ifconfig vtnet1 inet \$a -alias; done
+        rm -rf /var/db/atrium-net
+        sh /tmp/aura/atrium-net-service.sh /tmp/aura
+        mkdir -p /var/unbound/conf.d
+        printf 'server:\n    local-zone: \"test.\" nodefault\n    domain-insecure: \"atrium.test\"\n' > /var/unbound/conf.d/atrium-test.conf
+        service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
+        sysrc ifconfig_vtnet1=up atrium_net_flags=-v atrium_netconf_flags=-v >/dev/null
+        service atrium-net start
+        service atrium-netconf start" 2>&1) || fail "start: $out"
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -q 'local_unbound atrium-net atrium-netconf' && ok "rcorder: local_unbound, then atrium-net, then atrium-netconf" || fail "order: $out"
+    a=$("$V" 'ps -o command= -p $(pgrep -x atrium-net)')
+    case "$a" in *"--iface vtnet1 --wifi wlan0 --capsicum"*) ;; *) fail "atrium-net started as: $a" ;; esac
+    case "$a" in *vtnet0*) fail "atrium-net took vtnet0 (rc.conf's DHCP): $a" ;; esac
+    ok "AUTO: vtnet1 (ifconfig_vtnet1=up) and wlan0 taken, vtnet0 left to rc.conf: $a"
+    "$V" "procstat -s \$(pgrep -x atrium-net) | awk 'NR==2{print \$10}'" | grep -q C && ok "atrium-net in capability mode" || fail "atrium-net capmode"
+    u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
+    [ "$u" = _atrium-netconf ] && ok "atrium-netconf runs as _atrium-netconf" || fail "atrium-netconf runs as '$u'"
+    s=$("$V" 'ls /atrium/sockets | grep -E "^(network|wifi)-" | tr "\n" " "')
+    [ "$s" = "network-configure network-details network-read network-wifi wifi-nearby " ] && ok "its five sockets under /atrium/sockets" || fail "sockets: $s"
+    "$V" 'stat -f %Sp /atrium/sockets/atrium-net' | grep -q '^drwx------' && ok "atrium-net's control socket dir is root's alone (0700)" || fail "ctl dir: $("$V" 'ls -ld /atrium/sockets/atrium-net')"
+    i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.'; do i=$((i + 1)); [ $i -lt 40 ] || fail "vtnet1: no lease ($("$V" "$APP network-details interfaces"))"; sleep 3; done
+    ok "vtnet1 bound from lan.py's DHCP: $("$V" "$APP network-details interfaces" | grep -o 'name=vtnet1 .*addr=[^ ]*' | sed 's/ .* / /')"
+    i=0; until "$V" 'local-unbound-control list_forwards 2>&1' | grep -q 10.88.0.53; do i=$((i + 1)); [ $i -lt 20 ] || fail "forwarders: $("$V" 'local-unbound-control list_forwards 2>&1')"; sleep 2; done
+    "$V" 'grep -q "^nameserver 127.0.0.1" /etc/resolv.conf' && ok "local-unbound is the resolver and forwards to the LAN's DNS" || fail "resolv.conf: $("$V" 'cat /etc/resolv.conf')"
+    a=$("$V" 'drill gate.atrium.test @127.0.0.1 | awk "/^gate.atrium.test/{print \$5}"')
+    [ "$a" = 10.88.0.77 ] && ok "a name resolved through unbound: gate.atrium.test = $a" || fail "resolve: $a"
+
+    out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "joined aura-test through the service's sockets" || fail "join: $out"
+    i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=wlan0 .*addr=10\.77\.0\.'; do i=$((i + 1)); [ $i -lt 40 ] || fail "wlan0: no lease"; sleep 3; done
+    "$V" 'grep -q "ssid=" /var/db/atrium-net/networks' && ok "the network saved in /var/db/atrium-net" || fail "no saved profile"
+
+    n0=$("$V" 'pgrep -x atrium-net'); c0=$("$V" 'pgrep -x atrium-netconf')
+    "$V" 'pkill -KILL -x atrium-net'
+    i=0; while :; do
+        n=$("$V" 'pgrep -x atrium-net' || true); c=$("$V" 'pgrep -x atrium-netconf' || true)
+        [ -n "$n" ] && [ "$n" != "$n0" ] && [ -n "$c" ] && [ "$c" != "$c0" ] && break
+        i=$((i + 1)); [ $i -lt 20 ] || fail "not restarted: atrium-net $n0 -> '$n', atrium-netconf $c0 -> '$c'"; sleep 1
+    done
+    ok "atrium-net killed: both started again (atrium-net $n0 -> $n, atrium-netconf $c0 -> $c)"
+    i=0; until "$V" "$APP network-details interfaces" 2>/dev/null | grep -q '^iface name=wlan0 .*addr=10\.77\.0\.'; do i=$((i + 1)); [ $i -lt 60 ] || fail "after the restart: $("$V" "$APP network-details interfaces" 2>&1)"; sleep 3; done
+    "$V" "$APP network-details interfaces" | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.' || fail "vtnet1 after the restart"
+    ok "after the restart: Wi-Fi auto-joined aura-test again, vtnet1 bound ($((i * 3)) s)"
+
+    "$V" 'service atrium-netconf stop >/dev/null; service atrium-net stop >/dev/null; sleep 5'
+    p=$("$V" 'pgrep -lx "atrium-net|atrium-netconf|atrium-lease" | tr "\n" " "; pgrep -f "daemon: atrium_net" | tr "\n" " "' || true)
+    [ -z "$p" ] && ok "service stop: nothing left running, nothing restarted" || fail "after stop: $p"
+    "$V" 'service atrium-net status' >/dev/null 2>&1 && fail "status says running" || ok "service status: not running"
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -764,6 +845,12 @@ n4)
     n4
     teardown
     echo "atrium-net N4 gate: $pass checks passed" ;;
+svc)
+    setup hostapd-wpa2.conf
+    svc
+    svc_cleanup
+    teardown
+    echo "atrium-net services: $pass checks passed" ;;
 n3)
     setup hostapd-wpa2.conf
     n3

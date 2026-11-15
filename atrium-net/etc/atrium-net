@@ -1,0 +1,117 @@
+#!/bin/sh
+# PROVIDE: atrium_net
+# REQUIRE: FILESYSTEMS netif local_unbound
+# BEFORE: atrium_netconf atrium_portcullisd_daemon
+# KEYWORD: shutdown
+#
+# atrium-net: the host's network configuration (docs/spec/atrium-net.md).
+# Root, because it changes the host's interfaces, but it parses nothing from
+# the wire: a sandboxed atrium-lease per interface reads DHCP and router
+# advertisements, and atrium-net checks what it proposes. Capability mode
+# after start-up. Supervised by daemon(8): it is started again 2 s after it
+# exits, and atrium-netconf (which exits with it) follows.
+#
+# Add to /etc/rc.conf (scripts/atrium-net-service.sh does all of it):
+#   atrium_net_enable="YES"
+#   local_unbound_enable="YES"
+#
+# Optional:
+#   atrium_net_ifaces="AUTO"   # wired ports to manage; AUTO: every Ethernet
+#                              # port rc.conf does not configure (no
+#                              # ifconfig_<name> line and no ifconfig_DEFAULT,
+#                              # or ifconfig_<name>="up"), so a port left to
+#                              # rc.conf or dhclient is never taken
+#   atrium_net_wifi="AUTO"     # the Wi-Fi interface; AUTO: wlan0 if it exists,
+#                              # NONE: no Wi-Fi
+#   atrium_net_flags=""        # e.g. "-v", "--probe URL --probe-expect TEXT"
+#   atrium_net_logfile="/var/log/atrium/atrium-net.log"
+#
+# Needs (commissioned once): the _atrium-lease (65034) and _atrium-probe
+# (65035) users, /usr/local/libexec/atrium-lease and atrium-probe, and
+# local-unbound set up (`local-unbound-setup`), whose control socket
+# /var/run/local_unbound.ctl atrium-net uses to set forwarders.
+
+. /etc/rc.subr
+
+name="atrium_net"
+desc="Atrium network configuration"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_net_enable:="NO"}
+: ${atrium_net_ifaces:="AUTO"}
+: ${atrium_net_wifi:="AUTO"}
+: ${atrium_net_flags:=""}
+: ${atrium_net_logfile:="/var/log/atrium/atrium-net.log"}
+
+command="/usr/local/bin/atrium-net"
+pidfile="/var/run/atrium/atrium-net.pid"
+
+start_cmd="atrium_net_start"
+stop_cmd="atrium_net_stop"
+status_cmd="atrium_net_status"
+
+# Ethernet ports rc.conf leaves to atrium-net: no ifconfig_<name> line (and
+# no ifconfig_DEFAULT), or one that only brings the port up.
+atrium_net_auto_ifaces() {
+    for i in $(ifconfig -l ether); do
+        case "$i" in wlan*|lo*|bridge*|tap*|tun*|epair*) continue ;; esac
+        eval "c=\${ifconfig_${i}-\${ifconfig_DEFAULT:-}}"
+        case "$c" in ""|up|UP) echo "$i" ;; esac
+    done
+}
+
+atrium_net_start() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} already running."
+        return 0
+    fi
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium /atrium/sockets
+    install -d -m 0700 -o root -g wheel /var/db/atrium-net /atrium/sockets/atrium-net
+    args=""
+    ifaces="${atrium_net_ifaces}"
+    [ "${ifaces}" = AUTO ] && ifaces=$(atrium_net_auto_ifaces)
+    for i in ${ifaces}; do
+        ifconfig "$i" >/dev/null 2>&1 || { warn "${name}: no interface $i, skipped"; continue; }
+        args="${args} --iface $i"
+    done
+    wifi="${atrium_net_wifi}"
+    if [ "${wifi}" = AUTO ]; then
+        wifi=NONE
+        ifconfig wlan0 >/dev/null 2>&1 && wifi=wlan0
+    fi
+    [ "${wifi}" != NONE ] && args="${args} --wifi ${wifi}"
+    [ -n "${args}" ] || { warn "${name}: no interface to manage"; return 1; }
+    unbound=""
+    [ -S /var/run/local_unbound.ctl ] || { unbound="--no-unbound"; warn "${name}: local-unbound is not running; DNS forwarders not set"; }
+    echo "Starting ${name}:${args}."
+    # -r -R 2: started again 2 s after any exit; -P: the supervisor's pid.
+    /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_net_logfile}" -t "${name}" \
+        "${command}" ${args} --capsicum ${unbound} ${atrium_net_flags}
+}
+
+atrium_net_stop() {
+    [ -s "${pidfile}" ] || { echo "${name} not running (no pidfile)."; return 0; }
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    # daemon(8) passes SIGTERM on and does not restart a child it stopped.
+    kill -TERM "${pid}" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
+    done
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    pkill -KILL -x atrium-net 2>/dev/null
+    rm -f "${pidfile}" /atrium/sockets/atrium-net/ctl.sock
+}
+
+atrium_net_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running (supervisor pid $(cat "${pidfile}"), atrium-net pid $(pgrep -x atrium-net | tr '\n' ' '))."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"

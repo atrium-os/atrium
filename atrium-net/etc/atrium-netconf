@@ -1,0 +1,79 @@
+#!/bin/sh
+# PROVIDE: atrium_netconf
+# REQUIRE: atrium_net
+# BEFORE: atrium_portcullisd_daemon
+# KEYWORD: shutdown
+#
+# atrium-netconf: the apps' door to atrium-net (CLASS_NETCONF,
+# docs/spec/atrium-net.md §7.1). It opens one socket per capability under
+# /atrium/sockets (network-read, network-details, network-wifi, wifi-nearby,
+# network-configure; Portcullis mounts each only into jails that hold it),
+# connects to atrium-net's root-only control socket, then becomes
+# _atrium-netconf (65036) and enters capability mode, so app input is decoded
+# by an unprivileged process. It exits when atrium-net goes away; daemon(8)
+# starts it again 2 s later and it waits for atrium-net's socket.
+#
+# Add to /etc/rc.conf:
+#   atrium_netconf_enable="YES"
+#
+# Optional:
+#   atrium_netconf_flags=""      # "-v" logs each request's outcome
+#   atrium_netconf_logfile="/var/log/atrium/atrium-netconf.log"
+
+. /etc/rc.subr
+
+name="atrium_netconf"
+desc="Atrium network settings front (CLASS_NETCONF)"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_netconf_enable:="NO"}
+: ${atrium_netconf_flags:=""}
+: ${atrium_netconf_logfile:="/var/log/atrium/atrium-netconf.log"}
+
+command="/usr/local/bin/atrium-netconf"
+pidfile="/var/run/atrium/atrium-netconf.pid"
+ctl="/atrium/sockets/atrium-net/ctl.sock"
+
+start_cmd="atrium_netconf_start"
+stop_cmd="atrium_netconf_stop"
+status_cmd="atrium_netconf_status"
+
+atrium_netconf_start() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} already running."
+        return 0
+    fi
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium /atrium/sockets
+    # atrium-net makes its socket a moment after it starts.
+    for _ in $(seq 1 20); do [ -S "${ctl}" ] && break; sleep 1; done
+    [ -S "${ctl}" ] || warn "${name}: ${ctl} not there yet; it will be tried again"
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_netconf_logfile}" -t "${name}" \
+        "${command}" --ctl "${ctl}" --dir /atrium/sockets --uid 65036 --capsicum ${atrium_netconf_flags}
+}
+
+atrium_netconf_stop() {
+    [ -s "${pidfile}" ] || { echo "${name} not running (no pidfile)."; return 0; }
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    kill -TERM "${pid}" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
+    done
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    pkill -KILL -x atrium-netconf 2>/dev/null
+    rm -f "${pidfile}"
+}
+
+atrium_netconf_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running (supervisor pid $(cat "${pidfile}"), atrium-netconf pid $(pgrep -x atrium-netconf | tr '\n' ' '))."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"
