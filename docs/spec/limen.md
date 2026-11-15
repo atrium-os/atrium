@@ -116,6 +116,7 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `picker` | system | Scrinium (`org.atrium.scrinium`) | `plain` | one pick |
 | `share-target` | user | the app the user chose in the share sheet | `plain` | one share |
 | `media-player` | user | default media app | `plain` | as long as the parent wants |
+| `pdf-viewer` | user | default: Atrium PDF (`org.atrium.pdf`) | `plain` | as long as the parent wants |
 | `payment` | user | the user's payment app | `credential` | one payment |
 | `web-island` | system | the Navigator's engine host | `island` | as long as the page |
 | `map` | user | default map app | `plain` | as long as the parent wants |
@@ -219,7 +220,7 @@ The types are `limen::media_player` (atrium-player.md M0).
 **A file by descriptor.** `Load { source: Fd }` goes with `Parent::send_fd`, limend's
 `SEND_FD` op. The descriptor travels in the same frame as the message (`SCM_RIGHTS`), so the
 two can't be separated. Only a role whose catalogue entry says `takes_fd` may receive one,
-and today that is `media-player` alone. For any other role limend refuses `MALFORMED` and
+today `doc-viewer`, `media-player` and `pdf-viewer` (folium.md §8; types in `limen::pdf_viewer`). For any other role limend refuses `MALFORMED` and
 closes the descriptor. A message carries at most one descriptor. limend `fstat`s it and
 refuses anything but a regular file or a pipe opened read-only with `BAD_FD`. That rules out
 sockets, directories, devices and anything writable. FreeBSD's pipes are bidirectional, so a

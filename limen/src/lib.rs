@@ -19,5 +19,6 @@ pub mod fdpass;
 pub mod fresco;
 pub mod launch;
 pub mod media_player;
+pub mod pdf_viewer;
 pub mod picker;
 pub mod proto;

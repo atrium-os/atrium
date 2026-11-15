@@ -238,6 +238,9 @@ and `libmd-dev` for `vm-automount-check.sh`.
 
 ## 9. Home folders (proposed 2026-11-15)
 
+The layout around these folders (no user context, per-app data under the
+home, workspaces and consoles) is in [homes.md](homes.md).
+
 Asked for by Officina's O5h (recent files), which needs Scrinium to hold
 the user's files and to issue bookmarks (officina.md §4.3). Today no app
 can reach the user's files: portcullisd runs every app as its own per-app
