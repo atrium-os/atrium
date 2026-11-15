@@ -501,106 +501,24 @@ Whether the employer's policy allows split use is the user's business with their
 not something the gateway can check; Curia states plainly when the gateway asked for all
 traffic and the user scoped the tunnel to some apps.
 
-### 9.7 Personas: work and personal side by side, never confused
+### 9.7 Personas
 
-Shankar 2026-11-15: split tunnelling must split apps properly: a Navigator profile that
-uses the tunnel and says so, the same for mail and chat, and a workspace terminal through
-the tunnel next to one without, "all clearly indicated so there is no confusion".
+Splitting apps between work and personal (a Work Navigator window, Work mail and chat, a
+Work workspace terminal beside a Personal one, all clearly labelled) is a system feature of
+its own: [personas.md](personas.md). For the VPN it means:
 
-**The unit is (app, persona), not the app.** A tunnel's scope (§5.3) is a list of
-*personas*, not apps. A persona is the system-level identity Insula already describes
-(insula.md §13.6) and the Navigator already uses for cookies (navigator-ui.md §2.4):
-Personal (the default), and named ones such as **Work** that the person creates. A
-persona gets a name, a colour chosen from a fixed set that no app can draw over (below),
-and optionally one VPN profile. "Work → Acme VPN" is the whole setting.
-
-An app can run once per persona. Each **instance** (Mail · Work, Mail · Personal) is its
-own jail with:
-
-- its own uid (portcullisd allocates per (app, persona), as it does per app today) and its
-  own data at `~/.atrium/apps/<id>@<persona>/`, so the work mailbox and the personal one
-  never share a file, a cache or a process;
-- its own Arca persona: passwords, cookies and tokens of one are invisible to the other;
-- its own network stack, whose epair sits in the persona's FIB: through the tunnel for a
-  persona with a VPN, FIB 0 (direct) for the rest.
-
-A persona with a VPN and "block when not connected" (the default for a VPN persona) has no
-route at all while the tunnel is down, so a work app can never fall back to going direct.
-
-**Where each one lives:**
-
-| What | Through the tunnel | Direct |
-|---|---|---|
-| Navigator | a window of the Work persona: every trail in it is Work, and its page, converter, fetcher and courier jails are started in Work's FIB (§5.3). One window is one persona; a Work trail cannot be dragged into a Personal window | Personal and Unrecorded windows |
-| Mail, chat, other apps | the app's Work instance | its Personal instance |
-| Workspaces (homes.md §5) | a workspace whose persona is Work, chosen when it is made and shown in its settings; its jail's epair is in Work's FIB | a workspace with the Personal persona |
-| Workspace terminal | a console on the Work workspace (homes.md §4): it runs in that workspace's jail, so it has exactly that workspace's route | a console on a Personal workspace |
-| App console | a console on the app's Work instance | on its Personal instance |
-
-A terminal does not choose its route; the jail it is a console of does. Two terminals side
-by side, one for `acme-dev` and one for `scratch`, are two workspaces with two personas.
-
-**How it is shown.** The indication must come from something the app cannot fake, so it
-is drawn by frescod and Forum from what portcullisd registered for the client's uid, never
-from what the app says:
-
-- **The strip.** frescod's 24 px strip (navigator-ui.md §6.1) starts with a persona chip in
-  the persona's colour: `Work · via Acme VPN`. When any VPN is connected, every other
-  window's strip says `Personal · direct`, so both sides are labelled, not only the
-  tunnelled one. When the tunnel is down the chip turns amber: `Work · Acme VPN down: no
-  network`. While connecting: `Work · connecting`.
-- **The frame.** forum-wm draws a 3 px border in the persona's colour around every window
-  of a persona with a VPN. An app can draw anything inside its own surface, so the border
-  sits *outside* it, in the frame forum-wm owns, where no app can draw. Persona colours are
-  distinct by rule (Curia refuses two personas with close colours).
-- **Terminals.** A console's window is the terminal app's (atrium-term), but its strip and
-  frame show the persona of the jail the console is attached to (portcullisd registers the
-  terminal instance as "console of <instance>"). The title reads `Terminal: acme-dev ·
-  Work`. Inside, the shell prompt also starts with `[work]` (set by portcullisd in the
-  console's environment): convenient, but the strip and frame are the proof.
-- **Dock, Applications, overview, Alt-Tab.** Each running instance has its own icon with a
-  persona badge in the corner (a coloured dot and the first letter). Launching an app that
-  has instances in several personas asks which one, with the last used preselected; a
-  person with one persona never sees the question.
-- **The Forum VPN item** lists, per connected VPN, the personas and instances using it
-  right now ("Acme VPN: Navigator · Work, Mail · Work, acme-dev").
-- **Notifications** from an instance carry the same chip, so a work mail notification
-  cannot be mistaken for a personal one.
-
-**Moving data between personas.** Files go through Scrinium's picker as always; the picker's
-sheet shows both personas' chips when a file crosses from one to the other. Paste across
-personas works but the paste carries a one-line notice in the strip ("pasted from Work").
-Links opened from a Work app open in a Work Navigator window; from a Personal app in a
-Personal one. **Crossing personas is off by default, both ways** (Shankar 2026-11-15:
-"why should we not disable it by default?"):
-
-- A link from Work opened in a Personal app, or the reverse, opens in the persona it came
-  from; there is no "open in the other persona". A sheet drawn by Forum says why and offers
-  **Copy address**, so moving a link is one deliberate act that the person does with the
-  address in front of them.
-- **Allowing it is a per-persona switch** in Curia, per direction ("Links from Work may open
-  in Personal", "Outside links may open in Work"). With it on, each crossing still asks, in
-  the same sheet, with the full address and both chips ("Open in Personal, outside Acme
-  VPN?"), and says when the link has a query string (it may hold a session token). Never a
-  remembered choice; one press each.
-- **Never allowed, even with the switch:** a Work link that only works inside the tunnel
-  (its host is under a tunnel DNS domain or resolves into the tunnel's routes) opened
-  direct: it would only send an internal name to the public network.
-- **Personal → Work is the riskier direction** for the employer (a phishing link from a
-  personal chat reaching the internal network). When allowed, it opens anonymous
-  (navigator-ui.md §6.2, nothing signed in) in a new Work trail.
-
-
-**Hooks needed elsewhere** (passed to the threads building them):
-
-- portcullisd: instances keyed by (app, persona) with their own uid and overlay; the launch
-  registry line carries the persona, so frescod, forum-wm, Arca and jaild read it by peer
-  uid.
-- homes.md: a workspace record carries its persona; jaild puts its epair in the persona's
-  FIB; consoles inherit it and register as "console of" for frescod.
-- frescod: the persona chip in the strip and the "console of" rule; forum-wm: the frame
-  colour and badges.
-- navigator-ui: one persona per window; named personas (its D5) become needed for Work.
+- **A tunnel's scope is a list of personas**, not apps. "Work → Acme VPN" puts every Work
+  instance (personas.md §3: each app runs once per persona) and every Work workspace on
+  the tunnel's routing table (§5.3); Personal instances stay in FIB 0.
+- **Helpers follow their instance**: a Work Navigator window's page, converter, fetcher
+  and courier jails, and a Work workspace's consoles, are Work's.
+- **Labels** (personas.md §7): the strip chip carries the route, `Work · via Acme VPN`,
+  amber `Work · Acme VPN down: no network`; while a VPN is up every other window says
+  `Personal · direct`.
+- **Tunnel-only links never go direct**: a Work link whose host is under a tunnel DNS
+  domain or resolves into the tunnel's routes is never opened outside the tunnel, even when
+  the person allows links to cross personas (personas.md §6), because that would only send
+  an internal name to the public network.
 
 ## 10. Posture checks
 
@@ -733,18 +651,9 @@ tunnel, site-to-site, being a VPN server, multi-hop, post-quantum WireGuard (Ros
     *Recommend yes.*
 17. **Name Crypta** (`cryptad`, `crypta-*`). *Recommend yes*; alternative *Cuniculus*
     (tunnel).
-18. **A tunnel's scope is a list of personas; an app runs once per persona** as its own
-    jail, uid, data and Arca persona, and its network follows the persona (§9.7).
-    *Recommend yes.* Alternative: scope by app only (simpler, but no Work and Personal
-    instance of the same app).
-19. **Persona shown by frescod and forum-wm, never by the app:** a chip in the strip on
-    every window while any VPN is up (`Work · via Acme VPN`, `Personal · direct`), a
-    coloured frame for VPN personas, badges in the dock and overview. *Recommend yes.*
-20. **One persona per Navigator window**, and a workspace's persona fixed when it is made
-    (changeable in its settings, never from inside). *Recommend yes.*
-21. **Links do not cross personas by default** (Shankar 2026-11-15); the refusal sheet
-    offers Copy address; a per-persona, per-direction switch allows crossing with one press
-    each; tunnel-only links never go direct. *Recommend yes.*
+18–21. **Moved to [personas.md](personas.md) §9** (instances per persona, indication,
+    one persona per Navigator window and workspace, crossing off by default). For the VPN:
+    a tunnel's scope is a list of personas (§9.7). *Recommend yes.*
 
 ## 14. Build order
 
@@ -753,7 +662,7 @@ tunnel, site-to-site, being a VPN server, multi-hop, post-quantum WireGuard (Ros
 | V0 | `crypta-wg` core on the host (Noise IK, transport, timers, replay window); arcad `WireGuardKey` + `DH_X25519` | test vectors pass; a host-only run handshakes with a Linux WireGuard peer over a socket; fuzzers run clean for an hour |
 | V1 | cryptad, engine jail via jaild, `tun`, atrium-net tunnel proposals, machine scope, unbound forward-zones, `atrium/vpn` anchor with block-when-not-connected | cloud VM reaches the Ubuntu VM's WireGuard network; leak gate (§11) passes; killing the engine leaks nothing |
 | V2 | Persona scope: per-tunnel FIB, jaild epair FIB, helper inheritance, per-tunnel resolver; per-(app, persona) instances in portcullisd; workspaces with a persona | app scope gate (§11) passes; a Work and a Personal workspace side by side, captures show only Work's traffic in the tunnel |
-| V2b | Indication: frescod persona chip, forum-wm frame and badges, console-of rule for terminals, Navigator window per persona | frames of two Navigator windows, two Mail instances and two workspace terminals, Work and Personal, with the tunnel up, connecting and down |
+| V2b | The route in the persona chip (personas.md P1 first) | frames of Work and Personal windows with the tunnel up, connecting and down |
 | V3 | `CLASS_VPN` + crypta-ctl, Curia VPN page (generate key, import file, apps list, block switch), Forum item | Curia frames of each; an app without `vpn-configure` is refused |
 | V4 | `crypta-ac` TLS-only: forms through Arca fields (`TAKE_VPN`), saved passwords, client certificates through Arca and Sigillum, posture answer without HostScan | ocserv gate: password, OTP and certificate sign-ins; roam resumes; hostile pushes refused |
 | V5 | `crypta-gp`: portal and gateway login, ESP in UDP, SSL fallback, HIP from true facts with the Curia report view | stand-in gateway gate, the stand-in also accepting OpenConnect's GP client |
