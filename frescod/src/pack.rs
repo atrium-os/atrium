@@ -80,6 +80,8 @@ pub struct Sprite {
     /// and clip, wholly opaque, though its own opacity is now 0 (a slide
     /// held while the next comes in; pergola.md §4.2 sets end states).
     pub outgoing: bool,
+    /// An animation runs on it.
+    pub animated: bool,
 }
 
 /// A scroll viewport, for the pixel renderer's shift
@@ -440,17 +442,22 @@ impl SceneState {
 /// Window `id`'s scene as the frontend holds it, for a surface of `size`
 /// whose (0, 0) is at `pos` on the screen. None if it has drawn nothing.
 pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32)) -> Option<WindowFrame> {
-    window_frame_as(fe, id, pos, size, false)
+    window_frame_as(fe, id, pos, size, None)
 }
 
 /// [`window_frame`], with the groups an animation moves, fades or clips
 /// as [`Sprite`]s, for a pixel renderer that composites them
 /// ([`crate::sprites`]).
-pub fn window_frame_promoted(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32)) -> Option<WindowFrame> {
-    window_frame_as(fe, id, pos, size, true)
+///
+/// `keep`: groups that were sprites lately; they stay sprites while they
+/// can (and while any is kept, the window's hidden clipped groups, such as
+/// the next slide, are sprites too, so their content is rastered before
+/// it shows): a transition then neither starts nor ends with a raster.
+pub fn window_frame_promoted(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32), keep: &std::collections::HashSet<u32>) -> Option<WindowFrame> {
+    window_frame_as(fe, id, pos, size, Some(keep))
 }
 
-fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32), promote: bool) -> Option<WindowFrame> {
+fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32), promote: Option<&std::collections::HashSet<u32>>) -> Option<WindowFrame> {
     let state = fe.window_state(id)?;
     let fresh = || WindowFrame {
         id,
@@ -460,11 +467,11 @@ fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, 
     };
     let mut w = fresh();
     if state.has_groups() {
-        if promote && !state.anim_now.is_empty() && grouped_frame(state, &mut w, true) {
+        if promote.is_some_and(|k| !state.anim_now.is_empty() || !k.is_empty()) && grouped_frame(state, &mut w, promote) {
             return Some(w);
         }
         w = fresh();
-        grouped_frame(state, &mut w, false);
+        grouped_frame(state, &mut w, None);
         return Some(w);
     }
     /* Paint in node_id order (lower id → drawn first → bottom).
@@ -814,7 +821,11 @@ fn empty(c: Option<[f32; 4]>) -> bool {
 /// With `promote`, animated groups become [`Sprite`]s; `false` if that
 /// was asked and the window is not in a shape that allows it (`w` is then
 /// to be built again without).
-pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_frontend::WindowSceneState, w: &mut WindowFrame, promote: bool) -> bool {
+pub(crate) fn grouped_frame(
+    state: &fresco_scene_server::command::envelope_frontend::WindowSceneState,
+    w: &mut WindowFrame,
+    promote: Option<&std::collections::HashSet<u32>>,
+) -> bool {
     use fresco_compute::Node as Item;
     let mut order: Vec<OrderItem> = Vec::new();
     let sorted = |keys: Vec<&u32>| { let mut k: Vec<u32> = keys.into_iter().copied().collect(); k.sort_unstable(); k };
@@ -932,19 +943,26 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
         if let Some(g) = state.group_now(id) {
             // The group's clip is in its parent's space: map it with `x`.
             let c = meet(clip, g.clip.map(|c| x.rect(c)));
-            if empty(c) || at.seen * g.opacity <= 0.0 {
-                // Nothing of it can show (clipped away, or wholly
-                // transparent: a slide kept resident for the next
-                // transition): skip the subtree.
-                continue;
-            }
+            let hidden = at.seen * g.opacity <= 0.0;
             // A sprite: an animation moves, fades or clips the group, but
-            // does not scale it (its content would change every frame).
+            // does not scale it (its content would change every frame); a
+            // group that was one lately; or, beside those, a hidden one
+            // with a clip (a slide kept resident for the next transition).
             let scroll = g.flags & fresco_protocol::group_flags::SCROLL != 0;
+            let anim = state.anim_now.get(&id);
             let still = |a: &fresco_protocol::GroupParams| {
                 state.group_nodes.get(&id).is_some_and(|b| a.transform[..4] == b.transform[..4])
             };
-            if promote && !at.sprite && at.layers == 0 && !scroll && state.anim_now.get(&id).is_some_and(still) {
+            let sprite = promote.is_some_and(|keep| {
+                !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still)
+                    && (anim.is_some() || keep.contains(&id) || (hidden && g.clip.is_some()))
+            });
+            if !sprite && (empty(c) || hidden) {
+                // Nothing of it can show (clipped away, or wholly
+                // transparent): skip the subtree.
+                continue;
+            }
+            if sprite {
                 let t = &g.transform;
                 let inner_x = x.then(&[t[0], t[1], t[2], t[3], 0.0, 0.0]);
                 let clip = c.map_or([i32::MIN, i32::MIN, i32::MAX, i32::MAX], |c| c.map(|v| v.round() as i32));
@@ -959,6 +977,7 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
                     clip,
                     opaque: false,
                     outgoing,
+                    animated: anim.is_some(),
                 }));
                 push_kids(&mut stack, Some(id), At { x: inner_x, op: 1.0, seen: at.seen * g.opacity, clip: None, layers: 0, sprite: true });
                 continue;
@@ -984,7 +1003,7 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
             emit(w, &mut order, id, x, op, clip);
         }
     }
-    if promote {
+    if promote.is_some() {
         // Each sprite within the window's size in its own space, and
         // nothing that is not a sprite drawn over one.
         let why = |r: &str| {
@@ -1018,6 +1037,9 @@ pub(crate) fn grouped_frame(state: &fresco_scene_server::command::envelope_front
             }
             let (ox, oy) = (s.offset[0] as f32, s.offset[1] as f32);
             let c = s.clip.map(|v| v as f32);
+            if s.opacity <= 0.0 {
+                bbox = [0.0; 4];
+            }
             covers.push([(bbox[0] + ox).max(c[0]), (bbox[1] + oy).max(c[1]), (bbox[2] + ox).min(c[2]), (bbox[3] + oy).min(c[3])]);
             // Its own pixels hide the window under it wherever it shows:
             // an opaque, square rect drawn before anything isolated,
@@ -1422,7 +1444,7 @@ mod group_tests {
     }
     fn grouped(s: &WindowSceneState) -> WindowFrame {
         let mut w = WindowFrame { id: 1, size: (W, W), ..Default::default() };
-        grouped_frame(s, &mut w, false);
+        grouped_frame(s, &mut w, None);
         w
     }
     fn draw(w: &WindowFrame) -> Vec<u32> {

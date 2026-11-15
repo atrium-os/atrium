@@ -413,6 +413,14 @@ impl<'a> Backend<'a> {
     /// The last frame, BGRA8, `width * height * 4` bytes.
     /// The frames of the last render, by window, for hit-testing; empty
     /// for Vulkan, which merges the windows into one scene.
+    /// The groups window `id` keeps as sprites (crate::sprites::Sprites::keep).
+    pub fn sprite_keep(&self, id: u32) -> std::collections::HashSet<u32> {
+        match self {
+            Backend::Compute(c) => c.sprites.get(&id).map(|s| s.keep()).unwrap_or_default(),
+            _ => Default::default(),
+        }
+    }
+
     pub fn frames(&self) -> &[(u32, Arc<fresco_compute::Frame>)] {
         match self {
             Backend::Vulkan(_) => &[],
@@ -1692,14 +1700,14 @@ mod tests {
         s.set_group(10, slide, 1).unwrap();
         rect(&mut s, 11, 0.0, 0.0, 64.0, 48.0, [1.0, 0.0, 0.0, 1.0], Some(10));
         rect(&mut s, 12, 10.5, 10.0, 20.0, 20.0, [0.0, 0.0, 1.0, 0.5], Some(10));
-        let mut c = Compute::new(w, h).expect("kernels");
+        let c = Compute::new(w, h).expect("kernels");
         let scene = SceneState::default();
         let mut sp = crate::sprites::Sprites::default();
         let mut out = vec![0u32; (w * h) as usize];
         let mut step = |s: &mut WindowSceneState, dx: f32, op: f32, tol: u32| -> Option<[u32; 4]> {
             s.anim_now.insert(10, GroupParams { transform: [1.0, 0.0, 0.0, 1.0, 8.0 + dx, 8.0], opacity: op, ..slide });
             let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
-            assert!(grouped_frame(s, &mut pw, true), "promoted");
+            assert!(grouped_frame(s, &mut pw, Some(&Default::default())), "promoted");
             assert_eq!(pw.sprites.len(), 1);
             let mut cost = crate::sprites::Cost::default();
             let d = sp.draw(&c.t2, &scene, &pw, &mut out, w, h, false, &mut cost).unwrap();
@@ -1708,7 +1716,7 @@ mod tests {
             iso.flags = group_flags::ISOLATE;
             s.anim_now.insert(10, iso);
             let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
-            assert!(grouped_frame(s, &mut fw, false));
+            assert!(grouped_frame(s, &mut fw, None));
             let mut want = vec![0u32; (w * h) as usize];
             c.t2.render(&scene.pack(&fw, w, h), &mut want).unwrap();
             for (i, (g, e)) in out.iter().zip(&want).enumerate() {
@@ -1757,7 +1765,7 @@ mod tests {
         let scene = SceneState::default();
         let full = |s: &WindowSceneState| {
             let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
-            grouped_frame(s, &mut fw, false);
+            grouped_frame(s, &mut fw, None);
             let mut px = vec![0u32; (w * h) as usize];
             c.t2.render(&scene.pack(&fw, w, h), &mut px).unwrap();
             px
@@ -1771,7 +1779,7 @@ mod tests {
             for dx in [0.0f32, 24.0] {
                 s.anim_now.insert(10, GroupParams { transform: [1.0, 0.0, 0.0, 1.0, 16.0 + dx, 16.0], ..slide });
                 let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
-                assert!(grouped_frame(&s, &mut pw, true));
+                assert!(grouped_frame(&s, &mut pw, Some(&Default::default())));
                 assert!(pw.sprites[0].opaque && pw.sprites[0].outgoing == (dx == 0.0));
                 let mut cost = crate::sprites::Cost::default();
                 sp.draw(&c.t2, &scene, &pw, &mut out, w, h, dx == 0.0, &mut cost).unwrap();
@@ -1781,5 +1789,71 @@ mod tests {
                 assert!(out == full(&s), "dx {dx}, taken {want_taken}: differs from a full raster");
             }
         }
+    }
+
+    /// A hidden clipped group beside an animated one is a sprite drawn
+    /// ahead of time; when it comes in, and after (kept as a sprite), no
+    /// frame rasters it again.
+    #[test]
+    fn the_next_slide_is_ready_before_it_comes_in() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (128u32, 96u32);
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 128.0, 96.0, [0.0, 0.0, 0.0, 1.0], None);
+        let a = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 16.0, 16.0], clip: Some([16.0, 16.0, 112.0, 80.0]), opacity: 1.0, flags: 0 };
+        let b = GroupParams { order: 6, opacity: 0.0, ..a };
+        s.set_group(10, a, 1).unwrap();
+        s.set_group(20, b, 1).unwrap();
+        rect(&mut s, 11, 0.0, 0.0, 96.0, 64.0, [1.0, 1.0, 1.0, 1.0], Some(10));
+        rect(&mut s, 21, 0.0, 0.0, 96.0, 64.0, [0.9, 0.2, 0.2, 1.0], Some(20));
+        rect(&mut s, 22, 20.5, 8.0, 30.0, 30.0, [0.1, 0.1, 0.9, 0.7], Some(20));
+        let c = Compute::new(w, h).expect("kernels");
+        let scene = SceneState::default();
+        let full = |s: &WindowSceneState| {
+            let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            grouped_frame(s, &mut fw, None);
+            let mut px = vec![0u32; (w * h) as usize];
+            c.t2.render(&scene.pack(&fw, w, h), &mut px).unwrap();
+            px
+        };
+        let near = |a: &[u32], b: &[u32], tol: u32| a.iter().zip(b).all(|(x, y)| [0, 8, 16, 24].iter().all(|sh| ((x >> sh) & 255).abs_diff((y >> sh) & 255) <= tol));
+        let mut sp = crate::sprites::Sprites::default();
+        let mut out = vec![0u32; (w * h) as usize];
+        let mut draw = |s: &WindowSceneState, sp: &mut crate::sprites::Sprites, out: &mut Vec<u32>| {
+            let keep = sp.keep();
+            let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(s, &mut pw, Some(&keep)), "promoted");
+            let mut cost = crate::sprites::Cost::default();
+            sp.draw(&c.t2, &scene, &pw, out, w, h, false, &mut cost).unwrap();
+            (pw.sprites.len(), cost)
+        };
+        // Slide 10 settles in (an animation at its end values): 20 rides
+        // along hidden, rastered once nothing moves.
+        s.anim_now.insert(10, a);
+        let (n, _) = draw(&s, &mut sp, &mut out);
+        assert_eq!(n, 2, "the hidden slide is a sprite too");
+        s.anim_now.clear();
+        let (_, cost) = draw(&s, &mut sp, &mut out);
+        assert!(cost.content_tiles > 0, "drawn ahead while nothing moves");
+        assert!(near(&out, &full(&s), 1));
+        // 20 fades in over 10: nothing rastered.
+        s.set_group(20, GroupParams { opacity: 1.0, ..b }, 1).unwrap();
+        s.anim_now.insert(20, GroupParams { opacity: 0.5, ..b });
+        let (_, cost) = draw(&s, &mut sp, &mut out);
+        assert_eq!((cost.content_tiles, cost.base_tiles), (0, 0), "rastered as it came in");
+        // Ended: still sprites, nothing rastered, the same pixels.
+        s.anim_now.clear();
+        let (n, cost) = draw(&s, &mut sp, &mut out);
+        assert_eq!(n, 2);
+        assert_eq!((cost.content_tiles, cost.base_tiles), (0, 0), "rastered when it ended");
+        assert!(near(&out, &full(&s), 1), "differs from a full raster");
     }
 }

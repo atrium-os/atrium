@@ -637,7 +637,12 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         let wf = {
             let fe = fe.lock().unwrap();
             let size = (width as f32, height as f32);
-            if t2.is_some() { pack::window_frame_promoted(&fe, id, (0.0, 0.0), size) } else { pack::window_frame(&fe, id, (0.0, 0.0), size) }
+            if t2.is_some() {
+                let keep = w.sprites.as_ref().map(|s| s.keep()).unwrap_or_default();
+                pack::window_frame_promoted(&fe, id, (0.0, 0.0), size, &keep)
+            } else {
+                pack::window_frame(&fe, id, (0.0, 0.0), size)
+            }
         };
         let Some(wf) = wf else { continue };
         // An unchanged scene draws the same pixels: not packed again.

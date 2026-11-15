@@ -1541,7 +1541,7 @@ fn render_one_frame(
                     ..Default::default()
                 });
             } else if let Some(w) = if promote {
-                pack::window_frame_promoted(&fe, *win_id, *pos, *size)
+                pack::window_frame_promoted(&fe, *win_id, *pos, *size, &renderer.sprite_keep(*win_id))
             } else {
                 pack::window_frame(&fe, *win_id, *pos, *size)
             } {

@@ -19,6 +19,11 @@ struct Content {
     /// frame, so its first frame rasters only that strip).
     frame: Option<fresco_compute::Frame>,
     valid: Vec<bool>,
+    /// The group it was last drawn for, and its tiles' signatures: when
+    /// the group's content changes (a build inside a slide), only the
+    /// tiles whose signature changed are drawn again.
+    group: u32,
+    sig: Vec<u64>,
 }
 
 /// Contents kept beyond those in use: a transition's outgoing slide is
@@ -51,6 +56,8 @@ pub struct Sprites {
     shown: Option<Vec<Shown>>,
     draws: u64,
     paused: Option<std::time::Instant>,
+    /// When a sprite last animated.
+    animated: Option<std::time::Instant>,
 }
 
 fn union(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
@@ -151,6 +158,10 @@ impl Sprites {
             self.base_key = Some(key);
         }
         // Each sprite's content, and where it shows.
+        let moving = f.sprites.iter().any(|s| s.animated);
+        if moving {
+            self.animated = Some(std::time::Instant::now());
+        }
         self.paused = None;
         self.draws += 1;
         let mut shown = Vec::with_capacity(f.sprites.len());
@@ -171,22 +182,48 @@ impl Sprites {
                 (rect[2] as i64 - off[0]).clamp(0, width as i64) as u32,
                 (rect[3] as i64 - off[1]).clamp(0, height as i64) as u32,
             ];
-            let at = match self.content.iter().position(|c| c.key == key && c.px.len() == n) {
-                Some(at) => at,
-                None => {
+            let found = self.content.iter().position(|c| c.key == key && c.px.len() == n);
+            // Not held: the group's own content changed, drawn again by
+            // the tiles whose signatures changed (unless that content is
+            // in use this frame, or that is most of it).
+            let same = found.is_none().then(|| self.content.iter().position(|c| c.group == s.group && c.px.len() == n && !c.sig.is_empty())).flatten().filter(|j| !using.contains(j));
+            let at = match (found, same) {
+                (Some(at), _) => at,
+                (None, Some(at)) => {
+                    let (frame, _) = scene.pack_part(f, Some(i), width, height);
+                    let sig = damage::tile_signatures(&frame);
+                    let c = &mut self.content[at];
+                    if sig.len() == c.sig.len() {
+                        for (k, v) in c.valid.iter_mut().enumerate() {
+                            *v &= sig[k] == c.sig[k];
+                        }
+                    } else {
+                        c.valid = vec![false; sig.len()];
+                    }
+                    c.sig = sig;
+                    c.frame = Some(frame);
+                    c.key = key;
+                    at
+                }
+                (None, None) => {
                     // A new raster: into the least recently used content
                     // not in use, once more than KEEP are held.
                     let spare = (self.content.len() >= KEEP + f.sprites.len())
                         .then(|| (0..self.content.len()).filter(|j| !using.contains(j)).min_by_key(|&j| self.content[j].used))
                         .flatten();
                     let at = spare.unwrap_or_else(|| {
-                        self.content.push(Content { key: !key, px: Vec::new(), used: 0, frame: None, valid: Vec::new() });
+                        self.content.push(Content { key: !key, px: Vec::new(), used: 0, frame: None, valid: Vec::new(), group: s.group, sig: Vec::new() });
                         self.content.len() - 1
                     });
                     let (frame, _) = scene.pack_part(f, Some(i), width, height);
                     let c = &mut self.content[at];
                     c.px.resize(n, 0);
                     c.valid = vec![false; (frame.header.tiles_x * frame.header.tiles_y) as usize];
+                    c.sig = damage::tile_signatures(&frame);
+                    c.group = s.group;
+                    if first && std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
+                        eprintln!("frescod: sprite {} new: plain {plain} outgoing {} opaque {} rect {rect:?}", s.group, s.outgoing, s.opaque);
+                    }
                     if plain && first && s.outgoing && s.opaque && !empty(rect) {
                         cost.grabbed += take_from_window(t2, &frame, c, out, width, local, (off[0] as i32, off[1] as i32))?;
                     }
@@ -198,14 +235,18 @@ impl Sprites {
             };
             self.content[at].used = self.draws;
             using.push(at);
-            // The tiles of the content that show now, rastered if not yet.
+            // The tiles of the content that show now, rastered if not yet;
+            // while nothing animates, all of them (a hidden slide's, so it
+            // is ready when it comes in).
             let c = &mut self.content[at];
-            if let (Some(frame), false) = (&c.frame, empty(rect)) {
+            let all = !moving;
+            if let (Some(frame), true) = (&c.frame, all || !empty(rect)) {
                 let h = &frame.header;
                 let mut need = vec![false; c.valid.len()];
                 let mut any = false;
-                for ty in local[1] / TILE..local[3].div_ceil(TILE).min(h.tiles_y) {
-                    for tx in local[0] / TILE..local[2].div_ceil(TILE).min(h.tiles_x) {
+                let span = if all { [0, 0, width, height] } else { local };
+                for ty in span[1] / TILE..span[3].div_ceil(TILE).min(h.tiles_y) {
+                    for tx in span[0] / TILE..span[2].div_ceil(TILE).min(h.tiles_x) {
                         let k = (ty * h.tiles_x + tx) as usize;
                         if !c.valid[k] {
                             need[k] = true;
@@ -264,6 +305,15 @@ impl Sprites {
         }
         cost.composite += t.elapsed();
         Ok(Some(damage))
+    }
+
+    /// The groups to keep as sprites ([`crate::pack::window_frame_promoted`]):
+    /// those of the last drawing, while a sprite animated within [`IDLE`].
+    pub fn keep(&self) -> std::collections::HashSet<u32> {
+        match (&self.shown, self.animated) {
+            (Some(shown), Some(t)) if t.elapsed() < IDLE => shown.iter().map(|s| s.group).collect(),
+            _ => Default::default(),
+        }
     }
 
     /// The window has no sprites now (it is drawn the plain way): the next
