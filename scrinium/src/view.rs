@@ -59,6 +59,12 @@ pub fn compact(h: f32) -> bool {
     h < toolbar_h() + actions_h() + header_h() + 4.0 * row_h() + status_h()
 }
 pub fn pick_side_w() -> f32 { em(176.0) }
+/// The picker's places in a sheet `w` wide: [`pick_side_w`], but no more
+/// than three tenths of it, so names keep their room when the text grows
+/// and the sheet doesn't (its size is the catalogue's, limen.md §5.1).
+pub fn pick_side_for(w: f32) -> f32 {
+    pick_side_w().min(w * 0.3)
+}
 pub fn toolbar_h() -> f32 { em(48.0) }
 pub fn actions_h() -> f32 { em(40.0) }
 pub fn strip_h() -> f32 { em(48.0) }
@@ -73,6 +79,8 @@ pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4c4f_4f4b;
 fn text_x() -> f32 { 16.0 + em(28.0) }
 pub fn pick_title_h() -> f32 { em(52.0) }
 pub fn pick_foot_h() -> f32 { em(60.0) }
+/// The picker's path row, under its heading.
+pub fn pick_path_h() -> f32 { em(40.0) }
 
 pub struct ScriniumView {
     pub state: Mutable<Browser>,
@@ -1080,21 +1088,23 @@ impl ScriniumView {
                 (Kind::File, false) => "Choose a file".into(),
             }
         };
-        icon(ctx, 16.0, 16.0, ph::FOLDER_OPEN, 20.0, t.accent_fg());
-        text(ctx, 46.0, 18.0, &fit(&title, type_size::MD, Weight::Semibold, w - 70.0), type_size::MD, Weight::Semibold, t.text_primary());
+        // Two lines in em, so they stay apart as the text grows.
+        icon(ctx, 16.0, em(16.0), ph::FOLDER_OPEN, 20.0, t.accent_fg());
+        let tx = 16.0 + em(30.0);
+        text(ctx, tx, em(18.0), &fit(&title, type_size::MD, Weight::Semibold, w - tx - 24.0), type_size::MD, Weight::Semibold, t.text_primary());
         let who = if filter.write { format!("for {app}, which may change it") } else { format!("for {app}, to read") };
-        text(ctx, 46.0, 37.0, &fit(&who, type_size::XS, Weight::Regular, w - 70.0), type_size::XS, Weight::Regular, t.text_tertiary());
+        text(ctx, tx, em(37.0), &fit(&who, type_size::XS, Weight::Regular, w - tx - 24.0), type_size::XS, Weight::Regular, t.text_tertiary());
 
         let foot = h - pick_foot_h();
-        self.sidebar(ctx, b, pick_title_h(), pick_side_w(), foot);
-        let x0 = pick_side_w();
-        // The path row.
+        let x0 = pick_side_for(w);
+        self.sidebar(ctx, b, pick_title_h(), x0, foot);
+        // The path row: up, then the path after the (em-sized) button.
         let py = pick_title_h();
         let s = self.state.clone();
-        icon_button(ctx, x0 + 8.0, py + 6.0, ph::ARROW_UP, !b.path.is_empty(), "Up", move || with(&s, Browser::up));
-        self.crumbs(ctx, b, x0 + 46.0, py + 20.0, w - 12.0);
-        rect(ctx, x0, py + 39.0, w - x0, 1.0, t.border_default(), 0.0);
-        self.list(ctx, b, x0, w, py + 40.0, foot, false);
+        icon_button(ctx, x0 + 8.0, py + em(6.0), ph::ARROW_UP, !b.path.is_empty(), "Up", move || with(&s, Browser::up));
+        self.crumbs(ctx, b, x0 + 18.0 + em(28.0), py + pick_path_h() / 2.0, w - 12.0);
+        rect(ctx, x0, py + pick_path_h() - 1.0, w - x0, 1.0, t.border_default(), 0.0);
+        self.list(ctx, b, x0, w, py + pick_path_h(), foot, false);
 
         // The answer.
         rect(ctx, 0.0, foot, w, pick_foot_h(), t.bg_surface(), 0.0);
@@ -1104,12 +1114,13 @@ impl ScriniumView {
             Kind::File => "Open",
             Kind::Folder => "Choose folder",
         };
-        let gw = width(go, type_size::SM, Weight::Medium) + 28.0;
-        let cw = width("Cancel", type_size::SM, Weight::Medium) + 28.0;
+        // As wide as `button` draws them (their padding is em too).
+        let (gw, cw) = (button_w(go), button_w("Cancel"));
+        let by = foot + ((pick_foot_h() - em(32.0)) / 2.0).max(0.0);
         let s = self.state.clone();
-        button(ctx, w - 16.0 - gw, foot + 14.0, go, Look::Primary, pick.is_ok() && b.outcome.is_none(), move || with(&s, Browser::choose));
+        button(ctx, w - 16.0 - gw, by, go, Look::Primary, pick.is_ok() && b.outcome.is_none(), move || with(&s, Browser::choose));
         let s = self.state.clone();
-        button(ctx, w - 24.0 - gw - cw, foot + 14.0, "Cancel", Look::Secondary, b.outcome.is_none(), move || with(&s, Browser::cancel));
+        button(ctx, w - 24.0 - gw - cw, by, "Cancel", Look::Secondary, b.outcome.is_none(), move || with(&s, Browser::cancel));
         let (msg, color) = match (&b.notice, &pick, &b.outcome) {
             (_, _, Some(Outcome::Cancelled)) => ("Cancelled".to_string(), t.text_secondary()),
             (_, _, Some(_)) => ("Handing it over…".to_string(), t.text_secondary()),
