@@ -31,7 +31,7 @@ column. §17 D1 asks which go into the first release; my recommendation is the *
 | E2 | **Instant search that finds things inside attachments** | type and see results as you type, across all accounts of a persona, including text in PDFs and office files; a saved search becomes a folder | yes | §11.2 |
 | E3 | **Conversations that read well, or a plain timeline** | per folder: threads or strictly chronological messages; quick filters (Unread, To me, Needs reply, Has attachment); optional grouping by date, sender or account; quoted text and signatures folded, a "new since you last looked" line, every file in the thread in one strip at the top | yes | §11.1, §11.7 |
 | E4 | **One-press unsubscribe and a newsletter lane** | a real unsubscribe button (RFC 8058) on every list mail, newsletters read with the Navigator's reading settings (text size, dark, comfortable) | yes | §11.3 |
-| E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); quiet hours per persona (no Work mail after 19:00); a sound per account | yes | §12 |
+| E5 | **Quiet notifications** | alerts only for people and threads you are in; everything else waits for the times you pick ("9:00 and 17:00"); no storm of pings after a network drop or sleep, one silent catch-up summary instead; quiet hours per persona (no Work mail after 19:00); a sound per account | yes | §12 |
 | E6 | **Screener for first-time senders** | mail from someone new waits in a "New senders" list until you press Accept once; nothing from them bothers you before that | yes, off by default | §11.3 |
 | E7 | **Attachments as first-class things** | quick look without opening an app; "every file from Priya"; save straight into the right persona's folder; big files sent as a share link instead of 25 MB of base64 | yes (share links later) | §8 |
 | E8 | **Setup with just an address, usable in seconds** | type your address, sign in, done: servers found by autodiscovery; the inbox usable in seconds while the rest fills in politely, no gigabyte downloads; import mbox/Maildir; export everything any time | yes | §5.1, §6.4, §6.5 |
@@ -754,6 +754,43 @@ Vacation replies through Sieve or JMAP `VacationResponse`.
 - **Actions** (Archive, Mark read, Reply) when Praeco notification actions exist
   (CLASS_BROKER delivery, not built); a press on the notification gives the press Mail needs.
 - Per persona; the persona badge comes from Forum (personas.md §7), not from Mail.
+
+### 12.1 No storm of pings after a gap (Shankar 2026-11-16)
+
+Shankar: "Tons of pings when new mail arrives suddenly, maybe due to a network
+disconnection. Very annoying. Same with meeting reminders that suddenly show up." The
+cause is a client that notifies for everything it *learns about* rather than for what is
+*new to the person now*. Mail's rules:
+
+- **Only fresh mail pings.** A message notifies individually only if the server received
+  it within the last 10 minutes when Mail learns of it. Anything older (it arrived while
+  the machine slept, the network dropped, or the server was slow) never pings one by one.
+- **Catch-up is one summary, silent.** After a reconnect, wake from sleep, or any sync that
+  brings more than a few older messages: one notification, "While you were away: 23 new,
+  4 from people (Priya, Arun…)", no sound, replacing any earlier summary rather than
+  stacking. The People ones are listed in it; the rest are counted.
+- **Never for bulk work**: the first sync of an account (§6.4), a resync after the server
+  reset its ids (`UIDVALIDITY` change), mail moved between folders, imports.
+- **Bursts collapse.** More than 2 notifications within 30 s for a persona become one
+  grouped notification that updates in place ("5 new messages"); at most one sound per
+  minute per persona, however much arrives.
+- **Already read elsewhere, no ping.** If the message is `\Seen` by the time Mail would
+  notify (read on the phone), it doesn't; if it is read elsewhere after notifying, the
+  notification is withdrawn from Forum's list.
+- **Late reminders go quiet.** A *Later* item (§11.4) or an invite reminder (§14.1) that
+  comes due while the machine was asleep or offline is shown once, silently, in the next
+  summary ("Due while you were away: send Priya the numbers"). A reminder for a meeting
+  that has already started more than 5 minutes ago, or has ended, never pops up; it is in
+  the history only. Several overdue reminders are one summary, not one each.
+- **Quiet hours win** (§12): what arrives inside them is in the next working period's
+  summary, also silent.
+
+**Proposed for Praeco too, for every app**: the same rules belong in the notification
+service, not only in Mail, so a calendar app or chat app can't storm either: a notification
+carries the time its event happened; Praeco silently folds those older than the app's
+freshness window (default 10 minutes) into one per-app catch-up summary, collapses bursts
+(more than 2 in 30 s per app), caps sounds at one a minute per app, and drops reminders
+for events already past. Mail sets the event time on every post so it works either way.
 
 ## 13. Accounts across personas
 
