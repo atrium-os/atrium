@@ -25,7 +25,7 @@
 # fuzz gate after si-client-test: /root/si-fuzz (tests/si_fuzz.c, checked
 # against FUZZ_SHA) in mode "all" for <seconds> with <seed>, then
 # si-client-test once more as the health check. The kernel's messages over
-# the whole run are in /var/log/messages (the buffer wraps). The whole report is printed and
+# the whole run are in /root/runs/<stamp>.kern (the buffer wraps). The whole report is printed and
 # kept in /root/runs/. It never sets keep_state, gfx_cg or mode1_reset.
 #
 # This loads a kernel module and writes the GPU: only run it with the
@@ -193,4 +193,13 @@ echo "== temps 30 s after"; temps
 echo "== done, log $out"
 }
 
+# The whole run's kernel log, next to the run log: newsyslog keeps only 5
+# rotations of /var/log/messages, which a 24 h run outlives (fz24h-2963f5db
+# lost hours). tail -F follows across rotations.
+kern=${out%.log}.kern
+tail -n 0 -F /var/log/messages > "$kern" 2>/dev/null &
+kpid=$!
 run "$@" 2>&1 | tee "$out"
+sleep 2
+kill "$kpid" 2>/dev/null
+echo "kernel log for the run: $kern ($(wc -l < "$kern") lines)" | tee -a "$out"
