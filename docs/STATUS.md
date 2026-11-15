@@ -59,6 +59,12 @@ Command streams in `atrium-rdna4-cmd`, ISA tables in `atrium-rdna4-isa`
     `COMPUTE_START` is nonzero → fixed `4c9f6b2`, gpusim `60bb84e`.
   - **v19: 54 jobs, 82 MATCH, no mismatches** (includes LDS-alloc calibration).
 - **Bench v5** (quiet box): ours ≤ RADV on every case; 1M-node glyph_run 374 µs vs RADV 526.
+- **Compile time** (tracked from `d43749f`): `compile-time --all` in atrium-rdna4-oracle times
+  SPIR-V → RDNA4 per stage; bench-script now times RADV's `vkCreateComputePipelines`
+  (no caches) on the box, and ours there given a Linux build of `compile-time`. Host
+  (Apple Silicon): Fresco raster 250 → 40 ms (`fac48fd`: GIR post-dominators cached),
+  spilled at 96/64 VGPRs 560–610 → ~60 ms (`3a70d15`); output byte-identical. RADV
+  side not yet measured; desktop op_* shaders need slangc.
 - **Spilling:** stages 1–3 done (scratch ST mode; demand-driven spill + remat;
   SGPRs into VGPR lanes, `4bf3191`). Design doc in the artifact linked from
   project memory `rdna4-spill-design`.
