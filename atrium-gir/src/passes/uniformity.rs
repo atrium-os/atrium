@@ -112,9 +112,9 @@ impl<'a> U<'a> {
                         continue;
                     }
                     let source = match &i.op {
-                        Op::Builtin(b) => !matches!(b, Builtin::WorkgroupId | Builtin::SubgroupSize | Builtin::SubgroupId | Builtin::NumSubgroups),
+                        Op::Builtin(b) => !matches!(b, Builtin::WorkgroupId | Builtin::SubgroupSize | Builtin::SubgroupId | Builtin::NumSubgroups | Builtin::BaseVertex | Builtin::BaseInstance),
                         Op::Atomic(..) => true,
-                        Op::Load(Space::Private(_), _) => true,
+                        Op::Load(Space::Private(_) | Space::Input(_), _) => true,
                         Op::Load(s @ Space::Buffer { .. }, _) => self.written.contains(s),
                         _ => false,
                     };

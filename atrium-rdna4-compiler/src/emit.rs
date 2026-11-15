@@ -374,6 +374,26 @@ impl<'a> E<'a> {
                 let p = self.a.branch(name);
                 self.fixups.push((p, *target));
             }
+            MI::Export { tgt, src, done } => {
+                let regs: Vec<u16> = src.iter().flatten().flat_map(|x| self.regs(*x, 1)).collect();
+                self.wait_for(&regs);
+                self.flush_alu();
+                let mut f: Vec<(&str, u64)> = vec![("TGT", *tgt as u64), ("DONE", *done as u64), ("ROW_EN", 0)];
+                let mut en = 0u64;
+                for (i, (x, name)) in src.iter().zip(["VSRC0", "VSRC1", "VSRC2", "VSRC3"]).enumerate() {
+                    let r = x.map(|x| self.code(x) - 256).unwrap_or(0);
+                    if x.is_some() {
+                        en |= 1 << i;
+                    }
+                    f.push((name, r as u64));
+                }
+                f.push(("EN", en));
+                self.a.emit("EXPORT", "ENC_VEXPORT", &f);
+            }
+            MI::Sopp { name, imm } => {
+                self.drain();
+                self.a.sopp(name, *imm);
+            }
             MI::LoopBegin | MI::LoopEnd => {}
             MI::Endpgm => self.a.sopp("S_ENDPGM", 0),
         }

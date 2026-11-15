@@ -591,8 +591,11 @@ impl InterfaceContext {
         // rasterizer's interpolator produces.
         output_var_loc_size.sort_by_key(|(_, loc, _)| *loc);
         let mut running: u32 = 0;
-        for (var_id, _loc, sz) in &output_var_loc_size {
+        for (var_id, loc, sz) in &output_var_loc_size {
             ctx.output_varying_byte_offset.insert(*var_id, running);
+            for v in ctx.varyings.iter_mut().filter(|v| v.location == *loc) {
+                v.offset = running;
+            }
             running = running.saturating_add(*sz);
         }
         ctx.output_varying_total_bytes = running;
@@ -604,8 +607,11 @@ impl InterfaceContext {
         // the same `out_varyings` packing the VS produced.
         input_var_loc_size.sort_by_key(|(_, loc, _)| *loc);
         let mut running: u32 = 0;
-        for (var_id, _loc, sz) in &input_var_loc_size {
+        for (var_id, loc, sz) in &input_var_loc_size {
             ctx.input_varying_byte_offset.insert(*var_id, running);
+            for v in ctx.vertex_inputs.iter_mut().filter(|v| v.location == *loc) {
+                v.offset = running;
+            }
             running = running.saturating_add(*sz);
         }
 
@@ -751,6 +757,59 @@ pub(crate) fn aggregate_type_size(
             total
         }
         _ => 0,
+    }
+}
+
+/// Canonical byte offsets of the stage built-ins inside an output
+/// block such as glslang's `gl_PerVertex`, when
+/// [`crate::Options::builtin_blocks`] is on: Position at 0 (vec4),
+/// PointSize at 16, ClipDistance at 32 (up to 8 floats), CullDistance
+/// at 64 (up to 8 floats). The offsets do not depend on member order,
+/// so a GPU backend can tell the built-ins apart by offset alone.
+pub const BUILTIN_BLOCK_POSITION: u32 = 0;
+/// See [`BUILTIN_BLOCK_POSITION`].
+pub const BUILTIN_BLOCK_POINT_SIZE: u32 = 16;
+/// See [`BUILTIN_BLOCK_POSITION`].
+pub const BUILTIN_BLOCK_CLIP_DISTANCE: u32 = 32;
+/// See [`BUILTIN_BLOCK_POSITION`].
+pub const BUILTIN_BLOCK_CULL_DISTANCE: u32 = 64;
+/// Size of a built-in block laid out by [`BUILTIN_BLOCK_POSITION`]'s rule.
+pub const BUILTIN_BLOCK_BYTES: u32 = 96;
+
+impl InterfaceContext {
+    /// Give structs whose members are all `BuiltIn`-decorated (and carry
+    /// no `Offset`) the canonical layout of [`BUILTIN_BLOCK_POSITION`], so
+    /// `OpAccessChain` into `gl_PerVertex` resolves. Off by default: the
+    /// CPU tiers map a vertex output to a 16-byte position slot only.
+    pub(crate) fn synthesize_builtin_blocks(&mut self, module: &Module) {
+        use rspirv::spirv::BuiltIn as Bi;
+        let mut members: HashMap<(Word, u32), Bi> = HashMap::new();
+        for inst in &module.annotations {
+            if inst.class.opcode != SpvOp::MemberDecorate { continue; }
+            let (Some(Operand::IdRef(st)), Some(Operand::LiteralBit32(i)), Some(Operand::Decoration(Decoration::BuiltIn)), Some(Operand::BuiltIn(b))) =
+                (inst.operands.first(), inst.operands.get(1), inst.operands.get(2), inst.operands.get(3)) else { continue };
+            members.insert((*st, *i), *b);
+        }
+        for inst in &module.types_global_values {
+            if inst.class.opcode != SpvOp::TypeStruct { continue; }
+            let Some(id) = inst.result_id else { continue };
+            if self.struct_layouts.contains_key(&id) { continue; }
+            let mut layout = vec![];
+            for (i, op) in inst.operands.iter().enumerate() {
+                let Operand::IdRef(ty) = op else { layout.clear(); break };
+                let off = match members.get(&(id, i as u32)) {
+                    Some(Bi::Position) => BUILTIN_BLOCK_POSITION,
+                    Some(Bi::PointSize) => BUILTIN_BLOCK_POINT_SIZE,
+                    Some(Bi::ClipDistance) => BUILTIN_BLOCK_CLIP_DISTANCE,
+                    Some(Bi::CullDistance) => BUILTIN_BLOCK_CULL_DISTANCE,
+                    _ => { layout.clear(); break }
+                };
+                layout.push(StructMember { byte_offset: off, type_id: *ty });
+            }
+            if !layout.is_empty() {
+                self.struct_layouts.insert(id, layout);
+            }
+        }
     }
 }
 

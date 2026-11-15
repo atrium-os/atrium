@@ -73,9 +73,12 @@ pub const CODE_ALIGN: u64 = 256;
 impl Kernel {
     /// Compile entry point `opts.entry` of a SPIR-V module.
     pub fn from_spirv(spirv: &[u8], opts: &Options) -> Result<Kernel, Error> {
-        let fo = atrium_spv_frontend::Options { spec_overrides: opts.spec_overrides.clone(), native_subgroups: true };
+        let fo = atrium_spv_frontend::Options { spec_overrides: opts.spec_overrides.clone(), native_subgroups: true, builtin_blocks: true };
         let m = atrium_spv_frontend::translate_with_options(spirv, &fo).map_err(|e| Error::Frontend(format!("{e:?}")))?;
         let mut g = atrium_gir::build::build(&m, opts.entry).map_err(|e| Error::Gir(format!("{e:?}")))?;
+        if g.stage != atrium_gir::Stage::Compute {
+            return Err(Error::Gir(format!("{:?} entry point is not a compute kernel", g.stage)));
+        }
         atrium_gir::passes::optimize(&mut g);
         atrium_gir::verify::verify(&g).map_err(|e| Error::Gir(format!("{e:?}")))?;
         let co = atrium_rdna4_compiler::Options { max_vgprs: opts.max_vgprs.unwrap_or(256), max_sgprs: opts.max_sgprs.unwrap_or(106) };

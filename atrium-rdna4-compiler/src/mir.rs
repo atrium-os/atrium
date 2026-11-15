@@ -126,6 +126,23 @@ pub enum MI {
     },
     /// Workgroup execution and LDS memory barrier.
     Barrier,
+    /// Export to a graphics target (position, primitive, colour, depth):
+    /// one VGPR per enabled component.
+    Export {
+        /// Target (`TGT` field).
+        tgt: u8,
+        /// Component sources; `None` = not written.
+        src: [Option<O>; 4],
+        /// Last export of the shader.
+        done: bool,
+    },
+    /// SOPP with an immediate (`s_sendmsg`).
+    Sopp {
+        /// Instruction name.
+        name: &'static str,
+        /// The immediate.
+        imm: u16,
+    },
     /// Branch target.
     Label(u32),
     /// SOPP branch to a label.
@@ -207,6 +224,11 @@ impl MI {
                     r(x, false);
                 }
             }
+            MI::Export { src, .. } => {
+                for x in src.iter().flatten() {
+                    r(x, false);
+                }
+            }
             _ => {}
         }
     }
@@ -282,6 +304,9 @@ impl MI {
                 if let Some(x) = soff {
                     v.push((x, false, 1));
                 }
+            }
+            MI::Export { src, .. } => {
+                v.extend(src.iter_mut().flatten().map(|x| (x, false, 1)));
             }
             _ => {}
         }

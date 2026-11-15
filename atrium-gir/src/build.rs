@@ -41,6 +41,9 @@ struct LoopInfo {
 enum Val {
     V(ValueId),
     Ptr(Space, ValueId),
+    /// A vertex shader's built-in output block (`gl_PerVertex`, laid out
+    /// at the frontend's canonical offsets) or a lone `gl_Position`.
+    Block,
 }
 
 struct Builder<'a> {
@@ -68,6 +71,12 @@ struct Builder<'a> {
     /// for the whole function), computed on first use: `succ` and `loops`
     /// are fixed once the CFG is analysed.
     ipdoms: std::cell::RefCell<HashMap<Option<B>, std::rc::Rc<HashMap<B, Option<B>>>>>,
+    /// Private variables holding the stage outputs, parallel to
+    /// `out.outputs`; exported before every `return`.
+    out_vars: Vec<u32>,
+    /// Private variables of the built-in block's members:
+    /// (Position, PointSize).
+    block_vars: Option<(u32, u32)>,
 }
 
 fn terminator(b: &spv::Block) -> Option<&spv::Op> {
@@ -296,16 +305,50 @@ impl<'a> Builder<'a> {
     fn val(&self, v: &spv::Value) -> Result<ValueId, BuildError> {
         match self.vals.get(&v.id) {
             Some(Val::V(x)) => Ok(*x),
-            Some(Val::Ptr(..)) => unsup(format!("pointer value {:?} used as data", v.id)),
+            Some(Val::Ptr(..) | Val::Block) => unsup(format!("pointer value {:?} used as data", v.id)),
             None => malformed(format!("value {:?} used before definition", v.id)),
         }
     }
 
-    fn ptr(&self, v: &spv::Value) -> Result<(Space, ValueId), BuildError> {
-        match self.vals.get(&v.id) {
-            Some(Val::Ptr(s, o)) => Ok((*s, *o)),
+    fn ptr(&mut self, v: &spv::Value) -> Result<(Space, ValueId), BuildError> {
+        match self.vals.get(&v.id).copied().or_else(|| self.lone_output(v)) {
+            Some(Val::Ptr(s, o)) => Ok((s, o)),
+            Some(Val::Block) => self.block_member(0),
             _ => unsup(format!("value {:?} is not a known pointer", v.id)),
         }
+    }
+
+    /// An output variable with neither a location nor another role, in a
+    /// vertex shader: the built-in block (or a lone `gl_Position`).
+    fn lone_output(&self, v: &spv::Value) -> Option<Val> {
+        (self.block_vars.is_some() && matches!(v.ty, spv::Type::Pointer(spv::StorageClass::Output, _))).then_some(Val::Block)
+    }
+
+    /// The built-in block member at canonical byte offset `off`.
+    fn block_member(&mut self, off: u32) -> Result<(Space, ValueId), BuildError> {
+        use block_offsets as k;
+        let (pos, psize) = self.block_vars.ok_or_else(|| BuildError::Malformed("built-in block outside a vertex shader".into()))?;
+        let (var, rel) = match off {
+            o if o < k::POINT_SIZE => (pos, o),
+            o if o == k::POINT_SIZE => (psize, 0),
+            o => return unsup(format!("built-in output at block offset {o} (clip/cull distances)")),
+        };
+        let o = self.konst(rel, Ty::I32);
+        Ok((Space::Private(var), o))
+    }
+
+    /// `export` of the current output values.
+    fn export(&mut self, r: &mut Region) {
+        if self.out_vars.is_empty() {
+            return;
+        }
+        let z = self.konst(0, Ty::I32);
+        let mut vals = vec![];
+        for (i, var) in self.out_vars.clone().into_iter().enumerate() {
+            let ty = self.out.outputs[i].ty;
+            vals.push(self.emit(r, ty, Op::Load(Space::Private(var), z)));
+        }
+        Self::emit_void(r, Op::Export(vals));
     }
 
     fn comp(&mut self, r: &mut Region, v: ValueId, i: usize) -> ValueId {
@@ -596,7 +639,14 @@ impl<'a> Builder<'a> {
                     spv::BuiltinKind::SubgroupLocalInvocationId => (Builtin::SubgroupLocalId, Ty::I32),
                     spv::BuiltinKind::SubgroupId => (Builtin::SubgroupId, Ty::I32),
                     spv::BuiltinKind::NumSubgroups => (Builtin::NumSubgroups, Ty::I32),
-                    other => return unsup(format!("builtin {other:?} in compute")),
+                    spv::BuiltinKind::VertexIndex => (Builtin::VertexIndex, Ty::I32),
+                    spv::BuiltinKind::InstanceIndex => (Builtin::InstanceIndex, Ty::I32),
+                    spv::BuiltinKind::BaseVertex => (Builtin::BaseVertex, Ty::I32),
+                    spv::BuiltinKind::BaseInstance => (Builtin::BaseInstance, Ty::I32),
+                    spv::BuiltinKind::FragCoord => (Builtin::FragCoord, Ty::V(Scalar::F32, 4)),
+                    spv::BuiltinKind::FrontFacing => (Builtin::FrontFacing, Ty::I32),
+                    spv::BuiltinKind::PrimitiveId => (Builtin::PrimitiveId, Ty::I32),
+                    other => return unsup(format!("builtin {other:?}")),
                 };
                 Val::V(self.emit(r, t, Op::Builtin(b)))
             }
@@ -605,6 +655,11 @@ impl<'a> Builder<'a> {
                 if is_push && !self.vals.contains_key(&base.id) {
                     let z = self.konst(0, Ty::I32);
                     self.vals.insert(base.id, Val::Ptr(Space::Push, z));
+                }
+                if let Some(Val::Block) = self.vals.get(&base.id).copied().or_else(|| self.lone_output(base)) {
+                    let (s, o) = self.block_member(*byte_offset)?;
+                    self.vals.insert(inst.result.as_ref().unwrap().id, Val::Ptr(s, o));
+                    return Ok(());
                 }
                 let (s, o) = self.ptr(base)?;
                 if *byte_offset == 0 {
@@ -855,6 +910,7 @@ impl<'a> Builder<'a> {
             let block = &self.f.blocks[&cur];
             match terminator(block).cloned() {
                 Some(spv::Op::Return) => {
+                    self.export(&mut r);
                     Self::emit_void(&mut r, Op::Return);
                     break;
                 }
@@ -887,6 +943,52 @@ impl<'a> Builder<'a> {
         Ok(r)
     }
 
+    /// Inputs and outputs of a graphics stage. Inputs become
+    /// [`Space::Input`]; outputs become private variables, exported before
+    /// every `return`.
+    fn stage_io(&mut self, m: &spv::Module) -> Result<(), BuildError> {
+        let f = self.f;
+        let zero = self.konst(0, Ty::I32);
+        let mut ins: Vec<(&spv::ValueId, &u32)> = f.input_varying_byte_offset.iter().collect();
+        ins.sort_by_key(|(_, o)| **o);
+        for (vid, off) in ins {
+            let Some(vi) = m.vertex_inputs.iter().find(|v| v.offset == *off) else {
+                return malformed(format!("input at byte offset {off} has no location"));
+            };
+            let ty = map_ty(&vi.ty)?;
+            let interp = if self.out.stage == Stage::Fragment && ty.scalar() == Scalar::I32 { Interp::Flat } else { Interp::Smooth };
+            self.out.inputs.push(Input { location: vi.location, ty, interp });
+            self.vals.insert(*vid, Val::Ptr(Space::Input(self.out.inputs.len() as u32 - 1), zero));
+        }
+        let mut outs: Vec<(&spv::ValueId, &u32)> = f.output_varying_byte_offset.iter().collect();
+        outs.sort_by_key(|(_, o)| **o);
+        let add = |b: &mut Self, kind: OutputKind, ty: Ty| -> u32 {
+            b.out.privates.push(ty.bytes());
+            let var = b.out.privates.len() as u32 - 1;
+            b.out.outputs.push(Output { kind, ty });
+            b.out_vars.push(var);
+            var
+        };
+        if self.out.stage == Stage::Vertex {
+            let pos = add(self, OutputKind::Position, Ty::V(Scalar::F32, 4));
+            self.out.privates.push(4);
+            self.block_vars = Some((pos, self.out.privates.len() as u32 - 1));
+        }
+        for (vid, off) in outs {
+            let Some(vy) = m.varyings.iter().find(|v| v.offset == *off) else {
+                return malformed(format!("output at byte offset {off} has no location"));
+            };
+            let ty = map_ty(&vy.ty)?;
+            let var = add(self, OutputKind::Location(vy.location), ty);
+            self.vals.insert(*vid, Val::Ptr(Space::Private(var), zero));
+        }
+        if let Some(vid) = f.frag_depth_output {
+            let var = add(self, OutputKind::FragDepth, Ty::F32);
+            self.vals.insert(vid, Val::Ptr(Space::Private(var), zero));
+        }
+        Ok(())
+    }
+
     fn switch_chain(&mut self, sel: ValueId, cases: &[(i64, B)], default: B, m: Option<B>, lp: Option<&LoopInfo>) -> Result<Region, BuildError> {
         let Some(((v, t), rest)) = cases.split_first() else {
             return self.region(default, m, lp, false);
@@ -901,18 +1003,26 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Build GIR for entry point `entry` of `m`. Compute only, for now.
+/// Build GIR for entry point `entry` of `m`.
+///
+/// Graphics stages need the frontend's `builtin_blocks` option when the
+/// shader writes `gl_PerVertex` (glslang always declares it).
 pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
     let ep = m.entry_points.get(entry).ok_or_else(|| BuildError::Malformed("no such entry point".into()))?;
-    if ep.stage != spv::ShaderStage::Compute {
-        return unsup(format!("{:?} stage", ep.stage));
-    }
+    let stage = match ep.stage {
+        spv::ShaderStage::Compute => Stage::Compute,
+        spv::ShaderStage::Vertex => Stage::Vertex,
+        spv::ShaderStage::Fragment => Stage::Fragment,
+    };
     let f = &m.functions[ep.function_index];
     let (x, y, z) = f.local_size.unwrap_or((1, 1, 1));
     let mut b = Builder {
         f,
         out: Function {
             name: ep.name.clone(),
+            stage,
+            inputs: vec![],
+            outputs: vec![],
             local_size: [x, y, z],
             types: vec![],
             privates: vec![],
@@ -932,8 +1042,13 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
         escape: HashMap::new(),
         translated: HashSet::new(),
         dup_ok: HashSet::new(),
+        out_vars: vec![],
+        block_vars: None,
     };
     b.analyse()?;
+    if stage != Stage::Compute {
+        b.stage_io(m)?;
+    }
 
     let zero = b.konst(0, Ty::I32);
     let mut bufs: Vec<(u32, u32)> = f.ssbo_bindings.values().copied().collect();
@@ -1003,4 +1118,11 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
     all.extend(body);
     b.out.body = all;
     Ok(b.out)
+}
+
+/// The frontend's canonical built-in block offsets
+/// (`atrium_spv_frontend::interface::BUILTIN_BLOCK_*`; GIR does not depend
+/// on the frontend crate, so they are repeated here).
+mod block_offsets {
+    pub const POINT_SIZE: u32 = 16;
 }

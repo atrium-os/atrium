@@ -63,7 +63,22 @@ pub(crate) struct Isel<'a> {
     /// scalar cache is not coherent with vector writes, so loads from them
     /// stay on the vector path.
     written: HashSet<Space>,
+    /// Fragment: `SPI_PS_INPUT_ENA` for the inputs the shader reads.
+    pub ps_input_ena: u32,
+    /// Graphics: (target, component mask) of each export at the end.
+    pub exports: Vec<(u8, u8)>,
+    /// Graphics: the registers holding each output's last exported value.
+    exp_regs: Vec<VR>,
 }
+
+/// `s_sendmsg` id of GS_ALLOC_REQ (GFX11+).
+const MSG_GS_ALLOC_REQ: u16 = 9;
+/// `m0`.
+const M0: u8 = 125;
+/// Export targets.
+const TGT_MRTZ: u8 = 8;
+const TGT_POS0: u8 = 12;
+const TGT_PRIM: u8 = 20;
 
 fn unsup<T>(s: impl Into<String>) -> Result<T, Error> {
     Err(Error::Unsupported(s.into()))
@@ -246,7 +261,26 @@ impl<'a> Isel<'a> {
                 _ => {}
             }
         }
+        // Fragment input VGPRs: perspective centre barycentrics always (the
+        // hardware wants one interpolation mode on), then what is read.
+        let mut ps_input_ena = 0;
+        if f.stage == Stage::Fragment {
+            ps_input_ena = crate::ps_input::PERSP_CENTER;
+            for i in &defs {
+                match (&i.op, i.result) {
+                    (Op::Builtin(Builtin::FragCoord), Some(r)) => {
+                        let m = builtin_comps.get(&r).copied().unwrap_or(15) as u32;
+                        ps_input_ena |= (m & 15) << 8;
+                    }
+                    (Op::Builtin(Builtin::FrontFacing), _) => ps_input_ena |= crate::ps_input::FRONT_FACE,
+                    _ => {}
+                }
+            }
+        }
         Isel {
+            ps_input_ena,
+            exports: vec![],
+            exp_regs: vec![],
             addr_only,
             builtin_comps,
             f,
@@ -533,9 +567,10 @@ impl<'a> Isel<'a> {
                 .buffers
                 .iter()
                 .position(|b| *b == (set, binding))
-                .map(|i| 2 * i as u8)
+                .map(|i| self.abi.buffer_sgpr(i))
                 .ok_or_else(|| Error::Internal(format!("buffer ({set}, {binding}) not in the ABI"))),
             Space::Push => self.abi.push_sgpr().ok_or_else(|| Error::Internal("push load without a push block".into())),
+            Space::Input(_) => unsup("stage inputs (vertex attributes, varyings) come with stage 7c-2"),
             other => unsup(format!("{other:?} memory in G3")),
         }
     }
@@ -847,6 +882,15 @@ impl<'a> Isel<'a> {
                 self.parallel_copy(&pairs)?;
                 self.salu("S_OR_B32", O::R(mask, 0), vec![O::R(mask, 0), O::Exec]);
                 self.salu("S_MOV_B32", O::Exec, vec![O::Imm(0)]);
+            }
+            Op::Export(vals) => {
+                for (k, v) in vals.iter().enumerate() {
+                    let n = self.ty(*v).comps() as u8;
+                    for c in 0..n {
+                        let s = self.src(*v, c)?;
+                        self.valu("V_MOV_B32", O::R(self.exp_regs[k], c), vec![s], 0);
+                    }
+                }
             }
             Op::Return => {
                 self.exec_live = false;
@@ -1277,10 +1321,74 @@ impl<'a> Isel<'a> {
         Ok(())
     }
 
+    /// Physical VGPR of fragment input `bit` (an `SPI_PS_INPUT_ENA` bit):
+    /// enabled inputs are packed in bit order.
+    fn ps_vgpr(&self, bit: u32) -> u8 {
+        let widths = [2u32, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        (0..bit.trailing_zeros()).filter(|i| self.ps_input_ena & (1 << i) != 0).map(|i| widths[i as usize]).sum::<u32>() as u8
+    }
+
+    /// Number of VGPRs the hardware fills before the shader starts.
+    pub fn input_vgprs(&self) -> u8 {
+        match self.f.stage {
+            Stage::Compute => 1,
+            Stage::Vertex => 5,
+            Stage::Fragment => self.ps_vgpr(1 << 16),
+        }
+    }
+
+    fn graphics_builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
+        let stage = self.f.stage;
+        let need = |s: Stage| if stage == s { Ok(()) } else { unsup(format!("{b:?} in a {stage:?} shader")) };
+        let base = self.abi.user_base();
+        match b {
+            Builtin::VertexIndex | Builtin::InstanceIndex => {
+                need(Stage::Vertex)?;
+                let (v, s) = if b == Builtin::VertexIndex { (3, base) } else { (4, base + 1) };
+                let d = O::R(self.def_v(r), 0);
+                self.valu("V_ADD_NC_U32", d, vec![O::PS(s), O::PV(v)], 0);
+            }
+            Builtin::BaseVertex | Builtin::BaseInstance => {
+                need(Stage::Vertex)?;
+                let s = if b == Builtin::BaseVertex { base } else { base + 1 };
+                let d = O::R(self.def_v(r), 0);
+                self.valu("V_MOV_B32", d, vec![O::PS(s)], 0);
+            }
+            Builtin::FragCoord => {
+                need(Stage::Fragment)?;
+                let want = self.builtin_comps.get(&r).copied().unwrap_or(15);
+                let d = self.def_v(r);
+                for k in (0..4u8).filter(|k| want & (1 << k) != 0) {
+                    let p = O::PV(self.ps_vgpr(crate::ps_input::POS_X_FLOAT << k));
+                    // The hardware gives w; gl_FragCoord.w is 1/w.
+                    let name = if k == 3 { "V_RCP_F32" } else { "V_MOV_B32" };
+                    self.valu(name, O::R(d, k), vec![p], 0);
+                }
+            }
+            Builtin::FrontFacing => {
+                need(Stage::Fragment)?;
+                let p = O::PV(self.ps_vgpr(crate::ps_input::FRONT_FACE));
+                let c = O::R(self.vreg(Class::S, 1), 0);
+                self.valu("V_CMP_LT_F32", c, vec![O::Imm(0), p], 0);
+                let d = O::R(self.def_v(r), 0);
+                self.valu("V_CNDMASK_B32", d, vec![O::Imm(0), O::Imm(1), c], 0);
+            }
+            _ => return unsup(format!("{b:?}")),
+        }
+        Ok(())
+    }
+
     fn builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
         let ls = self.f.local_size;
         let want = self.builtin_comps.get(&r).copied().unwrap_or(7);
+        if self.f.stage != Stage::Compute
+            && matches!(b, Builtin::LocalId | Builtin::GlobalId | Builtin::WorkgroupId | Builtin::LocalIndex | Builtin::SubgroupId | Builtin::NumSubgroups)
+        {
+            return unsup(format!("{b:?} in a {:?} shader", self.f.stage));
+        }
         match b {
+            Builtin::VertexIndex | Builtin::InstanceIndex | Builtin::BaseVertex | Builtin::BaseInstance
+            | Builtin::FragCoord | Builtin::FrontFacing | Builtin::PrimitiveId => return self.graphics_builtin(b, r),
             Builtin::LocalId | Builtin::GlobalId => {
                 let d = self.def_v(r);
                 for k in (0..3u8).filter(|k| want & (1 << k) != 0) {
@@ -1521,6 +1629,9 @@ impl<'a> Isel<'a> {
         let r = self.ret;
         self.salu("S_MOV_B32", O::R(r, 0), vec![O::Imm(0)]);
         let f = self.f;
+        if f.stage != Stage::Compute {
+            return self.run_graphics();
+        }
         self.region(&f.body)?;
         // Mask bookkeeping at the very end is dead: nothing runs after it.
         while let Some(MI::Salu { dst, .. }) = self.mi.last() {
@@ -1530,6 +1641,94 @@ impl<'a> Isel<'a> {
                 break;
             }
         }
+        self.mi.push(MI::Endpgm);
+        Ok(())
+    }
+
+    /// A vertex (NGG) or fragment shader: the stage prologue, the body,
+    /// then the exports of every invocation that ran.
+    fn run_graphics(&mut self) -> Result<(), Error> {
+        let f = self.f;
+        for o in &f.outputs {
+            let r = self.vreg(Class::V, o.ty.comps() as u8);
+            self.exp_regs.push(r);
+        }
+        let l_end = self.label();
+        if f.stage == Stage::Vertex {
+            // NGG waves start with only some lanes in EXEC; ACO sets it all
+            // for every NEXT_GEN_GEOMETRY shader. merged_wave_info (s3) then
+            // says which lanes have a primitive ([15:8]) or a vertex ([7:0]).
+            self.salu("S_MOV_B32", O::Exec, vec![O::Imm(u32::MAX)]);
+            let lane = self.lane_id();
+            let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+            // Wave 0 of the group asks for export space: m0 = prims << 12 |
+            // verts, from gs_tg_info (s2). S_BFE sets SCC when non-zero.
+            let l_skip = self.label();
+            let w = s(self);
+            self.salu("S_BFE_U32", w, vec![O::PS(3), O::Imm(0x40018)]);
+            self.mi.push(MI::Branch { name: "S_CBRANCH_SCC1", target: l_skip });
+            let (v, p) = (s(self), s(self));
+            self.salu("S_BFE_U32", v, vec![O::PS(2), O::Imm(0x9000c)]);
+            self.salu("S_BFE_U32", p, vec![O::PS(2), O::Imm(0x90016)]);
+            self.salu("S_LSHL_B32", p, vec![p, O::Imm(12)]);
+            self.salu("S_OR_B32", O::PS(M0), vec![v, p]);
+            self.mi.push(MI::Sopp { name: "S_SENDMSG", imm: MSG_GS_ALLOC_REQ });
+            self.mi.push(MI::Label(l_skip));
+            // Primitive export (vertex-only NGG: the packed primitive in v0).
+            let (np, c) = (s(self), s(self));
+            self.salu("S_BFE_U32", np, vec![O::PS(3), O::Imm(0x80008)]);
+            self.valu("V_CMP_GT_U32", c, vec![np, lane], 0);
+            self.salu("S_MOV_B32", O::Exec, vec![c]);
+            let l_np = self.label();
+            self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_np });
+            self.mi.push(MI::Export { tgt: TGT_PRIM, src: [Some(O::PV(0)), None, None, None], done: true });
+            self.mi.push(MI::Label(l_np));
+            // The vertex lanes. EXEC back to every lane first: a v_cmp only
+            // writes the active lanes of its mask.
+            self.salu("S_MOV_B32", O::Exec, vec![O::Imm(u32::MAX)]);
+            let (nv, c) = (s(self), s(self));
+            self.salu("S_AND_B32", nv, vec![O::PS(3), O::Imm(0xff)]);
+            self.valu("V_CMP_GT_U32", c, vec![nv, lane], 0);
+            self.salu("S_MOV_B32", O::Exec, vec![c]);
+            self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_end });
+        }
+        self.exec_live = true;
+        self.region(&f.body)?;
+        let r = self.ret;
+        self.salu("S_OR_B32", O::Exec, vec![O::Exec, O::R(r, 0)]);
+        // Exports: depth first, then colours / position; the last is `done`.
+        let mut order: Vec<usize> = (0..f.outputs.len()).collect();
+        order.sort_by_key(|i| !matches!(f.outputs[*i].kind, OutputKind::FragDepth));
+        let mut ex: Vec<(u8, [Option<O>; 4])> = vec![];
+        for i in order {
+            let o = f.outputs[i];
+            let tgt = match (f.stage, o.kind) {
+                (Stage::Vertex, OutputKind::Position) => TGT_POS0,
+                (Stage::Vertex, OutputKind::Location(_)) => return unsup("vertex varyings (attribute ring) come with stage 7c-2"),
+                (Stage::Fragment, OutputKind::Location(n)) if n < 8 => n as u8,
+                (Stage::Fragment, OutputKind::FragDepth) => TGT_MRTZ,
+                (st, k) => return unsup(format!("{k:?} output in a {st:?} shader")),
+            };
+            let mut src = [None; 4];
+            for c in 0..o.ty.comps() {
+                src[c] = Some(O::R(self.exp_regs[i], c as u8));
+            }
+            ex.push((tgt, src));
+        }
+        if ex.is_empty() && f.stage == Stage::Fragment {
+            // A pixel shader always exports; nothing enabled.
+            ex.push((0, [None; 4]));
+        }
+        if f.stage == Stage::Vertex && !ex.iter().any(|e| e.0 == TGT_POS0) {
+            return Err(Error::Internal("vertex shader without a position output".into()));
+        }
+        let n = ex.len();
+        for (k, (tgt, src)) in ex.into_iter().enumerate() {
+            let mask = src.iter().enumerate().filter(|(_, x)| x.is_some()).fold(0u8, |m, (c, _)| m | 1 << c);
+            self.exports.push((tgt, mask));
+            self.mi.push(MI::Export { tgt, src, done: k + 1 == n });
+        }
+        self.mi.push(MI::Label(l_end));
         self.mi.push(MI::Endpgm);
         Ok(())
     }

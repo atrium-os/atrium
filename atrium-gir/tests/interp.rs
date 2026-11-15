@@ -10,7 +10,7 @@ struct K {
 
 impl K {
     fn new() -> Self {
-        K { f: Function { name: "t".into(), local_size: [8, 1, 1], types: vec![], privates: vec![], workgroup_bytes: 0, buffers: vec![(0, 0)], push_bytes: 0, body: vec![] } }
+        K { f: Function { name: "t".into(), stage: Stage::Compute, inputs: vec![], outputs: vec![], local_size: [8, 1, 1], types: vec![], privates: vec![], workgroup_bytes: 0, buffers: vec![(0, 0)], push_bytes: 0, body: vec![] } }
     }
     fn v(&mut self, ty: Ty) -> ValueId {
         self.f.new_value(ty)

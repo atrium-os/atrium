@@ -30,15 +30,28 @@ pub enum Error {
     Internal(String),
 }
 
-/// How resources reach the shader (the interim compute ABI).
+/// How resources reach the shader (the interim ABI).
 ///
-/// User SGPRs `s[2i:2i+1]` hold the 64-bit address of `buffers[i]`; if the
-/// kernel has push constants, the next pair holds the address of the
-/// push-constant block (read with uniform global loads); the
-/// workgroup id is architected (X in `ttmp9`, Y/Z in `ttmp7` halves); `v0` holds the
-/// packed local invocation id.
+/// User SGPRs, in order: for a vertex shader, the draw's first vertex and
+/// first instance (`gl_BaseVertex`, `gl_BaseInstance`); then the 64-bit
+/// address of each of `buffers`; then, if the shader has push constants,
+/// the address of the push-constant block (read with uniform loads).
+///
+/// * Compute: user SGPRs start at `s0`; the workgroup id is architected
+///   (X in `ttmp9`, Y/Z in `ttmp7` halves); `v0` holds the packed local
+///   invocation id.
+/// * Vertex (an NGG primitive shader, GFX12): `s2` is `gs_tg_info`, `s3`
+///   `merged_wave_info`, user SGPRs start at `s8`; `v0` is the packed
+///   primitive, `v3` the vertex id and `v4` the instance id, both counted
+///   from zero.
+/// * Fragment: user SGPRs start at `s0`, the primitive mask follows them;
+///   input VGPRs as [`Binary::ps_input_ena`] says (perspective centre
+///   barycentrics in `v0`–`v1` always, then the enabled position
+///   components and front face).
 #[derive(Debug, Clone)]
 pub struct Abi {
+    /// Shader stage.
+    pub stage: Stage,
     /// Storage buffers in user-SGPR order, as (set, binding).
     pub buffers: Vec<(u32, u32)>,
     /// The kernel reads push constants.
@@ -48,16 +61,50 @@ pub struct Abi {
 impl Abi {
     /// The ABI for `f`: its buffers in (set, binding) order.
     pub fn for_function(f: &Function) -> Abi {
-        Abi { buffers: f.buffers.clone(), push: f.push_bytes > 0 }
+        Abi { stage: f.stage, buffers: f.buffers.clone(), push: f.push_bytes > 0 }
+    }
+    /// First user SGPR.
+    pub fn user_base(&self) -> u8 {
+        if self.stage == Stage::Vertex { 8 } else { 0 }
+    }
+    /// User SGPRs before the buffer addresses (vertex: first vertex and
+    /// first instance).
+    pub fn fixed_user(&self) -> u8 {
+        if self.stage == Stage::Vertex { 2 } else { 0 }
     }
     /// Number of user SGPRs.
     pub fn user_sgprs(&self) -> u8 {
-        2 * self.buffers.len() as u8 + if self.push { 2 } else { 0 }
+        self.fixed_user() + 2 * self.buffers.len() as u8 + if self.push { 2 } else { 0 }
+    }
+    /// SGPR holding the address of `buffers[i]` (first of a pair).
+    pub fn buffer_sgpr(&self, i: usize) -> u8 {
+        self.user_base() + self.fixed_user() + 2 * i as u8
     }
     /// First user SGPR of the push-constant block address.
     pub fn push_sgpr(&self) -> Option<u8> {
-        self.push.then(|| 2 * self.buffers.len() as u8)
+        self.push.then(|| self.buffer_sgpr(self.buffers.len()))
     }
+    /// SGPRs the hardware fills before the shader starts (system and user
+    /// SGPRs, and the fragment primitive mask); allocation starts after.
+    pub fn input_sgprs(&self) -> u8 {
+        self.user_base() + self.user_sgprs() + if self.stage == Stage::Fragment { 1 } else { 0 }
+    }
+}
+
+/// `SPI_PS_INPUT_ENA` bits.
+pub mod ps_input {
+    /// Perspective barycentrics at the pixel centre (2 VGPRs).
+    pub const PERSP_CENTER: u32 = 1 << 1;
+    /// Window x of the pixel centre (1 VGPR each, x..w in order).
+    pub const POS_X_FLOAT: u32 = 1 << 8;
+    /// Window y.
+    pub const POS_Y_FLOAT: u32 = 1 << 9;
+    /// Depth.
+    pub const POS_Z_FLOAT: u32 = 1 << 10;
+    /// W (`1/gl_FragCoord.w`).
+    pub const POS_W_FLOAT: u32 = 1 << 11;
+    /// Front face (sign: front when > 0).
+    pub const FRONT_FACE: u32 = 1 << 12;
 }
 
 /// A compiled kernel.
@@ -78,7 +125,16 @@ pub struct Binary {
     /// Scratch (spill) space per lane, in dwords; 0 = the dispatch needs
     /// no scratch.
     pub scratch_dwords: u32,
+    /// Fragment shaders: `SPI_PS_INPUT_ENA` (and `_ADDR`) for the input
+    /// VGPRs the code reads; 0 otherwise.
+    pub ps_input_ena: u32,
+    /// Graphics: the exports at the end of the shader, as (target, enabled
+    /// component mask); position 0 is target 12, primitive 20, MRT n is n,
+    /// depth (MRTZ) 8.
+    pub exports: Vec<(u8, u8)>,
 }
+
+use atrium_gir::Stage;
 
 /// Compile options.
 #[derive(Debug, Clone)]
@@ -108,10 +164,10 @@ pub fn compile_with(f: &Function, o: &Options) -> Result<Binary, Error> {
     if f.workgroup_bytes > 64 * 1024 {
         return Err(Error::Unsupported("more than 64 KiB of workgroup memory".into()));
     }
-    if 2 * f.buffers.len() + if f.push_bytes > 0 { 2 } else { 0 } > 16 {
-        return Err(Error::Unsupported("more than 16 user SGPRs (8 buffers, or 7 plus push constants)".into()));
-    }
     let abi = Abi::for_function(f);
+    if abi.user_sgprs() > 16 {
+        return Err(Error::Unsupported("more than 16 user SGPRs (8 buffers, or 7 plus push constants; one fewer in a vertex shader)".into()));
+    }
     let u = atrium_gir::passes::uniformity::analyse(f);
     let mut is = isel::Isel::new(f, &u, &abi);
     is.run()?;
@@ -133,9 +189,21 @@ pub fn compile_with(f: &Function, o: &Options) -> Result<Binary, Error> {
             }
         }
     }
-    let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, 1, abi.user_sgprs(), o.max_vgprs.min(256), o.max_sgprs.min(106))?;
+    let v_first = is.input_vgprs();
+    let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, v_first, abi.input_sgprs(), o.max_vgprs.min(256), o.max_sgprs.min(106))?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
-    Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes, scratch_dwords })
+    let (ps_input_ena, exports) = (is.ps_input_ena, is.exports.clone());
+    Ok(Binary {
+        code,
+        vgprs: asg.vgprs.max(v_first as u32),
+        sgprs: asg.sgprs.max(abi.input_sgprs() as u32),
+        abi,
+        local_size: f.local_size,
+        lds_bytes: f.workgroup_bytes,
+        scratch_dwords,
+        ps_input_ena,
+        exports,
+    })
 }
 
 /// Disassembly-style listing (instruction names per decoded word group).

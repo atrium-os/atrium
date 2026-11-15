@@ -141,7 +141,7 @@ impl<'a> V<'a> {
         let ty = |v: ValueId| self.f.ty(v);
         let res = inst.result.map(|v| ty(v));
         let bad = || err(format!("type error in {:?} -> {:?}", inst.op, res));
-        let needs_result = !matches!(inst.op, Op::Store(..) | Op::Barrier | Op::Yield(_) | Op::Continue(_) | Op::Break(_) | Op::Return);
+        let needs_result = !matches!(inst.op, Op::Store(..) | Op::Barrier | Op::Yield(_) | Op::Continue(_) | Op::Break(_) | Op::Return | Op::Export(_));
         if needs_result != res.is_some() {
             return bad();
         }
@@ -196,6 +196,7 @@ impl<'a> V<'a> {
             Op::Store(_, o, _) => ty(*o) == Ty::I32,
             Op::Atomic(_, _, o, v) => ty(*o) == Ty::I32 && ty(*v) == Ty::I32 && res == Some(Ty::I32),
             Op::Barrier | Op::Yield(_) | Op::Continue(_) | Op::Break(_) | Op::Return => true,
+            Op::Export(v) => v.len() == self.f.outputs.len() && v.iter().zip(&self.f.outputs).all(|(x, o)| ty(*x) == o.ty),
             Op::Subgroup(o, v) => {
                 let data = |t: Ty| t == Ty::I32 || t == Ty::F32;
                 match (o, v.as_slice()) {

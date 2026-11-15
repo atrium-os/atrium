@@ -115,6 +115,10 @@ pub struct Options {
     /// builtin kinds) instead of lowering them to subgroupSize = 1.
     /// For GPU backends; the CPU backends need the default.
     pub native_subgroups: bool,
+    /// Lay out built-in output blocks (`gl_PerVertex`) at the canonical
+    /// offsets of [`interface::BUILTIN_BLOCK_POSITION`]. For GPU backends;
+    /// the CPU tiers keep the default (such blocks are rejected).
+    pub builtin_blocks: bool,
 }
 
 /// Translate SPIR-V to the IR with `opts`.
@@ -234,6 +238,9 @@ pub fn translate_with_options(
         &rspirv_module, &type_ctx, Some(&const_ctx),
     )?;
     iface_ctx.native_subgroups = opts.native_subgroups;
+    if opts.builtin_blocks {
+        iface_ctx.synthesize_builtin_blocks(&rspirv_module);
+    }
 
     // Compute the OffsetTable index of each function's
     // OpFunction instruction. Module instructions appear

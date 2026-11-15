@@ -100,6 +100,9 @@ pub enum Space {
     Workgroup,
     /// The push-constant block (read-only).
     Push,
+    /// A stage input (index into [`Function::inputs`]), read-only; the
+    /// offset is a constant byte offset inside it.
+    Input(u32),
 }
 
 /// Unary ops.
@@ -262,6 +265,80 @@ pub enum Builtin {
     SubgroupId,
     /// `gl_NumSubgroups` (`i32`).
     NumSubgroups,
+    /// `gl_VertexIndex` (`i32`, vertex stage): includes the draw's first
+    /// vertex (or the index buffer's value plus the vertex offset).
+    VertexIndex,
+    /// `gl_InstanceIndex` (`i32`, vertex stage): includes the first
+    /// instance.
+    InstanceIndex,
+    /// `gl_BaseVertex` (`i32`, vertex stage).
+    BaseVertex,
+    /// `gl_BaseInstance` (`i32`, vertex stage).
+    BaseInstance,
+    /// `gl_FragCoord` (`vec4<f32>`, fragment stage): window x, y, depth
+    /// z and 1/w.
+    FragCoord,
+    /// `gl_FrontFacing` (`i32` 0 or 1, fragment stage).
+    FrontFacing,
+    /// `gl_PrimitiveID` (`i32`, fragment stage).
+    PrimitiveId,
+}
+
+/// Shader stage of a [`Function`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// A compute kernel.
+    Compute,
+    /// A vertex shader (one invocation per vertex).
+    Vertex,
+    /// A fragment shader (one invocation per covered pixel or sample).
+    Fragment,
+}
+
+/// How a fragment input is interpolated across the primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Interp {
+    /// Perspective-correct.
+    Smooth,
+    /// Linear in screen space.
+    NoPerspective,
+    /// The provoking vertex's value.
+    Flat,
+}
+
+/// A stage input: a vertex attribute (vertex stage) or an interpolated
+/// varying (fragment stage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Input {
+    /// `layout(location = N)`.
+    pub location: u32,
+    /// Its type (scalar or vector).
+    pub ty: Ty,
+    /// Interpolation (fragment stage).
+    pub interp: Interp,
+}
+
+/// What a stage output feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputKind {
+    /// `gl_Position` (`vec4<f32>`).
+    Position,
+    /// `gl_PointSize` (`f32`).
+    PointSize,
+    /// A varying (vertex stage) or colour attachment (fragment stage) at
+    /// `layout(location = N)`.
+    Location(u32),
+    /// `gl_FragDepth` (`f32`).
+    FragDepth,
+}
+
+/// A stage output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Output {
+    /// Where it goes.
+    pub kind: OutputKind,
+    /// Its type (scalar or vector).
+    pub ty: Ty,
 }
 
 /// Subgroup size. Subgroups are consecutive runs of this many invocations
@@ -422,6 +499,11 @@ pub enum Op {
     Continue(Vec<ValueId>),
     /// Leave the innermost loop with these result values.
     Break(Vec<ValueId>),
+    /// Set the stage outputs ([`Function::outputs`], one value of each
+    /// output's type, in order) of the active invocations. The last
+    /// export an invocation runs before it ends is what it outputs; the
+    /// builder puts one before every `return` and at the end of the body.
+    Export(Vec<ValueId>),
     /// End the invocation.
     Return,
 }
@@ -439,7 +521,7 @@ impl Op {
             Op::Un(_, a) | Op::Conv(_, a) | Op::Bitcast(a) | Op::Extract(a, _) | Op::Load(_, a) => vec![*a],
             Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(_, a, b) | Op::Atomic(_, _, a, b) => vec![*a, *b],
             Op::Fma(a, b, c) | Op::Select(a, b, c) => vec![*a, *b, *c],
-            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) => v.clone(),
+            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) | Op::Export(v) => v.clone(),
         }
     }
 }
@@ -452,7 +534,7 @@ impl Op {
             Op::Un(_, a) | Op::Conv(_, a) | Op::Bitcast(a) | Op::Extract(a, _) | Op::Load(_, a) => vec![a],
             Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(_, a, b) | Op::Atomic(_, _, a, b) => vec![a, b],
             Op::Fma(a, b, c) | Op::Select(a, b, c) => vec![a, b, c],
-            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) => v.iter_mut().collect(),
+            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) | Op::Export(v) => v.iter_mut().collect(),
         }
     }
 
@@ -518,11 +600,17 @@ pub fn never_falls(r: &Region) -> bool {
     }
 }
 
-/// A compute kernel in GIR.
+/// A shader in GIR.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     /// Entry-point name.
     pub name: String,
+    /// Shader stage.
+    pub stage: Stage,
+    /// Stage inputs, read with [`Space::Input`] (graphics stages).
+    pub inputs: Vec<Input>,
+    /// Stage outputs, set by [`Op::Export`] (graphics stages).
+    pub outputs: Vec<Output>,
     /// Workgroup size.
     pub local_size: [u32; 3],
     /// Type of every value, indexed by `ValueId.0`.
@@ -608,6 +696,7 @@ impl Function {
                         Op::Atomic(a, s, o, v) => format!("atomic.{a:?} {s:?} + {o}, {v}"),
                         Op::Barrier => "barrier".into(),
                         Op::Subgroup(o, v) => format!("subgroup.{o:?} {}", list(v)),
+                        Op::Export(v) => format!("export {}", list(v)),
                         Op::Yield(v) => format!("yield {}", list(v)),
                         Op::Continue(v) => format!("continue {}", list(v)),
                         Op::Break(v) => format!("break {}", list(v)),
@@ -638,8 +727,8 @@ impl Function {
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut s = format!(
-            "kernel {} local_size({}, {}, {}) buffers {:?} push {}B privates {:?} workgroup {}B\n",
-            self.name, self.local_size[0], self.local_size[1], self.local_size[2],
+            "{:?} {} local_size({}, {}, {}) buffers {:?} push {}B privates {:?} workgroup {}B\n",
+            self.stage, self.name, self.local_size[0], self.local_size[1], self.local_size[2],
             self.buffers, self.push_bytes, self.privates, self.workgroup_bytes
         );
         self.print_region(&self.body, 1, &mut s);

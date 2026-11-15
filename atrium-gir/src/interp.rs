@@ -52,6 +52,33 @@ struct Wg<'a> {
     yields: Vec<&'a [ValueId]>,
     /// (params, results) of loops, innermost last.
     loops: Vec<(&'a [ValueId], &'a [ValueId])>,
+    /// Graphics: each invocation's stage inputs.
+    gfx: &'a [Invocation],
+    /// Graphics: each invocation's stage inputs as bytes, per input.
+    input_mem: Vec<Vec<Vec<u8>>>,
+    /// Graphics: each invocation's last export (flattened components).
+    exports: Vec<Vec<u32>>,
+}
+
+/// One graphics invocation's inputs, for [`run_graphics`].
+#[derive(Debug, Clone, Default)]
+pub struct Invocation {
+    /// `gl_VertexIndex`.
+    pub vertex_index: u32,
+    /// `gl_InstanceIndex`.
+    pub instance_index: u32,
+    /// `gl_BaseVertex`.
+    pub base_vertex: u32,
+    /// `gl_BaseInstance`.
+    pub base_instance: u32,
+    /// `gl_FragCoord`.
+    pub frag_coord: [f32; 4],
+    /// `gl_FrontFacing`.
+    pub front_facing: bool,
+    /// `gl_PrimitiveID`.
+    pub primitive_id: u32,
+    /// Raw bits of each of [`Function::inputs`], per component.
+    pub inputs: Vec<Vec<u32>>,
 }
 
 fn f(b: u32) -> f32 {
@@ -176,6 +203,10 @@ impl<'a> Wg<'a> {
             },
             Space::Private(i) => &mut self.private[l][i as usize],
             Space::Workgroup => &mut self.shared,
+            Space::Input(i) => match self.input_mem.get_mut(l).and_then(|m| m.get_mut(i as usize)) {
+                Some(m) => m,
+                None => return err(format!("input {i} not supplied")),
+            },
         })
     }
 
@@ -321,6 +352,19 @@ impl<'a> Wg<'a> {
                         Builtin::SubgroupLocalId => [l as u32 % SUBGROUP_SIZE, 0, 0, 0],
                         Builtin::SubgroupId => [l as u32 / SUBGROUP_SIZE, 0, 0, 0],
                         Builtin::NumSubgroups => [(self.n as u32).div_ceil(SUBGROUP_SIZE), 0, 0, 0],
+                        Builtin::VertexIndex | Builtin::InstanceIndex | Builtin::BaseVertex | Builtin::BaseInstance
+                        | Builtin::FragCoord | Builtin::FrontFacing | Builtin::PrimitiveId => {
+                            let Some(g) = self.gfx.get(l) else { return err(format!("{k:?} outside a graphics stage")) };
+                            match k {
+                                Builtin::VertexIndex => [g.vertex_index, 0, 0, 0],
+                                Builtin::InstanceIndex => [g.instance_index, 0, 0, 0],
+                                Builtin::BaseVertex => [g.base_vertex, 0, 0, 0],
+                                Builtin::BaseInstance => [g.base_instance, 0, 0, 0],
+                                Builtin::FragCoord => g.frag_coord.map(f32::to_bits),
+                                Builtin::FrontFacing => [g.front_facing as u32, 0, 0, 0],
+                                _ => [g.primitive_id, 0, 0, 0],
+                            }
+                        }
                     })
                 }
                 Op::Load(s, o) => {
@@ -378,6 +422,15 @@ impl<'a> Wg<'a> {
                 }
                 Op::Return => {
                     self.status[l] = Status::Returned;
+                    None
+                }
+                Op::Export(v) => {
+                    let mut e = vec![];
+                    for x in v {
+                        let n = fty.ty(*x).comps();
+                        e.extend_from_slice(&self.get(*x, l)[..n]);
+                    }
+                    self.exports[l] = e;
                     None
                 }
             };
@@ -476,6 +529,9 @@ pub fn run(f: &Function, groups: [u32; 3], buffers: &mut Buffers) -> Result<(), 
                     cont: vec![],
                     yields: vec![],
                     loops: vec![],
+                    gfx: &[],
+                    input_mem: vec![],
+                    exports: vec![],
                 };
                 let mask = vec![true; n];
                 wg.region(&f.body, &mask)?;
@@ -483,4 +539,49 @@ pub fn run(f: &Function, groups: [u32; 3], buffers: &mut Buffers) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Run a vertex or fragment shader: one invocation per entry of `invs`,
+/// all in one group (so subgroups are runs of [`SUBGROUP_SIZE`]
+/// invocations in order). Returns each invocation's exported outputs, the
+/// components of [`Function::outputs`] flattened in order (empty if it
+/// exported nothing).
+pub fn run_graphics(f: &Function, invs: &[Invocation], buffers: &mut Buffers) -> Result<Vec<Vec<u32>>, InterpError> {
+    let n = invs.len();
+    for (set, binding) in &f.buffers {
+        if !buffers.contains_key(&(*set, *binding)) {
+            return err(format!("buffer ({set}, {binding}) not bound"));
+        }
+    }
+    let mut input_mem = vec![];
+    for (l, inv) in invs.iter().enumerate() {
+        let mut m = vec![];
+        for (i, inp) in f.inputs.iter().enumerate() {
+            let Some(v) = inv.inputs.get(i) else { return err(format!("invocation {l}: input {i} not supplied")) };
+            if v.len() != inp.ty.comps() {
+                return err(format!("invocation {l}: input {i} has {} components, wants {}", v.len(), inp.ty.comps()));
+            }
+            m.push(v.iter().flat_map(|x| x.to_le_bytes()).collect());
+        }
+        input_mem.push(m);
+    }
+    let mut wg = Wg {
+        f,
+        n,
+        wg_id: [0; 3],
+        vals: vec![vec![[0; 4]; n]; f.types.len()],
+        status: vec![Status::Running; n],
+        private: vec![f.privates.iter().map(|b| vec![0u8; *b as usize]).collect(); n],
+        shared: vec![],
+        buffers,
+        cont: vec![],
+        yields: vec![],
+        loops: vec![],
+        gfx: invs,
+        input_mem,
+        exports: vec![vec![]; n],
+    };
+    let mask = vec![true; n];
+    wg.region(&f.body, &mask)?;
+    Ok(wg.exports)
 }
