@@ -426,12 +426,51 @@ reads correctly in Acrobat, Preview or pdf.js, and theirs read in ours.
   list (page, author, text, state) to copy or export as text. Comparing two
   PDFs' text, as Write compares documents (officina.md §16.26), is later
   work.
-- **With Officina.** Write's comments and tracked changes (officina.md
-  §16.21–16.27) go out in PDF export as markup annotations: a comment as a
-  note on its range with replies kept, and, when asked, insertions and
-  deletions as caret and strike-out marks. That export uses the same
-  annotation writer, and the round-trip gate (§5.1) checks Folium reads
-  them back.
+- **With Officina.** See §9.2: Write's comments and tracked changes go
+  out as these annotations, and a PDF review comes back into Write.
+
+### 9.2 What Officina's review gives PDF (asked by Shankar, 2026-11-15)
+
+*"See how Officina handles reviews and see if any of those translate into
+PDF."* Officina's review (officina.md §16.21–16.27) rests on five ideas.
+Each was checked against what PDF can carry:
+
+| Officina | in PDF | how |
+|---|---|---|
+| **Comments** on a range, threads, resolved (§16.21) | yes, directly | a Highlight over the range's quads with the text in `Contents`, author `T`, date `M`; replies are annotations with `IRT` pointing at it; "resolved" is a review-state reply `Completed` by whoever resolved it. A range that crosses pages is one annotation per page tied with `RT /Group`, shown as one comment |
+| **The page reads clean**; changes only as a thin bar and a count; one lane to go through them (§16.22) | yes, as the viewer's design | Atrium PDF does the same: the page shows the document; markup annotations are drawn faintly, the one picked in the comments lane fully; the status line says "12 comments by 3 people · Review". The lane is the comments pane of §9.1, with Next, Previous, and state buttons by key. "Show all markup" draws everything as other readers do |
+| **Edits, not fragments**: word-level, replacement as one, moves, formatting batched, with a sentence ("“thirty” → “fourteen”") (§16.24) | yes for text edits, as markup | an insertion is a Caret with the inserted text; a deletion a StrikeOut; a replacement a StrikeOut and a Caret grouped (`RT /Group`, the text-edit intents other readers use for "replace text"), so Acrobat and pdf.js show them as edits. The sentence goes in `Subj`. Formatting changes and moves have no PDF markup kind: they go as a note with the sentence ("moved “Costs” above “Plan”", "bold on 6 headings") |
+| **Change sets**, one person's pass, optionally named (§16.22) | partly | the author is standard (`T`); the set's name rides in a key of our own (`/AtSet`), which other readers ignore and we group by. Accept and reject can't apply to a PDF's text (it isn't reflowable), so in PDF they are review states (Accepted, Rejected) for whoever exported or returns it |
+| **Compare** two versions, word level, moves, formatting apart (§16.26) | yes, for text | Folium extracts each PDF's text in reading order as paragraphs (`folium-text`); Officina's `diff()` (Myers, paragraph pairing, moves, the alignment slide of §16.27) runs on them unchanged, since it is generic over sequences. The result is a set of edits shown in the lane over the second PDF, with deletions as faint marks where the text was. Not a pixel diff, though "show pixel differences" for drawings can come later |
+| **Merge** reviewed copies, conflicts as one card (§16.27) | yes, simpler than Officina's | our saves are incremental updates (§9), so every reviewer's copy is the original's bytes plus their appended comments. Merging takes each copy's annotations (deduplicated by their unique name `NM`) and states onto one copy; comments never overwrite each other. The only conflicts: two people changing the same comment's text (shown as one card, both kept), and a copy whose page content (not just comments) changed, which is refused with "this copy was edited, not only reviewed" and offered as a compare instead |
+
+From that, three pieces of work across Write and Atrium PDF:
+
+1. **Export review to PDF (Write, P5).** Write ▸ Export PDF gains
+   "Include comments and changes": *Clean* (default, Write's Reading
+   view: the proposed text, with comments and edits as annotations) or
+   *All markup* (Write's All view: old text drawn struck through as well).
+   Each annotation carries an anchor key of our own (`/AtAnchor`: the
+   paragraph id and offsets in the source document) so it can come back.
+2. **Import review from PDF (Write, P5).** The loop people actually run:
+   Write exports a PDF, it goes to someone who only has a PDF reader, they
+   comment and mark edits in Acrobat, Preview, pdf.js or Atrium PDF, and
+   it comes back. Write ▸ Import Review… reads the annotations: comments
+   become comments (with threads and resolved), Caret, StrikeOut and
+   replace groups become tracked changes by that reviewer, each in a
+   change set named after them, so the normal review lane goes through
+   them. Placement uses `/AtAnchor` when the annotation came from our
+   export (exact), else the annotation's quads matched to the source text
+   through the page's extracted text and the export's layout (the same
+   paginated document Write exported from), and what can't be placed is
+   listed, never dropped silently.
+3. **Review in Atrium PDF (P3 reading, P5 writing).** The lane, states,
+   compare and merge above, for any PDF.
+
+The engine pieces are shared, not copied: Officina's `diff()` and edit
+grouping move to a small crate both can use (`officina-diff`, depending on
+neither), and the annotation reader and writer are `folium-doc`'s, used by
+Write's export and import.
 
 ## 10. Testing
 
@@ -475,7 +514,7 @@ reads correctly in Acrobat, Preview or pdf.js, and theirs read in ours.
 | **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1); `officina-pdf` moved onto the shared base (§5.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates; Officina's export gate unchanged and its output read back by Folium |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |
-| **P5** | forms; comments and review (add, reply, state, resolve; Write's comments in its PDF export); incremental save | edit gate; a review done in Atrium PDF opens with the same threads and states in pdf.js and in a host-side reader |
+| **P5** | forms; comments and review (add, reply, state, resolve, compare, merge); Write's export with comments and changes and its Import Review (§9.2); incremental save | edit gate; a review done in Atrium PDF opens with the same threads and states in pdf.js and in a host-side reader |
 | **P6** | signature verification, PAdES signing via Sigillum | signs with the YubiKey and the InnaIT DSC token |
 | **P7** | print path, tagged PDF | with the print service |
 
@@ -500,3 +539,6 @@ several weeks and then ongoing as the corpus finds things.
 | D12 | Very detailed pages | Vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; the budget is tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
 | D13 | Folium and Officina | One base: `folium-syntax`, `folium-content`, `folium-font` (and later `folium-sign`) are used by both the reader and Officina's export; `officina-pdf` moves onto them in P2, its export gate unchanged before and after |
 | D14 | Comments and review | PDF's own markup annotations with replies (`IRT`) and review states, so reviews interoperate with other readers; read in P2–P3 (pane), written in P5 as incremental updates; Write's comments exported as annotations |
+| D15 | Write's PDF export of a reviewed document | Default *Clean* (proposed text, comments and edits as annotations, as Write's Reading view); *All markup* on request; annotations carry `/AtAnchor` so they can come back |
+| D16 | Bringing a PDF review back into Write | Yes: Write ▸ Import Review… turns comments into comments and text-edit marks into tracked changes by each reviewer, placed by anchor or by text, listing anything it can't place |
+| D17 | Sharing the review engine | Move Officina's word diff and edit grouping into `officina-diff`, used by Write and Atrium PDF; annotations read and written only by `folium-doc` |
