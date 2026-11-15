@@ -674,9 +674,15 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   `a_taken_transitions_script_cookie_is_kept` and `a_scripts_cookies_leave_out_httponly_ones`,
   navigatord and navigator-ui unit tests, and `scripts/arca-vm-test.sh` §8 against the
   real Arca (the site's next page carries the answer).
-- *Not yet:* inline `onclick="..."` attribute handlers are not run by the converter, so a
-  wall wired only that way is not found; a wall built inside an iframe (normalized
-  documents have none) is not either.
+- *Inline handlers (2026-11-15):* the converter runs HTML's event handler content
+  attributes (`onclick="..."` and the other names it exposes as slots): compiled as
+  `function (event) { text }` the first time a dispatch or a read needs it, again when the
+  text changes, with `this` the element; a slot assigned from script wins; text that does
+  not compile is no handler. Exploration and the consent search see them as listeners, so a
+  wall wired only by attributes is found (tests/attr_handlers.rs).
+- *Not yet:* a wall built inside an iframe (normalized documents have none); a wall placed
+  only by a stylesheet whose controls say no consent word (no computed style here);
+  `element.click()` and `focus()` are not implemented.
 - *Session cookies dying with the view* (Arca §8.6).
 - *The EU-vantage measurement.*
 

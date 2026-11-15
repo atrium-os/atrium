@@ -95,6 +95,12 @@ thread_local! {
     /// unset one must give null rather than undefined.
     static ONHANDLERS: RefCell<BTreeMap<(Handle, String), JsValue>> =
         RefCell::new(BTreeMap::new());
+    /// `<button onclick="...">`: the attribute's handler, compiled the
+    /// first time it is needed and again when the attribute's text changes
+    /// (HTML's event handler content attributes). A slot assigned from
+    /// script wins over it.
+    static ATTR_HANDLERS: RefCell<HashMap<(Handle, String), (String, JsValue)>> =
+        RefCell::new(HashMap::new());
     /// ★ RANDOMNESS IS SEEDED FROM THE DOCUMENT, NOT THE MACHINE.
     ///
     /// A converter whose output feeds a content-addressed store must produce
@@ -2467,8 +2473,26 @@ fn on_get(this: &JsValue, name: &str, ctx: &mut Context) -> JsResult<JsValue> {
     let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::null()) };
     // ★ null, not undefined: an unset handler is null in the DOM and pages
     // compare against it.
-    Ok(ONHANDLERS.with(|m| m.borrow().get(&(h, name.to_string())).cloned())
-        .unwrap_or(JsValue::null()))
+    Ok(handler_slot(h, name, ctx).unwrap_or(JsValue::null()))
+}
+
+/// The handler in `name`'s slot on `h`: one script assigned, else the
+/// element's `name` attribute compiled as `function (event) { text }`.
+/// Text that does not compile is no handler, as in a browser.
+fn handler_slot(h: Handle, name: &str, ctx: &mut Context) -> Option<JsValue> {
+    if let Some(f) = ONHANDLERS.with(|m| m.borrow().get(&(h, name.to_string())).cloned()) {
+        return Some(f);
+    }
+    let text = with(|d| d.attr(h, name).map(str::to_string))?;
+    let key = (h, name.to_string());
+    if let Some(f) = ATTR_HANDLERS.with(|m| m.borrow().get(&key).filter(|(t, _)| *t == text).map(|(_, f)| f.clone())) {
+        return Some(f);
+    }
+    let make = ctx.global_object().get(js_string!("Function"), ctx).ok()?;
+    let f = make.as_callable()?.call(&JsValue::undefined(), &[js_string!("event").into(), js_string!(text.clone()).into()], ctx).ok()?;
+    f.as_callable()?;
+    ATTR_HANDLERS.with(|m| m.borrow_mut().insert(key, (text, f.clone())));
+    Some(f)
 }
 
 fn on_set(this: &JsValue, name: &str, v: &JsValue, ctx: &mut Context) -> JsResult<JsValue> {
@@ -2856,6 +2880,17 @@ fn element_listeners(ctx: &mut Context) -> std::collections::BTreeMap<Handle, Ve
     ONHANDLERS.with(|m| for ((h, name), f) in m.borrow().iter() {
         raw.push((*h, name.strip_prefix("on").unwrap_or(name).to_string(), f.clone()))
     });
+    // Handlers written as attributes (`onclick="..."`) are listeners too.
+    let attrs: Vec<(Handle, String)> = with(|d| (0..d.nodes.len() as Handle).flat_map(|h| {
+        d.get(h).map(|n| n.attrs.iter().filter(|(k, _)| ON_HANDLERS.contains(&k.as_str()))
+            .map(|(k, _)| (h, k.clone())).collect::<Vec<_>>()).unwrap_or_default()
+    }).collect());
+    for (h, name) in attrs {
+        if ONHANDLERS.with(|m| m.borrow().contains_key(&(h, name.clone()))) { continue }
+        if let Some(f) = handler_slot(h, &name, ctx) {
+            raw.push((h, name.strip_prefix("on").unwrap_or(&name).to_string(), f));
+        }
+    }
     let mut out: std::collections::BTreeMap<Handle, Vec<(String, String)>> = Default::default();
     for (h, ty, f) in raw {
         let k = handler_key(&f, ctx);
@@ -4170,9 +4205,7 @@ fn el_dispatch(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
         let _ = evo.set(js_string!("currentTarget"), here, false, ctx);
         // The handler SLOT runs first, then the added listeners — the order
         // a browser uses when both are present.
-        let mut fns: Vec<JsValue> = ONHANDLERS
-            .with(|m| m.borrow().get(&(node, format!("on{ty}"))).cloned())
-            .into_iter().collect();
+        let mut fns: Vec<JsValue> = handler_slot(node, &format!("on{ty}"), ctx).into_iter().collect();
         fns.extend(ELISTENERS.with(|m| m.borrow().get(&node)
             .map(|v| v.iter().filter(|(t, _)| t == &ty).map(|(_, f)| f.clone())
                  .collect::<Vec<_>>())
@@ -6076,6 +6109,7 @@ impl BoaEngine {
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
         ONHANDLERS.with(|m| m.borrow_mut().clear());
+        ATTR_HANDLERS.with(|m| m.borrow_mut().clear());
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
         DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
@@ -6443,6 +6477,7 @@ impl BoaEngine {
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
         ONHANDLERS.with(|m| m.borrow_mut().clear());
+        ATTR_HANDLERS.with(|m| m.borrow_mut().clear());
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
