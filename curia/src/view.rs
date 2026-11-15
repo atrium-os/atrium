@@ -1279,6 +1279,67 @@ mod tests {
         assert!(all.iter().any(|s| s == "Cancel"));
     }
 
+    /// What frescod holds after each frame, as the deltas leave it: one
+    /// "details" label, never the one before as well.
+    #[test]
+    fn the_details_label_is_drawn_once_as_the_page_changes() {
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        #[derive(Default)]
+        struct Model(HashMap<u32, (Option<String>, Option<u32>)>);
+        impl Model {
+            fn gone(&mut self, id: u32) {
+                self.0.remove(&id);
+                let kids: Vec<u32> = self.0.iter().filter(|(_, v)| v.1 == Some(id)).map(|(k, _)| *k).collect();
+                for k in kids {
+                    self.gone(k);
+                }
+            }
+        }
+        impl pergola::Surface for Model {
+            fn begin_frame(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn end_frame(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn set_node(&mut self, id: NodeId, node: &Node, group: Option<NodeId>, _: u32) -> std::io::Result<()> {
+                let t = if let Node::Text { content, .. } = node { Some(content.clone()) } else { None };
+                self.0.insert(id.0, (t, group.map(|g| g.0)));
+                Ok(())
+            }
+            fn set_group(&mut self, id: NodeId, _: &Node, group: Option<NodeId>, _: u32) -> std::io::Result<()> {
+                let kept = self.0.get(&id.0).map(|v| v.0.clone()).unwrap_or(None);
+                self.0.insert(id.0, (kept, group.map(|g| g.0)));
+                Ok(())
+            }
+            fn clear_node(&mut self, id: NodeId) -> std::io::Result<()> {
+                self.gone(id.0);
+                Ok(())
+            }
+            fn present(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let dirty = Arc::new(AtomicBool::new(true));
+        macro_rules! m { ($v:expr) => { Mutable::with_dirty($v, dirty.clone()) }; }
+        let mut p = NetPage::new();
+        p.take_wants();
+        p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
+        let page = m!(p.clone());
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
+        let mut app = pergola::App::new_with_flag(v, dirty.clone());
+        let mut s = Model::default();
+        let labels = |s: &Model| s.0.values().filter_map(|v| v.0.clone()).filter(|t| t.ends_with(" details")).collect::<Vec<_>>();
+        pergola::commit(&mut s, &app.tick()).unwrap();
+        assert_eq!(labels(&s), vec!["Show details".to_string()]);
+        // The saved networks arrive: the label moves down.
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false }])));
+        page.set(p.clone());
+        pergola::commit(&mut s, &app.tick()).unwrap();
+        assert_eq!(labels(&s), vec!["Show details".to_string()], "after the list came");
+        p.toggle_details();
+        page.set(p.clone());
+        pergola::commit(&mut s, &app.tick()).unwrap();
+        assert_eq!(labels(&s), vec!["Hide details".to_string()], "after the click");
+    }
+
     #[test]
     fn details_show_ip_settings_and_dns_servers() {
         use atrium_netconf::{Iface, Manual};

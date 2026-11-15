@@ -1779,6 +1779,172 @@ mod tests {
         check(&mut inc, &|| input(&p3, [0.0, 1.0, 0.0, 1.0], (50.0, 30.0)));
     }
 
+    /// A grouped window whose item moves a little (a label pushed down by
+    /// a list arriving) gives, frame after frame, the screen a fresh
+    /// renderer gives: nothing of the old drawing stays behind.
+    #[test]
+    fn a_moved_item_leaves_nothing_behind() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (160u32, 120u32);
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 160.0, 120.0, [0.95, 0.95, 0.95, 1.0], None);
+        let page = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], clip: Some([0.0, 0.0, 160.0, 120.0]), opacity: 1.0, flags: 0 };
+        s.set_group(10, page, 1).unwrap();
+        rect(&mut s, 11, 20.0, 40.0, 50.0, 9.0, [0.1, 0.1, 0.1, 1.0], Some(10));
+        let mut inc = Compute::new(w, h).expect("kernels");
+        let frame = |s: &WindowSceneState| {
+            let mut fw = WindowFrame { id: 1, pos: (0.0, 0.0), size: (w, h), ..Default::default() };
+            assert!(grouped_frame(s, &mut fw, None));
+            ScreenInput { windows: vec![fw], uploads: Vec::new(), clears: Vec::new() }
+        };
+        for (i, y) in [40.0f32, 44.0, 44.0, 52.0, 40.0].into_iter().enumerate() {
+            s.rect_nodes.get_mut(&11).unwrap().y = y;
+            s.leaf_replaces(11);
+            inc.render(frame(&s)).unwrap();
+            let mut full = Compute::new(w, h).unwrap();
+            full.render(frame(&s)).unwrap();
+            let bad = inc.target.iter().zip(&full.target).position(|(a, b)| a != b);
+            assert!(bad.is_none(), "frame {i} (y {y}): pixel {:?} differs", bad.map(|p| (p as u32 % w, p as u32 / w)));
+        }
+    }
+
+    /// While a group animates (a sprite), an item of the window under it
+    /// that moves is drawn where it is now and nowhere else, frame after
+    /// frame, through the whole backend.
+    #[test]
+    fn a_moved_item_beside_a_sprite_leaves_nothing_behind() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (160u32, 120u32);
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 160.0, 120.0, [0.95, 0.95, 0.95, 1.0], None);
+        let spin = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 120.0, 8.0], clip: None, opacity: 1.0, flags: 0 };
+        s.set_group(10, spin, 1).unwrap();
+        rect(&mut s, 11, 0.0, 0.0, 20.0, 20.0, [0.0, 0.0, 1.0, 1.0], Some(10));
+        rect(&mut s, 20, 20.0, 40.0, 50.0, 9.0, [0.1, 0.1, 0.1, 1.0], None);
+        let mut inc = Compute::new(w, h).expect("kernels");
+        for (i, (y, op, anim)) in [(40.0f32, 1.0f32, false), (40.0, 0.9, true), (44.0, 0.8, true), (44.0, 0.7, true), (52.0, 1.0, false), (40.0, 1.0, false), (48.0, 0.5, true)].into_iter().enumerate() {
+            s.rect_nodes.get_mut(&20).unwrap().y = y;
+            s.leaf_replaces(20);
+            if anim {
+                s.anim_now.insert(10, GroupParams { opacity: op, ..spin });
+            } else {
+                s.anim_now.remove(&10);
+            }
+            let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(&s, &mut pw, anim.then(Default::default).as_ref()));
+            assert_eq!(pw.sprites.len(), anim as usize, "frame {i}");
+            inc.render(ScreenInput { windows: vec![pw], uploads: Vec::new(), clears: Vec::new() }).unwrap();
+            if anim {
+                s.anim_now.insert(10, GroupParams { opacity: op, flags: fresco_protocol::group_flags::ISOLATE, ..spin });
+            }
+            let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(&s, &mut fw, None));
+            let mut full = Compute::new(w, h).unwrap();
+            full.render(ScreenInput { windows: vec![fw], uploads: Vec::new(), clears: Vec::new() }).unwrap();
+            let bad = inc.target.iter().zip(&full.target).position(|(a, b)| {
+                [0, 8, 16, 24].iter().any(|sh| ((a >> sh) & 255).abs_diff((b >> sh) & 255) > 2)
+            });
+            assert!(bad.is_none(), "frame {i} (y {y}, anim {anim}): pixel {:?} differs", bad.map(|p| (p as u32 % w, p as u32 / w)));
+        }
+    }
+
+    /// Text in a page group that moves and changes (a label pushed down,
+    /// "Show" becoming "Hide", new glyphs added to the atlas), while
+    /// another group animates on and off: every frame equals a fresh
+    /// renderer's.
+    #[test]
+    fn moving_text_leaves_nothing_behind() {
+        use crate::pack::grouped_frame;
+        use fresco_protocol::{GlyphInstance, GlyphRunParams, GroupParams, PlaceParams, RectParams};
+        use fresco_scene_server::command::envelope_frontend::WindowSceneState;
+        let (w, h) = (160u32, 120u32);
+        let atlas = 0xF000_0010u32;
+        let mut s = WindowSceneState::default();
+        let rect = |s: &mut WindowSceneState, id: u32, x: f32, y: f32, rw: f32, rh: f32, c: [f32; 4], parent: Option<u32>| {
+            s.leaf_replaces(id);
+            s.rect_nodes.insert(id, RectParams { x, y, w: rw, h: rh, r: c[0], g: c[1], b: c[2], a: c[3], radius: 0.0 });
+            s.node_writers.insert(id, 1);
+            s.place(id, PlaceParams { parent, order: id }, 1).unwrap();
+        };
+        let label = |s: &mut WindowSceneState, y: f32, n: u32, u0: u32| {
+            s.leaf_replaces(30);
+            let glyphs = (0..n).map(|i| GlyphInstance { dx: i as f32 * 7.0, dy: 0.0, atlas_u: u0 + (i % 4) * 8, atlas_v: 0, atlas_w: 6, atlas_h: 9, bearing_x: 0.0, bearing_y: 8.0 }).collect();
+            s.glyph_run_nodes.insert(30, GlyphRunParams { x: 20.0, y, atlas_slot_id: atlas, atlas_width: 64, atlas_height: 16, r: 0.1, g: 0.1, b: 0.1, a: 1.0, glyphs });
+            s.node_writers.insert(30, 1);
+            s.place(30, PlaceParams { parent: Some(20), order: 30 }, 1).unwrap();
+        };
+        rect(&mut s, 1, 0.0, 0.0, 160.0, 120.0, [0.97, 0.97, 0.98, 1.0], None);
+        let page = GroupParams { parent: None, order: 3, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], clip: Some([0.0, 0.0, 160.0, 120.0]), opacity: 1.0, flags: 0 };
+        s.set_group(20, page, 1).unwrap();
+        let spin = GroupParams { parent: None, order: 5, transform: [1.0, 0.0, 0.0, 1.0, 120.0, 8.0], clip: None, opacity: 1.0, flags: 0 };
+        s.set_group(10, spin, 1).unwrap();
+        rect(&mut s, 11, 0.0, 0.0, 20.0, 20.0, [0.0, 0.0, 1.0, 1.0], Some(10));
+        // The atlas: glyph cells of ink, 8 px apart; later glyphs added by region.
+        let tex = || {
+            let mut b = vec![0u8; 64 * 16];
+            for (i, v) in b.iter_mut().enumerate() {
+                if (i % 64) % 8 < 6 && (i / 64) < 9 && (i % 64) < 32 {
+                    *v = 0xC0;
+                }
+            }
+            UploadRequest::Texture { slot_id: atlas, bytes: b, width: 64, height: 16, format: ash::vk::Format::R8_UNORM }
+        };
+        let grow = || UploadRequest::TextureRegion { slot_id: atlas, bytes: vec![0xE0; 24 * 9], dst_x: 32, dst_y: 0, width: 24, height: 9 };
+        let mut inc = Compute::new(w, h).expect("kernels");
+        let mut grown = false;
+        // (label y, glyphs, first atlas cell, grow the atlas, animate)
+        let steps = [
+            (40.0f32, 12, 0, false, false), (40.0, 12, 0, false, true), (44.0, 12, 0, false, true), (44.0, 12, 0, false, false),
+            (44.0, 12, 32, true, false), (48.0, 10, 32, false, false), (48.0, 10, 0, false, true), (40.0, 12, 0, false, true),
+            (52.0, 12, 32, false, false), (40.0, 12, 0, false, false),
+        ];
+        for (i, &(y, n, u0, g, anim)) in steps.iter().enumerate() {
+            label(&mut s, y, n, u0);
+            let mut ups = if i == 0 { vec![tex()] } else { Vec::new() };
+            if g {
+                ups.push(grow());
+                grown = true;
+            }
+            if anim {
+                s.anim_now.insert(10, GroupParams { opacity: 0.6 + i as f32 * 0.02, ..spin });
+            } else {
+                s.anim_now.remove(&10);
+            }
+            let mut pw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(&s, &mut pw, anim.then(Default::default).as_ref()));
+            inc.render(ScreenInput { windows: vec![pw], uploads: ups, clears: Vec::new() }).unwrap();
+            if anim {
+                s.anim_now.insert(10, GroupParams { opacity: 0.6 + i as f32 * 0.02, flags: fresco_protocol::group_flags::ISOLATE, ..spin });
+            }
+            let mut fw = WindowFrame { id: 1, size: (w, h), ..Default::default() };
+            assert!(grouped_frame(&s, &mut fw, None));
+            let mut full = Compute::new(w, h).unwrap();
+            let mut ups = vec![tex()];
+            if grown {
+                ups.push(grow());
+            }
+            full.render(ScreenInput { windows: vec![fw], uploads: ups, clears: Vec::new() }).unwrap();
+            let bad = inc.target.iter().zip(&full.target).position(|(a, b)| [0, 8, 16, 24].iter().any(|sh| ((a >> sh) & 255).abs_diff((b >> sh) & 255) > 2));
+            assert!(bad.is_none(), "step {i} {:?}: pixel {:?} differs", steps[i], bad.map(|p| (p as u32 % w, p as u32 / w)));
+        }
+    }
+
     /// A group an animation moves or fades, drawn as a sprite over the
     /// rest of the window, looks as the window rastered whole does: the
     /// same at opacity 1 (whole-pixel moves), within a step faded (as if
