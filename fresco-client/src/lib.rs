@@ -1060,8 +1060,9 @@ impl Connection {
     }
 
     /// Server-side shape + atlas + GLYPH_RUN install in one envelope.
-    /// `(x, y)` is the run origin in window pixels with `y` at the
-    /// baseline. The server commits the resulting glyph_run node into
+    /// `(x, y)` is the run origin in window pixels with `y` at the top
+    /// of the em box, one ascender above the baseline
+    /// ([`TextRunInstallPayload`]). The server commits the resulting glyph_run node into
     /// `node_id` in the routed window's scene state.
     pub fn text_run_install(
         &mut self,

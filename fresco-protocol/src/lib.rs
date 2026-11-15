@@ -1193,8 +1193,10 @@ pub struct TextRunInstallPayload {
     pub node_id: u32,
     pub font_id: u32,
     pub size_px: f32,
-    /// Run origin in window pixels; `y` is the text baseline (matches
-    /// `GlyphRunParams` convention).
+    /// Run origin in window pixels; `y` is the top of the em box, one
+    /// font ascender (`FontOpenResponse::ascent_units`) above the
+    /// baseline. frescod adds the ascender to reach `GlyphRunParams`'
+    /// baseline (fresco-scene-server's `shape_text_run`).
     pub x:       f32,
     pub y:       f32,
     /// Foreground colour. Atlas coverage is multiplied against this

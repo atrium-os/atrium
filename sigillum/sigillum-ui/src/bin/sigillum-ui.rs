@@ -47,7 +47,7 @@ fn harden() -> std::io::Result<()> {
 struct Open {
     win: Connection,
     window_id: u32,
-    font: u32,
+    font: view::Font,
     state: State,
     /// The window's size in points.
     size: (f32, f32),
@@ -92,13 +92,14 @@ fn open(fresco: &str, msg: ToUi) -> std::io::Result<Open> {
     let mut win = Connection::connect(fresco)?;
     // Sized from the system text size (resolution-independence.md §6).
     let text = win.appearance().map(|a| a.text_scale()).unwrap_or(1.0);
-    let (w, h) = view::size(text);
+    let state = State::new(key, sheet, devices);
+    let (w, h) = view::size(&state, text);
     let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some(pt(w, h)), ..Default::default() };
     let window_id = win.window_create(w.ceil() as u32, h.ceil() as u32, "Sigillum", hints)?;
     win.set_default_window(window_id as u16);
-    let font = win.font_open("system-sans").map(|f| f.font_id).unwrap_or(0);
+    let font = view::Font::open(&mut win);
     let scale = view::Scale { k: win.window_scale(window_id), text };
-    Ok(Open { win, window_id, font, state: State::new(key, sheet, devices), size: (w, h), scale, dirty: true })
+    Ok(Open { win, window_id, font, state, size: (w, h), scale, dirty: true })
 }
 
 fn pt(w: f32, h: f32) -> (u32, u32) {
@@ -213,7 +214,7 @@ fn main() -> ExitCode {
                 }
                 Event::Appearance(a) if a.text_scale() != o.scale.text => {
                     o.scale.text = a.text_scale();
-                    let (w, h) = view::size(o.scale.text);
+                    let (w, h) = view::size(&o.state, o.scale.text);
                     let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some(pt(w, h)), ..Default::default() };
                     let _ = o.win.window_set_hints(o.window_id, hints);
                     vec![Do::Redraw]

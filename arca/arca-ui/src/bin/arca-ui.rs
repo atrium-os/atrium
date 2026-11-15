@@ -30,6 +30,8 @@ use limen::proto::{ChildEvent, EmbedId};
 /// Until frescod's FocusChanged says pointer or keyboard, a focus this soon
 /// after a press in the window is taken as a click.
 const RING_AFTER_PRESS: Duration = Duration::from_millis(100);
+/// How long the chip must have been on screen for a press to hit it.
+const CHIP_SEEN: Duration = Duration::from_millis(100);
 
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
@@ -38,13 +40,19 @@ fn env(k: &str, d: &str) -> String {
 struct Embed {
     win: Connection,
     window_id: u32,
-    font: u32,
+    font: view::Font,
     parent: Option<Parent>,
     field: Field,
     /// The slot's size in points.
     size: (f32, f32),
     scale: view::Scale,
     look: view::Look,
+    /// The chip as last drawn (pt), and since when it has been: a press
+    /// can only hit a chip that was on screen (CHIP_SEEN) before it.
+    /// frescod's focus event comes just before the press that focused, and
+    /// the chip it brings may cover where the user pressed (all of a
+    /// narrow field at a large text size).
+    shown_chip: Option<(view::Rect, Instant)>,
     /// The last pointer press in this window: a focus that follows one
     /// within RING_AFTER_PRESS came by click and shows no ring.
     pressed_at: Option<Instant>,
@@ -191,7 +199,7 @@ fn main() -> ExitCode {
                             continue;
                         }
                     };
-                    let font = win.font_open("system-sans").map(|f| f.font_id).unwrap_or(0);
+                    let font = view::Font::open(&mut win);
                     let scale = view::Scale { k: win.window_scale(window_id), text: win.appearance().map(|a| a.text_scale()).unwrap_or(1.0) };
                     // The parent as the registry has it, by the uid limend
                     // read off its connection; `parent_app` is only a check.
@@ -207,7 +215,7 @@ fn main() -> ExitCode {
                     if parent.is_none() {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), scale, look: view::Look::default(), pressed_at: None, dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), scale, look: view::Look::default(), shown_chip: None, pressed_at: None, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -298,8 +306,7 @@ fn main() -> ExitCode {
                         e.pressed_at = Some(Instant::now());
                         e.look.ring = false;
                         e.dirty = true;
-                        let l = view::layout(&e.field, e.size.0, e.size.1, e.scale.text);
-                        if l.chip.is_some_and(|c| c.contains(x, y)) {
+                        if e.shown_chip.is_some_and(|(c, t)| c.contains(x, y) && t.elapsed() >= CHIP_SEEN) {
                             e.field.press_chip(activation)
                         } else if !e.field.focused {
                             // A click in the field shows the chip even if
@@ -324,8 +331,15 @@ fn main() -> ExitCode {
             if e.dirty {
                 e.dirty = false;
                 let who = e.parent.as_ref().map_or("unknown app", |p| p.app_id.as_str()).to_string();
-                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.look, e.size.0, e.size.1, e.scale) {
-                    eprintln!("arca-ui: draw {id}: {err}");
+                match view::draw(&mut e.win, e.font, &e.field, &who, e.look, e.size.0, e.size.1, e.scale) {
+                    Ok(()) => {
+                        let chip = view::layout(&e.field, e.size.0, e.size.1, e.scale.text).chip;
+                        e.shown_chip = match (chip, e.shown_chip) {
+                            (Some(c), Some((old, t))) if old == c => Some((c, t)),
+                            (c, _) => c.map(|c| (c, Instant::now())),
+                        };
+                    }
+                    Err(err) => eprintln!("arca-ui: draw {id}: {err}"),
                 }
             }
         }

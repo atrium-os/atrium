@@ -144,6 +144,19 @@ fn a_larger_text_size_fits_fewer_bullets_in_the_same_slot() {
     assert!(b.w >= a.w && b.x + b.w <= 160.0);
 }
 
+#[test]
+fn the_chip_text_and_bullets_stay_inside_a_slot_the_parent_kept_small() {
+    // A 36 pt slot at text 200%: the chip is 24 pt tall.
+    let f = sign_in();
+    let c = view::layout(&f, 240.0, 36.0, 2.0).chip.unwrap();
+    assert!(view::chip_font(&c, 2.0) <= c.h * 0.75);
+    // A slot the parent grew with the text: the full size.
+    let c = view::layout(&f, 240.0, 72.0, 2.0).chip.unwrap();
+    assert_eq!(view::chip_font(&c, 2.0), view::FONT_PT * 2.0);
+    let (b, _) = view::bullet(36.0, 2.0);
+    assert!(b <= (36.0 - 12.0) * 0.6 + 0.001 && b > view::bullet(36.0, 1.0).0);
+}
+
 // ── arcad over a socket ──────────────────────────────────────────────
 
 fn body(f: impl FnOnce(&mut Writer)) -> Vec<u8> {

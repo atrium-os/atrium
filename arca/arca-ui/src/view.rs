@@ -52,6 +52,41 @@ impl Rect {
     }
 }
 
+/// The font the chip's text is drawn in, and its ascender in em. frescod
+/// places a text run by the top of its em box, one ascender above the
+/// baseline (fresco-protocol's `TextRunInstallPayload`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Font {
+    pub id: u32,
+    pub ascent: f32,
+}
+
+impl Font {
+    /// IBM Plex Sans's, should frescod not say.
+    const ASCENT: f32 = 1.025;
+
+    pub fn open(conn: &mut Connection) -> Font {
+        match conn.font_open("system-sans") {
+            Ok(f) if f.units_per_em > 0 && f.ascent_units > 0 => Font { id: f.font_id, ascent: f.ascent_units as f32 / f.units_per_em as f32 },
+            Ok(f) => Font { id: f.font_id, ascent: Self::ASCENT },
+            Err(_) => Font { id: 0, ascent: Self::ASCENT },
+        }
+    }
+}
+
+/// A bullet's size and pitch in pt: grown with the text size, but never
+/// past what the parent's slot height leaves (the parent sizes the slot).
+pub fn bullet(h: f32, text: f32) -> (f32, f32) {
+    let size = (BULLET * text).min(((h - 2.0 * PAD) * 0.6).max(2.0));
+    (size, size * BULLET_STEP / BULLET)
+}
+
+/// The chip's text size in pt: grown with the text size, but kept inside
+/// the chip, whose height is the parent's slot's.
+pub fn chip_font(chip: &Rect, text: f32) -> f32 {
+    (FONT_PT * text).min(chip.h * 0.75)
+}
+
 /// Where things go in a `w` x `h` pt slot at text size `text`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
@@ -63,11 +98,13 @@ pub struct Layout {
 pub fn layout(f: &Field, w: f32, h: f32, text: f32) -> Layout {
     let shows = f.chip().is_some() || f.notice.is_some();
     let chip = shows.then(|| {
-        let cw = (w * 0.62).max(w.min(120.0 * text)) - PAD;
+        // At least 120 pt (grown with the text), but inside the field's
+        // outline on the left too.
+        let cw = ((w * 0.62).max(w.min(120.0 * text)) - PAD).min(w - 3.0 * PAD);
         Rect { x: w - cw - PAD, y: PAD, w: cw, h: (h - 2.0 * PAD).max(1.0) }
     });
     let right = chip.map_or(w - PAD, |c| c.x - PAD);
-    let bullets_max = (((right - 2.0 * PAD) / (BULLET_STEP * text)).floor().max(0.0)) as usize;
+    let bullets_max = (((right - 2.0 * PAD) / bullet(h, text).1).floor().max(0.0)) as usize;
     Layout { chip, bullets_max }
 }
 
@@ -115,8 +152,12 @@ impl Px<'_, '_> {
         self.raw(snap_rect(x, y, w, h, self.k), c, radius)
     }
 
-    fn text(&mut self, font: u32, size: f32, x: f32, y: f32, c: pergola::Color, s: String) -> io::Result<()> {
-        self.fr.text_run(font, size * self.k, (x * self.k).round(), (y * self.k).round(), rgba(c), s).map(drop)
+    /// A run with its baseline at `y` (pt), on a device pixel. The wire
+    /// takes the top of the em box, one ascender above the baseline.
+    fn text(&mut self, font: Font, size: f32, x: f32, y: f32, c: pergola::Color, s: String) -> io::Result<()> {
+        let px = size * self.k;
+        let top = (y * self.k).round() - font.ascent * px;
+        self.fr.text_run(font.id, px, (x * self.k).round(), top, rgba(c), s).map(drop)
     }
 }
 
@@ -137,7 +178,7 @@ pub struct Look {
 
 /// Draw a `w` x `h` pt slot with Pergola's semantic tokens (visual language rev. 2). Light
 /// until the system setting for the mode lands.
-pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, look: Look, w: f32, h: f32, sc: Scale) -> io::Result<()> {
+pub fn draw(conn: &mut Connection, font: Font, f: &Field, recipient: &str, look: Look, w: f32, h: f32, sc: Scale) -> io::Result<()> {
     let t = Semantic::LIGHT;
     let tx = sc.text;
     let l = layout(f, w, h, tx);
@@ -159,7 +200,7 @@ pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, look: 
         px.raw(inset(slot, halo + 2.0 * line), t.bg_canvas(), 3.0)?;
     }
     let shown = f.bullets().min(l.bullets_max);
-    let (bullet, step) = (BULLET * tx, BULLET_STEP * tx);
+    let (bullet, step) = bullet(h, tx);
     let cy = (h - bullet) / 2.0;
     for i in 0..shown {
         px.rect(2.0 * PAD + i as f32 * step, cy, bullet, bullet, t.text_primary(), bullet / 2.0)?;
@@ -177,9 +218,9 @@ pub fn draw(conn: &mut Connection, font: u32, f: &Field, recipient: &str, look: 
             px.raw(inset(r, line), t.bg_elevated(), 3.0)?;
             t.text_primary()
         };
-        if font != 0 {
-            let size = FONT_PT * tx;
-            let s = truncate(&text, c.w - 2.0 * PAD, tx);
+        if font.id != 0 {
+            let size = chip_font(&c, tx);
+            let s = truncate(&text, c.w - 2.0 * PAD, size / FONT_PT);
             px.text(font, size, c.x + PAD, c.y + c.h / 2.0 + size * 0.35, fg, s)?;
         }
     }

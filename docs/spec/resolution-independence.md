@@ -90,7 +90,11 @@ Built in step 1a (2026-11-14); fresco-protocol's "Units" note is the reference.
   text size (sheets and the field; the player's subtitles follow the picture), and multiply
   by the window's scale only where they emit, snapping edges with Pergola's `snap_rect` and
   1 pt borders to `hairline(k)` device px. Secrets stay rects, never glyphs. The player's
-  video layer is placed in buffer px (§9). libatrium's C ABI stays in device px by design:
+  video layer is placed in buffer px (§9). Their text runs go on the wire by the top of the
+  em box (frescod adds the font's ascender), as Pergola's do. A sheet that the WM keeps
+  shorter than its least size (the screen's free area at a large UI and text size) lays out
+  at a smaller text size that fits rather than overlapping its rows; Arca's chip text stays
+  inside the slot height the parent chose. libatrium's C ABI stays in device px by design:
   it hands C renderers the buffer size, like §9's GPU surfaces; `Connection::in_device_px`
   remains for it.
 - **Step 1b, built 2026-11-14:** the desktop and WM ops (`OP_WM_OUTPUTS`, arrange, move,
