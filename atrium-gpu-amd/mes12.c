@@ -1017,6 +1017,9 @@ mes_teardown(struct mes *m)
 #define PKT3(op, n)		(3u << 30 | ((n) & 0x3fffu) << 16 | (op) << 8)
 #define IT_INDIRECT_BUFFER	0x3fu
 #define IB_VALID		(1u << 23)
+/* gfx IB: take the VMID from the MQD (Mesa's userq S_3F3_INHERIT_VMID_MQD_GFX);
+ * the gfx IB has no VALID bit and its VMID field would otherwise be 0. */
+#define IB_INHERIT_VMID_GFX	(1u << 22)
 #define RM_EVENT_TYPE(x)	(x)
 #define RM_EVENT_INDEX(x)	((x) << 8)
 #define RM_GCR_GL2_WB		(1u << 21)
@@ -3016,7 +3019,7 @@ amd_mes12_uq_submit(struct amd_uq *q, uint64_t ib, uint32_t ib_dw,
 	pkt[n++] = PKT3(IT_INDIRECT_BUFFER, 2);
 	pkt[n++] = (uint32_t)ib;
 	pkt[n++] = (uint32_t)(ib >> 32);
-	pkt[n++] = IB_VALID | ib_dw;			/* VMID from the HQD */
+	pkt[n++] = (q->gfx ? IB_INHERIT_VMID_GFX : IB_VALID) | ib_dw;
 	pkt[n++] = PKT3(IT_RELEASE_MEM, 6);
 	pkt[n++] = RM_GCR_SEQ | RM_GCR_GL2_WB | RM_CACHE_POLICY(3) |
 	    RM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | RM_EVENT_INDEX(5);
@@ -3063,7 +3066,7 @@ amd_mes12_uq_preempt(struct amd_uq *q)
 	uint32_t pkt[API_DW], v;
 	uint8_t *b = (uint8_t *)pkt;
 	bool suspended;
-	int err, us;
+	int err, serr, us;
 
 	if (!q->added)
 		return (0);			/* off MES: nothing in flight */
@@ -3073,21 +3076,30 @@ amd_mes12_uq_preempt(struct amd_uq *q)
 	put64(b, SU_GANG_CTX, q->gva + UQ_G_GANG);
 	put64(b, SU_FENCE_ADDR, m->va + BLK_WB(0) + WB_SUSPEND_FENCE);
 	put32(b, SU_FENCE_VALUE, v);
-	if ((err = mes_api(m, 0, pkt, SU_API_STATUS,
-	    "SUSPEND (user gang)")) != 0)
-		return (err);
-	for (us = 0; us < UQ2_SUSPEND_WAIT_US &&
+	serr = mes_api(m, 0, pkt, SU_API_STATUS, "SUSPEND (user gang)");
+	for (us = 0; serr == 0 && us < UQ2_SUSPEND_WAIT_US &&
 	    (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) != v; us += 10)
 		DELAY(10);
-	suspended = (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) == v;
-	/* Resume whatever happened: a queue left suspended would hang. */
+	suspended = serr == 0 &&
+	    (uint32_t)*p64(m, BLK_WB(0) + WB_SUSPEND_FENCE) == v;
+	/*
+	 * Resume whatever happened, a refused SUSPEND too. Box run 6e
+	 * (5a796cdc, test 19): the queue's wave stored to the page just
+	 * unbound and faulted while MES tried to suspend its gang; MES
+	 * refused after its timeout, this returned without a RESUME, and
+	 * from then on no fence on the card advanced (CP busy, every new
+	 * queue added fine). A gang left half-suspended stops the pipe.
+	 */
 	memset(pkt, 0, sizeof(pkt));
 	pkt[0] = HDR_RESUME;
 	put64(b, RS_GANG_CTX, q->gva + UQ_G_GANG);
 	err = mes_api(m, 0, pkt, RS_API_STATUS, "RESUME (user gang)");
-	device_printf(m->sc->dev, "uq%u: preempted for a free: suspend fence "
-	    "%s after %d us, resume %s\n", q->slot, suspended ? "landed" :
-	    "MISSING", us, err == 0 ? "ok" : "FAILED");
+	device_printf(m->sc->dev, "uq%u: preempted for a free: suspend %s, "
+	    "fence %s after %d us, resume %s\n", q->slot, serr == 0 ? "ok" :
+	    "REFUSED", suspended ? "landed" : "MISSING", us, err == 0 ? "ok" :
+	    "FAILED");
+	if (serr != 0)
+		return (serr);
 	if (!suspended)
 		return (ETIMEDOUT);
 	return (err);

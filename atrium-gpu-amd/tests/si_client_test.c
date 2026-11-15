@@ -99,6 +99,11 @@
  *                closed, leaves nothing deferred once that work is done;
  *                an unbound page faults (EIO), the VM runs on a new
  *                queue and the range can be bound again at the same VA.
+ *  21 triangle   (stage 7b) one draw on a gfx queue: an NGG vertex shader
+ *                and a constant-colour pixel shader into a linear 64 x 64
+ *                RGBA8 target, compared with a CPU rasterisation (pixels
+ *                within half a pixel of an edge are not judged); the VS's
+ *                system SGPRs/VGPRs are printed per lane. Last of all.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -2562,17 +2567,22 @@ unbind(void)
 	r = job_wait(&j, 8000, &ms);
 	close(j.out);
 	j.out = -1;
-	for (i = 0; i < 100 && (now = iso("deferred_now")) != 0; i++)
-		usleep(20000);
-	check(r2 == 0 && (r == 0 || r == EIO) && now == 0, "19 unbind: a BO "
-	    "unbound under work that may use it, then closed, leaves nothing "
-	    "deferred", "unbind %s, the work %s after %d ms, deferred_now "
-	    "%jd", r2 == 0 ? "ok" : strerror(r2), r == 0 ? "landed" :
-	    strerror(r), ms, (intmax_t)now);
+	/*
+	 * The work may store to the page after its PTEs went (box run 6e):
+	 * then it faults (EIO), its queue is lost, and a BO the driver could
+	 * not prove idle waits for that queue to close. So close it first.
+	 */
 	if (r != 0 && job_renew(&j) != 0) {
 		check(0, "19 unbind: renew", "%s", strerror(errno));
 		goto out;
 	}
+	for (i = 0; i < 100 && (now = iso("deferred_now")) != 0; i++)
+		usleep(20000);
+	check(r2 == 0 && (r == 0 || r == EIO) && now == 0, "19 unbind: a BO "
+	    "unbound under work that may use it, then closed, leaves nothing "
+	    "deferred once that work's queue is done", "unbind %s, the work "
+	    "%s after %d ms, deferred_now %jd", r2 == 0 ? "ok" : strerror(r2),
+	    r == 0 ? "landed" : strerror(r), ms, (intmax_t)now);
 	if (j.out < 0 && ((j.out = bo_alloc(4096, 0)) < 0 ||
 	    vm_bind_at(j.vm, j.out, out_va) != 0)) {
 		check(0, "19 unbind: rebind", "%s", strerror(errno));
@@ -2609,6 +2619,577 @@ out0:
 		close(shared);
 	if (other >= 0)
 		close(other);
+}
+
+/* ---- 21: the first triangle, by hand (stage 7b) ---- */
+
+/*
+ * One draw on a gfx queue: an NGG vertex shader (wave32, VS as the merged
+ * ES/GS stage GFX12 always uses) places three vertices by their vertex id,
+ * a pixel shader exports a constant colour, the colour target is a linear
+ * 64 x 64 RGBA8 surface in system memory, read back and compared with a CPU
+ * rasterisation. Register state follows Mesa 25.2 for GFX12 (MIT): the
+ * graphics preamble (ac_cmdbuf.c gfx12_init_graphics_preamble_state, radv
+ * radv_emit_graphics, radeonsi gfx12_init_gfx_preamble_state's user-queue
+ * CONTEXT_CONTROL), the attribute/position/primitive rings (radv_queue.c),
+ * the NGG and PS registers (radv_shader.c, radv_cmd_buffer.c) and the
+ * colour surface (ac_descriptors.c ac_init_gfx12_cb_surface). Offsets come
+ * from gfx12_regs.h, generated from Linux's GFX12 header. Shader dwords:
+ * llvm-mc -mcpu=gfx1201 from si_tri_vs.s / si_tri_ps.s.
+ *
+ * The VS also stores, per lane, its SGPRs s0..s7 and VGPRs v0..v4 to a
+ * debug page (user SGPRs s[8:9]); they are printed whatever the outcome,
+ * so a first run on silicon shows the merged-shader ABI it really got.
+ */
+#include "gfx12_regs.h"
+
+#define TRI_W		64
+#define TRI_H		64
+#define TRI_PITCH	(TRI_W * 4)
+#define TRI_BG		0x5a5a5a5au
+#define TRI_FG		0xff00ffffu	/* R=G=0xff, B=0, A=0xff (bytes R,G,B,A) */
+/* 4 shader engines on the R9700 (Navi 48): ring sizes as radv's for GFX12
+ * (ac_gpu_info.c): 1400 KiB attribute ring per SE, 16384 position and
+ * 16368 primitive exports per SE, both rings sized for max_se^2. */
+#define TRI_SE		4u
+#define TRI_ATTR_SE	0x160000u		/* 1400 KiB, 64 KiB aligned */
+#define TRI_POS_SE	(16384u * 16)
+#define TRI_PRIM_SE	((16368u * 4 + 31) & ~31u)
+#define TRI_POS_OFF	(TRI_ATTR_SE * TRI_SE)
+#define TRI_POS_SZ	((TRI_POS_SE * TRI_SE * TRI_SE + 0xffffu) & ~0xffffu)
+#define TRI_PRIM_OFF	(TRI_POS_OFF + TRI_POS_SZ)
+#define TRI_PRIM_SZ	((TRI_PRIM_SE * TRI_SE * TRI_SE + 0xffffu) & ~0xffffu)
+#define TRI_RINGS	(TRI_PRIM_OFF + TRI_PRIM_SZ)
+#define TRI_RINGS_VA	0x18000000ull		/* 64 KiB aligned (base >> 16) */
+
+/* si_tri_vs.s: NGG VS. s2 gs_tg_info, s3 merged_wave_info (Mesa radv:
+ * merged shaders have 8 system SGPRs, user SGPRs from s8); v0 the packed
+ * primitive, v3 the vertex id. */
+static const uint32_t tri_vs[] = {
+	0xd71f0005u, 0x000100c1u, 0x30180a86u, 0x7e1a0200u,
+	0x7e1c0201u, 0x7e1e0202u, 0x7e200203u, 0xee068008u,
+	0x06800000u, 0x0000000cu, 0xee068008u, 0x07000000u,
+	0x0000040cu, 0xee068008u, 0x07800000u, 0x0000080cu,
+	0xee068008u, 0x08000000u, 0x00000c0cu, 0xee068008u,
+	0x00000000u, 0x0000100cu, 0xee068008u, 0x00800000u,
+	0x0000140cu, 0xee068008u, 0x01000000u, 0x0000180cu,
+	0xee068008u, 0x01800000u, 0x00001c0cu, 0xee068008u,
+	0x02000000u, 0x0000200cu, 0x7e1a0204u, 0x7e1c0205u,
+	0x7e1e0206u, 0x7e200207u, 0xee068008u, 0x06800000u,
+	0x0000240cu, 0xee068008u, 0x07000000u, 0x0000280cu,
+	0xee068008u, 0x07800000u, 0x00002c0cu, 0xee068008u,
+	0x08000000u, 0x0000300cu, 0x7e1a02ffu, 0x7b7b0000u,
+	0x381a0b0du, 0xee068008u, 0x06800000u, 0x00003c0cu,
+	0x930aff03u, 0x00040018u, 0xbf07800au, 0xbfa20007u,
+	0x930bff02u, 0x0009000cu, 0x930cff02u, 0x00090016u,
+	0x840c8c0cu, 0x8c7d0c0bu, 0xbfb60009u, 0xbe8d007eu,
+	0x930eff03u, 0x00080008u, 0x7c980a0eu, 0x8b7e6a0du,
+	0xbfa50002u, 0xf8000941u, 0x00000000u, 0x8b0fff03u,
+	0x000000ffu, 0x7c980a0fu, 0x8b7e6a0du, 0xbfa50010u,
+	0x7e0c02f1u, 0x7e0e02f1u, 0x7e1002ffu, 0x3e800000u,
+	0x7e1202ffu, 0x3f400000u, 0x7c940681u, 0xd5010006u,
+	0x01a9e106u, 0x7c940682u, 0x020c1106u, 0x020e1307u,
+	0x7e140280u, 0x7e1602f2u, 0xf80008cfu, 0x0b0a0706u,
+	0xbfb00000u,
+};
+/* si_tri_ps.s: export (1, 1, 0, 1) to MRT0. */
+static const uint32_t tri_ps[] = {
+	0x7e0002f2u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+	0xf800080fu, 0x03020100u, 0xbfb00000u,
+};
+#define TRI_PS_OFF	0x400u		/* 256-byte aligned (PGM_LO is >> 8) */
+
+/* Triangle in pixels (viewport 64 x 64, y down): the VS's NDC
+ * (-0.5,-0.5), (0.5,-0.5), (0.25,0.75). */
+static const float tri_px[3][2] = { { 16, 16 }, { 48, 16 }, { 40, 56 } };
+
+struct tri_pm4 {
+	uint32_t *w;
+	u_int n, max;
+};
+
+static void
+tri_put(struct tri_pm4 *p, uint32_t v)
+{
+	if (p->n < p->max)
+		p->w[p->n] = v;
+	p->n++;
+}
+
+#define PKT3_GFX(op, body)	(3u << 30 | (((body) - 1) & 0x3fffu) << 16 | \
+				(op) << 8)
+#define TRI_CTX_BASE	0x28000u
+#define TRI_SH_BASE	0xb000u
+#define TRI_UC_BASE	0x30000u
+
+/* `n` consecutive registers from byte address `r`. */
+static void
+tri_regs(struct tri_pm4 *p, uint32_t r, const uint32_t *v, u_int n)
+{
+	uint32_t op, base, idx = 0;
+	u_int i;
+
+	if (r >= TRI_UC_BASE) {
+		op = 0x79;			/* SET_UCONFIG_REG */
+		base = TRI_UC_BASE;
+	} else if (r >= TRI_CTX_BASE) {
+		op = 0x69;			/* SET_CONTEXT_REG */
+		base = TRI_CTX_BASE;
+	} else {
+		op = 0x76;			/* SET_SH_REG */
+		base = TRI_SH_BASE;
+	}
+	tri_put(p, PKT3_GFX(op, n + 1));
+	tri_put(p, ((r - base) >> 2) | idx);
+	for (i = 0; i < n; i++)
+		tri_put(p, v[i]);
+}
+
+static void
+tri_reg(struct tri_pm4 *p, uint32_t r, uint32_t v)
+{
+	tri_regs(p, r, &v, 1);
+}
+
+/* SET_SH_REG_INDEX with index 3 (Mesa ac_pm4_set_reg_idx3: CU masks). */
+static void
+tri_sh_idx3(struct tri_pm4 *p, uint32_t r, uint32_t v)
+{
+	tri_put(p, PKT3_GFX(0x9bu, 2));
+	tri_put(p, ((r - TRI_SH_BASE) >> 2) | 3u << 28);
+	tri_put(p, v);
+}
+
+static uint32_t
+tri_f(float f)
+{
+	uint32_t u;
+
+	memcpy(&u, &f, 4);
+	return (u);
+}
+
+/* The whole command stream: preamble, rings, target, state, one draw. */
+static u_int
+tri_build(uint32_t *w, u_int max, uint64_t vs_va, uint64_t ps_va,
+    uint64_t cb_va, uint64_t dbg_va, uint64_t rings_va)
+{
+	struct tri_pm4 p = { w, 0, max };
+	uint32_t v[16];
+	u_int i;
+
+	/* CONTEXT_CONTROL as radeonsi's user-queue register shadowing. */
+	tri_put(&p, PKT3_GFX(0x28u, 2));
+	tri_put(&p, 1u << 31 | 1u << 24 | 1u << 16 | 1u << 15 | 1u << 1);
+	tri_put(&p, 1u << 31 | 1u << 24 | 1u << 16 | 1u << 15 | 1u << 1 |
+	    1u << 0);
+
+	/* Graphics preamble (gfx12_init_graphics_preamble_state; temporal
+	 * hints left regular). */
+	tri_sh_idx3(&p, R_SPI_SHADER_PGM_RSRC3_PS, 0xffffu);
+	tri_reg(&p, R_SPI_SHADER_REQ_CTRL_PS, 1u | 3u << 1);
+	for (i = 0; i < 4; i++)
+		tri_reg(&p, R_SPI_SHADER_USER_ACCUM_PS_0 + 4 * i, 0);
+	tri_reg(&p, R_SPI_SHADER_PGM_HI_ES, 0);
+	tri_sh_idx3(&p, R_SPI_SHADER_PGM_RSRC3_GS, 0xfffffdfdu);
+	for (i = 0; i < 4; i++)
+		tri_reg(&p, R_SPI_SHADER_USER_ACCUM_ESGS_0 + 4 * i, 0);
+	tri_reg(&p, R_SPI_SHADER_PGM_HI_LS, 0);
+	tri_sh_idx3(&p, R_SPI_SHADER_PGM_RSRC3_HS, 0xffffffffu);
+	for (i = 0; i < 4; i++)
+		tri_reg(&p, R_SPI_SHADER_USER_ACCUM_LSHS_0 + 4 * i, 0);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC4_HS, 0x3ffu | 1u << 11);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC4_PS, 0x3ffu | 1u << 10);
+
+	tri_reg(&p, R_DB_GL1_INTERFACE_CONTROL, 0);
+	tri_reg(&p, R_DB_MEM_TEMPORAL, 0);
+	tri_reg(&p, R_DB_VIEWPORT_CONTROL, 0);
+	tri_reg(&p, R_DB_SPI_VRS_CENTER_LOCATION, 0);
+	tri_reg(&p, R_TA_BC_BASE_ADDR, 0);
+	tri_reg(&p, R_TA_BC_BASE_ADDR + 4, 0);
+	tri_reg(&p, R_DB_STENCIL_OPVAL, 1u | 1u << 8);
+	tri_reg(&p, R_SC_MEM_TEMPORAL, 0);
+	tri_reg(&p, R_SC_MEM_SPEC_READ, 1u | 1u << 2 | 1u << 4);
+	tri_reg(&p, R_PA_SC_SCREEN_SCISSOR_TL, 0);
+	tri_reg(&p, R_PA_SC_SCREEN_SCISSOR_TL + 4, 65535u | 65535u << 16);
+	tri_reg(&p, R_PA_SC_WINDOW_SCISSOR_TL, 0);
+	tri_reg(&p, R_PA_SC_GENERIC_SCISSOR_TL, 0);
+	tri_reg(&p, R_PA_SC_GENERIC_SCISSOR_TL + 4, 65535u | 65535u << 16);
+	tri_reg(&p, R_PA_SC_SCREEN_EXTENT_CONTROL, 0);
+	tri_reg(&p, R_PA_SC_TILE_STEERING_OVERRIDE, 0);
+	tri_reg(&p, R_PA_SC_VRS_INFO, 0);
+	tri_reg(&p, R_CB_RMI_GL2_CACHE_CONTROL, 0);
+	tri_reg(&p, R_SPI_BARYC_SSAA_CNTL, 1u << 2);
+	tri_reg(&p, R_SX_PS_DOWNCONVERT_CONTROL, 0xff);
+	tri_reg(&p, R_PA_CL_POINT_X_RAD, 0);
+	tri_reg(&p, R_PA_CL_POINT_Y_RAD, 0);
+	tri_reg(&p, R_PA_CL_POINT_SIZE, 0);
+	tri_reg(&p, R_PA_CL_POINT_CULL_RAD, 0);
+	tri_reg(&p, R_PA_CL_NANINF_CNTL, 0);
+	tri_reg(&p, R_PA_SU_LINE_STIPPLE_CNTL, 0);
+	tri_reg(&p, R_PA_SU_LINE_STIPPLE_SCALE, tri_f(1.0f));
+	tri_reg(&p, R_PA_SU_SMALL_PRIM_FILTER_CNTL, 1u | 1u << 6);
+	tri_reg(&p, R_PA_SU_OVER_RASTERIZATION_CNTL, 0);
+	tri_reg(&p, R_PA_STEREO_CNTL, 1u << 1);
+	tri_reg(&p, R_VGT_HOS_MAX_TESS_LEVEL, tri_f(64.0f));
+	tri_reg(&p, R_VGT_HOS_MIN_TESS_LEVEL, 0);
+	tri_reg(&p, R_GE_SE_ENHANCE, 0);
+	tri_reg(&p, R_GE_IA_ENHANCE, 0);
+	tri_reg(&p, R_GE_WD_ENHANCE, 0);
+	tri_reg(&p, R_VGT_REUSE_OFF, 0);
+	tri_reg(&p, R_VGT_DRAW_PAYLOAD_CNTL, 0);
+	tri_reg(&p, R_DB_HTILE_SURFACE, 0);
+	tri_reg(&p, R_VGT_TESS_DISTRIBUTION, 128u | 128u << 8 | 128u << 16 |
+	    24u << 24 | 6u << 29);
+	tri_reg(&p, R_PA_SC_HISZ_RENDER_OVERRIDE, 0);
+	tri_reg(&p, R_PA_SC_BINNER_OUTPUT_TIMEOUT_COUNTER, 0x800);
+	tri_reg(&p, R_PA_SC_BINNER_CNTL_1, 254u | 511u << 16);
+	tri_reg(&p, R_PA_SC_BINNER_CNTL_2, 1u << 23);
+	tri_reg(&p, R_PA_SC_NGG_MODE_CNTL, 64);
+	tri_reg(&p, R_PA_SC_SHADER_CONTROL, 1);
+	for (i = 0; i < 8; i++)
+		tri_reg(&p, R_CB_MEM0_INFO + 4 * i, 0);
+	tri_reg(&p, R_GE_MIN_VTX_INDX, 0);
+	tri_reg(&p, R_GE_INDX_OFFSET, 0);
+	tri_reg(&p, R_GE_MULTI_PRIM_IB_RESET_EN, 1u << 2);
+	tri_reg(&p, R_GE_GS_THROTTLE, 1u | 4u << 3 | 3u << 6 | 0x40u << 9 |
+	    2u << 16 | 3u << 19 | 0xffu << 23);
+	tri_reg(&p, R_GE_MAX_VTX_INDX, 0xffffffffu);
+	tri_reg(&p, R_VGT_INSTANCE_BASE_ID, 0);
+	tri_reg(&p, R_GE_STEREO_CNTL, 0);
+	tri_reg(&p, R_GE_USER_VGPR_EN, 0);
+	tri_reg(&p, R_VGT_PRIMITIVEID_RESET, 0);
+	tri_reg(&p, R_GE_VRS_RATE, 0);
+	tri_reg(&p, R_PA_SU_LINE_STIPPLE_VALUE, 0);
+	tri_reg(&p, R_PA_SC_LINE_STIPPLE_STATE, 0);
+	tri_reg(&p, R_PA_SU_PRIM_FILTER_CNTL, 0);
+	tri_reg(&p, R_SPI_GRP_LAUNCH_GUARANTEE_ENABLE, 1u | 1u << 2 |
+	    1u << 3 | 2u << 5 | 2u << 8 | 1u << 11 | 1u << 15);
+	tri_reg(&p, R_SPI_GRP_LAUNCH_GUARANTEE_CTRL, 3u | 4u << 3 | 4u << 6 |
+	    4u << 10 | 8u << 19);
+
+	/* radv_emit_graphics (no CLEAR_STATE on GFX11+) and radeonsi's
+	 * GFX12 additions. */
+	for (i = 0; i < 16; i++) {
+		tri_reg(&p, R_PA_SC_VPORT_ZMIN_0 + 8 * i, 0);
+		tri_reg(&p, R_PA_SC_VPORT_ZMIN_0 + 8 * i + 4, tri_f(1.0f));
+	}
+	tri_reg(&p, R_PA_SC_EDGERULE, 0xaaaaaaaau);
+	tri_reg(&p, R_PA_SU_HARDWARE_SCREEN_OFFSET, 0);
+	tri_reg(&p, R_PA_CL_NGG_CNTL, 30u << 2);
+	tri_reg(&p, R_PA_CL_VRS_CNTL, 1u | 1u << 9);
+	tri_reg(&p, R_VGT_MULTI_PRIM_IB_RESET_INDX, 0xffffffffu);
+	tri_reg(&p, R_PA_SU_POINT_SIZE, 8u | 8u << 16);
+	tri_reg(&p, R_PA_SU_POINT_MINMAX, 0xffffu << 16);
+	tri_reg(&p, R_SPI_INTERP_CONTROL_0, 1u | 1u << 1 | 2u << 2 | 3u << 5 |
+	    0u << 8 | 1u << 11);
+	tri_reg(&p, R_PA_SU_VTX_CNTL, 1u | 2u << 1 | 5u << 3);
+	tri_reg(&p, R_PA_CL_VTE_CNTL, 0x3fu | 1u << 10);
+	tri_reg(&p, R_DB_RENDER_CONTROL, 0);
+	tri_reg(&p, R_SPI_BARYC_CNTL, 0);
+	tri_reg(&p, R_PA_SC_CONSERVATIVE_RASTERIZATION_CNTL, 1u << 20);
+	tri_reg(&p, R_SPI_SHADER_GS_MESHLET_CTRL, 0);
+
+	/* Rings (radv_queue.c): throttles, attribute ring, then the four
+	 * position/primitive ring registers together. */
+	v[0] = 0x12355123u;
+	v[1] = 0x1544du;
+	v[2] = (uint32_t)(rings_va >> 16);
+	v[3] = ((TRI_ATTR_SE >> 16) - 1) | 1u << 17;
+	tri_regs(&p, R_SPI_GS_THROTTLE_CNTL1, v, 4);
+	v[0] = (uint32_t)((rings_va + TRI_POS_OFF) >> 16);
+	v[1] = TRI_POS_SE >> 5;
+	v[2] = (uint32_t)((rings_va + TRI_PRIM_OFF) >> 16);
+	v[3] = TRI_PRIM_SE >> 5 | 2u << 16 | 3u << 18 | 3u << 21 | 1u << 26 |
+	    1u << 27;
+	tri_regs(&p, R_GE_POS_RING_BASE, v, 4);
+
+	/* Colour target 0: linear 64 x 64 COLOR_8_8_8_8 UNORM, SWAP_STD. */
+	tri_reg(&p, R_CB_COLOR0_BASE, (uint32_t)(cb_va >> 8));
+	tri_reg(&p, R_CB_COLOR0_VIEW, 0);
+	tri_reg(&p, R_CB_COLOR0_VIEW2, 0);
+	tri_reg(&p, R_CB_COLOR0_ATTRIB, 0);
+	tri_reg(&p, R_CB_COLOR0_FDCC_CONTROL, 1u << 2 | 1u << 28);
+	tri_reg(&p, R_CB_COLOR0_ATTRIB2, (TRI_H - 1) | (TRI_W - 1) << 16);
+	tri_reg(&p, R_CB_COLOR0_ATTRIB3, 0u | 0u << 15 | 0u << 19 | 1u << 24);
+	tri_reg(&p, R_CB_COLOR0_BASE_EXT, (uint32_t)(cb_va >> 40));
+	tri_reg(&p, R_CB_COLOR0_INFO, 10u | 0u << 8 | 0u << 11 | 1u << 15 |
+	    1u << 17);
+	for (i = 1; i < 8; i++)
+		tri_reg(&p, R_CB_COLOR0_INFO + 4 * i, 0);	/* INVALID */
+	/* No depth/stencil (radv_gfx12_emit_null_ds_state). */
+	tri_reg(&p, R_DB_Z_INFO, 0u | 3u << 2);
+	tri_reg(&p, R_DB_STENCIL_INFO, 0u | 1u << 29);
+	tri_reg(&p, R_PA_SC_HIZ_INFO, 0);
+	tri_reg(&p, R_PA_SC_HIS_INFO, 0);
+	tri_reg(&p, R_DB_RENDER_OVERRIDE2, 1u << 27);
+	tri_reg(&p, R_DB_RENDER_OVERRIDE, 1u << 12);
+	tri_reg(&p, R_DB_DEPTH_CONTROL, 0);
+	tri_reg(&p, R_DB_STENCIL_CONTROL, 0);
+	tri_reg(&p, R_DB_COUNT_CONTROL, 0);
+	tri_reg(&p, R_DB_ALPHA_TO_MASK, 0);
+	tri_reg(&p, R_DB_SHADER_CONTROL, 1u << 4);	/* EARLY_Z_THEN_LATE_Z */
+
+	/* Viewport 0 over the target (y down), scissor, guard band. */
+	v[0] = tri_f(TRI_W / 2.0f);
+	v[1] = tri_f(TRI_W / 2.0f);
+	v[2] = tri_f(TRI_H / 2.0f);
+	v[3] = tri_f(TRI_H / 2.0f);
+	v[4] = tri_f(1.0f);
+	v[5] = 0;
+	tri_regs(&p, R_PA_CL_VPORT_XSCALE, v, 6);
+	v[0] = v[1] = v[2] = v[3] = tri_f(1.0f);
+	tri_regs(&p, R_PA_CL_GB_VERT_CLIP_ADJ, v, 4);
+	v[0] = 0;
+	v[1] = TRI_W | TRI_H << 16;
+	tri_regs(&p, R_PA_SC_VPORT_SCISSOR_0_TL, v, 2);
+	tri_reg(&p, R_PA_SC_WINDOW_OFFSET, 0);
+	tri_reg(&p, R_PA_SC_WINDOW_SCISSOR_TL + 4, TRI_W | TRI_H << 16);
+	tri_reg(&p, R_PA_SC_CLIPRECT_RULE, 0xffff);
+
+	/* Rasteriser: one sample, no culling, binning off. */
+	tri_reg(&p, R_PA_SC_AA_CONFIG, 0);
+	v[0] = v[1] = 0xffffffffu;
+	tri_regs(&p, R_PA_SC_AA_MASK_X0Y0_X1Y0, v, 2);
+	v[0] = v[1] = 0;
+	tri_regs(&p, R_PA_SC_CENTROID_PRIORITY_0, v, 2);
+	tri_reg(&p, R_PA_SC_SAMPLE_PROPERTIES, 0);
+	tri_reg(&p, R_PA_SC_MODE_CNTL_0, 1u << 1 | 1u << 5);
+	tri_reg(&p, R_PA_SC_MODE_CNTL_1, 0);
+	tri_reg(&p, R_PA_SC_LINE_CNTL, 0);
+	tri_reg(&p, R_PA_SU_LINE_CNTL, 8);
+	tri_reg(&p, R_PA_SC_BINNER_CNTL_0, 3u | 2u << 4 | 2u << 7 |
+	    1u << 18 | 63u << 19 | 1u << 27 | 1u << 28);
+	tri_reg(&p, R_PA_SU_SC_MODE_CNTL, 2u << 5 | 2u << 8);
+	tri_reg(&p, R_PA_CL_CLIP_CNTL, 1u << 19 | 1u << 24);
+
+	/* Colour output: write RGBA, no blend, ROP3 copy. */
+	tri_reg(&p, R_CB_TARGET_MASK, 0xf);
+	tri_reg(&p, R_CB_SHADER_MASK, 0xf);
+	tri_reg(&p, R_CB_COLOR_CONTROL, 1u << 4 | 0xccu << 16);
+	tri_reg(&p, R_CB_BLEND0_CONTROL, 0);
+	tri_reg(&p, R_SX_PS_DOWNCONVERT, 0);
+	tri_reg(&p, R_SX_BLEND_OPT_EPSILON, 0);
+	tri_reg(&p, R_SX_BLEND_OPT_CONTROL, 0);
+
+	/* VS on the NGG stage: wave32, 24 VGPRs (v0..v16 used), 2 user
+	 * SGPRs (the debug VA, in s[8:9]). */
+	tri_reg(&p, R_SPI_SHADER_PGM_LO_ES, (uint32_t)(vs_va >> 8));
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_GS, (24 - 1) / 8 | 0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_GS, 2u << 1);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC4_GS, 0x3ffu | 1u << 11 |
+	    127u << 16);
+	v[0] = (uint32_t)dbg_va;
+	v[1] = (uint32_t)(dbg_va >> 32);
+	tri_regs(&p, R_SPI_SHADER_USER_DATA_GS_0, v, 2);
+	tri_reg(&p, R_PA_CL_VS_OUT_CNTL, 0);
+	tri_reg(&p, R_VGT_GS_INSTANCE_CNT, 1u << 2);
+	v[0] = 1;			/* IDX0: SPI_SHADER_1COMP */
+	v[1] = 4;			/* POS0: SPI_SHADER_4COMP */
+	tri_regs(&p, R_SPI_SHADER_IDX_FORMAT, v, 2);
+	tri_reg(&p, R_GE_MAX_OUTPUT_PER_SUBGROUP, 128);
+	tri_reg(&p, R_GE_NGG_SUBGRP_CNTL, 1);
+	tri_reg(&p, R_GE_CNTL, 128u | 128u << 9 | 256u << 21 | 1u << 31);
+	tri_reg(&p, R_VGT_PRIMITIVEID_EN, 0);
+	tri_reg(&p, R_VGT_SHADER_STAGES_EN, 1u << 22);	/* GS_W32_EN */
+
+	/* PS: wave32, 8 VGPRs; one interpolation mode on (the hardware wants
+	 * one), no inputs, no parameters from the VS. */
+	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS, (uint32_t)(ps_va >> 8));
+	tri_reg(&p, R_SPI_SHADER_PGM_LO_PS + 4, (uint32_t)(ps_va >> 40));
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC1_PS, (8 - 1) / 8 | 0xc0u << 12);
+	tri_reg(&p, R_SPI_SHADER_PGM_RSRC2_PS, 0);
+	tri_reg(&p, R_SPI_SHADER_GS_OUT_CONFIG_PS, 1u << 10);	/* NO_PC_EXPORT */
+	v[0] = v[1] = 1u << 1;		/* PERSP_CENTER: ENA, ADDR */
+	tri_regs(&p, R_SPI_PS_INPUT_ENA, v, 2);
+	tri_reg(&p, R_SPI_PS_IN_CONTROL, 1u << 15);	/* PS_W32_EN */
+	tri_reg(&p, R_PA_SC_HISZ_CONTROL, 2);
+	tri_reg(&p, R_SPI_SHADER_Z_FORMAT, 0);
+	tri_reg(&p, R_SPI_SHADER_COL_FORMAT, 9);	/* SPI_SHADER_32_ABGR */
+
+	/* The draw: a triangle list, one instance, three auto-index vertices. */
+	tri_put(&p, PKT3_GFX(0x7au, 2));		/* SET_UCONFIG_REG_INDEX */
+	tri_put(&p, ((R_VGT_PRIMITIVE_TYPE - TRI_UC_BASE) >> 2) | 1u << 28);
+	tri_put(&p, 4);					/* DI_PT_TRILIST */
+	tri_put(&p, PKT3_GFX(0x2fu, 1));		/* NUM_INSTANCES */
+	tri_put(&p, 1);
+	tri_put(&p, PKT3_GFX(0x2du, 2));		/* DRAW_INDEX_AUTO */
+	tri_put(&p, 3);
+	tri_put(&p, 2);					/* DI_SRC_SEL_AUTO_INDEX */
+	return (p.n);
+}
+
+/* Edge function of (a, b) at (x, y), > 0 inside for this winding. */
+static float
+tri_edge(const float *a, const float *b, float x, float y)
+{
+	return ((b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]));
+}
+
+/* 1: inside, 0: outside, -1: within half a pixel of an edge (either). */
+static int
+tri_cover(int px, int py)
+{
+	float x = px + 0.5f, y = py + 0.5f, e, len2;
+	int k, in = 1, near = 0;
+
+	for (k = 0; k < 3; k++) {
+		const float *a = tri_px[k], *b = tri_px[(k + 1) % 3];
+
+		e = tri_edge(a, b, x, y);
+		len2 = (b[0] - a[0]) * (b[0] - a[0]) +
+		    (b[1] - a[1]) * (b[1] - a[1]);
+		if (e < 0)
+			in = 0;
+		if (e * e < 0.25f * len2)	/* distance < 0.5 px */
+			near = 1;
+	}
+	return (near ? -1 : in);
+}
+
+static void
+triangle(void)
+{
+	struct job j;
+	uint32_t *ib = NULL, *pix = NULL, dbg[1024];
+	uint64_t cb_va, dbg_va;
+	int old = 0, tmp, q = -1, code = -1, cb = -1, dbgbo = -1, rings = -1;
+	int r, ms, x, y, c, in = 0, out = 0, edge = 0, bad_in = 0, bad_out = 0;
+	u_int dw, i;
+
+	job_init(&j);
+	if (gfxq_set(1, &old) != 0) {
+		check(0, "21 triangle", "%s: %s", GFXQ_SYSCTL, strerror(errno));
+		return;
+	}
+	ib = calloc(4096, sizeof(*ib));
+	pix = malloc(TRI_PITCH * TRI_H);
+	if (ib == NULL || pix == NULL || job_open(&j, "21") != 0) {
+		check(0, "21 triangle", "setup failed");
+		goto out;
+	}
+	q = queue_create2(j.vm, ATRIUM_GPU_QUEUE_FAMILY_GFX, 0, 0);
+	code = bo_alloc(4096, 0);
+	cb = bo_alloc(TRI_PITCH * TRI_H, 0);
+	dbgbo = bo_alloc(4096, 0);
+	rings = bo_alloc(TRI_RINGS, ATRIUM_GPU_BO_VRAM);
+	if (q < 0 || code < 0 || cb < 0 || dbgbo < 0 || rings < 0) {
+		check(0, "21 triangle", "queue/BOs: %s", strerror(errno));
+		goto out;
+	}
+	{
+		uint8_t img[4096];
+
+		memset(img, 0, sizeof(img));
+		memcpy(img, tri_vs, sizeof(tri_vs));
+		memcpy(img + TRI_PS_OFF, tri_ps, sizeof(tri_ps));
+		for (i = 0; i < TRI_W * TRI_H; i++)
+			pix[i] = TRI_BG;
+		for (i = 0; i < 1024; i++)
+			dbg[i] = POISON_A;
+		if (bo_xfer(code, img, sizeof(img), 1) != 0 ||
+		    bo_xfer(cb, pix, TRI_PITCH * TRI_H, 1) != 0 ||
+		    bo_xfer(dbgbo, dbg, sizeof(dbg), 1) != 0) {
+			check(0, "21 triangle", "fill: %s", strerror(errno));
+			goto out;
+		}
+	}
+	{
+		uint64_t code_va;
+
+		if (vm_bind(j.vm, code, BIND_CODE, &code_va) != 0 ||
+		    vm_bind(j.vm, cb, 0, &cb_va) != 0 ||
+		    vm_bind(j.vm, dbgbo, 0, &dbg_va) != 0 ||
+		    (r = vm_bind_at(j.vm, rings, TRI_RINGS_VA)) != 0) {
+			check(0, "21 triangle", "bind: %s", strerror(errno));
+			goto out;
+		}
+		dw = tri_build(ib, 4096, code_va, code_va + TRI_PS_OFF, cb_va,
+		    dbg_va, TRI_RINGS_VA);
+		printf("21: VS %#jx, PS %#jx, target %#jx, debug %#jx, rings "
+		    "%#jx (%u KiB); %u dwords of PM4\n", (uintmax_t)code_va,
+		    (uintmax_t)(code_va + TRI_PS_OFF), (uintmax_t)cb_va,
+		    (uintmax_t)dbg_va, (uintmax_t)TRI_RINGS_VA,
+		    (u_int)(TRI_RINGS >> 10), dw);
+	}
+	if (dw > 1024) {
+		check(0, "21 triangle", "%u dwords: more than the IB page", dw);
+		goto out;
+	}
+	r = gfxq_run(&j, q, ib, dw, &ms);
+	check(r == 0, "21 triangle: the draw completes on the gfx queue",
+	    "completion %s after %d ms", r == 0 ? "ok" : strerror(r), ms);
+
+	/* What the VS saw, per lane, whatever happened. */
+	if (bo_xfer(dbgbo, dbg, sizeof(dbg), 0) == 0) {
+		for (i = 0; i < 8; i++) {
+			const uint32_t *l = dbg + 16 * i;
+
+			if (l[15] == POISON_A)
+				continue;
+			printf("21: VS lane %u (tag %#x): s0..s7 %#x %#x %#x %#x "
+			    "%#x %#x %#x %#x; v0..v4 %#x %#x %#x %#x %#x\n", i,
+			    l[15], l[0], l[1], l[2], l[3], l[9], l[10], l[11],
+			    l[12], l[4], l[5], l[6], l[7], l[8]);
+		}
+		check(dbg[15] != POISON_A, "21 triangle: the vertex shader ran",
+		    "lane 0 %s", dbg[15] != POISON_A ? "wrote its record" :
+		    "never ran");
+	}
+	if (bo_xfer(cb, pix, TRI_PITCH * TRI_H, 0) != 0) {
+		check(0, "21 triangle", "readback: %s", strerror(errno));
+		goto out;
+	}
+	for (y = 0; y < TRI_H; y++) {
+		for (x = 0; x < TRI_W; x++) {
+			uint32_t p = pix[y * TRI_W + x];
+
+			c = tri_cover(x, y);
+			if (c < 0) {
+				edge += p == TRI_FG;
+				continue;
+			}
+			if (c) {
+				in++;
+				bad_in += p != TRI_FG;
+			} else {
+				out++;
+				bad_out += p != TRI_BG;
+			}
+		}
+	}
+	for (y = 0; y < TRI_H; y += 4) {
+		char row[TRI_W / 2 + 1];
+
+		for (x = 0; x < TRI_W; x += 2) {
+			uint32_t p = pix[y * TRI_W + x];
+
+			row[x / 2] = p == TRI_FG ? '#' : p == TRI_BG ? '.' : '?';
+		}
+		row[TRI_W / 2] = '\0';
+		printf("21: |%s|\n", row);
+	}
+	check(bad_in == 0 && bad_out == 0 && in > 0, "21 triangle: every "
+	    "pixel inside is the colour, every pixel outside untouched",
+	    "inside %d/%d wrong, outside %d/%d wrong, edge pixels lit %d, "
+	    "pixel (32,24) %#x", bad_in, in, bad_out, out, edge,
+	    pix[24 * TRI_W + 32]);
+out:
+	if (q >= 0)
+		close(q);
+	if (code >= 0)
+		close(code);
+	if (cb >= 0)
+		close(cb);
+	if (dbgbo >= 0)
+		close(dbgbo);
+	if (rings >= 0)
+		close(rings);
+	job_close(&j);
+	free(ib);
+	free(pix);
+	if (gfxq_set(old, &tmp) != 0)
+		check(0, "21 triangle", "restore: %s", strerror(errno));
 }
 
 int
@@ -2932,6 +3513,11 @@ main(void)
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();
+
+	/* 21: the first triangle (stage 7b). Last: a draw the hardware does
+	 * not like may hang the gfx queue and reset the GPU. */
+	if (!skipped(21, "triangle"))
+		triangle();
 
 out:
 	job_close(&a);

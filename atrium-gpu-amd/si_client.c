@@ -96,6 +96,7 @@ struct si_uq {
 	bool	 seen_eop;		/* first routed EOP IV logged */
 	bool	 dead;			/* lost (fault, hang): work fails, EIO */
 	bool	 evict;			/* lost, still on MES: the task removes it */
+	bool	 hung;			/* lost to the hang check (no progress) */
 	bool	 user;			/* user mode: the client's ring (step 3) */
 	bool	 stale;			/* of a generation a GPU re-init ended */
 	uid_t	 ruid;			/* its creator's real uid (reset blame) */
@@ -134,6 +135,10 @@ struct amd_si_client {
 	uint32_t sig[ATRIUM_AMD_MAX_PENDING]; /* fences of signalled submits */
 	u_int	 sig_head, sig_n;
 	bool	 broken;		/* the queue could not be recovered */
+	/* MES refused a SUSPEND (the free rule): if a queue then hangs, the
+	 * card is reset (box run 6e: no fence advanced after one). Any
+	 * progress clears it. */
+	bool	 mes_suspect;
 
 	/* 5c-2b: client queue fds on MES user queues (uq_sx serialises
 	 * create and destroy; the slots' bookkeeping is under sc->lock). */
@@ -404,6 +409,7 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 	else if ((fence = amd_mes12_uq_fence(u->hw)) != u->prog_fence) {
 		u->prog_fence = fence;
 		u->prog_tick = ticks;
+		c->mes_suspect = false;		/* the card runs work */
 		return;
 	}
 	limit = MAX(1, (int)(((int64_t)sc->hang_ms * hz) / 1000));
@@ -421,6 +427,7 @@ si_uq_hang_check(struct amd_si_client *c, u_int slot)
 	}
 	u->dead = true;
 	u->evict = true;
+	u->hung = true;
 	c->uq_hangs++;
 	sc->iso.hangs++;
 	taskqueue_enqueue(taskqueue_thread, &c->uq_task);
@@ -576,12 +583,15 @@ si_uq_evict_task(void *arg, int pending __unused)
 	uid_t uid;
 	u_int i;
 	int err;
+	bool hung, suspect;
 
 	sx_xlock(&c->uq_sx);
 	for (i = 0; i < AMD_UQ_SLOTS; i++) {
 		mtx_lock(&sc->lock);
 		hw = c->uq[i].evict ? c->uq[i].hw : NULL;
 		uid = c->uq[i].ruid;
+		hung = c->uq[i].hung;
+		suspect = c->mes_suspect;
 		c->uq[i].evict = false;
 		mtx_unlock(&sc->lock);
 		if (hw == NULL || !amd_si_usable(sc))
@@ -595,6 +605,17 @@ si_uq_evict_task(void *arg, int pending __unused)
 		}
 		device_printf(sc->dev, "si: uq%u evicted (lost)\n", i);
 		si_dummy_scrub(c);
+		if (hung && suspect) {
+			/* Box run 6e: after a refused SUSPEND every later
+			 * queue hung, each removed fine, and the card never
+			 * ran work again. Removal is not proof here. */
+			mtx_lock(&sc->lock);
+			c->mes_suspect = false;
+			mtx_unlock(&sc->lock);
+			si_recover(c, "a queue hung after MES refused a "
+			    "suspend", uid);
+			break;
+		}
 	}
 	sx_xunlock(&c->uq_sx);
 }
@@ -1391,6 +1412,7 @@ amd_si_uq_preempt(struct atrium_amd_softc *sc, uint64_t mask)
 		if (err != 0) {
 			left |= bit;
 			c->uq_preempt_fails++;
+			c->mes_suspect = true;
 		} else
 			c->uq_preempts++;
 		mtx_unlock(&sc->lock);
