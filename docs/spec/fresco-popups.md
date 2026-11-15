@@ -52,7 +52,10 @@ A pop-up could be used to draw over another app. So:
   slots.
 - **The bar stays trusted** (asked by Shankar 2026-11-12: the bar's
   drop-downs reach into app area). An app's pop-up is kept below the
-  trusted strip (`reserved_top`). The shell's chrome windows (the Forum
+  trusted strip (`reserved_top`) and below the shell's bar (a `Chrome`
+  window, not a pop-up, at the monitor's top and at least half its
+  width): the bar stacks above it, so what went under the bar was hidden
+  (2026-11-15; a tall menu is shrunk to the room below and scrolls, §4). The shell's chrome windows (the Forum
   bar, role `Chrome`) and their pop-ups stack above every app's pop-up:
   app windows, app pop-ups, panels apps hang from the bar by its grant
   (forum-status-items.md §4: `OP_POPUP_GRANT` / `OP_POPUP_CLAIM`, kept
