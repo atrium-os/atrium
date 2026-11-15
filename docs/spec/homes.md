@@ -403,3 +403,14 @@ people ship without `sshd` on the host.
    home in the root renamed. Gate `scripts/vm-duplicate-check.sh` 0 failed.
 9. **W9 group object cache.** Gate: a workspace outside the group can't
    read or write the group's objects.
+   Built 2026-11-15: `object-cache` in the workspace's record (off by
+   default; `portcullis workspace set <name> --object-cache on|off`, a
+   checkbox by Uses in the Workspaces app). A group is the workspaces with
+   it on joined by uses links (either way) through ones that have it on;
+   its folder `~/.atrium/cache/objects/<members joined by +>` (root's,
+   files group, 2770) is at `/cache/objects` with `CCACHE_DIR` and
+   `SCCACHE_DIR` set for consoles and commands. A change in a group gives
+   it a new, empty folder: its members are stopped and the old folder
+   removed, so what an old member left never reaches a new group. The
+   person's CLI gained `portcullis workspace exec <name> -- <command>`.
+   Gate `scripts/vm-objects-check.sh` 0 failed.

@@ -79,6 +79,54 @@ pub struct Record {
     pub network:   String,
     #[serde(default)]
     pub uses:      Vec<String>,
+    /// Share compiled objects (ccache, sccache) with the workspaces it is
+    /// linked to by uses that share them too (homes.md §5.4, W9). Off by
+    /// default.
+    #[serde(default, rename = "object-cache")]
+    pub object_cache: bool,
+}
+
+/// Where a workspace's group cache is in its jail.
+pub const OBJECTS_IN_JAIL: &str = "cache/objects";
+
+/// The group `name` shares compiled objects with (itself included):
+/// the workspaces with the cache on, joined by uses links (either way)
+/// through workspaces that have it on too. Empty when its cache is off.
+pub fn object_group(all: &[Record], name: &str) -> Vec<String> {
+    let on: Vec<&Record> = all.iter().filter(|r| r.object_cache).collect();
+    if !on.iter().any(|r| r.name == name) {
+        return Vec::new();
+    }
+    let linked = |a: &Record, b: &Record| a.uses.contains(&b.name) || b.uses.contains(&a.name);
+    let mut group = vec![name.to_string()];
+    let mut i = 0;
+    while i < group.len() {
+        let cur = on.iter().find(|r| r.name == group[i]).unwrap();
+        for r in &on {
+            if !group.contains(&r.name) && linked(cur, r) {
+                group.push(r.name.clone());
+            }
+        }
+        i += 1;
+    }
+    group.sort();
+    group
+}
+
+/// The folder a group's objects are in, named by its members: a group
+/// that changes gets a new, empty one, so what an old member put there
+/// never reaches a new group.
+pub fn group_dir_name(group: &[String]) -> String {
+    let joined = group.join("+");
+    if joined.len() <= 200 {
+        return joined;
+    }
+    // Names are lowercase letters, digits and dashes: `+` never in one.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in joined.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{}+{:016x}", &group[0], h)
 }
 
 fn personal() -> String { "personal".into() }
@@ -175,7 +223,7 @@ pub fn list(owner: &str) -> Result<Vec<(Record, bool)>, String> {
     if load(&root.join(SCRATCH)).is_none() {
         create(owner, Record {
             name: SCRATCH.into(), toolchain: "c".into(), persona: personal(),
-            network: "outbound".into(), uses: vec![],
+            network: "outbound".into(), uses: vec![], object_cache: false,
         })?;
     }
     let mut v = Vec::new();
@@ -306,10 +354,14 @@ pub fn duplicate(owner: &str, from: &str, to: &str) -> Result<Record, String> {
 }
 
 /// Change its settings; a running one is stopped so the change applies.
-pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>) -> Result<Record, String> {
+pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool>) -> Result<Record, String> {
     let (home, gid) = person(owner)?;
     let dir = root_dir(&home, gid)?.join(name);
     let mut r = load(&dir).filter(|_| valid_name(name)).ok_or_else(|| format!("no workspace {name:?}"))?;
+    let before: Vec<Record> = list(owner)?.into_iter().map(|(r, _)| r).collect();
+    if let Some(o) = object_cache {
+        r.object_cache = o;
+    }
     if let Some(n) = network {
         r.network = n;
     }
@@ -319,8 +371,57 @@ pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<St
     check(owner, &home, &r)?;
     stop(owner, name);
     save(&dir, &r)?;
-    eprintln!("portcullisd: workspace {name} of {owner}: network {}, uses {:?}", r.network, r.uses);
+    // Every workspace whose object group changed starts again with the
+    // new one (its old group's folder is then removed).
+    let after: Vec<Record> = list(owner)?.into_iter().map(|(r, _)| r).collect();
+    for w in &after {
+        if w.name != name && object_group(&before, &w.name) != object_group(&after, &w.name) {
+            stop(owner, &w.name);
+        }
+    }
+    sweep_objects(owner);
+    eprintln!("portcullisd: workspace {name} of {owner}: network {}, uses {:?}, object cache {}", r.network, r.uses,
+              if r.object_cache { "on" } else { "off" });
     Ok(r)
+}
+
+/// `~/.atrium/cache/objects/<group>`: root's folders above it, the group's
+/// own the files group's, setgid, 2770 (every workspace's uid is in the
+/// files group, and its umask is 002). Folders of groups that no longer
+/// exist are removed.
+fn objects_dir(home: &Path, files: u32, group: &[String]) -> Result<PathBuf, String> {
+    let cache = home.join(".atrium").join("cache");
+    own_dir(&cache, 0, files, 0o750)?;
+    let objects = cache.join("objects");
+    own_dir(&objects, 0, files, 0o750)?;
+    let d = objects.join(group_dir_name(group));
+    own_dir(&d, 0, files, 0o2770)?;
+    Ok(d)
+}
+
+/// Remove the object folders of groups that are gone (none of their
+/// members is running: the mount would hold it).
+fn sweep_objects(owner: &str) {
+    let Ok((home, files)) = person(owner) else { return };
+    let objects = home.join(".atrium/cache/objects");
+    let Ok(rd) = fs::read_dir(&objects) else { return };
+    let all: Vec<Record> = list(owner).map(|l| l.into_iter().map(|(r, _)| r).collect()).unwrap_or_default();
+    let live: Vec<String> = all.iter().map(|r| object_group(&all, &r.name)).filter(|g| !g.is_empty()).map(|g| group_dir_name(&g)).collect();
+    let mounted: Vec<String> = Command::new("mount").arg("-p").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_whitespace().next().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let _ = files;
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        let p = e.path();
+        if live.contains(&n) || mounted.iter().any(|m| Path::new(m) == p) {
+            continue;
+        }
+        if e.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&p);
+            eprintln!("portcullisd: object cache {n} of {owner} removed (its group is gone)");
+        }
+    }
 }
 
 /// May `name` be deleted? Not while another workspace uses it.
@@ -403,6 +504,9 @@ pub struct Running {
     pub files:  u32,
     /// `$HOME` in the jail; `work` is under it.
     pub home:   String,
+    /// What its commands get in their environment (the object cache's
+    /// folders, when it shares one).
+    pub env:    Vec<String>,
 }
 
 /// Seed the jail's `/etc`: its own accounts (root and the workspace's) and
@@ -442,7 +546,17 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     let gid = crate::console::gid_of(uid).ok_or_else(|| format!("no group for uid {uid}"))?;
     crate_home::grant_group(owner, &user)?;
     let home_in = format!("/home/{user}");
-    let running = Running { jid: 0, uid, gid, files, home: home_in.clone() };
+    // Its group's object cache (W9): ~/.atrium/cache/objects/<group>, the
+    // files group's, at /cache/objects.
+    let all: Vec<Record> = list(owner)?.into_iter().map(|(r, _)| r).collect();
+    let group = object_group(&all, name);
+    let objects = if group.is_empty() { None } else { Some(objects_dir(&home, files, &group)?) };
+    let env = if objects.is_some() {
+        vec![format!("CCACHE_DIR=/{OBJECTS_IN_JAIL}/ccache"), format!("SCCACHE_DIR=/{OBJECTS_IN_JAIL}/sccache")]
+    } else {
+        Vec::new()
+    };
+    let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
         return Ok(Running { jid, ..running });
     }
@@ -502,10 +616,14 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     for u in &r.uses {
         jc.add_mount(&home.join(".atrium/workspaces").join(u).join(WORK), &jp.join(LINKS).join(u), "nullfs", &["ro"]);
     }
+    if let Some(o) = &objects {
+        jc.add_mount(o, &jp.join(OBJECTS_IN_JAIL), "nullfs", &["rw"]);
+    }
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
     launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
-    eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?})", r.network, r.uses);
+    eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?}, objects {:?})", r.network, r.uses,
+              objects.as_ref().map(|o| o.display().to_string()));
     Ok(Running { jid, ..running })
 }
 

@@ -46,6 +46,8 @@ pub enum Act {
     Run(String, [u8; 16]),
     /// The form, to copy this one (homes.md §5.4).
     DuplicateForm(String),
+    /// Share compiled objects with linked workspaces, or stop (§5.4, W9).
+    ToggleObjects(String),
 }
 
 /// What the loop asks portcullisd.
@@ -54,7 +56,7 @@ pub enum Want {
     List,
     /// Made, then its terminal opened with the same press.
     New { name: String, toolchain: String, network: String, activation: [u8; 16] },
-    Set { name: String, network: Option<String>, uses: Option<Vec<String>> },
+    Set { name: String, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool> },
     Stop(String),
     Delete(String, [u8; 16]),
     Open(String, [u8; 16]),
@@ -197,12 +199,16 @@ impl State {
                 Some(Want::Open(n, token))
             }
             Act::Stop(n) => Some(Want::Stop(n)),
+            Act::ToggleObjects(n) => {
+                let on = self.find(&n)?.object_cache;
+                Some(Want::Set { name: n, network: None, uses: None, object_cache: Some(!on) })
+            }
             Act::SetNetwork(n, net) => {
-                (self.find(&n)?.network != net).then(|| Want::Set { name: n, network: Some(net), uses: None })
+                (self.find(&n)?.network != net).then(|| Want::Set { name: n, network: Some(net), uses: None, object_cache: None })
             }
             Act::ToggleUse(n, other) => {
                 let uses = self.toggled_uses(&n, &other)?;
-                Some(Want::Set { name: n, network: None, uses: Some(uses) })
+                Some(Want::Set { name: n, network: None, uses: Some(uses), object_cache: None })
             }
             Act::AskDelete => {
                 self.confirm_delete = true;
@@ -439,6 +445,15 @@ impl View for WorkspacesView {
             y += em(36.0);
 
             text(ctx, x0, y, "Uses", type_size::MD, Weight::Medium, t.text_primary());
+            // Compiled objects shared with what it's linked to (homes.md §5.4, W9).
+            {
+                let (qq, a) = (q.clone(), name.clone());
+                ctx.key(399);
+                Checkbox::new(Mutable::new(if ws.object_cache { Check::On } else { Check::Off }), "Share compiled objects with them")
+                    .at(x0 + em(120.0), y - em(4.0))
+                    .on_change(move |_| push(&qq, Act::ToggleObjects(a.clone())))
+                    .render(ctx);
+            }
             y += em(14.0);
             let others: Vec<&WorkspaceInfo> = s.list.iter().filter(|o| o.name != name && o.persona == ws.persona).collect();
             if others.is_empty() {
@@ -515,7 +530,7 @@ mod tests {
 
     fn ws(name: &str, uses: &[&str]) -> WorkspaceInfo {
         WorkspaceInfo { name: name.into(), toolchain: "c".into(), persona: "personal".into(), network: "outbound".into(),
-                        uses: uses.iter().map(|s| s.to_string()).collect(), running: false }
+                        uses: uses.iter().map(|s| s.to_string()).collect(), running: false, object_cache: false }
     }
 
     fn state() -> State {
@@ -554,11 +569,13 @@ mod tests {
     fn uses_toggle_and_keep_a_used_one() {
         let mut s = state();
         assert_eq!(s.act(Act::ToggleUse("appb".into(), "liba".into()), ""),
-                   Some(Want::Set { name: "appb".into(), network: None, uses: Some(vec![]) }));
+                   Some(Want::Set { name: "appb".into(), network: None, uses: Some(vec![]), object_cache: None }));
         assert_eq!(s.act(Act::ToggleUse("scratch".into(), "liba".into()), ""),
-                   Some(Want::Set { name: "scratch".into(), network: None, uses: Some(vec!["liba".into()]) }));
+                   Some(Want::Set { name: "scratch".into(), network: None, uses: Some(vec!["liba".into()]), object_cache: None }));
         assert_eq!(s.users_of("liba"), vec!["appb".to_string()]);
         assert!(s.act(Act::SetNetwork("scratch".into(), "outbound".into()), "").is_none(), "no change, nothing asked");
+        assert_eq!(s.act(Act::ToggleObjects("liba".into()), ""),
+                   Some(Want::Set { name: "liba".into(), network: None, uses: None, object_cache: Some(true) }));
     }
 
     #[test]

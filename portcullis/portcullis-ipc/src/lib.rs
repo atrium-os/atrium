@@ -346,6 +346,9 @@ pub enum Request {
         network: Option<String>,
         #[serde(default)]
         uses:    Option<Vec<String>>,
+        /// Share compiled objects with linked workspaces (§5.4, W9).
+        #[serde(default)]
+        object_cache: Option<bool>,
     },
     /// Stop its jail (its consoles end); its files stay.
     WorkspaceStop { name: String },
@@ -419,6 +422,9 @@ pub struct WorkspaceInfo {
     pub network:   String,
     pub uses:      Vec<String>,
     pub running:   bool,
+    /// Shares compiled objects with linked workspaces (§5.4, W9).
+    #[serde(default)]
+    pub object_cache: bool,
 }
 
 /// A toolchain New workspace offers; `available` false until its layer

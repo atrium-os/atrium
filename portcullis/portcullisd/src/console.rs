@@ -143,6 +143,8 @@ pub struct Spec<'a> {
     /// Supplementary groups beyond `gid` (a workspace's: the person's
     /// files group, so what the file manager hands in is readable).
     pub groups: &'a [u32],
+    /// More environment (a workspace's object cache folders).
+    pub env: &'a [String],
     /// What runs where: the toolbox's shell in an app's jail, the base
     /// system's in a workspace.
     pub kind: Kind,
@@ -203,6 +205,9 @@ pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
         env.push(c("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")?);
         env.push(c(&format!("PS1={} $ ", s.app_id.strip_prefix(WORKSPACE_PREFIX).unwrap_or(s.app_id)))?);
         env.push(c(&format!("USER={}", s.owner))?);
+        for e in s.env {
+            env.push(c(e)?);
+        }
     } else {
         env.push(c(&format!("PATH=/{IN_JAIL}"))?);
         // The jail has no terminal database: the toolbox carries the one

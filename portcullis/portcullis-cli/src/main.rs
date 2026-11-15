@@ -101,8 +101,11 @@ usage:
 
     portcullis workspace [list]
     portcullis workspace new <name> [--toolchain c|shell] [--network outbound|none] [--uses a,b]
-    portcullis workspace set <name> [--network outbound|none] [--uses a,b | --no-uses]
+    portcullis workspace set <name> [--network outbound|none] [--uses a,b | --no-uses] [--object-cache on|off]
     portcullis workspace stop <name>
+    portcullis workspace duplicate <name> <new-name>
+    portcullis workspace run <name> [folder]
+    portcullis workspace exec <name> [--cwd <folder>] -- <command...>
         Your workspaces (homes.md §5). Their terminals open from Forum.
 
     portcullis policy revoke <app-id>
@@ -1368,6 +1371,22 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
         flag("--uses").map(|u| u.split(',').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>())
     };
     let name = args.get(1).cloned().unwrap_or_default();
+    if args.first().map(String::as_str) == Some("exec") {
+        // exec <ws> [--cwd <dir>] -- <command...>: output to stdout.
+        let Some(dd) = args.iter().position(|a| a == "--") else { usage() };
+        let argv: Vec<String> = args[dd + 1..].to_vec();
+        return match daemon::exec(name, argv, flag("--cwd").unwrap_or_default()) {
+            Ok(Some(())) => ExitCode::SUCCESS,
+            Ok(None) => {
+                eprintln!("portcullis workspace: portcullisd is not running");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("portcullis workspace exec: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     if args.first().map(String::as_str) == Some("run") {
         return match daemon::run(name, args.get(2).cloned().unwrap_or_default()) {
             Ok(Some((id, caps))) => {
@@ -1390,7 +1409,7 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
             name, toolchain: flag("--toolchain").unwrap_or_else(|| "c".into()),
             network: flag("--network"), uses: uses.unwrap_or_default(),
         },
-        "set" => Request::WorkspaceSet { name, network: flag("--network"), uses },
+        "set" => Request::WorkspaceSet { name, network: flag("--network"), uses, object_cache: flag("--object-cache").map(|v| v == "on") },
         "stop" => Request::WorkspaceStop { name },
         "duplicate" => Request::WorkspaceDuplicate { name, new_name: args.get(2).cloned().unwrap_or_default() },
         other => {
@@ -1401,8 +1420,8 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
     match daemon::workspaces(req) {
         Ok(Some((list, _))) => {
             for w in list {
-                println!("{}\t{}\t{}\t{}\tuses={}\t{}", w.name, w.toolchain, w.persona, w.network,
-                         w.uses.join(","), if w.running { "running" } else { "stopped" });
+                println!("{}\t{}\t{}\t{}\tuses={}\t{}\t{}", w.name, w.toolchain, w.persona, w.network,
+                         w.uses.join(","), if w.running { "running" } else { "stopped" }, if w.object_cache { "objects=on" } else { "objects=off" });
             }
             ExitCode::SUCCESS
         }

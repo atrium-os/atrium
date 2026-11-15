@@ -274,6 +274,31 @@ pub fn run(name: String, project: String) -> DaemonResult<(String, Vec<String>)>
     }
 }
 
+/// Run a command in one of the person's workspaces (homes.md W6), its
+/// output copied to stdout until it ends.
+pub fn exec(name: String, argv: Vec<String>, cwd: String) -> DaemonResult<()> {
+    use std::io::Write;
+    let Some(mut s) = opened()? else { return Ok(None) };
+    portcullis_ipc::write_request(&mut s, &Request::WorkspaceExec { name, argv, cwd })?;
+    match portcullis_ipc::read_response_unbuffered(&mut s)? {
+        Response::WorkspaceExecStarted { .. } => {}
+        Response::Error { message } => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("unexpected exec reply: {other:?}"))),
+    }
+    let mut fds = portcullis_ipc::recv_fds(&s, 3)?;
+    if fds.len() != 3 {
+        return Err(io::Error::other(format!("{} descriptors", fds.len())));
+    }
+    let out = fds.pop().unwrap();
+    drop(fds.pop()); // its stdin: nothing to give it
+    let pd = fds.pop().unwrap();
+    let mut text = std::fs::File::from(out);
+    io::copy(&mut text, &mut io::stdout())?;
+    io::stdout().flush()?;
+    drop(pd);
+    Ok(Some(()))
+}
+
 pub fn workspaces(req: Request) -> DaemonResult<(Vec<portcullis_ipc::WorkspaceInfo>, Vec<portcullis_ipc::Toolchain>)> {
     let Some(mut s) = opened()? else { return Ok(None) };
     match round_trip(&mut s, &req)? {

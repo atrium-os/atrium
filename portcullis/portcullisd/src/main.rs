@@ -1299,13 +1299,22 @@ fn handle_ws_exec(uid: u32, owner: &str, name: &str, argv: &[String], cwd: &str,
         eprintln!("portcullisd: exec in workspace {name} of {owner} REFUSED: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let app = match ide_of(uid) {
-        Ok(a) => a,
-        Err(why) => return refuse(writer, why),
+    let in_app = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().resolve(uid).is_some();
+    let app = if in_app {
+        let app = match ide_of(uid) {
+            Ok(a) => a,
+            Err(why) => return refuse(writer, why),
+        };
+        if !ide::picked(owner, &app).iter().any(|w| w == name) {
+            return refuse(writer, format!("cap.workspace_exec.denied: {app} wasn't given workspace {name}"));
+        }
+        app
+    } else if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 {
+        // The person's own CLI (`portcullis workspace exec`): their workspaces.
+        format!("{owner}'s CLI")
+    } else {
+        return refuse(writer, "cap.workspace_exec.denied: not a person or an IDE".into());
     };
-    if !ide::picked(owner, &app).iter().any(|w| w == name) {
-        return refuse(writer, format!("cap.workspace_exec.denied: {app} wasn't given workspace {name}"));
-    }
     let (pid, procdesc, stdin, output) = match ide::exec(owner, name, argv, cwd) {
         Ok(s) => s,
         Err(why) => return refuse(writer, why),
@@ -1334,9 +1343,9 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     let done = match req {
         Request::Workspaces => Ok(()),
         Request::WorkspaceNew { name, toolchain, network, uses } => workspace::create(owner, workspace::Record {
-            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses,
+            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses, object_cache: false,
         }).map(|_| ()),
-        Request::WorkspaceSet { name, network, uses } => workspace::set(owner, &name, network, uses).map(|_| ()),
+        Request::WorkspaceSet { name, network, uses, object_cache } => workspace::set(owner, &name, network, uses, object_cache).map(|_| ()),
         Request::WorkspaceDuplicate { name, new_name } => workspace::duplicate(owner, &name, &new_name).map(|_| ()),
         Request::WorkspaceStop { name } => {
             if workspace::valid_name(&name) {
@@ -1377,6 +1386,7 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     match workspace::list(owner) {
         Ok(l) => Response::WorkspaceList {
             workspaces: l.into_iter().map(|(r, running)| portcullis_ipc::WorkspaceInfo {
+                object_cache: r.object_cache,
                 name: r.name, toolchain: r.toolchain, persona: r.persona, network: r.network, uses: r.uses, running,
             }).collect(),
             toolchains: workspace::TOOLCHAINS.iter().map(|(id, name, available)| portcullis_ipc::Toolchain {
@@ -1420,6 +1430,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
     }
     // A workspace (homes.md §5) or an app (§4): where the shell goes.
     let ws_groups: Vec<u32>;
+    let mut ws_env: Vec<String> = Vec::new();
     let (jid, app_uid, gid, home, kind, title) = if to_empty {
         // Nothing to reach, so no press: a new tab or window of it is free.
         if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
@@ -1450,6 +1461,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
             Err(why) => return refuse(why),
         };
         ws_groups = vec![r.files];
+        ws_env = r.env.clone();
         (r.jid, r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
     } else {
         let Some(m) = launch::installed_manifest(app_id) else {
@@ -1498,7 +1510,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         ws_groups = Vec::new();
         (jid, app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
     };
-    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind };
+    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind, env: &ws_env };
     let hub = Hub::global();
     if let Err(e) = hub.listen(console::TERMINAL) {
         return refuse(format!("the terminal's channel: {e}"));

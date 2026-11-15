@@ -216,13 +216,16 @@ pub fn exec(owner: &str, name: &str, argv: &[String], cwd: &str) -> Result<Start
     } else {
         PATH.split(':').map(|d| c(&format!("{d}/{}", argv[0]))).collect::<Result<_, _>>()?
     };
-    let env = [
+    let mut env = vec![
         c(&format!("HOME={}", r.home))?,
         c(&format!("PATH={PATH}"))?,
         c(&format!("USER={owner}"))?,
         c("TERM=dumb")?,
         c(&format!("ATRIUM_WORKSPACE={name}"))?,
     ];
+    for e in &r.env {
+        env.push(c(e)?);
+    }
     let dir = if cwd.is_empty() { format!("{}/work", r.home) } else { format!("{}/work/{}", r.home, cwd.trim_end_matches('/')) };
     let dir = c(&dir)?;
     let mut argp: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
