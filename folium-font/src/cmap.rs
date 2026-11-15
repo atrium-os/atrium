@@ -210,6 +210,28 @@ impl Cmap {
     }
 }
 
+/// A ToUnicode CMap for two-byte codes (Identity-H CIDs): each code to the
+/// text it shows. Codes with no text are left out; a text is cut at 256
+/// UTF-16 units.
+pub fn write_to_unicode(map: &std::collections::BTreeMap<u16, String>) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut s = String::from("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+    let with_text: Vec<(&u16, &String)> = map.iter().filter(|(_, t)| !t.is_empty()).collect();
+    for chunk in with_text.chunks(100) {
+        let _ = writeln!(s, "{} beginbfchar", chunk.len());
+        for (g, t) in chunk {
+            let mut hex = String::new();
+            for u in t.encode_utf16().take(256) {
+                let _ = write!(hex, "{u:04X}");
+            }
+            let _ = writeln!(s, "<{g:04X}> <{hex}>");
+        }
+        s.push_str("endbfchar\n");
+    }
+    s.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    s.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +255,17 @@ mod tests {
         assert_eq!(c.next_code(&[0x81, 0x41]), (0x8141, 2));
         assert_eq!(c.cid(0x8141), 634);
         assert_eq!(c.cid(0x41), 34);
+    }
+
+    #[test]
+    fn written_to_unicode_reads_back() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(3u16, "fi".to_string());
+        m.insert(0x41, "é".to_string());
+        m.insert(9, String::new());
+        let t = ToUnicode::parse(&write_to_unicode(&m));
+        assert_eq!(t.get(3), Some("fi"));
+        assert_eq!(t.get(0x41), Some("é"));
+        assert_eq!(t.get(9), None);
     }
 }

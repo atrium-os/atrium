@@ -17,6 +17,7 @@ pub mod limits;
 pub mod object;
 pub mod repair;
 pub mod source;
+pub mod write;
 pub mod xref;
 
 pub use document::{Decoded, Document};

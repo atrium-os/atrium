@@ -12,6 +12,7 @@
 
 pub mod cmap;
 pub mod encoding;
+pub mod subset;
 pub mod geom;
 mod tables;
 pub mod type1;

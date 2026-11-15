@@ -9,7 +9,11 @@ description = "PDF export for Officina (docs/spec/officina.md §7.4, §14): page
 [dependencies]
 officina-text = { path = "../officina-text" }
 navigator-image = { path = "../navigator-image" }
-miniz_oxide = "0.8"
+# The shared base with Folium (docs/spec/folium.md §5.1): the object
+# writer, the TrueType subsetter and ToUnicode, the content operators.
+folium-syntax = { path = "../folium-syntax" }
+folium-font = { path = "../folium-font" }
+folium-content = { path = "../folium-content" }
 
 [profile.release]
 debug = 1

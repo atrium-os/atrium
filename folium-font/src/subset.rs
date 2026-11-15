@@ -1,4 +1,4 @@
-//! TrueType subsets for embedding: the glyphs a document uses (and the
+//! TrueType subsets for embedding (moved from officina-pdf, folium.md §5.1): the glyphs a document uses (and the
 //! components they are built from) are kept at their ids; every other glyph is
 //! emptied. Ids stay put, so the PDF uses them as CIDs directly (Identity).
 
@@ -205,8 +205,7 @@ mod tests {
 
     #[test]
     fn subsets_keep_ids_and_parse() {
-        let set = officina_text::layout::PinnedFonts::new().unwrap();
-        let bytes = set.face_bytes(0);
+        let bytes: &[u8] = include_bytes!("../../fonts/liberation/LiberationSans-Regular.ttf");
         let f = Face::parse(bytes).unwrap();
         let tt = ttf_parser_face(bytes);
         let a = tt.0;
@@ -218,7 +217,7 @@ mod tests {
         assert_eq!(g.glyph(a), f.glyph(a));
         assert_eq!(g.advance(a), f.advance(a));
         assert!(g.glyph(a + 1).is_empty() || f.glyph(a + 1).is_empty() || a + 1 == 0);
-        assert_eq!(checksum(&sub), 0xB1B0_AFBA);
+        assert_eq!(checksum(&sub), 0xB1B0_AFBA, "the whole-file checksum adjustment");
     }
 
     /// The glyph id of 'A' read from the cmap the slow way (format 4).

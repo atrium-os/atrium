@@ -13,6 +13,7 @@
 //! maps it to the screen.
 
 pub mod color;
+pub mod ops;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
