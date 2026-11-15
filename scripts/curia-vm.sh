@@ -10,7 +10,7 @@
 #                                               # arca-ui; then Curia, one frame
 #   sh scripts/curia-vm.sh shot                 # start Curia, one frame
 #   sh scripts/curia-vm.sh click X Y [name]     # a click, then a frame
-#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, space, Enter as \n), then a frame
+#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, 0-9, . / , space, Enter as |), then a frame
 #   sh scripts/curia-vm.sh frame [name]
 #   sh scripts/curia-vm.sh status               # atrium-netctl status + list
 #   sh scripts/curia-vm.sh away                 # after `arca`: each service Settings talks to
@@ -165,9 +165,14 @@ type)
         c=$(printf '%s' "$s" | cut -c1); s=$(printf '%s' "$s" | cut -c2-)
         case "$c" in
             [a-z]) u=$(( $(printf '%d' "'$c") - 97 + 4 )) ;;
+            [1-9]) u=$(( c + 29 )) ;;
+            0) u=39 ;;
+            .) u=55 ;;
+            /) u=56 ;;
+            ,) u=54 ;;
             " ") u=44 ;;
             "|") u=40 ;;   # Enter
-            *) echo "type: only a-z, space and | (Enter)"; exit 2 ;;
+            *) echo "type: only a-z, 0-9, . / , space and | (Enter)"; exit 2 ;;
         esac
         out="${out}KEY $u 1\nKEY $u 0\n"
     done

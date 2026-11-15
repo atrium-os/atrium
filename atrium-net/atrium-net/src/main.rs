@@ -28,6 +28,8 @@
 //!   wifi-remember ssid=HEX [secret=HEX|handle=HEX [trial=1]] [open=1] [auto=0] [prio=N] [mac=..]
 //!     (trial=1: saved, with its passphrase, only once the next join works)
 //!   wifi-forget ssid=HEX | country cc=XX
+//!   static ssid=HEX|iface=NAME [maddr=A/P [mrouter=R] [mdns=A,B]]  (no maddr: DHCP)
+//!   dns [servers=A,B,C]  (the machine's own DNS servers; none: each network's)
 
 #[cfg(target_os = "freebsd")]
 mod imp {
@@ -40,7 +42,8 @@ mod imp {
     use aura_ipc::{fmt_mac, Got, Line, Reader};
     use net_proto::{check_dns6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
     use std::io;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use atrium_netconf::{check_dns, lines as nlines, Manual};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -49,6 +52,47 @@ mod imp {
     use std::time::{Duration, Instant};
 
     const STATE_FILE: &str = "networks";
+    /// Fixed settings of wired ports and the machine's own DNS servers.
+    const SETTINGS_FILE: &str = "settings";
+
+    /// A fixed setting as a lease that never ends, so it takes the same
+    /// checks and the same path as one from DHCP.
+    fn fixed_lease(m: &Manual) -> LeaseV4 {
+        LeaseV4 {
+            addr: m.addr,
+            prefix: m.prefix,
+            router: m.router,
+            routes: Vec::new(),
+            dns: m.dns.clone(),
+            mtu: None,
+            lease_s: u32::MAX,
+            server: Ipv4Addr::UNSPECIFIED,
+            metered: false,
+        }
+    }
+
+    /// The settings file: `wired iface=NAME maddr=..` and `dns servers=..`.
+    fn parse_settings(text: &str) -> (Vec<(String, Manual)>, Vec<IpAddr>) {
+        let (mut wired, mut dns) = (Vec::new(), Vec::new());
+        for l in text.lines().take(64).filter_map(Line::parse) {
+            match l.verb.as_str() {
+                "wired" => {
+                    if let (Some(n), Some(m)) = (l.get("iface"), nlines::manual(&l)) {
+                        wired.retain(|(x, _): &(String, Manual)| x != n);
+                        wired.push((n.to_string(), m));
+                    }
+                }
+                "dns" => {
+                    let v: Option<Vec<IpAddr>> = l.get("servers").map(|s| s.split(',').map(|x| x.parse().ok()).collect()).unwrap_or(Some(Vec::new()));
+                    if let Some(v) = v.filter(|v| check_dns(v).is_ok()) {
+                        dns = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (wired, dns)
+    }
     /// A probe that has not answered by then is abandoned (atrium-probe's
     /// own timeouts add up to about 15 s).
     const PROBE_DEADLINE_MS: u64 = 30_000;
@@ -228,6 +272,10 @@ mod imp {
         wifi_grace: Option<u64>,
         /// What unbound forwards to now.
         forwarders: Vec<String>,
+        /// Wired ports with a fixed setting, and the machine's own DNS
+        /// servers (used instead of every network's when set).
+        wired_manual: Vec<(String, Manual)>,
+        own_dns: Vec<IpAddr>,
         egress: Egress,
         /// The default route we installed (interface, router), and the
         /// interface last announced as the egress.
@@ -311,13 +359,14 @@ mod imp {
         /// after '%'). Kept as is when nothing is known (an empty list would
         /// leave unbound resolving from the roots).
         fn forward(&mut self) {
-            let mut list: Vec<String> = Vec::new();
-            for i in &self.ifs {
+            let mut list: Vec<String> = self.own_dns.iter().map(|a| a.to_string()).collect();
+            let own = !list.is_empty();
+            for i in self.ifs.iter().filter(|_| !own) {
                 if let Some(l) = &i.applied.lease {
                     list.extend(l.dns.iter().map(|a| a.to_string()));
                 }
             }
-            for i in &self.ifs {
+            for i in self.ifs.iter().filter(|_| !own) {
                 for a in &i.dns6 {
                     let ll = a.segments()[0] & 0xffc0 == 0xfe80;
                     list.push(if ll { format!("{a}%{}", i.index) } else { a.to_string() });
@@ -329,6 +378,7 @@ mod imp {
                 return;
             }
             let Some(u) = &self.unbound else {
+                self.log(&format!("no unbound: would forward {}", list.join(" ")));
                 self.forwarders = list;
                 return;
             };
@@ -648,6 +698,60 @@ mod imp {
             }
         }
 
+        fn save_settings(&mut self) {
+            let mut out = String::from("# atrium-net: fixed settings of wired ports, own DNS servers; written by atrium-net\n");
+            for (n, m) in &self.wired_manual {
+                out.push_str(&String::from_utf8_lossy(&nlines::with_manual(Line::new("wired").with("iface", n), m).encode().unwrap_or_default()));
+            }
+            if !self.own_dns.is_empty() {
+                out.push_str(&format!("dns servers={}\n", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
+            }
+            if let Err(e) = self.state.write(SETTINGS_FILE, out.as_bytes()) {
+                eprintln!("atrium-net: saving settings: {e}");
+            }
+        }
+
+        /// The fixed setting this interface uses now: the wired port's, or
+        /// the Wi-Fi network's.
+        fn manual_for(&self, k: usize) -> Option<Manual> {
+            let i = &self.ifs[k];
+            if i.wifi {
+                self.wifi.as_ref().and_then(|w| w.manual_now())
+            } else {
+                self.wired_manual.iter().find(|(n, _)| *n == i.name).map(|(_, m)| m.clone())
+            }
+        }
+
+        /// The link is up: DHCP, or the fixed setting.
+        fn link_up_lease(&mut self, k: usize) {
+            match self.manual_for(k) {
+                Some(m) => {
+                    self.log(&format!("{}: fixed address {}/{}", self.ifs[k].name, m.addr, m.prefix));
+                    self.take_lease(k, fixed_lease(&m));
+                }
+                None => {
+                    let _ = self.ifs[k].lease.send(&Line::new("up"));
+                }
+            }
+        }
+
+        /// A setting changed for interface `k`: from DHCP to fixed, fixed
+        /// to another, or back to DHCP.
+        fn reapply(&mut self, k: usize) {
+            if !self.ifs[k].link {
+                return;
+            }
+            let fixed = self.manual_for(k);
+            let was_fixed = self.ifs[k].applied.lease.as_ref().is_some_and(|l| l.server.is_unspecified());
+            if fixed.is_some() && !was_fixed {
+                let _ = self.ifs[k].lease.send(&Line::new("down"));
+            }
+            if fixed.is_none() && was_fixed {
+                self.lose(k, "dhcp-again");
+            }
+            self.link_up_lease(k);
+        }
+
         fn save(&mut self) {
             let Some(w) = &self.wifi else { return };
             if let Err(e) = self.state.write(STATE_FILE, w.saved.render().as_bytes()) {
@@ -706,7 +810,12 @@ mod imp {
                         Act::LeaseUp | Act::LeaseDown => {
                             if let Some(k) = self.wifi_iface() {
                                 let up = a == Act::LeaseUp;
-                                let _ = self.ifs[k].lease.send(&Line::new(if up { "up" } else { "down" }));
+                                if up {
+                                    self.ifs[k].link = true;
+                                    self.link_up_lease(k);
+                                } else {
+                                    let _ = self.ifs[k].lease.send(&Line::new("down"));
+                                }
                                 // Off the network: atrium-lease keeps the lease
                                 // and confirms it on the next join (INIT-REBOOT).
                                 // The address stays for a grace period so a
@@ -826,6 +935,8 @@ mod imp {
                         auto: if open { l.get("auto") == Some("1") } else { l.get("auto") != Some("0") },
                         prio: l.num("prio").unwrap_or(0).clamp(-1000, 1000),
                         metered: l.get("metered") == Some("1"),
+                        // Kept from the saved profile (set by `static`).
+                        manual: None,
                     };
                     if trial && !open {
                         self.wifi.as_mut().unwrap().remember_on_trial(p);
@@ -833,6 +944,49 @@ mod imp {
                     }
                     let a = self.wifi.as_mut().unwrap().remember(p, now);
                     self.wifi_acts(a);
+                    ok()
+                }
+                "static" => {
+                    let m = nlines::manual(l);
+                    if l.get("maddr").is_some() && m.is_none() {
+                        return err("bad-address");
+                    }
+                    let k = if let Some(s) = l.hex("ssid") {
+                        let on = {
+                            let Some(w) = self.wifi.as_mut() else { return err("no-wifi") };
+                            if !w.set_manual(&s, m) {
+                                return err("not-saved");
+                            }
+                            w.ssid() == Some(s.as_slice())
+                        };
+                        self.save();
+                        self.ifs.iter().position(|i| i.wifi).filter(|_| on)
+                    } else if let Some(n) = l.get("iface") {
+                        let Some(k) = self.ifs.iter().position(|i| i.name == n && !i.wifi) else { return err("no-such-port") };
+                        self.wired_manual.retain(|(x, _)| x != n);
+                        if let Some(m) = m {
+                            self.wired_manual.push((n.to_string(), m));
+                        }
+                        self.save_settings();
+                        Some(k)
+                    } else {
+                        return err("no-target");
+                    };
+                    if let Some(k) = k {
+                        self.reapply(k);
+                    }
+                    ok()
+                }
+                "dns" => {
+                    let v: Option<Vec<IpAddr>> = l.get("servers").map(|s| s.split(',').map(|x| x.parse().ok()).collect()).unwrap_or(Some(Vec::new()));
+                    let Some(v) = v.filter(|v| check_dns(v).is_ok()) else { return err("bad-dns") };
+                    self.log(&format!("own DNS servers: {v:?}"));
+                    self.own_dns = v;
+                    self.save_settings();
+                    // Back to the networks' own: forward() keeps the list
+                    // when it is unchanged, so clear what it compares with.
+                    self.forwarders.clear();
+                    self.forward();
                     ok()
                 }
                 "wifi-forget" => {
@@ -894,6 +1048,9 @@ mod imp {
                 if i.wifi {
                     l = l.with("wifi", 1);
                 }
+                if let Some(m) = k.and_then(|k| self.manual_for(k)) {
+                    l = nlines::with_manual(l, &m);
+                }
                 if k.is_some() && self.announced == k {
                     l = l.with("egress", 1);
                 }
@@ -902,6 +1059,9 @@ mod imp {
                     l = l.with("last_refusal", &i.last_refusal);
                 }
                 v.push(l);
+            }
+            if !self.own_dns.is_empty() {
+                v.push(Line::new("dns").with("own", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
             }
             if let Some(w) = &self.wifi {
                 let mut l = Line::new("wifi").with("state", w.state()).with("mlme", self.mlme.is_some() as u8).with("profiles", w.saved.profiles.len());
@@ -914,34 +1074,52 @@ mod imp {
             v
         }
 
+        /// A checked lease (DHCP's, or a fixed setting's) bound to
+        /// interface `k`.
+        fn take_lease(&mut self, k: usize, lease: LeaseV4) {
+            let name = self.ifs[k].name.clone();
+            match check_v4(&lease, &self.host_view(&name)) {
+                Ok(()) => {
+                    self.log(&format!("{name}: lease {}/{} router {:?} dns {:?} for {} s", lease.addr, lease.prefix, lease.router, lease.dns, lease.lease_s));
+                    let addr = lease.addr;
+                    if self.ifs[k].applied.lease.as_ref().map(|o| (o.addr, o.router)) != Some((lease.addr, lease.router)) {
+                        self.ifs[k].inet = Inet::Unknown;
+                        self.ifs[k].portal = None;
+                        self.ifs[k].next_probe = self.now();
+                        self.ifs[k].probe_fails = 0;
+                    }
+                    let ev = Line::new("lease").with("iface", &name).with("addr", format!("{}/{}", lease.addr, lease.prefix));
+                    let acts = self.ifs[k].applied.bind(lease);
+                    self.apply(&name, Some(addr), acts);
+                    let ev = ev.with("metered", self.metered(&self.ifs[k]) as u8);
+                    self.event(&ev);
+                }
+                Err(e) if lease.server.is_unspecified() => {
+                    let i = &mut self.ifs[k];
+                    i.refusals += 1;
+                    i.last_refusal = format!("fixed: {e:?}");
+                    eprintln!("atrium-net: {name}: fixed address refused: {e:?}");
+                }
+                Err(e) => self.refuse(k, &format!("{e:?}")),
+            }
+        }
+
         fn lease_line(&mut self, k: usize, l: &Line) {
             match l.verb.as_str() {
                 "send" => self.lease_send(k, l),
                 "lease4" => {
-                    let name = self.ifs[k].name.clone();
                     let Some(lease) = LeaseV4::from_line(l) else {
                         self.refuse(k, "unparsable");
                         return;
                     };
-                    match check_v4(&lease, &self.host_view(&name)) {
-                        Ok(()) => {
-                            self.log(&format!("{name}: lease {}/{} router {:?} dns {:?} for {} s", lease.addr, lease.prefix, lease.router, lease.dns, lease.lease_s));
-                            let addr = lease.addr;
-                            if self.ifs[k].applied.lease.as_ref().map(|o| (o.addr, o.router)) != Some((lease.addr, lease.router)) {
-                                self.ifs[k].inet = Inet::Unknown;
-                                self.ifs[k].portal = None;
-                                self.ifs[k].next_probe = self.now();
-                                self.ifs[k].probe_fails = 0;
-                            }
-                            let ev = Line::new("lease").with("iface", &name).with("addr", format!("{}/{}", lease.addr, lease.prefix));
-                            let acts = self.ifs[k].applied.bind(lease);
-                            self.apply(&name, Some(addr), acts);
-                            let ev = ev.with("metered", self.metered(&self.ifs[k]) as u8);
-                            self.event(&ev);
-                        }
-                        Err(e) => self.refuse(k, &format!("{e:?}")),
+                    if self.manual_for(k).is_some() {
+                        // A fixed setting is in use: DHCP's offer is not.
+                        self.log(&format!("{}: DHCP lease ignored (fixed address)", self.ifs[k].name));
+                        return;
                     }
+                    self.take_lease(k, lease);
                 }
+                "lost" if self.manual_for(k).is_some() => {}
                 "lost" => self.lose(k, l.get("why").unwrap_or("?")),
                 "dns6" => {
                     let list: Option<Vec<Ipv6Addr>> = l.get("servers").map(|s| s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect()).unwrap_or(None);
@@ -1049,6 +1227,7 @@ mod imp {
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
+        let (wired_manual, own_dns) = parse_settings(&state.read(SETTINGS_FILE, 1 << 16).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
         let wifi = o.wifi.as_ref().map(|_| {
             let text = state.read(STATE_FILE, 1 << 20).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
             Wifi::new(Saved::parse(&text))
@@ -1070,6 +1249,8 @@ mod imp {
             mlme_retry: 0,
             wifi_grace: None,
             forwarders: Vec::new(),
+            wired_manual,
+            own_dns,
             egress: Egress::new(o.ifaces.len()),
             def4: None,
             announced: None,
@@ -1095,8 +1276,9 @@ mod imp {
             let bpf = Bpf::open(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
             let (child, mut lease) = spawn_child(&o.lease, o.verbose);
             lease.send(&Line::new("hello").with("mac", fmt_mac(&mac))).unwrap_or_else(|_| die("hello"));
-            // Wired links start now; Wi-Fi when aura-mlme reports the port open.
-            if !is_wifi {
+            // Wired links start now (DHCP, or the port's fixed setting just
+            // below); Wi-Fi when aura-mlme reports the port open.
+            if !is_wifi && !net.wired_manual.iter().any(|(n, _)| n == name) {
                 lease.send(&Line::new("up")).unwrap_or_else(|_| die("up"));
             }
             net.log(&format!("{name}: managing{}, mac {}", if is_wifi { " (Wi-Fi)" } else { "" }, fmt_mac(&mac)));
@@ -1125,6 +1307,12 @@ mod imp {
                 probe_fails: 0,
             });
         }
+        for k in 0..net.ifs.len() {
+            if !net.ifs[k].wifi && net.manual_for(k).is_some() {
+                net.link_up_lease(k);
+            }
+        }
+        net.forward();
         // The probe must exist before capability mode (no exec after it).
         if let Some(url) = &o.probe {
             let cfg = probe_cfg(url, o.probe_expect.as_deref(), o.probe_every);
@@ -1177,8 +1365,12 @@ mod imp {
                             i.rs_left = 3;
                             i.rs_at = 0;
                         }
-                        let _ = i.lease.send(&Line::new(if up { "up" } else { "down" }));
                         net.log(&m);
+                        if up {
+                            net.link_up_lease(k);
+                        } else {
+                            let _ = net.ifs[k].lease.send(&Line::new("down"));
+                        }
                     }
                 }
             }

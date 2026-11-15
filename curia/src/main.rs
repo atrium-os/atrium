@@ -270,6 +270,9 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
             Want::Leave => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.leave().map_err(e)) },
             Want::Forget(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.forget(s).map_err(e)) },
             Want::Save(p) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.set_profile(p).map_err(e)) },
+            Want::Routes => Got::OwnDns(connect(Grant::Details).and_then(|mut c| c.routes().map(|r| r.own_dns).map_err(e))),
+            Want::SetStatic(s) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_static(s).map_err(e)) },
+            Want::SetDns(v) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_dns(v).map_err(e)) },
         };
         let _ = tx.send(g);
     });
@@ -452,7 +455,7 @@ fn main() {
     let (atx, arx) = channel();
     let apps_refreshing = Arc::new(AtomicBool::new(false));
     let mut next_apps = Instant::now();
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();

@@ -45,9 +45,18 @@ service is not reachable says so in place ("atrium-net is not running") and offe
   Address (per network / new each time / the device's own), Forget (asks first). Changes
   go to atrium-net at once (`WIFI_SET_PROFILE`).
 - **Details** (`network-details`): per interface its addresses, router and DNS servers,
-  folded by default.
-- **Wi-Fi country** (`network-configure`): a list of countries. Static addresses and DNS
-  servers come later (atrium-netconf answers "not built yet").
+  folded by default. Under them, scrolling with them:
+- **IP settings** (`network-configure`, 2026-11-15): one row per saved network and per
+  wired port, "Automatic (DHCP)" or "Fixed: a.b.c.d/p", and Change. Change opens three
+  plain fields (address with prefix, "/24" if left out; router; DNS servers, optional)
+  with "Use this address", "Automatic" and Cancel. What was typed is checked in Curia
+  first (`parse_manual`: an IPv4 address, the subnet's rules of `Manual::check`), and a
+  mistake shows under the fields with the row left open. These are not secrets, so
+  they are Curia's own fields, not Arca's. A saved network's setting is used whenever it
+  is joined and applies at once to the one in use (atrium-net.md §5.1).
+- **DNS servers** (`network-configure`): "Each network's own" or the machine's own list,
+  and Change: one field (up to 3, IPv4 or IPv6; empty goes back to each network's).
+- **Wi-Fi country** (`network-configure`): a list of countries.
 
 ## 4. The passphrase
 

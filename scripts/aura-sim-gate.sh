@@ -622,8 +622,42 @@ n4() {
     app network-wifi country DE; refused && ok "network-wifi cannot set the country" || fail "wifi country: rc=$rc $out"
     app network-configure country DE
     [ "$rc" = 0 ] && ok "network-configure sets the country" || fail "configure country: rc=$rc $out"
-    app network-configure static
-    [ "$rc" = 1 ] && echo "$out" | grep -q '^refused: unsupported' && ok "static addresses: unsupported for now" || fail "static: rc=$rc $out"
+    # A fixed address for aura-test (outside udhcpd's .100-.120 pool),
+    # applied at once to the joined network, then back to DHCP.
+    app network-wifi static wifi aura-test 10.77.0.200/24 10.77.0.1; refused && ok "network-wifi cannot set a fixed address" || fail "wifi static: rc=$rc $out"
+    app network-configure static wifi aura-test 10.77.0.0/24 10.77.0.1
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^refused: malformed' && ok "the network's own address refused: $out" || fail "static .0: rc=$rc $out"
+    app network-configure static wifi aura-test 10.77.0.200/24 10.78.0.1
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^refused: malformed' && ok "a router outside the subnet refused: $out" || fail "static router: rc=$rc $out"
+    app network-configure static wired vtnet9 10.77.0.200/24
+    [ "$rc" = 1 ] && ok "no such wired port: $out" || fail "static vtnet9: rc=$rc $out"
+    app network-configure static wifi aura-test 10.77.0.200/24 10.77.0.1 10.77.0.1
+    [ "$rc" = 0 ] && ok "network-configure sets 10.77.0.200/24 for aura-test" || fail "static: rc=$rc $out"
+    i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=wlan0 .*addr=10.77.0.200/24 router=10.77.0.1 .*manual=1'; do i=$((i + 1)); [ $i -lt 10 ] || { "$V" "$APP network-details interfaces; tail -n 20 /tmp/aura/net.log"; fail "fixed address not applied"; }; sleep 2; done
+    ok "wlan0 has the fixed address at once ($((i * 2)) s)"
+    "$V" 'ifconfig wlan0 | grep -q "inet 10.77.0.200 "' && ok "the kernel has 10.77.0.200 on wlan0" || fail "ifconfig: $("$V" 'ifconfig wlan0 | grep inet')"
+    "$V" 'ping -c 2 -t 6 10.77.0.1 >/dev/null' && ok "the router answers from the fixed address" || fail "no ping to the router"
+    app network-wifi list
+    echo "$out" | grep -q 'manual=10.77.0.200/24' && ok "the setting is saved with the network" || fail "list: $out"
+    app network-configure static wifi aura-test
+    [ "$rc" = 0 ] || fail "back to DHCP: rc=$rc $out"
+    i=0; until "$V" "$APP network-details interfaces" | grep -Eq '^iface name=wlan0 .*addr=10.77.0.1[0-2][0-9]/24 router=10.77.0.1'; do i=$((i + 1)); [ $i -lt 20 ] || { "$V" "$APP network-details interfaces; tail -n 20 /tmp/aura/net.log"; fail "no DHCP lease again"; }; sleep 3; done
+    app network-details interfaces
+    echo "$out" | grep -q 'manual=1' && fail "still manual: $out" || ok "back to a DHCP lease: $(echo "$out" | grep -o 'addr=[^ ]*')"
+
+    # The machine's own DNS servers replace the network's, then go back.
+    app network-wifi dns 9.9.9.9; refused && ok "network-wifi cannot set DNS servers" || fail "wifi dns: rc=$rc $out"
+    app network-configure dns 9.9.9.9,224.0.0.1
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^refused: malformed' && ok "a multicast DNS server refused" || fail "dns multicast: rc=$rc $out"
+    app network-configure dns 9.9.9.9,2620:fe::fe
+    [ "$rc" = 0 ] || fail "dns: rc=$rc $out"
+    app network-details routes
+    echo "$out" | grep -q '^own dns 9.9.9.9,2620:fe::fe$' && ok "network-details shows own DNS servers" || fail "routes: $out"
+    "$V" 'tail -n 20 /tmp/aura/net.log' | grep -q 'forward 9.9.9.9 2620:fe::fe$' && ok "DNS forwards to them alone" || fail "forward: $("$V" 'tail -n 20 /tmp/aura/net.log')"
+    app network-configure dns
+    "$V" 'tail -n 5 /tmp/aura/net.log' | grep -q 'forward 10.77.0.1$' && ok "cleared: back to the network's DNS server" || fail "forward after clearing: $("$V" 'tail -n 5 /tmp/aura/net.log')"
+    app network-details routes
+    echo "$out" | grep -q 'own dns' && fail "own dns kept: $out" || ok "no own DNS servers listed"
 
     # Subscribe: the bar hears leaving at once.
     "$V" "($APP network-read watch 40 > /tmp/aura/watch-n4.log 2>&1 &) ; sleep 4"

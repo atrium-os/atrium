@@ -2,6 +2,7 @@
 //! auto-join, and turning aura-mlme's events into link up/down for the
 //! interface's lease. Pure: `main` carries the actions out.
 
+use atrium_netconf::{lines, Manual};
 use aura_ipc::{Line, MAX_LINE};
 
 /// Looking for a known network when none was in range.
@@ -45,18 +46,24 @@ pub struct Profile {
     /// The user says this network is metered (a phone's hotspot, a data
     /// plan). Also inferred per lease (DHCP's ANDROID_METERED).
     pub metered: bool,
+    /// A fixed IPv4 setting used instead of DHCP on this network.
+    pub manual: Option<Manual>,
 }
 
 impl Profile {
     pub fn to_line(&self) -> Line {
-        Line::new("net")
+        let l = Line::new("net")
             .with_hex("ssid", &self.ssid)
             .with("open", self.open as u8)
             .with("wpa3_only", self.wpa3_only as u8)
             .with("mac", &self.mac)
             .with("auto", self.auto as u8)
             .with("prio", self.prio)
-            .with("metered", self.metered as u8)
+            .with("metered", self.metered as u8);
+        match &self.manual {
+            Some(m) => lines::with_manual(l, m),
+            None => l,
+        }
     }
 
     pub fn from_line(l: &Line) -> Option<Profile> {
@@ -71,6 +78,7 @@ impl Profile {
             auto: l.get("auto") != Some("0"),
             prio: l.num("prio").unwrap_or(0).clamp(-1000, 1000),
             metered: l.get("metered") == Some("1"),
+            manual: lines::manual(l),
         })
     }
 
@@ -374,10 +382,14 @@ impl Wifi {
     pub fn remember(&mut self, p: Profile, now: u64) -> Vec<Act> {
         let auto = p.auto;
         let p_ssid = p.ssid.clone();
-        // Remembering keeps an earlier Transition Disable.
+        // Remembering keeps an earlier Transition Disable, and a fixed
+        // address (set on its own, `set_manual`).
         let mut p = p;
         if let Some(old) = self.saved.get(&p.ssid) {
             p.wpa3_only |= old.wpa3_only;
+            if p.manual.is_none() {
+                p.manual = old.manual.clone();
+            }
         }
         self.saved.profiles.retain(|q| q.ssid != p.ssid);
         self.saved.profiles.push(p);
@@ -393,6 +405,23 @@ impl Wifi {
             }
         }
         vec![Act::Save]
+    }
+
+    /// A fixed address for a saved network (None: DHCP again). False if
+    /// the network is not saved.
+    pub fn set_manual(&mut self, ssid: &[u8], m: Option<Manual>) -> bool {
+        match self.saved.profiles.iter_mut().find(|p| p.ssid == ssid) {
+            Some(p) => {
+                p.manual = m;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The fixed address of the network we are on, if it has one.
+    pub fn manual_now(&self) -> Option<Manual> {
+        self.ssid().and_then(|s| self.saved.get(s)).and_then(|p| p.manual.clone())
     }
 
     pub fn forget(&mut self, ssid: &[u8]) -> Vec<Act> {
@@ -554,7 +583,7 @@ mod tests {
     use super::*;
 
     fn prof(s: &str, prio: i32) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None }
     }
 
     fn line(s: &str) -> Line {
@@ -665,7 +694,7 @@ mod dropout_tests {
     use super::*;
 
     fn prof(s: &str) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }
     }
 
     fn line(s: &str) -> Line {
@@ -762,7 +791,7 @@ mod weak_signal_tests {
     use super::*;
 
     fn prof(s: &str, prio: i32) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None }
     }
 
     fn line(s: &str) -> Line {

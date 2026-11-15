@@ -18,7 +18,9 @@ use vinculum_control::Prompt;
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
 use crate::sound::{self as snd, SoundPage};
-use crate::network::{headline, name, security_label, NetPage, MAC_POLICIES};
+use crate::network::{headline, manual_fields, name, security_label, NetPage, MAC_POLICIES};
+use atrium_netconf::Target;
+use pergola::text_edit::TextEdit;
 
 fn em(pt: f32) -> f32 {
     pergola::theme::size::em(pt)
@@ -55,6 +57,10 @@ pub struct CuriaView {
     pub bt_scroll: Mutable<ScrollState>,
     /// The code a device being paired shows, typed here.
     pub bt_code: Mutable<pergola::text_edit::TextEdit>,
+    /// The IP settings row's address, router and DNS fields, then the DNS
+    /// servers row's field.
+    pub net_fields: [Mutable<TextEdit>; 4],
+    pub net_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
@@ -324,24 +330,44 @@ impl CuriaView {
             y += em(36.0);
         }
         if p.show_details {
-            for i in &p.ifaces {
-                let line = format!(
-                    "{}{}: {} · {} · router {} · DNS {}{}",
-                    i.name,
-                    if i.wifi { " (Wi-Fi)" } else { "" },
-                    i.link,
-                    i.addr.clone().unwrap_or_else(|| "no address".into()),
-                    i.router.clone().unwrap_or_else(|| "none".into()),
-                    if i.dns.is_empty() { "none".to_string() } else { i.dns.join(", ") },
-                    if i.egress { " · default route" } else { "" }
-                );
-                text(ctx, x0 + em(12.0), y + em(10.0), &line, type_size::SM, Weight::Regular, t.text_secondary());
-                y += em(22.0);
-                if !i.addrs6.is_empty() {
-                    text(ctx, x0 + em(24.0), y + em(10.0), &format!("IPv6 {}", i.addrs6.join(", ")), type_size::SM, Weight::Regular, t.text_tertiary());
+            // Interfaces, IP settings and DNS servers scroll: the rows that
+            // open to type in can run past the window's foot.
+            let top = y;
+            let foot = if p.notice.is_some() { em(52.0) } else { em(8.0) };
+            let content = pergola::view::Draw(|ctx: &mut Ctx| {
+                let t = ctx.theme;
+                let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+                ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+                let mut y = em(4.0);
+                for i in &p.ifaces {
+                    let line = format!(
+                        "{}{}: {} · {} · router {} · DNS {}{}",
+                        i.name,
+                        if i.wifi { " (Wi-Fi)" } else { "" },
+                        i.link,
+                        i.addr.clone().unwrap_or_else(|| "no address".into()),
+                        i.router.clone().unwrap_or_else(|| "none".into()),
+                        if i.dns.is_empty() { "none".to_string() } else { i.dns.join(", ") },
+                        if i.egress { " · default route" } else { "" }
+                    );
+                    text(ctx, em(12.0), y + em(10.0), &line, type_size::SM, Weight::Regular, t.text_secondary());
                     y += em(22.0);
+                    if !i.addrs6.is_empty() {
+                        text(ctx, em(24.0), y + em(10.0), &format!("IPv6 {}", i.addrs6.join(", ")), type_size::SM, Weight::Regular, t.text_tertiary());
+                        y += em(22.0);
+                    }
                 }
-            }
+                y += em(12.0);
+                y = self.ip_settings(ctx, &p, 0.0, pw, y) + em(8.0);
+                if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                    rect.size.h = y;
+                }
+                ctx.pop();
+            });
+            ScrollView::new(self.net_scroll.clone(), Rect::new(x0, top, pw, (h - top - foot).max(em(60.0))), content)
+                .key(96)
+                .backdrop(t.bg_canvas())
+                .emit(ctx);
         }
 
         // The last outcome, at the foot.
@@ -354,6 +380,114 @@ impl CuriaView {
 }
 
 impl CuriaView {
+    /// IP settings (curia.md §3): a fixed address for each saved network
+    /// and wired port, and the machine's own DNS servers. Under "Show
+    /// details", as most people never need them.
+    fn ip_settings(&self, ctx: &mut Ctx, p: &NetPage, x0: f32, pw: f32, mut y: f32) -> f32 {
+        let t = ctx.theme;
+        text(ctx, x0, y + em(10.0), "IP settings", type_size::SM, Weight::Semibold, t.text_secondary());
+        y += em(28.0);
+        let mut targets: Vec<(Target, String)> = p.profiles.iter().take(6).map(|pr| (Target::Wifi(pr.ssid.clone()), format!("{} (Wi-Fi)", name(&pr.ssid)))).collect();
+        targets.extend(p.ifaces.iter().filter(|i| !i.wifi).map(|i| (Target::Wired(i.name.clone()), format!("{} (Ethernet)", i.name))));
+        let rh = em(36.0);
+        for (tg, label) in targets {
+            let m = p.manual_of(&tg).cloned();
+            text(ctx, x0 + em(12.0), y + rh / 2.0, &label, type_size::SM, Weight::Medium, t.text_primary());
+            let now = match &m {
+                Some(m) => format!("Fixed: {}/{}", m.addr, m.prefix),
+                None => "Automatic (DHCP)".to_string(),
+            };
+            text(ctx, x0 + em(220.0), y + rh / 2.0, &now, type_size::SM, Weight::Regular, t.text_secondary());
+            let open = p.ip_editing.as_ref() == Some(&tg);
+            let label = if open { "Close" } else { "Change" };
+            let bw = width(label, type_size::SM, Weight::Medium) + em(24.0);
+            let (pg, f, vals, tg2) = (self.page.clone(), self.net_fields.clone(), manual_fields(m.as_ref()), tg.clone());
+            button(ctx, x0 + pw - bw, y + (rh - em(30.0)) / 2.0, label, Look::Ghost, true, move || {
+                for (i, v) in vals.iter().enumerate() {
+                    f[i].set(TextEdit::new(v));
+                }
+                with(&pg, |p| p.edit_ip(tg2.clone()));
+            });
+            y += rh;
+            if open {
+                let fx = x0 + em(24.0);
+                let fy = y + em(2.0);
+                let widths = [em(170.0), em(130.0), em(190.0)];
+                let holders = ["Address, e.g. 192.168.1.20/24", "Router", "DNS servers (optional)"];
+                let mut x = fx;
+                for i in 0..3 {
+                    let (pg, f) = (self.page.clone(), self.net_fields.clone());
+                    pergola::widgets::TextField::new(self.net_fields[i].clone())
+                        .placeholder(holders[i])
+                        .autofocus(i == 0)
+                        .at(x, fy)
+                        .width(widths[i])
+                        .on_submit(move |_| {
+                            let v: Vec<String> = f.iter().take(3).map(|s| s.get_cloned().text().to_string()).collect();
+                            with(&pg, |p| p.save_ip(false, &v[0], &v[1], &v[2]));
+                        })
+                        .render(ctx);
+                    x += widths[i] + em(8.0);
+                }
+                let by = fy + em(40.0);
+                let (pg, f) = (self.page.clone(), self.net_fields.clone());
+                let mut bx = fx;
+                bx += button(ctx, bx, by, "Use this address", Look::Primary, true, move || {
+                    let v: Vec<String> = f.iter().take(3).map(|s| s.get_cloned().text().to_string()).collect();
+                    with(&pg, |p| p.save_ip(false, &v[0], &v[1], &v[2]));
+                }) + em(8.0);
+                let pg = self.page.clone();
+                bx += button(ctx, bx, by, "Automatic", Look::Secondary, m.is_some(), move || with(&pg, |p| p.save_ip(true, "", "", ""))) + em(8.0);
+                let pg = self.page.clone();
+                button(ctx, bx, by, "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_edit));
+                y = by + em(38.0);
+                if let Some(e) = &p.edit_error {
+                    text(ctx, fx, y + em(6.0), e, type_size::XS, Weight::Regular, t.danger_fg());
+                    y += em(22.0);
+                }
+            }
+        }
+        // The machine's own DNS servers.
+        let now = if p.own_dns.is_empty() { "Each network's own".to_string() } else { p.own_dns.join(", ") };
+        text(ctx, x0 + em(12.0), y + rh / 2.0, "DNS servers", type_size::SM, Weight::Medium, t.text_primary());
+        text(ctx, x0 + em(220.0), y + rh / 2.0, &now, type_size::SM, Weight::Regular, t.text_secondary());
+        let label = if p.dns_editing { "Close" } else { "Change" };
+        let bw = width(label, type_size::SM, Weight::Medium) + em(24.0);
+        let (pg, f, cur) = (self.page.clone(), self.net_fields[3].clone(), p.own_dns.join(", "));
+        button(ctx, x0 + pw - bw, y + (rh - em(30.0)) / 2.0, label, Look::Ghost, true, move || {
+            f.set(TextEdit::new(&cur));
+            with(&pg, NetPage::edit_dns);
+        });
+        y += rh;
+        if p.dns_editing {
+            let fx = x0 + em(24.0);
+            let fy = y + em(2.0);
+            let fw = em(300.0);
+            let pg = self.page.clone();
+            pergola::widgets::TextField::new(self.net_fields[3].clone())
+                .placeholder("e.g. 9.9.9.9, 2620:fe::fe (empty: each network's)")
+                .autofocus(true)
+                .at(fx, fy)
+                .width(fw)
+                .on_submit(move |v| with(&pg, |p| p.save_dns(v)))
+                .render(ctx);
+            let (pg, f) = (self.page.clone(), self.net_fields[3].clone());
+            let bx = fx + fw + em(8.0);
+            let sw = button(ctx, bx, fy + em(1.0), "Save", Look::Primary, true, move || {
+                let v = f.get_cloned().text().to_string();
+                with(&pg, |p| p.save_dns(&v));
+            });
+            let pg = self.page.clone();
+            button(ctx, bx + sw + em(8.0), fy + em(1.0), "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_edit));
+            y = fy + em(40.0);
+            if let Some(e) = &p.edit_error {
+                text(ctx, fx, y + em(6.0), e, type_size::XS, Weight::Regular, t.danger_fg());
+                y += em(22.0);
+            }
+        }
+        y
+    }
+
     /// The Devices page (curia.md §3a): what dispensatord decided for each
     /// device. Read-only.
     fn devices(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
@@ -1128,10 +1262,10 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
-        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false, manual: None }])));
         p.apply(Got::Nearby(Ok(vec![Nearby { ssid: b"home".to_vec(), security: "wpa2".into(), bars: 3, known: true }, Nearby { ssid: b"cafe".to_vec(), security: "wpa3".into(), bars: 2, known: false }])));
         p.pick(b"cafe");
         v.page.set(p);
@@ -1146,11 +1280,33 @@ mod tests {
     }
 
     #[test]
+    fn details_show_ip_settings_and_dns_servers() {
+        use atrium_netconf::{Iface, Manual};
+        let mut p = NetPage::new();
+        p.take_wants();
+        p.apply(Got::Status(Some(Status { link: Link::Wired, online: Online::Yes, metered: false, bars: None, ssid: None, portal: None })));
+        let m = Manual { addr: "10.0.0.5".parse().unwrap(), prefix: 24, router: Some("10.0.0.1".parse().unwrap()), dns: vec![] };
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: Some(m) }])));
+        let em0 = Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: Some("192.168.1.9/24".into()), router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::Yes, metered: false, egress: true, manual: None };
+        p.apply(Got::Details(Ok(vec![em0])));
+        p.apply(Got::OwnDns(Ok(vec!["9.9.9.9".into()])));
+        p.toggle_details();
+        p.edit_ip(atrium_netconf::Target::Wired("em0".into()));
+        p.edit_error = Some("\"10.0.0.300\" is not an IPv4 address".into());
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let all = texts(&v);
+        for want in ["IP settings", "home (Wi-Fi)", "Fixed: 10.0.0.5/24", "em0 (Ethernet)", "Automatic (DHCP)", "Use this address", "Automatic", "Close", "DNS servers", "9.9.9.9", "\"10.0.0.300\" is not an IPv4 address"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
+    }
+
+    #[test]
     fn the_display_page_shows_appearance_text_size_and_monitors() {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -1169,7 +1325,7 @@ mod tests {
     fn the_sound_page_shows_volume_outputs_and_apps() {
         use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
         with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
@@ -1189,7 +1345,7 @@ mod tests {
         use crate::apps::Got;
         use portcullis_ipc::{AccessBy, AccessEntry};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
@@ -1214,7 +1370,7 @@ mod tests {
     fn the_bluetooth_page_shows_the_prompt_paired_and_nearby() {
         use vinculum_control::{Addr, DeviceInfo, Event};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking vinculumd for Bluetooth…"));
         with_bt(&v.bt, |p| p.lost("vinculumd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "vinculumd is not running; trying again"));
@@ -1238,7 +1394,7 @@ mod tests {
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

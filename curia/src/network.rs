@@ -3,7 +3,8 @@
 //! the requests the page wants made. `main.rs` makes them on a thread and
 //! feeds the answers back with [`NetPage::apply`].
 
-use atrium_netconf::{Iface, Link, Nearby, Online, Profile, Status};
+use atrium_netconf::{check_dns, Iface, Link, Manual, Nearby, Online, Profile, SetStatic, Status, Target};
+use std::net::{IpAddr, Ipv4Addr};
 
 /// A request to atrium-netconf.
 #[derive(Clone, PartialEq, Eq)]
@@ -19,6 +20,12 @@ pub enum Want {
     Leave,
     Forget(Vec<u8>),
     Save(Profile),
+    /// The default route and the machine's own DNS servers.
+    Routes,
+    /// A fixed address for a saved network or a wired port, or None: DHCP.
+    SetStatic(SetStatic),
+    /// The machine's own DNS servers; empty: each network's.
+    SetDns(Vec<IpAddr>),
 }
 
 impl std::fmt::Debug for Want {
@@ -32,6 +39,9 @@ impl std::fmt::Debug for Want {
             Want::Profiles => write!(f, "Profiles"),
             Want::Details => write!(f, "Details"),
             Want::Leave => write!(f, "Leave"),
+            Want::Routes => write!(f, "Routes"),
+            Want::SetStatic(s) => write!(f, "SetStatic({:?})", s.target),
+            Want::SetDns(v) => write!(f, "SetDns({v:?})"),
         }
     }
 }
@@ -43,6 +53,8 @@ pub enum Got {
     Nearby(Result<Vec<Nearby>, String>),
     Profiles(Result<Vec<Profile>, String>),
     Details(Result<Vec<Iface>, String>),
+    /// The machine's own DNS servers (from the routes).
+    OwnDns(Result<Vec<String>, String>),
     /// A join, leave, forget or save finished.
     Done { what: Want, result: Result<(), String> },
 }
@@ -81,6 +93,58 @@ pub struct NetPage {
     pub confirm_forget: Option<Vec<u8>>,
     pub notice: Option<Notice>,
     pub wants: Vec<Want>,
+    /// The machine's own DNS servers (empty: each network's).
+    pub own_dns: Vec<String>,
+    /// The IP settings row that is open: a saved network or a wired port.
+    pub ip_editing: Option<Target>,
+    /// The DNS servers row is open.
+    pub dns_editing: bool,
+    /// What is wrong with what was typed on the open row.
+    pub edit_error: Option<String>,
+}
+
+/// What the IP settings row shows for a setting: ("10.0.0.5/24",
+/// "10.0.0.1", "1.1.1.1, 9.9.9.9"), empty when automatic.
+pub fn manual_fields(m: Option<&Manual>) -> [String; 3] {
+    match m {
+        None => Default::default(),
+        Some(m) => [
+            format!("{}/{}", m.addr, m.prefix),
+            m.router.map(|r| r.to_string()).unwrap_or_default(),
+            m.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),
+        ],
+    }
+}
+
+fn list<T: std::str::FromStr>(s: &str, what: &str) -> Result<Vec<T>, String> {
+    s.split([',', ' ']).filter(|x| !x.is_empty()).map(|x| x.parse().map_err(|_| format!("{x:?} is not {what}"))).collect()
+}
+
+/// What was typed on the IP settings row, as a fixed setting. The address
+/// may leave out the prefix ("/24" is assumed, as most home networks are).
+pub fn parse_manual(addr: &str, router: &str, dns: &str) -> Result<Manual, String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err("type an address, such as 192.168.1.20/24".into());
+    }
+    let (a, p) = addr.split_once('/').unwrap_or((addr, "24"));
+    let addr: Ipv4Addr = a.trim().parse().map_err(|_| format!("{a:?} is not an IPv4 address"))?;
+    let prefix: u8 = p.trim().parse().map_err(|_| format!("/{p} is not a prefix length"))?;
+    let router = match router.trim() {
+        "" => None,
+        r => Some(r.parse().map_err(|_| format!("{r:?} is not an IPv4 address"))?),
+    };
+    let dns = list(dns, "an IPv4 address")?;
+    let m = Manual { addr, prefix, router, dns };
+    m.check().map_err(|f| f.1)?;
+    Ok(m)
+}
+
+/// What was typed on the DNS servers row (IPv4 or IPv6, up to 3).
+pub fn parse_dns(s: &str) -> Result<Vec<IpAddr>, String> {
+    let v = list(s, "an IP address")?;
+    check_dns(&v).map_err(|f| f.1)?;
+    Ok(v)
 }
 
 /// How long a press on Join waits for Arca's handle.
@@ -266,7 +330,67 @@ impl NetPage {
         self.show_details = !self.show_details;
         if self.show_details {
             self.wants.push(Want::Details);
+            self.wants.push(Want::Routes);
         }
+    }
+
+    /// The setting a target has now (a saved network's, a wired port's).
+    pub fn manual_of(&self, t: &Target) -> Option<&Manual> {
+        match t {
+            Target::Wifi(s) => self.profiles.iter().find(|p| &p.ssid == s)?.manual.as_ref(),
+            Target::Wired(n) => self.ifaces.iter().find(|i| &i.name == n && !i.wifi)?.manual.as_ref(),
+        }
+    }
+
+    /// Open (or close) the IP settings row for a target.
+    pub fn edit_ip(&mut self, t: Target) {
+        self.dns_editing = false;
+        self.edit_error = None;
+        self.ip_editing = if self.ip_editing.as_ref() == Some(&t) { None } else { Some(t) };
+    }
+
+    /// Save pressed on the IP settings row: a fixed setting, or with
+    /// `automatic`, DHCP again.
+    pub fn save_ip(&mut self, automatic: bool, addr: &str, router: &str, dns: &str) {
+        let Some(target) = self.ip_editing.clone() else { return };
+        let manual = if automatic {
+            None
+        } else {
+            match parse_manual(addr, router, dns) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    self.edit_error = Some(e);
+                    return;
+                }
+            }
+        };
+        self.edit_error = None;
+        self.ip_editing = None;
+        self.wants.push(Want::SetStatic(SetStatic { target, manual }));
+    }
+
+    pub fn edit_dns(&mut self) {
+        self.ip_editing = None;
+        self.edit_error = None;
+        self.dns_editing = !self.dns_editing;
+    }
+
+    /// Save pressed on the DNS servers row; empty: each network's again.
+    pub fn save_dns(&mut self, typed: &str) {
+        match parse_dns(typed) {
+            Ok(v) => {
+                self.edit_error = None;
+                self.dns_editing = false;
+                self.wants.push(Want::SetDns(v));
+            }
+            Err(e) => self.edit_error = Some(e),
+        }
+    }
+
+    pub fn cancel_edit(&mut self) {
+        self.ip_editing = None;
+        self.dns_editing = false;
+        self.edit_error = None;
     }
 
     pub fn apply(&mut self, g: Got) {
@@ -292,6 +416,8 @@ impl NetPage {
             Got::Profiles(Err(_)) => {}
             Got::Details(Ok(v)) => self.ifaces = v,
             Got::Details(Err(_)) => {}
+            Got::OwnDns(Ok(v)) => self.own_dns = v,
+            Got::OwnDns(Err(_)) => {}
             Got::Done { what, result } => {
                 match (&what, &result) {
                     (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. }, Ok(())) => {
@@ -314,6 +440,25 @@ impl NetPage {
                         self.notice = Some(Notice { text: format!("Could not join {}: {why}", name(ssid)), error: true });
                     }
                     (Want::Forget(ssid), Ok(())) => self.notice = Some(Notice { text: format!("Forgot {}", name(ssid)), error: false }),
+                    (Want::SetStatic(s), r) => {
+                        let what = match &s.target {
+                            Target::Wifi(n) => name(n),
+                            Target::Wired(n) => n.clone(),
+                        };
+                        self.notice = Some(match (r, &s.manual) {
+                            (Ok(()), Some(m)) => Notice { text: format!("{what} uses {}/{}", m.addr, m.prefix), error: false },
+                            (Ok(()), None) => Notice { text: format!("{what} gets its address automatically"), error: false },
+                            (Err(e), _) => Notice { text: format!("Could not change {what}: {}", e.replace('-', " ")), error: true },
+                        });
+                        self.wants.push(Want::Details);
+                    }
+                    (Want::SetDns(v), Ok(())) => {
+                        self.notice = Some(Notice {
+                            text: if v.is_empty() { "DNS servers: each network's own".into() } else { format!("DNS servers: {}", v.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")) },
+                            error: false,
+                        });
+                        self.wants.push(Want::Routes);
+                    }
                     (_, Err(e)) => self.notice = Some(Notice { text: format!("Did not work: {e}"), error: true }),
                     _ => {}
                 }
@@ -337,7 +482,7 @@ mod tests {
     }
 
     fn prof(s: &str) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }
     }
 
     fn page() -> NetPage {
@@ -403,6 +548,49 @@ mod tests {
         let Want::Save(last) = w.last().unwrap() else { panic!() };
         assert_eq!((last.auto, last.prio, last.mac.as_str()), (false, 5, "random"));
         assert_eq!(w.len(), 3);
+    }
+
+    #[test]
+    fn ip_settings_parse_check_and_send() {
+        let m = parse_manual("192.168.1.20", "192.168.1.1", "1.1.1.1, 9.9.9.9").unwrap();
+        assert_eq!((m.prefix, m.router, m.dns.len()), (24, Some("192.168.1.1".parse().unwrap()), 2), "/24 assumed");
+        assert_eq!(manual_fields(Some(&m)), ["192.168.1.20/24".to_string(), "192.168.1.1".into(), "1.1.1.1, 9.9.9.9".into()]);
+        assert!(parse_manual("", "", "").is_err());
+        assert!(parse_manual("192.168.1.0/24", "", "").is_err(), "the network's own address");
+        assert!(parse_manual("192.168.1.20/24", "10.0.0.1", "").is_err(), "router outside");
+        assert!(parse_manual("192.168.1.20/33", "", "").is_err());
+        assert!(parse_manual("fe80::1/64", "", "").is_err(), "IPv4 only");
+        assert!(parse_dns("").unwrap().is_empty(), "empty: each network's");
+        assert_eq!(parse_dns("9.9.9.9 2620:fe::fe").unwrap().len(), 2);
+        assert!(parse_dns("127.0.0.1").is_err());
+        assert!(parse_dns("1.1.1.1,1.0.0.1,9.9.9.9,8.8.8.8").is_err(), "at most 3");
+
+        let mut p = page();
+        p.take_wants();
+        p.edit_ip(Target::Wifi(b"office".to_vec()));
+        p.save_ip(false, "10.0.0.300", "", "");
+        assert!(p.edit_error.is_some() && p.ip_editing.is_some() && p.take_wants().is_empty(), "a typo keeps the row open");
+        p.save_ip(false, "10.0.0.5/24", "10.0.0.1", "");
+        assert_eq!(p.ip_editing, None);
+        let w = p.take_wants();
+        assert!(matches!(&w[..], [Want::SetStatic(SetStatic { target: Target::Wifi(s), manual: Some(m) })] if s == b"office" && m.addr == Ipv4Addr::new(10, 0, 0, 5)));
+        p.apply(Got::Done { what: w[0].clone(), result: Ok(()) });
+        assert_eq!(p.notice.as_ref().unwrap().text, "office uses 10.0.0.5/24");
+        assert!(p.take_wants().contains(&Want::Details));
+        p.edit_ip(Target::Wired("em0".into()));
+        p.save_ip(true, "junk", "", "");
+        assert_eq!(p.take_wants(), vec![Want::SetStatic(SetStatic { target: Target::Wired("em0".into()), manual: None })], "automatic ignores the fields");
+
+        p.edit_dns();
+        p.save_dns("9.9.9.9");
+        let w = p.take_wants();
+        assert_eq!(w, vec![Want::SetDns(vec!["9.9.9.9".parse().unwrap()])]);
+        p.apply(Got::Done { what: w[0].clone(), result: Ok(()) });
+        assert!(p.take_wants().contains(&Want::Routes));
+        p.apply(Got::OwnDns(Ok(vec!["9.9.9.9".into()])));
+        assert_eq!(p.own_dns, vec!["9.9.9.9".to_string()]);
+        p.apply(Got::Done { what: Want::SetDns(vec![]), result: Err("not-allowed".into()) });
+        assert!(p.notice.as_ref().unwrap().error);
     }
 
     #[test]

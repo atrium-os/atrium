@@ -17,7 +17,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atrium_netconf::server::{serve, Backend};
-use atrium_netconf::{lines, status, Fail, Grant, Iface, Join, Nearby, Profile, Res, Routes, Status};
+use atrium_netconf::{lines, status, Fail, Grant, Iface, Join, Nearby, Profile, Res, Routes, SetStatic, Status, Target};
 use aura_ipc::{Got, Line, Reader};
 
 fn die(s: &str) -> ! {
@@ -273,6 +273,27 @@ impl Backend for Front {
 
     fn set_country(&self, cc: String) -> Res<()> {
         self.call(&Line::new("country").with("cc", cc)).map(|_| ())
+    }
+
+    fn set_static(&self, s: SetStatic) -> Res<()> {
+        let l = match &s.target {
+            Target::Wifi(ssid) => Line::new("static").with_hex("ssid", ssid),
+            Target::Wired(n) => Line::new("static").with("iface", n),
+        };
+        let l = match &s.manual {
+            Some(m) => lines::with_manual(l, m),
+            None => l,
+        };
+        self.log(&format!("static {:?} {}", s.target, if s.manual.is_some() { "fixed" } else { "dhcp" }));
+        self.call(&l).map(|_| ())
+    }
+
+    fn set_dns(&self, servers: Vec<std::net::IpAddr>) -> Res<()> {
+        let mut l = Line::new("dns");
+        if !servers.is_empty() {
+            l = l.with("servers", servers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+        }
+        self.call(&l).map(|_| ())
     }
 }
 

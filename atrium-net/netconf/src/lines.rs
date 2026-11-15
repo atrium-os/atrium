@@ -3,7 +3,35 @@
 
 use aura_ipc::Line;
 
-use crate::{bars, Iface, Link, Nearby, Online, Profile, Routes, Status};
+use crate::{bars, Iface, Link, Manual, Nearby, Online, Profile, Routes, Status};
+
+/// A fixed setting's fields on a line: `maddr=a.b.c.d/p [mrouter=..]
+/// [mdns=a,b]`.
+pub fn manual(l: &Line) -> Option<Manual> {
+    let (a, p) = l.get("maddr")?.split_once('/')?;
+    let m = Manual {
+        addr: a.parse().ok()?,
+        prefix: p.parse().ok()?,
+        router: match l.get("mrouter") {
+            Some(r) => Some(r.parse().ok()?),
+            None => None,
+        },
+        dns: list(l, "mdns").iter().map(|d| d.parse().ok()).collect::<Option<_>>()?,
+    };
+    m.check().ok()?;
+    Some(m)
+}
+
+pub fn with_manual(mut l: Line, m: &Manual) -> Line {
+    l = l.with("maddr", format!("{}/{}", m.addr, m.prefix));
+    if let Some(r) = m.router {
+        l = l.with("mrouter", r);
+    }
+    if !m.dns.is_empty() {
+        l = l.with("mdns", m.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+    }
+    l
+}
 
 fn list(l: &Line, k: &str) -> Vec<String> {
     l.get(k).map(|v| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect()).unwrap_or_default()
@@ -37,6 +65,7 @@ pub fn iface(l: &Line) -> Option<Iface> {
         online: online(l.get("internet")),
         metered: l.get("metered") == Some("1"),
         egress: l.get("egress") == Some("1"),
+        manual: manual(l),
     })
 }
 
@@ -60,7 +89,8 @@ pub fn status(lines: &[Line], rssi: Option<i32>) -> Status {
 
 pub fn routes(lines: &[Line]) -> Routes {
     let e = lines.iter().filter_map(iface).find(|i| i.egress);
-    Routes { default4: e.and_then(|i| Some((i.name.clone(), i.router.clone()?))) }
+    let own_dns = lines.iter().find(|l| l.verb == "dns").map(|l| list(l, "own")).unwrap_or_default();
+    Routes { default4: e.and_then(|i| Some((i.name.clone(), i.router.clone()?))), own_dns }
 }
 
 /// A `net` line of `wifi-list`.
@@ -76,6 +106,7 @@ pub fn profile(l: &Line) -> Option<Profile> {
         auto: l.get("auto") != Some("0"),
         prio: l.num("prio").unwrap_or(0),
         metered: l.get("metered") == Some("1"),
+        manual: manual(l),
     })
 }
 

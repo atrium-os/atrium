@@ -312,16 +312,42 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
         "status" => c.status().map(|s| println!("{}", show(&s))),
         "interfaces" => c.interfaces().map(|v| {
             for i in v {
-                println!("iface name={} wifi={} link={} addr={} router={} online={:?} egress={}", i.name, i.wifi as u8, i.link, i.addr.unwrap_or_default(), i.router.unwrap_or_default(), i.online, i.egress as u8);
+                println!(
+                    "iface name={} wifi={} link={} addr={} router={} dns={} online={:?} egress={}{}",
+                    i.name,
+                    i.wifi as u8,
+                    i.link,
+                    i.addr.unwrap_or_default(),
+                    i.router.unwrap_or_default(),
+                    i.dns.join(","),
+                    i.online,
+                    i.egress as u8,
+                    if i.manual.is_some() { " manual=1" } else { "" }
+                );
             }
         }),
-        "routes" => c.routes().map(|r| match r.default4 {
-            Some((i, gw)) => println!("default via {gw} on {i}"),
-            None => println!("no default route"),
+        "routes" => c.routes().map(|r| {
+            match r.default4 {
+                Some((i, gw)) => println!("default via {gw} on {i}"),
+                None => println!("no default route"),
+            }
+            if !r.own_dns.is_empty() {
+                println!("own dns {}", r.own_dns.join(","));
+            }
         }),
         "list" => c.profiles().map(|v| {
             for p in v {
-                println!("net ssid=\"{}\" open={} auto={} prio={} metered={} mac={} wpa3_only={}", name(&p.ssid), p.open as u8, p.auto as u8, p.prio, p.metered as u8, p.mac, p.wpa3_only as u8);
+                println!(
+                    "net ssid=\"{}\" open={} auto={} prio={} metered={} mac={} wpa3_only={}{}",
+                    name(&p.ssid),
+                    p.open as u8,
+                    p.auto as u8,
+                    p.prio,
+                    p.metered as u8,
+                    p.mac,
+                    p.wpa3_only as u8,
+                    p.manual.map(|m| format!(" manual={}/{}", m.addr, m.prefix)).unwrap_or_default()
+                );
             }
         }),
         "join" => {
@@ -342,7 +368,31 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
             }
         }),
         "country" => c.set_country(args.get(1).map(String::as_str).unwrap_or("")).map(|_| println!("ok")),
-        "static" => c.set_static().map(|_| println!("ok")),
+        // static wifi SSID|wired IFACE [ADDR/PREFIX [ROUTER [DNS,DNS]]]: no address is DHCP.
+        "static" => {
+            use atrium_netconf::{Manual, SetStatic, Target};
+            let what = args.get(2).cloned().unwrap_or_else(|| die("static wifi SSID|wired IFACE [ADDR/PREFIX [ROUTER [DNS,..]]]"));
+            let target = match args.get(1).map(String::as_str) {
+                Some("wifi") => Target::Wifi(what.into_bytes()),
+                Some("wired") => Target::Wired(what),
+                _ => die("static wifi SSID|wired IFACE ..."),
+            };
+            let manual = args.get(3).map(|a| {
+                let (ip, p) = a.split_once('/').unwrap_or_else(|| die("ADDR/PREFIX"));
+                Manual {
+                    addr: ip.parse().unwrap_or_else(|_| die("bad address")),
+                    prefix: p.parse().unwrap_or_else(|_| die("bad prefix")),
+                    router: args.get(4).filter(|r| *r != "-").map(|r| r.parse().unwrap_or_else(|_| die("bad router"))),
+                    dns: args.get(5).map(|d| d.split(',').map(|x| x.parse().unwrap_or_else(|_| die("bad DNS server"))).collect()).unwrap_or_default(),
+                }
+            });
+            c.set_static(&SetStatic { target, manual }).map(|_| println!("ok"))
+        }
+        // dns [A,B,C]: the machine's own DNS servers; none: each network's.
+        "dns" => {
+            let v: Vec<std::net::IpAddr> = args.get(1).map(|d| d.split(',').map(|x| x.parse().unwrap_or_else(|_| die("bad DNS server"))).collect()).unwrap_or_default();
+            c.set_dns(&v).map(|_| println!("ok"))
+        }
         "watch" => {
             let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             let mut ch = c.subscribe().unwrap_or_else(|f| refused(f));

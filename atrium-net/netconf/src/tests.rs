@@ -130,6 +130,14 @@ impl Backend for Fake {
         self.log.lock().unwrap().push(format!("country {cc}"));
         Ok(())
     }
+    fn set_static(&self, s: SetStatic) -> Res<()> {
+        self.log.lock().unwrap().push(format!("static {:?} {:?}", s.target, s.manual.map(|m| m.addr)));
+        Ok(())
+    }
+    fn set_dns(&self, v: Vec<std::net::IpAddr>) -> Res<()> {
+        self.log.lock().unwrap().push(format!("dns {v:?}"));
+        Ok(())
+    }
 }
 
 fn serve_all(dir: &Path, b: Arc<Fake>) {
@@ -188,8 +196,41 @@ fn over_sockets() {
     let mut conf = c(Grant::Configure);
     conf.set_country("DE").unwrap();
     assert_eq!(conf.set_country("D1").unwrap_err().0, status::MALFORMED);
-    assert_eq!(conf.set_static().unwrap_err().0, status::UNSUPPORTED);
-    assert_eq!(*fake.log.lock().unwrap(), vec!["join x", "join x", "country DE"]);
+    let m = Manual { addr: "10.0.0.5".parse().unwrap(), prefix: 24, router: Some("10.0.0.1".parse().unwrap()), dns: vec!["1.1.1.1".parse().unwrap()] };
+    let fixed = SetStatic { target: Target::Wifi(b"home".to_vec()), manual: Some(m.clone()) };
+    assert_eq!(wifi.set_static(&fixed).unwrap_err().0, status::NOT_ALLOWED, "network-configure only");
+    conf.set_static(&fixed).unwrap();
+    conf.set_static(&SetStatic { target: Target::Wired("vtnet1".into()), manual: None }).unwrap();
+    for bad in [
+        Manual { prefix: 31, ..m.clone() },
+        Manual { addr: "10.0.0.0".parse().unwrap(), ..m.clone() },
+        Manual { addr: "127.0.0.5".parse().unwrap(), ..m.clone() },
+        Manual { router: Some("10.0.1.1".parse().unwrap()), ..m.clone() },
+        Manual { router: Some("10.0.0.5".parse().unwrap()), ..m.clone() },
+        Manual { dns: vec!["1.1.1.1".parse().unwrap(); 4], ..m.clone() },
+    ] {
+        assert_eq!(conf.set_static(&SetStatic { target: Target::Wifi(b"home".to_vec()), manual: Some(bad.clone()) }).unwrap_err().0, status::MALFORMED, "{bad:?}");
+    }
+    assert_eq!(conf.set_static(&SetStatic { target: Target::Wired("../x".into()), manual: None }).unwrap_err().0, status::MALFORMED);
+    conf.set_dns(&["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()]).unwrap();
+    conf.set_dns(&[]).unwrap();
+    assert_eq!(conf.set_dns(&["127.0.0.1".parse().unwrap()]).unwrap_err().0, status::MALFORMED);
+    assert_eq!(
+        *fake.log.lock().unwrap(),
+        vec![
+            "join x",
+            "join x",
+            "country DE",
+            "static Wifi([104, 111, 109, 101]) Some(10.0.0.5)",
+            "static Wired(\"vtnet1\") None",
+            "dns [9.9.9.9, 2620:fe::fe]",
+            "dns []"
+        ]
+    );
+    // Fixed settings and own DNS servers read back from atrium-net's lines.
+    let l = lines::with_manual(Line::new("net").with_hex("ssid", b"home"), &m);
+    assert_eq!(lines::profile(&l).unwrap().manual, Some(m.clone()));
+    assert_eq!(lines::routes(&[parse("dns own=9.9.9.9,1.1.1.1")]).own_dns, vec!["9.9.9.9".to_string(), "1.1.1.1".into()]);
 
     // Subscribe: now, then only changes, names filtered by grant.
     let mut ch = c(Grant::Read).subscribe().unwrap();

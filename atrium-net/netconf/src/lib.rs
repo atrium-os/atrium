@@ -21,6 +21,7 @@
 //! change.
 
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr};
 
 pub use aqueduct::classes::CLASS_NETCONF as CLASS;
 
@@ -162,12 +163,89 @@ pub struct Iface {
     pub metered: bool,
     /// Carries the default route.
     pub egress: bool,
+    /// A fixed IPv4 setting in use instead of DHCP (a wired port's own,
+    /// or the Wi-Fi network's).
+    pub manual: Option<Manual>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Routes {
     /// The IPv4 default route: interface and router.
     pub default4: Option<(String, String)>,
+    /// The DNS servers set for the whole machine (`SET_DNS`); empty: each
+    /// network's own.
+    pub own_dns: Vec<String>,
+}
+
+/// A fixed IPv4 setting, used instead of DHCP.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manual {
+    pub addr: Ipv4Addr,
+    pub prefix: u8,
+    pub router: Option<Ipv4Addr>,
+    /// At most 3; empty: none from this setting.
+    pub dns: Vec<Ipv4Addr>,
+}
+
+fn unicast4(a: Ipv4Addr) -> bool {
+    let o = a.octets();
+    !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_broadcast() || a.is_link_local() || o[0] == 0 || o[0] >= 240)
+}
+
+impl Manual {
+    /// Sane on its own (atrium-net checks it again against the host, as
+    /// it does a DHCP lease).
+    pub fn check(&self) -> Res<()> {
+        let bad = |w: &str| Err(Fail::new(status::MALFORMED, w));
+        if !(8..=30).contains(&self.prefix) {
+            return bad("the prefix is 8 to 30");
+        }
+        if !unicast4(self.addr) {
+            return bad("not a usable address");
+        }
+        let m = u32::MAX << (32 - self.prefix);
+        let (a, net) = (u32::from(self.addr), u32::from(self.addr) & m);
+        if a == net || a == net | !m {
+            return bad("the address is the network's or its broadcast");
+        }
+        if let Some(r) = self.router {
+            if !unicast4(r) || u32::from(r) & m != net || r == self.addr {
+                return bad("the router must be another address in the same network");
+            }
+        }
+        if self.dns.len() > 3 || !self.dns.iter().all(|d| unicast4(*d)) {
+            return bad("at most 3 DNS servers, each a usable address");
+        }
+        Ok(())
+    }
+}
+
+/// What a fixed setting is for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    /// A saved Wi-Fi network (used whenever it is joined).
+    Wifi(Vec<u8>),
+    /// A wired port, by name.
+    Wired(String),
+}
+
+/// `SET_STATIC`: a fixed setting, or None to go back to DHCP.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetStatic {
+    pub target: Target,
+    pub manual: Option<Manual>,
+}
+
+/// DNS servers for `SET_DNS`: at most 3, unicast, not loopback.
+pub fn check_dns(v: &[IpAddr]) -> Res<()> {
+    let ok = |a: &IpAddr| match a {
+        IpAddr::V4(a) => unicast4(*a),
+        IpAddr::V6(a) => !(a.is_unspecified() || a.is_loopback() || a.is_multicast()),
+    };
+    if v.len() > 3 || !v.iter().all(ok) {
+        return Err(Fail::new(status::MALFORMED, "at most 3 DNS servers, each a usable address"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +259,9 @@ pub struct Profile {
     pub auto: bool,
     pub prio: i32,
     pub metered: bool,
+    /// A fixed IPv4 setting for this network (`SET_STATIC`); None: DHCP.
+    /// Not changed by `WIFI_SET_PROFILE`.
+    pub manual: Option<Manual>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +363,8 @@ pub mod server {
         fn set_profile(&self, p: Profile) -> Res<()>;
         fn nearby(&self) -> Res<Vec<Nearby>>;
         fn set_country(&self, cc: String) -> Res<()>;
+        fn set_static(&self, s: SetStatic) -> Res<()>;
+        fn set_dns(&self, servers: Vec<IpAddr>) -> Res<()>;
     }
 
     fn arg<T: for<'a> Deserialize<'a>>(p: &[u8]) -> Res<T> {
@@ -366,7 +449,23 @@ pub mod server {
                     }
                     b.set_country(cc)
                 })),
-                op::SET_STATIC | op::SET_DNS => enc::<()>(&Err(Fail::new(status::UNSUPPORTED, "not built yet"))),
+                op::SET_STATIC => enc(&arg::<SetStatic>(p).and_then(|s| {
+                    match &s.target {
+                        Target::Wifi(ssid) => valid_ssid(ssid)?,
+                        Target::Wired(n) if n.is_empty() || n.len() > 15 || !n.bytes().all(|c| c.is_ascii_alphanumeric()) => {
+                            return Err(Fail::new(status::MALFORMED, "not an interface name"));
+                        }
+                        Target::Wired(_) => {}
+                    }
+                    if let Some(m) = &s.manual {
+                        m.check()?;
+                    }
+                    b.set_static(s)
+                })),
+                op::SET_DNS => enc(&arg::<Vec<IpAddr>>(p).and_then(|v| {
+                    check_dns(&v)?;
+                    b.set_dns(v)
+                })),
                 _ => enc::<()>(&Err(Fail::new(status::MALFORMED, "unknown op"))),
             };
             conn.send_message(CLASS, o, flag::IS_RESPONSE, &reply)?;
@@ -453,8 +552,11 @@ pub mod client {
         pub fn set_country(&mut self, cc: &str) -> Res<()> {
             self.call(op::SET_COUNTRY, &cc.to_string())
         }
-        pub fn set_static(&mut self) -> Res<()> {
-            self.call(op::SET_STATIC, &())
+        pub fn set_static(&mut self, s: &SetStatic) -> Res<()> {
+            self.call(op::SET_STATIC, s)
+        }
+        pub fn set_dns(&mut self, servers: &[IpAddr]) -> Res<()> {
+            self.call(op::SET_DNS, &servers.to_vec())
         }
 
         /// Subscribe: the connection then carries only status events.

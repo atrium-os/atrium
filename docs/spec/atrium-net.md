@@ -185,6 +185,18 @@ DNS, lease times, MTU (clamped 1280–9000), classless static routes (RFC 3442, 
 like the router). Options sent: none that identify the machine. Static addresses are a
 profile setting applied directly by `atrium-net`.
 
+As built (2026-11-15): a fixed setting (`Manual`: address/prefix, optional router, up to 3
+DNS servers) belongs to a saved Wi-Fi network (stored with its profile, `maddr=`,
+`mrouter=`, `mdns=`) or to a wired port by name (the `settings` file in the state dir).
+`atrium-net` turns it into a lease of its own (no server, never expires) that goes
+through the same checks (§5.2) as a DHCP one, and atrium-lease is told `down` for that
+interface; DHCP answers are ignored while it applies. A refused fixed setting is logged
+and counted as a refusal; it is not sent back to DHCP silently. Changing the setting of
+the network in use applies it at once (fixed to fixed, DHCP to fixed, fixed back to
+DHCP with a fresh DISCOVER). `Manual::check` (in `atrium-netconf`) refuses a prefix
+outside 8–30, the network or broadcast address, a router outside the subnet or equal to
+the address.
+
 ### 5.2 Proposal checks (in atrium-net)
 
 A proposal is applied only if: the address is unicast and not in 0/8, 127/8, 169.254/16
@@ -231,7 +243,10 @@ As built (N2):
   DHCP/RA servers through `unbound-control` (no config rewrite, no restart).
 - `/etc/resolv.conf` is fixed: `nameserver 127.0.0.1`. Nothing else writes it.
 - A user setting can replace the network's servers (and later turn on DoT upstreams,
-  which unbound supports).
+  which unbound supports). As built (2026-11-15): `SetDns` (up to 3 unicast IPv4/IPv6
+  servers, not loopback) is kept in the state dir's `settings` file; while set, unbound
+  forwards to those alone, and an empty list goes back to each network's. `GetRoutes`
+  returns it as `own_dns`.
 - The Insula broker and Nuntius already resolve on the host; they now get the cache and
   validation for free.
 
@@ -445,8 +460,8 @@ VM from the Aura gates cover them.
   passphrase, so they are left to Settings. Manifest gains `network-read`,
   `network-wifi`, `wifi-nearby`.
 - Gate: `aura-sim-gate.sh n4` (RUNBOOK §13.6e).
-- Not yet: `SET_STATIC`/`SET_DNS` (answer unsupported), service manifests for
-  atrium-net and atrium-netconf.
+- Not yet: service manifests for atrium-net and atrium-netconf. (`SET_STATIC`/`SET_DNS`
+  built 2026-11-15, §5.1 and §6.)
 - Since (2026-11-14): the bar checked live under Forum (`aura-sim-gate.sh bar`, icon and
   menu frames); the Settings page is Curia's Network page ([curia.md](curia.md) §7).
   aura-mlme answers `scan` while connected with a scan on the association's address
