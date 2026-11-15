@@ -49,7 +49,9 @@ struct Open {
     window_id: u32,
     font: u32,
     state: State,
+    /// The window's size in points.
     size: (f32, f32),
+    scale: view::Scale,
     dirty: bool,
 }
 
@@ -88,11 +90,19 @@ impl Ctx {
 fn open(fresco: &str, msg: ToUi) -> std::io::Result<Open> {
     let ToUi::Show { key, sheet, devices } = msg else { unreachable!() };
     let mut win = Connection::connect(fresco)?;
-    let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), ..Default::default() };
-    let window_id = win.window_create(view::W as u32, view::H as u32, "Sigillum", hints)?;
+    // Sized from the system text size (resolution-independence.md §6).
+    let text = win.appearance().map(|a| a.text_scale()).unwrap_or(1.0);
+    let (w, h) = view::size(text);
+    let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some(pt(w, h)), ..Default::default() };
+    let window_id = win.window_create(w.ceil() as u32, h.ceil() as u32, "Sigillum", hints)?;
     win.set_default_window(window_id as u16);
     let font = win.font_open("system-sans").map(|f| f.font_id).unwrap_or(0);
-    Ok(Open { win, window_id, font, state: State::new(key, sheet, devices), size: (view::W, view::H), dirty: true })
+    let scale = view::Scale { k: win.window_scale(window_id), text };
+    Ok(Open { win, window_id, font, state: State::new(key, sheet, devices), size: (w, h), scale, dirty: true })
+}
+
+fn pt(w: f32, h: f32) -> (u32, u32) {
+    (w.ceil() as u32, h.ceil() as u32)
 }
 
 fn main() -> ExitCode {
@@ -185,8 +195,8 @@ fn main() -> ExitCode {
         let mut gone = false;
         loop {
             let ev = match o.win.poll_event() {
-                // It lays out in device pixels (resolution-independence.md §3).
-                Ok(Some(ev)) => o.win.in_device_px(ev),
+                // Laid out in points (resolution-independence.md §3).
+                Ok(Some(ev)) => ev,
                 Ok(None) => break,
                 Err(_) => {
                     gone = true;
@@ -194,8 +204,18 @@ fn main() -> ExitCode {
                 }
             };
             let dos = match ev {
-                Event::Resized { width, height, .. } => {
-                    o.size = (width as f32, height as f32);
+                Event::Resized { width, height, scale, .. } => {
+                    o.size = (width, height);
+                    if scale > 0.0 {
+                        o.scale.k = scale;
+                    }
+                    vec![Do::Redraw]
+                }
+                Event::Appearance(a) if a.text_scale() != o.scale.text => {
+                    o.scale.text = a.text_scale();
+                    let (w, h) = view::size(o.scale.text);
+                    let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some(pt(w, h)), ..Default::default() };
+                    let _ = o.win.window_set_hints(o.window_id, hints);
                     vec![Do::Redraw]
                 }
                 Event::Key { hid_usage, pressed: true, repeat, modifiers, activation, .. } => {
@@ -207,7 +227,7 @@ fn main() -> ExitCode {
                         o.state.key(k, activation)
                     }
                 }
-                Event::PointerButton { x, y, pressed: true, activation, .. } => match view::hit(&o.state, o.size.0, o.size.1, x, y) {
+                Event::PointerButton { x, y, pressed: true, activation, .. } => match view::hit(&o.state, o.size.0, o.size.1, o.scale.text, x, y) {
                     Some(i) => o.state.click(i, activation),
                     None => Vec::new(),
                 },
@@ -227,7 +247,7 @@ fn main() -> ExitCode {
         }
         if o.dirty {
             o.dirty = false;
-            if let Err(e) = view::draw(&mut o.win, o.font, &o.state, o.size.0, o.size.1) {
+            if let Err(e) = view::draw(&mut o.win, o.font, &o.state, o.size.0, o.size.1, o.scale) {
                 eprintln!("sigillum-ui: draw: {e}");
             }
         }

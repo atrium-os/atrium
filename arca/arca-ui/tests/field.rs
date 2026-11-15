@@ -124,10 +124,24 @@ fn unconfigured_fields_offer_nothing_and_the_chip_hit_test_matches_the_layout() 
     f.focus(true);
     assert_eq!(f.chip(), None);
     let f = sign_in();
-    let l = view::layout(&f, 240.0, 36.0);
+    let l = view::layout(&f, 240.0, 36.0, 1.0);
     let c = l.chip.unwrap();
     assert!(c.contains(c.x + 1.0, 18.0) && !c.contains(c.x - 1.0, 18.0));
     assert!(c.x + c.w <= 240.0 && l.bullets_max > 0);
+}
+
+#[test]
+fn a_larger_text_size_fits_fewer_bullets_in_the_same_slot() {
+    // A narrow slot: the chip takes its minimum width, which grows with text.
+    let mut f = Field::new().unwrap();
+    f.focus(true);
+    let one = view::layout(&f, 400.0, 36.0, 1.0);
+    let two = view::layout(&f, 400.0, 36.0, 2.0);
+    assert!(two.bullets_max < one.bullets_max && two.bullets_max > 0, "{} vs {}", two.bullets_max, one.bullets_max);
+    let f = sign_in();
+    let a = view::layout(&f, 160.0, 36.0, 1.0).chip.unwrap();
+    let b = view::layout(&f, 160.0, 36.0, 2.0).chip.unwrap();
+    assert!(b.w >= a.w && b.x + b.w <= 160.0);
 }
 
 // ── arcad over a socket ──────────────────────────────────────────────

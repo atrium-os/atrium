@@ -63,6 +63,8 @@ struct Drawn {
     visible: bool,
     playing: bool,
     size: (u32, u32),
+    /// The window's scale in thousandths.
+    scale_milli: u32,
     /// In tenths of a pixel, so tiny moves don't redraw.
     played: i32,
     ranges: Vec<(i32, i32)>,
@@ -71,7 +73,11 @@ struct Drawn {
 }
 
 pub struct Controls {
-    pub size: (u32, u32),
+    /// The window's size in points: the controls lay out in points and
+    /// draw in device pixels at `scale` (resolution-independence.md §3).
+    pub size: (f32, f32),
+    /// Device px per pt.
+    pub scale: f32,
     pub playing: bool,
     pub duration_s: f64,
     pub position_s: f64,
@@ -161,7 +167,7 @@ impl Text {
 
 impl Controls {
     pub fn new(size: (u32, u32)) -> Self {
-        Controls { size, playing: false, duration_s: 0.0, position_s: 0.0, buffered: Vec::new(), subtitles: Vec::new(), pip_button: false, shown_until: Instant::now() + IDLE_HIDE, drawn: None, text: None }
+        Controls { size: (size.0 as f32, size.1 as f32), scale: 1.0, playing: false, duration_s: 0.0, position_s: 0.0, buffered: Vec::new(), subtitles: Vec::new(), pip_button: false, shown_until: Instant::now() + IDLE_HIDE, drawn: None, text: None }
     }
 
     /// Pointer motion or a key: show for a while.
@@ -176,8 +182,8 @@ impl Controls {
     fn track(&self) -> (f32, f32, f32) {
         let x0 = BUTTON_W + PAD / 2.0;
         let right = if self.pip_button { BUTTON_W } else { 0.0 };
-        let x1 = (self.size.0 as f32 - PAD - right).max(x0 + 1.0);
-        (x0, x1, self.size.1 as f32 - BAR_H / 2.0)
+        let x1 = (self.size.0 - PAD - right).max(x0 + 1.0);
+        (x0, x1, self.size.1 - BAR_H / 2.0)
     }
 
     fn x_of(&self, secs: f64) -> f32 {
@@ -190,7 +196,7 @@ impl Controls {
     pub fn press(&mut self, x: f32, y: f32) -> Option<Action> {
         let was_visible = self.visible();
         self.poke();
-        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let (w, h) = self.size;
         if !(0.0..w).contains(&x) || !(0.0..h).contains(&y) {
             return None;
         }
@@ -252,16 +258,18 @@ impl Controls {
         ranges.truncate(RANGES_MAX);
         let mut subtitles = self.subtitles.iter().flat_map(|s| s.lines()).map(str::to_string).collect::<Vec<_>>();
         subtitles.truncate(SUB_LINES);
-        Drawn { visible: self.visible(), playing: self.playing, size: self.size, played: (self.x_of(self.position_s) * 10.0) as i32, ranges, subtitles, pip_button: self.pip_button }
+        Drawn { visible: self.visible(), playing: self.playing, size: (self.size.0.round() as u32, self.size.1.round() as u32), scale_milli: (self.scale * 1000.0).round() as u32, played: (self.x_of(self.position_s) * 10.0) as i32, ranges, subtitles, pip_button: self.pip_button }
     }
 
     /// Subtitle lines, centred near the bottom (above the bar when it shows),
     /// each on a dark box for contrast over any picture.
     fn draw_subtitles(&mut self, c: &mut Connection, st: &Drawn) -> io::Result<()> {
-        let (w, h) = (st.size.0 as f32, st.size.1 as f32);
-        let size = (h * 0.05).clamp(14.0, 48.0);
+        // Sized from the picture, in points, then laid out in device px.
+        let k = self.scale;
+        let (w, h) = (self.size.0 * k, self.size.1 * k);
+        let size = (self.size.1 * 0.05).clamp(14.0, 48.0) * k;
         let line_h = size * 1.35;
-        let bottom = h - if st.visible { BAR_H } else { 0.0 } - size * 0.8;
+        let bottom = h - if st.visible { BAR_H * k } else { 0.0 } - size * 0.8;
         let n = st.subtitles.len();
         let text = self.text.get_or_insert_with(Text::new);
         for i in 0..SUB_LINES {
@@ -273,10 +281,10 @@ impl Controls {
             };
             let (glyphs, width) = text.shape(line, size);
             // Wider than the window: the line is cut by the edges, not wrapped.
-            let x = ((w - width) / 2.0).max(4.0);
-            let baseline = bottom - (n - 1 - i) as f32 * line_h;
+            let x = ((w - width) / 2.0).max(4.0 * k).round();
+            let baseline = (bottom - (n - 1 - i) as f32 * line_h).round();
             let pad = size * 0.25;
-            c.scene_node_rect(bg, RectParams { x: x - pad, y: baseline - size * 0.95, w: width + 2.0 * pad, h: line_h, r: 0.0, g: 0.0, b: 0.0, a: 0.7, radius: 2.0 })?;
+            c.scene_node_rect(bg, RectParams { x: x - pad, y: baseline - size * 0.95, w: width + 2.0 * pad, h: line_h, r: 0.0, g: 0.0, b: 0.0, a: 0.7, radius: 2.0 * k })?;
             let params = text.run(c, &glyphs, size, (x, baseline))?;
             c.scene_node_glyph_run(run, params)?;
         }
@@ -302,8 +310,14 @@ impl Controls {
             }
             return c.scene_frame_end();
         }
-        let (w, h) = (st.size.0 as f32, st.size.1 as f32);
-        let rect = |x: f32, y: f32, w: f32, h: f32, rgb: f32, a: f32, radius: f32| RectParams { x, y, w, h, r: rgb, g: rgb, b: rgb, a, radius };
+        // Laid out in points; drawn in device px, edges snapped.
+        let (w, h) = self.size;
+        let k = self.scale;
+        let px = |x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32, radius: f32| {
+            let (x, y, w, h) = pergola::surface::snap_rect(x, y, w, h, k);
+            RectParams { x, y, w, h, r, g, b, a, radius: radius * k }
+        };
+        let rect = |x: f32, y: f32, w: f32, h: f32, rgb: f32, a: f32, radius: f32| px(x, y, w, h, rgb, rgb, rgb, a, radius);
         c.scene_node_rect(N_BAR, rect(0.0, h - BAR_H, w, BAR_H, 0.0, 0.55, 0.0))?;
         // The button: a triangle to play, two bars to pause.
         let (cx, cy) = (BUTTON_W / 2.0, h - BAR_H / 2.0);
@@ -318,7 +332,7 @@ impl Controls {
                 opacity: 1.0,
                 clip: None,
                 verbs: vec![fill_verb::MOVE, fill_verb::LINE, fill_verb::LINE, fill_verb::CLOSE],
-                points: vec![[cx - 6.0, cy - 9.0], [cx + 9.0, cy], [cx - 6.0, cy + 9.0]],
+                points: vec![[(cx - 6.0) * k, (cy - 9.0) * k], [(cx + 9.0) * k, cy * k], [(cx - 6.0) * k, (cy + 9.0) * k]],
             })?;
             c.scene_node_clear(N_ICON2)?;
         }
@@ -331,10 +345,10 @@ impl Controls {
                 None => c.scene_node_clear(n)?,
             }
         }
-        let px = st.played as f32 / 10.0;
+        let played = st.played as f32 / 10.0;
         // The played part in the accent colour (linear RGB).
-        c.scene_node_rect(N_PLAYED, RectParams { x: x0, y: ty - TRACK_H / 2.0, w: (px - x0).max(0.0), h: TRACK_H, r: 0.05, g: 0.45, b: 1.0, a: 1.0, radius: TRACK_H / 2.0 })?;
-        c.scene_node_rect(N_THUMB, rect(px - THUMB / 2.0, ty - THUMB / 2.0, THUMB, THUMB, 1.0, 1.0, THUMB / 2.0))?;
+        c.scene_node_rect(N_PLAYED, px(x0, ty - TRACK_H / 2.0, (played - x0).max(0.0), TRACK_H, 0.05, 0.45, 1.0, 1.0, TRACK_H / 2.0))?;
+        c.scene_node_rect(N_THUMB, rect(played - THUMB / 2.0, ty - THUMB / 2.0, THUMB, THUMB, 1.0, 1.0, THUMB / 2.0))?;
         if st.pip_button {
             let (cx, cy) = (w - BUTTON_W / 2.0, h - BAR_H / 2.0);
             c.scene_node_rect(N_PIP, rect(cx - 11.0, cy - 8.0, 22.0, 16.0, 1.0, 0.4, 2.0))?;
@@ -362,6 +376,22 @@ mod tests {
         let mut c = Controls::new((640, 360));
         c.subtitles = vec!["a\nb".into(), "c\nd\ne".into()];
         assert_eq!(c.state().subtitles, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn the_bar_lays_out_in_points_at_any_scale() {
+        // The same window in points at scale 1, 1.5 and 2: the same press
+        // means the same thing, and the bar keeps its height in points.
+        for k in [1.0, 1.5, 2.0] {
+            let mut c = Controls::new((640, 360));
+            c.scale = k;
+            c.duration_s = 100.0;
+            let (x0, x1, y) = c.track();
+            assert_eq!(y, 360.0 - BAR_H / 2.0);
+            assert_eq!(c.press((x0 + x1) / 2.0, y), Some(Action::Seek(0.5)));
+            assert_eq!(c.press(20.0, 340.0), Some(Action::Toggle));
+            assert_eq!(c.state().scale_milli, (k * 1000.0) as u32);
+        }
     }
 
     #[test]
@@ -399,7 +429,7 @@ mod tests {
         c.pip_button = true;
         let (_, x1p, _) = c.track();
         assert!(x1p < x1);
-        let (w, h) = (c.size.0 as f32, c.size.1 as f32);
+        let (w, h) = c.size;
         assert_eq!(c.press(w - 10.0, h - 10.0), Some(Action::TogglePip));
     }
 }

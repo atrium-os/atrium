@@ -214,6 +214,21 @@ pub fn snap_span(x: f32, w: f32, k: f32) -> (f32, f32) {
     (x0, (((x + w) * k).round() - x0).max(1.0))
 }
 
+/// A rect in points (`x`, `y`, `w`, `h`) in device pixels at scale `k`,
+/// each axis snapped by [`snap_span`]: for clients that draw raw scene
+/// ops themselves (Arca's field, Sigillum's sheets) yet lay out in points.
+pub fn snap_rect(x: f32, y: f32, w: f32, h: f32, k: f32) -> (f32, f32, f32, f32) {
+    let (x, w) = snap_span(x, w, k);
+    let (y, h) = snap_span(y, h, k);
+    (x, y, w, h)
+}
+
+/// How wide a 1 pt line is drawn at scale `k`: `max(1, round(k))` device
+/// pixels (resolution-independence.md §5).
+pub fn hairline(k: f32) -> f32 {
+    k.round().max(1.0)
+}
+
 /// Where drawn edges went, per group, so an edge 2 pt or less from one
 /// already placed is placed from it: a box inset by a 1 pt border, a
 /// divider at a box's edge or a child group inside its parent then keeps

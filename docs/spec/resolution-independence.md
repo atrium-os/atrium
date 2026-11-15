@@ -84,9 +84,15 @@ Built in step 1a (2026-11-14); fresco-protocol's "Units" note is the reference.
   split renderer's own), outgoing events where they're encoded for the client, each at that
   window's scale. Inside frescod and between broker and renderers everything stays device
   px; a claim's size reaches frescod in pt, since only frescod knows the bar's scale.
-- Clients that lay out in device px themselves (Arca's UI, the lock screen, the player's
-  controls, libatrium's C ABI) call `Connection::in_device_px` on each event; moving them to
-  Pergola or to points is later work.
+- Clients that draw raw scene ops themselves lay out in points too (built 2026-11-15):
+  Sigillum's sheets (the lock screen's key and passcode prompts), Arca's password field and
+  the player's controls keep geometry in pt, grow what is sized from text with the system
+  text size (sheets and the field; the player's subtitles follow the picture), and multiply
+  by the window's scale only where they emit, snapping edges with Pergola's `snap_rect` and
+  1 pt borders to `hairline(k)` device px. Secrets stay rects, never glyphs. The player's
+  video layer is placed in buffer px (§9). libatrium's C ABI stays in device px by design:
+  it hands C renderers the buffer size, like §9's GPU surfaces; `Connection::in_device_px`
+  remains for it.
 - **Step 1b, built 2026-11-14:** the desktop and WM ops (`OP_WM_OUTPUTS`, arrange, move,
   declare layout) stay in device px, because one desktop spans monitors of different scales
   and the WM is a system client that frescod trusts with raw geometry. What forum-wm sizes in

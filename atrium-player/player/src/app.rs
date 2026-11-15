@@ -215,12 +215,18 @@ fn limen_code(c: u32) -> u16 {
 }
 
 impl<H: Host> App<H> {
+    /// `size` is the window's in points, as created.
     pub fn new(host: H, conn: Connection, window: u32, size: (u32, u32), opts: Options) -> Self {
+        let k = conn.window_scale(window);
+        let mut controls = Controls::new(size);
+        controls.scale = k;
+        // The video layer is placed in the buffer's device pixels.
+        let buffer = ((size.0 as f32 * k).round() as u32, (size.1 as f32 * k).round() as u32);
         App {
             host,
-            sink: Some(FrescoSink::new(conn, window, size)),
+            sink: Some(FrescoSink::new(conn, window, buffer)),
             player: None,
-            controls: Controls::new(size),
+            controls,
             opts,
             duration: None,
             ready_sent: false,
@@ -724,8 +730,11 @@ impl<H: Host> App<H> {
 
     fn on_fresco(&mut self, ev: Event) {
         let action = match ev {
-            Event::Resized { buffer_width, buffer_height, .. } => {
-                self.controls.size = (buffer_width, buffer_height);
+            Event::Resized { width, height, scale, .. } => {
+                self.controls.size = (width, height);
+                if scale > 0.0 {
+                    self.controls.scale = scale;
+                }
                 None
             }
             Event::PointerMotion { .. } => {

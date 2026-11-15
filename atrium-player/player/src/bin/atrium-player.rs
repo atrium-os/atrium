@@ -359,7 +359,8 @@ fn embedded() {
     let token = loop {
         match conn.wait_event(Some(Duration::from_millis(100))) {
             Ok(Some(fresco_client::Event::EmbedToken { token, .. })) => break token,
-            Ok(Some(fresco_client::Event::Resized { buffer_width, buffer_height, .. })) => size = (buffer_width, buffer_height),
+            // In points, as App::new takes it.
+            Ok(Some(fresco_client::Event::Resized { width, height, .. })) => size = (width.round() as u32, height.round() as u32),
             Err(e) => {
                 eprintln!("atrium-player: frescod: {e}");
                 std::process::exit(1)

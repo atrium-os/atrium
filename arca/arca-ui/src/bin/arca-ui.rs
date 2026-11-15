@@ -41,7 +41,9 @@ struct Embed {
     font: u32,
     parent: Option<Parent>,
     field: Field,
+    /// The slot's size in points.
     size: (f32, f32),
+    scale: view::Scale,
     look: view::Look,
     /// The last pointer press in this window: a focus that follows one
     /// within RING_AFTER_PRESS came by click and shows no ring.
@@ -190,6 +192,7 @@ fn main() -> ExitCode {
                         }
                     };
                     let font = win.font_open("system-sans").map(|f| f.font_id).unwrap_or(0);
+                    let scale = view::Scale { k: win.window_scale(window_id), text: win.appearance().map(|a| a.text_scale()).unwrap_or(1.0) };
                     // The parent as the registry has it, by the uid limend
                     // read off its connection; `parent_app` is only a check.
                     let parent = Parent::resolve(&registry, parent_uid, allow_unsigned)
@@ -204,7 +207,7 @@ fn main() -> ExitCode {
                     if parent.is_none() {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), look: view::Look::default(), pressed_at: None, dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), scale, look: view::Look::default(), pressed_at: None, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -250,8 +253,8 @@ fn main() -> ExitCode {
             let e = embeds.get_mut(&id).unwrap();
             loop {
                 let ev = match e.win.poll_event() {
-                    // It lays out in device pixels (resolution-independence.md §3).
-                    Ok(Some(ev)) => e.win.in_device_px(ev),
+                    // Laid out in points (resolution-independence.md §3).
+                    Ok(Some(ev)) => ev,
                     Ok(None) => break,
                     Err(_) => {
                         gone = true;
@@ -259,8 +262,15 @@ fn main() -> ExitCode {
                     }
                 };
                 let dos = match ev {
-                    Event::Resized { width, height, .. } => {
-                        e.size = (width as f32, height as f32);
+                    Event::Resized { width, height, scale, .. } => {
+                        e.size = (width, height);
+                        if scale > 0.0 {
+                            e.scale.k = scale;
+                        }
+                        vec![Do::Redraw]
+                    }
+                    Event::Appearance(a) if a.text_scale() != e.scale.text => {
+                        e.scale.text = a.text_scale();
                         vec![Do::Redraw]
                     }
                     Event::PointerMotion { .. } if !e.look.hover => {
@@ -288,7 +298,7 @@ fn main() -> ExitCode {
                         e.pressed_at = Some(Instant::now());
                         e.look.ring = false;
                         e.dirty = true;
-                        let l = view::layout(&e.field, e.size.0, e.size.1);
+                        let l = view::layout(&e.field, e.size.0, e.size.1, e.scale.text);
                         if l.chip.is_some_and(|c| c.contains(x, y)) {
                             e.field.press_chip(activation)
                         } else if !e.field.focused {
@@ -314,7 +324,7 @@ fn main() -> ExitCode {
             if e.dirty {
                 e.dirty = false;
                 let who = e.parent.as_ref().map_or("unknown app", |p| p.app_id.as_str()).to_string();
-                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.look, e.size.0, e.size.1) {
+                if let Err(err) = view::draw(&mut e.win, e.font, &e.field, &who, e.look, e.size.0, e.size.1, e.scale) {
                     eprintln!("arca-ui: draw {id}: {err}");
                 }
             }
