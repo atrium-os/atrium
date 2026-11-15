@@ -24,9 +24,15 @@ fn hash_words(mut h: u64, w: &[u32]) -> u64 {
 }
 
 /// One signature per tile, row major (`tiles_x * tiles_y`).
+/// The signature [`tile_signatures`] gives a tile no op touches: one
+/// holding only the frame's clear colour.
+pub fn empty_signature(h: &crate::Header) -> u64 {
+    hash_words(mix(0, h.width as u64 | (h.height as u64) << 32), &h.clear.map(f32::to_bits))
+}
+
 pub fn tile_signatures(f: &Frame) -> Vec<u64> {
     let h = &f.header;
-    let base = hash_words(mix(0, h.width as u64 | (h.height as u64) << 32), &h.clear.map(f32::to_bits));
+    let base = empty_signature(h);
     let mut sig = vec![base; (h.tiles_x * h.tiles_y) as usize];
     // Texel content per texture, hashed once.
     let tex_hash: Vec<u64> = f

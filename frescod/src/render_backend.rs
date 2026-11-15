@@ -624,6 +624,7 @@ impl Compute {
                 times.raster += t.elapsed();
                 times.tiles += cost.base_tiles + cost.content_tiles;
                 times.grabbed += cost.grabbed;
+                times.cleared += cost.cleared;
                 times.sprites += cost.sprites_rastered;
                 times.composite += cost.composite;
                 match r {
@@ -743,6 +744,7 @@ struct Times {
     compose: std::time::Duration,
     /// Sprites rastered, and the time compositing them.
     sprites: u32,
+    cleared: u32,
     composite: std::time::Duration,
     /// Sprite tiles taken from the window's own last drawing.
     grabbed: u32,
@@ -755,14 +757,14 @@ impl Times {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let on = *ON.get_or_init(|| std::env::var_os("FRESCOD_RENDER_TIMES").is_some());
         let z = std::time::Duration::ZERO;
-        Times { on, begun: std::time::Instant::now(), pack: z, sig: z, raster: z, tiles: 0, compose: z, sprites: 0, composite: z, grabbed: 0, per: Vec::new() }
+        Times { on, begun: std::time::Instant::now(), pack: z, sig: z, raster: z, tiles: 0, compose: z, sprites: 0, composite: z, grabbed: 0, cleared: 0, per: Vec::new() }
     }
     fn report(&self) {
         if self.on {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "frescod: render {:.1} ms: pack {:.1}, signatures {:.1}, raster {:.1} ({} tiles, {} sprites, {} tiles taken, composite {:.1}), compose {:.1}",
-                ms(self.begun.elapsed()), ms(self.pack), ms(self.sig), ms(self.raster), self.tiles, self.sprites, self.grabbed, ms(self.composite), ms(self.compose)
+                "frescod: render {:.1} ms: pack {:.1}, signatures {:.1}, raster {:.1} ({} tiles, {} sprites, {} tiles taken, {} cleared, composite {:.1}), compose {:.1}",
+                ms(self.begun.elapsed()), ms(self.pack), ms(self.sig), ms(self.raster), self.tiles, self.sprites, self.grabbed, self.cleared, ms(self.composite), ms(self.compose)
             );
             for (id, d, ops) in &self.per {
                 eprintln!("frescod:   window {id}: packed {ops} ops in {:.1} ms", ms(*d));

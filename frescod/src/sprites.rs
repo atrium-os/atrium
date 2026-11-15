@@ -112,6 +112,8 @@ pub struct Cost {
     pub content_tiles: u32,
     /// Tiles of sprite content taken from the window's last drawing.
     pub grabbed: u32,
+    /// Tiles of sprite content nothing draws on, cleared, not rastered.
+    pub cleared: u32,
     pub composite: std::time::Duration,
 }
 
@@ -295,9 +297,37 @@ impl Sprites {
                         }
                     }
                 }
+                // A tile nothing draws on is transparent: cleared, not
+                // rastered (most of a build item's or a title's window).
+                if any && h.clear == [0.0; 4] {
+                    let e = damage::empty_signature(h);
+                    any = false;
+                    for k in 0..need.len() {
+                        if need[k] && c.sig[k] == e {
+                            need[k] = false;
+                            c.valid[k] = true;
+                            let (tx, ty) = (k as u32 % h.tiles_x, k as u32 / h.tiles_x);
+                            let (x0, x1) = ((tx * TILE) as usize, (((tx + 1) * TILE).min(width)) as usize);
+                            for y in ty * TILE..((ty + 1) * TILE).min(height) {
+                                let r = y as usize * width as usize;
+                                c.px[r + x0..r + x1].fill(0);
+                            }
+                            cost.cleared += 1;
+                        }
+                        any |= need[k];
+                    }
+                }
                 if any {
                     let tiles = damage::rects(&need, h.tiles_x, h.tiles_y, fresco_compute::tier2::Tier2::MAX_TILE_RECTS);
+                    let t = std::time::Instant::now();
                     t2.render_tiles(frame, &mut c.px, &tiles).map_err(|e| e.to_string())?;
+                    if std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
+                        let n: u32 = tiles.iter().map(|t| (t[2] - t[0]) * (t[3] - t[1])).sum();
+                        eprintln!(
+                            "frescod:   sprite {}: {n} tiles in {:.1} ms ({} ops, {} shows, {})",
+                            s.group, t.elapsed().as_secs_f64() * 1e3, h.op_count, !empty(rect), if all { "still" } else { "moving" }
+                        );
+                    }
                     // What a rect list covers (it may round up past `need`).
                     for t in &tiles {
                         for ty in t[1]..t[3].min(h.tiles_y) {

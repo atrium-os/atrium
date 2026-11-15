@@ -675,7 +675,14 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             let mut cost = sprites::Cost::default();
             let plain = w.tiles.is_some();
             let sp = w.sprites.get_or_insert_with(Default::default);
+            let t = std::time::Instant::now();
             let r = sp.draw(t2, scene, &wf, &mut w.px, width, height, plain, &mut cost);
+            if std::env::var_os("FRESCOD_RENDER_TIMES").is_some() {
+                eprintln!(
+                    "fresco-renderer: window {id}: sprites drawn in {:.1} ms ({} base tiles, {} content tiles, {} new, {} taken, {} cleared)",
+                    t.elapsed().as_secs_f64() * 1e3, cost.base_tiles, cost.content_tiles, cost.sprites_rastered, cost.grabbed, cost.cleared
+                );
+            }
             warming |= sp.warming();
             // `px` no longer holds a plain drawing.
             w.tiles = None;
