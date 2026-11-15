@@ -221,7 +221,10 @@ A lint (test) walks the widget catalogue at text sizes 85% to 200% and display s
   idle icons (battery, activity, bell), moves Light/Dark and Lock into a More menu, then
   leaves out the surface chips, the word "atrium" and the date. The clock, the workspace,
   the status items and the system menus always stay. Scrinium's rename and delete strips
-  keep their buttons at the strip's end and shorten the question instead.
+  keep their buttons at the strip's end and shorten the question instead. In a window too short
+  for the actions' own row, Scrinium puts them on the path's row (the path keeps two
+  fifths, the rest overflow into More), and in a narrow one its places take at most about
+  a third of the width.
 - **Min window size** is the layout's natural minimum, sent to the WM as a hint. When text
   grows, min sizes grow, and forum-wm re-tiles if a window no longer fits its tile.
 - **Scroll position** is kept by anchor (the first visible element and the offset into it),

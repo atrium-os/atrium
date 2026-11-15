@@ -44,6 +44,20 @@ pub mod ph {
 // (resolution-independence.md §6.2), so rows and bars fit their labels.
 fn em(pt: f32) -> f32 { pergola::theme::size::em(pt) }
 pub fn side_w() -> f32 { em(208.0) }
+
+/// The places' width in a window `w` wide: [`side_w`], but no more than
+/// about a third of a narrow window, so the list keeps room for names
+/// (a big text size on a small screen).
+pub fn side_for(w: f32) -> f32 {
+    side_w().min((w * 0.3).max(em(140.0)))
+}
+
+/// Whether a window `h` tall is too short for the actions on a row of
+/// their own under the path: then they share the path's row, and what
+/// doesn't fit goes into More (resolution-independence.md §6.3).
+pub fn compact(h: f32) -> bool {
+    h < toolbar_h() + actions_h() + header_h() + 4.0 * row_h() + status_h()
+}
 pub fn pick_side_w() -> f32 { em(176.0) }
 pub fn toolbar_h() -> f32 { em(48.0) }
 pub fn actions_h() -> f32 { em(40.0) }
@@ -343,7 +357,9 @@ impl View for ScriniumView {
                 // Laid out by hand, so the minimum is stated: the places,
                 // a name and a size column, a few rows (em: it grows with
                 // the text size).
-                ctx.min_size(pergola::geom::Size::new(side_w() + em(360.0), em(360.0)));
+                // Short of that it shares the path's row with the actions
+                // (`compact`); the minimum is what that layout needs.
+                ctx.min_size(pergola::geom::Size::new(em(140.0) + em(360.0), toolbar_h() + header_h() + 3.0 * row_h() + status_h()));
                 self.manager(ctx, &b, w, h);
                 if b.connect.is_some() {
                     self.connect_sheet(ctx, &b, w, h);
@@ -831,18 +847,22 @@ impl ScriniumView {
 
     fn manager(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
-        self.sidebar(ctx, b, 0.0, side_w(), h);
-        let x0 = side_w();
+        let x0 = side_for(w);
+        self.sidebar(ctx, b, 0.0, x0, h);
+        let compact = compact(h);
         // Toolbar: back, up, the path.
         rect(ctx, x0, toolbar_h() - 1.0, w - x0, 1.0, t.border_default(), 0.0);
         let s = self.state.clone();
         icon_button(ctx, x0 + 10.0, em(10.0), ph::ARROW_LEFT, b.can_go_back(), "Back (Alt-Left)", move || with(&s, Browser::go_back));
         let s = self.state.clone();
         icon_button(ctx, x0 + 10.0 + em(32.0), em(10.0), ph::ARROW_UP, !b.path.is_empty(), "Up (Backspace)", move || with(&s, Browser::up));
-        self.crumbs(ctx, b, x0 + 20.0 + em(64.0), toolbar_h() / 2.0, w - 16.0);
+        let cx = x0 + 20.0 + em(64.0);
+        // Short: the path keeps two fifths of the row, the actions the rest.
+        let crumbs_end = if compact { cx + (w - 16.0 - cx) * 0.4 } else { w - 16.0 };
+        self.crumbs(ctx, b, cx, toolbar_h() / 2.0, crumbs_end);
 
         // What can be done here.
-        let ay = toolbar_h() + 4.0;
+        let ay = if compact { 4.0 } else { toolbar_h() + 4.0 };
         let open = b.place().is_some() && b.unreadable.is_none();
         let writable = open && !b.place().is_some_and(|p| p.read_only);
         let n = b.selected.len();
@@ -852,9 +872,9 @@ impl ScriniumView {
         let hw = width(hid, type_size::SM, Weight::Medium) + em(28.0);
         let (s1, f1, s2, f2) = (self.state.clone(), self.field.clone(), self.state.clone(), self.field.clone());
         let (s3, s4, s5, s6) = (self.state.clone(), self.state.clone(), self.state.clone(), self.state.clone());
-        let (s7, s8) = (self.state.clone(), self.state.clone());
+        let (s7, s8, s9) = (self.state.clone(), self.state.clone(), self.state.clone());
         let one_file = n == 1 && b.entries.get(b.selected[0]).is_some_and(|e| !e.dir && !e.link);
-        let items = vec![
+        let mut items = vec![
             ToolItem::new("Open", move || with(&s7, |b| b.open_selected(false))).priority(1).enabled(open && one_file),
             ToolItem::new("Open with…", move || with(&s8, |b| b.open_selected(true))).priority(2).enabled(open && one_file),
             ToolItem::new("New folder", move || begin_edit(&s1, &f1, false)).priority(2).enabled(writable),
@@ -864,11 +884,18 @@ impl ScriniumView {
             ToolItem::new("Cut", move || with(&s5, |b| b.copy(true))).priority(2).enabled(writable && n > 0),
             ToolItem::new("Paste", move || with(&s6, Browser::paste)).priority(3).enabled(writable && b.clip.is_some()),
         ];
-        let tx = x0 + 8.0;
-        Toolbar::new(Rect::new(tx, ay, (w - hw - 16.0 - tx).max(0.0), actions_h() - 8.0), self.more.clone(), items).render(ctx);
-        let s = self.state.clone();
-        button(ctx, w - hw - 8.0, ay + ((actions_h() - 8.0 - em(32.0)) / 2.0).max(0.0), hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
-        let mut y = toolbar_h() + actions_h();
+        if compact {
+            // The hidden-files switch joins them, first into More.
+            items.push(ToolItem::new(hid, move || with(&s9, Browser::toggle_hidden)).priority(0).enabled(open));
+            let tx = crumbs_end + 8.0;
+            Toolbar::new(Rect::new(tx, ay, (w - 8.0 - tx).max(0.0), toolbar_h() - 8.0), self.more.clone(), items).render(ctx);
+        } else {
+            let tx = x0 + 8.0;
+            Toolbar::new(Rect::new(tx, ay, (w - hw - 16.0 - tx).max(0.0), actions_h() - 8.0), self.more.clone(), items).render(ctx);
+            let s = self.state.clone();
+            button(ctx, w - hw - 8.0, ay + ((actions_h() - 8.0 - em(32.0)) / 2.0).max(0.0), hid, Look::Ghost, open, move || with(&s, Browser::toggle_hidden));
+        }
+        let mut y = if compact { toolbar_h() } else { toolbar_h() + actions_h() };
         rect(ctx, x0, y - 1.0, w - x0, 1.0, t.border_default(), 0.0);
 
         // A name being typed, or a question.
@@ -1073,6 +1100,31 @@ mod tests {
         app.tick();
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t.starts_with("Delete “hello.txt”?")), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A short window puts the actions on the path's row, so the list
+    /// keeps its rows; a narrow one gives the places less of its width.
+    #[test]
+    fn a_short_window_shares_the_path_row_with_the_actions() {
+        let d = std::env::temp_dir().join(format!("scrinium-view-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("hello.txt"), "hello").unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![place(&d)]);
+        assert!(!compact(600.0) && compact(240.0));
+        let (app, _) = app_for(b.clone(), (960.0, 240.0));
+        let tree = app.tree();
+        let at = |want: &str| tree.iter().find_map(|(_, n)| match n {
+            Node::Text { content, rect, .. } if content == want => Some(*rect),
+            _ => None,
+        });
+        let row = at("hello.txt").expect("a file row shows");
+        assert!(row.y() + row.h() <= 240.0 - status_h(), "{row:?} above the status line");
+        let new = at("Paste").expect("an action on the path's row");
+        assert!(new.y() < toolbar_h(), "{new:?}");
+        assert!(side_for(480.0) < side_w() && side_for(1600.0) == side_w());
         let _ = std::fs::remove_dir_all(&d);
     }
 
