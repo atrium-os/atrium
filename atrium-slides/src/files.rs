@@ -110,6 +110,26 @@ pub fn encode(d: &mut Doc, f: Format) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// Opens the file `f`, named `name`: a native deck is mapped (§9.3),
+/// anything else is read (up to `max` bytes) and converted.
+pub fn load_file(name: &str, f: &mut std::fs::File, max: u64) -> Result<Doc, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let native = |f: &std::fs::File| Doc::from_file(name, f);
+    match format_of(name) {
+        Format::Native => native(f).map_err(|e| format!("“{name}” didn't open: {e}")),
+        Format::Other if native(f).is_ok() => native(f),
+        _ => {
+            let mut data = Vec::new();
+            f.seek(SeekFrom::Start(0)).map_err(|e| format!("Couldn't read “{name}”: {e}"))?;
+            f.take(max + 1).read_to_end(&mut data).map_err(|e| format!("Couldn't read “{name}”: {e}"))?;
+            if data.len() as u64 > max {
+                return Err(format!("Couldn't read “{name}”: the file is over {} MB", max >> 20));
+            }
+            load(name, data)
+        }
+    }
+}
+
 /// Opens `data`, named `name`, as a document.
 pub fn load(name: &str, data: Vec<u8>) -> Result<Doc, String> {
     match format_of(name) {

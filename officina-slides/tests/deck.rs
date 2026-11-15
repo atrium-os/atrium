@@ -317,6 +317,35 @@ fn native_round_trip_is_exact_and_lazy() {
 }
 
 #[test]
+fn previews_are_kept_with_their_pictures() {
+    let mut d = deck_with(3);
+    let photo: Vec<u8> = (0..50_000u32).map(|i| (i * 7 % 253) as u8).collect();
+    let m = d.add_media("image/jpeg", &photo);
+    let gone = d.add_media("image/png", b"not used");
+    assert_eq!(d.pictures_without_preview(), vec![m, gone]);
+    assert!(d.set_preview(m, "image/jpeg", 512, 341, b"small copy"));
+    assert!(d.set_preview(gone, "image/png", 10, 10, b"x"));
+    assert!(!d.set_preview(m, "image/jpeg", 0, 10, b"x"), "an empty preview");
+    let sid = d.slide_ids().next().unwrap();
+    let id = d.new_id();
+    let pic = Shape::new(id, Rect::new(0, 0, 1000, 1000), ShapeKind::Picture { media: m, crop: [0; 4], line: None });
+    DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: 0, shape: Box::new(pic) }.apply(&mut d);
+    let b = bytes(&d);
+    let l = native::load(Arc::new(b.clone())).unwrap();
+    assert_eq!(l.preview(m), Some((512, 341)));
+    assert_eq!(&*l.preview_bytes(m).unwrap().unwrap(), b"small copy");
+    assert!(l.pictures_without_preview().is_empty(), "the unused picture and its preview are dropped");
+    assert_eq!(bytes(&l), b, "saving a read deck copies its previews");
+    // A damaged preview table costs the previews only.
+    let pos = b.windows(10).position(|w| w == b"small copy").unwrap();
+    let mut bad = b.clone();
+    bad[pos] ^= 1;
+    let l = native::load(Arc::new(bad)).unwrap();
+    assert!(l.preview_bytes(m).unwrap().is_err(), "the preview fails its checksum");
+    assert_eq!(*l.media_bytes(m).unwrap(), photo[..]);
+}
+
+#[test]
 fn damage_fails_alone_and_never_panics() {
     let d = deck_with(6);
     let b = bytes(&d);

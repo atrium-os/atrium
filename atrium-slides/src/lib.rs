@@ -8,5 +8,6 @@ pub mod app;
 pub mod doc;
 pub mod files;
 pub mod frame;
+pub mod mapped;
 pub mod present;
 pub mod render;

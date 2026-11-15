@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use atrium_slides::app::{Cmd, Slides, Ui, PICKER_SLOT};
 use atrium_slides::doc::{self, Doc};
-use atrium_slides::files::{encode, format_of, load, picture_mime, stem_of, Format};
+use atrium_slides::files::{encode, format_of, load_file, picture_mime, stem_of, Format};
+use atrium_slides::mapped::copy_file;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
@@ -89,15 +90,17 @@ fn write_over(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 
 /// Writes `bytes` to `dir` as `stem.oslides` through a temp file and a hard
 /// link; never replaces a file already there (`stem 2.oslides` and so on).
-fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+fn write_new(dir: &Path, stem: &str, src: &File) -> io::Result<PathBuf> {
     let stem: String = stem.chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
     let stem = stem.trim_start_matches('.');
     let stem = if stem.is_empty() { "Presentation" } else { stem };
     let tmp = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
     {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        if let Err(e) = copy_file(src, &mut f) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     for n in 1..1000 {
         let name = if n == 1 { format!("{stem}.oslides") } else { format!("{stem} {n}.oslides") };
@@ -154,24 +157,27 @@ impl Run {
         }
     }
 
-    /// Saves to the file the deck came from; false when there is none.
+    /// Saves to the file the deck came from; false when there is none. A
+    /// native deck is written to a new file first and copied over the old
+    /// one (the deck is mapped from the file it was opened from, which must
+    /// not change under it); other formats are encoded in memory.
     fn save(&mut self) -> bool {
         let Some(t) = self.target.as_mut() else { return false };
         let format = match t {
             Target::Picked { format, .. } | Target::Path { format, .. } => *format,
         };
-        let r = {
-            let mut d = self.slides.doc.borrow_mut();
-            encode(&mut d, format).and_then(|bytes| match t {
-                Target::Picked { file, .. } => write_over(file, &bytes),
-                Target::Path { path, .. } => {
-                    let mut f = OpenOptions::new().write(true).open(&*path)?;
-                    write_over(&mut f, &bytes)
-                }
-            })
-        };
         let mut d = self.slides.doc.borrow_mut();
-        match r.and_then(|_| d.saved()) {
+        let into = |t: &mut Target, f: &mut dyn FnMut(&mut File) -> io::Result<()>| match t {
+            Target::Picked { file, .. } => f(file),
+            Target::Path { path, .. } => f(&mut OpenOptions::new().write(true).open(&*path)?),
+        };
+        let r = if matches!(format, Format::Native | Format::Other) {
+            let spool = d.spool_path();
+            d.spool(&spool).and_then(|src| into(t, &mut |dst| copy_file(&src, dst).map(|_| ()))).and_then(|_| d.saved_as(&spool))
+        } else {
+            encode(&mut d, format).and_then(|bytes| into(t, &mut |dst| write_over(dst, &bytes))).and_then(|_| d.saved())
+        };
+        match r {
             Ok(()) => d.status = format!("Saved “{}”.", d.name),
             Err(e) => d.status = format!("Couldn't save “{}”: {e}. Your changes are still here and in the autosave.", d.name),
         }
@@ -181,17 +187,19 @@ impl Run {
     }
 
     fn save_into(&mut self, dir: &Path) {
-        let (stem, bytes) = {
-            let d = self.slides.doc.borrow();
-            (stem_of(&d.name).to_string(), d.write_native(Vec::new()))
+        let r = {
+            let mut d = self.slides.doc.borrow_mut();
+            let stem = stem_of(&d.name).to_string();
+            let spool = d.spool_path();
+            d.spool(&spool).and_then(|src| write_new(dir, &stem, &src)).map(|p| (p, spool))
         };
-        match bytes.and_then(|b| write_new(dir, &stem, &b)) {
-            Ok(path) => {
+        match r {
+            Ok((path, spool)) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 {
                     let mut d = self.slides.doc.borrow_mut();
                     d.name = name.clone();
-                    let _ = d.saved();
+                    let _ = d.saved_as(&spool);
                     d.status = format!("Saved as “{name}”.");
                 }
                 self.target = Some(Target::Path { path, format: Format::Native });
@@ -204,7 +212,7 @@ impl Run {
     /// A picked deck arrived.
     fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
-        match read_all(&mut f, MAX_FILE).map_err(|e| format!("Couldn't read “{name}”: {e}")).and_then(|data| load(&name, data)) {
+        match load_file(&name, &mut f, MAX_FILE) {
             Ok(mut d) => {
                 let format = format_of(&name);
                 if !write {
@@ -249,7 +257,7 @@ fn main() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-            match fs::read(&p).map_err(|e| e.to_string()).and_then(|data| load(&name, data)) {
+            match File::open(&p).map_err(|e| e.to_string()).and_then(|mut f| load_file(&name, &mut f, MAX_FILE)) {
                 Ok(d) => {
                     let format = format_of(&name);
                     first = Some((d, (format != Format::Other).then_some(Target::Path { path: p, format })));

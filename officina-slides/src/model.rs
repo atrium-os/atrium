@@ -750,7 +750,26 @@ pub struct Deck {
     pub(crate) backing: Option<crate::native::Backing>,
     /// Slides in memory that the backing file holds unchanged: their chunks.
     pub(crate) clean: HashMap<SlideId, usize>,
+    /// Small copies of pictures, by the picture's content hash (§9.3): what
+    /// thumbnails and a first look draw from. Derived data, not journaled.
+    pub(crate) previews: HashMap<[u8; 16], Preview>,
 }
+
+/// A picture's small copy (an image file of its own, at most
+/// [`PREVIEW_SIDE`] px on its longer side).
+#[derive(Debug, Clone)]
+pub struct Preview {
+    pub mime: Arc<str>,
+    pub width: u32,
+    pub height: u32,
+    pub(crate) len: u64,
+    pub(crate) bytes: MediaBytes,
+}
+
+/// The longer side of a picture's preview, px.
+pub const PREVIEW_SIDE: u32 = 512;
+/// The largest preview file kept.
+pub const MAX_PREVIEW_LEN: u64 = 4 << 20;
 
 impl std::fmt::Debug for Deck {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -771,14 +790,14 @@ impl std::fmt::Display for Damaged {
 impl Deck {
     /// An empty deck: 16:9, the Office theme, one master with the usual layouts.
     pub fn new() -> Deck {
-        let mut d = Deck { size: (12_192_000, 6_858_000), theme: Theme::default(), masters: Vec::new(), layouts: Vec::new(), slides: Vec::new(), media: HashMap::new(), by_hash: HashMap::new(), next_id: 1, backing: None, clean: HashMap::new() };
+        let mut d = Deck { size: (12_192_000, 6_858_000), theme: Theme::default(), masters: Vec::new(), layouts: Vec::new(), slides: Vec::new(), media: HashMap::new(), by_hash: HashMap::new(), next_id: 1, backing: None, clean: HashMap::new(), previews: HashMap::new() };
         crate::resolve::default_master(&mut d);
         d
     }
 
     /// A deck with nothing in it (for readers to fill).
     pub fn empty() -> Deck {
-        Deck { size: (12_192_000, 6_858_000), theme: Theme::default(), masters: Vec::new(), layouts: Vec::new(), slides: Vec::new(), media: HashMap::new(), by_hash: HashMap::new(), next_id: 1, backing: None, clean: HashMap::new() }
+        Deck { size: (12_192_000, 6_858_000), theme: Theme::default(), masters: Vec::new(), layouts: Vec::new(), slides: Vec::new(), media: HashMap::new(), by_hash: HashMap::new(), next_id: 1, backing: None, clean: HashMap::new(), previews: HashMap::new() }
     }
 
     /// A fresh id for a slide, master, layout or shape (never reused while
@@ -916,6 +935,40 @@ impl Deck {
         let hash = content_hash(bytes);
         self.media.insert(id, MediaItem { mime: mime.into(), hash, len: bytes.len() as u64, bytes: MediaBytes::Loaded(bytes.into()) });
         self.by_hash.entry(hash).or_insert(id);
+    }
+
+    /// Picture `id`'s preview: its size, if it has one.
+    pub fn preview(&self, id: MediaId) -> Option<(u32, u32)> {
+        let m = self.media.get(&id)?;
+        self.previews.get(&m.hash).map(|p| (p.width, p.height))
+    }
+
+    /// Picture `id`'s preview file.
+    pub fn preview_bytes(&self, id: MediaId) -> Option<Result<Arc<[u8]>, Damaged>> {
+        let m = self.media.get(&id)?;
+        let p = self.previews.get(&m.hash)?;
+        Some(match &p.bytes {
+            MediaBytes::Loaded(b) => Ok(b.clone()),
+            MediaBytes::InFile(chunks) => crate::native::read_media(self, chunks, p.len),
+        })
+    }
+
+    /// Gives picture `id` a preview (`bytes`, an image file of `mime`,
+    /// `width` × `height` px). Refused past [`MAX_PREVIEW_LEN`].
+    pub fn set_preview(&mut self, id: MediaId, mime: &str, width: u32, height: u32, bytes: &[u8]) -> bool {
+        let Some(m) = self.media.get(&id) else { return false };
+        if bytes.len() as u64 > MAX_PREVIEW_LEN || width == 0 || height == 0 {
+            return false;
+        }
+        self.previews.insert(m.hash, Preview { mime: mime.into(), width, height, len: bytes.len() as u64, bytes: MediaBytes::Loaded(bytes.into()) });
+        true
+    }
+
+    /// Pictures (image media) with no preview yet, by id.
+    pub fn pictures_without_preview(&self) -> Vec<MediaId> {
+        let mut v: Vec<MediaId> = self.media.iter().filter(|(_, m)| m.mime.starts_with("image/") && !self.previews.contains_key(&m.hash)).map(|(&id, _)| id).collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn media_count(&self) -> usize {

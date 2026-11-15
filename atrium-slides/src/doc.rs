@@ -130,36 +130,78 @@ pub struct Autosave {
     journal: JournalWriter<File>,
     unsynced: usize,
     _lock: File,
+    /// The generation of the base and journal in use.
+    g: u64,
+    /// The base still being written (a big deck's takes a while): the
+    /// folder counts for recovery once it is done.
+    base: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+/// Makes generation `g` (its base and journal in place) the current one and
+/// removes the one before.
+fn commit(dir: &Path, g: u64, old: Option<u64>) -> io::Result<()> {
+    let cur = dir.join(".current.tmp");
+    {
+        let mut c = File::create(&cur)?;
+        c.write_all(g.to_string().as_bytes())?;
+        c.sync_all()?;
+    }
+    sync_dir(dir);
+    fs::rename(&cur, dir.join(CURRENT))?;
+    sync_dir(dir);
+    if let Some(o) = old.filter(|&o| o != g) {
+        let _ = fs::remove_file(base_path(dir, o));
+        let _ = fs::remove_file(dir.join(format!("journal.{o}")));
+    }
+    Ok(())
 }
 
 impl Autosave {
+    /// Starts an autosave folder for `deck`. The base is written on a
+    /// thread (copying a 2 GB deck takes seconds); the journal takes
+    /// records at once, and the folder is found by [`pending`] once the
+    /// base is in place.
     pub fn start(dir: &Path, deck: &Deck, name: &str) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let l = lock(dir)?;
-        let g = generation(dir).map(|g| g + 1).unwrap_or(1);
         let old = generation(dir).ok();
-        let tmp = dir.join(".base.tmp");
-        let f = File::create(&tmp)?;
-        let f = native::save(deck, io::BufWriter::new(f))?.into_inner().map_err(|e| e.into_error())?;
-        f.sync_all()?;
-        fs::rename(&tmp, base_path(dir, g))?;
+        let g = old.map(|g| g + 1).unwrap_or(1);
         let j = OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(format!("journal.{g}")))?;
         j.sync_all()?;
         fs::write(dir.join(META), name.as_bytes())?;
-        let cur = dir.join(".current.tmp");
-        {
-            let mut c = File::create(&cur)?;
-            c.write_all(g.to_string().as_bytes())?;
-            c.sync_all()?;
+        let (deck, d) = (deck.clone(), dir.to_path_buf());
+        let base = std::thread::Builder::new().name("autosave base".into()).spawn(move || {
+            let tmp = d.join(".base.tmp");
+            let f = File::create(&tmp)?;
+            let f = native::save(&deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
+            f.sync_all()?;
+            fs::rename(&tmp, base_path(&d, g))?;
+            commit(&d, g, old)
+        })?;
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l, g, base: Some(base) })
+    }
+
+    /// Waits for the base to be written.
+    pub fn settle(&mut self) -> io::Result<()> {
+        match self.base.take() {
+            Some(h) => h.join().unwrap_or_else(|_| Err(io::Error::other("autosave base thread panicked"))),
+            None => Ok(()),
         }
-        sync_dir(dir);
-        fs::rename(&cur, dir.join(CURRENT))?;
-        sync_dir(dir);
-        if let Some(o) = old.filter(|&o| o != g) {
-            let _ = fs::remove_file(base_path(dir, o));
-            let _ = fs::remove_file(dir.join(format!("journal.{o}")));
-        }
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+    }
+
+    /// The deck was saved as `file` (a complete `.oslides`, in this folder):
+    /// it becomes the base, with an empty journal.
+    pub fn rebase(&mut self, file: &Path) -> io::Result<()> {
+        let _ = self.settle();
+        let (old, g) = (Some(self.g), self.g + 1);
+        fs::rename(file, base_path(&self.dir, g))?;
+        let j = OpenOptions::new().create(true).write(true).truncate(true).open(self.dir.join(format!("journal.{g}")))?;
+        j.sync_all()?;
+        commit(&self.dir, g, old)?;
+        self.journal = JournalWriter::new(j);
+        self.unsynced = 0;
+        self.g = g;
+        Ok(())
     }
 
     fn resume(dir: &Path, l: File, g: u64, good: u64) -> io::Result<Self> {
@@ -167,7 +209,7 @@ impl Autosave {
         j.set_len(good)?;
         j.seek(io::SeekFrom::End(0))?;
         j.sync_all()?;
-        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l })
+        Ok(Self { dir: dir.to_path_buf(), journal: JournalWriter::new(j), unsynced: 0, _lock: l, g, base: None })
     }
 
     fn append(&mut self, r: &Record) -> io::Result<()> {
@@ -189,7 +231,8 @@ impl Autosave {
         &self.dir
     }
 
-    pub fn remove(self) -> io::Result<()> {
+    pub fn remove(mut self) -> io::Result<()> {
+        let _ = self.settle();
         fs::remove_dir_all(&self.dir)
     }
 }
@@ -218,7 +261,7 @@ pub struct Recovered {
 pub fn recover(dir: &Path) -> io::Result<(Doc, Recovered)> {
     let l = lock(dir)?;
     let g = generation(dir)?;
-    let base = fs::read(base_path(dir, g))?;
+    let base = crate::mapped::Mapped::new(&File::open(base_path(dir, g))?)?;
     let deck = native::load(Arc::new(base)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let name = fs::read_to_string(dir.join(META)).unwrap_or_else(|_| "Recovered".into());
     let mut doc = Doc::from_deck(deck, &name);
@@ -278,6 +321,60 @@ impl Doc {
         let mut history = History::new();
         history.limit = UNDO_LIMIT;
         Doc { deck, history, name: name.into(), dirty: false, current: 0, autosave: None, status: String::new(), notes: Vec::new(), generation: 0, touched: Vec::new(), typing: None }
+    }
+
+    /// Opens the `.oslides` in `f` mapped: only its index, deck and masters
+    /// are read now (§9.3).
+    pub fn from_file(name: &str, f: &File) -> Result<Self, String> {
+        let map = crate::mapped::Mapped::new(f).map_err(|e| e.to_string())?;
+        let deck = native::load(Arc::new(map)).map_err(|e| e.to_string())?;
+        Ok(Self::from_deck(deck, name))
+    }
+
+    /// Writes the deck to the new file `path` (streamed: nothing the size of
+    /// the deck is held in memory) and maps the deck from it, so the file it
+    /// came from can be written over. The caller copies `path` where the
+    /// deck goes and then hands it to [`Doc::saved_as`].
+    pub fn spool(&mut self, path: &Path) -> io::Result<File> {
+        let f = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        let r = (|| {
+            let f = native::save(&self.deck, io::BufWriter::with_capacity(1 << 20, f))?.into_inner().map_err(|e| e.into_error())?;
+            f.sync_all()?;
+            let map = crate::mapped::Mapped::new(&f)?;
+            let deck = native::load(Arc::new(map)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok::<_, io::Error>((f, deck))
+        })();
+        match r {
+            Ok((f, deck)) => {
+                self.deck = deck;
+                Ok(f)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(path);
+                Err(e)
+            }
+        }
+    }
+
+    /// A folder for [`Doc::spool`]'s file: the autosave folder (so the saved
+    /// file can become its base), else the system's temporary folder.
+    pub fn spool_path(&self) -> PathBuf {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = self.autosave.as_ref().map(|a| a.dir.clone()).unwrap_or_else(std::env::temp_dir);
+        dir.join(format!(".save.{}.{n}.oslides", std::process::id()))
+    }
+
+    /// The deck is saved, and `spooled` (from [`Doc::spool`]) holds it: it
+    /// becomes the autosave base, else it is removed (the deck stays mapped).
+    pub fn saved_as(&mut self, spooled: &Path) -> io::Result<()> {
+        self.dirty = false;
+        match &mut self.autosave {
+            Some(a) if spooled.parent() == Some(a.dir.as_path()) => a.rebase(spooled),
+            _ => {
+                let _ = fs::remove_file(spooled);
+                self.saved()
+            }
+        }
     }
 
     pub fn from_native(name: &str, data: Vec<u8>) -> Result<Self, String> {
@@ -521,6 +618,7 @@ mod tests {
         let pid = doc.deck.new_id();
         doc.run("Insert Picture", vec![DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: 0, shape: Box::new(Shape::new(pid, Rect::new(0, 0, 10, 10), ShapeKind::Picture { media, crop: [0; 4], line: None })) }]);
         doc.autosave().unwrap().sync().unwrap();
+        doc.autosave().unwrap().settle().unwrap();
         let want = content(&mut doc.deck);
         drop(doc); // a crash: the folder stays
         let (mut back, rec) = recover(&dir).unwrap();
@@ -538,5 +636,46 @@ mod tests {
         back.undo();
         assert_eq!(back.deck.slide(1).unwrap().shapes[0].text().unwrap().text(), "");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_streams_and_becomes_the_base() {
+        let dir = tmp("spool");
+        let src_path = dir.with_extension("src.oslides");
+        let mut doc = Doc::new("Talk");
+        let obj = doc.deck.layout_of_kind("obj").unwrap().id;
+        for _ in 0..5 {
+            let s = new_slide(&mut doc.deck, obj);
+            doc.deck.push_slide(s);
+        }
+        let media = doc.deck.add_media("image/png", &[9u8; 100_000]);
+        let pid = doc.deck.new_id();
+        doc.deck.slide_mut(0).unwrap().shapes.push(Shape::new(pid, Rect::new(0, 0, 10, 10), ShapeKind::Picture { media, crop: [0; 4], line: None }));
+        fs::write(&src_path, native::save_to_vec(&doc.deck)).unwrap();
+        // Opened mapped, as a picked file is.
+        let mut doc = Doc::from_file("Talk.oslides", &File::open(&src_path).unwrap()).unwrap();
+        assert_eq!(doc.deck.loaded_count(), 0);
+        doc.autosave_to(&dir).unwrap();
+        let s = new_slide(&mut doc.deck, obj);
+        doc.run("New Slide", vec![DeckOp::InsertSlide { at: 1, slide: Box::new(s) }]);
+        // Save over the file the deck is mapped from: spooled, then copied.
+        let spool = doc.spool_path();
+        let src = doc.spool(&spool).unwrap();
+        crate::mapped::copy_file(&src, &mut OpenOptions::new().write(true).open(&src_path).unwrap()).unwrap();
+        doc.saved_as(&spool).unwrap();
+        assert!(!doc.dirty && !spool.exists(), "the spooled file is the base now");
+        assert_eq!(doc.deck.slide_count(), 7);
+        assert_eq!(doc.deck.media_bytes(media).unwrap().len(), 100_000);
+        let saved = fs::read(&src_path).unwrap();
+        assert_eq!(native::load(Arc::new(saved)).unwrap().slide_count(), 7);
+        // An edit after the save, then a crash: the base is the saved deck.
+        let s = new_slide(&mut doc.deck, obj);
+        doc.run("New Slide", vec![DeckOp::InsertSlide { at: 0, slide: Box::new(s) }]);
+        doc.autosave().unwrap().sync().unwrap();
+        drop(doc);
+        let (back, rec) = recover(&dir).unwrap();
+        assert_eq!((rec.actions, back.deck.slide_count()), (1, 8));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&src_path);
     }
 }

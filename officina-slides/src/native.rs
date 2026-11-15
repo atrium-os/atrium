@@ -7,6 +7,9 @@
 //! MASTERS  the masters and layouts
 //! DECK     size, id watermark, theme, the slides in order (id, chunk), the
 //!          media table (id, type, hash, length, chunks)
+//! PREVIEW* a picture's small copy (an image file), one chunk each
+//! PREVIEWS optional: the previews' table (picture hash, type, width,
+//!          height, chunk); a file without it has no previews
 //! ```
 //!
 //! Opening reads DECK and MASTERS; a slide is read when it is first shown and
@@ -30,6 +33,8 @@ pub const SLIDE: u16 = 1;
 pub const MEDIA: u16 = 2;
 pub const MASTERS: u16 = 3;
 pub const DECK: u16 = 4;
+pub const PREVIEW: u16 = 5;
+pub const PREVIEWS: u16 = 6;
 
 /// The largest media piece.
 pub const MEDIA_PIECE: usize = 16 << 20;
@@ -794,6 +799,36 @@ pub fn save<W: Write>(deck: &Deck, out: W) -> io::Result<W> {
         }
         table.push((id, m, pieces));
     }
+    // Previews of the pictures kept.
+    let mut prev = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, m, _) in &table {
+        let Some(p) = deck.previews.get(&m.hash) else { continue };
+        if !seen.insert(m.hash) {
+            continue;
+        }
+        let k = match &p.bytes {
+            MediaBytes::Loaded(b) => c.add(PREVIEW, b)?,
+            MediaBytes::InFile(chunks) => {
+                let b = deck.backing.as_ref().ok_or_else(|| err(Damaged("no file".into())))?;
+                let bytes = chunks.first().map(|&k| b.chunk(k)).transpose().map_err(err)?.unwrap_or(&[]);
+                c.add(PREVIEW, bytes)?
+            }
+        };
+        prev.push((m.hash, p, k));
+    }
+    if !prev.is_empty() {
+        let mut w = Writer::new();
+        w.var(prev.len() as u64);
+        for (h, p, k) in &prev {
+            w.bytes(h);
+            w.str(&p.mime);
+            w.var(p.width as u64);
+            w.var(p.height as u64);
+            w.var(*k as u64);
+        }
+        c.add(PREVIEWS, &w.into_bytes())?;
+    }
     let mut w = Writer::new();
     w.var(deck.masters.len() as u64);
     for m in &deck.masters {
@@ -928,6 +963,13 @@ pub fn load(data: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Result<Deck, Damaged> {
         deck.layouts.push(layout(&mut r)?);
     }
     done(&r)?;
+    // Previews: optional, and a damaged table only costs the previews.
+    let mut it = c.entries().iter().enumerate().filter(|(_, e)| e.kind == PREVIEWS);
+    if let (Some((pk, _)), None) = (it.next(), it.next()) {
+        if let Ok(p) = previews(&c, &backing, pk) {
+            deck.previews = p;
+        }
+    }
     deck.next_id = watermark.max(1);
     let ids: Vec<u32> = deck.masters.iter().map(|m| m.id).chain(deck.layouts.iter().map(|l| l.id)).chain(deck.media.keys().copied()).chain(deck.slides.iter().map(|s| s.id())).collect();
     for id in ids {
@@ -935,6 +977,29 @@ pub fn load(data: Arc<dyn AsRef<[u8]> + Send + Sync>) -> Result<Deck, Damaged> {
     }
     deck.backing = Some(backing);
     Ok(deck)
+}
+
+fn previews(c: &ContainerReader<'_>, backing: &Backing, k: usize) -> Result<std::collections::HashMap<[u8; 16], Preview>, Damaged> {
+    let mut r = Reader::new(c.chunk(k)?);
+    let n = r.count("previews", MAX_MEDIA as u64, 20)?;
+    let mut out = std::collections::HashMap::with_capacity(n);
+    for _ in 0..n {
+        let hash: [u8; 16] = r.bytes("hash", 16)?.try_into().map_err(|_| Damaged("preview hash".into()))?;
+        let mime: Arc<str> = r.str("preview type", 256)?.into();
+        let width = u32v(&mut r, "preview width")?;
+        let height = u32v(&mut r, "preview height")?;
+        let ch = r.len("preview chunk", u32::MAX as u64)?;
+        if backing.kind(ch) != Some(PREVIEW) || width == 0 || height == 0 || width > 4 * PREVIEW_SIDE || height > 4 * PREVIEW_SIDE {
+            return Err(Damaged("preview table".into()));
+        }
+        let len = backing.entries[ch].len as u64;
+        if len > MAX_PREVIEW_LEN {
+            return Err(Damaged("preview table".into()));
+        }
+        out.insert(hash, Preview { mime, width, height, len, bytes: MediaBytes::InFile(vec![ch]) });
+    }
+    done(&r)?;
+    Ok(out)
 }
 
 pub(crate) fn read_slide(deck: &Deck, chunk: usize) -> Result<Slide, Damaged> {
