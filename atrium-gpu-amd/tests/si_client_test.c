@@ -84,6 +84,14 @@
  *                waited for, three rounds; every page must hold its own
  *                64 x 42 and nothing else's. Raises isolation.queue_limit
  *                for the run (root's queues count too) and puts it back.
+ *  19 unbind     VM_UNBIND: flags and a BO not bound there are refused; a
+ *                BO shared into four VMs and unbound from each no longer
+ *                keeps them alive once their fds close (isolation.vms),
+ *                while a binding left in place does until the BO closes;
+ *                a BO unbound while work under its VM may use it, then
+ *                closed, leaves nothing deferred once that work is done;
+ *                an unbound page faults (EIO), the VM runs on a new
+ *                queue and the range can be bound again at the same VA.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -2262,6 +2270,173 @@ scale(void)
 	}
 }
 
+/* ---- 19: VM_UNBIND ---- */
+
+static int
+vm_unbind(int vm, int bo, uint32_t flags)
+{
+	struct atrium_gpu_vm_unbind u;
+
+	memset(&u, 0, sizeof(u));
+	u.vm_fd = (uint32_t)vm;
+	u.bo_fd = (uint32_t)bo;
+	u.flags = flags;
+	return (ioctl(fd, ATRIUM_GPU_IOC_VM_UNBIND, &u) == 0 ? 0 : errno);
+}
+
+/* VM_BIND2 at a chosen VA. */
+static int
+vm_bind_at(int vm, int bo, uint64_t va)
+{
+	struct atrium_gpu_vm_bind2 b;
+
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = (uint32_t)vm;
+	b.bo_fd = (uint32_t)bo;
+	b.va = va;
+	return (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND2, &b) == 0 && b.va == va ?
+	    0 : errno != 0 ? errno : EINVAL);
+}
+
+#define UNBIND_VMS	4
+
+static void
+unbind(void)
+{
+	struct job j;
+	int vm[UNBIND_VMS], shared, other, i, r, r2, ok, ms, n;
+	int64_t v0, v1, v2, now;
+	uint64_t va, out_va;
+	uint32_t first;
+
+	job_init(&j);
+	v0 = iso("vms");
+	if (v0 < 0) {
+		check(0, "19 unbind", "isolation.vms unreadable: %s",
+		    strerror(errno));
+		return;
+	}
+
+	/* a: refusals. */
+	shared = bo_alloc(4096, 0);
+	other = bo_alloc(4096, 0);
+	vm[0] = vm_create();
+	if (shared < 0 || other < 0 || vm[0] < 0 ||
+	    vm_bind(vm[0], shared, 0, &va) != 0) {
+		check(0, "19 unbind", "setup: %s", strerror(errno));
+		goto out0;
+	}
+	r = vm_unbind(vm[0], shared, 1);
+	check(r == EINVAL, "19 unbind: unknown flags refused", "%s",
+	    r == 0 ? "accepted" : strerror(r));
+	r = vm_unbind(vm[0], other, 0);
+	check(r == ENOENT, "19 unbind: a BO not bound in the VM refused",
+	    "%s", r == 0 ? "accepted" : strerror(r));
+	r = vm_unbind(vm[0], vm[0], 0);
+	check(r != 0, "19 unbind: a VM fd as the BO refused", "%s",
+	    r == 0 ? "accepted" : strerror(r));
+
+	/* b: one BO in four VMs, unbound from each: the VMs go with their
+	 * fds. */
+	for (i = 1; i < UNBIND_VMS; i++) {
+		vm[i] = vm_create();
+		if (vm[i] < 0 || vm_bind(vm[i], shared, 0, &va) != 0) {
+			check(0, "19 unbind", "VM %d: %s", i, strerror(errno));
+			while (i-- > 1)
+				close(vm[i]);
+			goto out0;
+		}
+	}
+	for (i = 0, ok = 0; i < UNBIND_VMS; i++)
+		ok += vm_unbind(vm[i], shared, 0) == 0;
+	r = vm_unbind(vm[0], shared, 0);
+	check(ok == UNBIND_VMS && r == ENOENT, "19 unbind: a shared BO "
+	    "unbinds from each of its VMs, once", "%d/%d unbound, again: %s",
+	    ok, UNBIND_VMS, r == 0 ? "accepted" : strerror(r));
+	for (i = 0; i < UNBIND_VMS; i++)
+		close(vm[i]);
+	v1 = iso("vms");
+	check(v1 == v0, "19 unbind: unbound, the VMs go when their fds "
+	    "close", "vms %jd -> %jd", (intmax_t)v0, (intmax_t)v1);
+
+	/* c: the control: a binding left in place keeps its VM alive. */
+	vm[0] = vm_create();
+	r = vm[0] >= 0 ? (vm_bind(vm[0], shared, 0, &va) == 0 ? 0 : errno) :
+	    errno;
+	if (vm[0] >= 0)
+		close(vm[0]);
+	v1 = iso("vms");
+	close(shared);
+	shared = -1;
+	v2 = iso("vms");
+	check(r == 0 && v1 == v0 + 1 && v2 == v0, "19 unbind: a binding "
+	    "left in place holds its VM until the BO closes", "bind %s, vms "
+	    "%jd -> %jd -> %jd", r == 0 ? "ok" : strerror(r), (intmax_t)v0,
+	    (intmax_t)v1, (intmax_t)v2);
+
+	/* d: unbind under work that may still use the page, then close. */
+	if (job_open(&j, "19") != 0) {
+		check(0, "19 unbind", "job setup failed");
+		goto out0;
+	}
+	if (poison(j.out, POISON_A) != 0 || job_submit(&j, j.out_va) != 0) {
+		check(0, "19 unbind: in flight", "submit: %s", strerror(errno));
+		goto out;
+	}
+	out_va = j.out_va;
+	r2 = vm_unbind(j.vm, j.out, 0);
+	r = job_wait(&j, 8000, &ms);
+	close(j.out);
+	j.out = -1;
+	for (i = 0; i < 100 && (now = iso("deferred_now")) != 0; i++)
+		usleep(20000);
+	check(r2 == 0 && (r == 0 || r == EIO) && now == 0, "19 unbind: a BO "
+	    "unbound under work that may use it, then closed, leaves nothing "
+	    "deferred", "unbind %s, the work %s after %d ms, deferred_now "
+	    "%jd", r2 == 0 ? "ok" : strerror(r2), r == 0 ? "landed" :
+	    strerror(r), ms, (intmax_t)now);
+	if (r != 0 && job_renew(&j) != 0) {
+		check(0, "19 unbind: renew", "%s", strerror(errno));
+		goto out;
+	}
+	if (j.out < 0 && ((j.out = bo_alloc(4096, 0)) < 0 ||
+	    vm_bind_at(j.vm, j.out, out_va) != 0)) {
+		check(0, "19 unbind: rebind", "%s", strerror(errno));
+		goto out;
+	}
+	run_clean(&j, "19 unbind: the VM runs clean after");
+	out_va = j.out_va;
+
+	/* e: an unbound page faults; the range binds again at its VA. */
+	if ((r = vm_unbind(j.vm, j.out, 0)) != 0 ||
+	    poison(j.out, POISON_A) != 0 || job_submit(&j, out_va) != 0) {
+		check(0, "19 unbind: fault", "%s", strerror(r != 0 ? r : errno));
+		goto out;
+	}
+	r = job_wait(&j, 8000, &ms);
+	n = count(j.out, SIW42_OUT_VALUE, &first);
+	check(r == EIO && n == 0, "19 unbind: a store to the unbound page "
+	    "faults and fails the work, the BO untouched", "completion %s "
+	    "after %d ms, %d/64 words 42", r == 0 ? "ok" : strerror(r), ms,
+	    n);
+	if (job_renew(&j) != 0) {
+		check(0, "19 unbind: renew", "%s", strerror(errno));
+		goto out;
+	}
+	r = vm_bind_at(j.vm, j.out, out_va);
+	check(r == 0, "19 unbind: the BO binds again at the same VA", "%s",
+	    r == 0 ? "ok" : strerror(r));
+	if (r == 0)
+		run_clean(&j, "19 unbind: and the VM runs clean on it");
+out:
+	job_close(&j);
+out0:
+	if (shared >= 0)
+		close(shared);
+	if (other >= 0)
+		close(other);
+}
+
 int
 main(void)
 {
@@ -2572,6 +2747,10 @@ main(void)
 	/* 18: many VMs and queues (6b; before 14's re-inits). */
 	if (!skipped(18, "scale"))
 		scale();
+
+	/* 19: VM_UNBIND (before 14's re-inits). */
+	if (!skipped(19, "unbind"))
+		unbind();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();

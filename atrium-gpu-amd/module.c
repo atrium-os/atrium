@@ -83,7 +83,8 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	c->va_align = PAGE_SIZE;
 	c->vram_bytes = sc->vram.total;
-	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC;
+	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC |
+	    ATRIUM_GPU_BIND_FEAT_UNBIND;
 	/* From GC's discovered (gpusim: modelled) version, identify.c. */
 	c->isa_family = sc->isa_family;
 	c->isa_revision = sc->isa_revision;
@@ -138,7 +139,7 @@ amd_gpu_reset(struct atrium_amd_softc *sc)
 static const char amd_build_id[] = ATRIUM_BUILD_ID;
 /* Bumped when the client-visible rules change: 2 = isolation (control node,
  * exclusive queue ownership, owner-only doorbell mmap). */
-#define ATRIUM_AMD_ABI_REV	4	/* 3: VM_BIND2 (read-only binds); 4: v2 cap ids, CAP_ISA */
+#define ATRIUM_AMD_ABI_REV	5	/* 3: VM_BIND2 (read-only binds); 4: v2 cap ids, CAP_ISA; 5: VM_UNBIND */
 
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",

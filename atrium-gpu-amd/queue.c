@@ -425,6 +425,11 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64
 #undef AMD_ISO_INT
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "vms",
+	    CTLFLAG_RD, &sc->vm_count, 0,
+	    "live VMs (a VM lives while its fd or any BO binding holds it)");
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "bos",
+	    CTLFLAG_RD, &sc->bo_count, 0, "live BOs");
 	SYSCTL_ADD_U64(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "ih_overflows",
 	    CTLFLAG_RD, &sc->ih_overflows, 0,
 	    "interrupt passes where the device lapped the IH ring");

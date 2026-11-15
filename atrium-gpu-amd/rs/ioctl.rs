@@ -53,6 +53,7 @@ abi_structs! {
     atrium_gpu_vm_create = 8;
     atrium_gpu_vm_bind = 16;
     atrium_gpu_vm_bind2 = 24;
+    atrium_gpu_vm_unbind = 16;
     atrium_gpu_queue_map = 32;
     atrium_gpu_caps_query = 16;
     atrium_gpu_sched = 40;
@@ -183,6 +184,13 @@ fn client_ioctl(dev: Dev, client: &Client, cmd: u_long, data: &mut IoctlData<'_>
             errno(vm_bind(a.vm_fd, a.bo_fd, a.va, a.flags).map(|va| a.va = va))
         }),
 
+        sys::ATRIUM_RS_IOC_VM_UNBIND => with_arg(data, |a: &mut sys::atrium_gpu_vm_unbind| {
+            if a.flags != 0 || a.pad != 0 {
+                return EINVAL.as_c_type();
+            }
+            errno(vm_unbind(a.vm_fd, a.bo_fd))
+        }),
+
         sys::ATRIUM_RS_IOC_QUEUE_MAP => with_arg(data, |a: &mut sys::atrium_gpu_queue_map| {
             errno(queue_map(dev, client, a))
         }),
@@ -239,6 +247,12 @@ fn vm_bind(vm_fd: u32, bo_fd: u32, va: u64, flags: u32) -> Result<u64> {
     let vm = FileRef::<Vm>::get(fd(vm_fd))?;
     let bo = FileRef::<BoFile>::get(fd(bo_fd))?;
     bo.bind(&vm, va, flags)
+}
+
+fn vm_unbind(vm_fd: u32, bo_fd: u32) -> Result<()> {
+    let vm = FileRef::<Vm>::get(fd(vm_fd))?;
+    let bo = FileRef::<BoFile>::get(fd(bo_fd))?;
+    bo.unbind(&vm)
 }
 
 fn queue_map(dev: Dev, client: &Client, a: &mut sys::atrium_gpu_queue_map) -> Result<()> {

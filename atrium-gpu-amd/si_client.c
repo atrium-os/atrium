@@ -1646,7 +1646,8 @@ si_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->va_align = PAGE_SIZE;
 	/* The device heap: the allocator's range (5d), if it is up. */
 	c->vram_bytes = sc->vram.inited ? sc->vram.total : 0;
-	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC;
+	c->bind_features = ATRIUM_GPU_BIND_FEAT_READ_ONLY | ATRIUM_GPU_BIND_FEAT_EXEC |
+	    ATRIUM_GPU_BIND_FEAT_UNBIND;
 	c->isa_family = sc->isa_family;
 	c->isa_revision = sc->isa_revision;
 	c->isa_name = sc->isa_name;

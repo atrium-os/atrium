@@ -7,7 +7,8 @@
  * A BO is independent of any VM (ABI-v2 principle 4): the same object can be
  * bound into up to ATRIUM_AMD_BO_MAX_BIND VMs at once, each at its own GPU-VA
  * (a compositor importing a client's buffer). Each binding holds a file
- * reference on its VM, so every VM a BO is mapped into outlives the BO.
+ * reference on its VM, so every VM a BO is mapped into outlives the BO, or
+ * until VM_UNBIND takes the mapping out (`Bo::unbind`).
  *
  * The backing store (bus_dma System pages or VRAM) is the backend's
  * `struct atrium_amd_bo`, this object's first field.
@@ -21,7 +22,7 @@
  */
 
 use crate::backend::Dev;
-use crate::defer;
+use crate::defer::{self, BusyAt};
 use crate::quota::Charge;
 use crate::sys;
 use crate::vm::Vm;
@@ -46,6 +47,15 @@ struct Binding {
     gpu_va: u64,
 }
 
+/// The BO's bindings, and what unbinds left behind.
+struct Binds {
+    slots: [Option<Binding>; MAX_BIND],
+    /// Queues that were busy under a VM when the BO was unbound from it and could not be
+    /// shown to be done with its pages then. The last close waits for them too, as for a
+    /// VM the BO is still bound in.
+    stale: Option<BusyAt>,
+}
+
 #[repr(C)]
 pub struct Bo {
     /// The backend's part. Must stay the first field (C casts between the two).
@@ -55,7 +65,7 @@ pub struct Bo {
     /// second wrote one past the array (kmod audit 2026-11-07, G1). Here the slots can only
     /// be reached through the exclusive guard, and a full table is an error, not an index.
     /// Exclusive in bind (which may sleep in map_page), shared in gpu_va.
-    binds: SxLock<[Option<Binding>; MAX_BIND]>,
+    binds: SxLock<Binds>,
     /// What the BO holds against its allocator's uid (quota.rs); `None` until charged.
     charge: Option<Charge>,
 }
@@ -107,6 +117,7 @@ impl Bo {
     pub fn gpu_va(&self, vm: &Vm) -> Option<u64> {
         let binds = sx_slock(&self.binds);
         binds
+            .slots
             .iter()
             .flatten()
             .find(|b| core::ptr::eq(&*b.vm, vm))
@@ -136,10 +147,10 @@ impl Bo {
         let mut binds = sx_xlock(&self.binds);
 
         // A BO maps at most once per VM: a second bind would alias it at two VAs.
-        if binds.iter().flatten().any(|b| core::ptr::eq(&*b.vm, &**vm)) {
+        if binds.slots.iter().flatten().any(|b| core::ptr::eq(&*b.vm, &**vm)) {
             return Err(EBUSY);
         }
-        let slot = binds.iter().position(Option::is_none).ok_or(ENOSPC)?; // shared too widely
+        let slot = binds.slots.iter().position(Option::is_none).ok_or(ENOSPC)?; // shared too widely
 
         // Reserve the range. A caller-chosen VA must be page-aligned, inside the window and
         // clear of every other binding (review §A2.5); otherwise next-fit picks one.
@@ -168,8 +179,46 @@ impl Bo {
                 return Err(e);
             }
         }
-        binds[slot] = Some(Binding { vm: vm.clone(), gpu_va: addr });
+        binds.slots[slot] = Some(Binding { vm: vm.clone(), gpu_va: addr });
         Ok(addr)
+    }
+
+    /// VM_UNBIND: take the BO's mapping out of `vm`. The PTEs are cleared (each unmap
+    /// flushes the TLB) and the range goes back to the arena; then, as at the last close
+    /// (the free rule, spec §4.5.1 step 4), one MES preemption of the VM's user queues
+    /// shows nothing still uses the old translations. Whatever could not be shown done is
+    /// kept in `stale` for the last close to wait on. Dropping the binding drops its
+    /// reference on the VM.
+    pub fn unbind(&self, vm: &Vm) -> Result<()> {
+        let dev = self.dev();
+        let span = self.span();
+        let mut binds = sx_xlock(&self.binds);
+        let slot = binds
+            .slots
+            .iter()
+            .position(|b| b.as_ref().is_some_and(|b| core::ptr::eq(&*b.vm, vm)))
+            .ok_or(ENOENT)?;
+        let b = binds.slots[slot].take().ok_or(ENOENT)?;
+        for i in 0..self.hw.npages as u64 {
+            dev.unmap_page(b.vm.as_c(), b.gpu_va + i * PAGE_SIZE);
+        }
+        // SAFETY: the binding's reserved range, unmapped above.
+        unsafe { b.vm.arena.free(b.gpu_va, span) };
+        // SAFETY: the VM is held by the binding until it drops below.
+        let vmid = unsafe { (*b.vm.as_c()).vmid };
+        let mut at = dev.busy_snapshot(&[vmid]);
+        if at.uq != 0 {
+            at.uq = dev.uq_preempt(at.uq);
+        }
+        if at.mask != 0 || at.uq != 0 {
+            binds.stale = Some(match binds.stale {
+                Some(old) => old.then(&at),
+                None => at,
+            });
+        }
+        drop(binds);
+        drop(b); // the VM reference; the last one tears the VM down
+        Ok(())
     }
 }
 
@@ -204,7 +253,7 @@ impl Drop for BoFile {
         // Clear the BO's PTEs in every VM it is bound into (each unmap flushes the TLB), so
         // no new access can reach its pages, and give the ranges back to the arenas.
         let binds = bo.binds.get_mut();
-        for b in binds.iter().flatten() {
+        for b in binds.slots.iter().flatten() {
             for i in 0..npages {
                 dev.unmap_page(b.vm.as_c(), b.gpu_va + i * PAGE_SIZE);
             }
@@ -224,7 +273,11 @@ impl Drop for BoFile {
         if at.uq != 0 {
             at.uq = dev.uq_preempt(at.uq);
         }
-        for b in binds.iter_mut() {
+        // Unbinds may have left work behind that could still reach the pages.
+        if let Some(old) = binds.stale.take() {
+            at = old.then(&at);
+        }
+        for b in binds.slots.iter_mut() {
             *b = None; // drops the VM reference
         }
         // SAFETY: created by create_fd with Box; this was the last user and nothing else
@@ -269,7 +322,7 @@ pub fn create_fd(dev: Dev, size: u64, flags: u32) -> Result<c_int> {
     }
     let charge = dev.state().quotas.charge(dev, vram, bytes)?;
     let mut bo: Box<Bo> =
-        Box::new(Bo { hw, binds: SxLock::new([const { None }; MAX_BIND]), charge: None }, M_WAITOK);
+        Box::new(Bo { hw, binds: SxLock::new(Binds { slots: [const { None }; MAX_BIND], stale: None }), charge: None }, M_WAITOK);
     // SAFETY: boxed, never moves again.
     unsafe { sx_init(Pin::new_unchecked(&bo.binds), c"amdbobind") };
     // Self-cleaning on failure; the Box then frees the struct.

@@ -56,6 +56,7 @@ struct atrium_gpu_cap_record {
 #define ATRIUM_GPU_BIND_FEAT_SPARSE	0x1u
 #define ATRIUM_GPU_BIND_FEAT_READ_ONLY	0x2u	/* VM_BIND2 + BIND_READONLY */
 #define ATRIUM_GPU_BIND_FEAT_EXEC	0x4u	/* 2.3: BIND_EXEC honoured (GPU W^X) */
+#define ATRIUM_GPU_BIND_FEAT_UNBIND	0x8u	/* VM_UNBIND */
 
 /*
  * ISA — which instruction set the device runs, so userspace picks its
@@ -205,6 +206,23 @@ struct atrium_gpu_vm_bind2 {
  * (EINVAL otherwise). Shader code is bound READONLY|EXEC; data never gets
  * X. Silicon enforces it while isolation.gpu_wx has bit 1; gpusim has no X bit. */
 #define ATRIUM_GPU_BIND_EXEC		0x4
+
+/*
+ * VM_UNBIND: take a BO's mapping out of one VM (on the device fd, like
+ * VM_BIND). Its PTEs there are cleared and the TLB flushed at once, its VA
+ * range is free for the next bind, and the binding's reference on the VM is
+ * dropped, so a long-lived shared BO no longer keeps every VM it was ever
+ * bound into alive. Work still queued under that VM that touches the range
+ * faults in that VM only. The BO itself lives on: if that work may still be
+ * using its pages when the BO's last fd closes, the free waits for it as for
+ * a bound BO. ENOENT if the BO is not bound in that VM.
+ */
+struct atrium_gpu_vm_unbind {
+	uint32_t	vm_fd;
+	uint32_t	bo_fd;
+	uint32_t	flags;		/* must be 0 */
+	uint32_t	pad;		/* must be 0 */
+};
 
 /*
  * Queue fds (GPU ABI v2 §5.5, §5.7; stage 5c-2b). Layouts and numbers are
@@ -377,5 +395,6 @@ struct atrium_gpu_powergate {
 };
 #define ATRIUM_GPU_IOC_POWERGATE	_IOWR('A', 26, struct atrium_gpu_powergate)
 #define ATRIUM_GPU_IOC_VM_BIND2		_IOWR('A', 27, struct atrium_gpu_vm_bind2)
+#define ATRIUM_GPU_IOC_VM_UNBIND	_IOW('A', 28, struct atrium_gpu_vm_unbind)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

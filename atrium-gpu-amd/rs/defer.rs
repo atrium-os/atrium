@@ -43,6 +43,21 @@ pub struct BusyAt {
 }
 
 impl BusyAt {
+    /// The union of an older snapshot and a `newer` one: every queue either saw busy, and
+    /// for a queue busy in the newer one its newer generation (a queue that moved past the
+    /// newer work has also moved past the older). VMs with unpreempted user queues: both.
+    pub fn then(&self, newer: &BusyAt) -> BusyAt {
+        let mut out = *self;
+        for i in 0..NHWQ {
+            if newer.mask & (1 << i) != 0 {
+                out.gens[i] = newer.gens[i];
+            }
+        }
+        out.mask |= newer.mask;
+        out.uq |= newer.uq;
+        out
+    }
+
     /// Has every queue that was busy then moved on, given the queues' state `now`?
     fn retired(&self, now: &BusyAt) -> bool {
         self.uq & now.uq == 0 && (0..NHWQ).all(|i| {

@@ -92,6 +92,10 @@ pub const BIND_READONLY: u32 = 0x1;
 /// `VM_BIND2` flag (ABI 2.3, GPU W^X §5.4): executable PTEs; only with
 /// [`BIND_READONLY`].
 pub const BIND_EXEC: u32 = 0x4;
+/// `VM_UNBIND` ('A',28, driver ABI rev 5): take a BO's mapping out of one VM.
+#[repr(C)]
+#[derive(Default)]
+struct VmUnbind { vm_fd: u32, bo_fd: u32, flags: u32, pad: u32 }
 /// `QUEUE_CREATE` (on a VM fd) and `QUEUE_SUBMIT` (on a queue fd): GPU ABI
 /// v2 §5.5/§5.9. The old ring `SUBMIT` ('A',4) is gone.
 #[repr(C)]
@@ -654,7 +658,7 @@ impl<'a> Vm<'a> {
             unsafe { libc::close(a.bo_fd as RawFd) };
             return Err(e);
         }
-        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
+        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size, unbind_vm: -1 })
     }
 
     /// Allocate a BO the GPU may execute from in this VM and never write
@@ -685,7 +689,7 @@ impl<'a> Vm<'a> {
             unsafe { libc::close(a.bo_fd as RawFd) };
             return Err(e);
         }
-        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: va, size })
+        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: va, size, unbind_vm: -1 })
     }
 
     /// Map `bo`, which another VM of the same device allocated, into this
@@ -704,7 +708,7 @@ impl<'a> Vm<'a> {
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        Ok(Bo { gpu: self.gpu, fd, gpu_va: b.va, size: bo.size })
+        Ok(Bo { gpu: self.gpu, fd, gpu_va: b.va, size: bo.size, unbind_vm: self.dup_fd() })
     }
 
     pub fn alloc(&self, size: u64, flags: u32) -> io::Result<Bo<'a>> {
@@ -715,7 +719,7 @@ impl<'a> Vm<'a> {
             unsafe { libc::close(a.bo_fd as RawFd) };
             return Err(e);
         }
-        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
+        Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size, unbind_vm: -1 })
     }
 
     /// Bind a BO obtained from elsewhere — a `bo_fd` passed in via SCM_RIGHTS
@@ -727,7 +731,13 @@ impl<'a> Vm<'a> {
     pub fn import(&self, bo_fd: RawFd, size: u64) -> io::Result<Bo<'a>> {
         let mut b = VmBind { va: 0, vm_fd: self.fd as u32, bo_fd: bo_fd as u32 };
         unsafe { call(self.gpu.fd, iowr(G, 13, std::mem::size_of::<VmBind>()), &mut b)? };
-        Ok(Bo { gpu: self.gpu, fd: bo_fd, gpu_va: b.va, size })
+        Ok(Bo { gpu: self.gpu, fd: bo_fd, gpu_va: b.va, size, unbind_vm: self.dup_fd() })
+    }
+
+    /// A dup of this VM's fd for a shared BO's unbind on drop; -1 if the dup fails (the
+    /// mapping then lasts as long as the BO, as before VM_UNBIND).
+    fn dup_fd(&self) -> RawFd {
+        unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) }
     }
 
     /// This VM's queue fd for `engine`, made on first use. On silicon (no
@@ -814,7 +824,17 @@ impl Drop for Vm<'_> {
 // Bo — a buffer object (fd-as-handle)
 // ---------------------------------------------------------------------------
 
-pub struct Bo<'a> { gpu: &'a Gpu, fd: RawFd, gpu_va: u64, size: u64 }
+pub struct Bo<'a> {
+    gpu: &'a Gpu,
+    fd: RawFd,
+    gpu_va: u64,
+    size: u64,
+    /// For a BO mapped into another VM ([`Vm::share`], [`Vm::import`]): a dup of that VM's
+    /// fd, to `VM_UNBIND` the mapping on drop. Otherwise the binding would hold the VM
+    /// until every fd of the BO is gone, which for a long-lived shared BO is never. -1 if
+    /// none.
+    unbind_vm: RawFd,
+}
 
 impl<'a> Bo<'a> {
     pub fn gpu_va(&self) -> u64 { self.gpu_va }
@@ -850,7 +870,17 @@ impl<'a> Bo<'a> {
     }
 }
 
-impl Drop for Bo<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
+impl Drop for Bo<'_> {
+    fn drop(&mut self) {
+        if self.unbind_vm >= 0 {
+            // Best effort: an older driver (ENOTTY) keeps the mapping until the BO goes.
+            let mut u = VmUnbind { vm_fd: self.unbind_vm as u32, bo_fd: self.fd as u32, ..Default::default() };
+            let _ = unsafe { call(self.gpu.fd, iow(G, 28, std::mem::size_of::<VmUnbind>()), &mut u) };
+            unsafe { libc::close(self.unbind_vm) };
+        }
+        unsafe { libc::close(self.fd) };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scanout — the offset-model "CPU pixels -> onscreen" surface
