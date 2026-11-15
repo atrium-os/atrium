@@ -130,7 +130,9 @@ pub fn apply_all(
     // `protected-media` (OpenCdm) reaches it the same way.
     // The file manager opens files in apps through portcullisd (OpenFile,
     // opening-files.md §6.2), which checks it by its uid on every request.
-    if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)) && caps.app_launch != Some(true) {
+    // The terminal asks for more consoles (Console, homes.md §4) the same way.
+    if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)
+        || caps.consoles == Some(true)) && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }
     Ok(())

@@ -27,7 +27,7 @@ use portcullis_jail::{build, jail_name_from_app_id, BuildOpts, JailConfig};
 use portcullis_toml::{merge_capabilities, Manifest};
 
 const APPS_DIR:     &str = "/var/lib/atrium/apps";
-const JAILS_DIR:    &str = "/var/lib/atrium/jails";
+pub const JAILS_DIR:    &str = "/var/lib/atrium/jails";
 const SENTINEL:     &str = ".atrium-firstrun-done";
 
 #[derive(Debug)]
@@ -282,7 +282,8 @@ pub fn launch_with_stdio(
      * types gets its own directory of the channel hub, and only its own,
      * at /atrium/sockets/opens. Made before the mount, so the source exists. */
     let mut jc = jc;
-    if !manifest.opens.is_empty() {
+    // The terminal gets its consoles the same way (homes.md §4).
+    if !manifest.opens.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(app_id)
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
@@ -707,6 +708,7 @@ pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
             uid:         registry.as_ref().zip(user).and_then(|(r, u)| r.uid_for(u, &m.app.id)),
             icon_svg:    m.app.icon.as_deref()
                 .and_then(|i| portcullis_toml::icon::read_bundle_svg(&e.path(), i)),
+            console:     no_console(&m).is_none(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -725,6 +727,34 @@ fn installed(app_id: &str) -> Option<Manifest> {
 /// Is `app_id` a file manager (`removable-files` in its INSTALLED
 /// manifest)? The only caller of OpenApps and OpenFile (opening-files.md
 /// §6.2), as of dispensatord's CONNECT.
+/// Why an app has no console (homes.md §4, decision H5), or `None` when
+/// it may have one: the installer granted it (part of the system), or it
+/// asks for a system-only capability.
+pub fn no_console(m: &Manifest) -> Option<String> {
+    let name = if m.app.name.is_empty() { &m.app.id } else { &m.app.name };
+    let system = portcullis_policy::Policy::load_system(Path::new(portcullis_policy::SYSTEM_PATH))
+        .map(|p| p.grants.contains_key(&m.app.id))
+        .unwrap_or(true); // an unreadable system policy: assume the worst
+    if system {
+        return Some(format!("{name} is part of the system: it has no console"));
+    }
+    let caps = m.capabilities.system_only();
+    if !caps.is_empty() {
+        return Some(format!("{name} is part of the system ({}): it has no console", caps.join(", ")));
+    }
+    None
+}
+
+/// `app_id`'s installed manifest, for the console's checks.
+pub fn installed_manifest(app_id: &str) -> Option<Manifest> {
+    installed(app_id)
+}
+
+/// Is this the terminal (its INSTALLED manifest holds `consoles`)?
+pub fn app_shows_consoles(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.consoles == Some(true))
+}
+
 pub fn app_is_file_manager(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.removable_files == Some(true))
 }

@@ -2581,6 +2581,9 @@ pub mod activation {
         /// Opening a file in its app (opening-files.md §6.2): a click, or
         /// Enter, in the file manager's window, spent by portcullisd.
         pub const OPEN: u8 = 9;
+        /// An app's console (homes.md §4): a click, or Enter, on Terminal
+        /// in the launcher's window, spent by portcullisd.
+        pub const CONSOLE: u8 = 10;
     }
 
     /// What minted a token.

@@ -208,7 +208,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, uid: Option<u32>) -> AppEntry {
-        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid, vector: None }
+        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid, vector: None, console: false }
     }
 
     #[test]

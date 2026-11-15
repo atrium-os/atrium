@@ -25,6 +25,20 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// A shell someone else started: its pty's master side (an app's
+    /// console, from portcullisd; homes.md §4). Nothing to reap here.
+    pub fn from_master(master: OwnedFd) -> Self {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+        // SAFETY: fcntl on a descriptor we own.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        Shell { master, pid: 0 }
+    }
+}
+
+impl Shell {
     /// Spawn `program` with `args` in a fresh pty of size cols × rows.
     /// Returns master fd + child pid.
     pub fn spawn(program: &OsStr, args: &[&str], cols: u16, rows: u16) -> io::Result<Self> {

@@ -25,6 +25,8 @@ const HID_V: u16 = 0x19;
 const HID_X: u16 = 0x1b;
 const HID_ENTER: u16 = 0x28;
 const HID_INSERT: u16 = 0x49;
+const HID_N: u16 = 0x11;
+const HID_T: u16 = 0x17;
 const HID_KP_ENTER: u16 = 0x58;
 /// The HID modifier byte (either hand), as the wire carries it.
 const MOD_CTRL: u8 = 0x01 | 0x10;
@@ -84,6 +86,13 @@ fn fits(e: &Entry, p: u8) -> bool {
         // Opening a file: a double-click or Open, or Enter on the row.
         (kind::BUTTON, purpose::OPEN) => true,
         (kind::KEY, purpose::OPEN) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
+        // An app's console: Terminal pressed, or Enter on it, in the
+        // launcher; in the terminal, New Tab or New Window, or their keys.
+        (kind::BUTTON, purpose::CONSOLE) => true,
+        (kind::KEY, purpose::CONSOLE) => {
+            e.hid == HID_ENTER || e.hid == HID_KP_ENTER
+                || (ctrl && e.mods & MOD_SHIFT != 0 && (e.hid == HID_T || e.hid == HID_N))
+        }
         _ => false,
     }
 }
@@ -580,6 +589,22 @@ mod tests {
         assert_eq!(why(t.consume(1, &enter, 1001, purpose::IDENTITY, |_| false, |_, _| true)), refusal::NOT_FOCUSED);
         let typed = t.mint(key(0x1e, 0, 0));
         assert_eq!(why(t.consume(1, &typed, 1001, purpose::IDENTITY, YES, |_, _| true)), refusal::WRONG_KIND, "a PIN digit authorises nothing");
+    }
+
+    #[test]
+    fn a_console_is_terminal_pressed_in_the_launchers_window() {
+        let mut t = Table::default();
+        let click = t.mint(button(0));
+        assert_eq!(why(t.consume(1, &click, 1002, purpose::CONSOLE, YES, NOVIS)), refusal::WRONG_UID, "another app's press");
+        assert_eq!(why(t.consume(1, &click, 1001, purpose::CONSOLE, YES, NOVIS)), 0);
+        let enter = t.mint(key(HID_ENTER, 0, 0));
+        assert_eq!(why(t.consume(1, &enter, 1001, purpose::CONSOLE, YES, NOVIS)), 0);
+        let typed = t.mint(key(0x04, 0, 0));
+        assert_eq!(why(t.consume(1, &typed, 1001, purpose::CONSOLE, YES, NOVIS)), refusal::WRONG_KIND, "typing opens no console");
+        let tab = t.mint(key(HID_T, MOD_CTRL | MOD_SHIFT, 0));
+        assert_eq!(why(t.consume(1, &tab, 1001, purpose::CONSOLE, YES, NOVIS)), 0, "Ctrl+Shift+T in the terminal");
+        let plain_t = t.mint(key(HID_T, MOD_CTRL, 0));
+        assert_eq!(why(t.consume(1, &plain_t, 1001, purpose::CONSOLE, YES, NOVIS)), refusal::WRONG_KIND, "Ctrl+T is the shell's");
     }
 
     #[test]

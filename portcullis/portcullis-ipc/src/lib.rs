@@ -286,6 +286,15 @@ pub enum Request {
         #[serde(default)]
         always:     bool,
     },
+
+    /// ★ A console in an app's jail (docs/spec/homes.md §4): a shell as the
+    /// app's uid for this person, on a new pty whose master side goes to the
+    /// terminal app. Only from a launcher (its INSTALLED manifest holds
+    /// `app-launch`), and only with `activation`, a press on Terminal in its
+    /// window that portcullisd spends with frescod (purpose CONSOLE). Never
+    /// for a system app (one the installer granted, or one asking for a
+    /// system-only capability). Answer: `ConsoleOpened`.
+    Console { app_id: String, activation: [u8; 16] },
 }
 
 /// An app that opens a type, for the Open with sheet.
@@ -323,6 +332,10 @@ pub struct CatalogEntry {
     /// under a strict profile; `None` → the system icon set or a letter tile.
     #[serde(default)]
     pub icon_svg:    Option<String>,
+    /// The app may have a console (homes.md §4, decision H5): a launcher
+    /// shows Terminal for it.
+    #[serde(default)]
+    pub console:     bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +391,8 @@ pub enum Response {
     OpenApps { apps: Vec<OpenChoice> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
+    /// Console → the shell runs; its terminal window is `title`.
+    ConsoleOpened { title: String },
 
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable

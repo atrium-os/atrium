@@ -3,6 +3,10 @@
 //! what its overlay already holds (`old-state` from before the move, its own
 //! run counter, bumped here), and the person's folders at /atrium/home if
 //! it was given them, trying to make a file in Documents.
+//!
+//! Installed as `stay_probe` (scripts/vm-console-check.sh, homes.md §4) it
+//! also leaves `/var/console-mark` in its overlay and stays running, so a
+//! console has a jail to join.
 
 use std::io::Write;
 
@@ -31,4 +35,11 @@ fn main() {
     };
     let group = std::fs::metadata("/atrium/home/Documents/probe.txt").map(|m| format!("{}", m.gid())).unwrap_or_else(|_| "-".into());
     eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group}");
+    let me = std::env::args().next().unwrap_or_default();
+    if me.ends_with("stay_probe") {
+        let _ = std::fs::write("/var/console-mark", "stay-mark\n");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
 }

@@ -138,3 +138,19 @@ pub fn focus_running(uid: u32) -> io::Result<Option<u32>> {
 pub fn wait_apps_key() -> io::Result<()> {
     ack(intent(&forum_ctl::Intent::WaitAppsKey))
 }
+
+/// Ask portcullisd for a console in `app_id` (homes.md §4), `activation`
+/// the press on Terminal. Its window comes from the terminal app.
+pub fn console(app_id: &str, activation: [u8; 16]) -> Result<String, String> {
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not reachable")?;
+    let mut s = UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+        other => return Err(format!("handshake: {other:?}")),
+    }
+    match round_trip(&mut s, &Request::Console { app_id: app_id.into(), activation }) {
+        Ok(Response::ConsoleOpened { title }) => Ok(title),
+        Ok(Response::Error { message }) => Err(message),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}

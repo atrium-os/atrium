@@ -34,6 +34,8 @@ pub const MAX_PENDING: usize = 16;
 
 struct Pending {
     at: Instant,
+    /// Whose it is: only that person's instance of the app gets it.
+    owner: String,
     name: String,
     mime: String,
     write: bool,
@@ -43,7 +45,8 @@ struct Pending {
 #[derive(Default)]
 struct Slot {
     listening: bool,
-    conn: Option<(u64, UnixStream)>,
+    /// The connected instance, and the person it runs for.
+    conn: Option<(u64, UnixStream, String)>,
     pending: Vec<Pending>,
 }
 
@@ -115,17 +118,19 @@ impl Hub {
     fn accepted(self: &Arc<Self>, app: &str, s: UnixStream) {
         let uid = portcullis_peer::uid_gid(s.as_raw_fd()).map(|(u, _)| u);
         let reg = portcullis_peer::AppRegistry::load(&self.registry).unwrap_or_default();
-        let theirs = uid.as_ref().ok().and_then(|u| reg.resolve(*u)).is_some_and(|(_, a)| a == app);
-        if !theirs {
-            eprintln!("portcullisd: {app}'s document channel: refused uid {uid:?}, not {app}");
-            return;
-        }
+        let owner = match uid.as_ref().ok().and_then(|u| reg.resolve(*u)) {
+            Some((o, a)) if a == app => o.to_string(),
+            _ => {
+                eprintln!("portcullisd: {app}'s document channel: refused uid {uid:?}, not {app}");
+                return;
+            }
+        };
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let Ok(mut watch) = s.try_clone() else { return };
         {
             let mut apps = self.apps.lock().unwrap();
             let slot = apps.entry(app.to_string()).or_default();
-            slot.conn = Some((id, s));
+            slot.conn = Some((id, s, owner));
             Self::flush(app, slot);
         }
         eprintln!("portcullisd: {app} connected its document channel");
@@ -136,7 +141,7 @@ impl Hub {
             while matches!(watch.read(&mut b), Ok(n) if n > 0) {}
             let mut apps = hub.apps.lock().unwrap();
             if let Some(slot) = apps.get_mut(&app) {
-                if slot.conn.as_ref().is_some_and(|(i, _)| *i == id) {
+                if slot.conn.as_ref().is_some_and(|(i, _, _)| *i == id) {
                     slot.conn = None;
                 }
             }
@@ -147,8 +152,14 @@ impl Hub {
     fn flush(app: &str, slot: &mut Slot) {
         slot.pending.retain(|p| p.at.elapsed() < PENDING_FOR);
         while !slot.pending.is_empty() {
-            let Some((_, c)) = &slot.conn else { return };
+            let Some((_, c, owner)) = &slot.conn else { return };
             let p = &slot.pending[0];
+            // ★ Another person's instance: never theirs to have.
+            if &p.owner != owner {
+                eprintln!("portcullisd: {app}: “{}” was {}'s, and {app} runs for {owner}: dropped", p.name, p.owner);
+                slot.pending.remove(0);
+                continue;
+            }
             match atrium_open::send(c, &p.name, &p.mime, p.write, p.fd.as_raw_fd()) {
                 Ok(()) => {
                     eprintln!("portcullisd: {app}: “{}” ({}) handed over{}", p.name, p.mime, if p.write { " (write)" } else { "" });
@@ -162,15 +173,21 @@ impl Hub {
         }
     }
 
-    /// Hand `fd` to `app`, now or once it connects.
-    pub fn deliver(&self, app: &str, name: &str, mime: &str, write: bool, fd: OwnedFd) -> io::Result<Delivery> {
+    /// Hand `fd` to `owner`'s `app`, now or once it connects. Refused while
+    /// the app runs for someone else.
+    pub fn deliver(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: OwnedFd) -> io::Result<Delivery> {
         let mut apps = self.apps.lock().unwrap();
         let slot = apps.entry(app.to_string()).or_default();
+        if let Some((_, _, o)) = &slot.conn {
+            if o != owner {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{app} is open for another person")));
+            }
+        }
         slot.pending.retain(|p| p.at.elapsed() < PENDING_FOR);
         if slot.pending.len() >= MAX_PENDING {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("{MAX_PENDING} files are already waiting for {app}")));
         }
-        slot.pending.push(Pending { at: Instant::now(), name: name.into(), mime: mime.into(), write, fd });
+        slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd });
         Self::flush(app, slot);
         Ok(if slot.pending.is_empty() { Delivery::Sent } else { Delivery::Queued })
     }
@@ -233,6 +250,11 @@ pub fn narrow(fd: &OwnedFd, write: bool) -> io::Result<()> {
 /// Spend `token`, a press in a window of `presenter_uid`'s, with frescod
 /// on purpose OPEN. `Err` says why not, for the file manager to show.
 pub fn spend_press(sock: &Path, token: [u8; 16], presenter_uid: u32) -> Result<(), String> {
+    spend_press_for(sock, token, presenter_uid, fresco_protocol::activation::purpose::OPEN)
+}
+
+/// [`spend_press`] for another purpose (an app's console: `CONSOLE`).
+pub fn spend_press_for(sock: &Path, token: [u8; 16], presenter_uid: u32, purpose_: u8) -> Result<(), String> {
     use fresco_protocol::activation::{op, purpose, refusal, Consume, ConsumeResult};
     if token == fresco_protocol::activation::NONE {
         return Err("no press came with it".into());
@@ -240,7 +262,7 @@ pub fn spend_press(sock: &Path, token: [u8; 16], presenter_uid: u32) -> Result<(
     let ask = || -> io::Result<ConsumeResult> {
         let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
         let mut conn = aqueduct::Connection::connect(sock)?;
-        let payload = postcard::to_stdvec(&Consume { token, presenter_uid, purpose: purpose::OPEN }).map_err(|e| bad(e.to_string()))?;
+        let payload = postcard::to_stdvec(&Consume { token, presenter_uid, purpose: purpose_ }).map_err(|e| bad(e.to_string()))?;
         conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, aqueduct::flag::RESPONSE_EXPECTED, &payload)?;
         conn.set_read_timeout(Some(Duration::from_millis(500)))?;
         let m = conn.recv_message()?;
@@ -254,8 +276,8 @@ pub fn spend_press(sock: &Path, token: [u8; 16], presenter_uid: u32) -> Result<(
         Ok(ConsumeResult::Refused { reason }) => Err(match reason {
             refusal::EXPIRED | refusal::UNKNOWN => "the press was too long ago; open it again",
             refusal::NOT_FOCUSED => "the window lost focus; open it again",
-            refusal::WRONG_UID => "the press wasn't in the file manager's window",
-            refusal::WRONG_KIND => "that press can't open files",
+            refusal::WRONG_UID => "the press wasn't in the asking app's window",
+            refusal::WRONG_KIND => "that press can't do this",
             _ => "frescod refused the press",
         }
         .into()),
@@ -293,21 +315,24 @@ mod tests {
         std::fs::write(d.join("a.flac"), b"fLaC").unwrap();
         let fd = OwnedFd::from(File::open(d.join("a.flac")).unwrap());
         // Before the app is up: it waits.
-        assert_eq!(hub.deliver("org.test.player", "a.flac", "audio/flac", false, fd).unwrap(), Delivery::Queued);
+        assert_eq!(hub.deliver("alice", "org.test.player", "a.flac", "audio/flac", false, fd).unwrap(), Delivery::Queued);
         assert!(!hub.connected("org.test.player"));
         let mut ch = atrium_open::Channel::connect_to(&dir.join("opens.sock")).unwrap();
         let o = ch.recv(Some(Duration::from_secs(2))).unwrap().expect("the waiting file");
         assert_eq!((o.name.as_str(), o.mime.as_str(), o.write), ("a.flac", "audio/flac", false));
         // Running: straight there.
         let fd = OwnedFd::from(File::open(d.join("a.flac")).unwrap());
-        assert_eq!(hub.deliver("org.test.player", "b.flac", "audio/flac", false, fd).unwrap(), Delivery::Sent);
+        assert_eq!(hub.deliver("alice", "org.test.player", "b.flac", "audio/flac", false, fd).unwrap(), Delivery::Sent);
         assert_eq!(ch.recv(Some(Duration::from_secs(2))).unwrap().unwrap().name, "b.flac");
         // Another app's channel: this uid isn't that app, so it's refused.
         let other = hub.listen("org.test.other").unwrap();
         let fd = OwnedFd::from(File::open(d.join("a.flac")).unwrap());
-        hub.deliver("org.test.other", "c.flac", "audio/flac", false, fd).unwrap();
+        hub.deliver("alice", "org.test.other", "c.flac", "audio/flac", false, fd).unwrap();
         let mut wrong = atrium_open::Channel::connect_to(&other.join("opens.sock")).unwrap();
         assert!(matches!(wrong.recv(Some(Duration::from_secs(2))), Err(_)), "closed without a file");
+        // Someone else's: refused while alice's runs.
+        let fd = OwnedFd::from(File::open(d.join("a.flac")).unwrap());
+        assert!(hub.deliver("bob", "org.test.player", "d.flac", "audio/flac", false, fd).is_err(), "not bob's player");
         // The app goes: files wait again.
         drop(ch);
         std::thread::sleep(Duration::from_millis(200));

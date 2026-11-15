@@ -330,6 +330,21 @@ fn run_apps_view(rx: &Receiver<ToApps>, to_self: &Sender<ToApps>, shared: &Share
             match a {
                 Action::Close => close = true,
                 Action::TogglePin(id) => toggle_pin(shared, &id),
+                Action::Console(id, token) => {
+                    let name = name_of(shared, &id);
+                    let tx = to_self.clone();
+                    std::thread::spawn(move || {
+                        let r = launch::console(&id, token);
+                        match &r {
+                            Ok(title) => eprintln!("forum-dock: console in '{id}': {title}"),
+                            Err(e) => eprintln!("forum-dock: console in '{id}': {e}"),
+                        }
+                        if let Err(e) = r {
+                            let _ = tx.send(ToApps::Launched(Report::Note(id, format!("No terminal for {name}: {e}"))));
+                        }
+                    });
+                    // The terminal's window taking focus closes the view.
+                }
                 Action::Launch(id) => {
                     let mut s = state.get_cloned();
                     if s.launching.is_none() {

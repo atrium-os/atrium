@@ -47,12 +47,15 @@ pub const MAX_COLS: usize = 8;
 const PUSH_PIN: char = '\u{e3e2}';
 const PUSH_PIN_SLASH: char = '\u{e3e4}';
 const MAGNIFYING_GLASS: char = '\u{e30c}';
+const TERMINAL_WINDOW: char = '\u{eae8}';
 
 /// What the person asked for; the loop carries it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Launch(String),
     TogglePin(String),
+    /// Terminal: a console in the app, with the press that asked.
+    Console(String, [u8; 16]),
     Close,
 }
 
@@ -311,6 +314,33 @@ impl View for AppsView {
                 ctx.tooltip(pin, if pinned { "Remove from Dock" } else { "Keep in Dock" });
             }
             ctx.pop();
+
+            // Terminal: a console in the app's jail (homes.md §4), on the
+            // selected or hovered tile of an app that may have one.
+            if app.console {
+                let tr = Rect::new(br.x() - b - em(4.0), br.y(), b, b);
+                ctx.key(6000 + ai as u64);
+                let term = ctx.push(Node::Rect { rect: tr, fill: Color::TRANSPARENT, radius: radius::SM });
+                let on_term = ctx.is_hovered(term) || ctx.is_pressed(term);
+                if hovered || selected || on_term || on_pin {
+                    if on_term {
+                        let c = if ctx.is_pressed(term) { t.state_pressed() } else { t.state_hover() };
+                        if let Some(Node::Rect { fill: f, .. }) = ctx.tree.get_mut(term) {
+                            *f = c;
+                        }
+                    }
+                    let gs = em(16.0);
+                    Glyph::new(TERMINAL_WINDOW).size(16.0).color(t.text_secondary()).at(tr.x() + (b - gs) / 2.0, tr.y() + (b - gs) / 2.0).emit(ctx);
+                    let (q, id) = (self.actions.clone(), app.id.clone());
+                    // The press that clicked it is the proof portcullisd spends.
+                    ctx.on_click(term, move || {
+                        let token = pergola::clipboard::current_activation().unwrap_or([0; 16]);
+                        q.borrow_mut().push(Action::Console(id.clone(), token));
+                    });
+                    ctx.tooltip(term, "Terminal");
+                }
+                ctx.pop();
+            }
         }
 
         // Page dots.

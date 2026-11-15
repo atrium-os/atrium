@@ -51,6 +51,7 @@ use portcullis_ipc::{
 };
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
+mod console;
 mod launch;
 use portcullisd::manifest_trust;
 #[cfg(feature = "pam")]
@@ -431,6 +432,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
          * connection itself. */
         if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. }) {
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
+            continue;
+        }
+        /* ★ App consoles (homes.md §4): gated on the PEER UID, a launcher. */
+        if let Request::Console { app_id, activation } = req {
+            let resp = handle_console(uid, &owner, &app_id, activation, &shared);
+            write_response(&mut writer, &resp)?;
             continue;
         }
         if let Request::Launch { app_id, bypass_policy } = req {
@@ -1035,23 +1042,9 @@ fn handle_open(
             if let Err(e) = hub.listen(&app) {
                 return refuse(writer, format!("{app}'s document channel: {e}"));
             }
-            match hub.deliver(&app, &name, &mime, write, fd) {
+            match hub.deliver(owner, &app, &name, &mime, write, fd) {
                 Ok(Delivery::Sent) => {}
-                Ok(Delivery::Queued) => {
-                    let mut started = STARTED_FOR_OPEN.lock().unwrap();
-                    if !started.contains(&app) && launch::running_jid(&app).is_none() {
-                        started.push(app.clone());
-                        let (a, o) = (app.clone(), owner.to_string());
-                        eprintln!("portcullisd: starting {a} for {o} to open “{name}”");
-                        thread::spawn(move || {
-                            match launch::launch_with_stdio(&a, &o, None) {
-                                Ok(out) => eprintln!("portcullisd: {a} (opened a file) exited {:?}", out.exit_code),
-                                Err(e) => eprintln!("portcullisd: {a} (opened a file) failed at {}: {}", e.stage(), e.message()),
-                            }
-                            STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &a);
-                        });
-                    }
-                }
+                Ok(Delivery::Queued) => start_for(&app, owner, "to open a file"),
                 Err(e) => return refuse(writer, e.to_string()),
             }
             eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
@@ -1059,6 +1052,103 @@ fn handle_open(
         }
         _ => unreachable!("routed by serve()"),
     }
+}
+
+/// Start `app` for `owner` on a thread, unless it is starting already.
+fn start_for(app: &str, owner: &str, why: &'static str) {
+    let mut started = STARTED_FOR_OPEN.lock().unwrap();
+    if started.iter().any(|a| a == app) || launch::running_jid(app).is_some() {
+        return;
+    }
+    started.push(app.to_string());
+    let (a, o) = (app.to_string(), owner.to_string());
+    eprintln!("portcullisd: starting {a} for {o} ({why})");
+    thread::spawn(move || {
+        match launch::launch_with_stdio(&a, &o, None) {
+            Ok(out) => eprintln!("portcullisd: {a} ({why}) exited {:?}", out.exit_code),
+            Err(e) => eprintln!("portcullisd: {a} ({why}) failed at {}: {}", e.stage(), e.message()),
+        }
+        STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &a);
+    });
+}
+
+/// Console (homes.md §4). `uid` is the caller's peer uid; `owner` the
+/// person it belongs to, whose app instance the shell joins.
+fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::opens::{self, Delivery, Hub};
+    let refuse = |why: String| {
+        eprintln!("portcullisd: console for {app_id} REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    /* A launcher opens any app's console; the terminal (`consoles`) only
+     * another tab or window in an app this person has one in already. */
+    let launcher = caller.as_deref().is_some_and(launch::app_may_launch_apps);
+    let terminal = caller.as_deref().is_some_and(launch::app_shows_consoles);
+    if !launcher && !(terminal && console::live(owner, app_id)) {
+        return refuse(format!("cap.console.denied: only a launcher opens consoles, and the terminal more of one it shows (caller {})",
+                              caller.as_deref().unwrap_or("is not a launched app")));
+    }
+    let Some(m) = launch::installed_manifest(app_id) else {
+        return refuse(format!("{app_id} is not installed"));
+    };
+    let name = if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() };
+    if let Some(why) = launch::no_console(&m) {
+        return refuse(why);
+    }
+    if let Err(why) = may_run_unasked(app_id, owner, shared) {
+        return refuse(why);
+    }
+    if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
+        return refuse(format!("the terminal: {why}"));
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::CONSOLE) {
+        return refuse(why);
+    }
+    // The app's jail: joined if it runs, started if not.
+    start_for(app_id, owner, "a console");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let jid = loop {
+        if let Some(j) = launch::running_jid(app_id) {
+            break j;
+        }
+        if std::time::Instant::now() > deadline {
+            return refuse(format!("{name} did not start"));
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let Some(app_uid) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().uid_for(owner, app_id) else {
+        return refuse(format!("{name} has no account for {owner}"));
+    };
+    // ★ Running, but for someone else: not this person's to enter.
+    if !console::jail_runs_as(jid, app_uid) {
+        return refuse(format!("{name} is open for another person"));
+    }
+    let Some(gid) = console::gid_of(app_uid) else {
+        return refuse(format!("no group for uid {app_uid}"));
+    };
+    if let Err(why) = console::mount_toolbox(&PathBuf::from(launch::JAILS_DIR).join(app_id)) {
+        return refuse(why);
+    }
+    let master = match console::spawn(&console::Spec { owner, jid, uid: app_uid, gid, home: "/nonexistent", app_id, cols: 80, rows: 24 }) {
+        Ok(m) => m,
+        Err(e) => return refuse(format!("the shell: {e}")),
+    };
+    let title = format!("Terminal: {name}");
+    let hub = Hub::global();
+    if let Err(e) = hub.listen(console::TERMINAL) {
+        return refuse(format!("the terminal's channel: {e}"));
+    }
+    match hub.deliver(owner, console::TERMINAL, &title, &format!("{}; app={app_id}", console::MIME), true, master) {
+        Ok(Delivery::Sent) => {}
+        Ok(Delivery::Queued) => start_for(console::TERMINAL, owner, "a console"),
+        Err(e) => return refuse(e.to_string()),
+    }
+    eprintln!("portcullisd: console in {app_id} (jid {jid}) as uid {app_uid} for {owner}");
+    Response::ConsoleOpened { title }
 }
 
 /// Service-manifest dir + jaild socket for the governor broker path.
@@ -1584,6 +1674,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         | Request::TeardownSessionComponent { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
+        },
+        Request::Console { .. } => Response::Error {
+            message: "internal: Console must go through handle_console".into(),
         },
         Request::OpenApps { .. } | Request::OpenFile { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */

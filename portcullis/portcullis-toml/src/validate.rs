@@ -249,6 +249,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.home-files = true: restricted to the file manager (every one of the person's \
              own files, read-write, while it runs); requires explicit policy approval"));
     }
+    if c.consoles == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.consoles = true: restricted to the system terminal (shells in apps' jails \
+             it already shows); requires explicit policy approval"));
+    }
     if c.file_picker == Some(true) {
         r.warnings.push(format!(
             "{ctx}.file-picker = true: restricted to the system file picker (puts what the \

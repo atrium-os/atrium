@@ -267,6 +267,10 @@ pub struct Capabilities {
     /// person picks, one at a time.
     #[serde(rename = "home-files")]
     pub home_files: Option<bool>,
+    /// The terminal (homes.md §4): it shows apps' consoles, and asks
+    /// portcullisd for another tab or window in an app it already has a
+    /// console in. Restricted to the system terminal.
+    pub consoles: Option<bool>,
     /// A status item in Forum's bar (forum-status-items.md): an icon and a
     /// menu the bar draws for this app, over forum-wm's `forum-status/`
     /// socket. The app never draws in the bar.
@@ -312,6 +316,28 @@ pub struct Capabilities {
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
+}
+
+impl Capabilities {
+    /// The system-only capabilities this asks for (homes.md §4, decision
+    /// H5): an app holding any of them is part of the system, whose files
+    /// are not the person's to edit by hand, so it has no console.
+    pub fn system_only(&self) -> Vec<&'static str> {
+        let all = [
+            ("window-management", self.window_management), ("forum-control", self.forum_control),
+            ("app-launch", self.app_launch), ("audio-control", self.audio_control),
+            ("media-control", self.media_control), ("removable-media", self.removable_media),
+            ("session-lock", self.session_lock), ("device-list", self.device_list),
+            ("display-settings", self.display_settings), ("network-details", self.network_details),
+            ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
+            ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
+            ("removable-files", self.removable_files), ("file-picker", self.file_picker),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("status-item", self.status_item),
+            ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
+            ("protected-media", self.protected_media),
+        ];
+        all.into_iter().filter(|(_, v)| *v == Some(true)).map(|(n, _)| n).collect()
+    }
 }
 
 /// `[capabilities] input.*` (fresco-capabilities.md §3). Underscored as
@@ -496,6 +522,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),
         home_files:       ovr.home_files.or(base.home_files),
+        consoles:         ovr.consoles.or(base.consoles),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),

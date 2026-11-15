@@ -37,6 +37,8 @@ pub struct AppEntry {
     /// The app's own icon from its bundle, parsed (`bundle_icon`); `None`
     /// when it has none or it was refused.
     pub vector: Option<std::sync::Arc<bundle_icon::VectorIcon>>,
+    /// It may have a console (homes.md §4): its tile offers Terminal.
+    pub console: bool,
 }
 
 /// Parse a bundle icon's SVG, saying why one is not drawn.
@@ -61,6 +63,7 @@ pub fn entry_from_manifest(text: &str) -> Option<AppEntry> {
         icon: m.app.icon,
         uid: None,
         vector: None,
+        console: false,
     })
 }
 
@@ -123,6 +126,7 @@ pub fn catalog_from_daemon() -> Option<Vec<AppEntry>> {
                     description: a.description,
                     icon: a.icon,
                     uid: a.uid,
+                    console: a.console,
                 })
                 .collect(),
         ),
