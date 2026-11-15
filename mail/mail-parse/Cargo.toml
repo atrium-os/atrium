@@ -8,6 +8,8 @@ description = "Mail's message parser (docs/spec/mail.md §7.1): RFC 5322 headers
 
 [dependencies]
 encoding_rs = "0.8"
+psl = "2"
+ring = "0.17"
 
 [profile.release]
 debug = 1

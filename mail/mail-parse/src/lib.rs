@@ -12,8 +12,10 @@
 
 pub mod address;
 pub mod decode;
+pub mod dkim;
 pub mod header;
-mod mime;
+pub mod ical;
+pub(crate) mod mime;
 
 pub use address::Address;
 pub use mime::{parse_date, part_bytes, sanitize_filename, Part, PartKind};
