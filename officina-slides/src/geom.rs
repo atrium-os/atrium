@@ -1,6 +1,7 @@
-//! Outlines of OOXML's preset shapes (ECMA-376 Part 1 §20.1.10.56) that
-//! decks use most, as paths in a shape's own box. A preset not here draws
-//! as its box and is kept by name, so a round trip keeps it.
+//! Outlines of OOXML's preset shapes (ECMA-376 Part 1 §20.1.10.56) as paths
+//! in a shape's own box: from the standard's definitions (`presets`), with
+//! hand-made ones for the most used as a fallback. A name neither knows
+//! draws as its box and is kept by name, so a round trip keeps it.
 
 use crate::model::{Geom, Path, PathCmd};
 
@@ -40,6 +41,10 @@ pub fn paths(g: &Geom, w: i64, h: i64) -> (Vec<Path>, bool) {
         Geom::Custom(p) => return (p.clone(), true),
         Geom::Preset { name, adj } => (&**name, adj.as_slice()),
     };
+    // The standard's own definition, when it has one.
+    if let Some(d) = crate::presets::preset(name) {
+        return (d.paths(w, h, a), true);
+    }
     let ss = w.min(h);
     let p = match name {
         "rect" => poly(w, h, &[(0, 0), (w, 0), (w, h), (0, h)]),

@@ -124,11 +124,11 @@ fn slides_draw_with_master_layout_and_own_text() {
     let id = d.new_id();
     let mut s = Shape::rect(id, Rect::new(0, 0, 100_000, 100_000), Fill::Solid(Color::theme(Slot::Accent2)));
     if let ShapeKind::Geom { geom, .. } = &mut s.kind {
-        *geom = Some(Geom::preset("cloudCallout"));
+        *geom = Some(Geom::preset("notAPreset"));
     }
     DeckOp::InsertShape { target: Target::Slide(sid), group: None, at: 9, shape: Box::new(s) }.apply(&mut d);
     let items = draw_slide(&mut d, 1, &FixedFonts, &mut n).unwrap();
-    assert_eq!(n.unknown_presets, vec![Arc::<str>::from("cloudCallout")]);
+    assert_eq!(n.unknown_presets, vec![Arc::<str>::from("notAPreset")]);
     assert!(items.iter().any(|i| matches!(i, DrawItem::Path { fill: Some(officina_slides::draw::Paint::Solid(0xED7D31FF)), .. })));
 }
 

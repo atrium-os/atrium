@@ -384,6 +384,13 @@ impl<'a> Reader<'a> {
             return Some(Geom::Preset { name: name.into(), adj });
         }
         let c = sp_pr.child("a:custGeom")?;
+        // Guide formulas: worked out for the shape's own size.
+        let guided = c.child("a:gdLst").is_some_and(|g| g.children("a:gd").next().is_some());
+        if guided || c.child("a:avLst").is_some_and(|g| g.children("a:gd").next().is_some()) {
+            let ext = sp_pr.child("a:xfrm").and_then(|x| x.child("a:ext"));
+            let (w, h) = ext.map_or((0, 0), |e| (num(e, "cx").unwrap_or(0).clamp(0, EMU_MAX_SIDE), num(e, "cy").unwrap_or(0).clamp(0, EMU_MAX_SIDE)));
+            return Some(Geom::Custom(guided_geom(c).paths(w, h, &[])));
+        }
         let mut out = Vec::new();
         for p in c.child("a:pathLst")?.children("a:path") {
             let (w, h) = (num(p, "w").unwrap_or(0).max(0), num(p, "h").unwrap_or(0).max(0));
@@ -1116,6 +1123,45 @@ fn preset_color(n: &str) -> u32 {
 
 /// An elliptical arc from `cur`: radii `wr`, `hr`, start and sweep angles in
 /// 60,000ths of a degree; cubic pieces of at most 90°. Returns the end.
+/// A custom geometry with guides, as a definition (the evaluator the
+/// preset shapes use).
+fn guided_geom(c: &El) -> officina_slides::presets::Def {
+    use officina_slides::presets::{Builder, Cmd};
+    let mut b = Builder::new();
+    for (list, adj) in [("a:avLst", true), ("a:gdLst", false)] {
+        for g in c.child(list).into_iter().flat_map(|l| l.children("a:gd")) {
+            let (Some(n), Some(f)) = (g.attr("name"), g.attr("fmla")) else { continue };
+            if adj {
+                b.adj(n, f);
+            } else {
+                b.guide(n, f);
+            }
+        }
+    }
+    for p in c.child("a:pathLst").into_iter().flat_map(|l| l.children("a:path")) {
+        let size = |a: &str| p.attr(a).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+        let stroked = !matches!(p.attr("stroke"), Some("0") | Some("false"));
+        b.path(size("w"), size("h"), p.attr("fill") != Some("none"), stroked);
+        for cmd in p.els() {
+            let pts: Vec<_> = cmd.children("a:pt").map(|pt| (b.arg(pt.attr("x").unwrap_or("0")), b.arg(pt.attr("y").unwrap_or("0")))).collect();
+            let c = match (cmd.name.as_str(), &pts[..]) {
+                ("a:moveTo", [p, ..]) => Cmd::Move(p.0, p.1),
+                ("a:lnTo", [p, ..]) => Cmd::Line(p.0, p.1),
+                ("a:quadBezTo", [p, q, ..]) => Cmd::Quad(p.0, p.1, q.0, q.1),
+                ("a:cubicBezTo", [p, q, r, ..]) => Cmd::Cubic(p.0, p.1, q.0, q.1, r.0, r.1),
+                ("a:arcTo", _) => {
+                    let mut a = |n: &str| b.arg(cmd.attr(n).unwrap_or("0"));
+                    Cmd::Arc(a("wR"), a("hR"), a("stAng"), a("swAng"))
+                }
+                ("a:close", _) => Cmd::Close,
+                _ => continue,
+            };
+            b.cmd(c);
+        }
+    }
+    b.finish()
+}
+
 fn arc(out: &mut Vec<PathCmd>, cur: (i64, i64), wr: f64, hr: f64, st: f64, sw: f64) -> (i64, i64) {
     let a0 = (st / 60_000.0).to_radians();
     let da = (sw / 60_000.0).to_radians();
@@ -1458,4 +1504,20 @@ pub fn read(data: &[u8]) -> Result<(Deck, Loaded), PptxError> {
         r.rep.note(Kind::Dropped, "macros");
     }
     Ok((r.deck, Loaded { report: r.rep, ..r.loaded }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_geometry_guides_follow_the_shape_size() {
+        let x = br#"<a:custGeom><a:avLst><a:gd name="adj" fmla="val 25000"/></a:avLst><a:gdLst><a:gd name="x1" fmla="*/ w adj 100000"/><a:gd name="y1" fmla="+- b 0 hd4"/></a:gdLst><a:pathLst><a:path><a:moveTo><a:pt x="l" y="t"/></a:moveTo><a:lnTo><a:pt x="x1" y="y1"/></a:lnTo><a:arcTo wR="wd4" hR="hd4" stAng="0" swAng="cd4"/><a:close/></a:path><a:path w="10" h="10" fill="none"><a:moveTo><a:pt x="5" y="10"/></a:moveTo></a:path></a:pathLst></a:custGeom>"#;
+        let c = xml::parse(x).unwrap();
+        let p = guided_geom(&c).paths(400, 200, &[]);
+        assert_eq!(p.len(), 2);
+        assert_eq!(&p[0].cmds[..2], &[PathCmd::Move(0, 0), PathCmd::Line(100, 150)]);
+        assert!(matches!(p[0].cmds[2], PathCmd::Cubic(.., 0, 200)));
+        assert_eq!((p[1].cmds[0].clone(), p[1].filled), (PathCmd::Move(200, 200), false));
+    }
 }

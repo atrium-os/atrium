@@ -18,6 +18,7 @@ pub mod geom;
 pub mod model;
 pub mod native;
 pub mod ops;
+pub mod presets;
 pub mod resolve;
 pub mod show;
 

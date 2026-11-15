@@ -3082,6 +3082,39 @@ floats 8/8, contents 16/16); 2,546 corpus documents paginate with no panic,
 85 of them with pages of more than one size, and sample files' portrait and
 landscape pages run in LibreOffice's order.
 
+### 16.48 Preset shapes from the standard's definitions (2026-11-16)
+
+- **Definitions.** All 187 of ECMA-376's preset shapes (Part 1 §20.1.9,
+  `presetShapeDefinitions.xml`) are drawn from their definitions, kept
+  compact in `officina-slides/src/presets.txt` (made by
+  `tools/gen_presets.py`). LICENCE: the definitions are the standard's,
+  taken from the copy Apache POI ships under Apache-2.0; the evaluator is
+  ours.
+- **Evaluator** (`officina-slides::presets`): adjust values (the file's
+  override the defaults), guides by the 17 shape-guide formulas over the 42
+  built-in variables, then paths of moves, lines, quadratic and cubic
+  Béziers and arcs (angles as seen, turned into the ellipse's parameter,
+  Béziers of at most a quarter turn). At most 1,024 guides and 4,096 path
+  commands a geometry. The hand-drawn shapes stay only as a fallback.
+- **`.pptx` custom shapes with guides**: `a:custGeom` with `a:gdLst` or
+  `a:avLst` goes through the same evaluator at the shape's size; plain
+  custom paths are read as before. Written back as fixed paths.
+- **`.ppt`**: every MSO shape type with a DrawingML counterpart maps to it
+  (all but WordArt, which stays text, and freeforms); connectors of every
+  kind draw as lines, not filled. MSO's curved connector 2 was mapped to 3.
+- **Not yet**: `.ppt` shapes with their own guide formulas (one corpus deck,
+  22 shapes) still draw as rectangles; `.ppt` adjust values are not carried
+  over (defaults used); text rectangles of presets are the shape's box.
+
+Gates: all 187 presets rendered and checked by eye; `.ppt` corpus shapes
+that drew as rectangles (flowchart collate, braces, arcs, striped and
+curved arrows, magnetic disks and others, 113 shapes) now draw as
+themselves; slides corpus 739 files, 0 panics, slide counts equal to
+LibreOffice's 666/666, 99.38 % of its words, round trips unchanged; `.ppt`
+LibreOffice gate 19/19. The slides LibreOffice gate is 82/84: the gradient
+angle check fails the same way without this change (LibreOffice writes our
+0° gradient back at 30°), left for its own look.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
