@@ -84,9 +84,7 @@ impl Pane {
         let field = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
         let scroll = Mutable::with_dirty(ScrollState::default(), dirty.clone());
         let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
-        let mut view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
-        // The More menu's state (highlight, scroll) repaints when it moves.
-        view.more = view.more.clone().attach(dirty.clone());
+        let view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
         let mods = view.mods.clone();
         let (cred, cred_state) = (view.cred.clone(), view.cred_state.clone());
         let app = App::new_with_flag(view, dirty);

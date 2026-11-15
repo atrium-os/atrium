@@ -72,6 +72,12 @@ impl<T: 'static> Mutable<T> {
         self
     }
 
+    /// A new Mutable on the same app dirty flag as this one (if any): a
+    /// widget's state made inside a view repaints like the view's own.
+    pub fn sibling<U: 'static>(&self, value: U) -> Mutable<U> {
+        Mutable { inner: FsMutable::new(value), dirty: self.dirty.clone() }
+    }
+
     /// Sync write. Marks dirty, replaces the value.
     pub fn set(&self, value: T) {
         self.inner.set(value);

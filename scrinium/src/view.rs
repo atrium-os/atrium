@@ -95,9 +95,12 @@ pub struct ScriniumView {
 
 impl ScriniumView {
     pub fn new(state: Mutable<Browser>, field: Mutable<TextEdit>, scroll: Mutable<ScrollState>, size: Mutable<(f32, f32)>) -> Self {
-        let cred_state = Mutable::new(CredentialState::default());
+        // On the app's dirty flag, as `state` is: typing in the password
+        // field and moving in the More menu repaint.
+        let cred_state = state.sibling(CredentialState::default());
         let cred = CredentialField::password(cred_state.clone());
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more: Mutable::new(Default::default()) }
+        let more = state.sibling(Default::default());
+        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more }
     }
 }
 
