@@ -168,3 +168,26 @@ All four accepted as recommended, 2026-11-15.
   35 FreeBSD drives and 33 are firmware placeholders, both folded. Unfolding, scrolling and
   opening `pci0` work (frames `scratch/curia-{devices,scrolled,opened}.png`, not
   committed). `nobody` is refused (status 2).
+
+## 10. Services going away (2026-11-15)
+
+Every setting lives in its own service, so Curia must stay up and say what is wrong when
+one goes away, hangs, or comes back (Shankar, 2026-11-15).
+
+- Calls time out. `netconf::Client` sets a read timeout per op (join 90 s, nearby 30 s,
+  others 10 s) and a timeout becomes `UNAVAILABLE "not answering"`; `CLASS_DEVICES`
+  calls have 10 s. Subscriptions have no timeout; instead the follower waits at most 30 s
+  for an event (`Changes::next_within`) and then makes a fresh call as a liveness check,
+  dropping the stream and reconnecting if it fails.
+- Network: while atrium-net is gone or hung the page says "Network settings are not
+  available / Can't reach the network service; trying again" and recovers alone.
+- Devices: "dispensatord is not running", "not answering" or "went away", then the list
+  comes back by itself.
+- The passphrase field: if arca-ui or limend dies, Curia drops the field's state, disables
+  Join and says "The passphrase field is not available right now; trying again…". limend
+  is reconnected every 5 s and the field asked for again at most every 2 s.
+- Only frescod's loss ends Curia, with exit status 1, so its supervision restarts it.
+- Live check `curia-vm.sh away` in the cloud arm64 VM, 2026-11-15, 11 steps: atrium-netconf
+  killed and back, stopped with SIGSTOP and continued, dispensatord stopped and started,
+  arca-ui killed and back, limend killed and back. Each time the page showed the right
+  notice and recovered without help, and Curia's pid never changed.

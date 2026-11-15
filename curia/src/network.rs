@@ -75,6 +75,8 @@ pub struct NetPage {
     /// The handle was spent on a join that failed: Arca's field starts
     /// afresh (the window asks for a new one).
     pub reset_field: bool,
+    /// Arca's field is on the passphrase row (limend and arca-ui answer).
+    pub field_up: bool,
     /// The network whose Forget waits for a second press.
     pub confirm_forget: Option<Vec<u8>>,
     pub notice: Option<Notice>,
@@ -91,7 +93,7 @@ pub fn name(s: &[u8]) -> String {
 /// "Wi-Fi: home", "Ethernet", "Not connected", and what is wrong.
 pub fn headline(s: Option<&Status>, reachable: bool) -> (String, Option<String>) {
     let Some(s) = s.filter(|_| reachable) else {
-        return ("Network settings are not available".into(), Some("atrium-net is not running".into()));
+        return ("Network settings are not available".into(), Some("Can't reach the network service; trying again".into()));
     };
     let head = match s.link {
         Link::None => "Not connected".to_string(),

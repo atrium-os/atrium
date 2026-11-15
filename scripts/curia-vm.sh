@@ -13,6 +13,8 @@
 #   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, space, Enter as \n), then a frame
 #   sh scripts/curia-vm.sh frame [name]
 #   sh scripts/curia-vm.sh status               # atrium-netctl status + list
+#   sh scripts/curia-vm.sh away                 # after `arca`: each service Settings talks to
+#                                               # dies or hangs and comes back; frames curia-away-*.png
 #   sh scripts/curia-vm.sh core [TEXT]          # Curia's core: TEXT (default the gate's
 #                                               # passphrase) must not be in it
 set -eu
@@ -68,6 +70,42 @@ arca)
             daemon -f -o $Sx/arca-ui.log -u sg-ui $D/arca-ui </dev/null
         sleep 3; pgrep -lx 'frescod|forum-wm|forum-bar|limend|arca-ui' | tr '\n' ' '; echo"
     exec sh "$0" shot ;;
+away)
+    # Each service the pages use goes away (killed, or stopped so it hangs
+    # with its socket open) and comes back; the page must say so and recover
+    # by itself, with no restart of Settings. Frames show each step.
+    NC="daemon -f -o /tmp/aura/netconf.log /tmp/aura/atrium-netconf -v --ctl /tmp/aura/net.sock --dir /tmp/aura/sockets --uid 65036 --capsicum"
+    pid0=$("$V" "pgrep -x curia")
+    "$V" "pkill -x atrium-netconf; sleep 1; rm -rf /tmp/aura/sockets"
+    GAP=8 frame away-1-netconf-killed
+    "$V" "$NC"
+    GAP=12 frame away-2-netconf-back
+    "$V" "pkill -STOP -x atrium-netconf"
+    GAP=50 frame away-3-netconf-hung
+    "$V" "pkill -CONT -x atrium-netconf"
+    GAP=40 frame away-4-netconf-answers
+    inj "MOVE 70 149"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    "$V" "service atrium-dispensatord stop >/dev/null"
+    GAP=10 frame away-5-devices-gone
+    "$V" "service atrium-dispensatord start >/dev/null"
+    GAP=12 frame away-6-devices-back
+    inj "MOVE 70 111"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    # Arca's field: a network that is not saved, its row open.
+    for i in 1 2; do inj "MOVE 1216 332"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"; sleep 6; done
+    sleep 10; inj "MOVE 300 242"; sleep 2; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"
+    GAP=12 frame away-7-field
+    "$V" "pkill -x arca-ui"
+    GAP=8 frame away-8-arca-ui-killed
+    "$V" "cd $Sx && env LIMEN_SOCKET=$Sx/limend.sock FRESCO_SOCKET=$Sx/fresco.sock ARCA_SOCKET=$AS ARCA_APP_REGISTRY=/tmp/aura/launch-registry daemon -f -o $Sx/arca-ui.log -u sg-ui $D/arca-ui </dev/null"
+    GAP=12 frame away-9-arca-ui-back
+    "$V" "pkill -x limend; pkill -x arca-ui; true"
+    GAP=8 frame away-10-limend-killed
+    "$V" "cd $Sx && env LIMEN_SOCKET=$Sx/limend.sock LIMEN_FRESCOD_ACTIVATION=$Sx/activation.sock LIMEN_APP_REGISTRY=/tmp/aura/launch-registry LIMEN_ARCA_UID=65021 daemon -f -o $Sx/limend.log $D/limend </dev/null; sleep 3; chmod 666 $Sx/limend.sock
+        env LIMEN_SOCKET=$Sx/limend.sock FRESCO_SOCKET=$Sx/fresco.sock ARCA_SOCKET=$AS ARCA_APP_REGISTRY=/tmp/aura/launch-registry daemon -f -o $Sx/arca-ui.log -u sg-ui $D/arca-ui </dev/null"
+    GAP=15 frame away-11-limend-back
+    pid1=$("$V" "pgrep -x curia")
+    [ "$pid0" = "$pid1" ] && echo "ok   Settings ran throughout (pid $pid0)" || echo "FAIL Settings restarted: $pid0 -> $pid1"
+    "$V" "grep -E 'limend|frescod' $Sx/curia.log | tail -5" ;;
 core)
     t=${2:-correct horse battery staple}
     "$V" "rm -f $Sx/curia.core; gcore -c $Sx/curia.core \$(pgrep -x curia) >/dev/null 2>&1; ls -l $Sx/curia.core | awk '{print \"core:\", \$5, \"bytes\"}'

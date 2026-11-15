@@ -196,7 +196,12 @@ pub mod client {
 
     use super::*;
 
+    /// A reply takes at most this long: a daemon that hangs is "not
+    /// answering", never a caller stuck for good.
+    pub const LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
     fn call(c: &mut Connection, o: u16) -> io::Result<Vec<u8>> {
+        c.set_read_timeout(Some(LIMIT))?;
         c.send_message(CLASS, o, flag::RESPONSE_EXPECTED, &[])?;
         loop {
             let m = c.recv_message()?;
@@ -229,10 +234,25 @@ pub mod client {
         pub fn open(sock: &Path) -> io::Result<Self> {
             let mut c = Connection::connect(sock)?;
             match call(&mut c, op::SUBSCRIBE)?.first() {
-                Some(&status::OK) => Ok(Self(c)),
+                Some(&status::OK) => {
+                    c.set_read_timeout(None)?;
+                    Ok(Self(c))
+                }
                 Some(&st) => Err(refused(st, "subscribe refused")),
                 None => Err(io::Error::new(io::ErrorKind::InvalidData, "empty reply")),
             }
+        }
+
+        /// Wait at most `t` for the next generation; `None` when it is quiet.
+        pub fn next_within(&mut self, t: std::time::Duration) -> io::Result<Option<u64>> {
+            self.0.set_read_timeout(Some(t))?;
+            let r = match self.next() {
+                Ok(g) => Ok(Some(g)),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(None),
+                Err(e) => Err(e),
+            };
+            self.0.set_read_timeout(None)?;
+            r
         }
 
         /// The next generation (blocking).

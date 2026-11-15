@@ -203,3 +203,25 @@ fn over_sockets() {
     assert_eq!(ch.next().unwrap().ssid, Some(b"aura-test".to_vec()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A service that hangs (socket open, nobody answering) is "not answering"
+/// after the op's limit, never a caller stuck for good.
+#[test]
+fn a_hung_service_times_out() {
+    let dir = std::env::temp_dir().join(format!("netconf-hung-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("hung.sock");
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let held = std::thread::spawn(move || {
+        let s = l.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(14));
+        drop(s);
+    });
+    let t = std::time::Instant::now();
+    let e = Client::connect(&sock).unwrap().status().unwrap_err();
+    assert_eq!(e, Fail::new(status::UNAVAILABLE, "not answering"));
+    assert!(t.elapsed() >= Client::limit(op::STATUS) && t.elapsed() < Client::limit(op::STATUS) * 2);
+    held.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

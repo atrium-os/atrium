@@ -30,12 +30,20 @@ fn connect(g: Grant) -> Result<Client, String> {
 }
 
 /// Status now and on every change; None while atrium-netconf is away.
+/// A quiet stream is checked every 30 s with a status call of its own, so a
+/// service that hangs (alive, socket open, not answering) is seen as away.
 fn follow(tx: Sender<Got>) {
     std::thread::spawn(move || loop {
         if let Ok(mut ch) = connect(Grant::Wifi).and_then(|c| c.subscribe().map_err(|f| f.1)) {
-            while let Ok(s) = ch.next() {
-                if tx.send(Got::Status(Some(s))).is_err() {
-                    return;
+            loop {
+                match ch.next_within(Duration::from_secs(30)) {
+                    Ok(Some(s)) => {
+                        if tx.send(Got::Status(Some(s))).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) if connect(Grant::Wifi).and_then(|mut c| c.status().map_err(|f| f.1)).is_ok() => {}
+                    _ => break,
                 }
             }
         }
@@ -52,12 +60,19 @@ fn follow_devices(tx: Sender<Result<Vec<atrium_devices::Device>, String>>) {
     std::thread::spawn(move || loop {
         let why = match atrium_devices::client::Changes::open(&sock) {
             Ok(mut ch) => loop {
-                if let Err(e) = ch.next() {
-                    break e;
+                match ch.next_within(Duration::from_secs(30)) {
+                    Ok(Some(_)) => {}
+                    // Quiet: is it still there? (The list below asks.)
+                    Ok(None) => {}
+                    Err(e) => break e,
                 }
-                let r = atrium_devices::client::list(&sock).map_err(|e| e.to_string());
-                if tx.send(r).is_err() {
-                    return;
+                match atrium_devices::client::list(&sock) {
+                    Ok(v) => {
+                        if tx.send(Ok(v)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => break e,
                 }
             },
             Err(e) => e,
@@ -65,6 +80,8 @@ fn follow_devices(tx: Sender<Result<Vec<atrium_devices::Device>, String>>) {
         let msg = match why.kind() {
             std::io::ErrorKind::PermissionDenied => "only the person using this machine may see it".to_string(),
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => "dispensatord is not running".to_string(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "dispensatord is not answering".to_string(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => "dispensatord went away; asking again".to_string(),
             _ => why.to_string(),
         };
         if tx.send(Err(msg)).is_err() {
@@ -133,18 +150,24 @@ fn main() {
     // Arca's passphrase field comes through limend (curia.md §4). Without
     // it the row shows a field that can't be typed into: Curia never takes
     // a passphrase itself.
-    let embeds = match Embeds::connect() {
+    // limend going away (or not there yet) is retried every 5 s; the field
+    // is asked for again at most every 2 s.
+    let link_limend = |win: &mut Window| match Embeds::connect() {
         Ok(e) => {
             win.set_slot_binder(Embeds::binder(&e));
+            eprintln!("curia: limend: connected");
             Some(e)
         }
         Err(e) => {
-            eprintln!("curia: limend: {e:?}: no passphrase field");
+            eprintln!("curia: limend: {e:?}: no passphrase field for now");
             None
         }
     };
-    let mut embeds = embeds;
+    let mut embeds = link_limend(&mut win);
+    let mut next_limend = Instant::now() + Duration::from_secs(5);
     let mut cred_embed = None;
+    let mut next_ask = Instant::now();
+    let mut failed = false;
     let mut app = App::new_with_flag(view, dirty);
     let (tx, rx): (Sender<Got>, Receiver<Got>) = channel();
     follow(tx.clone());
@@ -156,7 +179,10 @@ fn main() {
             Ok(StepResult::Closed) => break,
             Ok(_) => {}
             Err(e) => {
+                // Exit as a failure, so supervision (restart = on-crash)
+                // brings Settings back when frescod does.
                 eprintln!("curia: frescod: {e}");
+                failed = true;
                 break;
             }
         }
@@ -173,6 +199,15 @@ fn main() {
             changed = true;
         }
         // Arca's field: asked for while a passphrase row is open.
+        if embeds.is_none() && Instant::now() >= next_limend {
+            next_limend = Instant::now() + Duration::from_secs(5);
+            embeds = link_limend(&mut win);
+        }
+        let field_up = embeds.is_some() && cred_embed.is_some();
+        if p.field_up != field_up {
+            p.field_up = field_up;
+            changed = true;
+        }
         if let Some(e) = &embeds {
             if std::mem::take(&mut p.reset_field) {
                 if let Some(id) = cred_embed.take() {
@@ -182,7 +217,8 @@ fn main() {
                 changed = true;
             }
             match (p.asking.is_some(), cred_embed) {
-                (true, None) => {
+                (true, None) if Instant::now() >= next_ask => {
+                    next_ask = Instant::now() + Duration::from_secs(2);
                     if let Some(token) = win.embed_token() {
                         let asked = e.borrow_mut().request("credential", token, cred.slot_key());
                         match asked {
@@ -212,7 +248,14 @@ fn main() {
                             changed = true;
                         }
                     }
-                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == cred_embed => cred_embed = None,
+                    // Arca's side went (arca-ui restarted): what was typed is
+                    // gone with it; a new field is asked for.
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == cred_embed => {
+                        cred_embed = None;
+                        cred_state.set(CredentialState::default());
+                        p.field(None, Instant::now());
+                        changed = true;
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(err) => {
@@ -224,6 +267,10 @@ fn main() {
             }
             if lost {
                 embeds = None;
+                cred_embed = None;
+                cred_state.set(CredentialState::default());
+                p.field(None, Instant::now());
+                changed = true;
             }
         }
         if p.tick(Instant::now()) {
@@ -245,5 +292,8 @@ fn main() {
         if until.is_some_and(|u| Instant::now() >= u) {
             break;
         }
+    }
+    if failed {
+        std::process::exit(1);
     }
 }

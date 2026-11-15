@@ -235,7 +235,7 @@ impl CuriaView {
                 self.cred.clone().at(fx, fy).size(fw, em(32.0)).render(ctx);
                 let pg = self.page.clone();
                 let bx = fx + fw + em(12.0);
-                let ready = p.joining.is_none() && p.armed.is_none();
+                let ready = p.joining.is_none() && p.armed.is_none() && p.field_up;
                 let jw = button(ctx, bx, fy + em(1.0), "Join", Look::Primary, ready, move || {
                     with(&pg, |p| p.join_pressed(std::time::Instant::now()));
                 });
@@ -244,6 +244,12 @@ impl CuriaView {
                     with(&pg, NetPage::cancel_ask);
                 });
                 y += em(44.0);
+                if !p.field_up {
+                    // Arca's side (limend, arca-ui) is away: say so rather than
+                    // show a field that silently takes nothing.
+                    text(ctx, fx, y - em(2.0), "The passphrase field is not available right now; trying again…", type_size::XS, Weight::Regular, t.text_tertiary());
+                    y += em(20.0);
+                }
             }
         }
         y += em(20.0);

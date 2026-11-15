@@ -395,9 +395,25 @@ pub mod client {
             dir.join(g.name()).join(format!("{}.sock", g.name()))
         }
 
+        /// How long an answer may take: a join waits for the handshake
+        /// (atrium-netconf gives it 60 s), a list of networks for a scan;
+        /// anything else is quick. A service that hangs is then "not
+        /// answering", never a caller stuck for good.
+        pub fn limit(o: u16) -> std::time::Duration {
+            std::time::Duration::from_secs(match o {
+                op::WIFI_JOIN => 90,
+                op::WIFI_NEARBY => 30,
+                _ => 10,
+            })
+        }
+
         fn call<A: Serialize, T: for<'a> Deserialize<'a>>(&mut self, o: u16, a: &A) -> Res<T> {
             let p = postcard::to_stdvec(a).map_err(|e| Fail(status::MALFORMED, e.to_string()))?;
-            let io = |e: io::Error| Fail(status::UNAVAILABLE, e.to_string());
+            let io = |e: io::Error| match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Fail(status::UNAVAILABLE, "not answering".into()),
+                _ => Fail(status::UNAVAILABLE, e.to_string()),
+            };
+            self.0.set_read_timeout(Some(Self::limit(o))).map_err(io)?;
             self.0.send_message(CLASS, o, flag::RESPONSE_EXPECTED, &p).map_err(io)?;
             loop {
                 let m = self.0.recv_message().map_err(io)?;
@@ -444,6 +460,7 @@ pub mod client {
         /// Subscribe: the connection then carries only status events.
         pub fn subscribe(mut self) -> Res<Changes> {
             self.call::<(), ()>(op::SUBSCRIBE, &())?;
+            let _ = self.0.set_read_timeout(None);
             Ok(Changes(self.0))
         }
     }
