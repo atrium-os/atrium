@@ -34,10 +34,11 @@
 #     the descriptor;
 #   - quick look (§7): Space shows text drawn by Scrinium (a lying name
 #     only as text), programs and unviewable types only as words, and
-#     hands a FLAC or a Web page to a viewer limend starts through
-#     portcullisd (a stand-in, limen's view-probe) in its own jail and
-#     uid, read-only, no path, no /media; it goes when the pane moves on
-#     or closes;
+#     hands a FLAC to a viewer limend starts through portcullisd (a
+#     stand-in, limen's view-probe) in its own jail and uid, read-only, no
+#     path, no /media, and a Web page and a PNG to the real doc-viewer,
+#     the Navigator's page worker, which decodes the picture in its jail;
+#     each goes when the pane moves on or closes;
 #   - nobody but the file manager may ask: the opener itself and alice are
 #     refused; the file manager without a press, or with a made-up one, is
 #     refused, and a refused "Always" changes no default.
@@ -81,7 +82,7 @@ V 'test -x /root/am/atrium-portcullisd-jclient && id grantfm >/dev/null' || { ec
 
 # What an earlier run that was stopped left: its sticks, Scrinium's jails.
 for d in $(mon "info usb" | tr -d '\r' | grep -o 'ID: ost[0-9]*' | cut -d' ' -f2); do mon "device_del $d" >/dev/null; done
-V "pkill -f /bin/scrinium; pkill -x open-probe; pkill -x atrium-write; pkill -x limend; pkill -x limen-view-probe; for j in \$(jls name | grep '^app-scrinium-o'); do for m in \$(mount -p | awk -v r=/var/lib/atrium/jails/\$j/ 'index(\$2, r)==1 {print \$2}' | sort -r); do umount -f \$m; done; /root/am/atrium-portcullisd-jclient /var/run/atrium/jaild.sock remove \$j >/dev/null; done; true"
+V "pkill -f /bin/scrinium; pkill -x open-probe; pkill -x atrium-write; pkill -x limend; pkill -x limen-view-probe; pkill -x navigator-page; for j in \$(jls name | grep '^app-scrinium-o'); do for m in \$(mount -p | awk -v r=/var/lib/atrium/jails/\$j/ 'index(\$2, r)==1 {print \$2}' | sort -r); do umount -f \$m; done; /root/am/atrium-portcullisd-jclient /var/run/atrium/jaild.sock remove \$j >/dev/null; done; true"
 sleep 3
 
 echo "=== the stick: a FLAC, an ODT, a PDF that is HTML, a script, a text file"
@@ -99,6 +100,14 @@ printf '<!DOCTYPE html><html><script>steal()</script></html>\n' > "$SD/invoice.p
 printf '#!/bin/sh\necho hi\n' > "$SD/run.sh"
 printf 'hello from the stick\n' > "$SD/hello.txt"
 printf '<!DOCTYPE html><html><body><h1>A page</h1><script>steal()</script></body></html>\n' > "$SD/web.html"
+python3 -I - "$SD/wide.png" <<'PY'
+# A wide picture: a gradient, 1600 x 400, wider than the pane.
+import sys, struct, zlib
+w, h = 1600, 400
+rows = b"".join(b"\0" + bytes(c for x in range(w) for c in (x * 255 // w, 90, 255 - y * 255 // h)) for y in range(h))
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+open(sys.argv[1], "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+PY
 python3 -I - "$SD/story.docx" <<'PY'
 import sys, zipfile
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -116,7 +125,7 @@ e=struct.pack("<B3sB3sII",0,b"\0\2\0",0x0C,b"\xfe\xff\xff",2048,size-2048)
 f.seek(446); f.write(e); f.seek(510); f.write(b"\x55\xaa")
 PY
 mkfs.fat -F 32 --offset 2048 -n OPENS "$IMG" $(( (64*1024*1024 - 1048576) / 1024 )) >/dev/null || { echo "mkfs failed"; exit 1; }
-for f in song.flac notes.odt invoice.pdf run.sh hello.txt story.docx web.html; do MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" "$SD/$f" ::$f || exit 1; done
+for f in song.flac notes.odt invoice.pdf run.sh hello.txt story.docx web.html wide.png; do MTOOLS_SKIP_CHECK=1 mcopy -i "$IMG@@1M" "$SD/$f" ::$f || exit 1; done
 ODT_SUM=$(sha256sum "$SD/notes.odt" | cut -d' ' -f1)
 DOCX_SUM=$(sha256sum "$SD/story.docx" | cut -d' ' -f1)
 rm -rf "$SD"
@@ -132,6 +141,7 @@ xb atrium-open "--example open-probe"
 xb atrium-write "--bin atrium-write"
 xb officina-convert "--bin officina-convert"
 xb limen "--bin limend --example limen-view-probe"
+xb navigator-page "--bin navigator-page"
 
 echo "=== copy and set up"
 B=/var/tmp/of
@@ -140,7 +150,8 @@ for b in "frescod/target/$TARGET/release/frescod" "scrinium/target/$TARGET/relea
          "portcullis/target/$TARGET/release/portcullisd" "portcullis/target/$TARGET/release/portcullis" "portcullis/target/$TARGET/release/opifex" \
          "atrium-open/target/$TARGET/release/examples/open-probe" "atrium-write/target/$TARGET/release/atrium-write" \
          "officina-convert/target/$TARGET/release/officina-convert" "atrium-write/atrium.toml" \
-         "limen/target/$TARGET/release/limend" "limen/target/$TARGET/release/examples/limen-view-probe"; do
+         "limen/target/$TARGET/release/limend" "limen/target/$TARGET/release/examples/limen-view-probe" \
+         "navigator-page/target/$TARGET/release/navigator-page"; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || exit 1
     [ "$(sha256sum "$ROOT/$b" | cut -d' ' -f1)" = "$(V "sha256 -q $B/$(basename $b)")" ] || { echo "ABORT: $(basename $b) arrived damaged"; exit 1; }
     case $b in atrium-write/atrium.toml) V "mv $B/atrium.toml $B/write.toml" ;; esac
@@ -211,10 +222,19 @@ opifex uninstall org.test.viewer >/dev/null 2>&1 || true
 openssl dgst -sha256 -sign /root/of-key.pem -out \$V2/atrium.toml.sig \$V2/atrium.toml
 opifex install \$V2 >/dev/null
 portcullis policy grant --system org.test.viewer >/dev/null
+# The real document worker as the doc-viewer: the Navigator's page child,
+# which draws pictures and pages in its own jail (D5).
+V3=$B/pbundle; rm -rf \$V3; mkdir -p \$V3/bin; cp $B/navigator-page \$V3/bin/
+printf '[app]\nid = "org.test.page"\nname = "Page"\nversion = "1"\nentry = "bin/navigator-page"\n\n[resources]\nmemory = "512M"\ncpu = 100\n' > \$V3/atrium.toml
+opifex uninstall org.test.page >/dev/null 2>&1 || true
+openssl dgst -sha256 -sign /root/of-key.pem -out \$V3/atrium.toml.sig \$V3/atrium.toml
+opifex install \$V3 >/dev/null
+portcullis policy grant --system org.test.page >/dev/null
 pw usershow _limen >/dev/null 2>&1 || pw useradd _limen -u 65022 -d /nonexistent -s /usr/sbin/nologin
 # In jaild's user range: a test worker, not a system one.
 [ "\$(id -u _viewer 2>/dev/null)" = 50650 ] || { pw userdel _viewer 2>/dev/null || true; pw groupdel _viewer 2>/dev/null || true; pw groupadd _viewer -g 50650; pw useradd _viewer -u 50650 -g _viewer -d /nonexistent -s /usr/sbin/nologin; }
 grep -q 'workers."org.test.viewer"' /etc/atrium/policy.toml 2>/dev/null || printf '\n[workers."org.test.viewer"]\ncallers    = ["_limen"]\nrun_as     = "_viewer"\nconcurrent = 8\n' >> /etc/atrium/policy.toml
+grep -q 'workers."org.test.page"' /etc/atrium/policy.toml 2>/dev/null || printf '\n[workers."org.test.page"]\ncallers    = ["_limen"]\nrun_as     = "_viewer"\nconcurrent = 8\n' >> /etc/atrium/policy.toml
 chmod 644 /etc/atrium/policy.toml
 rm -f /var/db/atrium/alice/opens.toml
 rm -rf /tmp/of; mkdir -p /tmp/of; chmod 777 /tmp/of
@@ -254,7 +274,7 @@ V "cd /tmp/of && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=/tmp/of/screen FRESCOD
    daemon -f -o /tmp/of/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 /tmp/of/*.sock /atrium/sockets/fresco/fresco.sock"
-V "cd /tmp/of && env LIMEN_SOCKET=/tmp/of/limend.sock LIMEN_DEFAULTS=doc-viewer=org.test.viewer,media-player=org.test.viewer \
+V "cd /tmp/of && env LIMEN_SOCKET=/tmp/of/limend.sock LIMEN_DEFAULTS=doc-viewer=org.test.page,media-player=org.test.viewer \
    LIMEN_FRESCOD_ACTIVATION=/tmp/of/activation.sock daemon -f -o /tmp/of/limend.log -u _limen $B/limend </dev/null"
 i=0; while [ $i -lt 20 ] && ! V "test -S /tmp/of/limend.sock"; do sleep 1; i=$((i+1)); done
 SENV="LIMEN_SOCKET=/tmp/of/limend.sock FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock SCRINIUM_MEDIA_SOCKET=/sock/removable-media.sock SCRINIUM_TRACE=1"
@@ -278,7 +298,7 @@ sleep $WAIT
 waitfor "places=\[$PART\]" 30 && ok "up with the stick" || bad "Scrinium: $(trace | cut -c1-200) $(V 'tail -3 /tmp/of/scrinium.log' | tr '\n' ';')"
 # The stick may need a press in the sidebar to open.
 waitfor "place=$PART" 4 || { press 90 92; waitfor "place=$PART" 10 || press 90 80; }
-waitfor "entries=\[hello.txt,invoice.pdf,notes.odt,run.sh,song.flac,story.docx,web.html\]" 20 && ok "the stick's files listed" || bad "listing: $(trace | cut -c1-240)"
+waitfor "entries=\[hello.txt,invoice.pdf,notes.odt,run.sh,song.flac,story.docx,web.html,wide.png\]" 20 && ok "the stick's files listed" || bad "listing: $(trace | cut -c1-240)"
 shot 2 open-0-files
 
 # Rows: the window is 960x600 at the origin; the list's first row is at
@@ -504,11 +524,21 @@ waitlook "story.docx:info" && ok "a .docx: no viewer yet, only words" || bad "lo
 waitvp "media-player detached" 20 && ok "the media viewer let go when the pane moved on" || bad "not detached: $(V "tail -3 $LL" | tr '\n' ';')"
 key 81
 waitlook "web.html:embed:doc-viewer" && ok "a Web page goes to the doc-viewer" || bad "look: $(look)"
-waitvp "doc-viewer load" && ok "the doc-viewer got it ($(vp 'doc-viewer load' | grep -o 'kind=[^ ]* head=[^ ]*'))" || bad "no doc-viewer: $(V "tail -5 $LL" | tr '\n' ';')"
-case "$(vp 'doc-viewer load')" in *"wrote=ok"*|*"chmod=ok"*) bad "the doc-viewer could change it" ;; *) ok "read-only" ;; esac
+np() { V "grep 'navigator-page: $1' $LL | tail -1"; }
+waitnp() { i=0; while [ $i -lt ${2:-60} ] && [ -z "$(np "$1")" ]; do sleep 3; i=$((i+3)); done; [ -n "$(np "$1")" ]; }
+pj() { V "jls name | grep -c org-test-page" | tr -d ' '; }
+i=0; while [ $i -lt 30 ] && [ "$(pj)" = 0 ]; do sleep 2; i=$((i+2)); done
+check "the Navigator's page worker took it, in a jail of its own" 1 "$(pj)"
+shot 3 open-10-look-web
+key 81
+waitlook "wide.png:embed:doc-viewer" && ok "a PNG goes to the doc-viewer too" || bad "look: $(look)"
+waitnp "picture " && ok "the worker decoded it in its jail: $(np 'picture ' | sed 's/.*picture //')" || bad "no picture: $(V "grep navigator-page $LL | tail -4" | tr '\n' ';')"
+check "reduced to fit, never past 2048" "picture 1600x400" "$(np 'picture ' | grep -o 'picture [0-9]*x[0-9]*')"
+shot 3 open-11-look-picture
 key 44
 waitlook "^-$" 10 && ok "Space again closes the pane" || bad "look: $(look)"
-waitvp "doc-viewer detached" 20 && ok "and the viewer goes with it" || bad "doc-viewer not detached"
+i=0; while [ $i -lt 30 ] && [ "$(pj)" != 0 ]; do sleep 2; i=$((i+2)); done
+check "and the worker's jail goes with it" 0 "$(pj)"
 
 echo "=== only the file manager, only with a press"
 ask() { # user json-line: hello, then the line, as that user

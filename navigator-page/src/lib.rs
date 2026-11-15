@@ -34,6 +34,59 @@ pub fn read_bounded(r: impl Read) -> Result<Vec<u8>, u16> {
     Ok(b)
 }
 
+/// The largest picture decoded, per axis: more than a large screen shows.
+pub const PICTURE_PX_MAX: u32 = 2048;
+/// An SVG smaller than this on its longer side is drawn at this size, so a
+/// small icon stays sharp when it is shown large.
+pub const SVG_PX_MIN: u32 = 1024;
+
+/// A picture (`DocKind::Picture`) decoded here, in the child's jail, under
+/// the same decoders and ceilings as a page's images, reduced to at most
+/// [`PICTURE_PX_MAX`] per axis.
+pub fn picture(bytes: &[u8]) -> Result<navigator_image::image::Pixels, u16> {
+    use navigator_image::image::{decode_unaddressed, sniff, Ceilings, DecodeError, Format};
+    let format = sniff(bytes).map_err(|_| error::UNREADABLE)?;
+    let at = |target| decode_unaddressed(bytes, Ceilings { target, ..Ceilings::default() });
+    let px = if format == Format::Svg {
+        // Vectors have no natural pixel size to reduce from: draw at its
+        // own size, then again larger or smaller to fit the range.
+        let scaled = |w: u32, h: u32, to: u32| {
+            let (w, h) = (w as u64, h as u64);
+            let m = w.max(h).max(1);
+            (((w * to as u64) / m).max(1) as u32, ((h * to as u64) / m).max(1) as u32)
+        };
+        match at(None) {
+            Ok(px) if px.width.max(px.height) < SVG_PX_MIN => at(Some(scaled(px.width, px.height, SVG_PX_MIN))),
+            Ok(px) if px.width.max(px.height) > PICTURE_PX_MAX => at(Some(scaled(px.width, px.height, PICTURE_PX_MAX))),
+            Err(DecodeError::TooLarge { width, height, .. }) => at(Some(scaled(width, height, PICTURE_PX_MAX))),
+            other => other,
+        }
+    } else {
+        // The decoders reduce to cover their target, so ask for the box
+        // the picture fits in whole, not a square.
+        let (_, w, h) = navigator_image::image::natural_size(bytes).map_err(|_| error::UNREADABLE)?;
+        let m = w.max(h) as u64;
+        let target = if m <= PICTURE_PX_MAX as u64 { None } else {
+            let t = |v: u32| ((v as u64 * PICTURE_PX_MAX as u64).div_ceil(m)).max(1) as u32;
+            Some((t(w), t(h)))
+        };
+        at(target)
+    };
+    px.map_err(|e| {
+        eprintln!("navigator-page: picture not shown: {e:?}");
+        error::UNREADABLE
+    })
+}
+
+/// Where a `iw` x `ih` picture goes in a `w` x `h` window: whole, centred,
+/// never drawn larger than its own pixels (an SVG was drawn large already).
+pub fn fit_picture(iw: u32, ih: u32, w: f32, h: f32) -> [f32; 4] {
+    let (iw, ih) = (iw.max(1) as f32, ih.max(1) as f32);
+    let s = (w / iw).min(h / ih).min(1.0).max(0.0);
+    let (pw, ph) = ((iw * s).round(), (ih * s).round());
+    [((w - pw) / 2.0).floor(), ((h - ph) / 2.0).floor(), pw, ph]
+}
+
 /// A recording (or, for `DocKind::Html`, a page's own HTML) as a
 /// normalized document.
 pub fn prepare(kind: DocKind, bytes: &[u8]) -> Result<Prepared, u16> {
@@ -47,6 +100,7 @@ pub fn prepare(kind: DocKind, bytes: &[u8]) -> Result<Prepared, u16> {
             (r.document, r.inputs, subs)
         }
         DocKind::Html => (text.to_string(), Default::default(), Subresources::default()),
+        DocKind::Picture => return Err(error::UNREADABLE),
     };
     let html = navigator_normalize::normalize_and_measure(&doc, &inputs, fonts, &env).0;
     Ok(Prepared { title: title(&doc), anchors: anchors(&doc), html, subs })
@@ -157,6 +211,31 @@ mod tests {
         assert!(p.html.contains("Impluvium"), "{}", p.html);
         assert_eq!(prepare(DocKind::Recording, b"{\"format\":\"nope\"}").err(), Some(error::UNREADABLE));
         assert_eq!(prepare(DocKind::Recording, &[0xff, 0xfe]).err(), Some(error::UNREADABLE));
+    }
+
+    #[test]
+    fn a_picture_is_decoded_reduced_and_fitted() {
+        // A 4000 x 1000 PNG, one colour.
+        let mut png = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut png, 4000, 1000);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            e.write_header().unwrap().write_image_data(&vec![200u8; 4000 * 1000 * 4]).unwrap();
+        }
+        let px = picture(&png).unwrap();
+        assert!(px.width <= PICTURE_PX_MAX && px.height <= PICTURE_PX_MAX, "{}x{}", px.width, px.height);
+        assert_eq!(px.rgba.len(), (px.width * px.height * 4) as usize);
+        // A small SVG is drawn large.
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"><rect width="24" height="12" fill="red"/></svg>"#;
+        let s = picture(svg).unwrap();
+        assert_eq!((s.width, s.height), (SVG_PX_MIN, SVG_PX_MIN / 2));
+        // Not a picture.
+        assert_eq!(picture(b"hello").err(), Some(error::UNREADABLE));
+        assert_eq!(picture(b"\x89PNG\r\n\x1a\nbroken").err(), Some(error::UNREADABLE));
+        // Fitted: whole, centred, never enlarged.
+        assert_eq!(fit_picture(2000, 500, 400.0, 300.0), [0.0, 100.0, 400.0, 100.0]);
+        assert_eq!(fit_picture(100, 100, 400.0, 300.0), [150.0, 100.0, 100.0, 100.0]);
     }
 
     #[test]

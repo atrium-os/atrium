@@ -333,9 +333,15 @@ and type. D6 asks whether quick look comes in the first build.
    look part, with a stand-in viewer (`limen-view-probe`, both roles)
    that limend starts through portcullisd as its own user in its own
    jail: it gets the FLAC and the page read-only, can't write, chmod,
-   map it or learn its path, sees no `/media`. Not yet: a picture
-   viewer and PDFs (no viewer role takes them), the real viewers in the
-   gate (Navigator's page for HTML, Player for media).
+   map it or learn its path, sees no `/media`. Pictures (2026-11-15):
+   `doc-viewer` gained `DocKind::Picture`; the Navigator's page worker
+   (`navigator-page`) decodes PNG, JPEG, GIF, WebP and SVG in its jail
+   with navigator-image's decoders and ceilings, reduced to at most 2048
+   px per axis, and draws it whole and centred. Other pictures (TIFF,
+   HEIC, AVIF, BMP) say "No viewer shows these yet". The gate now runs
+   the real page worker as the doc-viewer (a Web page and a 1600x400
+   PNG). Not yet: PDFs (renderer choice open), Player as the real
+   media-player in the gate.
 5. **T5** bundles open the installer.
 
 ## 11. Decisions, with recommendations

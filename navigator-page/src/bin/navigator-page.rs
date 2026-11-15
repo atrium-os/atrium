@@ -11,7 +11,7 @@
 //!   navigator-page                       # as a Limen child
 //!                                        # (NAVIGATOR_PAGE_SOCKET: where
 //!                                        # an `Open` ticket is redeemed)
-//!   navigator-page --file rec.json [--html] [--dark]
+//!   navigator-page --file rec.json [--html|--picture] [--dark]
 //!                                        # development: its own window on
 //!                                        # FRESCO_SOCKET, links to stderr
 
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use limen::doc_viewer::{error, ChromeKey, DocKind, Reading, ToChild, ToParent, FOUND_MAX};
 use limen::proto::{ChildEvent, EmbedId};
-use navigator_page::{prepare, read_bounded, resolve, Prepared};
+use navigator_page::{fit_picture, picture, prepare, read_bounded, resolve, Prepared};
 use pergola::geom::Rect;
 use pergola::reactive::Mutable;
 use pergola::view::{Ctx, View};
@@ -131,6 +131,9 @@ struct PageView {
     size: Mutable<(f32, f32)>,
     /// The current find match, in document px (`[x, y, w, h]`).
     mark: Mutable<Option<[f32; 4]>>,
+    /// A picture shown instead of a page (`DocKind::Picture`), and
+    /// whether its canvas is dark.
+    picture: Mutable<Option<(pergola::node::Image, bool)>>,
 }
 
 impl PageView {
@@ -151,6 +154,14 @@ impl PageView {
 
 impl View for PageView {
     fn render(&self, ctx: &mut Ctx) {
+        if let Some((img, dark)) = self.picture.get_cloned() {
+            let (w, h) = self.size.get();
+            let c = if dark { pergola::Color::rgba(0.11, 0.11, 0.12, 1.0) } else { pergola::Color::rgba(0.94, 0.94, 0.95, 1.0) };
+            ctx.add(pergola::node::Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: c, radius: 0.0 });
+            let [x, y, pw, ph] = fit_picture(img.data().width, img.data().height, w, h);
+            ctx.add(pergola::node::Node::Image { rect: Rect::new(x, y, pw, ph), image: img });
+            return;
+        }
         match self.view() {
             Some(v) => {
                 // Either side of a comfortable measure: the page's canvas.
@@ -232,6 +243,20 @@ struct Run {
 
 impl Run {
     fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, reading: Reading, scroll: f32, bytes: Result<Vec<u8>, u16>, images: Vec<(String, Vec<u8>)>) {
+        self.view.picture.set(None);
+        if kind == DocKind::Picture {
+            self.view.page.set(None);
+            self.finding = None;
+            let t = Instant::now();
+            return match bytes.and_then(|b| picture(&b)) {
+                Ok(px) => {
+                    eprintln!("navigator-page: picture {}x{} in {:.0} ms", px.width, px.height, t.elapsed().as_secs_f64() * 1e3);
+                    self.view.picture.set(Some((pergola::node::Image::new(px.width, px.height, px.rgba), reading.dark)));
+                    out.send(ToParent::Loaded { title: String::new(), anchors: Vec::new() });
+                }
+                Err(code) => out.send(ToParent::Error { code }),
+            };
+        }
         let images = Rc::new(Images::new(images));
         let prepared = match bytes.and_then(|b| prepare(kind, &b)) {
             Ok(p) => Rc::new(p),
@@ -511,6 +536,7 @@ fn new_app(size: (f32, f32)) -> (App<PageView>, PageView) {
         more: Mutable::with_dirty(0, dirty.clone()),
         size: Mutable::with_dirty(size, dirty.clone()),
         mark: Mutable::with_dirty(None, dirty.clone()),
+        picture: Mutable::with_dirty(None, dirty.clone()),
     };
     (App::new_with_flag(view.clone(), dirty), view)
 }
@@ -519,7 +545,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--file") {
         let path = args.get(i + 1).unwrap_or_else(|| die("--file PATH"));
-        let kind = if args.iter().any(|a| a == "--html") { DocKind::Html } else { DocKind::Recording };
+        let kind = if args.iter().any(|a| a == "--html") {
+            DocKind::Html
+        } else if args.iter().any(|a| a == "--picture") {
+            DocKind::Picture
+        } else {
+            DocKind::Recording
+        };
         let dark = args.iter().any(|a| a == "--dark");
         return standalone(path, kind, dark);
     }
@@ -591,6 +623,10 @@ fn embedded() {
             match out.0.poll(Duration::from_millis(1)) {
                 Ok(Some(ChildEvent::Message { bytes, .. })) => match ToChild::decode(&bytes) {
                     Some(ToChild::SetTheme { dark }) => {
+                        if let Some((img, _)) = run.view.picture.get_cloned() {
+                            run.view.picture.set(Some((img, dark)));
+                            continue;
+                        }
                         let r = run.view.page.get_cloned().map_or(Reading::plain(dark), |p| Reading { dark, ..p.reading });
                         run.relayout(Some(r))
                     }

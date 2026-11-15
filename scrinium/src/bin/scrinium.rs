@@ -501,7 +501,8 @@ impl Network {
             return false;
         };
         let msg = if role == "doc-viewer" {
-            limen::doc_viewer::ToChild::Load { kind: limen::doc_viewer::DocKind::Html, base: String::new(), dark: false }.encode()
+            let kind = if mime.starts_with("image/") { limen::doc_viewer::DocKind::Picture } else { limen::doc_viewer::DocKind::Html };
+            limen::doc_viewer::ToChild::Load { kind, base: String::new(), dark: false }.encode()
         } else {
             limen::media_player::ToChild::Load { source: limen::media_player::Source::Fd, mime, growing: false }.encode()
         };

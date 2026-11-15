@@ -165,6 +165,9 @@ pub const LOOK_LINES: usize = 400;
 /// What quick look does with a file, from its name and first bytes (§7,
 /// §8): text Scrinium draws; Web pages, audio and video go to a viewer;
 /// programs and anything whose name lies get no viewer, only words.
+/// The pictures the document worker decodes (navigator-image).
+pub const PICTURES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"];
+
 pub fn look_kind(name: &str, head: &[u8]) -> LookBody {
     use atrium_types::{Detected, Family};
     let d = atrium_types::detect(name, head);
@@ -172,6 +175,10 @@ pub fn look_kind(name: &str, head: &[u8]) -> LookBody {
     match d {
         _ if d.is_program() => LookBody::Info { words: "Program".into(), why: d.question() },
         Detected::Known(t) if t.family == Family::WebPage => LookBody::Embed { role: "doc-viewer", mime: t.mime.into(), words: t.words.into() },
+        // Pictures go to the same document worker (D5), which decodes them
+        // in its jail; the kinds its decoders don't read say so.
+        Detected::Known(t) if t.family == Family::Image && PICTURES.contains(&t.mime) => LookBody::Embed { role: "doc-viewer", mime: t.mime.into(), words: t.words.into() },
+        Detected::Known(t) if t.family == Family::Image => LookBody::Info { words: t.words.into(), why: Some("No viewer shows these yet".into()) },
         Detected::Known(t) if matches!(t.family, Family::Audio | Family::Video) => LookBody::Embed { role: "media-player", mime: t.mime.into(), words: t.words.into() },
         Detected::Known(t) if text && matches!(t.family, Family::Text | Family::Link) => LookBody::Text { text: String::new(), words: t.words.into(), cut: false },
         Detected::Known(t) => LookBody::Info { words: t.words.into(), why: None },
@@ -1260,6 +1267,9 @@ mod tests {
         assert!(matches!(look_kind("song.flac", b"fLaC\0\0\0\x22"), LookBody::Embed { role: "media-player", .. }));
         assert!(matches!(look_kind("page.html", b"<!DOCTYPE html><p>hi"), LookBody::Embed { role: "doc-viewer", .. }));
         assert!(matches!(look_kind("notes.txt", b"plain words\n"), LookBody::Text { .. }));
+        assert!(matches!(look_kind("cat.png", b"\x89PNG\r\n\x1a\n"), LookBody::Embed { role: "doc-viewer", .. }));
+        assert!(matches!(look_kind("logo.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\">"), LookBody::Embed { role: "doc-viewer", .. }));
+        assert!(matches!(look_kind("scan.tiff", b"II*\x00"), LookBody::Info { why: Some(_), .. }));
         // A Web page named as a PDF: no viewer, only its text.
         let LookBody::Text { words, .. } = look_kind("invoice.pdf", b"<!DOCTYPE html><script>steal()</script>") else { panic!() };
         assert!(words.contains("PDF"), "{words}");

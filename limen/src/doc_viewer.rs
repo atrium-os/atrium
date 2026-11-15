@@ -33,6 +33,10 @@ pub enum DocKind {
     Recording,
     /// An HTML document (a mail body, a help page).
     Html,
+    /// A picture (PNG, JPEG, GIF, WebP or SVG; the child sniffs which),
+    /// shown whole, fitted to the window (the file manager's quick look,
+    /// opening-files.md §7).
+    Picture,
 }
 
 /// Parent to child.

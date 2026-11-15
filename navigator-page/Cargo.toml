@@ -28,6 +28,9 @@ navigator-style = { path = "../navigator-style" }
 # the header before allocating): images decode here, in the page's jail.
 navigator-image = { path = "../navigator-image" }
 
+[dev-dependencies]
+png = "0.17"
+
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch.
 [patch.crates-io]
