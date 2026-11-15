@@ -196,6 +196,11 @@ struct Record {
     /// (content address, store address) of each image, in order.
     #[serde(default)]
     images: Vec<(String, String)>,
+    /// What each of its consent controls writes (`atrium-consent:<n>`,
+    /// legacy-web §5.4.1e), so a page from the store can still be
+    /// answered. The page's own script text, held as the recording is.
+    #[serde(default)]
+    consents: Vec<Vec<String>>,
 }
 
 struct State {
@@ -223,7 +228,7 @@ impl State {
         let store: &mut dyn Store = if written { &mut *self.store } else { self.memory.entry(p.ctx.jar).or_default() };
         let put = store.put(&p.recording).and_then(|rec| {
             let images = p.images.iter().map(|(a, b)| store.put(b).map(|s| (a.clone(), s))).collect::<Result<Vec<_>, _>>()?;
-            let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec, images };
+            let r = Record { format: RECORD.into(), url: p.url.clone(), recording: rec, images, consents: (*p.consents).clone() };
             store.put(&serde_json::to_vec(&r).expect("encodes"))
         });
         match put {
@@ -271,7 +276,10 @@ impl State {
         if !ctl::images_ok(&lens) {
             return Err("the record's images are out of bounds".into());
         }
-        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images), consents: Default::default() })
+        if !consents_ok(&r.consents) {
+            return Err("the record's consents are out of bounds".into());
+        }
+        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images), consents: Arc::new(r.consents) })
     }
 
     /// The page at `url` this UI may act on: the cache, else the store.
@@ -716,6 +724,12 @@ fn consents_of(report: &str) -> Vec<Vec<String>> {
     out
 }
 
+/// Within the converter's bounds: at most [`CONSENTS_MAX`] controls, 16
+/// lines each, 4 KiB a line, no control characters.
+fn consents_ok(c: &[Vec<String>]) -> bool {
+    c.len() <= CONSENTS_MAX && c.iter().all(|ls| ls.len() <= 16 && ls.iter().all(|l| l.len() <= 4096 && !l.chars().any(char::is_control)))
+}
+
 /// The most consent controls a page keeps (the converter's own bound).
 const CONSENTS_MAX: usize = 4;
 /// A consent control's mark in a recording (the converter's).
@@ -731,7 +745,7 @@ fn consent(page: &Page, href: &str, jar: Jar, cookies: Option<&Cookies>) -> Link
     if !page.recording.windows(href.len()).any(|w| w == href.as_bytes()) {
         return blocked("the page does not carry this control");
     }
-    let Some(lines) = page.consents.get(n) else { return blocked("this page's answer is no longer held here; reload it and press again") };
+    let Some(lines) = page.consents.get(n) else { return blocked("this page's answer is not held here; reload it and press again") };
     let Some(c) = cookies else { return blocked("Arca isn't running here") };
     let Ok(u) = url::Url::parse(&page.url) else { return blocked("not an address") };
     let (Some(host), Some(part)) = (u.host_str().map(str::to_ascii_lowercase), navigator_cookies::partition_in(jar_id(jar), &page.url)) else {
@@ -1348,6 +1362,10 @@ mod tests {
         assert!(ctl::is_address(&p.saved));
         let back = st.reopen("https://a.example/", &p.saved, Ctx::ANON).unwrap();
         assert_eq!(back.recording, p.recording);
+        // Its consent answers come back with it.
+        let c = st.stored(Page { consents: Arc::new(vec![vec!["ok=1; Path=/".into()]]), ..page("https://cs.example/", "<a href=\"atrium-consent:0\">OK</a>") });
+        assert_eq!(*st.reopen("https://cs.example/", &c.saved, Ctx::ANON).unwrap().consents, vec![vec!["ok=1; Path=/".to_string()]]);
+        assert!(!consents_ok(&[vec!["a\nb".into()]]) && !consents_ok(&vec![vec![]; CONSENTS_MAX + 1]));
         assert_eq!(back.saved, p.saved);
         assert!(st.reopen("https://b.example/", &p.saved, Ctx::ANON).is_err(), "a record names its address");
         let rec = navigator_backend::session::digest(&p.recording);

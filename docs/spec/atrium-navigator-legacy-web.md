@@ -662,8 +662,10 @@ A2 jar (arca.md §8.7) is on main, so this follows its build order rather than w
   At most 4 are marked, each turned into `<a href="atrium-consent:<n>">` keeping its text,
   with what it wrote reported as `CW <n> <line>` (at most 16 lines, 4 KiB each, no
   control characters).
-- *The reader's press.* navigatord keeps a page's consents in memory with the page (a page
-  from the store has none: "reload it and press again"). A press of
+- *The reader's press.* navigatord keeps a page's consents with the page, and in its
+  store record beside the recording (since 2026-11-15; bounded as the converter bounds
+  them, checked again when the record is read), so a page reopened from the store can be
+  answered too. A record written before then has none: "reload it and press again". A press of
   `atrium-consent:<n>` that the recording carries writes each line to Arca with
   `W_SCRIPT_SET_COOKIE` (0x75, broker only) in the trail's jar: parsed as a `Set-Cookie`
   for the document's host and path, never `HttpOnly`, never replacing an `HttpOnly`
