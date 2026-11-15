@@ -746,15 +746,34 @@ impl SceneState {
             index.insert(slot, scene.textures.len() - 1);
             Some(scene.textures.len() - 1)
         };
+        // Only the batches these items draw: a texture packed is copied and
+        // hashed whole, so a sprite or the window under one would otherwise
+        // pay for every image and glyph atlas of the window.
+        let (mut quads, mut runs) = (vec![false; f.batches.len()], vec![false; f.glyph_batches.len()]);
+        for o in order {
+            match o.item {
+                fc::Node::Quad(b, _) if b < quads.len() => quads[b] = true,
+                fc::Node::Run(b, _) if b < runs.len() => runs[b] = true,
+                _ => {}
+            }
+        }
         let mut tex_remap = Vec::with_capacity(f.batches.len());
-        for b in &f.batches {
+        for (b, used) in f.batches.iter().zip(&quads) {
+            if !used {
+                tex_remap.push(None);
+                continue;
+            }
             tex_remap.push(tex_index(b.slot_id, &mut scene).map(|texture| {
                 scene.texture_batches.push(fc::TextureBatch { texture, quads: b.nodes.iter().map(|n| n.model).collect() });
                 scene.texture_batches.len() - 1
             }));
         }
         let mut glyph_remap = Vec::with_capacity(f.glyph_batches.len());
-        for b in &f.glyph_batches {
+        for (b, used) in f.glyph_batches.iter().zip(&runs) {
+            if !used {
+                glyph_remap.push(None);
+                continue;
+            }
             glyph_remap.push(tex_index(b.atlas_slot_id, &mut scene).map(|atlas| {
                 let runs = b.nodes.iter().map(|n| {
                     let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
