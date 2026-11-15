@@ -281,6 +281,12 @@ pub struct Capabilities {
     /// delete them, and open their terminals, over portcullisd's socket.
     /// Restricted to the Workspaces app.
     pub workspaces: Option<bool>,
+    /// An IDE (homes.md §5.3, W6): list the person's workspaces, get the
+    /// `work` of one the person picks in it (a press) at `/work/<name>`, and
+    /// run commands in that workspace's jail as its uid, over portcullisd's
+    /// socket. Not restricted: every pick is the person's press.
+    #[serde(rename = "workspace-exec")]
+    pub workspace_exec: Option<bool>,
     /// Bluetooth's settings (bluetooth.md §13): power, scan, pair (drawing
     /// the pairing prompts), connect and forget devices, over vinculumd's
     /// `bluetooth-control/` socket. Restricted to the settings app and the
@@ -563,6 +569,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         consoles:         ovr.consoles.or(base.consoles),
         app_grants:       ovr.app_grants.or(base.app_grants),
         workspaces:       ovr.workspaces.or(base.workspaces),
+        workspace_exec:   ovr.workspace_exec.or(base.workspace_exec),
         bluetooth_control: ovr.bluetooth_control.or(base.bluetooth_control),
         status_item:      ovr.status_item.or(base.status_item),
         audio_device:     ovr.audio_device.or(base.audio_device),

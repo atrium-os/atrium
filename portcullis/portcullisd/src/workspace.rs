@@ -341,12 +341,29 @@ pub fn check_delete(owner: &str, name: &str) -> Result<(), String> {
 
 /// Delete it: stopped, its mounts gone (checked), then its folder, work
 /// and all. Scratch comes back, empty, at the next list.
+/// A workspace's `work` on the host (it must exist, and be a folder).
+pub fn work_dir(owner: &str, name: &str) -> Result<PathBuf, String> {
+    if !valid_name(name) {
+        return Err(format!("{name:?} is not a workspace name"));
+    }
+    let (home, gid) = person(owner)?;
+    let d = root_dir(&home, gid)?.join(name);
+    load(&d).ok_or_else(|| format!("{owner} has no workspace {name}"))?;
+    let w = d.join(WORK);
+    match fs::symlink_metadata(&w) {
+        Ok(m) if m.is_dir() => Ok(w),
+        _ => Err(format!("{} is not a folder", w.display())),
+    }
+}
+
 pub fn delete(owner: &str, name: &str) -> Result<(), String> {
     check_delete(owner, name)?;
     stop(owner, name);
     if running_jid(owner, name).is_some() {
         return Err(format!("{name} is still running"));
     }
+    // Out of every IDE first (homes.md W6).
+    crate::ide::forget(owner, name)?;
     let (home, gid) = person(owner)?;
     let dir = root_dir(&home, gid)?.join(name);
     // ★ Never remove through a mount: whatever is mounted under it would go too.

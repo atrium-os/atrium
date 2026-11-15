@@ -364,6 +364,20 @@ pub enum Request {
     /// From an app, only with `activation`, a press on Run (purpose
     /// LAUNCH); the person's own CLI needs none. Answer: `WorkspaceRan`.
     WorkspaceRun { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// An IDE (`workspace-exec`, homes.md §5.3, W6) is given workspace
+    /// `name`: only with `activation`, a press in the IDE's window that
+    /// portcullisd spends with frescod (purpose APPROVE). Its `work` is then
+    /// at `/work/<name>` in the IDE's jail, now and at each launch, and the
+    /// IDE may `WorkspaceExec` there. Answer: `Ok`.
+    WorkspacePick { name: String, activation: [u8; 16] },
+    /// Run `argv` in picked workspace `name`'s jail as its uid, in
+    /// `work/<cwd>` (`cwd` relative, no `..`). Answer: `WorkspaceExecStarted`,
+    /// then over SCM_RIGHTS `[procdesc, stdin, output]`: the process
+    /// descriptor (closing it ends the command; it reports POLLHUP when the
+    /// command is done), the command's standard input, and its standard
+    /// output and error together. Read the answer with
+    /// [`read_response_unbuffered`] so the descriptors aren't lost.
+    WorkspaceExec { name: String, argv: Vec<String>, #[serde(default)] cwd: String },
 }
 
 /// Who allowed what an app has now (curia.md §13).
@@ -514,6 +528,9 @@ pub enum Response {
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.
     WorkspaceRan { app_id: String, capabilities: Vec<String> },
+    /// A `WorkspaceExec` started (pid in the workspace's jail); three
+    /// descriptors follow.
+    WorkspaceExecStarted { pid: i32 },
     /// Access → each installed app, by name.
     Access { apps: Vec<AccessEntry> },
 
@@ -573,6 +590,27 @@ pub fn read_request<R: BufRead>(r: &mut R) -> io::Result<Request> {
     serde_json::from_str(line.trim_end())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                  format!("bad request frame: {e}")))
+}
+
+/// [`read_response`] without read-ahead: one byte at a time up to the
+/// newline, so data (and descriptors) sent after the answer stay on the
+/// socket for [`recv_fds`].
+pub fn read_response_unbuffered<R: Read>(r: &mut R) -> io::Result<Response> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        if r.read(&mut b)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "daemon closed"));
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        line.push(b[0]);
+        if line.len() > 1 << 20 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response frame too long"));
+        }
+    }
+    serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad response frame: {e}")))
 }
 
 pub fn read_response<R: Read>(r: &mut R) -> io::Result<Response> {

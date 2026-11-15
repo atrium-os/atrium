@@ -209,6 +209,7 @@ pub struct CapabilityDelta {
     pub consoles:        bool,
     pub app_grants:      bool,
     pub workspaces:      bool,
+    pub workspace_exec:  bool,
     pub bluetooth_control: bool,
     pub status_item:     bool,
     pub audio_device:    bool,
@@ -267,6 +268,7 @@ impl CapabilityDelta {
             && !self.consoles
             && !self.app_grants
             && !self.workspaces
+            && !self.workspace_exec
             && !self.bluetooth_control
             && !self.status_item
             && !self.audio_device
@@ -321,6 +323,7 @@ impl CapabilityDelta {
         if self.consoles        { out.push("Show apps' consoles, and open more of them".into()); }
         if self.app_grants      { out.push("See what each app may do, and allow or remove it".into()); }
         if self.workspaces      { out.push("Make, change and delete your workspaces, and open their terminals".into()); }
+        if self.workspace_exec  { out.push("Build and run commands in the workspaces you pick in it".into()); }
         if self.bluetooth_control { out.push("Pair, connect and forget Bluetooth devices".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
@@ -426,6 +429,7 @@ pub fn compute_delta(
     bool_cap!(consoles);
     bool_cap!(app_grants);
     bool_cap!(workspaces);
+    bool_cap!(workspace_exec);
     bool_cap!(bluetooth_control);
     bool_cap!(status_item);
     bool_cap!(audio_device);
@@ -636,6 +640,7 @@ mod tests {
             consoles: None,
             app_grants: None,
             workspaces: None,
+            workspace_exec: None,
             bluetooth_control: None,
             status_item: None,
             audio_device: None,

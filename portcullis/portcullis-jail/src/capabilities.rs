@@ -135,9 +135,11 @@ pub fn apply_all(
     // The file manager opens files in apps through portcullisd (OpenFile,
     // opening-files.md §6.2), which checks it by its uid on every request.
     // The terminal asks for more consoles (Console, homes.md §4) the same way,
-    // and Settings lists and changes apps' access (`app-grants`, curia.md §13).
+    // and Settings lists and changes apps' access (`app-grants`, curia.md §13);
+    // an IDE asks for workspace picks and commands (`workspace-exec`).
     if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)
-        || caps.consoles == Some(true) || caps.app_grants == Some(true) || caps.workspaces == Some(true))
+        || caps.consoles == Some(true) || caps.app_grants == Some(true) || caps.workspaces == Some(true)
+        || caps.workspace_exec == Some(true))
         && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }

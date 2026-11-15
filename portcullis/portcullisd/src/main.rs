@@ -54,6 +54,7 @@ use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTE
 mod console;
 mod dev;
 mod empty;
+mod ide;
 mod launch;
 mod workspace;
 use portcullisd::manifest_trust;
@@ -441,6 +442,17 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
         if let Request::WorkspaceRun { name, project, activation } = req {
             let resp = handle_run(uid, &owner, &name, &project, activation, &shared);
             write_response(&mut writer, &resp)?;
+            continue;
+        }
+        /* ★ An IDE (`workspace-exec`, homes.md W6): picks with a press, and
+         * runs commands only in what was picked. */
+        if let Request::WorkspacePick { name, activation } = req {
+            let resp = handle_pick(uid, &owner, &name, activation);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if let Request::WorkspaceExec { name, argv, cwd } = req {
+            handle_ws_exec(uid, &owner, &name, &argv, &cwd, &mut writer)?;
             continue;
         }
         if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceDuplicate { .. }) {
@@ -1248,13 +1260,69 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     Response::WorkspaceRan { app_id: p.id, capabilities: caps }
 }
 
+/// The IDE asking (by its uid), if it is one.
+fn ide_of(uid: u32) -> Result<String, String> {
+    match portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().resolve(uid) {
+        Some((_, a)) if launch::app_execs_in_workspaces(a) => Ok(a.to_string()),
+        Some((_, a)) => Err(format!("cap.workspace_exec.denied: {a} has no workspace-exec")),
+        None => Err("cap.workspace_exec.denied: not an app".into()),
+    }
+}
+
+fn handle_pick(uid: u32, owner: &str, name: &str, activation: [u8; 16]) -> Response {
+    let refuse = |why: String| {
+        eprintln!("portcullisd: workspace pick of {name} for {owner} REFUSED: {why}");
+        Response::Error { message: why }
+    };
+    let app = match ide_of(uid) {
+        Ok(a) => a,
+        Err(why) => return refuse(why),
+    };
+    if let Err(why) = workspace::work_dir(owner, name) {
+        return refuse(why);
+    }
+    if let Err(why) = portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
+                                                          fresco_protocol::activation::purpose::APPROVE) {
+        return refuse(why);
+    }
+    match ide::pick(owner, &app, name) {
+        Ok(()) => {
+            eprintln!("portcullisd: {app} was given workspace {name} of {owner}");
+            Response::Ok
+        }
+        Err(why) => refuse(why),
+    }
+}
+
+fn handle_ws_exec(uid: u32, owner: &str, name: &str, argv: &[String], cwd: &str, writer: &mut UnixStream) -> std::io::Result<()> {
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: exec in workspace {name} of {owner} REFUSED: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let app = match ide_of(uid) {
+        Ok(a) => a,
+        Err(why) => return refuse(writer, why),
+    };
+    if !ide::picked(owner, &app).iter().any(|w| w == name) {
+        return refuse(writer, format!("cap.workspace_exec.denied: {app} wasn't given workspace {name}"));
+    }
+    let (pid, procdesc, stdin, output) = match ide::exec(owner, name, argv, cwd) {
+        Ok(s) => s,
+        Err(why) => return refuse(writer, why),
+    };
+    eprintln!("portcullisd: {app} runs {:?} in workspace {name} of {owner} (pid {pid})", argv.first().map(String::as_str).unwrap_or(""));
+    write_response(writer, &Response::WorkspaceExecStarted { pid })?;
+    // The caller's copies are all that remain: closing the descriptor ends it.
+    portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
+}
+
 fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
         // The terminal lists them only, for its switcher (homes.md §5.3).
         Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_workspaces(app)
-            || (matches!(req, Request::Workspaces) && launch::app_shows_consoles(app)),
+            || (matches!(req, Request::Workspaces) && (launch::app_shows_consoles(app) || launch::app_execs_in_workspaces(app))),
         // Not an app: a person, with a home, asking about their own.
         None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
     };
@@ -2010,7 +2078,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
-        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. } => Response::Error {
+        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
+        | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

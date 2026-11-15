@@ -368,6 +368,15 @@ people ship without `sshd` on the host.
 6. **W6 `workspace-exec`.** The capability, `WorkspaceExec`, the pick.
    Gate: a test app builds in a picked workspace and is refused for one it
    didn't pick.
+   Built 2026-11-15: `WorkspacePick { name, activation }` (press, purpose
+   APPROVE) kept in `/var/db/atrium/<person>/workspace-picks`;
+   `/work` in the IDE's jail is a read-only mount of root's
+   `/var/run/atrium/ide/<person>/<app>`, each picked `work` mounted on a
+   folder made there (now if running, and at each launch), the IDE's uid in
+   the files group; `WorkspaceExec { name, argv, cwd }` answers
+   `WorkspaceExecStarted` then `[procdesc, stdin, output]` (closing the
+   descriptor ends the command); deleting a workspace unmounts it from
+   every IDE and drops its picks. Gate `scripts/vm-ide-check.sh` 0 failed.
 7. **W7 Terminal app.** Empty-jail shell, the switcher, the grid entry.
    Gate: an empty tab sees no home and no network; switching to Scratch
    needs the press and lands in `~/work`.

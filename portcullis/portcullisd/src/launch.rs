@@ -312,6 +312,14 @@ pub fn launch_with_stdio(
             }
         }
     }
+    /* An IDE (`workspace-exec`, homes.md W6): /work, and the `work` of each
+     * workspace the person picked in it. */
+    if manifest.capabilities.workspace_exec == Some(true) {
+        if let Err(e) = crate::ide::launch_mounts(user, app_id, &run_as_user, &jail_path, &mut jc) {
+            full_teardown(&jail_path, None);
+            return Err(LaunchError::Failed("workspace-exec", e));
+        }
+    }
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
         return Err(e);
@@ -881,6 +889,11 @@ pub fn apps_opening(mime: &str) -> Vec<(String, String, portcullis_toml::OpenMod
 /// launch registry, so this reads the capability off the INSTALLED manifest, not
 /// off anything the caller sent. An app that is not in the registry at all (not
 /// Portcullis-launched) resolves to no app-id and is refused by the caller.
+/// Is this an IDE (its INSTALLED manifest holds `workspace-exec`, W6)?
+pub fn app_execs_in_workspaces(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.workspace_exec == Some(true))
+}
+
 /// Does this app's INSTALLED manifest hold `workspaces` (homes.md §5)?
 pub fn app_manages_workspaces(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.workspaces == Some(true))
