@@ -203,6 +203,7 @@ pub struct CapabilityDelta {
     pub wifi_nearby: bool,
     pub network_configure: bool,
     pub navigator_page:  bool,
+    pub navigator_broker: bool,
     pub removable_files: bool,
     pub file_picker:     bool,
     pub home_files:      bool,
@@ -262,6 +263,7 @@ impl CapabilityDelta {
             && !self.wifi_nearby
             && !self.network_configure
             && !self.navigator_page
+            && !self.navigator_broker
             && !self.removable_files
             && !self.file_picker
             && !self.home_files
@@ -317,6 +319,7 @@ impl CapabilityDelta {
         if self.wifi_nearby { out.push("See the Wi-Fi networks around you (this can tell where you are)".into()); }
         if self.network_configure { out.push("Change the machine's network settings".into()); }
         if self.navigator_page  { out.push("Fetch the Navigator's pages by ticket (the Navigator's page view)".into()); }
+        if self.navigator_broker { out.push("Run the Navigator's broker: its windows' origin, page jails and the presses it answers".into()); }
         if self.removable_files { out.push("Read and change every file on the USB sticks plugged in".into()); }
         if self.file_picker     { out.push("Be the file picker: give other apps the files and folders you pick".into()); }
         if self.home_files      { out.push("Read and change all of your own files (Documents, Downloads, Pictures, Music, Videos)".into()); }
@@ -423,6 +426,7 @@ pub fn compute_delta(
     bool_cap!(wifi_nearby);
     bool_cap!(network_configure);
     bool_cap!(navigator_page);
+    bool_cap!(navigator_broker);
     bool_cap!(removable_files);
     bool_cap!(file_picker);
     bool_cap!(home_files);
@@ -634,6 +638,7 @@ mod tests {
             wifi_nearby: None,
             network_configure: None,
             navigator_page: None,
+            navigator_broker: None,
             removable_files: None,
             file_picker: None,
             home_files: None,

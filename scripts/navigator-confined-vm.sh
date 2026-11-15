@@ -170,7 +170,8 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
          "$ROOT/limen/target/$R/limend" "$ROOT/navigator-prerender/target/$R/prerender" \
          "$ROOT/navigator-fetch/target/$R/navigator-fetchd" "$ROOT/navigatord/target/$R/navigatord" \
-         "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" "$FIX/ca.pem"; do
+         "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" \
+         "$ROOT/scripts/navigator-broker-bundle.sh" "$FIX/ca.pem"; do
     h=$(sha256sum "$b" | cut -d' ' -f1)
     [ "$h" = "$(g "sha256 -q $D/$(basename "$b") 2>/dev/null || true")" ] && continue
     put "$b" "$D/"
@@ -207,9 +208,17 @@ g "set -e
     chmod +x $D/fresco-renderer
     cd /root && sh $D/fresco-renderer-bundle.sh $D/fresco-renderer /usr/local/share/fonts /root/e2e-key.pem /usr/local/bin/opifex
     pw usershow _limen >/dev/null 2>&1 || pw useradd _limen -u 65022 -d /nonexistent -s /usr/sbin/nologin
-    pw usershow navtest >/dev/null 2>&1 || pw useradd navtest -m" > "$OUT.bundles.log" 2>&1 \
+    pw usershow navtest >/dev/null 2>&1 || pw useradd navtest -m
+    printf '%s\n' NAVIGATORD_SOCKET=/atrium/sockets/navigator/navigator.sock \
+        FRESCOD_CHROME_SOCK=/atrium/sockets/fresco-chrome/fresco-chrome.sock \
+        NAVIGATORD_ACTIVATION=/atrium/sockets/fresco-activation/fresco-activation.sock \
+        NAVIGATORD_LIMEN=/atrium/sockets/limen/limend.sock PORTCULLIS_SOCKET=$PSOCK \
+        NAVIGATORD_CONVERTER=jail:$CONV_ID NAVIGATORD_FETCHD=jail:$FETCH_ID \
+        NAVIGATORD_STORE=/var/db/navigatord/store NAVIGATORD_DOWNLOADS=/var/db/navigatord/downloads > /root/navigatord.conf
+    chmod +x $D/navigatord
+    sh $D/navigator-broker-bundle.sh $D/navigatord /root/navigatord.conf /root/e2e-key.pem /usr/local/bin/opifex" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
-for a in $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
+for a in org.atrium.navigator:navigatord $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
     g "test -x /var/lib/atrium/apps/${a%%:*}/bin/${a#*:}" && ok "${a%%:*} installed" || bad "${a%%:*} not installed"
 done
 g "grep -q 'workers.\"$PAGE_ID\"' /etc/atrium/policy.toml" && ok "worker rule: _limen starts the page as _navpage" || bad "no worker rule for $PAGE_ID"
@@ -217,31 +226,55 @@ g "grep -q 'workers.\"$PAGE_ID\"' /etc/atrium/policy.toml" && ok "worker rule: _
 echo "=== start"
 # frescod as _frescod, renderers from portcullisd (no FRESCOD_RENDERER_LAUNCHER):
 # the worker rule runs each as _fresco-render.
-AS=$S/activation.sock
+# frescod's activation and chrome sockets and limend's are in directories of
+# their own under /atrium/sockets, which the Navigator's jail mounts.
+AS=/atrium/sockets/fresco-activation/fresco-activation.sock
+CS=/atrium/sockets/fresco-chrome/fresco-chrome.sock
+LS=/atrium/sockets/limen/limend.sock
+NS=/atrium/sockets/navigator/navigator.sock
+g "mkdir -p /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome /atrium/sockets/limen /atrium/sockets/navigator \
+      /atrium/sockets/navigator-page /atrium/sockets/arca /atrium/sockets/arca-courier
+   chown _frescod /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome; chown _limen /atrium/sockets/limen
+   rm -f /atrium/sockets/navigator/*.sock /atrium/sockets/navigator-page/*.sock
+   # Bound by the Navigator's per-app uid, which portcullisd allocates at its
+   # first launch: open to it here (portcullisd making a served socket's
+   # directory the app's own is a later step).
+   chmod 1777 /atrium/sockets/navigator /atrium/sockets/navigator-page"
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute \
     FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$S/fresco.sock FRESCOD_WM_SOCK=$S/wm.sock \
-    FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$S/chrome.sock FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
+    FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$CS FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
     daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S $S/fresco.sock && test -S $AS"; do sleep 2; i=$((i+1)); done
 g "grep -q 'renderers are org.atrium.fresco.renderer jails' $S/frescod.log" && ok "frescod (as _frescod) starts renderers as jails" || bad "frescod: $(g "grep -i renderer $S/frescod.log | head -3 | tr '\n' ';'")"
 g "cd $S && env FRESCO_SOCKET=$S/fresco.sock FRESCO_WM_SOCKET=$S/wm.sock FORUM_CTL_SOCKET=$S/ctl.sock FORUM_STATE=$S/forum-state daemon -f -o $S/wm.log $D/forum-wm </dev/null"
-# limend as _limen: the Navigator (navigator-ui, as navtest: navigatord,
-# also navtest, opens the UI's frescod connection, so its windows are
-# navtest's) is named by this run's registry, as portcullisd's launch
-# registry would name it.
-g "printf '%s navtest org.atrium.navigator\n' \$(id -u navtest) > $S/registry; chmod 644 $S/registry
-   cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_APP_REGISTRY=$S/registry LIMEN_DEFAULTS=doc-viewer=$PAGE_ID \
+# limend as _limen: the Navigator is navigatord, launched by navtest, so
+# portcullisd's launch registry names its per-app uid (navtest,
+# org.atrium.navigator); navigatord opens both the UI's frescod and limend
+# connections, so the UI's windows and its limend parent are that uid's.
+g "cd $S && env LIMEN_SOCKET=$LS LIMEN_DEFAULTS=doc-viewer=$PAGE_ID \
     LIMEN_FRESCOD_ACTIVATION=$AS daemon -f -o $S/limend.log -u _limen $D/limend </dev/null"
-# navigatord as an unprivileged broker: a worker runs as whoever asks for
-# it, and portcullisd refuses a one-shot for root. Its ticket socket is in
-# the directory the page's capability mounts.
-g "mkdir -p /atrium/sockets/navigator-page && chown navtest /atrium/sockets/navigator-page && chmod 755 /atrium/sockets/navigator-page
-   mkdir -p $S/store && chown navtest $S/store
-   cd $S && env PORTCULLIS_SOCKET=$PSOCK NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_STORE=$S/store FRESCOD_CHROME_SOCK=$S/chrome.sock \
-    NAVIGATORD_CONVERTER=jail:$CONV_ID NAVIGATORD_FETCHD=jail:$FETCH_ID \
-    NAVIGATORD_ACTIVATION=$AS NAVIGATORD_DOWNLOADS=$S/downloads daemon -f -o $S/navigatord.log -u navtest $D/navigatord </dev/null"
-sleep 10
-g "test -S $S/limend.sock && test -S $S/nav.sock" || { g "tail -5 $S/limend.log $S/navigatord.log"; die "limend or navigatord did not start"; }
+# navigatord as the Navigator app (navigator-ui.md §2.3a): navtest launches
+# it, portcullisd runs it as the Navigator's per-app uid in its jail, with
+# its settings from the bundle. Its converter and fetcher jails run as that
+# uid too (a worker runs as whoever asks, and never as root).
+g "cd $S && daemon -f -o $S/navigatord.log -u navtest /usr/local/bin/portcullis launch --no-prompt org.atrium.navigator </dev/null"
+i=0; while [ $i -lt 30 ] && ! g "test -S $LS && test -S $NS"; do sleep 2; i=$((i+1)); done
+g "test -S $LS && test -S $NS" || { g "tail -5 $S/limend.log $S/navigatord.log /var/log/atrium/portcullisd-navigator.log"; die "limend or navigatord did not start"; }
+NAV=$(g "ps -o jid= -o uid= -p \$(pgrep -x navigatord | head -1)" | tr -d '\r' | awk '{print $1, $2}')
+NJID=${NAV%% *}; NUID=${NAV#* }
+NAVTEST=$(g "id -u navtest" | tr -d '\r')
+[ -n "$NJID" ] && [ "$NJID" != 0 ] && ok "navigatord runs in a jail (jid $NJID)" || bad "navigatord is not in a jail: '$NAV'"
+[ -n "$NUID" ] && [ "$NUID" -ge 50000 ] && [ "$NUID" != "$NAVTEST" ] && ok "as the Navigator's own uid ($NUID), not navtest's ($NAVTEST)" || bad "navigatord's uid: '$NUID'"
+g "grep -q \"^$NUID navtest org.atrium.navigator\" /var/run/atrium/app-registry" && ok "the launch registry names it (navtest, org.atrium.navigator)" || bad "registry: $(g "grep -a navigator /var/run/atrium/app-registry")"
+NM=$(g "mount -p | awk '{print \$2}' | grep -E \"/jails/[^/]*navigator[^/.]*/\" | grep -v -e '/dev\$' -e '/tmp\$' | sed 's#.*/atrium/sockets/#sockets/#' | sort | tr '\n' ' '" | tr -d '\r')
+echo "  navigator jail mounts: $NM"
+for d in navigator navigator-page fresco-chrome fresco-activation limen portcullis arca arca-courier; do
+    echo "$NM" | grep -q "sockets/$d " || bad "no $d socket directory in the Navigator's jail"
+done
+echo "$NM" | grep -qE 'sockets/(fresco|forum|clipboard|audio)( |$)' && bad "the Navigator's jail has a socket it was not given" || ok "the Navigator's jail has its broker's sockets and no others"
+# The jail has no ifconfig; its interfaces, as the host sees its vnet.
+VN=$(g "jls -j $NJID vnet 2>&1" | tr -d '\r')
+case "$VN" in new|1) ok "no network: a network stack of its own with nothing in it (vnet $VN)" ;; *) bad "the Navigator's jail is on the host's network stack (vnet '$VN')" ;; esac
 g "grep -q UNCONFINED $S/navigatord.log" && bad "navigatord says it is unconfined" || ok "navigatord runs confined (no testing switch, no fixtures)"
 mkdir -p "$OUT"
 
@@ -254,7 +287,7 @@ until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 
 jails() { g "jls name | grep -c 'limen-' || true" | tr -d '\r'; }
 
 echo "=== drive"
-g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$S/nav.sock LIMEN_SOCKET=$S/limend.sock NAVIGATOR_UI_TRACE=1 \
+g "cd $S && env FRESCO_SOCKET=$S/fresco.sock NAVIGATORD_SOCKET=$NS NAVIGATOR_UI_TRACE=1 \
     NAVIGATOR_TRAILS=$S/trails.json NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium daemon -f -o $S/ui.log -u navtest $D/navigator-ui --light </dev/null"
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first page opened over the network" || bad "first page: $(last)"
 sleep "$GAP"

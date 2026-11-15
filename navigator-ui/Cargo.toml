@@ -18,6 +18,7 @@ path = "src/main.rs"
 pergola = { path = "../pergola" }
 fresco-client = { path = "../fresco-client" }
 limen = { path = "../limen" }
+aqueduct = { path = "../aqueduct" }
 navigator-control = { path = "../navigator-control" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -93,6 +93,9 @@ pub fn apply_all(
         // navigatord's ticket socket (navigator-ui.md §2.1), nothing else of it.
         apply_socket("navigator-page.sock", jc, opts);
     }
+    if caps.navigator_broker == Some(true) {
+        apply_navigator_broker(jc, opts);
+    }
     if caps.audio_device == Some(true) {
         apply_audio_device(jc, opts);
     }
@@ -229,6 +232,20 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
     let src = opts.host_sockets.join(service);
     let dst_in_jail = jc.root_path.join("atrium/sockets").join(service);
     jc.add_mount(&src, &dst_in_jail, "nullfs", &["rw"]);
+}
+
+/// `navigator-broker`: navigatord as the Navigator app (navigator-ui.md
+/// §2.3a). The directories of the sockets it serves (its UI's, the page
+/// tickets') and of those it uses: frescod's chrome channel (it opens the
+/// UI's connection and names the page's origin) and activation socket (it
+/// spends the prompt row's presses), limend (it opens the UI's limend
+/// connection), portcullisd (its converter and fetcher jails) and Arca
+/// (cookies for sites that know you, through the couriers). No network:
+/// pages come through the fetcher jails.
+pub fn apply_navigator_broker(jc: &mut JailConfig, opts: &BuildOpts) {
+    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier"] {
+        apply_socket(s, jc, opts);
+    }
 }
 
 /// `audio`: choragusd's playback socket directory (`audio/`), and nothing else.

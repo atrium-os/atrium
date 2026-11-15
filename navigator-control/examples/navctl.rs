@@ -27,7 +27,7 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let mut s = UnixStream::connect(&a[0]).expect("navigatord");
     s.set_read_timeout(Some(Duration::from_secs(180))).unwrap();
-    write_frame(&mut s, &Request::Hello { chrome: false }).unwrap();
+    write_frame(&mut s, &Request::Hello { chrome: false, limen: false }).unwrap();
     let _ = read_frame::<Event>(&mut s).unwrap();
     let mut i = 1;
     while i < a.len() {

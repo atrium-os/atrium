@@ -239,6 +239,12 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.navigator-page = true: restricted to the Navigator's page child (redeems \
              page tickets at navigatord); requires explicit policy approval"));
     }
+    if c.navigator_broker == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.navigator-broker = true: restricted to the Navigator (its broker's sockets, \
+             frescod's chrome and activation sockets, limend, portcullisd and Arca); requires \
+             explicit policy approval"));
+    }
     if c.removable_files == Some(true) {
         r.warnings.push(format!(
             "{ctx}.removable-files = true: restricted to the file manager (every USB stick, \

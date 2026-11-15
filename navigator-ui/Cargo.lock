@@ -32,6 +32,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-types"
+version = "0.1.0"
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,6 +476,7 @@ dependencies = [
 name = "navigator-ui"
 version = "0.1.0"
 dependencies = [
+ "aqueduct",
  "fresco-client",
  "libc",
  "limen",
@@ -557,6 +562,7 @@ dependencies = [
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
+ "atrium-types",
  "hex",
  "portcullis-toml",
  "serde",
@@ -568,6 +574,7 @@ dependencies = [
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
+ "atrium-types",
  "serde",
  "thiserror 1.0.69",
  "toml",

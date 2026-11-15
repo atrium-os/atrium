@@ -13,7 +13,11 @@ use serde::Serialize;
 
 use crate::proto::{self, op, ChildEvent, EmbedId, ParentEvent, Reply, WindowToken};
 
-pub const DEFAULT_SOCKET: &str = "/var/run/atrium/limend.sock";
+/// In a directory of its own, so a capability can mount it into a jail
+/// (navigator-ui.md §2.3a); limend links [`OLD_SOCKET`] to it.
+pub const DEFAULT_SOCKET: &str = "/atrium/sockets/limen/limend.sock";
+/// limend's old place: a link to [`DEFAULT_SOCKET`] while clients move.
+pub const OLD_SOCKET: &str = "/var/run/atrium/limend.sock";
 
 #[derive(Debug)]
 pub enum Error {

@@ -5797,11 +5797,17 @@ the `navigator-page` capability, system grant, worker rule `_limen` → `_navpag
 `org.atrium.fresco.renderer` (`scripts/fresco-renderer-bundle.sh`; frescod runs as `_frescod`
 with `FRESCOD_ACTIVATION_SOCK` in the run dir, and each window's renderer is a jail as
 `_fresco-render`), `org.atrium.navigator.converter` (prerender, no capabilities) and `org.atrium.navigator.fetcher`
-(navigator-fetchd, `network = "full"`, its trust store plus the fixture CA). limend runs as
-`_limen` with a run registry naming navtest's uid as `org.atrium.navigator`; navigatord runs as
-navtest with `NAVIGATORD_CONVERTER`/`NAVIGATORD_FETCHD` set to `jail:<app id>` (navigatord asks portcullisd
-for each jail itself, no `portcullis` program; 30/30 on 2026-11-15), and
-the UI runs as navtest too (navigatord opens its frescod connection, so its windows are navtest's).
+(navigator-fetchd, `network = "full"`, its trust store plus the fixture CA), and
+`org.atrium.navigator` (`scripts/navigator-broker-bundle.sh`: navigatord with
+`etc/navigatord.conf`, the restricted `navigator-broker` capability; navigator-ui.md §2.3a J2).
+frescod's activation and chrome sockets and limend's are in `/atrium/sockets/fresco-activation/`,
+`fresco-chrome/` and `limen/`. navtest launches the Navigator (`portcullis launch --no-prompt`),
+so navigatord runs in its jail as the Navigator's per-app uid (50000+, in the launch registry as
+navtest's `org.atrium.navigator`, which limend reads), starts converter and fetcher jails itself
+(`jail:<app id>`), and opens the UI's frescod and limend connections; the UI runs as navtest,
+unjailed, on `/atrium/sockets/navigator/navigator.sock`. Extra checks: navigatord's jail, its uid
+(not navtest's), the registry line, the jail's socket mounts (exactly the broker's eight
+directories) and its empty network stack; 36/36 on 2026-11-15.
 
 Checks: the page opens over the network; the child runs as 65035 in a jail; the page jail's
 mounts are its bundle, its tmpfs, devfs and `/atrium/sockets/navigator-page` only; its network

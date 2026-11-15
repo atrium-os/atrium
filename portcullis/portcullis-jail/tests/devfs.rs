@@ -99,6 +99,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         ("wifi-nearby = true\n", ["wifi-nearby"].as_slice()),
         ("network-configure = true\n", ["network-configure"].as_slice()),
         ("navigator-page = true\n", ["navigator-page"].as_slice()),
+        ("navigator-broker = true\n", ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier"].as_slice()),
         ("audio-device = true\n", ["audio-device"].as_slice()),
         ("audio = true\nmicrophone = true\naudio-monitor = true\n", ["audio", "audio-capture", "audio-monitor"].as_slice()),
     ] {
@@ -108,13 +109,13 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         }
         let conf = jc.render_jail_conf();
         assert!(!conf.contains("dsp") && !conf.contains("mixer"), "{caps}: {conf}");
-        for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "bluetooth-control", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
+        for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "bluetooth-control", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure", "navigator", "fresco-chrome", "fresco-activation", "limen", "arca", "arca-courier"] {
             let n = sock(&jc, name);
             assert_eq!(n, want.contains(&name) as usize, "{caps}: {name} mounted {n} times");
         }
     }
     let jc = build(&manifest(""), &opts()).expect("builds");
-    for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "bluetooth-control", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure"] {
+    for name in ["audio", "audio-capture", "audio-monitor", "audio-control", "media-control", "audio-device", "removable-media", "ostiarius-lock", "device-list", "display-settings", "bluetooth-control", "navigator-page", "network-read", "network-details", "network-wifi", "wifi-nearby", "network-configure", "navigator", "fresco-chrome", "fresco-activation", "limen", "arca", "arca-courier"] {
         assert_eq!(sock(&jc, name), 0, "no capability, no {name} socket");
     }
 }

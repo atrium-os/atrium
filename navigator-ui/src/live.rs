@@ -127,12 +127,21 @@ impl Live {
     /// navigatord opens the window's frescod connection over the chrome
     /// channel and hands it back (so it can name the page's origin in
     /// frescod's strip); it comes back here when it did.
-    pub fn connect(path: &str, chrome: bool) -> io::Result<(Live, Option<OwnedFd>)> {
+    ///
+    /// The UI also asks for its limend connection: navigatord opens it when
+    /// it is configured to (navigator-ui.md §2.3a), so limend's parent is the
+    /// owner of the UI's windows; the second descriptor is that, if any.
+    pub fn connect(path: &str, chrome: bool) -> io::Result<(Live, Option<OwnedFd>, Option<OwnedFd>)> {
         let mut s = UnixStream::connect(path)?;
-        ctl::write_frame(&mut s, &Request::Hello { chrome })?;
+        ctl::write_frame(&mut s, &Request::Hello { chrome, limen: true })?;
         let fd = match ctl::read_frame::<Event>(&mut s)? {
             Some(Event::Chrome { fd: true }) => Some(ctl::recv_fd(&s)?),
             Some(Event::Chrome { fd: false }) => None,
+            other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
+        };
+        let limen = match ctl::read_frame::<Event>(&mut s)? {
+            Some(Event::Limen { fd: true }) => Some(ctl::recv_fd(&s)?),
+            Some(Event::Limen { fd: false }) => None,
             other => return Err(io::Error::other(format!("navigatord said {other:?}"))),
         };
         let (tx, rx) = mpsc::channel();
@@ -176,6 +185,7 @@ impl Live {
                 idle,
             },
             fd,
+            limen,
         ))
     }
 
@@ -434,7 +444,7 @@ impl Live {
                     eprintln!("navigator-ui: Arca holds {} accounts for {}{}", accounts.len(), crate::trail::site(&url), why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
                     s.accounts_answer(&url, accounts, why);
                 }
-                Event::Chrome { .. } => {}
+                Event::Chrome { .. } | Event::Limen { .. } => {}
             }
         }
         // The page children.

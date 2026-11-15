@@ -91,10 +91,12 @@ fn main() -> std::io::Result<()> {
     let desc = WindowDesc::new("Navigator", SizeSpec::Fixed(w, h));
     // Live: navigatord first, since it may open the window's connection.
     let mut live = None;
+    let mut limen_fd: Option<std::os::fd::OwnedFd> = None;
     let mut window = match std::env::var("NAVIGATORD_SOCKET").ok().filter(|_| scene.is_none()) {
         Some(path) => {
-            let (l, fd) = Live::connect(&path, true).unwrap_or_else(|e| die(format_args!("navigatord at {path}: {e}")));
+            let (l, fd, lfd) = Live::connect(&path, true).unwrap_or_else(|e| die(format_args!("navigatord at {path}: {e}")));
             live = Some(l);
+            limen_fd = lfd;
             match fd {
                 Some(fd) => {
                     // Text is measured on a connection of its own, as
@@ -148,7 +150,13 @@ fn main() -> std::io::Result<()> {
         Some(l) => {
             l.dark = theme == Some(Semantic::DARK);
             l.window(window.id());
-            let embeds = pergola::embed::Embeds::connect().unwrap_or_else(|e| die(format_args!("limend: {e:?}")));
+            // limend over navigatord's connection when it opened one for us.
+            let embeds = match limen_fd.take() {
+                Some(fd) => aqueduct::Connection::wrap(std::os::unix::net::UnixStream::from(fd))
+                    .map(|c| pergola::embed::Embeds::wrap(limen::client::Parent::wrap(c)))
+                    .unwrap_or_else(|e| die(format_args!("limend via navigatord: {e}"))),
+                None => pergola::embed::Embeds::connect().unwrap_or_else(|e| die(format_args!("limend: {e:?}"))),
+            };
             window.set_slot_binder(pergola::embed::Embeds::binder(&embeds));
             // frescod names the window with an embed token; limend wants it.
             let until = std::time::Instant::now() + Duration::from_secs(10);

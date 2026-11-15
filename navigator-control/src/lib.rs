@@ -47,8 +47,10 @@ pub const CLEAR_MAX: usize = 512;
 pub enum Request {
     /// The first message. `chrome`: send a frescod connection opened over
     /// the chrome channel (F4d) for the UI's window, so navigatord can name
-    /// the page's origin in frescod's strip.
-    Hello { chrome: bool },
+    /// the page's origin in frescod's strip. `limen`: send a limend
+    /// connection opened for the UI (navigator-ui.md §2.3a), answered by
+    /// `Limen` after `Chrome`.
+    Hello { chrome: bool, limen: bool },
     /// The UI's window on that connection (its local id), whose origin
     /// navigatord sets.
     Window { window: u32 },
@@ -153,6 +155,9 @@ pub enum Event {
     /// The answer to `Hello`. With `fd`, a descriptor follows: the UI's
     /// frescod connection.
     Chrome { fd: bool },
+    /// After `Chrome`, when `Hello` asked for it. With `fd`, a descriptor
+    /// follows: a limend connection navigatord opened.
+    Limen { fd: bool },
     /// `saved`: the store address of this version of the page, for the
     /// UI's trail record; `from`: where it came from.
     /// `knows`: whether it was fetched with the site knowing you (false

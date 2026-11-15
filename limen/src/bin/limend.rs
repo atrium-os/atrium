@@ -1,7 +1,8 @@
 //! limend, the embed broker (docs/spec/limen.md).
 //!
 //! Environment:
-//! - `LIMEN_SOCKET` (default /var/run/atrium/limend.sock)
+//! - `LIMEN_SOCKET` (default /atrium/sockets/limen/limend.sock, linked from
+//!   /var/run/atrium/limend.sock)
 //! - `LIMEN_APP_REGISTRY` (default the launch registry)
 //! - `LIMEN_DEFAULTS`: `role=app-id,...`, the provider of each user role
 //!   until Curia holds the user's choice (limen.md §3.2).
@@ -23,7 +24,9 @@ use std::os::unix::net::UnixListener;
 use limen::daemon::Shared;
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::var("LIMEN_SOCKET").unwrap_or_else(|_| limen::client::DEFAULT_SOCKET.into());
+    let set = std::env::var("LIMEN_SOCKET").ok().filter(|p| !p.is_empty());
+    let default = set.is_none();
+    let path = set.unwrap_or_else(|| limen::client::DEFAULT_SOCKET.into());
     let registry = std::env::var("LIMEN_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
     let defaults: Vec<(String, String)> = std::env::var("LIMEN_DEFAULTS").unwrap_or_default()
         .split(',')
@@ -43,8 +46,17 @@ fn main() -> std::io::Result<()> {
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
     shared.set_attribution(Box::new(limen::audio::Choragus::new(
         std::env::var("LIMEN_CHORAGUS").unwrap_or_else(|_| limen::audio::DEFAULT_SOCKET.into()))));
+    if let Some(d) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    if default {
+        let _ = std::fs::remove_file(limen::client::OLD_SOCKET);
+        if let Err(e) = std::os::unix::fs::symlink(&path, limen::client::OLD_SOCKET) {
+            eprintln!("limend: link {} -> {path}: {e}", limen::client::OLD_SOCKET);
+        }
+    }
     // Every app may connect: who it is comes from the connection
     // (getpeereid), never from the socket's mode.
     {

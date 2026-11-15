@@ -247,6 +247,14 @@ pub struct Capabilities {
     /// to that child's bundle.
     #[serde(rename = "navigator-page")]
     pub navigator_page: Option<bool>,
+    /// The Navigator's broker, navigatord, jailed as the Navigator app
+    /// (navigator-ui.md §2.3a): the sockets it serves (`navigator/` for its
+    /// UI, `navigator-page/` for page tickets) and the ones it uses
+    /// (frescod's `fresco-chrome/` and `fresco-activation/`, `limen/`,
+    /// `portcullis/` for its converter and fetcher jails, `arca/` and
+    /// `arca-courier/`). Restricted to the Navigator's bundle.
+    #[serde(rename = "navigator-broker")]
+    pub navigator_broker: Option<bool>,
     /// The file manager's standing grant (device-assignment.md §4.8): every
     /// served stick, read-write, in its own jail at `/media/<part>`, for as
     /// long as the jail runs. Implies the `removable-media/` socket (it asks
@@ -353,6 +361,7 @@ impl Capabilities {
             ("display-settings", self.display_settings), ("network-details", self.network_details),
             ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
+            ("navigator-broker", self.navigator_broker),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
             ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
@@ -563,6 +572,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         wifi_nearby: ovr.wifi_nearby.or(base.wifi_nearby),
         network_configure: ovr.network_configure.or(base.network_configure),
         navigator_page:   ovr.navigator_page.or(base.navigator_page),
+        navigator_broker: ovr.navigator_broker.or(base.navigator_broker),
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),
         home_files:       ovr.home_files.or(base.home_files),

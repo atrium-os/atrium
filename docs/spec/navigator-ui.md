@@ -183,6 +183,19 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   uses the jailed form, 30/30. Arca's couriers already come over courierd's socket.
 - **J2.** frescod's chrome and activation sockets in `/atrium/sockets/`; the `navigator-broker`
   capability; navigatord as the Navigator bundle in its jail (UI still a plain process).
+  *Built 2026-11-15:* frescod's activation socket defaults to
+  `/atrium/sockets/fresco-activation/` and limend's to `/atrium/sockets/limen/`, each linked
+  from its old `/var/run/atrium` path; the chrome socket is set to `/atrium/sockets/fresco-chrome/`.
+  `navigator-broker` (restricted) mounts `navigator/`, `navigator-page/`, `fresco-chrome/`,
+  `fresco-activation/`, `limen/`, `portcullis/`, `arca/` and `arca-courier/`; no network (its
+  own empty stack). `scripts/navigator-broker-bundle.sh` installs `org.atrium.navigator`
+  (navigatord, `etc/navigatord.conf`); the confined script has navtest launch it, so it runs
+  as the Navigator's per-app uid (50000+) that the launch registry names (navtest,
+  `org.atrium.navigator`), with its store in its own jail. navigatord now also opens the UI's
+  limend connection (`Hello { limen }`, `NAVIGATORD_LIMEN`), so limend's parent is the owner of
+  the UI's windows whoever runs the UI, and spends prompt presses as that owner. Left for later:
+  portcullisd making a served socket's directory the app's own (the script opens `navigator/`
+  and `navigator-page/` 1777), and Downloads in the person's folder (the jail's own for now).
 - **J3.** navigator-ui as navigatord's worker jail (`_navui`), trails kept by navigatord.
 - **J4.** hand-offs through `open-uri`.
 

@@ -21,7 +21,11 @@
 //! - **The origin** of the page the UI shows is set in frescod's strip over
 //!   the chrome channel (`FRESCOD_CHROME_SOCK`, F4d): on `Hello { chrome }`
 //!   navigatord opens the UI's frescod connection there and hands it over,
-//!   so the UI's window is one navigatord may name.
+//!   so the UI's window is one navigatord may name. When the UI asks
+//!   (`Hello { limen }`) and `NAVIGATORD_LIMEN` is set, navigatord opens the
+//!   UI's limend connection too, so limend's parent is the same owner.
+//!   Jailed as the Navigator app (navigator-ui.md §2.3a), navigatord is
+//!   that owner, whoever runs the UI.
 //!
 //! - **Parked pages** (navigator-ui.md §4.4): every page opened is kept in
 //!   a content-addressed store (`NAVIGATORD_STORE`, a directory; in memory
@@ -100,6 +104,9 @@ struct Config {
     unconfined: bool,
     deadline_s: u64,
     chrome: Option<PathBuf>,
+    /// limend's socket (`NAVIGATORD_LIMEN`): the UI's limend connection is
+    /// opened here when it asks, as its frescod one is.
+    limen: Option<PathBuf>,
     store: Option<PathBuf>,
     /// arcad's socket and Arca's courier launcher's: with both, a page
     /// whose site knows you is fetched through Arca's couriers.
@@ -131,6 +138,7 @@ impl Config {
             unconfined,
             deadline_s: var("NAVIGATORD_DEADLINE").and_then(|v| v.parse().ok()).unwrap_or(30),
             chrome: var("FRESCOD_CHROME_SOCK").map(PathBuf::from),
+            limen: var("NAVIGATORD_LIMEN").map(PathBuf::from),
             store: var("NAVIGATORD_STORE").map(PathBuf::from),
             arca: var("NAVIGATORD_ARCA").zip(var("NAVIGATORD_COURIERD")).map(|(a, c)| (PathBuf::from(a), c)),
             downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from)
@@ -868,10 +876,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // connection only.
     let waiting = Arc::new(Mutex::new(files::Waiting::default()));
     let mut handed: Vec<String> = Vec::new();
-    // Save and hand-offs: the press, spent with frescod by the UI's uid.
-    let ui_uid = press::peer_uid(&s);
+    // Save and hand-offs: the press, spent with frescod as a press on a
+    // window of the UI's connection: ours when we opened it over the chrome
+    // channel (navigator-ui.md §2.3a), else the UI's own.
+    let presenter = Arc::new(Mutex::new(press::peer_uid(&s)));
+    let presenter_s = presenter.clone();
     let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
     let mut spend = move |p: ctl::Press| -> Result<(), String> {
+        let ui_uid = *presenter_s.lock().unwrap();
         match (&mut presses, ui_uid) {
             (Some(f), Some(uid)) => f.spend(p, uid),
             (Some(_), None) => Err("the UI's uid is unknown".into()),
@@ -890,7 +902,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             }
         };
         match req {
-            Request::Hello { chrome } => {
+            Request::Hello { chrome, limen } => {
                 let opened = match (&cfg.chrome, chrome) {
                     (Some(p), true) => match open_chrome(p) {
                         Ok(o) => Some(o),
@@ -904,6 +916,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 match opened {
                     Some((c, handle, fd)) => {
                         strip.lock().unwrap().chan = Some((c, handle));
+                        *presenter.lock().unwrap() = Some(unsafe { libc::geteuid() });
                         let s = w.lock().unwrap();
                         let ok = ctl::write_frame(&mut &*s, &Event::Chrome { fd: true }).and_then(|_| ctl::send_fd(&s, fd.as_raw_fd()));
                         if let Err(e) = ok {
@@ -912,6 +925,22 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                         }
                     }
                     None => send(&w, &Event::Chrome { fd: false }),
+                }
+                // limend, on the UI's behalf: the parent limend sees is then
+                // the owner of the UI's windows (us), whoever runs the UI.
+                if limen {
+                    let opened = cfg.limen.as_ref().map(|p| UnixStream::connect(p).map_err(|e| eprintln!("navigatord: limend {}: {e}", p.display())));
+                    match opened {
+                        Some(Ok(l)) => {
+                            let s = w.lock().unwrap();
+                            let ok = ctl::write_frame(&mut &*s, &Event::Limen { fd: true }).and_then(|_| ctl::send_fd(&s, l.as_raw_fd()));
+                            if let Err(e) = ok {
+                                eprintln!("navigatord: UI: {e}");
+                                return;
+                            }
+                        }
+                        _ => send(&w, &Event::Limen { fd: false }),
+                    }
                 }
             }
             Request::Window { window } => strip.lock().unwrap().window = Some(window),

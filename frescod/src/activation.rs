@@ -498,20 +498,42 @@ pub fn focused_window(comp: &Mutex<fresco_scene_server::window::Compositor>) -> 
     comp.lock().unwrap().keyboard_window()
 }
 
-/// Serve the activation socket on FRESCOD_ACTIVATION_SOCK (default
-/// /var/run/atrium/fresco-activation.sock, where tabulad looks).
+/// Where the activation socket is by default: a directory of its own under
+/// `/atrium/sockets`, so a capability can mount it into a jail
+/// (navigator-ui.md §2.3a).
+pub const DEFAULT_SOCK: &str = "/atrium/sockets/fresco-activation/fresco-activation.sock";
+/// Its old place, where its clients look by default: a link to it.
+pub const OLD_SOCK: &str = "/var/run/atrium/fresco-activation.sock";
+
+/// Serve the activation socket on FRESCOD_ACTIVATION_SOCK, else
+/// [`DEFAULT_SOCK`] with a link at [`OLD_SOCK`].
 pub fn start(comp: Arc<Mutex<fresco_scene_server::window::Compositor>>) {
-    let path = std::env::var("FRESCOD_ACTIVATION_SOCK")
-        .unwrap_or_else(|_| "/var/run/atrium/fresco-activation.sock".into());
+    let set = std::env::var("FRESCOD_ACTIVATION_SOCK").ok().filter(|p| !p.is_empty());
+    let default = set.is_none();
+    let path = set.unwrap_or_else(|| DEFAULT_SOCK.into());
     let path = std::path::Path::new(&path);
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
+    }
+    if default {
+        link_old(path, std::path::Path::new(OLD_SOCK));
     }
     let allowed = Callers { consumers: consumers(), forum: forum_uid(), binders: binders() };
     let slots = comp.clone();
     let focused: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |w| w != 0 && focused_window(&comp) == w);
     if let Err(e) = serve(path, allowed, focused, slots) {
         eprintln!("frescod: activation socket {}: {e}", path.display());
+    }
+}
+
+/// A link at `old` to `new`, replacing whatever was there.
+pub fn link_old(new: &std::path::Path, old: &std::path::Path) {
+    if let Some(d) = old.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::remove_file(old);
+    if let Err(e) = std::os::unix::fs::symlink(new, old) {
+        eprintln!("frescod: link {} -> {}: {e}", old.display(), new.display());
     }
 }
 
