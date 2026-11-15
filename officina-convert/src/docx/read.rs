@@ -18,7 +18,7 @@
 //! Reported, not carried: floating pictures (kept in line), merged cells, nested
 //! tables (their text kept), notes inside notes or headers, comments without a
 //! range, tracked changes in notes and headers (insertions kept, deletions
-//! dropped), deleted table rows, paragraph property changes (kept as made), sections after the first, fields other than
+//! dropped), deleted table rows, paragraph property changes (kept as made), fields other than
 //! page numbers (their shown result kept), text boxes, charts, equations, embedded
 //! objects. Kept inert: macros (`.docm`, not read).
 
@@ -286,6 +286,24 @@ fn sect_settings(s: &El) -> Section {
     x
 }
 
+/// A `w:sectPr`'s page size and margins (the model's defaults where it
+/// gives none).
+fn page_setup(s: &El) -> PageSetup {
+    let mut g = PageSetup::default();
+    if let Some(sz) = s.child("w:pgSz") {
+        g.width = twips(sz.attr("w:w")).unwrap_or(g.width).clamp(1440, 31680 * 2);
+        g.height = twips(sz.attr("w:h")).unwrap_or(g.height).clamp(1440, 31680 * 2);
+    }
+    if let Some(m) = s.child("w:pgMar") {
+        let t = |k: &str, d: i32| twips(m.attr(k)).map(|v| v.abs()).unwrap_or(d).min(31680);
+        g.margin_top = t("w:top", g.margin_top);
+        g.margin_bottom = t("w:bottom", g.margin_bottom);
+        g.margin_start = t("w:left", g.margin_start);
+        g.margin_end = t("w:right", g.margin_end);
+    }
+    g
+}
+
 /// A `w:tabs`: its stops, in order, and the positions it clears.
 fn tab_stops(e: &El) -> (Vec<TabStop>, Vec<i32>) {
     let mut v = Vec::new();
@@ -410,7 +428,8 @@ struct Reader<'a> {
     /// Sections: the block the current one starts at, and the page sizes of
     /// those before the last.
     sec_from: usize,
-    sec_pages: Vec<Option<(Option<i32>, Option<i32>)>>,
+    /// Each section read: its first block, settings and page setup.
+    secs: Vec<(Option<usize>, Section, PageSetup)>,
 }
 
 /// A comment's text: a line a paragraph.
@@ -1310,12 +1329,24 @@ impl<'a> Reader<'a> {
     /// A section's `w:sectPr` read where it ends (the body's last one is the
     /// document's last section): the section's first paragraph gets its
     /// settings.
-    fn end_section(&mut self, s: &El, last: bool) {
+    fn end_section(&mut self, s: &El, _last: bool) {
         let first = (self.sec_from..self.doc.blocks.len()).find(|&k| self.doc.cell(k).is_none());
         let x = sect_settings(s);
-        if let Some(k) = first {
-            // The first section: only its columns matter.
-            if k > 0 || x.columns > 1 {
+        self.secs.push((first, x, page_setup(s)));
+        if x.start == SectionStart::OddPage || x.start == SectionStart::EvenPage {
+            self.rep.note(Kind::Approximate, "sections on odd or even pages (on the next page)");
+        }
+        self.sec_from = self.doc.blocks.len();
+    }
+
+    /// The sections read, onto their first paragraphs: settings, and a page
+    /// setup of their own where it isn't the document's (the last section's).
+    fn place_sections(&mut self) {
+        for (first, mut x, g) in std::mem::take(&mut self.secs) {
+            let Some(k) = first else { continue };
+            x.page = (g != self.doc.page).then_some(g);
+            // The first section: only its columns and page matter.
+            if k > 0 || x.columns > 1 || x.page.is_some() {
                 self.doc.blocks.update(k, |b| {
                     if let Some(q) = b.as_para_mut() {
                         q.props.section = Some(x);
@@ -1323,35 +1354,10 @@ impl<'a> Reader<'a> {
                 });
             }
         }
-        if !last {
-            let g = s.child("w:pgSz").map(|z| (twips(z.attr("w:w")), twips(z.attr("w:h"))));
-            self.sec_pages.push(g);
-        }
-        if x.start == SectionStart::OddPage || x.start == SectionStart::EvenPage {
-            self.rep.note(Kind::Approximate, "sections on odd or even pages (on the next page)");
-        }
-        self.sec_from = self.doc.blocks.len();
     }
 
     fn section(&mut self, s: &El) {
-        let mut g = self.doc.page;
-        if let Some(sz) = s.child("w:pgSz") {
-            g.width = twips(sz.attr("w:w")).unwrap_or(g.width).max(1440);
-            g.height = twips(sz.attr("w:h")).unwrap_or(g.height).max(1440);
-        }
-        if let Some(m) = s.child("w:pgMar") {
-            let t = |k: &str, d: i32| twips(m.attr(k)).map(|v| v.abs()).unwrap_or(d);
-            g.margin_top = t("w:top", g.margin_top);
-            g.margin_bottom = t("w:bottom", g.margin_bottom);
-            g.margin_start = t("w:left", g.margin_start);
-            g.margin_end = t("w:right", g.margin_end);
-        }
-        self.doc.page = PageSetup { ..g };
-        // Earlier sections with another page size keep the last one's.
-        let size = (Some(g.width), Some(g.height));
-        if self.sec_pages.iter().flatten().any(|&(w, h)| (w.unwrap_or(g.width), h.unwrap_or(g.height)) != (size.0.unwrap(), size.1.unwrap())) {
-            self.rep.note(Kind::Approximate, "sections with their own page size (the last section's kept)");
-        }
+        self.doc.page = page_setup(s);
         for (tag, header) in [("w:headerReference", true), ("w:footerReference", false)] {
             let refs: Vec<&El> = s.children(tag).collect();
             let pick = refs.iter().find(|r| r.attr("w:type") == Some("default")).or(refs.first());
@@ -1578,7 +1584,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, sec_pages: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1634,6 +1640,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     for more in doc_xml.children("w:body").skip(1).take(16) {
         r.body(more);
     }
+    r.place_sections();
     r.read_notes();
     r.read_replies(&comment_order);
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);

@@ -69,7 +69,9 @@ pub const HEADER_COLOR: u32 = 0x555555;
 pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &mut LayoutCache, fonts: &dyn Fonts, numbering: &Numbering, pages_text: &str) -> Vec<Item> {
     let mut out = Vec::new();
     let Some(page) = pages.get(i) else { return out };
-    let g = &doc.page;
+    // The page's own size and margins (its section's).
+    let g = &page.setup;
+    let col_w = if *g == doc.page { col_w } else { crate::paginate::content_width(g) };
     let (mx, my) = (twips(g.margin_start as i64), twips(g.margin_top as i64));
     let (pw, ph) = (twips(g.width as i64), twips(g.height as i64));
 

@@ -43,16 +43,32 @@ pub const REBASE: f64 = 8192.0;
 pub const FRAME_BUDGET: Duration = Duration::from_millis(6);
 
 /// The geometry one render used, for the handlers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Geom {
     rect: Rect,
     /// Units per layout unit.
     k: f64,
+    /// The document's page: its size, where it sits across, its margins.
     page_w: f64,
     page_h: f64,
     left: f64,
     margin_x: f64,
     margin_y: f64,
+    /// Pages of other sizes (sections with their own): each page laid out so
+    /// far, when any differs; pages past them are the document's.
+    boxes: std::rc::Rc<[PageBox]>,
+    /// The widest page.
+    max_w: f64,
+}
+
+/// One page's place in the view: its top, size and margins (view units).
+#[derive(Debug, Clone, Copy)]
+struct PageBox {
+    top: f64,
+    w: f64,
+    h: f64,
+    mx: f64,
+    my: f64,
 }
 
 impl Geom {
@@ -72,14 +88,50 @@ impl Geom {
         } else {
             ((rect.w() as f64 - page_w) / 2.0).max(GAP as f64)
         };
-        Geom { rect, k, page_w, page_h, left, margin_x: twips(g.margin_start as i64) as f64 * k, margin_y: twips(g.margin_top as i64) as f64 * k }
+        let pages = ed.pages.pages();
+        let (mut boxes, mut max_w) = (Vec::new(), page_w);
+        if pages.iter().any(|p| p.setup != *g) {
+            let mut top = GAP as f64;
+            for p in pages {
+                let s = &p.setup;
+                let b = PageBox { top, w: twips(s.width as i64) as f64 * k, h: twips(s.height as i64) as f64 * k, mx: twips(s.margin_start as i64) as f64 * k, my: twips(s.margin_top as i64) as f64 * k };
+                max_w = max_w.max(b.w);
+                top += b.h + GAP as f64;
+                boxes.push(b);
+            }
+        }
+        Geom { rect, k, page_w, page_h, left, margin_x: twips(g.margin_start as i64) as f64 * k, margin_y: twips(g.margin_top as i64) as f64 * k, boxes: boxes.into(), max_w }
+    }
+    /// Page `i`'s place: its own, or the document page's.
+    fn page(&self, i: usize) -> PageBox {
+        match self.boxes.get(i) {
+            Some(b) => *b,
+            None => {
+                let (top, n) = match self.boxes.last() {
+                    Some(b) => (b.top + b.h + GAP as f64, self.boxes.len()),
+                    None => (GAP as f64, 0),
+                };
+                PageBox { top: top + (i - n) as f64 * (self.page_h + GAP as f64), w: self.page_w, h: self.page_h, mx: self.margin_x, my: self.margin_y }
+            }
+        }
     }
     fn page_top(&self, i: usize) -> f64 {
-        GAP as f64 + i as f64 * (self.page_h + GAP as f64)
+        self.page(i).top
+    }
+    /// Where page `i`'s left edge sits: pages of other widths centred on the
+    /// document's.
+    fn left_of(&self, i: usize) -> f64 {
+        let w = self.page(i).w;
+        (self.left + (self.page_w - w) / 2.0).max(GAP as f64)
     }
     /// The page at content y (nearest).
     fn page_at(&self, y: f64, pages: usize) -> usize {
-        (((y - GAP as f64 / 2.0) / (self.page_h + GAP as f64)).floor().max(0.0) as usize).min(pages.saturating_sub(1))
+        let n = self.boxes.len();
+        if n > 0 && y < self.page(n).top - GAP as f64 / 2.0 {
+            return self.boxes.partition_point(|b| b.top + b.h + GAP as f64 / 2.0 <= y).min(pages.saturating_sub(1));
+        }
+        let top = self.page(n).top;
+        (n + ((y - top + GAP as f64 / 2.0) / (self.page_h + GAP as f64)).floor().max(0.0) as usize).min(pages.saturating_sub(1))
     }
 }
 
@@ -189,7 +241,7 @@ impl RichTextView {
         let g = Geom::of(&ed, self.rect, self.zoom);
         let (known, est) = Self::page_count(&ed);
         let ext_h = g.page_top(est);
-        let ext_w = (g.page_w + 2.0 * GAP as f64).max(self.rect.w() as f64);
+        let ext_w = (g.max_w + 2.0 * GAP as f64).max(self.rect.w() as f64);
         let mut st = self.scroll.get();
         if st.extent != Some([ext_w, ext_h]) || !st.fixed_zoom {
             st.extent = Some([ext_w, ext_h]);
@@ -215,12 +267,13 @@ impl RichTextView {
             let paper = Color::rgba(1.0, 1.0, 1.0, 1.0);
             let picked = if ed.review { ed.review_edit() } else { None };
             for i in first..=last {
-                let (px, py) = at(g.left, g.page_top(i));
+                let pb = g.page(i);
+                let (px, py) = at(g.left_of(i), pb.top);
                 ctx.key(2 + i as u64);
-                let grp = ctx.push(Node::vstack(Rect::new(px, py, g.page_w as f32, g.page_h as f32), 0.0));
+                let grp = ctx.push(Node::vstack(Rect::new(px, py, pb.w as f32, pb.h as f32), 0.0));
                 ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
-                ctx.add(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, g.page_w as f32 + 2.0, g.page_h as f32 + 2.0), fill: t.border_default(), radius: 0.0 });
-                ctx.add(Node::Rect { rect: Rect::new(px, py, g.page_w as f32, g.page_h as f32), fill: paper, radius: 0.0 });
+                ctx.add(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, pb.w as f32 + 2.0, pb.h as f32 + 2.0), fill: t.border_default(), radius: 0.0 });
+                ctx.add(Node::Rect { rect: Rect::new(px, py, pb.w as f32, pb.h as f32), fill: paper, radius: 0.0 });
                 let numbering = ed.numbering();
                 let pages_text = if ed.pages.done() { known.to_string() } else { format!("{est}") };
                 let col_w = ed.pages.width();
@@ -229,7 +282,7 @@ impl RichTextView {
                 if a != b {
                     let sel = t.selection_bg();
                     for (_, rx, ry, rw, rh) in selection_rects(&mut ed, a, b, i, i) {
-                        let (sx, sy) = at(g.left + g.margin_x + rx as f64 * g.k, g.page_top(i) + g.margin_y + ry as f64 * g.k);
+                        let (sx, sy) = at(g.left_of(i) + pb.mx + rx as f64 * g.k, pb.top + pb.my + ry as f64 * g.k);
                         ctx.add(Node::Rect { rect: Rect::new(sx, sy, (rw as f64 * g.k) as f32, (rh as f64 * g.k) as f32), fill: sel, radius: 0.0 });
                     }
                 }
@@ -286,7 +339,7 @@ impl RichTextView {
                             if !bars.iter().any(|b| b.0 == y && b.1 == author) {
                                 let n = bars.iter().filter(|b| b.0 == y).count() as f64;
                                 bars.push((y, author.clone()));
-                                ctx.add(Node::Rect { rect: Rect::new(q(ox + g.margin_x * 0.5 - 1.5 - 5.0 * n), q(oy + y as f64 * g.k), 3.0, (h as f64 * g.k).max(2.0) as f32), fill: col, radius: 1.5 });
+                                ctx.add(Node::Rect { rect: Rect::new(q(ox + pb.mx * 0.5 - 1.5 - 5.0 * n), q(oy + y as f64 * g.k), 3.0, (h as f64 * g.k).max(2.0) as f32), fill: col, radius: 1.5 });
                             }
                             // In review, the picked edit is shown in place.
                             let Some(e) = picked.as_ref().filter(|e| in_edit(e, block, start, end)) else { continue };
@@ -341,10 +394,10 @@ impl RichTextView {
                 }
                 // Comment balloons in the space right of the page, each at its
                 // text's first line on this page, pushed down so none overlap.
-                let room = r.w() as f64 - (g.left + g.page_w);
+                let room = r.w() as f64 - (g.left_of(i) + pb.w);
                 if !ed.review && !balloons.is_empty() && room >= BALLOON_W as f64 + 16.0 {
                     let at_caret = ed.comment_at_caret();
-                    let bx = px + g.page_w as f32 + 8.0;
+                    let bx = px + pb.w as f32 + 8.0;
                     let mut next_y = f64::MIN;
                     let small = |c: Color, wt| pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: pergola::theme::type_size::XS, weight: wt, color: c };
                     for (id, y) in std::mem::take(&mut balloons) {
@@ -404,8 +457,8 @@ impl RichTextView {
                                 }
                                 let x0 = ed.x_in_line(s.block, &l, line, a.max(line.start));
                                 let x1 = ed.x_in_line(s.block, &l, line, b.min(line.end));
-                                let y = py as f64 + g.margin_y + (base + line.descent / 2) as f64 * g.k;
-                                let (sx0, sx1) = (px as f64 + g.margin_x + (s.x + x0) as f64 * g.k, px as f64 + g.margin_x + (s.x + x1) as f64 * g.k);
+                                let y = py as f64 + pb.my + (base + line.descent / 2) as f64 * g.k;
+                                let (sx0, sx1) = (px as f64 + pb.mx + (s.x + x0) as f64 * g.k, px as f64 + pb.mx + (s.x + x1) as f64 * g.k);
                                 let mut x = sx0;
                                 while x < sx1 {
                                     ctx.add(Node::Rect { rect: Rect::new(q(x), q(y), 2.0f32.min((sx1 - x) as f32), 1.5), fill: red, radius: 0.0 });
@@ -425,7 +478,8 @@ impl RichTextView {
             let c = ed.caret;
             let s = ed.spot(c);
             if s.page >= first && s.page <= last {
-                let (px, py) = at(g.left + g.margin_x + s.x as f64 * g.k, g.page_top(s.page) + g.margin_y + s.y as f64 * g.k);
+                let pb = g.page(s.page);
+                let (px, py) = at(g.left_of(s.page) + pb.mx + s.x as f64 * g.k, pb.top + pb.my + s.y as f64 * g.k);
                 ctx.add(Node::Rect { rect: Rect::new(px, py, 1.5, (s.h as f64 * g.k) as f32), fill: t.accent_fg(), radius: 0.0 });
             }
             ctx.pop();
@@ -455,6 +509,7 @@ impl RichTextView {
         });
         {
             let (ed, sc, rev, find) = (self.editor.clone(), self.scroll.clone(), self.rev.clone(), self.on_find.clone());
+            let g = g.clone();
             ctx.on_key(body, move |ev| {
                 let Event::Key { kind, key, modifiers, chars } = ev else { return };
                 if *kind == KeyEventKind::Up {
@@ -492,6 +547,7 @@ impl RichTextView {
         }
         {
             let (ed, sc, rev) = (self.editor.clone(), self.scroll.clone(), self.rev.clone());
+            let g = g.clone();
             ctx.on_drag(body, move |phase, p| {
                 let st = sc.get();
                 let mut e = ed.borrow_mut();
@@ -598,8 +654,9 @@ fn hit(e: &mut Editor, g: &Geom, scroll_y: f64, p: Point) -> Pos {
     let cy = scroll_y + (p.y - g.rect.y()) as f64;
     let n = e.pages.pages().len();
     let pg = g.page_at(cy, n);
-    let lx = ((p.x - g.rect.x()) as f64 - g.left - g.margin_x) / g.k;
-    let ly = (cy - g.page_top(pg) - g.margin_y) / g.k;
+    let pb = g.page(pg);
+    let lx = ((p.x - g.rect.x()) as f64 - g.left_of(pg) - pb.mx) / g.k;
+    let ly = (cy - pb.top - pb.my) / g.k;
     e.hit(pg, lx as i64, ly as i64)
 }
 
@@ -607,7 +664,8 @@ fn hit(e: &mut Editor, g: &Geom, scroll_y: f64, p: Point) -> Pos {
 fn reveal(e: &mut Editor, g: &Geom, st: &mut ScrollState) {
     let c = e.caret;
     let s = e.spot(c);
-    let top = g.page_top(s.page) + g.margin_y + s.y as f64 * g.k;
+    let pb = g.page(s.page);
+    let top = pb.top + pb.my + s.y as f64 * g.k;
     let bottom = top + s.h as f64 * g.k;
     let h = g.rect.h() as f64;
     let margin = (s.h as f64 * g.k * 2.0).min(h / 4.0);
@@ -786,6 +844,50 @@ mod tests {
                 assert!(origin.y.abs() < 3.0 * REBASE as f32 + 2000.0, "rebased: {}", origin.y);
             }
         }
+    }
+
+    /// Pages of a section with a landscape page of its own sit at their own
+    /// size, one under another, and clicks land on the page under them.
+    #[test]
+    fn pages_of_other_sizes_stack_and_take_clicks() {
+        use officina_text::model::{PageSetup, Section};
+        let (mut app, ed, scroll) = host(400);
+        {
+            let mut guard = ed.borrow_mut();
+            let e = &mut *guard;
+            let g = e.doc.page;
+            let wide = PageSetup { width: g.height, height: g.width, ..g };
+            e.doc.blocks.update(200, |b| b.as_para_mut().unwrap().props.section = Some(Section { page: Some(wide), ..Section::default() }));
+            e.pages.reset(&e.doc);
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        app.tick();
+        let g = Geom::of(&ed.borrow(), Rect::new(0.0, 0.0, 900.0, 700.0), 1.0);
+        let n = ed.borrow().pages.pages().len();
+        let k = ed.borrow().pages.page_of(200, 0);
+        assert!(k > 0 && k + 1 < n, "the landscape section is in the middle");
+        let (a, b) = (g.page(k - 1), g.page(k));
+        assert!(b.w > a.w && b.h < a.h, "landscape: {a:?} then {b:?}");
+        for i in 0..n {
+            let p = g.page(i);
+            assert_eq!(g.page_at(p.top + p.h / 2.0, n), i, "page {i}");
+            if i + 1 < n {
+                assert!((g.page(i + 1).top - (p.top + p.h + GAP as f64)).abs() < 1e-6);
+            }
+        }
+        // Scrolled to it, a click on the landscape page's first line, 10
+        // characters in.
+        let mut st = scroll.get();
+        st.physics.set_position(b.top - 20.0);
+        scroll.set(st);
+        app.tick();
+        let x = (g.left_of(k) + b.mx + (10.0 * 352.0 + 100.0) * g.k) as f32;
+        let y = (b.top + b.my + (0.5 * 11.0 * 64.0 * 1.15) * g.k - scroll.get().physics.y) as f32;
+        app.handle_event(Event::PointerDown { at: Point::new(x, y) });
+        app.handle_event(Event::PointerUp { at: Point::new(x, y) });
+        app.tick();
+        let c = ed.borrow().caret;
+        assert_eq!((c.block, ed.borrow_mut().spot(c).page), (200, k), "{c:?}");
     }
 
     #[test]

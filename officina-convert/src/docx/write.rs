@@ -838,8 +838,8 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             parts.push((format!("word/{name}"), margin_part(hf, tag)));
         }
     }
-    let g = &doc.page;
-    let geo = format!(r#"<w:pgSz w:w="{}" w:h="{}"/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{h}" w:footer="{h}" w:gutter="0"/>"#, g.width, g.height, g.margin_top, g.margin_end, g.margin_bottom, g.margin_start, h = HEADER_FROM_EDGE);
+    // Each section's page: its own, else the document's.
+    let geo = |g: &officina_text::model::PageSetup| format!(r#"<w:pgSz w:w="{}" w:h="{}"{}/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{h}" w:footer="{h}" w:gutter="0"/>"#, g.width, g.height, if g.width > g.height { r#" w:orient="landscape""# } else { "" }, g.margin_top, g.margin_end, g.margin_bottom, g.margin_start, h = HEADER_FROM_EDGE);
     // Every section names the header and footer (a first one without would
     // have none).
     let sect_pr = |x: &Section| {
@@ -850,6 +850,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             SectionStart::EvenPage => r#"<w:type w:val="evenPage"/>"#,
         };
         let cols = if x.columns > 1 || x.rule { format!(r#"<w:cols w:num="{}" w:space="{}"{}/>"#, x.columns, x.gap, if x.rule { r#" w:sep="1""# } else { "" }) } else { String::new() };
+        let geo = geo(x.page.as_ref().unwrap_or(&doc.page));
         format!("<w:sectPr>{sect}{ty}{geo}{cols}</w:sectPr>")
     };
     if secs.len() > 1 {

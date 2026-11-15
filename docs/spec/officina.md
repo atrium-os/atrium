@@ -3052,6 +3052,33 @@ picture test files (POI 58804, Bug47731, LibreOffice tdf132094, tdf160049,
 tdf162541) place them the same. 20,000 mutated files with floats clean
 (slowest 12 ms). LibreOffice gate 31/31.
 
+### 16.47 Each section's own page (2026-11-16)
+
+- **Model.** `Section.page: Option<PageSetup>`: a section's own size and
+  margins, `None` for the document's. The native file carries it after the
+  section (paragraph extension bit 3). A section on a page of another size
+  starts a new page even when continuous.
+- **Pagination.** Each page takes its section's setup (`Page.setup`); a
+  section's paragraphs are laid out at its own column width. The painter,
+  PDF export (a media box per page) and the editor view (pages stacked at
+  their own sizes, centred on the document's; hits and caret per page) read
+  it from the page.
+- **Files.** `.docx`: each `w:sectPr`'s `pgSz`/`pgMar` read into its section
+  (the last section's is the document's), written back per section with
+  `w:orient`. `.odt`: a paragraph starting a master page of another size
+  starts a section with that page; each section page is written as its own
+  page layout and master page (`Section_20_Page_N`), the document's again
+  where a section returns to it. The body's first paragraph is now found
+  inside sections and lists too. `.doc` gets it through `.docx` (§16.43).
+- **Not yet**: Page Setup in Write changes the document's page, not the
+  section's; headers and footers stay the document's.
+
+Gates: LibreOffice both ways across formats 8/8 with a landscape section;
+Write's other LibreOffice gates unchanged (docx 26/26, odt 52/52, doc 31/31,
+floats 8/8, contents 16/16); 2,546 corpus documents paginate with no panic,
+85 of them with pages of more than one size, and sample files' portrait and
+landscape pages run in LibreOffice's order.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

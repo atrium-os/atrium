@@ -22,7 +22,7 @@ fn main() {
         d.push_para(&body.repeat(2), 0, vec![]);
         d.push_para(&body.repeat(1), 0, vec![]);
     }
-    marks.push((d.blocks.len(), Section { start: SectionStart::Continuous, columns: 3, gap: 360, rule: true }));
+    marks.push((d.blocks.len(), Section { start: SectionStart::Continuous, columns: 3, gap: 360, rule: true, page: None }));
     for h in ["Menu", "Library", "Sports"] {
         d.push_para(h, h2, vec![]);
         d.push_para(&body.repeat(2), 0, vec![]);

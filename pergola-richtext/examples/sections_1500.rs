@@ -61,7 +61,7 @@ fn main() {
         }
         if i % 20 == 0 {
             let three = (i / 20) % 3 == 2;
-            marks.push((d.blocks.len(), Section { start: SectionStart::Continuous, columns: if three { 3 } else { 2 }, gap: 360, rule: three }));
+            marks.push((d.blocks.len(), Section { start: SectionStart::Continuous, columns: if three { 3 } else { 2 }, gap: 360, rule: three, page: None }));
         }
         let n = 40 + rnd(60) as usize;
         let s: Vec<&str> = (0..n).map(|_| WORDS[rnd(WORDS.len() as u64) as usize]).collect();

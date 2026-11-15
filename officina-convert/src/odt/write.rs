@@ -166,9 +166,14 @@ fn ref_name(id: BlockId) -> String {
 /// A section starting on a new page (but the first) starts the master page
 /// again at its first paragraph, as LibreOffice has Word's section breaks
 /// (its columns go on the `text:section`); `section` stands for that.
-fn para_key(p: &ParaProps, first: bool) -> ParaProps {
-    let new_page = p.section.is_some_and(|s| s.start != SectionStart::Continuous) && !first;
-    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(Section::default), ..p.clone() }
+/// A section with a page of its own starts its own master page (the first
+/// one too).
+/// `page_change`: the section's page differs from the one before's, so it
+/// starts its master page even when continuous.
+fn para_key(p: &ParaProps, first: bool, page_change: bool) -> ParaProps {
+    let own = p.section.and_then(|s| s.page);
+    let new_page = (p.section.is_some_and(|s| s.start != SectionStart::Continuous || page_change) && !first) || (first && own.is_some());
+    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, ..Section::default() }), ..p.clone() }
 }
 
 struct Out<'a> {
@@ -201,6 +206,10 @@ struct Out<'a> {
     targets: std::collections::HashSet<BlockId>,
     /// Graphic styles of floating pictures, by placement.
     graphic_styles: HashMap<Float, String>,
+    /// Sections' own pages, each a master page (`Section_20_Page_{n}`, from 1).
+    pages: Vec<officina_text::model::PageSetup>,
+    /// Blocks starting a section whose page differs from the section before's.
+    page_changes: std::collections::HashSet<usize>,
 }
 
 /// The name an annotation goes by.
@@ -210,7 +219,7 @@ fn annotation_name(id: CommentId) -> String {
 
 impl Out<'_> {
     fn para_style(&mut self, style: u16, p: &ParaProps) -> String {
-        let key = (style, para_key(p, self.cur == Some(0)));
+        let key = (style, para_key(p, self.cur == Some(0), self.cur.is_some_and(|k| self.page_changes.contains(&k))));
         if let Some(n) = self.para_styles.get(&key) {
             return n.clone();
         }
@@ -221,7 +230,20 @@ impl Out<'_> {
         }
         let n = format!("P{}", self.para_styles.len() + 1);
         let parent = self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
-        let master = if key.1.section.is_some() { r#" style:master-page-name="Section_20_Page""# } else { "" };
+        let master = match key.1.section {
+            Some(Section { page: Some(g), .. }) => {
+                let k = match self.pages.iter().position(|x| *x == g) {
+                    Some(k) => k,
+                    None => {
+                        self.pages.push(g);
+                        self.pages.len() - 1
+                    }
+                };
+                format!(r#" style:master-page-name="Section_20_Page_{}""#, k + 1)
+            }
+            Some(_) => r#" style:master-page-name="Section_20_Page""#.to_string(),
+            None => String::new(),
+        };
         let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}"{master}>{body}</style:style>"#, esc(&parent));
         self.para_styles.insert(key, n.clone());
         n
@@ -399,7 +421,7 @@ impl Out<'_> {
                 Some((_, s, p)) if k > 0 => (*s, p.clone()),
                 _ => (style, ParaProps::default()),
             };
-            let name = self.para_style(st, &para_key(&props, true));
+            let name = self.para_style(st, &para_key(&props, true, false));
             let _ = write!(content, r#"<text:p text:style-name="{}">"#, esc(&name));
             for (i, &(rs, ra)) in piece.runs.iter().enumerate() {
                 let re = piece.runs.get(i + 1).map_or(piece.text.len() as u32, |r| r.0);
@@ -726,7 +748,16 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new() };
+    let mut o = Out { doc, names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
+    let mut last_page = None;
+    for k in 0..doc.blocks.len() {
+        if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
+            if k > 0 && x.page != last_page {
+                o.page_changes.insert(k);
+            }
+            last_page = x.page;
+        }
+    }
     for bl in doc.blocks.iter() {
         if let Some(p) = bl.as_para() {
             o.targets.extend(doc.fields_in(p).into_iter().map(|f| f.1.target()));
@@ -838,26 +869,28 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
 
     // The page: ODF's header and footer sit inside the margins, so the page
     // margin is their distance from the edge and their height is the rest.
-    let g = &doc.page;
-    let mut hf_styles = String::new();
-    let mut margins = (g.margin_top, g.margin_bottom);
-    for (hf, tag, top) in [(&doc.header, "header-style", true), (&doc.footer, "footer-style", false)] {
-        if hf.is_some() {
-            let m = if top { g.margin_top } else { g.margin_bottom };
-            let edge = HEADER_FROM_EDGE.min(m);
-            let rest = (m - edge).max(0);
-            let (gap_k, gap) = if top { ("fo:margin-bottom", 0) } else { ("fo:margin-top", 0) };
-            let _ = write!(hf_styles, r#"<style:{tag}><style:header-footer-properties fo:min-height="{}" {gap_k}="{}" style:dynamic-spacing="false"/></style:{tag}>"#, pt(rest as i64), pt(gap));
-            if top {
-                margins.0 = edge;
+    let page_layout = |name: &str, g: &officina_text::model::PageSetup| {
+        let mut hf_styles = String::new();
+        let mut margins = (g.margin_top, g.margin_bottom);
+        for (hf, tag, top) in [(&doc.header, "header-style", true), (&doc.footer, "footer-style", false)] {
+            if hf.is_some() {
+                let m = if top { g.margin_top } else { g.margin_bottom };
+                let edge = HEADER_FROM_EDGE.min(m);
+                let rest = (m - edge).max(0);
+                let (gap_k, gap) = if top { ("fo:margin-bottom", 0) } else { ("fo:margin-top", 0) };
+                let _ = write!(hf_styles, r#"<style:{tag}><style:header-footer-properties fo:min-height="{}" {gap_k}="{}" style:dynamic-spacing="false"/></style:{tag}>"#, pt(rest as i64), pt(gap));
+                if top {
+                    margins.0 = edge;
+                } else {
+                    margins.1 = edge;
+                }
             } else {
-                margins.1 = edge;
+                let _ = write!(hf_styles, "<style:{tag}/>");
             }
-        } else {
-            let _ = write!(hf_styles, "<style:{tag}/>");
         }
-    }
-    let layout = format!(r#"<style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}" style:print-orientation="{}"/>{hf_styles}</style:page-layout>"#, pt(g.width as i64), pt(g.height as i64), pt(margins.0 as i64), pt(margins.1 as i64), pt(g.margin_start as i64), pt(g.margin_end as i64), if g.width > g.height { "landscape" } else { "portrait" });
+        format!(r#"<style:page-layout style:name="{name}"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}" style:print-orientation="{}"/>{hf_styles}</style:page-layout>"#, pt(g.width as i64), pt(g.height as i64), pt(margins.0 as i64), pt(margins.1 as i64), pt(g.margin_start as i64), pt(g.margin_end as i64), if g.width > g.height { "landscape" } else { "portrait" })
+    };
+    let mut layout = page_layout("pm1", &doc.page);
     let mut mp_styles = String::new();
     let mut master = String::from(r#"<style:master-page style:name="Standard" style:page-layout-name="pm1">"#);
     for (i, (hf, tag)) in [(&doc.header, "header"), (&doc.footer, "footer")].into_iter().enumerate() {
@@ -879,6 +912,13 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
     if o.para_styles.keys().any(|k| k.1.section.is_some()) {
         let again = master.replacen(r#"style:name="Standard""#, r#"style:name="Section_20_Page" style:display-name="Section Page" style:next-style-name="Section_20_Page""#, 1);
         master += &again;
+    }
+    // Sections with a page of their own: a page layout and master page each.
+    let standard = master.split("</style:master-page>").next().unwrap_or("").to_string() + "</style:master-page>";
+    for (k, g) in o.pages.iter().enumerate() {
+        let n = k + 1;
+        layout += &page_layout(&format!("pmS{n}"), g);
+        master += &standard.replacen(r#"style:name="Standard" style:page-layout-name="pm1""#, &format!(r#"style:name="Section_20_Page_{n}" style:display-name="Section Page {n}" style:next-style-name="Section_20_Page_{n}" style:page-layout-name="pmS{n}""#), 1);
     }
     let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{fonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();

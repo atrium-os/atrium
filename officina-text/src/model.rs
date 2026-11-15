@@ -724,11 +724,14 @@ pub struct Section {
     pub gap: i32,
     /// A line between columns.
     pub rule: bool,
+    /// The section's own page size and margins; `None`: the document's.
+    /// A section with a page of its own starts on a new page.
+    pub page: Option<PageSetup>,
 }
 
 impl Default for Section {
     fn default() -> Self {
-        Section { start: SectionStart::NextPage, columns: 1, gap: 720, rule: false }
+        Section { start: SectionStart::NextPage, columns: 1, gap: 720, rule: false, page: None }
     }
 }
 

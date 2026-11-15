@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::layout::{object_size, Band, Fonts, LayoutCache, ParaLayout};
-use crate::model::{BlockId, Float, HAlign, NoteId, NoteKind, ObjectRef, Rel, Section, SectionStart, TextDoc, Wrap, OBJECT_CHAR};
+use crate::model::{BlockId, Float, HAlign, NoteId, NoteKind, ObjectRef, PageSetup, Rel, Section, SectionStart, TextDoc, Wrap, OBJECT_CHAR};
 use std::collections::HashMap;
 use crate::twips;
 use std::rc::Rc;
@@ -130,6 +130,8 @@ pub struct Page {
     pub rules: Vec<(i64, i64, i64)>,
     /// Floating pictures anchored on the page.
     pub floats: Vec<PlacedFloat>,
+    /// The page's size and margins (its section's, else the document's).
+    pub setup: PageSetup,
 }
 
 impl Page {
@@ -150,6 +152,11 @@ pub use crate::model::Edit;
 /// table cells don't count).
 fn sections_of(doc: &TextDoc) -> Vec<(usize, Section)> {
     doc.blocks.iter().enumerate().filter_map(|(i, b)| b.as_para().and_then(|p| p.props.section.filter(|_| p.props.cell.is_none()).map(|s| (i, s)))).collect()
+}
+
+/// A page setup's content width in layout units.
+pub fn content_width(g: &PageSetup) -> i64 {
+    twips((g.width - g.margin_start - g.margin_end).max(720) as i64)
 }
 
 /// Longest keep-with-next chain looked at; longer chains don't keep.
@@ -185,6 +192,9 @@ pub struct Paginator {
     page_h: i64,
     margin_start: i64,
     margin_top: i64,
+    /// The document's page setup, and the one the page being laid out uses.
+    base: PageSetup,
+    cur: PageSetup,
 }
 
 impl Paginator {
@@ -197,11 +207,8 @@ impl Paginator {
 
     /// Throws the pages away (page setup changed).
     pub fn reset(&mut self, doc: &TextDoc) {
-        let g = &doc.page;
-        self.width = twips((g.width - g.margin_start - g.margin_end).max(720) as i64);
-        self.height = twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64);
-        self.width_tw = (g.width - g.margin_start - g.margin_end).max(720);
-        (self.page_w, self.page_h, self.margin_start, self.margin_top) = (twips(g.width as i64), twips(g.height as i64), twips(g.margin_start as i64), twips(g.margin_top as i64));
+        self.base = doc.page;
+        self.set_page(doc.page);
         self.wraps.clear();
         self.sections = sections_of(doc);
         self.pages.clear();
@@ -210,15 +217,29 @@ impl Paginator {
         self.cursor = Some(Checkpoint::default());
     }
 
-    /// Whether the pages were laid out for `doc`'s page geometry.
-    pub fn fits(&self, doc: &TextDoc) -> bool {
-        let g = &doc.page;
-        self.width == twips((g.width - g.margin_start - g.margin_end).max(720) as i64) && self.height == twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64)
+    /// Takes `g` as the geometry of the page about to be laid out.
+    fn set_page(&mut self, g: PageSetup) {
+        self.cur = g;
+        self.width = twips((g.width - g.margin_start - g.margin_end).max(720) as i64);
+        self.height = twips((g.height - g.margin_top - g.margin_bottom).max(720) as i64);
+        self.width_tw = (g.width - g.margin_start - g.margin_end).max(720);
+        (self.page_w, self.page_h, self.margin_start, self.margin_top) = (twips(g.width as i64), twips(g.height as i64), twips(g.margin_start as i64), twips(g.margin_top as i64));
     }
 
-    /// Column width in layout units, for laying paragraphs out.
+    /// Whether the pages were laid out for `doc`'s page geometry.
+    pub fn fits(&self, doc: &TextDoc) -> bool {
+        self.base == doc.page
+    }
+
+    /// The document's content width in layout units (sections with a page
+    /// of their own may differ: [`Paginator::col_width`]).
     pub fn width(&self) -> i64 {
-        self.width
+        content_width(&self.base)
+    }
+
+    /// The page setup block `b`'s section uses.
+    pub fn setup_at(&self, b: usize) -> PageSetup {
+        self.section_at(b).page.unwrap_or(self.base)
     }
 
     /// The room floats left paragraph `id`, if its lines go round any.
@@ -241,11 +262,20 @@ impl Paginator {
         self.sections.binary_search_by_key(&b, |s| s.0).is_ok_and(|_| b > 0)
     }
 
-    /// A section's columns as laid out: count, column width and gap (layout units).
+    /// A section's columns as laid out on its pages: count, column width and
+    /// gap (layout units).
     fn columns(&self, s: &Section) -> (u8, i64, i64) {
-        let (n, gap) = s.fitted(self.width_tw);
+        let g = s.page.unwrap_or(self.base);
+        let width_tw = (g.width - g.margin_start - g.margin_end).max(720);
+        let (n, gap) = s.fitted(width_tw);
         let gap = twips(gap as i64);
-        (n, ((self.width - gap * (n as i64 - 1)) / n as i64).max(crate::LU), gap)
+        (n, ((content_width(&g) - gap * (n as i64 - 1)) / n as i64).max(crate::LU), gap)
+    }
+
+    /// Whether the section starting at `b` goes on under the one before on
+    /// the same page: continuous, on a page the same size.
+    fn continues(&self, b: usize) -> bool {
+        self.section_at(b).start == SectionStart::Continuous && self.setup_at(b) == self.setup_at(b.saturating_sub(1))
     }
 
     /// The width of the column block `b` is laid out in (layout units).
@@ -353,6 +383,7 @@ impl Paginator {
             self.finish();
             return false;
         }
+        self.set_page(self.setup_at(at.block.min(n_blocks.saturating_sub(1))));
         let (page, next) = self.page(doc, cache, fonts, at);
         for sl in &page.slices {
             let Some(id) = doc.blocks.get(sl.block).map(|b| b.id()) else { continue };
@@ -642,7 +673,7 @@ impl Paginator {
         let mut cur = start;
         let mut rules: Vec<(i64, i64, i64)> = Vec::new();
         let finish = |f: Fill, y: i64, rules: Vec<(i64, i64, i64)>, next: Option<Checkpoint>, cache: &mut LayoutCache| {
-            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats };
+            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur };
             self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
             (page, next)
         };
@@ -653,7 +684,7 @@ impl Paginator {
             let (stop, bottom) = self.band(doc, cache, fonts, &mut f, cur, top, full_h, n, colw, gap);
             let mut bottom = bottom;
             if let (Stop::Section(b2), Some(snap)) = (stop, &snapshot) {
-                if self.section_at(b2).start == SectionStart::Continuous && bottom > top {
+                if self.continues(b2) && bottom > top {
                     // Balance: the least height the band fits in.
                     let fits = |h: i64, cache: &mut LayoutCache| {
                         let mut g = snap.clone();
@@ -682,7 +713,7 @@ impl Paginator {
                 }
             }
             match stop {
-                Stop::Section(b2) if self.section_at(b2).start == SectionStart::Continuous && bottom < full_h - f.foot_h => {
+                Stop::Section(b2) if self.continues(b2) && bottom < full_h - f.foot_h => {
                     // The next section goes on under this one.
                     top = bottom;
                     cur = Checkpoint::at(b2, 0);
@@ -691,7 +722,7 @@ impl Paginator {
                 Stop::Full(next) => return finish(f, bottom, rules, Some(next), cache),
                 Stop::End(line) => {
                     // The text has ended: endnotes, if any, follow it.
-                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats };
+                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur };
                     let next = self.place_endnotes(doc, cache, fonts, &mut page, line, full_h - f.foot_h);
                     self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
                     return (page, next);
@@ -1254,7 +1285,7 @@ mod tests {
     }
 
     fn sec(columns: u8, start: SectionStart) -> Option<Section> {
-        Some(Section { start, columns, gap: 200, rule: true })
+        Some(Section { start, columns, gap: 200, rule: true, page: None })
     }
 
     fn set_section(d: &mut TextDoc, b: usize, s: Option<Section>) {
@@ -1423,6 +1454,25 @@ mod tests {
                 _ => assert_eq!(shape(&p), shape(&p0), "{wrap:?}: the text runs on"),
             }
         }
+    }
+
+    /// A section with a page of its own: its pages take its size and its
+    /// paragraphs its width; a continuous one still starts a new page.
+    #[test]
+    fn sections_with_their_own_page() {
+        use crate::model::PageSetup;
+        let mut d = doc_with(&[2, 2, 2, 2], 40);
+        let wide = PageSetup { width: d.page.width * 2, ..d.page };
+        set_section(&mut d, 2, Some(Section { start: SectionStart::Continuous, page: Some(wide), ..Section::default() }));
+        set_section(&mut d, 3, Some(Section { start: SectionStart::Continuous, ..Section::default() }));
+        let (p, _) = all(&d);
+        let pages = p.pages();
+        assert_eq!(pages.len(), 3, "each page change starts a page");
+        assert_eq!(pages.iter().map(|pg| pg.setup.width).collect::<Vec<_>>(), vec![d.page.width, wide.width, d.page.width]);
+        let w = |b: usize| pages.iter().flat_map(|pg| &pg.slices).find(|s| s.block == b).unwrap().w;
+        assert_eq!(w(2), crate::paginate::content_width(&wide));
+        assert_eq!((w(0), w(3)), (p.width(), p.width()));
+        assert!(p.col_width(2) > p.col_width(1));
     }
 
     /// A cell grows to hold a picture its text wraps round; one in front of

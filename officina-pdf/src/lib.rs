@@ -125,13 +125,14 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
     let catalog = o.reserve();
     let tree = o.reserve();
     let info_obj = o.reserve();
-    let (pw, ph) = (pt(twips(doc.page.width as i64)), pt(twips(doc.page.height as i64)));
     let mut kids = Vec::with_capacity(total);
     let mut fonts_used: BTreeMap<u16, FontUse> = BTreeMap::new();
     let mut images: HashMap<u32, Option<Ref>> = HashMap::new();
     let mut stats = Stats { pages: total, ..Default::default() };
 
-    for (i, _) in pages.iter().enumerate() {
+    for (i, pg) in pages.iter().enumerate() {
+        // Each page its own size (a section may have its own).
+        let (pw, ph) = (pt(twips(pg.setup.width as i64)), pt(twips(pg.setup.height as i64)));
         if i % CACHE_PAGES == 0 {
             cache = LayoutCache::default();
         }

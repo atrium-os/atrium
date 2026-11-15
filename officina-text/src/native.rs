@@ -321,7 +321,7 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         }
     }
     // Bit 15: a second mask follows (tab stops, table of contents entry).
-    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2;
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -410,6 +410,9 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         w.u8(x.columns);
         w.ivar(x.gap as i64);
         w.u8(x.rule as u8);
+        if let Some(g) = &x.page {
+            encode_page(w, g);
+        }
     }
 }
 
@@ -419,7 +422,7 @@ const MAX_TWIPS: i64 = 31_680;
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 3 != 0 || (m >> 15 != 0 && ext == 0) {
+    if ext >> 4 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -544,7 +547,9 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
             1 => true,
             _ => return Err(WireError::Invalid("flag")),
         };
-        p.section = Some(Section { start, columns, gap, rule });
+        // Bit 3: the section's own page setup follows.
+        let page = if ext & 8 != 0 { Some(decode_page(r)?) } else { None };
+        p.section = Some(Section { start, columns, gap, rule, page });
     }
     Ok(p)
 }
@@ -1414,7 +1419,8 @@ mod tests {
         }
         d.blocks.update(3, |b| b.as_para_mut().unwrap().props = ParaProps { align: Some(Align::Justify), line_spacing: Some(LineSpacing::Exact(300)), keep_together: Some(true), first_line: Some(-200), list: Some(Some(ListRef { id: 3, kind: ListKind::Numbered, level: 2 })), ..Default::default() });
         d.blocks.update(4, |b| b.as_para_mut().unwrap().props.cell = Some(CellRef { table: 2, row: 7, col: 1, width: 2000 }));
-        d.blocks.update(9, |b| b.as_para_mut().unwrap().props.section = Some(Section { start: SectionStart::Continuous, columns: 3, gap: 400, rule: true }));
+        d.blocks.update(9, |b| b.as_para_mut().unwrap().props.section = Some(Section { start: SectionStart::Continuous, columns: 3, gap: 400, rule: true, page: None }));
+        d.blocks.update(10, |b| b.as_para_mut().unwrap().props.section = Some(Section { page: Some(PageSetup { width: 16838, height: 11906, ..PageSetup::default() }), ..Section::default() }));
         d.page.margin_start = 1000;
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });

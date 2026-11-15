@@ -23,6 +23,7 @@
 //! cells, nested tables (their text kept), fields other than page numbers (their
 //! text kept), drawings and charts, embedded objects.
 
+use officina_text::model::PageSetup;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -208,6 +209,62 @@ pub(crate) fn para_props(e: &El) -> ParaProps {
     p
 }
 
+/// The body's first paragraph, in sections and lists too.
+fn first_para(e: &El, depth: usize) -> Option<&El> {
+    for x in e.els() {
+        match x.name.as_str() {
+            "text:p" | "text:h" => return Some(x),
+            "text:section" | "text:list" | "text:list-item" | "text:list-header" if depth < 16 => {
+                if let Some(p) = first_para(x, depth + 1) {
+                    return Some(p);
+                }
+            }
+            "table:table" => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A master page's size and margins (its header and footer heights added to
+/// them, as ODF puts those inside the margins), and its columns if any.
+fn master_setup(st: &El, master: &El, base: PageSetup) -> (PageSetup, Option<Section>) {
+    let mut out = base;
+    let mut cols = None;
+    let layout = master.attr("style:page-layout-name").and_then(|n| {
+        st.child("office:automatic-styles").and_then(|a| a.children("style:page-layout").find(|l| l.attr("style:name") == Some(n)))
+    });
+    if let Some(pp) = layout.and_then(|l| l.child("style:page-layout-properties")) {
+        let g = &mut out;
+        let t = |k: &str| pp.attr(k).and_then(length).map(|v| v.clamp(0, 31680 * 2) as i32);
+        g.width = t("fo:page-width").unwrap_or(g.width).max(1440);
+        g.height = t("fo:page-height").unwrap_or(g.height).max(1440);
+        g.margin_top = t("fo:margin-top").unwrap_or(g.margin_top);
+        g.margin_bottom = t("fo:margin-bottom").unwrap_or(g.margin_bottom);
+        g.margin_start = t("fo:margin-left").unwrap_or(g.margin_start);
+        g.margin_end = t("fo:margin-right").unwrap_or(g.margin_end);
+        if let Some(c) = pp.child("style:columns") {
+            cols = Some(odf_columns(c));
+        }
+        // ODF puts the header and footer inside the margins; their heights add to them.
+        // With dynamic spacing (LibreOffice's import of Word files) the spacing lies
+        // inside the minimum height rather than after it.
+        for (tag, top) in [("style:header-style", true), ("style:footer-style", false)] {
+            if let Some(h) = layout.and_then(|l| l.child(tag)).and_then(|s| s.child("style:header-footer-properties")) {
+                let spacing = if h.attr("style:dynamic-spacing") == Some("true") { 0 } else { h.attr(if top { "fo:margin-bottom" } else { "fo:margin-top" }).and_then(length).unwrap_or(0) };
+                let extra = h.attr("fo:min-height").and_then(length).unwrap_or(0) + spacing;
+                if top && master.child("style:header").is_some() {
+                    g.margin_top = (g.margin_top as i64 + extra).clamp(0, 63360) as i32;
+                }
+                if !top && master.child("style:footer").is_some() {
+                    g.margin_bottom = (g.margin_bottom as i64 + extra).clamp(0, 63360) as i32;
+                }
+            }
+        }
+    }
+    (out, cols)
+}
+
 /// A `style:columns`: count, gap and the line between. Columns of their own
 /// widths come out equal.
 fn odf_columns(c: &El) -> Section {
@@ -221,7 +278,7 @@ fn odf_columns(c: &El) -> Section {
     // LibreOffice writes a separator only when it draws one, and draws it
     // even styled "none" (as it writes Word's).
     let rule = c.child("style:column-sep").is_some_and(|s| s.attr("style:width").is_none_or(|w| w.trim_start().trim_start_matches(['0', '.']).starts_with(|c: char| c.is_ascii_digit())));
-    Section { start: SectionStart::Continuous, columns: n, gap: gap.unwrap_or(720).clamp(0, 2880) as i32, rule }
+    Section { start: SectionStart::Continuous, columns: n, gap: gap.unwrap_or(720).clamp(0, 2880) as i32, rule, page: None }
 }
 
 /// A style as the file has it.
@@ -232,6 +289,8 @@ struct OStyle {
     chars: CharAttrs,
     list_style: Option<String>,
     outline: Option<u8>,
+    /// The master page a paragraph style starts.
+    master: Option<String>,
 }
 
 fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
@@ -291,6 +350,9 @@ struct Reader<'a> {
     /// (block, section, a start rather than a return to the enclosing one).
     page_cols: Section,
     sec_marks: Vec<(usize, Section, bool)>,
+    /// Every master page's page setup, and paragraphs that start one.
+    masters: HashMap<String, PageSetup>,
+    master_marks: Vec<(usize, String)>,
     sec_stack: Vec<Section>,
     /// The last list id per list style, for continued lists.
     last_list: HashMap<String, u32>,
@@ -537,6 +599,7 @@ impl<'a> Reader<'a> {
                                 chars: s.child("style:text-properties").map(|t| text_props(t, &self.fonts)).unwrap_or_default(),
                                 list_style: s.attr("style:list-style-name").map(str::to_string),
                                 outline: s.attr("style:default-outline-level").and_then(|v| v.parse::<u8>().ok()).filter(|v| (1..=9).contains(v)),
+                                master: s.attr("style:master-page-name").filter(|m| !m.is_empty() && s.attr("style:family") == Some("paragraph")).map(str::to_string),
                             };
                             self.styles.insert(name.to_string(), st);
                         }
@@ -1081,6 +1144,11 @@ impl<'a> Reader<'a> {
     /// A `text:p` or `text:h` into the document.
     fn para(&mut self, e: &El, cell: Option<CellRef>, list: Option<Option<ListRef>>) {
         let (style, mut props, chars) = self.para_style(e.attr("text:style-name"));
+        if cell.is_none() && !self.in_note && self.box_depth == 0 {
+            if let Some(m) = e.attr("text:style-name").and_then(|n| self.styles.get(n)).and_then(|o| o.master.clone()) {
+                self.master_marks.push((self.doc.blocks.len(), m));
+            }
+        }
         if e.name == "text:h" {
             let lvl = e.attr("text:outline-level").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1).clamp(1, 9);
             if style == 0 {
@@ -1446,7 +1514,37 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Page size, margins, header and footer from the master page the body uses.
+    /// Paragraphs that start a master page of another size: sections with
+    /// that page (keeping the columns in effect), in place of a page break.
+    fn place_masters(&mut self) {
+        let mut cur = self.doc.page;
+        for (k, name) in std::mem::take(&mut self.master_marks) {
+            let Some(&g) = self.masters.get(&name) else { continue };
+            if g == cur || k >= self.doc.blocks.len() {
+                continue;
+            }
+            cur = g;
+            let base = (0..=k).rev().find_map(|j| self.doc.para(j).and_then(|p| p.props.section.filter(|_| p.props.cell.is_none()))).unwrap_or(self.page_cols);
+            let own = (g != self.doc.page).then_some(g);
+            self.doc.blocks.update(k, |b| {
+                if let Some(q) = b.as_para_mut() {
+                    // A section already starting here keeps how it starts (a
+                    // page of another size starts a new page anyway).
+                    let start = match q.props.section {
+                        Some(x) => x.start,
+                        None if k > 0 => SectionStart::NextPage,
+                        None => base.start,
+                    };
+                    let sec = q.props.section.unwrap_or(base);
+                    q.props.section = Some(Section { start, page: own, ..sec });
+                    q.props.page_break_before = None;
+                }
+            });
+        }
+    }
+
+    /// Page size, margins, header and footer from the master page the body
+    /// uses; every master page's size and margins, for paragraphs that start one.
     fn page(&mut self, styles: Option<&El>, first_master: Option<String>) {
         let Some(st) = styles else { return };
         let masters = st.child("office:master-styles");
@@ -1455,35 +1553,15 @@ impl<'a> Reader<'a> {
             first_master.as_ref().and_then(|n| all.iter().find(|x| x.attr("style:name") == Some(n.as_str())).copied()).or_else(|| all.iter().find(|x| x.attr("style:name") == Some("Standard")).copied()).or(all.first().copied())
         });
         let Some(master) = master else { return };
-        let layout = master.attr("style:page-layout-name").and_then(|n| {
-            st.child("office:automatic-styles").and_then(|a| a.children("style:page-layout").find(|l| l.attr("style:name") == Some(n)))
-        });
-        if let Some(pp) = layout.and_then(|l| l.child("style:page-layout-properties")) {
-            let g = &mut self.doc.page;
-            let t = |k: &str| pp.attr(k).and_then(length).map(|v| v.clamp(0, 31680 * 2) as i32);
-            g.width = t("fo:page-width").unwrap_or(g.width).max(1440);
-            g.height = t("fo:page-height").unwrap_or(g.height).max(1440);
-            g.margin_top = t("fo:margin-top").unwrap_or(g.margin_top);
-            g.margin_bottom = t("fo:margin-bottom").unwrap_or(g.margin_bottom);
-            g.margin_start = t("fo:margin-left").unwrap_or(g.margin_start);
-            g.margin_end = t("fo:margin-right").unwrap_or(g.margin_end);
-            if let Some(c) = pp.child("style:columns") {
-                self.page_cols = Section { start: SectionStart::NextPage, ..odf_columns(c) };
-            }
-            // ODF puts the header and footer inside the margins; their heights add to them.
-            // With dynamic spacing (LibreOffice's import of Word files) the spacing lies
-            // inside the minimum height rather than after it.
-            for (tag, top) in [("style:header-style", true), ("style:footer-style", false)] {
-                if let Some(h) = layout.and_then(|l| l.child(tag)).and_then(|s| s.child("style:header-footer-properties")) {
-                    let spacing = if h.attr("style:dynamic-spacing") == Some("true") { 0 } else { h.attr(if top { "fo:margin-bottom" } else { "fo:margin-top" }).and_then(length).unwrap_or(0) };
-                    let extra = h.attr("fo:min-height").and_then(length).unwrap_or(0) + spacing;
-                    if top && master.child("style:header").is_some() {
-                        g.margin_top = (g.margin_top as i64 + extra).clamp(0, 63360) as i32;
-                    }
-                    if !top && master.child("style:footer").is_some() {
-                        g.margin_bottom = (g.margin_bottom as i64 + extra).clamp(0, 63360) as i32;
-                    }
-                }
+        let base = self.doc.page;
+        let (g, cols) = master_setup(st, master, base);
+        self.doc.page = g;
+        if let Some(c) = cols {
+            self.page_cols = Section { start: SectionStart::NextPage, ..c };
+        }
+        for m in masters.into_iter().flat_map(|m| m.children("style:master-page")).take(256) {
+            if let Some(n) = m.attr("style:name") {
+                self.masters.insert(n.to_string(), master_setup(st, m, base).0);
             }
         }
         for (tag, header) in [("style:header", true), ("style:footer", false)] {
@@ -1543,7 +1621,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {
@@ -1564,10 +1642,11 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     // Lists in named styles took ids; a body list starts its own.
     r.last_list.clear();
     // The master page the first paragraph's style names, if any.
-    let first_master = text.els().find(|x| x.name == "text:p" || x.name == "text:h").and_then(|p| p.attr("text:style-name")).and_then(|n| content.child("office:automatic-styles").and_then(|a| a.children("style:style").find(|s| s.attr("style:name") == Some(n)))).and_then(|s| s.attr("style:master-page-name")).map(str::to_string);
+    let first_master = first_para(text, 0).and_then(|p| p.attr("text:style-name")).and_then(|n| content.child("office:automatic-styles").and_then(|a| a.children("style:style").find(|s| s.attr("style:name") == Some(n)))).and_then(|s| s.attr("style:master-page-name")).map(str::to_string);
     r.page(styles.as_ref(), first_master);
     r.body(text);
     r.place_sections();
+    r.place_masters();
     // The first page needs no break before it (a master page named there).
     if r.doc.para(0).is_some_and(|p| p.props.page_break_before == Some(true)) {
         r.doc.blocks.update(0, |b| {
