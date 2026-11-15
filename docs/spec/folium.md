@@ -29,6 +29,10 @@ out entirely: separate parser, separate threat surface"),
 - **Nothing in a PDF runs.** No JavaScript, ever. No launch actions. Embedded
   files are listed, never opened by themselves. Links go to the parent,
   which decides (§3).
+- Opening, scrolling and zooming cost what is on screen, never the
+  page count, image sizes or page detail: lazy parsing, images decoded at
+  the size drawn, cancellable work, raster tiles past a node budget, and
+  no CPU when nothing changes (§7.1).
 - Pages are drawn **through Pergola and Fresco** (filled paths, glyph
   runs, images) so they stay sharp at any zoom and the GPU path applies.
   The effects the scene can't express yet (soft masks, blend modes,
@@ -191,12 +195,119 @@ The display list is drawn into the window through Pergola:
   isolation are drawn with tiny-skia into an image for that group at the
   painted size (D3). The rest of the page stays vector.
 
-Pages are laid out continuously (one column, a gap between pages), drawn
-in tiles as they come into view, with the visible page first. Zoom redraws
-at the new scale; until then the old tiles are scaled. Colour: CMYK and
-the other device spaces convert with simple formulas in v1; ICC profiles
-are read for their component count (colour management is later work, for
-the whole system, not just here).
+Colour: CMYK and the other device spaces convert with simple formulas in
+v1; ICC profiles are read for their component count (colour management is
+later work, for the whole system, not just here).
+
+### 7.1 Huge documents, many images, high zoom (asked by Shankar, 2026-11-15)
+
+*"The same caution during design as Officina. Huge PDFs with lots of
+images, high zoom etc. should not become sluggish or hog the CPU."* The
+rule is Officina's (officina.md §7.4): **the cost of opening, scrolling
+and zooming depends on what is on screen, never on the number of pages,
+the size of the images or how detailed a page is.** A 20,000-page
+manual, a 2,000-page book of 600 dpi scans and a city map with millions
+of path segments should feel like a two-page letter. A PDF is
+read-only to us in v1, so this is easier than Officina's case in one way
+(no repagination) and harder in another (we don't control what's inside a
+page).
+
+**Opening reads almost nothing.**
+
+- The trailer and cross-reference table are read from the end of the
+  file with `pread`; objects are parsed when first asked for. The file is
+  never read whole, and never mapped (the descriptor has no mmap right,
+  opening-files §6.3).
+- Page count comes from the page tree's `/Count`. Page sizes come from
+  each page's `MediaBox`, `CropBox`, `Rotate` and `UserUnit`, small
+  dictionaries read without touching the content. The tree is walked
+  from the reading position outwards; until the walk is done, unseen pages
+  take the size of their neighbours and ScrollView's anchoring keeps the
+  view from jumping when a size turns out different. So the scrollbar is
+  right at once for nearly every file, and exact soon after.
+- The outline (bookmarks) and page labels load when the sidebar asks.
+- A damaged cross-reference table is rebuilt by one bounded scan in the
+  background; pages are shown as the scan finds them, in file order.
+
+**Only pages near the view do any work.**
+
+- Pages are the bands of pergola.md §10.4. About three screens of pages
+  are resident as scene groups; the rest are evicted with their decoded
+  content. A 20,000-page document holds the same scene as a 10-page one.
+- A page's content stream is interpreted once into a **display list**,
+  kept in an LRU with a fixed budget (start at 128 MB) and dropped first
+  under memory pressure. The display list carries a bounding box per item
+  and a coarse spatial grid, so drawing a part of a page visits only the
+  items in that part.
+- Shared resources (fonts, images, Form XObjects, patterns used on many
+  pages) are keyed by object number and decoded once for the document,
+  under the same budget.
+
+**Images: decoded at the size they're drawn, never larger.**
+
+- An image's pixel size and colour space come from its dictionary, so a
+  page lays out and draws its placeholder without decoding anything.
+- Pixels are decoded only for resident pages, at the size they appear on
+  screen at the current zoom, rounded up to a power-of-two step so a small
+  zoom change reuses them. A 600 dpi scan shown at 100% decodes to about
+  the screen's size, not 5,100 by 6,600.
+- Decoders that can, decode small directly: JPEG 2000 decodes only the
+  resolution levels needed; JBIG2 and CCITT decode a band at a time into a
+  downsampler; Flate and LZW images are decoded row by row into the
+  downsampler, so a huge image never exists at full size. JPEG is the
+  common scan format and zune-jpeg only decodes full size, so a scaled
+  DCT decode (1/2, 1/4, 1/8, the last from DC coefficients alone) is ours,
+  in P4; until then a JPEG is capped by the natural-frame ceiling in §6.
+- Decoded pixels live in an LRU with a fixed budget (start at 256 MB, as
+  Officina). An image that isn't ready draws a placeholder in its frame;
+  nothing on the page moves when it arrives. Thumbnails decode at
+  thumbnail size from the same machinery.
+
+**Zoom: tiles, scaled at once, redrawn when it settles.**
+
+- During a pinch or Ctrl+wheel, ScrollView scales what is already drawn
+  (pergola.md §10.4), so zooming never waits. About 100 ms after it
+  settles, the visible area is redrawn at the new scale, visible tiles
+  first; tiles from older zoom levels stay until replaced.
+- A page is drawn as **vector** (Fill, Glyphs and Image nodes) when the
+  items visible in the view fit a per-window node budget (start at 8,000
+  nodes, under Fresco's 65,536-op frame ceiling, officina.md §10.5).
+  When they don't (a whole map, a dense chart, a CAD drawing at fit-page),
+  the view is drawn as **raster tiles** (512 px, at device resolution)
+  made from the display list on the worker pool, and becomes vector again
+  as zooming in brings the visible items under the budget. Either way the
+  scene sent to Fresco stays under a fixed ceiling, whatever the page
+  holds.
+- At high zoom only the items under the view are visited (the spatial
+  grid), so 6,400% on a detailed map costs about what 100% on a plain
+  page does. Page coordinates are kept in f64 so tiles line up at any
+  zoom; the zoom range is 10% to 6,400%.
+
+**The CPU is used for what's visible, then left alone.**
+
+- All parsing, interpreting, decoding and tile drawing runs on a worker
+  pool off the UI thread, at most one thread fewer than the cores, at
+  background priority. The UI thread only builds scene groups from
+  finished results, inside the frame budget.
+- Every task carries the generation of the view it was asked for. A
+  scroll or zoom that makes it stale cancels it: interpreters check
+  between operators, decoders between rows or bands, so a cancelled page
+  stops within a few milliseconds instead of finishing.
+- Order: visible tiles, then the rest of the visible pages, then one
+  screen ahead in the direction of travel. Nothing more is prefetched.
+  Thumbnails are made only for the thumbnails on screen. When those are
+  done the worker pool is empty and the app uses **no CPU** (no timers, no
+  polling), until the view or the window changes.
+- Find runs in the background, page by page from the current one, with
+  results as they come; each page's extracted text is kept in a small
+  cache so a second search is quicker. It never holds up scrolling and it
+  stops when the find bar closes.
+- On battery (energy-policy.md), the pool uses fewer threads and the
+  look-ahead screen is skipped.
+- The jail's rctl limits are the backstop, not the plan: memory 1 GiB,
+  CPU the pool's share.
+
+Everything here is a target with a gate (§10).
 
 ## 8. The app and the role
 
@@ -264,16 +375,25 @@ gets a separate binary and jail, and limend picks providers per role.
   from Scrinium; a hostile set (JavaScript actions, Launch, a bomb, a
   reference cycle, an endless content stream) shown or refused within the
   budgets, with no network and no file access attempted.
-- **Speed**: first page of a typical document drawn under 150 ms after the
-  descriptor arrives on the dev VM; scrolling a 1,000-page document with no
-  missed frames once pages are drawn; memory flat while scrolling.
+- **Speed and scale** (§7.1), on the dev VM for comparison between builds
+  and on real hardware for numbers:
+
+  | case | target |
+  |---|---|
+  | first page of a typical document | drawn under 150 ms after the descriptor arrives |
+  | open a 20,000-page document | first page under 300 ms; memory for the document under 64 MB before any page is drawn |
+  | scroll a 2,000-page book of 600 dpi scans at 4,000 px/s | no stall over 100 ms at 60 Hz, p99.9 frame work within two periods (ScrollView's gates); placeholders allowed; memory flat at the cache budgets |
+  | pinch from 25% to 6,400% on a map with 1 M path segments | every frame on time (scaled tiles); sharp within 300 ms after it settles |
+  | scene per window | resident nodes and scene bytes under a fixed ceiling at any page count, page complexity and zoom |
+  | after interaction stops | worker pool idle within 1 s; 0% CPU while nothing changes |
+  | scroll or zoom away from a slow page | its work cancelled within 10 ms |
 
 ## 11. Build order
 
 | step | what | shows |
 |---|---|---|
 | **P1** | `folium-syntax` and `folium-doc`: objects, xref and recovery, all filters but JPX/JBIG2, decryption, page tree, outline, info; a host tool `folium-dump` (page count, objects, outline); budgets and fuzzing set up | page count and outline for the whole corpus with no panics; fuzz coverage reported |
-| **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score |
+| **P2** | `folium-font` (TrueType, CFF, Type 1, standard 14), `folium-content`, `folium-render` (paths, text, images, clips); `pdf-viewer` child; Scrinium quick look sends PDFs; from the start, not later: lazy pages, the display-list and image caches, the worker pool with cancellation, decode at painted size, vector/raster tiles (§7.1) | typical text-and-vector PDFs in quick look, in the VM gate; first corpus score; the §10 scale gates |
 | **P3** | `atrium-pdf` app: page column, zoom, thumbnails, outline, find and copy (`folium-text`), links, password sheet; system default for PDF | opened from Scrinium end to end in the VM |
 | **P4** | the long tail: Type 3, CID fonts and CMaps, shadings 1 and 4–7, patterns, soft masks, blend modes and groups via the CPU fallback, optional content, JPX, JBIG2, CCITT; corpus score raised to the target in D9 | corpus score |
 | **P5** | forms, annotations, incremental save | edit gate |
@@ -298,3 +418,4 @@ several weeks and then ongoing as the corpus finds things.
 | D9 | Fidelity target for v1 | 95% of the corpus's pages within the pixel threshold of the reference, every miss listed with its cause; 100% with no crash, hang or budget overrun outside the listed limits |
 | D10 | Order against other work | P1–P3 next (PDFs in quick look and in their own app), then back to opening-files T5 and Player end to end; P4 continues alongside |
 | D11 | Clip paths, which FILL can't express (its clip is a rectangle) | Add a path clip to Fresco's FILL (a clip path id the server rasterizes as a coverage mask), done by the Fresco thread during P2; until it lands, non-rectangular clips go through the CPU fallback |
+| D12 | Very detailed pages | Vector while the visible items fit a per-window node budget (start at 8,000), raster tiles from the display list past it; the budget is tuned on the corpus, so the scene stays under a fixed ceiling at any zoom |
