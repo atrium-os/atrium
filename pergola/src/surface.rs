@@ -176,6 +176,9 @@ pub struct FrescoSurface {
     images: std::collections::HashSet<u32>,
     /// Where this window's drawn edges went.
     edges: Edges,
+    /// What each placed node was last sent as, to send again when
+    /// [`Edges::settle`] finds it drawn elsewhere.
+    sent: std::collections::HashMap<u32, (Node, Option<NodeId>, u32)>,
     /// The other windows' slot and scroll state (pop-ups,
     /// [`FrescoSurface::select`]): slots are per window.
     others: std::collections::HashMap<u32, WindowState>,
@@ -188,6 +191,7 @@ struct WindowState {
     atlas_seen: Option<u64>,
     images: std::collections::HashSet<u32>,
     edges: Edges,
+    sent: std::collections::HashMap<u32, (Node, Option<NodeId>, u32)>,
 }
 
 /// Image texture slots: this bit plus the image's id.
@@ -245,14 +249,38 @@ struct Edges {
     /// own box is the `ROOT` group's bounds.
     size: (f32, f32),
     /// Per group (`ROOT` for the window), per axis, a placed edge in points
-    /// (in 1/64 pt) to its device position and the paint orders of the
-    /// nodes holding it (order -> count).
-    groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, (f32, std::collections::BTreeMap<u32, u32>)>; 2]>,
+    /// (in 1/64 pt) to the paint orders of the nodes holding it, each with
+    /// where that node drew it and how many of its edges are there
+    /// (order -> (device, count)). Holders may disagree: a node placed
+    /// only from earlier ones can put an edge where a later one did not.
+    groups: std::collections::HashMap<u32, [std::collections::BTreeMap<i32, std::collections::BTreeMap<u32, (f32, u32)>>; 2]>,
     /// The edges each node holds and its order, to let go when it
     /// changes or goes.
     nodes: std::collections::HashMap<u32, (u32, u32, Vec<(u8, i32)>)>,
     /// Each group's own box: points `w`, `h`, pixels `dw`, `dh`.
     bounds: std::collections::HashMap<u32, [f32; 4]>,
+    /// Each placed node: its group, order, box in points and where it was
+    /// drawn, to place it again when what it was placed from moves.
+    placed: std::collections::HashMap<u32, Placed>,
+    /// Per group, its placed nodes in paint order (order, id).
+    members: std::collections::HashMap<u32, std::collections::BTreeSet<(u32, u32)>>,
+    /// Groups whose nodes may now land elsewhere than where they were
+    /// sent: the group's own box was drawn another size, or a node in it
+    /// moved or went, and later siblings may have been placed from it.
+    /// [`Edges::settle`] places them again.
+    dirty: std::collections::BTreeSet<u32>,
+}
+
+/// A placed node, as [`Edges::place_rect`] last placed it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Placed {
+    group: u32,
+    order: u32,
+    rect: crate::geom::Rect,
+    /// A group (a Stack): its box is what its contents are placed from.
+    boxed: bool,
+    /// Device pixels `x`, `y`, `w`, `h`.
+    dev: (f32, f32, f32, f32),
 }
 
 const ROOT: u32 = u32::MAX;
@@ -306,8 +334,10 @@ impl Edges {
         // Saturating: an edge far off (a huge or infinite extent) saturates
         // its key at i32::MAX, and `key + reach` would wrap below `key - reach`.
         let held = self.groups.get(&group).map(|g| g[axis as usize].range(key.saturating_sub(reach)..=key.saturating_add(reach)));
-        let before = |holders: &std::collections::BTreeMap<u32, u32>| holders.keys().next().is_some_and(|&o| o < order);
-        let all = own.iter().flatten().copied().chain(held.into_iter().flatten().filter(|(_, (_, h))| before(h)).map(|(&b, &(dev, _))| (b, dev)));
+        // Where the first node painted holding it drew it: in a full
+        // redraw the later ones took it from there.
+        let first = |holders: &std::collections::BTreeMap<u32, (f32, u32)>| holders.iter().next().filter(|(&o, _)| o < order).map(|(_, &(dev, _))| dev);
+        let all = own.iter().flatten().copied().chain(held.into_iter().flatten().filter_map(|(&b, h)| first(h).map(|dev| (b, dev))));
         // The same point, else outside the span first (a box's own
         // border), then inside.
         let mut best: Option<(f32, f32)> = None;
@@ -351,8 +381,8 @@ impl Edges {
         let mut keys = Vec::with_capacity(edges.len());
         for &(axis, e, dev) in edges {
             let key = edge_key(e);
-            let entry = g[axis as usize].entry(key).or_insert((dev, Default::default()));
-            *entry.1.entry(order).or_insert(0) += 1;
+            let entry = g[axis as usize].entry(key).or_default().entry(order).or_insert((dev, 0));
+            entry.1 += 1;
             keys.push((axis, key));
         }
         self.nodes.insert(node, (group, order, keys));
@@ -361,7 +391,88 @@ impl Edges {
     /// A group's own box, `w` x `h` points drawn `dw` x `dh` pixels: its
     /// contents are placed from these edges.
     fn bounds(&mut self, group: u32, w: f32, h: f32, dw: f32, dh: f32) {
-        self.bounds.insert(group, [w, h, dw, dh]);
+        let new = [w, h, dw, dh];
+        if self.bounds.insert(group, new).is_some_and(|old| old != new) {
+            self.dirty.insert(group);
+        }
+    }
+
+    /// Whether `group` has a node painted after `order`.
+    fn later(&self, group: u32, order: u32) -> bool {
+        self.members.get(&group).is_some_and(|m| m.range((order + 1, 0)..).next().is_some())
+    }
+
+    /// `rect` (points, in `group`) in device pixels, its edges placed
+    /// from those near it, and held by `id` for what comes after. A
+    /// `boxed` node is a group: its contents are placed from its box.
+    fn place_rect(&mut self, id: u32, group: u32, order: u32, rect: crate::geom::Rect, boxed: bool) -> (f32, f32, f32, f32) {
+        self.drop_node(id);
+        let prev = self.placed.remove(&id);
+        if let Some(p) = prev {
+            if let Some(m) = self.members.get_mut(&p.group) {
+                m.remove(&(p.order, id));
+            }
+        }
+        // A dot (an icon's round join, a mark) is no border: snapped on its
+        // own, holding nothing, or it and its neighbours pull each other off.
+        let dev = if rect.w() <= NEAR && rect.h() <= NEAR {
+            let (x, w) = snap_span(rect.x(), rect.w(), self.k);
+            let (y, h) = snap_span(rect.y(), rect.h(), self.k);
+            (x, y, w, h)
+        } else {
+            let (x, w) = self.span(group, 0, rect.x(), rect.w(), order);
+            let (y, h) = self.span(group, 1, rect.y(), rect.h(), order);
+            self.hold(id, group, order, &[
+                (0, rect.x(), x), (0, rect.x() + rect.w(), x + w),
+                (1, rect.y(), y), (1, rect.y() + rect.h(), y + h),
+            ]);
+            (x, y, w, h)
+        };
+        if boxed {
+            self.bounds(id, rect.w(), rect.h(), dev.2, dev.3);
+        }
+        self.placed.insert(id, Placed { group, order, rect, boxed, dev });
+        self.members.entry(group).or_default().insert((order, id));
+        // Its later siblings were placed from where it was (or without
+        // it): they may land elsewhere now.
+        match prev {
+            Some(p) if p.group != group || p.order != order => {
+                self.dirty.insert(p.group);
+                self.dirty.insert(group);
+            }
+            Some(p) if p.dev == dev => {}
+            _ => {
+                if self.later(group, order) {
+                    self.dirty.insert(group);
+                }
+            }
+        }
+        dev
+    }
+
+    /// Place again every node of a group marked dirty, in paint order,
+    /// and the contents of every group drawn another size by that: what
+    /// a node is placed from (its group's box, its earlier siblings) may
+    /// have moved in a frame that did not send the node. Returns the ids
+    /// now drawn elsewhere than they were sent, to send again; then the
+    /// window shows what a full redraw would.
+    fn settle(&mut self) -> Vec<u32> {
+        let mut moved = Vec::new();
+        // Each pass settles a group from its box and its own nodes; only a
+        // group inside it can be marked by that, so this ends.
+        while let Some(g) = self.dirty.pop_first() {
+            let ids: Vec<u32> = self.members.get(&g).map(|m| m.iter().map(|&(_, id)| id).collect()).unwrap_or_default();
+            for id in ids {
+                let p = self.placed[&id];
+                if self.place_rect(id, g, p.order, p.rect, p.boxed) != p.dev {
+                    moved.push(id);
+                }
+            }
+            self.dirty.remove(&g);
+        }
+        moved.sort_unstable();
+        moved.dedup();
+        moved
     }
 
     fn drop_node(&mut self, node: u32) {
@@ -370,23 +481,45 @@ impl Edges {
             for (axis, key) in keys {
                 let m = &mut g[axis as usize];
                 let Some(v) = m.get_mut(&key) else { continue };
-                match v.1.get_mut(&order) {
-                    Some(c) if *c > 1 => *c -= 1,
-                    Some(_) => { v.1.remove(&order); }
+                match v.get_mut(&order) {
+                    Some((_, c)) if *c > 1 => *c -= 1,
+                    Some(_) => { v.remove(&order); }
                     None => {}
                 }
-                if v.1.is_empty() {
+                if v.is_empty() {
                     m.remove(&key);
                 }
             }
         }
     }
 
-    /// `node` is gone, and with it what it held and, if a group, its box.
-    fn forget(&mut self, node: u32) {
-        self.drop_node(node);
-        self.groups.remove(&node);
-        self.bounds.remove(&node);
+    /// `node` is gone, and with it what it held and, if a group, its box
+    /// and its contents (removing a group removes what it holds). Returns
+    /// every id let go of.
+    fn forget(&mut self, node: u32) -> Vec<u32> {
+        let mut gone = vec![node];
+        let mut i = 0;
+        while i < gone.len() {
+            let id = gone[i];
+            i += 1;
+            self.drop_node(id);
+            if let Some(p) = self.placed.remove(&id) {
+                if let Some(m) = self.members.get_mut(&p.group) {
+                    m.remove(&(p.order, id));
+                }
+                // What came after it was placed with it there.
+                if i == 1 && self.later(p.group, p.order) {
+                    self.dirty.insert(p.group);
+                }
+            }
+            self.groups.remove(&id);
+            self.bounds.remove(&id);
+            self.dirty.remove(&id);
+            if let Some(m) = self.members.remove(&id) {
+                gone.extend(m.into_iter().map(|(_, c)| c));
+            }
+        }
+        gone
     }
 }
 
@@ -404,6 +537,7 @@ impl FrescoSurface {
             conn, window_id, fonts: std::collections::HashMap::new(), scale, scrolls: Default::default(),
             atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, images: Default::default(),
             edges: Default::default(),
+            sent: Default::default(),
             others: Default::default(),
         }
     }
@@ -418,6 +552,7 @@ impl FrescoSurface {
             atlas_seen: self.atlas_seen,
             images: std::mem::take(&mut self.images),
             edges: std::mem::take(&mut self.edges),
+            sent: std::mem::take(&mut self.sent),
         };
         self.others.insert(self.window_id, mine);
         let w = self.others.remove(&window).unwrap_or_default();
@@ -425,6 +560,7 @@ impl FrescoSurface {
         self.atlas_seen = w.atlas_seen;
         self.images = w.images;
         self.edges = w.edges;
+        self.sent = w.sent;
         self.window_id = window;
         self.conn.set_default_window(window as u16);
     }
@@ -498,31 +634,36 @@ impl FrescoSurface {
         })
     }
 
-    /// `rect` (points, in `group`) in device pixels, its edges placed
-    /// from those near it, and held by `id` for what comes after.
-    fn place_rect(&mut self, id: u32, group: Option<NodeId>, order: u32, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
+    /// `node`'s `rect` (points, in `group`) in device pixels
+    /// ([`Edges::place_rect`]), and the node kept to send again if what it
+    /// was placed from moves.
+    fn place_rect(&mut self, id: u32, node: &Node, group: Option<NodeId>, order: u32, rect: crate::geom::Rect) -> (f32, f32, f32, f32) {
         self.edges.reset_if(self.scale);
-        self.edges.drop_node(id);
-        // A dot (an icon's round join, a mark) is no border: snapped on its
-        // own, holding nothing, or it and its neighbours pull each other off.
-        if rect.w() <= NEAR && rect.h() <= NEAR {
-            let (x, w) = snap_span(rect.x(), rect.w(), self.scale);
-            let (y, h) = snap_span(rect.y(), rect.h(), self.scale);
-            return (x, y, w, h);
-        }
-        let g = group.map_or(ROOT, |g| g.0);
-        let (x, w) = self.edges.span(g, 0, rect.x(), rect.w(), order);
-        let (y, h) = self.edges.span(g, 1, rect.y(), rect.h(), order);
-        self.edges.hold(id, g, order, &[
-            (0, rect.x(), x), (0, rect.x() + rect.w(), x + w),
-            (1, rect.y(), y), (1, rect.y() + rect.h(), y + h),
-        ]);
-        (x, y, w, h)
+        let boxed = matches!(node, Node::Stack { .. });
+        let dev = self.edges.place_rect(id, group.map_or(ROOT, |g| g.0), order, rect, boxed);
+        self.sent.insert(id, (node.clone(), group, order));
+        dev
     }
 
-    fn rect_params(&mut self, id: u32, group: Option<NodeId>, order: u32, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
+    /// Send again what [`Edges::settle`] finds drawn elsewhere than it
+    /// was sent: a group drawn a pixel wider after a move, say, whose
+    /// contents' points did not change and so were not in the frame.
+    fn settle(&mut self) -> io::Result<()> {
+        for id in self.edges.settle() {
+            let Some((node, group, order)) = self.sent.get(&id).cloned() else { continue };
+            let id = NodeId(id);
+            if matches!(node, Node::Stack { .. } | Node::Scroll { .. }) {
+                self.set_group(id, &node, group, order)?;
+            } else {
+                self.set_node(id, &node, group, order)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rect_params(&mut self, id: u32, node: &Node, group: Option<NodeId>, order: u32, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
         let k = self.scale;
-        let (x, y, w, h) = self.place_rect(id, group, order, rect);
+        let (x, y, w, h) = self.place_rect(id, node, group, order, rect);
         fresco_protocol::RectParams {
             x, y, w, h,
             r: fill.r, g: fill.g, b: fill.b, a: fill.a,
@@ -540,7 +681,7 @@ impl FrescoSurface {
         let Node::Scroll { rect, offset, offset_x, zoom, stretch, backdrop, .. } = node else { unreachable!() };
         use fresco_protocol::{group_flags, GroupParams};
         let k = self.scale;
-        let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
+        let (x, y, w, h) = self.place_rect(id.0, node, group, order, *rect);
         let mut outer = GroupParams {
             parent: group.map(|g| g.0),
             order,
@@ -602,6 +743,7 @@ impl Surface for FrescoSurface {
     }
 
     fn end_frame(&mut self) -> io::Result<()> {
+        self.settle()?;
         self.conn.scene_frame_end()
     }
 
@@ -609,7 +751,7 @@ impl Surface for FrescoSurface {
         let k = self.scale;
         match node {
             Node::Rect { rect, fill, radius } => {
-                let params = self.rect_params(id.0, group, order, *rect, *fill, *radius);
+                let params = self.rect_params(id.0, node, group, order, *rect, *fill, *radius);
                 self.conn.scene_node_rect(id.0, params)?;
             }
             Node::Text { rect, content, style } => {
@@ -668,7 +810,7 @@ impl Surface for FrescoSurface {
                     let hash = self.conn.upload_blob(&d.rgba)?;
                     self.conn.slot_set_texture(slot, hash, d.width, d.height, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
                 }
-                let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
+                let (x, y, w, h) = self.place_rect(id.0, node, group, order, *rect);
                 self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x, y, w, h, slot_id: slot })?;
             }
             Node::Glyphs { origin, face, size, color, glyphs } => {
@@ -698,8 +840,7 @@ impl Surface for FrescoSurface {
         };
         // Whole device pixels, placed from the edges near it, so its
         // contents keep their snapped edges and an inset keeps its border.
-        let (x, y, w, h) = self.place_rect(id.0, group, order, *rect);
-        self.edges.bounds(id.0, rect.w(), rect.h(), w, h);
+        let (x, y, w, h) = self.place_rect(id.0, stack, group, order, *rect);
         g.transform[4] = x;
         g.transform[5] = y;
         self.conn.scene_group(id.0, g)?;
@@ -720,7 +861,9 @@ impl Surface for FrescoSurface {
 
     fn clear_node(&mut self, id: NodeId) -> io::Result<()> {
         self.scrolls.remove(&id.0);
-        self.edges.forget(id.0);
+        for gone in self.edges.forget(id.0) {
+            self.sent.remove(&gone);
+        }
         self.conn.scene_node_clear(id.0)
     }
 
@@ -877,4 +1020,95 @@ mod tests {
             assert_eq!((d, r), full, "at {k}");
         }
     }
+
+    /// A group drawn a pixel wider or narrower after a move places its
+    /// contents again, though their points did not change and so they were
+    /// not in the frame. forum-bar's first frame is laid out 5546 pt wide;
+    /// at 1.5 its workspace chip (a 1 pt border box around its body) sat at
+    /// 2726 pt, 191 px wide, the body at 2..189. At the real 1280 pt the
+    /// chip moved to 593 pt and drew 190 px wide, the body was not sent
+    /// again, and its right border was 1 px where a fresh frame gives 2.
+    #[test]
+    fn a_group_drawn_another_size_places_its_contents_again() {
+        use super::{Edges, ROOT};
+        use crate::geom::Rect;
+        let k = 1.5;
+        let mut e = Edges::default();
+        e.reset_if(k);
+        // The window is 1280 pt throughout: the first layouts ran before
+        // forum-bar knew its width.
+        e.window(1280.0, 38.0);
+        let (bar, chip, body) = (1, 0xd, 0xe);
+        e.place_rect(bar, ROOT, 2, Rect::new(0.0, 0.0, 5546.0, 37.0), true);
+        let c = e.place_rect(chip, bar, 6, Rect::new(2726.0, 6.0, 127.0, 26.0), true);
+        let b = e.place_rect(body, chip, 1, Rect::new(1.0, 1.0, 125.0, 24.0), true);
+        assert_eq!((c.2, b.0, b.0 + b.2), (191.0, 2.0, 189.0));
+        assert!(e.settle().is_empty(), "a full frame in paint order is settled");
+        // The real width: the chip moves, its body's points don't.
+        let bar_box = e.place_rect(bar, ROOT, 2, Rect::new(0.0, 0.0, 1280.0, 37.0), true);
+        let c = e.place_rect(chip, bar, 6, Rect::new(593.0, 6.0, 127.0, 26.0), true);
+        assert_eq!(c.2, 190.0);
+        let moved = e.settle();
+        let b = e.placed[&body].dev;
+        assert_eq!((b.0, c.2 - (b.0 + b.2)), (2.0, 2.0), "both borders 2 px, as a fresh frame draws them");
+        assert_eq!(moved, vec![body], "only the body is sent again");
+        // What a fresh frame at that width gives, exactly.
+        let mut f = Edges::default();
+        f.reset_if(k);
+        f.window(1280.0, 38.0);
+        assert_eq!(f.place_rect(bar, ROOT, 2, Rect::new(0.0, 0.0, 1280.0, 37.0), true), bar_box);
+        assert_eq!(f.place_rect(chip, bar, 6, Rect::new(593.0, 6.0, 127.0, 26.0), true), c);
+        assert_eq!(f.place_rect(body, chip, 1, Rect::new(1.0, 1.0, 125.0, 24.0), true), b);
+    }
+
+    /// A node that moves (or goes) places again the later siblings that
+    /// were placed from its edges.
+    #[test]
+    fn later_siblings_follow_a_node_that_moves_or_goes() {
+        use super::{Edges, ROOT};
+        use crate::geom::Rect;
+        let mut e = Edges::default();
+        e.reset_if(1.5);
+        // A box, then a 1 pt divider 1 pt inside its foot.
+        e.place_rect(1, ROOT, 1, Rect::new(0.0, 0.3, 100.0, 40.0), false);
+        let d = e.place_rect(2, ROOT, 2, Rect::new(0.0, 39.3, 100.0, 1.0), false);
+        assert_eq!((d.1, d.3), (58.0, 2.0), "inside the box's foot at 60 px (40.3 pt = 60.45)");
+        // The box alone is sent again, 0.4 pt lower: its foot at 61 px.
+        let b = e.place_rect(1, ROOT, 1, Rect::new(0.0, 0.7, 100.0, 40.0), false);
+        assert_eq!(b, (0.0, 1.0, 150.0, 60.0), "its foot now at 61 px");
+        assert_eq!(e.settle(), vec![2]);
+        let mut f = Edges::default();
+        f.reset_if(1.5);
+        f.place_rect(1, ROOT, 1, Rect::new(0.0, 0.7, 100.0, 40.0), false);
+        let full = f.place_rect(2, ROOT, 2, Rect::new(0.0, 39.3, 100.0, 1.0), false);
+        assert_eq!(e.placed[&2].dev, full, "as a full redraw");
+        assert_eq!(full.1, 59.0);
+        // Back where it was, then gone: the divider is placed on its own
+        // (58.95 rounds to 59), not left at 58 from the box's foot.
+        e.place_rect(1, ROOT, 1, Rect::new(0.0, 0.3, 100.0, 40.0), false);
+        assert_eq!(e.settle(), vec![2]);
+        assert_eq!(e.placed[&2].dev.1, 58.0);
+        e.forget(1);
+        assert_eq!(e.settle(), vec![2]);
+        assert_eq!(e.placed[&2].dev.1, 59.0);
+    }
+
+    /// A group that goes takes its contents with it: nothing it held is
+    /// placed or sent again.
+    #[test]
+    fn a_group_that_goes_takes_its_contents() {
+        use super::{Edges, ROOT};
+        use crate::geom::Rect;
+        let mut e = Edges::default();
+        e.reset_if(1.5);
+        e.place_rect(1, ROOT, 1, Rect::new(10.3, 0.0, 50.0, 20.0), true);
+        e.place_rect(2, 1, 1, Rect::new(1.0, 1.0, 48.0, 18.0), true);
+        e.place_rect(3, 2, 1, Rect::new(0.0, 0.0, 10.0, 10.0), false);
+        let mut gone = e.forget(1);
+        gone.sort();
+        assert_eq!(gone, vec![1, 2, 3]);
+        assert!(e.placed.is_empty() && e.members.values().all(|m| m.is_empty()));
+        assert!(e.settle().is_empty());
+    }
+
 }

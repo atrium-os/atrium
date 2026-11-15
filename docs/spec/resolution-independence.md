@@ -181,7 +181,14 @@ sides at every scale, and neighbours that share an edge still meet. Unrelated ed
 as before. Re-checked live 2026-11-15 (PASS at 1.25 and 1.5). Since 2026-11-15 a node is
 placed only from edges of nodes painted before it in its group (its paint order), so an
 update of one node lands it where a full redraw would: Scrinium's divider had sat a row
-lower after a partial update, placed from a later sibling's edge.
+lower after a partial update, placed from a later sibling's edge. And what a node was
+placed from can move in a frame that does not send the node: a group drawn a pixel wider
+after a move (its contents' points unchanged), an earlier sibling that moved or went. At
+the end of each frame pergola places such groups' nodes again in paint order and sends
+again what now lands elsewhere, so the window shows what a full redraw would: forum-bar's
+workspace chip, first laid out before the bar knew its width, had kept a 1 px right border
+at 1.5 (2 px after a live switch). Each holder of an edge keeps where it drew it; the
+first one painted counts.
 
 ## 6. Text size and relative sizing of widgets
 
