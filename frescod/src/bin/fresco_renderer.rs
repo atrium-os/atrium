@@ -763,9 +763,15 @@ fn from_broker(
             Msg::CloseRequested { .. } => {
                 comp.lock().unwrap().request_close(local as u16);
             }
-            Msg::Scale { scale_milli, .. } => {
+            Msg::Scale { scale_milli, width, height, .. } => {
+                if let Some(w) = state.lock().unwrap().wins.get_mut(&local) {
+                    w.size = Some((width, height));
+                    w.forget();
+                }
+                // Both at once, in one event to the client: the new scale
+                // with the window's size at it (fresco-split `Msg::Scale`).
                 let mut c = comp.lock().unwrap();
-                c.set_window_dpi(local as u16, scale_milli as f32 / 1000.0);
+                c.rescale_window(local as u16, scale_milli as f32 / 1000.0, width, height);
                 // The app's next window most likely opens beside this one.
                 c.new_scale_milli = scale_milli;
             }

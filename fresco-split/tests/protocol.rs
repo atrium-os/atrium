@@ -24,7 +24,7 @@ fn samples() -> Vec<Msg> {
         Msg::Focus { window: 2, gained: true, cause: 2 },
         Msg::CloseRequested { window: 2 },
         Msg::RasterRefused { window: 2, cost_mops: 975_000, limit_mops: 2147 },
-        Msg::Scale { window: 2, scale_milli: 1500 },
+        Msg::Scale { window: 2, scale_milli: 1500, width: 1920, height: 57 },
         Msg::Input { window: 4, input: Input::Key { usage: 0x04, pressed: true, modifiers: 2, activation: [9; 16], repeat: true } },
         Msg::Input { window: 4, input: Input::Motion { x: 1.5, y: -2.0 } },
         Msg::Input { window: 4, input: Input::Button { x: 3.0, y: 4.0, button: 1, pressed: false, modifiers: 0, activation: [0; 16] } },
@@ -85,9 +85,21 @@ fn a_min_size_out_of_range_is_refused() {
 #[test]
 fn a_scale_out_of_range_is_refused() {
     for bad in [0, 499, 4001, u32::MAX] {
-        let mut b = Msg::Scale { window: 2, scale_milli: 1000 }.encode();
+        let mut b = Msg::Scale { window: 2, scale_milli: 1000, width: 1, height: 1 }.encode();
         b[8..12].copy_from_slice(&bad.to_le_bytes());
         assert!(Msg::decode(&b).is_err(), "{bad}");
+    }
+}
+
+/// A scale comes with the window's size at it, which must be one.
+#[test]
+fn a_scale_carries_a_size_in_range() {
+    let m = Msg::Scale { window: 2, scale_milli: 1500, width: 1920, height: 57 };
+    assert_eq!(Msg::decode(&m.encode()), Ok(m.clone()));
+    for (at, bad) in [(12, 0u32), (16, 0), (12, fresco_split::MAX_WINDOW_DIM + 1), (16, u32::MAX)] {
+        let mut b = m.encode();
+        b[at..at + 4].copy_from_slice(&bad.to_le_bytes());
+        assert!(Msg::decode(&b).is_err(), "{at} {bad}");
     }
 }
 

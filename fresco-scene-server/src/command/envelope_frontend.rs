@@ -2576,7 +2576,7 @@ mod tests {
         f.set_outputs(vec![out(0, 10, 0, 1000), out(1, 20, 1920, 1500)]);
         let dpi = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| -> Vec<(u32, f32)> {
             rx.try_iter().filter_map(|e| match e {
-                crate::window::DisplayEvent::WindowDpiChanged { window_id, scale_factor } => Some((window_id, scale_factor)),
+                crate::window::DisplayEvent::WindowDpiChanged { window_id, scale_factor, .. } => Some((window_id, scale_factor)),
                 _ => None,
             }).collect()
         };
@@ -2757,7 +2757,7 @@ mod tests {
         let resized = |rx: &std::sync::mpsc::Receiver<crate::window::DisplayEvent>| {
             rx.try_iter()
                 .filter_map(|e| match e {
-                    crate::window::DisplayEvent::WindowResized { window_id, width, height } => Some((window_id, width, height)),
+                    crate::window::DisplayEvent::WindowResized { window_id, width, height, .. } => Some((window_id, width, height)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

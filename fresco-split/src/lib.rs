@@ -162,8 +162,12 @@ pub enum Msg {
     /// renderer tells its client (`budget::RASTER_TIME`).
     RasterRefused { window: u32, cost_mops: u32, limit_mops: u32 },
     /// The window is on a monitor of this scale (thousandths, 500..=4000):
-    /// the client should render at it.
-    Scale { window: u32, scale_milli: u32 },
+    /// the client should render at it. `width` x `height`: the window's
+    /// size at it, which is its size from now on as [`Msg::Geometry`]'s
+    /// is. The two come together so the renderer tells its client both at
+    /// once: sent apart, the client heard of the window between them, at
+    /// the new scale with its old size, and laid out for it.
+    Scale { window: u32, scale_milli: u32, width: u32, height: u32 },
     /// Input routed to `window` by the layer list.
     Input { window: u32, input: Input },
     /// One MIME type the drag entering `window` offers; they precede its
@@ -466,9 +470,11 @@ impl Msg {
                 r.put(3, *limit_mops);
                 r
             }
-            Msg::Scale { window, scale_milli } => {
+            Msg::Scale { window, scale_milli, width, height } => {
                 let mut r = Rec::new(SCALE, *window);
                 r.put(2, *scale_milli);
+                r.put(3, *width);
+                r.put(4, *height);
                 r
             }
             Msg::Input { window, input } => match *input {
@@ -734,8 +740,9 @@ impl Msg {
             FRAME_READY | GEOMETRY | MOTION => (2, false),
             SCROLL => (3, false),
             MAGNIFY => (4, false),
-            SLOTS | FRAME_DONE | SCALE => (1, false),
+            SLOTS | FRAME_DONE => (1, false),
             FOCUS | RASTER_REFUSED => (2, false),
+            SCALE => (3, false), // scale, width, height
             KEY => (4, false), // usage, pressed, modifiers, repeat
             CLIENT => (5, false),
             BUTTON => (5, false),
@@ -847,7 +854,7 @@ impl Msg {
                 if !(SCALE_MIN..=SCALE_MAX).contains(&scale_milli) {
                     return Err(Refused("scale out of range"));
                 }
-                Msg::Scale { window, scale_milli }
+                Msg::Scale { window, scale_milli, width: dim(r.get(3))?, height: dim(r.get(4))? }
             }
             KEY => {
                 let usage = u16::try_from(r.get(2)).map_err(|_| Refused("key usage"))?;

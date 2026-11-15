@@ -354,22 +354,13 @@ impl Broker {
         let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
         for r in rs {
             let mut changed: Vec<(Msg, Vec<std::os::fd::RawFd>)> = Vec::new();
-            for (&local, w) in r.wins.lock().unwrap().iter_mut() {
+            // Told under its windows' lock, as `rescale` tells a size, so
+            // the last size a window's renderer gets is the one in `told`.
+            let mut wins = r.wins.lock().unwrap();
+            for (&local, w) in wins.iter_mut() {
                 if let Some(&s) = sizes.get(&w.global) {
                     if s != w.told {
-                        w.told = s;
-                        // Pixel slots hold the window's size: a bigger window
-                        // gets new ones, before the size that needs them.
-                        let bytes = self.slot_bytes(s);
-                        if bytes > w.slots[0].len() {
-                            match (Shm::create(bytes), Shm::create(bytes)) {
-                                (Ok(a), Ok(b)) => {
-                                    changed.push((Msg::Slots { window: local, bytes: bytes as u32 }, vec![a.fd(), b.fd()]));
-                                    w.slots = [a, b];
-                                }
-                                _ => log::warn!("frescod: client {}: cannot create frame slots", r.client_id),
-                            }
-                        }
+                        self.grow_slots(&r, local, w, s, &mut changed);
                         changed.push((Msg::Geometry { window: local, width: s.0, height: s.1 }, Vec::new()));
                     }
                 }
@@ -379,7 +370,55 @@ impl Broker {
                     break;
                 }
             }
+            drop(wins);
         }
+    }
+
+    /// Window `local` is told it is `s` from now on: note it, and give it
+    /// new pixel slots first if they no longer hold it (a bigger window
+    /// gets new ones before the size that needs them).
+    fn grow_slots(&self, r: &Renderer, local: u32, w: &mut Win, s: (u32, u32), out: &mut Vec<(Msg, Vec<std::os::fd::RawFd>)>) {
+        w.told = s;
+        let bytes = self.slot_bytes(s);
+        if bytes > w.slots[0].len() {
+            match (Shm::create(bytes), Shm::create(bytes)) {
+                (Ok(a), Ok(b)) => {
+                    out.push((Msg::Slots { window: local, bytes: bytes as u32 }, vec![a.fd(), b.fd()]));
+                    w.slots = [a, b];
+                }
+                _ => log::warn!("frescod: client {}: cannot create frame slots", r.client_id),
+            }
+        }
+    }
+
+    /// The records that tell `r` window `global`'s new scale: the scale
+    /// and its size now, in one [`Msg::Scale`] (with new slots before it
+    /// if the size needs them). The size goes with the scale rather than
+    /// at the next frame's [`Broker::sync`]: apart, they reached the
+    /// renderer in either order, and its client heard of a window that
+    /// never was, at the new scale with the old size (forum-bar 48 px at
+    /// 1.5, 32 pt) or the reverse, and drew for it.
+    /// Told under `r`'s windows' lock, as `sync` tells a size, so the
+    /// last size the renderer gets is the one in `told`.
+    fn rescale(&self, r: &Renderer, global: u32) -> Result<(), String> {
+        let now = u16::try_from(global).ok().and_then(|id| {
+            let c = self.comp.lock().unwrap();
+            let screen = self.screen();
+            c.windows.get(&id).map(|w| (w.scale_milli, (self.dim(w.size.0, screen.0), self.dim(w.size.1, screen.1))))
+        });
+        let Some((scale_milli, s)) = now else { return Ok(()) };
+        if !(fresco_split::SCALE_MIN..=fresco_split::SCALE_MAX).contains(&scale_milli) {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        let mut wins = r.wins.lock().unwrap();
+        let Some((&local, w)) = wins.iter_mut().find(|(_, w)| w.global as u32 == global) else { return Ok(()) };
+        self.grow_slots(r, local, w, s, &mut out);
+        out.push((Msg::Scale { window: local, scale_milli, width: s.0, height: s.1 }, Vec::new()));
+        for (m, fds) in out {
+            r.tell(&m, &fds)?;
+        }
+        Ok(())
     }
 
     /// A window's slot size: a packed frame's fixed room, or, in pixel mode,
@@ -461,8 +500,16 @@ impl Broker {
         }
         {
             let r = r.clone();
+            let broker = self.clone();
             std::thread::Builder::new().name(format!("frescod-split-ev-{client_id}")).spawn(move || {
                 'events: for ev in ev_rx.iter() {
+                    // A new scale goes with the size it comes with.
+                    if let DisplayEvent::WindowDpiChanged { window_id, .. } = ev {
+                        if broker.rescale(&r, window_id).is_err() {
+                            break 'events;
+                        }
+                        continue;
+                    }
                     for m in event_records(&r, &ev) {
                         if r.tell(&m, &[]).is_err() {
                             break 'events;
@@ -572,8 +619,7 @@ impl Broker {
                 let scale_milli = self.comp.lock().unwrap().windows.get(&global).map_or(1000, |w| w.scale_milli)
                     .clamp(fresco_split::SCALE_MIN, fresco_split::SCALE_MAX);
                 r.tell(&Msg::Slots { window: local, bytes: bytes as u32 }, &[a.fd(), b.fd()])
-                    .and_then(|_| r.tell(&Msg::Scale { window: local, scale_milli }, &[]))
-                    .and_then(|_| r.tell(&Msg::Geometry { window: local, width, height }, &[]))?;
+                    .and_then(|_| r.tell(&Msg::Scale { window: local, scale_milli, width, height }, &[]))?;
                 wins.insert(local, Win { global, slots: [a, b], told: (width, height) });
                 drop(wins);
                 // Its embed token, for the client alone (limen.md §5).
@@ -1064,13 +1110,7 @@ fn event_record(r: &Renderer, ev: &DisplayEvent) -> Option<Msg> {
         E::VideoPresented { window_id, layer, seq, vblank_ns, dropped } => {
             return Some(Msg::VideoPresented { window: r.local_of(window_id)?, layer, seq, vblank_ns, dropped });
         }
-        E::WindowDpiChanged { window_id, scale_factor } => {
-            let scale_milli = (scale_factor * 1000.0).round() as u32; /* NaN -> 0 */
-            if !(fresco_split::SCALE_MIN..=fresco_split::SCALE_MAX).contains(&scale_milli) {
-                return None;
-            }
-            return Some(Msg::Scale { window: r.local_of(window_id)?, scale_milli });
-        }
+        // A scale change goes by `Broker::rescale`, with its size.
         E::InputKey { window_id, hid_usage, pressed, modifiers, activation, repeat } => {
             (window_id, Input::Key { usage: hid_usage, pressed, modifiers, activation, repeat })
         }

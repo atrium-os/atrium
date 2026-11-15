@@ -432,15 +432,11 @@ impl Window {
                 app.invalidate();
             }
             fresco_client::Event::Resized { window_id, width, height, scale, .. } if window_id == main => {
-                if scale.is_finite() && scale > 0.0 && scale != self.surface.scale {
-                    self.surface.scale = scale;
-                    app.resend_all();
-                }
-                if (width, height) != (self.width, self.height) {
-                    self.min_due = !self.hosted && width != self.width;
-                    self.width = width;
-                    self.height = height;
-                    app.invalidate();
+                let mut size = (self.width, self.height);
+                let wider = resized(&mut self.surface.scale, &mut size, (width, height, scale), app);
+                (self.width, self.height) = size;
+                if wider.is_some() {
+                    self.min_due = !self.hosted && wider == Some(true);
                 }
             }
             _ => {}
@@ -602,3 +598,61 @@ fn activation_of(ev: &fresco_client::Event) -> Option<crate::clipboard::Token> {
     (tok != [0u8; 16]).then_some(tok)
 }
 
+
+/// The main window is now `width` x `height` points at `scale` (an
+/// `EV_WINDOW_RESIZED`): note it in `k` and `size`. `None` if its size is
+/// the same, else whether its width changed.
+///
+/// A new scale or a new size starts the surface's edges over (they are
+/// placed from the window's own box, resolution-independence.md §5), so
+/// every node is sent again, not only those whose points changed: one
+/// left as it was keeps where the old edges put it. forum-bar, told 32 pt
+/// for a moment during a live UI-size change, drew its hairline at 37 pt
+/// where nothing pulled it to the 32 pt window's foot; told its real
+/// 38 pt next, the hairline had not moved in points, was not sent again,
+/// and stayed a pixel low, half of it past the window.
+fn resized<V: View>(k: &mut f32, size: &mut (f32, f32), (width, height, scale): (f32, f32, f32), app: &mut App<V>) -> Option<bool> {
+    if scale.is_finite() && scale > 0.0 && scale != *k {
+        *k = scale;
+        app.resend_all();
+    }
+    if (width, height) == *size {
+        return None;
+    }
+    let wider = width != size.0;
+    *size = (width, height);
+    app.resend_all();
+    app.invalidate();
+    Some(wider)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{App, Color, Ctx, Node, Rect, View};
+
+    /// A hairline whose points stay put while its window grows.
+    struct Line;
+    impl View for Line {
+        fn render(&self, ctx: &mut Ctx) {
+            ctx.add(Node::Rect { rect: Rect::new(0.0, 37.0, 100.0, 1.0), fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0 });
+        }
+    }
+
+    #[test]
+    fn a_resize_sends_every_node_again() {
+        let mut app = App::new(Line);
+        let (mut k, mut size) = (1.5, (1280.0, 32.0));
+        assert!(!app.tick().is_empty());
+        assert!(app.tick().is_empty(), "nothing changed");
+        // The same scale, a new size: the line did not move in points, but
+        // the surface placed it from the old window's edges.
+        assert_eq!(super::resized(&mut k, &mut size, (1280.0, 38.0, 1.5), &mut app), Some(false));
+        assert_eq!(size, (1280.0, 38.0));
+        assert!(!app.tick().is_empty(), "the line is placed again for the new window");
+        assert_eq!(super::resized(&mut k, &mut size, (1280.0, 38.0, 1.5), &mut app), None, "the same again is no news");
+        assert!(app.tick().is_empty());
+        assert_eq!(super::resized(&mut k, &mut size, (1300.0, 38.0, 2.0), &mut app), Some(true));
+        assert_eq!(k, 2.0);
+        assert!(!app.tick().is_empty());
+    }
+}

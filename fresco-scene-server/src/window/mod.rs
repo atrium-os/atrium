@@ -41,8 +41,13 @@ pub const MINT_HERE: [u8; 16] = [0xff; 16];
 #[derive(Clone, Debug)]
 pub enum DisplayEvent {
     /// Window dimensions changed (compositor / WM resized; user
-    /// dragged corner; DPI scaling shift).
-    WindowResized        { window_id: u32, width: u32, height: u32 },
+    /// dragged corner; DPI scaling shift). `scale_milli`: the window's
+    /// scale when it changed. The event carries the window's size and
+    /// scale as of the change, and its client is told those, never what
+    /// the window has become by the time the event is sent: a size read
+    /// later, beside a scale from the event (or the reverse), is a window
+    /// that never was, and a client laid out for it.
+    WindowResized        { window_id: u32, width: u32, height: u32, scale_milli: u32 },
     /// Focus gained or lost. Toolkits redraw active-state visuals.
     WindowFocusChanged   { window_id: u32, gained: bool, cause: u8 },
     /// User clicked X (or equivalent gesture). Toolkit decides
@@ -51,8 +56,10 @@ pub enum DisplayEvent {
     WindowCloseRequested { window_id: u32 },
     /// The window's scale changed (it moved to a monitor of another
     /// density, or the monitor's scale changed): device pixels per point,
-    /// 1.0 at 110 ppi. Clients are told it as `EV_WINDOW_RESIZED`.
-    WindowDpiChanged     { window_id: u32, scale_factor: f32 },
+    /// 1.0 at 110 ppi. Clients are told it as `EV_WINDOW_RESIZED`, with
+    /// `width` x `height`, the window's size in device pixels as of the
+    /// change (see `WindowResized`).
+    WindowDpiChanged     { window_id: u32, scale_factor: f32, width: u32, height: u32 },
     /// A surface was created. The signal the WM reconciles on to place
     /// the newcomer (every client receives it; only the WM acts).
     WindowCreated        { window_id: u32 },
@@ -242,7 +249,9 @@ pub type ScaleOf<'a> = dyn Fn(u32) -> Option<(u32, (f32, f32))> + 'a;
 /// (resolution-independence.md §3): window sizes, pop-up places, pointer
 /// positions, scroll deltas and drag positions are divided by the
 /// window's scale, which `scale_of` gives with the window's size. A scale
-/// change (`WindowDpiChanged`) goes out as `EV_WINDOW_RESIZED`.
+/// change (`WindowDpiChanged`) goes out as `EV_WINDOW_RESIZED`. A resize
+/// or a scale change carries its own size and scale and is told those;
+/// `scale_of` is not asked for either.
 pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
     -> Result<(u16, Vec<u8>), fresco_protocol::CodecError>
 {
@@ -261,8 +270,8 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
         Ok((control::EV_WINDOW_RESIZED, encode(&p)?))
     };
     match ev {
-        DisplayEvent::WindowResized { window_id, width, height } => {
-            resized(*window_id, (*width, *height), scale(*window_id))
+        DisplayEvent::WindowResized { window_id, width, height, scale_milli } => {
+            resized(*window_id, (*width, *height), *scale_milli)
         }
         DisplayEvent::WindowFocusChanged { window_id, gained, cause } => {
             let p = WindowFocusChangedEvent {
@@ -274,9 +283,8 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
             let p = WindowCloseRequestedEvent { window_id: *window_id };
             Ok((control::EV_WINDOW_CLOSE_REQUESTED, encode(&p)?))
         }
-        DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
-            let size = scale_of(*window_id).map_or((0, 0), |(_, (w, h))| (w as u32, h as u32));
-            resized(*window_id, size, (scale_factor * 1000.0).round() as u32)
+        DisplayEvent::WindowDpiChanged { window_id, scale_factor, width, height } => {
+            resized(*window_id, (*width, *height), (scale_factor * 1000.0).round() as u32)
         }
         DisplayEvent::WindowCreated { window_id } => {
             let p = WindowCreatedEvent { window_id: *window_id };
@@ -1060,9 +1068,10 @@ impl Compositor {
             return false;
         }
         win.size = new_size;
+        let scale_milli = win.scale_milli;
         self.emit(DisplayEvent::WindowResized {
             window_id: id as u32,
-            width, height,
+            width, height, scale_milli,
         });
         true
     }
@@ -1084,10 +1093,23 @@ impl Compositor {
     pub fn set_window_dpi(&mut self, id: WindowId, scale_factor: f32) -> bool {
         let Some(w) = self.windows.get_mut(&id) else { return false };
         w.scale_milli = (scale_factor * 1000.0).round() as u32;
+        let (width, height) = (w.size.0 as u32, w.size.1 as u32);
         self.emit(DisplayEvent::WindowDpiChanged {
-            window_id: id as u32, scale_factor,
+            window_id: id as u32, scale_factor, width, height,
         });
         true
+    }
+
+    /// Set window `id`'s scale and size together, `width` x `height`
+    /// device pixels at `scale_factor`, and tell its client both in one
+    /// `WindowDpiChanged`. A split renderer is told a window's new scale
+    /// with the size it has at it: set one at a time, the client heard of
+    /// the one between, the new scale over the old size (a 48 px bar at
+    /// 1.5, 32 pt), and laid out for it.
+    pub fn rescale_window(&mut self, id: WindowId, scale_factor: f32, width: u32, height: u32) -> bool {
+        let Some(w) = self.windows.get_mut(&id) else { return false };
+        w.size = (width as f32, height as f32);
+        self.set_window_dpi(id, scale_factor)
     }
 
     /// Notify the window's owner that the user has requested close
@@ -1982,9 +2004,9 @@ mod event_tests {
         drain(&rx); // discard the WindowCreated from create()
         assert!(c.resize_window(id, 320, 240));
         match expect_event(&rx) {
-            DisplayEvent::WindowResized { window_id, width, height } => {
+            DisplayEvent::WindowResized { window_id, width, height, scale_milli } => {
                 assert_eq!(window_id, id as u32);
-                assert_eq!((width, height), (320, 240));
+                assert_eq!((width, height, scale_milli), (320, 240, 1000));
             }
             other => panic!("expected WindowResized, got {other:?}"),
         }
@@ -2069,9 +2091,9 @@ mod event_tests {
         drain(&rx); // discard the WindowCreated from create()
         assert!(c.set_window_dpi(id, 2.0));
         match expect_event(&rx) {
-            DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
+            DisplayEvent::WindowDpiChanged { window_id, scale_factor, width, height } => {
                 assert_eq!(window_id, id as u32);
-                assert_eq!(scale_factor, 2.0);
+                assert_eq!((scale_factor, width, height), (2.0, 100, 100));
             }
             other => panic!("expected DPI event, got {other:?}"),
         }
@@ -2130,7 +2152,7 @@ mod event_tests {
     fn encode_event_roundtrip() {
         use fresco_protocol::{control, decode, WindowResizedEvent};
         let ev = DisplayEvent::WindowResized {
-            window_id: 7, width: 1280, height: 720,
+            window_id: 7, width: 1280, height: 720, scale_milli: 1000,
         };
         let (op, payload) = encode_event(&ev).expect("encode");
         assert_eq!(op, control::EV_WINDOW_RESIZED);
@@ -2147,11 +2169,11 @@ mod event_tests {
     fn clients_are_told_points() {
         use fresco_protocol::{control, decode, InputPointerButtonEvent, InputPointerScrollEvent, PopupPlacedEvent, WindowResizedEvent};
         let scale_of = |w: u32| (w == 7).then_some((1500, (1200.0, 900.0)));
-        let (op, p) = encode_event_with(&DisplayEvent::WindowResized { window_id: 7, width: 1200, height: 900 }, &scale_of).unwrap();
+        let (op, p) = encode_event_with(&DisplayEvent::WindowResized { window_id: 7, width: 1200, height: 900, scale_milli: 1500 }, &scale_of).unwrap();
         assert_eq!(op, control::EV_WINDOW_RESIZED);
         let r: WindowResizedEvent = decode(&p).unwrap();
         assert_eq!((r.width, r.height, r.scale_milli, r.buffer_width, r.buffer_height), (800.0, 600.0, 1500, 1200, 900));
-        let (op, p) = encode_event_with(&DisplayEvent::WindowDpiChanged { window_id: 7, scale_factor: 1.5 }, &scale_of).unwrap();
+        let (op, p) = encode_event_with(&DisplayEvent::WindowDpiChanged { window_id: 7, scale_factor: 1.5, width: 1200, height: 900 }, &scale_of).unwrap();
         assert_eq!(op, control::EV_WINDOW_RESIZED, "a scale change is a resize");
         assert_eq!(decode::<WindowResizedEvent>(&p).unwrap().width, 800.0);
         let ev = DisplayEvent::InputPointerButton { window_id: 7, x: 300.0, y: 150.0, button: 1, pressed: true, modifiers: 0, activation: [0; 16] };
@@ -2167,6 +2189,55 @@ mod event_tests {
         let ev = DisplayEvent::InputPointerButton { window_id: 0, x: 300.0, y: 150.0, button: 1, pressed: true, modifiers: 0, activation: [0; 16] };
         let b: InputPointerButtonEvent = decode(&encode_event_with(&ev, &scale_of).unwrap().1).unwrap();
         assert_eq!((b.x, b.y), (300.0, 150.0));
+    }
+
+    /// Each resize or scale change tells its client the window as it was
+    /// at that change, however late it is sent: frescod's event fan-out
+    /// encodes on another thread, by when the window may have changed
+    /// again. Read from the compositor at send time, a resize to 57 px at
+    /// 1.25 went out at the later 1.5 (38 pt), and a scale change went
+    /// out over a size the window took after it.
+    #[test]
+    fn resizes_and_scale_changes_are_told_as_they_were() {
+        use fresco_protocol::{decode, WindowResizedEvent};
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (1920, 48));
+        assert!(c.set_window_dpi(id, 1.25));
+        drain(&rx);
+        // The WM's new size at the old scale, again, then the new scale.
+        assert!(c.resize_window(id, 1920, 57));
+        assert!(c.resize_window(id, 1920, 60));
+        assert!(c.set_window_dpi(id, 1.5));
+        assert!(c.resize_window(id, 1920, 57));
+        // Sent only now, the window final at 57 px and 1.5.
+        let w = |c: &Compositor| c.windows.get(&id).map(|w| (w.scale_milli, w.size));
+        let told: Vec<(f32, u32, u32)> = rx.try_iter().map(|e| {
+            let p: WindowResizedEvent = decode(&encode_event_with(&e, &|_| w(&c)).unwrap().1).unwrap();
+            (p.height, p.scale_milli, p.buffer_height)
+        }).collect();
+        assert_eq!(told, vec![
+            (45.6, 1250, 57),
+            (48.0, 1250, 60),
+            (40.0, 1500, 60),
+            (38.0, 1500, 57),
+        ]);
+    }
+
+    /// A scale and the size that goes with it are one change to the
+    /// client: one event, both new.
+    #[test]
+    fn a_rescale_is_one_event_with_both() {
+        use fresco_protocol::{decode, WindowResizedEvent};
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (1920, 48));
+        assert!(c.set_window_dpi(id, 1.25));
+        drain(&rx);
+        assert!(c.rescale_window(id, 1.5, 1920, 57));
+        let told: Vec<WindowResizedEvent> = rx.try_iter().map(|e| decode(&encode_event(&e).unwrap().1).unwrap()).collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!((told[0].width, told[0].height, told[0].scale_milli, told[0].buffer_height), (1280.0, 38.0, 1500, 57));
+        assert_eq!(c.windows[&id].size, (1920.0, 57.0));
+        assert!(!c.rescale_window(999, 1.5, 1, 1), "no such window");
     }
 
     /// A sheet's size and its gap below the parent's top are points.
