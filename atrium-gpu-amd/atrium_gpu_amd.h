@@ -855,6 +855,7 @@ int	amd_gmc12_gart_map(struct amd_gart *gt, uint64_t gart_addr,
 	    vm_paddr_t pa);
 int	amd_gmc12_flush(struct amd_gart *gt);
 void	amd_gmc12_cold(void);
+void	amd_gmc12_ctx_fault_irq(struct amd_gart *gt, u_int vmid, bool on);
 void	amd_gmc12_fault_report(struct amd_gart *gt, const char *when);
 /* Stage 5b: per-client page tables (gmc12.c). */
 struct amd_vm12 {

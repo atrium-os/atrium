@@ -1115,6 +1115,34 @@ amd_gmc12_vm_bind(struct amd_gart *gt, u_int vmid, struct amd_vm12 *vm)
 	return (amd_gmc12_vm_flush(gt, vmid));
 }
 
+/*
+ * Fault interrupts of context `vmid` on both hubs off (or back on). A
+ * client VM's empty tables make every access anywhere a 4 KiB PTE fault
+ * (tbl_alloc), so a queue sweeping its address space raised ~8 M fault
+ * IVs in a few seconds (24 h run 2963f5db: GCR on VMID 8, 12125 IH
+ * overflows), drowning the EOP and CP error IVs of every other queue.
+ * The first fault already loses the queue (si_uq_faulted), so the rest
+ * tell nothing: they are muted until the queue is removed. The faulting
+ * accesses still go to the default (dummy) page, as with the interrupt on.
+ */
+void
+amd_gmc12_ctx_fault_irq(struct amd_gart *gt, u_int vmid, bool on)
+{
+	struct hub h;
+	int i;
+
+	if (vmid == 0 || vmid >= NUM_CTX)
+		return;
+	mtx_lock(&gmc12_inv_mtx);
+	if (!gmc12_cold && gt->enabled)
+		for (i = 0; i < 2; i++)
+			if (hub_open(gt->sc, i == 1, &h))
+				hrmw(&h, h.g->ctx0_cntl + vmid,
+				    CTX_FAULT_INTERRUPTS,
+				    on ? CTX_FAULT_INTERRUPTS : 0);
+	mtx_unlock(&gmc12_inv_mtx);
+}
+
 /* GFXHUB's context `vmid` registers and the L2 setup, read back. */
 void
 amd_gmc12_ctx_report(struct amd_gart *gt, u_int vmid, const char *when)

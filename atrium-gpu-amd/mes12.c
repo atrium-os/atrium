@@ -2444,6 +2444,7 @@ struct amd_uq {
 				 * and rings its own doorbell page; pg is the
 				 * caller's (rs/uqueue.rs RamPages) */
 	u_int	 fault_vmid;	/* VMID the IH found it on at its fault */
+	u_int	 muted_vmid;	/* its fault IVs muted on this VMID */
 };
 
 static bool
@@ -2601,6 +2602,22 @@ void
 amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid)
 {
 	q->fault_vmid = vmid;
+	if (q->muted_vmid == 0 && vmid >= 8) {
+		amd_gmc12_ctx_fault_irq(q->m->gt, vmid, false);
+		q->muted_vmid = vmid;
+		device_printf(q->m->sc->dev, "uq%u: VMID %u's fault "
+		    "interrupts muted until the queue is removed\n", q->slot,
+		    vmid);
+	}
+}
+
+/* The queue is off its VMID: that VMID's faults count again. */
+static void
+uq2_unmute(struct amd_uq *q)
+{
+	if (q->muted_vmid != 0)
+		amd_gmc12_ctx_fault_irq(q->m->gt, q->muted_vmid, true);
+	q->muted_vmid = 0;
 }
 
 /*
@@ -3244,6 +3261,7 @@ amd_mes12_uq_evict(struct amd_uq *q)
 		amd_mes12_uq_report(q, "HQD stuck after its reset");
 		if (uq2_pipe_reset(q) || uq2_recover(q)) {
 			q->added = false;
+			uq2_unmute(q);
 			return (0);
 		}
 		device_printf(m->sc->dev, "uq%u: HQD will not stop; the GPU "
@@ -3276,6 +3294,7 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			return (EBUSY);
 		}
 		q->added = false;
+		uq2_unmute(q);
 		device_printf(m->sc->dev, "uq%u: removed (seq %u, fence %u)\n",
 		    q->slot, q->seq, amd_mes12_uq_fence(q));
 	}

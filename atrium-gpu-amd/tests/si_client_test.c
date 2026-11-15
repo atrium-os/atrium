@@ -1735,6 +1735,82 @@ hostile_isa(void)
 		    "re-inits %d -> %d", ri0, ri);
 }
 
+/*
+ * 16: a fault storm (24 h run 2963f5db: a fuzzed ACQUIRE_MEM with a GL2
+ * range op over the whole VA space made one queue raise ~8 M fault IVs
+ * and overflow the IH ring 12125 times). One such packet: the queue is
+ * lost, its later faults are muted (amd_gmc12_ctx_fault_irq), the IH
+ * ring does not overflow, and a bystander runs clean.
+ */
+#define GCR_GL2_RANGE_RANGE	(2u << 11)
+#define GCR_GL2_INV		(1u << 14)
+#define GCR_GL2_WB		(1u << 15)
+
+static void
+fault_storm(void)
+{
+	struct job h, by;
+	uint32_t ib[16];
+	int64_t f0, f1, o0, o1;
+	int r, ms, ri0 = -1, ri = -1, n = 0;
+	char what[160];
+
+	job_init(&h);
+	job_init(&by);
+	if (job_open(&by, "16 bystander") != 0 || job_open(&h, "16 storm")
+	    != 0) {
+		check(0, "16 fault storm", "setup: %s", strerror(errno));
+		goto out;
+	}
+	(void)preg_read(NULL, &ri0);
+	ib[n++] = PKT3(0x58, 6);		/* ACQUIRE_MEM */
+	ib[n++] = 0;				/* CP_COHER_CNTL */
+	ib[n++] = 0xffffffffu;			/* CP_COHER_SIZE */
+	ib[n++] = 0x00ffffffu;			/* CP_COHER_SIZE_HI */
+	ib[n++] = 0;				/* CP_COHER_BASE */
+	ib[n++] = 0;				/* CP_COHER_BASE_HI */
+	ib[n++] = 0x0000000a;			/* POLL_INTERVAL */
+	ib[n++] = GCR_GL2_RANGE_RANGE | GCR_GL2_INV | GCR_GL2_WB;
+	if (bo_xfer(h.ib, ib, (size_t)n * 4, 1) != 0) {
+		check(0, "16 fault storm", "IB: %s", strerror(errno));
+		goto out;
+	}
+	f0 = iso("vm_faults");
+	o0 = iso("ih_overflows");
+	r = queue_submit(h.q, h.ib_va, (uint32_t)n, h.so, ++h.value, NULL);
+	if (r != 0) {
+		check(0, "16 fault storm", "submit: %s", strerror(r));
+		goto out;
+	}
+	r = job_wait(&h, 15000, &ms);
+	sleep(2);
+	f1 = iso("vm_faults");
+	o1 = iso("ih_overflows");
+	printf("16: range ACQUIRE_MEM: %s after %d ms; fault IVs +%jd, IH "
+	    "overflows +%jd\n", r == 0 ? "completed" : strerror(r), ms,
+	    (intmax_t)(f1 - f0), (intmax_t)(o1 - o0));
+	if (r == 0 && f1 == f0)
+		printf("KNOWN: 16 fault storm: the packet raised no fault on "
+		    "this GPU; nothing to mute\n");
+	else {
+		check(o1 == o0, "16 fault storm: the IH ring does not "
+		    "overflow", "+%jd overflows, +%jd fault IVs",
+		    (intmax_t)(o1 - o0), (intmax_t)(f1 - f0));
+		check(f1 - f0 < 20000, "16 fault storm: the faults are "
+		    "muted after the first batch", "+%jd fault IVs",
+		    (intmax_t)(f1 - f0));
+	}
+	job_close(&h);
+	snprintf(what, sizeof(what), "16 fault storm: afterwards another VM "
+	    "runs clean");
+	run_clean(&by, what);
+	if (preg_read(NULL, &ri) >= 0)
+		printf("16: re-inits %d -> %d\n", ri0, ri);
+out:
+	job_close(&h);
+	job_close(&by);
+}
+
 static void
 hostile_pm4(void)
 {
@@ -2179,6 +2255,9 @@ main(void)
 
 	/* 15: hostile ISA (F6 G5). Before 14, whose refusals use up re-inits. */
 	hostile_isa();
+
+	/* 16: a fault storm, muted (before 14 too). */
+	fault_storm();
 
 	/* 14: hostile PM4 (silicon only). */
 	hostile_pm4();
