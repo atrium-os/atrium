@@ -588,6 +588,21 @@ amd_gmc12_gart_enable(struct atrium_amd_softc *sc, struct resource *vram,
 	gt->dummy = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	gt->dummy_phys = vtophys(gt->dummy);
+	/*
+	 * Empty client VA reads as zeros (Shankar 2026-11-15, the fault
+	 * storm fix): a separate page the GPU only ever reads. Not the
+	 * dummy page: faulting writes land there (default page), so it
+	 * would carry one VM's data to another.
+	 */
+	gt->zero = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	gt->zero_phys = vtophys(gt->zero);
+	{
+		int zv = 1;
+
+		TUNABLE_INT_FETCH("hw.atrium_gpu.zero_va", &zv);
+		gt->zero_va = zv != 0;
+	}
 
 	/* Empty table, scratch page zeroed. */
 	bus_set_region_4(vram, gt->table_off, 0, GART_TABLE_SIZE / 4);
@@ -635,6 +650,9 @@ amd_gmc12_gart_disable(struct amd_gart *gt)
 	if (gt->dummy != NULL)
 		contigfree(gt->dummy, PAGE_SIZE, M_DEVBUF);
 	gt->dummy = NULL;
+	if (gt->zero != NULL)
+		contigfree(gt->zero, PAGE_SIZE, M_DEVBUF);
+	gt->zero = NULL;
 	gt->enabled = false;
 }
 
@@ -757,6 +775,27 @@ tbl_null(const struct amd_vm12 *vm, u_int t)
 	return (false);
 }
 
+/*
+ * What an empty PTE of `vm` holds. A client VM (4L heap): valid, read-only,
+ * on the zero page. Box runs 2963f5db/5eff3373: with invalid PTEs there,
+ * one ACQUIRE_MEM with a GL2 range op over the whole VA space faulted once
+ * per 4 KiB page, ~1 M fault IVs a second, overflowing the IH ring until a
+ * GPU reset; no per-VMID mute stopped it. Reads of empty VA now return
+ * zeros; writes and instruction fetches still fault (no W, no X). Other
+ * VMs (kernel, tests): the invalid pattern (EXECUTABLE | IS_PTE, the GMC9
+ * fault-priority workaround), as before.
+ */
+static uint64_t
+empty_pte(const struct amd_vm12 *vm)
+{
+	if (vm->mode == AMD_VM12_FLAT)
+		return (0);
+	if (vm_heap(vm) && vm->gt->zero_va && vm->gt->zero != NULL)
+		return ((uint64_t)vm->gt->zero_phys | PTE_VALID | PTE_SYSTEM |
+		    PTE_SNOOPED | PTE_READABLE | PTE_IS_PTE);
+	return (PTE_EXECUTABLE | PTE_IS_PTE);
+}
+
 /* A new table at level `lvl` (0 the root .. VM_LEVELS - 1 a PTB). */
 static int
 tbl_alloc(struct amd_vm12 *vm, u_int lvl, u_int *t)
@@ -801,7 +840,7 @@ tbl_alloc(struct amd_vm12 *vm, u_int lvl, u_int *t)
 	 * PTB (vm->nullt): every fault, anywhere in the 48-bit range, is a
 	 * 4 KiB PTE fault.
 	 */
-	fill = ptb ? PTE_EXECUTABLE | PTE_IS_PTE : vm->nullt[lvl + 1] != 0 ?
+	fill = ptb ? empty_pte(vm) : vm->nullt[lvl + 1] != 0 ?
 	    tbl_pde(vm, vm->nullt[lvl + 1]) : PTE_IS_PTE;
 	for (i = 0; i < PAGE_SIZE / 8; i++)
 		tbl_wr(vm, *t, i, fill);
@@ -1012,8 +1051,7 @@ amd_gmc12_vm_unmap(struct amd_vm12 *vm, uint64_t va)
 		sx_xlock(&vm->tlock);
 	err = vm_walk(vm, va, false, &t, &i);
 	if (err == 0)
-		tbl_wr(vm, t, i, vm->mode == AMD_VM12_FLAT ? 0 :
-		    PTE_EXECUTABLE | PTE_IS_PTE);
+		tbl_wr(vm, t, i, empty_pte(vm));
 	if (vm_heap(vm))
 		sx_xunlock(&vm->tlock);
 	return (err);

@@ -845,6 +845,9 @@ struct amd_gart {
 	bus_size_t table_off;		/* in BAR0 */
 	void	*dummy;
 	vm_paddr_t dummy_phys;
+	void	*zero;		/* read-only zero page behind empty client VA */
+	vm_paddr_t zero_phys;
+	bool	zero_va;	/* hw.atrium_gpu.zero_va (default 1) */
 	bool	enabled;
 	u_int	vm_slices;		/* VRAM page-table pool slices in use */
 };

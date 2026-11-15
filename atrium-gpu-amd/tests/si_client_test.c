@@ -73,8 +73,9 @@
  *                re-inits (cap 3 per 10 min).
  *  17 dummy page one VM's shader stores a pattern to an unmapped VA; a
  *                fresh VM's shader then loads from an unmapped VA. Faulting
- *                accesses go to the hub's one fault default page, so the
- *                reader must not see the writer's pattern.
+ *                writes go to the hub's one fault default page; the reader
+ *                must not see the writer's pattern. With zero_va (default)
+ *                empty VA reads as zeros without a fault.
  *
  * Prints one PASS/FAIL line per check and a summary; exit 0 only if all
  * passed.
@@ -1839,6 +1840,7 @@ out:
  */
 #define DUMMY_VA	0xf00000000ull		/* unmapped in every VM */
 #define DUMMY_PAT	0x5ec2e700u
+static int dummy_zeros;			/* of the last dummy_read */
 
 static int
 dummy_job(struct job *j, const char *name, const uint32_t *code,
@@ -1880,8 +1882,10 @@ dummy_read(const char *name, uint32_t *first, int *rr)
 	if (bo_xfer(r.out, out, sizeof(out), 0) != 0)
 		goto out;
 	*first = out[0];
-	for (i = 0, n = 0; i < SIOPS_N; i++)
+	for (i = 0, n = 0, dummy_zeros = 0; i < SIOPS_N; i++) {
 		n += (out[i] & 0xffffff00u) == DUMMY_PAT;
+		dummy_zeros += out[i] == 0;
+	}
 out:
 	if (cbo >= 0)
 		close(cbo);
@@ -1921,6 +1925,16 @@ dummy_page(void)
 		check(n1 == 0, "17 dummy page: no VM reads another VM's "
 		    "faulting writes", "%d/64 words carried the writer's "
 		    "pattern (out[0] %#x)", n1, first);
+	/* hw.atrium_gpu.zero_va (default on): empty client VA is a read-only
+	 * zero page, so the load completes with zeros and never touches the
+	 * fault default page. Off: the load faults (5e11d762: the wave never
+	 * got past it, so the out page kept its poison). */
+	if (rr == 0)
+		check(dummy_zeros == SIOPS_N, "17 dummy page: unmapped VA "
+		    "reads as zeros", "%d/64 words 0", dummy_zeros);
+	else
+		printf("KNOWN: 17 dummy page: the load from unmapped VA "
+		    "faulted (%s): zero_va off?\n", strerror(rr));
 	if (job_open(&by, "17 bystander") == 0)
 		run_clean(&by, "17 dummy page: afterwards another VM runs "
 		    "clean");
