@@ -823,7 +823,11 @@ Choices are remembered per site and per persona, in the trail store, never sent 
 
 **Find** (Ctrl-F) is a bar under the toolbar (Pergola's find UI, pergola.md §10.4): matches
 come from the page's worker over its role channel as counts and the current match's rect,
-never as text. The anchors list from `Loaded` gives "Jump to section".
+never as text. The anchors list from `Loaded` gives "Jump to section": the child also
+reports the page's h1–h3 headings that carry an anchor (the heading's id or the first id in
+it), at most 64, titles at most 128 characters, each anchor one it listed. A Sections button
+in the find bar opens them as a list, narrowed to headings with the find text when any have
+it; a press scrolls the page to that anchor (`ScrollTo`).
 
 ---
 
@@ -1347,4 +1351,8 @@ Each step runs in the VM on headless frescod before the next.
      taken from the outbox was sent again every tick until then (Enter stepped three matches).
    - The find mark on bold text: checked 2026-11-15 and covers the word (the last glyph's
      width from the font fixed it; `a_bold_match_ends_where_the_next_text_starts`, and the
-     live script's find frame). Not yet: "Jump to section" from the anchors list.
+     live script's find frame). "Jump to section" built 2026-11-15: the page child sends
+     its headings with anchors in `Loaded { sections }` (limen doc_viewer, checked on
+     decode), a Sections button in the find bar lists them and a press scrolls to one (unit
+     tests `sections_are_headings_with_anchors`, `jump_to_section_lists_the_pages_headings`;
+     live script: the Atrium fixture's "The peristyle").

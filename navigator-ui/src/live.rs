@@ -71,6 +71,8 @@ struct Child {
     knows: bool,
     /// The reading choices the child was last told (§9.1).
     reading: Reading,
+    /// Its page's sections, from `Loaded` (§7 "Jump to section").
+    sections: Vec<(String, String)>,
 }
 
 pub struct Live {
@@ -264,6 +266,7 @@ impl Live {
             parking: None,
             knows,
             reading,
+            sections: Vec::new(),
         });
         s.live = Some(LivePage::Loading(url.clone()));
         let fresh = self.fresh.remove(&key);
@@ -471,8 +474,9 @@ impl Live {
                         changed = true;
                     }
                     Some(ToParent::LinkActivated { .. } | ToParent::LinkHover { .. }) => {}
-                    Some(ToParent::Loaded { title, .. }) => {
+                    Some(ToParent::Loaded { title, sections, .. }) => {
                         let c = &mut self.children[i];
+                        c.sections = sections;
                         eprintln!("navigator-ui: the page child laid out \"{title}\"");
                         if let Some((t, from)) = c.since.take() {
                             let how = match from {
@@ -614,7 +618,19 @@ impl Live {
                         self.to_child(c.embed, &ToChild::Find { query, step });
                     }
                 }
+                Out::Jump { anchor } => {
+                    if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
+                        eprintln!("navigator-ui: jump to section #{anchor}");
+                        self.to_child(c.embed, &ToChild::ScrollTo { anchor });
+                    }
+                }
             }
+        }
+        // The page shown's sections, for the find bar.
+        let secs = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k)).map(|c| c.sections.clone()).unwrap_or_default();
+        if s.sections != secs {
+            s.set_sections(secs);
+            changed = true;
         }
         // Unrecorded trails that closed: their jars are forgotten.
         let jars: HashSet<u64> = s.store.trails.iter().filter(|t| t.unrecorded).map(|t| t.jar).collect();

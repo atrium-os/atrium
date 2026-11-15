@@ -101,6 +101,8 @@ mod id {
     pub const HISTORY_CLEAR_ALL: u64 = 25;
     pub const HISTORY_CONFIRM: u64 = 26;
     pub const PRESENCE_MENU: u64 = 27;
+    pub const SECTIONS: u64 = 28;
+    pub const SECTIONS_MENU: u64 = 29;
     pub const HISTORY_CLEAR_SITE: u64 = 5 << 40;
     pub const TRAIL: u64 = 1 << 40;
     pub const PAGE_ROW: u64 = 2 << 40;
@@ -210,8 +212,15 @@ pub fn tree(s: &Shell) -> Node {
             Node::new(id::FIND_FIELD, "text-input", "Find in page").value(f.edit.text()).with(if s.editing.is_none() && s.history.is_none() { state::FOCUSED } else { 0 }),
             Node::new(id::FIND_COUNT, "text", "Matches").value(count),
         ]);
+        if g.sections_button.is_some() {
+            n.children.push(Node::new(id::SECTIONS, "button", "Jump to section").with(if s.sections_open { state::EXPANDED } else { 0 }));
+        }
         n.live = Some("polite");
         top.push(n);
+    }
+    if g.sections_menu.is_some() {
+        let kids = s.sections_shown().into_iter().enumerate().map(|(i, (_, t))| Node::new(id::SECTIONS_MENU | (i as u64 + 1) << 8, "menu-item", t)).collect();
+        top.push(Node::new(id::SECTIONS_MENU, "menu", "Sections").kids(kids));
     }
 
     // The prompt row, announced when it appears.

@@ -96,7 +96,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -123,6 +123,9 @@ pub fn trace(s: &mut Shell) {
             s.geo().page.x(),
             s.geo().page.y(),
             s.w,
+            // Where to press for Sections, and for its first row.
+            s.geo().sections_button.map_or("-".to_string(), |b| format!("{},{}", (b.x() + b.w() / 2.0) as i32, (b.y() + b.h() / 2.0) as i32)),
+            s.geo().sections_menu.map_or("-".to_string(), |m| format!("{},{}", (m.x() + m.w() / 2.0) as i32, (m.y() + em(8.0) + em(shell::SECTION_ROW) / 2.0) as i32)),
         );
     }
 }
@@ -291,7 +294,7 @@ impl View for ShellView {
             }
         }
         if let (Some(r), Some(f)) = (g.find, &s.find) {
-            find_bar(ctx, r, f, &self.state);
+            find_bar(ctx, r, f, g.sections_button, s.sections_open, &self.state);
         }
         if g.rail > em(shell::RAIL_NARROW) {
             rail(ctx, &s, &g, &self.state);
@@ -314,6 +317,11 @@ impl View for ShellView {
             let knows = s.store.knows(&site);
             let accounts = s.accounts.as_ref().filter(|(a, _)| *a == site).map(|(_, a)| a.clone());
             floating(ctx, r, g.presence, move || with(&st, |s| s.presence_open = false), move |ctx| presence_menu(ctx, r, &site, knows, accounts, &st2));
+        }
+        if let Some(r) = g.sections_menu {
+            let (st, st2) = (self.state.clone(), self.state.clone());
+            let rows = s.sections_shown();
+            floating(ctx, r, g.sections_button.unwrap_or(r), move || with(&st, |s| s.sections_open = false), move |ctx| sections_menu(ctx, r, rows.clone(), &st2));
         }
         if let (Some(r), Some(p)) = (g.reading, &page) {
             let (st, st2) = (self.state.clone(), self.state.clone());
@@ -1051,7 +1059,7 @@ fn reading_controls(ctx: &mut Ctx, r: Rect, p: trail::ReadingPrefs, site: &str, 
 
 /// The find bar (§7), under the toolbar: the field, "n of m" as the page
 /// worker counts them, previous and next, close.
-fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, st: &Mutable<Shell>) {
+fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, sections_button: Option<Rect>, sections_open: bool, st: &Mutable<Shell>) {
     let t = ctx.theme;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_surface(), 0.0);
     rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
@@ -1077,6 +1085,25 @@ fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, st: &Mutable<Shell>) {
     icon_button(ctx, x + em(96.0), r.y() + em(6.0), ph::CARET_UP, has, t.text_secondary(), "Previous match (Shift-Enter)", move || with(&a, |s| { s.find_key(pergola::Key::Enter, enter(true), ""); }));
     icon_button(ctx, x + em(126.0), r.y() + em(6.0), ph::CARET_DOWN, has, t.text_secondary(), "Next match (Enter)", move || with(&b, |s| { s.find_key(pergola::Key::Enter, enter(false), ""); }));
     icon_button(ctx, r.x() + r.w() - em(40.0), r.y() + em(6.0), ph::X, true, t.text_secondary(), "Close (Esc)", move || with(&c2, |s| s.close_find()));
+    if let Some(b) = sections_button {
+        let st2 = st.clone();
+        small_button(ctx, b, None, "Sections", sections_open, "Jump to section", move || with(&st2, |s| s.toggle_sections()));
+    }
+}
+
+/// "Jump to section" (§7): the page's headings; a press scrolls to one.
+fn sections_menu(ctx: &mut Ctx, r: Rect, rows: Vec<(String, String)>, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
+    let st_row = sans(type_size::SM, Weight::Regular, t.text_primary());
+    let mut y = r.y() + em(8.0);
+    for (anchor, title) in rows {
+        let s2 = st.clone();
+        area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(shell::SECTION_ROW)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&s2, |s| s.jump_to(&anchor)));
+        text(ctx, r.x() + em(16.0), y + em(shell::SECTION_ROW) / 2.0, &fit(&title, &st_row, r.w() - em(32.0)), type_size::SM, Weight::Regular, t.text_primary());
+        ctx.pop();
+        y += em(shell::SECTION_ROW);
+    }
 }
 
 // -- the history view (§5.5) ---------------------------------------------------------

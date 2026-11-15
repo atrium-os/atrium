@@ -292,6 +292,19 @@ N=$(g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | sed -n 's/.*find: \([0
 key 0x28                    # Enter: the next match
 g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q ', at 2' && ok "Enter went to the next match" || bad "next: $(g "grep 'find:' $S/ui9.log | tail -2")"
 shot live-10-find
+# Jump to section (§7): the page's headings with anchors, from the find bar.
+SB=$(last | sed -n 's/.* sections=\([0-9]*\),\([0-9]*\) .*/\1 \2/p')
+if [ -n "$SB" ]; then
+    ok "the find bar offered the page's sections"
+    press ${SB% *} $((TOP + ${SB#* }))
+    SR=$(last | sed -n 's/.* section=\([0-9]*\),\([0-9]*\).*/\1 \2/p')
+    g "grep -q 'ax  *menu \"Sections\"' $S/ui9.log" && ok "…Sections opened a list of them" || bad "sections list: $(g "grep 'ax' $S/ui9.log | tail -5")"
+    if [ -n "$SR" ]; then
+        press ${SR% *} $((TOP + ${SR#* }))
+        sleep 3
+        g "grep -q 'jump to section #garden' $S/ui9.log" && ok "…and a press on one scrolled the page to it" || bad "jump: $(g "grep -v trace $S/ui9.log | tail -3")"
+    else bad "sections list: no row in $(last)"; fi
+else bad "no sections button: $(last)"; fi
 key 0x29                    # Esc
 g "grep 'navigator-ui: find:' $S/ui9.log | tail -1" | grep -q 'find: 0 matches' && ok "Esc closed find and cleared the mark" || bad "esc: $(g "grep 'find:' $S/ui9.log | tail -2")"
 # F6 (§9): rail, toolbar, page, and from the page (handed back) the rail.

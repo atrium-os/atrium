@@ -21,6 +21,10 @@ pub const TITLE_MAX: usize = 256;
 /// Most anchors in `Loaded`, and the longest one.
 pub const ANCHORS_MAX: usize = 256;
 pub const ANCHOR_MAX: usize = 256;
+/// Most sections in `Loaded` (the document's headings that can be jumped
+/// to), and the longest heading text.
+pub const SECTIONS_MAX: usize = 64;
+pub const SECTION_TITLE_MAX: usize = 128;
 /// Longest URL either way (a link's target, a document's base).
 pub const URL_MAX: usize = 16 * 1024;
 /// The largest document a child reads from a `Load` descriptor.
@@ -98,7 +102,9 @@ pub const FOUND_MAX: u32 = 1000;
 /// Child to parent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToParent {
-    Loaded { title: String, anchors: Vec<String> },
+    /// `sections`: (anchor, heading text) of the headings a reader can
+    /// jump to, in document order; each anchor is one of `anchors`.
+    Loaded { title: String, anchors: Vec<String>, sections: Vec<(String, String)> },
     /// Only after a press in the child: the link's href as the document
     /// spells it, unresolved, so the parent (navigatord, for the
     /// Navigator) can check the document carries it and decide what it
@@ -187,8 +193,10 @@ impl ToParent {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
         let ok = match &m {
-            ToParent::Loaded { title, anchors } => {
+            ToParent::Loaded { title, anchors, sections } => {
                 clean_text(title, TITLE_MAX) && anchors.len() <= ANCHORS_MAX && anchors.iter().all(|a| clean_text(a, ANCHOR_MAX))
+                    && sections.len() <= SECTIONS_MAX
+                    && sections.iter().all(|(a, t)| anchors.contains(a) && !t.is_empty() && clean_text(t, SECTION_TITLE_MAX))
             }
             ToParent::LinkActivated { url } => !url.is_empty() && clean_text(url, URL_MAX),
             ToParent::LinkHover { url } => url.as_ref().is_none_or(|u| clean_text(u, URL_MAX)),
@@ -244,7 +252,7 @@ mod tests {
             assert_eq!(ToChild::decode(&m.encode()), Some(m));
         }
         for m in [
-            ToParent::Loaded { title: "Atrium".into(), anchors: vec!["plan".into()] },
+            ToParent::Loaded { title: "Atrium".into(), anchors: vec!["plan".into()], sections: vec![("plan".into(), "The plan".into())] },
             ToParent::LinkActivated { url: "https://atlas.example/wiki/B".into() },
             ToParent::LinkHover { url: None },
             ToParent::Error { code: error::UNREADABLE },
@@ -257,7 +265,8 @@ mod tests {
         ] {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
         }
-        assert_eq!(ToParent::decode(&ToParent::Loaded { title: "x".repeat(TITLE_MAX + 1), anchors: vec![] }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Loaded { title: "x".repeat(TITLE_MAX + 1), anchors: vec![], sections: vec![] }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Loaded { title: "x".into(), anchors: vec![], sections: vec![("plan".into(), "Plan".into())] }.encode()), None, "a section names an anchor");
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: String::new() }.encode()), None);
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: "a\nb".into() }.encode()), None);
         assert_eq!(ToParent::decode(&[0xff, 0x00]), None);

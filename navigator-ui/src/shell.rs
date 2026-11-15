@@ -114,6 +114,10 @@ pub struct Shell {
     pub prompt_at: Option<Rect>,
     /// Ctrl-F (§7).
     pub find: Option<FindBar>,
+    /// The shown page's sections (anchor, heading), from its `Loaded`
+    /// (§7 "Jump to section"), and whether their list is open.
+    pub sections: Vec<(String, String)>,
+    pub sections_open: bool,
     /// The Aa pop-up is open (§7).
     pub reading_open: bool,
     /// Ctrl-H (§5.5): drawn where the page is, the page's slot withdrawn.
@@ -172,6 +176,8 @@ pub enum Out {
     /// "Sign out here" (§6.2): the session cookies of the page's site in
     /// its jar end (then the page opens again, `Reload`).
     SignOut { jar: navigator_control::Jar, url: String },
+    /// "Jump to section" (§7): the page shown scrolls to `anchor`.
+    Jump { anchor: String },
     /// A branch made its own trail (§4.2): the moved pages' keys, old to
     /// new, so their live children follow them.
     Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
@@ -195,6 +201,10 @@ pub enum Accounts {
 /// The presence menu's size (§6.2): a heading, the account lines, and
 /// its one or two actions.
 pub const PRESENCE_W: f32 = 300.0;
+/// The "Jump to section" list: its width, a row, the most rows shown.
+pub const SECTIONS_W: f32 = 320.0;
+pub const SECTION_ROW: f32 = 30.0;
+pub const SECTIONS_SHOWN: usize = 12;
 pub fn presence_height(s: &Shell) -> f32 {
     let knows = s.store.trail().page().is_some_and(|p| s.store.knows(crate::trail::site(&p.url)));
     if !knows {
@@ -241,13 +251,16 @@ pub struct Geo {
     /// The presence control, and its menu while open (§6.2).
     pub presence: Rect,
     pub presence_menu: Option<Rect>,
+    /// The "Jump to section" list under the find bar, and its button.
+    pub sections_menu: Option<Rect>,
+    pub sections_button: Option<Rect>,
     /// Space on the toolbar for the current page's media glyph.
     pub media: bool,
 }
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -411,7 +424,12 @@ impl Shell {
         let presence = Rect::new(where_.x() + where_.w() + em(12.0) + if media { em(32.0) } else { 0.0 }, em(6.0), em(112.0), em(28.0));
         let presence_menu = (self.presence_open && self.store.trail().page().is_some())
             .then(|| Rect::new((presence.x() + presence.w() - em(PRESENCE_W)).max(x0 + 8.0), bar() + 4.0, em(PRESENCE_W), presence_height(self)));
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu }
+        let sections_button = find.filter(|_| !self.sections.is_empty()).map(|f| Rect::new(f.x() + f.w() - em(140.0), f.y() + em(6.0), em(92.0), em(28.0)));
+        let sections_menu = sections_button.filter(|_| self.sections_open).map(|b| {
+            let n = self.sections_shown().len().max(1) as f32;
+            Rect::new((b.x() + b.w() - em(SECTIONS_W)).max(x0 + 8.0), b.y() + b.h() + 4.0, em(SECTIONS_W), em(16.0) + n * em(SECTION_ROW))
+        });
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, sections_menu, sections_button }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -557,7 +575,7 @@ impl Shell {
         let g = self.geo();
         let Some(r) = g.prompt else { return false };
         let over = |o: Option<Rect>| o.is_some_and(|o| o.x() < r.x() + r.w() && r.x() < o.x() + o.w() && o.y() < r.y() + r.h() && r.y() < o.y() + o.h());
-        over(g.drop) || over(g.popover) || over(g.reading) || over(g.presence_menu)
+        over(g.drop) || over(g.popover) || over(g.reading) || over(g.presence_menu) || over(g.sections_menu)
     }
 
     /// Called every frame: a prompt row that moved, or is covered, starts
@@ -910,10 +928,11 @@ impl Shell {
     /// Escape closes what is on top: a pop-up, then the Where field, then
     /// the history view, then find. Returns whether it closed anything.
     pub fn escape(&mut self) -> bool {
-        if self.popover || self.reading_open || self.presence_open {
+        if self.popover || self.reading_open || self.presence_open || self.sections_open {
             self.popover = false;
             self.reading_open = false;
             self.presence_open = false;
+            self.sections_open = false;
         } else if self.rail_focus {
             self.rail_focus = false;
         } else if self.editing.is_some() {
@@ -955,8 +974,42 @@ impl Shell {
         }
     }
 
+    /// The sections the list shows: those whose heading has the find
+    /// bar's text (all of them when none does, or it is empty), at most
+    /// [`SECTIONS_SHOWN`].
+    pub fn sections_shown(&self) -> Vec<(String, String)> {
+        let q = self.find.as_ref().map(|f| f.edit.text().to_lowercase()).unwrap_or_default();
+        let hit: Vec<_> = self.sections.iter().filter(|(_, t)| !q.is_empty() && t.to_lowercase().contains(&q)).cloned().collect();
+        let v = if hit.is_empty() { self.sections.clone() } else { hit };
+        v.into_iter().take(SECTIONS_SHOWN).collect()
+    }
+
+    /// The find bar's "Sections" button.
+    pub fn toggle_sections(&mut self) {
+        self.sections_open = !self.sections_open && !self.sections.is_empty();
+    }
+
+    /// A section chosen (§7): the page scrolls to it, the list closes.
+    pub fn jump_to(&mut self, anchor: &str) {
+        self.sections_open = false;
+        if self.sections.iter().any(|(a, _)| a == anchor) {
+            self.outbox.push(Out::Jump { anchor: anchor.to_string() });
+        }
+    }
+
+    /// The page shown laid out with these sections.
+    pub fn set_sections(&mut self, v: Vec<(String, String)>) {
+        if self.sections != v {
+            self.sections = v;
+            if self.sections.is_empty() {
+                self.sections_open = false;
+            }
+        }
+    }
+
     /// Esc on the find bar: closed, and the page's mark cleared.
     pub fn close_find(&mut self) {
+        self.sections_open = false;
         if self.find.take().is_some() {
             self.outbox.push(Out::Find { query: String::new(), step: 0 });
         }
@@ -1127,6 +1180,9 @@ impl Shell {
         if self.presence_open && !inside(g.presence_menu) && !inside(Some(g.presence)) {
             self.presence_open = false;
         }
+        if self.sections_open && !inside(g.sections_menu) && !inside(g.sections_button) {
+            self.sections_open = false;
+        }
     }
 }
 
@@ -1261,6 +1317,36 @@ mod tests {
         let (t, _) = s.shown_key().unwrap();
         let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
         assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
+    }
+
+    #[test]
+    fn jump_to_section_lists_the_pages_headings() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(false);
+        s.enter("https://atlas.example/wiki/Atrium");
+        s.open_find();
+        assert!(s.geo().sections_button.is_none(), "no sections, no button");
+        s.set_sections(vec![("top".into(), "Atrium".into()), ("Plan".into(), "The plan".into()), ("Rain".into(), "Rain and the impluvium".into())]);
+        assert!(s.geo().sections_button.is_some());
+        s.toggle_sections();
+        assert!(s.sections_open && s.geo().sections_menu.is_some());
+        assert_eq!(s.sections_shown().len(), 3);
+        // The find bar's text narrows it, unless nothing matches.
+        s.find.as_mut().unwrap().edit.set_text("impluv");
+        assert_eq!(s.sections_shown(), vec![("Rain".to_string(), "Rain and the impluvium".to_string())]);
+        s.find.as_mut().unwrap().edit.set_text("zebra");
+        assert_eq!(s.sections_shown().len(), 3);
+        s.outbox.clear();
+        s.jump_to("nowhere");
+        assert!(s.outbox.is_empty() && !s.sections_open, "only the page's own anchors");
+        s.toggle_sections();
+        s.jump_to("Plan");
+        assert_eq!(s.outbox, vec![Out::Jump { anchor: "Plan".into() }]);
+        assert!(!s.sections_open);
+        // Escape closes the list before the find bar.
+        s.toggle_sections();
+        assert!(s.escape() && !s.sections_open && s.find.is_some());
     }
 
     #[test]

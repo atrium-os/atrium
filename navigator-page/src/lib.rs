@@ -22,6 +22,9 @@ pub struct Prepared {
     /// The `id`s the page's fragments can name (for `ScrollTo`), at most
     /// `ANCHORS_MAX`.
     pub anchors: Vec<String>,
+    /// The headings a reader can jump to (navigator-ui.md §7 "Jump to
+    /// section"): (anchor, heading text), at most `SECTIONS_MAX`.
+    pub sections: Vec<(String, String)>,
 }
 
 /// Read all of `r`, refusing more than `DOC_MAX` bytes.
@@ -103,7 +106,9 @@ pub fn prepare(kind: DocKind, bytes: &[u8]) -> Result<Prepared, u16> {
         DocKind::Picture => return Err(error::UNREADABLE),
     };
     let html = navigator_normalize::normalize_and_measure(&doc, &inputs, fonts, &env).0;
-    Ok(Prepared { title: title(&doc), anchors: anchors(&doc), html, subs })
+    let anchors = anchors(&doc);
+    let sections = sections(&doc, &anchors);
+    Ok(Prepared { title: title(&doc), anchors, sections, html, subs })
 }
 
 /// The first `<title>`'s text, whitespace folded, the common entities
@@ -118,6 +123,50 @@ pub fn title(doc: &str) -> String {
         .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
     let t: String = t.chars().filter(|c| !c.is_control()).collect();
     limen::doc_viewer::cut(&t, TITLE_MAX)
+}
+
+/// The document's `h1`–`h3` headings that carry an anchor (an `id` on the
+/// heading, or the first one inside it, as wikis put it), with their text:
+/// "Jump to section". Only anchors in `anchors` are named, so each can be
+/// scrolled to.
+pub fn sections(doc: &str, anchors: &[String]) -> Vec<(String, String)> {
+    use limen::doc_viewer::{SECTIONS_MAX, SECTION_TITLE_MAX};
+    let lower = doc.to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut at = 0;
+    while out.len() < SECTIONS_MAX {
+        let Some(i) = lower[at..].find("<h").map(|i| at + i) else { break };
+        at = i + 2;
+        let level = lower.as_bytes().get(i + 2).copied();
+        if !matches!(level, Some(b'1'..=b'3')) || !matches!(lower.as_bytes().get(i + 3), Some(b' ' | b'>')) {
+            continue;
+        }
+        let Some(open_end) = lower[i..].find('>').map(|k| i + k + 1) else { break };
+        let close_tag = format!("</h{}", level.unwrap() as char);
+        let Some(close) = lower[open_end..].find(&close_tag).map(|k| open_end + k) else { break };
+        let id_in = |s: &str| s.find(" id=\"").and_then(|k| s[k + 5..].find('"').map(|e| s[k + 5..k + 5 + e].to_string()));
+        let anchor = id_in(&doc[i..open_end]).or_else(|| id_in(&doc[open_end..close]));
+        at = close;
+        let Some(anchor) = anchor.filter(|a| anchors.contains(a)) else { continue };
+        // The heading's text: its tags left out, the common entities read.
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in doc[open_end..close].chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => { in_tag = false; text.push(' ') }
+                c if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        let t = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ").replace("&amp;", "&");
+        let t: String = t.split_whitespace().collect::<Vec<_>>().join(" ").chars().filter(|c| !c.is_control()).collect();
+        let t = limen::doc_viewer::cut(&t, SECTION_TITLE_MAX);
+        if !t.is_empty() && !out.iter().any(|(a, _)| *a == anchor) {
+            out.push((anchor, t));
+        }
+    }
+    out
 }
 
 /// The document's `id="…"` values, in order, unique, bounded as the
@@ -201,6 +250,18 @@ mod tests {
     }
 
     #[test]
+    fn sections_are_headings_with_anchors() {
+        let doc = r#"<body><h1 id="top">Atrium <small>(architecture)</small></h1><h2><span id="Plan">The plan &amp; court</span></h2>
+            <h2>No anchor</h2><h3 id="x">Rain</h3><h4 id="deep">Too deep</h4><header id="hd">Not a heading</header><h2 id="gone">Unlisted</h2></body>"#;
+        let anchors: Vec<String> = ["top", "Plan", "x", "deep", "hd"].map(String::from).to_vec();
+        assert_eq!(sections(doc, &anchors), vec![
+            ("top".into(), "Atrium (architecture)".into()),
+            ("Plan".into(), "The plan & court".into()),
+            ("x".into(), "Rain".into()),
+        ]);
+    }
+
+    #[test]
     fn a_recording_is_prepared_with_its_title_and_anchors() {
         let rec = br##"{"format":"atrium-navigator-recording/3","url":"https://a.test/","tier":2,"tier_reason":"","measurements":{},
           "transitions":[],"stylesheets":[{"href":"/s.css","media":"","text":"h1 { color: #224466 }"}],"images":[],
@@ -208,6 +269,7 @@ mod tests {
         let p = prepare(DocKind::Recording, rec).unwrap();
         assert_eq!(p.title, "Atrium & its court");
         assert_eq!(p.anchors, vec!["top", "plan"]);
+        assert_eq!(p.sections, vec![("top".to_string(), "Atrium".to_string())]);
         assert!(p.html.contains("Impluvium"), "{}", p.html);
         assert_eq!(prepare(DocKind::Recording, b"{\"format\":\"nope\"}").err(), Some(error::UNREADABLE));
         assert_eq!(prepare(DocKind::Recording, &[0xff, 0xfe]).err(), Some(error::UNREADABLE));

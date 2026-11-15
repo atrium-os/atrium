@@ -252,7 +252,7 @@ impl Run {
                 Ok(px) => {
                     eprintln!("navigator-page: picture {}x{} in {:.0} ms", px.width, px.height, t.elapsed().as_secs_f64() * 1e3);
                     self.view.picture.set(Some((pergola::node::Image::new(px.width, px.height, px.rgba), reading.dark)));
-                    out.send(ToParent::Loaded { title: String::new(), anchors: Vec::new() });
+                    out.send(ToParent::Loaded { title: String::new(), anchors: Vec::new(), sections: Vec::new() });
                 }
                 Err(code) => out.send(ToParent::Error { code }),
             };
@@ -279,7 +279,7 @@ impl Run {
                 }
                 self.view.page.set(Some(Rc::new(p)));
                 eprintln!("navigator-page: laid out in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
-                out.send(ToParent::Loaded { title: prepared.title.clone(), anchors: prepared.anchors.clone() });
+                out.send(ToParent::Loaded { title: prepared.title.clone(), anchors: prepared.anchors.clone(), sections: prepared.sections.clone() });
             }
             Err(e) => {
                 eprintln!("navigator-page: layout: {e}");
