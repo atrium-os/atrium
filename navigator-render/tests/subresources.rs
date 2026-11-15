@@ -33,7 +33,13 @@ fn an_image_paints_only_when_the_recording_names_its_bytes() {
     // no layout shift — but there is nothing to paint, and that is counted.
     let bare = render_html(DOC, &fonts, &env);
     assert!(bare.diagnostics.is_empty(), "a declared size is enough to lay out: {:?}", bare.diagnostics);
-    assert!(bare.scene.images.is_empty(), "nothing to paint without an address");
+    // Its box is still in the scene, with no address: a painter holds the
+    // place with a placeholder (resolution-independence.md §6.4).
+    assert_eq!(bare.scene.images.len(), 1, "the declared box is in the scene");
+    assert_eq!(bare.scene.images[0].address, "", "with no address: nothing to fetch or paint");
+    let a = &bare.scene.images[0].area;
+    assert_eq!((a.w, a.h), (40 * 64, 20 * 64), "at its declared size");
+    assert!(!navigator_render::nsg::write(&bare.scene, &fonts).contains("\nimage "), "NSG names no image without bytes");
     assert!(bare.unimplemented.keys().any(|k| k.starts_with("image bytes not supplied")));
 
     // With the recording: the node carries the address the bytes live under.

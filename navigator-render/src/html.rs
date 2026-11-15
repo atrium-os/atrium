@@ -1746,8 +1746,13 @@ impl<'a> Cx<'a> {
         if let Some(im) = bg_url {
             if !hidden && im.area.w > 0 && im.area.h > 0 { self.scene.insert_image(slot, im); slot += 1 }
         }
-        // The replaced content itself, fitted into the content box.
-        if let Some((addr, nat)) = repl.filter(|(a, ..)| !a.is_empty()) {
+        // The replaced content itself, fitted into the content box. ★ A
+        // declared image whose bytes are not in hand (an empty address: a
+        // first display, or a fetch that failed) is still a scene image, so
+        // whoever paints the scene can hold its place with a placeholder
+        // (resolution-independence.md §6.4); NSG and the rasterizer paint
+        // nothing for it.
+        if let Some((addr, nat)) = repl {
             let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
             // `object-fit` needs a natural size; an image without one (or
             // without a ratio) simply fills its box.
@@ -1758,7 +1763,9 @@ impl<'a> Cx<'a> {
             };
             let fit = match kw(s, "object-fit") { "contain" => "contain", "cover" => "cover", "none" => "none", "scale-down" => "scale-down", _ => "fill" };
             let (tx, ty, tw, th) = Self::object_tile(fit, content, (iw, ih));
-            if !hidden && content.2 > 0 && content.3 > 0 {
+            // A pixel (at most 1 px either way) with no bytes holds no box.
+            let shown = if addr.is_empty() { content.2 > 64 && content.3 > 64 } else { content.2 > 0 && content.3 > 0 };
+            if !hidden && shown {
                 // ★ An inline SVG as VECTOR SHAPES where all of it can be
                 // (navigator-svg `vector`, Fresco's fill op, its limits at
                 // this painted scale); otherwise its blob's bitmap, as below.

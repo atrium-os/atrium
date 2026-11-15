@@ -114,6 +114,8 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 attrs(&mut o, scene.run_attrs.get(i));
                 o.push('\n');
             }
+            // An image with no bytes (a placeholder) has nothing to name.
+            5 if scene.images[i].address.is_empty() => {}
             5 => {
                 let im = &scene.images[i];
                 let a = &im.area;

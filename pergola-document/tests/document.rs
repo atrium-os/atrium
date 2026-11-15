@@ -155,3 +155,20 @@ fn an_image_not_here_yet_holds_its_place() {
     let held = count(&first, |n| matches!(n, Node::Rect { rect, fill, .. } if (rect.w(), rect.h()) == (120.0, 80.0) && fill.a > 0.0 && fill.a < 0.3));
     assert_eq!(held, 1, "one placeholder the image's size");
 }
+
+/// What the converter records for a declared image whose bytes it does not
+/// have (a first display, or a fetch that failed): its size and no address.
+/// That holds its place as a faint box too, not a blank gap.
+#[test]
+fn an_image_with_no_bytes_holds_its_place() {
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+    let more = Mutable::with_dirty(0u64, dirty.clone());
+    let page = r#"<html><body><p>Before</p><img src="https://example.com/a.png" width="120" height="80"><p>After</p></body></html>"#;
+    let doc = Rc::new(RefCell::new(Doc::html(page.into(), navigator_render::Subresources::new(), 800.0, 600.0, false, |_| None).unwrap()));
+    let view = DocumentView::new(state, Rect::new(0.0, 0.0, 800.0, 600.0), doc, more);
+    let mut app = App::new_with_flag(Page { view }, dirty);
+    let first = app.tick();
+    let held = count(&first, |n| matches!(n, Node::Rect { rect, fill, .. } if (rect.w(), rect.h()) == (120.0, 80.0) && fill.a > 0.0 && fill.a < 0.3));
+    assert_eq!(held, 1, "one placeholder the image's size");
+}
