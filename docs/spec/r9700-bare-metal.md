@@ -1631,3 +1631,17 @@ work (self-test, scrub).
   test. First run with the runner's own kernel log (.kern, 9445 lines, no
   gaps). Logs: claude/project-thread-33aauq d5089858
   (docs/r9700-runs/fzdiag-5e11d762/).
+- **2026-11-15 13:01 to 14:25, 1 h fuzz diagnostic (caede735, zero_va on):
+  si-fuzz PASS, si-client-test 97/2 both times, both FAILs test
+  expectations.** Empty client VA now maps a read-only zero page:
+  vm_faults over the fuzz fell from 6184 (5e11d762) to 18, IH overflows 0,
+  isolation.dummy_dirty 0. Test 17's reader now completes and reads 64/64
+  zeros (no pattern); the writer's store is a write-permission fault
+  (status 0xc41040) that never reaches the fault default page, so the
+  positive control (+0 dirty scrubs) expected the wrong thing. Test 16's
+  ACQUIRE_MEM raises no fault at all: its queue hangs, and the hang path
+  (REMOVE and MES RESET refused) resets the GPU ~9 s in; the bystander was
+  submitted into that reset (EIO). Both checks fixed after the run. 15
+  re-inits, cap never hit, 0 flush timeouts, 0 panics, card proven idle at
+  detach. Logs: claude/project-thread-33aauq cb502ed6
+  (docs/r9700-runs/fzdiag-caede735/).

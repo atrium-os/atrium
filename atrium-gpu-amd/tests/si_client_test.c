@@ -1744,8 +1744,9 @@ hostile_isa(void)
  * 16: a fault storm (24 h run 2963f5db: a fuzzed ACQUIRE_MEM with a GL2
  * range op over the whole VA space made one queue raise ~8 M fault IVs
  * and overflow the IH ring 12125 times). One such packet: the queue is
- * lost, its later faults are muted (amd_gmc12_ctx_fault_irq), the IH
- * ring does not overflow, and a bystander runs clean.
+ * lost, the IH ring does not overflow, and a bystander runs clean. Since
+ * zero_va (caede735) empty VA no longer faults: the queue hangs and the
+ * hang path resets the GPU, with no fault IVs at all.
  */
 #define GCR_GL2_RANGE_RANGE	(2u << 11)
 #define GCR_GL2_INV		(1u << 14)
@@ -1789,7 +1790,17 @@ fault_storm(void)
 	}
 	r = job_wait(&h, 15000, &ms);
 	sleep(2);
-	/* A re-init in progress reads as lost (-1): let it finish. */
+	/*
+	 * With zero_va (caede735) the packet raises no fault: the queue
+	 * hangs, and the hang path (REMOVE refused, MES RESET refused) resets
+	 * the GPU some 4-7 s after the hang is seen. Wait up to 20 s for that
+	 * re-init to start, then for it to finish (a re-init in progress
+	 * reads as lost, -1).
+	 */
+	if (r != 0)
+		for (x = 0; x < 100 && preg_read(NULL, &ri) >= 0 && ri == ri0;
+		    x++)
+			usleep(200000);
 	for (x = 0; x < 150 && (preg_read(NULL, &ri) < 0 || ri < 0); x++)
 		usleep(200000);
 	f1 = iso("vm_faults");
@@ -1921,11 +1932,22 @@ dummy_page(void)
 	 * shared fault page (the kernel found it written and zeroed it). */
 	printf("17: fault page scrubs that found it written: +%jd\n",
 	    (intmax_t)(d1 - d0));
-	if (d1 >= 0 && d0 >= 0)
+	n1 = dummy_read("17 reader after", &first, &rr);
+	/*
+	 * zero_va on (the reader's load completes): empty VA is a valid
+	 * read-only page, so the store is a write-permission fault that never
+	 * reaches the fault page (caede735 on silicon: status 0xc41040, 0
+	 * dirty scrubs). zero_va off: the store does reach it, and the kernel
+	 * must find it written and zero it.
+	 */
+	if (d1 >= 0 && d0 >= 0 && rr == 0)
+		check(d1 == d0, "17 dummy page: a store to unmapped VA does "
+		    "not reach the fault page", "+%jd dirty scrubs",
+		    (intmax_t)(d1 - d0));
+	else if (d1 >= 0 && d0 >= 0)
 		check(d1 > d0, "17 dummy page: the writer's faulting stores "
 		    "reach the fault page, and the kernel zeroes it",
 		    "+%jd dirty scrubs", (intmax_t)(d1 - d0));
-	n1 = dummy_read("17 reader after", &first, &rr);
 	(void)preg_read(NULL, &ri);
 	printf("17: reader's load from the unmapped VA: %s; %d/64 pattern "
 	    "words, out[0] %#x; re-inits %d -> %d\n", rr == 0 ? "completed" :
