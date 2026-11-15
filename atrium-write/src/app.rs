@@ -1296,6 +1296,29 @@ mod tests {
     }
 
     #[test]
+    fn password_bar_commands() {
+        let doc = Doc::from_text("n.txt", b"Some text here.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        w.cmds.lock().unwrap().push(Cmd::PasswordOpen);
+        assert!(w.take_cmds().is_empty());
+        let pb = w.password.get_cloned();
+        assert!(pb.open && pb.setting && pb.prompt.starts_with("Password to protect"));
+        assert!(w.password_text.get_cloned().is_secret());
+        // Done goes to the event loop, which takes the text.
+        w.password_text.set(TextEdit::new("hunter2").secret(true));
+        w.cmds.lock().unwrap().push(Cmd::PasswordDone);
+        assert_eq!(w.take_cmds(), vec![Cmd::PasswordDone]);
+        let (bar, text) = w.take_password();
+        assert!(bar.setting && text == "hunter2");
+        assert!(!w.password.get_cloned().open && w.password_text.get_cloned().text().is_empty());
+        // Cancel closes the bar and tells the event loop.
+        w.ask_password("“a.docx” is protected. Its password", false);
+        w.cmds.lock().unwrap().push(Cmd::PasswordClose);
+        assert_eq!(w.take_cmds(), vec![Cmd::PasswordClose]);
+        assert!(!w.password.get_cloned().open);
+    }
+
+    #[test]
     fn note_bar_commands() {
         let doc = Doc::from_text("n.txt", b"Some text here.").unwrap();
         let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));

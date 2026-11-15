@@ -2676,6 +2676,69 @@ that need nothing new from elsewhere go first:
 Legacy formats are import only (D8): `.doc`, `.xls` and `.ppt` open through the
 converter and save as the current formats.
 
+### 16.41 O7a as built (2026-11-15): password-protected documents
+
+- **OOXML** (`cfb.rs`, `crypt.rs`). A bounded compound-file reader (DIFAT,
+  FAT, directory walk, mini stream, every offset and chain checked) and
+  writer. MS-OFFCRYPTO Agile decryption (any of SHA-1/256/384/512, AES-128 to
+  256, spun key, 4096-byte segments, HMAC data integrity checked before
+  anything is returned) and Standard decryption (SHA-1 50,000 spins,
+  CryptDeriveKey, AES-ECB), which is what LibreOffice writes. We write Agile
+  AES-256/SHA-512 with 100,000 spins.
+- **ODF** (`odfcrypt.rs`). Per-part encryption (every ODF writer and
+  LibreOffice's default): AES-256-CBC or AES-GCM, PBKDF2-HMAC-SHA1 or
+  Argon2id over a SHA-1/SHA-256 start key, the SHA-256 or SHA-1 checksum of
+  the first 1 KiB telling a wrong password. LibreOffice's newest mode (whole
+  package in one `encrypted-package` entry, AES-256-GCM with Argon2id) is read
+  too; it puts the GCM nonce in front of the ciphertext rather than using the
+  manifest's IV. We write per-part AES-256-CBC with PBKDF2 (100,000
+  iterations, SHA-256 start key), which every ODF reader opens. Blowfish (OOo
+  1–2) is refused as unsupported. Costs a file asks for are capped (PBKDF2
+  10 M iterations, Argon2 64 passes and 1 GiB).
+- **Decryption runs in the converter**, after it has sandboxed itself
+  (`launch.rs`). The app passes the password on stdin before the file
+  (`officina-convert KIND --password`); the converter answers
+  `needs-password` or `wrong-password` distinctly, so the app can ask (again).
+  The app never parses the encrypted container. Encryption on save runs in
+  the app, over bytes our own writers made.
+- **Native files with a password** (`sealed.rs`): a random 256-bit data key
+  seals the native bytes in 1 MiB AES-256-GCM segments (nonce = a per-save
+  random file id and the segment index; the header's hash is the additional
+  data, so truncation, reordering and header edits fail). The data key is
+  wrapped by an Argon2id key from the password (3 passes, 64 MiB, 4 lanes).
+  Changing the password rewraps the key. Arca-wrapped keys replace the
+  password when Arca offers `arca_decrypt` to apps.
+- **In the apps.** Write (Tools ▸ Password…), Sheets (Password…) and Slides
+  (Slide ▸ Password…) set, change or remove a document's password. Opening a
+  protected file shows a password bar (a secret field, Open and Cancel) and the
+  file waits for it; a wrong password asks again. A protected document saves
+  protected in every format that can carry a password (plain text and CSV
+  can't, and say so); PDF export is not protected.
+  - **The autosave journal of a protected document is sealed** with the same
+    key: the base as a sealed file, each record sealed on its own. A crash
+    restore asks for the password before it shows anything. Setting or
+    removing a password restarts the journal (the old files are unlinked,
+    not overwritten).
+  - A sealed deck is read into memory, never mapped. A protected deck's save
+    seals through the spool and the deck stops reading the file it may be
+    saved over. Reduce File Size seals its copy.
+
+**Gates.** `officina-convert/examples/password_lo.rs` against LibreOffice 24.2
+over UNO, for `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods` and `.odp`: ours
+opened by LibreOffice with the password and refused with a wrong one;
+LibreOffice's (Standard OOXML, per-part AES-CBC ODF, whole-package
+AES-GCM/Argon2id ODF) opened by us with the password, refused with a wrong one
+and asked for with none: **54/54**. Unit tests: compound files with 8 MB
+streams (DIFAT), hostile containers mutated at random never panic, a tampered
+HMAC or sealed segment is caught, absurd KDF costs are refused before any
+work. Each app has a test that a protected document's autosave folder and
+saved file hold none of its text, that the file opens only with the password,
+and that the journal restores only with it; Write, Sheets and Slides open
+protected files through the real converter process.
+
+Open: Arca-held keys instead of passwords; protected PDF export; the legacy
+binary formats' RC4 encryption comes with O7b–O7d.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
