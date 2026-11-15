@@ -328,17 +328,39 @@ impl Compositor {
 
     /// The monitor a screen point is on, from [`Compositor::popup_bounds`]
     /// (the first one if it is on none; `None` if none are known). An
-    /// app's pop-up (`trusted` false) is kept below the trusted strip.
+    /// app's pop-up (`trusted` false) is kept below the trusted strip and
+    /// below the shell's bar at the monitor's top: the bar stacks above
+    /// it (§2), so what went under the bar could not be seen or pressed.
     fn bounds_at(&self, x: f32, y: f32, trusted: bool) -> Option<[f32; 4]> {
         let b = self.popup_bounds
             .iter()
             .find(|b| x >= b[0] && x < b[0] + b[2] && y >= b[1] && y < b[1] + b[3])
             .or(self.popup_bounds.first())
             .copied()?;
-        if trusted || b[1] >= self.popup_top || b[3] <= self.popup_top - b[1] {
+        if trusted {
             return Some(b);
         }
-        let cut = self.popup_top - b[1];
+        let mut top = self.popup_top.max(b[1]);
+        // A chrome window (not a pop-up) touching that top and as wide as
+        // half the monitor is the bar; one below another counts too.
+        loop {
+            let under = self.windows.values()
+                .filter(|w| w.role == WmRole::Chrome && w.popup.is_none() && !w.hidden)
+                .filter(|w| {
+                    let (l, r) = (w.pos.0.max(b[0]), (w.pos.0 + w.size.0).min(b[0] + b[2]));
+                    r - l >= b[2] / 2.0 && w.pos.1 <= top + 0.5 && w.pos.1 + w.size.1 > top + 0.5
+                })
+                .map(|w| w.pos.1 + w.size.1)
+                .fold(top, f32::max);
+            if under <= top {
+                break;
+            }
+            top = under;
+        }
+        let cut = top - b[1];
+        if cut <= 0.0 || cut >= b[3] {
+            return Some(b);
+        }
         Some([b[0], b[1] + cut, b[2], b[3] - cut])
     }
 
@@ -659,6 +681,32 @@ mod tests {
         assert_eq!(*c.z_order.last().unwrap(), bm, "the bar's menu is on top");
         assert_eq!(c.keyboard_window(), bm as u32, "and takes the keys");
         let _ = popup_events(&rx);
+    }
+
+    #[test]
+    fn an_apps_menu_taller_than_the_room_under_the_bar_is_shrunk_below_it() {
+        // UI size 2, text 200: Scrinium's More menu (912 px) on a 1080 px
+        // monitor, strip 48 px, bar 48..200. It used to fit under the
+        // strip, so it slid up under the bar, which covered its first item.
+        let (mut c, rx) = comp();
+        c.popup_bounds = vec![[0.0, 0.0, 1920.0, 1080.0]];
+        c.popup_top = 48.0;
+        let bar = c.create(9, (1920, 152));
+        c.windows.get_mut(&bar).unwrap().role = WmRole::Chrome;
+        c.windows.get_mut(&bar).unwrap().pos = (0.0, 48.0);
+        let app = c.create(3, (1920, 640));
+        c.windows.get_mut(&app).unwrap().pos = (0.0, 200.0);
+        c.set_focus_no_raise(Some(app));
+        let m = c.open_popup(3, app, [1820.0, 60.0, 80.0, 80.0], popup_side::BELOW, 2, (600, 912), true).unwrap();
+        assert_eq!(c.windows[&m].pos.1, 200.0, "just below the bar");
+        assert_eq!(c.windows[&m].size, (600.0, 880.0), "shrunk to the room below the bar");
+        let ev = popup_events(&rx);
+        assert!(matches!(ev[..], [DisplayEvent::PopupPlaced { height: 880, .. }]), "{ev:?}");
+        // The bar's own menus still reach past it.
+        assert!(c.press_dismisses_popups(0));
+        c.last_press = Some(bar);
+        let bm = c.open_popup(9, bar, [1800.0, 0.0, 40.0, 152.0], popup_side::BELOW, 2, (300, 912), true).unwrap();
+        assert_eq!(c.windows[&bm].size, (300.0, 912.0));
     }
 
     #[test]
