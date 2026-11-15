@@ -10,7 +10,7 @@
 //!   `sae-done` or `sae-failed` (aura-mlme frames them, this side does the
 //!   crypto); `assoc ...` when associated (BSSID, RSNEs and RSNXEs, AKM),
 //!   `disassoc`; gets back `authorized [td=..]` or `failed why=..`.
-//! - atrium-net (`--ctl-uid`): `remember ssid=.. secret=..`, `forget
+//! - atrium-net (`--ctl-uid`): `remember ssid=.. secret=..|handle=..` (a handle is redeemed at arcad, TAKE_WIFI), `forget
 //!   ssid=..`, `prepare ssid=..` (release the credential for the next join;
 //!   Arca hands out one per join, never the list); gets `ok` or `error`.
 //!
@@ -338,8 +338,20 @@ impl Keys {
         };
         match l.verb.as_str() {
             "remember" => {
-                let Some(secret) = l.hex("secret").map(zeroize::Zeroizing::new) else {
-                    return err("bad-secret");
+                // The passphrase itself (atrium-netctl, as root), or the
+                // handle to what the user typed into Arca's field, which
+                // only we can redeem (curia.md §4).
+                let secret = match (l.hex("secret"), l.hex("handle")) {
+                    (Some(s), None) => zeroize::Zeroizing::new(s),
+                    (None, Some(h)) => {
+                        let Ok(h) = <[u8; 16]>::try_from(h.as_slice()) else { return err("bad-handle") };
+                        match self.store.take_typed(&h) {
+                            Ok(s) => s,
+                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return err("handle-refused"),
+                            Err(e) => return err(&store_err(&e)),
+                        }
+                    }
+                    _ => return err("bad-secret"),
                 };
                 if crypto::psk(&secret, &ssid).is_none() {
                     return err("bad-secret");

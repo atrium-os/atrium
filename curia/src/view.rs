@@ -4,10 +4,9 @@
 
 use pergola::geom::Rect;
 use pergola::node::Node;
-use pergola::text_edit::TextEdit;
 use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{phosphor as ph, Glyph, TextField};
+use pergola::widgets::{phosphor as ph, CredentialField, Glyph};
 use pergola::{Color, Mutable, NodeId, TextStyle};
 
 use atrium_netconf::{Link, Online};
@@ -24,8 +23,9 @@ pub fn side_w() -> f32 {
 
 pub struct CuriaView {
     pub page: Mutable<NetPage>,
-    /// The passphrase being typed (interim, curia.md §4).
-    pub pass: Mutable<TextEdit>,
+    /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
+    /// its keys; Curia only reserves its place and gets a handle.
+    pub cred: CredentialField,
     pub size: Mutable<(f32, f32)>,
 }
 
@@ -210,34 +210,16 @@ impl CuriaView {
                 let fy = y + em(4.0);
                 let fx = x0 + em(44.0);
                 let fw = (pw - em(260.0)).clamp(em(160.0), em(320.0));
+                self.cred.clone().at(fx, fy).size(fw, em(32.0)).render(ctx);
                 let pg = self.page.clone();
-                let pass = self.pass.clone();
-                let holder = ctx.push(Node::Rect { rect: Rect::new(fx, fy, fw, em(32.0)), fill: Color::TRANSPARENT, radius: 0.0 });
-                TextField::new(self.pass.clone())
-                    .placeholder("Passphrase")
-                    .at(fx, fy)
-                    .width(fw)
-                    .on_submit(move |v| {
-                        with(&pg, |p| p.join_typed(v));
-                        pass.set(TextEdit::new("").secret(true));
-                    })
-                    .render(ctx);
-                ctx.pop();
-                if let Some(&bg) = ctx.tree.children_of(holder).get(2) {
-                    ctx.autofocus(bg);
-                }
-                let (pg, pass) = (self.page.clone(), self.pass.clone());
-                let typed = !self.pass.get_cloned().text().is_empty();
                 let bx = fx + fw + em(12.0);
-                let jw = button(ctx, bx, fy + em(1.0), "Join", Look::Primary, typed && p.joining.is_none(), move || {
-                    let v = pass.get_cloned().text().to_string();
-                    with(&pg, |p| p.join_typed(&v));
-                    pass.set(TextEdit::new("").secret(true));
+                let ready = p.joining.is_none() && p.armed.is_none();
+                let jw = button(ctx, bx, fy + em(1.0), "Join", Look::Primary, ready, move || {
+                    with(&pg, |p| p.join_pressed(std::time::Instant::now()));
                 });
-                let (pg, pass) = (self.page.clone(), self.pass.clone());
+                let pg = self.page.clone();
                 button(ctx, bx + jw + em(8.0), fy + em(1.0), "Cancel", Look::Ghost, true, move || {
                     with(&pg, NetPage::cancel_ask);
-                    pass.set(TextEdit::new("").secret(true));
                 });
                 y += em(44.0);
             }
@@ -336,7 +318,8 @@ mod tests {
     fn the_network_page_shows_status_networks_and_saved_ones() {
         let mut p = NetPage::new();
         p.take_wants();
-        let v = CuriaView { page: Mutable::new(p.clone()), pass: Mutable::new(TextEdit::new("").secret(true)), size: Mutable::new((960.0, 720.0)) };
+        let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
+        let v = CuriaView { page: Mutable::new(p.clone()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false }])));
@@ -347,6 +330,9 @@ mod tests {
         for want in ["Wi-Fi: home", "Disconnect", "Wi-Fi networks", "Connected · WPA2", "cafe", "WPA3", "Join", "Saved networks", "Auto-join: on", "Priority 2", "Forget"] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
         }
-        assert!(all.iter().any(|s| s == "Passphrase"), "the passphrase row is open under cafe");
+        // The passphrase row is open under cafe: Arca's slot, never a field of ours.
+        let (tree, _) = pergola::view::render(&v, Semantic::LIGHT);
+        assert!(!tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Passphrase")));
+        assert!(all.iter().any(|s| s == "Cancel"));
     }
 }

@@ -272,8 +272,14 @@ impl Station {
                 // Idle: a scan of its own. Connected: the background scan
                 // (our association's address, never a second identity), its
                 // results listed when it ends; one already running is used.
+                // A scan running for a join is listed too when it ends; a
+                // plain one is listed anyway.
                 if matches!(self.st, State::Idle) {
                     self.start_scan(None, &mut out);
+                } else if let State::Scanning { join } = &self.st {
+                    if join.is_some() {
+                        self.list_scan = true;
+                    }
                 } else if matches!(self.st, State::Up { .. }) {
                     self.list_scan = true;
                     if !self.roam_scan {
@@ -530,7 +536,8 @@ impl Station {
         if join.is_some() {
             done = done.with("for", "join");
         }
-        if join.is_none() {
+        let list = join.is_none() || std::mem::take(&mut self.list_scan);
+        if list {
             for b in &self.results {
                 out.push(Out::Ctl(
                     Line::new("bss")
@@ -541,6 +548,10 @@ impl Station {
                         .with("security", b.security.name()),
                 ));
             }
+        }
+        if join.is_some() && list {
+            // Asked for a list during the join's scan: a plain scan-done too.
+            out.push(Out::Ctl(Line::new("scan-done").with("status", status).with("count", self.results.len())));
         }
         out.push(Out::Ctl(done));
         match join {

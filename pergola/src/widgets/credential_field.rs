@@ -59,6 +59,8 @@ impl CredentialField {
     pub fn password(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::CurrentPassword, state) }
     pub fn new_password(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::NewPassword, state) }
     pub fn one_time_code(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::OneTimeCode, state) }
+    /// A Wi-Fi passphrase (Settings): only the Wi-Fi key service redeems it.
+    pub fn wifi_passphrase(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::WifiPassphrase, state) }
 
     /// Let Arca fill this username field on the same press.
     pub fn username_field(mut self, u: Mutable<String>) -> Self {

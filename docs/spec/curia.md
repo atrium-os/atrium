@@ -1,7 +1,8 @@
 # Curia: Settings
 
-**Status:** proposed 2026-11-14. Shankar chose (2026-11-14) to start Curia with a Network
-page, so a Wi-Fi passphrase has somewhere to be typed. Decisions in §6.
+**Status:** accepted 2026-11-15, all four §6 decisions as recommended (Shankar: "Move it
+to Arca"). Shankar chose (2026-11-14) to start Curia with a Network page, so a Wi-Fi
+passphrase has somewhere to be typed. C1 built 2026-11-14 (§7), C2 built 2026-11-15 (§8).
 **Scope:** the Settings app (`curia/`), its first page (Network), and the page model the
 next pages (Devices, then the rest) follow.
 
@@ -63,20 +64,22 @@ field, not in an app widget. Curia, atrium-netconf and atrium-net then never hol
    arcad with a new service op that releases a held value only to the service its
    purpose names (`wifi` → aura-keys) and only once. It stores the item as today.
 
-Until that op exists, Curia uses Pergola's `TextField::secret` and sends the passphrase in
-`WIFI_JOIN` (built and gated in N4); the value then passes through Curia, atrium-netconf
-and atrium-net in memory, zeroed after use, and is stored only by aura-keys.
+C1 used Pergola's `TextField::secret` and sent the passphrase in `WIFI_JOIN`; since C2
+(§8) Curia has only Arca's field. `WIFI_JOIN` with a passphrase stays for
+`atrium-netctl` (root, tests).
 
 ## 5. Build order
 
 | Step | What | Done when |
 |---|---|---|
 | C1 | Curia shell, Network page with the interim secret field | in the cloud VM with real Wi-Fi (aura-sim-gate): the page lists aura-test, a typed passphrase joins it, Forget removes it; frames of each. **Built 2026-11-14** (§7) |
-| C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia) |
+| C2 | Arca's field for the passphrase (§4): Limen `credential` purpose `wifi`, arcad redeem-for-service op, aura-keys `remember handle=` | the same gate with arcad and arca-ui running; Curia's memory never holds the passphrase (a canary passphrase not found in a core of Curia). **Built 2026-11-15** (§8) |
 | C3 | Devices page (dispensatord `CLASS_DEVICES`, `device-list`) | the device-assignment thread's Devices page check |
 | C4 | further pages (Appearance, Sound, Displays, Apps' grants) | each with its own gate |
 
 ## 6. Decisions
+
+All four accepted as recommended, 2026-11-15.
 
 1. **One app with pages, in one jail**, holding every capability its pages need.
    *Recommend yes.* Alternative: a process per page with only that page's capabilities
@@ -109,5 +112,32 @@ and atrium-net in memory, zeroed after use, and is stored only by aura-keys.
   the list shows aura-test while connected; Forget, Forget it; pick aura-test, type the
   passphrase, Enter: joined, DHCP bound, saved with auto-join (frames
   `scratch/curia-{start,forget2,typed,joined}.png`, not committed).
-- Not yet: Arca's field (C2); a wrong passphrase reports only after the join's 60 s
+- Not yet: a wrong passphrase reports only after the join's 60 s
   timeout (aura-keys does not yet say "wrong passphrase" early).
+
+## 8. C2 as built (2026-11-15)
+
+- Limen: `Purpose::WifiPassphrase`; Pergola `CredentialField::wifi_passphrase`. arca-ui
+  offers nothing for it (no chip, no saved items) and holds what was typed with a
+  trailing `HOLD_FOR_WIFI` byte on `U_HOLD`.
+- arcad: a handle held that way is marked Wi-Fi. No courier, fill or file-manager save
+  takes it (`Handles::take` and `item_of` refuse it). The service op `TAKE_WIFI` (0x0A,
+  `handle[16]` → `bytes value`) redeems it once, only for the service named `aura-keys` in
+  `ARCA_SERVICES`. Any other handle shown there is burned. A lock voids it, as with every
+  pending value.
+- `Join` gains `handle`. atrium-netconf sends `wifi-remember ssid= handle=`, atrium-net
+  passes `remember ssid= handle=` to aura-keys, and aura-keys redeems it at arcad, checks
+  it as a passphrase (8 to 63 characters, or 64 hex) and stores it as before. `handle=` is
+  hidden in logs like `secret=`.
+- Curia: the passphrase row is Arca's field (asked of limend while the row is open,
+  detached after). Join pressed with the field focused takes the focus, Arca holds the
+  value, and the handle that follows starts the join (`armed`, 3 s, then "Type the
+  passphrase in the field first"). After a failed join the field starts afresh, since its
+  handle was spent. Without limend the row has a field that can't be typed into. Curia
+  never takes a passphrase itself.
+- Live check (`sh scripts/curia-vm.sh arca` after `aura-sim-gate.sh bar`, 2026-11-15): forget
+  aura-test, pick it, click Arca's field, type the passphrase, press Join. It joined and
+  got an address by DHCP. The audit log shows `ui op=0x0063` then
+  `service:aura-keys op=0x000a`. `curia-vm.sh core` finds the passphrase 0 times in a core of
+  Curia (and 0 in arca-ui's), while the same check finds the page's own "Connected to
+  aura-test" text (frames `scratch/curia-{pick,typed,joined}.png`, not committed).

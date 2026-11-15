@@ -205,10 +205,13 @@ impl Backend for Front {
 
     fn join(&self, j: Join) -> Res<()> {
         self.log(&format!("join {:?}", String::from_utf8_lossy(&j.ssid)));
-        if j.passphrase.is_some() || j.open {
+        if j.passphrase.is_some() || j.handle.is_some() || j.open {
             let mut r = Line::new("wifi-remember").with_hex("ssid", &j.ssid).with("open", j.open as u8);
             if let Some(pw) = &j.passphrase {
                 r = r.with_hex("secret", pw.as_bytes());
+            }
+            if let Some(h) = &j.handle {
+                r = r.with_hex("handle", h);
             }
             self.call(&r)?;
         }

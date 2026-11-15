@@ -466,6 +466,19 @@ impl State {
     /// milliseconds).
     fn service_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         let Ok(me) = Recipient::service(name) else { return reply(status::UNKNOWN_PEER) };
+        if op == op::TAKE_WIFI {
+            // What the user typed into a Wi-Fi passphrase field: only the
+            // Wi-Fi key service redeems it, once (curia.md §4).
+            if name != op::WIFI_SERVICE {
+                return reply(status::DENIED);
+            }
+            let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
+            let Some(v) = self.handles.take_wifi(&h) else { return reply(status::DENIED) };
+            let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
+            out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+            out.as_mut()[4..].copy_from_slice(v.as_ref());
+            return Reply { status: status::OK, body: Body::Secret(out) };
+        }
         let Some(store) = self.machine.as_mut() else { return reply(status::LOCKED) };
         let who = Access { persona: MACHINE_PERSONA, recipient: &me };
         let mut r = Reader::new(body);
@@ -737,13 +750,14 @@ impl State {
         let Ok(app) = Recipient::app(publisher, &app_id) else { return malformed() };
         let Some(store) = self.stores.get(&user) else { return reply(status::LOCKED) };
         let who = Access { persona: PERSONA, recipient: &app };
-        let entry = |source, generated| Entry {
+        let entry = |source, generated, wifi| Entry {
             user: user.clone(),
             persona: PERSONA.into(),
             recipient: app.clone(),
             source,
             expires: std::time::Instant::now() + crate::handles::TTL,
             generated,
+            wifi,
         };
         let issued = |h: Option<[u8; 16]>| match h {
             Some(h) => ok(h.to_vec()),
@@ -766,6 +780,13 @@ impl State {
             }
             op::U_HOLD => {
                 let Ok(v) = r.bytes(caps::VALUE) else { return malformed() };
+                let wifi = match r.remaining() {
+                    0 => false,
+                    _ => match r.u8() {
+                        Ok(op::HOLD_FOR_WIFI) => true,
+                        _ => return malformed(),
+                    },
+                };
                 if r.end().is_err() || v.is_empty() {
                     return malformed();
                 }
@@ -773,7 +794,7 @@ impl State {
                     return reply(status::LOCKED); // passwords are while-unlocked
                 }
                 let v = tri!(LockedBuf::from_slice(v).map_err(Error::Io));
-                issued(self.handles.issue(entry(Source::Pending(v), false)))
+                issued(self.handles.issue(entry(Source::Pending(v), false, wifi)))
             }
             op::U_HANDLE => {
                 let Ok(id) = r.array::<16>() else { return malformed() };
@@ -796,7 +817,7 @@ impl State {
                 if m.class != Class::AfterFirstUnlock && store.state() != LockState::Unlocked {
                     return reply(status::LOCKED);
                 }
-                issued(self.handles.issue(entry(Source::Item(id), false)))
+                issued(self.handles.issue(entry(Source::Item(id), false, false)))
             }
             op::U_GENERATE => {
                 if r.end().is_err() {
@@ -806,7 +827,7 @@ impl State {
                     return reply(status::LOCKED);
                 }
                 let v = tri!(generate_password());
-                issued(self.handles.issue(entry(Source::Pending(v), true)))
+                issued(self.handles.issue(entry(Source::Pending(v), true, false)))
             }
             _ => reply(status::DENIED),
         }

@@ -411,3 +411,22 @@ fn scan_while_connected_lists() {
     let c: Vec<&str> = ctl(&o).iter().map(|l| l.verb.as_str()).collect();
     assert!(c.contains(&"bss") && c.last() == Some(&"scan-done"), "{c:?}");
 }
+
+/// `scan` while a scan runs is never "busy": a plain scan is listed anyway;
+/// a join's scan is listed too, with a plain scan-done before the join's.
+#[test]
+fn scan_during_a_scan_lists() {
+    let mut s = Station::new(OWN, Box::new(|b: &mut [u8]| b.fill(7)));
+    s.cmd(&Line::new("scan"), 0);
+    let o = s.cmd(&Line::new("scan"), 1);
+    assert!(o.is_empty(), "{o:?}");
+    let o = s.cmd(&Line::new("join").with_hex("ssid", b"aura-test").with("security", "psk").with("mac", "device"), 2);
+    assert_eq!(ctl_states(&o), vec!["scanning"]);
+    let o = s.cmd(&Line::new("scan"), 3);
+    assert!(o.is_empty(), "{o:?}");
+    s.mgmt_rx(2437, -40, rx_flags::SCAN, &beacon(b"aura-test", Some(wpa2_pmf()), true, 6), 4);
+    let o = s.scan_done(0, 5);
+    let c: Vec<String> = ctl(&o).iter().map(|l| format!("{}{}", l.verb, l.get("for").map(|f| format!(" for={f}")).unwrap_or_default())).collect();
+    let i = c.iter().position(|v| v == "scan-done").expect("plain scan-done");
+    assert!(c[..i].iter().any(|v| v == "bss") && c[i + 1] == "scan-done for=join", "{c:?}");
+}

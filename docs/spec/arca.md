@@ -407,6 +407,10 @@ root key.
   - `LIST 0x06`: empty → `u32 n | n × (id[16] | u16 kind | u8 class | u32 flags | str account)`.
   - `DELETE 0x07`: `id[16]`.
   - Any other op is `DENIED`; with no machine store open, `LOCKED`.
+  - `TAKE_WIFI` (0x0A, 2026-11-15, [curia.md](curia.md) §8): the service named `aura-keys`
+    only, and it needs no machine store. It redeems, once, a handle to what the user
+    typed into a Wi-Fi passphrase credential field (`U_HOLD` with `HOLD_FOR_WIFI`). Such a
+    handle is redeemable nowhere else.
 - **The key.** With a TPM, the machine root key is sealed to it (A4; boot-state PCRs, so a
   disk moved to another machine or booted into another OS can't open it). Until then, and on
   machines without one, the key is 32 random bytes in `/var/db/arca/machine.key` (0600,

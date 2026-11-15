@@ -13,6 +13,9 @@ pub enum Purpose {
     OneTimeCode,
     /// A username the item marks private: a slot too, not the app's field.
     PrivateUsername,
+    /// A Wi-Fi passphrase (curia.md §4): typed, never offered, and held so
+    /// that only the Wi-Fi key service can redeem it, never a courier.
+    WifiPassphrase,
 }
 
 /// One submit's worth of reference to the value, meaningful only on this

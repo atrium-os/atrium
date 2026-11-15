@@ -168,16 +168,16 @@ fn over_sockets() {
     let s = read.status().unwrap();
     assert_eq!((s.link, s.bars, s.ssid.clone()), (Link::Wifi, Some(3), None));
     assert_eq!(read.interfaces().unwrap_err().0, status::NOT_ALLOWED);
-    let j = Join { ssid: b"x".to_vec(), passphrase: None, open: true };
+    let j = Join { ssid: b"x".to_vec(), passphrase: None, handle: None, open: true };
     assert_eq!(read.join(&j).unwrap_err().0, status::NOT_ALLOWED);
     assert_eq!(read.nearby().unwrap_err().0, status::NOT_ALLOWED);
 
     let mut wifi = c(Grant::Wifi);
     assert_eq!(wifi.status().unwrap().ssid, Some(b"aura-test".to_vec()));
     wifi.join(&j).unwrap();
-    let bad = Join { ssid: b"x".to_vec(), passphrase: Some("short".into()), open: false };
+    let bad = Join { ssid: b"x".to_vec(), passphrase: Some("short".into()), handle: None, open: false };
     assert_eq!(wifi.join(&bad).unwrap_err().0, status::MALFORMED);
-    let wrong = Join { ssid: b"x".to_vec(), passphrase: Some("wrong-passphrase".into()), open: false };
+    let wrong = Join { ssid: b"x".to_vec(), passphrase: Some("wrong-passphrase".into()), handle: None, open: false };
     assert_eq!(wifi.join(&wrong).unwrap_err(), Fail::new(status::FAILED, "handshake failed"));
     assert_eq!(wifi.nearby().unwrap_err().0, status::NOT_ALLOWED, "joining is not seeing what is around");
     assert_eq!(wifi.set_country("DE").unwrap_err().0, status::NOT_ALLOWED);

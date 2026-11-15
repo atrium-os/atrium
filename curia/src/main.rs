@@ -14,7 +14,8 @@ use atrium_netconf::client::Client;
 use atrium_netconf::{Grant, Join};
 use curia::network::{Got, NetPage, Want};
 use curia::view::CuriaView;
-use pergola::text_edit::TextEdit;
+use pergola::embed::Embeds;
+use pergola::widgets::{CredentialField, CredentialState};
 use pergola::window::StepResult;
 use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
 
@@ -61,14 +62,12 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
             Want::Profiles => Got::Profiles(connect(Grant::Wifi).and_then(|mut c| c.profiles().map_err(e))),
             Want::Details => Got::Details(connect(Grant::Details).and_then(|mut c| c.interfaces().map_err(e))),
             Want::Join { ssid, open } => {
-                let r = connect(Grant::Wifi).and_then(|mut c| c.join(&Join { ssid: ssid.clone(), passphrase: None, open: *open }).map_err(e));
+                let r = connect(Grant::Wifi).and_then(|mut c| c.join(&Join { ssid: ssid.clone(), passphrase: None, handle: None, open: *open }).map_err(e));
                 Got::Done { what: w.clone(), result: r }
             }
-            Want::JoinWith { ssid, passphrase } => {
-                let j = Join { ssid: ssid.clone(), passphrase: Some(passphrase.clone()), open: false };
-                let r = connect(Grant::Wifi).and_then(|mut c| c.join(&j).map_err(e));
-                // What is reported back carries no passphrase.
-                Got::Done { what: Want::JoinWith { ssid: ssid.clone(), passphrase: String::new() }, result: r }
+            Want::JoinWith { ssid, handle } => {
+                let j = Join { ssid: ssid.clone(), passphrase: None, handle: Some(*handle), open: false };
+                Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join(&j).map_err(e)) }
             }
             Want::Leave => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.leave().map_err(e)) },
             Want::Forget(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.forget(s).map_err(e)) },
@@ -92,9 +91,25 @@ fn main() {
     };
     let dirty = Arc::new(AtomicBool::new(true));
     let page = Mutable::with_dirty(NetPage::new(), dirty.clone());
-    let pass = Mutable::with_dirty(TextEdit::new("").secret(true), dirty.clone());
+    let cred_state = Mutable::with_dirty(CredentialState::default(), dirty.clone());
+    let cred = CredentialField::wifi_passphrase(cred_state.clone());
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
-    let view = CuriaView { page: page.clone(), pass, size: size.clone() };
+    let view = CuriaView { page: page.clone(), cred: cred.clone(), size: size.clone() };
+    // Arca's passphrase field comes through limend (curia.md §4). Without
+    // it the row shows a field that can't be typed into: Curia never takes
+    // a passphrase itself.
+    let embeds = match Embeds::connect() {
+        Ok(e) => {
+            win.set_slot_binder(Embeds::binder(&e));
+            Some(e)
+        }
+        Err(e) => {
+            eprintln!("curia: limend: {e:?}: no passphrase field");
+            None
+        }
+    };
+    let mut embeds = embeds;
+    let mut cred_embed = None;
     let mut app = App::new_with_flag(view, dirty);
     let (tx, rx): (Sender<Got>, Receiver<Got>) = channel();
     follow(tx.clone());
@@ -117,6 +132,63 @@ fn main() {
         let mut p = page.get_cloned();
         while let Ok(g) = rx.try_recv() {
             p.apply(g);
+            changed = true;
+        }
+        // Arca's field: asked for while a passphrase row is open.
+        if let Some(e) = &embeds {
+            if std::mem::take(&mut p.reset_field) {
+                if let Some(id) = cred_embed.take() {
+                    let _ = e.borrow_mut().detach_embed(id);
+                }
+                cred_state.set(CredentialState::default());
+                changed = true;
+            }
+            match (p.asking.is_some(), cred_embed) {
+                (true, None) => {
+                    if let Some(token) = win.embed_token() {
+                        let asked = e.borrow_mut().request("credential", token, cred.slot_key());
+                        match asked {
+                            Ok(id) => {
+                                let _ = e.borrow_mut().send(id, cred.configure().encode());
+                                cred_embed = Some(id);
+                            }
+                            Err(err) => eprintln!("curia: Arca's passphrase field: {err:?}"),
+                        }
+                    }
+                }
+                (false, Some(id)) => {
+                    let _ = e.borrow_mut().detach_embed(id);
+                    cred_embed = None;
+                    cred_state.set(CredentialState::default());
+                }
+                _ => {}
+            }
+            let mut lost = false;
+            loop {
+                let ev = e.borrow_mut().poll(Duration::from_millis(1));
+                match ev {
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == cred_embed => {
+                        if let Some(m) = limen::credential::ToParent::decode(&bytes) {
+                            cred.apply(m);
+                            p.field(cred_state.get_cloned().handle, Instant::now());
+                            changed = true;
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == cred_embed => cred_embed = None,
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => {
+                        eprintln!("curia: limend: {err:?}");
+                        lost = true;
+                        break;
+                    }
+                }
+            }
+            if lost {
+                embeds = None;
+            }
+        }
+        if p.tick(Instant::now()) {
             changed = true;
         }
         if Instant::now() >= next_scan {

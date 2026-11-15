@@ -22,6 +22,11 @@ pub trait Store {
     fn remember(&mut self, acc: &str, secret: &[u8]) -> io::Result<()>;
     fn forget(&mut self, acc: &str) -> io::Result<bool>;
     fn release(&mut self, acc: &str) -> io::Result<Option<Secret>>;
+    /// What the user typed into Arca's Wi-Fi passphrase field, by the
+    /// handle Settings was given (curia.md §4): once, and only from Arca.
+    fn take_typed(&mut self, _handle: &[u8; 16]) -> io::Result<Secret> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no Arca"))
+    }
 }
 
 pub fn account(ssid: &[u8]) -> String {
@@ -53,6 +58,7 @@ const OP_STORE: u16 = 0x04;
 const OP_RELEASE: u16 = 0x05;
 const OP_LIST: u16 = 0x06;
 const OP_DELETE: u16 = 0x07;
+const OP_TAKE_WIFI: u16 = 0x0A;
 const KIND_WIFI: u16 = 8;
 const CLASS_AFTER_BOOT: u8 = 1;
 const MAX_FRAME: usize = 64 * 1024;
@@ -126,6 +132,19 @@ impl Arca {
     }
 }
 
+/// `bytes value` out of a RELEASE or TAKE_WIFI reply.
+fn value(mut v: Zeroizing<Vec<u8>>) -> io::Result<Secret> {
+    if v.len() < 4 {
+        return Err(io::Error::other("short arcad reply"));
+    }
+    let n = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
+    if v.len() != 4 + n {
+        v.zeroize();
+        return Err(io::Error::other("bad arcad reply"));
+    }
+    Ok(Zeroizing::new(v[4..].to_vec()))
+}
+
 impl Store for Arca {
     fn remember(&mut self, acc: &str, secret: &[u8]) -> io::Result<()> {
         self.forget(acc)?;
@@ -154,15 +173,10 @@ impl Store for Arca {
         let Some((id, _)) = self.list()?.into_iter().find(|(_, a)| *a == acc) else {
             return Ok(None);
         };
-        let mut v = self.call(OP_RELEASE, &id)?;
-        if v.len() < 4 {
-            return Err(io::Error::other("short RELEASE reply"));
-        }
-        let n = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
-        if v.len() != 4 + n {
-            v.zeroize();
-            return Err(io::Error::other("bad RELEASE reply"));
-        }
-        Ok(Some(Zeroizing::new(v[4..].to_vec())))
+        value(self.call(OP_RELEASE, &id)?).map(Some)
+    }
+
+    fn take_typed(&mut self, handle: &[u8; 16]) -> io::Result<Secret> {
+        value(self.call(OP_TAKE_WIFI, handle)?)
     }
 }

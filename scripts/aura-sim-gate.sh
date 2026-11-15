@@ -116,7 +116,7 @@ setup() {
         if [ $ARCA = 1 ]; then
             rm -rf /tmp/aura/arca && mkdir -m 0700 /tmp/aura/arca
             : > /tmp/aura/launch-registry
-            env ARCA_DIR=/tmp/aura/arca ARCA_SOCKET=/atrium/sockets/arca/arcad.sock ARCA_APP_REGISTRY=/tmp/aura/launch-registry ARCA_SERVICES=aura-keys=65032 \\
+            env ARCA_DIR=/tmp/aura/arca ARCA_SOCKET=/atrium/sockets/arca/arcad.sock ARCA_APP_REGISTRY=/tmp/aura/launch-registry ARCA_SERVICES=aura-keys=65032 ARCA_VESTIBULUM_UID=50093 ARCA_UI_UID=65021 \\
                 daemon -f -o /tmp/aura/arcad.log ./arcad
             i=0; until [ -S /atrium/sockets/arca/arcad.sock ]; do i=\$((i+1)); [ \$i -lt 30 ] || { cat /tmp/aura/arcad.log; exit 1; }; sleep 1; done
         fi

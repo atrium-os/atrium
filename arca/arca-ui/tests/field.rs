@@ -197,7 +197,7 @@ fn the_client_against_arcad() {
     a.drop_handle(&h).unwrap();
     assert!(st.lock().unwrap().redeem(&h, "alice", &rcp).is_none(), "dropped");
 
-    let h = a.hold(&mail(), b"typed by hand").unwrap();
+    let h = a.hold(&mail(), b"typed by hand", false).unwrap();
     assert_eq!(st.lock().unwrap().redeem(&h, "alice", &rcp).unwrap().as_ref(), b"typed by hand");
 
     let h = a.generate(&mail()).unwrap();
@@ -208,7 +208,7 @@ fn the_client_against_arcad() {
     assert_eq!(st.lock().unwrap().handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     let e = a.handle_for(&mail(), &accts[0].id).unwrap_err();
     assert!(e.locked(), "{e:?}");
-    assert!(a.hold(&mail(), b"x").unwrap_err().locked());
+    assert!(a.hold(&mail(), b"x", false).unwrap_err().locked());
 }
 
 #[test]

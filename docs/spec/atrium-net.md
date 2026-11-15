@@ -451,5 +451,7 @@ VM from the Aura gates cover them.
   menu frames); the Settings page is Curia's Network page ([curia.md](curia.md) §7).
   aura-mlme answers `scan` while connected with a scan on the association's address
   (the roam scan, listed as `bss` lines and `scan-done`), so the nearby list works
-  while joined; atrium-netconf answers a busy radio (a join running) at once.
+  while joined. A `scan` while a scan runs (auto-join's, or a join's) is listed when it
+  ends, never refused (2026-11-15); atrium-netconf answers a busy radio (a handshake
+  running) at once.
 

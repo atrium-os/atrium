@@ -45,6 +45,15 @@ pub mod op {
     pub const STORE_FOR: u16 = 0x08;
     /// `endpoint` → as LIST, for this app's items bound to that endpoint.
     pub const LIST_FOR: u16 = 0x09;
+    /// The Wi-Fi key service only (`WIFI_SERVICE`, curia.md §4):
+    /// `handle[16]` → `bytes value`, once. Redeems what the user typed into
+    /// a Wi-Fi passphrase field (held with `HOLD_FOR_WIFI`) and nothing
+    /// else: not a stored item, not another field's value.
+    pub const TAKE_WIFI: u16 = 0x0A;
+    /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
+    pub const WIFI_SERVICE: &str = "aura-keys";
+    /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.
+    pub const HOLD_FOR_WIFI: u8 = 1;
 
     /// `str user | root[32]` → nothing. First login: make the user's store.
     pub const V_CREATE: u16 = 0x40;
@@ -73,7 +82,9 @@ pub mod op {
 
     /// → `u32 n | n × (id[16] | str account)`: the passwords the chip offers.
     pub const U_ACCOUNTS: u16 = 0x62;
-    /// `parent | bytes value` → `handle[16]`: hold what the user typed.
+    /// `parent | bytes value [| u8 HOLD_FOR_WIFI]` → `handle[16]`: hold what
+    /// the user typed. With `HOLD_FOR_WIFI`, only the Wi-Fi key service can
+    /// redeem it (`TAKE_WIFI`); no courier, fill or save takes it.
     pub const U_HOLD: u16 = 0x63;
     /// `parent | id[16]` → `handle[16]`: the item the user picked on the chip.
     pub const U_HANDLE: u16 = 0x64;

@@ -332,7 +332,7 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
                 std::io::stdin().lock().read_line(&mut l).ok();
                 l.trim_end_matches(['\r', '\n']).to_string()
             });
-            c.join(&Join { ssid: ssid(), passphrase, open }).map(|_| println!("joined"))
+            c.join(&Join { ssid: ssid(), passphrase, handle: None, open }).map(|_| println!("joined"))
         }
         "leave" => c.leave().map(|_| println!("left")),
         "forget" => c.forget(&ssid()).map(|_| println!("forgotten")),

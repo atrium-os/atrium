@@ -165,7 +165,7 @@ impl Field {
         match self.purpose {
             Purpose::CurrentPassword => (0..self.accounts.len()).map(Offer::Account).collect(),
             Purpose::NewPassword => vec![Offer::Generate],
-            Purpose::OneTimeCode | Purpose::PrivateUsername => Vec::new(),
+            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase => Vec::new(),
         }
     }
 

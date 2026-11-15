@@ -25,7 +25,7 @@
 //! `internet`):
 //!   status | subscribe | wifi-scan | wifi-status | wifi-list | wifi-leave
 //!   wifi-join ssid=HEX [security=open|psk|sae] [mac=network|random|device]
-//!   wifi-remember ssid=HEX [secret=HEX] [open=1] [auto=0] [prio=N] [mac=..]
+//!   wifi-remember ssid=HEX [secret=HEX|handle=HEX] [open=1] [auto=0] [prio=N] [mac=..]
 //!   wifi-forget ssid=HEX | country cc=XX
 
 #[cfg(target_os = "freebsd")]
@@ -800,9 +800,14 @@ mod imp {
                     let known = self.wifi.as_ref().unwrap().saved.get(&s).is_some_and(|p| p.open == open);
                     // No secret: change the settings of a network already
                     // remembered; its credential stays as it is in aura-keys.
-                    if !open && !(known && l.get("secret").is_none()) {
-                        let Some(secret) = l.hex("secret") else { return err("no-secret") };
-                        let r = self.keys_call(&Line::new("remember").with_hex("ssid", &s).with_hex("secret", &secret));
+                    if !open && !(known && l.get("secret").is_none() && l.get("handle").is_none()) {
+                        // The passphrase, or the handle to what the user typed
+                        // into Arca's field (aura-keys redeems it at Arca).
+                        let r = match (l.hex("secret"), l.hex("handle")) {
+                            (Some(secret), None) => self.keys_call(&Line::new("remember").with_hex("ssid", &s).with_hex("secret", &secret)),
+                            (None, Some(h)) if h.len() == 16 => self.keys_call(&Line::new("remember").with_hex("ssid", &s).with_hex("handle", &h)),
+                            _ => return err("no-secret"),
+                        };
                         match r {
                             Some(r) if r.verb == "ok" => {}
                             Some(r) => return vec![r],

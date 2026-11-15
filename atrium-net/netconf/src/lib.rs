@@ -189,12 +189,16 @@ pub struct Join {
     /// Remember the network with this passphrase first (passed to aura-keys,
     /// kept nowhere else). None: join a network already remembered.
     pub passphrase: Option<String>,
+    /// Or remember it with what the user typed into Arca's Wi-Fi passphrase
+    /// field: the handle Arca gave the app, which only aura-keys can redeem
+    /// (curia.md §4). The passphrase then passes through no one else.
+    pub handle: Option<[u8; 16]>,
     pub open: bool,
 }
 
 impl std::fmt::Debug for Join {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("Join").field("ssid", &self.ssid).field("passphrase", &self.passphrase.as_ref().map(|_| "..")).field("open", &self.open).finish()
+        f.debug_struct("Join").field("ssid", &self.ssid).field("passphrase", &self.passphrase.as_ref().map(|_| "..")).field("handle", &self.handle.map(|_| "..")).field("open", &self.open).finish()
     }
 }
 
@@ -333,6 +337,9 @@ pub mod server {
                 op::WIFI_PROFILES => enc(&b.profiles()),
                 op::WIFI_JOIN => enc(&arg::<Join>(p).and_then(|j| {
                     valid_ssid(&j.ssid)?;
+                    if j.handle.is_some() && (j.open || j.passphrase.is_some()) {
+                        return Err(Fail::new(status::MALFORMED, "a passphrase or Arca's handle, not both"));
+                    }
                     if let Some(pw) = &j.passphrase {
                         if j.open || !(8..=63).contains(&pw.len()) || !pw.bytes().all(|c| (0x20..0x7f).contains(&c)) {
                             return Err(Fail::new(status::MALFORMED, "a passphrase is 8 to 63 printable characters"));

@@ -152,7 +152,7 @@ pub fn act(tx: Sender<NetMsg>, a: NetAction) {
     std::thread::spawn(move || {
         let r = connect(Grant::Wifi).and_then(|mut c| {
             match &a {
-                NetAction::Join { ssid, open } => c.join(&Join { ssid: ssid.clone(), passphrase: None, open: *open }),
+                NetAction::Join { ssid, open } => c.join(&Join { ssid: ssid.clone(), passphrase: None, handle: None, open: *open }),
                 NetAction::Leave => c.leave(),
             }
             .map_err(|f| f.1)

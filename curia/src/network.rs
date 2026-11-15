@@ -13,8 +13,9 @@ pub enum Want {
     Details,
     /// Join a remembered or open network.
     Join { ssid: Vec<u8>, open: bool },
-    /// Remember with this passphrase, then join (interim, curia.md §4).
-    JoinWith { ssid: Vec<u8>, passphrase: String },
+    /// Remember with what was typed into Arca's field, then join: the
+    /// handle Arca gave us (curia.md §4). Curia never has the passphrase.
+    JoinWith { ssid: Vec<u8>, handle: [u8; 16] },
     Leave,
     Forget(Vec<u8>),
     Save(Profile),
@@ -66,11 +67,22 @@ pub struct NetPage {
     pub asking: Option<Vec<u8>>,
     /// The network being joined.
     pub joining: Option<Vec<u8>>,
+    /// Arca's handle for what was typed in its field on the passphrase row.
+    pub handle: Option<[u8; 16]>,
+    /// Join was pressed before the handle came (the press took the field's
+    /// focus, and Arca holds what was typed then): join when it comes.
+    pub armed: Option<std::time::Instant>,
+    /// The handle was spent on a join that failed: Arca's field starts
+    /// afresh (the window asks for a new one).
+    pub reset_field: bool,
     /// The network whose Forget waits for a second press.
     pub confirm_forget: Option<Vec<u8>>,
     pub notice: Option<Notice>,
     pub wants: Vec<Want>,
 }
+
+/// How long a press on Join waits for Arca's handle.
+pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn name(s: &[u8]) -> String {
     String::from_utf8_lossy(s).into_owned()
@@ -157,24 +169,50 @@ impl NetPage {
             self.wants.push(Want::Join { ssid: ssid.to_vec(), open });
         } else {
             self.asking = if self.asking.as_deref() == Some(ssid) { None } else { Some(ssid.to_vec()) };
+            self.handle = None;
+            self.armed = None;
         }
     }
 
-    /// Join pressed (or Enter) on the passphrase row.
-    pub fn join_typed(&mut self, passphrase: &str) {
+    /// Join pressed on the passphrase row.
+    pub fn join_pressed(&mut self, now: std::time::Instant) {
         let Some(ssid) = self.asking.clone() else { return };
-        let n = passphrase.chars().count();
-        if !(8..=63).contains(&n) || !passphrase.bytes().all(|c| (0x20..0x7f).contains(&c)) {
-            self.notice = Some(Notice { text: "A Wi-Fi passphrase is 8 to 63 letters, digits or symbols".into(), error: true });
-            return;
-        }
         self.notice = None;
-        self.joining = Some(ssid.clone());
-        self.wants.push(Want::JoinWith { ssid, passphrase: passphrase.to_string() });
+        match self.handle.take() {
+            Some(handle) => {
+                self.armed = None;
+                self.joining = Some(ssid.clone());
+                self.wants.push(Want::JoinWith { ssid, handle });
+            }
+            None => self.armed = Some(now),
+        }
+    }
+
+    /// Arca's field said something: a handle (what was typed is held) or
+    /// none (emptied).
+    pub fn field(&mut self, handle: Option<[u8; 16]>, now: std::time::Instant) {
+        self.handle = handle;
+        if handle.is_some() && self.armed.take().is_some() {
+            self.join_pressed(now);
+        }
+    }
+
+    /// No handle came after a press on Join: the field was empty.
+    pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        match self.armed {
+            Some(t) if now.duration_since(t) >= ARMED_WAIT => {
+                self.armed = None;
+                self.notice = Some(Notice { text: "Type the passphrase in the field first".into(), error: true });
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn cancel_ask(&mut self) {
         self.asking = None;
+        self.armed = None;
+        self.handle = None;
         self.notice = None;
     }
 
@@ -261,8 +299,13 @@ impl NetPage {
                     }
                     (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. }, Err(e)) => {
                         self.joining = None;
+                        if matches!(what, Want::JoinWith { .. }) {
+                            self.handle = None;
+                            self.reset_field = true;
+                        }
                         let why = match e.as_str() {
                             "timed out" => "no answer in time: a wrong passphrase, or out of range".to_string(),
+                            "bad-secret" => "a Wi-Fi passphrase is 8 to 63 letters, digits or symbols".to_string(),
                             w => w.replace('-', " "),
                         };
                         self.notice = Some(Notice { text: format!("Could not join {}: {why}", name(ssid)), error: true });
@@ -323,11 +366,18 @@ mod tests {
         p.pick(b"neighbour");
         assert!(p.take_wants().is_empty());
         assert_eq!(p.asking.as_deref(), Some(&b"neighbour"[..]));
-        p.join_typed("short");
-        assert!(p.take_wants().is_empty(), "a short passphrase never leaves the page");
-        p.join_typed("correct horse battery staple");
-        assert_eq!(p.take_wants(), vec![Want::JoinWith { ssid: b"neighbour".to_vec(), passphrase: "correct horse battery staple".into() }]);
-        p.apply(Got::Done { what: Want::JoinWith { ssid: b"neighbour".to_vec(), passphrase: String::new() }, result: Ok(()) });
+        // Join pressed on an empty field: no handle comes, so it says why.
+        let t = std::time::Instant::now();
+        p.join_pressed(t);
+        assert!(p.take_wants().is_empty());
+        assert!(!p.tick(t) && p.tick(t + ARMED_WAIT));
+        assert!(p.notice.as_ref().unwrap().error);
+        // The press takes the field's focus; Arca's handle follows and joins.
+        p.join_pressed(t);
+        p.field(Some([5; 16]), t);
+        assert_eq!(p.take_wants(), vec![Want::JoinWith { ssid: b"neighbour".to_vec(), handle: [5; 16] }]);
+        assert_eq!(p.handle, None, "one join per handle");
+        p.apply(Got::Done { what: Want::JoinWith { ssid: b"neighbour".to_vec(), handle: [5; 16] }, result: Ok(()) });
         assert_eq!((p.asking.clone(), p.notice.clone().unwrap().text), (None, "Connected to neighbour".to_string()));
         p.pick(b"home");
         p.take_wants();
@@ -352,9 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_shows_a_passphrase() {
-        let w = Want::JoinWith { ssid: b"x".to_vec(), passphrase: "hunter2hunter2".into() };
-        assert!(!format!("{w:?}").contains("hunter2"));
+    fn debug_never_shows_a_handle() {
+        let w = Want::JoinWith { ssid: b"x".to_vec(), handle: [0xab; 16] };
+        assert!(!format!("{w:?}").contains("171"));
     }
 
     #[test]

@@ -113,3 +113,39 @@ fn dropped_handles_are_gone() {
     assert_eq!(s.handle(&Label::TrustedUi, op::U_DROP, &h).status, status::OK);
     assert!(s.redeem(&h, "alice", &rcp(7, "org.example.mail")).is_none());
 }
+
+#[test]
+fn a_wifi_passphrase_goes_only_to_the_wifi_key_service_once() {
+    let (_d, mut s) = setup();
+    let keys = Label::Service(op::WIFI_SERVICE.into());
+    let hold = |s: &mut State| -> [u8; 16] {
+        let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { parent(w, 7, "org.atrium.curia"); w.bytes(b"correct horse"); w.u8(op::HOLD_FOR_WIFI); }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().try_into().unwrap()
+    };
+    let h = hold(&mut s);
+    // Not the app's courier, not another service, not the app itself.
+    assert!(s.redeem(&h, "alice", &rcp(7, "org.atrium.curia")).is_none());
+    let h = hold(&mut s);
+    assert_eq!(s.handle(&Label::Service("vinculumd".into()), op::TAKE_WIFI, &h).status, status::DENIED);
+    assert_eq!(s.handle(&Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.atrium.curia".into() }, op::TAKE_WIFI, &h).status, status::DENIED);
+    // The Wi-Fi key service, once.
+    let h = hold(&mut s);
+    let r = s.handle(&keys, op::TAKE_WIFI, &h);
+    assert_eq!(r.status, status::OK);
+    let mut rd = Reader::new(r.body.bytes());
+    assert_eq!(rd.bytes(64).unwrap(), b"correct horse");
+    assert_eq!(s.handle(&keys, op::TAKE_WIFI, &h).status, status::DENIED, "once");
+    // An ordinary field's value is not the service's to take (and is burned).
+    let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { parent(w, 7, "org.example.mail"); w.bytes(b"mail-pw"); }));
+    let h: [u8; 16] = r.body.bytes().try_into().unwrap();
+    assert_eq!(s.handle(&keys, op::TAKE_WIFI, &h).status, status::DENIED);
+    assert!(s.redeem(&h, "alice", &rcp(7, "org.example.mail")).is_none());
+    // A bad trailing byte is malformed.
+    let st = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { parent(w, 7, "org.atrium.curia"); w.bytes(b"x"); w.u8(9); })).status;
+    assert_eq!(st, status::MALFORMED);
+    // Lock voids a held passphrase.
+    let h = hold(&mut s);
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
+    assert_eq!(s.handle(&keys, op::TAKE_WIFI, &h).status, status::DENIED);
+}

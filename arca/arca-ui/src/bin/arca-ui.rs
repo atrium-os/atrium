@@ -83,7 +83,7 @@ impl Ctx {
                 }
                 Do::Hold => match &e.parent {
                     None => e.field.refused(Notice::UnknownApp),
-                    Some(p) => match self.arcad.hold(p, e.field.typed()) {
+                    Some(p) => match self.arcad.hold(p, e.field.typed(), e.field.purpose == limen::credential::Purpose::WifiPassphrase) {
                         Ok(h) => {
                             eprintln!("arca-ui: held what was typed");
                             e.field.held(h)
