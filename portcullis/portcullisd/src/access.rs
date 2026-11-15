@@ -16,12 +16,14 @@ pub fn entry(m: &Manifest, hash: &str, user: &Policy, system: Result<&Policy, &i
     // What it opens is part of what it asks (opening-files.md §5.1).
     let mut asks = compute_delta(&m.capabilities, None, None, hash).describe();
     asks.extend(m.opens_lines());
+    asks.extend(m.links_line());
     let d = decide(&id, &m.capabilities, hash, user, system);
     let missing = if d.delta.is_empty() {
         Vec::new()
     } else {
         let mut v = d.delta.describe();
         v.extend(m.opens_lines());
+        v.extend(m.links_line());
         v
     };
     let by = match (d.delta.is_empty(), d.by) {

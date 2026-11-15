@@ -2610,6 +2610,11 @@ pub mod activation {
         /// guard (`control::OP_WINDOW_GUARD`) frescod saw whole, uncovered
         /// and still for `credential::STILL_NS` before the press.
         pub const PROMPT: u8 = 12;
+        /// Opening a link in another app (opening-links.md §5): a click, or
+        /// Enter, in the asking app's window, spent by portcullisd. When
+        /// that window has a guard (`OP_WINDOW_GUARD`, the Navigator's
+        /// prompt row), the guard must have been seen as for `PROMPT`.
+        pub const LINK: u8 = 13;
     }
 
     /// What minted a token.

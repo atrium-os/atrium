@@ -17,6 +17,7 @@ pub mod jaild_client;
 /// Settings' Apps page (curia.md §13).
 pub mod access;
 /// Opening files in apps (opening-files.md §6.2).
+pub mod links;
 pub mod opens;
 /// The manifest trust gate, re-exported so existing call sites keep working.
 /// It lives in `portcullis-trust` so the CLI and `atrium-launch` share it

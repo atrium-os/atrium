@@ -283,7 +283,7 @@ pub fn launch_with_stdio(
      * at /atrium/sockets/opens. Made before the mount, so the source exists. */
     let mut jc = jc;
     // The terminal gets its consoles the same way (homes.md §4).
-    if !manifest.opens.is_empty() || manifest.capabilities.consoles == Some(true) {
+    if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(app_id)
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
@@ -357,6 +357,7 @@ fn clone_manifest_with(
         resources:    None,
         supervision:  None,
         opens:        Vec::new(),
+        links:        Vec::new(),
     }
 }
 
@@ -862,6 +863,38 @@ pub fn app_is_file_manager(app_id: &str) -> bool {
 pub fn app_opens(app_id: &str, mime: &str) -> Option<(portcullis_toml::OpenMode, String)> {
     let m = installed(app_id)?;
     m.opens(mime).map(|mode| (mode, if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }))
+}
+
+/// `app_id`'s name, if its INSTALLED manifest takes links of `scheme`.
+pub fn app_takes_link(app_id: &str, scheme: &str) -> Option<String> {
+    let m = installed(app_id)?;
+    m.takes_link(scheme).then(|| if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() })
+}
+
+/// An installed app's name (for `atrium-app:` links).
+pub fn app_name(app_id: &str) -> Option<String> {
+    let m = installed(app_id)?;
+    Some(if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() })
+}
+
+/// Every installed app that takes links of `scheme`: (id, name), by name.
+pub fn apps_taking_link(scheme: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
+        let Ok(m) = Manifest::from_str(&text) else { continue };
+        if e.file_name().to_str() != Some(m.app.id.as_str()) || !m.takes_link(scheme) {
+            continue;
+        }
+        // Web links are the Navigator's alone, whatever a tree says (D5).
+        if atrium_links::WEB.contains(&scheme) && m.capabilities.navigator_broker != Some(true) {
+            continue;
+        }
+        out.push((m.app.id.clone(), if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }));
+    }
+    out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
+    out
 }
 
 /// Every installed app that opens `mime`: (id, name, mode), by name.

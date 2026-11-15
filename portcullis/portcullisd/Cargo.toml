@@ -67,6 +67,7 @@ sockmux             = { path = "../sockmux" }
 # table, and spending the press with frescod (purpose OPEN).
 atrium-open         = { path = "../../atrium-open" }
 atrium-types        = { path = "../../atrium-types" }
+atrium-links        = { path = "../../atrium-links" }
 fresco-protocol     = { path = "../../fresco-protocol" }
 postcard            = { version = "1", features = ["use-std"] }
 libc                = "0.2"

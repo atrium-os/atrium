@@ -116,6 +116,9 @@ fn fits(e: &Entry, p: u8) -> bool {
         // A prompt's answer (navigator-ui.md §6.4): a click, or Enter.
         (kind::BUTTON, purpose::PROMPT) => true,
         (kind::KEY, purpose::PROMPT) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
+        // Opening a link: a click, or Enter.
+        (kind::BUTTON, purpose::LINK) => true,
+        (kind::KEY, purpose::LINK) => e.hid == HID_ENTER || e.hid == HID_KP_ENTER,
         _ => false,
     }
 }
@@ -166,8 +169,10 @@ impl Table {
         // Visibility first: a slot under a cover is OBSCURED whichever
         // window took focus.
         // A prompt's answer: the window's guard, not the window.
-        let watched = if purpose == purpose::PROMPT { e.window_id | crate::credential::GUARD } else { e.window_id };
-        if matches!(purpose, purpose::FILL | purpose::IDENTITY | purpose::APPROVE | purpose::PROMPT) && !visible(watched, e.minted_ns) {
+        // A link: the window's guard too, if it has one (`visible` answers
+        // for an unguarded window's `LINK` press).
+        let watched = if matches!(purpose, purpose::PROMPT | purpose::LINK) { e.window_id | crate::credential::GUARD } else { e.window_id };
+        if matches!(purpose, purpose::FILL | purpose::IDENTITY | purpose::APPROVE | purpose::PROMPT | purpose::LINK) && !visible(watched, e.minted_ns) {
             return refused(refusal::OBSCURED);
         }
         // A drop lands on whatever window is under the pointer, focused
@@ -379,7 +384,7 @@ pub type Consumers = std::collections::BTreeMap<u32, Option<Vec<u8>>>;
 /// meant for another (a compromised navigatord can't paste or open a file).
 pub const DEFAULT_CONSUMERS: &[(&str, &[u8])] = &[
     // portcullisd (opening-files.md §6.2, homes.md §4, curia.md §13).
-    ("root", &[purpose::OPEN, purpose::CONSOLE, purpose::APPROVE]),
+    ("root", &[purpose::OPEN, purpose::CONSOLE, purpose::APPROVE, purpose::LINK]),
     ("_tabula", &[purpose::COPY, purpose::PASTE, purpose::DRAG, purpose::DROP]),
     ("_share", &[purpose::SHARE]),
     ("_praeco", &[purpose::ACTION]),
@@ -402,6 +407,7 @@ fn purpose_named(n: &str) -> Option<u8> {
         "console" => purpose::CONSOLE,
         "approve" => purpose::APPROVE,
         "prompt" => purpose::PROMPT,
+        "link" => purpose::LINK,
         n => return n.parse().ok(),
     })
 }
@@ -737,7 +743,7 @@ mod tests {
         assert!(may_spend(&Some(vec![purpose::PROMPT]), purpose::PROMPT));
         assert!(!may_spend(&Some(vec![purpose::PROMPT]), purpose::PASTE), "navigatord can't paste");
         let named: Vec<u8> = DEFAULT_CONSUMERS.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE] {
+        for p in [purpose::COPY, purpose::PASTE, purpose::DROP, purpose::DRAG, purpose::SHARE, purpose::ACTION, purpose::FILL, purpose::IDENTITY, purpose::OPEN, purpose::CONSOLE, purpose::APPROVE, purpose::LINK] {
             assert_eq!(named.iter().filter(|&&q| q == p).count(), 1, "purpose {p}: exactly one default broker");
         }
         for p in SELF_SPENT {

@@ -32,6 +32,17 @@ pub struct Manifest {
     /// gives it no file.
     #[serde(default)]
     pub opens:        Vec<OpensSection>,
+    /// `[[links]]`: the link schemes the app takes (opening-links.md
+    /// §4.1). Eligibility only, as for `[[opens]]`.
+    #[serde(default)]
+    pub links:        Vec<LinksSection>,
+}
+
+/// One `[[links]]` entry: schemes (`mailto`, the app's own).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinksSection {
+    pub schemes: Vec<String>,
 }
 
 /// One `[[opens]]` entry: media types from the system table
@@ -62,6 +73,22 @@ impl Manifest {
     /// How the app opens `mime`, if it declares it.
     pub fn opens(&self, mime: &str) -> Option<OpenMode> {
         self.opens.iter().find(|o| o.types.iter().any(|t| t == mime)).map(|o| o.mode)
+    }
+
+    /// Whether the app takes links of `scheme`.
+    pub fn takes_link(&self, scheme: &str) -> bool {
+        self.links.iter().any(|l| l.schemes.iter().any(|s| s == scheme))
+    }
+
+    /// For the install screen: "Opens links: mailto, org.example.notes".
+    pub fn links_line(&self) -> Option<String> {
+        let mut v: Vec<&str> = Vec::new();
+        for s in self.links.iter().flat_map(|l| l.schemes.iter()) {
+            if !v.contains(&s.as_str()) {
+                v.push(s);
+            }
+        }
+        (!v.is_empty()).then(|| format!("Opens links: {}", v.join(", ")))
     }
 
     /// For the install screen: "Opens Audio: FLAC audio, MP3 audio", one

@@ -1,0 +1,9 @@
+# A mail app declaring the links it takes (opening-links.md §4.1).
+[app]
+id      = "org.example.mail"
+name    = "Mail"
+version = "0.1.0"
+entry   = "bin/mail"
+
+[[links]]
+schemes = ["mailto", "org.example.mail"]

@@ -39,7 +39,8 @@ struct Pending {
     name: String,
     mime: String,
     write: bool,
-    fd: OwnedFd,
+    /// A file, or (`None`) the link in `name` (opening-links.md §5).
+    fd: Option<OwnedFd>,
 }
 
 #[derive(Default)]
@@ -160,9 +161,16 @@ impl Hub {
                 slot.pending.remove(0);
                 continue;
             }
-            match atrium_open::send(c, &p.name, &p.mime, p.write, p.fd.as_raw_fd()) {
+            let sent = match &p.fd {
+                Some(fd) => atrium_open::send(c, &p.name, &p.mime, p.write, fd.as_raw_fd()),
+                None => atrium_open::send_link(c, &p.name),
+            };
+            match sent {
                 Ok(()) => {
-                    eprintln!("portcullisd: {app}: “{}” ({}) handed over{}", p.name, p.mime, if p.write { " (write)" } else { "" });
+                    match p.fd {
+                        Some(_) => eprintln!("portcullisd: {app}: “{}” ({}) handed over{}", p.name, p.mime, if p.write { " (write)" } else { "" }),
+                        None => eprintln!("portcullisd: {app}: a {} link handed over", p.mime),
+                    }
                     slot.pending.remove(0);
                 }
                 Err(e) => {
@@ -176,6 +184,18 @@ impl Hub {
     /// Hand `fd` to `owner`'s `app`, now or once it connects. Refused while
     /// the app runs for someone else.
     pub fn deliver(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: OwnedFd) -> io::Result<Delivery> {
+        self.push(owner, app, name, mime, write, Some(fd))
+    }
+
+    /// Hand `url` (a link of `scheme`) to `owner`'s `app`, as [`Hub::deliver`].
+    pub fn deliver_link(&self, owner: &str, app: &str, scheme: &str, url: &str) -> io::Result<Delivery> {
+        if atrium_open::encode_link(url).is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"));
+        }
+        self.push(owner, app, url, scheme, false, None)
+    }
+
+    fn push(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: Option<OwnedFd>) -> io::Result<Delivery> {
         let mut apps = self.apps.lock().unwrap();
         let slot = apps.entry(app.to_string()).or_default();
         if let Some((_, _, o)) = &slot.conn {
@@ -185,7 +205,7 @@ impl Hub {
         }
         slot.pending.retain(|p| p.at.elapsed() < PENDING_FOR);
         if slot.pending.len() >= MAX_PENDING {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("{MAX_PENDING} files are already waiting for {app}")));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("{MAX_PENDING} files or links are already waiting for {app}")));
         }
         slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd });
         Self::flush(app, slot);
@@ -334,6 +354,13 @@ mod tests {
         // Someone else's: refused while alice's runs.
         let fd = OwnedFd::from(File::open(d.join("a.flac")).unwrap());
         assert!(hub.deliver("bob", "org.test.player", "d.flac", "audio/flac", false, fd).is_err(), "not bob's player");
+        // A link, on the same channel, no descriptor.
+        assert_eq!(hub.deliver_link("alice", "org.test.player", "mailto", "mailto:a@b").unwrap(), Delivery::Sent);
+        match ch.recv_any(Some(Duration::from_secs(2))).unwrap() {
+            Some(atrium_open::Message::Link(u)) => assert_eq!(u, "mailto:a@b"),
+            other => panic!("{other:?}"),
+        }
+        assert!(hub.deliver_link("bob", "org.test.player", "mailto", "mailto:a@b").is_err(), "not bob's");
         // The app goes: files wait again.
         drop(ch);
         std::thread::sleep(Duration::from_millis(200));

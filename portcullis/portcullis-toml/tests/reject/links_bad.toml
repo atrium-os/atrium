@@ -1,0 +1,9 @@
+# EXPECT_ERROR: a scheme is a lowercase
+[app]
+id      = "org.example.mail"
+name    = "Mail"
+version = "0.1.0"
+entry   = "bin/mail"
+
+[[links]]
+schemes = ["Mail"]

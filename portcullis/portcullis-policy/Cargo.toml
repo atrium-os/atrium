@@ -9,6 +9,7 @@ description = "Per-user capability grant policy for Portcullis. policy.toml load
 [dependencies]
 portcullis-toml = { path = "../portcullis-toml" }
 atrium-types    = { path = "../../atrium-types" }
+atrium-links    = { path = "../../atrium-links" }
 serde           = { version = "1", features = ["derive"] }
 toml            = "0.8"
 sha2            = "0.10"

@@ -122,6 +122,28 @@ pub fn validate(m: &Manifest) -> Report {
         r.errors.push(format!("[[opens]]: {} types, at most {}", seen.len(), crate::schema::MAX_OPENS));
     }
 
+    /* ── [[links]] (opening-links.md §4.1) ───────────────────── */
+
+    let mut schemes = std::collections::BTreeSet::new();
+    for l in &m.links {
+        if l.schemes.is_empty() {
+            r.errors.push("[[links]].schemes: must name at least one scheme".into());
+        }
+        for s in &l.schemes {
+            if let Err(why) = atrium_links::declarable(s) {
+                r.errors.push(format!("[[links]] {why}"));
+            } else if atrium_links::WEB.contains(&s.as_str()) && m.capabilities.navigator_broker != Some(true) {
+                r.errors.push(format!("[[links]] {s:?}: web links are the Navigator's alone"));
+            }
+            if !schemes.insert(s.as_str()) {
+                r.errors.push(format!("[[links]] {s:?}: listed twice"));
+            }
+        }
+    }
+    if schemes.len() > atrium_links::MAX_SCHEMES {
+        r.errors.push(format!("[[links]]: {} schemes, at most {}", schemes.len(), atrium_links::MAX_SCHEMES));
+    }
+
     /* ── [supervision] — schema enforces enum values, nothing else here ── */
 
     r

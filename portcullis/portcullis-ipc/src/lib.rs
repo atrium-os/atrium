@@ -287,6 +287,31 @@ pub enum Request {
         always:     bool,
     },
 
+    /// ★ A link to open (opening-links.md §5), first step. Only from
+    /// Monstrator (peer uid `_monstrator`). `asker_uid` is the app the
+    /// person pressed in, `activation` that press, spent here with frescod
+    /// (purpose LINK) for that uid, so Monstrator can't open links on its
+    /// own. `scheme` is the link's; `app` names the app for an
+    /// `atrium-app:` link. Answer: `LinkGranted`.
+    LinkGrant {
+        asker_uid:  u32,
+        activation: [u8; 16],
+        scheme:     String,
+        #[serde(default)]
+        app:        Option<String>,
+    },
+    /// ★ Second step: hand `url` to `app` under `grant` (once, within two
+    /// minutes). `app` must be one `LinkGranted` listed; `url` must start
+    /// with the grant's scheme. `always` makes it the person's default for
+    /// the scheme (the sheet's "Always use"). Answer: `LinkDelivered`.
+    DeliverLink {
+        grant:  [u8; 16],
+        app:    String,
+        url:    String,
+        #[serde(default)]
+        always: bool,
+    },
+
     /// ★ A console in an app's jail (docs/spec/homes.md §4): a shell as the
     /// app's uid for this person, on a new pty whose master side goes to the
     /// terminal app. Only from a launcher (its INSTALLED manifest holds
@@ -438,6 +463,14 @@ pub struct Toolchain {
 
 /// An app that opens a type, for the Open with sheet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkChoice {
+    pub id:      String,
+    pub name:    String,
+    /// The person's default for the scheme (or the system's, unchosen).
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenChoice {
     pub id:      String,
     pub name:    String,
@@ -528,6 +561,11 @@ pub enum Response {
 
     /// OpenApps → the apps that open the type, the default first.
     OpenApps { apps: Vec<OpenChoice> },
+    /// LinkGrant → a grant for one link, for `person`, and the apps that
+    /// take the scheme there (the asker left out), the default first.
+    LinkGranted { grant: [u8; 16], person: String, apps: Vec<LinkChoice> },
+    /// DeliverLink → handed to `app` (its name).
+    LinkDelivered { app: String },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.

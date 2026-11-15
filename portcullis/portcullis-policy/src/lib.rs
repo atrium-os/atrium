@@ -24,6 +24,7 @@
 //! network     = "none"
 //! ```
 
+pub mod links;
 pub mod opens;
 
 use std::collections::BTreeMap;

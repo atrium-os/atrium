@@ -438,6 +438,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
             continue;
         }
+        /* ★ Opening links (opening-links.md §5): only from Monstrator, by
+         * its system user; the person is the asking app's. */
+        if matches!(req, Request::LinkGrant { .. } | Request::DeliverLink { .. }) {
+            let resp = handle_link(&user, req, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         /* ★ Workspaces (homes.md §5): a launcher, or the person. */
         if let Request::WorkspaceRun { name, project, activation } = req {
             let resp = handle_run(uid, &owner, &name, &project, activation, &shared);
@@ -918,6 +925,7 @@ fn handle_launch(
             // What it opens is part of what the user approves (opening-files.md §5.1).
             let mut lines = delta.describe();
             lines.extend(manifest.opens_lines());
+            lines.extend(manifest.links_line());
             return write_response(writer, &Response::LaunchNeedsApproval {
                 delta: lines,
             });
@@ -1084,6 +1092,105 @@ fn handle_open(
             }
             eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
             write_response(writer, &Response::Opened { app: app_name, name })
+        }
+        _ => unreachable!("routed by serve()"),
+    }
+}
+
+/// LinkGrant and DeliverLink (opening-links.md §5). `user` is the
+/// caller's own user name: Monstrator's system user, or refused.
+fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
+    use portcullis_ipc::LinkChoice;
+    use portcullis_policy::links::LinkDefaults;
+    use portcullisd::links::{Grant, Grants, MONSTRATOR_USER};
+    use portcullisd::opens::{self, Delivery, Hub};
+    let refuse = |why: String| {
+        eprintln!("portcullisd: link REFUSED ({user}): {why}");
+        Response::Error { message: why }
+    };
+    if user != MONSTRATOR_USER {
+        return refuse(format!("cap.link.denied: only the link opener ({MONSTRATOR_USER}) asks this"));
+    }
+    let grants = Grants::global();
+    match req {
+        Request::LinkGrant { asker_uid, activation, scheme, app } => {
+            let Some((person, asker_app)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+                .unwrap_or_default().resolve(asker_uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+                return refuse(format!("uid {asker_uid} is not a launched app"));
+            };
+            let now = std::time::Instant::now();
+            if let Err(why) = grants.may_ask(&asker_app, now) {
+                return refuse(why);
+            }
+            // The apps it may go to, before the press is spent.
+            let apps: Vec<(String, String)> = if scheme == atrium_links::APP {
+                let Some(id) = app else { return refuse("an atrium-app: link names its app".into()) };
+                match launch::app_name(&id) {
+                    Some(name) if id != asker_app => vec![(id, name)],
+                    Some(_) => return refuse("an app's link to itself".into()),
+                    None => return refuse(format!("{id} isn't installed")),
+                }
+            } else {
+                if let Err(why) = atrium_links::declarable(&scheme) {
+                    return refuse(why);
+                }
+                launch::apps_taking_link(&scheme).into_iter()
+                    .filter(|(id, _)| id != &asker_app && may_run_unasked(id, &person, shared).is_ok())
+                    .collect()
+            };
+            if apps.is_empty() {
+                return refuse(format!("no app here opens {scheme} links"));
+            }
+            // Last of the checks: a refusal above doesn't spend the press.
+            if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, asker_uid, fresco_protocol::activation::purpose::LINK) {
+                return refuse(why);
+            }
+            let def = if scheme == atrium_links::APP { None } else {
+                LinkDefaults::load(&LinkDefaults::user_path(&person)).unwrap_or_default()
+                    .app_for(&scheme, |id| apps.iter().any(|(a, _)| a == id))
+            };
+            let grant = match grants.issue(Grant { at: now, person: person.clone(), asker_app: asker_app.clone(), scheme: scheme.clone(),
+                                                   apps: apps.iter().map(|(a, _)| a.clone()).collect() }) {
+                Ok(g) => g,
+                Err(why) => return refuse(why),
+            };
+            let mut list: Vec<LinkChoice> = apps.into_iter()
+                .map(|(id, name)| LinkChoice { default: def.as_deref() == Some(id.as_str()), id, name })
+                .collect();
+            list.sort_by_key(|c| !c.default);
+            eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}: {} app(s)", list.len());
+            Response::LinkGranted { grant, person, apps: list }
+        }
+        Request::DeliverLink { grant, app, url, always } => {
+            let g = match grants.take(&grant, &app, &url, std::time::Instant::now()) {
+                Ok(g) => g,
+                Err(why) => return refuse(why),
+            };
+            let name = launch::app_name(&app).unwrap_or_else(|| app.clone());
+            if g.scheme == atrium_links::APP {
+                start_for(&app, &g.person, "an atrium-app link");
+                eprintln!("portcullisd: {app} opened from {} for {}", g.asker_app, g.person);
+                return Response::LinkDelivered { app: name };
+            }
+            if always {
+                let p = LinkDefaults::user_path(&g.person);
+                let mut d = LinkDefaults::load(&p).unwrap_or_default();
+                match d.choose(&g.scheme, &app).map_err(std::io::Error::other).and_then(|_| d.save(&p)) {
+                    Ok(()) => eprintln!("portcullisd: {}'s default for {} links is now {app}", g.person, g.scheme),
+                    Err(e) => eprintln!("portcullisd: default for {} links: {e}", g.scheme),
+                }
+            }
+            let hub = Hub::global();
+            if let Err(e) = hub.listen(&app) {
+                return refuse(format!("{app}'s document channel: {e}"));
+            }
+            match hub.deliver_link(&g.person, &app, &g.scheme, &url) {
+                Ok(Delivery::Sent) => {}
+                Ok(Delivery::Queued) => start_for(&app, &g.person, "to open a link"),
+                Err(e) => return refuse(e.to_string()),
+            }
+            eprintln!("portcullisd: a {} link from {} opened in {app} for {}", g.scheme, g.asker_app, g.person);
+            Response::LinkDelivered { app: name }
         }
         _ => unreachable!("routed by serve()"),
     }
@@ -2096,6 +2203,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::Console { .. } => Response::Error {
             message: "internal: Console must go through handle_console".into(),
+        },
+        Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
+            message: "internal: link verbs must go through handle_link".into(),
         },
         Request::OpenApps { .. } | Request::OpenFile { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */

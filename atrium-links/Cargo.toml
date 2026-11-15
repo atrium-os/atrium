@@ -1,0 +1,12 @@
+[package]
+name = "atrium-links"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Which links may be opened in apps (docs/spec/opening-links.md): schemes apps may declare, schemes never taken, and the checks Monstrator makes on a link."
+
+[dependencies]
+url = "2"
+idna = "1"
+
+[workspace]

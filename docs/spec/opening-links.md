@@ -53,7 +53,9 @@ portcullisd, reads the directory).
 3. **A link that lies** (look-alike hosts, a long `mailto:` with a hidden body, control
    characters). Monstrator shows scheme and host only, the host in its ASCII (punycode) form
    when it mixes scripts, and refuses control characters, embedded newlines and links over
-   8 KiB.
+   8 KiB. (As built: a host is shown in its own letters only when every label is Latin
+   script; anything else, including a whole label of Cyrillic look-alikes, is shown in its
+   `xn--` form.)
 4. **A link that is a command** (`file:`, `javascript:`, `data:`, `vbscript:`, `about:`,
    custom schemes that name programs). Those schemes are never taken (§4.2); no handler runs
    a program named by a link.
@@ -160,7 +162,18 @@ new trail.
 | hand-offs through Monstrator | navigatord, navigator-ui |
 
 1. **L1** manifest `[[links]]`, frescod `LINK`, portcullisd grant/deliver and defaults,
-   `LINK` on the document channel; host tests.
+   `LINK` on the document channel; host tests. *Built 2026-11-15:* crate `atrium-links`
+   (the scheme rules of §4.1–4.2 and Monstrator's link check, §3.3); portcullis-toml
+   `[[links]]` (web schemes only with `navigator-broker`, at most 16, the install line
+   "Opens links: …"); frescod purpose `LINK` (13), root its broker, a guarded window's guard
+   checked as for `PROMPT`; portcullis-policy `LinkDefaults` (`<user>/links.toml`, the
+   Navigator for `http`/`https`); portcullisd `LinkGrant` (only from `_monstrator`; the asker
+   and its person from the launch registry; ten a minute per asking app; the press spent last)
+   and `DeliverLink` (a grant once, two minutes, one of its apps, a link of its scheme in
+   printable ASCII), an app with `[[links]]` gets the document channel, and `atrium-open`'s
+   `LINK` message (`Channel::recv_any`; `recv` passes links over). Tests: atrium-links 3,
+   portcullis-toml fixtures, frescod activation and credential 16/16, portcullisd opens and
+   links 6/6 (in the VM).
 2. **L2** `monstratord` in its jail with the link checks and the flow, no sheet (default or
    single app only); a test app bundle that takes `mailto`; VM gate.
 3. **L3** the sheet and "Always use", Curia's Links section.

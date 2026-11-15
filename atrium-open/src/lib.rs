@@ -16,6 +16,12 @@
 //! On the wire each open is one `sendmsg`: a two-byte little-endian length,
 //! then `OPEN\0<type>\0<r|w>\0<name>`, with the descriptor in
 //! `SCM_RIGHTS` on the first byte.
+//!
+//! Apps that take links (`[[links]]`, docs/spec/opening-links.md §5) get
+//! them on the same channel as `LINK\0<url>`, with no descriptor: a link
+//! the person pressed for in another app, passed by Monstrator and
+//! portcullisd. [`Channel::recv`] passes over links; an app that takes
+//! them reads [`Channel::recv_any`].
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -28,8 +34,11 @@ use std::time::Duration;
 pub const SOCKET: &str = "/atrium/sockets/opens/opens.sock";
 /// Overrides [`SOCKET`] (tests, a development run outside a jail).
 pub const SOCKET_ENV: &str = "ATRIUM_OPENS_SOCKET";
-/// The longest message: a type and a file name fit many times over.
-pub const MAX: usize = 4096;
+/// The longest message: a type and a file name fit many times over, and a
+/// link of `atrium_links::MAX_URL` (8 KiB).
+pub const MAX: usize = 10240;
+/// The longest link passed on.
+pub const MAX_LINK: usize = 8192;
 /// The longest name passed on: a file name, not a path.
 pub const MAX_NAME: usize = 255;
 
@@ -80,11 +89,44 @@ pub fn decode(b: &[u8]) -> Option<(String, String, bool)> {
     Some((name.to_string(), mime.to_string(), write))
 }
 
+/// `LINK\0url`, or `None` for a link too long or with a NUL.
+pub fn encode_link(url: &str) -> Option<Vec<u8>> {
+    if url.is_empty() || url.len() > MAX_LINK || url.contains('\0') {
+        return None;
+    }
+    let mut v = b"LINK\0".to_vec();
+    v.extend_from_slice(url.as_bytes());
+    Some(v)
+}
+
+/// The link of a `LINK` message.
+pub fn decode_link(b: &[u8]) -> Option<String> {
+    let u = std::str::from_utf8(b.strip_prefix(b"LINK\0")?).ok()?;
+    (!u.is_empty() && u.len() <= MAX_LINK && !u.contains('\0')).then(|| u.to_string())
+}
+
+/// Send one link (no descriptor).
+pub fn send_link(mut s: &UnixStream, url: &str) -> io::Result<()> {
+    use std::io::Write;
+    let body = encode_link(url).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"))?;
+    let mut data = (body.len() as u16).to_le_bytes().to_vec();
+    data.extend_from_slice(&body);
+    s.write_all(&data)
+}
+
+/// What came on the channel.
+#[derive(Debug)]
+pub enum Message {
+    File(Opened),
+    /// A link the person opened in this app (opening-links.md §5).
+    Link(String),
+}
+
 /// Send one open: `fd` with its name and type.
 pub fn send(s: &UnixStream, name: &str, mime: &str, write: bool, fd: RawFd) -> io::Result<()> {
     let body = encode(name, mime, write);
     if body.len() > MAX {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "an open message over 4 KiB"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a message over 10 KiB"));
     }
     let mut data = (body.len() as u16).to_le_bytes().to_vec();
     data.extend_from_slice(&body);
@@ -146,6 +188,17 @@ impl Channel {
     /// portcullisd has gone.
     pub fn recv(&mut self, wait: Option<Duration>) -> io::Result<Option<Opened>> {
         loop {
+            match self.recv_any(wait)? {
+                Some(Message::File(o)) => return Ok(Some(o)),
+                Some(Message::Link(_)) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The next file or link: as [`Channel::recv`], links included.
+    pub fn recv_any(&mut self, wait: Option<Duration>) -> io::Result<Option<Message>> {
+        loop {
             let ms = wait.map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
             let mut p = libc::pollfd { fd: self.s.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             // SAFETY: one pollfd we own.
@@ -164,7 +217,7 @@ impl Channel {
         }
     }
 
-    fn read_one(&mut self) -> io::Result<Option<Opened>> {
+    fn read_one(&mut self) -> io::Result<Option<Message>> {
         let mut len = [0u8; 2];
         let mut iov = libc::iovec { iov_base: len.as_mut_ptr().cast(), iov_len: 2 };
         // Room for a few descriptors: a sender that puts in more than one
@@ -206,17 +259,24 @@ impl Channel {
         }
         let want = u16::from_le_bytes(len) as usize;
         if want > MAX {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "an open message over 4 KiB"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a message over 10 KiB"));
         }
         let mut body = vec![0u8; want];
         self.s.read_exact(&mut body)?;
+        if body.starts_with(b"LINK\0") {
+            if !fds.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "a link with descriptors"));
+            }
+            return decode_link(&body).map(|u| Some(Message::Link(u)))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a link message"));
+        }
         let Some((name, mime, write)) = decode(&body) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an open message"));
         };
         if fds.len() != 1 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("an open with {} descriptors", fds.len())));
         }
-        Ok(Some(Opened { name, mime, write, file: File::from(fds.pop().unwrap()) }))
+        Ok(Some(Message::File(Opened { name, mime, write, file: File::from(fds.pop().unwrap()) })))
     }
 }
 
@@ -269,6 +329,26 @@ mod tests {
         drop(a);
         assert_eq!(ch.recv(Some(Duration::from_secs(1))).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn links_come_on_the_same_channel() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut ch = Channel::from_stream(b);
+        send_link(&a, "mailto:ana@example.org").unwrap();
+        match ch.recv_any(Some(Duration::from_secs(1))).unwrap() {
+            Some(Message::Link(u)) => assert_eq!(u, "mailto:ana@example.org"),
+            other => panic!("{other:?}"),
+        }
+        assert!(send_link(&a, &format!("mailto:{}", "a".repeat(MAX_LINK))).is_err(), "too long");
+        assert!(encode_link("a\0b").is_none());
+        // recv() passes links over to the next file.
+        send_link(&a, "mailto:b@example.org").unwrap();
+        let p = std::env::temp_dir().join(format!("atrium-open-link-{}", std::process::id()));
+        std::fs::write(&p, "x").unwrap();
+        send(&a, "x.txt", "text/plain", false, File::open(&p).unwrap().as_raw_fd()).unwrap();
+        assert_eq!(ch.recv(Some(Duration::from_secs(1))).unwrap().unwrap().name, "x.txt");
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

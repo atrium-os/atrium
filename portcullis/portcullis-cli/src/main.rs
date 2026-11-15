@@ -986,7 +986,7 @@ fn policy_diff(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("{id} wants:");
-    for line in delta.describe().into_iter().chain(manifest.opens_lines()) {
+    for line in delta.describe().into_iter().chain(manifest.opens_lines()).chain(manifest.links_line()) {
         println!("  - {line}");
     }
     /* Exit 1 so scripts can detect "needs-prompt" without parsing. */

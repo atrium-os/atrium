@@ -1,0 +1,9 @@
+# EXPECT_ERROR: the Navigator's alone
+[app]
+id      = "org.example.mail"
+name    = "Mail"
+version = "0.1.0"
+entry   = "bin/mail"
+
+[[links]]
+schemes = ["https"]

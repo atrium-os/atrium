@@ -146,11 +146,19 @@ pub fn window_visible_for(window: u32, minted: u64, now: u64) -> bool {
 
 /// Which check a press for `purpose` takes.
 pub fn visible_for_purpose(purpose: u8, window: u32, minted: u64, now: u64) -> bool {
-    if purpose == fresco_protocol::activation::purpose::APPROVE {
+    if purpose == fresco_protocol::activation::purpose::LINK {
+        // Asked of the guard: none, nothing more to see; else as `PROMPT`.
+        !guarded(window) || visible_for(window, minted, now)
+    } else if purpose == fresco_protocol::activation::purpose::APPROVE {
         window_visible_for(window, minted, now)
     } else {
         visible_for(window, minted, now)
     }
+}
+
+/// Whether a guard is recorded under `key` (`window | GUARD`).
+pub fn guarded(key: u32) -> bool {
+    key & GUARD != 0 && RECS.lock().unwrap().as_ref().is_some_and(|r| r.contains_key(&key))
 }
 
 fn seen_whole(window: u32, minted: u64, now: u64, any: bool) -> bool {
@@ -286,6 +294,10 @@ mod tests {
         // Over the row (y 142..182 on screen): not, and for half a second after.
         observe_frame(&comp, &[win, (other, [100, 150, 400, 350])], screen, t0 + 900 * ms);
         assert!(!visible_for(g, t0 + 1000 * ms, t0 + 1000 * ms), "covered");
+        // A link pressed there: its guard is asked; another window has none.
+        let link = fresco_protocol::activation::purpose::LINK;
+        assert!(!visible_for_purpose(link, g, t0 + 1000 * ms, t0 + 1000 * ms), "a link from a covered row");
+        assert!(visible_for_purpose(link, other | GUARD, t0 + 1000 * ms, t0 + 1000 * ms), "no guard, no look");
         observe_frame(&comp, &[win, (other, [100, 300, 400, 500])], screen, t0 + 1100 * ms);
         assert!(!visible_for(g, t0 + 1300 * ms, t0 + 1300 * ms), "just uncovered");
         assert!(visible_for(g, t0 + 1700 * ms, t0 + 1700 * ms));
@@ -304,6 +316,7 @@ mod tests {
         assert!(comp.lock().unwrap().set_guard(ui as u16, 1, None));
         observe_frame(&comp, &[(ui, [0, 70, 1000, 770])], screen, t0 + 7000 * ms);
         assert!(!visible_for(g, t0 + 7000 * ms, t0 + 7000 * ms), "no guard");
+        assert!(!guarded(g), "its record went with it");
         assert!(!comp.lock().unwrap().set_guard(ui as u16, 1, Some([-1, 0, 100, 40])), "outside the window");
     }
 }
