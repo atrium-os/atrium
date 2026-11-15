@@ -23,6 +23,8 @@ const HID_BACKTICK:    u16 = 0x35;
 const HID_COMMA:       u16 = 0x36;
 const HID_PERIOD:      u16 = 0x37;
 const HID_SLASH:       u16 = 0x38;
+const HID_HOME:        u16 = 0x4a;
+const HID_END:         u16 = 0x4d;
 const HID_ARROW_R:     u16 = 0x4f;
 const HID_ARROW_L:     u16 = 0x50;
 const HID_ARROW_D:     u16 = 0x51;
@@ -39,6 +41,7 @@ pub enum Action {
     Backspace,
     Tab,
     Left, Right, Up, Down,
+    Home, End,
     Save,
     Quit,
 }
@@ -65,6 +68,8 @@ impl Keymap {
             HID_ARROW_R   => Some(Action::Right),
             HID_ARROW_U   => Some(Action::Up),
             HID_ARROW_D   => Some(Action::Down),
+            HID_HOME      => Some(Action::Home),
+            HID_END       => Some(Action::End),
             _ => self.printable_or_ctrl(code),
         }
     }
@@ -104,5 +109,18 @@ impl Keymap {
             _ => return None,
         };
         Some(Action::Insert((if self.shift { hi } else { lo }) as char))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, Keymap};
+
+    #[test]
+    fn home_and_end_keys() {
+        let mut k = Keymap::new();
+        assert!(matches!(k.handle(0x4a, true), Some(Action::Home)));
+        assert!(matches!(k.handle(0x4d, true), Some(Action::End)));
+        assert!(k.handle(0x4d, false).is_none(), "release does nothing");
     }
 }

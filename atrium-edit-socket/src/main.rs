@@ -130,6 +130,8 @@ fn apply(buf: &mut buffer::Buffer, a: Action, alive: &mut bool) -> io::Result<bo
         Action::Right       => { buf.move_right(); true }
         Action::Up          => { buf.move_up();    true }
         Action::Down        => { buf.move_down();  true }
+        Action::Home        => { buf.move_home();  true }
+        Action::End         => { buf.move_end();   true }
         Action::Save        => match buf.save() {
             Ok(())  => true,
             Err(e)  => { buf.status = format!("[save error: {e}]"); true }
