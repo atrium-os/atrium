@@ -66,3 +66,40 @@ fn a_listening_socket_accepts_and_names_its_peer() {
     assert!(matches!(s.recv().unwrap(), Recv::Msg(Msg::WindowDestroy { window: 9 }, _)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Threads sending at once without waiting, to a channel with room, all
+/// get through: none is told the channel is full. FreeBSD's send I/O lock
+/// is a try-lock under MSG_DONTWAIT, so unserialized senders would get
+/// EWOULDBLOCK from each other, and frescod retired a renderer for it.
+#[test]
+fn senders_at_once_are_not_told_the_channel_is_full() {
+    let (a, b) = Chan::pair().unwrap();
+    a.set_buffer(256 << 10).unwrap();
+    b.set_buffer(256 << 10).unwrap();
+    const THREADS: usize = 8;
+    const EACH: usize = 200;
+    let reader = std::thread::spawn(move || {
+        let mut n = 0;
+        while n < THREADS * EACH {
+            match b.recv().unwrap() {
+                Recv::Msg(..) => n += 1,
+                _ => panic!("the channel ended early"),
+            }
+        }
+        n
+    });
+    let senders: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let a = a.try_clone().unwrap();
+            std::thread::spawn(move || {
+                for _ in 0..EACH {
+                    a.send_now(&Msg::WindowDestroy { window: t as u32 + 1 }, &[]).expect("a send with room refused");
+                }
+            })
+        })
+        .collect();
+    for s in senders {
+        s.join().unwrap();
+    }
+    assert_eq!(reader.join().unwrap(), THREADS * EACH);
+}
