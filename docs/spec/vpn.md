@@ -571,20 +571,24 @@ from what the app says:
 sheet shows both personas' chips when a file crosses from one to the other. Paste across
 personas works but the paste carries a one-line notice in the strip ("pasted from Work").
 Links opened from a Work app open in a Work Navigator window; from a Personal app in a
-Personal one. Crossing personas (Shankar asked 2026-11-15) is allowed but never silent:
+Personal one. **Crossing personas is off by default, both ways** (Shankar 2026-11-15:
+"why should we not disable it by default?"):
 
-- **Work → Personal** asks each time, in a sheet drawn by Forum showing the full address and
-  both chips ("Open in Personal, outside Acme VPN?"). A link that only works inside the
-  tunnel (its host is under a tunnel DNS domain or resolves into the tunnel's routes) is
-  refused rather than asked: opening it direct would only send an internal name to the
-  public network. Query strings stay as they are, so the sheet says when the link carries
-  one (it may hold a session token).
-- **Personal → Work** asks the same way. It is the riskier direction for the employer: a
-  phishing link from a personal chat would reach the internal network. The page opens
-  anonymous (navigator-ui.md §6.2, nothing signs it in) in a new Work trail.
-- **A persona can forbid crossing** ("Links never leave Work" and/or "No outside links
-  into Work"), for people whose employer requires it. Off by default.
-- "Open in the other persona" is never a remembered choice; each crossing is one press.
+- A link from Work opened in a Personal app, or the reverse, opens in the persona it came
+  from; there is no "open in the other persona". A sheet drawn by Forum says why and offers
+  **Copy address**, so moving a link is one deliberate act that the person does with the
+  address in front of them.
+- **Allowing it is a per-persona switch** in Curia, per direction ("Links from Work may open
+  in Personal", "Outside links may open in Work"). With it on, each crossing still asks, in
+  the same sheet, with the full address and both chips ("Open in Personal, outside Acme
+  VPN?"), and says when the link has a query string (it may hold a session token). Never a
+  remembered choice; one press each.
+- **Never allowed, even with the switch:** a Work link that only works inside the tunnel
+  (its host is under a tunnel DNS domain or resolves into the tunnel's routes) opened
+  direct: it would only send an internal name to the public network.
+- **Personal → Work is the riskier direction** for the employer (a phishing link from a
+  personal chat reaching the internal network). When allowed, it opens anonymous
+  (navigator-ui.md §6.2, nothing signed in) in a new Work trail.
 
 
 **Hooks needed elsewhere** (passed to the threads building them):
@@ -738,9 +742,9 @@ tunnel, site-to-site, being a VPN server, multi-hop, post-quantum WireGuard (Ros
     coloured frame for VPN personas, badges in the dock and overview. *Recommend yes.*
 20. **One persona per Navigator window**, and a workspace's persona fixed when it is made
     (changeable in its settings, never from inside). *Recommend yes.*
-21. **Links may cross personas, one press each, never remembered;** links that only work
-    inside the tunnel are refused; a persona can forbid crossing either way. *Recommend
-    yes.* Alternative: no crossing at all (copy the address by hand).
+21. **Links do not cross personas by default** (Shankar 2026-11-15); the refusal sheet
+    offers Copy address; a per-persona, per-direction switch allows crossing with one press
+    each; tunnel-only links never go direct. *Recommend yes.*
 
 ## 14. Build order
 
