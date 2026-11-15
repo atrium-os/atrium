@@ -20,7 +20,6 @@ use crate::keymap::Action;
 
 const FONT_NAME:    &str   = "system-mono";
 const FONT_SIZE_PX: f32    = 18.0;
-const VIEWPORT_ROWS: usize = 24;
 const WIN_W: u32 = 720;
 const WIN_H: u32 = 540;
 
@@ -62,11 +61,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         FONT_NAME, font.font_id, cell_w, line_h, ascent_px,
     );
 
-    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+    let mut renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
                                          cell_w, line_h, ascent_px);
+    renderer.k = conn.window_scale(win);
+    // In points; the WM's size replaces it (resolution-independence.md §3).
+    let mut viewport_rows = renderer.viewport_rows(WIN_H as f32);
     let mut keymap = keymap::Keymap::new();
 
-    renderer.render(&mut conn, &buf, VIEWPORT_ROWS, /*cursor_visible=*/true)?;
+    renderer.render(&mut conn, &buf, viewport_rows, /*cursor_visible=*/true)?;
     eprintln!("rendered initial view; now waiting for events");
 
     let mut alive = true;
@@ -79,6 +81,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match next {
                 Some(Event::CloseRequested { window_id }) if window_id == win => {
                     alive = false;
+                }
+                Some(Event::Resized { window_id, height, scale, .. }) if window_id == win => {
+                    if scale > 0.0 {
+                        renderer.k = scale;
+                    }
+                    viewport_rows = renderer.viewport_rows(height);
+                    dirty = true;
                 }
                 Some(Event::Key { hid_usage, pressed, modifiers, window_id, .. })
                     if window_id == win =>
@@ -100,8 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if dirty {
-            buf.scroll_into_view(VIEWPORT_ROWS);
-            renderer.render(&mut conn, &buf, VIEWPORT_ROWS, /*cursor_visible=*/true)?;
+            buf.scroll_into_view(viewport_rows);
+            renderer.render(&mut conn, &buf, viewport_rows, /*cursor_visible=*/true)?;
         }
     }
     eprintln!("exiting");

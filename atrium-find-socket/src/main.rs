@@ -128,13 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else { FONT_SIZE_PX * 0.6 };
     let line_h = ascent_px + descent_px + 2.0;
 
-    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+    let mut renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
                                          cell_w, line_h, ascent_px,
                                          WIN_W, WIN_H);
+    renderer.k = conn.window_scale(win);
     let mut keymap = keymap::Keymap::new();
 
-    let visible_rows = ((WIN_H as f32 - 24.0) / line_h).floor() as usize;
-    let list_visible = visible_rows.saturating_sub(3);
+    let mut list_visible = renderer.list_visible();
 
     renderer.render(&mut conn, &state.cwd.display().to_string(),
                     &state.entries, state.selected, state.scroll_top, &state.preview)?;
@@ -148,6 +148,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match next {
                 Some(Event::CloseRequested { window_id }) if window_id == win => {
                     alive = false;
+                }
+                // The WM's size and the monitor's scale (points;
+                // resolution-independence.md §3): lay the panes out again.
+                Some(Event::Resized { window_id, width, height, scale, .. }) if window_id == win => {
+                    if scale > 0.0 {
+                        renderer.k = scale;
+                    }
+                    renderer.win_w = width;
+                    renderer.win_h = height;
+                    list_visible = renderer.list_visible();
+                    state.move_sel(0, list_visible);
+                    dirty = true;
                 }
                 Some(Event::Key { hid_usage, pressed, window_id, .. }) if window_id == win => {
                     if let Some(action) = keymap.handle(hid_usage, pressed) {

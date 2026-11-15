@@ -9,6 +9,8 @@ use crate::dir::Entry;
 use fresco_client::{Connection, FrameBuilder};
 use fresco_protocol::RectParams;
 
+/// Lays out in points (the window's size as the WM gives it) and draws
+/// at the window's scale `k` (resolution-independence.md §3).
 pub struct Renderer {
     font_id:  u32,
     size_px:  f32,
@@ -19,8 +21,10 @@ pub struct Renderer {
     baseline: f32,
     pad_x:    f32,
     pad_y:    f32,
-    win_w:    f32,
-    win_h:    f32,
+    pub win_w: f32,
+    pub win_h: f32,
+    /// Device px per pt.
+    pub k:    f32,
 }
 
 impl Renderer {
@@ -30,8 +34,14 @@ impl Renderer {
         Self {
             font_id, size_px, cell_w, line_h, baseline,
             pad_x: 12.0, pad_y: 12.0,
-            win_w: win_w as f32, win_h: win_h as f32,
+            win_w: win_w as f32, win_h: win_h as f32, k: 1.0,
         }
+    }
+
+    /// How many list rows the window shows (between header and footer).
+    pub fn list_visible(&self) -> usize {
+        let visible_rows = ((self.win_h - self.pad_y * 2.0) / self.line_h).floor().max(0.0) as usize;
+        visible_rows.saturating_sub(3)
     }
 
     pub fn render(
@@ -56,8 +66,10 @@ impl Renderer {
             let row = list_top_row + (selected - scroll_top);
             let row_top = self.pad_y + (row as f32) * self.line_h;
             let bar_w = (left_cols as f32) * self.cell_w;
+            let k = self.k;
+            let (x0, y0) = ((self.pad_x * k).round(), (row_top * k).round());
             f.rect(RectParams {
-                x: self.pad_x, y: row_top, w: bar_w, h: self.line_h,
+                x: x0, y: y0, w: ((self.pad_x + bar_w) * k).round() - x0, h: ((row_top + self.line_h) * k).round() - y0,
                 r: 0.27, g: 0.30, b: 0.50, a: 0.5, radius: 0.0,
             })?;
         }
@@ -100,10 +112,28 @@ impl Renderer {
         col0: usize,
     ) -> std::io::Result<()> {
         if text.is_empty() { return Ok(()); }
-        let x = self.pad_x + (col0 as f32) * self.cell_w;
-        let y_base = self.pad_y + (row as f32) * self.line_h + self.baseline;
-        f.text_run(self.font_id, self.size_px, x, y_base - self.baseline,
+        let k = self.k;
+        let x = ((self.pad_x + (col0 as f32) * self.cell_w) * k).round();
+        let y_base = ((self.pad_y + (row as f32) * self.line_h + self.baseline) * k).round();
+        f.text_run(self.font_id, self.size_px * k, x, y_base - self.baseline * k,
                    [0.95, 0.95, 0.95, 1.0], text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Renderer;
+
+    /// The list follows the window's height in points, at any scale.
+    #[test]
+    fn the_list_follows_the_window_height() {
+        let mut r = Renderer::new(1, 18.0, 10.8, 24.0, 18.0, 1000, 600);
+        let at_600 = r.list_visible();
+        r.win_h = 900.0;
+        r.k = 2.0;
+        assert!(r.list_visible() > at_600);
+        r.win_h = 20.0;
+        assert_eq!(r.list_visible(), 0);
     }
 }

@@ -25,6 +25,7 @@ use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 
 const FONT_NAME:    &str = "system-mono";
+/// In points, like everything this lays out (resolution-independence.md §3).
 const FONT_SIZE_PX: f32  = 18.0;
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
@@ -54,8 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         font.mono_advance_units as f32 * FONT_SIZE_PX / upe
     } else { FONT_SIZE_PX * 0.6 };
     let line_h = ascent_px + descent_px + 2.0;
-    let renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
+    let mut renderer = render::Renderer::new(font.font_id, FONT_SIZE_PX,
                                          cell_w, line_h, ascent_px);
+    renderer.k = conn.window_scale(win);
 
     let shell = pty::Shell::spawn(OsStr::new("/bin/sh"), &["-i"], COLS, ROWS)?;
     eprintln!("spawned /bin/sh pid={}", shell.pid);
@@ -117,6 +119,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(bytes) = keymap.handle(hid_usage, pressed) {
                                 let _ = shell.write(&bytes);
                             }
+                        }
+                        // The WM's size, in points: as many cells as fit,
+                        // and the shell told (SIGWINCH); a new scale only
+                        // changes how it is drawn.
+                        Event::Resized { window_id, width, height, scale, .. } if window_id == win => {
+                            if scale > 0.0 {
+                                renderer.k = scale;
+                            }
+                            let (cols, rows) = renderer.grid_for(width, height);
+                            if (cols, rows) != (grid.cols, grid.rows) {
+                                grid.resize(cols, rows);
+                                let _ = shell.resize(cols, rows);
+                            }
+                            dirty = true;
                         }
                         Event::CloseRequested { window_id } if window_id == win => {
                             eprintln!("close requested — exiting");
