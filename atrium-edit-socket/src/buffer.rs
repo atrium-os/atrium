@@ -129,6 +129,14 @@ impl Buffer {
             self.cursor_col = 0;
         }
     }
+    /// To the start of the line.
+    pub fn move_home(&mut self) {
+        self.cursor_col = 0;
+    }
+    /// To the end of the line.
+    pub fn move_end(&mut self) {
+        self.cursor_col = self.lines[self.cursor_line].len();
+    }
     pub fn move_up(&mut self) {
         if self.cursor_line > 0 {
             self.cursor_line -= 1;
@@ -189,5 +197,26 @@ mod tests {
         }
         b.scroll_into_view_x(40);
         assert_eq!(b.scroll_left, 0);
+    }
+
+    /// End jumps to the end of a long line and scrolls there; Home comes
+    /// back to its start and scrolls back.
+    #[test]
+    fn end_and_home_scroll_with_the_cursor() {
+        let mut b = Buffer::empty();
+        for c in "é".chars().chain(std::iter::repeat('x').take(99)) {
+            b.insert_char(c);
+        }
+        b.newline();
+        b.move_up();
+        b.move_home();
+        b.scroll_into_view_x(40);
+        assert_eq!((b.cursor_line, b.cursor_cell(), b.scroll_left), (0, 0, 0));
+        b.move_end();
+        b.scroll_into_view_x(40);
+        assert_eq!((b.cursor_line, b.cursor_cell(), b.scroll_left), (0, 100, 61), "at the end, its cell the last shown");
+        b.move_home();
+        b.scroll_into_view_x(40);
+        assert_eq!((b.cursor_cell(), b.scroll_left), (0, 0));
     }
 }
