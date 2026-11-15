@@ -140,6 +140,48 @@ where it was (§4.5).
 The alternative, one UI process per window, is cheap to switch to later because windows share
 nothing but the trail store.
 
+### 2.3a Confining navigatord (proposed 2026-11-15)
+
+Shankar chose (2026-11-15) one navigatord per person, jailed, over one shared `_navigatord`
+broker for everyone: a shared broker holds every person's pages and Arca tickets in one process.
+In Atrium nothing runs as the person's own uid: an app runs as its per-app uid for that person
+(portcullis.md §9.0, "execution = a non-human, per-app uid"). So "per person" means:
+
+1. **navigatord is the Navigator app** (`org.atrium.navigator`), started by portcullisd's
+   `Launch` for the person, as the Navigator's per-app uid, in the Navigator's jail. The launch
+   registry names that uid (person, `org.atrium.navigator`), which is what limend already checks
+   for a page slot's parent.
+2. **navigator-ui becomes navigatord's worker**, as limend's page children are: an
+   `ExecInstance` one-shot jail (`org.atrium.navigator.ui`) as its own system uid (`_navui`),
+   with no capabilities. Its stdin is its channel to navigatord; frescod and limend reach it
+   only through descriptors navigatord passes (the chrome-channel connection navigatord opens
+   today, and a limend connection). It keeps "the UI holds no authority" true by construction
+   rather than by trust: today the UI and navigatord share a uid.
+3. **The trail store moves behind navigatord**: the UI sends `SaveTrails` and gets them back
+   at start; navigatord writes them in the Navigator's own state folder (homes.md). The UI then
+   needs no files at all.
+4. **The Navigator's jail holds**: one restricted capability, `navigator-broker`, that mounts
+   frescod's chrome and activation sockets (both move into `/atrium/sockets/` directories, the
+   old paths kept as symlinks), portcullisd's socket (converters, fetchers, Arca couriers and
+   the UI worker, by `ExecInstance` in-process instead of the `portcullis` CLI), arcad's
+   socket, limend's, and the ticket socket directory it serves; plus its state folder and the
+   person's Downloads (`filesystem`). No network: pages come through fetcher jails.
+5. **Configuration** comes from the bundle (`etc/navigatord.conf`, the same keys as today's
+   environment), since a jail gets no environment of the caller's.
+6. **Hand-offs** go through `open-uri` (the broker socket) instead of `NAVIGATORD_OPENER`.
+
+`PROMPT` stays self-spent (tabula.md): the UI's windows are navigatord's connection, so the
+press's window owner and the spender are the same uid.
+
+Steps, each checked by `scripts/navigator-confined-vm.sh`:
+
+- **J1.** navigatord reads its bundle config, and starts converters, fetchers and couriers by
+  `ExecInstance` itself (no `portcullis` CLI).
+- **J2.** frescod's chrome and activation sockets in `/atrium/sockets/`; the `navigator-broker`
+  capability; navigatord as the Navigator bundle in its jail (UI still a plain process).
+- **J3.** navigator-ui as navigatord's worker jail (`_navui`), trails kept by navigatord.
+- **J4.** hand-offs through `open-uri`.
+
 ### 2.4 Personas: what pages may share
 
 A **persona** is a cookie and credential namespace. Arca's partition key becomes
@@ -1249,7 +1291,7 @@ Each step runs in the VM on headless frescod before the next.
      Arca tickets in one process and act for each person). Open: the jail (a
      `org.atrium.navigator.broker` bundle whose restricted capability mounts its UI and ticket
      sockets, frescod's chrome and activation sockets, portcullisd's and arcad's, with its
-     store and Downloads; no network).
+     store and Downloads; no network). Proposed in §2.3a, steps J1–J4.
    - **Downloads.** navigatord decides from the fetched bytes, not from anything the site
      claims, whether an `Open` is a document or a file (`navigatord/src/files.rs`). The
      fetcher's reply carries no media type anyway. Markup and UTF-8 text are documents; a
