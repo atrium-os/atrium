@@ -396,7 +396,7 @@ matters so don't show if locked or logged out." Not built.
   when CLASS_BROKER delivery exists.
 - **History** in the shelf shows the same full text.
 - **When it shows less:**
-  - **Locked** (lock screen, tabula/lock-screen): app name and a count only ("Mail · 3
+  - **Locked** (the lock screen, lock-screen.md): app name and a count only ("Mail · 3
     new"), no title, sender or body, unless the person allows titles for that app; bodies
     never on the lock screen.
   - **Logged out, at the login screen, or another person's session on the seat**: nothing
