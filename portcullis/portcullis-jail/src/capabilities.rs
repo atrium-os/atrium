@@ -31,7 +31,8 @@ pub fn apply_all(
         apply_socket("notify.sock", jc, opts);
     }
     if caps.open_uri == Some(true) {
-        apply_socket("broker.sock", jc, opts);
+        // Monstrator, the link opener (opening-links.md §6).
+        apply_socket("monstrator", jc, opts);
     }
     if caps.audio == Some(true) {
         apply_audio(jc, opts);
@@ -240,10 +241,11 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
 /// UI's connection and names the page's origin) and activation socket (it
 /// spends the prompt row's presses), limend (it opens the UI's limend
 /// connection), portcullisd (its converter and fetcher jails) and Arca
-/// (cookies for sites that know you, through the couriers). No network:
+/// (cookies for sites that know you, through the couriers), and Monstrator
+/// (hand-offs, opening-links.md §7). No network:
 /// pages come through the fetcher jails.
 pub fn apply_navigator_broker(jc: &mut JailConfig, opts: &BuildOpts) {
-    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier"] {
+    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator"] {
         apply_socket(s, jc, opts);
     }
 }

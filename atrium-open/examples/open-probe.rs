@@ -1,5 +1,5 @@
 //! A test app for the opening-files gate (scripts/vm-open-files.sh): takes
-//! files from its document channel and says, for each, what it got and
+//! files (and links, `link url=…`) from its document channel and says, for each, what it got and
 //! what it can do with it. With each new file it reads the earlier ones
 //! again (`again name=… read=ok|E5`), so the gate sees a disconnected
 //! share or an ejected stick end them. Exits when the channel closes or after five
@@ -28,8 +28,13 @@ fn main() {
     println!("open-probe: up, pid {}", std::process::id());
     let mut kept: Vec<(String, std::fs::File)> = Vec::new();
     loop {
-        let mut o = match ch.recv(Some(Duration::from_secs(300))) {
-            Ok(Some(o)) => o,
+        let mut o = match ch.recv_any(Some(Duration::from_secs(300))) {
+            Ok(Some(atrium_open::Message::File(o))) => o,
+            // A link (opening-links.md §5), as it came.
+            Ok(Some(atrium_open::Message::Link(u))) => {
+                println!("open-probe: link url={u}");
+                continue;
+            }
             Ok(None) => return println!("open-probe: idle, bye"),
             Err(e) => return println!("open-probe: channel: {e}"),
         };

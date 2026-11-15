@@ -1,0 +1,57 @@
+# /etc/atrium/services.d/38-atrium-monstratord.toml
+#
+# The jailed launch of monstratord, the link opener
+# (docs/spec/opening-links.md §6). atrium-portcullisd-bootstrap reads this,
+# asks jaild to create the jail and supervises monstratord inside it.
+#
+# monstratord runs NON-ROOT (_monstrator) with no devices (ruleset 4), no
+# network and none of anyone's files. It reaches two sockets: its own
+# (/atrium/sockets/monstrator/, which apps with `open-uri` and the Navigator
+# see) and portcullisd's, which takes LinkGrant and DeliverLink only from
+# this user. It can't launch anything or spend a press: portcullisd does both.
+#
+# REQUIRES (scripts/monstrator-service.sh does all of it):
+#   1. The _monstrator (65038) system user, in jaild.policy's allowed_system_uids.
+#   2. /atrium/sockets/monstrator, owned _monstrator, 0755.
+#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets/monstrator,atrium/sockets/portcullis}.
+
+enabled       = true
+name          = "atrium-monstratord"
+path          = "/var/lib/atrium/jails/monstratord"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: no devices
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/monstrator"             # rw: binds monstrator.sock
+dest   = "atrium/sockets/monstrator"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/portcullis"             # rw: connects to portcullisd
+dest   = "atrium/sockets/portcullis"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-monstratord"
+argv = ["atrium-monstratord"]
+uid  = 65038   # _monstrator
+gid  = 65038
+
+[[exec.env]]
+key   = "PORTCULLIS_SOCKET"
+value = "/atrium/sockets/portcullis/portcullis.sock"

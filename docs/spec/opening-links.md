@@ -134,9 +134,11 @@ monstratord ── Opened | NotOpened { why } ───────────�
 
 ## 6. Where it runs
 
-- Bundle `org.atrium.monstrator`, a per-person system service started at login by portcullisd, as `_monstrator` (65038). Restricted capability `link-opener`: mounts
-  `/atrium/sockets/monstrator/` (served), `portcullis/` and `fresco-chrome/`; a frescod
-  window for the sheet; nothing else; no network.
+- A system service (`etc/services.d`, started by portcullisd's bootstrap), as `_monstrator`
+  (65038), one for the machine: each link's person is the asking app's, from the launch
+  registry. Its jail mounts `/atrium/sockets/monstrator/` (served) and `portcullis/`, and for
+  the sheet (L3) frescod's; nothing else; no network. *(As built: a services.d jail rather than
+  a bundle with a restricted `link-opener` capability, since it isn't anyone's app.)*
 - **`open-uri = true`** mounts `/atrium/sockets/monstrator/` into the app's jail (replacing the
   planned `broker.sock` in portcullis.md §3.2). `navigator-broker` mounts it too.
 
@@ -175,7 +177,14 @@ new trail.
    portcullis-toml fixtures, frescod activation and credential 16/16, portcullisd opens and
    links 6/6 (in the VM).
 2. **L2** `monstratord` in its jail with the link checks and the flow, no sheet (default or
-   single app only); a test app bundle that takes `mailto`; VM gate.
+   single app only); a test app bundle that takes `mailto`; VM gate. *Built 2026-11-15
+   (host-tested; its VM run is L4's):* crate `monstrator/` (`monstratord`; `open_link` for
+   apps; `monctl` for tests): one link at a time per asker, the link checked before
+   portcullisd is asked, the default or the only app, logs that name the scheme and never
+   the link; `38-atrium-monstratord.toml` and `scripts/monstrator-service.sh` (jailed as
+   `_monstrator` 65038, devfs ruleset 4, no network, only its own and portcullisd's socket
+   directories); `open-uri` and `navigator-broker` now mount `/atrium/sockets/monstrator/`;
+   atrium-open's `open-probe` prints the links it gets.
 3. **L3** the sheet and "Always use", Curia's Links section.
 4. **L4** (= navigator-ui J4) navigatord's hand-offs through Monstrator, `NAVIGATORD_OPENER`
    removed; links into the Navigator open trails; `navigator-confined-vm.sh`.
