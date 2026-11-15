@@ -1645,3 +1645,12 @@ work (self-test, scrub).
   re-inits, cap never hit, 0 flush timeouts, 0 panics, card proven idle at
   detach. Logs: claude/project-thread-33aauq cb502ed6
   (docs/r9700-runs/fzdiag-caede735/).
+- **2026-11-15 14:48 to 16:13, 1 h fuzz diagnostic (si-fuzz 4933be80,
+  kmods caede735): PASS.** si-client-test 99/0 before and after, tests 16
+  and 17 pass with the fixed expectations: 16's range ACQUIRE_MEM hangs (+1
+  fault IV, 0 overflows), one re-init, bystander clean; 17's store to empty
+  VA never reaches the fault page (+0 dirty scrubs), the reader gets 64/64
+  zeros. si-fuzz 0 findings (266221 calls, 14 re-inits, cap never hit),
+  ih_overflows 0, dummy_dirty 0, vm_faults 29 at the end, 0 flush timeouts,
+  0 panics, card proven idle at detach. Logs: claude/project-thread-33aauq
+  0315da7d (docs/r9700-runs/fzdiag-4933be80/).
