@@ -905,6 +905,7 @@ void	amd_gmc12_fault_decode(struct amd_gart *gt, uint32_t st,
 	    const char *when);
 u_int	amd_gmc12_fault_vmid(uint32_t status);
 uint32_t amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid);
+uint32_t amd_gmc12_ctx_cntl_raw(struct amd_gart *gt, u_int vmid);
 int	amd_ih7_test(struct atrium_amd_softc *sc, struct amd_gart *gt,
 	    int (*during)(struct atrium_amd_softc *, struct amd_gart *));
 struct amd_ih7;

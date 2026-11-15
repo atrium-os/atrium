@@ -2425,6 +2425,7 @@ out:
 #define UQ2_PID(slot)		(0x200u + (slot))
 #define UQ2_PKT_DW		12u
 #define UQ2_KILL_WAIT_US	200000
+#define UQ2_STORM_IVS		4096	/* faults after a mute: a storm */
 
 struct amd_uq {
 	struct mes *m;
@@ -2445,6 +2446,7 @@ struct amd_uq {
 				 * caller's (rs/uqueue.rs RamPages) */
 	u_int	 fault_vmid;	/* VMID the IH found it on at its fault */
 	u_int	 muted_vmid;	/* its fault IVs muted on this VMID */
+	uint64_t mute_faults;	/* iso.vm_faults when it was muted */
 };
 
 static bool
@@ -2605,9 +2607,11 @@ amd_mes12_uq_note_fault(struct amd_uq *q, u_int vmid)
 	if (q->muted_vmid == 0 && vmid >= 8) {
 		amd_gmc12_ctx_fault_irq(q->m->gt, vmid, false);
 		q->muted_vmid = vmid;
+		q->mute_faults = q->m->sc->iso.vm_faults;
 		device_printf(q->m->sc->dev, "uq%u: VMID %u's fault "
-		    "interrupts muted until the queue is removed\n", q->slot,
-		    vmid);
+		    "interrupts muted until the queue is removed (GFXHUB "
+		    "CONTEXT%u_CNTL now %#x)\n", q->slot, vmid, vmid,
+		    amd_gmc12_ctx_cntl_raw(q->m->gt, vmid));
 	}
 }
 
@@ -3229,6 +3233,28 @@ amd_mes12_uq_evict(struct amd_uq *q)
 			device_printf(m->sc->dev, "uq%u: VMID %u found only "
 			    "by an HQD scan\n", q->slot, vmid);
 		amd_gmc12_l2_note(m->gt, "evict: after the HQD lookup");
+		/*
+		 * Box run 5eff3373 (si-client-test 16): a range ACQUIRE_MEM
+		 * over the whole VA space kept raising fault IVs after the
+		 * mute, ~1 M/s, and its queue cannot be removed while the GCR
+		 * op runs: the wave kill, REMOVE_QUEUE, the HQD reset and MES
+		 * RESET took 4 s to fail (3.8 M IVs, 1867 IH overflows). If
+		 * the faults go on past the mute, only the GPU reset stops
+		 * them: watch 20 ms, then go there at once.
+		 */
+		for (us = 0; q->muted_vmid != 0 && us < 20000 &&
+		    m->sc->iso.vm_faults - q->mute_faults <= UQ2_STORM_IVS;
+		    us += 1000)
+			DELAY(1000);
+		if (q->muted_vmid != 0 &&
+		    m->sc->iso.vm_faults - q->mute_faults > UQ2_STORM_IVS) {
+			device_printf(m->sc->dev, "uq%u: VMID %u still faulting "
+			    "after the mute (+%ju IVs in %u us): a fault storm "
+			    "only a GPU reset stops\n", q->slot,
+			    q->muted_vmid, (uintmax_t)(m->sc->iso.vm_faults -
+			    q->mute_faults), us);
+			return (EBUSY);
+		}
 		if (vmid >= 8) {
 			cp_snap(m, "before the wave kill");
 			err = amd_gfx12_sq_kill_vmid(m->sc, vmid);

@@ -1752,7 +1752,7 @@ fault_storm(void)
 	struct job h, by;
 	uint32_t ib[16];
 	int64_t f0, f1, o0, o1;
-	int r, ms, ri0 = -1, ri = -1, n = 0;
+	int r, ms, ri0 = -1, ri = -1, n = 0, x;
 	char what[160];
 
 	job_init(&h);
@@ -1784,6 +1784,9 @@ fault_storm(void)
 	}
 	r = job_wait(&h, 15000, &ms);
 	sleep(2);
+	/* A re-init in progress reads as lost (-1): let it finish. */
+	for (x = 0; x < 150 && (preg_read(NULL, &ri) < 0 || ri < 0); x++)
+		usleep(200000);
 	f1 = iso("vm_faults");
 	o1 = iso("ih_overflows");
 	printf("16: range ACQUIRE_MEM: %s after %d ms; fault IVs +%jd, IH "
@@ -1793,19 +1796,29 @@ fault_storm(void)
 		printf("KNOWN: 16 fault storm: the packet raised no fault on "
 		    "this GPU; nothing to mute\n");
 	else {
-		check(o1 == o0, "16 fault storm: the IH ring does not "
-		    "overflow", "+%jd overflows, +%jd fault IVs",
-		    (intmax_t)(o1 - o0), (intmax_t)(f1 - f0));
-		check(f1 - f0 < 20000, "16 fault storm: the faults are "
-		    "muted after the first batch", "+%jd fault IVs",
-		    (intmax_t)(f1 - f0));
+		/* Run 5eff3373: +3.8 M IVs, +1867 overflows over 4 s before
+		 * the driver reset the GPU. Bounded now: a storm that outlives
+		 * the mute goes straight to the reset. */
+		check(f1 - f0 < 100000, "16 fault storm: the storm is cut "
+		    "short", "+%jd fault IVs, re-inits %d -> %d",
+		    (intmax_t)(f1 - f0), ri0, ri);
+		check(o1 - o0 < 50, "16 fault storm: the IH ring barely "
+		    "overflows", "+%jd overflows", (intmax_t)(o1 - o0));
 	}
 	job_close(&h);
+	if (ri != ri0) {
+		/* A GPU reset loses every VM: the bystander too. */
+		job_close(&by);
+		if (job_open(&by, "16 bystander after the reset") != 0) {
+			check(0, "16 fault storm: afterwards another VM runs "
+			    "clean", "setup: %s", strerror(errno));
+			goto out;
+		}
+	}
 	snprintf(what, sizeof(what), "16 fault storm: afterwards another VM "
 	    "runs clean");
 	run_clean(&by, what);
-	if (preg_read(NULL, &ri) >= 0)
-		printf("16: re-inits %d -> %d\n", ri0, ri);
+	printf("16: re-inits %d -> %d\n", ri0, ri);
 out:
 	job_close(&h);
 	job_close(&by);

@@ -1250,13 +1250,24 @@ amd_gmc12_fault_vmid(uint32_t status)
 	return (FAULT_STATUS_VMID(status));
 }
 
-/* GFXHUB CONTEXTn_CNTL as programmed (MES ADD_QUEUE's vm_context_cntl). */
+/* GFXHUB CONTEXTn_CNTL as it reads now (the log). */
 uint32_t
-amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid)
+amd_gmc12_ctx_cntl_raw(struct amd_gart *gt, u_int vmid)
 {
 	struct hub h;
 
-	if (vmid >= NUM_CTX || !hub_open(gt->sc, true, &h))
+	if (vmid >= NUM_CTX || gmc12_cold || !hub_open(gt->sc, true, &h))
 		return (0);
 	return (hr(&h, h.g->ctx0_cntl + vmid));
+}
+
+/*
+ * GFXHUB CONTEXTn_CNTL as programmed (MES ADD_QUEUE's vm_context_cntl),
+ * with the fault interrupts on: context `vmid` may be muted right now
+ * (amd_gmc12_ctx_fault_irq), and a new queue must not inherit that.
+ */
+uint32_t
+amd_gmc12_ctx_cntl(struct amd_gart *gt, u_int vmid)
+{
+	return (amd_gmc12_ctx_cntl_raw(gt, vmid) | CTX_FAULT_INTERRUPTS);
 }

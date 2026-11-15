@@ -151,6 +151,7 @@ struct amd_si_client {
 	uint32_t b_other_iv0, b_other_iv4;	/* the first unknown IV */
 	uint32_t b_uq;			/* user queues named by an EOP */
 	uint32_t b_fault_vmids;		/* every VMID that faulted */
+	uint32_t b_fault_retry;		/* of them, retry faults (data 1 bit 7) */
 	bool	 b_uq_scan;		/* an EOP named no queue: check all */
 	uint32_t b_unrouted_db;		/* ... and the doorbell it gave */
 	/* The first distinct unrouted src_data[0] values and their counts
@@ -595,10 +596,10 @@ si_iv_batch_end(struct amd_si_client *c)
 		/* Re-arm the latch (GC registers: valid while VMs hold
 		 * GfxOff off, and only a VM's work can fault here). */
 		if (flog)
-			device_printf(sc->dev, "si: VM fault: %u IV(s), VMIDs "
-			    "%#x, first VMID %u at %#jx\n", c->b_fault,
-			    c->b_fault_vmids, c->b_fault_vmid,
-			    (uintmax_t)c->b_fault_addr);
+			device_printf(sc->dev, "si: VM fault: %u IV(s) (%u "
+			    "retry), VMIDs %#x, first VMID %u at %#jx\n",
+			    c->b_fault, c->b_fault_retry, c->b_fault_vmids,
+			    c->b_fault_vmid, (uintmax_t)c->b_fault_addr);
 		if (c->vmids != 0 && amd_gmc12_fault_take(c->gt, &status,
 		    &addr) && flog)
 			amd_gmc12_fault_decode(c->gt, status, "client fault");
@@ -677,6 +678,7 @@ si_iv_batch_end(struct amd_si_client *c)
 	c->b_uq = 0;
 	c->b_uq_scan = false;
 	c->b_fault_vmids = 0;
+	c->b_fault_retry = 0;
 }
 
 /*
@@ -759,6 +761,8 @@ si_iv(void *arg, const uint32_t *iv)
 		/* gmc_v12_0_process_interrupt: VMID in dword 0, the page in
 		 * data 0 and bits 47:44 in data 1. */
 		c->b_fault_vmids |= 1u << ((iv[0] >> 24) & 0xf);
+		if ((iv[5] & 0x80) != 0)
+			c->b_fault_retry++;
 		if (c->b_fault++ == 0) {
 			c->b_fault_vmid = (iv[0] >> 24) & 0xf;
 			c->b_fault_addr = (uint64_t)iv[4] << 12 |
