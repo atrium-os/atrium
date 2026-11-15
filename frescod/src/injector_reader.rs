@@ -81,6 +81,11 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
             if let (Some(x), Some(y)) = (next_f32(&mut it), next_f32(&mut it)) {
                 let (lx, ly, target) = cursor_to(comp, x.clamp(0.0, sw - 1.0), y.clamp(0.0, sh - 1.0));
                 eprintln!("frescod: inject MOVE {x} {y} -> window {target}");
+                if std::env::var_os("FRESCOD_INJECT_LAYERS").is_some() {
+                    let c = comp.lock().unwrap();
+                    let l: Vec<String> = c.shown.as_ref().map(|v| v.iter().map(|l| format!("{}@{:?}", l.id, l.rect)).collect()).unwrap_or_default();
+                    eprintln!("frescod: inject layers {} z {:?}", l.join(" "), c.z_order);
+                }
                 let _ = sink.send(DisplayEvent::InputPointerMotion { window_id: target, x: lx, y: ly });
             }
         }

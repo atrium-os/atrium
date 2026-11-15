@@ -5746,7 +5746,7 @@ testing only). Islands are checked by
 clicks; it also guards a rect of a window (`OP_WINDOW_GUARD`) and spends presses on `PROMPT`: counted when
 clear, refused with another window over part of the rect, counted again once clear and still, refused with
 no guard. `scripts/island-probe-vm.sh` (logs in `$OUT`, default /tmp) deploys the probe and the current frescod and runs it in split mode with
-`PROBE_SLOTS_ONLY=1` (24/24 on 2026-11-14; 2026-11-15 with the guard checks 27/28: "a covered island takes no click, even away from the cover" fails, open). The probe's other sections, clipboard, drag and toasts, need a
+`PROBE_SLOTS_ONLY=1` (24/24 on 2026-11-14; 2026-11-15 with the guard checks 28/28; the cover slot must draw at its bound size, or frescod composes nothing there and it covers nothing. `FRESCOD_INJECT_LAYERS=1` logs the composed layers and z-order with each injected MOVE). The probe's other sections, clipboard, drag and toasts, need a
 full session with Forum, and fail without one. frescod's unit tests run only on FreeBSD: cross-build
 them with `cargo test --release --target aarch64-unknown-freebsd --no-run`, then copy and run the binary
 in the VM (61/61).

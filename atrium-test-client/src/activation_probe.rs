@@ -445,6 +445,12 @@ fn main() {
     p.check(h, "a clear island takes the click");
     let r = bind_z(&mut p, iht, ot, sk::PLAIN, Some([180.0, 90.0, 100.0, 60.0]), 2); // (680, 540) to (780, 600), over its corner
     p.check(matches!(r, SlotBindResult::Ok { .. }), &format!("something of the page's over its corner ({r:?})"));
+    // The cover hears its new size and draws at it: a window with nothing
+    // drawn at its size is not composed, so it covers nothing.
+    while let Ok(Some(_)) = over.wait_event(Some(Duration::from_millis(200))) {}
+    over.scene_frame_begin().unwrap();
+    over.scene_node_rect(1, RectParams { x: 0.0, y: 0.0, w: 2000.0, h: 2000.0, r: 0.1, g: 0.4, b: 0.4, a: 1.0, radius: 0.0 }).unwrap();
+    over.scene_frame_end().unwrap();
     still();
     let h = !hits(&mut p, &mut isl, 560, 500);
     p.check(h, "a covered island takes no click, even away from the cover");
