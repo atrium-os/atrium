@@ -2,6 +2,7 @@
 //!
 //!   officina-convert xlsx < book.xlsx > book.osheet 2> report
 //!   officina-convert ods < book.ods > book.osheet 2> report
+//!   officina-convert xls < book.xls > book.osheet 2> report
 //!   officina-convert pptx < talk.pptx > talk.oslides 2> report
 //!
 //! With `--password` after the kind, stdin starts with the password (its
@@ -79,7 +80,12 @@ fn main() {
         }
     };
     match what.as_str() {
-        "xlsx" | "xlsm" | "ods" => match if what == "ods" { officina_convert::ods::read(&input).map_err(|e| e.to_string()) } else { officina_convert::xlsx::read(&input).map_err(|e| e.to_string()) } {
+        "xlsx" | "xlsm" | "ods" | "xls" => match match what.as_str() {
+            "ods" => officina_convert::ods::read(&input).map_err(|e| e.to_string()),
+            // A protected .xls is decrypted by its reader.
+            "xls" => officina_convert::xls::read(&input, password.as_deref()).map_err(|e| e.to_string()),
+            _ => officina_convert::xlsx::read(&input).map_err(|e| e.to_string()),
+        } {
             Ok((wb, loaded)) => {
                 let out = std::io::BufWriter::new(std::io::stdout().lock());
                 if let Err(e) = officina_grid::native::save(&wb, out).and_then(|mut o| o.flush()) {
@@ -137,7 +143,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("error\tusage: officina-convert xlsx|ods|docx|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
+            eprintln!("error\tusage: officina-convert xlsx|xls|ods|docx|odt|pptx|odp < in > out (.osheet, .owrite or .oslides)");
             std::process::exit(2);
         }
     }

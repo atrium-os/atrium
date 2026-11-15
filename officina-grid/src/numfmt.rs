@@ -511,7 +511,7 @@ fn parse_section(src: &str) -> (Section, bool) {
             }
             _ => {
                 let l = lower(c);
-                if src[byte_at(&ch, i)..].len() >= 7 && ch[i..i + 7].iter().collect::<String>().eq_ignore_ascii_case("general") {
+                if ch.len() >= i + 7 && ch[i..i + 7].iter().collect::<String>().eq_ignore_ascii_case("general") {
                     toks.push(Tok::General);
                     i += 7;
                 } else if ch.len() >= i + 5 && ch[i..i + 5].iter().collect::<String>().eq_ignore_ascii_case("am/pm") {
@@ -609,10 +609,6 @@ fn parse_section(src: &str) -> (Section, bool) {
     }
     sec.toks = merged;
     (sec, ok)
-}
-
-fn byte_at(ch: &[char], i: usize) -> usize {
-    ch[..i].iter().map(|c| c.len_utf8()).sum()
 }
 
 fn parse_cond(s: &str) -> Option<(Cmp, f64)> {
@@ -1060,6 +1056,14 @@ fn format_date(sec: &Section, v: f64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codes_with_wide_characters_near_the_end() {
+        // Bytes left aren't characters left: no slicing past the end.
+        for code in ["Gé€", "0 Gé€", "Gé", "€€€€€€G"] {
+            let _ = NumFmt::parse(code).format(&Value::num(1.5));
+        }
+    }
 
     fn f(code: &str, x: f64) -> String {
         NumFmt::parse(code).format(&Value::Num(x)).text

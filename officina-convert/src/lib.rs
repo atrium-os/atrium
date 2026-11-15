@@ -17,6 +17,7 @@ pub mod ods;
 pub mod pptx;
 pub mod report;
 pub mod sealed;
+pub mod xls;
 pub mod xlsx;
 pub mod xml;
 pub mod zip;

@@ -322,7 +322,7 @@ impl Pending {
     }
 }
 
-enum Src {
+pub(crate) enum Src {
     Text(String),
     Shared(u32),
     /// An array formula (dynamic, or Ctrl+Shift+Enter): its text and the area its
@@ -330,11 +330,11 @@ enum Src {
     Array(String, Option<(u32, u32, u32, u32)>),
 }
 
-struct FCell {
-    row: u32,
-    col: u32,
-    src: Src,
-    cached: Value,
+pub(crate) struct FCell {
+    pub(crate) row: u32,
+    pub(crate) col: u32,
+    pub(crate) src: Src,
+    pub(crate) cached: Value,
 }
 
 /// What one piece of a sheet's XML holds (whole rows; the first piece also what comes
@@ -815,52 +815,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             }
         }
         // Styles: a column's own style under its cells' runs.
-        let mut id = |xf: u32| -> StyleId {
-            match xf_ids.get(xf as usize) {
-                Some(&i) => i,
-                None => {
-                    rep.note(Kind::Approximate, "cells naming a style the file does not have, shown unstyled");
-                    0
-                }
-            }
-        };
-        let mut base: Vec<StyleId> = Vec::new();
-        for (c0, c1, xf) in col_styles {
-            let i = id(xf);
-            if i != 0 && base.len() <= c1 as usize {
-                base.resize(c1 as usize + 1, 0);
-            }
-            if i != 0 {
-                for b in &mut base[c0 as usize..=c1 as usize] {
-                    *b = i;
-                }
-            }
-        }
-        let ncols = sruns.len().max(base.len());
-        let mut cols: Vec<StyleRuns> = Vec::with_capacity(ncols);
-        for c in 0..ncols {
-            let b = base.get(c).copied().unwrap_or(0);
-            let mut v: Vec<(u32, StyleId)> = Vec::new();
-            let mut at = 0u32;
-            if b != 0 {
-                v.push((0, b));
-            }
-            for &(r0, r1, xf) in sruns.get(c).map(Vec::as_slice).unwrap_or(&[]) {
-                if r0 > at && b != 0 {
-                    v.push((at, b));
-                }
-                v.push((r0, id(xf)));
-                at = r1 + 1;
-            }
-            if (at as u64) < MAX_ROWS as u64 && at > 0 {
-                v.push((at, b));
-            }
-            cols.push(StyleRuns::from_runs(v));
-        }
-        while cols.last().is_some_and(|c| c.is_empty()) {
-            cols.pop();
-        }
-        wb.sheet_mut(s).styles = cols;
+        apply_styles(wb, s, col_styles, &sruns, xf_ids, rep);
         Ok(())
     })
 }
@@ -1068,59 +1023,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Formulas, once every sheet exists (they name each other).
     let mut cached: Vec<(CellAddr, Value)> = Vec::new();
     for (s, fcells, shared) in all_f {
-        // A shared formula's expression, parsed once at its master cell; relative, so
-        // the same for every cell of the fill.
-        let mut exprs: HashMap<u32, Option<Arc<Expr>>> = HashMap::new();
-        let mut cells: Vec<(u32, u32, Arc<Expr>)> = Vec::with_capacity(fcells.len());
-        for fc in fcells {
-            // Formulas from before dynamic arrays keep their one value (`@`); array
-            // formulas spill, over the area the file kept for them.
-            let e = match &fc.src {
-                Src::Text(t) => wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(|e| Arc::new(arrays::legacy(e))),
-                Src::Shared(si) => exprs
-                    .entry(*si)
-                    .or_insert_with(|| shared.get(si).and_then(|(r, c, t)| wb_parse(&wb, &formula_in(t), s, *r, *c)).map(|e| Arc::new(arrays::legacy(e))))
-                    .clone(),
-                Src::Array(t, area) => {
-                    if let Some((r0, c0, r1, c1)) = *area {
-                        if (r0, c0) == (fc.row, fc.col) && (r1, c1) != (r0, c0) {
-                            wb.claim_spill(CellAddr::new(s, r0, c0), officina_grid::Rect { sheet: s, r0, c0, r1, c1 });
-                        }
-                    }
-                    wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new)
-                }
-            };
-            match e {
-                Some(e) => {
-                    cells.push((fc.col, fc.row, e));
-                    cached.push((CellAddr::new(s, fc.row, fc.col), fc.cached));
-                }
-                None => {
-                    let text = match &fc.src {
-                        Src::Text(t) | Src::Array(t, _) => t.clone(),
-                        Src::Shared(si) => shared.get(si).map(|x| x.2.clone()).unwrap_or_default(),
-                    };
-                    rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || format!("{}: ={}", a1(fc.row, fc.col), text.chars().take(60).collect::<String>()));
-                }
-            }
-        }
-        out.formulas += cells.len() as u64;
-        // Runs of the same expression down a column become one fill.
-        cells.sort_by_key(|c| (c.0, c.1));
-        let mut i = 0;
-        while i < cells.len() {
-            let (col, r0, e) = (cells[i].0, cells[i].1, cells[i].2.clone());
-            let mut j = i + 1;
-            while j < cells.len() && cells[j].0 == col && cells[j].1 == cells[j - 1].1 + 1 && (Arc::ptr_eq(&cells[j].2, &e) || *cells[j].2 == *e) {
-                j += 1;
-            }
-            let r1 = cells[j - 1].1;
-            let text = formula::to_a1(&e, r0, col, &|id| wb.sheet_name(id));
-            if wb.fill_formula(s, col, r0, r1, &text).is_err() {
-                rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || a1(r0, col));
-            }
-            i = j;
-        }
+        place_formulas(&mut wb, s, fcells, &shared, &mut rep, &mut out, &mut cached);
     }
     // Pivot tables, over the cells they wrote.
     let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
@@ -1131,13 +1034,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     }
     wb.recalc();
     // The differential: our results against the file's.
-    for (a, want) in cached {
-        let got = wb.get(a);
-        if !same(&got, &want) {
-            out.differ += 1;
-            rep.note_at(Kind::Approximate, "formula results that differ from the file's saved results", || format!("{}: {} vs {}", a1(a.row, a.col), got.display(), want.display()));
-        }
-    }
+    differential(&wb, cached, &mut out, &mut rep);
     // Macros, kept inert.
     let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
     super::macros::read(&z, &mut wb, &wb_xml, &wb_rels, &parts, &mut rep)?;
@@ -1202,6 +1099,128 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result
 
 fn wb_parse(wb: &Workbook, src: &str, s: u16, row: u32, col: u32) -> Option<Expr> {
     wb.parse(src, s, row, col).ok()
+}
+
+/// A sheet's cell styles: per column, the column's own style (`col_styles`:
+/// first column, last column, xf) under its cells' runs (`sruns`: per column,
+/// first row, last row, xf), xfs mapped through `xf_ids`.
+pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32, u32)>, sruns: &[Vec<(u32, u32, u32)>], xf_ids: &[StyleId], rep: &mut Report) {
+    let mut id = |xf: u32| -> StyleId {
+        match xf_ids.get(xf as usize) {
+            Some(&i) => i,
+            None => {
+                rep.note(Kind::Approximate, "cells naming a style the file does not have, shown unstyled");
+                0
+            }
+        }
+    };
+    let mut base: Vec<StyleId> = Vec::new();
+    for (c0, c1, xf) in col_styles {
+        let i = id(xf);
+        if i != 0 && base.len() <= c1 as usize {
+            base.resize(c1 as usize + 1, 0);
+        }
+        if i != 0 {
+            for b in &mut base[c0 as usize..=c1 as usize] {
+                *b = i;
+            }
+        }
+    }
+    let ncols = sruns.len().max(base.len());
+    let mut cols: Vec<StyleRuns> = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let b = base.get(c).copied().unwrap_or(0);
+        let mut v: Vec<(u32, StyleId)> = Vec::new();
+        let mut at = 0u32;
+        if b != 0 {
+            v.push((0, b));
+        }
+        for &(r0, r1, xf) in sruns.get(c).map(Vec::as_slice).unwrap_or(&[]) {
+            if r0 > at && b != 0 {
+                v.push((at, b));
+            }
+            v.push((r0, id(xf)));
+            at = r1 + 1;
+        }
+        if (at as u64) < MAX_ROWS as u64 && at > 0 {
+            v.push((at, b));
+        }
+        cols.push(StyleRuns::from_runs(v));
+    }
+    while cols.last().is_some_and(|c| c.is_empty()) {
+        cols.pop();
+    }
+    wb.sheet_mut(s).styles = cols;
+}
+
+/// Places one sheet's formula cells: each parsed at its cell (a shared formula
+/// once, at its master cell), runs of one expression down a column as one fill.
+/// Cells whose formula parses go into `cached` with the file's value.
+pub(crate) fn place_formulas(wb: &mut Workbook, s: u16, fcells: Vec<FCell>, shared: &HashMap<u32, (u32, u32, String)>, rep: &mut Report, out: &mut Loaded, cached: &mut Vec<(CellAddr, Value)>) {
+    // A shared formula's expression, parsed once at its master cell; relative, so
+    // the same for every cell of the fill.
+    let mut exprs: HashMap<u32, Option<Arc<Expr>>> = HashMap::new();
+    let mut cells: Vec<(u32, u32, Arc<Expr>)> = Vec::with_capacity(fcells.len());
+    for fc in fcells {
+        // Formulas from before dynamic arrays keep their one value (`@`); array
+        // formulas spill, over the area the file kept for them.
+        let e = match &fc.src {
+            Src::Text(t) => wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(|e| Arc::new(arrays::legacy(e))),
+            Src::Shared(si) => exprs
+                .entry(*si)
+                .or_insert_with(|| shared.get(si).and_then(|(r, c, t)| wb_parse(&wb, &formula_in(t), s, *r, *c)).map(|e| Arc::new(arrays::legacy(e))))
+                .clone(),
+            Src::Array(t, area) => {
+                if let Some((r0, c0, r1, c1)) = *area {
+                    if (r0, c0) == (fc.row, fc.col) && (r1, c1) != (r0, c0) {
+                        wb.claim_spill(CellAddr::new(s, r0, c0), officina_grid::Rect { sheet: s, r0, c0, r1, c1 });
+                    }
+                }
+                wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new)
+            }
+        };
+        match e {
+            Some(e) => {
+                cells.push((fc.col, fc.row, e));
+                cached.push((CellAddr::new(s, fc.row, fc.col), fc.cached));
+            }
+            None => {
+                let text = match &fc.src {
+                    Src::Text(t) | Src::Array(t, _) => t.clone(),
+                    Src::Shared(si) => shared.get(si).map(|x| x.2.clone()).unwrap_or_default(),
+                };
+                rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || format!("{}: ={}", a1(fc.row, fc.col), text.chars().take(60).collect::<String>()));
+            }
+        }
+    }
+    out.formulas += cells.len() as u64;
+    // Runs of the same expression down a column become one fill.
+    cells.sort_by_key(|c| (c.0, c.1));
+    let mut i = 0;
+    while i < cells.len() {
+        let (col, r0, e) = (cells[i].0, cells[i].1, cells[i].2.clone());
+        let mut j = i + 1;
+        while j < cells.len() && cells[j].0 == col && cells[j].1 == cells[j - 1].1 + 1 && (Arc::ptr_eq(&cells[j].2, &e) || *cells[j].2 == *e) {
+            j += 1;
+        }
+        let r1 = cells[j - 1].1;
+        let text = formula::to_a1(&e, r0, col, &|id| wb.sheet_name(id));
+        if wb.fill_formula(s, col, r0, r1, &text).is_err() {
+            rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || a1(r0, col));
+        }
+        i = j;
+    }
+}
+
+/// The differential: our results against the file's, after recalculation.
+pub(crate) fn differential(wb: &Workbook, cached: Vec<(CellAddr, Value)>, out: &mut Loaded, rep: &mut Report) {
+for (a, want) in cached {
+    let got = wb.get(a);
+    if !same(&got, &want) {
+        out.differ += 1;
+        rep.note_at(Kind::Approximate, "formula results that differ from the file's saved results", || format!("{}: {} vs {}", a1(a.row, a.col), got.display(), want.display()));
+    }
+}
 }
 
 /// Equal as a spreadsheet shows them: numbers to 15 significant digits.

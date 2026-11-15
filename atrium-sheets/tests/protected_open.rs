@@ -1,4 +1,4 @@
-//! Protected .xlsx and .ods, saved here and opened through the converter
+//! Excel 97–2003 .xls, plain and protected; protected .xlsx and .ods, saved here and opened through the converter
 //! process, as the app does; a protected sheet's journal and restore.
 
 use std::path::PathBuf;
@@ -31,6 +31,22 @@ fn protected_sheets_open_only_with_their_password() {
         assert_eq!(back.wb.get(CellAddr::new(0, 1, 1)), Value::Num(12.0), "{name}");
         assert!(back.protection.is_some());
     }
+}
+
+#[test]
+fn xls_files_open_through_the_converter() {
+    std::env::set_var("OFFICINA_CONVERT", converter());
+    let plain = officina_convert::xls::sample::workbook(None);
+    let d = load_with("old.xls", &plain, None).unwrap();
+    assert_eq!(d.wb.get(CellAddr::new(0, 0, 1)), Value::str("hello"));
+    assert_eq!(d.wb.get(CellAddr::new(0, 0, 2)), Value::Num(42.0));
+    assert!(d.protection.is_none());
+    let locked = officina_convert::xls::sample::workbook(Some("pa55"));
+    assert_eq!(load_with("old.xls", &locked, None).err(), Some(ConvertError::NeedsPassword));
+    assert_eq!(load_with("old.xls", &locked, Some("pass")).err(), Some(ConvertError::WrongPassword));
+    let back = load_with("old.xls", &locked, Some("pa55")).unwrap();
+    assert_eq!(back.wb.formula_text(CellAddr::new(0, 0, 2)).as_deref(), Some("=A1*21"));
+    assert_eq!(atrium_sheets::files::format_of("Old.XLS"), atrium_sheets::files::Format::Xls);
 }
 
 #[test]

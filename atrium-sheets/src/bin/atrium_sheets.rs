@@ -95,6 +95,19 @@ fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
         Format::Xlsx => protect("xlsx", officina_convert::xlsx::write(&d.wb, Vec::new())?),
         Format::Xlsm => protect("xlsm", officina_convert::xlsx::write_xlsm(&d.wb, Vec::new())?),
         Format::Ods => protect("ods", officina_convert::ods::write(&d.wb, Vec::new())?),
+        Format::Xls => Err(io::Error::other("Sheets doesn't write Excel 97–2003 files")),
+    }
+}
+
+/// Where Save writes a document opened from `target`: nowhere for an `.xls`,
+/// which Sheets reads but doesn't write (Save asks where to keep a copy).
+fn keep_target(d: &mut Doc, target: Option<Target>) -> Option<Target> {
+    match target {
+        Some(Target::Picked { format: Format::Xls, .. } | Target::Path { format: Format::Xls, .. }) => {
+            d.status = format!("{} Sheets reads Excel 97–2003 files but doesn't write them: Save asks where to keep a copy.", d.status);
+            None
+        }
+        t => t,
     }
 }
 
@@ -164,6 +177,7 @@ impl Run {
     /// closes cleanly if saved; with unsaved changes its autosave folder stays, and
     /// it comes back at the next start.
     fn show(&mut self, mut d: Doc, target: Option<Target>) {
+        let target = keep_target(&mut d, target);
         if d.autosave().is_none() {
             if let Err(e) = d.autosave_to(&new_autosave_dir(&self.root)) {
                 d.status = format!("{} Autosave is off: {e}.", d.status);
@@ -367,7 +381,8 @@ fn main() {
             }
         }
     }
-    let (doc, target) = first.unwrap_or_else(|| (Doc::new("Untitled"), None));
+    let (mut doc, target) = first.unwrap_or_else(|| (Doc::new("Untitled"), None));
+    let target = keep_target(&mut doc, target);
 
     let mut win = match Window::open(&WindowDesc::new("Sheets", SizeSpec::Fixed(1100, 720))) {
         Ok(w) => w,

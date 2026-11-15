@@ -15,6 +15,8 @@ pub enum Format {
     /// `.xlsm`: an `.xlsx` that may carry macros (kept inert, never run).
     Xlsm,
     Ods,
+    /// `.xls`, Excel 97–2003: read, never written.
+    Xls,
 }
 
 pub fn format_of(name: &str) -> Format {
@@ -27,6 +29,8 @@ pub fn format_of(name: &str) -> Format {
         Format::Xlsm
     } else if n.ends_with(".ods") {
         Format::Ods
+    } else if n.ends_with(".xls") {
+        Format::Xls
     } else {
         Format::Csv
     }
@@ -72,6 +76,7 @@ pub fn load_with(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc,
     let foreign = match format_of(name) {
         Format::Xlsx | Format::Xlsm => Some("xlsx"),
         Format::Ods => Some("ods"),
+        Format::Xls => Some("xls"),
         _ => None,
     };
     if let Some(kind) = foreign {

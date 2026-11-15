@@ -2739,6 +2739,71 @@ protected files through the real converter process.
 Open: Arca-held keys instead of passwords; protected PDF export; the legacy
 binary formats' RC4 encryption comes with O7b–O7d.
 
+### 16.42 O7b as built (2026-11-15): `.xls` import
+
+- **Records** (`officina-convert/src/xls/biff.rs`). The `Workbook` stream of
+  the compound file cut into records, `CONTINUE`s joined with their breaks
+  kept, so a string crossing one reads its new flags byte (the width can
+  change mid-string). Substreams nested in a sheet (embedded charts) are
+  walked over. Every read is checked; a short record is an error.
+- **Protected files** are decrypted by the reader, inside the converter's
+  sandbox: RC4 with MD5 (Excel 97/2000) and RC4 CryptoAPI (Excel 2002 on,
+  LibreOffice), key restarted every 1,024 bytes, the records MS-XLS leaves in
+  the clear left alone. A file protected only against writing opens with
+  Excel's default password without asking. XOR obfuscation (Excel 95) is
+  refused.
+- **Formulas** (`xls/formula.rs`, `xls/ftab.rs`). The parsed tokens run as a
+  postfix program over a stack of strings, back to the text Excel shows:
+  operators with brackets put back by precedence, the 380-entry built-in
+  function table, newer and add-in functions through function 255 with a
+  defined or external name (`_xlfn.` dropped), references relative or not,
+  whole rows and columns, 3D references through `EXTERNSHEET` and
+  `SUPBOOK`, array constants, `#REF!` forms. Shared formulas are rendered at
+  each cell from their `SHRFMLA`; array formulas at their first cell with
+  their area claimed as a spill; data tables keep their values. The text then
+  goes through the same placing, fill grouping, recalculation and
+  differential as `.xlsx` (shared with `xlsx/read.rs`). Defined names are
+  read from mid-grid so their relative parts keep both signs.
+- **Cells and formats.** Numbers, RK and MULRK, shared and inline strings,
+  booleans and errors, formula results (strings from the `STRING` record);
+  fonts (font 4 skipped as BIFF8 numbers them), number formats (`FORMAT` and
+  built-ins), the palette (the file's `PALETTE` over the default 56),
+  fills, the four borders with colours, alignment, wrap, indent, column
+  widths and hidden columns, row heights and hidden rows, default sizes, the
+  1904 date system, hidden sheets shown.
+- **Reported, not carried:** merged cells, comments, hyperlinks, charts,
+  pictures, shapes and form controls, conditional formats, data validation,
+  frozen panes, pivot tables (their values kept), macros, chart and macro
+  sheets, print areas. **Refused** in words: Excel 95 and older (BIFF5 and
+  before, in a compound file or bare) and XML or HTML spreadsheets saved as
+  `.xls`.
+- **Sheets** opens `.xls` through the converter (`officina-convert xls`,
+  `--password` as for the others). It doesn't write `.xls` (§16.40, D8): a
+  document opened from one has no save target, so Save asks where to keep a
+  copy and says why.
+
+**Gates.** `officina-convert/examples/xls_lo.rs`: the conformance workbook
+(152 formulas) and a sheet of formats, saved as `.xls` by LibreOffice 24.2,
+plain and with a password. Our engine on LibreOffice's tokens gives Excel's
+result on all 149 that LibreOffice can write to `.xls` (it saves `XLOOKUP`
+twice and `ISERROR(#REF!)` as `#N/A`); ours equals LibreOffice's saved
+result wherever that is Excel's; values, sheet names, 14 formatted cells,
+a width and a height equal; the protected copy asks for its password,
+refuses a wrong one and opens with it: **26/26**. LibreOffice's 72 `.xls`
+test files (`sc/qa/unit/data/xls`): the 66 BIFF8 workbooks open, 6 are
+refused in words (Excel 95, bare BIFF2–5, XML); where results differ from
+the files' it is functions the engine doesn't have yet (`AVERAGEIFS`,
+`SUBTOTAL`, `CODE`, `NORMSDIST`, `FREQUENCY`, `DCOUNT`, `GETPIVOTDATA`),
+Excel 4 macro names and user-defined functions. 68,000 randomly mutated copies
+of those files never panic (one engine crash found on the way: number format
+codes with multi-byte characters near the end, fixed in `numfmt.rs`). A 65,536
+× 20 `.xls` from LibreOffice opens in 0.2 s. Unit tests build a workbook
+record by record, plain and RC4 CryptoAPI protected (`xls::sample`), and Sheets
+opens both through the real converter.
+
+Open: the missing functions above; merged cells and comments once the grid
+has them; `.xls` charts and pictures; Excel 4 macro sheets.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
