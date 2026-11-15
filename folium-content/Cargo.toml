@@ -1,0 +1,14 @@
+[package]
+name = "folium-content"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Folium's content stream interpreter (docs/spec/folium.md §5, §7): graphics and text state, operators to a display list of fills, strokes, glyph runs and images, with rectangle-clip elision (§7.3) and coalescing by paint state (§7.2), under operation and size budgets, cancellable."
+
+[dependencies]
+folium-syntax = { path = "../folium-syntax" }
+folium-font = { path = "../folium-font" }
+
+[profile.release]
+debug = 1

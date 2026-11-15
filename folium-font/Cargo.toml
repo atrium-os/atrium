@@ -1,0 +1,15 @@
+[package]
+name = "folium-font"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Folium's fonts (docs/spec/folium.md §5): PDF font dictionaries, encodings, glyph names, ToUnicode, CID fonts with Identity CMaps, and glyph outlines from TrueType and CFF (ttf-parser) and Type 1 (our own parser and charstring interpreter), with the standard 14 drawn by metric-compatible Liberation fonts (D7)."
+
+[dependencies]
+folium-syntax = { path = "../folium-syntax" }
+# TrueType and CFF outlines only; no shaping, no system fonts.
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "glyph-names"] }
+
+[profile.release]
+debug = 1

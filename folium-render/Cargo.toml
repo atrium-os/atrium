@@ -1,0 +1,22 @@
+[package]
+name = "folium-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Folium's renderer (docs/spec/folium.md §7): a display list to pixels for one tile at device scale, with images decoded at the painted size and cached under a budget. The CPU path first (tiny-skia); vector scene nodes for Fresco build on the same pieces."
+
+[dependencies]
+folium-syntax = { path = "../folium-syntax" }
+folium-font = { path = "../folium-font" }
+folium-content = { path = "../folium-content" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+# Pure Rust, without SIMD intrinsics, as navigator-image uses it.
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
+
+[profile.release]
+debug = 1
+
+[dev-dependencies]
+folium-doc = { path = "../folium-doc" }
