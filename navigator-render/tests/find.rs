@@ -81,3 +81,18 @@ fn the_word_at_the_top_is_found_again_at_another_text_size() {
     let (same_px, _) = word_at(&doc, &fonts, &big, &subs, top).unwrap();
     assert_ne!(same_px, word, "the same px shows other words");
 }
+
+#[test]
+fn a_bold_match_ends_where_the_next_text_starts() {
+    let fonts = FontSet::load().unwrap();
+    for doc in ["<!doctype html><html><body><p><b>atrium</b>xq</p></body></html>",
+                "<!doctype html><html><body><p><b>WWWWWW</b>xq</p></body></html>",
+                "<!doctype html><html><body><p>atrium<b>xq</b></p></body></html>"] {
+        let word = if doc.contains("WWW") { "wwwwww" } else { "atrium" };
+        let a = find(doc, &fonts, &Env::default(), &Default::default(), word, 1);
+        let b = find(doc, &fonts, &Env::default(), &Default::default(), "xq", 1);
+        let end = a[0][0] + a[0][2];
+        eprintln!("{doc}: {a:?} {b:?}");
+        assert!((end - b[0][0]).abs() < 0.75, "{doc}: the mark ends at {end}, the next text starts at {}", b[0][0]);
+    }
+}

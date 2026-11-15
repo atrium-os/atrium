@@ -1345,6 +1345,6 @@ Each step runs in the VM on headless frescod before the next.
      §"step 7". The whole script ran 52/52 on 2026-11-14. Its first run (50/54) found a
      resend bug: the UI wrote its state back only when a tick changed something, so a request
      taken from the outbox was sent again every tick until then (Enter stepped three matches).
-   - Not yet, beyond the above: the find mark sits a few px short on bold text (the search
-     measures runs as laid out but the mark is a run-relative rect); "Jump to section" from
-     the anchors list.
+   - The find mark on bold text: checked 2026-11-15 and covers the word (the last glyph's
+     width from the font fixed it; `a_bold_match_ends_where_the_next_text_starts`, and the
+     live script's find frame). Not yet: "Jump to section" from the anchors list.
