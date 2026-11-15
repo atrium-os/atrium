@@ -183,15 +183,18 @@ if [ "$hold" -gt 0 ]; then
 		if [ "$fcheck" = 1 ]; then
 			echo "== frescod gpu renderer check"
 			mkdir -p /root/fresco-kernels
-			# FRESCO_WX (stage 6c): run the check under GPU W^X
-			# (isolation.gpu_wx, AMD_WX_*: 1 client BOs, 2 queue pages).
+			# FRESCO_WX (stage 6c): run the check with this GPU W^X
+			# setting (isolation.gpu_wx, AMD_WX_*: 1 client BOs, 2 queue
+			# pages; the driver default is 1 since 6d), restored after.
+			wx_old=$(sysctl -n dev.atrium_gpu_amd.0.isolation.gpu_wx)
+			echo "isolation.gpu_wx=$wx_old"
 			if [ -n "${FRESCO_WX:-}" ]; then
 				sysctl dev.atrium_gpu_amd.0.isolation.gpu_wx="$FRESCO_WX"
 			fi
 			FRESCO_COMPUTE_CACHE=/root/fresco-kernels FRESCOD_GPU_CHECK="${out%.log}-fc" \
 			    timeout 900 "$FRESCOD"; echo "frescod check rc=$?"
 			if [ -n "${FRESCO_WX:-}" ]; then
-				sysctl dev.atrium_gpu_amd.0.isolation.gpu_wx=0
+				sysctl dev.atrium_gpu_amd.0.isolation.gpu_wx="$wx_old"
 			fi
 			sysctl dev.atrium_gpu_amd_pci.0.si_protected_regs 2>/dev/null | grep reinits
 			echo "== si-client-test after the check (its health check)"
