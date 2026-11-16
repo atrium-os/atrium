@@ -20,6 +20,14 @@ fe80::1, fd77:0:0:88::1 and fd77:0:0:88::53.
 Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
   good | hostile | silent   -- DHCP behaviour
   hostile6 | good6          -- a rogue router fe80::66 sends bad RAs every 2 s
+  d6-off | d6-info | d6-addr -- the RAs' O / M+O flags; the DHCPv6 server on
+                               fe80::1 answers Information-Requests with DNS
+                               fd77:0:0:88::153, Solicit/Request/Renew/Rebind
+                               with fd77:0:0:88::1:50 (T1 60 s, valid 240 s)
+  d6-hostile                -- the server answers with bad messages, and every
+                               second pushes one carrying the client's last
+                               transaction id (so only the client's checks
+                               stand between it and the host)
   flap6                     -- kernel stress: RAs every 0.2 s and unsolicited
                                NAs for fe80::1 without the Router flag
   web-ok | web-dead | web-captive  -- what 198.51.100.80:80 does (default ok)
@@ -41,8 +49,12 @@ MAGIC = bytes([99, 130, 83, 99])
 mode = "good"
 stats = {"discover": 0, "request": 0, "renew": 0, "rebind": 0, "reboot": 0,
          "hostile_sent": 0, "dns": 0, "ping": 0, "arp": 0, "frames": 0,
-         "rs": 0, "ra": 0, "ns": 0, "ping6": 0, "dns6": 0, "hostile6_sent": 0}
+         "rs": 0, "ra": 0, "ns": 0, "ping6": 0, "dns6": 0, "hostile6_sent": 0,
+         "d6_solicit": 0, "d6_request": 0, "d6_renew": 0, "d6_rebind": 0, "d6_info": 0,
+         "d6_hostile_sent": 0}
 mode6 = "good6"
+d6 = "d6-off"
+d6_last = None  # (client mac, client ll, xid, client id, iaid) of the last client message
 web = "web-ok"
 tcp = {}  # (client ip, port) -> bytes of our answer already sent
 rnd = random.Random(7)
@@ -234,7 +246,9 @@ DNS6 = a6("fd77:0:0:88::53")
 V6_HOST = a6("fd77:0:0:88::77")
 PREFIX = a6("fd77:0:0:88::")
 ALL_NODES = a6("ff02::1")
-MINE6 = (R_LL, R_GLOBAL, DNS6)
+D6_DNS = a6("fd77:0:0:88::153")
+D6_ADDR = a6("fd77:0:0:88::1:50")
+MINE6 = (R_LL, R_GLOBAL, DNS6, D6_DNS)
 
 
 def ip6(src, dst, nxt, payload, hlim=255):
@@ -263,7 +277,8 @@ def good_ra():
     pi = bytes([3, 4, 64, 0xC0]) + struct.pack("!III", 86400, 14400, 0) + PREFIX
     mtu = bytes([5, 1, 0, 0]) + struct.pack("!I", 1500)
     sll = bytes([1, 1]) + RMAC
-    body = bytes([64, 0]) + struct.pack("!HII", 1800, 0, 0) + pi + mtu + sll + rdnss(600, [DNS6, R_LL])
+    flags = {"d6-info": 0x40, "d6-addr": 0xC0, "d6-hostile": 0xC0}.get(d6, 0)
+    body = bytes([64, flags]) + struct.pack("!HII", 1800, 0, 0) + pi + mtu + sll + rdnss(600, [DNS6, R_LL])
     stats["ra"] += 1
     return eth(mcast_mac(ALL_NODES), RMAC, 0x86DD, icmp6(R_LL, ALL_NODES, 134, 0, body))
 
@@ -321,6 +336,8 @@ def frame6(src_mac, p):
         if typ == 128 and d in MINE6:
             stats["ping6"] += 1
             return [eth(src_mac, RMAC, 0x86DD, icmp6(d, s, 129, 0, body[4:], hlim=64))]
+    if nxt == 17 and len(body) >= 8 and d == ALL_D6 and s[:2] == b"\xfe\x80" and body[:4] == b"\x02\x22\x02\x23":
+        return dhcp6(src_mac, s, body[8:struct.unpack("!H", body[4:6])[0]])
     if nxt == 17 and len(body) >= 8 and d in MINE6:
         sport, dport = struct.unpack("!HH", body[:4])
         if dport == 53:
@@ -332,6 +349,108 @@ def frame6(src_mac, p):
                 u = u[:6] + struct.pack("!H", c) + u[8:]
                 return [eth(src_mac, RMAC, 0x86DD, ip6(d, s, 17, u, hlim=64))]
     return []
+
+
+# ---- DHCPv6 server (RFC 8415, the parts the client uses) --------------------
+
+ALL_D6 = a6("ff02::1:2")
+SDUID = b"\x00\x03\x00\x01" + RMAC
+
+
+def o6(code, body):
+    return struct.pack("!HH", code, len(body)) + body
+
+
+def opts6(b):
+    out, i = {}, 0
+    while i + 4 <= len(b):
+        c, n = struct.unpack("!HH", b[i:i + 4])
+        out.setdefault(c, b[i + 4:i + 4 + n])
+        i += 4 + n
+    return out
+
+
+def ia_na(iaid, t1, t2, addrs):
+    b = struct.pack("!III", iaid, t1, t2)
+    for a, p, v in addrs:
+        b += o6(5, a + struct.pack("!II", p, v))
+    return o6(3, b)
+
+
+def d6_send(cmac, cll, msg, bad_sum=False):
+    u = struct.pack("!HHHH", 547, 546, 8 + len(msg), 0) + msg
+    c = (l4sum6(R_LL, cll, 17, u) or 0xFFFF) ^ (1 if bad_sum else 0)
+    u = u[:6] + struct.pack("!H", c) + u[8:]
+    return eth(cmac, RMAC, 0x86DD, ip6(R_LL, cll, 17, u, hlim=255))
+
+
+def d6_good(typ, xid, cid, iaid):
+    m = bytes([typ]) + xid + o6(1, cid) + o6(2, SDUID)
+    if iaid is not None:
+        m += ia_na(iaid, 60, 96, [(D6_ADDR, 120, 240)])
+    return m + o6(23, D6_DNS)
+
+
+def d6_bad(typ, xid, cid, iaid):
+    head = lambda c=cid, s=SDUID: bytes([typ]) + xid + o6(1, c) + (o6(2, s) if s else b"")
+    ia = lambda a, p=120, v=240, i=iaid, t=(60, 96): ia_na(i, t[0], t[1], [(a6(a), p, v)])
+    kinds = [
+        ("link-local address", head() + ia("fe80::bad")),
+        ("multicast address", head() + ia("ff02::1:3")),
+        ("loopback address", head() + ia("::1")),
+        ("IPv4-mapped address", head() + ia("::ffff:10.88.0.66")),
+        ("6to4 address", head() + ia("2002:a58:66::1")),
+        ("preferred beyond valid", head() + ia("fd66::53", p=500, v=100)),
+        ("valid lifetime 0", head() + ia("fd66::54", p=0, v=0)),
+        ("another client's id", head(c=b"\x00\x03\x00\x01\x02\x00\x00\x00\x00\x99") + ia("fd66::c1")),
+        ("no server id", head(s=None) + ia("fd66::51")),
+        ("another IAID", head() + ia("fd66::52", i=iaid ^ 1)),
+        ("option past the end", head() + ia("fd66::56")[:-6] + struct.pack("!HH", 23, 400) + D6_DNS),
+        ("200-byte server id", head(s=bytes(200)) + ia("fd66::57")),
+        ("bad DNS servers", head() + ia(socket.inet_ntop(socket.AF_INET6, D6_ADDR)) + o6(23, a6("::1") + a6("ff02::1") + a6("::ffff:10.88.0.53") + a6("2002:a58:35::1"))),
+        ("odd DNS option", head() + o6(23, a6("fd66::5") + b"\x01")),
+        ("huge lifetimes", head() + ia(socket.inet_ntop(socket.AF_INET6, D6_ADDR), p=0xFFFFFFFF, v=0xFFFFFFFF, t=(0xFFFFFFFF, 0xFFFFFFFF))),
+        ("IA_NA status NoAddrsAvail with an address", head() + o6(3, struct.pack("!III", iaid, 0, 0) + o6(13, b"\x00\x02") + o6(5, a6("fd66::58") + struct.pack("!II", 9, 9)))),
+        ("bad checksum", None),
+    ]
+    name, m = kinds[stats["d6_hostile_sent"] % len(kinds)]
+    stats["d6_hostile_sent"] += 1
+    stats["last_d6_hostile"] = name
+    return name, m if m is not None else head() + ia("fd66::55")
+
+
+def d6_hostile_push():
+    if not d6_last:
+        return []
+    cmac, cll, xid, cid, iaid = d6_last
+    out = []
+    for typ in (2, 7):
+        name, m = d6_bad(typ, xid, cid, iaid if iaid is not None else 0)
+        out.append(d6_send(cmac, cll, m, bad_sum=(name == "bad checksum")))
+    return out
+
+
+def dhcp6(cmac, cll, m):
+    global d6_last
+    if len(m) < 4 or d6 == "d6-off":
+        return []
+    typ, xid, o = m[0], m[1:4], opts6(m[4:])
+    cid = o.get(1)
+    if not cid:
+        return []
+    iaid = struct.unpack("!I", o[3][:4])[0] if 3 in o and len(o[3]) >= 4 else None
+    d6_last = (cmac, cll, xid, cid, iaid)
+    name = {1: "d6_solicit", 3: "d6_request", 5: "d6_renew", 6: "d6_rebind", 11: "d6_info"}.get(typ)
+    if not name:
+        return []
+    stats[name] += 1
+    if d6 == "d6-hostile":
+        return d6_hostile_push()
+    if typ == 11:
+        return [d6_send(cmac, cll, bytes([7]) + xid + o6(1, cid) + o6(2, SDUID) + o6(23, D6_DNS) + o6(32, struct.pack("!I", 600)))]
+    if d6 != "d6-addr" or iaid is None:
+        return []
+    return [d6_send(cmac, cll, d6_good(2 if typ == 1 else 7, xid, cid, iaid))]
 
 
 def frame(f):
@@ -374,7 +493,7 @@ def frame(f):
 
 
 def main():
-    global mode, mode6, web
+    global mode, mode6, web, d6
     lan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -382,7 +501,7 @@ def main():
     import select
     print(f"lan: up, lease {LEASE} s", flush=True)
     import time
-    next_ra = next_bad = 0.0
+    next_ra = next_bad = next_d6 = 0.0
     while True:
         now = time.monotonic()
         if now >= next_ra:
@@ -396,6 +515,10 @@ def main():
             na = struct.pack("!I", 0x20000000) + R_LL + bytes([2, 1]) + RMAC
             lan.sendto(eth(mcast_mac(ALL_NODES), RMAC, 0x86DD, icmp6(R_LL, ALL_NODES, 136, 0, na)), GUEST)
             next_bad = now + 0.2
+        if d6 == "d6-hostile" and now >= next_d6:
+            for out in d6_hostile_push():
+                lan.sendto(out, GUEST)
+            next_d6 = now + 1
         r, _, _ = select.select([lan, ctl], [], [], 0.1 if mode6 == "flap6" else 1.0)
         if lan in r:
             f, _ = lan.recvfrom(65536)
@@ -410,10 +533,14 @@ def main():
             if w in ("web-ok", "web-dead", "web-captive"):
                 web = w
                 print(f"lan: {w}", flush=True)
+            if w in ("d6-off", "d6-info", "d6-addr", "d6-hostile"):
+                d6 = w
+                print(f"lan: {w}", flush=True)
+                lan.sendto(good_ra(), GUEST)
             if w in ("good6", "hostile6", "flap6"):
                 mode6 = w
                 print(f"lan: mode {w}", flush=True)
-            ctl.sendto(json.dumps(dict(stats, mode=mode, web=web)).encode(), a)
+            ctl.sendto(json.dumps(dict(stats, mode=mode, web=web, d6=d6)).encode(), a)
 
 
 if __name__ == "__main__":

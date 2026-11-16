@@ -22,6 +22,9 @@ pub struct Ra {
     pub router: Ipv6Addr,
     /// Router lifetime, seconds (0: not a default router).
     pub router_life: u16,
+    /// M and O flags: addresses, or other configuration (DNS), by DHCPv6.
+    pub managed: bool,
+    pub other: bool,
     /// (server, lifetime s); lifetime 0 withdraws the server.
     pub dns: Vec<(Ipv6Addr, u32)>,
 }
@@ -79,6 +82,7 @@ pub fn ra_from_frame(f: &[u8]) -> Option<Ra> {
         return None;
     }
     let router_life = u16::from_be_bytes([m[6], m[7]]);
+    let (managed, other) = (m[5] & 0x80 != 0, m[5] & 0x40 != 0);
     let mut dns = Vec::new();
     let mut i = 16;
     while i < m.len() {
@@ -103,7 +107,7 @@ pub fn ra_from_frame(f: &[u8]) -> Option<Ra> {
         }
         i += len;
     }
-    Some(Ra { router: src, router_life, dns })
+    Some(Ra { router: src, router_life, managed, other, dns })
 }
 
 /// DNS servers learned from RAs, per router, with expiry.
@@ -142,6 +146,11 @@ impl Rdnss {
         })
     }
 
+    /// The servers last reported.
+    pub fn current(&self) -> &[Ipv6Addr] {
+        &self.told
+    }
+
     pub fn deadline(&self) -> Option<u64> {
         self.have.iter().map(|(_, _, t)| *t).min()
     }
@@ -155,7 +164,12 @@ impl Rdnss {
 
 /// Build an RA frame (tests, fuzzing).
 pub fn ra_for_test(src: Ipv6Addr, router_life: u16, opts: &[u8]) -> Vec<u8> {
-    let mut m = vec![RA, 0, 0, 0, 64, 0];
+    ra_flags_for_test(src, router_life, 0, opts)
+}
+
+/// With the flags octet (0x80 M, 0x40 O).
+pub fn ra_flags_for_test(src: Ipv6Addr, router_life: u16, flags: u8, opts: &[u8]) -> Vec<u8> {
+    let mut m = vec![RA, 0, 0, 0, 64, flags];
     m.extend_from_slice(&router_life.to_be_bytes());
     m.extend_from_slice(&[0; 8]);
     m.extend_from_slice(opts);

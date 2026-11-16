@@ -101,6 +101,19 @@ pub fn ordinary_unicast6(a: std::net::Ipv6Addr) -> bool {
     (global && !tunnel) || ula || ll
 }
 
+/// A DHCPv6 address proposed by atrium-lease: global or unique-local
+/// unicast, lifetimes at most a week, preferred within valid, and not an
+/// address another interface of this host has.
+pub fn check_lease6(a: std::net::Ipv6Addr, pref: u32, valid: u32, others: &[std::net::Ipv6Addr]) -> Result<(), Refused> {
+    if !ordinary_unicast6(a) || a.segments()[0] & 0xffc0 == 0xfe80 || others.contains(&a) {
+        return Err(Refused::Address);
+    }
+    if valid == 0 || valid > 7 * 86400 || pref > valid {
+        return Err(Refused::Lease);
+    }
+    Ok(())
+}
+
 /// RDNSS servers proposed by atrium-lease.
 pub fn check_dns6(d: &[std::net::Ipv6Addr]) -> Result<(), Refused> {
     if d.len() > MAX_DNS || d.iter().any(|&a| !ordinary_unicast6(a)) {

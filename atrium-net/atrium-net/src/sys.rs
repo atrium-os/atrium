@@ -27,6 +27,8 @@ const SIOCDIFGROUP: u64 = ioc(IOC_IN, b'i', 137, IFGROUPREQ);
 const IN6_IFREQ: usize = 288;
 const IN6_NDIREQ: usize = 72;
 const SIOCDIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 25, IN6_IFREQ);
+const IN6_ALIASREQ: usize = 136;
+const SIOCAIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 27, IN6_ALIASREQ);
 const SIOCGIFINFO_IN6: u64 = ioc(IOC_IN | IOC_OUT, b'i', 108, IN6_NDIREQ);
 const SIOCSIFINFO_FLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 87, IN6_NDIREQ);
 const ND6_IFF_PERFORMNUD: u32 = 0x1;
@@ -142,6 +144,28 @@ impl Ifc {
         r[36..40].copy_from_slice(&f.to_ne_bytes());
         if unsafe { ioctl(self.s6.as_raw_fd(), SIOCSIFINFO_FLAGS, r.as_mut_ptr()) } != 0 {
             return err("SIOCSIFINFO_FLAGS");
+        }
+        Ok(())
+    }
+
+    /// Add (or refresh the lifetimes of) a DHCPv6 address, as a /128: the
+    /// on-link prefix, if any, comes from RAs.
+    pub fn add_addr6(&self, name: &str, a: Ipv6Addr, pref: u32, valid: u32) -> io::Result<()> {
+        let mut r = [0u8; IN6_ALIASREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        let sin6 = |r: &mut [u8], at: usize, v: [u8; 16]| {
+            r[at] = 28;
+            r[at + 1] = libc::AF_INET6 as u8;
+            r[at + 8..at + 24].copy_from_slice(&v);
+        };
+        sin6(&mut r, 16, a.octets());
+        sin6(&mut r, 72, [0xff; 16]);
+        // in6_addrlifetime at 104: expire, preferred (time_t; the kernel
+        // computes them), vltime, pltime.
+        r[120..124].copy_from_slice(&valid.to_ne_bytes());
+        r[124..128].copy_from_slice(&pref.to_ne_bytes());
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCAIFADDR_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCAIFADDR_IN6");
         }
         Ok(())
     }
@@ -292,6 +316,8 @@ pub const RTM_DELETE: u8 = 2;
 pub const RTM_CHANGE: u8 = 3;
 pub const RTM_IFINFO: u8 = 0xe;
 pub const RTM_IFANNOUNCE: u8 = 0x11;
+pub const RTM_NEWADDR: u8 = 0xc;
+pub const RTM_DELADDR: u8 = 0xd;
 const RTF_UP: i32 = 0x1;
 const RTF_GATEWAY: i32 = 0x2;
 const RTF_STATIC: i32 = 0x800;
@@ -393,6 +419,16 @@ impl Rtsock {
                     let what = u16::from_ne_bytes([b[22], b[23]]);
                     out.push(if what == 0 { IfEvent::Arrived(name.to_string()) } else { IfEvent::Departed(name.to_string()) });
                 }
+                // ifa_msghdr (20 bytes), then the sockaddrs its address
+                // bits name, each padded to 8: the netmask (bit 2) and the
+                // address (bit 5) are what we keep. getifaddrs(3) needs a
+                // sysctl capability mode refuses, so after start-up this is
+                // how atrium-net knows the host's addresses.
+                t @ (RTM_NEWADDR | RTM_DELADDR) if n >= 20 => {
+                    if let Some(e) = parse_addr_msg(&b[..n], t == RTM_NEWADDR) {
+                        out.push(e);
+                    }
+                }
                 _ => {}
             }
         }
@@ -400,11 +436,45 @@ impl Rtsock {
     }
 }
 
+/// An RTM_NEWADDR / RTM_DELADDR message, or `None` if it is not one we can read.
+pub fn parse_addr_msg(b: &[u8], add: bool) -> Option<IfEvent> {
+    let bits = i32::from_ne_bytes(b.get(4..8)?.try_into().ok()?);
+    let index = u16::from_ne_bytes([b[12], b[13]]);
+    let mut at = 20;
+    let (mut mask, mut addr) = (None, None);
+    for bit in 0..8 {
+        if bits & (1 << bit) == 0 {
+            continue;
+        }
+        let len = *b.get(at)? as usize;
+        let sa = b.get(at..at + len.max(2))?;
+        if bit == 2 {
+            mask = Some(sa.to_vec());
+        }
+        if bit == 5 {
+            addr = Some(sa.to_vec());
+        }
+        at += if len == 0 { 8 } else { 1 + ((len - 1) | 7) };
+    }
+    let sa = addr?;
+    let ip: std::net::IpAddr = match sa[1] as i32 {
+        libc::AF_INET if sa.len() >= 8 => Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]).into(),
+        libc::AF_INET6 if sa.len() >= 24 => Ipv6Addr::from(<[u8; 16]>::try_from(&sa[8..24]).ok()?).into(),
+        _ => return None,
+    };
+    // The netmask's sockaddr may be cut after its last nonzero byte.
+    let off = if ip.is_ipv4() { 4 } else { 8 };
+    let width = if ip.is_ipv4() { 4 } else { 16 };
+    let prefix = mask.map_or(if ip.is_ipv4() { 32 } else { 128 }, |m| (0..width).map(|i| m.get(off + i).copied().unwrap_or(0).count_ones() as u8).sum());
+    Some(IfEvent::Addr { index, add, addr: ip, prefix })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IfEvent {
     Link(u16, bool),
     Arrived(String),
     Departed(String),
+    Addr { index: u16, add: bool, addr: std::net::IpAddr, prefix: u8 },
 }
 
 
@@ -418,30 +488,6 @@ struct BpfInsn {
     k: u32,
 }
 
-/// DHCP replies (IPv4, UDP, not a fragment, 67 -> 68) and IPv6 router
-/// advertisements (ICMPv6 134, hop limit 255, no extension headers).
-const RX_FILTER: [(u16, u8, u8, u32); 20] = [
-    (0x28, 0, 0, 12),       // 0  ldh [12]
-    (0x15, 0, 9, 0x0800),   // 1  jeq IPv4 ? 2 : 11
-    (0x30, 0, 0, 23),       // 2  ldb [23]
-    (0x15, 0, 15, 17),      // 3  jeq UDP ? 4 : drop
-    (0x28, 0, 0, 20),       // 4  ldh [20]
-    (0x45, 13, 0, 0x1fff),  // 5  fragment ? drop : 6
-    (0xb1, 0, 0, 14),       // 6  ldx 4*([14]&0xf)
-    (0x48, 0, 0, 14),       // 7  ldh [x+14]
-    (0x15, 0, 10, 67),      // 8  jeq 67 ? 9 : drop
-    (0x48, 0, 0, 16),       // 9  ldh [x+16]
-    (0x15, 7, 8, 68),       // 10 jeq 68 ? take : drop
-    (0x15, 0, 7, 0x86dd),   // 11 jeq IPv6 ? 12 : drop
-    (0x30, 0, 0, 20),       // 12 ldb [20] next header
-    (0x15, 0, 5, 58),       // 13 jeq ICMPv6 ? 14 : drop
-    (0x30, 0, 0, 21),       // 14 ldb [21] hop limit
-    (0x15, 0, 3, 255),      // 15 jeq 255 ? 16 : drop
-    (0x30, 0, 0, 54),       // 16 ldb [54] ICMPv6 type
-    (0x15, 0, 1, 134),      // 17 jeq RA ? take : drop
-    (0x06, 0, 0, 1514),     // 18 take
-    (0x06, 0, 0, 0),        // 19 drop
-];
 
 pub struct Bpf {
     pub fd: OwnedFd,
@@ -460,7 +506,7 @@ impl Bpf {
         let mut zero: u32 = 0;
         let mut blen: u32 = 0;
         let mut ir = ifreq(ifname);
-        let insns: Vec<BpfInsn> = RX_FILTER.iter().map(|&(code, jt, jf, k)| BpfInsn { code, jt, jf, k }).collect();
+        let insns: Vec<BpfInsn> = crate::wrap::RX_FILTER.iter().map(|&(code, jt, jf, k)| BpfInsn { code, jt, jf, k }).collect();
         #[repr(C)]
         struct Prog {
             len: u32,

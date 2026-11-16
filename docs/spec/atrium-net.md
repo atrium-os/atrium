@@ -23,7 +23,8 @@ for it and `dhclient` doing DHCP. This spec turns the sketch into something buil
   127.0.0.1; `atrium-net` only rewrites its forwarders. Apps keep resolving through the
   Insula broker (`CLASS_NET`), which uses that resolver.
 - IPv6: SLAAC with stable-private (RFC 7217) and temporary (RFC 8981) addresses, RDNSS
-  from router advertisements. DHCPv6 later.
+  from router advertisements; DHCPv6 for DNS servers and addresses where the RA asks
+  for it (§5.3).
 - Privacy by default: no hostname sent, DHCP client identifier is the per-network MAC
   (RFC 7844 anonymity profile).
 - Apps and the future settings UI reach it over a new Aqueduct class, `CLASS_NETCONF`,
@@ -211,7 +212,7 @@ on its previous good state.
 Kernel SLAAC (`accept_rtadv`) with stable-private interface IDs (RFC 7217) and
 temporary addresses (RFC 8981) preferred for outgoing connections. atrium-lease reads
 RAs only for RDNSS (RFC 8106) and proposes the servers; the kernel handles prefixes and
-routes. DHCPv6 (stateful) later, if a network needs it.
+routes. DHCPv6 where the RA's flags ask for it (built 2026-11-15, below).
 
 As built (N2):
 - atrium-net sets `use_stableaddr`, `use_tempaddr`, `prefer_tempaddr` and per interface
@@ -251,6 +252,38 @@ As built (N2):
   validation for free.
 
 ## 7. Interfaces to others
+
+
+DHCPv6 as built (2026-11-15):
+- atrium-lease reads the RA's M and O flags. O alone: an Information-Request, and the
+  Reply's DNS servers (option 23, at most 3, ordinary unicast only) join the RA's in the
+  `dns6` line (RA servers first, three in all); asked again at the information refresh
+  time, 10 min to 1 day. M: Solicit, the first usable Advertise, Request; Renew at T1,
+  Rebind at T2, the address dropped when its valid lifetime ends or the server refuses
+  it. IA_NA only: no prefix delegation, rapid commit, reconfigure or authentication. The
+  client's DUID is DUID-LL of the interface's MAC, so Wi-Fi's per-network address gives
+  a per-network DUID. Lifetimes are capped at a week; T1/T2 of 0 become 0.5 and 0.8 of
+  the preferred lifetime; Solicit and Information-Request back off to 120 s.
+- atrium-lease proposes `send6` payloads; atrium-net checks them (`wrap::check_send6`:
+  a client message type, only the options the client builds, exactly one client id and
+  it is this interface's DUID, at most 256 bytes; the DHCPv4 token bucket) and sends
+  them from the interface's link-local address to ff02::1:2. The bpf filter passes UDP
+  547 to 546; atrium-lease takes only frames to a link-local address with a valid UDP
+  checksum. `lease6` is checked again (`check_lease6`: global or unique-local unicast,
+  not another interface's address, valid at most a week, preferred within valid) and
+  applied as a /128 with its lifetimes (`SIOCAIFADDR_IN6`); on-link prefixes and routes
+  still come from RAs. `lost6`, link down and leaving a Wi-Fi network remove it.
+- Gate: `atrium-net-gate.sh n0` 35/35, with `lan.py d6-info`, `d6-addr` and `d6-hostile`
+  (17 kinds of bad message, pushed with the client's own transaction id: 62 sent, none
+  applied).
+- Found on the way: getifaddrs(3) needs a sysctl that capability mode refuses, so after
+  start-up atrium-net could not list the host's addresses (the status line had no
+  `inet6`, leaving a Wi-Fi network did not remove its SLAAC addresses, and the overlap
+  check saw only the addresses from start-up). It now reads them once at start and then
+  keeps them from the routing socket's RTM_NEWADDR/RTM_DELADDR messages.
+- Seen once each on two fresh boots: no RFC 8981 temporary address on the first run
+  after boot (the kernel makes one only together with a new stable address); later runs
+  have one. Not yet looked into.
 
 ### 7.1 CLASS_NETCONF (new Aqueduct class 18)
 
@@ -301,7 +334,7 @@ Stays as a test and debug tool. The gates switch to `atrium-net` once N1 lands.
 
 ## 8. Not in v1
 
-VPN tunnels (designed in [vpn.md](vpn.md): atrium-net applies checked tunnel proposals and owns the `atrium/vpn` pf anchor), DHCPv6, captive portal sign-in (v1 only detects
+VPN tunnels (designed in [vpn.md](vpn.md): atrium-net applies checked tunnel proposals and owns the `atrium/vpn` pf anchor), DHCPv6 prefix delegation, captive portal sign-in (v1 only detects
 it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 
 ## 9. Decisions
@@ -411,7 +444,7 @@ VM from the Aura gates cover them.
   addresses made and deleted under the flood with no panic or hang, 10 minutes clean, the
   gate 28/28 on that kernel. Pushed to atrium-os/freebsd-src branch `atrium-os` as
   92ffd19c3; a private report to the FreeBSD Security Officer is drafted, not sent.
-- Not yet: DHCPv6, the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
+- Not yet: the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
   wired), RA MTU beyond what the kernel applies.
 
 ### 10.4 N3 as built (2026-11-14)

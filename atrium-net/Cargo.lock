@@ -32,6 +32,7 @@ dependencies = [
 name = "atrium-net"
 version = "0.1.0"
 dependencies = [
+ "atrium-lease",
  "atrium-netconf",
  "aura-ipc",
  "libc",

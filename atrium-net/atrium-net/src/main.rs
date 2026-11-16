@@ -40,7 +40,7 @@ mod imp {
     use atrium_net::wrap;
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
-    use net_proto::{check_dns6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
+    use net_proto::{check_dns6, check_lease6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
     use std::io;
     use atrium_netconf::{check_dns, lines as nlines, Manual};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -225,6 +225,8 @@ mod imp {
         /// DNS servers from RAs (checked), and the router solicitations
         /// still to send (three, 4 s apart, after the link comes up).
         dns6: Vec<Ipv6Addr>,
+        /// The DHCPv6 address applied (checked), if any.
+        addr6: Option<Ipv6Addr>,
         rs_left: u8,
         rs_at: u64,
         /// Link up (wired: the kernel's link state; Wi-Fi: port open).
@@ -267,6 +269,11 @@ mod imp {
         rt: Rtsock,
         unbound: Option<Unbound>,
         host: Vec<(String, Ipv4Addr, u8)>,
+        /// The host's IPv6 addresses, by interface; with `host`, read at
+        /// start and then kept from the routing socket's address messages.
+        host6: Vec<(String, Ipv6Addr)>,
+        /// Interface names by index (start-up, then arrivals).
+        names: Vec<(u16, String)>,
         ifs: Vec<Iface>,
         ctls: Vec<Ctl>,
         state: Dir,
@@ -323,7 +330,30 @@ mod imp {
         fn refresh_host(&mut self) {
             if let Ok(all) = sys::interfaces() {
                 self.host = all.iter().flat_map(|i| i.v4.iter().map(move |&(a, p)| (i.name.clone(), a, p))).collect();
+                self.host6 = all.iter().flat_map(|i| i.v6.iter().map(move |&a| (i.name.clone(), a))).collect();
             }
+        }
+
+        fn addr_event(&mut self, index: u16, add: bool, addr: IpAddr, prefix: u8) {
+            let Some(name) = self.names.iter().find(|(i, _)| *i == index).map(|(_, n)| n.clone()) else { return };
+            match addr {
+                IpAddr::V4(a) => {
+                    self.host.retain(|(n, x, _)| !(n == &name && *x == a));
+                    if add {
+                        self.host.push((name, a, prefix));
+                    }
+                }
+                IpAddr::V6(a) => {
+                    self.host6.retain(|(n, x)| !(n == &name && *x == a));
+                    if add {
+                        self.host6.push((name, a));
+                    }
+                }
+            }
+        }
+
+        fn v6_of(&self, name: &str) -> Vec<Ipv6Addr> {
+            self.host6.iter().filter(|(n, _)| n == name).map(|&(_, a)| a).collect()
         }
 
         fn host_view(&self, except: &str) -> HostView {
@@ -702,16 +732,13 @@ mod imp {
         /// them until their lifetimes end, on a link that no longer has them).
         fn drop_v6(&mut self, k: usize) {
             let name = self.ifs[k].name.clone();
+            self.ifs[k].addr6 = None;
             let _ = self.ifc.accept_rtadv(&name, false);
-            if let Ok(all) = sys::interfaces() {
-                if let Some(info) = all.iter().find(|x| x.name == name) {
-                    for a in &info.v6 {
-                        if a.segments()[0] & 0xffc0 != 0xfe80 {
-                            match self.ifc.del_addr6(&name, *a) {
-                                Ok(()) => self.log(&format!("{name}: removed {a}")),
-                                Err(e) => eprintln!("atrium-net: {name}: removing {a}: {e}"),
-                            }
-                        }
+            for a in self.v6_of(&name) {
+                if a.segments()[0] & 0xffc0 != 0xfe80 {
+                    match self.ifc.del_addr6(&name, a) {
+                        Ok(()) => self.log(&format!("{name}: removed {a}")),
+                        Err(e) => eprintln!("atrium-net: {name}: removing {a}: {e}"),
                     }
                 }
             }
@@ -1058,10 +1085,9 @@ mod imp {
 
         fn status(&self) -> Vec<Line> {
             let mut v = Vec::new();
-            let all = sys::interfaces().unwrap_or_default();
             for i in &self.ifs {
                 let mut l = Line::new("iface").with("name", &i.name).with("mac", fmt_mac(&i.mac));
-                let v6: Vec<String> = all.iter().filter(|x| x.name == i.name).flat_map(|x| x.v6.iter()).map(|a| a.to_string()).collect();
+                let v6: Vec<String> = self.v6_of(&i.name).iter().map(|a| a.to_string()).collect();
                 match &i.applied.lease {
                     Some(x) => {
                         l = l.with("state", "bound").with("addr", format!("{}/{}", x.addr, x.prefix));
@@ -1164,6 +1190,17 @@ mod imp {
                 }
                 "lost" if self.manual_for(k).is_some() => {}
                 "lost" => self.lose(k, l.get("why").unwrap_or("?")),
+                "send6" => self.lease_send6(k, l),
+                "lease6" => self.lease6(k, l),
+                "lost6" => {
+                    if let Some(a) = self.ifs[k].addr6.take() {
+                        let name = self.ifs[k].name.clone();
+                        match self.ifc.del_addr6(&name, a) {
+                            Ok(()) => self.log(&format!("{name}: DHCPv6 address {a} removed ({})", l.get("why").unwrap_or("?"))),
+                            Err(e) => eprintln!("atrium-net: {name}: removing {a}: {e}"),
+                        }
+                    }
+                }
                 "dns6" => {
                     let list: Option<Vec<Ipv6Addr>> = l.get("servers").map(|s| s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().ok()).collect()).unwrap_or(None);
                     match list {
@@ -1217,6 +1254,81 @@ mod imp {
             if let Err(e) = i.bpf.write(&f) {
                 eprintln!("atrium-net: {}: bpf write: {e}", i.name);
             }
+        }
+
+        /// A DHCPv6 message from atrium-lease: checked, then sent from the
+        /// interface's link-local address to ff02::1:2, under the same
+        /// token bucket as DHCPv4.
+        fn lease_send6(&mut self, k: usize, l: &Line) {
+            let ll = self.v6_of(&self.ifs[k].name).into_iter().find(|a| a.segments()[0] & 0xffc0 == 0xfe80);
+            let i = &mut self.ifs[k];
+            let now = Instant::now();
+            i.tokens = (i.tokens + now.duration_since(i.last_fill).as_secs_f64() / 2.0).min(10.0);
+            i.last_fill = now;
+            let Some(p) = l.hex("hex") else {
+                i.sends_refused += 1;
+                return;
+            };
+            if i.tokens < 1.0 {
+                i.sends_refused += 1;
+                return;
+            }
+            if let Err(e) = wrap::check_send6(&p, &i.mac) {
+                i.sends_refused += 1;
+                let m = format!("{}: DHCPv6 send refused: {e:?}", i.name);
+                self.log(&m);
+                return;
+            }
+            let Some(ll) = ll else {
+                // No link-local address yet (IPv6 still starting): the
+                // client retransmits.
+                return;
+            };
+            i.tokens -= 1.0;
+            if let Err(e) = i.bpf.write(&wrap::frame6(&i.mac, ll, &p)) {
+                eprintln!("atrium-net: {}: bpf write: {e}", i.name);
+            }
+        }
+
+        fn lease6(&mut self, k: usize, l: &Line) {
+            let name = self.ifs[k].name.clone();
+            let a = l.get("addr").and_then(|x| x.parse::<Ipv6Addr>().ok());
+            let pref = l.get("pref").and_then(|x| x.parse::<u32>().ok());
+            let valid = l.get("valid").and_then(|x| x.parse::<u32>().ok());
+            let (Some(a), Some(pref), Some(valid)) = (a, pref, valid) else {
+                self.refuse6(k, "lease6: unparsable".into());
+                return;
+            };
+            let others: Vec<Ipv6Addr> = self.host6.iter().filter(|(n, _)| *n != name).map(|&(_, a)| a).collect();
+            if let Err(e) = check_lease6(a, pref, valid, &others) {
+                self.refuse6(k, format!("lease6: {e:?}"));
+                return;
+            }
+            if let Some(old) = self.ifs[k].addr6.filter(|o| *o != a) {
+                let _ = self.ifc.del_addr6(&name, old);
+                self.log(&format!("{name}: DHCPv6 address {old} replaced"));
+            }
+            match self.ifc.add_addr6(&name, a, pref, valid) {
+                Ok(()) => {
+                    if self.ifs[k].addr6 != Some(a) {
+                        self.log(&format!("{name}: DHCPv6 address {a} (valid {valid} s)"));
+                    }
+                    self.ifs[k].addr6 = Some(a);
+                }
+                Err(e) => {
+                    self.ifs[k].addr6 = None;
+                    eprintln!("atrium-net: {name}: adding {a}: {e}");
+                }
+            }
+        }
+
+        /// A refused DHCPv6 address: counted and logged; the DHCPv4 client
+        /// is not told (its back-off is for its own leases).
+        fn refuse6(&mut self, k: usize, why: String) {
+            let i = &mut self.ifs[k];
+            i.refusals += 1;
+            eprintln!("atrium-net: {}: refused: {why}", i.name);
+            i.last_refusal = why;
         }
 
         fn refuse(&mut self, k: usize, why: &str) {
@@ -1283,6 +1395,8 @@ mod imp {
             rt: Rtsock::new().unwrap_or_else(|e| die(&e.to_string())),
             unbound: o.unbound.as_ref().map(|d| Unbound::new(d, "local_unbound.ctl").unwrap_or_else(|e| die(&format!("unbound: {e}")))),
             host: Vec::new(),
+            host6: Vec::new(),
+            names: all.iter().map(|i| (i.index, i.name.clone())).collect(),
             ifs: Vec::new(),
             ctls: Vec::new(),
             state,
@@ -1345,6 +1459,7 @@ mod imp {
                 last_refusal: String::new(),
                 sends_refused: 0,
                 dns6: Vec::new(),
+                addr6: None,
                 rs_left: if is_wifi { 0 } else { 3 },
                 rs_at: 0,
                 link: !is_wifi,
@@ -1409,6 +1524,10 @@ mod imp {
                         sys::IfEvent::Departed(n) if follow && net.ifs.iter().any(|i| i.name == n) => {
                             eprintln!("atrium-net: {n} went away: exiting to start again without it");
                             std::process::exit(75);
+                        }
+                        sys::IfEvent::Addr { index, add, addr, prefix } => {
+                            net.addr_event(index, add, addr, prefix);
+                            continue;
                         }
                         sys::IfEvent::Arrived(n) | sys::IfEvent::Departed(n) => {
                             net.log(&format!("{n}: arrived or went away (not followed)"));

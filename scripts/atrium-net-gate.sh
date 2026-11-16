@@ -1,7 +1,7 @@
 #!/bin/sh
 # atrium-net's N0 + N2 gate (docs/spec/atrium-net.md §10): the FreeBSD VM's
 # second NIC (vtnet1) on a fake LAN (atrium-net/sim/lan.py: router, DHCP, DNS,
-# IPv6 RAs) that can turn hostile.
+# IPv6 RAs, DHCPv6) that can turn hostile.
 #
 #   sh scripts/atrium-net-gate.sh vm     boot the VM with the LAN NIC (and the
 #                                        Aura gates' port, so one VM serves both)
@@ -143,6 +143,48 @@ n0)
     sv=$("$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock")
     echo "$sv" | grep -q 'dns6=fd77:0:0:88::53,fe80::1' && ok "the LAN's IPv6 DNS servers kept through the rogue RAs" || fail "dns6 after rogue RAs: $sv"
     "$V" 'pgrep -x atrium-lease >/dev/null && pgrep -x atrium-net >/dev/null' && ok "atrium-net and atrium-lease still running" || fail "a process died on hostile RAs"
+
+    # DHCPv6 (§5.3): the RA's O flag asks for DNS servers by
+    # Information-Request, M for an address by Solicit/Request; atrium-lease
+    # reads the replies, atrium-net checks and applies them.
+    fwd() { "$V" 'local-unbound-control list_forwards 2>&1 | grep "^\. " || true'; }
+    lanctl d6-info >/dev/null
+    i=0; while [ $i -lt 30 ] && ! fwd | grep -q fd77:0:0:88::153; do sleep 2; i=$((i + 2)); done
+    fw=$(fwd)
+    [ "$(stat d6_info)" -ge 1 ] && echo "$fw" | grep -q fd77:0:0:88::153 && ok "O flag: Information-Request, DHCPv6 DNS server forwarded ($fw)" || fail "DHCPv6 DNS: info=$(stat d6_info) $fw"
+    lanctl d6-addr >/dev/null
+    has6() { "$V" 'ifconfig vtnet1 inet6' | grep -q "inet6 fd77::88:0:0:1:50 prefixlen 128"; }
+    i=0; while [ $i -lt 30 ] && ! has6; do sleep 2; i=$((i + 2)); done
+    has6 && ok "M flag: Solicit/Request ($(stat d6_solicit)/$(stat d6_request)), fd77:0:0:88::1:50/128 on vtnet1" || fail "no DHCPv6 address: $("$V" 'ifconfig vtnet1 inet6')"
+    "$V" 'ping6 -c 2 -t 10 -S fd77:0:0:88::1:50 fd77:0:0:88::1' >/dev/null && ok "ping6 from the DHCPv6 address" || fail "ping6 from the DHCPv6 address"
+    i=0; while [ $i -lt 90 ] && [ "$(stat d6_renew)" -lt 1 ]; do sleep 3; i=$((i + 3)); done
+    [ "$(stat d6_renew)" -ge 1 ] && has6 && ok "renewed at T1 ($(stat d6_renew)), address kept" || fail "no DHCPv6 renewal"
+    # A hostile server: answers and pushes carry the client's own transaction
+    # id. A fresh atrium-net so the client is soliciting again.
+    lanctl d6-hostile >/dev/null
+    "$V" 'pkill -f "atrium-net -v"; sleep 1
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+    bad=""
+    i=0
+    while [ $i -lt 120 ] && [ "$(stat d6_hostile_sent)" -lt 60 ]; do
+        a=$("$V" 'ifconfig vtnet1 inet6' | awk '/inet6 /{print $2}' | tr '\n' ' ')
+        for b in fd66: fe80::bad ff02:: ::1 ::ffff 2002:; do case " $a " in *" $b"*) bad="$bad addr:$b" ;; esac; done
+        fw=$(fwd)
+        for b in ' ::1 ' ff02:: ::ffff 2002: fd66:; do case " $fw " in *"$b"*) bad="$bad dns:$b" ;; esac; done
+        sleep 3; i=$((i + 3))
+    done
+    n=$(stat d6_hostile_sent)
+    [ "$n" -ge 34 ] || fail "hostile DHCPv6 server only sent $n"
+    [ -z "$bad" ] && ok "$n hostile DHCPv6 messages (17 kinds, cycled): no bad address or DNS server applied" || fail "hostile DHCPv6 applied:$bad"
+    "$V" 'pgrep -x atrium-lease >/dev/null && pgrep -x atrium-net >/dev/null' && ok "atrium-net and atrium-lease still running" || fail "a process died on hostile DHCPv6"
+    # (A "huge lifetimes" answer is a usable lease, capped to a week: start
+    # clean so the good server has to give the address again.)
+    lanctl d6-addr >/dev/null
+    "$V" 'pkill -f "atrium-net -v"; sleep 1; ifconfig vtnet1 inet6 fd77:0:0:88::1:50 -alias 2>/dev/null
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+    i=0; while [ $i -lt 60 ] && ! has6; do sleep 3; i=$((i + 3)); done
+    has6 && ok "good server again: DHCPv6 address back" || fail "no DHCPv6 recovery"
+    lanctl d6-off >/dev/null
 
     # The parser's sandbox: its own uid, only its socket (fds 0-3).
     p=$("$V" 'pgrep -x atrium-lease')

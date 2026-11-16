@@ -10,3 +10,6 @@ net-proto = { path = "../net-proto" }
 aura-ipc = { path = "../../aura/aura-ipc" }
 atrium-netconf = { path = "../netconf" }
 libc = "0.2"
+
+[dev-dependencies]
+atrium-lease = { path = "../atrium-lease" }

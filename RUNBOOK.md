@@ -5580,10 +5580,12 @@ fe80::1 sends RAs for fd77:0:0:88::/64 with RDNSS fd77:0:0:88::53 and fe80::1, a
 answers neighbor solicitations, pings and DNS (AAAA). `vtnet0` keeps ssh.
 
     sh scripts/atrium-net-gate.sh vm     # boot the VM with the LAN NIC (stock kernel is fine)
-    sh scripts/atrium-net-gate.sh n0     # host tests, cross-build, install, 28 checks (IPv4 + IPv6)
+    sh scripts/atrium-net-gate.sh n0     # host tests, cross-build, install, 35 checks (IPv4, IPv6, DHCPv6)
 
 `sh scripts/aura-sim-gate.sh vms` boots the same VM with the LAN NIC too, so the Aura
 and atrium-net gates share one VM (and one boot of the fork kernel).
+The first n0 run after a fresh boot has twice found no temporary IPv6 address (later
+runs do); run it again before chasing it.
 
 N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP VM):
 

@@ -4,9 +4,12 @@
 
 pub mod client;
 pub mod dhcp;
+pub mod dhcp6;
 pub mod frame;
 pub mod probe;
 pub mod ra;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests6;

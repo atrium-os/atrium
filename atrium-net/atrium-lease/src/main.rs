@@ -9,11 +9,15 @@
 //! lease -> atrium-net: `send dest=bcast|A.B.C.D dmac=M hex=..` (a DHCP
 //!                      payload; atrium-net wraps it), `lease4 ..`,
 //!                      `lost why=..`, `state s=..`,
-//!                      `dns6 servers=A,B` (from RAs; empty when none)
+//!                      `dns6 servers=A,B` (from RAs and DHCPv6; empty
+//!                      when none), `send6 hex=..` (a DHCPv6 payload;
+//!                      atrium-net sends it to ff02::1:2), `lease6 addr=A
+//!                      pref=S valid=S`, `lost6 why=..`
 //!
 //! usage: atrium-lease [-v] [--no-sandbox] [--uid UID]
 
 use atrium_lease::client::{Client, Dest, Out};
+use atrium_lease::dhcp6::{self, Client6, Out6};
 use atrium_lease::frame;
 use atrium_lease::ra::{self, Rdnss};
 use aura_ipc::sock::{poll_read, Conn};
@@ -89,16 +93,18 @@ fn main() {
     let mut client: Option<Client> = None;
     let mut dmac = [0xffu8; 6];
     let mut rdnss = Rdnss::default();
-    let mut dns6: Vec<Option<Vec<std::net::Ipv6Addr>>> = Vec::new();
+    let mut c6: Option<Client6> = None;
+    let mut told6: Vec<std::net::Ipv6Addr> = Vec::new();
 
     loop {
-        let d = [client.as_ref().and_then(|c| c.deadline()), rdnss.deadline()].into_iter().flatten().min();
+        let d = [client.as_ref().and_then(|c| c.deadline()), rdnss.deadline(), c6.as_ref().and_then(|c| c.deadline())].into_iter().flatten().min();
         let wait = match d {
             Some(d) => d.saturating_sub(now()).min(60_000) as i32,
             None => 60_000,
         };
         let ready = poll_read(&[c.fd()], wait);
         let mut outs = Vec::new();
+        let mut outs6 = Vec::new();
         if ready.first() == Some(&true) {
             let lines = c.lines().unwrap_or_else(|_| std::process::exit(0));
             for g in lines {
@@ -110,17 +116,25 @@ fn main() {
                     ("hello", None) => {
                         let mac = l.mac("mac").unwrap_or_else(|| die("hello without mac"));
                         client = Some(Client::new(mac, Box::new(rand)));
+                        c6 = Some(Client6::new(mac, Box::new(rand)));
                     }
                     // A new address (Wi-Fi's per-network MAC): a new client;
                     // a lease held under the old address belongs to another network.
                     ("mac", Some(cl)) => {
                         let mac = l.mac("mac").unwrap_or_else(|| die("mac without mac"));
                         *cl = Client::new(mac, Box::new(rand));
+                        if let Some(x) = c6.as_mut() {
+                            outs6.extend(x.stop());
+                        }
+                        c6 = Some(Client6::new(mac, Box::new(rand)));
                     }
                     ("up", Some(cl)) => outs.extend(cl.start(now())),
                     ("down", Some(cl)) => {
                         cl.stop();
-                        dns6.push(rdnss.clear());
+                        rdnss.clear();
+                        if let Some(x) = c6.as_mut() {
+                            outs6.extend(x.stop());
+                        }
                     }
                     ("refused", Some(cl)) => {
                         if verbose {
@@ -131,7 +145,16 @@ fn main() {
                     ("frame", Some(cl)) => {
                         let Some(f) = l.hex("hex") else { continue };
                         if let Some(r) = ra::ra_from_frame(&f) {
-                            dns6.push(rdnss.rx(&r, now()));
+                            rdnss.rx(&r, now());
+                            if let Some(x) = c6.as_mut() {
+                                outs6.extend(x.ra(r.managed, r.other, now()));
+                            }
+                            continue;
+                        }
+                        if let Some(p) = dhcp6::from_frame(&f) {
+                            if let Some(x) = c6.as_mut() {
+                                outs6.extend(x.rx(p, now()));
+                            }
                             continue;
                         }
                         if let Some((src_mac, _src, p)) = frame::dhcp_from_frame_mac(&f) {
@@ -149,9 +172,36 @@ fn main() {
         if let Some(cl) = client.as_mut() {
             outs.extend(cl.tick(now()));
         }
-        dns6.push(rdnss.tick(now()));
-        for v in dns6.drain(..).flatten() {
-            let list: Vec<String> = v.iter().map(|a| a.to_string()).collect();
+        rdnss.tick(now());
+        if let Some(x) = c6.as_mut() {
+            outs6.extend(x.tick(now()));
+        }
+        for o in outs6 {
+            let line = match o {
+                Out6::Send(p) => Line::new("send6").with_hex("hex", &p),
+                Out6::Bound(a) => Line::new("lease6").with("addr", a.addr.to_string()).with("pref", a.pref.to_string()).with("valid", a.valid.to_string()),
+                Out6::Lost(why) => Line::new("lost6").with("why", why),
+            };
+            if verbose {
+                if let Some(x) = c6.as_ref() {
+                    eprintln!("atrium-lease: dhcpv6 {} -> {}", x.state(), line.verb);
+                }
+            }
+            if c.send(&line).is_err() {
+                std::process::exit(0);
+            }
+        }
+        // RA servers first, then DHCPv6's; three at most, no repeats.
+        let mut all: Vec<std::net::Ipv6Addr> = rdnss.current().to_vec();
+        for a in c6.as_ref().map(|x| x.dns()).unwrap_or(&[]) {
+            if !all.contains(a) {
+                all.push(*a);
+            }
+        }
+        all.truncate(ra::MAX_RDNSS);
+        if all != told6 {
+            told6 = all;
+            let list: Vec<String> = told6.iter().map(|a| a.to_string()).collect();
             if c.send(&Line::new("dns6").with("servers", list.join(","))).is_err() {
                 std::process::exit(0);
             }
