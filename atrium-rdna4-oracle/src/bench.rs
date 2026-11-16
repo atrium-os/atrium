@@ -23,11 +23,18 @@ pub const BENCH_SCRATCH_WAVES: u32 = 2048;
 
 /// The scratch ring for `dwords` per lane: the dispatch field and its
 /// `job.txt` line (4x the ring, as in the oracle cases).
+///
+/// Diagnosis knobs (bench v7 found spilled shaders wrong on silicon only):
+/// `ATRIUM_BENCH_SCRATCH_X` multiplies the per-wave slot (2: as if the
+/// card laid scratch out for 64 lanes), `ATRIUM_BENCH_SCRATCH_WAVES` sets
+/// COMPUTE_TMPRING_SIZE.WAVES (512 is RADV's per-SE value on the R9700).
 fn bench_ring(dwords: u32) -> (Option<atrium_rdna4_cmd::Scratch>, String) {
     if dwords == 0 {
         return (None, String::new());
     }
-    let s = atrium_rdna4_cmd::Scratch { va: BENCH_SCRATCH_VA, wave_bytes: atrium_rdna4_cmd::Scratch::wave_bytes(dwords, 32), waves: BENCH_SCRATCH_WAVES };
+    let knob = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let wave_bytes = atrium_rdna4_cmd::Scratch::wave_bytes(dwords, 32) * knob("ATRIUM_BENCH_SCRATCH_X", 1);
+    let s = atrium_rdna4_cmd::Scratch { va: BENCH_SCRATCH_VA, wave_bytes, waves: knob("ATRIUM_BENCH_SCRATCH_WAVES", BENCH_SCRATCH_WAVES) };
     let size = 4 * s.bytes();
     assert!(size < 128 << 20, "scratch ring of {dwords} dwords per lane is too large");
     (Some(s), format!("bo scratch {BENCH_SCRATCH_VA:x} {size} - 0\n"))
@@ -231,7 +238,10 @@ pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
     let mut ib = Blob::compute();
     ib.acquire_all();
     ib.timestamp(TS_VA);
-    emit_dispatch(&mut ib, &k.dispatch_with(CODE_VA, &bind, None, groups, ring.map(|r| (r.va, r.waves))).ok()?);
+    let mut d = k.dispatch_with(CODE_VA, &bind, None, groups, ring.map(|r| (r.va, r.waves))).ok()?;
+    // The ring as bench_ring sized it (its knobs may enlarge the slot).
+    d.scratch = ring;
+    emit_dispatch(&mut ib, &d);
     ib.timestamp(TS_VA + 8);
     ib.pad(8);
     let mut code = k.code();

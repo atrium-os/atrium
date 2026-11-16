@@ -499,6 +499,11 @@ pub fn calibration() -> Vec<Case> {
         vgpr_alloc(true, 1),
         vgpr_alloc(false, 0),
         vgpr_alloc(false, 1),
+        // Scratch: the per-lane layout, and isolation of concurrent waves
+        // (the oracle's ring setting and the bench's).
+        scratch_layout(),
+        scratch_isolation(SCRATCH_WAVES),
+        scratch_isolation(2048),
         lds_alloc(1, 508),
         lds_alloc(1, 1020),
         lds_alloc(64, 65532),
@@ -508,4 +513,121 @@ pub fn calibration() -> Vec<Case> {
         lds_alloc(2, 1024),
         lds_alloc(128, 65532),
     ]
+}
+
+// ------------------------------------------------------ scratch layout ---
+
+/// ST-mode scratch access `name` (`SCRATCH_STORE_*` / `SCRATCH_LOAD_*`) of
+/// v[`reg`..] at byte `ioffset` of the lane's scratch space.
+fn scratch_op(name: &str, reg: u64, ioffset: u64) -> Vec<u32> {
+    let r = if name.contains("STORE") { "VSRC" } else { "VDST" };
+    encode(name, "ENC_VSCRATCH", "default", &[("SADDR", 124), ("SVE", 0), ("VADDR", 0), ("IOFFSET", ioffset), (r, reg)]).unwrap()
+}
+
+/// `v[dst] = literal + v[src]`.
+fn add_lit(dst: u64, value: u32, src: u64) -> Vec<u32> {
+    lit(encode("V_ADD_NC_U32", "ENC_VOP2", "default", &[("VDST", dst), ("SRC0", 255), ("VSRC1", src)]).unwrap(), value)
+}
+
+fn sopp(name: &str, imm: u64) -> Vec<u32> {
+    encode(name, "ENC_SOPP", "default", &[("SIMM16", imm)]).unwrap()
+}
+
+/// Dwords per lane the scratch calibration cases use.
+pub const SCRATCH_PROBE_DW: u32 = 16;
+
+/// The 16 scratch stores of the calibration cases: dword `k` of the lane
+/// holds `v[1] + (k << 24)` (v1 = the lane's id), written as eight b32,
+/// one b128 (dwords 8..11), one b64 (12, 13) and two b32 (14, 15), so the
+/// layout of every access width shows.
+fn scratch_probe_stores() -> Vec<u32> {
+    let mut sh = vec![];
+    for k in 0..SCRATCH_PROBE_DW as u64 {
+        sh.extend(add_lit(2 + k, (k as u32) << 24, 1));
+    }
+    for k in 0..8 {
+        sh.extend(scratch_op("SCRATCH_STORE_B32", 2 + k, 4 * k));
+    }
+    sh.extend(scratch_op("SCRATCH_STORE_B128", 10, 32));
+    sh.extend(scratch_op("SCRATCH_STORE_B64", 14, 48));
+    sh.extend(scratch_op("SCRATCH_STORE_B32", 16, 56));
+    sh.extend(scratch_op("SCRATCH_STORE_B32", 17, 60));
+    sh
+}
+
+/// A compute case of `groups` x 32 lanes (wave32) with scratch, `user`
+/// SGPRs from s0, and the given buffers after the code.
+fn scratch_case(name: String, sh: Vec<u32>, vgprs: u32, groups: u32, ring: atrium_rdna4_cmd::Scratch, user: Vec<u32>, mut buffers: Vec<Buffer>) -> Case {
+    let mut ib = Blob::compute();
+    ib.acquire_all();
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user, threads: [32, 1, 1], groups: [groups, 1, 1], wave32: true, lds_bytes: 0, scratch: Some(ring) });
+    ib.pad(8);
+    let mut code = words_to_bytes(&sh);
+    assert!(code.len() <= IB_OFFSET as usize, "shader larger than the code slot");
+    code.resize(IB_OFFSET as usize, 0);
+    code.extend(ib.bytes());
+    let ib_dw = ib.dw.len() as u64;
+    buffers.insert(0, Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None });
+    Case { name, ip: "compute", buffers, ib: ("code".into(), IB_OFFSET, ib_dw) }
+}
+
+/// `scratch_layout`: where the hardware puts each lane's scratch dwords.
+/// One wave32 stores dword k of lane t = `t + (k << 24)` through every
+/// access width; the whole ring (8 slots, WAVES = 1) is read back. The
+/// expectation is gpusim's model, dword k of lane t at byte
+/// `(k * 32 + t) * 4` of slot 0; on a mismatch the dump shows the
+/// card's real layout (and slot).
+pub fn scratch_layout() -> Case {
+    let ring = atrium_rdna4_cmd::Scratch { va: SCRATCH_VA, wave_bytes: atrium_rdna4_cmd::Scratch::wave_bytes(SCRATCH_PROBE_DW, 32), waves: 1 };
+    let mut sh = encode("V_MOV_B32", "ENC_VOP1", "default", &[("VDST", 1), ("SRC0", 256)]).unwrap();
+    sh.extend(scratch_probe_stores());
+    sh.extend(sopp("S_WAIT_STORECNT", 0));
+    sh.extend(sopp("S_ENDPGM", 0));
+    let slot = ring.wave_bytes as usize;
+    let mut expect = vec![0u32; 8 * slot / 4];
+    for k in 0..SCRATCH_PROBE_DW {
+        for t in 0..32 {
+            expect[(k * 32 + t) as usize] = t + (k << 24);
+        }
+    }
+    let b = Buffer { name: "scratch".into(), va: SCRATCH_VA, size: (8 * slot) as u64, init: vec![], expect: Some(words_to_bytes(&expect)), unordered: None };
+    scratch_case("scratch_layout".into(), sh, 24, 1, ring, vec![], vec![b])
+}
+
+/// `scratch_isolation_w{waves}`: do concurrent waves keep their own
+/// scratch? 8192 wave32 groups each store 16 dwords per lane (value =
+/// global id + (k << 24)), sleep, load them back and write the XOR-OR of
+/// every difference to `out[global id]`: all zero if no wave saw another's
+/// data. `waves` is COMPUTE_TMPRING_SIZE.WAVES (the buffer is 4x the ring,
+/// as the other cases'); 2048 is the bench's setting.
+pub fn scratch_isolation(waves: u32) -> Case {
+    const GROUPS: u32 = 8192;
+    let ring = atrium_rdna4_cmd::Scratch { va: SCRATCH_VA, wave_bytes: atrium_rdna4_cmd::Scratch::wave_bytes(SCRATCH_PROBE_DW, 32), waves };
+    // v1 = ttmp9 * 32 + lane.
+    let mut sh = encode("S_LSHL_B32", "ENC_SOP2", "default", &[("SDST", 2), ("SSRC0", 117), ("SSRC1", 133)]).unwrap();
+    sh.extend(encode("V_ADD_NC_U32", "ENC_VOP2", "default", &[("VDST", 1), ("SRC0", 2), ("VSRC1", 0)]).unwrap());
+    sh.extend(scratch_probe_stores());
+    for _ in 0..4 {
+        sh.extend(sopp("S_SLEEP", 20));
+    }
+    for k in 0..8 {
+        sh.extend(scratch_op("SCRATCH_LOAD_B32", 20 + k, 4 * k));
+    }
+    sh.extend(scratch_op("SCRATCH_LOAD_B128", 28, 32));
+    sh.extend(scratch_op("SCRATCH_LOAD_B64", 32, 48));
+    sh.extend(scratch_op("SCRATCH_LOAD_B32", 34, 56));
+    sh.extend(scratch_op("SCRATCH_LOAD_B32", 35, 60));
+    sh.extend(sopp("S_WAIT_LOADCNT", 0));
+    sh.extend(mov_lit(40, 0));
+    for k in 0..SCRATCH_PROBE_DW as u64 {
+        sh.extend(encode("V_XOR_B32", "ENC_VOP2", "default", &[("VDST", 41), ("SRC0", 256 + 20 + k), ("VSRC1", 2 + k)]).unwrap());
+        sh.extend(encode("V_OR_B32", "ENC_VOP2", "default", &[("VDST", 40), ("SRC0", 256 + 41), ("VSRC1", 40)]).unwrap());
+    }
+    sh.extend(encode("V_LSHLREV_B32", "ENC_VOP2", "default", &[("VDST", 42), ("SRC0", 130), ("VSRC1", 1)]).unwrap());
+    sh.extend(store(42, 40, 0));
+    sh.extend(sopp("S_ENDPGM", 0));
+    let n = (GROUPS * 32) as usize;
+    let out = Buffer { name: "out".into(), va: DATA_VA, size: (4 * n) as u64, init: vec![], expect: Some(vec![0; 4 * n]), unordered: None };
+    let scratch = Buffer { name: "scratch".into(), va: SCRATCH_VA, size: (4 * ring.bytes()).next_multiple_of(0x1000), init: vec![], expect: None, unordered: None };
+    scratch_case(format!("scratch_isolation_w{waves}"), sh, 48, GROUPS, ring, vec![DATA_VA as u32, (DATA_VA >> 32) as u32], vec![out, scratch])
 }
