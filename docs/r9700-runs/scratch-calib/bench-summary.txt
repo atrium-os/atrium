@@ -1,0 +1,193 @@
+===== variant a (2026-11-16T00:09:38Z 2026-11-16T00:11:33Z )
+bo scratch 300000000 50331648 - 0 bo scratch 300000000 92274688 - 0 bo scratch 300000000 33554432 - 0 bo scratch 300000000 8388608 - 0 
+--- fresco_raster_1080p_v96 (ours: 4122 dwords, 96 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=2393654
+   counter_khz=100000
+   gpu_ns_median=2131320
+   [radv]
+   status=ok
+   gpu_ns_median=453400
+   target: DIFFER (6684152 bytes)
+--- fresco_raster_1080p_v64 (ours: 4986 dwords, 61 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=5733568
+   counter_khz=100000
+   gpu_ns_median=5238000
+   [radv]
+   status=ok
+   gpu_ns_median=422000
+   target: DIFFER (6666783 bytes)
+--- op_glyph_run_262144_v16 (ours: 316 dwords, 14 VGPRs, 13 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=2034613583
+   counter_khz=100000
+   gpu_ns_median=212480
+   [radv]
+   status=ok
+   gpu_ns_median=178480
+   counter atrium=394448 radv=394142
+   instances: differ at byte 14691 (sorted records)
+   scene: same
+--- op_path_1048576_v16 (ours: 73 dwords, 13 VGPRs, 8 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=659665
+   counter_khz=100000
+   gpu_ns_median=209640
+   [radv]
+   status=ok
+   gpu_ns_median=163560
+   counter atrium=1048576 radv=1048576
+   instances: differ at byte 7 (sorted records)
+   scene: same
+--- fresco_raster_1080p_v96
+   [radv]
+   status=ok
+--- fresco_raster_1080p_v64
+   [radv]
+   status=ok
+--- op_glyph_run_262144_v16
+   [radv]
+   status=ok
+--- op_path_1048576_v16
+   [radv]
+   status=ok
+dmesg: 30 fault lines, 9 ring timeouts, 9 resets; suppressed: 253
+      9 0x000000022120b000
+      5 0x000000022120c000
+     12 0x000000022120d000
+      4 0x000000022120e000
+===== variant b (2026-11-16T00:11:38Z 2026-11-16T00:13:07Z )
+bo scratch 300000000 25165824 - 0 bo scratch 300000000 46137344 - 0 bo scratch 300000000 16777216 - 0 bo scratch 300000000 4194304 - 0 
+--- fresco_raster_1080p_v96 (ours: 4122 dwords, 96 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=4146533
+   counter_khz=100000
+   gpu_ns_median=3928960
+   [radv]
+   status=ok
+   gpu_ns_median=656120
+   target: DIFFER (31 bytes)
+--- fresco_raster_1080p_v64 (ours: 4986 dwords, 61 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=7738146
+   counter_khz=100000
+   gpu_ns_median=7489840
+   [radv]
+   status=ok
+   gpu_ns_median=447480
+   target: DIFFER (31 bytes)
+--- op_glyph_run_262144_v16 (ours: 316 dwords, 14 VGPRs, 13 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=785092
+   counter_khz=100000
+   gpu_ns_median=297560
+   [radv]
+   status=ok
+   gpu_ns_median=179440
+   counter atrium=394142 radv=394142
+   instances: differ at byte 68 (sorted records)
+   scene: same
+--- op_path_1048576_v16 (ours: 73 dwords, 13 VGPRs, 8 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=680421
+   counter_khz=100000
+   gpu_ns_median=191120
+   [radv]
+   status=ok
+   gpu_ns_median=164440
+   counter atrium=1048576 radv=1048576
+   instances: same
+   scene: same
+--- fresco_raster_1080p_v96
+   [radv]
+   status=ok
+--- fresco_raster_1080p_v64
+   [radv]
+   status=ok
+--- op_glyph_run_262144_v16
+   [radv]
+   status=ok
+--- op_path_1048576_v16
+   [radv]
+   status=ok
+dmesg: 0 fault lines, 0 ring timeouts, 0 resets; suppressed: 0
+===== variant c (2026-11-16T00:13:12Z 2026-11-16T00:14:46Z )
+bo scratch 300000000 12582912 - 0 bo scratch 300000000 23068672 - 0 bo scratch 300000000 8388608 - 0 bo scratch 300000000 2097152 - 0 
+--- fresco_raster_1080p_v96 (ours: 4122 dwords, 96 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=4121116
+   counter_khz=100000
+   gpu_ns_median=3845480
+   [radv]
+   status=ok
+   gpu_ns_median=449520
+   target: DIFFER (31 bytes)
+--- fresco_raster_1080p_v64 (ours: 4986 dwords, 61 VGPRs, 46 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=7679484
+   counter_khz=100000
+   gpu_ns_median=7455120
+   [radv]
+   status=ok
+   gpu_ns_median=655640
+   target: DIFFER (31 bytes)
+--- op_glyph_run_262144_v16 (ours: 316 dwords, 14 VGPRs, 13 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=782939
+   counter_khz=100000
+   gpu_ns_median=292640
+   [radv]
+   status=ok
+   gpu_ns_median=179400
+   counter atrium=394142 radv=394142
+   instances: differ at byte 68 (sorted records)
+   scene: same
+--- op_path_1048576_v16 (ours: 73 dwords, 13 VGPRs, 8 SGPRs)
+   [atrium]
+   status=ok
+   wait_status=0
+   elapsed_ns=655468
+   counter_khz=100000
+   gpu_ns_median=194120
+   [radv]
+   status=ok
+   gpu_ns_median=161640
+   counter atrium=1048576 radv=1048576
+   instances: same
+   scene: same
+--- fresco_raster_1080p_v96
+   [radv]
+   status=ok
+--- fresco_raster_1080p_v64
+   [radv]
+   status=ok
+--- op_glyph_run_262144_v16
+   [radv]
+   status=ok
+--- op_path_1048576_v16
+   [radv]
+   status=ok
+dmesg: 0 fault lines, 0 ring timeouts, 0 resets; suppressed: 0

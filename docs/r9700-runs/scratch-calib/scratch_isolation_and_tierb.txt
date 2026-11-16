@@ -1,0 +1,82 @@
+== scratch_isolation_w64
+bo code 100000000 8192 code.in 0
+bo out 100100000 1048576 - 1
+bo scratch 110000000 524288 - 0
+  nonzero words: 0 of 262144
+  value histogram (top 12):
+ 262144  00000000
+  nonzero words per 32-word group (= per wave), histogram:
+   0 nonzero: 8192 groups
+== scratch_isolation_w2048
+bo code 100000000 8192 code.in 0
+bo out 100100000 1048576 - 1
+bo scratch 110000000 16777216 - 0
+  [0] 0x00000060
+  [1] 0x00000060
+  [2] 0x00000060
+  [3] 0x00000060
+  [4] 0x00000060
+  [5] 0x00000060
+  [6] 0x00000060
+  [7] 0x00000060
+  [8] 0x00000060
+  [9] 0x00000060
+  [10] 0x00000060
+  [11] 0x00000060
+  [12] 0x00000060
+  [13] 0x00000060
+  [14] 0x00000060
+  [15] 0x00000060
+  [16] 0x00000060
+  [17] 0x00000060
+  [18] 0x00000060
+  [19] 0x00000060
+  nonzero words: 227440 of 262144
+  value histogram (top 12):
+  50096  00000060
+  34704  00000000
+   9568  00000020
+   5824  000007e0
+   4096  000003e0
+   3968  00000040
+   3904  00000120
+   3696  000002c0
+   3424  00000220
+   3184  000000e0
+   3040  000001e0
+   2880  00000fe0
+  nonzero words per 32-word group (= per wave), histogram:
+   0 nonzero: 1073 groups
+   16 nonzero: 23 groups
+   32 nonzero: 7096 groups
+== tierb_raster_math b0_1 differing words (out vs expect)
+  w60 out=c0e23a1e exp=40e23a1e
+  w76 out=c0423271 exp=40423271
+  w92 out=c06b7e6e exp=406b7e6e
+  w108 out=c0a8c5e9 exp=40a8c5e9
+  w140 out=bf4acda8 exp=3f4acda8
+  w204 out=c061870b exp=4061870b
+  w236 out=c16ff5bd exp=416ff5bd
+  w252 out=c0be4116 exp=40be4116
+  w284 out=c12329cc exp=412329cc
+  w332 out=bfc68338 exp=3fc68338
+  w380 out=c0aa31e7 exp=40aa31e7
+  w396 out=c0e3cf4d exp=40e3cf4d
+  w412 out=bfc2108d exp=3fc2108d
+  w428 out=c0a329cc exp=40a329cc
+  w492 out=bfb3d323 exp=3fb3d323
+  w524 out=c0b6b482 exp=40b6b482
+  w540 out=c275bb09 exp=4275bb09
+  w556 out=c027ba06 exp=4027ba06
+  w572 out=c0ad2a59 exp=40ad2a59
+  w668 out=c0bc4d5a exp=40bc4d5a
+  w684 out=c0b7ce4d exp=40b7ce4d
+  w700 out=c089e83a exp=4089e83a
+  w716 out=c0f72517 exp=40f72517
+  w764 out=c0734376 exp=40734376
+  w812 out=c080c122 exp=4080c122
+  w860 out=c0916f26 exp=40916f26
+  w908 out=c0f9f0ef exp=40f9f0ef
+  w956 out=c098b330 exp=4098b330
+  w988 out=c05f8a16 exp=405f8a16
+  w1004 out=c1484c47 exp=41484c47

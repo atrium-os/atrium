@@ -1,0 +1,482 @@
+amdgpu_runner.c: In function 'main':
+amdgpu_runner.c:259:49: warning: '%s' directive output may be truncated writing up to 11519 bytes into a region of size 4095 [-Wformat-truncation=]
+  259 |                 snprintf(path, sizeof path, "%s/%s.out", argv[1], bos[i].name);
+      |                                                 ^~
+In file included from /usr/include/stdio.h:974,
+                 from amdgpu_runner.c:40:
+In function 'snprintf',
+    inlined from 'main' at amdgpu_runner.c:259:3:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:68:10: note: '__builtin___snprintf_chk' output 6 or more bytes (assuming 11525) into a destination of size 4096
+   68 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   69 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   70 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+=== atrium rdna4 oracle report ===
+Linux 7.0.0-38-generic x86_64
+render node: /dev/dri/renderD128
+--- write_42
+status=ok
+wait_status=0
+elapsed_ns=417834
+gc_base=0x00001260
+device=/dev/dri/renderD128
+write_42/out.out sha256=a7c578abbe373f01
+ 0000002a 0000002a 0000002a 0000002a
+*
+MATCH
+--- tierb_subgroup_ops
+status=ok
+wait_status=0
+elapsed_ns=531319
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_subgroup_ops/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_subgroup_ops/b0_1.out sha256=303952a02acab2e5
+ 0000007a 00000001 00000000 8f1e3c78
+ 00000003 0000000b 00000001 000186a3
+ 00000015 01e89620 43098000 00067dc3
+ 67fffff7 00000008 00000002 00000003
+MATCH
+--- tierb_subgroup_partial
+status=ok
+wait_status=0
+elapsed_ns=513045
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_subgroup_partial/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_subgroup_partial/b0_1.out sha256=bb3d1125ebc117c5
+ fffffc92 00030d41 00000007 0000001f
+ 000000d9 00000007 00000008 00000002
+ fffffc92 00030d43 00000009 efdfc009
+ 0000000c 00000008 00000002 00000003
+MATCH
+--- tierb_math_exact
+status=ok
+wait_status=0
+elapsed_ns=546688
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_math_exact/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_math_exact/b0_1.out sha256=5bf26c75d0c42f90
+ 00000000 0025a3ab 2ccd3eda 0025a378
+ 80000000 00000000 3f3d52e5 f9ce4004
+ 7f800000 4d586d55 2125e5b5 4d586d55
+ 1a3504f3 00000000 0a2c36e1 fd0ca27f
+MATCH
+--- tierb_raster_math
+status=ok
+wait_status=0
+elapsed_ns=931621
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_raster_math/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_raster_math/b0_1.out sha256=71b1f9449aeb1acd
+ 06060606 06060009 3e2a8b54 0000002a
+ 2f2f2f49 00000000 3f800000 3b808081
+ 81e6536c 00000000 40284d84 0030d3f9
+ 01e9d167 00000000 000009cc 3c40c080
+MISMATCH
+tierb_raster_math/b0_1.cut tierb_raster_math/b0_1.expect differ: char 244, line 1
+ 06060606 06060009 3e2a8b54 0000002a
+ 2f2f2f49 00000000 3f800000 3b808081
+ 81e6536c 00000000 40284d84 0030d3f9
+ 01e9d167 00000000 000009cc 3c40c080
+ 00e37e00 2c7ee093 c10096f1 00000000
+ 0000ff00 00000000 3f800000 3b43ea02
+ fb866227 c07fffff 4006b61e 002f5141
+ 00000000 40000000 00000c2e 3f163f70
+ fb00c366 66c3e156 3f7e3747 000000fd
+ e25f00ff 00000000 3f800000 3abdc58d
+ 00c6727f bffffffe 402ee5dc 002dce89
+ 00e36b63 3f800000 00000b67 3e4d87f0
+ 66eb0000 857ce0db 3f2a9609 000000aa
+ 7c1affff 00000000 3f800000 3c16646c
+ 83cf1fc0 bf7ffffd 3fecd5a3 002c4bd1
+ c0e23a1e 40000000 00000c2e 3f42be74
+--- tierb_control_flow
+status=ok
+wait_status=0
+elapsed_ns=1145556
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_control_flow/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_control_flow/b0_1.out sha256=44ba107724fed019
+ 00000000 00000000 00000014 00000000
+ 00000000 5bd15e35 00000000 0000001b
+ 00000001 00000000 00000014 00000001
+ 00000001 48a4c41d 00000000 0000001a
+MATCH
+--- tierb_scalar_loads
+status=ok
+wait_status=0
+elapsed_ns=1269176
+gc_base=0x00001260
+device=/dev/dri/renderD128
+tierb_scalar_loads/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+tierb_scalar_loads/b0_1.out sha256=18291d648962e7d1
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000008 00000002
+ 00000003 00000004 00000005 00000006
+ 00000007 00000008 00000002 00000003
+MATCH
+tierb_scalar_loads/b0_2.out sha256=12c163943d805e91
+ 00000014 00000006 00000fac 00000195
+ 0000000a 00000006 00000009 00000003
+ 00000014 00000006 00000fac 00000195
+ 0000000b 00000007 00000003 00000004
+MATCH
+--- fresco_bin
+status=ok
+wait_status=0
+elapsed_ns=922259
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_bin/b0_4.out sha256=f18cb832c0a9ba18
+ 00000021 000000b3 000000da 000001c8
+ 00000940 00003225 000002a3 000004ca
+ 000005c8 00000540 00003204 00000280
+ 000004c0 000004c0 00000440 00000000
+MATCH
+--- fresco_raster
+status=ok
+wait_status=0
+elapsed_ns=1057089
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_raster/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_frame
+status=ok
+wait_status=0
+elapsed_ns=1199632
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_frame/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_damage
+status=ok
+wait_status=0
+elapsed_ns=1218106
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_damage/b0_5.out sha256=478518ca91f64a5e
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_sliced
+status=ok
+wait_status=0
+elapsed_ns=1466539
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_sliced/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_shift
+status=ok
+wait_status=0
+elapsed_ns=1253016
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_shift/b0_5.out sha256=c3b72e62223496de
+ ff0a808c ff0a808c ffd67d69 fff37c59
+ fff37c59 fff37c59 fff37c59 fff37c59
+*
+ fff37c59 fff3af59 fff3eb59 fff3a159
+MATCH
+--- fresco_shift_diagonal
+status=ok
+wait_status=0
+elapsed_ns=1089913
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_shift_diagonal/b0_5.out sha256=003e847720f420de
+ ff0a808c ff0a808c ff0a808c ff0a808c
+ ff0a808c ff0a808c ff0a808c ffd67d69
+ fff37c59 fff37c59 fff37c59 fff37c59
+*
+MATCH
+--- fresco_shift_across
+status=ok
+wait_status=0
+elapsed_ns=1070739
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_shift_across/b0_5.out sha256=f7fd8d26914eedef
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_isolate
+status=ok
+wait_status=0
+elapsed_ns=873973
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_isolate/b0_5.out sha256=1b086cab05b8f8e6
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- fresco_compose
+status=ok
+wait_status=0
+elapsed_ns=720730
+gc_base=0x00001260
+device=/dev/dri/renderD128
+fresco_compose/c0_3.out sha256=6fbe37ddfb67789d
+ ffff2a2d ffd97ab3 ff29bd79 ff3b908c
+ ff48b67c ff87f082 ffcfffdd ffe1aed6
+ ff86a149 ff5fc0a0 ffc8924a ff51e5bb
+ ffaa74d0 ff9821fa ff987bef ffa85d99
+MATCH
+--- spill_tierb_raster_math
+status=ok
+wait_status=0
+elapsed_ns=299499
+gc_base=0x00001260
+device=/dev/dri/renderD128
+spill_tierb_raster_math/b0_0.out sha256=5cca1138ba3525ab
+ 00000001 00000002 00000003 00000004
+ 00000005 00000006 00000007 00000001
+ 00000002 00000003 00000004 00000005
+ 00000006 00000007 00000001 00000002
+MATCH
+spill_tierb_raster_math/b0_1.out sha256=71b1f9449aeb1acd
+ 06060606 06060009 3e2a8b54 0000002a
+ 2f2f2f49 00000000 3f800000 3b808081
+ 81e6536c 00000000 40284d84 0030d3f9
+ 01e9d167 00000000 000009cc 3c40c080
+MISMATCH
+spill_tierb_raster_math/b0_1.cut spill_tierb_raster_math/b0_1.expect differ: char 244, line 1
+ 06060606 06060009 3e2a8b54 0000002a
+ 2f2f2f49 00000000 3f800000 3b808081
+ 81e6536c 00000000 40284d84 0030d3f9
+ 01e9d167 00000000 000009cc 3c40c080
+ 00e37e00 2c7ee093 c10096f1 00000000
+ 0000ff00 00000000 3f800000 3b43ea02
+ fb866227 c07fffff 4006b61e 002f5141
+ 00000000 40000000 00000c2e 3f163f70
+ fb00c366 66c3e156 3f7e3747 000000fd
+ e25f00ff 00000000 3f800000 3abdc58d
+ 00c6727f bffffffe 402ee5dc 002dce89
+ 00e36b63 3f800000 00000b67 3e4d87f0
+ 66eb0000 857ce0db 3f2a9609 000000aa
+ 7c1affff 00000000 3f800000 3c16646c
+ 83cf1fc0 bf7ffffd 3fecd5a3 002c4bd1
+ c0e23a1e 40000000 00000c2e 3f42be74
+--- spill_fresco_raster
+status=ok
+wait_status=0
+elapsed_ns=703940
+gc_base=0x00001260
+device=/dev/dri/renderD128
+spill_fresco_raster/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- sspill_fresco_bin
+status=ok
+wait_status=0
+elapsed_ns=1245151
+gc_base=0x00001260
+device=/dev/dri/renderD128
+sspill_fresco_bin/b0_4.out sha256=f18cb832c0a9ba18
+ 00000021 000000b3 000000da 000001c8
+ 00000940 00003225 000002a3 000004ca
+ 000005c8 00000540 00003204 00000280
+ 000004c0 000004c0 00000440 00000000
+MATCH
+--- sspill_fresco_raster
+status=ok
+wait_status=0
+elapsed_ns=1230606
+gc_base=0x00001260
+device=/dev/dri/renderD128
+sspill_fresco_raster/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- vsspill_fresco_raster
+status=ok
+wait_status=0
+elapsed_ns=727233
+gc_base=0x00001260
+device=/dev/dri/renderD128
+vsspill_fresco_raster/b0_5.out sha256=78ea1fff66c75d4c
+ ff0a808c ff0a808c ff0a808c ff0a808c
+*
+MATCH
+--- vgpr_alloc_w32_f0
+status=ok
+wait_status=0
+elapsed_ns=1070072
+gc_base=0x00001260
+device=/dev/dri/renderD128
+vgpr_alloc_w32_f0/out.out sha256=5b1e2c1f90ef77c1
+ 00000000 00000000 a0000002 a0000003
+ a0000004 a0000005 a0000006 a0000007
+ 00000000 00000000 00000000 00000000
+*
+MATCH
+--- vgpr_alloc_w32_f1
+status=ok
+wait_status=0
+elapsed_ns=772051
+gc_base=0x00001260
+device=/dev/dri/renderD128
+vgpr_alloc_w32_f1/out.out sha256=8f971275238dead9
+ 00000000 00000000 a0000002 a0000003
+ a0000004 a0000005 a0000006 a0000007
+ a0000008 a0000009 a000000a a000000b
+ a000000c a000000d a000000e a000000f
+MATCH
+--- vgpr_alloc_w64_f0
+status=ok
+wait_status=0
+elapsed_ns=1060465
+gc_base=0x00001260
+device=/dev/dri/renderD128
+vgpr_alloc_w64_f0/out.out sha256=2d641e5ee1c0ec88
+ 00000000 00000000 a0000002 a0000003
+ 00000000 00000000 00000000 00000000
+*
+MATCH
+--- vgpr_alloc_w64_f1
+status=ok
+wait_status=0
+elapsed_ns=908369
+gc_base=0x00001260
+device=/dev/dri/renderD128
+vgpr_alloc_w64_f1/out.out sha256=5b1e2c1f90ef77c1
+ 00000000 00000000 a0000002 a0000003
+ a0000004 a0000005 a0000006 a0000007
+ 00000000 00000000 00000000 00000000
+*
+MATCH
+--- scratch_layout
+status=ok
+wait_status=0
+elapsed_ns=380282
+gc_base=0x00001260
+device=/dev/dri/renderD128
+scratch_layout/scratch.out sha256=4167dd38fc6b12b6
+ 00000000 00000000 00000000 00000000
+*
+MISMATCH
+scratch_layout/scratch.cut scratch_layout/scratch.expect differ: char 5, line 1
+ 00000000 00000000 00000000 00000000
+*
+--- scratch_isolation_w64
+status=ok
+wait_status=0
+elapsed_ns=711321
+gc_base=0x00001260
+device=/dev/dri/renderD128
+scratch_isolation_w64/out.out sha256=30e14955ebf13522
+ 00000000 00000000 00000000 00000000
+*
+MATCH
+--- scratch_isolation_w2048
+status=ok
+wait_status=0
+elapsed_ns=546326
+gc_base=0x00001260
+device=/dev/dri/renderD128
+scratch_isolation_w2048/out.out sha256=72094a8fc7d1d012
+ 00000060 00000060 00000060 00000060
+*
+MISMATCH
+scratch_isolation_w2048/out.cut scratch_isolation_w2048/out.expect differ: char 1, line 1
+ 00000060 00000060 00000060 00000060
+*
+--- lds_alloc_f1_at_508
+status=ok
+wait_status=0
+elapsed_ns=770766
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f1_at_508/out.out sha256=20b308ea6a78558f
+ 1d5001fc
+MATCH
+--- lds_alloc_f1_at_1020
+status=ok
+wait_status=0
+elapsed_ns=917149
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f1_at_1020/out.out sha256=df3f619804a92fdb
+ 00000000
+MATCH
+--- lds_alloc_f64_at_65532
+status=ok
+wait_status=0
+elapsed_ns=935842
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f64_at_65532/out.out sha256=df3f619804a92fdb
+ 00000000
+MATCH
+--- lds_alloc_f2_at_1020
+status=ok
+wait_status=0
+elapsed_ns=913530
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f2_at_1020/out.out sha256=9b7c3e4aeb6324b0
+ 1d5003fc
+MATCH
+--- lds_alloc_f2_at_1024
+status=ok
+wait_status=0
+elapsed_ns=893026
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f2_at_1024/out.out sha256=df3f619804a92fdb
+ 00000000
+MATCH
+--- lds_alloc_f128_at_65532
+status=ok
+wait_status=0
+elapsed_ns=954191
+gc_base=0x00001260
+device=/dev/dri/renderD128
+lds_alloc_f128_at_65532/out.out sha256=2efad6f24fc42f8a
+ 1d50fffc
+MATCH
+=== end ===

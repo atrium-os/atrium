@@ -1,0 +1,384 @@
+[ 3415.777074] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3415.777075] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3415.777077] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3415.782036] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3434.800451] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3434.800473] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3435.003904] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3435.009174] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3435.009178] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3435.009183] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3435.009189] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3435.037680] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3435.037881] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3435.037886] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3435.049268] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3435.058387] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3435.058397] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3435.058400] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3435.058401] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3435.058403] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3435.058404] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3435.058405] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3435.058407] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3435.058408] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3435.058410] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3435.063368] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3441.629401] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3441.629421] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3441.834212] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3441.839428] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3441.839433] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3441.839437] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3441.839443] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3441.867434] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3441.867624] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3441.867629] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3441.879314] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3441.888606] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3441.888613] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3441.888616] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3441.888617] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3441.888619] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3441.888620] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3441.888621] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3441.888622] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3441.888624] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3441.888625] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3441.893409] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3449.785698] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3449.785719] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3449.990528] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3449.995763] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3449.995768] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3449.995773] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3449.995779] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3450.024246] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3450.024401] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3450.024404] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3450.035070] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3450.043928] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3450.043950] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3450.043951] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3450.043952] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3450.043953] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3450.043954] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3450.043955] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3450.043956] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3450.043957] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3450.043958] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3450.048929] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3456.602920] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3456.602941] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3456.808974] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3456.814059] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3456.814062] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3456.814066] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3456.814071] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3456.842253] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3456.842442] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3456.842447] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3456.853719] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3456.861847] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3456.861854] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3456.861856] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3456.861858] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3456.861859] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3456.861860] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3456.861865] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3456.861867] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3456.861868] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3456.861870] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3456.867029] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3465.447406] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3465.447427] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3465.651418] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3465.656440] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3465.656443] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3465.656446] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3465.656450] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3465.684458] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3465.684629] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3465.684633] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3465.696899] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3465.704372] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3465.704379] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3465.704381] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3465.704382] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3465.704383] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3465.704384] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3465.704385] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3465.704386] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3465.704388] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3465.704389] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3465.709465] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3473.560730] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3473.560750] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3473.767165] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3473.772381] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3473.772385] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3473.772390] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3473.772395] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3473.801034] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3473.801210] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3473.801214] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3473.812607] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3473.822680] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3473.822687] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3473.822689] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3473.822690] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3473.822691] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3473.822692] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3473.822694] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3473.822695] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3473.822696] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3473.822697] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3473.827701] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3487.900638] gmc_v12_0_process_interrupt: 39 callbacks suppressed
+[ 3487.900641] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.900803] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.900950] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3487.901075] amdgpu 0000:03:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x0074115B
+[ 3487.901194] amdgpu 0000:03:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[ 3487.901311] amdgpu 0000:03:00.0: 	 MORE_FAULTS: 0x1
+[ 3487.901426] amdgpu 0000:03:00.0: 	 WALKER_ERROR: 0x5
+[ 3487.901540] amdgpu 0000:03:00.0: 	 PERMISSION_FAULTS: 0x5
+[ 3487.901654] amdgpu 0000:03:00.0: 	 MAPPING_ERROR: 0x1
+[ 3487.901768] amdgpu 0000:03:00.0: 	 RW: 0x1
+[ 3487.901885] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.902004] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.902123] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3487.902245] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.902364] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.902483] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120c000 from client 10
+[ 3487.902605] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.902723] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.902842] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120c000 from client 10
+[ 3487.902964] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.903084] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.903203] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3487.903324] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.903443] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.903561] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120e000 from client 10
+[ 3487.903683] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.903801] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.903920] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120e000 from client 10
+[ 3487.904045] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.904163] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.904282] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3487.904404] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.904522] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.904640] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3487.904762] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3487.904880] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3487.905000] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120e000 from client 10
+[ 3489.963132] amdgpu 0000:03:00.0: Dumping IP State
+[ 3489.963992] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3489.964102] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3489.964108] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3489.964114] amdgpu 0000:03:00.0: ring comp_1.1.0 timeout, signaled seq=1591, emitted seq=1592
+[ 3489.964732] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3489.965326] amdgpu 0000:03:00.0: Starting comp_1.1.0 ring reset
+[ 3489.965908] amdgpu 0000:03:00.0: reset compute queue (1:1:0)
+[ 3489.966058] amdgpu 0000:03:00.0: Ring comp_1.1.0 reset succeeded
+[ 3489.967849] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3492.011163] amdgpu 0000:03:00.0: Dumping IP State
+[ 3492.013241] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3492.013262] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3492.013267] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3492.013273] amdgpu 0000:03:00.0: ring comp_1.0.1 timeout, signaled seq=1414, emitted seq=1415
+[ 3492.013931] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3492.014580] amdgpu 0000:03:00.0: Starting comp_1.0.1 ring reset
+[ 3492.016170] amdgpu 0000:03:00.0: reset compute queue (1:0:1)
+[ 3492.016401] amdgpu 0000:03:00.0: Ring comp_1.0.1 reset succeeded
+[ 3492.018032] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3494.059158] amdgpu 0000:03:00.0: Dumping IP State
+[ 3494.061106] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3494.061135] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3494.061144] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3494.061154] amdgpu 0000:03:00.0: ring comp_1.1.0 timeout, signaled seq=1593, emitted seq=1594
+[ 3494.062335] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.068028] amdgpu 0000:03:00.0: Starting comp_1.1.0 ring reset
+[ 3494.068270] amdgpu 0000:03:00.0: reset compute queue (1:1:0)
+[ 3494.068360] amdgpu 0000:03:00.0: Ring comp_1.1.0 reset succeeded
+[ 3494.069490] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3494.164057] gmc_v12_0_process_interrupt: 157 callbacks suppressed
+[ 3494.164059] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.164214] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.164363] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3494.164495] amdgpu 0000:03:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x0074115B
+[ 3494.164610] amdgpu 0000:03:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[ 3494.164726] amdgpu 0000:03:00.0: 	 MORE_FAULTS: 0x1
+[ 3494.164842] amdgpu 0000:03:00.0: 	 WALKER_ERROR: 0x5
+[ 3494.164957] amdgpu 0000:03:00.0: 	 PERMISSION_FAULTS: 0x5
+[ 3494.165081] amdgpu 0000:03:00.0: 	 MAPPING_ERROR: 0x1
+[ 3494.165195] amdgpu 0000:03:00.0: 	 RW: 0x1
+[ 3494.165311] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.165426] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.165541] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3494.165658] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.165773] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.165888] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3494.166006] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.166125] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.166239] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3494.166357] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.166472] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.166586] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120c000 from client 10
+[ 3494.166704] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.166819] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.166933] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3494.167054] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.167168] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.167283] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3494.167401] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.167515] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.167630] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3494.167747] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.167862] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.167976] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120e000 from client 10
+[ 3494.168098] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3494.168213] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3494.168327] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3496.171198] amdgpu 0000:03:00.0: Dumping IP State
+[ 3496.172284] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3496.172312] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3496.172321] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3496.172331] amdgpu 0000:03:00.0: ring comp_1.1.0 timeout, signaled seq=1595, emitted seq=1596
+[ 3496.173482] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3496.174595] amdgpu 0000:03:00.0: Starting comp_1.1.0 ring reset
+[ 3496.179125] amdgpu 0000:03:00.0: reset compute queue (1:1:0)
+[ 3496.179254] amdgpu 0000:03:00.0: Ring comp_1.1.0 reset succeeded
+[ 3496.180276] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3498.219124] amdgpu 0000:03:00.0: Dumping IP State
+[ 3498.221093] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3498.221110] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3498.221115] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3498.221121] amdgpu 0000:03:00.0: ring comp_1.0.1 timeout, signaled seq=1419, emitted seq=1420
+[ 3498.221780] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3498.222434] amdgpu 0000:03:00.0: Starting comp_1.0.1 ring reset
+[ 3498.227059] amdgpu 0000:03:00.0: reset compute queue (1:0:1)
+[ 3498.227178] amdgpu 0000:03:00.0: Ring comp_1.0.1 reset succeeded
+[ 3498.228047] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3500.331170] amdgpu 0000:03:00.0: Dumping IP State
+[ 3500.332204] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3500.332222] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3500.332227] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3500.332233] amdgpu 0000:03:00.0: ring comp_1.0.1 timeout, signaled seq=1421, emitted seq=1422
+[ 3500.332886] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.333529] amdgpu 0000:03:00.0: Starting comp_1.0.1 ring reset
+[ 3500.334176] amdgpu 0000:03:00.0: reset compute queue (1:0:1)
+[ 3500.334271] amdgpu 0000:03:00.0: Ring comp_1.0.1 reset succeeded
+[ 3500.337307] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3500.383587] gmc_v12_0_process_interrupt: 57 callbacks suppressed
+[ 3500.383589] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.383710] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.383826] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3500.383942] amdgpu 0000:03:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x0074115B
+[ 3500.384064] amdgpu 0000:03:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+[ 3500.384180] amdgpu 0000:03:00.0: 	 MORE_FAULTS: 0x1
+[ 3500.384295] amdgpu 0000:03:00.0: 	 WALKER_ERROR: 0x5
+[ 3500.384410] amdgpu 0000:03:00.0: 	 PERMISSION_FAULTS: 0x5
+[ 3500.384525] amdgpu 0000:03:00.0: 	 MAPPING_ERROR: 0x1
+[ 3500.384638] amdgpu 0000:03:00.0: 	 RW: 0x1
+[ 3500.384758] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.384872] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.384987] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3500.385149] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.385264] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.385378] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3500.385495] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.385610] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.385724] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3500.385842] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.385956] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.386074] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120c000 from client 10
+[ 3500.386191] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.386306] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.386420] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3500.386538] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.386652] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.386766] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120d000 from client 10
+[ 3500.386883] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.386997] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.387151] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3500.387269] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.387383] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.387498] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120b000 from client 10
+[ 3500.387615] amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:173 vmid:7 pasid:176)
+[ 3500.387729] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3500.387843] amdgpu 0000:03:00.0:   in page starting at address 0x000000022120c000 from client 10
+[ 3502.443179] amdgpu 0000:03:00.0: Dumping IP State
+[ 3502.444296] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3502.444316] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3502.444320] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3502.444326] amdgpu 0000:03:00.0: ring comp_1.0.1 timeout, signaled seq=1422, emitted seq=1423
+[ 3502.444988] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3502.445634] amdgpu 0000:03:00.0: Starting comp_1.0.1 ring reset
+[ 3502.446279] amdgpu 0000:03:00.0: reset compute queue (1:0:1)
+[ 3502.446376] amdgpu 0000:03:00.0: Ring comp_1.0.1 reset succeeded
+[ 3502.448391] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3504.491164] amdgpu 0000:03:00.0: Dumping IP State
+[ 3504.493344] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3504.493371] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3504.493377] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3504.493384] amdgpu 0000:03:00.0: ring comp_1.1.0 timeout, signaled seq=1602, emitted seq=1603
+[ 3504.494059] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3504.494720] amdgpu 0000:03:00.0: Starting comp_1.1.0 ring reset
+[ 3504.500090] amdgpu 0000:03:00.0: reset compute queue (1:1:0)
+[ 3504.500175] amdgpu 0000:03:00.0: Ring comp_1.1.0 reset succeeded
+[ 3504.501247] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3506.603195] amdgpu 0000:03:00.0: Dumping IP State
+[ 3506.604465] amdgpu 0000:03:00.0: Dumping IP State Completed
+[ 3506.604486] amdgpu 0000:03:00.0: [drm] AMDGPU device coredump file has been created
+[ 3506.604491] amdgpu 0000:03:00.0: [drm] Check your /sys/class/drm/card1/device/devcoredump/data
+[ 3506.604497] amdgpu 0000:03:00.0: ring comp_1.0.1 timeout, signaled seq=1425, emitted seq=1426
+[ 3506.605176] amdgpu 0000:03:00.0:  Process amdgpu_runner pid 9742 thread amdgpu_runner pid 9742
+[ 3506.605818] amdgpu 0000:03:00.0: Starting comp_1.0.1 ring reset
+[ 3506.606469] amdgpu 0000:03:00.0: reset compute queue (1:0:1)
+[ 3506.606571] amdgpu 0000:03:00.0: Ring comp_1.0.1 reset succeeded
+[ 3506.609267] amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+[ 3518.854908] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3518.854929] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3519.060152] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3519.065336] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3519.065340] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3519.065344] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3519.065349] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3519.094220] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3519.094415] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3519.094420] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3519.105705] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3519.114897] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3519.114904] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3519.114906] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3519.114908] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3519.114910] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3519.114911] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3519.114912] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3519.114914] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3519.114915] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3519.114917] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3519.120013] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3525.687862] amdgpu 0000:03:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000008000000000).
+[ 3525.687883] amdgpu 0000:03:00.0: PSP is resuming...
+[ 3525.893068] amdgpu 0000:03:00.0: GECC is disabled, set amdgpu_ras_enable=1 to enable GECC in next boot cycle if needed
+[ 3525.898296] amdgpu 0000:03:00.0: RAP: optional rap ta ucode is not available
+[ 3525.898300] amdgpu 0000:03:00.0: SECUREDISPLAY: optional securedisplay ta ucode is not available
+[ 3525.898305] amdgpu 0000:03:00.0: SMU is resuming...
+[ 3525.898311] amdgpu 0000:03:00.0: smu driver if version = 0x0000002e, smu fw if version = 0x00000033, smu fw program = 0, smu fw version = 0x00684c00 (104.76.0)
+[ 3525.926898] amdgpu 0000:03:00.0: SMU is resumed successfully!
+[ 3525.927095] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0x4000000
+[ 3525.927101] amdgpu 0000:03:00.0: program CP_MES_CNTL : 0xc000000
+[ 3525.938829] amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x0A000800
+[ 3525.947834] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
+[ 3525.947842] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[ 3525.947845] amdgpu 0000:03:00.0: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[ 3525.947846] amdgpu 0000:03:00.0: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[ 3525.947848] amdgpu 0000:03:00.0: ring comp_1.0.1 uses VM inv eng 7 on hub 0
+[ 3525.947849] amdgpu 0000:03:00.0: ring comp_1.1.1 uses VM inv eng 8 on hub 0
+[ 3525.947850] amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 9 on hub 0
+[ 3525.947852] amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 10 on hub 0
+[ 3525.947853] amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[ 3525.947855] amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
+[ 3525.952122] amdgpu 0000:03:00.0: [drm] Cannot find any crtc or sizes
