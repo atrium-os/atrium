@@ -3,7 +3,7 @@
 //! hand-made ones for the most used as a fallback. A name neither knows
 //! draws as its box and is kept by name, so a round trip keeps it.
 
-use crate::model::{Geom, Path, PathCmd};
+use crate::{Geom, Path, PathCmd};
 
 /// Bézier handle length for a quarter circle, as a fraction of the radius.
 const K: f64 = 0.552_284_75;
@@ -32,6 +32,15 @@ fn quarter(cmds: &mut Vec<PathCmd>, cx: i64, cy: i64, rx: i64, ry: i64, q: u8) {
         _ => PathCmd::Cubic(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy),
     };
     cmds.push(c);
+}
+
+/// Where a geometry's text goes in a `w` × `h` box: left, top, right,
+/// bottom (a preset's own text rectangle, else the whole box).
+pub fn text_rect(g: &Geom, w: i64, h: i64) -> [i64; 4] {
+    match g {
+        Geom::Preset { name, adj } => crate::presets::preset(name).map_or([0, 0, w, h], |d| d.text_rect(w, h, adj)),
+        Geom::Custom(_) => [0, 0, w, h],
+    }
 }
 
 /// The paths of a geometry in a `w` × `h` box, and whether it was drawn as

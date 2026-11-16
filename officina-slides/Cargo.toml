@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 officina-core = { path = "../officina-core" }
 officina-text = { path = "../officina-text" }
+officina-shapes = { path = "../officina-shapes" }
 
 [profile.release]
 debug = 1

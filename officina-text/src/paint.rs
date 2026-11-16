@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::layout::{object_height, size_lu, vert_shift, Fonts, LayoutCache, ParaLayout, OBJECT_FACE};
 use crate::lists::Numbering;
-use crate::model::{Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
+use crate::model::{ArrowEnd, Dash, PathCmd, Wrap, Align, CharFormat, Leader, TextDoc, HEADER_FROM_EDGE, OBJECT_CHAR};
 use crate::paginate::{Page, NOTE_HANG, NOTE_RULE_SPACE};
 use crate::twips;
 
@@ -54,6 +54,204 @@ pub enum Item {
     /// screen draws a bar in the margin, and in review the edit it belongs
     /// to; a PDF leaves it out.
     Change { x: i64, y: i64, w: i64, h: i64, block: usize, start: u32, end: u32, rev: crate::model::RevId },
+    /// A drawn shape's outline in page coordinates: filled with `fill`
+    /// (RGB), outlined with `line` (RGB, width in layout units, at least a
+    /// hairline, dashes).
+    Path { cmds: Vec<PathCmd>, fill: Option<u32>, line: Option<(u32, i64, Dash)> },
+    /// A drawn shape's frame: [`paint_page`] puts its outline and text in
+    /// its place; [`paint_para`] leaves it for its caller.
+    Shape { shape: u32, x: i64, y: i64, w: i64, h: i64 },
+}
+
+/// The items for shape `id` in the frame `x`, `y`, `w`, `h`: its outlines,
+/// then its text (upright: a turned shape's text keeps its place), then
+/// its group's shapes.
+#[allow(clippy::too_many_arguments)]
+pub fn shape_items(out: &mut Vec<Item>, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, id: u32, x: i64, y: i64, w: i64, h: i64) {
+    let Some(sd) = doc.shapes.get(id) else { return };
+    let m = place(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0], sd, x as f64, y as f64, w as f64, h as f64);
+    draw_shape(out, doc, cache, fonts, sd, &m, w, h, 0);
+}
+
+/// An affine map `[a, b, c, d, e, f]`: (x, y) to (a x + c y + e, b x + d y + f).
+type Xf = [f64; 6];
+
+fn mul(p: &Xf, q: &Xf) -> Xf {
+    [p[0] * q[0] + p[2] * q[1], p[1] * q[0] + p[3] * q[1], p[0] * q[2] + p[2] * q[3], p[1] * q[2] + p[3] * q[3], p[0] * q[4] + p[2] * q[5] + p[4], p[1] * q[4] + p[3] * q[5] + p[5]]
+}
+
+fn apply(m: &Xf, x: f64, y: f64) -> (i64, i64) {
+    ((m[0] * x + m[2] * y + m[4]).round() as i64, (m[1] * x + m[3] * y + m[5]).round() as i64)
+}
+
+/// `parent` then the map from shape `sd`'s own box (`0..w`, `0..h`) onto
+/// its frame at `x`, `y` in the parent's: turned and flipped about its middle.
+fn place(parent: &Xf, sd: &crate::model::ShapeData, x: f64, y: f64, w: f64, h: f64) -> Xf {
+    let t = (sd.rot as f64 / 60_000.0).to_radians();
+    let (sin, cos) = t.sin_cos();
+    let (fx, fy) = (if sd.flip_h { -1.0 } else { 1.0 }, if sd.flip_v { -1.0 } else { 1.0 });
+    let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+    let rs = [cos * fx, sin * fx, -sin * fy, cos * fy, cx, cy];
+    mul(parent, &mul(&rs, &[1.0, 0.0, 0.0, 1.0, -w / 2.0, -h / 2.0]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_shape(out: &mut Vec<Item>, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts, sd: &crate::model::ShapeData, m: &Xf, w: i64, h: i64, depth: usize) {
+    // How much the map stretches lengths (for outline widths).
+    let k = (m[0] * m[3] - m[1] * m[2]).abs().sqrt();
+    if sd.fill.is_some() || sd.line.is_some() {
+        let (paths, _) = officina_shapes::geom::paths(&sd.geom, w.max(1), h.max(1));
+        for p in &paths {
+            let sx = if p.w > 0 { w as f64 / p.w as f64 } else { 1.0 };
+            let sy = if p.h > 0 { h as f64 / p.h as f64 } else { 1.0 };
+            let pt = |px: i64, py: i64| apply(m, px as f64 * sx, py as f64 * sy);
+            let cmds: Vec<PathCmd> = p
+                .cmds
+                .iter()
+                .map(|c| match *c {
+                    PathCmd::Move(a, b) => {
+                        let (a, b) = pt(a, b);
+                        PathCmd::Move(a, b)
+                    }
+                    PathCmd::Line(a, b) => {
+                        let (a, b) = pt(a, b);
+                        PathCmd::Line(a, b)
+                    }
+                    PathCmd::Cubic(a, b, c, d, e, f) => {
+                        let ((a, b), (c, d), (e, f)) = (pt(a, b), pt(c, d), pt(e, f));
+                        PathCmd::Cubic(a, b, c, d, e, f)
+                    }
+                    PathCmd::Close => PathCmd::Close,
+                })
+                .collect();
+            let fill = sd.fill.filter(|_| p.filled);
+            let line = sd.line.filter(|_| p.stroked).map(|l| (l.color, ((twips(l.width as i64) as f64 * k) as i64).max(crate::LU / 2), l.dash));
+            let ends = sd.line.filter(|l| p.stroked && (l.head != ArrowEnd::None || l.tail != ArrowEnd::None) && !cmds.contains(&PathCmd::Close));
+            let marks: Vec<Item> = match (ends, line) {
+                (Some(l), Some((color, lw, _))) => arrow_ends(&cmds, l.head, l.tail, lw).into_iter().map(|(c, filled)| Item::Path { cmds: c, fill: filled.then_some(color), line: (!filled).then_some((color, lw, Dash::Solid)) }).collect(),
+                _ => Vec::new(),
+            };
+            if fill.is_some() || line.is_some() {
+                out.push(Item::Path { cmds, fill, line });
+            }
+            out.extend(marks);
+        }
+    }
+    if !sd.paras.is_empty() {
+        // The text box: the shape's text rectangle (an ellipse's, the
+        // rectangle inside it; an arrow's, its body) less its insets,
+        // upright at the frame's place.
+        let [il, it, ir, ib] = sd.inset.map(|v| (twips(v as i64) as f64 * k) as i64);
+        let (fw, fh) = ((w as f64 * k) as i64, (h as f64 * k) as i64);
+        let [rl, rt, rr, rb] = officina_shapes::geom::text_rect(&sd.geom, fw.max(1), fh.max(1));
+        let (il, it, ir, ib) = (il + rl, it + rt, ir + (fw - rr).max(0), ib + (fh - rb).max(0));
+        let (cx, cy) = apply(m, w as f64 / 2.0, h as f64 / 2.0);
+        let (x, y) = (cx - fw / 2, cy - fh / 2);
+        let width = (fw - il - ir).max(crate::LU);
+        let lays: Vec<_> = sd.paras.iter().map(|p| cache.get(doc, p, width, fonts)).collect();
+        let total: i64 = lays.iter().map(|l| l.height).sum();
+        let room = fh - it - ib;
+        let mut ty = y + it + match sd.anchor {
+            crate::model::TextAnchor::Top => 0,
+            crate::model::TextAnchor::Middle => (room - total) / 2,
+            crate::model::TextAnchor::Bottom => room - total,
+        }
+        .max(0);
+        for (p, l) in sd.paras.iter().zip(&lays) {
+            for li in 0..l.lines.len() {
+                line(out, doc, fonts, l, li, &p.text, x + il, ty, None);
+                ty += l.lines[li].height;
+            }
+        }
+    }
+    if depth < crate::model::MAX_GROUP_DEPTH {
+        for kid in &sd.kids {
+            let f = |v: i32, s: i64| v as f64 * s as f64 / 100_000.0;
+            let (kw, kh) = (f(kid.w, w).max(1.0), f(kid.h, h).max(1.0));
+            let km = place(m, &kid.shape, f(kid.x, w), f(kid.y, h), kw, kh);
+            draw_shape(out, doc, cache, fonts, &kid.shape, &km, kw as i64, kh as i64, depth + 1);
+        }
+    }
+}
+
+/// The marks ending an open path: at its start (`head`) and end (`tail`),
+/// sized from the line width `lw` as Office's medium ends are; each
+/// filled, or (an open arrow) stroked.
+fn arrow_ends(cmds: &[PathCmd], head: ArrowEnd, tail: ArrowEnd, lw: i64) -> Vec<(Vec<PathCmd>, bool)> {
+    let pts: Vec<(i64, i64)> = cmds
+        .iter()
+        .flat_map(|c| match *c {
+            PathCmd::Move(x, y) | PathCmd::Line(x, y) => vec![(x, y)],
+            PathCmd::Cubic(a, b, c, d, e, f) => vec![(a, b), (c, d), (e, f)],
+            PathCmd::Close => vec![],
+        })
+        .collect();
+    let mut out = Vec::new();
+    // The end point and the direction the line arrives along.
+    let pick = |rev: bool| -> Option<((f64, f64), (f64, f64))> {
+        let it: Box<dyn Iterator<Item = &(i64, i64)>> = if rev { Box::new(pts.iter().rev()) } else { Box::new(pts.iter()) };
+        let mut it = it.peekable();
+        let &(ex, ey) = *it.peek()?;
+        let &(px, py) = it.find(|&&(x, y)| (x, y) != (ex, ey))?;
+        let (dx, dy) = ((ex - px) as f64, (ey - py) as f64);
+        let n = (dx * dx + dy * dy).sqrt();
+        Some(((ex as f64, ey as f64), (dx / n, dy / n)))
+    };
+    let size = (lw as f64 * 3.0).max(crate::LU as f64 * 4.0);
+    for (kind, rev) in [(head, false), (tail, true)] {
+        if kind == ArrowEnd::None {
+            continue;
+        }
+        let Some(((ex, ey), (ux, uy))) = pick(rev) else { continue };
+        // Along the line back from the end, and across it.
+        let at = |along: f64, across: f64| ((ex - ux * along - uy * across).round() as i64, (ey - uy * along + ux * across).round() as i64);
+        let poly = |p: &[(i64, i64)], close: bool| {
+            let mut v: Vec<PathCmd> = p.iter().enumerate().map(|(i, &(x, y))| if i == 0 { PathCmd::Move(x, y) } else { PathCmd::Line(x, y) }).collect();
+            if close {
+                v.push(PathCmd::Close);
+            }
+            v
+        };
+        let (l, hw) = (size, size / 2.0);
+        match kind {
+            ArrowEnd::Triangle => out.push((poly(&[at(0.0, 0.0), at(l, hw), at(l, -hw)], true), true)),
+            ArrowEnd::Stealth => out.push((poly(&[at(0.0, 0.0), at(l, hw), at(l * 0.6, 0.0), at(l, -hw)], true), true)),
+            ArrowEnd::Open => out.push((poly(&[at(l, hw), at(0.0, 0.0), at(l, -hw)], false), false)),
+            ArrowEnd::Diamond => out.push((poly(&[at(-hw, 0.0), at(0.0, hw), at(hw, 0.0), at(0.0, -hw)], true), true)),
+            ArrowEnd::Oval => {
+                let r = hw;
+                let k = r * 0.552_284_75;
+                let p = |a: f64, b: f64| at(a, b);
+                let (a, b, c, d) = (p(0.0, r), p(r, 0.0), p(0.0, -r), p(-r, 0.0));
+                let q = |(x1, y1): (i64, i64), (x2, y2): (i64, i64), (x, y): (i64, i64)| PathCmd::Cubic(x1, y1, x2, y2, x, y);
+                out.push((
+                    vec![PathCmd::Move(a.0, a.1), q(p(k, r), p(r, k), b), q(p(r, -k), p(k, -r), c), q(p(-k, -r), p(-r, -k), d), q(p(-r, k), p(-k, r), a), PathCmd::Close],
+                    true,
+                ));
+            }
+            ArrowEnd::None => {}
+        }
+    }
+    out
+}
+
+/// Puts each shape frame's outline and text in its place.
+fn expand_shapes(out: Vec<Item>, doc: &TextDoc, cache: &mut LayoutCache, fonts: &dyn Fonts) -> Vec<Item> {
+    if !out.iter().any(|i| matches!(i, Item::Shape { .. })) {
+        return out;
+    }
+    let mut v = Vec::with_capacity(out.len() + 8);
+    for it in out {
+        match it {
+            Item::Shape { shape, x, y, w, h } => {
+                let mut inner = Vec::new();
+                shape_items(&mut inner, doc, cache, fonts, shape, x, y, w, h);
+                v.extend(inner.into_iter().filter(|i| !matches!(i, Item::Shape { .. })));
+            }
+            other => v.push(other),
+        }
+    }
+    v
 }
 
 /// A table rule's thickness: half a point.
@@ -121,7 +319,7 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
 
     // Floating pictures behind the text first; the rest go over it.
     let float = |out: &mut Vec<Item>, f: &crate::paginate::PlacedFloat| {
-        out.push(Item::Image { image: f.object.image, x: mx + f.x, y: my + f.y, w: f.w, h: f.h });
+        out.push(object_item(&f.object, mx + f.x, my + f.y, f.w, f.h));
     };
     for f in page.floats.iter().filter(|f| f.wrap() == Wrap::Behind) {
         float(&mut out, f);
@@ -185,7 +383,16 @@ pub fn paint_page(doc: &TextDoc, pages: &[Page], i: usize, col_w: i64, cache: &m
             ly += l.lines[li].height;
         }
     }
-    out
+    expand_shapes(out, doc, cache, fonts)
+}
+
+/// A picture's or shape's item in the frame.
+fn object_item(o: &crate::model::ObjectRef, x: i64, y: i64, w: i64, h: i64) -> Item {
+    if o.shape {
+        Item::Shape { shape: o.image, x, y, w, h }
+    } else {
+        Item::Image { image: o.image, x, y, w, h }
+    }
 }
 
 /// The baseline of line `li` whose top is `top`.
@@ -227,7 +434,7 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
             }
             if let Some(o) = f.object.as_ref().filter(|o| o.float.is_none()) {
                 let h = object_height(o, g.adv);
-                out.push(Item::Image { image: o.image, x: left + pen, y: baseline - h, w: g.adv, h });
+                out.push(object_item(o, left + pen, baseline - h, g.adv, h));
                 if let Some(u) = &f.link {
                     out.push(Item::Link { x: left + pen, y: baseline - h, w: g.adv, h, uri: u.to_string() });
                 }
@@ -423,7 +630,7 @@ mod tests {
         let link = d.attrs.intern(CharAttrs { link: Some("https://example.org/".into()), ..Default::default() });
         d.push_para("Hello world", 0, vec![(0, 0), (6, link)]);
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 10, height: 10 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None, shape: false }), ..Default::default() });
         d.push_para("a\u{FFFC}b", 0, vec![(0, 0), (1, pic), (4, 0)]);
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
         let fonts = FixedFonts;
@@ -447,12 +654,50 @@ mod tests {
     }
 
     #[test]
+    fn shapes_paint_their_outline_and_text() {
+        use crate::model::{Float, Geom, Para, ShapeData, ShapeLine, TextAnchor};
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        let mut sd = ShapeData::new(Geom::preset("ellipse"));
+        sd.fill = Some(0x4472C4);
+        sd.line = Some(ShapeLine { color: 0x000000, width: 0, dash: Dash::Dash, head: Default::default(), tail: Default::default() });
+        sd.anchor = TextAnchor::Middle;
+        sd.paras.push(Para::new(d.new_id(), "Inside", 0));
+        let id = d.shapes.add(sd).unwrap();
+        let mut box_ = ShapeData::new(Geom::preset("rect"));
+        box_.rot = 90 * 60_000;
+        let id2 = d.shapes.add(box_).unwrap();
+        let a = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: id, width: 2880, height: 1440, float: None, shape: true }), ..Default::default() });
+        let f = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: id2, width: 1440, height: 720, float: Some(Float::default()), shape: true }), ..Default::default() });
+        d.push_para("x\u{FFFC}y\u{FFFC}", 0, vec![(0, 0), (1, a), (4, 0), (5, f)]);
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let mut p = Paginator::new(&d);
+        p.run(&d, &mut cache, &fonts, usize::MAX);
+        let items = paint_page(&d, p.pages(), 0, p.width(), &mut cache, &fonts, &Numbering::build(&d), "1");
+        assert!(!items.iter().any(|i| matches!(i, Item::Shape { .. } | Item::Image { .. })));
+        let paths: Vec<_> = items.iter().filter_map(|i| if let Item::Path { cmds, fill, line } = i { Some((cmds, fill, line)) } else { None }).collect();
+        assert_eq!(paths.len(), 1, "the unfilled, unoutlined box draws nothing");
+        let (cmds, fill, line) = paths[0];
+        assert_eq!(*fill, Some(0x4472C4));
+        assert_eq!(line.map(|l| (l.1, l.2)), Some((crate::LU / 2, Dash::Dash)), "a hairline at least");
+        // The ellipse's points span its frame: 2 in by 1 in.
+        let xs: Vec<i64> = cmds.iter().filter_map(|c| if let PathCmd::Move(x, _) | PathCmd::Line(x, _) | PathCmd::Cubic(_, _, _, _, x, _) = c { Some(*x) } else { None }).collect();
+        let span = xs.iter().max().unwrap() - xs.iter().min().unwrap();
+        assert!((span - twips(2880)).abs() <= 2, "{span}");
+        // Its text in the middle, after the outline.
+        let ti = items.iter().position(|i| matches!(i, Item::Glyphs(r) if r.text == "Inside")).unwrap();
+        let pi = items.iter().position(|i| matches!(i, Item::Path { .. })).unwrap();
+        assert!(ti > pi);
+    }
+
+    #[test]
     fn headers_of_their_own_paragraphs_paint_pictures_and_page_numbers() {
         use crate::model::Para;
         let mut d = TextDoc::new();
         d.push_para("Body", 0, vec![]);
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![0u8; 4]), width: 10, height: 10 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 720, height: 360, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 720, height: 360, float: None, shape: false }), ..Default::default() });
         let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
         let mut logo = Para::new(d.new_id(), "\u{FFFC} Acme", 0);
         logo.runs = vec![(0, pic), (3, bold)];
@@ -503,7 +748,7 @@ mod tests {
         let mut d = TextDoc::new();
         let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(vec![1u8; 4]), width: 1, height: 1 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 20, height: 20, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 20, height: 20, float: None, shape: false }), ..Default::default() });
         let p = Para { runs: vec![(0, pic), (3, 0), (4, bold), (8, 0)], ..Para::new(1, "\u{FFFC} Acme Ltd", 0) };
         // A word typed after the bold one: plain, as the space before it.
         let q = p.retext("\u{FFFC} Acme Big Ltd", &d.attrs, 0);

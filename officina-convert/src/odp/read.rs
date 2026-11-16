@@ -1109,37 +1109,7 @@ impl<'a> Reader<'a> {
     }
 
     fn custom_geom(&mut self, eg: &El, frame: Rect) -> Geom {
-        let ty = eg.attr("draw:type").unwrap_or("");
-        let mods: Vec<i64> = eg.attr("draw:modifiers").unwrap_or("").split([' ', ',']).filter(|s| !s.is_empty()).filter_map(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round().clamp(-1e9, 1e9) as i64).collect();
-        let logw = frame.w as f64 / 360.0;
-        let logh = frame.h as f64 / 360.0;
-        if let Some(p) = ty.strip_prefix("ooxml-").filter(|p| *p != "non-primitive" && !p.is_empty()) {
-            let adj = match mods.len() {
-                0 => Vec::new(),
-                1 => vec![("adj".into(), mods[0])],
-                _ => mods.iter().enumerate().map(|(i, v)| (format!("adj{}", i + 1).into(), *v)).collect(),
-            };
-            return Geom::Preset { name: p.into(), adj };
-        }
-        let preset = preset_of(ty);
-        if let Some(p) = preset {
-            if officina_slides::geom::paths(&Geom::preset(p), 100, 100).1 || eg.attr("draw:enhanced-path").is_none() {
-                if p == "roundRect" {
-                    if let Some(m) = mods.first() {
-                        return Geom::Preset { name: p.into(), adj: vec![("adj".into(), (m * 100_000 / 21_600).clamp(0, 50_000))] };
-                    }
-                }
-                return Geom::preset(p);
-            }
-        }
-        if let Some(paths) = geom::enhanced(eg, logw, logh) {
-            return Geom::Custom(paths);
-        }
-        if let Some(p) = preset {
-            return Geom::preset(p);
-        }
-        self.rep.note_at(Kind::Approximate, "shapes of kinds not in the set drawn as boxes", || ty.to_string());
-        Geom::preset("rect")
+        odf_geom(eg, frame.w, frame.h, &mut self.rep)
     }
 
     /// A table drawn as a group of cells, each a rectangle with its text.
@@ -1416,6 +1386,43 @@ struct TextCtx<'a> {
     outline: Option<String>,
     fallback: Option<&'a El>,
     ph: bool,
+}
+
+/// An `draw:enhanced-geometry`'s outline for a `w` × `h` EMU shape: an
+/// OOXML preset by name, a preset of the kind, or its own paths.
+pub(crate) fn odf_geom(eg: &El, w: i64, h: i64, rep: &mut Report) -> Geom {
+    let frame = Rect::new(0, 0, w, h);
+    let ty = eg.attr("draw:type").unwrap_or("");
+    let mods: Vec<i64> = eg.attr("draw:modifiers").unwrap_or("").split([' ', ',']).filter(|s| !s.is_empty()).filter_map(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round().clamp(-1e9, 1e9) as i64).collect();
+    let logw = frame.w as f64 / 360.0;
+    let logh = frame.h as f64 / 360.0;
+    if let Some(p) = ty.strip_prefix("ooxml-").filter(|p| *p != "non-primitive" && !p.is_empty()) {
+        let adj = match mods.len() {
+            0 => Vec::new(),
+            1 => vec![("adj".into(), mods[0])],
+            _ => mods.iter().enumerate().map(|(i, v)| (format!("adj{}", i + 1).into(), *v)).collect(),
+        };
+        return Geom::Preset { name: p.into(), adj };
+    }
+    let preset = preset_of(ty);
+    if let Some(p) = preset {
+        if officina_slides::geom::paths(&Geom::preset(p), 100, 100).1 || eg.attr("draw:enhanced-path").is_none() {
+            if p == "roundRect" {
+                if let Some(m) = mods.first() {
+                    return Geom::Preset { name: p.into(), adj: vec![("adj".into(), (m * 100_000 / 21_600).clamp(0, 50_000))] };
+                }
+            }
+            return Geom::preset(p);
+        }
+    }
+    if let Some(paths) = geom::enhanced(eg, logw, logh) {
+        return Geom::Custom(paths);
+    }
+    if let Some(p) = preset {
+        return Geom::preset(p);
+    }
+    rep.note_at(Kind::Approximate, "shapes of kinds not in the set drawn as boxes", || ty.to_string());
+    Geom::preset("rect")
 }
 
 pub fn read(data: &[u8]) -> Result<(Deck, Loaded), OdpError> {

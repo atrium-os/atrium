@@ -8,6 +8,7 @@ g y1 */ h adj1 100000
 g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -34,6 +35,7 @@ g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -65,6 +67,7 @@ g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -89,6 +92,7 @@ g y1 */ h adj1 100000
 g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -115,6 +119,7 @@ g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -146,6 +151,7 @@ g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -167,6 +173,7 @@ g g9 +- vc 0 dx2
 g g10 +- vc dx2 0
 g g11 +- hc 0 dx2
 g g12 +- hc dx2 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -204,6 +211,7 @@ g g14 */ g13 1 8
 g g15 */ g13 1 4
 g g16 +- g11 g14 0
 g g17 +- g11 g15 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -246,6 +254,7 @@ L r b
 L l b
 Z
 =actionButtonBlank
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -262,6 +271,7 @@ g g12 +- hc dx1 0
 g g13 */ ss 3 16
 g g14 +- g12 0 g13
 g g15 +- g9 g13 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -314,6 +324,7 @@ g g14 */ g13 3 4
 g g15 */ g13 7 8
 g g16 +- g11 g14 0
 g g17 +- g11 g15 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -361,6 +372,7 @@ g g9 +- vc 0 dx2
 g g10 +- vc dx2 0
 g g11 +- hc 0 dx2
 g g12 +- hc dx2 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -409,6 +421,7 @@ g g36 +- g11 g19 0
 g g37 +- g11 g20 0
 g g41 */ g13 1 14
 g g42 */ g13 3 28
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -492,6 +505,7 @@ g g30 +- g11 g19 0
 g g31 +- g11 g20 0
 g g32 +- g11 g22 0
 g g33 +- g11 g23 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -585,6 +599,7 @@ g g34 +- g11 g19 0
 g g35 +- g11 g20 0
 g g37 +- g11 g22 0
 g g38 */ g13 3 32
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -690,6 +705,7 @@ g g45 +- g9 g28 0
 g g46 +- g9 g29 0
 g g47 +- g9 g30 0
 g g48 +- g9 g31 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -785,6 +801,7 @@ g g24 +- g11 g16 0
 g g25 +- g11 g17 0
 g g26 +- g11 g18 0
 g g27 */ g13 1 8
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -867,6 +884,7 @@ g g23 +- g9 g19 0
 g g24 +- g11 g15 0
 g g25 +- g11 g16 0
 g g26 +- g11 g18 0
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -953,6 +971,7 @@ g it ?: da4 t g13
 g cang1 +- stAng 0 cd4
 g cang2 +- enAng cd4 0
 g cang3 +/ cang1 cang2 2
+r il it ir ib
 p 0 0 n 0
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -989,6 +1008,7 @@ g y3 +- dh2 th 0
 g y4 +- y3 dh2 0
 g y5 +- dh2 bd 0
 g y6 +- y3 bd2 0
+r l t r b
 p 0 0 n 1
 M l b
 L l y5
@@ -1003,6 +1023,7 @@ A bd2 bd2 3cd4 -5400000
 L th b
 Z
 =bentConnector2
+r l t r b
 p 0 0 - 1
 M l t
 L r t
@@ -1010,6 +1031,7 @@ L r b
 =bentConnector3
 a adj1 val 50000
 g x1 */ w adj1 100000
+r l t r b
 p 0 0 - 1
 M l t
 L x1 t
@@ -1022,6 +1044,7 @@ g x1 */ w adj1 100000
 g x2 +/ x1 r 2
 g y2 */ h adj2 100000
 g y1 +/ t y2 2
+r l t r b
 p 0 0 - 1
 M l t
 L x1 t
@@ -1038,6 +1061,7 @@ g x2 +/ x1 x3 2
 g y2 */ h adj2 100000
 g y1 +/ t y2 2
 g y3 +/ b y2 2
+r l t r b
 p 0 0 - 1
 M l t
 L x1 t
@@ -1065,6 +1089,7 @@ g y2 +- b 0 dy2
 g x0 */ x4 1 2
 g y3 +/ y2 b 2
 g y15 +/ y1 b 2
+r l y2 x4 b
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -1082,6 +1107,7 @@ g a pin 0 adj 50000
 g x1 */ ss a 100000
 g x2 +- r 0 x1
 g y2 +- b 0 x1
+r x1 x1 x2 y2
 p 0 0 n 0
 M x1 x1
 L x2 x1
@@ -1206,6 +1232,7 @@ g y6 +/ y3 y2 2
 g cang1 +- stAng 0 cd4
 g cang2 +- istAng cd4 0
 g cang3 +/ cang1 cang2 2
+r il it ir ib
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -1221,6 +1248,7 @@ g y1 */ h adj1 100000
 g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -1243,6 +1271,7 @@ g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -1270,6 +1299,7 @@ g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -1295,6 +1325,7 @@ g it */ x1 29289 100000
 g il +- x1 it 0
 g ir +- r 0 il
 g ib +- b 0 it
+r il il ir ib
 p 0 0 n 0
 M x2 b
 A x1 x1 cd4 cd4
@@ -1335,6 +1366,7 @@ g y2 +- b 0 x1
 g il */ x1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 0
 M l x1
 A x1 x1 cd2 cd4
@@ -1363,6 +1395,7 @@ g y1 */ h adj1 100000
 g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -1385,6 +1418,7 @@ g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -1412,6 +1446,7 @@ g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
+r l t r b
 p 0 0 n 0
 M l t
 L r t
@@ -1430,6 +1465,7 @@ g a pin 0 adj maxAdj
 g y1 */ ss a 200000
 g y2 +- y1 y1 0
 g y3 +- b 0 y1
+r l y2 r y3
 p 0 0 n 0
 M l y1
 A wd2 y1 cd2 -10800000
@@ -1496,6 +1532,7 @@ g x3 */ x2 1 2
 g dx +- x2 0 x1
 g il ?: dx x1 l
 g ir ?: dx x2 r
+r il t ir b
 p 0 0 n 1
 M l t
 L x2 t
@@ -1534,6 +1571,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -1736,6 +1774,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M xE yE
 A rw1 rh1 stAng swAng
@@ -1754,6 +1793,7 @@ g g27 */ w 67 21600
 g g28 */ h 21577 21600
 g g29 */ w 21582 21600
 g g30 */ h 1235 21600
+r il it ir ib
 p 43200 43200 n 1
 M 3900 14370
 A 6753 9190 -11429249 7426832
@@ -1837,6 +1877,7 @@ g g28 */ h 21577 21600
 g g29 */ w 21582 21600
 g g30 */ h 1235 21600
 g pang at2 dxPos dyPos
+r il it ir ib
 p 43200 43200 n 1
 M 3900 14370
 A 6753 9190 -11429249 7426832
@@ -1901,6 +1942,7 @@ g cy1 +/ y1 b 2
 g d +- w 0 h
 g it ?: d y1 t
 g ir ?: d r x1
+r l it ir b
 p 0 0 n 1
 M l t
 L x1 t
@@ -1914,6 +1956,7 @@ g md mod w h 0
 g dx */ 1 md 20
 g y1 +- 0 b dx
 g x1 +- 0 r dx
+r dx dx x1 y1
 p 0 0 n 1
 M l t
 L dx t
@@ -1944,6 +1987,7 @@ g y3 +/ y1 b 2
 g x4 +- r 0 y1
 g x2 */ x4 1 2
 g x3 +/ y1 r 2
+r l y1 x4 b
 p 0 0 n 0
 M l y1
 L x4 y1
@@ -1976,6 +2020,7 @@ L r t
 M x4 y1
 L x4 b
 =curvedConnector2
+r l t r b
 p 0 0 - 1
 M l t
 C wd2 t r hd2 r b
@@ -1985,6 +2030,7 @@ g x2 */ w adj1 100000
 g x1 +/ l x2 2
 g x3 +/ r x2 2
 g y3 */ h 3 4
+r l t r b
 p 0 0 - 1
 M l t
 C x1 t x2 hd4 x2 vc
@@ -2002,6 +2048,7 @@ g y1 +/ t y4 2
 g y2 +/ t y1 2
 g y3 +/ y1 y4 2
 g y5 +/ b y4 2
+r l t r b
 p 0 0 - 1
 M l t
 C x1 t x2 y2 x2 y1
@@ -2025,6 +2072,7 @@ g y3 +/ y1 y4 2
 g y5 +/ b y4 2
 g y6 +/ y5 y4 2
 g y7 +/ y5 b 2
+r l t r b
 p 0 0 - 1
 M l t
 C x2 t x3 y2 x3 y1
@@ -2076,6 +2124,7 @@ g stAng +- 3cd4 swAng 0
 g stAng2 +- 3cd4 0 dang2
 g swAng2 +- dang2 0 cd4
 g swAng3 +- cd4 dang2 0
+r l t r b
 p 0 0 n 0
 M x6 b
 L x4 y1
@@ -2147,6 +2196,7 @@ g dang2 at2 idx q12
 g swAng2 +- dang2 0 swAng
 g swAng3 +- swAng dang2 0
 g stAng3 +- 0 0 dang2
+r l t r b
 p 0 0 n 0
 M l y6
 L x1 y4
@@ -2218,6 +2268,7 @@ g dang2 at2 idx q12
 g swAng2 +- dang2 0 cd4
 g swAng3 +- cd4 dang2 0
 g stAng3 +- cd2 0 dang2
+r l t r b
 p 0 0 n 0
 M l hR
 A w hR cd2 mswAng
@@ -2290,6 +2341,7 @@ g mswAng2 +- 0 0 swAng2
 g stAng3 +- cd4 0 swAng
 g swAng3 +- swAng dang2 0
 g stAng2 +- cd4 0 dang2
+r l t r b
 p 0 0 n 0
 M x6 t
 L x8 y1
@@ -2331,6 +2383,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc 0 dy2
 g y3 +- vc dy2 0
 g y4 +- vc dy1 0
+r x1 y2 x4 y3
 p 0 0 n 1
 M l vc
 L x1 y2
@@ -2352,6 +2405,7 @@ g x3 +/ x2 r 2
 g y2 */ h a 100000
 g y1 */ y2 1 2
 g y3 +/ y2 b 2
+r l t x3 y3
 p 0 0 n 1
 M l y2
 L x2 t
@@ -2361,6 +2415,7 @@ Z
 =diamond
 g ir */ w 3 4
 g ib */ h 3 4
+r wd4 hd4 ir ib
 p 0 0 n 1
 M l vc
 L hc t
@@ -2376,6 +2431,7 @@ g y1 */ h 2894 21600
 g y2 */ h 7906 21600
 g y3 */ h 13694 21600
 g y4 */ h 18706 21600
+r x1 y1 x4 y4
 p 0 0 n 1
 M l y2
 L x1 y1
@@ -2402,6 +2458,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -2454,6 +2511,7 @@ g il max x2 x9
 g ir min x8 x15
 g it */ h a1 50000
 g ib +- b 0 it
+r il it ir ib
 p 0 0 n 1
 M x2 y1
 C x3 y2 x4 y3 x5 y1
@@ -2475,6 +2533,7 @@ g x1 +- hc 0 dx1
 g x2 +- hc dx1 0
 g dy2 */ x1 dy1 wd2
 g y2 +- y1 dy2 0
+r x1 t x2 y2
 p 0 0 n 1
 M l y1
 L x1 y1
@@ -2508,6 +2567,7 @@ g dy3 */ ss a3 100000
 g y3 +- b 0 dy3
 g y2 */ h a4 100000
 g y1 */ y2 1 2
+r l t r y2
 p 0 0 n 1
 M l t
 L r t
@@ -2528,6 +2588,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -2582,6 +2643,7 @@ g cy6 +- cy3 rh 0
 g y7 +- y1 dy3 0
 g cy7 +- q1 q1 y7
 g y8 +- b 0 dy1
+r x2 q1 x5 y6
 p 0 0 n 0
 M l t
 Q cx1 cy1 x3 y1
@@ -2688,6 +2750,7 @@ g u7 +- u1 dy3 0
 g y7 +- b 0 u7
 g cu7 +- q1 q1 u7
 g cy7 +- b 0 cu7
+r x2 y6 x5 rh
 p 0 0 n 0
 M l b
 Q cx1 cy1 x3 y1
@@ -2744,6 +2807,7 @@ g y2 +- b 0 ssd6
 g il */ ssd6 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M l ssd6
 A ssd6 ssd6 cd2 cd4
@@ -2757,6 +2821,7 @@ Z
 =flowChartCollate
 g ir */ w 3 4
 g ib */ h 3 4
+r wd4 hd4 ir ib
 p 2 2 n 1
 M 0 0
 L 2 0
@@ -2772,6 +2837,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -2782,6 +2848,7 @@ Z
 =flowChartDecision
 g ir */ w 3 4
 g ib */ h 3 4
+r wd4 hd4 ir ib
 p 2 2 n 1
 M 0 1
 L 1 0
@@ -2794,6 +2861,7 @@ g idy sin hd2 2700000
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r l it ir ib
 p 0 0 n 1
 M l t
 L hc t
@@ -2802,6 +2870,7 @@ L l b
 Z
 =flowChartDisplay
 g x2 */ w 5 6
+r wd6 t x2 b
 p 6 6 n 1
 M 0 3
 L 1 0
@@ -2812,6 +2881,7 @@ Z
 =flowChartDocument
 g y1 */ h 17322 21600
 g y2 */ h 20172 21600
+r l t r y1
 p 21600 21600 n 1
 M 0 0
 L 21600 0
@@ -2820,6 +2890,7 @@ C 10800 17322 10800 23922 0 20172
 Z
 =flowChartExtract
 g x2 */ w 3 4
+r wd4 vc x2 b
 p 2 2 n 1
 M 0 2
 L 1 0
@@ -2830,6 +2901,7 @@ g x3 */ w 2 5
 g x4 */ w 3 5
 g x5 */ w 4 5
 g x6 */ w 9 10
+r wd5 t x5 b
 p 5 5 n 1
 M 0 5
 L 1 0
@@ -2837,6 +2909,7 @@ L 5 0
 L 4 5
 Z
 =flowChartInternalStorage
+r wd8 hd8 r b
 p 1 1 n 0
 M 0 0
 L 1 0
@@ -2856,6 +2929,7 @@ L 0 1
 Z
 =flowChartMagneticDisk
 g y3 */ h 5 6
+r l hd3 r y3
 p 6 6 n 0
 M 0 1
 A 3 1 cd2 cd2
@@ -2873,6 +2947,7 @@ A 3 1 0 cd2
 Z
 =flowChartMagneticDrum
 g x2 */ w 2 3
+r wd6 t x2 b
 p 6 6 n 0
 M 1 0
 L 5 0
@@ -2898,6 +2973,7 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 g ang1 at2 w h
+r il it ir ib
 p 0 0 n 1
 M hc b
 A wd2 hd2 cd4 cd4
@@ -2908,6 +2984,7 @@ L r ib
 L r b
 Z
 =flowChartManualInput
+r l hd5 r b
 p 5 5 n 1
 M 0 1
 L 5 0
@@ -2917,6 +2994,7 @@ Z
 =flowChartManualOperation
 g x3 */ w 4 5
 g x4 */ w 9 10
+r wd5 t x3 b
 p 5 5 n 1
 M 0 0
 L 5 0
@@ -2925,6 +3003,7 @@ L 1 5
 Z
 =flowChartMerge
 g x2 */ w 3 4
+r wd4 t x2 vc
 p 2 2 n 1
 M 0 0
 L 2 0
@@ -2936,6 +3015,7 @@ g y8 */ h 20782 21600
 g x3 */ w 9298 21600
 g x4 */ w 12286 21600
 g x5 */ w 18595 21600
+r l y2 x5 y8
 p 21600 21600 n 0
 M 0 20782
 C 9298 23542 9298 18022 18595 18022
@@ -2988,6 +3068,7 @@ L 0 3675
 Z
 =flowChartOfflineStorage
 g x4 */ w 3 4
+r wd4 t x4 vc
 p 2 2 n 0
 M 0 0
 L 2 0
@@ -3003,6 +3084,7 @@ L 1 2
 Z
 =flowChartOffpageConnector
 g y1 */ h 4 5
+r l t r y1
 p 10 10 n 1
 M 0 0
 L 10 0
@@ -3012,6 +3094,7 @@ L 0 8
 Z
 =flowChartOnlineStorage
 g x2 */ w 5 6
+r wd6 t x2 b
 p 6 6 n 1
 M 1 0
 L 6 0
@@ -3026,6 +3109,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 0
 M l vc
 A wd2 hd2 cd2 cd4
@@ -3047,6 +3131,7 @@ A wd2 hd2 cd4 cd4
 Z
 =flowChartPredefinedProcess
 g x2 */ w 7 8
+r wd8 t x2 b
 p 1 1 n 0
 M 0 0
 L 1 0
@@ -3066,6 +3151,7 @@ L 0 1
 Z
 =flowChartPreparation
 g x2 */ w 4 5
+r wd5 t x2 b
 p 10 10 n 1
 M 0 5
 L 2 0
@@ -3075,6 +3161,7 @@ L 8 10
 L 2 10
 Z
 =flowChartProcess
+r l t r b
 p 1 1 n 1
 M 0 0
 L 1 0
@@ -3082,6 +3169,7 @@ L 1 1
 L 0 1
 Z
 =flowChartPunchedCard
+r l hd5 r b
 p 5 5 n 1
 M 0 1
 L 1 0
@@ -3092,6 +3180,7 @@ Z
 =flowChartPunchedTape
 g y2 */ h 9 10
 g ib */ h 4 5
+r l hd5 r ib
 p 20 20 n 1
 M 0 2
 A 5 2 cd2 -10800000
@@ -3103,6 +3192,7 @@ Z
 =flowChartSort
 g ir */ w 3 4
 g ib */ h 3 4
+r wd4 hd4 ir ib
 p 2 2 n 0
 M 0 1
 L 1 0
@@ -3125,6 +3215,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 0
 M l vc
 A wd2 hd2 cd2 cd4
@@ -3149,6 +3240,7 @@ g il */ w 1018 21600
 g ir */ w 20582 21600
 g it */ h 3163 21600
 g ib */ h 18437 21600
+r il it ir ib
 p 21600 21600 n 1
 M 3475 0
 L 18125 0
@@ -3165,6 +3257,7 @@ g x1 +- r 0 dy2
 g x2 +- x1 dy1 0
 g y2 +- b 0 dy2
 g y1 +- y2 dy1 0
+r l t r y2
 p 0 0 n 0
 M l t
 L r t
@@ -3192,6 +3285,7 @@ g a1 pin 0 adj1 50000
 g x1 */ ss a1 100000
 g x4 +- r 0 x1
 g y4 +- b 0 x1
+r x1 x1 x4 y4
 p 0 0 n 1
 M l t
 L r t
@@ -3235,6 +3329,7 @@ g vc3 +- b 0 rh3
 g y2 +- vc3 dy3 0
 g x2 +- wd2 0 rw2
 g cd */ cd2 2 1
+r l t r b
 p 0 0 n 1
 M x1 y1
 A wd2 hd4 stAng1 swAng1
@@ -3354,6 +3449,7 @@ g xCxn1 +/ xB1 xC1 2
 g yCxn1 +/ yB1 yC1 2
 g yCxn2 +- b 0 yCxn1
 g xCxn4 +/ r 0 xCxn1
+r xD5 yA1 xA1 yD2
 p 0 0 n 1
 M xA1 yA1
 L xB1 yB1
@@ -3626,6 +3722,7 @@ g xCxn5 +/ r 0 xCxn4
 g xCxn6 +/ r 0 xCxn3
 g xCxn7 +/ r 0 xCxn2
 g xCxn8 +/ r 0 xCxn1
+r xA8 yD1 xD1 yD3
 p 0 0 n 1
 M xA1 yA1
 L xB1 yB1
@@ -3684,6 +3781,7 @@ g cx1 */ x1 1 2
 g cy1 +/ y2 b 2
 g cx2 +/ x2 r 2
 g cy2 */ y1 1 2
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -3703,6 +3801,7 @@ g y1 +- t 0 hd3
 g il */ w 1 6
 g ir */ w 5 6
 g ib */ h 2 3
+r il hd4 ir ib
 p 0 0 n 1
 M hc hd4
 C x3 y1 x4 hd4 hc b
@@ -3730,6 +3829,7 @@ g y1 +- svc 0 dy1
 g y2 +- svc dy2 0
 g y3 +- svc dy3 0
 g ib +- b 0 y1
+r x2 y1 x5 ib
 p 0 0 n 1
 M x1 y2
 L x2 y1
@@ -3762,6 +3862,7 @@ g il */ w q8 24
 g it */ h q8 24
 g ir +- r 0 il
 g ib +- b 0 it
+r il it ir ib
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -3778,6 +3879,7 @@ g dx1 */ ss a 100000
 g x1 +- r 0 dx1
 g ir +/ x1 r 2
 g x2 */ x1 1 2
+r l t ir b
 p 0 0 n 1
 M l t
 L x1 t
@@ -3798,6 +3900,7 @@ g y7 +- b 0 ch2
 g y5 +- y6 0 ch2
 g x3 +- r 0 ch
 g x4 +- r 0 ch2
+r ch ch x4 y6
 p 0 0 n 0
 M r ch2
 A ch2 ch2 0 cd4
@@ -3858,6 +3961,7 @@ g y3 */ h 6320 21600
 g y6 */ h 8615 21600
 g y9 */ h 13937 21600
 g y18 */ h 13290 21600
+r x5 y3 x21 y9
 p 21600 21600 n 1
 M 10800 5800
 L 14522 0
@@ -3896,6 +4000,7 @@ g y14 */ h 19712 21600
 g y16 */ h 18842 21600
 g y17 */ h 15935 21600
 g y24 */ h 6645 21600
+r x5 y3 x19 y17
 p 21600 21600 n 1
 M 11462 4342
 L 14790 0
@@ -3939,6 +4044,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc dy1 0
 g dx1 */ y1 dx2 hd2
 g x1 +- x2  0 dx1
+r x1 y1 r y2
 p 0 0 n 1
 M l vc
 L x2 t
@@ -3972,6 +4078,7 @@ g x1 */ ss a3 100000
 g dx2 */ w a4 100000
 g x2 +- r 0 dx2
 g x3 +/ x2 r 2
+r x2 t r b
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -4002,6 +4109,7 @@ g dy1 sin y1 2700000
 g il +- r 0 dx1
 g it +- y1 0 dy1
 g ib +- b dy1 y1
+r il it r ib
 p 0 0 n 0
 M r b
 A wd2 y1 cd4 cd4
@@ -4030,6 +4138,7 @@ g dy1 sin y1 2700000
 g il +- r 0 dx1
 g it +- y1 0 dy1
 g ib +- b dy1 y1
+r il it r ib
 p 0 0 n 0
 M r b
 A w y1 cd4 cd4
@@ -4252,6 +4361,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M xE yE
 L xD yD
@@ -4276,6 +4386,7 @@ g y2 +- vc dy 0
 g dx1 */ y1 x2 hd2
 g x1 +- x2 0 dx1
 g x4 +- x3 dx1 0
+r x1 y1 x4 y2
 p 0 0 n 1
 M l vc
 L x2 t
@@ -4313,6 +4424,7 @@ g x4 +- r 0 x1
 g dx2 */ w a4 200000
 g x2 +- hc 0 dx2
 g x3 +- hc dx2 0
+r x2 t x3 b
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -4569,6 +4681,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M xL yL
 L xKp yKp
@@ -4608,6 +4721,7 @@ g x2 +- hc 0 wd32
 g x3 +- hc wd32 0
 g y1 +- ly1 hR 0
 g y2 +- ry2 0 hR
+r x1 ly1 x4 ry4
 p 0 0 n 0
 M l ly2
 L x1 t
@@ -4679,6 +4793,7 @@ g y3 +- y4 0 dx3
 g y5 +- y4 dx3 0
 g il */ dx3 x1 dx2
 g ir +- r 0 il
+r il y3 ir y5
 p 0 0 n 1
 M l y4
 L x1 y2
@@ -4722,6 +4837,7 @@ g y5 +- y4 dx3 0
 g il */ dx3 x1 dx4
 g cx1 +/ x1 x5 2
 g cy1 +/ x1 y5 2
+r il y3 x4 y5
 p 0 0 n 1
 M l y4
 L x1 y2
@@ -4751,6 +4867,7 @@ g y6 */ h 9705 21600
 g y7 */ h 12007 21600
 g y10 */ h 14277 21600
 g y11 */ h 14915 21600
+r x4 y4 x9 y10
 p 21600 21600 n 1
 M 8472 0
 L 12860 6080
@@ -4798,6 +4915,7 @@ g y5 +- b 0 y1
 g x1 +- hc 0 dx1
 g x3 +- hc dx1 0
 g x2 +- hc 0 rad
+r x1 y3 x3 y4
 p 0 0 n 1
 M hc y1
 A rad rad 3cd4 21600000
@@ -4828,6 +4946,7 @@ g x1 +- hc 0 dx1
 g x2 +- hc dx1 0
 g yC1 +/ y1 y2 2
 g yC2 +/ y3 y4 2
+r x1 y1 x2 y4
 p 0 0 n 1
 M x1 y1
 L x2 y1
@@ -4848,6 +4967,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc dy1 0
 g x1 +- hc 0 dx1
 g x2 +- hc dx1 0
+r x1 y1 x2 y2
 p 0 0 n 1
 M x1 y1
 L x2 y1
@@ -4887,6 +5007,7 @@ g yH +- b 0 yB
 g yI +- b 0 yC
 g xC2 +- r 0 xM
 g yC3 +- b 0 yM
+r xA yB xE yH
 p 0 0 n 1
 M xA yA
 L xB yB
@@ -4960,6 +5081,7 @@ g yC1 +/ ry ly 2
 g yC2 +/ y1 y2 2
 g yC3 +/ y3 y4 2
 g yC4 +/ dry dly 2
+r x1 y1 x8 y4
 p 0 0 n 1
 M x1 y1
 L x6 y1
@@ -4996,6 +5118,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc 0 dx2
 g y3 +- vc dx2 0
 g y4 +- vc dy1 0
+r x1 y2 x4 y3
 p 0 0 n 1
 M x1 y2
 L x2 y2
@@ -5046,6 +5169,7 @@ g stAng1 at2 dx2 dy2
 g enAngp1 at2 dx2 hd2
 g enAng1 +- enAngp1 0 21600000
 g swAng1 +- enAng1 0 stAng1
+r g12w g15h g0w g16h
 p 0 0 n 1
 M r b
 A w hd2 cd4 cd2
@@ -5067,6 +5191,7 @@ g adjm max a1 a2
 g it */ hd3 adjm maxAdj
 g irt */ wd3 a2 maxAdj
 g ir +- r 0 irt
+r il it ir b
 p 0 0 n 1
 M l b
 L x2 t
@@ -5107,6 +5232,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -5133,6 +5259,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc dy1 0
 g x1 */ dy1 dx2 hd2
 g x3 +- r 0 x1
+r x1 y1 x3 y2
 p 0 0 n 1
 M l y1
 L x2 y1
@@ -5152,6 +5279,7 @@ g y2 +- b 0 x1
 g il */ x1 1 2
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M l x1
 L x1 t
@@ -5182,6 +5310,7 @@ g ib +- b 0 it
 g q3 */ h hc x2
 g y1 pin 0 q3 h
 g y2 +- b 0 y1
+r il it ir ib
 p 0 0 n 1
 M l b
 L x2 t
@@ -5205,6 +5334,7 @@ g x4 +- hc dx1 0
 g y1 +- svc 0 dy1
 g y2 +- svc 0 dy2
 g it */ y1 dx2 dx1
+r x2 it x3 y2
 p 0 0 n 1
 M x1 y1
 L hc t
@@ -5238,6 +5368,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il ir it ib
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -5248,6 +5379,7 @@ g g1 cos w 13500000
 g g2 sin h 13500000
 g x1 +- r g1 0
 g y1 +- b g2 0
+r x1 y1 r b
 p 0 0 n 1
 M l b
 A w h cd2 cd4
@@ -5262,6 +5394,7 @@ g y2 +- b 0 x1
 g il */ x1 70711 100000
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M l x1
 A x1 x1 cd4 -5400000
@@ -5277,6 +5410,7 @@ g md mod w h 0
 g dx */ 1 md 20
 g y1 +- 0 b dx
 g x1 +- 0 r dx
+r dx dx x1 y1
 p 0 0 n 1
 M l t
 L dx t
@@ -5308,6 +5442,7 @@ g il ?: d l x1
 g ir ?: d r x2
 g it ?: d x1 t
 g ib ?: d y2 b
+r il it ir ib
 p 0 0 n 1
 M l x1
 L x1 x1
@@ -5347,6 +5482,7 @@ g y4 +- vc dx3 0
 g y6 +- b 0 x1
 g il */ dx3 x1 dx2
 g ir +- r 0 il
+r il y3 ir y4
 p 0 0 n 1
 M l vc
 L x1 y2
@@ -5405,6 +5541,7 @@ g y3 +- vc 0 dx2
 g y6 +- vc dx2 0
 g y4 +- vc 0 dx3
 g y5 +- vc dx3 0
+r x2 y2 x7 y7
 p 0 0 n 1
 M l vc
 L ah y3
@@ -5440,6 +5577,7 @@ L ah y5
 L ah y6
 Z
 =rect
+r l t r b
 p 0 0 n 1
 M l t
 L r t
@@ -5468,6 +5606,7 @@ g y3 */ y4 1 2
 g hR */ h a1 400000
 g y5 +- b 0 hR
 g y6 +- y2 0 hR
+r x2 y2 x9 b
 p 0 0 n 0
 M l t
 L x4 t
@@ -5557,6 +5696,7 @@ g y3 +/ y4 b 2
 g hR */ h a1 400000
 g y6 +- b 0 hR
 g y7 +- y1 0 hR
+r x2 t x9 y2
 p 0 0 n 0
 M l b
 L x4 b
@@ -5636,6 +5776,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc dy1 0
 g dx2 */ y1 dx1 hd2
 g x2 +- x1 dx2 0
+r l y1 x2 y2
 p 0 0 n 1
 M l y1
 L x1 y1
@@ -5669,6 +5810,7 @@ g dx3 */ ss a3 100000
 g x3 +- r 0 dx3
 g x2 */ w a4 100000
 g x1 */ x2 1 2
+r l t x2 b
 p 0 0 n 1
 M l t
 L x2 t
@@ -5700,6 +5842,7 @@ g dy1 sin y1 2700000
 g ir +- l dx1 0
 g it +- y1 0 dy1
 g ib +- b dy1 y1
+r l it ir ib
 p 0 0 n 0
 M l t
 A wd2 y1 3cd4 cd4
@@ -5728,6 +5871,7 @@ g dy1 sin y1 2700000
 g ir +- l dx1 0
 g it +- y1 0 dy1
 g ib +- b dy1 y1
+r l it ir ib
 p 0 0 n 0
 M l t
 A w y1 3cd4 cd4
@@ -5746,6 +5890,7 @@ g dx1 */ ss a 100000
 g x1 +- r 0 dx1
 g idx */ dx1 29289 100000
 g ir +- r 0 idx
+r l t ir b
 p 0 0 n 1
 M l t
 L x1 t
@@ -5769,6 +5914,7 @@ g d +- dx1 0 dx2
 g dx ?: d dx1 dx2
 g ir +- r 0 dx
 g ib +- b 0 dx
+r dx dx ir ib
 p 0 0 n 1
 M x1 t
 L x2 t
@@ -5796,6 +5942,7 @@ g bdx */ bx1 29289 100000
 g il ?: d tdx bdx
 g ir +- r 0 il
 g ib +- b 0 bdx
+r il tdx ir ib
 p 0 0 n 1
 M tx1 t
 L tx2 t
@@ -5816,6 +5963,7 @@ g y2 +- b 0 x1
 g il */ x1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M l x1
 A x1 x1 cd2 cd4
@@ -5830,6 +5978,7 @@ Z
 g it */ h 7 12
 g ir */ w 7 12
 g ib */ h 11 12
+r wd12 it ir ib
 p 0 0 n 1
 M l b
 L l t
@@ -5857,6 +6006,7 @@ g it +- vc 0 idy
 g ib +- vc idy 0
 g wR */ w 1125 21600
 g hR */ h 1125 21600
+r il it ir ib
 p 0 0 n 0
 M l vc
 A wd2 hd2 cd2 21600000
@@ -5880,6 +6030,7 @@ g dx1 */ ss a 100000
 g x1 +- r 0 dx1
 g it */ dx1 1 2
 g ir +/ x1 r 2
+r l it ir b
 p 0 0 n 1
 M l t
 L x1 t
@@ -5903,6 +6054,7 @@ g dx ?: d lx1 rx1
 g il */ dx 1 2
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M lx1 t
 L rx2 t
@@ -5929,6 +6081,7 @@ g il */ dx 1 2
 g ir +- r 0 il
 g it */ tx1 1 2
 g ib +/ by1 b 2
+r il it ir ib
 p 0 0 n 1
 M tx1 t
 L tx2 t
@@ -5949,6 +6102,7 @@ g dx2 */ ss a2 100000
 g x2 +- r 0 dx2
 g il */ x1 29289 100000
 g ir +/ x2 r 2
+r il il ir b
 p 0 0 n 1
 M x1 t
 L x2 t
@@ -5963,6 +6117,7 @@ g md mod w h 0
 g dx */ 1 md 20
 g y1 +- 0 b dx
 g x1 +- 0 r dx
+r dx dx x1 y1
 p 0 0 n 1
 M l t
 L dx t
@@ -6021,6 +6176,7 @@ g sy2 +- vc 0 sdy2
 g sy3 +- vc sdy2 0
 g sy4 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
+r sx2 sy2 sx5 sy3
 p 0 0 n 1
 M x1 y2
 L sx2 sy2
@@ -6075,6 +6231,7 @@ g sy4 +- vc sdy3 0
 g sy5 +- vc sdy2 0
 g sy6 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
+r sx2 sy2 sx5 sy5
 p 0 0 n 1
 M l vc
 L sx1 sy3
@@ -6155,6 +6312,7 @@ g it +- vc 0 idy
 g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
+r il it ir ib
 p 0 0 n 1
 M l vc
 L sx1 sy4
@@ -6267,6 +6425,7 @@ g it +- vc 0 idy
 g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
+r il it ir ib
 p 0 0 n 1
 M l vc
 L sx1 sy6
@@ -6419,6 +6578,7 @@ g it +- vc 0 idy
 g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
+r il it ir ib
 p 0 0 n 1
 M l vc
 L sx1 sy8
@@ -6497,6 +6657,7 @@ g sx2 +- hc sdx 0
 g sy1 +- vc 0 sdy
 g sy2 +- vc sdy 0
 g yAdj +- vc 0 ihd2
+r sx1 sy1 sx2 sy2
 p 0 0 n 1
 M l vc
 L sx1 sy1
@@ -6539,6 +6700,7 @@ g sy1 +- svc 0 sdy1
 g sy2 +- svc 0 sdy2
 g sy3 +- svc ihd2 0
 g yAdj +- svc 0 ihd2
+r sx1 sy1 sx4 sy3
 p 0 0 n 1
 M x1 y1
 L sx2 sy1
@@ -6571,6 +6733,7 @@ g sdy1 sin ihd2 3600000
 g sy1 +- vc 0 sdy1
 g sy2 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
+r sx1 sy1 sx4 sy2
 p 0 0 n 1
 M x1 hd4
 L sx2 sy1
@@ -6627,6 +6790,7 @@ g sy2 +- svc 0 sdy2
 g sy3 +- svc sdy3 0
 g sy4 +- svc ihd2 0
 g yAdj +- svc 0 ihd2
+r sx2 sy1 sx5 sy3
 p 0 0 n 1
 M x1 y2
 L sx1 sy2
@@ -6667,6 +6831,7 @@ g sy2 +- vc 0 sdy2
 g sy3 +- vc sdy2 0
 g sy4 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
+r sx1 sy1 sx4 sy4
 p 0 0 n 1
 M l vc
 L sx1 sy2
@@ -6686,6 +6851,7 @@ L x1 y2
 L sx1 sy3
 Z
 =straightConnector1
+r l t r b
 p 0 0 - 1
 M l t
 L r b
@@ -6703,6 +6869,7 @@ g y1 +- vc 0 dy1
 g y2 +- vc dy1 0
 g dx6 */ dy1 dx5 hd2
 g x6 +- r 0 dx6
+r x4 y1 x6 y2
 p 0 0 n 1
 M l y1
 L ssd32 y1
@@ -6771,6 +6938,7 @@ g y15 */ h g15 100000
 g y16 */ h g16 100000
 g y17 */ h g17 100000
 g y18 */ h g18 100000
+r x9 y9 x8 y8
 p 0 0 n 1
 M r vc
 L x15 y18
@@ -6835,6 +7003,7 @@ g xP1 val wd6
 g dy5 */ hd6 1 2
 g yP2 +- yF dy5 0
 g xP2 val wd4
+r l t r b
 p 0 0 n 1
 M l b
 Q xP1 yP1 xB yB
@@ -6864,6 +7033,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -6883,6 +7053,7 @@ g x4 +- r 0 x1
 g il */ wd3 a maxAdj
 g it */ hd3 a maxAdj
 g ir +- r 0 il
+r il it ir b
 p 0 0 n 1
 M l b
 L x2 t
@@ -6895,6 +7066,7 @@ g a pin 0 adj 100000
 g x1 */ w a 200000
 g x2 */ w a 100000
 g x3 +- x1 wd2 0
+r x1 vc x3 b
 p 0 0 n 1
 M l b
 L x2 t
@@ -6924,6 +7096,7 @@ g y1 */ ss a3 100000
 g dy2 */ h a4 100000
 g y2 +- b 0 dy2
 g y3 +/ y2 b 2
+r l y2 r b
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -6951,6 +7124,7 @@ g x2 +- hc dx1 0
 g dy1 */ x1 y2 wd2
 g y1 +- y2 0 dy1
 g y4 +- y3 dy1 0
+r x1 y1 x2 y4
 p 0 0 n 1
 M l y2
 L hc t
@@ -6976,6 +7150,7 @@ g x1 +- hc 0 dx1
 g x2 +- hc dx1 0
 g dy1 */ x1 dy2 wd2
 g y1 +- y2  0 dy1
+r x1 y1 x2 b
 p 0 0 n 1
 M l y2
 L hc t
@@ -7010,6 +7185,7 @@ g y4 +- b 0 y1
 g dy2 */ h a4 200000
 g y2 +- vc 0 dy2
 g y3 +- vc dy2 0
+r l y2 r y3
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -7068,6 +7244,7 @@ g x7 +- x6 dh2 0
 g x4 +- x9 0 bd
 g x5 +- x7 0 bd2
 g cx +/ th x7 2
+r l t r b
 p 0 0 n 1
 M l b
 L l bd
@@ -7098,6 +7275,7 @@ g x7 +- r 0 ch2
 g x5 +- x6 0 ch2
 g y3 +- b 0 ch
 g y4 +- b 0 ch2
+r ch ch x6 y4
 p 0 0 n 0
 M ch2 b
 A ch2 ch2 cd4 -5400000
@@ -7182,6 +7360,7 @@ g il max x2 x6
 g ir min x5 x10
 g it */ h a1 50000
 g ib +- b 0 it
+r il it ir ib
 p 0 0 n 1
 M x2 y1
 C x3 y2 x4 y3 x5 y1
@@ -7219,6 +7398,7 @@ g il +- hc 0 idx
 g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
+r il it ir ib
 p 0 0 n 1
 M xPos yPos
 L x1 y1
@@ -7261,6 +7441,7 @@ g t7 ?: dxPos yPos y1
 g yr ?: dz y1 t7
 g t8 ?: dyPos yPos b
 g yb ?: dz t8 b
+r l t r b
 p 0 0 n 1
 M l t
 L x1 t
@@ -7321,6 +7502,7 @@ g v2 +- b 0 u1
 g il */ u1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
+r il il ir ib
 p 0 0 n 1
 M l u1
 A u1 u1 cd2 cd4

@@ -51,7 +51,7 @@ pub fn floats_doc() -> TextDoc {
     ];
     let body = "Text goes round the picture this paragraph anchors, beside it, above and below it, or over it. ".repeat(4);
     for (i, f) in floats.iter().enumerate() {
-        let a = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 2160 - 200 * i as u32, height: 1440, float: Some(*f) }), ..Default::default() });
+        let a = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 2160 - 200 * i as u32, height: 1440, float: Some(*f), shape: false }), ..Default::default() });
         let text = format!("{OBJECT_CHAR}{body}");
         d.push_para(&text, 0, vec![(0, a), (OBJECT_CHAR.len_utf8() as u32, 0)]);
     }

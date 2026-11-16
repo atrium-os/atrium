@@ -163,7 +163,47 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
                     }
                 }
                 // Comments stay out of the PDF.
-                Item::Mark { .. } | Item::Change { .. } => {}
+                Item::Mark { .. } | Item::Change { .. } | Item::Shape { .. } => {}
+                Item::Path { cmds, fill, line } => {
+                    use officina_text::model::{Dash, PathCmd};
+                    let p = |x: i64, y: i64| (pt(x), ph - pt(y));
+                    let mut path = Vec::with_capacity(cmds.len());
+                    for cm in &cmds {
+                        path.push(match *cm {
+                            PathCmd::Move(x, y) => {
+                                let (x, y) = p(x, y);
+                                Op::MoveTo(x, y)
+                            }
+                            PathCmd::Line(x, y) => {
+                                let (x, y) = p(x, y);
+                                Op::LineTo(x, y)
+                            }
+                            PathCmd::Cubic(a, b, cc, d, e, f) => {
+                                let ((a, b), (cc, d), (e, f)) = (p(a, b), p(cc, d), p(e, f));
+                                Op::CurveTo([a, b, cc, d, e, f])
+                            }
+                            PathCmd::Close => Op::ClosePath,
+                        });
+                    }
+                    if let Some(f) = fill {
+                        c.push(Op::FillRgb(rgb(f)));
+                        c.extend(path.iter().cloned());
+                        c.push(Op::Fill);
+                    }
+                    if let Some((color, width, dash)) = line {
+                        let w = pt(width);
+                        let pattern = match dash {
+                            Dash::Solid => vec![],
+                            Dash::Dot => vec![w, w],
+                            Dash::Dash => vec![4.0 * w, 3.0 * w],
+                            Dash::DashDot => vec![4.0 * w, 3.0 * w, w, 3.0 * w],
+                            Dash::LongDash => vec![8.0 * w, 3.0 * w],
+                        };
+                        c.extend([Op::Save, Op::StrokeRgb(rgb(color)), Op::LineWidth(w), Op::Dash(pattern, 0.0)]);
+                        c.extend(path);
+                        c.extend([Op::Stroke, Op::Restore]);
+                    }
+                }
                 Item::Link { x, y, w, h, uri } => {
                     if uri_ok(&uri) {
                         annots.push(Object::Dict(dict([

@@ -909,7 +909,7 @@ impl Editor {
             let before = self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1)));
             self.doc.attrs.get(before).clone()
         });
-        a.object = Some(ObjectRef { image, width: w.max(1) as u32, height: h.max(1) as u32, float: None });
+        a.object = Some(ObjectRef { image, width: w.max(1) as u32, height: h.max(1) as u32, float: None, shape: false });
         let attr = self.doc.attrs.intern(a);
         let ins = Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] };
         ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins });

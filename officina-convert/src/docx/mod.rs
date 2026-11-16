@@ -43,7 +43,7 @@ pub(crate) mod tests {
             v
         };
         let img = d.images.add(ImageData { bytes: Arc::from(png), width: 40, height: 20 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None, shape: false }), ..Default::default() });
         d.push_para("See \u{FFFC} here", 0, vec![(0, 0), (4, pic), (7, 0)]);
         let sup = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Super), ..Default::default() });
         let sub = d.attrs.intern(CharAttrs { vert: Some(officina_text::model::VertAlign::Sub), ..Default::default() });
@@ -213,7 +213,7 @@ pub(crate) mod tests {
         let mut d = TextDoc::new();
         d.push_para("Body", 0, vec![]);
         let img = d.images.add(ImageData { bytes: std::sync::Arc::from(&b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x08\x08\x02\0\0\0"[..]), width: 16, height: 8 });
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None, shape: false }), ..Default::default() });
         let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
         let logo = Para { runs: vec![(0, pic), (3, bold)], ..Para::new(d.new_id(), "\u{FFFC} Acme Ltd", 0) };
         let num = Para { runs: vec![(0, 0), (5, bold), (11, 0)], ..Para::new(d.new_id(), "Page {page} of {pages}", 0) };

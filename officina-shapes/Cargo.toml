@@ -1,0 +1,16 @@
+[package]
+name = "officina-shapes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Shape outlines for Officina (docs/spec/officina.md §16.48, §16.50): paths, OOXML preset shapes from the standard's definitions, custom geometry with guides."
+
+[lib]
+name = "officina_shapes"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+debug = 1

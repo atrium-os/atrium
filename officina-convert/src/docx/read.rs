@@ -392,6 +392,13 @@ struct Reader<'a> {
     /// Text boxes met in the paragraph being read; their paragraphs follow it.
     boxes: Vec<El>,
     box_depth: usize,
+    /// The theme (colours, line widths) shapes' style references name.
+    theme: Option<(officina_slides::model::Theme, Vec<i64>)>,
+    /// Shapes' text to read once the body is read: shape, `w:txbxContent`,
+    /// the style's text colour.
+    shape_text: Vec<(u32, Vec<usize>, El, Option<u32>)>,
+    /// Reading a shape's text (which holds no shapes).
+    in_shape: bool,
     /// Footnotes and endnotes by their `w:id`, and the relationships of their parts.
     foot_xml: HashMap<String, El>,
     end_xml: HashMap<String, El>,
@@ -656,7 +663,218 @@ impl<'a> Reader<'a> {
         self.pictures += 1;
         // Notes have no page of their own to float on: in line there.
         let float = drawing.child("wp:anchor").filter(|_| !self.in_note).map(|a| self.anchor(a, h));
-        Some(ObjectRef { image, width: w, height: h, float })
+        Some(ObjectRef { image, width: w, height: h, float, shape: false })
+    }
+
+    /// Whether drawing `d` is a shape this reader reads as one (not in a
+    /// header, a note or another shape's text): a shape or a group of them.
+    fn takes_shape(&self, d: &El, field: &FieldState) -> bool {
+        !self.in_shape && !field.in_margin && d.find("a:graphicData").is_some_and(|g| g.child("wps:wsp").is_some() || g.child("wpg:wgp").is_some())
+    }
+
+    /// A drawn shape (`wps:wsp`) or group (`wpg:wgp`); text is read after
+    /// the body.
+    fn shape(&mut self, drawing: &El) -> Option<ObjectRef> {
+        use officina_text::model::MAX_SHAPES;
+        let gd = drawing.find("a:graphicData")?;
+        if self.doc.shapes.next_id() as usize >= MAX_SHAPES {
+            self.rep.note(Kind::Dropped, "shapes past the limit");
+            return None;
+        }
+        let mut texts = Vec::new();
+        let sd = if let Some(wsp) = gd.child("wps:wsp") {
+            let (sd, t) = self.wsp(wsp);
+            texts.extend(t.map(|(e, f)| (Vec::new(), e, f)));
+            sd
+        } else {
+            let mut budget = officina_text::model::MAX_GROUP_SHAPES;
+            self.group(gd.child("wpg:wgp")?, 0, &mut Vec::new(), &mut texts, &mut budget)
+        };
+        let ext = drawing.find("wp:extent");
+        let emu = |k: &str| ext.and_then(|e| num(e.attr(k))).unwrap_or(0);
+        let side = |v: i64| (v / 635).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
+        let (w, h) = (side(emu("cx")), side(emu("cy")));
+        let id = self.doc.shapes.add(sd)?;
+        for (path, e, f) in texts {
+            self.shape_text.push((id, path, e, f));
+        }
+        let float = drawing.child("wp:anchor").filter(|_| !self.in_note).map(|a| self.anchor(a, h));
+        Some(ObjectRef { image: id, width: w, height: h, float, shape: true })
+    }
+
+    /// A group's shapes, each framed in the group's child coordinates.
+    fn group(&mut self, g: &El, depth: usize, path: &mut Vec<usize>, texts: &mut Vec<(Vec<usize>, El, Option<u32>)>, budget: &mut usize) -> officina_text::model::ShapeData {
+        use officina_text::model::{Geom, ShapeData, ShapeKid, MAX_GROUP_DEPTH};
+        let mut sd = ShapeData::new(Geom::preset("rect"));
+        let gx = g.child("wpg:grpSpPr").and_then(|p| p.child("a:xfrm"));
+        if let Some(x) = gx {
+            sd.rot = num(x.attr("rot")).unwrap_or(0).rem_euclid(21_600_000) as i32;
+            sd.flip_h = matches!(x.attr("flipH"), Some("1") | Some("true"));
+            sd.flip_v = matches!(x.attr("flipV"), Some("1") | Some("true"));
+        }
+        let pair = |x: Option<&El>, k: &str, a: &str, b: &str| x.and_then(|x| x.child(k)).map(|e| (num(e.attr(a)).unwrap_or(0), num(e.attr(b)).unwrap_or(0)));
+        // Without child coordinates of its own, a group's shapes are placed
+        // from its corner at its own scale (as Word and LibreOffice read it).
+        let ch_off = pair(gx, "a:chOff", "x", "y").unwrap_or((0, 0));
+        let ch_ext = pair(gx, "a:chExt", "cx", "cy").or(pair(gx, "a:ext", "cx", "cy")).unwrap_or((1, 1));
+        let (ew, eh) = (ch_ext.0.max(1) as i128, ch_ext.1.max(1) as i128);
+        let frac = |v: i64, o: i64, e: i128| ((v as i128 - o as i128) * 100_000 / e).clamp(-100_000_000, 100_000_000) as i32;
+        for k in g.els() {
+            let (kid, xf) = match k.name.as_str() {
+                "wps:wsp" => {
+                    let (kd, t) = self.wsp(k);
+                    path.push(sd.kids.len());
+                    texts.extend(t.map(|(e, f)| (path.clone(), e, f)));
+                    path.pop();
+                    (kd, k.child("wps:spPr").and_then(|p| p.child("a:xfrm")))
+                }
+                "wpg:grpSp" if depth + 1 < MAX_GROUP_DEPTH => {
+                    path.push(sd.kids.len());
+                    let kd = self.group(k, depth + 1, path, texts, budget);
+                    path.pop();
+                    (kd, k.child("wpg:grpSpPr").and_then(|p| p.child("a:xfrm")))
+                }
+                "pic:pic" | "wpg:graphicFrame" => {
+                    self.rep.note(Kind::Dropped, "pictures and charts in groups of shapes");
+                    continue;
+                }
+                _ => continue,
+            };
+            if *budget == 0 {
+                self.rep.note(Kind::Dropped, "shapes past the limit");
+                break;
+            }
+            *budget -= 1;
+            let off = pair(xf, "a:off", "x", "y").unwrap_or(ch_off);
+            let ext = pair(xf, "a:ext", "cx", "cy").unwrap_or((0, 0));
+            sd.kids.push(ShapeKid { x: frac(off.0, ch_off.0, ew), y: frac(off.1, ch_off.1, eh), w: frac(ext.0, 0, ew).max(0), h: frac(ext.1, 0, eh).max(0), shape: kid });
+        }
+        sd
+    }
+
+    /// A `wps:wsp`'s outline, fill, line, turn and text box, and its text
+    /// to read later (with the style's text colour).
+    fn wsp(&mut self, wsp: &El) -> (officina_text::model::ShapeData, Option<(El, Option<u32>)>) {
+        use officina_slides::model::{Dash as SDash, Fill};
+        use officina_text::model::{Dash, Geom, ShapeData, ShapeLine, TextAnchor};
+        let sp_pr = wsp.child("wps:spPr");
+        let widths = self.theme.as_ref().map_or(&[][..], |t| &t.1[..]).to_vec();
+        let look = crate::pptx::read::drawing_look(self.archive, &self.rels, sp_pr, wsp.child("wps:style"), &widths, &mut self.rep);
+        let default_theme = officina_slides::model::Theme::default();
+        let theme = self.theme.as_ref().map_or(&default_theme, |t| &t.0);
+        let rgb = |c: &officina_slides::model::Color| {
+            let v = officina_slides::resolve::color(theme, c);
+            (v & 0xFF != 0).then_some(v >> 8)
+        };
+        let mut sd = ShapeData::new(look.geom.unwrap_or_else(|| Geom::preset("rect")));
+        sd.fill = match &look.fill {
+            Some(Fill::Solid(c)) => rgb(c),
+            Some(Fill::Gradient { stops, .. }) => {
+                self.rep.note(Kind::Approximate, "gradient fills in documents drawn in one colour");
+                stops.get(stops.len() / 2).and_then(|g| rgb(&g.color))
+            }
+            Some(Fill::Picture(_)) => {
+                self.rep.note(Kind::Dropped, "picture fills of shapes");
+                None
+            }
+            _ => None,
+        };
+        sd.line = look.line.as_ref().and_then(|l| {
+            let color = rgb(l.color.as_ref()?)?;
+            let dash = match l.dash {
+                SDash::Solid => Dash::Solid,
+                SDash::Dot => Dash::Dot,
+                SDash::Dash => Dash::Dash,
+                SDash::DashDot => Dash::DashDot,
+                SDash::LongDash => Dash::LongDash,
+            };
+            let end = |a: officina_slides::model::Arrow| {
+                use officina_slides::model::Arrow as A;
+                use officina_text::model::ArrowEnd as E;
+                match a {
+                    A::None => E::None,
+                    A::Triangle => E::Triangle,
+                    A::Open => E::Open,
+                    A::Stealth => E::Stealth,
+                    A::Diamond => E::Diamond,
+                    A::Oval => E::Oval,
+                }
+            };
+            Some(ShapeLine { color, width: (l.width / 635).clamp(0, 2880) as i32, dash, head: end(l.head), tail: end(l.tail) })
+        });
+        if let Some(x) = sp_pr.and_then(|s| s.child("a:xfrm")) {
+            sd.rot = num(x.attr("rot")).unwrap_or(0).rem_euclid(21_600_000) as i32;
+            sd.flip_h = matches!(x.attr("flipH"), Some("1") | Some("true"));
+            sd.flip_v = matches!(x.attr("flipV"), Some("1") | Some("true"));
+        }
+        if let Some(b) = wsp.child("wps:bodyPr") {
+            for (i, k) in ["lIns", "tIns", "rIns", "bIns"].into_iter().enumerate() {
+                if let Some(v) = num(b.attr(k)) {
+                    sd.inset[i] = (v / 635).clamp(0, 31_680) as i32;
+                }
+            }
+            sd.anchor = match b.attr("anchor") {
+                Some("ctr") => TextAnchor::Middle,
+                Some("b") => TextAnchor::Bottom,
+                _ => TextAnchor::Top,
+            };
+            if b.child("a:prstTxWarp").is_some() {
+                self.rep.note(Kind::Approximate, "WordArt drawn as plain text");
+            }
+        }
+        let font = look.font.as_ref().and_then(rgb);
+        let text = wsp.child("wps:txbx").and_then(|t| t.child("w:txbxContent")).cloned().map(|t| (t, font));
+        (sd, text)
+    }
+
+    /// Each shape's text: read as blocks at the end, then taken into the shape.
+    fn read_shape_text(&mut self) {
+        let pending = std::mem::take(&mut self.shape_text);
+        if pending.is_empty() {
+            return;
+        }
+        let was = self.in_note;
+        self.in_note = true;
+        self.in_shape = true;
+        for (id, path, el, font) in pending {
+            let before = self.doc.blocks.len();
+            let mut field = FieldState::default();
+            self.box_blocks(&el, &mut field, 0);
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.section = None;
+                    paras.push(p);
+                }
+            }
+            let mut paras = officina_text::model::rows_as_lines(paras);
+            if paras.len() > officina_text::model::MAX_SHAPE_PARAS {
+                self.rep.note(Kind::Approximate, "very long text in shapes (cut)");
+                paras.truncate(officina_text::model::MAX_SHAPE_PARAS);
+            }
+            // The style's text colour where the text names none.
+            if let Some(c) = font {
+                for p in &mut paras {
+                    for r in &mut p.runs {
+                        let a = self.doc.attrs.get(r.1);
+                        if a.color.is_none() && !self.doc.styles.sets_color(p.style, a.style) {
+                            let mut a = a.clone();
+                            a.color = Some(c);
+                            r.1 = self.doc.attrs.intern(a);
+                        }
+                    }
+                }
+            }
+            if let Some(sd) = self.doc.shapes.get(id) {
+                let mut sd = (**sd).clone();
+                if let Some(k) = sd.kid_mut(&path) {
+                    k.paras = paras;
+                }
+                self.doc.shapes.set(id, Some(sd));
+            }
+        }
+        self.in_shape = false;
+        self.in_note = was;
     }
 
     /// A `wp:anchor`'s position and wrap; `h` is the picture's height (twips).
@@ -775,7 +993,8 @@ impl<'a> Reader<'a> {
                         }
                     }
                     for k in kids {
-                        if matches!(k.name.as_str(), "w:drawing" | "w:pict" | "w:object") && self.box_depth < 4 {
+                        let as_shape = k.name == "w:drawing" && self.takes_shape(k, field);
+                        if matches!(k.name.as_str(), "w:drawing" | "w:pict" | "w:object") && self.box_depth < 4 && !as_shape {
                             let mut b = Vec::new();
                             all_of(k, "w:txbxContent", &mut b, 0);
                             if !b.is_empty() {
@@ -844,7 +1063,8 @@ impl<'a> Reader<'a> {
                                 }
                             }
                             "w:drawing" => {
-                                if let Some(o) = self.picture(k) {
+                                let o = if as_shape { self.shape(k) } else { self.picture(k) };
+                                if let Some(o) = o {
                                     let mut pa = a.clone();
                                     pa.object = Some(o);
                                     p.push(&OBJECT_CHAR.to_string(), &pa);
@@ -1639,7 +1859,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     };
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), styles: HashMap::new(), numbering: Numbering::read(numbering.as_ref()), rels: rels_main.clone(), images: HashMap::new(), next_table: 1, pictures: 0, even_odd: false, boxes: Vec::new(), box_depth: 0, theme: None, shape_text: Vec::new(), in_shape: false, foot_xml: HashMap::new(), end_xml: HashMap::new(), foot_rels: HashMap::new(), end_rels: HashMap::new(), pending: Vec::new(), in_note: false, margin_parts: Vec::new(), comment_xml: HashMap::new(), comment_parent: HashMap::new(), comment_done: HashMap::new(), comment_ids: HashMap::new(), active: Vec::new(), revs: HashMap::new(), ins: None, break_rev: None, dels: Vec::new(), del_marks: Vec::new(), ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), sec_from: 0, secs: Vec::new() };
     for (kind, key) in [("footnotes", "w:footnote"), ("endnotes", "w:endnote")] {
         let Some(p) = find(kind) else { continue };
         let Some(x) = part(&archive, &p)? else { continue };
@@ -1690,6 +1910,9 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
         r.even_odd = st.as_ref().is_some_and(|s| s.child("w:evenAndOddHeaders").is_some_and(on));
         r.doc.tracking = st.as_ref().is_some_and(|s| s.child("w:trackRevisions").is_some_and(on));
     }
+    if let Some(t) = find("theme").map(|p| part(&archive, &p)).transpose()?.flatten() {
+        r.theme = Some(crate::pptx::read::read_theme(&t));
+    }
     r.read_styles(styles.as_ref());
     r.body(body);
     for more in doc_xml.children("w:body").skip(1).take(16) {
@@ -1698,6 +1921,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), DocxError> {
     r.place_sections();
     r.read_notes();
     r.read_margins();
+    r.read_shape_text();
     r.read_replies(&comment_order);
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
     fields::relink_toc(&mut r.doc);

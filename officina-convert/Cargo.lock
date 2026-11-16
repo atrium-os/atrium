@@ -916,10 +916,15 @@ name = "officina-pict"
 version = "0.1.0"
 
 [[package]]
+name = "officina-shapes"
+version = "0.1.0"
+
+[[package]]
 name = "officina-slides"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+ "officina-shapes",
  "officina-text",
 ]
 
@@ -929,6 +934,7 @@ version = "0.1.0"
 dependencies = [
  "navigator-render",
  "officina-core",
+ "officina-shapes",
  "rustybuzz",
  "ttf-parser",
  "unicode-linebreak",

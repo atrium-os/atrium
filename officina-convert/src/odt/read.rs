@@ -70,6 +70,59 @@ fn part(a: &Archive, name: &str) -> Result<Option<El>, OdtError> {
 }
 
 /// An ODF length (`1.27cm`, `0.5in`, `12pt`, `3mm`, `1pc`, `96px`) in twips.
+/// The key the default graphic style is kept under.
+const DEFAULT_GRAPHIC: &str = "\u{0}default";
+
+/// A drawing's frame (twips, from its anchor) and turn (60,000ths of a
+/// degree, clockwise): `draw:transform` turns about the frame's corner and
+/// moves it; ours turns about the middle.
+/// A dash style's kind, by its name (ours and LibreOffice's say what they
+/// are: "Dash_20_Dot", "Fine_20_Dotted", "Long_20_Dash").
+fn dash_of(name: Option<&str>) -> officina_text::model::Dash {
+    use officina_text::model::Dash;
+    let n = name.unwrap_or("").to_ascii_lowercase();
+    if n.contains("dot") && n.contains("dash") {
+        Dash::DashDot
+    } else if n.contains("dot") {
+        Dash::Dot
+    } else if n.contains("long") {
+        Dash::LongDash
+    } else {
+        Dash::Dash
+    }
+}
+
+fn odf_place(e: &El) -> (f64, f64, f64, f64, i32) {
+    let l = |k: &str| e.attr(k).and_then(length).unwrap_or(0) as f64;
+    let (x, y, w, h) = (l("svg:x"), l("svg:y"), l("svg:width").max(0.0), l("svg:height").max(0.0));
+    let Some(tf) = e.attr("draw:transform") else { return (x, y, w, h, 0) };
+    let (mut turn, mut tx, mut ty) = (0.0f64, x, y);
+    let mut rest = tf;
+    for _ in 0..16 {
+        let Some(open) = rest.find('(') else { break };
+        let Some(close) = rest[open..].find(')') else { break };
+        let name = rest[..open].trim().trim_start_matches(',').trim();
+        let args: Vec<&str> = rest[open + 1..open + close].split([' ', ',']).filter(|s| !s.is_empty()).collect();
+        rest = &rest[open + close + 1..];
+        let len = |i: usize| args.get(i).and_then(|v| length(v).map(|t| t as f64).or_else(|| v.parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| v / 1.763_888)));
+        match name {
+            "rotate" => turn += args.first().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(0.0),
+            "translate" => {
+                tx = len(0).unwrap_or(0.0);
+                ty = len(1).unwrap_or(0.0);
+            }
+            _ => {}
+        }
+    }
+    // The corner at (tx, ty), the box turned by -turn (counter-clockwise
+    // in ODF) about it: its middle, then our frame round the middle.
+    let (s, c) = (-turn).sin_cos();
+    let (cx, cy) = (tx + c * w / 2.0 - s * h / 2.0, ty + s * w / 2.0 + c * h / 2.0);
+    let deg = (-turn.to_degrees()).rem_euclid(360.0);
+    let rot = if deg.is_finite() { ((deg * 60_000.0).round() as i64 % 21_600_000) as i32 } else { 0 };
+    (cx - w / 2.0, cy - h / 2.0, w, h, rot)
+}
+
 pub fn length(s: &str) -> Option<i64> {
     let s = s.trim();
     let split = s.find(|c: char| c.is_ascii_alphabetic() || c == '%').unwrap_or(s.len());
@@ -364,6 +417,11 @@ struct Reader<'a> {
     /// text follows the paragraph.
     boxes: Vec<El>,
     box_depth: usize,
+    /// Shapes' text to read once the body is read: shape, path to it in
+    /// its groups, the element holding the paragraphs.
+    shape_text: Vec<(u32, Vec<usize>, El)>,
+    /// Reading a shape's text (which holds no shapes).
+    in_shape: bool,
     /// Notes anchored in the text, read after it.
     pending: Vec<(NoteId, NoteKind, El)>,
     in_note: bool,
@@ -586,6 +644,10 @@ impl<'a> Reader<'a> {
     fn style_block(&mut self, e: &El) {
         for s in e.els() {
             match s.name.as_str() {
+                "style:default-style" if s.attr("style:family") == Some("graphic") => {
+                    let props = s.child("style:graphic-properties").map(|g| g.attrs.clone()).unwrap_or_default();
+                    self.graphic.insert(DEFAULT_GRAPHIC.to_string(), (None, props));
+                }
                 "style:style" => {
                     let Some(name) = s.attr("style:name") else { continue };
                     match s.attr("style:family") {
@@ -789,20 +851,255 @@ impl<'a> Reader<'a> {
         let h = frame.attr("svg:height").and_then(length).map(side).unwrap_or(side(px.1 as i64 * 15));
         self.pictures += 1;
         let float = (!self.in_note && !matches!(frame.attr("text:anchor-type"), Some("as-char") | None)).then(|| self.frame_float(frame, h));
-        Some(ObjectRef { image, width: w, height: h, float })
+        Some(ObjectRef { image, width: w, height: h, float, shape: false })
     }
 
     /// A graphic property of `style`, through its parents.
     fn graphic_prop(&self, style: Option<&str>, key: &str) -> Option<String> {
         let mut cur = style.map(str::to_string);
         for _ in 0..16 {
-            let (parent, props) = self.graphic.get(cur.as_deref()?)?;
+            let Some((parent, props)) = cur.as_deref().and_then(|c| self.graphic.get(c)) else { break };
             if let Some((_, v)) = props.iter().find(|(k, _)| k == key) {
                 return Some(v.clone());
             }
             cur = parent.clone();
         }
         None
+    }
+
+    /// As [`graphic_prop`], then the default graphic style (what drawings
+    /// fall back on; frames have their own defaults).
+    fn drawing_prop(&self, style: Option<&str>, key: &str) -> Option<String> {
+        self.graphic_prop(style, key).or_else(|| self.graphic_prop(Some(DEFAULT_GRAPHIC), key))
+    }
+
+    /// Whether this reader takes drawing `e` as a shape: in the body text
+    /// (not a note, header or another shape).
+    fn takes_shape(&self, e: &El, at: Where) -> bool {
+        at == Where::Body && !self.in_note && !self.in_shape && (e.name != "draw:frame" || e.child("draw:text-box").is_some())
+    }
+
+    /// A drawing anchored in the text as a shape; its text is read after
+    /// the body.
+    fn odf_shape(&mut self, e: &El) -> Option<ObjectRef> {
+        use officina_text::model::{MAX_GROUP_SHAPES, MAX_SHAPES};
+        if self.doc.shapes.next_id() as usize >= MAX_SHAPES {
+            self.rep.note(Kind::Dropped, "shapes past the limit");
+            return None;
+        }
+        let mut texts = Vec::new();
+        let mut budget = MAX_GROUP_SHAPES;
+        let (sd, [x, y, w, h]) = self.drawn(e, 0, &mut Vec::new(), &mut texts, &mut budget)?;
+        let side = |v: f64| (v.round() as i64).clamp(1, MAX_OBJECT_TWIPS as i64) as u32;
+        let (w, h) = (side(w), side(h));
+        let id = self.doc.shapes.add(sd)?;
+        for (path, el) in texts {
+            self.shape_text.push((id, path, el));
+        }
+        let float = (!matches!(e.attr("text:anchor-type"), Some("as-char") | None)).then(|| {
+            let mut f = self.frame_float(e, h);
+            // Turned and drawn shapes are placed by their frame.
+            let off = |v: f64| (v.round() as i64).clamp(-(MAX_FLOAT_OFFSET as i64), MAX_FLOAT_OFFSET as i64) as i32;
+            if f.h_align == HAlign::Offset {
+                f.x = off(x);
+            }
+            if e.attr("svg:y").is_none() || e.attr("draw:transform").is_some() {
+                f.y = off(y);
+            }
+            f
+        });
+        Some(ObjectRef { image: id, width: w, height: h, float, shape: true })
+    }
+
+    /// A drawing element as a shape and its frame (twips, from its anchor):
+    /// a group's shapes framed in their bounds.
+    fn drawn(&mut self, e: &El, depth: usize, path: &mut Vec<usize>, texts: &mut Vec<(Vec<usize>, El)>, budget: &mut usize) -> Option<(officina_text::model::ShapeData, [f64; 4])> {
+        use officina_text::model::{ArrowEnd, Dash, Geom, ShapeData, ShapeKid, ShapeLine, TextAnchor, MAX_GROUP_DEPTH};
+        let name = e.name.as_str();
+        if name == "draw:g" {
+            if depth + 1 >= MAX_GROUP_DEPTH {
+                self.rep.note(Kind::Dropped, "groups nested too deep");
+                return None;
+            }
+            let mut kids: Vec<(ShapeData, [f64; 4])> = Vec::new();
+            for k in e.els() {
+                if *budget == 0 {
+                    self.rep.note(Kind::Dropped, "shapes past the limit");
+                    break;
+                }
+                path.push(kids.len());
+                let got = self.drawn(k, depth + 1, path, texts, budget);
+                path.pop();
+                if let Some(x) = got {
+                    *budget -= 1;
+                    kids.push(x);
+                }
+            }
+            if kids.is_empty() {
+                return None;
+            }
+            let (x0, y0) = kids.iter().fold((f64::MAX, f64::MAX), |a, k| (a.0.min(k.1[0]), a.1.min(k.1[1])));
+            let (x1, y1) = kids.iter().fold((f64::MIN, f64::MIN), |a, k| (a.0.max(k.1[0] + k.1[2]), a.1.max(k.1[1] + k.1[3])));
+            let (gw, gh) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
+            let mut g = ShapeData::new(Geom::preset("rect"));
+            let f = |v: f64, s: f64| (v * 100_000.0 / s).round().clamp(-1e8, 1e8) as i32;
+            g.kids = kids.into_iter().map(|(sd, [x, y, w, h])| ShapeKid { x: f(x - x0, gw), y: f(y - y0, gh), w: f(w, gw), h: f(h, gh), shape: sd }).collect();
+            return Some((g, [x0, y0, gw, gh]));
+        }
+        if !matches!(name, "draw:custom-shape" | "draw:rect" | "draw:ellipse" | "draw:circle" | "draw:line" | "draw:connector" | "draw:polygon" | "draw:polyline" | "draw:path") && !(name == "draw:frame" && e.child("draw:text-box").is_some()) {
+            if name == "draw:frame" {
+                self.rep.note(Kind::Dropped, "pictures and objects in groups of shapes");
+            }
+            return None;
+        }
+        let st = e.attr("draw:style-name").map(str::to_string);
+        let frame = name == "draw:frame";
+        let keys = ["style:mirror", "draw:fill", "draw:fill-color", "fo:background-color", "draw:stroke", "draw:stroke-dash", "svg:stroke-width", "svg:stroke-color", "draw:marker-start", "draw:marker-end", "fo:border", "fo:border-top", "fo:padding", "fo:padding-left", "fo:padding-top", "fo:padding-right", "fo:padding-bottom", "draw:textarea-vertical-align"];
+        let vals: HashMap<&str, String> = keys.iter().filter_map(|&k| if frame { self.graphic_prop(st.as_deref(), k) } else { self.drawing_prop(st.as_deref(), k) }.map(|v| (k, v))).collect();
+        let g = |k: &str| vals.get(k).cloned();
+        let (mut x, mut y, mut w, mut h, rot) = odf_place(e);
+        let mut sd = ShapeData::new(Geom::preset("rect"));
+        sd.rot = rot;
+        if let Some(m) = g("style:mirror") {
+            sd.flip_h = m.contains("horizontal");
+            sd.flip_v = m.contains("vertical");
+        }
+        let emu = |v: f64| (v * 635.0).round() as i64;
+        let mut line_shape = false;
+        sd.geom = match name {
+            "draw:custom-shape" => match e.child("draw:enhanced-geometry") {
+                Some(eg) => {
+                    let on = |k: &str| eg.attr(k) == Some("true");
+                    sd.flip_h ^= on("draw:mirror-horizontal");
+                    sd.flip_v ^= on("draw:mirror-vertical");
+                    crate::odp::read::odf_geom(eg, emu(w), emu(h), &mut self.rep)
+                }
+                None => Geom::preset("rect"),
+            },
+            "draw:ellipse" | "draw:circle" => Geom::preset("ellipse"),
+            "draw:line" | "draw:connector" => {
+                let p = |k: &str| e.attr(k).and_then(length).unwrap_or(0) as f64;
+                let (x1, y1, x2, y2) = (p("svg:x1"), p("svg:y1"), p("svg:x2"), p("svg:y2"));
+                (x, y, w, h) = (x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs());
+                sd.flip_h = x2 < x1;
+                sd.flip_v = y2 < y1;
+                line_shape = true;
+                if name == "draw:connector" && e.attr("draw:type").is_some_and(|t| t != "line") {
+                    self.rep.note(Kind::Approximate, "bent and curved connectors drawn straight");
+                }
+                Geom::preset(if name == "draw:connector" { "straightConnector1" } else { "line" })
+            }
+            "draw:polygon" | "draw:polyline" | "draw:path" => {
+                let vb = crate::odp::geom::view_box(e.attr("svg:viewBox")).unwrap_or([0.0, 0.0, w.max(1.0) * 1.763_888, h.max(1.0) * 1.763_888]);
+                let paths = if name == "draw:path" { e.attr("svg:d").and_then(|d| crate::odp::geom::svg_path(d, vb)) } else { e.attr("draw:points").and_then(|p| crate::odp::geom::points(p, vb, name == "draw:polygon")) };
+                line_shape = name == "draw:polyline";
+                match paths {
+                    Some(p) => Geom::Custom(p),
+                    None => {
+                        self.rep.note(Kind::Dropped, "drawings with unreadable outlines");
+                        return None;
+                    }
+                }
+            }
+            _ => Geom::preset("rect"),
+        };
+        // Fill: a text frame's background, else the drawing's fill.
+        let fill_kind = g("draw:fill");
+        sd.fill = match fill_kind.as_deref() {
+            _ if line_shape => None,
+            Some("none") => None,
+            Some("solid") => g("draw:fill-color").as_deref().and_then(|c| color(Some(c))),
+            Some("gradient") | Some("hatch") | Some("bitmap") => {
+                self.rep.note(Kind::Approximate, "gradient, hatch and picture fills of shapes drawn in one colour");
+                g("draw:fill-color").as_deref().and_then(|c| color(Some(c)))
+            }
+            _ if frame => g("fo:background-color").as_deref().filter(|c| *c != "transparent").and_then(|c| color(Some(c))),
+            _ => g("draw:fill-color").as_deref().and_then(|c| color(Some(c))),
+        };
+        let marker = |m: Option<String>| -> ArrowEnd {
+            let Some(m) = m.filter(|m| !m.is_empty()) else { return ArrowEnd::None };
+            let n = m.to_ascii_lowercase().replace("_20_", " ");
+            if n.contains("circle") || n.contains("oval") {
+                ArrowEnd::Oval
+            } else if n.contains("diamond") || n.contains("square 45") {
+                ArrowEnd::Diamond
+            } else if n.contains("concave") {
+                ArrowEnd::Stealth
+            } else if n.contains("line") || n.contains("open") {
+                ArrowEnd::Open
+            } else {
+                ArrowEnd::Triangle
+            }
+        };
+        sd.line = match g("draw:stroke").as_deref() {
+            Some("none") => None,
+            Some(k) => {
+                let width = g("svg:stroke-width").as_deref().and_then(length).unwrap_or(0).clamp(0, 2880) as i32;
+                let color = g("svg:stroke-color").as_deref().and_then(|c| color(Some(c))).unwrap_or(0);
+                Some(ShapeLine { color, width, dash: if k == "dash" { dash_of(g("draw:stroke-dash").as_deref()) } else { Dash::Solid }, head: marker(g("draw:marker-start")), tail: marker(g("draw:marker-end")) })
+            }
+            // A text frame's border: "0.06pt solid #000000".
+            None if frame => g("fo:border").or_else(|| g("fo:border-top")).filter(|b| b != "none").map(|b| {
+                let mut it = b.split_whitespace();
+                let width = it.next().and_then(length).unwrap_or(0).clamp(0, 2880) as i32;
+                let style = it.next().unwrap_or("solid");
+                let color = it.next().and_then(|c| color(Some(c))).unwrap_or(0);
+                ShapeLine { color, width, dash: if matches!(style, "dashed" | "dotted") { Dash::Dash } else { Dash::Solid }, head: ArrowEnd::None, tail: ArrowEnd::None }
+            }),
+            None => None,
+        };
+        let pad = |k: &str| g(k).or_else(|| g("fo:padding")).as_deref().and_then(length).map(|v| v.clamp(0, 31_680) as i32);
+        for (i, k) in ["fo:padding-left", "fo:padding-top", "fo:padding-right", "fo:padding-bottom"].into_iter().enumerate() {
+            if let Some(v) = pad(k) {
+                sd.inset[i] = v;
+            }
+        }
+        sd.anchor = match g("draw:textarea-vertical-align").as_deref() {
+            Some("middle") => TextAnchor::Middle,
+            Some("bottom") => TextAnchor::Bottom,
+            _ => TextAnchor::Top,
+        };
+        let text = if frame { e.child("draw:text-box") } else { Some(e) };
+        if let Some(t) = text.filter(|t| t.els().any(|k| matches!(k.name.as_str(), "text:p" | "text:h" | "text:list"))) {
+            texts.push((path.clone(), t.clone()));
+        }
+        Some((sd, [x, y, w.max(1.0), h.max(1.0)]))
+    }
+
+    /// Each shape's text: read as blocks at the end, then taken into the shape.
+    fn read_shape_text(&mut self) {
+        let pending = std::mem::take(&mut self.shape_text);
+        if pending.is_empty() {
+            return;
+        }
+        let was = self.in_note;
+        self.in_note = true;
+        self.in_shape = true;
+        for (id, path, el) in pending {
+            let before = self.doc.blocks.len();
+            self.box_content(&el, None);
+            let mut paras = Vec::new();
+            while self.doc.blocks.len() > before {
+                if let Some(Block::Para(mut p)) = self.doc.blocks.remove(before) {
+                    p.props.section = None;
+                    paras.push(p);
+                }
+            }
+            let mut paras = officina_text::model::rows_as_lines(paras);
+            if paras.len() > officina_text::model::MAX_SHAPE_PARAS {
+                self.rep.note(Kind::Approximate, "very long text in shapes (cut)");
+                paras.truncate(officina_text::model::MAX_SHAPE_PARAS);
+            }
+            if let Some(sd) = self.doc.shapes.get(id) {
+                let mut sd = (**sd).clone();
+                if let Some(k) = sd.kid_mut(&path) {
+                    k.paras = paras;
+                }
+                self.doc.shapes.set(id, Some(sd));
+            }
+        }
+        self.in_shape = false;
+        self.in_note = was;
     }
 
     /// Where a frame anchored to its paragraph, a character or the page
@@ -889,6 +1186,13 @@ impl<'a> Reader<'a> {
                     "text:line-break" => p.push("\u{2028}", a),
                     "text:page-number" if at == Where::Margin => p.push("{page}", a),
                     "text:page-count" if at == Where::Margin => p.push("{pages}", a),
+                    "draw:frame" | "draw:custom-shape" | "draw:rect" | "draw:line" | "draw:g" | "draw:ellipse" | "draw:path" | "draw:polygon" | "draw:circle" | "draw:polyline" | "draw:connector" if x.child("draw:image").is_none() && self.takes_shape(x, at) => {
+                        if let Some(o) = self.odf_shape(x) {
+                            let mut b = a.clone();
+                            b.object = Some(o);
+                            p.push(&OBJECT_CHAR.to_string(), &b);
+                        }
+                    }
                     "draw:frame" => {
                         if let Some(o) = self.picture(x) {
                             let mut b = a.clone();
@@ -1676,7 +1980,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {
@@ -1712,6 +2016,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     }
     r.read_notes();
     r.read_margins();
+    r.read_shape_text();
     let lost = fields::bind(&mut r.doc, &r.ref_names, &r.marks, &r.ref_shown);
     fields::relink_toc(&mut r.doc);
     if lost > 0 {

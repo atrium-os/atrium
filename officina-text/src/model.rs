@@ -380,6 +380,124 @@ pub struct ObjectRef {
     /// Floating: placed by position near its anchor (this character) rather
     /// than in the line, the text wrapping around it as `float.wrap` says.
     pub float: Option<Float>,
+    /// A drawn shape: `image` is its index in [`TextDoc::shapes`].
+    pub shape: bool,
+}
+
+pub use officina_shapes::{Geom, Path as ShapePath, PathCmd};
+
+/// How a shape's outline is dashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dot,
+    Dash,
+    DashDot,
+    LongDash,
+}
+
+/// A shape's outline: its colour (RGB), width in twips (0: a hairline) and
+/// dashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShapeLine {
+    pub color: u32,
+    pub width: i32,
+    pub dash: Dash,
+    /// Ends of an open outline: at its start and at its end.
+    pub head: ArrowEnd,
+    pub tail: ArrowEnd,
+}
+
+/// What ends an open line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ArrowEnd {
+    #[default]
+    None,
+    Triangle,
+    Open,
+    Stealth,
+    Diamond,
+    Oval,
+}
+
+/// Where a shape's text sits when it is shorter than the shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextAnchor {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// A drawn shape (a rectangle, an arrow, a callout, a text box): its outline
+/// in its frame, filled and outlined, turned and flipped about its middle,
+/// with paragraphs of its own inside. Its frame and place are the
+/// [`ObjectRef`]'s, as a picture's are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeData {
+    pub geom: Geom,
+    /// The fill (RGB); none shows what is behind.
+    pub fill: Option<u32>,
+    pub line: Option<ShapeLine>,
+    /// Clockwise, in 60,000ths of a degree.
+    pub rot: i32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+    /// Its text, laid out inside the frame less `inset`.
+    pub paras: Vec<Para>,
+    /// Room between the frame and the text: start, top, end, bottom (twips).
+    pub inset: [i32; 4],
+    pub anchor: TextAnchor,
+    /// A group's shapes, drawn in order over its own outline.
+    pub kids: Vec<ShapeKid>,
+}
+
+/// A shape in a group: its frame in the group's (hundred-thousandths of
+/// the group's width and height from its top-left corner; it may reach
+/// outside).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeKid {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub shape: ShapeData,
+}
+
+/// Groups in groups, at most this deep; shapes in one shape's groups, at
+/// most this many.
+pub const MAX_GROUP_DEPTH: usize = 8;
+pub const MAX_GROUP_SHAPES: usize = 1024;
+
+/// Word's text box insets: a tenth of an inch across, a twentieth down.
+pub const DEFAULT_INSET: [i32; 4] = [144, 72, 144, 72];
+/// Most shapes a document holds, and paragraphs one shape holds.
+pub const MAX_SHAPES: usize = 1 << 16;
+pub const MAX_SHAPE_PARAS: usize = 256;
+
+impl ShapeData {
+    /// A shape of `geom` with no fill, outline or text.
+    pub fn new(geom: Geom) -> ShapeData {
+        ShapeData { geom, fill: None, line: None, rot: 0, flip_h: false, flip_v: false, paras: Vec::new(), inset: DEFAULT_INSET, anchor: TextAnchor::Top, kids: Vec::new() }
+    }
+
+    /// Its paragraphs and its group's shapes', in order.
+    pub fn all_paras(&self) -> Vec<&Para> {
+        let mut v: Vec<&Para> = self.paras.iter().collect();
+        for k in &self.kids {
+            v.extend(k.shape.all_paras());
+        }
+        v
+    }
+
+    /// The shape down `path` of group indices (itself for an empty path).
+    pub fn kid_mut(&mut self, path: &[usize]) -> Option<&mut ShapeData> {
+        match path.split_first() {
+            None => Some(self),
+            Some((&i, rest)) => self.kids.get_mut(i)?.shape.kid_mut(rest),
+        }
+    }
 }
 
 /// How text goes around a floating picture.
@@ -928,6 +1046,12 @@ impl StyleSheet {
         self.styles.iter().position(|s| &*s.name == name).map(|i| i as StyleId)
     }
 
+    /// Whether paragraph style `para` or character style `chars` (or
+    /// what they are based on) sets a text colour.
+    pub fn sets_color(&self, para: StyleId, chars: Option<StyleId>) -> bool {
+        self.chain(para).iter().chain(chars.map(|c| self.chain(c)).unwrap_or_default().iter()).any(|s| s.chars.color.is_some())
+    }
+
     /// The chain from the root down to `id` (at most [`MAX_STYLE_DEPTH`]).
     fn chain(&self, id: StyleId) -> Vec<&Style> {
         let mut v = Vec::new();
@@ -1248,6 +1372,8 @@ pub struct TextDoc {
     pub even_pages: Option<Margins>,
     /// The pictures placed in the text.
     pub images: Images,
+    /// The drawn shapes placed in the text (as pictures are).
+    pub shapes: Store<ShapeData>,
     /// Footnotes and endnotes, anchored in the text.
     pub notes: Notes,
     /// Comments on ranges of the text.
@@ -1300,7 +1426,7 @@ impl Default for TextDoc {
 impl TextDoc {
     /// One empty Normal paragraph.
     pub fn new() -> TextDoc {
-        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
+        let mut d = TextDoc { blocks: BlockTree::default(), attrs: AttrTable::default(), styles: StyleSheet::default(), page: PageSetup::default(), header: None, footer: None, first_page: None, even_pages: None, images: Images::default(), shapes: Store::new(MAX_SHAPES), notes: Notes::default(), comments: Comments::default(), revisions: Store::new(MAX_REVISIONS), deletions: Store::new(MAX_DELETIONS), conflicts: Store::new(MAX_CONFLICTS), tracking: false, field_values: HashMap::new(), next_id: 1, changes: None };
         let id = d.new_id();
         d.blocks.insert(0, Block::Para(Para::new(id, "", 0)));
         d

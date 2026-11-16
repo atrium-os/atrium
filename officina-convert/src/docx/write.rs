@@ -10,13 +10,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{ArrowEnd, Dash, Geom, PathCmd, ShapeData, TextAnchor, Float, HAlign, Rel, Wrap, Section, SectionStart, Field, Leader, TabAlign, RevId, Align, AttrId, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteId, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
 
 const W_NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
-const DRAW_NS: &str = r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture""#;
+const DRAW_NS: &str = r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup""#;
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 /// A style's id in the file: Word's for the built-in ones.
@@ -367,7 +367,26 @@ impl Out {
                     }
                     OBJECT_CHAR => {
                         flush(&mut text, &mut body);
-                        if let Some(o) = attrs.object {
+                        if let Some(o) = attrs.object.filter(|o| o.shape) {
+                            if let Some(sd) = doc.shapes.get(o.image).cloned() {
+                                self.pic += 1;
+                                let (cx, cy) = (o.width as i64 * 635, o.height as i64 * 635);
+                                let n = self.pic;
+                                let (open, close) = match o.float {
+                                    None => (r#"<wp:inline distT="0" distB="0" distL="0" distR="0">"#.to_string(), "</wp:inline>"),
+                                    Some(f) => (anchor_open(&f, n), "</wp:anchor>"),
+                                };
+                                let (uri, inner) = if sd.kids.is_empty() {
+                                    ("wordprocessingShape", self.wsp(doc, &sd, cx, cy, None))
+                                } else {
+                                    let mut g = format!(r#"<wpg:wgp><wpg:cNvGrpSpPr/><wpg:grpSpPr>{}</wpg:grpSpPr>"#, xfrm(&sd, 0, 0, cx, cy, true));
+                                    self.group_kids(doc, &sd, cx, cy, &mut g, 0);
+                                    g += "</wpg:wgp>";
+                                    ("wordprocessingGroup", g)
+                                };
+                                let _ = write!(body, r#"<w:r>{props}<w:drawing>{open}<wp:extent cx="{cx}" cy="{cy}"/>{}<wp:docPr id="{n}" name="Shape {n}"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/{uri}">{inner}</a:graphicData></a:graphic>{close}</w:drawing></w:r>"#, o.float.map_or(String::new(), |f| anchor_wrap(&f)));
+                            }
+                        } else if let Some(o) = attrs.object {
                             if let Some(rid) = self.image(doc, o.image) {
                                 self.pic += 1;
                                 let (cx, cy) = (o.width as u64 * 635, o.height as u64 * 635);
@@ -489,6 +508,84 @@ impl Out {
         out.push_str("</w:p>");
     }
 
+    /// A `wps:wsp`: shape `sd` `cx` by `cy` EMU, at `off` in its group.
+    fn wsp(&mut self, doc: &TextDoc, sd: &ShapeData, cx: i64, cy: i64, off: Option<(i64, i64)>) -> String {
+        let (x, y) = off.unwrap_or((0, 0));
+        let mut out = format!("<wps:wsp><wps:cNvSpPr/><wps:spPr>{}{}", xfrm(sd, x, y, cx, cy, false), geom_xml(&sd.geom));
+        match sd.fill {
+            Some(c) => {
+                let _ = write!(out, r#"<a:solidFill><a:srgbClr val="{c:06X}"/></a:solidFill>"#);
+            }
+            None => out += "<a:noFill/>",
+        }
+        match sd.line {
+            Some(l) => {
+                let dash = match l.dash {
+                    Dash::Solid => "solid",
+                    Dash::Dot => "sysDot",
+                    Dash::Dash => "dash",
+                    Dash::DashDot => "dashDot",
+                    Dash::LongDash => "lgDash",
+                };
+                let end = |e: ArrowEnd| match e {
+                    ArrowEnd::None => "none",
+                    ArrowEnd::Triangle => "triangle",
+                    ArrowEnd::Open => "arrow",
+                    ArrowEnd::Stealth => "stealth",
+                    ArrowEnd::Diamond => "diamond",
+                    ArrowEnd::Oval => "oval",
+                };
+                let _ = write!(out, r#"<a:ln w="{}"><a:solidFill><a:srgbClr val="{:06X}"/></a:solidFill><a:prstDash val="{dash}"/>"#, l.width as i64 * 635, l.color);
+                if l.head != ArrowEnd::None {
+                    let _ = write!(out, r#"<a:headEnd type="{}"/>"#, end(l.head));
+                }
+                if l.tail != ArrowEnd::None {
+                    let _ = write!(out, r#"<a:tailEnd type="{}"/>"#, end(l.tail));
+                }
+                out += "</a:ln>";
+            }
+            None => out += "<a:ln><a:noFill/></a:ln>",
+        }
+        out += "</wps:spPr>";
+        if !sd.paras.is_empty() {
+            out += "<wps:txbx><w:txbxContent>";
+            let cur = self.cur.take();
+            for p in &sd.paras {
+                let mut q = p.clone();
+                q.props.cell = None;
+                q.props.section = None;
+                self.para_of(doc, &q, &mut out, "", "");
+            }
+            self.cur = cur;
+            out += "</w:txbxContent></wps:txbx>";
+        }
+        let anchor = match sd.anchor {
+            TextAnchor::Top => "t",
+            TextAnchor::Middle => "ctr",
+            TextAnchor::Bottom => "b",
+        };
+        let [l, t, r, b] = sd.inset.map(|v| v as i64 * 635);
+        let _ = write!(out, r#"<wps:bodyPr lIns="{l}" tIns="{t}" rIns="{r}" bIns="{b}" anchor="{anchor}"/></wps:wsp>"#);
+        out
+    }
+
+    /// A group's shapes into `out`, in its `cx` by `cy` EMU (its child
+    /// coordinates the same).
+    fn group_kids(&mut self, doc: &TextDoc, sd: &ShapeData, cx: i64, cy: i64, out: &mut String, depth: usize) {
+        for k in &sd.kids {
+            let f = |v: i32, s: i64| (v as i128 * s as i128 / 100_000) as i64;
+            let (x, y, w, h) = (f(k.x, cx), f(k.y, cy), f(k.w, cx).max(1), f(k.h, cy).max(1));
+            if k.shape.kids.is_empty() || depth + 1 >= officina_text::model::MAX_GROUP_DEPTH {
+                let x2 = self.wsp(doc, &k.shape, w, h, Some((x, y)));
+                out.push_str(&x2);
+            } else {
+                let _ = write!(out, "<wpg:grpSp><wpg:cNvGrpSpPr/><wpg:grpSpPr>{}</wpg:grpSpPr>", xfrm(&k.shape, x, y, w, h, true));
+                self.group_kids(doc, &k.shape, w, h, out, depth + 1);
+                out.push_str("</wpg:grpSp>");
+            }
+        }
+    }
+
     /// The table starting at block `b`; returns the block after it.
     fn table(&mut self, doc: &TextDoc, b: usize, out: &mut String) -> usize {
         let t = doc.cell(b).map(|c| c.table);
@@ -549,6 +646,53 @@ fn cells_of(doc: &TextDoc, row: std::ops::Range<usize>) -> Vec<std::ops::Range<u
         }
     }
     out
+}
+
+/// A shape's `a:xfrm`: turn, flips, place and size (a group's with child
+/// coordinates the same as its own size).
+fn xfrm(sd: &ShapeData, x: i64, y: i64, cx: i64, cy: i64, group: bool) -> String {
+    let mut a = String::new();
+    if sd.rot != 0 {
+        let _ = write!(a, r#" rot="{}""#, sd.rot);
+    }
+    if sd.flip_h {
+        a += r#" flipH="1""#;
+    }
+    if sd.flip_v {
+        a += r#" flipV="1""#;
+    }
+    let ch = if group { r#"<a:chOff x="0" y="0"/>"#.to_string() + &format!(r#"<a:chExt cx="{cx}" cy="{cy}"/>"#) } else { String::new() };
+    format!(r#"<a:xfrm{a}><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/>{ch}</a:xfrm>"#)
+}
+
+/// A preset's `a:prstGeom` with its adjust values, or paths as `a:custGeom`.
+fn geom_xml(g: &Geom) -> String {
+    match g {
+        Geom::Preset { name, adj } => {
+            let mut s = format!(r#"<a:prstGeom prst="{}"><a:avLst>"#, esc(name));
+            for (n, v) in adj {
+                let _ = write!(s, r#"<a:gd name="{}" fmla="val {v}"/>"#, esc(n));
+            }
+            s + "</a:avLst></a:prstGeom>"
+        }
+        Geom::Custom(paths) => {
+            let mut s = String::from(r#"<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="l" t="t" r="r" b="b"/><a:pathLst>"#);
+            for p in paths {
+                let _ = write!(s, r#"<a:path w="{}" h="{}"{}{}>"#, p.w, p.h, if p.filled { "" } else { r#" fill="none""# }, if p.stroked { "" } else { r#" stroke="0""# });
+                for c in &p.cmds {
+                    let pt = |x: i64, y: i64| format!(r#"<a:pt x="{x}" y="{y}"/>"#);
+                    match *c {
+                        PathCmd::Move(x, y) => s += &format!("<a:moveTo>{}</a:moveTo>", pt(x, y)),
+                        PathCmd::Line(x, y) => s += &format!("<a:lnTo>{}</a:lnTo>", pt(x, y)),
+                        PathCmd::Cubic(a, b, c2, d, e, f) => s += &format!("<a:cubicBezTo>{}{}{}</a:cubicBezTo>", pt(a, b), pt(c2, d), pt(e, f)),
+                        PathCmd::Close => s += "<a:close/>",
+                    }
+                }
+                s += "</a:path>";
+            }
+            s + "</a:pathLst></a:custGeom>"
+        }
+    }
 }
 
 fn image_ext(b: &[u8]) -> &'static str {

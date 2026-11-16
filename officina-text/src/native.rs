@@ -14,6 +14,7 @@
 //! | 9 | REVISIONS | whether edits are tracked; revisions: id, author, date, change set, its name |
 //! | 10 | DELETIONS | tracked deletions a tombstone holds: id, revision, pieces (paragraph, text, runs) |
 //! | 11 | CONFLICTS | merge conflicts: id, then the other version as a deletion's encoding |
+//! | 13 | SHAPE | one drawn shape: its index, outline (a preset's name and adjust values, or paths), fill, outline, turn and flips, text insets and anchor, its paragraphs |
 //! | 12 | MARGINS | the header's then the footer's own paragraphs (count, blocks); then the first page's and even pages' own header and footer, each absent (0) or present (1: both lines, then their paragraphs) |
 //!
 //! Block chunks are independent, so a reader can load the chunks around the
@@ -46,6 +47,7 @@ pub const REVISIONS: u16 = 9;
 pub const DELETIONS: u16 = 10;
 pub const CONFLICTS: u16 = 11;
 pub const MARGINS: u16 = 12;
+pub const SHAPE: u16 = 13;
 
 /// Largest picture side recorded, pixels.
 pub const MAX_IMAGE_PX: u64 = 1 << 16;
@@ -101,7 +103,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
     let float = a.object.and_then(|o| o.float);
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -186,7 +188,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 5 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 != 0 && m & (1 << 10) == 0) {
+    if ext >> 6 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 != 0 && m & (1 << 10) == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -230,7 +232,7 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         if image > u32::MAX as u64 || !side.contains(&w) || !side.contains(&h) {
             return Err(WireError::Invalid("picture frame"));
         }
-        a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32, float: None });
+        a.object = Some(ObjectRef { image: image as u32, width: w as u32, height: h as u32, float: None, shape: false });
     }
     if on(11) {
         a.vert = Some(match r.u8()? {
@@ -309,6 +311,11 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         }
         if let Some(o) = a.object.as_mut() {
             o.float = Some(Float { wrap, h_rel, h_align, x, v_rel, y, gap: gap as i32 });
+        }
+    }
+    if ext >> 5 & 1 != 0 {
+        if let Some(o) = a.object.as_mut() {
+            o.shape = true;
         }
     }
     Ok(a)
@@ -734,6 +741,201 @@ fn encode_hf(w: &mut Writer, hf: &Option<HeaderFooter>) {
 }
 
 /// A header's and a footer's own paragraphs (a count each, then blocks).
+/// A drawn shape: outline, fill, outline style, turn, text box and paragraphs.
+pub fn encode_shape(w: &mut Writer, s: &crate::model::ShapeData) {
+    use crate::model::{Geom, PathCmd};
+    match &s.geom {
+        Geom::Preset { name, adj } => {
+            w.u8(0);
+            w.str(name);
+            w.var(adj.len() as u64);
+            for (n, v) in adj {
+                w.str(n);
+                w.ivar(*v);
+            }
+        }
+        Geom::Custom(paths) => {
+            w.u8(1);
+            w.var(paths.len() as u64);
+            for p in paths {
+                w.ivar(p.w);
+                w.ivar(p.h);
+                w.u8(p.filled as u8 | (p.stroked as u8) << 1);
+                w.var(p.cmds.len() as u64);
+                for c in &p.cmds {
+                    let (tag, v): (u8, &[i64]) = match c {
+                        PathCmd::Move(x, y) => (0, &[*x, *y][..]),
+                        PathCmd::Line(x, y) => (1, &[*x, *y][..]),
+                        PathCmd::Cubic(a, b, c, d, e, f) => (2, &[*a, *b, *c, *d, *e, *f][..]),
+                        PathCmd::Close => (3, &[][..]),
+                    };
+                    w.u8(tag);
+                    for &x in v {
+                        w.ivar(x);
+                    }
+                }
+            }
+        }
+    }
+    w.u8(s.fill.is_some() as u8 | (s.line.is_some() as u8) << 1 | (s.flip_h as u8) << 2 | (s.flip_v as u8) << 3);
+    if let Some(f) = s.fill {
+        w.u32(f);
+    }
+    if let Some(l) = s.line {
+        w.u32(l.color);
+        w.ivar(l.width as i64);
+        w.u8(l.dash as u8);
+        w.u8(l.head as u8 | (l.tail as u8) << 4);
+    }
+    w.ivar(s.rot as i64);
+    for i in s.inset {
+        w.ivar(i as i64);
+    }
+    w.u8(s.anchor as u8);
+    w.var(s.paras.len() as u64);
+    for p in &s.paras {
+        encode_para(w, p);
+    }
+    w.var(s.kids.len() as u64);
+    for k in &s.kids {
+        for v in [k.x, k.y, k.w, k.h] {
+            w.ivar(v as i64);
+        }
+        encode_shape(w, &k.shape);
+    }
+}
+
+/// Most guides' worth of adjust values, paths and steps a shape keeps.
+const MAX_SHAPE_ADJ: u64 = 64;
+const MAX_SHAPE_PATHS: u64 = 64;
+const MAX_PATH_CMDS: u64 = 1 << 16;
+const MAX_SHAPE_COORD: i64 = 1 << 40;
+
+pub fn decode_shape(r: &mut Reader, attrs: usize, styles: usize) -> Result<crate::model::ShapeData, WireError> {
+    let mut budget = crate::model::MAX_GROUP_SHAPES;
+    decode_shape_in(r, attrs, styles, 0, &mut budget)
+}
+
+fn decode_shape_in(r: &mut Reader, attrs: usize, styles: usize, depth: usize, budget: &mut usize) -> Result<crate::model::ShapeData, WireError> {
+    use crate::model::{Dash, Geom, PathCmd, ShapeData, ShapeLine, ShapePath, TextAnchor, MAX_SHAPE_PARAS};
+    let coord = |r: &mut Reader| -> Result<i64, WireError> {
+        let v = r.ivar()?;
+        if v.abs() > MAX_SHAPE_COORD {
+            return Err(WireError::Invalid("shape coordinate"));
+        }
+        Ok(v)
+    };
+    let geom = match r.u8()? {
+        0 => {
+            let name: Arc<str> = Arc::from(r.str("shape name", MAX_NAME)?);
+            let n = r.count("adjust values", MAX_SHAPE_ADJ, 2)?;
+            let mut adj = Vec::with_capacity(n);
+            for _ in 0..n {
+                let k: Arc<str> = Arc::from(r.str("adjust name", MAX_NAME)?);
+                adj.push((k, coord(r)?));
+            }
+            Geom::Preset { name, adj }
+        }
+        1 => {
+            let n = r.count("paths", MAX_SHAPE_PATHS, 4)?;
+            let mut paths = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (w, h) = (coord(r)?, coord(r)?);
+                let f = r.u8()?;
+                if f > 3 {
+                    return Err(WireError::Invalid("path flags"));
+                }
+                let k = r.count("path steps", MAX_PATH_CMDS, 1)?;
+                let mut cmds = Vec::with_capacity(k);
+                for _ in 0..k {
+                    cmds.push(match r.u8()? {
+                        0 => PathCmd::Move(coord(r)?, coord(r)?),
+                        1 => PathCmd::Line(coord(r)?, coord(r)?),
+                        2 => PathCmd::Cubic(coord(r)?, coord(r)?, coord(r)?, coord(r)?, coord(r)?, coord(r)?),
+                        3 => PathCmd::Close,
+                        _ => return Err(WireError::Invalid("path step")),
+                    });
+                }
+                paths.push(ShapePath { w, h, cmds, filled: f & 1 != 0, stroked: f & 2 != 0 });
+            }
+            Geom::Custom(paths)
+        }
+        _ => return Err(WireError::Invalid("shape outline")),
+    };
+    let flags = r.u8()?;
+    if flags > 15 {
+        return Err(WireError::Invalid("shape flags"));
+    }
+    let mut s = ShapeData::new(geom);
+    if flags & 1 != 0 {
+        s.fill = Some(r.u32()? & 0xFF_FFFF);
+    }
+    if flags & 2 != 0 {
+        let color = r.u32()? & 0xFF_FFFF;
+        let width = r.ivar()?;
+        if !(0..=2880).contains(&width) {
+            return Err(WireError::Invalid("outline width"));
+        }
+        let dash = match r.u8()? {
+            0 => Dash::Solid,
+            1 => Dash::Dot,
+            2 => Dash::Dash,
+            3 => Dash::DashDot,
+            4 => Dash::LongDash,
+            _ => return Err(WireError::Invalid("dash")),
+        };
+        let ends = r.u8()?;
+        let end = |v: u8| -> Result<crate::model::ArrowEnd, WireError> {
+            use crate::model::ArrowEnd::*;
+            Ok([None, Triangle, Open, Stealth, Diamond, Oval].get(v as usize).copied().ok_or(WireError::Invalid("line end"))?)
+        };
+        let (head, tail) = (end(ends & 15)?, end(ends >> 4)?);
+        s.line = Some(ShapeLine { color, width: width as i32, dash, head, tail });
+    }
+    s.flip_h = flags & 4 != 0;
+    s.flip_v = flags & 8 != 0;
+    s.rot = r.ivar()?.rem_euclid(21_600_000) as i32;
+    for i in 0..4 {
+        let v = r.ivar()?;
+        if !(0..=MAX_TWIPS).contains(&v) {
+            return Err(WireError::Invalid("text inset"));
+        }
+        s.inset[i] = v as i32;
+    }
+    s.anchor = match r.u8()? {
+        0 => TextAnchor::Top,
+        1 => TextAnchor::Middle,
+        2 => TextAnchor::Bottom,
+        _ => return Err(WireError::Invalid("text anchor")),
+    };
+    let k = r.count("shape paragraphs", MAX_SHAPE_PARAS as u64, 7)?;
+    for _ in 0..k {
+        let Block::Para(p) = decode_block(r, attrs, styles)?;
+        s.paras.push(p);
+    }
+    let k = r.count("group shapes", crate::model::MAX_GROUP_SHAPES as u64, 8)?;
+    if k > 0 && depth >= crate::model::MAX_GROUP_DEPTH {
+        return Err(WireError::Invalid("groups too deep"));
+    }
+    for _ in 0..k {
+        if *budget == 0 {
+            return Err(WireError::Invalid("too many group shapes"));
+        }
+        *budget -= 1;
+        let mut f = [0i32; 4];
+        for v in &mut f {
+            let x = r.ivar()?;
+            if x.abs() > 100_000_000 {
+                return Err(WireError::Invalid("group frame"));
+            }
+            *v = x as i32;
+        }
+        let shape = decode_shape_in(r, attrs, styles, depth + 1, budget)?;
+        s.kids.push(crate::model::ShapeKid { x: f[0], y: f[1], w: f[2], h: f[3], shape });
+    }
+    Ok(s)
+}
+
 fn encode_margin_paras(w: &mut Writer, header: &Option<HeaderFooter>, footer: &Option<HeaderFooter>) {
     for hf in [header, footer] {
         let paras = hf.as_ref().map_or(&[][..], |h| &h.paras[..]);
@@ -1129,6 +1331,12 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
         encode_image(&mut w, i as u32, img);
         c.add(IMAGE, &w.into_bytes())?;
     }
+    for (i, sh) in doc.shapes.iter() {
+        let mut w = Writer::new();
+        w.var(i as u64);
+        encode_shape(&mut w, sh);
+        c.add(SHAPE, &w.into_bytes())?;
+    }
 
     let mut w = Writer::new();
     let n = doc.attrs.len();
@@ -1352,7 +1560,7 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
     let n = r.count("attributes", MAX_ATTRS, 2)?;
     for i in 0..n {
         let a = decode_attrs(&mut r)?;
-        if a.object.is_some_and(|o| o.image as usize >= doc.images.len()) {
+        if a.object.is_some_and(|o| !o.shape && o.image as usize >= doc.images.len()) {
             return Err(LoadError::Bad("picture reference"));
         }
         // A formatting change names an earlier entry (never itself or a later one).
@@ -1509,6 +1717,32 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
             }
         }
     }
+    for (i, e) in c.entries().iter().enumerate() {
+        if e.kind != SHAPE {
+            continue;
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let id = r.len("shape", crate::model::MAX_SHAPES as u64 - 1)? as u32;
+        let sh = decode_shape(&mut r, attrs, styles)?;
+        for p in sh.all_paras() {
+            if !ids.insert(p.id) || p.id >= watermark {
+                return Err(LoadError::Bad("block id"));
+            }
+            // A shape holds no shapes.
+            if p.runs.iter().any(|&(_, a)| doc.attrs.get(a).object.is_some_and(|o| o.shape)) {
+                return Err(LoadError::Bad("shape in a shape"));
+            }
+        }
+        if doc.shapes.get(id).is_some() {
+            return Err(LoadError::Bad("shape listed twice"));
+        }
+        doc.shapes.set(id, Some(sh));
+    }
+    for i in 1..doc.attrs.len() {
+        if doc.attrs.get(i as AttrId).object.is_some_and(|o| o.shape && doc.shapes.get(o.image).is_none()) {
+            return Err(LoadError::Bad("shape reference"));
+        }
+    }
     doc.raise_watermark(watermark);
 
     let mut checkpoints = Vec::new();
@@ -1548,7 +1782,7 @@ mod tests {
         d.footer = Some(HeaderFooter { text: "Page {page} of {pages}".into(), align: Align::Center, paras: Vec::new() });
         let img = d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 });
         assert_eq!(d.images.add(ImageData { bytes: Arc::from(&b"\x89PNG fake"[..]), width: 40, height: 20 }), img, "the same bytes are stored once");
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 600, height: 300, float: None, shape: false }), ..Default::default() });
         d.push_para("a \u{FFFC} b", 0, vec![(0, 0), (2, pic), (5, 0)]);
         let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
         d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);
@@ -1603,8 +1837,47 @@ mod tests {
     #[test]
     fn a_picture_reference_past_the_pictures_is_refused() {
         let mut d = TextDoc::new();
-        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 600, height: 300, float: None }), ..Default::default() });
+        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 600, height: 300, float: None, shape: false }), ..Default::default() });
         assert!(matches!(load(&save_to_vec(&d, &[])), Err(LoadError::Bad("picture reference"))));
+    }
+
+    #[test]
+    fn shapes_round_trip_and_bad_ones_are_refused() {
+        use crate::model::{Dash, Geom, PathCmd, ShapeData, ShapeLine, ShapePath, TextAnchor};
+        let mut d = TextDoc::new();
+        let mut sd = ShapeData::new(Geom::Preset { name: "wedgeRectCallout".into(), adj: vec![("adj1".into(), -20_833), ("adj2".into(), 62_500)] });
+        sd.fill = Some(0xFFC000);
+        sd.line = Some(ShapeLine { color: 0x1F3864, width: 25, dash: Dash::DashDot, head: crate::model::ArrowEnd::Oval, tail: crate::model::ArrowEnd::Stealth });
+        sd.rot = 45 * 60_000;
+        sd.flip_v = true;
+        sd.anchor = TextAnchor::Bottom;
+        sd.inset = [0, 10, 20, 30];
+        let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
+        let mut p = Para::new(d.new_id(), "Note this", 0);
+        p.runs = vec![(0, bold)];
+        sd.paras.push(p);
+        let a = d.shapes.add(sd).unwrap();
+        let custom = ShapeData::new(Geom::Custom(vec![ShapePath { w: 100, h: 50, cmds: vec![PathCmd::Move(0, 0), PathCmd::Line(100, 0), PathCmd::Cubic(100, 20, 50, 50, 0, 50), PathCmd::Close], filled: true, stroked: false }]));
+        let b = d.shapes.add(custom).unwrap();
+        let ra = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: a, width: 2000, height: 1000, float: None, shape: true }), ..Default::default() });
+        let rb = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: b, width: 300, height: 300, float: Some(Float::default()), shape: true }), ..Default::default() });
+        d.push_para("\u{FFFC}\u{FFFC}", 0, vec![(0, ra), (3, rb)]);
+        let back = load(&save_to_vec(&d, &[])).unwrap().doc;
+        assert_eq!(back.shapes.iter().map(|(i, s)| (i, (**s).clone())).collect::<Vec<_>>(), d.shapes.iter().map(|(i, s)| (i, (**s).clone())).collect::<Vec<_>>());
+        let objs: Vec<_> = back.blocks.iter().filter_map(|b| b.as_para()).flat_map(|p| p.runs.iter().filter_map(|&(_, a)| back.attrs.get(a).object)).collect();
+        assert_eq!(objs.len(), 2);
+        assert!(objs.iter().all(|o| o.shape));
+        // A reference to a shape the file lacks.
+        let mut bad = d.clone();
+        bad.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 7, width: 300, height: 300, float: None, shape: true }), ..Default::default() });
+        assert!(matches!(load(&save_to_vec(&bad, &[])), Err(LoadError::Bad("shape reference"))));
+        // A shape inside a shape.
+        let mut nest = d.clone();
+        let mut inner = (**nest.shapes.get(a).unwrap()).clone();
+        let id = nest.new_id();
+        inner.paras = vec![Para { id, text: "\u{FFFC}".into(), runs: vec![(0, rb)], style: 0, props: Default::default() }];
+        nest.shapes.set(a, Some(inner));
+        assert!(matches!(load(&save_to_vec(&nest, &[])), Err(LoadError::Bad("shape in a shape"))));
     }
 
     #[test]

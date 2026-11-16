@@ -8,6 +8,7 @@ Apache-2.0: poi/src/main/resources/org/apache/poi/sl/draw/geom/).
 Format, one item per line:
   =name                 a shape
   a NAME FMLA           an adjust value's default (avLst)
+  r L T R B             the text rectangle (guide names or numbers)
   g NAME FMLA           a guide (gdLst)
   p W H FILL STROKE     a path: its own size (0: the shape's), fill
                         (n norm, - none, l lighten, L lightenLess, d darken,
@@ -37,6 +38,9 @@ def main():
                 continue
             for gd in lst.findall(NS + 'gd'):
                 out.append(f"{kind} {gd.get('name')} {gd.get('fmla')}")
+        rect = shape.find(NS + 'rect')
+        if rect is not None:
+            out.append('r ' + ' '.join(rect.get(k, '0') for k in ('l', 't', 'r', 'b')))
         pl = shape.find(NS + 'pathLst')
         if pl is None:
             continue

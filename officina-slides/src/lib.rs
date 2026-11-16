@@ -14,11 +14,11 @@
 //! say exactly.
 
 pub mod draw;
-pub mod geom;
+pub use officina_shapes::geom;
 pub mod model;
 pub mod native;
 pub mod ops;
-pub mod presets;
+pub use officina_shapes::presets;
 pub mod resolve;
 pub mod show;
 

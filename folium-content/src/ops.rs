@@ -21,6 +21,8 @@ pub enum Op {
     Restore,
     Transform([f64; 6]),
     LineWidth(f64),
+    /// The dash pattern and its phase (`d`; empty: solid).
+    Dash(Vec<f64>, f64),
     FillRgb([f64; 3]),
     StrokeRgb([f64; 3]),
     FillGray(f64),
@@ -68,6 +70,18 @@ impl Op {
             Op::Transform(m) => {
                 nums(out, m);
                 out.extend(b"cm");
+            }
+            Op::Dash(v, phase) => {
+                out.push(b'[');
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend(num(*x).bytes());
+                }
+                out.extend(b"] ");
+                nums(out, &[*phase]);
+                out.extend(b"d");
             }
             Op::LineWidth(w) => {
                 nums(out, &[*w]);

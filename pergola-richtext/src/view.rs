@@ -319,6 +319,49 @@ impl RichTextView {
                                 }
                             }
                         }
+                        Item::Path { cmds, fill, line } => {
+                            use officina_text::model::{Dash, PathCmd};
+                            use pergola::shape::{Paint, PathData, Shape, Stroke};
+                            let p = |x: i64, y: i64| ((ox + x as f64 * g.k) as f32, (oy + y as f64 * g.k) as f32);
+                            let mut d = PathData::new();
+                            for c in &cmds {
+                                d = match *c {
+                                    PathCmd::Move(x, y) => {
+                                        let (x, y) = p(x, y);
+                                        d.move_to(x, y)
+                                    }
+                                    PathCmd::Line(x, y) => {
+                                        let (x, y) = p(x, y);
+                                        d.line_to(x, y)
+                                    }
+                                    PathCmd::Cubic(a, b, c, e, f, h) => {
+                                        let ((a, b), (c, e), (f, h)) = (p(a, b), p(c, e), p(f, h));
+                                        d.cubic_to(a, b, c, e, f, h)
+                                    }
+                                    PathCmd::Close => d.close(),
+                                };
+                            }
+                            let mut sh = Shape::new(d);
+                            if let Some(f) = fill {
+                                sh = sh.fill(Paint::Solid(rgb(f)));
+                            }
+                            if let Some((color, width, dash)) = line {
+                                let wd = ((width as f64 * g.k) as f32).max(0.75);
+                                let mut st = Stroke::new(Paint::Solid(rgb(color)), wd);
+                                st.dash = match dash {
+                                    Dash::Solid => None,
+                                    Dash::Dot => Some((vec![wd, wd], 0.0)),
+                                    Dash::Dash => Some((vec![4.0 * wd, 3.0 * wd], 0.0)),
+                                    Dash::DashDot => Some((vec![4.0 * wd, 3.0 * wd, wd, 3.0 * wd], 0.0)),
+                                    Dash::LongDash => Some((vec![8.0 * wd, 3.0 * wd], 0.0)),
+                                };
+                                sh = sh.stroke(st);
+                            }
+                            for f in sh.fills() {
+                                ctx.add(Node::Fill(Arc::new(f)));
+                            }
+                        }
+                        Item::Shape { .. } => {}
                         Item::Mark { x, y, w, h, comments } => {
                             let done = comments.iter().all(|&c| ed.doc.comments.get(c).is_none_or(|c| c.done));
                             let fill = if done { Color::rgba(0.55, 0.57, 0.6, 0.12) } else { Color::rgba(1.0, 0.78, 0.15, 0.32) };

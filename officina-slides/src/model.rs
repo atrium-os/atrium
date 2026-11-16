@@ -177,37 +177,7 @@ impl Stroke {
     }
 }
 
-/// A path step in a custom shape's own coordinates (`0..w`, `0..h`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PathCmd {
-    Move(i64, i64),
-    Line(i64, i64),
-    Cubic(i64, i64, i64, i64, i64, i64),
-    Close,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Path {
-    pub w: i64,
-    pub h: i64,
-    pub cmds: Vec<PathCmd>,
-    pub filled: bool,
-    pub stroked: bool,
-}
-
-/// A shape's outline: an OOXML preset by name (`rect`, `roundRect`,
-/// `ellipse`, ...) with its adjust values, or paths of its own.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Geom {
-    Preset { name: Arc<str>, adj: Vec<(Arc<str>, i64)> },
-    Custom(Vec<Path>),
-}
-
-impl Geom {
-    pub fn preset(name: &str) -> Geom {
-        Geom::Preset { name: name.into(), adj: Vec::new() }
-    }
-}
+pub use officina_shapes::{Geom, Path, PathCmd};
 
 /// Where a frame's text sits when it is shorter than the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

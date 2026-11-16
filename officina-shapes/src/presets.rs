@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use crate::model::{Path, PathCmd};
+use crate::{Path, PathCmd};
 
 /// A formula's operands: a guide by number, or a number.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +77,8 @@ pub struct Def {
     pub adj: Vec<(u16, Formula)>,
     pub guides: Vec<(u16, Formula)>,
     pub paths: Vec<PathDef>,
+    /// Where text goes: left, top, right, bottom (none: the whole box).
+    pub rect: Option<[Arg; 4]>,
 }
 
 /// The built-in variables (§20.1.9.11), in order: their values depend on
@@ -200,6 +202,12 @@ impl Builder {
         self.def.paths.last_mut().expect("a path").cmds.push(c);
     }
 
+    /// The text rectangle, from names or numbers.
+    pub fn rect(&mut self, l: &str, t: &str, r: &str, b: &str) {
+        let r = [self.arg(l), self.arg(t), self.arg(r), self.arg(b)];
+        self.def.rect = Some(r);
+    }
+
     pub fn finish(self) -> Def {
         self.def
     }
@@ -247,9 +255,8 @@ fn eval(f: &Formula, v: &[f64]) -> f64 {
 }
 
 impl Def {
-    /// The paths in a `w` × `h` box; `adj` overrides adjust values by name.
-    pub fn paths(&self, w: i64, h: i64, adj: &[(Arc<str>, i64)]) -> Vec<Path> {
-        let (wf, hf) = (w.max(0) as f64, h.max(0) as f64);
+    /// Every variable's value in a `w` × `h` box.
+    fn values(&self, wf: f64, hf: f64, adj: &[(Arc<str>, i64)]) -> Vec<f64> {
         let mut v = vec![0.0; self.names.len()];
         v[..BUILTINS.len()].copy_from_slice(&builtins(wf, hf));
         for (k, f) in &self.adj {
@@ -262,6 +269,27 @@ impl Def {
         for (k, f) in &self.guides {
             v[*k as usize] = eval(f, &v);
         }
+        v
+    }
+
+    /// Where its text goes in a `w` × `h` box: left, top, right, bottom
+    /// (the whole box when the definition names none).
+    pub fn text_rect(&self, w: i64, h: i64, adj: &[(Arc<str>, i64)]) -> [i64; 4] {
+        let Some(r) = self.rect else { return [0, 0, w, h] };
+        let v = self.values(w.max(0) as f64, h.max(0) as f64, adj);
+        let get = |a: Arg| match a {
+            Arg::Num(x) => x,
+            Arg::Var(k) => v.get(k as usize).copied().unwrap_or(0.0),
+        };
+        let c = |x: f64| x.round().clamp(-1e12, 1e12) as i64;
+        let [l, t, rr, b] = r.map(|a| c(get(a)));
+        if rr > l && b > t { [l, t, rr, b] } else { [0, 0, w, h] }
+    }
+
+    /// The paths in a `w` × `h` box; `adj` overrides adjust values by name.
+    pub fn paths(&self, w: i64, h: i64, adj: &[(Arc<str>, i64)]) -> Vec<Path> {
+        let (wf, hf) = (w.max(0) as f64, h.max(0) as f64);
+        let v = self.values(wf, hf, adj);
         let get = |a: Arg| match a {
             Arg::Num(x) => x,
             Arg::Var(k) => v.get(k as usize).copied().unwrap_or(0.0),
@@ -386,6 +414,7 @@ fn all() -> &'static HashMap<&'static str, Def> {
                         if tag == "a" { b.adj(name, fmla) } else { b.guide(name, fmla) }
                     }
                 }
+                "r" => b.rect(f.first().copied().unwrap_or("l"), f.get(1).copied().unwrap_or("t"), f.get(2).copied().unwrap_or("r"), f.get(3).copied().unwrap_or("b")),
                 "p" => {
                     let num = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                     b.path(num(0), num(1), f.get(2) != Some(&"-"), f.get(3) != Some(&"0"));
@@ -434,6 +463,17 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_rectangles_follow_the_definitions() {
+        // An ellipse's text sits in the square inside it (about 14.6 % in).
+        let [l, t, r, b] = preset("ellipse").unwrap().text_rect(10_000, 4_000, &[]);
+        assert!((l - 1_464).abs() <= 2 && (t - 586).abs() <= 2 && (r - 8_536).abs() <= 2 && (b - 3_414).abs() <= 2, "{l} {t} {r} {b}");
+        // A right arrow's in its body: the middle half of the height.
+        let [_, t, _, b] = preset("rightArrow").unwrap().text_rect(10_000, 4_000, &[]);
+        assert_eq!((t, b), (1_000, 3_000));
+        assert_eq!(preset("rect").unwrap().text_rect(500, 300, &[]), [0, 0, 500, 300]);
+    }
 
     fn bounds(p: &[Path]) -> (i64, i64, i64, i64) {
         let mut b = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);

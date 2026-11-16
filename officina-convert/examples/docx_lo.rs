@@ -78,7 +78,7 @@ pub fn sample() -> TextDoc {
         }
     }
     let img = d.images.add(ImageData { bytes: Arc::from(png(40, 20)), width: 40, height: 20 });
-    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None, shape: false }), ..Default::default() });
     d.push_para("See \u{FFFC} here", 0, vec![(0, 0), (4, pic), (7, 0)]);
     let sup = d.attrs.intern(CharAttrs { vert: Some(VertAlign::Super), ..Default::default() });
     d.push_para("E = mc2", 0, vec![(0, 0), (6, sup)]);

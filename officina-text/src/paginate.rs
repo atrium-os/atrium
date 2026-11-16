@@ -1426,7 +1426,7 @@ mod tests {
 
     /// A floating picture `w`×`h` twips at the start of block `b`.
     fn float_op(d: &mut TextDoc, b: usize, fl: crate::model::Float, w: u32, h: u32) -> TextOp {
-        let a = d.attrs.intern(crate::model::CharAttrs { object: Some(ObjectRef { image: 0, width: w, height: h, float: Some(fl) }), ..Default::default() });
+        let a = d.attrs.intern(crate::model::CharAttrs { object: Some(ObjectRef { image: 0, width: w, height: h, float: Some(fl), shape: false }), ..Default::default() });
         let ins = crate::ops::Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, a)] };
         TextOp::Splice { block: b as u32, at: 0, del: 0, ins }
     }

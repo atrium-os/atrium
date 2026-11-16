@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 
-use officina_text::model::{Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
+use officina_text::model::{ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor, MAX_GROUP_DEPTH, MAX_GROUP_SHAPES, Float, HAlign, Rel, Wrap, Section, SectionStart, BlockId, Field, Leader, TabAlign, RevId, Align, CharAttrs, CommentId, HeaderFooter, LineSpacing, ListKind, NoteKind, Para, ParaProps, StyleKind, TextDoc, VertAlign, HEADER_FROM_EDGE, OBJECT_CHAR};
 
 use crate::xml::esc;
 use crate::zip::ZipWriter;
@@ -21,6 +21,50 @@ const NS: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1
 fn pt(t: i64) -> String {
     let v = t as f64 / 20.0;
     format!("{}pt", (v * 100.0).round() / 100.0)
+}
+
+/// RGB as `#rrggbb`.
+fn hex(c: u32) -> String {
+    format!("#{:06x}", c & 0xFF_FFFF)
+}
+
+/// A floating object's wrap, gap and how its position is measured, as
+/// graphic properties.
+fn float_props(f: &Float) -> String {
+    let wrap = match f.wrap {
+        Wrap::Square => r#"style:wrap="parallel" style:number-wrapped-paragraphs="no-limit" style:wrap-contour="false""#,
+        Wrap::TopBottom => r#"style:wrap="none""#,
+        Wrap::Behind => r#"style:wrap="run-through" style:run-through="background""#,
+        Wrap::InFront => r#"style:wrap="run-through" style:run-through="foreground""#,
+    };
+    let hpos = match f.h_align {
+        HAlign::Start => "left",
+        HAlign::Center => "center",
+        HAlign::End => "right",
+        HAlign::Offset => "from-left",
+    };
+    let rel = |r: Rel| match r {
+        Rel::Text => "paragraph",
+        Rel::Margin => "page-content",
+        Rel::Page => "page",
+    };
+    let g = pt(f.gap as i64);
+    format!(r#" {wrap} fo:margin-left="{g}" fo:margin-right="{g}" fo:margin-top="{g}" fo:margin-bottom="{g}" style:vertical-pos="from-top" style:vertical-rel="{}" style:horizontal-pos="{hpos}" style:horizontal-rel="{}" style:flow-with-text="false""#, rel(f.v_rel), rel(f.h_rel))
+}
+
+/// A frame's size and place in twips, turned `deg` clockwise about its
+/// middle: ODF turns counter-clockwise about the top left, then moves.
+fn place(b: [f64; 4], deg: f64) -> String {
+    let [x, y, w, h] = b;
+    let p = |v: f64| pt(v.round() as i64);
+    let size = format!(r#" svg:width="{}" svg:height="{}""#, p(w), p(h));
+    if deg.abs() < 1e-6 || (deg - 360.0).abs() < 1e-6 {
+        return format!(r#"{size} svg:x="{}" svg:y="{}""#, p(x), p(y));
+    }
+    let a = (360.0 - deg).rem_euclid(360.0).to_radians();
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let (rx, ry) = (cx * a.cos() + cy * a.sin(), -cx * a.sin() + cy * a.cos());
+    format!(r#"{size} draw:transform="rotate ({a:.9}) translate ({} {})""#, p(x + cx - rx), p(y + cy - ry))
 }
 
 /// A named style's name in the file, and its display name.
@@ -209,6 +253,11 @@ struct Out<'a> {
     targets: std::collections::HashSet<BlockId>,
     /// Graphic styles of floating pictures, by placement.
     graphic_styles: HashMap<Float, String>,
+    /// Drawn shapes' graphic styles written.
+    shape_styles: u32,
+    /// Dashes and arrowheads (`office:styles`), by name.
+    common: String,
+    common_names: std::collections::HashSet<String>,
     /// Sections' own pages, each a master page (`Section_20_Page_{n}`, from 1).
     pages: Vec<officina_text::model::PageSetup>,
     /// Blocks starting a section whose page differs from the section before's.
@@ -305,27 +354,148 @@ impl Out<'_> {
             return n.clone();
         }
         let n = format!("{}fr{}", self.prefix, self.graphic_styles.len() + 1);
-        let wrap = match f.wrap {
-            Wrap::Square => r#"style:wrap="parallel" style:number-wrapped-paragraphs="no-limit" style:wrap-contour="false""#,
-            Wrap::TopBottom => r#"style:wrap="none""#,
-            Wrap::Behind => r#"style:wrap="run-through" style:run-through="background""#,
-            Wrap::InFront => r#"style:wrap="run-through" style:run-through="foreground""#,
-        };
-        let hpos = match f.h_align {
-            HAlign::Start => "left",
-            HAlign::Center => "center",
-            HAlign::End => "right",
-            HAlign::Offset => "from-left",
-        };
-        let rel = |r: Rel| match r {
-            Rel::Text => "paragraph",
-            Rel::Margin => "page-content",
-            Rel::Page => "page",
-        };
-        let g = pt(f.gap as i64);
-        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="graphic"><style:graphic-properties {wrap} fo:margin-left="{g}" fo:margin-right="{g}" fo:margin-top="{g}" fo:margin-bottom="{g}" style:vertical-pos="from-top" style:vertical-rel="{}" style:horizontal-pos="{hpos}" style:horizontal-rel="{}"/></style:style>"#, rel(f.v_rel), rel(f.h_rel));
+        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="graphic"><style:graphic-properties{}/></style:style>"#, float_props(f));
         self.graphic_styles.insert(*f, n.clone());
         n
+    }
+
+    /// A drawn shape's object: a `draw:custom-shape` (a `draw:line` for a
+    /// line, a `draw:g` for a group) with its own graphic style, placed as
+    /// a picture is, its paragraphs inside.
+    fn shape_object(&mut self, sd: &ShapeData, o: &officina_text::model::ObjectRef, out: &mut String) {
+        self.frames += 1;
+        let (w, h) = (o.width as f64, o.height as f64);
+        let (anchor, x, y) = match &o.float {
+            None => (r#" text:anchor-type="as-char""#.to_string(), 0.0, 0.0),
+            Some(f) => (r#" text:anchor-type="char""#.to_string(), if f.h_align == HAlign::Offset { f.x as f64 } else { 0.0 }, f.y as f64),
+        };
+        let mut budget = MAX_GROUP_SHAPES;
+        self.drawn(sd, o.float.as_ref(), &anchor, [x, y, w, h], o.float.is_none(), 0, &mut budget, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drawn(&mut self, sd: &ShapeData, float: Option<&Float>, anchor: &str, b: [f64; 4], inline: bool, depth: usize, budget: &mut usize, out: &mut String) {
+        if depth > MAX_GROUP_DEPTH || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let [x, y, w, h] = b;
+        let name = format!(r#" draw:name="Shape {}-{}""#, self.frames, MAX_GROUP_SHAPES - *budget);
+        let wrap = float.map(float_props).unwrap_or_default();
+        if !sd.kids.is_empty() {
+            let st = self.shape_style(&format!(r#"{wrap} draw:fill="none" draw:stroke="none""#));
+            let _ = write!(out, r#"<draw:g draw:style-name="{st}"{name}{anchor} draw:z-index="0">"#);
+            if sd.fill.is_some() || sd.line.is_some() || !sd.paras.is_empty() {
+                let own = ShapeData { kids: Vec::new(), ..sd.clone() };
+                self.drawn(&own, None, "", b, false, depth + 1, budget, out);
+            }
+            for k in &sd.kids {
+                let kb = [x + k.x as f64 * w / 1e5, y + k.y as f64 * h / 1e5, k.w as f64 * w / 1e5, k.h as f64 * h / 1e5];
+                self.drawn(&k.shape, None, "", kb, false, depth + 1, budget, out);
+            }
+            out.push_str("</draw:g>");
+            return;
+        }
+        let mut g = wrap;
+        match sd.fill {
+            Some(c) => {
+                let _ = write!(g, r#" draw:fill="solid" draw:fill-color="{}""#, hex(c));
+            }
+            None => g.push_str(r#" draw:fill="none""#),
+        }
+        g.push_str(&self.stroke(sd.line.as_ref()));
+        let [l, t, r, bt] = sd.inset;
+        let _ = write!(g, r#" fo:padding-left="{}" fo:padding-top="{}" fo:padding-right="{}" fo:padding-bottom="{}" draw:textarea-horizontal-align="justify" draw:textarea-vertical-align="{}" draw:auto-grow-height="false" fo:wrap-option="wrap""#, pt(l as i64), pt(t as i64), pt(r as i64), pt(bt as i64), match sd.anchor {
+            TextAnchor::Top => "top",
+            TextAnchor::Middle => "middle",
+            TextAnchor::Bottom => "bottom",
+        });
+        let st = self.shape_style(&g);
+        let mut body = String::new();
+        self.in_note += 1;
+        for p in &sd.paras {
+            let mut q = p.clone();
+            q.props.list = None;
+            q.props.cell = None;
+            self.para_of(&q, &mut body);
+        }
+        self.in_note -= 1;
+        let deg = sd.rot as f64 / 60_000.0;
+        let is_line = matches!(&sd.geom, Geom::Preset { name, .. } if &**name == "line" || &**name == "straightConnector1");
+        if is_line {
+            let (mut x1, mut y1, mut x2, mut y2) = (x, y, x + w, y + h);
+            if sd.flip_h {
+                std::mem::swap(&mut x1, &mut x2);
+            }
+            if sd.flip_v {
+                std::mem::swap(&mut y1, &mut y2);
+            }
+            if deg.abs() > 1e-6 {
+                let t = deg.to_radians();
+                let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                let turn = |px: f64, py: f64| (cx + (px - cx) * t.cos() - (py - cy) * t.sin(), cy + (px - cx) * t.sin() + (py - cy) * t.cos());
+                (x1, y1) = turn(x1, y1);
+                (x2, y2) = turn(x2, y2);
+            }
+            let f = |v: f64| pt(v.round() as i64);
+            let (tag, ty) = if matches!(&sd.geom, Geom::Preset { name, .. } if &**name == "straightConnector1") { ("draw:connector", r#" draw:type="line""#) } else { ("draw:line", "") };
+            let _ = write!(out, r#"<{tag} draw:style-name="{st}"{name}{anchor} draw:z-index="0"{ty} svg:x1="{}" svg:y1="{}" svg:x2="{}" svg:y2="{}">{body}</{tag}>"#, f(x1), f(y1), f(x2), f(y2));
+            return;
+        }
+        let place = if inline && deg.abs() < 1e-6 { format!(r#" svg:width="{}" svg:height="{}""#, pt(w.round() as i64), pt(h.round() as i64)) } else { place(b, deg) };
+        let mirror = format!("{}{}", if sd.flip_h { r#" draw:mirror-horizontal="true""# } else { "" }, if sd.flip_v { r#" draw:mirror-vertical="true""# } else { "" });
+        let geo = crate::odp::write::geometry(&sd.geom, w * 635.0, h * 635.0, true);
+        let _ = write!(out, r#"<draw:custom-shape draw:style-name="{st}"{name}{anchor} draw:z-index="0"{place}>{body}<draw:enhanced-geometry{mirror} {geo}/></draw:custom-shape>"#);
+    }
+
+    fn shape_style(&mut self, props: &str) -> String {
+        let n = format!("{}gr{}", self.prefix, self.shape_styles + 1);
+        self.shape_styles += 1;
+        let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="graphic"><style:graphic-properties{props}/></style:style>"#);
+        n
+    }
+
+    /// A shape's outline attributes; its arrowheads' markers go to the
+    /// common styles.
+    fn stroke(&mut self, l: Option<&ShapeLine>) -> String {
+        let Some(l) = l else { return r#" draw:stroke="none""#.into() };
+        let mut s = String::new();
+        let dash = match l.dash {
+            Dash::Solid => None,
+            Dash::Dot => Some(("Dot", r#"draw:dots1="1" draw:dots1-length="100%" draw:distance="100%""#)),
+            Dash::Dash => Some(("Dash", r#"draw:dots1="1" draw:dots1-length="400%" draw:distance="300%""#)),
+            Dash::LongDash => Some(("Long_Dash", r#"draw:dots1="1" draw:dots1-length="800%" draw:distance="300%""#)),
+            Dash::DashDot => Some(("Dash_Dot", r#"draw:dots1="1" draw:dots1-length="400%" draw:dots2="1" draw:dots2-length="100%" draw:distance="300%""#)),
+        };
+        match dash {
+            Some((n, attrs)) => {
+                let name = format!("Officina_{n}");
+                if !self.common_names.contains(&name) {
+                    let _ = write!(self.common, r#"<draw:stroke-dash draw:name="{name}" draw:display-name="{n}" draw:style="rect" {attrs}/>"#);
+                    self.common_names.insert(name.clone());
+                }
+                let _ = write!(s, r#" draw:stroke="dash" draw:stroke-dash="{name}""#);
+            }
+            None => s.push_str(r#" draw:stroke="solid""#),
+        }
+        let _ = write!(s, r#" svg:stroke-color="{}" svg:stroke-width="{}""#, hex(l.color), pt(l.width as i64));
+        let mw = pt((l.width as i64 * 3).max(113));
+        for (end, a) in [("start", l.head), ("end", l.tail)] {
+            let m = match a {
+                ArrowEnd::None => continue,
+                ArrowEnd::Triangle => ("Arrow", "0 0 20 30", "M10 0 L20 30 L0 30 Z"),
+                ArrowEnd::Open => ("Line_20_Arrow", "0 0 20 30", "M10 0 L20 28 L17 30 L10 8 L3 30 L0 28 Z"),
+                ArrowEnd::Stealth => ("Arrow_20_concave", "0 0 20 30", "M10 0 L20 30 L10 22 L0 30 Z"),
+                ArrowEnd::Diamond => ("Diamond", "0 0 20 20", "M10 0 L20 10 L10 20 L0 10 Z"),
+                ArrowEnd::Oval => ("Circle", "0 0 20 20", "M20 10 C20 15.5 15.5 20 10 20 C4.5 20 0 15.5 0 10 C0 4.5 4.5 0 10 0 C15.5 0 20 4.5 20 10 Z"),
+            };
+            if !self.common_names.contains(m.0) {
+                self.common_names.insert(m.0.to_string());
+                let _ = write!(self.common, r#"<draw:marker draw:name="{}" draw:display-name="{}" svg:viewBox="{}" svg:d="{}"/>"#, m.0, m.0.replace("_20_", " "), m.1, m.2);
+            }
+            let _ = write!(s, r#" draw:marker-{end}="{}" draw:marker-{end}-width="{mw}""#, m.0);
+        }
+        s
     }
 
     fn image(&mut self, i: u32) -> Option<String> {
@@ -574,7 +744,11 @@ impl Out<'_> {
                     }
                 }
                 if i < piece.len() {
-                    if let Some(o) = attrs.object {
+                    if let Some(o) = attrs.object.filter(|o| o.shape) {
+                        if let Some(sd) = doc.shapes.get(o.image) {
+                            self.shape_object(&sd.clone(), &o, &mut inner);
+                        }
+                    } else if let Some(o) = attrs.object {
                         if let Some(href) = self.image(o.image) {
                             self.frames += 1;
                             let place = match o.float {
@@ -751,7 +925,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
+    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::collections::HashSet::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
     let mut last_page = None;
     for k in 0..doc.blocks.len() {
         if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
@@ -939,7 +1113,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             // Its own paragraphs: their automatic styles and pictures go
             // with the master page.
             let prefix = ["MH", "MHL", "MHF", "MF", "MFL", "MFF"][i * 3 + k];
-            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
+            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::mem::take(&mut o.common_names), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
             let mut x = String::new();
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -957,6 +1131,8 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
                 }
             }
             o.media.extend(ho.media);
+            o.common += &ho.common;
+            o.common_names = ho.common_names;
         }
     }
     master += "</style:master-page>";
@@ -974,7 +1150,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         master += &standard.replacen(r#"style:name="Standard" style:page-layout-name="pm1""#, &format!(r#"style:name="Section_20_Page_{n}" style:display-name="Section Page {n}" style:next-style-name="Section_20_Page_{n}" style:page-layout-name="pmS{n}""#), 1);
     }
     let sfonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
-    let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{sfonts}</office:font-face-decls><office:styles>{defaults}{styles}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#);
+    let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{sfonts}</office:font-face-decls><office:styles>{defaults}{styles}{}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#, o.common);
     let fonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let tracked = if o.regions.is_empty() && !doc.tracking {
         String::new()

@@ -108,6 +108,54 @@ fn placed(r: Rect, rot: i32, stack: &[GroupXf]) -> ([f64; 4], f64) {
 }
 
 /// Position attributes: `svg:x`/`svg:y`, or a `draw:transform` for a turn.
+/// A `draw:enhanced-geometry`'s attributes for a `w` × `h` EMU outline: the
+/// preset's `ooxml-…` type and modifiers with the outline drawn. With
+/// `text_area`, the preset's own text rectangle as the text area.
+pub(crate) fn geometry(g: &Geom, w: f64, h: f64, text_area: bool) -> String {
+    let (vw, vh) = ((w / 360.0).round().max(1.0) as i64, (h / 360.0).round().max(1.0) as i64);
+    if matches!(g, Geom::Preset { name, .. } if &**name == "ellipse") {
+        // LibreOffice's own ellipse, with its own text area.
+        return r#"svg:viewBox="0 0 21600 21600" draw:type="ellipse""#.into();
+    }
+    let (paths, _) = officina_slides::geom::paths(g, vw, vh);
+    let ty = match g {
+        Geom::Preset { name, .. } => match &**name {
+            "rect" => "rectangle".to_string(),
+            "ellipse" => "ellipse".to_string(),
+            n => format!("ooxml-{}", n.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()),
+        },
+        Geom::Custom(_) => "ooxml-non-primitive".to_string(),
+    };
+    let mods = match g {
+        Geom::Preset { adj, .. } if !adj.is_empty() => format!(r#" draw:modifiers="{}""#, adj.iter().map(|(_, v)| v.to_string()).collect::<Vec<_>>().join(" ")),
+        _ => String::new(),
+    };
+    let mut d = String::new();
+    for p in &paths {
+        let sx = vw as f64 / p.w.max(1) as f64;
+        let sy = vh as f64 / p.h.max(1) as f64;
+        let x = |v: i64| (v as f64 * sx).round() as i64;
+        let y = |v: i64| (v as f64 * sy).round() as i64;
+        for c in &p.cmds {
+            let _ = match *c {
+                PathCmd::Move(a, b) => write!(d, "M {} {} ", x(a), y(b)),
+                PathCmd::Line(a, b) => write!(d, "L {} {} ", x(a), y(b)),
+                PathCmd::Cubic(a, b, c2, d2, e, f) => write!(d, "C {} {} {} {} {} {} ", x(a), y(b), x(c2), y(d2), x(e), y(f)),
+                PathCmd::Close => write!(d, "Z "),
+            };
+        }
+        if !p.filled {
+            d.push_str("F ");
+        }
+        if !p.stroked {
+            d.push_str("S ");
+        }
+        d.push_str("N ");
+    }
+    let [l, t, r, b] = if text_area { officina_slides::geom::text_rect(g, vw, vh) } else { [0, 0, vw, vh] };
+    format!(r#"svg:viewBox="0 0 {vw} {vh}" draw:text-areas="{l} {t} {r} {b}" draw:type="{ty}"{mods} draw:enhanced-path="{}""#, d.trim_end())
+}
+
 fn position(b: [f64; 4], deg: f64) -> String {
     let [x, y, w, h] = b;
     let size = format!(r#" svg:width="{}" svg:height="{}""#, cm(w), cm(h));
@@ -545,50 +593,6 @@ impl W<'_> {
         })
     }
 
-    fn geometry(g: &Geom, w: f64, h: f64) -> String {
-        let (vw, vh) = ((w / 360.0).round().max(1.0) as i64, (h / 360.0).round().max(1.0) as i64);
-        if matches!(g, Geom::Preset { name, .. } if &**name == "ellipse") {
-            // LibreOffice's own ellipse, with its own text area.
-            return r#"svg:viewBox="0 0 21600 21600" draw:type="ellipse""#.into();
-        }
-        let (paths, _) = officina_slides::geom::paths(g, vw, vh);
-        let ty = match g {
-            Geom::Preset { name, .. } => match &**name {
-                "rect" => "rectangle".to_string(),
-                "ellipse" => "ellipse".to_string(),
-                n => format!("ooxml-{}", n.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()),
-            },
-            Geom::Custom(_) => "ooxml-non-primitive".to_string(),
-        };
-        let mods = match g {
-            Geom::Preset { adj, .. } if !adj.is_empty() => format!(r#" draw:modifiers="{}""#, adj.iter().map(|(_, v)| v.to_string()).collect::<Vec<_>>().join(" ")),
-            _ => String::new(),
-        };
-        let mut d = String::new();
-        for p in &paths {
-            let sx = vw as f64 / p.w.max(1) as f64;
-            let sy = vh as f64 / p.h.max(1) as f64;
-            let x = |v: i64| (v as f64 * sx).round() as i64;
-            let y = |v: i64| (v as f64 * sy).round() as i64;
-            for c in &p.cmds {
-                let _ = match *c {
-                    PathCmd::Move(a, b) => write!(d, "M {} {} ", x(a), y(b)),
-                    PathCmd::Line(a, b) => write!(d, "L {} {} ", x(a), y(b)),
-                    PathCmd::Cubic(a, b, c2, d2, e, f) => write!(d, "C {} {} {} {} {} {} ", x(a), y(b), x(c2), y(d2), x(e), y(f)),
-                    PathCmd::Close => write!(d, "Z "),
-                };
-            }
-            if !p.filled {
-                d.push_str("F ");
-            }
-            if !p.stroked {
-                d.push_str("S ");
-            }
-            d.push_str("N ");
-        }
-        format!(r#"svg:viewBox="0 0 {vw} {vh}" draw:text-areas="0 0 {vw} {vh}" draw:type="{ty}"{mods} draw:enhanced-path="{}""#, d.trim_end())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn shape(&mut self, owner: Owner, sh: &Shape, stack: &mut Vec<GroupXf>, a: &mut Auto, layer: &str, on_page: bool, out: &mut String) {
         if stack.len() > MAX_DEPTH {
@@ -692,7 +696,7 @@ impl W<'_> {
                     self.text(t, &r.levels, a, &mut body);
                 }
                 let mirror = format!("{}{}", if sh.flip_h { r#" draw:mirror-horizontal="true""# } else { "" }, if sh.flip_v { r#" draw:mirror-vertical="true""# } else { "" });
-                let _ = write!(out, r#"<draw:custom-shape draw:style-name="{st}"{common}{}>{desc}{body}<draw:enhanced-geometry{mirror} {}/></draw:custom-shape>"#, position(b, deg), Self::geometry(&r.geom, b[2], b[3]));
+                let _ = write!(out, r#"<draw:custom-shape draw:style-name="{st}"{common}{}>{desc}{body}<draw:enhanced-geometry{mirror} {}/></draw:custom-shape>"#, position(b, deg), geometry(&r.geom, b[2], b[3], false));
             }
         }
     }

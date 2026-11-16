@@ -3186,6 +3186,64 @@ paginate and paint with no panic, 379 with headers or footers of their
 own paragraphs, 26 with pictures in them (checked against LibreOffice's
 renders on samples), 180 with margins grown for them.
 
+### 16.50 Drawn shapes and text boxes in documents (2026-11-16)
+
+- **Shared outlines.** `officina-shapes` (new, no dependencies) holds the
+  outline model (`Geom`, `Path`, `PathCmd`), the 187 preset definitions
+  (§16.48) and their evaluation, moved out of `officina-slides`, which
+  re-exports them. The presets now carry each definition's text rectangle
+  (`Def::text_rect`, 182 shapes; from the same Apache POI data), so an
+  arrow's or ellipse's text sits where Word and LibreOffice put it.
+- **Model.** An object run with `ObjectRef.shape` points into
+  `TextDoc.shapes` (a `Store<ShapeData>`, at most 65,536) instead of the
+  pictures: outline, fill (RGB), line (colour, width, solid / dot / dash /
+  dash-dot / long dash, arrowheads at each end: triangle, open, stealth,
+  diamond, oval), turn and flips about the middle, insets, text anchored
+  top / middle / bottom, its own paragraphs (at most 256) and a group's
+  shapes (frames as fractions of the group's, at most 8 deep and 1,024 in
+  one). Placed in line or floating exactly as a picture is (§16.30).
+- **Pages.** The page painter emits `Item::Path` (fill, then line with
+  dashes; arrowheads as their own marks) for each outline and lays the text
+  out upright in the outline's text rectangle less the insets; groups draw
+  their shapes in order. The screen (`pergola-richtext`) and PDF export draw
+  the paths (`folium-content` gained the dash operator).
+- **Native file.** A SHAPE chunk (13) per shape; attribute ext bit 5 marks a
+  shape object. Loading refuses a shape reference the file lacks, a shape
+  inside a shape's text and groups past the limits.
+- **`.docx`.** `wps:wsp` and `wpg:wgp` both ways: preset and custom
+  outlines (through the `.pptx` reader's drawing code, theme colours from
+  the document's theme), solid fills (a gradient's middle stop), lines with
+  dashes and arrowheads, `bodyPr` insets and anchor, `txbx` paragraphs,
+  group child frames (`chOff`/`chExt`). Shapes in headers, notes and other
+  shapes' text stay pictures-or-nothing as before.
+- **`.odt`.** Read: `draw:custom-shape` (enhanced geometry, `ooxml-…`
+  presets kept), `draw:rect`, `ellipse`, `circle`, `line`, `connector`,
+  `polygon`, `polyline`, `path`, text-box frames and `draw:g`, with
+  `draw:transform` turns and mirroring, graphic styles (falling back to the
+  default graphic style), markers mapped to arrowheads, dash styles by
+  kind. Written: custom shapes with `ooxml-…` types and the preset's text
+  area, `draw:line`/`draw:connector` for lines, `draw:g` for groups, an
+  automatic graphic style per shape, dashes and markers in `office:styles`;
+  floating objects now say `style:flow-with-text="false"` so LibreOffice
+  places them where Word does (a group left of the margin stayed inside
+  without it).
+- **Not yet**: text turned with its shape (drawn upright); paragraph
+  shading inside shapes; WordArt as plain text; picture and gradient fills
+  as one colour; pictures inside groups; transparency; shapes in headers;
+  no shape drawing or editing in Write yet.
+
+Gates: our files through LibreOffice both ways across formats 4/4
+(`shapes_lo`: a turned callout with dash-dot line and bottom text, a
+connector with oval and triangle ends, a custom outline, a group of an
+ellipse with text and a flipped arrow); `.docx` and `.odt` round trips keep
+every field (`tests/shapes.rs`); five LibreOffice test documents (text
+boxes, dash kinds, nested groups, an organisation chart, a circuit drawn
+from 30 shapes) render as LibreOffice renders them from the original and
+from our `.docx` and `.odt`; corpus: 1,893 documents read, paginate and
+paint with no panic, 308 with 928 shapes, every one kept through our own
+`.docx` and `.odt`; Write's other LibreOffice gates unchanged (docx 26/26,
+odt 52/52, floats 8/8, headers 4/4, slides 84/84).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

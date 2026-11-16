@@ -37,7 +37,7 @@ fn main() {
     let body = "The new building opens in spring. Every office moves in over two weekends, the library first, and the cafeteria keeps its old menu for a month while the kitchen settles in. ";
     let mut pic = |d: &mut TextDoc, w: u32, h: u32, pale: bool, f: Float, tw: u32, th: u32| {
         let img = d.images.add(ImageData { bytes: picture(w, h, pale).into(), width: w, height: h });
-        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: tw, height: th, float: Some(f) }), ..Default::default() })
+        d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: tw, height: th, float: Some(f), shape: false }), ..Default::default() })
     };
     let n = OBJECT_CHAR.len_utf8() as u32;
     d.push_para("Moving Day", title, vec![]);

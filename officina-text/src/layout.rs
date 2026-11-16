@@ -687,7 +687,7 @@ mod tests {
     fn a_picture_is_one_glyph_on_the_baseline_and_fits_the_column() {
         use crate::model::ObjectRef;
         let mut d = doc("ab\u{FFFC}cd");
-        let o = ObjectRef { image: 0, width: 2880, height: 1440, float: None };
+        let o = ObjectRef { image: 0, width: 2880, height: 1440, float: None, shape: false };
         let pic = d.attrs.intern(CharAttrs { object: Some(o), ..Default::default() });
         d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, 0), (2, pic), (5, 0)]);
         // A column 1 inch wide: the 2 x 1 inch frame scales to 1 x 0.5.

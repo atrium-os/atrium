@@ -1085,6 +1085,48 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A DrawingML shape's look outside a deck (a Word drawing's `wps:wsp`):
+/// its outline, fill and line from `sp_pr` over its style references, and
+/// the style's text colour.
+pub(crate) struct Look {
+    pub geom: Option<Geom>,
+    pub fill: Option<Fill>,
+    pub line: Option<Stroke>,
+    pub font: Option<Color>,
+}
+
+pub(crate) fn drawing_look(archive: &Archive, rels: &Rels, sp_pr: Option<&El>, style: Option<&El>, line_widths: &[Emu], rep: &mut Report) -> Look {
+    let mut r = Reader { archive, deck: Deck::empty(), rep: std::mem::take(rep), loaded: Loaded::default(), media: HashMap::new(), line_widths: line_widths.to_vec(), shapes: 0, on_slide: true };
+    let map = ClrMap::standard();
+    let mut ctx = Ctx { rels, map: &map, ph_color: None, ids: HashMap::new() };
+    let (sfill, sline, font, fc, lc) = r.style_refs(&ctx, style);
+    let geom = sp_pr.and_then(|s| r.geom(s));
+    ctx.ph_color = fc;
+    let fill = sp_pr.and_then(|s| r.fill(&ctx, s)).or(sfill);
+    ctx.ph_color = lc;
+    let line = match sp_pr.and_then(|s| s.child("a:ln")) {
+        Some(l) => {
+            let mut st = r.line(&ctx, l);
+            if l.attr("w").is_none() {
+                if let Some(sl) = &sline {
+                    st.width = sl.width;
+                }
+            }
+            Some(st)
+        }
+        None => sline,
+    };
+    *rep = r.rep;
+    Look { geom, fill, line, font }
+}
+
+/// A theme part's colours and fonts, and its line widths.
+pub(crate) fn read_theme(t: &El) -> (Theme, Vec<Emu>) {
+    let mut w = Vec::new();
+    let th = theme(t, &mut w);
+    (th, w)
+}
+
 fn mods(c: &El) -> Vec<ColorMod> {
     c.els()
         .filter_map(|m| {

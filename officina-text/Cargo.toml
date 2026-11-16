@@ -8,6 +8,7 @@ description = "Officina's word-processing engine (docs/spec/officina.md §7): th
 
 [dependencies]
 officina-core = { path = "../officina-core" }
+officina-shapes = { path = "../officina-shapes" }
 navigator-render = { path = "../navigator-render" }
 rustybuzz = "0.20"
 ttf-parser = "0.25"

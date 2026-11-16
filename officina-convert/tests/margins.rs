@@ -16,7 +16,7 @@ pub fn margins_doc() -> TextDoc {
         d.push_para(&format!("Body paragraph {i} with enough words to fill the line and run on."), 0, vec![]);
     }
     let img = d.images.add(ImageData { bytes: Arc::from(&PNG[..]), width: 16, height: 8 });
-    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None }), ..Default::default() });
+    let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: img, width: 1440, height: 720, float: None, shape: false }), ..Default::default() });
     let bold = d.attrs.intern(CharAttrs { bold: Some(true), ..Default::default() });
     let logo = Para { runs: vec![(0, pic), (3, bold)], ..Para::new(d.new_id(), "\u{FFFC} Acme Ltd", 0) };
     let num = Para { runs: vec![(0, 0), (5, bold), (11, 0)], ..Para::new(d.new_id(), "Page {page} of {pages}", 0) };

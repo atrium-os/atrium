@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn replace_all_is_one_undoable_action() {
         let mut d = doc(&["a cat and a cat", "cat"]);
-        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 10, height: 10, float: None }), ..Default::default() });
+        let pic = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 10, height: 10, float: None, shape: false }), ..Default::default() });
         d.push_para("\u{FFFC}cat", 0, vec![(0, pic), (3, 0)]);
         let before = d.plain_text();
         let ops = d.replace_all_ops(&q("cat"), "dog");
