@@ -12,6 +12,7 @@ mail-schema = { path = "../mail-schema" }
 mail-store = { path = "../mail-store" }
 mail-sync = { path = "../mail-sync" }
 postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
 # Remote pictures (§7.4) go through the caller's Nuntius channel.
 nuntius = { path = "../../nuntius", default-features = false }
 

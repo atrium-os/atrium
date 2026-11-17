@@ -196,6 +196,9 @@ pub struct Message {
     /// Locations the person moved or deleted it from, until the server
     /// has done it too (they are no longer in `locations`).
     pub leaving: Vec<(FolderId, u32)>,
+    /// The attachments' names and text, as a parse jail took it out (§8,
+    /// §11.2), for search: one blob of UTF-8 text.
+    pub files_text: Option<Hash>,
 }
 
 /// One row of a folder's list.
@@ -533,6 +536,7 @@ impl Writer<'_> {
                     thread: 0,
                     document: None,
                     pictures: Vec::new(),
+                    files_text: None,
                     leaving: Vec::new(),
                 };
                 self.put_msg(id, &msg)?;
@@ -562,6 +566,13 @@ impl Writer<'_> {
     pub fn set_document(&mut self, id: MsgId, document: Option<Hash>) -> Result<()> {
         let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
         m.document = document;
+        self.put_msg(id, &m)
+    }
+
+    /// Keep a message's attachment text for search.
+    pub fn set_files_text(&mut self, id: MsgId, text: Option<Hash>) -> Result<()> {
+        let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        m.files_text = text;
         self.put_msg(id, &m)
     }
 

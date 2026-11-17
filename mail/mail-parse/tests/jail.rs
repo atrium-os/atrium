@@ -163,3 +163,28 @@ fn a_message_s_own_pictures_come_with_its_document() {
     assert!(d.html.contains("width=\"120\""), "{}", d.html);
     e.finish();
 }
+
+#[test]
+fn attachments_are_listed_and_handed_over() {
+    let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--B\r\nContent-Type: application/pdf; name=\"invoice.pdf\"\r\nContent-Disposition: attachment; filename=\"invoice.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBHNjcmlwdA==\r\n--B\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"../notes.txt\"\r\n\r\nquarterly numbers\r\n--B--\r\n".to_vec();
+    let mut e = Engine::start();
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, message: wire::Raw { id: 3, bytes: raw.clone() }, loaded: vec![] });
+    let out = e.run(raw.len() as u64, &|_| None);
+    let FromJail::Opened { id: 3, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
+    let names: Vec<&str> = o.attachments.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["invoice.pdf", "notes.txt"]);
+    // Called a PDF, but the bytes are a zip: the head shows it.
+    assert_eq!(&o.attachments[0].head[..4], b"PK\x03\x04");
+    let which = o.attachments[1].which.clone();
+    e.send(&ToJail::Attachment { message: wire::Raw { id: 4, bytes: raw.clone() }, which });
+    let out = e.run(raw.len() as u64, &|_| None);
+    let FromJail::Attachment { id: 4, result: Ok(a) } = &out[0] else { panic!("{out:?}") };
+    assert_eq!(a.bytes, b"quarterly numbers");
+    assert_eq!(a.text.as_deref(), Some("quarterly numbers"));
+    e.send(&ToJail::Attachment { message: wire::Raw { id: 5, bytes: raw.clone() }, which: o.attachments[0].which.clone() });
+    let out = e.run(raw.len() as u64, &|_| None);
+    let FromJail::Attachment { id: 5, result: Ok(a) } = &out[0] else { panic!("{out:?}") };
+    assert_eq!(a.bytes, b"PK\x03\x04script");
+    assert_eq!(a.text, None, "a zip has no text");
+    e.finish();
+}

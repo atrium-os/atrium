@@ -18,6 +18,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+pub mod attachments;
 pub mod compose;
 pub mod drafts;
 pub mod pictures;
@@ -109,7 +110,7 @@ impl Parser {
         loop {
             let f: FromJail = wire::read_frame(&mut j.r).map_err(|e| Error::Jail(e.to_string()))?.ok_or_else(|| Error::Jail("closed".into()))?;
             let raw_len = match &f {
-                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
+                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
                 _ => 0,
             };
             f.check(&caps, raw_len).map_err(|e| Error::Jail(e.to_string()))?;
@@ -150,6 +151,20 @@ impl Parser {
     }
 
     /// One message for reading, alone in its jail.
+    /// One attachment's bytes, alone in a jail; `None` when the jail
+    /// refused (the part isn't there).
+    pub fn attachment(&self, raw: &[u8], which: &wire::Which) -> Result<Option<wire::Attached>, Error> {
+        let mut j = self.start()?;
+        wire::write_frame(&mut j.w, &ToJail::Attachment { message: wire::Raw { id: 1, bytes: raw.to_vec() }, which: which.clone() })
+            .map_err(|e| Error::Jail(e.to_string()))?;
+        let len = raw.len() as u64;
+        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
+        match frames.into_iter().next() {
+            Some(FromJail::Attachment { result, .. }) => Ok(result.ok()),
+            _ => Err(Error::Jail("no answer".into())),
+        }
+    }
+
     pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>) -> Result<Option<Opened>, Error> {
         let mut j = self.start()?;
         wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
@@ -178,6 +193,16 @@ pub struct Reading {
     /// The HTML body converted into a document, with the message's own
     /// pictures, for the document viewer.
     pub document: Option<wire::Document>,
+    /// The attachments (§8.1), empty until the whole message is here.
+    pub attachments: Vec<wire::Attachment>,
+}
+
+/// What a parse leaves for the next opening: the converted document and
+/// the attachment list (a postcard blob, `Message::document`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Shown {
+    pub document: Option<wire::Document>,
+    pub attachments: Vec<wire::Attachment>,
 }
 
 impl Engine {
@@ -196,11 +221,12 @@ impl Engine {
     pub fn open(&self, msg: u64) -> Result<Reading, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let Some(full) = m.full else {
-            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None });
+            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None, attachments: Vec::new() });
         };
-        if let Some(d) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<wire::Document>(&b).ok()) {
+        if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()) {
+            let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
-            return Ok(Reading { summary: m.summary, text, has_html: true, document: Some(d) });
+            return Ok(Reading { summary: m.summary, text, has_html, document: sh.document, attachments: sh.attachments });
         }
         let raw = self.store.blob(&full)?;
         // Remote pictures already loaded: their first bytes, for their sizes.
@@ -212,15 +238,14 @@ impl Engine {
             .collect();
         match self.parser.open(&raw, loaded)? {
             Some(o) => {
-                if let Some(d) = &o.document {
-                    let h = self.store.put_blob(&postcard::to_stdvec(d).map_err(|e| Error::Jail(e.to_string()))?)?;
-                    self.store.write(|w| w.set_document(msg, Some(h)))?;
-                }
-                let has_html = o.document.is_some();
-                let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
-                Ok(Reading { summary: o.summary, text, has_html, document: o.document })
+                let sh = Shown { document: o.document, attachments: o.attachments };
+                let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
+                self.store.write(|w| w.set_document(msg, Some(h)))?;
+                let has_html = sh.document.is_some();
+                let text = o.summary.text.clone().or_else(|| sh.document.as_ref().map(|_| String::new()));
+                Ok(Reading { summary: o.summary, text, has_html, document: sh.document, attachments: sh.attachments })
             }
-            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None }),
+            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None, attachments: Vec::new() }),
         }
     }
 }

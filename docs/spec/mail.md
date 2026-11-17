@@ -511,6 +511,10 @@ doesn't run a spam classifier of its own in v1.
   descriptor of the attachment from Mail with a press (new verb, `OpenAttachment`,
   §16 step M5) and hands it to the app as opening-files §6.2 does for a file from Scrinium.
   The app can't learn where it came from beyond its name.
+- **No temporary files** (Shankar 2026-11-18): other mail clients write an opened
+  attachment to a temp folder and leave it there. Mail never writes one: opening and quick
+  look hand over a sealed memfd, which is gone when the app closes it. An app that edits it
+  saves a copy through the picker; the memfd can't be written.
 - **Save** goes through Scrinium's picker (Save target, persona places only), with the
   origin written to `atrium.origin` ("mail: from priya@example.com, 2026-11-15") like a
   Navigator download.

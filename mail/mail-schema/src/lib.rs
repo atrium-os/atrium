@@ -74,7 +74,18 @@ pub enum ToJail {
     /// The answer to a [`FromJail::Query`]: the TXT record's text (strings
     /// joined), or `None` for no record or a failed lookup.
     Answer { query: u32, txt: Option<String> },
+    /// One attachment's decoded bytes (§8), and its text for search when
+    /// it has some.
+    Attachment { message: Raw, which: Which },
 }
+
+/// Which attachment of a message: a MIME part by its path, or the `n`th
+/// file unpacked from its `winmail.dat` parts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Which { Part(String), Unpacked(u32) }
+
+/// The longest attachment text kept for search.
+pub const ATTACHMENT_TEXT_MAX: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Raw {
@@ -92,6 +103,7 @@ pub enum FromJail {
     Query { query: u32, name: String },
     Summary { id: u64, result: Result<Summary, Refusal> },
     Opened { id: u64, result: Result<Opened, Refusal> },
+    Attachment { id: u64, result: Result<Attached, Refusal> },
     Done,
 }
 
@@ -193,8 +205,37 @@ pub struct Opened {
     pub summary: Summary,
     /// The HTML body as a profile document (§7.3), when there is one.
     pub document: Option<Document>,
-    /// Files unpacked from a `winmail.dat` (TNEF), shown as attachments.
-    pub unpacked: Vec<Unpacked>,
+    /// The attachments, in order: files attached (a `winmail.dat`
+    /// replaced by the files in it), forwarded messages, pictures that no
+    /// HTML shows. Their bytes come with [`ToJail::Attachment`].
+    pub attachments: Vec<Attachment>,
+}
+
+/// One attachment, for the strip (§8.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub which: Which,
+    /// Its name, with no path; "attachment" when it has none.
+    pub name: String,
+    /// What the message says it is (the type shown is from `head`).
+    pub content_type: String,
+    /// Decoded size.
+    pub size: u64,
+    /// Its first decoded bytes (at most [`ATTACHMENT_HEAD`]), so its type
+    /// is decided from what it is, not what it is called.
+    pub head: Vec<u8>,
+}
+
+/// How many leading bytes an attachment's type is decided from (atrium-types `HEAD`).
+pub const ATTACHMENT_HEAD: usize = 4096;
+
+/// An attachment's bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Attached {
+    pub bytes: Vec<u8>,
+    /// Its text, for search (text attachments now; PDFs and office files
+    /// through their converters later). At most [`ATTACHMENT_TEXT_MAX`].
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -246,8 +287,6 @@ impl Resource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unpacked { pub name: String, pub data: Vec<u8> }
 
 // ---- the engine's checks ----
 
@@ -264,13 +303,13 @@ pub struct Caps {
     pub document: usize,
     pub resources: usize,
     pub url: usize,
-    pub unpacked: usize,
+    pub attachments: usize,
 }
 
 impl Default for Caps {
     fn default() -> Self {
         Caps { short: 1024, addresses: 1000, ids: 1000, parts: 1000, text: 4 << 20, preview: 256,
-               document: 16 << 20, resources: 10_000, url: 8192, unpacked: 64 }
+               document: 16 << 20, resources: 10_000, url: 8192, attachments: 1000 }
     }
 }
 
@@ -356,11 +395,17 @@ impl Opened {
                 if text.chars().count() > LINK_TEXT_MAX || text.len() > 4 * LINK_TEXT_MAX { return Err(Lie("link text too long")) }
             }
         }
-        if self.unpacked.len() > c.unpacked { return Err(Lie("too many unpacked files")) }
-        for u in &self.unpacked {
-            short(&u.name, c, "unpacked name")?;
-            if u.name.contains(['/', '\\']) { return Err(Lie("unpacked name with a path")) }
-            if u.data.len() as u64 > raw_len { return Err(Lie("unpacked file larger than its message")) }
+        if self.attachments.len() > c.attachments { return Err(Lie("too many attachments")) }
+        for a in &self.attachments {
+            short(&a.name, c, "attachment name")?;
+            short(&a.content_type, c, "attachment type")?;
+            if a.name.is_empty() || a.name.contains(['/', '\\']) || a.name == ".." { return Err(Lie("attachment name with a path")) }
+            if a.head.len() > ATTACHMENT_HEAD || a.head.len() as u64 > a.size { return Err(Lie("attachment head")) }
+            if a.size > raw_len { return Err(Lie("attachment larger than its message")) }
+            match &a.which {
+                Which::Part(p) => if !self.summary.parts.iter().any(|q| q.path == *p) { return Err(Lie("attachment for no part")) },
+                Which::Unpacked(n) => if *n as usize >= c.attachments { return Err(Lie("unpacked index")) },
+            }
         }
         Ok(())
     }
@@ -386,6 +431,11 @@ impl FromJail {
             FromJail::Query { name, .. } => if query_allowed(name) { Ok(()) } else { Err(Lie("lookup outside _domainkey/_dmarc")) },
             FromJail::Summary { result: Ok(s), .. } => s.check(c, raw_len),
             FromJail::Opened { result: Ok(o), .. } => o.check(c, raw_len),
+            FromJail::Attachment { result: Ok(a), .. } => {
+                if a.bytes.len() as u64 > raw_len { return Err(Lie("attachment larger than its message")) }
+                if a.text.as_ref().is_some_and(|t| t.len() > ATTACHMENT_TEXT_MAX) { return Err(Lie("attachment text too long")) }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -435,7 +485,7 @@ mod tests {
                 pictures: vec![("mail-res:0".into(), vec![1; 10])],
                 links: vec![],
             }),
-            unpacked: vec![],
+            attachments: vec![],
         };
         let c = Caps::default();
         assert_eq!(o.check(&c, 100), Ok(()));
