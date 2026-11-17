@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces).
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1303,6 +1303,38 @@ Stalwart in the cloud VM, and later a real account):
    than the session's is refused; uploads up to 1 MiB), IMAP IDLE.
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
+   **Built on the host (2026-11-18)**: lanes, cards, private addresses and OpenPGP.
+   *Lanes* (E10, `19720979`): People, Updates and Newsletters as views, sorted by the
+   person's own rules first (`from:@github.com updates`, `list:… newsletters`,
+   `subject:…`; up to 500, readable in Settings), then VIPs, people they wrote to,
+   lists, automated mail and machine-looking senders; the last message of a
+   conversation says which lane and why, with "Always …" to make a rule. *Cards*
+   (§14.3, `7c4acfbe`): the jail reads schema.org JSON-LD for orders, deliveries,
+   flights, trains, buses, hotels, tables, events and rental cars into a bounded card
+   (no URLs kept; 16 fields of 200 characters), shown above the text only when the
+   sender is verified (so in practice once DKIM lookups are wired). *Private
+   addresses* (§13.3, E12, `ba95fba5`): with a catch-all domain of the person's own,
+   Settings makes `site-k3qx@domain` per site (copied for pasting), remembers addresses
+   first seen in new mail with their sender, replies come from the address written
+   to, the reader says which address it came to and warns when it came from someone
+   else, and one turned off sends its mail to Trash. *OpenPGP* (§10.2, `f6bb3e47`):
+   new crate `mail/mail-pgp` over rpgp (MIT/Apache; all 153 dependencies' licences
+   checked). The jail takes one `Autocrypt:` header per message, only for a key whose
+   address is From, and sends it in its own frame; the engine keeps 3 keys per address
+   (a key for the person's own address only from their Sent folder). The jail checks a
+   PGP/MIME signature at opening with the sender's keys (bare-LF copies as CRLF); a
+   message read before its key arrived is parsed again once it is there. The reader
+   says "Signed with OpenPGP by … · key 89AB CDEF …", or no key, wrong address, or not
+   good. Encrypt uses S/MIME when everyone has a certificate, else PGP/MIME (RFC 3156,
+   SEIPD AES-256) when everyone has a key, with the person's own key for the Sent copy
+   (learned from their sent mail, or pasted in Settings). Tests: jail 2, engine 2,
+   mail-pgp 1, schema 1, window and settings. **Not yet**: reading PGP/MIME encrypted
+   mail and signing with OpenPGP (the private key belongs in Arca, which has no OpenPGP
+   ops; the reader says so), inline PGP, Autocrypt's prefer-encrypt and gossip, key
+   expiry and revocation, a keys page (forget a key); cards need DKIM lookups to show;
+   lane counts and notifications per lane. *Big-file links* need a share-link service
+   (Loculus or Crypta) and *local assistance* a local model service, neither of which
+   exists yet.
 
 ## 17. Decisions, with recommendations
 
