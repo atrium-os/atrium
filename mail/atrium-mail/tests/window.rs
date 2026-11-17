@@ -357,3 +357,63 @@ fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
     assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
     assert!(mail.ui.get_cloned().link.is_none());
 }
+
+#[test]
+fn archive_delete_and_undo_from_the_keyboard() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
+            RemoteFolder { name: "Trash".into(), role: Role::Trash, selectable: true },
+        ]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200), f(3, "Three", NOW - 100)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    assert_eq!(subjects(&mail), ["Three", "Two", "One"]);
+
+    // Opening reads it: in the list at once, on the server at the next sync.
+    assert!(mail.key(&key("j"), None));
+    assert!(!mail.row(0).unwrap().unread);
+    assert_eq!(engine.store.ops_pending().unwrap(), 1);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Archive") && t.iter().any(|x| x == "e") && t.iter().any(|x| x == "#"), "{t:?}");
+
+    // e: archived, the next one opens in its place, Undo offered.
+    assert!(mail.key(&key("e"), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.reading.as_ref().unwrap().subject, "Two");
+    assert_eq!(ui.undo.as_ref().unwrap().label, "Message archived");
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Message archived") && t.iter().any(|x| x == "Undo"), "{t:?}");
+    // z: back.
+    assert!(mail.key(&key("z"), None));
+    assert_eq!(subjects(&mail), ["Three", "Two", "One"]);
+    assert!(mail.ui.get_cloned().undo.is_none());
+    assert!(!mail.key(&key("z"), None), "nothing more to undo");
+
+    // #: to Trash.
+    mail.open(2);
+    assert!(mail.key(&key("#"), None));
+    assert_eq!(subjects(&mail), ["Three", "Two"]);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message deleted");
+    // Due after the undo window: archive and delete wait, the reads don't.
+    let real_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let due_now = engine.store.ops_due(account, real_now).unwrap();
+    assert!(due_now.iter().all(|(_, o)| matches!(o.kind, mail_store::OpKind::Flags { .. })), "{due_now:?}");
+}

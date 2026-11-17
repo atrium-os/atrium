@@ -180,6 +180,7 @@ fn main() {
         }
         mail.set_size(win.width, win.height);
         mail.poll_link();
+        mail.tick();
         // Pictures asked for go to the fetch thread; what came back is kept
         // and, when its message is in the viewer, handed to it.
         for msg in mail.take_loads() {

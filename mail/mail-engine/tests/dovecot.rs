@@ -15,7 +15,7 @@ use arca_courier::mail::{encode_hello, session, MailEndpoint, MailVault};
 use arca_courier::schema::Refusal;
 use arca_store::secret::LockedBuf;
 use arca_store::Scheme;
-use mail_engine::{Engine, Parser};
+use mail_engine::{Action, Engine, Parser};
 use mail_store::{flag, Role, Store};
 use mail_sync::{FolderState, Session, Sink};
 use navigator_fetch::{addr, Connect};
@@ -131,6 +131,14 @@ namespace inbox {{
   separator = /
   mailbox Sent {{
     special_use = \Sent
+  }}
+  mailbox Archive {{
+    special_use = \Archive
+    auto = create
+  }}
+  mailbox Trash {{
+    special_use = \Trash
+    auto = create
   }}
 }}
 service imap-login {{
@@ -321,6 +329,42 @@ fn dovecot_through_the_courier_into_the_store() {
     // ── a third pass with nothing new is cheap ──
     let r3 = Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     assert_eq!((r3.headers, r3.texts, r3.vanished), (0, 0, 0), "{r3:?}");
+
+    // ── the person's changes reach the server ──
+    let folders = engine.store.folders(account).unwrap();
+    let id_of = |role: Role| folders.iter().find(|(_, f)| f.role == role).unwrap().0;
+    let (archive, trash) = (id_of(Role::Archive), id_of(Role::Trash));
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    let unread = rows.iter().find(|r| r.flags & flag::SEEN == 0).unwrap().clone();
+    let others: Vec<_> = rows.iter().filter(|r| r.uid != unread.uid).cloned().collect();
+    // Read goes at once; archive and delete wait out the undo window.
+    assert_eq!(engine.act(inbox, &[unread.uid], Action::Read(true)).unwrap().len(), 1);
+    let a = engine.act(inbox, &[others[0].uid], Action::Archive).unwrap();
+    let d = engine.act(inbox, &[others[1].uid], Action::Delete).unwrap();
+    let kept = engine.act(inbox, &[others[2].uid], Action::Delete).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 297, "gone from the list at once");
+    assert_eq!(engine.undo(&kept).unwrap(), 1);
+    assert_eq!(engine.store.count(inbox).unwrap(), 298);
+    // A pass inside the window sends only the read.
+    Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.ops_pending().unwrap(), 2);
+    assert_eq!(engine.store.count(inbox).unwrap(), 298, "not fetched again while leaving");
+    // Past the window (made due here rather than waiting 10 s).
+    engine.store.write(|w| { for id in a.iter().chain(&d) { w.undo(*id)?; } Ok(()) }).unwrap();
+    engine.store.write(|w| { w.queue(inbox, others[0].uid, mail_store::OpKind::Move { to: archive }, 0)?; w.queue(inbox, others[1].uid, mail_store::OpKind::Move { to: trash }, 0)?; Ok(()) }).unwrap();
+    let r4 = Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.ops_pending().unwrap(), 0, "{r4:?}\n{}", log());
+    assert_eq!(engine.store.count(inbox).unwrap(), 298);
+    assert_eq!(engine.store.count(archive).unwrap(), 1);
+    assert_eq!(engine.store.count(trash).unwrap(), 1);
+    assert_eq!(engine.store.list(archive, 0, 1).unwrap()[0].subject, others[0].subject);
+    assert_eq!(engine.store.list(trash, 0, 1).unwrap()[0].subject, others[1].subject);
+    let read = engine.store.list(inbox, 0, 20).unwrap().into_iter().find(|r| r.subject == unread.subject).unwrap();
+    assert!(read.flags & flag::SEEN != 0);
+    // On the server: the maildirs and the \Seen flag.
+    let count = |dir: PathBuf| ["cur", "new"].iter().map(|c| std::fs::read_dir(dir.join(c)).map(|r| r.count()).unwrap_or(0)).sum::<usize>();
+    assert_eq!(count(maildir(&home).join(".Archive")), 1);
+    assert_eq!(count(maildir(&home).join(".Trash")), 1);
     let _ = s2.logout();
     let _ = Arc::new(());
 }
