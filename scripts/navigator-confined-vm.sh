@@ -241,6 +241,8 @@ g "set -e
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/mail2-bundle/atrium.toml.sig /root/mail2-bundle/atrium.toml
     opifex install /root/mail2-bundle
     rm -f /var/db/atrium/navtest/links.toml
+    # Only these two take mailto: here (vm-apps-access-check.sh's own may linger).
+    for a in org.test.new org.test.sys; do opifex uninstall \$a >/dev/null 2>&1 || true; done
     chmod +x $D/monstratord $D/monctl
     sh $D/monstrator-service.sh $D/monstratord $D/38-atrium-monstratord.toml" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
@@ -325,6 +327,7 @@ echo "$NM" | grep -qE 'sockets/(fresco|forum|clipboard|audio)( |$)' && bad "the 
 VN=$(g "jls -j $NJID vnet 2>&1" | tr -d '\r')
 case "$VN" in new|1) ok "no network: a network stack of its own with nothing in it (vnet $VN)" ;; *) bad "the Navigator's jail is on the host's network stack (vnet '$VN')" ;; esac
 g "grep -q UNCONFINED $S/navigatord.log" && bad "navigatord says it is unconfined" || ok "navigatord runs confined (no testing switch, no fixtures)"
+g "grep -q 'taking links from other apps' $S/navigatord.log" && ok "…and takes web links from other apps on its document channel" || bad "no document channel: $(g "grep -i 'document channel' $S/navigatord.log | tail -2")"
 mkdir -p "$OUT"
 # The UI is navigatord's worker: what it says goes to navigatord's log.
 UL=$S/navigatord.log

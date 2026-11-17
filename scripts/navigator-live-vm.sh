@@ -55,6 +55,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb limen "--example limend-dev"
     xb navigator-prerender "--bin prerender"
     xb navigatord "--bin navigatord"
+    xb atrium-open "--example link-serve"
 fi
 
 D=/opt/navigator-live
@@ -64,7 +65,7 @@ g "pkill -x frescod; pkill -x navigator-ui; pkill -x forum-wm; pkill -x limend-d
 for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-renderer" "$ROOT/forum-wm/target/$R/forum-wm" \
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
          "$ROOT/limen/target/$R/examples/limend-dev" "$ROOT/navigator-prerender/target/$R/prerender" \
-         "$ROOT/navigatord/target/$R/navigatord"; do
+         "$ROOT/navigatord/target/$R/navigatord" "$ROOT/atrium-open/target/$R/examples/link-serve"; do
     h=$(sha256sum "$b" | cut -d' ' -f1)
     [ "$h" = "$(g "sha256 -q $D/$(basename "$b") 2>/dev/null || true")" ] && continue
     put "$b" "$D/"
@@ -94,7 +95,7 @@ g "cd $S && env LIMEN_SOCKET=$S/limend.sock LIMEN_DEV_UID=50901 LIMEN_DEFAULTS=d
 nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/page.sock NAVIGATORD_FIXTURES=$D/fixtures \
     NAVIGATORD_STORE=$S/store NAVIGATORD_PRERENDER=$D/prerender FRESCOD_CHROME_SOCK=$S/chrome.sock \
     NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock \
-    NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_MONSTRATOR=$S/mon.sock \
+    NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_MONSTRATOR=$S/mon.sock ${NDENV:-} \
     daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
 # A stand-in for Monstrator, the link opener (opening-links.md): keeps what
 # it was asked and never answers (the confined script runs the real one).
@@ -416,8 +417,26 @@ g "grep -q 'a branch of 1 pages is its own trail now' $S/ui10.log" && last | gre
 shot live-16-own-trail
 g "pkill -x navigator-ui; sleep 2; true"
 
+echo "=== a link from another app (opening-links.md §5)"
+# link-serve stands in for portcullisd's end of the Navigator's document
+# channel: it hands navigatord an https link as soon as navigatord takes
+# it up, before any UI is there; navigatord holds it, and the UI that
+# comes up opens it in a trail of its own.
+last() { g "grep 'trace' $S/ui11.log | tail -1"; }
+g "pkill -x navigatord; sleep 2; daemon -f -o $S/link-serve.log $D/link-serve $S/opens.sock https://atlas.example/wiki/Impluvium </dev/null; sleep 1"
+NDENV="ATRIUM_OPENS_SOCKET=$S/opens.sock" nd navigatord3
+sleep 10
+g "grep -q 'taking links from other apps' $S/navigatord3.log" && g "grep -q 'link-serve: sent' $S/link-serve.log" \
+    && ok "navigatord took up its document channel and got the link" || bad "channel: $(g "tail -3 $S/navigatord3.log; cat $S/link-serve.log")"
+UIENV="NAVIGATOR_TRAILS=$S/trails11.json" ui "" ui11
+until_trace 'url=https://atlas.example/wiki/Impluvium live=shown' \
+    && ok "the UI that came up opened it in a trail of its own" || bad "incoming: $(last); $(g "grep -v trace $S/ui11.log | tail -3")"
+g "grep -q 'a link from another app: a new trail' $S/ui11.log" && ok "…as a link from another app" || bad "ui11: $(g "grep -v trace $S/ui11.log | tail -3")"
+shot live-17-incoming
+g "pkill -x navigator-ui; pkill -x link-serve; sleep 2; true"
+
 echo "=== logs"
-for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 ui10 navigatord2; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
+for l in navigatord limend ui ui4 ui5 ui6 ui7 ui8 ui9 ui10 ui11 navigatord2 navigatord3; do echo "--- $l"; g "grep -v trace $S/$l.log | tail -12"; done
 g "grep -iE 'chrome|slot|origin|panic' $S/frescod.log | tail -8; true"
 echo "navigator-live: $fails failed"
 [ "$fails" = 0 ]

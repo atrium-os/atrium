@@ -863,6 +863,81 @@ fn open_chrome(path: &Path) -> std::io::Result<(fresco_split::chan::Chan, u32, s
     }
 }
 
+/// Links other apps open in the Navigator (opening-links.md §5): the
+/// UIs to tell, newest last, and links that came before any UI did.
+struct Incoming {
+    uis: Vec<std::sync::Weak<Mutex<UnixStream>>>,
+    held: Vec<String>,
+}
+
+static INCOMING: Mutex<Incoming> = Mutex::new(Incoming { uis: Vec::new(), held: Vec::new() });
+
+/// At most this many links wait for a UI.
+const HELD_MAX: usize = 16;
+
+/// A link from another app: to the newest UI, else held for the first.
+fn incoming_link(url: String) {
+    let mut g = INCOMING.lock().unwrap_or_else(|e| e.into_inner());
+    g.uis.retain(|w| w.strong_count() > 0);
+    match g.uis.last().and_then(std::sync::Weak::upgrade) {
+        Some(w) => send(&w, &Event::Incoming { url }),
+        None if g.held.len() < HELD_MAX => g.held.push(url),
+        None => eprintln!("navigatord: a link from another app dropped: {HELD_MAX} already wait for the window"),
+    }
+}
+
+/// A UI past its Hello: it gets the links from now on, and those held.
+fn ui_ready(w: &Arc<Mutex<UnixStream>>) {
+    let mut g = INCOMING.lock().unwrap_or_else(|e| e.into_inner());
+    g.uis.push(Arc::downgrade(w));
+    for url in std::mem::take(&mut g.held) {
+        send(w, &Event::Incoming { url });
+    }
+}
+
+/// Whether a link from another app is one the Navigator opens: a web
+/// address, nothing else (D5), and one the Where field would take.
+fn web_link(url: &str) -> bool {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && url.len() <= atrium_open::MAX_LINK
+        && url.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The document channel portcullisd made for the Navigator: links that
+/// other apps open here (`[[links]] schemes = ["http", "https"]`). Each
+/// goes to the UI, which opens it in a trail of its own.
+fn document_channel() {
+    std::thread::spawn(|| loop {
+        let mut ch = match atrium_open::Channel::connect() {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("navigatord: the document channel: {e}");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+        eprintln!("navigatord: taking links from other apps");
+        loop {
+            match ch.recv_any(None) {
+                Ok(Some(atrium_open::Message::Link(url))) if web_link(&url) => {
+                    eprintln!("navigatord: a link from another app: a new trail");
+                    incoming_link(url);
+                }
+                Ok(Some(atrium_open::Message::Link(_))) => eprintln!("navigatord: a link from another app refused: not a web address"),
+                Ok(Some(atrium_open::Message::File(_))) => eprintln!("navigatord: a file on the document channel: the Navigator opens none"),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("navigatord: the document channel: {e}");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
+}
+
 fn send(w: &Mutex<UnixStream>, e: &Event) {
     let mut s = w.lock().unwrap();
     if let Err(err) = ctl::write_frame(&mut *s, e) {
@@ -973,6 +1048,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                         None => send(&w, &Event::Trails { part: None, last: true }),
                     }
                 }
+                ui_ready(&w);
             }
             Request::SaveTrails { part, last } => {
                 // Kept whole or not at all: a store over its bound is refused
@@ -1434,6 +1510,7 @@ fn main() {
     });
     let ui = listen(&ctl_path);
     eprintln!("navigatord: control on {ctl_path}, pages on {page_path}");
+    document_channel();
     // The UI as our worker: its control channel is one end of a pair, and
     // the Navigator ends when it does.
     if let Some(spec) = cfg.ui.clone() {
@@ -1470,6 +1547,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_web_links_come_in() {
+        assert!(web_link("https://atlas.example/wiki"));
+        assert!(web_link("HTTP://atlas.example/"));
+        for bad in ["mailto:a@b", "javascript:alert(1)", "https://a b", "file:///etc/passwd", "httpx://a"] {
+            assert!(!web_link(bad), "{bad}");
+        }
+    }
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);

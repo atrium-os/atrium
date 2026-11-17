@@ -5737,7 +5737,11 @@ run it again with `BUILD=0`.
 
 Last (ui10.log, a fresh trail store `trails10.json`): Ctrl held in the chrome
 (`KEY 0xe0`) while a link in the page is pressed opens it beside as a branch, and the branch row's
-"Make its own trail" button (at 206, 62 + 135) makes it a trail of its own (`trails=2`). Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
+"Make its own trail" button (at 206, 62 + 135) makes it a trail of its own (`trails=2`). Then a link
+from another app (opening-links.md §5): atrium-open's `link-serve` stands in for portcullisd's end of
+the Navigator's document channel (`$S/opens.sock`, `ATRIUM_OPENS_SOCKET` for navigatord3) and hands
+navigatord `https://atlas.example/wiki/Impluvium` before any UI is up; the UI that comes up (ui11.log)
+shows it in a trail of its own. 73/73 on 2026-11-16. Step 6's prompts run after presence (ui8.log). navigatord gets `NAVIGATORD_DOWNLOADS=$S/downloads`,
 `NAVIGATORD_SCHEMES=mailto` and a stand-in Monstrator (`NAVIGATORD_MONSTRATOR=$S/mon.sock`, an
 `nc -lkU` that keeps what it is asked in `$S/mon.log` and never answers; the confined script runs
 the real one). The script presses the fixture's PDF link, finds the download prompt with
@@ -5834,7 +5838,10 @@ mail app, `org.test.mail2`, also takes `mailto:` and links.toml is removed first
 in its own window (frescod's socket at `/atrium/sockets/fresco/`, which the jail mounts with
 `fresco-activation/`); keys Down, Down, Space (Always use), Up, Up, Enter pick Test mail, frescod counts
 the Enter (`PROMPT`, the rows its guard), the link reaches `org.test.mail`, navtest's links.toml
-says `mailto = "org.test.mail"`, and the next `mailto:` link goes there with no sheet. 60/60 on
+says `mailto = "org.test.mail"`, and the next `mailto:` link goes there with no sheet. The Navigator's
+manifest takes `http`/`https` links, so its jail has a document channel, which navigatord takes up
+("taking links from other apps"). `vm-apps-access-check.sh`'s mailto test apps are uninstalled
+first. 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

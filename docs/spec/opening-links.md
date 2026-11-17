@@ -206,8 +206,15 @@ new trail.
    directories for services. `navigator-confined-vm.sh` 55/55: monstratord from the
    bootstrap in its jail as 65038, a `mailto:` link pressed in the jailed Navigator reaches
    `org.test.mail` (open-probe) on its document channel, started for navtest by portcullisd.
-   Not yet: links coming *into* the Navigator (`https:` from another app) open a trail; that
-   needs navigatord to read its document channel.
+   *Links into the Navigator, built 2026-11-15:* the Navigator's manifest takes `http` and
+   `https` (`[[links]]`, `navigator-broker-bundle.sh`), so portcullisd gives navigatord a
+   document channel; navigatord reads it on a thread, keeps only web addresses (printable,
+   at most 8192 bytes), and sends each to the newest UI as `Event::Incoming { url }`,
+   holding up to 16 until a UI has said Hello. The UI opens it in a recorded trail of its
+   own and shows it. `navigator-live-vm.sh` hands navigatord a link through a stand-in
+   for portcullisd's end (atrium-open's `link-serve`) before any UI is up, and the UI that
+   comes up shows it in a new trail; `navigator-confined-vm.sh` checks the jailed
+   navigatord takes up its channel.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
 
 ## 9. Decisions, with recommendations

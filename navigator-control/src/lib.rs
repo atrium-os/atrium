@@ -221,6 +221,10 @@ pub enum Event {
     /// (something was over the prompt row, or it had just moved): nothing
     /// was done, and the file or hand-off is still held.
     PressRefused { why: String },
+    /// A link another app opened in the Navigator (opening-links.md §5),
+    /// as navigatord took it from its document channel: a web address.
+    /// The UI opens it in a trail of its own.
+    Incoming { url: String },
     /// A hand-off was passed to its handler, or why not.
     Handed { url: String, ok: bool, why: Option<String> },
     /// `SignOut` done: how many session cookies ended, or why not.

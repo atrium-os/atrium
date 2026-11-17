@@ -171,5 +171,6 @@ V "grep -q mailto $LT" && bad "still in links.toml" || ok "not in her links.toml
 shot links-2
 
 V "pkill -x curia" >/dev/null 2>&1
-V "mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
+# Its own test apps go (they take mailto:, which other gates count on).
+V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
 echo "apps-access: $fails failed"

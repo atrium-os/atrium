@@ -255,6 +255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-open"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
 
@@ -2478,6 +2485,7 @@ name = "navigatord"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-open",
  "fresco-protocol",
  "fresco-split",
  "libc",

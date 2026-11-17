@@ -30,6 +30,10 @@ entry = "bin/navigatord"
 [capabilities]
 navigator-broker = true
 
+# Web links other apps open come here (opening-links.md §4.1, D5).
+[[links]]
+schemes = ["http", "https"]
+
 [resources]
 memory = "1G"
 cpu = 100

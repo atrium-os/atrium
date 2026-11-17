@@ -482,6 +482,11 @@ impl Live {
                     eprintln!("navigator-ui: {note}");
                     s.last_note = Some(note)
                 }
+                Event::Incoming { url } => {
+                    if s.incoming(&url) {
+                        eprintln!("navigator-ui: a link from another app: a new trail");
+                    }
+                }
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
                     eprintln!("navigator-ui: signed out of {site} here: {}", match (cookies, &why) {
