@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 #[allow(unused_imports)]
 use std::os::unix::fs::FileExt;	/* read_at, for the blob-index scan */
 
+pub mod crypt;
+
 use tessera_sys::*;
 
 pub const SECTOR_SIZE: u64 = 4096;

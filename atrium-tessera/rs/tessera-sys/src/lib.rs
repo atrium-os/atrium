@@ -557,3 +557,56 @@ extern "C" {
     pub fn tessera_reader_foreach(rd: *mut tessera_reader_t, dir_ino: u32,
                                   f: tessera_reader_entry_fn, ctx: *mut c_void) -> c_int;
 }
+
+// ── sealed volumes (docs/spec/tessera-encryption.md; tessera/seal.h,
+//    tessera/crypt.h, tessera/volume.h). The keys stay opaque here: the
+//    tools reach them through tessera_volume_seal_keys_for and the
+//    tessera_volume_open_* helpers.
+
+/// Registry value of a sealed volume: the 64-byte entry, then the pack
+/// front's 16-byte tag.
+pub const TESSERA_REGISTRY_ENTRY_SIZE_SEALED: u32 = 80;
+pub const TESSERA_SB_ROOT_TAGS: u8 = 7;
+pub const TESSERA_SEAL_OVERHEAD: u32 = 40;
+pub const TESSERA_AEAD96_AES_256_GCM: u32 = 1;
+pub const TESSERA_AEAD96_CHACHA20_POLY1305: u32 = 2;
+
+#[repr(C)]
+pub struct tessera_seal_keys { _p: [u8; 0] }
+
+/// tessera_crypt_backend_t (crypt.h), the primitives the C core's sealing
+/// calls are built on.
+#[repr(C)]
+pub struct tessera_crypt_backend_t {
+    pub aes256_ecb: Option<unsafe extern "C" fn(key: *const u8, input: *const u8,
+        out: *mut u8, nblocks: usize) -> c_int>,
+    pub aead96_seal: Option<unsafe extern "C" fn(alg: u32, key: *const u8,
+        nonce: *const u8, aad: *const u8, aad_len: usize, pt: *const u8,
+        len: usize, ct: *mut u8, tag: *mut u8) -> c_int>,
+    pub aead96_open: Option<unsafe extern "C" fn(alg: u32, key: *const u8,
+        nonce: *const u8, aad: *const u8, aad_len: usize, ct: *const u8,
+        len: usize, tag: *const u8, pt: *mut u8) -> c_int>,
+    pub random: Option<unsafe extern "C" fn(buf: *mut u8, len: usize)>,
+}
+
+extern "C" {
+    pub fn tessera_crypt_set_backend(be: *const tessera_crypt_backend_t);
+
+    pub fn tessera_volume_seal_keys_for(io: *const tessera_block_io_t,
+        vk: *const u8, err: *mut c_int) -> *mut tessera_seal_keys;
+    pub fn tessera_volume_seal_keys_free(k: *mut tessera_seal_keys);
+    pub fn tessera_volume_open_sealed(io: *const tessera_block_io_t,
+        seal: *const tessera_seal_keys, out: *mut *mut tessera_volume_t) -> c_int;
+    pub fn tessera_volume_is_sealed(v: *const tessera_volume_t) -> c_int;
+    pub fn tessera_volume_root_tag(v: *const tessera_volume_t, tree_kind: u8,
+        out: *mut u8) -> c_int;
+    pub fn tessera_volume_open_pack_front(k: *const tessera_seal_keys,
+        tag: *const u8, pack: *mut u8, len: usize) -> c_int;
+    pub fn tessera_volume_open_blob(k: *const tessera_seal_keys, id: *const u8,
+        input: *const u8, len: usize, pt: *mut u8) -> c_int;
+    pub fn tessera_volume_keyed_id(k: *const tessera_seal_keys, hash_alg: u32,
+        data: *const u8, len: usize, out: *mut u8) -> c_int;
+    pub fn tessera_btree_open_sealed(io: *const tessera_block_io_t,
+        seal: *const tessera_seal_keys, root_sector: u64, root_tag: *const u8,
+        tree_kind: u8, key_size: u32, value_size: u32) -> *mut tessera_btree_t;
+}

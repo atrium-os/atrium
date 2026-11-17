@@ -934,6 +934,91 @@ tessera_volume_is_sealed(const tessera_volume_t *v)
 	return v != NULL && v->seal != NULL;
 }
 
+/* ── tools: sealed volumes through an opaque key handle ─────────────── */
+
+#if VOLUME_SEALING
+tessera_seal_keys_t *
+tessera_volume_seal_keys_for(const tessera_block_io_t *io,
+                             const uint8_t vk[32], int *err)
+{
+	uint8_t *buf;
+	tessera_superblock_t *sb;
+	tessera_seal_keys_t *k = NULL;
+	int r = TESSERA_EINVAL;
+
+	if (io == NULL || io->read_block == NULL || vk == NULL) {
+		if (err != NULL) *err = TESSERA_EINVAL;
+		return NULL;
+	}
+	buf = tessera_malloc(TESSERA_SECTOR_SIZE);
+	sb = tessera_malloc(sizeof(*sb));
+	if (buf == NULL || sb == NULL) {
+		r = TESSERA_ENOMEM;
+		goto out;
+	}
+	/* The clear fields only (suite, uuid, key id); open_sealed
+	 * authenticates the copy it uses. */
+	for (uint64_t s = 0; s < 2 && k == NULL; s++) {
+		if (io->read_block(io->ctx, s, buf) != 0 ||
+		    tessera_decode_superblock(buf, sb) != TESSERA_OK ||
+		    (sb->incompat_flags & TESSERA_INCOMPAT_SEALED) == 0)
+			continue;
+		k = tessera_calloc(1, sizeof(*k));
+		if (k == NULL) {
+			r = TESSERA_ENOMEM;
+			break;
+		}
+		r = tessera_seal_keys_init(k, sb->enc_suite, vk,
+		    sb->volume_uuid);
+		if (r != TESSERA_OK) {
+			tessera_free(k);
+			k = NULL;
+			break;
+		}
+		memcpy(k->key_id, sb->master_key_id, 16);
+	}
+out:
+	if (buf != NULL) tessera_free(buf);
+	if (sb != NULL) tessera_free(sb);
+	if (err != NULL) *err = k != NULL ? TESSERA_OK : r;
+	return k;
+}
+
+void
+tessera_volume_seal_keys_free(tessera_seal_keys_t *k)
+{
+	if (k == NULL) return;
+	tessera_seal_keys_clear(k);
+	tessera_free(k);
+}
+
+int
+tessera_volume_open_pack_front(const tessera_seal_keys_t *k,
+                               const uint8_t tag[16], uint8_t *pack,
+                               size_t len)
+{
+	if (k == NULL) return TESSERA_EINVAL;
+	return tessera_pack_open_front(&k->meta, k->uuid, 0, tag, pack, len);
+}
+
+int
+tessera_volume_open_blob(const tessera_seal_keys_t *k,
+                         const tessera_hash_t id, const uint8_t *in,
+                         size_t len, uint8_t *pt)
+{
+	if (k == NULL) return TESSERA_EINVAL;
+	return tessera_blob_open(&k->blob, k->uuid, 0, id, in, len, pt);
+}
+
+int
+tessera_volume_keyed_id(const tessera_seal_keys_t *k, uint32_t hash_alg,
+                        const uint8_t *data, size_t len, tessera_hash_t out)
+{
+	if (k == NULL) return TESSERA_EINVAL;
+	return tessera_keyed_id(hash_alg, k->id, data, len, out);
+}
+#endif
+
 void
 tessera_volume_close(tessera_volume_t *v)
 {

@@ -119,6 +119,23 @@ int tessera_volume_root_tag(const tessera_volume_t *, uint8_t tree_kind,
                             uint8_t out[16]);
 int tessera_volume_journal_anchor(const tessera_volume_t *, uint8_t out[16]);
 
+/* For tools that cannot see tessera_seal_keys_t (tessera-fsck --key-file):
+ * keys derived from VK for the volume on `io`, from the clear superblock
+ * fields (suite, uuid; key_id set from master_key_id). NULL with *err
+ * TESSERA_EINVAL when neither copy says sealed. Free with _free. */
+struct tessera_seal_keys *tessera_volume_seal_keys_for(
+        const tessera_block_io_t *io, const uint8_t vk[32], int *err);
+void tessera_volume_seal_keys_free(struct tessera_seal_keys *);
+/* A sealed pack's front opened in place (tessera_pack_open_front with
+ * K_meta, key group 0); a blob opened under K_blob; a keyed content id. */
+int tessera_volume_open_pack_front(const struct tessera_seal_keys *,
+        const uint8_t tag[16], uint8_t *pack, size_t len);
+int tessera_volume_open_blob(const struct tessera_seal_keys *,
+        const tessera_hash_t id, const uint8_t *in, size_t len, uint8_t *pt);
+int tessera_volume_keyed_id(const struct tessera_seal_keys *,
+        uint32_t hash_alg, const uint8_t *data, size_t len,
+        tessera_hash_t out);
+
 
 /* Offline-repair commit (tessera-fsck --repair). Overrides the roots a
  * consistency repair can legitimately move, bumps the superblock

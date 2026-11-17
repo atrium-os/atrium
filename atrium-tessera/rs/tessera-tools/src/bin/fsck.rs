@@ -29,6 +29,14 @@
 //!   - quota accounting: each domain's used_bytes == summed logical size of
 //!     the regular files in it
 //!
+//! Sealed volumes (docs/spec/tessera-encryption.md, developer builds):
+//! `--key-file K` (the 32-byte volume key) opens the volume through its
+//! authenticated superblock and every tree under its root tag; each pack's
+//! front must open under the tag its registry entry holds and each blob
+//! under its id, and each id must be the keyed id of the blob's bytes. Any
+//! that does not is reported, never decoded. Repair of a sealed volume is
+//! not built yet.
+//!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,6 +47,46 @@ use tessera_sys::*;
 use tessera_tools::{fd_of, make_io, open_file_ro, open_file_rw, DiskCtx, SECTOR_SIZE};
 
 type Hash = [u8; 32];
+
+/// The volume key from --key-file, when checking a sealed volume.
+static VOLUME_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// An open sealed volume's keys and handle (tessera_volume_seal_keys_for).
+struct Sealed {
+    k: *mut tessera_seal_keys,
+    v: *mut tessera_volume_t,
+}
+
+unsafe fn sb_root(v: *mut tessera_volume_t, kind: u8) -> u64 {
+    match kind {
+        TESSERA_BTREE_KIND_INODE => tessera_volume_inode_root(v),
+        TESSERA_BTREE_KIND_PACK_REG => tessera_volume_pack_registry_root(v),
+        TESSERA_BTREE_KIND_FREE_EXT => tessera_volume_free_extent_root(v),
+        TESSERA_BTREE_KIND_SNAPSHOT => tessera_volume_snapshots_root(v),
+        TESSERA_BTREE_KIND_QUOTA => tessera_volume_quota_tree_root(v),
+        TESSERA_BTREE_KIND_BLOB_INDEX => tessera_volume_blob_index_root(v),
+        TESSERA_BTREE_KIND_DEAD_EXT => tessera_volume_dead_extent_root(v),
+        _ => 0,
+    }
+}
+
+/// Open a tree. On a sealed volume only a superblock root opens, under its
+/// tag, and the registry's values are 80 bytes whatever the caller asked.
+unsafe fn open_tree(io: &tessera_block_io_t, s: Option<&Sealed>, root: u64,
+                    kind: u8, ks: u32, vs: u32) -> *mut tessera_btree_t {
+    let Some(s) = s else { return tessera_btree_open(io, root, kind, ks, vs) };
+    if kind >= TESSERA_SB_ROOT_TAGS || root == 0 || root != sb_root(s.v, kind) {
+        return std::ptr::null_mut();
+    }
+    let mut tag = [0u8; 16];
+    if tessera_volume_root_tag(s.v, kind, tag.as_mut_ptr()) != 0 {
+        return std::ptr::null_mut();
+    }
+    let vs = if kind == TESSERA_BTREE_KIND_PACK_REG {
+        TESSERA_REGISTRY_ENTRY_SIZE_SEALED
+    } else { vs };
+    tessera_btree_open_sealed(io, s.k, root, tag.as_ptr(), kind, ks, vs)
+}
 
 fn rd_u32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
 fn rd_u64(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) }
@@ -545,9 +593,38 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     let ctxp = io.ctx as *mut DiskCtx;
 
     let mut v: *mut tessera_volume_t = std::ptr::null_mut();
-    let r = unsafe { tessera_volume_open(&io, &mut v) };
+    let mut seal: Option<Sealed> = None;
+    let r = if let Some(vk) = VOLUME_KEY.get() {
+        if repair {
+            return Err("--repair of a sealed volume is not built yet; \
+                        run without -y to check it".into());
+        }
+        tessera_tools::crypt::install();
+        let mut err = 0;
+        let k = unsafe { tessera_volume_seal_keys_for(&io, vk.as_ptr(), &mut err) };
+        if k.is_null() {
+            return Err(format!("{path}: not a sealed volume, or its suite is \
+                                unknown (errno={err})"));
+        }
+        let r = unsafe { tessera_volume_open_sealed(&io, k, &mut v) };
+        if r == -12 /* EINCOMPAT */ || r == -26 /* ENOKEY */ || r == -25 {
+            eprintln!("tessera-fsck: the key does not open this sealed volume \
+                       (errno={r}): wrong key, or both superblock copies fail \
+                       their HMAC");
+            return Ok((1, 0, false));
+        }
+        if r == 0 { seal = Some(Sealed { k, v }); }
+        r
+    } else {
+        unsafe { tessera_volume_open(&io, &mut v) }
+    };
     if r != 0 {
         // The superblock itself is unreadable/corrupt — the worst case.
+        if r == -12 && VOLUME_KEY.get().is_none() {
+            eprintln!("tessera-fsck: the volume uses a feature this tool cannot read \
+                       without more (errno={r}); a sealed volume needs --key-file");
+            return Ok((1, 0, false));
+        }
         eprintln!("tessera-fsck: SUPERBLOCK INVALID (tessera_volume_open errno={r}) — both SB copies failed magic/CRC/HMAC/version");
         return Ok((1, 0, false));
     }
@@ -636,6 +713,22 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     for t in RESERVE_TREES {
         let root = unsafe { reserve_tree_root(v, t) };
         if root == 0 { continue; }          // an unset root is not damage
+        // Sealed: a node is ciphertext; the test is that it opens under the
+        // superblock's tag for that root, as its own kind.
+        let sealed_why = seal.as_ref().and_then(|_| unsafe {
+            let tr = open_tree(&io, seal.as_ref(), root, t.kind, t.ksz, t.vsz);
+            if tr.is_null() {
+                return Some(format!("sector {root} cannot be opened as a sealed root"));
+            }
+            let c = tessera_btree_seek_first(tr);
+            let fail = if c.is_null() { tessera_btree_last_fail(tr,
+                std::ptr::null_mut(), std::ptr::null_mut()) } else { 0 };
+            if !c.is_null() { tessera_btree_cursor_free(c); }
+            tessera_btree_close(tr);
+            (fail != 0).then(|| format!("sector {root} does not open under its \
+                root tag as a kind-{} node (overwritten, stale or tampered)", t.kind))
+        });
+        if seal.is_some() && sealed_why.is_none() { continue; }
         let mut hb = [0u8; SECTOR_SIZE as usize];
         let ok = f.read_at(&mut hb, root * SECTOR_SIZE)
             .map(|n| n == hb.len()).unwrap_or(false);
@@ -643,7 +736,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         // (tree_kind is byte 7 of tessera_btree_node_header_t). Anything
         // else — unreadable, bad magic, wrong kind — gets described.
         if ok && &hb[0..4] == b"TBTR" && hb[7] == t.kind { continue; }
-        let why = describe_root_sector(&f, root, t.kind);
+        let why = sealed_why.unwrap_or_else(|| describe_root_sector(&f, root, t.kind));
         let plan = match t.tier {
             StaleTier::Rebuild => "--repair rebuilds it from the pack zone",
             StaleTier::Clear   => "--repair clears it (that tree stays lost)",
@@ -689,7 +782,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     let mut pack_ids: HashSet<[u8; 16]> = HashSet::new();
     let mut blob_pack: HashMap<Hash, Vec<[u8; 16]>> = HashMap::new();
     unsafe {
-        let t = tessera_btree_open(&io, pack_root, TESSERA_BTREE_KIND_PACK_REG, 16,
+        let t = open_tree(&io, seal.as_ref(), pack_root, TESSERA_BTREE_KIND_PACK_REG, 16,
             TESSERA_REGISTRY_ENTRY_SIZE);
         if t.is_null() {
             fsck.problem("could not open pack registry tree".into());
@@ -698,7 +791,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             let cur = c;
             while !cur.is_null() {
                 let mut key = [0u8; 16];
-                let mut val = [0u8; TESSERA_REGISTRY_ENTRY_SIZE as usize];
+                let mut val = [0u8; TESSERA_REGISTRY_ENTRY_SIZE_SEALED as usize];
                 if tessera_btree_cursor_get(cur, key.as_mut_ptr(), val.as_mut_ptr()) != 0 {
                     break;
                 }
@@ -758,6 +851,20 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     intervals.push((*s, *e, lbl.clone()));
                 }
 
+                // Sealed: the front opens in place under the registry's tag,
+                // leaving a plain pack whose blobs are still sealed units.
+                let body = match (body, seal.as_ref()) {
+                    (Some(mut buf), Some(s)) => {
+                        if tessera_volume_open_pack_front(s.k, val[64..80].as_ptr(),
+                            buf.as_mut_ptr(), buf.len()) != 0 {
+                            fsck.problem(format!("pack {pid}: sealed front does not \
+                                open under its registry tag (tampered, stale or \
+                                another pack's)"));
+                            None
+                        } else { Some(buf) }
+                    }
+                    (b, _) => b,
+                };
                 // open + enumerate blobs (content hash + manifest capture)
                 if let Some(buf) = body {
                     let pr = tessera_pack_open(buf.as_ptr(), buf.len());
@@ -792,10 +899,30 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                 let mut blen: u32 = 0;
                                 if tessera_pack_lookup(pr, bh.as_ptr(), &mut bytes, &mut blen) == 0
                                     && !bytes.is_null() {
-                                    let slice = std::slice::from_raw_parts(bytes, blen as usize);
-                                    // content-address integrity: re-hash vs claimed hash
+                                    let unit = std::slice::from_raw_parts(bytes, blen as usize);
+                                    // Sealed: the blob opens under its id, and
+                                    // the id is the keyed id of what it holds.
+                                    let mut pt: Vec<u8> = Vec::new();
                                     let mut got = [0u8; 32];
-                                    tessera_content_hash(hash_alg, slice.as_ptr(), slice.len(), got.as_mut_ptr());
+                                    let slice: &[u8] = if let Some(s) = seal.as_ref() {
+                                        if unit.len() < TESSERA_SEAL_OVERHEAD as usize
+                                            || { pt.resize(unit.len() - TESSERA_SEAL_OVERHEAD as usize, 0);
+                                                 tessera_volume_open_blob(s.k, bh.as_ptr(), unit.as_ptr(),
+                                                     unit.len(), pt.as_mut_ptr()) != 0 } {
+                                            fsck.problem(format!("pack {pid}: sealed blob {} \
+                                                does not open under its id", hx(&bh)));
+                                            continue;
+                                        }
+                                        tessera_volume_keyed_id(s.k, hash_alg, pt.as_ptr(), pt.len(),
+                                            got.as_mut_ptr());
+                                        &pt
+                                    } else {
+                                        tessera_content_hash(hash_alg, unit.as_ptr(), unit.len(),
+                                            got.as_mut_ptr());
+                                        unit
+                                    };
+                                    let blen = slice.len() as u32;
+                                    // content-address integrity: re-hash vs claimed hash
                                     if got != bh {
                                         fsck.problem(format!(
                                             "pack {pid}: blob {} content hashes to {} (corrupted data)",
@@ -852,7 +979,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // invisible through a whole dogfood, because nothing audited it.
     if blob_index_root != 0 {
         unsafe {
-            let t = tessera_btree_open(&io, blob_index_root,
+            let t = open_tree(&io, seal.as_ref(), blob_index_root,
                 TESSERA_BTREE_KIND_BLOB_INDEX,
                 TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE);
             if t.is_null() {
@@ -940,7 +1067,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
 
     // ── Pass B: inode tree → sanity + reachability ───────────────
     unsafe {
-        let t = tessera_btree_open(&io, inode_root, TESSERA_BTREE_KIND_INODE, 4,
+        let t = open_tree(&io, seal.as_ref(), inode_root, TESSERA_BTREE_KIND_INODE, 4,
             TESSERA_INODE_RECORD_SIZE);
         if t.is_null() {
             fsck.problem("could not open inode tree".into());
@@ -1038,7 +1165,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // snapshot, so damage is bucketed per generation rather than per inode.
     if snapshots_root != 0 {
         unsafe {
-            let st = tessera_btree_open(&io, snapshots_root,
+            let st = open_tree(&io, seal.as_ref(), snapshots_root,
                 TESSERA_BTREE_KIND_SNAPSHOT, 8, TESSERA_SNAPSHOT_RECORD_SIZE);
             if st.is_null() {
                 fsck.problem("could not open snapshots tree".into());
@@ -1081,7 +1208,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                             let before = fsck.snapshot_problems
                                 .get(&snap_gen).map_or(0, |v| v.len());
                             fsck.current_snapshot = Some(snap_gen);
-                            let sit = tessera_btree_open(&io, snap_inode_root,
+                            let sit = open_tree(&io, seal.as_ref(), snap_inode_root,
                                 TESSERA_BTREE_KIND_INODE, 4,
                                 TESSERA_INODE_RECORD_SIZE);
                             if sit.is_null() {
@@ -1337,7 +1464,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         let mut dead_sectors = 0u64;
         if dead_root != 0 {
             unsafe {
-                let t = tessera_btree_open(&io, dead_root,
+                let t = open_tree(&io, seal.as_ref(), dead_root,
                     TESSERA_BTREE_KIND_DEAD_EXT, 8, 24);
                 if t.is_null() {
                     // Not cosmetic: without the tree we cannot tell these
@@ -1390,7 +1517,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         let mut free: Vec<(u64, u64)> = Vec::new();
         if free_root != 0 && !free_root_stale {
             unsafe {
-                let t = tessera_btree_open(&io, free_root, TESSERA_BTREE_KIND_FREE_EXT, 8, 8);
+                let t = open_tree(&io, seal.as_ref(), free_root, TESSERA_BTREE_KIND_FREE_EXT, 8, 8);
                 if t.is_null() {
                     fsck.problem("could not open free-extent tree".into());
                 } else {
@@ -1503,7 +1630,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // quota_root read up-front (also needed by apply_repairs).
     if quota_root != 0 && !quota_root_stale {
         unsafe {
-            let t = tessera_btree_open(&io, quota_root, TESSERA_BTREE_KIND_QUOTA, 8, 128);
+            let t = open_tree(&io, seal.as_ref(), quota_root, TESSERA_BTREE_KIND_QUOTA, 8, 128);
             if t.is_null() {
                 fsck.problem("could not open quota tree".into());
             } else {
@@ -2427,6 +2554,7 @@ fn main() -> ExitCode {
     let mut path = None;
     let mut verbose = false;
     let mut repair = false;
+    let mut key_next = false;
     for a in &args[1..] {
         match a.as_str() {
             "-v" | "--verbose" => verbose = true,
@@ -2434,6 +2562,21 @@ fn main() -> ExitCode {
             // Opens the device O_SYNC read-write. -n forces detect-only.
             "-y" | "--repair" => repair = true,
             "-n" | "--dry-run" => repair = false,
+            "--key-file" => key_next = true,
+            s if key_next => {
+                key_next = false;
+                match std::fs::read(s) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(&b);
+                        let _ = VOLUME_KEY.set(k);
+                    }
+                    Ok(_) => { eprintln!("tessera-fsck: {s}: must be exactly 32 bytes");
+                               return ExitCode::from(2); }
+                    Err(e) => { eprintln!("tessera-fsck: {s}: {e}");
+                                return ExitCode::from(2); }
+                }
+            }
             s if !s.starts_with('-') => path = Some(s.to_string()),
             _ => {}
         }
@@ -2441,7 +2584,9 @@ fn main() -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("usage: tessera-fsck [-v] [-y|--repair | -n] PATH");
+            eprintln!("usage: tessera-fsck [-v] [-y|--repair | -n] [--key-file K] PATH");
+            eprintln!("  --key-file K: check a sealed volume with its 32-byte key \
+                       (developer builds; no repair)");
             eprintln!("  default: read-only check (exit 1 if problems found)");
             eprintln!("  -y, --repair: apply repairs in place, then re-verify");
             return ExitCode::from(2);
