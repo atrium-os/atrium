@@ -17,6 +17,9 @@ F=$1
 HERE=$(dirname "$0")/..
 
 id _capsa >/dev/null 2>&1 || pw useradd _capsa -u 65031 -d /nonexistent -s /usr/sbin/nologin -c "Capsa removable storage"
+# Sealed sticks (tessera-encryption.md §7): dispensatord asks arcad for their
+# keys as this uid (arcad's ARCA_SERVICES names it dispensatord).
+id _dispensator-vk >/dev/null 2>&1 || pw useradd _dispensator-vk -u 65043 -d /nonexistent -s /usr/sbin/nologin -c "Dispensator volume keys"
 for m in fusefs nullfs; do
   kldload -n $m
   sysrc -n kld_list 2>/dev/null | grep -qw $m || sysrc kld_list+=$m >/dev/null

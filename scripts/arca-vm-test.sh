@@ -122,9 +122,10 @@ put "$tmpd/jaild.policy.toml" /etc/atrium/jaild.policy.toml
 # The web broker (§6): a test app id and publisher, as the Navigator's will be.
 BROKER_PUB=$(printf 'b%.0s' $(seq 64))
 # And a test system service for the machine store (§3, uid 50804).
-# §9: a test uid (50805) stands in for dispensatord.
+# §9: a test uid (50805) stands in for atrium-volumes, a volume service;
+# dispensatord keeps its own (65043, scripts/tessera-sticks-vm.sh).
 sed -e "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" -e "s|vinculumd=65024|vinculumd=50804|" \
-    -e "s|aura-keys=65032|aura-keys=65032,dispensatord=50805|" \
+    -e "s|dispensatord=65043|dispensatord=65043,atrium-volumes=50805|" \
     "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
 put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.

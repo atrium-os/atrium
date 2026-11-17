@@ -548,6 +548,31 @@ Personal:
    when it has a recovery slot, and **Erase and format**. Nothing on it is decoded,
    by the kernel or by any process.
 
+### 7.2a As built (E3, 2026-11-17)
+
+- **Format:** media op `FORMAT { part, persona, label }` (root or the session's user,
+  `dispensator/media`). dispensatord stops whatever served the stick, picks a uuid, has
+  arcad `VK_MINT` the key under that persona, then `TKEY_FORMAT`, mounts it and gives the
+  top folder to the person (0700). A blank stick can be formatted; it never has to be
+  listed first.
+- **Plug-in:** dispensatord reads the two superblock copies' magic, SEALED bit, uuid and
+  key id (fixed offsets, `dispensator/src/sealed.rs`) itself rather than through the
+  FUSE probe: four fixed fields, and the kernel authenticates everything before it
+  mounts. arcad `VK_FIND { user, key_id, uuid }` looks in every persona of the session's
+  person and answers the persona. Found: the kernel mounts it `nosuid,noexec` at
+  `/media/<part>`, listed with `persona`. Not found, or the kernel refuses it (damaged,
+  or older than the key's high-water mark): listed `locked`, not mounted.
+- **Leaving:** lock, logout, a user switch, eject and unplug unmount it, record the
+  generation (`VK_RECORD`) and drop the key.
+- **arcad sees dispensatord by uid**, and dispensatord is root, which arcad serves no
+  one as; its arcad calls run in a child as `_dispensator-vk` (65043), named
+  `dispensatord` in `ARCA_SERVICES`.
+- **Not yet:** recovery codes (§7.4), opening an older copy read-only after
+  verification (§8), grants of a trusted stick's folders into app jails (the FUSE
+  server's control socket does that for FAT; a trusted stick has no server), and
+  Scrinium's and Forum's Locked display and "Make this a Work stick".
+- Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick).
+
 ### 7.3 Not mine, but a person here has the key
 
 Keys are looked up in the active person's stores only. If someone else on this machine
