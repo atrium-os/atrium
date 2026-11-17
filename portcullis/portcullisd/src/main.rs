@@ -1606,7 +1606,7 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     let done = match req {
         Request::Workspaces => Ok(()),
         Request::WorkspaceNew { name, toolchain, network, uses } => workspace::create(owner, workspace::Record {
-            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses, object_cache: false,
+            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses, object_cache: false, layers: vec![],
         }).map(|_| ()),
         Request::WorkspaceSet { name, network, uses, object_cache } => workspace::set(owner, &name, network, uses, object_cache).map(|_| ()),
         Request::WorkspaceDuplicate { name, new_name } => workspace::duplicate(owner, &name, &new_name).map(|_| ()),
@@ -1652,8 +1652,8 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
                 object_cache: r.object_cache,
                 name: r.name, toolchain: r.toolchain, persona: r.persona, network: r.network, uses: r.uses, running,
             }).collect(),
-            toolchains: workspace::TOOLCHAINS.iter().map(|(id, name, available)| portcullis_ipc::Toolchain {
-                id: id.to_string(), name: name.to_string(), available: *available,
+            toolchains: workspace::toolchains().into_iter().map(|(id, name, available)| portcullis_ipc::Toolchain {
+                id: id.to_string(), name: name.to_string(), available,
             }).collect(),
         },
         Err(message) => Response::Error { message },

@@ -23,8 +23,11 @@
 //! stopped (or the machine stops); a console joins it.
 //!
 //! Toolchains: the base system has C (cc, ld, make) and the shell; the
-//! others wait for their layers (atrium-devjail.md §4) and are listed as
-//! unavailable. Personas (personas.md, a proposal) will key a workspace by
+//! others come as toolchain layers (dev-tools-plan.md M3): signed,
+//! read-only trees Opifex installs at `/var/lib/atrium/layers/<name>@<ver>`,
+//! mounted read-only at `/atrium/toolchains/<name>` and put first on the
+//! workspace's `PATH`. The record names them (`layers = ["rust@1.100.0"]`);
+//! a toolchain is available once its layer is installed. Personas (personas.md, a proposal) will key a workspace by
 //! persona: the record carries one, "personal".
 
 use std::fs;
@@ -47,15 +50,109 @@ pub const IN_FILE_MANAGER: &str = "atrium/workspaces";
 /// Where the workspaces it uses appear.
 pub const LINKS: &str = "workspaces";
 
-/// (id, name, available now).
-pub const TOOLCHAINS: &[(&str, &str, bool)] = &[
-    ("c", "C (cc, make)", true),
-    ("shell", "Plain shell", true),
-    ("rust", "Rust", false),
-    ("python", "Python", false),
-    ("go", "Go", false),
-    ("node", "Node", false),
+/// (id, name, the layer it needs: None = the base system has it).
+pub const TOOLCHAINS: &[(&str, &str, Option<&str>)] = &[
+    ("c", "C (cc, make)", None),
+    ("shell", "Plain shell", None),
+    ("rust", "Rust", Some("rust")),
+    ("python", "Python", Some("python")),
+    ("go", "Go", Some("go")),
+    ("node", "Node", Some("node")),
 ];
+
+/// Layers a new workspace of a toolchain gets besides its own, when
+/// installed: the C tools (CMake, Meson, pkgconf, git) for C and Rust.
+const EXTRA_LAYERS: &[(&str, &str)] = &[("c", "c-dev"), ("rust", "c-dev")];
+
+/// Where installed layers are (`<state root>/layers`).
+pub const LAYERS_ROOT: &str = "/var/lib/atrium";
+/// The base system's `PATH` in a workspace; layers go before it.
+pub const BASE_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
+
+/// The installed layers for this machine's arch: (reference, manifest).
+pub fn installed_layers() -> Vec<(String, portcullis_toml::layer::LayerManifest)> {
+    installed_layers_in(Path::new(LAYERS_ROOT))
+}
+
+fn installed_layers_in(root: &Path) -> Vec<(String, portcullis_toml::layer::LayerManifest)> {
+    use portcullis_toml::layer as tl;
+    let mut v = Vec::new();
+    let Ok(rd) = fs::read_dir(root.join(tl::INSTALLED)) else { return v };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if let Ok(m) = load_layer_in(root, &n) {
+            v.push((n, m));
+        }
+    }
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// One installed layer's manifest, checked: its folder is root's and
+/// not a link, it is packed, it is for this arch, and its name matches.
+fn load_layer_in(root: &Path, reference: &str) -> Result<portcullis_toml::layer::LayerManifest, String> {
+    use portcullis_toml::layer as tl;
+    let d = tl::installed_dir(root, reference).ok_or_else(|| format!("{reference:?}: name@version"))?;
+    let md = fs::symlink_metadata(&d).map_err(|_| format!("layer {reference} is not installed"))?;
+    if !md.is_dir() || (cfg!(target_os = "freebsd") && md.uid() != 0) {
+        return Err(format!("{} is not a root-owned folder", d.display()));
+    }
+    let t = fs::read_to_string(d.join("atrium.toml")).map_err(|e| format!("layer {reference}: {e}"))?;
+    let m = tl::LayerManifest::from_str(&t).map_err(|e| format!("layer {reference}: {e}"))?;
+    m.require_content()?;
+    if m.reference() != reference {
+        return Err(format!("layer {reference}: its manifest says {}", m.reference()));
+    }
+    if m.layer.arch != tl::host_arch() {
+        return Err(format!("layer {reference} is for {}", m.layer.arch));
+    }
+    Ok(m)
+}
+
+/// The newest installed version of layer `name` (by version order).
+fn newest_layer(installed: &[(String, portcullis_toml::layer::LayerManifest)], name: &str) -> Option<String> {
+    installed.iter().filter(|(_, m)| m.layer.name == name)
+        .max_by(|a, b| version_cmp(&a.1.layer.version, &b.1.layer.version))
+        .map(|(r, _)| r.clone())
+}
+
+/// Dotted versions compared number by number ("1.100.0" > "1.99.1").
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |s: &str| s.split(['.', '-', '+']).map(|p| p.parse::<u64>().map_err(|_| p.to_string())).collect::<Vec<_>>();
+    let (pa, pb) = (parts(a), parts(b));
+    for (x, y) in pa.iter().zip(pb.iter()) {
+        let o = match (x, y) {
+            (Ok(x), Ok(y)) => x.cmp(y),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+            (Err(x), Err(y)) => x.cmp(y),
+        };
+        if o.is_ne() {
+            return o;
+        }
+    }
+    pa.len().cmp(&pb.len())
+}
+
+/// The toolchains a New workspace offers: (id, name, available now).
+pub fn toolchains() -> Vec<(&'static str, &'static str, bool)> {
+    let installed = installed_layers();
+    TOOLCHAINS.iter().map(|(id, n, layer)| (*id, *n, layer.is_none_or(|l| newest_layer(&installed, l).is_some()))).collect()
+}
+
+/// A workspace's layers composed: PATH, environment and mounts.
+fn compose_layers(r: &Record) -> Result<(portcullis_toml::layer::Composed, Vec<(PathBuf, String)>), String> {
+    use portcullis_toml::layer as tl;
+    let root = Path::new(LAYERS_ROOT);
+    let mut ms = Vec::new();
+    let mut dirs = Vec::new();
+    for l in &r.layers {
+        let m = load_layer_in(root, l)?;
+        dirs.push((tl::installed_dir(root, l).unwrap_or_default(), m.layer.mount.clone()));
+        ms.push(m);
+    }
+    Ok((tl::compose(&ms, BASE_PATH)?, dirs))
+}
 
 /// The base system, read-only in every workspace.
 const BASE: &[&str] = &[
@@ -84,6 +181,9 @@ pub struct Record {
     /// default.
     #[serde(default, rename = "object-cache")]
     pub object_cache: bool,
+    /// Toolchain layers it mounts, `name@version` (dev-tools-plan.md M3).
+    #[serde(default)]
+    pub layers: Vec<String>,
 }
 
 /// Where a workspace's group cache is in its jail.
@@ -223,7 +323,7 @@ pub fn list(owner: &str) -> Result<Vec<(Record, bool)>, String> {
     if load(&root.join(SCRATCH)).is_none() {
         create(owner, Record {
             name: SCRATCH.into(), toolchain: "c".into(), persona: personal(),
-            network: "outbound".into(), uses: vec![], object_cache: false,
+            network: "outbound".into(), uses: vec![], object_cache: false, layers: vec![],
         })?;
     }
     let mut v = Vec::new();
@@ -248,9 +348,11 @@ fn check(owner: &str, home: &Path, r: &Record) -> Result<(), String> {
     }
     match TOOLCHAINS.iter().find(|t| t.0 == r.toolchain) {
         None => return Err(format!("no toolchain {:?}", r.toolchain)),
-        Some((_, n, false)) => return Err(format!("{n} isn't available yet: its toolchain layer comes with atrium-pkg")),
+        Some((_, n, Some(l))) if !r.layers.iter().any(|x| x.split('@').next() == Some(*l)) =>
+            return Err(format!("{n} needs its toolchain layer ({l}); none is installed")),
         Some(_) => {}
     }
+    compose_layers(r)?;
     if !valid_network(&r.network) {
         return Err(format!("network {:?}: outbound or none", r.network));
     }
@@ -269,8 +371,18 @@ fn check(owner: &str, home: &Path, r: &Record) -> Result<(), String> {
     Ok(())
 }
 
-pub fn create(owner: &str, r: Record) -> Result<Record, String> {
+pub fn create(owner: &str, mut r: Record) -> Result<Record, String> {
     let (home, gid) = person(owner)?;
+    // Its toolchain's layer and the extras, newest installed, unless named.
+    if r.layers.is_empty() {
+        let installed = installed_layers();
+        let own = TOOLCHAINS.iter().find(|t| t.0 == r.toolchain).and_then(|t| t.2);
+        for name in own.into_iter().chain(EXTRA_LAYERS.iter().filter(|(t, _)| *t == r.toolchain).map(|(_, l)| *l)) {
+            if let Some(v) = newest_layer(&installed, name) {
+                r.layers.push(v);
+            }
+        }
+    }
     check(owner, &home, &r)?;
     let dir = root_dir(&home, gid)?.join(&r.name);
     if load(&dir).is_some() {
@@ -284,8 +396,8 @@ pub fn create(owner: &str, r: Record) -> Result<Record, String> {
     if fs::symlink_metadata(&meta).is_err() && fs::create_dir(&meta).is_ok() {
         let _ = std::os::unix::fs::chown(&meta, Some(uid), Some(gid));
         let _ = fs::set_permissions(&meta, fs::Permissions::from_mode(0o2770));
-        let text = format!("# Made by New workspace (homes.md §5; atrium-devjail.md §3).\nname = {:?}\n\n[toolchain]\nlanguage = {:?}\n\n[network]\noutbound = {:?}\n",
-                           r.name, r.toolchain, if r.network == "none" { "none" } else { "any" });
+        let text = format!("# Made by New workspace (homes.md §5; atrium-devjail.md §3).\nname = {:?}\n\n[toolchain]\nlanguage = {:?}\nlayers = {:?}\n\n[network]\noutbound = {:?}\n",
+                           r.name, r.toolchain, r.layers, if r.network == "none" { "none" } else { "any" });
         let f = meta.join("devjail.toml");
         if fs::write(&f, text).is_ok() {
             let _ = std::os::unix::fs::chown(&f, Some(uid), Some(gid));
@@ -551,11 +663,15 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     let all: Vec<Record> = list(owner)?.into_iter().map(|(r, _)| r).collect();
     let group = object_group(&all, name);
     let objects = if group.is_empty() { None } else { Some(objects_dir(&home, files, &group)?) };
-    let env = if objects.is_some() {
+    let mut env = if objects.is_some() {
         vec![format!("CCACHE_DIR=/{OBJECTS_IN_JAIL}/ccache"), format!("SCCACHE_DIR=/{OBJECTS_IN_JAIL}/sccache")]
     } else {
         Vec::new()
     };
+    // Its toolchain layers: PATH first, then what they set.
+    let (layers, layer_dirs) = compose_layers(&r)?;
+    env.insert(0, format!("PATH={}", layers.path));
+    env.extend(layers.env);
     let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
         return Ok(Running { jid, ..running });
@@ -619,11 +735,15 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     if let Some(o) = &objects {
         jc.add_mount(o, &jp.join(OBJECTS_IN_JAIL), "nullfs", &["rw"]);
     }
+    // ★ Read-only, shared by every workspace that names the same version.
+    for (src, at) in &layer_dirs {
+        jc.add_mount(src, &jp.join(at.trim_start_matches('/')), "nullfs", &["ro"]);
+    }
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
     launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
-    eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?}, objects {:?})", r.network, r.uses,
-              objects.as_ref().map(|o| o.display().to_string()));
+    eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?}, layers {:?}, objects {:?})", r.network, r.uses,
+              r.layers, objects.as_ref().map(|o| o.display().to_string()));
     Ok(Running { jid, ..running })
 }
 
@@ -653,6 +773,31 @@ mod tests {
         for bad in ["", "A", "a b", "a/b", "../x", ".x", "-x", "a.b", &"a".repeat(33)] {
             assert!(!valid_name(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn versions_and_layers() {
+        use std::cmp::Ordering::*;
+        assert_eq!(version_cmp("1.100.0", "1.99.1"), Greater);
+        assert_eq!(version_cmp("1.91", "1.91.0"), Less);
+        assert_eq!(version_cmp("2", "2"), Equal);
+        let d = std::env::temp_dir().join(format!("ws-layers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let arch = portcullis_toml::layer::host_arch();
+        for (n, v) in [("rust", "1.99.1"), ("rust", "1.100.0"), ("c-dev", "1")] {
+            let l = d.join("layers").join(format!("{n}@{v}"));
+            fs::create_dir_all(&l).unwrap();
+            fs::write(l.join("atrium.toml"), format!("kind = \"layer\"\n[layer]\nname = \"{n}\"\nversion = \"{v}\"\narch = \"{arch}\"\nmount = \"/atrium/toolchains/{n}\"\npath = [\"bin\"]\ncontent = \"sha256:{}\"\n", "0".repeat(64))).unwrap();
+        }
+        // Named under another reference than its manifest's: not a layer.
+        let l = d.join("layers/rust@9");
+        fs::create_dir_all(&l).unwrap();
+        fs::copy(d.join("layers/rust@1.99.1/atrium.toml"), l.join("atrium.toml")).unwrap();
+        let inst = installed_layers_in(&d);
+        assert_eq!(inst.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["c-dev@1", "rust@1.100.0", "rust@1.99.1"]);
+        assert_eq!(newest_layer(&inst, "rust").as_deref(), Some("rust@1.100.0"));
+        assert_eq!(newest_layer(&inst, "go"), None);
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

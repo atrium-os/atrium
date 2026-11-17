@@ -202,7 +202,10 @@ pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
         c("ENV=")?,
     ];
     if ws {
-        env.push(c("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")?);
+        // The workspace's own PATH (its toolchain layers first) when it has one.
+        if !s.env.iter().any(|e| e.starts_with("PATH=")) {
+            env.push(c("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")?);
+        }
         env.push(c(&format!("PS1={} $ ", s.app_id.strip_prefix(WORKSPACE_PREFIX).unwrap_or(s.app_id)))?);
         env.push(c(&format!("USER={}", s.owner))?);
         for e in s.env {

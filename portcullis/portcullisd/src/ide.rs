@@ -209,21 +209,23 @@ pub fn exec(owner: &str, name: &str, argv: &[String], cwd: &str) -> Result<Start
     let r = workspace::start(owner, name)?;
     let c = |v: &str| CString::new(v).map_err(|_| "a NUL in the command".to_string());
     let args: Vec<CString> = argv.iter().map(|a| c(a)).collect::<Result<_, _>>()?;
-    const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
+    // The workspace's PATH: its toolchain layers, then the base.
+    let path_var = r.env.iter().find_map(|e| e.strip_prefix("PATH=")).unwrap_or(workspace::BASE_PATH).to_string();
+    let path: &str = &path_var;
     // Where argv[0] is tried: as given if it has a `/`, else along PATH.
     let tries: Vec<CString> = if argv[0].contains('/') {
         vec![args[0].clone()]
     } else {
-        PATH.split(':').map(|d| c(&format!("{d}/{}", argv[0]))).collect::<Result<_, _>>()?
+        path.split(':').map(|d| c(&format!("{d}/{}", argv[0]))).collect::<Result<_, _>>()?
     };
     let mut env = vec![
         c(&format!("HOME={}", r.home))?,
-        c(&format!("PATH={PATH}"))?,
         c(&format!("USER={owner}"))?,
         c("TERM=dumb")?,
         c(&format!("ATRIUM_WORKSPACE={name}"))?,
     ];
-    for e in &r.env {
+    env.push(c(&format!("PATH={path}"))?);
+    for e in r.env.iter().filter(|e| !e.starts_with("PATH=")) {
         env.push(c(e)?);
     }
     let dir = if cwd.is_empty() { format!("{}/work", r.home) } else { format!("{}/work/{}", r.home, cwd.trim_end_matches('/')) };
