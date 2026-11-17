@@ -11,6 +11,10 @@
  *
  * Prints the uuid (random unless given) for tessera-keyload.
  *
+ *   tessera-mkfs-sealed --plain [--create -s SIZE_MIB] [...] PATH
+ *
+ * formats the same volume unsealed, for sealed-vs-plain comparisons.
+ *
  * Build (FreeBSD, beside the core library):
  *   cc -I../core/include -o tessera-mkfs-sealed tessera-mkfs-sealed.c \
  *       ../core/src/crypt_openssl.c libtessera_core.a -lmd -lcrypto
@@ -103,7 +107,7 @@ main(int argc, char **argv)
 	const char *keyfile = NULL, *path = NULL, *seed_name = NULL;
 	const char *seed_file = NULL;
 	uint8_t key_id[16], uuid[16], vk[32];
-	int have_id = 0, have_uuid = 0, create = 0;
+	int have_id = 0, have_uuid = 0, create = 0, plain = 0;
 	uint32_t suite = TESSERA_SUITE_XAES_256_GCM, hash_alg = 0;
 	uint64_t jsect = 256, mib = 0, seed_inode = 100;
 	uint32_t chunk = 0;
@@ -138,6 +142,7 @@ main(int argc, char **argv)
 			else usage();
 		} else if (strcmp(a, "-j") == 0) { NEED(); jsect = strtoull(v, NULL, 0); }
 		else if (strcmp(a, "--create") == 0) create = 1;
+		else if (strcmp(a, "--plain") == 0) plain = 1;
 		else if (strcmp(a, "-s") == 0) { NEED(); mib = strtoull(v, NULL, 0); }
 		else if (strcmp(a, "--seed-file") == 0) { NEED(); seed_name = v; }
 		else if (strcmp(a, "--seed-inode") == 0) { NEED(); seed_inode = strtoull(v, NULL, 0); }
@@ -147,11 +152,12 @@ main(int argc, char **argv)
 		else path = a;
 #undef NEED
 	}
-	if (keyfile == NULL || !have_id || path == NULL || (create && mib == 0))
+	if ((!plain && (keyfile == NULL || !have_id)) || path == NULL ||
+	    (create && mib == 0))
 		usage();
 
 	tessera_crypt_openssl_install();
-	{
+	if (!plain) {
 		size_t kl;
 		uint8_t *kb = slurp(keyfile, &kl);
 		if (kl != 32) {
@@ -199,6 +205,21 @@ main(int argc, char **argv)
 			o.seed_chunk_size = chunk;
 		}
 	}
+	tessera_block_io_t io;
+	memset(&io, 0, sizeof io);
+	io.read_block = f_read;
+	io.write_block = f_write;
+	if (plain) {
+		int pr = tessera_volume_format(&io, &o);
+		free(content);
+		if (pr != TESSERA_OK || fsync(fd) != 0) {
+			fprintf(stderr, "format failed: %d\n", pr);
+			return (1);
+		}
+		close(fd);
+		printf("formatted %s (plain)\n", path);
+		return (0);
+	}
 	if (tessera_seal_keys_init(&k, suite, vk, uuid) != TESSERA_OK) {
 		fprintf(stderr, "key derivation failed\n");
 		return (1);
@@ -206,10 +227,6 @@ main(int argc, char **argv)
 	tessera_wipe(vk, sizeof vk);
 	memcpy(k.key_id, key_id, 16);
 
-	tessera_block_io_t io;
-	memset(&io, 0, sizeof io);
-	io.read_block = f_read;
-	io.write_block = f_write;
 	int r = tessera_volume_format_sealed(&io, &o, &k);
 	tessera_seal_keys_clear(&k);
 	free(content);

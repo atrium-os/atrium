@@ -6,6 +6,9 @@
 #
 #   sh scripts/tessera-sealed-vm.sh deploy   # module + sources to the guest
 #   sh scripts/tessera-sealed-vm.sh run      # the checks, one module per run
+#   FSCK=path/to/tessera-fsck sh scripts/tessera-sealed-vm.sh fsck
+#        # host fsck --key-file of the kernel-written images run left
+#   sh scripts/tessera-sealed-vm.sh bench    # sealed vs plain throughput
 #
 # deploy needs atrium-tessera/kmod/out/<target>-<kernconf>/ from
 # scripts/tessera-kmod-rust.sh build. The developer tools (tessera-mkfs-sealed,
@@ -186,7 +189,10 @@ mount -t tessera -r $DEV $M || fail "remount after the crash"
 umount $M
 echo "crash replay: ok"
 
-mdconfig -d -u ${DEV#/dev/md}; rm -f $IMG $IMG.crash $T/key $T/wrong
+# kept for the host's fsck --key-file (the fsck subcommand)
+mdconfig -d -u ${DEV#/dev/md}
+cp $IMG.crash $T/kept-$1.img && cp $T/key $T/kept-$1.key
+rm -f $IMG $IMG.crash $T/key $T/wrong
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload
 dmesg | tail -60 | grep -iE 'panic|tessera_fs: sealed' | tail -8
@@ -211,8 +217,83 @@ guest_run() {
     echo "FAIL: no result after polling (guest hung or panicked?)"
 }
 
+# Host fsck of the images the guest kept, one per module.
+host_fsck() {
+    : "${FSCK:?FSCK=path/to/tessera-fsck (cargo build -p tessera-tools)}"
+    w=$(mktemp -d); rc=0
+    for ko in ${MODULES:-tessera_fs.ko tessera_fs-c.ko}; do
+        if ! "$VSSH" "cat $T/kept-$ko.img" > "$w/img" ||
+           ! "$VSSH" "cat $T/kept-$ko.key" > "$w/key"; then
+            echo "no kept image for $ko"; rc=1; continue
+        fi
+        echo "== $ko ($(wc -c < "$w/img") bytes)"
+        "$FSCK" --key-file "$w/key" "$w/img" > "$w/out" 2>&1 || rc=1
+        sed 's/^/   /' "$w/out"
+    done
+    rm -rf "$w"
+    [ $rc -eq 0 ] && echo "tessera-sealed-vm fsck: all CLEAN" ||
+        echo "tessera-sealed-vm fsck: PROBLEMS"
+    return $rc
+}
+
+# Throughput, sealed vs plain, on md-backed images in the guest: a file of
+# random bytes (BENCH_MB, default 1024) written (cp + sync) and read back
+# after a remount.
+bench_script() {
+    cat <<'BENCH'
+set -u
+KO=/root/sealed/$1; T=/root/sealed; M=/mnt/sealed; IMG=/var/tmp/bench.img
+PATH=$T:$PATH
+KID=c0ffee00112233445566778899aabbcc
+MB=${2:-1024}
+fail() { echo "FAIL: $*"; exit 1; }
+secs() { /usr/bin/time -p sh -c "$1" 2>&1 >/dev/null | awk '/^real/ {print $2}'; }
+umount $M 2>/dev/null
+for u in $(mdconfig -l); do mdconfig -lv -u $u | grep -q bench.img && mdconfig -d -u $u; done
+for id in $(kldstat | awk '/tessera_fs/ {print $1}'); do kldunload -i $id || fail "tessera_fs in use"; done
+kldload $KO || fail kldload
+dmesg | tail -20 | grep 'sealed volumes ready' | tail -1
+[ -f /var/tmp/bench.src ] && [ $(wc -c < /var/tmp/bench.src) -eq $((MB * 1048576)) ] ||
+    dd if=/dev/random of=/var/tmp/bench.src bs=1m count=$MB 2>/dev/null
+cat /var/tmp/bench.src > /dev/null
+head -c 32 /dev/random > $T/bkey
+mkdir -p $M
+for mode in plain sealed; do
+    rm -f $IMG
+    if [ $mode = plain ]; then
+        tessera-mkfs-sealed --plain --create -s $((MB * 2 + 512)) $IMG >/dev/null || fail mkfs
+    else
+        U=$(tessera-mkfs-sealed --key-file $T/bkey --key-id $KID --create \
+            -s $((MB * 2 + 512)) $IMG | awk '/^uuid/ {print $2}') || fail mkfs
+        tessera-keyload drop $KID >/dev/null 2>&1
+        tessera-keyload load $T/bkey $KID $U >/dev/null || fail keyload
+    fi
+    DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+    mount -t tessera $DEV $M || fail "mount $mode"
+    w=$(secs "cp /var/tmp/bench.src $M/f && sync")
+    umount $M || fail umount
+    mount -t tessera -r $DEV $M || fail "remount $mode"
+    r=$(secs "cat $M/f > /dev/null")
+    cmp -s $M/f /var/tmp/bench.src || fail "$mode: read back differs"
+    umount $M; mdconfig -d -u ${DEV#/dev/md}
+    echo "$mode: write $MB MiB in ${w}s = $(echo "$MB / $w" | bc) MiB/s; read in ${r}s = $(echo "$MB / $r" | bc) MiB/s"
+done
+rm -f $IMG $T/bkey
+tessera-keyload drop $KID >/dev/null 2>&1
+kldunload $1
+echo BENCH-DONE
+BENCH
+}
+
 case "${1:-}" in
     deploy) deploy ;;
+    fsck) host_fsck; exit $? ;;
+    bench)
+        for ko in ${MODULES:-tessera_fs.ko}; do
+            echo "== $ko"
+            bench_script | "$VSSH" "cat > $T/bench.sh" || exit 1
+            "$VSSH" "sh $T/bench.sh $ko ${BENCH_MB:-1024}" 2>&1 | tr -d '\r' | sed 's/^/   /'
+        done ;;
     run)
         rc=0
         for ko in ${MODULES:-tessera_fs.ko tessera_fs-c.ko}; do
@@ -223,5 +304,5 @@ case "${1:-}" in
         done
         [ $rc -eq 0 ] && echo "tessera-sealed-vm: all modules PASS" || echo "tessera-sealed-vm: FAILED"
         exit $rc ;;
-    *) sed -n '2,25p' "$0"; exit 2 ;;
+    *) sed -n '2,40p' "$0"; exit 2 ;;
 esac
