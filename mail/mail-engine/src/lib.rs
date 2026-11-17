@@ -24,6 +24,7 @@ pub mod search;
 pub mod drafts;
 pub mod pictures;
 pub mod send;
+pub mod senders;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
@@ -72,7 +73,7 @@ impl From<mail_store::Error> for Error {
     fn from(e: mail_store::Error) -> Self { Error::Store(e) }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -364,12 +365,19 @@ impl Sink for AccountSink<'_> {
             i = end;
         }
         let account = self.account;
+        // New to the index (not a resync of what is here): the rules apply.
+        let fresh: Vec<bool> = stored.iter().map(|(uid, _)| self.e.store.at(id, *uid).ok().flatten().is_none()).collect();
+        let mut new = Vec::new();
         self.e.store.write(|w| {
-            for (uid, m) in stored {
-                w.put(id, account, uid, m)?;
+            for ((uid, m), fresh) in stored.into_iter().zip(fresh) {
+                let msg = w.put(id, account, uid, m)?;
+                if fresh {
+                    new.push((uid, msg));
+                }
             }
             Ok(())
-        }).map_err(|e| e.to_string())
+        }).map_err(|e| e.to_string())?;
+        self.e.arrived(account, id, &new).map_err(|e| e.to_string())
     }
 
     fn flags(&mut self, folder: &str, changes: &[(u32, Vec<String>)]) -> Result<(), String> {

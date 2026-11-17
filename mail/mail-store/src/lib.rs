@@ -29,12 +29,13 @@ pub use drafts::LocalDraft;
 mod outbox;
 pub use outbox::{retry_after, Outgoing, SendState};
 pub mod search;
+pub mod senders;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
 /// The index's layout; an index of another layout is rebuilt from the blobs
 /// by sync (the store refuses to open it).
-const SCHEMA: u64 = 5;
+const SCHEMA: u64 = 6;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -200,6 +201,9 @@ pub struct Message {
     /// The attachments' names and text, as a parse jail took it out (§8,
     /// §11.2), for search: one blob of UTF-8 text.
     pub files_text: Option<Hash>,
+    /// Locations held back from their folder's list by the screener
+    /// (§11.3) until the sender is accepted; local only.
+    pub held: Vec<(FolderId, u32)>,
 }
 
 /// One row of a folder's list.
@@ -254,6 +258,11 @@ impl Store {
             tx.open_table(search::TERMS)?;
             tx.open_table(search::MSG_TERMS)?;
             tx.open_table(search::SAVED)?;
+            tx.open_table(senders::LISTS)?;
+            tx.open_table(senders::CONTACTS)?;
+            tx.open_table(senders::SETTINGS)?;
+            tx.open_table(senders::HELD)?;
+            tx.open_table(senders::LANES)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();
@@ -513,7 +522,7 @@ impl Writer<'_> {
                     old.summary = m.summary;
                     self.index(id, &old, None)?;
                 }
-                if !old.locations.contains(&(folder, uid)) && !old.leaving.contains(&(folder, uid)) {
+                if !old.locations.contains(&(folder, uid)) && !old.leaving.contains(&(folder, uid)) && !old.held.contains(&(folder, uid)) {
                     old.locations.push((folder, uid));
                 }
                 // The list key carries the date: re-key if it changed.
@@ -543,6 +552,7 @@ impl Writer<'_> {
                     pictures: Vec::new(),
                     files_text: None,
                     leaving: Vec::new(),
+                    held: Vec::new(),
                 };
                 self.put_msg(id, &msg)?;
                 self.index(id, &msg, None)?;
@@ -556,6 +566,11 @@ impl Writer<'_> {
         // Leaving this folder (a move waits for the server): stays out of its list.
         if cur.leaving.contains(&(folder, uid)) {
             self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags | LEAVING))?;
+            return Ok(id);
+        }
+        // Held by the screener: known, but not in the folder's list.
+        if cur.held.contains(&(folder, uid)) {
+            self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags))?;
             return Ok(id);
         }
         self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags))?;
@@ -633,7 +648,11 @@ impl Writer<'_> {
         self.tx.open_table(LIST)?.remove((folder, date_key(m.date), id))?;
         m.locations.retain(|l| *l != (folder, uid));
         m.leaving.retain(|l| *l != (folder, uid));
-        if m.locations.is_empty() && m.leaving.is_empty() {
+        if m.held.contains(&(folder, uid)) {
+            m.held.retain(|l| *l != (folder, uid));
+            self.tx.open_table(senders::HELD)?.remove((m.account, date_key(m.date), id))?;
+        }
+        if m.locations.is_empty() && m.leaving.is_empty() && m.held.is_empty() {
             self.tx.open_table(MESSAGES)?.remove(id)?;
             self.unindex(id)?;
             if let Some(s) = &m.server_id {
