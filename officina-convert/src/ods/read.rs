@@ -1056,11 +1056,26 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     }
                     b"calcext:formatting-entry" => {
                         let a = attrs(e);
-                        if let Some(CfEntry::Bar { points, .. }) = cf.as_mut().and_then(|f| f.entries.last_mut()) {
-                            points.push((a.get("calcext:type").cloned().unwrap_or_default(), a.get("calcext:value").cloned().unwrap_or_default()));
+                        let p = (a.get("calcext:type").cloned().unwrap_or_default(), a.get("calcext:value").cloned().unwrap_or_default());
+                        match cf.as_mut().and_then(|f| f.entries.last_mut()) {
+                            Some(CfEntry::Bar { points, .. }) => points.push(p),
+                            Some(CfEntry::Icons { points, show_value, .. }) if points.len() < 5 => {
+                                // LibreOffice puts the set's show-value on an entry.
+                                if a.get("calcext:show-value").is_some_and(|v| v == "false") {
+                                    *show_value = false;
+                                }
+                                points.push(p);
+                            }
+                            _ => {}
                         }
                     }
-                    b"calcext:icon-set" | b"calcext:date-is" => {
+                    b"calcext:icon-set" => {
+                        let a = attrs(e);
+                        if let Some(f) = cf.as_mut() {
+                            f.entries.push(CfEntry::Icons { set: a.get("calcext:icon-set-type").cloned().unwrap_or_default(), show_value: a.get("calcext:show-value").is_none_or(|v| v != "false"), points: Vec::new() });
+                        }
+                    }
+                    b"calcext:date-is" => {
                         if let Some(f) = cf.as_mut() {
                             f.entries.push(CfEntry::Other(String::from_utf8_lossy(name).into_owned()));
                         }

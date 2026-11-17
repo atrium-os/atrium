@@ -18,7 +18,7 @@ pub fn dxfs(wb: &Workbook) -> Vec<Dxf> {
     let mut out: Vec<Dxf> = Vec::new();
     for f in wb.cond_formats() {
         for r in &f.rules {
-            if !matches!(r.kind, RuleKind::ColorScale(_) | RuleKind::DataBar { .. }) && !out.contains(&r.dxf) {
+            if !matches!(r.kind, RuleKind::ColorScale(_) | RuleKind::DataBar { .. } | RuleKind::IconSet { .. }) && !out.contains(&r.dxf) {
                 out.push(r.dxf.clone());
             }
         }
@@ -176,6 +176,26 @@ pub fn sheet_xml(wb: &Workbook, s: u16, dxfs: &[Dxf], o: &mut Vec<u8>) {
                     cfvo(&mut x, max);
                     let _ = write!(x, r#"<color rgb="FF{color:06X}"/></dataBar>"#);
                 }
+                RuleKind::IconSet { set, points, reverse, show_value } => {
+                    head(&mut x, "iconSet", "", false);
+                    let name = officina_grid::condfmt::ICON_SETS[*set as usize].0;
+                    let _ = write!(x, r#"<iconSet iconSet="{name}""#);
+                    if *reverse {
+                        x.push_str(r#" reverse="1""#);
+                    }
+                    if !*show_value {
+                        x.push_str(r#" showValue="0""#);
+                    }
+                    x.push('>');
+                    for (p, gte) in points {
+                        cfvo(&mut x, p);
+                        if !*gte {
+                            x.truncate(x.len() - 2);
+                            x.push_str(r#" gte="0"/>"#);
+                        }
+                    }
+                    x.push_str("</iconSet>");
+                }
             }
             x.push_str("</cfRule>");
             priority += 1;
@@ -297,6 +317,8 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
         // The rule being read: its attributes, formulas, points and colours.
         let mut rule: Option<HashMap<Vec<u8>, String>> = None;
         let (mut formulas, mut cfvos, mut colors): (Vec<String>, Vec<(String, Option<String>)>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
+        // Each point's gte (icon sets), as read.
+        let mut gtes: Vec<bool> = Vec::new();
         let mut in_formula = false;
         loop {
             buf.clear();
@@ -306,9 +328,10 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
                     formulas.clear();
                     cfvos.clear();
                     colors.clear();
+                    gtes.clear();
                 }
                 Ok(Event::Empty(e)) if e.local_name().as_ref() == b"cfRule" => {
-                    if let Some(x) = make(wb, s, origin, attrs(&e), &[], &[], &[], dxfs, rep) {
+                    if let Some(x) = make(wb, s, origin, attrs(&e), &[], &[], &[], &[], dxfs, rep) {
                         rules.push(x);
                     }
                 }
@@ -324,9 +347,22 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
                 Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                     let a = attrs(&e);
                     match e.local_name().as_ref() {
-                        b"cfvo" => cfvos.push((a.get(b"type".as_slice()).cloned().unwrap_or_default(), a.get(b"val".as_slice()).cloned())),
+                        b"cfvo" => {
+                            cfvos.push((a.get(b"type".as_slice()).cloned().unwrap_or_default(), a.get(b"val".as_slice()).cloned()));
+                            gtes.push(!a.get(b"gte".as_slice()).is_some_and(|v| v == "0" || v == "false"));
+                        }
                         b"color" => colors.push(rgb(&a, theme).unwrap_or(0)),
-                        b"iconSet" => rep.note(Kind::Dropped, "icon sets in conditional formats"),
+                        // The set's own attributes join the rule's (cfRule has none of these names).
+                        b"iconSet" => {
+                            if let Some(r) = rule.as_mut() {
+                                for k in ["iconSet", "reverse", "showValue"] {
+                                    if let Some(v) = a.get(k.as_bytes()) {
+                                        r.insert(format!("icon.{k}").into_bytes(), v.clone());
+                                    }
+                                }
+                                r.entry(b"icon.iconSet".to_vec()).or_insert_with(|| "3TrafficLights1".into());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -334,7 +370,7 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
                     b"formula" => in_formula = false,
                     b"cfRule" => {
                         if let Some(a) = rule.take() {
-                            if let Some(x) = make(wb, s, origin, a, &formulas, &cfvos, &colors, dxfs, rep) {
+                            if let Some(x) = make(wb, s, origin, a, &formulas, &cfvos, &gtes, &colors, dxfs, rep) {
                                 rules.push(x);
                             }
                         }
@@ -358,7 +394,7 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, formulas: &[String], cfvos: &[(String, Option<String>)], colors: &[u32], dxfs: &[Dxf], rep: &mut Report) -> Option<(u32, Rule)> {
+fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, formulas: &[String], cfvos: &[(String, Option<String>)], gtes: &[bool], colors: &[u32], dxfs: &[Dxf], rep: &mut Report) -> Option<(u32, Rule)> {
     let get = |k: &str| a.get(k.as_bytes()).map(String::as_str);
     let flag = |k: &str| get(k).is_some_and(|v| v == "1" || v == "true");
     let priority = get("priority").and_then(|v| v.parse().ok()).unwrap_or(u32::MAX);
@@ -410,8 +446,19 @@ fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, 
             RuleKind::DataBar { min, max, color: *colors.first()? }
         }
         "iconSet" => {
-            rep.note(Kind::Dropped, "icon sets in conditional formats");
-            return None;
+            let name = get("icon.iconSet").unwrap_or("3TrafficLights1");
+            let Some(set) = officina_grid::condfmt::icon_set(name) else {
+                rep.note_at(Kind::Dropped, "icon sets Officina doesn't have", || name.to_string());
+                return None;
+            };
+            let n = officina_grid::condfmt::ICON_SETS[set as usize].1 as usize;
+            let points: Option<Vec<(Cfvo, bool)>> = cfvos.iter().zip(gtes.iter().chain(std::iter::repeat(&true))).map(|(c, g)| point(c).map(|p| (p, *g))).collect();
+            let points = match points {
+                Some(p) if p.len() == n => p,
+                _ => officina_grid::condfmt::icon_points(n as u8),
+            };
+            let off = |k: &str| get(k).is_some_and(|v| v == "0" || v == "false");
+            RuleKind::IconSet { set, points, reverse: flag("icon.reverse"), show_value: !off("icon.showValue") }
         }
         other => {
             rep.note_at(Kind::Dropped, "conditional format rules of kinds Officina doesn't have", || other.to_string());

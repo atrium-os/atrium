@@ -51,7 +51,19 @@ fn book(lo: bool) -> Workbook {
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![Rect { sheet: 0, r0: 0, c0: 3, r1: 9, c1: 3 }], rules: d }).unwrap();
     for i in 0..10u32 {
         wb.set_input(CellAddr::new(0, i, 3), &((i * 3) % 7 + 1).to_string()).unwrap();
+        wb.set_input(CellAddr::new(0, i, 4), &(i * 11 % 10).to_string()).unwrap();
+        wb.set_input(CellAddr::new(0, i, 5), &(i + 1).to_string()).unwrap();
     }
+    // Icon sets: Excel's default arrows; five ratings reversed and icon only
+    // where LibreOffice keeps those (not in .ods, which it reads without them).
+    // LibreOffice drops gte="0" both ways.
+    let arrows = officina_grid::condfmt::icon_set("3Arrows").unwrap();
+    let e = RuleKind::IconSet { set: arrows, points: officina_grid::condfmt::icon_points(3), reverse: false, show_value: true };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(4)], rules: vec![Rule { kind: e, dxf: Dxf::default(), stop: false }] }).unwrap();
+    let rating = officina_grid::condfmt::icon_set("5Rating").unwrap();
+    let points = vec![(Cfvo::Num(0.0), true), (Cfvo::Num(3.0), true), (Cfvo::Percent(50.0), true), (Cfvo::Percentile(70.0), true), (Cfvo::Num(9.0), true)];
+    let g = RuleKind::IconSet { set: rating, points, reverse: !lo, show_value: lo };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(5)], rules: vec![Rule { kind: g, dxf: Dxf::default(), stop: false }] }).unwrap();
     wb.recalc();
     wb
 }
@@ -86,11 +98,11 @@ fn run(from: &str, to: &str) {
     println!("{from}→{to} report {:?}", loaded.report.human());
     let (mut same, mut all) = (0, 0);
     for r in 0..10 {
-        for c in 0..4 {
+        for c in 0..6 {
             all += 1;
             let (p, q) = (wb.look(CellAddr::new(0, r, c)), rb.look(CellAddr::new(0, r, c)));
             // LibreOffice's bars and scales are its own sums: compare which cells have one.
-            if p.dxf == q.dxf && p.scale.is_some() == q.scale.is_some() && p.bar.is_some() == q.bar.is_some() {
+            if p.dxf == q.dxf && p.scale.is_some() == q.scale.is_some() && p.bar.is_some() == q.bar.is_some() && p.icon == q.icon && p.hide_value == q.hide_value {
                 same += 1;
                 if p.scale != q.scale || p.bar.map(|b| (b.0 * 100.0).round()) != q.bar.map(|b| (b.0 * 100.0).round()) {
                     println!("  {r},{c}: scale/bar {:?}/{:?} vs {:?}/{:?}", p.scale, p.bar, q.scale, q.bar);
