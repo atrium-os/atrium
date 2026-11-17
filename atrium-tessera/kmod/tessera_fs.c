@@ -80,6 +80,7 @@
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
 #include "tessera/volume.h"
+#include "tessera_crypt_ocf.h"
 #include "tessera_rs.h"	/* D3: Rust on-disk decoders (core/src) */
 
 MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
@@ -9338,6 +9339,8 @@ tessera_init_impl(struct vfsconf *vfsp)
 {
 	(void)vfsp;
 	printf("tessera_fs: VFS registered\n");
+	/* Sealed volumes need it; plain ones mount either way. */
+	(void)tessera_crypt_ocf_install();
 	return (0);
 }
 
@@ -9345,6 +9348,7 @@ static int
 tessera_uninit_impl(struct vfsconf *vfsp)
 {
 	(void)vfsp;
+	tessera_crypt_ocf_remove();
 	printf("tessera_fs: VFS unregistered\n");
 	return (0);
 }
@@ -32568,3 +32572,4 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, mounts,
     "Per-mount metadata-reserve admission inputs and pinscan state");
 
 MODULE_VERSION(tessera_fs, 1);
+MODULE_DEPEND(tessera_fs, crypto, 1, 1, 1);

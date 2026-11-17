@@ -29,6 +29,7 @@ SRCS=       tessera_fs.c \
             quota_store.c \
             crypt.c \
             seal.c \
+            tessera_crypt_ocf.c \
             vnode_if.h
 
 CFLAGS+=    -I${.CURDIR}/../core/include
