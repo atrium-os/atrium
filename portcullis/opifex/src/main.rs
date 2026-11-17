@@ -14,10 +14,15 @@
 //! left alone, though they are still walked for their own dependencies.)
 //!
 //! ```text
+//! opifex pack <bundle-dir> [--sign <key.pem>]
 //! opifex install <bundle-dir> [--allow-unsigned] [--root <dir>] [--sysroot <dir>]
 //! opifex list                 [--root <dir>]
 //! opifex uninstall <app-id>   [--root <dir>]
+//! opifex rollback <app-id>    [--root <dir>]
 //! ```
+//! `pack` writes `content.index` and names it in `[bundle] content`, so the
+//! manifest's signature covers every file; install then checks each file
+//! (opifex.md §4.2). See `app.rs`.
 //! `--root` is the Atrium state root (default `/var/lib/atrium`); apps install
 //! under `<root>/apps/<id>/`, with the writable overlay at `<root>/overlays/<id>/`.
 //!
@@ -31,6 +36,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod app;
+mod content;
 mod layer;
 
 const DEFAULT_ROOT: &str = "/var/lib/atrium";
@@ -38,10 +45,6 @@ const DEFAULT_ROOT: &str = "/var/lib/atrium";
 /// on-target case). Point it at an extracted FreeBSD sysroot to install from a
 /// cross-build host.
 const DEFAULT_SYSROOT: &str = "/";
-/// The trusted-publisher set (same root portcullisd checks). Empty = trust not
-/// configured → unsigned allowed with a loud warning (auditable, never silent).
-const PUBLISHERS_DIR: &str = "/etc/atrium/publishers";
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -49,7 +52,9 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let res = match args[1].as_str() {
+        "pack"      => cmd_pack(&args[2..]),
         "install"   => cmd_install(&args[2..]),
+        "rollback"  => cmd_rollback(&args[2..]),
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
@@ -66,8 +71,11 @@ fn usage() {
     eprintln!(
         "Usage: opifex <command> [args]\n\n\
          Commands:\n  \
+           pack <bundle-dir> [--sign <key.pem>]\n      \
+             Index every file, name the index in atrium.toml, sign it.\n  \
            install <bundle-dir> [--allow-unsigned] [--root <dir>] [--sysroot <dir>]\n      \
              Install a pre-built signed bundle into the Portcullis app tree.\n  \
+           rollback <app-id> [--root <dir>]    Swap back to the version before the last install.\n  \
            list [--root <dir>]                 Show installed apps.\n  \
            uninstall <app-id> [--root <dir>]   Remove an app + its overlay.\n  \
            layer pack <tree> --manifest <toml> [--sign <key.pem>]\n  \
@@ -100,6 +108,26 @@ fn take_root(args: &[String]) -> (PathBuf, PathBuf, Vec<String>) {
     (root, sysroot, rest)
 }
 
+fn cmd_pack(args: &[String]) -> Result<(), String> {
+    let mut tree = None;
+    let mut sign = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--sign" => sign = Some(it.next().ok_or("--sign needs a key file")?.clone()),
+            o if o.starts_with("--") => return Err(format!("pack: unknown flag {o}")),
+            o => tree = Some(o.to_string()),
+        }
+    }
+    let tree = tree.ok_or("pack: missing <bundle-dir>")?;
+    let key = match sign { Some(k) => Some(std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?), None => None };
+    let m = app::pack(Path::new(&tree), key.as_deref())?;
+    println!("opifex: packed {} ({}){}", m.app.id,
+             m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
+             if key.is_some() { ", signed" } else { ", NOT signed" });
+    Ok(())
+}
+
 fn cmd_install(args: &[String]) -> Result<(), String> {
     let (root, sysroot, rest) = take_root(args);
     let mut allow_unsigned = false;
@@ -113,41 +141,44 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     }
     let bundle = PathBuf::from(src.ok_or("install: missing <bundle-dir>")?);
 
-    // 1. Read + validate the manifest.
-    let manifest_path = bundle.join("atrium.toml");
-    let text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read {}: {e}", manifest_path.display()))?;
-    let manifest = portcullis_toml::Manifest::from_str(&text)
-        .map_err(|e| format!("parse {}: {e:?}", manifest_path.display()))?;
-    let report = portcullis_toml::validate(&manifest);
-    if !report.is_ok() {
-        return Err(format!("invalid manifest: {}", report.errors.join("; ")));
-    }
-    let id = &manifest.app.id;
-    let entry = manifest.entry(); // canonical: [bundle].entry → [app].entry
+    // 1–2. Manifest, trust gate (the same one portcullisd applies at launch),
+    //      and every file against the signed content index, into staging.
+    let trust = portcullis_trust::Trust::load();
+    let opts = app::Opts {
+        root: &root,
+        trust: &trust,
+        allow_unsigned,
+        require_content: app::require_content(Path::new(portcullis_trust::TRUST_CONFIG)),
+    };
+    let (manifest, stage) = app::stage(&bundle, &opts)?;
+    let id = manifest.app.id.clone();
+    let entry = manifest.entry();
 
-    // 2. Trust gate — the SAME check portcullisd applies at launch, so install and
-    //    launch agree. --allow-unsigned is the explicit dev escape hatch.
-    verify_signature(&bundle, &text, allow_unsigned)?;
+    // 3. Make it self-contained for its jail: resolve the entry's lib closure +
+    //    the rtld into the tree (the jail rootfs has no shared /lib). Bring-up
+    //    exception for side-loads (atrium-bundle-format.md); catalog packages
+    //    will have to ship their closure.
+    let entry_path = stage.join(entry);
+    let added = entry_path.exists()
+        .then(|| resolve_runtime(&entry_path, &stage, &sysroot))
+        .unwrap_or_else(|| Err(format!("manifest entry {entry:?} not found in bundle")));
+    let added = match added {
+        Ok(n) => n,
+        Err(e) => { let _ = std::fs::remove_dir_all(&stage); return Err(e); }
+    };
 
-    // 3. Place the bundle into the app tree (clean install).
-    let dest = root.join("apps").join(id);
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest).map_err(|e| format!("clean {}: {e}", dest.display()))?;
-    }
-    std::fs::create_dir_all(&dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
-    copy_tree(&bundle, &dest)?;
-
-    // 4. Make it self-contained for its jail: resolve the entry's lib closure +
-    //    the rtld into the tree (the jail rootfs has no shared /lib).
-    let entry_path = dest.join(entry);
-    if !entry_path.exists() {
-        return Err(format!("manifest entry {entry:?} not found in bundle ({})", entry_path.display()));
-    }
-    let added = resolve_runtime(&entry_path, &dest, &sysroot)?;
-
+    // 4. Swap it in; the previous version is kept for `opifex rollback`.
+    let dest = app::commit(&root, &id, &stage)?;
     println!("opifex: installed {id} -> {}", dest.display());
     println!("opifex:   entry {entry}, {added} runtime file(s) resolved into the app tree");
+    Ok(())
+}
+
+fn cmd_rollback(args: &[String]) -> Result<(), String> {
+    let (root, _sysroot, rest) = take_root(args);
+    let id = rest.first().ok_or("rollback: missing <app-id>")?;
+    let dest = app::rollback(&root, id)?;
+    println!("opifex: {id} rolled back -> {}", dest.display());
     Ok(())
 }
 
@@ -233,8 +264,7 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
     let (root, _sysroot, rest) = take_root(args);
     let id = rest.first().ok_or("uninstall: missing <app-id>")?;
     let mut removed = false;
-    for sub in ["apps", "overlays"] {
-        let p = root.join(sub).join(id);
+    for p in [root.join("apps").join(id), root.join("overlays").join(id), app::state(&root).join("prev").join(id)] {
         if p.exists() {
             std::fs::remove_dir_all(&p).map_err(|e| format!("remove {}: {e}", p.display()))?;
             println!("opifex: removed {}", p.display());
@@ -249,23 +279,6 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
 
 // ── trust ─────────────────────────────────────────────────────────────────────
 
-fn verify_signature(bundle: &Path, manifest_text: &str, allow_unsigned: bool) -> Result<(), String> {
-    if allow_unsigned {
-        eprintln!("opifex: --allow-unsigned: skipping signature verification for {}", bundle.display());
-        return Ok(());
-    }
-    let publishers = load_publishers(PUBLISHERS_DIR);
-    if publishers.is_empty() {
-        eprintln!("opifex: WARNING manifest trust not configured ({PUBLISHERS_DIR} empty); \
-                   allowing UNSIGNED {}", bundle.display());
-        return Ok(());
-    }
-    let sig = read_signature(&bundle.join("atrium.toml.sig"));
-    portcullis_sig::verify_trusted(manifest_text.as_bytes(), &sig, &publishers)
-        .map(|()| eprintln!("opifex: signature verified (trusted publisher)"))
-        .map_err(|e| format!("manifest not signed by a trusted publisher ({e:?})"))
-}
-
 fn load_publishers(dir: &str) -> Vec<String> {
     let mut keys = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -279,32 +292,7 @@ fn load_publishers(dir: &str) -> Vec<String> {
     keys
 }
 
-fn read_signature(sig_path: &Path) -> Vec<u8> {
-    let raw = std::fs::read(sig_path).unwrap_or_default();
-    if let Ok(s) = std::str::from_utf8(&raw) {
-        if let Ok(der) = portcullis_sig::sig_from_base64(s) { return der; }
-    }
-    raw
-}
-
 // ── filesystem ──────────────────────────────────────────────────────────────
-
-/// Recursively copy `src`'s contents into `dst` (both dirs exist).
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    for e in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?.flatten() {
-        let from = e.path();
-        let to = dst.join(e.file_name());
-        let ft = e.file_type().map_err(|e| format!("stat {}: {e}", from.display()))?;
-        if ft.is_dir() {
-            std::fs::create_dir_all(&to).map_err(|e| format!("mkdir {}: {e}", to.display()))?;
-            copy_tree(&from, &to)?;
-        } else if ft.is_file() {
-            std::fs::copy(&from, &to).map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
-        }
-        // (sockets/symlinks in a bundle dir are not expected; skipped.)
-    }
-    Ok(())
-}
 
 /// Resolve the entry binary's shared-library closure into the app tree so it can
 /// run inside a jail whose rootfs is only that tree. Walks the entry binary's

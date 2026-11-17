@@ -5,7 +5,7 @@
 
 **Status:** accepted 2026-11-17 (Shankar: all §15 decisions as recommended; decision 1 with
 the Atrium catalog holding only what Atrium builds; GitHub Pages first, a domain later).
-Building C0.
+C0 built 2026-11-17 (§14.1).
 **Scope:** what a package is, who may publish one, how the catalog is signed, hosted and
 downloaded, how a package is fetched, checked and installed, what the person sees, updates and
 rollback, and how fonts, drivers, firmware, toolchain layers and the SDK crate registry ride on
@@ -148,10 +148,11 @@ layers enter every workspace that names them, fonts are parsed by every app.
 Today the signature covers `atrium.toml` and nothing ties `bin/` to it. The fix is small and
 keeps the scheme:
 
-- The packer writes `content.idx`: one line per entry in sorted path order, `type mode size
-  sha256 path` (types `f`, `d`, `l` for in-tree symlinks only). No mtimes, owners, devices,
+- The packer (`opifex pack`, `opifex layer pack`) writes `content.index`: one line per
+  entry in sorted path order, tab-separated `kind mode size sha256 path target` (kinds `f`,
+  `d`, `l` for in-tree symlinks only; `opifex/src/content.rs`). No mtimes, owners, devices,
   hard links, setuid or setgid bits; the checker refuses all of them.
-- `atrium.toml` gains `[bundle] content = "sha256:<hash of content.idx>"`.
+- `atrium.toml` gains `[bundle] content = "sha256:<hash of content.index>"`.
 - The publisher signs `atrium.toml` as today. One signature now covers the whole tree.
 - `opifexd` and portcullisd both require `content` for anything not `dev.` (portcullisd's
   launch check reads the stored index hash from the installed record, §7.5, so launch stays
@@ -352,9 +353,9 @@ opifexd ◀─────────────────────┘
   │ 1. look up (id, arch) in the local catalog
   │ 2. opifex-fetch: archive → /var/db/atrium/opifex/dl/<sha256> (via Nuntius)
   │ 3. opifex-check (worker, no caps): sha256 of archive = catalog; unpack into
-  │    staging; refuse anything content.idx can't describe; tree matches content.idx
+  │    staging; refuse anything content.index can't describe; tree matches content.index
   │ 4. opifexd: verify atrium.toml.sig itself (portcullis-trust gate + scopes);
-  │    content.idx hash = atrium.toml; copy staging → apps/.<id>.new,
+  │    content.index hash = atrium.toml; copy staging → apps/.<id>.new,
   │    hashing every file again as it copies
   │ 5. portcullis-toml validation (incl. [[workers]], [roles], [ipc]); kind-specific checks
   │ 6. atomic switch (§7.5); record; tell portcullisd (uids for workers, installed list)
@@ -390,16 +391,18 @@ which `opifexd` refuses.
 
 ```
 /var/lib/atrium/apps/<id>/            the installed tree (what portcullisd reads today)
-/var/lib/atrium/apps/.<id>.prev/      the previous version, kept for rollback
+/var/lib/atrium/opifex/prev/<id>/     the previous version, kept for rollback
+/var/lib/atrium/opifex/staging/       trees being checked (same file system, so placing is a rename)
 /var/db/atrium/opifex/catalog.db      checked local catalog
 /var/db/atrium/opifex/installed.toml  per id: version, publisher id, archive sha256,
-                                      content.idx hash, source (catalog | side-load),
+                                      content.index hash, source (catalog | side-load),
                                       verified RPs, who installed, when
 /var/db/atrium/opifex/dl/             downloaded archives (kept until the install settles)
 ```
 
-Switching: unpack to `.<id>.new`, then rename the current tree to `.<id>.prev` (dropping
-the older one) and `.<id>.new` to `<id>`. Running instances keep the tree they started with
+Switching: stage under `opifex/staging/`, then rename the current tree to `opifex/prev/<id>`
+(dropping the older one) and the staged tree to `apps/<id>`. Staging and the previous
+version stay outside `apps/`, which portcullisd lists as the installed apps. Running instances keep the tree they started with
 (their nullfs mount holds the old directory) until they restart under the update's timing
 class. No change to portcullisd's layout. Deduplication between versions and between apps is
 Tessera's, since `/var/lib/atrium` is on the Tessera root; when Tessera grows an ingest API,
@@ -424,7 +427,7 @@ the tree is deleted when nobody uses it.
 - Uninstall: removes the person's approval and, if nobody else uses it, the tree and
   `.prev`. The app's data in people's homes stays until they remove it on the Curia Apps page
   (as today).
-- Rollback: swaps `<id>` and `.<id>.prev`. Offered in Curia for 30 days after an update.
+- Rollback: swaps `apps/<id>` and `opifex/prev/<id>`. Offered in Curia for 30 days after an update.
   Rolling back across a capability change asks again.
 - A publisher key recovery (§5.2) is shown to people who have that publisher's apps, and
   the next update of each app asks again even with unchanged capabilities.
@@ -515,7 +518,7 @@ order and delay, not forge (§1). Root keys never touch CI.
 ### 10.2 Checks
 
 The CI fetches each archive (it must, to check the hash and the tree) and checks: schema;
-publisher signature; id in prefixes, kind in scopes; content.idx matches the archive;
+publisher signature; id in prefixes, kind in scopes; content.index matches the archive;
 self-contained closure; portcullis-toml validation; capabilities on the review list (device
 claims, `network.host`-class grants, `arca`, `embeds` of system roles) need Shankar's
 approval on the pull request; atrium-ax coverage below threshold is refused unless overridden,
@@ -566,7 +569,7 @@ the base rule except dev layers, which dev-tools already allows to carry GPL too
 
 | Step | What | Unblocks |
 |---|---|---|
-| **C0** | Today's `opifex`: use `portcullis-trust`'s gate instead of its own copy; `content.idx` and `[bundle] content`; refuse `dev.` ids, setuid, devices, hard links, escaping symlinks; staging and rename; drop `--allow-unsigned`. Shared with the toolchains thread's `opifex layer`. | layers on the VM; signed bundles from workspaces |
+| **C0** | Today's `opifex`: use `portcullis-trust`'s gate instead of its own copy; `content.index` and `[bundle] content`; refuse `dev.` ids, setuid, devices, hard links, escaping symlinks; staging and rename; drop `--allow-unsigned`. Shared with the toolchains thread's `opifex layer`. | layers on the VM; signed bundles from workspaces |
 | **C1** | Key roles: `root.toml` (2-of-3), platform and catalog keys, scopes; key ceremony for Shankar with hardware tokens. Catalog entry format, log, tiles; `opifex catalog append|sign|verify` tools; a local catalog directory works offline. | fonts and layers from a local catalog |
 | **C2** | `opifexd`, `opifex-check` (worker), installed record, install, uninstall, rollback from a local catalog and local archives. `Describe`, `Search`. | |
 | **C3** | `opifex-sheet` as the Limen `install` role; callers: Monstrator L5, the Navigator prompt, Scrinium, Curia. | L5, publisher prompt |
@@ -580,6 +583,26 @@ installs, updates and rolls back an app with a running instance kept on the old 
 the sheet from an `atrium-app://` link and a click-check that the sheet is the system's; C4
 syncs from Pages through Nuntius and refuses a catalog with a forked history; C6 installs a CJK
 font on demand and a driver from a `nobody` device's notice.
+
+### 14.1 C0 as built (2026-11-17)
+
+- `opifex/src/content.rs`: the content index (format, indexing, parsing, placing with
+  per-file hashing), shared by apps and the toolchains thread's layers (`layer.rs`).
+- `opifex pack <bundle> [--sign key.pem]`: writes `content.index`, sets `[bundle] content`
+  (new optional field in portcullis-toml), signs `atrium.toml`.
+- `opifex install`: the signature goes through `portcullis-trust`'s gate (opifex's own copy
+  is gone, so `trust.toml require_signatures` now applies to installs too); `dev.` ids are
+  refused; with `[bundle] content` every file is checked as it is copied into staging, and
+  setuid, devices, hard links, unlisted types and escaping links are refused; the tree is
+  swapped in by rename with the previous version kept; `opifex rollback <id>` swaps back.
+- Not yet: bundles without `content` are still accepted with a warning, because the VM gate
+  scripts sign bare `atrium.toml` files; `trust.toml require_content = true` refuses them.
+  It becomes the default once the build scripts run `opifex pack`. portcullisd does not
+  check the index at launch yet (C2, from the installed record). `--allow-unsigned` stays
+  for `forum-on-tessera.sh` until C2.
+- Checked: 10 unit tests (pack, install, update, rollback, and refusals of a changed file, a
+  setuid file, an edited manifest, a missing index when required, a `dev.` id, an unsigned
+  bundle). Not yet run on the VM.
 
 ## 15. Decisions, with recommendations
 

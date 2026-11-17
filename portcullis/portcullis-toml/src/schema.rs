@@ -125,6 +125,11 @@ pub struct BundleSection {
     /// Canonical home for the entry path. When absent the loader falls back to
     /// `[app].entry` (the legacy location) — see [`Manifest::entry`].
     pub entry:  Option<String>,
+    /// `sha256:<hex>` of the bundle's `content.index` (every file's path,
+    /// mode, size and SHA-256), so the manifest's one signature covers every
+    /// byte (opifex.md §4.2). Written by `opifex pack`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// How the entry artifact is shipped: a native ELF per arch, or a portable IR

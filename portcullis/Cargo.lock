@@ -915,6 +915,7 @@ dependencies = [
  "base64",
  "portcullis-sig",
  "portcullis-toml",
+ "portcullis-trust",
  "sha2",
  "toml",
 ]
