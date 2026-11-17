@@ -105,7 +105,20 @@ pub struct ComposeUi {
     /// The text's first shown line (the wheel moves it).
     pub top: usize,
     pub done: Option<Done>,
+    /// Attach was pressed: the app opens the system picker.
+    pub want_attach: bool,
+    /// The picker is up, over the window.
+    pub attaching: bool,
 }
+
+/// The picker's slot in a compose window, while files are attached.
+pub const ATTACH_SLOT: pergola::slot::SlotKey = 0x4154_4348;
+
+/// Past this much attached, compose says the server may refuse it
+/// (§8.3: most take 20–25 MB; big files as links come later).
+pub const ATTACH_WARN: usize = 20 << 20;
+/// What one attached file may be (the whole message's limit).
+pub const ATTACH_MAX: usize = mail_compose::write::MESSAGE_MAX;
 
 /// Addresses as typed: "Name <a@x.example>, b@y.example". Commas inside
 /// quotes or angle brackets don't split.
@@ -249,6 +262,59 @@ impl Composer {
         b.set_text(&text);
         b.set_caret(0, false);
         self.body.set(b);
+    }
+
+    /// Attach `bytes` as `name` (a file the person picked). Its type is
+    /// decided from its bytes, as a received one's is.
+    pub fn attach(&self, name: &str, bytes: Vec<u8>) {
+        let head = &bytes[..bytes.len().min(atrium_types::HEAD)];
+        let mime = atrium_types::detect(name, head).known().map_or("application/octet-stream", |t| t.mime).to_string();
+        self.base.borrow_mut().attachments.push(mail_compose::Attachment { name: name.into(), mime, bytes });
+        self.attached_note();
+    }
+
+    /// Take attachment `i` off.
+    pub fn remove_attachment(&self, i: usize) {
+        let mut b = self.base.borrow_mut();
+        if i < b.attachments.len() {
+            b.attachments.remove(i);
+        }
+        drop(b);
+        self.attached_note();
+    }
+
+    /// The attachments: name and size.
+    pub fn attachments(&self) -> Vec<(String, u64)> {
+        self.base.borrow().attachments.iter().map(|a| (a.name.clone(), a.bytes.len() as u64)).collect()
+    }
+
+    fn attached_note(&self) {
+        let total: usize = self.base.borrow().attachments.iter().map(|a| a.bytes.len()).sum();
+        self.ui.update(|u| {
+            u.error = (total > ATTACH_WARN).then(|| format!("{} attached: many servers refuse messages over 20 MB.", crate::files::size_words(total as u64)));
+        });
+    }
+
+    /// Attach was pressed: the app shows the picker.
+    pub fn ask_attach(&self) {
+        self.ui.update(|u| u.want_attach = true);
+    }
+
+    /// Whether the app should open the picker now (once per press).
+    pub fn take_attach_ask(&self) -> bool {
+        let ui = self.ui.get_cloned();
+        if !ui.want_attach {
+            return false;
+        }
+        self.ui.update(|u| u.want_attach = false);
+        true
+    }
+
+    /// The picker is up, or gone.
+    pub fn set_attaching(&self, on: bool) {
+        if self.ui.get_cloned().attaching != on {
+            self.ui.update(|u| u.attaching = on);
+        }
     }
 
     /// Take the quoted original away.
@@ -697,12 +763,25 @@ impl View for ComposeView {
                 tool(ctx, &mut bx, label, wt, Box::new(move || c.format(f)));
             }
         }
+        let c = self.c.clone();
+        tool(ctx, &mut bx, "Attach…", Weight::Regular, Box::new(move || c.ask_attach()));
         let switch = if rich_on { "Plain text" } else { "Rich text" };
         let mut sx = w - 16.0 - measure(switch, &sans(type_size::SM, Weight::Regular, t.text_primary())) - em(16.0);
         let c = self.c.clone();
         tool(ctx, &mut sx, switch, Weight::Regular, Box::new(move || c.set_rich(!rich_on)));
         y += bar;
         ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        // The attachments, a row each: name, size, and ✕.
+        for (i, (name, size)) in self.c.attachments().into_iter().enumerate() {
+            let rh = em(28.0);
+            let cy = y + 1.0 + rh / 2.0;
+            let words = format!("{name}  ·  {}", crate::files::size_words(size));
+            line(ctx, 16.0, cy, &words, type_size::SM, Weight::Regular, t.text_primary());
+            let mut rx = w - 16.0 - measure("Remove", &sans(type_size::SM, Weight::Regular, t.text_primary())) - em(16.0);
+            let c = self.c.clone();
+            tool_at(ctx, &mut rx, y + 1.0, rh, "Remove", Box::new(move || c.remove_attachment(i)));
+            y += rh;
+        }
         let mut body = Rect::new(0.0, y + 1.0, w, h - y - 1.0 - em(28.0));
         // The original under a reply or forward: its own area at the foot.
         if let Some(intro) = self.c.quote_intro() {
@@ -733,6 +812,11 @@ impl View for ComposeView {
             self.rich_body(ctx, body);
         } else {
             self.body(ctx, Rect::new(16.0, body.y() + em(8.0), w - 32.0, body.h() - em(8.0)));
+        }
+        // The system picker, over the window, while files are attached.
+        if ui.attaching {
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, ATTACH_SLOT);
         }
         // The status line.
         if let Some(s) = &ui.status {

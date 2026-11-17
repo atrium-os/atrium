@@ -158,6 +158,8 @@ struct ComposeWin {
     quote: Option<limen::proto::EmbedId>,
     /// The original couldn't be shown; not asked again.
     quote_failed: bool,
+    /// The system picker, while files are attached.
+    attach: Option<limen::proto::EmbedId>,
 }
 
 /// Open a compose window for `c` (`draft`: the stored draft it continues).
@@ -171,7 +173,7 @@ fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<per
     let k = Composer::new(engine.clone(), c, draft, dirty.clone(), now);
     let view = ComposeView::new(k.clone(), (win.width, win.height));
     let size = view.size.clone();
-    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false })
+    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false, attach: None })
 }
 
 /// The drafts whose windows were open, so a crash or a restart opens them
@@ -346,6 +348,23 @@ fn main() {
             if save {
                 cw.c.tick();
             }
+            // Attach…: the system picker over the window, files to read.
+            if cw.c.take_attach_ask() && cw.attach.is_none() {
+                match (&embeds, cw.win.embed_token()) {
+                    (Some(e), Some(token)) => {
+                        let filter = limen::picker::Filter { multiple: true, title: "Attach files".into(), ..limen::picker::Filter::file() };
+                        let asked = e.borrow_mut().request("picker", token, atrium_mail::compose::ATTACH_SLOT);
+                        match asked.and_then(|id| e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map(|_| id)) {
+                            Ok(id) => {
+                                cw.attach = Some(id);
+                                cw.c.set_attaching(true);
+                            }
+                            Err(err) => cw.c.ui.set(atrium_mail::compose::ComposeUi { error: Some(format!("The picker didn't open: {err:?}")), ..cw.c.ui.get_cloned() }),
+                        }
+                    }
+                    _ => cw.c.ui.set(atrium_mail::compose::ComposeUi { error: Some("Attaching needs the system picker, which isn't running".into()), ..cw.c.ui.get_cloned() }),
+                }
+            }
             // The original under a reply, in a jailed doc-viewer.
             if let Some(embeds) = &embeds {
                 let original = cw.c.original.borrow().clone();
@@ -369,6 +388,9 @@ fn main() {
                 }
                 if cw.c.done().is_some() {
                     if let Some(e) = cw.quote.take() {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                    }
+                    if let Some(e) = cw.attach.take() {
                         let _ = embeds.borrow_mut().detach_embed(e);
                     }
                 }
@@ -498,6 +520,37 @@ fn main() {
                             Some(limen::doc_viewer::ToParent::LinkActivated { url }) => mail.link(&url),
                             Some(limen::doc_viewer::ToParent::Error { code }) => eprintln!("atrium-mail: doc-viewer error {code}"),
                             _ => {}
+                        }
+                    }
+                    // Files picked for a compose window: read them in.
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if composes.iter().any(|c| c.attach == Some(embed)) => {
+                        let fd = embeds.borrow_mut().take_fd();
+                        let cw = composes.iter().find(|c| c.attach == Some(embed)).unwrap();
+                        if let (Some(limen::picker::ToParent::File { name, .. }), Some(fd)) = (limen::picker::ToParent::decode(&bytes), fd) {
+                            use std::io::Read;
+                            let mut buf = Vec::new();
+                            let max = atrium_mail::compose::ATTACH_MAX as u64;
+                            match File::from(fd).take(max + 1).read_to_end(&mut buf) {
+                                Ok(n) if n as u64 > max => cw.c.ui.set(atrium_mail::compose::ComposeUi { error: Some(format!("“{name}” is too large to attach")), ..cw.c.ui.get_cloned() }),
+                                Ok(_) => cw.c.attach(&name, buf),
+                                Err(e) => cw.c.ui.set(atrium_mail::compose::ComposeUi { error: Some(format!("Couldn't read “{name}”: {e}")), ..cw.c.ui.get_cloned() }),
+                            }
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if composes.iter().any(|c| c.attach == Some(embed)) => {
+                        let end = matches!(limen::picker::ToParent::decode(&bytes), Some(limen::picker::ToParent::Done { .. } | limen::picker::ToParent::Cancelled | limen::picker::ToParent::Failed { .. }));
+                        if end {
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                            if let Some(cw) = composes.iter_mut().find(|c| c.attach == Some(embed)) {
+                                cw.attach = None;
+                                cw.c.set_attaching(false);
+                            }
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if composes.iter().any(|c| c.attach == Some(embed)) => {
+                        if let Some(cw) = composes.iter_mut().find(|c| c.attach == Some(embed)) {
+                            cw.attach = None;
+                            cw.c.set_attaching(false);
                         }
                     }
                     // The picker made the new file: write the attachment into it.
