@@ -3281,9 +3281,18 @@ odt 52/52, floats 8/8, headers 4/4, slides 84/84).
   the margin); dragging the corner sizes it (a picture keeps its
   proportions, the top-left stays put). With the shape bar open, a click on
   another shape offers Edit This Shape.
-- **Not yet**: adjust handles (an arrow's head, a callout's pointer), a
-  rotation handle, moving the anchor with the shape, dragging objects in
-  line with the text, grouping in Write.
+- **Turning and objects in line** (same day): a picked shape has a turn
+  handle on a stalk above its middle; dragging it turns the shape by the
+  angle swept about its middle, to the whole degree, snapping to 15° steps
+  within 3° (one undoable Turn). A picture or shape in line with the text
+  is picked by a click (framed) and dragged to where it is let go (a drop
+  caret shows the place; one undoable Move; not while changes are tracked,
+  and not between a table and the body).
+- **Turned words** wait on Fresco drawing turned glyph runs; a Fresco
+  thread was asked for it on 2026-11-17, and Write's shape text and
+  Slides' turned frames switch over when it lands.
+- **Not yet**: adjust handles (an arrow's head, a callout's pointer),
+  moving the anchor with the shape, grouping in Write.
 
 Gates: engine (set, undo, refusals), native journal op round trip, editor
 (insert, words keeping their format, fill, turn, size, undo, text box,
@@ -3291,7 +3300,7 @@ arrow), Write's bar (both modes, every command, undo a step each, bars
 sharing their place), and a crash recovery that keeps a shape's words
 and fill; the view: a click picks a shape, a drag moves it 40 px left and
 30 px down within 2 px, undo puts it back, its corner sizes it 50 px wider
-and 20 px shorter with its corner fixed; officina-text 68, officina-convert, pergola-richtext 28 and
+and 20 px shorter with its corner fixed, its turn handle pulled round to its right turns it 90°; a picture in line dragged into another paragraph moves there and one undo puts it back; officina-text 68, officina-convert, pergola-richtext 28 and
 Write tests all pass; twelve shapes drawn by the editor look right in our
 PDF.
 

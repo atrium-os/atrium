@@ -33,7 +33,7 @@ use pergola_document::Faces;
 
 use officina_text::track::{Edit, EditKind};
 
-use crate::editor::{ObjectDrag, Editor, Outcome, Pos};
+use crate::editor::{DragKind, ObjectDrag, Editor, Outcome, Pos};
 
 /// Space between pages and around them, in units.
 pub const GAP: f32 = 16.0;
@@ -422,30 +422,52 @@ impl RichTextView {
                 }
                 // The picked floating object: a frame round it, and where a
                 // drag would put it.
-                if let Some((b, at, _)) = ed.picture_at_caret() {
+                if let Some((b, at, o)) = ed.picture_at_caret() {
                     let drag = ed.dragging.filter(|d| d.block == b && d.at == at && d.page == i);
+                    let accent = t.accent_fg();
+                    let ghost = Color::rgba(0.2, 0.45, 0.95, 0.6);
+                    let frame = |ctx: &mut Ctx, x: i64, y: i64, w: i64, h: i64, c: Color| {
+                        let (fx, fy) = (ox + pb.mx + x as f64 * g.k, oy + pb.my + y as f64 * g.k);
+                        let (fw, fh) = ((w as f64 * g.k).max(2.0) as f32, (h as f64 * g.k).max(2.0) as f32);
+                        let (fx, fy) = (q(fx - 2.0), q(fy - 2.0));
+                        for r in [Rect::new(fx, fy, fw + 4.0, 1.5), Rect::new(fx, fy + fh + 2.5, fw + 4.0, 1.5), Rect::new(fx, fy, 1.5, fh + 4.0), Rect::new(fx + fw + 2.5, fy, 1.5, fh + 4.0)] {
+                            ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
+                        }
+                    };
                     if let Some(f) = ed.pages.pages().get(i).and_then(|pg| pg.floats.iter().find(|f| f.block == b && f.at == at)).cloned() {
-                        let accent = t.accent_fg();
-                        let frame = |ctx: &mut Ctx, dx: i64, dy: i64, dw: i64, dh: i64, c: Color| {
-                            let (fx, fy) = (ox + pb.mx + (f.x + dx) as f64 * g.k, oy + pb.my + (f.y + dy) as f64 * g.k);
-                            let (fw, fh) = (((f.w + dw) as f64 * g.k).max(2.0) as f32, ((f.h + dh) as f64 * g.k).max(2.0) as f32);
-                            let (fx, fy) = (q(fx - 2.0), q(fy - 2.0));
-                            for r in [Rect::new(fx, fy, fw + 4.0, 1.5), Rect::new(fx, fy + fh + 2.5, fw + 4.0, 1.5), Rect::new(fx, fy, 1.5, fh + 4.0), Rect::new(fx + fw + 2.5, fy, 1.5, fh + 4.0)] {
-                                ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
-                            }
-                        };
-                        frame(ctx, 0, 0, 0, 0, accent);
+                        frame(ctx, f.x, f.y, f.w, f.h, accent);
                         // The corner handle that sizes it.
                         let (hx, hy) = (ox + pb.mx + (f.x + f.w) as f64 * g.k, oy + pb.my + (f.y + f.h) as f64 * g.k);
                         ctx.add(Node::Rect { rect: Rect::new(q(hx - HANDLE as f64 + 2.0), q(hy - HANDLE as f64 + 2.0), HANDLE, HANDLE), fill: accent, radius: 2.0 });
+                        if o.shape {
+                            // The turn handle above its middle, on a stalk.
+                            let (tx, ty) = (ox + pb.mx + (f.x + f.w / 2) as f64 * g.k, oy + pb.my + f.y as f64 * g.k);
+                            ctx.add(Node::Rect { rect: Rect::new(q(tx - 0.75), q(ty - TURN_LIFT as f64), 1.5, TURN_LIFT - 2.0), fill: accent, radius: 0.0 });
+                            ctx.add(Node::Rect { rect: Rect::new(q(tx - HANDLE as f64 / 2.0), q(ty - TURN_LIFT as f64 - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: accent, radius: HANDLE / 2.0 });
+                        }
                         if let Some(d) = drag {
-                            let ghost = Color::rgba(0.2, 0.45, 0.95, 0.6);
-                            if d.resize {
-                                frame(ctx, 0, 0, d.dx, d.dy, ghost);
-                            } else {
-                                frame(ctx, d.dx, d.dy, 0, 0, ghost);
+                            match d.kind {
+                                DragKind::Size => frame(ctx, f.x, f.y, f.w + d.dx, f.h + d.dy, ghost),
+                                DragKind::Move => frame(ctx, f.x + d.dx, f.y + d.dy, f.w, f.h, ghost),
+                                DragKind::Turn => {
+                                    // Where the handle is pulled to.
+                                    let (px, py) = (ox + pb.mx + (d.sx + d.dx) as f64 * g.k, oy + pb.my + (d.sy + d.dy) as f64 * g.k);
+                                    ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: ghost, radius: HANDLE / 2.0 });
+                                }
+                                DragKind::Inline => {}
                             }
                         }
+                    } else if let Some((pg, x, y, w, h)) = ed.inline_box(b, at).filter(|bx| bx.0 == i) {
+                        let _ = pg;
+                        frame(ctx, x, y, w, h, accent);
+                    }
+                }
+                // Where an object in line being dragged would go.
+                if let Some(to) = ed.dragging.and_then(|d| d.drop) {
+                    let s = ed.spot(to);
+                    if s.page == i {
+                        let (cx, cy) = (ox + pb.mx + s.x as f64 * g.k, oy + pb.my + s.y as f64 * g.k);
+                        ctx.add(Node::Rect { rect: Rect::new(q(cx - 1.0), q(cy), 2.0, (s.h as f64 * g.k).max(4.0) as f32), fill: Color::rgba(0.2, 0.45, 0.95, 0.9), radius: 0.0 });
                     }
                 }
                 // What a deletion took away, struck through, over its place.
@@ -628,13 +650,30 @@ impl RichTextView {
                 // moves it (one undo step when let go).
                 match phase {
                     DragPhase::Start => {
-                        if let Some(f) = e.float_at(pg, lx, ly) {
+                        let picked = e.picture_at_caret().map(|(b, at, _)| (b, at));
+                        let grip = (HANDLE as f64 / g.k) as i64;
+                        let lift = (TURN_LIFT as f64 / g.k) as i64;
+                        // The picked shape's turn handle, above its middle.
+                        let turn = picked.and_then(|(b, at)| e.pages.pages().get(pg).and_then(|p| p.floats.iter().find(|f| f.block == b && f.at == at && f.object.shape)).cloned()).filter(|f| (lx - (f.x + f.w / 2)).abs() <= grip && (ly - (f.y - lift)).abs() <= grip);
+                        let float = if turn.is_some() { turn.clone() } else { e.float_at(pg, lx, ly) };
+                        if let Some(f) = float {
                             // Its corner handle (shown when picked) sizes it.
-                            let picked = e.picture_at_caret().is_some_and(|(b, at, _)| b == f.block && at == f.at);
-                            let grip = (HANDLE as f64 / g.k) as i64;
-                            let resize = picked && lx >= f.x + f.w - grip && ly >= f.y + f.h - grip;
+                            let is_picked = picked == Some((f.block, f.at));
+                            let kind = if turn.is_some() {
+                                DragKind::Turn
+                            } else if is_picked && lx >= f.x + f.w - grip && ly >= f.y + f.h - grip {
+                                DragKind::Size
+                            } else {
+                                DragKind::Move
+                            };
                             e.set_caret(Pos::new(f.block, f.at), false);
-                            e.dragging = Some(ObjectDrag { block: f.block, at: f.at, page: pg, dx: 0, dy: 0, resize });
+                            e.dragging = Some(ObjectDrag { block: f.block, at: f.at, page: pg, dx: 0, dy: 0, kind, sx: lx, sy: ly, drop: None });
+                            start.set((pg, lx, ly));
+                        } else if let Some((b, at)) = e.inline_object_at(pg, lx, ly) {
+                            // A picture or shape in line: picked, and a drag
+                            // takes it elsewhere in the text.
+                            e.set_caret(Pos::new(b, at), false);
+                            e.dragging = Some(ObjectDrag { block: b, at, page: pg, dx: 0, dy: 0, kind: DragKind::Inline, sx: lx, sy: ly, drop: None });
                             start.set((pg, lx, ly));
                         } else {
                             e.dragging = None;
@@ -642,27 +681,38 @@ impl RichTextView {
                             e.set_caret(pos, false);
                         }
                     }
-                    DragPhase::Move => match e.dragging.as_mut() {
-                        Some(d) => {
+                    DragPhase::Move => {
+                        if let Some(d) = e.dragging {
                             let (spg, sx, sy) = start.get();
                             // Across pages: the distance as if on its own.
-                            let (lx, ly) = if pg == spg { (lx, ly) } else { local_on(&g, st.physics.y, p, spg) };
-                            d.dx = lx - sx;
-                            d.dy = ly - sy;
-                        }
-                        None => {
+                            let (mx, my) = if pg == spg { (lx, ly) } else { local_on(&g, st.physics.y, p, spg) };
+                            let drop = if d.kind == DragKind::Inline { Some(e.hit(pg, lx, ly)) } else { None };
+                            e.dragging = Some(ObjectDrag { dx: mx - sx, dy: my - sy, drop, ..d });
+                        } else {
                             let pos = e.hit(pg, lx, ly);
                             e.set_caret(pos, true);
                         }
-                    },
+                    }
                     DragPhase::End => {
                         let Some(d) = e.dragging.take() else { return };
                         // A press that hardly moved only picks.
                         if d.dx.abs() + d.dy.abs() > officina_text::LU * 2 {
-                            if d.resize {
-                                e.resize_by_drag(d.block, d.at, d.page, d.dx, d.dy);
-                            } else {
-                                e.move_float(d.block, d.at, d.page, d.dx, d.dy);
+                            match d.kind {
+                                DragKind::Size => {
+                                    e.resize_by_drag(d.block, d.at, d.page, d.dx, d.dy);
+                                }
+                                DragKind::Move => {
+                                    e.move_float(d.block, d.at, d.page, d.dx, d.dy);
+                                }
+                                DragKind::Turn => {
+                                    e.turn_by_drag(d.block, d.at, d.page, d.sx, d.sy, d.sx + d.dx, d.sy + d.dy);
+                                }
+                                DragKind::Inline => {
+                                    if let Some(to) = d.drop {
+                                        e.move_inline(d.block, d.at, to);
+                                    }
+                                    return rev.set(rev.get().wrapping_add(1));
+                                }
                             }
                             e.set_caret(Pos::new(d.block, d.at), false);
                         }
@@ -762,6 +812,8 @@ impl View for RichTextView {
 
 /// The side of a picked object's corner handle (px).
 const HANDLE: f32 = 9.0;
+/// How far above a picked shape its turn handle sits (px).
+const TURN_LIFT: f32 = 22.0;
 
 /// The page under window point `p` and the point in layout units from
 /// that page's content box.
@@ -1081,6 +1133,57 @@ mod tests {
         let (dw, dh) = ((sized.w - f.w) as f64 * g.k, (sized.h - f.h) as f64 * g.k);
         assert!((dw - 50.0).abs() <= 2.0 && (dh + 20.0).abs() <= 2.0, "sized by {dw}, {dh}");
         assert_eq!((sized.x, sized.y), (f.x, f.y), "the corner moves, not the shape");
+        // Its turn handle, pulled from above its middle round to its right,
+        // turns it a quarter (to the whole degree, snapped near 90).
+        let (cx, cy) = (sized.x + sized.w / 2, sized.y + sized.h / 2);
+        let handle = Point::new(win(cx, sized.y).x, win(cx, sized.y).y - TURN_LIFT);
+        let right = Point::new(win(cx, cy).x + 60.0, win(cx, cy).y + 2.0);
+        app.handle_event(Event::PointerDown { at: handle });
+        app.handle_event(Event::PointerMove { at: Point::new(handle.x + 30.0, handle.y + 10.0) });
+        app.handle_event(Event::PointerMove { at: right });
+        app.tick();
+        assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Turn));
+        app.handle_event(Event::PointerUp { at: right });
+        assert_eq!(ed.borrow().shape_at_caret().map(|s| s.2.rot), Some(90 * 60_000));
+    }
+
+    #[test]
+    fn a_picture_in_line_is_dragged_to_another_place_in_the_text() {
+        use officina_text::model::{ImageData, OBJECT_CHAR};
+        let (mut app, ed, _) = host(6);
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(Pos::new(0, 2), false);
+            assert!(e.insert_image(ImageData { bytes: Arc::from(crate::editor::tests::png(64, 48)), width: 64, height: 48 }));
+            while !e.paginate(Duration::from_secs(5)) {}
+            e.set_caret(Pos::new(3, 0), false);
+        }
+        app.tick();
+        let g = Geom::of(&ed.borrow(), Rect::new(0.0, 0.0, 900.0, 700.0), 1.0);
+        let pb = g.page(0);
+        let win = |x: i64, y: i64| Point::new((g.left_of(0) + pb.mx + x as f64 * g.k) as f32, (pb.top + pb.my + y as f64 * g.k) as f32);
+        let (pg, x, y, w, h) = ed.borrow_mut().inline_box(0, 2).expect("drawn in line");
+        assert_eq!(pg, 0);
+        let mid = win(x + w / 2, y + h / 2);
+        // A click picks it.
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerUp { at: mid });
+        assert_eq!(ed.borrow().picture_at_caret().map(|p| (p.0, p.1)), Some((0, 2)));
+        // Dragged to the start of the fourth paragraph's first line.
+        let s = ed.borrow_mut().spot(Pos::new(3, 0));
+        let to = win(s.x + 8, s.y + s.h / 2);
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerMove { at: Point::new(mid.x, mid.y + 20.0) });
+        app.handle_event(Event::PointerMove { at: to });
+        app.tick();
+        assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Inline));
+        app.handle_event(Event::PointerUp { at: to });
+        let e = ed.borrow();
+        assert!(!e.doc.para(0).unwrap().text.contains(OBJECT_CHAR), "gone from where it was");
+        assert!(e.doc.para(3).unwrap().text.starts_with(OBJECT_CHAR), "{:?}", e.doc.para(3).unwrap().text);
+        drop(e);
+        ed.borrow_mut().undo();
+        assert!(ed.borrow().doc.para(0).unwrap().text[2..].starts_with(OBJECT_CHAR), "one undo puts it back");
     }
 
     #[test]

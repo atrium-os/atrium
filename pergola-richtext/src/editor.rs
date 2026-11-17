@@ -172,8 +172,25 @@ pub struct ObjectDrag {
     pub page: usize,
     pub dx: i64,
     pub dy: i64,
-    /// Its bottom-right corner is being dragged: it grows or shrinks.
-    pub resize: bool,
+    pub kind: DragKind,
+    /// Where the press was (layout units, the page's content box).
+    pub sx: i64,
+    pub sy: i64,
+    /// An object in line: where it would go.
+    pub drop: Option<Pos>,
+}
+
+/// What a drag on an object does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    /// Moves a floating object.
+    Move,
+    /// Its bottom-right corner: it grows or shrinks.
+    Size,
+    /// The handle above a shape: it turns about its middle.
+    Turn,
+    /// An object in line with the text: it goes where it is let go.
+    Inline,
 }
 
 impl Editor {
@@ -1546,6 +1563,81 @@ impl Editor {
                 }
             }
         })
+    }
+
+    /// Turns the shape anchored at byte `at` of paragraph `b`, drawn on
+    /// page `page`, by the angle a drag from (`sx`, `sy`) to (`ex`, `ey`)
+    /// sweeps about its middle, to the whole degree (to 15° steps within
+    /// 3° of one). One undo step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turn_by_drag(&mut self, b: usize, at: u32, page: usize, sx: i64, sy: i64, ex: i64, ey: i64) -> bool {
+        let Some(pf) = self.pages.pages().get(page).and_then(|pg| pg.floats.iter().find(|f| f.block == b && f.at == at)).cloned() else { return false };
+        if !pf.object.shape {
+            return false;
+        }
+        let Some(sd) = self.doc.shapes.get(pf.object.image).map(|s| (**s).clone()) else { return false };
+        let (cx, cy) = ((pf.x + pf.w / 2) as f64, (pf.y + pf.h / 2) as f64);
+        let a0 = (sy as f64 - cy).atan2(sx as f64 - cx);
+        let a1 = (ey as f64 - cy).atan2(ex as f64 - cx);
+        let deg = sd.rot as f64 / 60_000.0 + (a1 - a0).to_degrees();
+        let mut deg = deg.round().rem_euclid(360.0);
+        let near = (deg / 15.0).round() * 15.0;
+        if (deg - near).abs() <= 3.0 {
+            deg = near.rem_euclid(360.0);
+        }
+        let rot = (deg as i32 * 60_000) % 21_600_000;
+        if rot == sd.rot {
+            return false;
+        }
+        self.apply("Turn", vec![TextOp::SetShape { id: pf.object.image, shape: Some(officina_text::model::ShapeData { rot, ..sd }) }], Kind::Other);
+        true
+    }
+
+    /// The box of the object in line at byte `at` of paragraph `b`: its
+    /// page and frame (layout units, the page's content box).
+    pub fn inline_box(&mut self, b: usize, at: u32) -> Option<(usize, i64, i64, i64, i64)> {
+        let o = self.doc.para(b).map(|p| self.doc.attrs.get(p.attr_at(at)).clone()).filter(|a| a.deleted.is_none())?.object.filter(|o| o.float.is_none())?;
+        if self.doc.para(b)?.text.get(at as usize..)?.chars().next() != Some(OBJECT_CHAR) {
+            return None;
+        }
+        let s = self.spot(Pos::new(b, at));
+        let (w, h) = (officina_text::twips(o.width as i64), officina_text::twips(o.height as i64));
+        // It sits on the line's baseline: its bottom near the line's.
+        let bottom = s.y + s.h;
+        Some((s.page, s.x, bottom - h.min(s.h.max(h)), w, h.min(s.h.max(h))))
+    }
+
+    /// The object in line drawn at (`x`, `y`) on page `page`: its anchor.
+    pub fn inline_object_at(&mut self, page: usize, x: i64, y: i64) -> Option<(usize, u32)> {
+        let p = self.hit(page, x, y);
+        let n = OBJECT_CHAR.len_utf8() as u32;
+        [Some(p.at), p.at.checked_sub(n)].into_iter().flatten().find(|&at| self.inline_box(p.block, at).is_some_and(|(pg, bx, by, bw, bh)| pg == page && x >= bx && x < bx + bw && y >= by && y < by + bh)).map(|at| (p.block, at))
+    }
+
+    /// Moves the object in line at byte `at` of paragraph `b` to `to` (one
+    /// undo step); false while changes are tracked, or if it wouldn't move.
+    pub fn move_inline(&mut self, b: usize, at: u32, to: Pos) -> bool {
+        let n = OBJECT_CHAR.len_utf8() as u32;
+        if self.doc.tracking || self.doc.cell(b).is_some() != self.doc.cell(to.block).is_some() {
+            return false;
+        }
+        if to.block == b && (to.at == at || to.at == at + n) {
+            return false;
+        }
+        let Some(attr) = self.doc.para(b).filter(|p| p.text.get(at as usize..).and_then(|t| t.chars().next()) == Some(OBJECT_CHAR)).map(|p| p.attr_at(at)) else { return false };
+        if self.doc.attrs.get(attr).object.is_none() || to.block >= self.blocks() || to.at > self.len(to.block) {
+            return false;
+        }
+        let dest = if to.block == b && to.at > at { Pos::new(b, to.at - n) } else { to };
+        let ops = vec![
+            TextOp::Splice { block: b as u32, at, del: n, ins: Fragment::default() },
+            TextOp::Splice { block: dest.block as u32, at: dest.at, del: 0, ins: Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] } },
+        ];
+        self.apply("Move", ops, Kind::Other);
+        self.caret = dest;
+        self.anchor = dest;
+        self.goal_x = None;
+        true
     }
 
     /// Bold, italic or underline on or off, by what the caret shows.
