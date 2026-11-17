@@ -91,6 +91,19 @@ with reference grids; on the Mac VM, frames of each editor open on a file, a
 mouse click moving Helix's cursor, a bracketed paste arriving as one edit.
 The recordings are made once on FreeBSD with `script(1)` and kept in `test-assets/`.
 
+**As built (2026-11-17).** Done: `stoa-term` is a full xterm-style emulator
+(scroll regions, insert/delete, tab stops, alternate screens, the modes above, mouse
+1000/1002/1006, DA/DSR/DECRQM and OSC 10/11 replies, wide characters, OSC 52 writes
+only); state diffs carry modes, title and one-shot clipboard text; stoad answers the
+program's queries; the Terminal encodes xterm keys, mouse and bracketed paste, and
+copies OSC 52 only with a copy-capable press (tabula.md §2.2). The recordings were
+made with tmux as the oracle (`scripts/terminal-record.sh`, 8 sessions). The gate
+passes on the cloud amd64 VM: vi (insert, motions, write), `less`, `top`, and the
+`pkg` question (below); Helix and Neovim are skipped there because pkg can't fetch
+through the cloud egress, so their on-screen check waits for the Mac VM. Found on
+the way: consoles had no `/var/tmp`, so vi opened on a recovery-folder error that ate
+the first key (the empty console now has one; app consoles set vi's `recdir`).
+
 ## 4. M2: `pkg` in a workspace (M)
 
 **Code.** `portcullis/portcullis-protocol` (new `WorkspaceAdmin { name, argv,
@@ -120,9 +133,11 @@ package whose post-install script writes `/usr/bin/x` fails (base read-only); th
 host's `/var/db/pkg` is untouched; `pkg` without a press is refused; argv other
 than the allowed words is refused.
 
-**As built (2026-11-18).** Done except the Terminal's half of the press
-(homes.md §5.5 has the contract: the wrapper asks with OSC 7770, the Terminal shows
-Install/Cancel and sends `WorkspaceAdmin`). Two changes from the plan. There is no
+**As built (2026-11-18).** Done, with the Terminal's half of the press
+(homes.md §5.5: the wrapper asks with OSC 7770, stoad forwards it from the pane
+with the keys, the Terminal asks "<workspace> asks to run: pkg …" with Install
+and Cancel, sends `WorkspaceAdmin` and shows pkg's output over the tab;
+`vm-terminal-apps-check.sh` checks the ask, Cancel and Install). Two changes from the plan. There is no
 separate `pkg` class: a jail has one filter, so pkg runs under the workspace's
 `develop` class, which gained `chflags`, `symlink` and `eaccess` (with
 `allow.chflags` off, no system flag can be set). `update` and `remove` were added to
@@ -248,6 +263,20 @@ and Mail's host tests pass with real jails.
   the launch registry. Gate `scripts/vm-artifex-check.sh` (on-screen): open Scratch,
   edit, a rust-analyzer diagnostic shows, Build, Run shows the amber dev window, the
   composition panel lists the template's core and worker.
+  **As built (2026-11-17).** Built: `artifex/syntax` (tree-sitter 0.25 with eight MIT
+  grammars, incremental reparse with a time budget) and `artifex/app` (Pergola's
+  code grid, workspace chooser and tree, tabs, atomic saves that keep a workspace
+  file's owner, LSP over `WorkspaceExec` with path mapping into the workspace, tasks
+  from Cargo/Meson/CMake/make/a lone C file with a Problems panel, git status, the
+  composition panel with `cargo atrium check`, New project from `cargo atrium new`,
+  and the workspace's Terminal from a button). `vm-artifex-check.sh` passes on the
+  cloud VM (pick, edit, save, build problems, jump to the error, the terminal);
+  rust-analyzer and clangd diagnostics wait for the toolchain layers to be installed
+  there. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
+  `WorkspaceExec` (breakpoints in the gutter, stack, locals, stepping; end-to-end on
+  Linux), and the fuzz panel running `cargo atrium fuzz` in the background, core
+  crashes first with "Move into a worker", a crash opening at its line and replaying
+  under the debugger (end-to-end on Linux against the real fuzzer).
 - **M12 (L).** Artifex fuzz panel (background `cargo atrium fuzz` per worker and per
   core input surface, crashes in the core flagged with "Move into a worker"), DAP to
   `lldb-dap`, SDK registry (static sparse index), sysroot archives, the developer
