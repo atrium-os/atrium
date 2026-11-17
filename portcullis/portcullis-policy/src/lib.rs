@@ -113,6 +113,16 @@ pub struct WorkerRule {
     #[serde(default)]
     pub caller_apps: Vec<String>,
     pub run_as: String,
+    /// ★ Run each worker as a uid of the instance it serves, not as
+    /// `run_as` (personas.md §3; navigator-ui.md §2.4): one uid per
+    /// (person, worker app, persona), allocated and named in the launch
+    /// registry like an app instance's. The instance served is the caller
+    /// (a `caller_apps` rule), or for a system caller (`callers`, e.g.
+    /// `_limen`) the uid it names in `ExecInstance.serves`. A worker of one
+    /// person or persona then shares no uid with another's, and services
+    /// tell them apart by uid. `run_as` is not used.
+    #[serde(default)]
+    pub per_instance: bool,
     /// How many of these workers may run at once. They are counted on their
     /// own, not against the per-user and host one-shot limits: frescod runs
     /// one per connection, and the Navigator's workers must not compete
@@ -747,6 +757,9 @@ run_as = "_navpage"
         assert!(p.worker_rule_for(ui, "navtest", None).is_none(), "not a launched app");
         assert!(p.worker_rule_for(ui, "org.atrium.navigator", None).is_none(), "an app id is not a user name");
         assert_eq!(p.worker_rule_for("org.atrium.navigator.page", "_limen", None).map(|r| r.run_as.as_str()), Some("_navpage"));
+        assert!(!p.workers[ui].per_instance, "one uid for all unless asked");
+        let q: Policy = toml::from_str("[workers.\"org.atrium.navigator.page\"]\ncallers = [\"_limen\"]\nrun_as = \"_navpage\"\nper_instance = true\n").unwrap();
+        assert!(q.worker_rule_for("org.atrium.navigator.page", "_limen", None).unwrap().per_instance);
     }
 
     fn caps_full() -> Capabilities {

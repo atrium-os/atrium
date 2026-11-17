@@ -315,7 +315,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit } = req {
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
              * fetcher's own network would make it anyone's raw fetch. */
@@ -332,10 +332,54 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                 continue;
             }
             let limits = (memory_mb, cpu_pct, require_memory_limit);
-            let rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+            let mut rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule_for(&app_id, &owner, registry.resolve(uid).map(|(_, a)| a)).cloned());
+            /* ★ A per-instance worker (personas.md §3): its uid is the
+             * served instance's, one per (person, worker app, persona). The
+             * served instance is the caller itself, or for a system caller
+             * the rule names by user (limend) the uid it says it serves (the
+             * embed's parent: limend has it from that parent's peer cred).
+             * Neither resolving in the launch registry: refused, never the
+             * shared `run_as`. */
+            let mut as_uid = None;
+            if let Some(r) = rule.as_mut().filter(|r| r.per_instance) {
+                let served = match serves {
+                    Some(s) if r.callers.iter().any(|c| c == &owner) => s,
+                    _ => uid,
+                };
+                let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+                let inst = reg.resolve(served).map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(served).flatten().map(String::from)));
+                let Some((person, served_app, persona)) = inst else {
+                    write_response(&mut writer, &Response::LaunchFailed { stage: "worker".into(),
+                        message: format!("{app_id} serves an app instance, and uid {served} is none") })?;
+                    continue;
+                };
+                // One allocation at a time: two pages at once must not both
+                // allocate a uid for the same instance.
+                static WORKER_UIDS: Mutex<()> = Mutex::new(());
+                let held = WORKER_UIDS.lock().unwrap_or_else(|e| e.into_inner());
+                let got = launch::resolve_instance_uid(&person, &app_id, None, persona.as_deref());
+                drop(held);
+                match got {
+                    Ok((wuid, name)) => {
+                        eprintln!("portcullisd: {app_id} for {person}'s {served_app}{} runs as {name}",
+                                  persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default());
+                        r.run_as = name;
+                        as_uid = Some(wuid);
+                    }
+                    Err(e) => {
+                        write_response(&mut writer, &Response::LaunchFailed { stage: "worker".into(),
+                            message: format!("{app_id}'s uid for {person}: {e:?}") })?;
+                        continue;
+                    }
+                }
+            }
+            // Asked (limend), the answer says whom the worker runs as.
+            let as_uid = if serves.is_some() {
+                as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
+            } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -379,7 +423,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None)?;
             continue;
         }
         /* ★ OpenCdm (docs/spec/hospes.md §3, §8.4): a content decryption
@@ -427,7 +471,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare))?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None)?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -655,6 +699,8 @@ fn handle_exec_instance(
      * (OpenCdm: its channels go to the CDM host over a socket of its own,
      * beside the library and the store). None: the caller's, as sent. */
     prepare:  Option<&dyn Fn([OwnedFd; 3]) -> std::io::Result<[OwnedFd; 3]>>,
+    /* Some: answer `ReadyForFdsAs` with this uid (the caller asked). */
+    as_uid:   Option<u32>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -731,7 +777,10 @@ fn handle_exec_instance(
         });
     }
 
-    write_response(writer, &Response::ReadyForFds)?;
+    write_response(writer, &match as_uid {
+        Some(uid) => Response::ReadyForFdsAs { uid },
+        None => Response::ReadyForFds,
+    })?;
 
     if !reader.buffer().is_empty() {
         return write_response(writer, &Response::LaunchFailed {
@@ -1235,10 +1284,12 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let grants = Grants::global();
     match req {
         Request::LinkGrant { asker_uid, activation, scheme, app } => {
-            let Some((person, asker_app)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-                .unwrap_or_default().resolve(asker_uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let Some((person, asker_app)) = reg.resolve(asker_uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
                 return refuse(format!("uid {asker_uid} is not a launched app"));
             };
+            // The asker's persona, by its uid (personas.md §3).
+            let persona = reg.persona(asker_uid).flatten().map(String::from);
             let now = std::time::Instant::now();
             if let Err(why) = grants.may_ask(&asker_app, now) {
                 return refuse(why);
@@ -1270,7 +1321,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 LinkDefaults::load(&LinkDefaults::user_path(&person)).unwrap_or_default()
                     .app_for(&scheme, |id| apps.iter().any(|(a, _)| a == id))
             };
-            let grant = match grants.issue(Grant { at: now, person: person.clone(), asker_app: asker_app.clone(), scheme: scheme.clone(),
+            let grant = match grants.issue(Grant { at: now, person: person.clone(), asker_app: asker_app.clone(), persona: persona.clone(), scheme: scheme.clone(),
                                                    apps: apps.iter().map(|(a, _)| a.clone()).collect() }) {
                 Ok(g) => g,
                 Err(why) => return refuse(why),
@@ -1279,7 +1330,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 .map(|(id, name)| LinkChoice { default: def.as_deref() == Some(id.as_str()), id, name })
                 .collect();
             list.sort_by_key(|c| !c.default);
-            eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}: {} app(s)", list.len());
+            eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}{}: {} app(s)", persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default(), list.len());
             Response::LinkGranted { grant, person, apps: list }
         }
         Request::DeliverLink { grant, app, url, always } => {
@@ -1288,8 +1339,16 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Err(why) => return refuse(why),
             };
             let name = launch::app_name(&app).unwrap_or_else(|| app.clone());
+            /* ★ The same persona's instance (personas.md §3): a link from
+             * Work opens in Work's, never in Personal's. An app that runs
+             * once for every persona (Settings, the file manager) is the
+             * one exception: it has no other instance. Crossing on purpose
+             * is P3. */
+            let persona = if launch::not_instanced(&app).is_some() { None } else { g.persona.clone() };
+            let persona = persona.as_deref();
+            let key = opens::channel_key(&app, persona);
             if g.scheme == atrium_links::APP {
-                start_for(&app, &g.person, "an atrium-app link");
+                start_for_instance(&app, persona, &g.person, "an atrium-app link");
                 eprintln!("portcullisd: {app} opened from {} for {}", g.asker_app, g.person);
                 return Response::LinkDelivered { app: name };
             }
@@ -1302,43 +1361,58 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 }
             }
             let hub = Hub::global();
-            if let Err(e) = hub.listen(&app) {
-                return refuse(format!("{app}'s document channel: {e}"));
+            if let Err(e) = hub.listen(&key) {
+                return refuse(format!("{key}'s document channel: {e}"));
             }
-            match hub.deliver_link(&g.person, &app, &g.scheme, &url) {
+            match hub.deliver_link(&g.person, &key, &g.scheme, &url) {
                 // Running: bring its window forward, as a new one would be.
-                Ok(Delivery::Sent) => match portcullis_peer::uid_for_app(portcullis_peer::DEFAULT_REGISTRY, &g.person, &app) {
+                Ok(Delivery::Sent) => match launch::instance_uid(&g.person, &app, persona) {
                     Some(uid) => match opens::raise(&opens::activation_socket(), uid) {
                         Ok(w) => eprintln!("portcullisd: {app}'s window {w} brought forward"),
                         Err(why) => eprintln!("portcullisd: {app}'s window not brought forward: {why}"),
                     },
                     None => eprintln!("portcullisd: {app}'s window not brought forward: no uid for it"),
                 },
-                Ok(Delivery::Queued) => start_for(&app, &g.person, "to open a link"),
+                Ok(Delivery::Queued) => start_for_instance(&app, persona, &g.person, "to open a link"),
                 Err(e) => return refuse(e.to_string()),
             }
-            eprintln!("portcullisd: a {} link from {} opened in {app} for {}", g.scheme, g.asker_app, g.person);
+            eprintln!("portcullisd: a {} link from {} opened in {key} for {}", g.scheme, g.asker_app, g.person);
             Response::LinkDelivered { app: name }
         }
         _ => unreachable!("routed by serve()"),
     }
 }
 
+/// A user's uid, by name.
+fn uid_of_user(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getpwnam with a valid C string; the field is read at once.
+    // (Rare here: only an `ExecInstance` that asked whom its worker runs as.)
+    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
+    (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
+}
+
 /// Start `app` for `owner` on a thread, unless it is starting already.
 fn start_for(app: &str, owner: &str, why: &'static str) {
+    start_for_instance(app, None, owner, why)
+}
+
+/// [`start_for`], for `app`'s instance in `persona`.
+fn start_for_instance(app: &str, persona: Option<&str>, owner: &str, why: &'static str) {
+    let key = portcullisd::opens::channel_key(app, persona);
     let mut started = STARTED_FOR_OPEN.lock().unwrap();
-    if started.iter().any(|a| a == app) || launch::running_jid(app).is_some() {
+    if started.iter().any(|a| a == &key) || launch::running_jid_instance(app, persona).is_some() {
         return;
     }
-    started.push(app.to_string());
-    let (a, o) = (app.to_string(), owner.to_string());
-    eprintln!("portcullisd: starting {a} for {o} ({why})");
+    started.push(key.clone());
+    let (a, o, p) = (app.to_string(), owner.to_string(), persona.map(String::from));
+    eprintln!("portcullisd: starting {key} for {o} ({why})");
     thread::spawn(move || {
-        match launch::launch_with_stdio(&a, &o, None) {
-            Ok(out) => eprintln!("portcullisd: {a} ({why}) exited {:?}", out.exit_code),
-            Err(e) => eprintln!("portcullisd: {a} ({why}) failed at {}: {}", e.stage(), e.message()),
+        match launch::launch_instance(&a, p.as_deref(), &o, None) {
+            Ok(out) => eprintln!("portcullisd: {key} ({why}) exited {:?}", out.exit_code),
+            Err(e) => eprintln!("portcullisd: {key} ({why}) failed at {}: {}", e.stage(), e.message()),
         }
-        STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &a);
+        STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &key);
     });
 }
 

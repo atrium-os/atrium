@@ -256,8 +256,14 @@ window**, each its own Navigator instance. `portcullis launch --persona work
 org.atrium.navigator` starts a second navigatord with its own uid, jail, overlay (trails, page
 store, downloads) and synthetic host identity; its converter and fetcher jails run as its uid,
 since a worker runs as whoever asks; and Arca keys its items by that uid. Its page and UI jails
-run as the shared `_navpage` and `_navui` uids, as every person's do: they hold no files and no
-network, and a page reaches only the navigatord whose ticket it holds.
+run as uids of their own too (Shankar, 2026-11-17, for the long term): the worker rules for
+`org.atrium.navigator.ui` and `org.atrium.navigator.page` are `per_instance`, so portcullisd runs
+each as a uid of the instance it serves, one per (person, worker app, persona), allocated and
+named in the launch registry like an app instance's (`<uid> navtest org.atrium.navigator.page
+persona=work`). The UI serves navigatord, its caller. A page serves navigatord too, since navigatord
+opens the UI's limend connection: limend names that parent's uid in `ExecInstance.serves` (from
+its peer credentials) and learns the page's uid back in `ReadyForFdsAs`. No person or persona shares a page or window uid with another any more,
+so rctl limits, and anything that tells instances apart by uid, follow the instance.
 - **Sockets per instance.** Every navigatord serves in the same shared directories, so each
   names its sockets by its uid: the page socket `navigator-page/<uid>.sock`
   (`navigator_control::PAGE_SOCKET`, `{instance}` filled in) and the control socket where the
@@ -271,9 +277,12 @@ network, and a page reaches only the navigatord whose ticket it holds.
   chip names the window's persona ("Work") for recorded trails, and Unrecorded trails stay
   Unrecorded inside it. frescod's strip chip and forum-wm's frame (personas.md P1) come from
   the uid, not from the Navigator.
-- Not yet: link crossing into a Work window (personas.md P3; a persona instance has no document
-  channel until then), downloads into the persona's folder (P2), a Work window's network routes
-  (vpn.md V2), and choosing the persona from the Navigator's own New window menu.
+- **Links stay in their persona.** Each persona instance of an app has its own document channel
+  (`<id>@<persona>`), and a link opens in the asking app's persona: from Work Mail into the Work
+  Navigator, never the Personal one (opening-links.md §5). Crossing on purpose, with its switch,
+  is personas.md P3.
+- Not yet: downloads into the persona's folder (P2), a Work window's network routes (vpn.md V2),
+  and choosing the persona from the Navigator's own New window menu.
 
 ---
 

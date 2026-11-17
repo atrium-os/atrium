@@ -147,6 +147,7 @@ fn jail(app: &str, instance: &str, stdin: OwnedFd) -> io::Result<Proc> {
         // The bundle's [resources] set the caps; a machine without
         // racct refuses rather than runs a worker uncapped.
         require_memory_limit: true,
+        serves: None,
     })?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}

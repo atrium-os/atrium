@@ -54,6 +54,13 @@ pub trait Launcher: Send {
     /// Start `app_id` for `embed` with `channel` as its limend connection.
     /// Returns the uid the child runs as.
     fn launch(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String>;
+    /// [`Launcher::launch`] for the parent running as `parent_uid`: a
+    /// launcher whose children run as a uid of the parent's instance
+    /// (person and persona) needs it.
+    fn launch_for(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+        let _ = parent_uid;
+        self.launch(app_id, embed, channel)
+    }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
 }
@@ -334,7 +341,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
             st.next_conn += 1;
             let id = st.next_conn;
             st.conns.insert(id, tx);
-            let child_uid = match shared.launcher.lock().unwrap().launch(&provider, embed, theirs) {
+            let child_uid = match shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid) {
                 Ok(u) => u,
                 Err(e) => {
                     eprintln!("limend: launching {provider} for {}: {e}", role.name);

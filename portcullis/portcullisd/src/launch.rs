@@ -311,13 +311,11 @@ pub fn launch_instance(
      * at /atrium/sockets/opens. Made before the mount, so the source exists. */
     let mut jc = jc;
     // The terminal gets its consoles the same way (homes.md §4).
-    /* A named persona's instance gets no document channel yet: the hub is
-     * keyed by app id, so it would share the Personal instance's, and
-     * crossing personas is off by default (personas.md §6, step P3). */
-    if persona.is_some() && (!manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true)) {
-        eprintln!("portcullisd: {app_id}@{}: no document channel for persona instances yet (personas.md P3)", persona.unwrap_or(""));
-    } else if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
-        let dir = portcullisd::opens::Hub::global().listen(app_id)
+    /* A named persona's instance has a channel of its own, keyed
+     * `<id>@<persona>`: what reaches it comes from its own persona
+     * (personas.md §3; crossing is P3, off by default). */
+    if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
+        let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
     }
