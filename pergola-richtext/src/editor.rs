@@ -159,12 +159,27 @@ pub struct Editor {
     /// The selected edit, an index into [`Editor::edits`].
     pub review_at: usize,
     edits_cache: Option<(u64, Rc<Vec<Edit>>)>,
+    /// A floating picture or shape being dragged: where, and how far so far.
+    pub dragging: Option<ObjectDrag>,
+}
+
+/// A floating object being dragged on page `page`: its anchor and the
+/// distance moved so far (layout units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectDrag {
+    pub block: usize,
+    pub at: u32,
+    pub page: usize,
+    pub dx: i64,
+    pub dy: i64,
+    /// Its bottom-right corner is being dragged: it grows or shrinks.
+    pub resize: bool,
 }
 
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None, dragging: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e
@@ -1299,7 +1314,13 @@ impl Editor {
     /// Changes the picture at the caret's frame through `f`; false if there's
     /// no picture there or nothing changed.
     fn reframe(&mut self, label: &str, f: impl Fn(&mut ObjectRef)) -> bool {
-        let Some((b, at, o)) = self.picture_at_caret() else { return false };
+        let Some((b, at, _)) = self.picture_at_caret() else { return false };
+        self.reframe_at(b, at, label, f)
+    }
+
+    /// [`Editor::reframe`] for the object at byte `at` of paragraph `b`.
+    fn reframe_at(&mut self, b: usize, at: u32, label: &str, f: impl Fn(&mut ObjectRef)) -> bool {
+        let Some(o) = self.doc.para(b).and_then(|p| self.doc.attrs.get(p.attr_at(at)).object) else { return false };
         let mut new = o;
         f(&mut new);
         if new == o {
@@ -1434,10 +1455,96 @@ impl Editor {
     /// Makes the picture or shape at the caret `dw` wider and `dh` taller
     /// (twips; at least a twip, at most the largest object).
     pub fn resize_object(&mut self, dw: i32, dh: i32) -> bool {
+        let Some((b, at, _)) = self.picture_at_caret() else { return false };
+        self.resize_object_at(b, at, dw, dh)
+    }
+
+    /// Drags the bottom-right corner of the object at byte `at` of paragraph
+    /// `b` by (`dx`, `dy`) layout units: a shape takes both, a picture keeps
+    /// its proportions (the larger change wins). One undo step.
+    pub fn resize_by_drag(&mut self, b: usize, at: u32, page: usize, dx: i64, dy: i64) -> bool {
+        let Some(o) = self.doc.para(b).and_then(|p| self.doc.attrs.get(p.attr_at(at)).object) else { return false };
+        // Its top-left corner stays where it is drawn.
+        let left = self.pages.pages().get(page).and_then(|pg| pg.floats.iter().find(|f| f.block == b && f.at == at)).map(|f| (f.x * 20).div_euclid(officina_text::LU) as i32 + i32::from((f.x * 20).rem_euclid(officina_text::LU) * 2 >= officina_text::LU));
+        let tw = |lu: i64| (lu * 20 / officina_text::LU) as i32;
+        let (mut dw, mut dh) = (tw(dx), tw(dy));
+        if !o.shape && o.width > 0 && o.height > 0 {
+            let (w, h) = (o.width as f64, o.height as f64);
+            if (dw as f64 / w).abs() >= (dh as f64 / h).abs() {
+                dh = (dw as f64 * h / w).round() as i32;
+            } else {
+                dw = (dh as f64 * w / h).round() as i32;
+            }
+        }
         let max = MAX_OBJECT_TWIPS as i64;
-        self.reframe("Size", |o| {
+        self.reframe_at(b, at, "Size", move |o| {
             o.width = (o.width as i64 + dw as i64).clamp(1, max) as u32;
             o.height = (o.height as i64 + dh as i64).clamp(1, max) as u32;
+            if let (Some(f), Some(x)) = (o.float.as_mut(), left) {
+                if f.h_align != HAlign::Offset || f.h_rel != Rel::Margin {
+                    f.h_rel = Rel::Margin;
+                    f.h_align = HAlign::Offset;
+                    f.x = x;
+                }
+            }
+        })
+    }
+
+    fn resize_object_at(&mut self, b: usize, at: u32, dw: i32, dh: i32) -> bool {
+        let max = MAX_OBJECT_TWIPS as i64;
+        self.reframe_at(b, at, "Size", |o| {
+            o.width = (o.width as i64 + dw as i64).clamp(1, max) as u32;
+            o.height = (o.height as i64 + dh as i64).clamp(1, max) as u32;
+        })
+    }
+
+    /// The floating picture or shape drawn at (`x`, `y`) on page `page`
+    /// (layout units from its content box), the topmost; those behind the
+    /// text only where no text is.
+    pub fn float_at(&mut self, page: usize, x: i64, y: i64) -> Option<officina_text::paginate::PlacedFloat> {
+        let pg = self.pages.pages().get(page)?.clone();
+        let inside = |f: &&officina_text::paginate::PlacedFloat| x >= f.x && x < f.x + f.w.max(officina_text::LU * 4) && y >= f.y - officina_text::LU * 2 && y < f.y + f.h.max(officina_text::LU * 4);
+        let front = pg.floats.iter().rev().filter(|f| f.wrap() != Wrap::Behind).find(inside).cloned();
+        if front.is_some() {
+            return front;
+        }
+        // Behind the text: picked where the press lands on no line.
+        let on_text = pg.slices.iter().any(|s| x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.lines.clone().map(|li| self.cache_line_height(s.block, li)).sum::<i64>());
+        if on_text {
+            return None;
+        }
+        self.pages.pages().get(page)?.floats.iter().rev().find(inside).cloned()
+    }
+
+    fn cache_line_height(&mut self, b: usize, li: usize) -> i64 {
+        self.layout(b).lines.get(li).map_or(0, |l| l.height)
+    }
+
+    /// Moves the floating object anchored at byte `at` of paragraph `block`,
+    /// drawn on page `page`, by (`dx`, `dy`) layout units (one undo step):
+    /// across it is then placed from the margin; down it stays measured
+    /// from its paragraph when it was, else from the margin. False if
+    /// there's no such object or it didn't move.
+    pub fn move_float(&mut self, block: usize, at: u32, page: usize, dx: i64, dy: i64) -> bool {
+        let Some(pf) = self.pages.pages().get(page).and_then(|pg| pg.floats.iter().find(|f| f.block == block && f.at == at)).cloned() else { return false };
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+        let tw = |lu: i64| (lu * 20 + officina_text::LU / 2).div_euclid(officina_text::LU).clamp(-(officina_text::model::MAX_FLOAT_OFFSET as i64), officina_text::model::MAX_FLOAT_OFFSET as i64) as i32;
+        let (nx, ny) = (tw(pf.x + dx), tw(pf.y + dy));
+        let ddy = tw(dy);
+        self.reframe_at(block, at, "Move", move |o| {
+            if let Some(f) = o.float.as_mut() {
+                f.h_rel = Rel::Margin;
+                f.h_align = HAlign::Offset;
+                f.x = nx;
+                if f.v_rel == Rel::Text {
+                    f.y = (f.y as i64 + ddy as i64).clamp(-(officina_text::model::MAX_FLOAT_OFFSET as i64), officina_text::model::MAX_FLOAT_OFFSET as i64) as i32;
+                } else {
+                    f.v_rel = Rel::Margin;
+                    f.y = ny;
+                }
+            }
         })
     }
 

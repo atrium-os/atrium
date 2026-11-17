@@ -1488,7 +1488,7 @@ impl View for Write {
                 move || cmds.lock().unwrap().push(c)
             };
             let on = ed.borrow().shape_at_caret();
-            match on.filter(|s| Some(s.0) == sb.id) {
+            match on.clone().filter(|s| Some(s.0) == sb.id) {
                 None => {
                     ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 120.0, 20.0), content: "Draw a shape".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
                     let bw = ((w - 140.0 - 90.0) / 6.0 - 6.0).clamp(72.0, 110.0);
@@ -1497,6 +1497,10 @@ impl View for Write {
                         Button::secondary(*label).at(140.0 + col as f32 * (bw + 6.0), y + row as f32 * FIND_H + 8.0).width(bw).on_click(push(Cmd::ShapeInsert(i))).render(ctx);
                     }
                     Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ShapeClose)).render(ctx);
+                    if on.is_some() {
+                        // The caret moved onto another shape (a click picks one).
+                        Button::primary("Edit This Shape").at(w - 212.0, y + FIND_H + 8.0).width(136.0).on_click(push(Cmd::ShapeOpen)).render(ctx);
+                    }
                 }
                 Some((_, _, sd)) => {
                     ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 70.0, 20.0), content: "Words".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
@@ -1871,6 +1875,13 @@ mod tests {
         run(Cmd::insert(35));
         let (id, _, tb) = ed.borrow().shape_at_caret().unwrap();
         assert_eq!((w.shape.get_cloned().id, tb.fill), (Some(id), Some(0xFFFFFF)));
+        // The caret on another shape: the bar offers to edit it.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 0), false);
+        let first = ed.borrow().shape_at_caret().map(|s| s.0);
+        assert!(first.is_some() && first != Some(id));
+        assert!(texts().iter().any(|s| s == "Edit This Shape"));
+        run(Cmd::ShapeOpen);
+        assert_eq!(w.shape.get_cloned().id, first);
         run(Cmd::FindOpen);
         assert!(!w.shape.get_cloned().open, "bars share one place");
     }

@@ -33,7 +33,7 @@ use pergola_document::Faces;
 
 use officina_text::track::{Edit, EditKind};
 
-use crate::editor::{Editor, Outcome, Pos};
+use crate::editor::{ObjectDrag, Editor, Outcome, Pos};
 
 /// Space between pages and around them, in units.
 pub const GAP: f32 = 16.0;
@@ -420,6 +420,34 @@ impl RichTextView {
                         Item::Link { .. } => {}
                     }
                 }
+                // The picked floating object: a frame round it, and where a
+                // drag would put it.
+                if let Some((b, at, _)) = ed.picture_at_caret() {
+                    let drag = ed.dragging.filter(|d| d.block == b && d.at == at && d.page == i);
+                    if let Some(f) = ed.pages.pages().get(i).and_then(|pg| pg.floats.iter().find(|f| f.block == b && f.at == at)).cloned() {
+                        let accent = t.accent_fg();
+                        let frame = |ctx: &mut Ctx, dx: i64, dy: i64, dw: i64, dh: i64, c: Color| {
+                            let (fx, fy) = (ox + pb.mx + (f.x + dx) as f64 * g.k, oy + pb.my + (f.y + dy) as f64 * g.k);
+                            let (fw, fh) = (((f.w + dw) as f64 * g.k).max(2.0) as f32, ((f.h + dh) as f64 * g.k).max(2.0) as f32);
+                            let (fx, fy) = (q(fx - 2.0), q(fy - 2.0));
+                            for r in [Rect::new(fx, fy, fw + 4.0, 1.5), Rect::new(fx, fy + fh + 2.5, fw + 4.0, 1.5), Rect::new(fx, fy, 1.5, fh + 4.0), Rect::new(fx + fw + 2.5, fy, 1.5, fh + 4.0)] {
+                                ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
+                            }
+                        };
+                        frame(ctx, 0, 0, 0, 0, accent);
+                        // The corner handle that sizes it.
+                        let (hx, hy) = (ox + pb.mx + (f.x + f.w) as f64 * g.k, oy + pb.my + (f.y + f.h) as f64 * g.k);
+                        ctx.add(Node::Rect { rect: Rect::new(q(hx - HANDLE as f64 + 2.0), q(hy - HANDLE as f64 + 2.0), HANDLE, HANDLE), fill: accent, radius: 2.0 });
+                        if let Some(d) = drag {
+                            let ghost = Color::rgba(0.2, 0.45, 0.95, 0.6);
+                            if d.resize {
+                                frame(ctx, 0, 0, d.dx, d.dy, ghost);
+                            } else {
+                                frame(ctx, d.dx, d.dy, 0, 0, ghost);
+                            }
+                        }
+                    }
+                }
                 // What a deletion took away, struck through, over its place.
                 // A conflict's other version, in amber, not struck.
                 for (lx, ly, text) in labels {
@@ -591,14 +619,54 @@ impl RichTextView {
         {
             let (ed, sc, rev) = (self.editor.clone(), self.scroll.clone(), self.rev.clone());
             let g = g.clone();
+            let start = std::cell::Cell::new((0usize, 0i64, 0i64));
             ctx.on_drag(body, move |phase, p| {
                 let st = sc.get();
                 let mut e = ed.borrow_mut();
-                let pos = hit(&mut e, &g, st.physics.y, p);
+                let (pg, lx, ly) = local(&e, &g, st.physics.y, p);
+                // A press on a floating picture or shape picks it; a drag
+                // moves it (one undo step when let go).
                 match phase {
-                    DragPhase::Start => e.set_caret(pos, false),
-                    DragPhase::Move => e.set_caret(pos, true),
-                    _ => return,
+                    DragPhase::Start => {
+                        if let Some(f) = e.float_at(pg, lx, ly) {
+                            // Its corner handle (shown when picked) sizes it.
+                            let picked = e.picture_at_caret().is_some_and(|(b, at, _)| b == f.block && at == f.at);
+                            let grip = (HANDLE as f64 / g.k) as i64;
+                            let resize = picked && lx >= f.x + f.w - grip && ly >= f.y + f.h - grip;
+                            e.set_caret(Pos::new(f.block, f.at), false);
+                            e.dragging = Some(ObjectDrag { block: f.block, at: f.at, page: pg, dx: 0, dy: 0, resize });
+                            start.set((pg, lx, ly));
+                        } else {
+                            e.dragging = None;
+                            let pos = e.hit(pg, lx, ly);
+                            e.set_caret(pos, false);
+                        }
+                    }
+                    DragPhase::Move => match e.dragging.as_mut() {
+                        Some(d) => {
+                            let (spg, sx, sy) = start.get();
+                            // Across pages: the distance as if on its own.
+                            let (lx, ly) = if pg == spg { (lx, ly) } else { local_on(&g, st.physics.y, p, spg) };
+                            d.dx = lx - sx;
+                            d.dy = ly - sy;
+                        }
+                        None => {
+                            let pos = e.hit(pg, lx, ly);
+                            e.set_caret(pos, true);
+                        }
+                    },
+                    DragPhase::End => {
+                        let Some(d) = e.dragging.take() else { return };
+                        // A press that hardly moved only picks.
+                        if d.dx.abs() + d.dy.abs() > officina_text::LU * 2 {
+                            if d.resize {
+                                e.resize_by_drag(d.block, d.at, d.page, d.dx, d.dy);
+                            } else {
+                                e.move_float(d.block, d.at, d.page, d.dx, d.dy);
+                            }
+                            e.set_caret(Pos::new(d.block, d.at), false);
+                        }
+                    }
                 }
                 rev.set(rev.get().wrapping_add(1));
             });
@@ -692,15 +760,32 @@ impl View for RichTextView {
     }
 }
 
-/// The text position under window point `p`.
-fn hit(e: &mut Editor, g: &Geom, scroll_y: f64, p: Point) -> Pos {
+/// The side of a picked object's corner handle (px).
+const HANDLE: f32 = 9.0;
+
+/// The page under window point `p` and the point in layout units from
+/// that page's content box.
+fn local(e: &Editor, g: &Geom, scroll_y: f64, p: Point) -> (usize, i64, i64) {
     let cy = scroll_y + (p.y - g.rect.y()) as f64;
-    let n = e.pages.pages().len();
-    let pg = g.page_at(cy, n);
+    let pg = g.page_at(cy, e.pages.pages().len());
+    let (lx, ly) = local_on(g, scroll_y, p, pg);
+    (pg, lx, ly)
+}
+
+/// Window point `p` in layout units from page `pg`'s content box.
+fn local_on(g: &Geom, scroll_y: f64, p: Point, pg: usize) -> (i64, i64) {
+    let cy = scroll_y + (p.y - g.rect.y()) as f64;
     let pb = g.page(pg);
     let lx = ((p.x - g.rect.x()) as f64 - g.left_of(pg) - pb.mx) / g.k;
     let ly = (cy - pb.top - pb.my) / g.k;
-    e.hit(pg, lx as i64, ly as i64)
+    (lx as i64, ly as i64)
+}
+
+/// The text position under window point `p`.
+#[allow(dead_code)]
+fn hit(e: &mut Editor, g: &Geom, scroll_y: f64, p: Point) -> Pos {
+    let (pg, lx, ly) = local(e, g, scroll_y, p);
+    e.hit(pg, lx, ly)
 }
 
 /// Scrolls so the caret shows.
@@ -931,6 +1016,71 @@ mod tests {
         app.tick();
         let c = ed.borrow().caret;
         assert_eq!((c.block, ed.borrow_mut().spot(c).page), (200, k), "{c:?}");
+    }
+
+    #[test]
+    fn a_floating_shape_is_picked_by_a_click_and_moved_by_a_drag() {
+        let (mut app, ed, _) = host(20);
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(Pos::new(2, 0), false);
+            assert!(e.insert_shape("rect"));
+            while !e.paginate(Duration::from_secs(5)) {}
+            e.set_caret(Pos::new(0, 0), false);
+        }
+        app.tick();
+        let g = Geom::of(&ed.borrow(), Rect::new(0.0, 0.0, 900.0, 700.0), 1.0);
+        let f = ed.borrow().pages.pages()[0].floats[0].clone();
+        let pb = g.page(0);
+        let win = |x: i64, y: i64| Point::new((g.left_of(0) + pb.mx + x as f64 * g.k) as f32, (pb.top + pb.my + y as f64 * g.k) as f32);
+        // A click in its middle picks it: the caret goes to its anchor.
+        let mid = win(f.x + f.w / 2, f.y + f.h / 2);
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerUp { at: mid });
+        app.tick();
+        assert_eq!(ed.borrow().shape_at_caret().map(|s| s.0), Some(0), "picked");
+        // A drag 40 px left and 30 px down moves it that far.
+        let to = Point::new(mid.x - 40.0, mid.y + 30.0);
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerMove { at: Point::new(mid.x - 20.0, mid.y + 15.0) });
+        app.handle_event(Event::PointerMove { at: to });
+        app.tick();
+        assert!(ed.borrow().dragging.is_some(), "dragging");
+        app.handle_event(Event::PointerUp { at: to });
+        app.tick();
+        assert!(ed.borrow().dragging.is_none());
+        {
+            let mut e = ed.borrow_mut();
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let moved = ed.borrow().pages.pages()[0].floats[0].clone();
+        let (dx, dy) = ((moved.x - f.x) as f64 * g.k, (moved.y - f.y) as f64 * g.k);
+        assert!((dx + 40.0).abs() <= 2.0 && (dy - 30.0).abs() <= 2.0, "moved by {dx}, {dy}");
+        assert_eq!(ed.borrow().shape_at_caret().map(|s| s.0), Some(0), "still picked");
+        // One undo puts it back.
+        ed.borrow_mut().undo();
+        {
+            let mut e = ed.borrow_mut();
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let back = ed.borrow().pages.pages()[0].floats[0].clone();
+        assert_eq!((back.x, back.y), (f.x, f.y));
+        // Picked again, its corner handle sizes it: 50 px wider, 20 px shorter.
+        app.handle_event(Event::PointerDown { at: mid });
+        app.handle_event(Event::PointerUp { at: mid });
+        let corner = win(f.x + f.w - 4, f.y + f.h - 4);
+        app.handle_event(Event::PointerDown { at: corner });
+        app.handle_event(Event::PointerMove { at: Point::new(corner.x + 25.0, corner.y - 10.0) });
+        app.handle_event(Event::PointerMove { at: Point::new(corner.x + 50.0, corner.y - 20.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(corner.x + 50.0, corner.y - 20.0) });
+        {
+            let mut e = ed.borrow_mut();
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let sized = ed.borrow().pages.pages()[0].floats[0].clone();
+        let (dw, dh) = ((sized.w - f.w) as f64 * g.k, (sized.h - f.h) as f64 * g.k);
+        assert!((dw - 50.0).abs() <= 2.0 && (dh + 20.0).abs() <= 2.0, "sized by {dw}, {dh}");
+        assert_eq!((sized.x, sized.y), (f.x, f.y), "the corner moves, not the shape");
     }
 
     #[test]

@@ -3273,15 +3273,25 @@ odt 52/52, floats 8/8, headers 4/4, slides 84/84).
   as upright atlas bitmaps (a run moves with its group but does not turn),
   so turned words wait on the Fresco renderer; Write draws them upright
   in the turned shape's middle, on screen and in PDF alike.
-- **Not yet**: dragging shapes and handles on the page, adjust handles
-  (an arrow's head, a callout's pointer), picking a shape by clicking it
-  (the caret beside its anchor picks it), grouping in Write.
+- **On the page** (same day): a press on a floating shape or picture
+  picks it (the caret goes to its anchor; behind-text ones only where no
+  line is); the picked one gets a frame and a corner handle. Dragging it
+  moves it (a ghost frame follows; on release one undoable Move: placed
+  from the margin across, from its paragraph down when it was, else from
+  the margin); dragging the corner sizes it (a picture keeps its
+  proportions, the top-left stays put). With the shape bar open, a click on
+  another shape offers Edit This Shape.
+- **Not yet**: adjust handles (an arrow's head, a callout's pointer), a
+  rotation handle, moving the anchor with the shape, dragging objects in
+  line with the text, grouping in Write.
 
 Gates: engine (set, undo, refusals), native journal op round trip, editor
 (insert, words keeping their format, fill, turn, size, undo, text box,
 arrow), Write's bar (both modes, every command, undo a step each, bars
 sharing their place), and a crash recovery that keeps a shape's words
-and fill; officina-text 68, officina-convert, pergola-richtext 28 and
+and fill; the view: a click picks a shape, a drag moves it 40 px left and
+30 px down within 2 px, undo puts it back, its corner sizes it 50 px wider
+and 20 px shorter with its corner fixed; officina-text 68, officina-convert, pergola-richtext 28 and
 Write tests all pass; twelve shapes drawn by the editor look right in our
 PDF.
 
