@@ -186,8 +186,9 @@ key holds, so it cannot be copied to another key the way an ID could.
 
 ### 5.4 Other devices
 
-Cameras, microphones, printers and the like follow the instance that asked, under their
-existing grants. Nothing persona-specific in v1.
+Cameras, microphones and the like follow the instance that asked, under their existing
+grants. Nothing persona-specific in v1. Printers belong to a persona or are shared, and
+printing onto another persona's printer is a crossing (printing.md §9, accepted 2026-11-17).
 
 ## 6. Crossing between personas
 

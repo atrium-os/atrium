@@ -3,8 +3,8 @@
 > *Prelum* (Latin): a press. The wine and olive press first; from the fifteenth century the
 > printing press (*sub prelo*, "in the press"). Atrium's print system.
 
-**Status:** proposed 2026-11-17, waiting for Shankar's review (§12 decisions 1–16). Nothing
-is built.
+**Status:** accepted 2026-11-17 (Shankar: all §12 decisions as recommended; D16: a printer
+simulator first, his own printer for R6 and R8). Nothing is built.
 **Scope:** how an app prints, how printers are found and added, how a document becomes
 what a printer accepts, how it reaches the printer over the network or USB, what the user
 sees while it prints, and where printer passwords live.
