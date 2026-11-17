@@ -73,7 +73,7 @@ sign \$O; opifex install \$O >/dev/null
 O=$B/b-$ART; mkdir -p \$O/bin; cp $B/artifex \$O/bin/; cp $B/artifex.toml \$O/atrium.toml
 echo on > \$O/.trace; echo 40,30 > \$O/.at
 sign \$O; opifex install \$O >/dev/null
-mkdir -p /atrium/sockets/portcullis /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
+mkdir -p /atrium/sockets/portcullis /atrium/sockets/clipboard /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
 daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=off $B/stoad
 sleep 1; chmod 600 /var/run/atrium/stoad.sock
@@ -153,11 +153,13 @@ ROW=$(( ${ROW:-2} - 1 ))
 press 735 $((351 + 48 * ROW))
 waitstate 'ws=Some("proj")' 60 && ok "a click's press allows proj" || bad "pick: $(state) $(V "grep -i 'pick\|REFUSED' $LOG | tail -2")"
 check "remembered for Artifex" "$ART	proj" "$(V "cat /var/db/atrium/alice/workspace-picks")"
-waitstate 'rows=\[hello.c,README.md\]' 20 && ok "its work is the tree" || bad "tree: $(state)"
+waitstate 'rows=\[[^]]*hello.c' 20 && ok "its work is the tree" || bad "tree: $(state)"
 shot artifex-1-tree
 
 echo "=== edit and save"
-press 100 89               # the tree's first row: hello.c
+# hello.c's row (the workspace may hold .atrium and a README too).
+ROW=$(state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n' | grep -n '^hello.c$' | cut -d: -f1)
+press 100 $((89 + 22 * (${ROW:-1} - 1)))
 waitstate 'tabs=\[hello.c\]' 20 && ok "a click opens hello.c" || bad "open: $(state)"
 shot artifex-2-open
 typ "// edited in artifex
@@ -174,7 +176,7 @@ waitstate 'running=None problems=[1-9]' 120 && ok "Ctrl+B builds in proj and the
 waitstate 'diags=[1-9]' 10 && ok "and marks the editor" || bad "diags: $(state)"
 shot artifex-3-problems
 GAP=6 press 440 508        # the first problem (panel under the editor)
-waitstate 'caret=(7, ' 20 && ok "a click on it goes to line 7" || bad "jump: $(state)"
+waitstate 'caret=(6, 9)' 20 && ok "a click on it goes to line 6, column 9" || bad "jump: $(state)"
 
 echo "=== terminal"
 press 1080 52              # the bar's Terminal button
