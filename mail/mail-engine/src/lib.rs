@@ -27,6 +27,7 @@ pub mod send;
 pub mod senders;
 pub mod later;
 pub mod notify;
+pub mod smime;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
@@ -130,10 +131,10 @@ impl Parser {
 
     /// Summaries for one batch, in order; `None` for a message the jail
     /// refused (too large, not mail). An invalid jail fails the batch.
-    pub fn summarize(&self, batch: &[(u64, &[u8])], headers_only: bool) -> Result<Vec<Option<Summary>>, Error> {
+    pub fn summarize(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>]) -> Result<Vec<Option<Summary>>, Error> {
         let mut j = self.start()?;
         let msgs: Vec<wire::Raw> = batch.iter().map(|(id, b)| wire::Raw { id: *id, bytes: b.to_vec() }).collect();
-        wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, batch: msgs })
+        wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let lens = |id: u64| batch.iter().find(|(i, _)| *i == id).map(|(_, b)| b.len() as u64);
         let frames = Self::exchange(&mut j, &lens)?;
@@ -169,9 +170,9 @@ impl Parser {
         }
     }
 
-    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>) -> Result<Option<Opened>, Error> {
+    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>]) -> Result<Option<Opened>, Error> {
         let mut j = self.start()?;
-        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
+        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
         let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
@@ -185,6 +186,8 @@ impl Parser {
 pub struct Engine {
     pub store: Store,
     pub parser: Parser,
+    /// Trusted roots for S/MIME (DER), sent to each jail ([`smime`]).
+    roots: Vec<Vec<u8>>,
 }
 
 /// What the reading pane shows (§7.2, §7.3).
@@ -211,7 +214,7 @@ pub struct Shown {
 
 impl Engine {
     pub fn new(store: Store, parser: Parser) -> Engine {
-        Engine { store, parser }
+        Engine { store, parser, roots: smime::system_roots() }
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {
@@ -240,7 +243,7 @@ impl Engine {
             .take(wire::LOADED_MAX)
             .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
             .collect();
-        match self.parser.open(&raw, loaded)? {
+        match self.parser.open(&raw, loaded, &self.roots)? {
             Some(o) => {
                 let sh = Shown { document: o.document, attachments: o.attachments };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
@@ -347,7 +350,7 @@ impl Sink for AccountSink<'_> {
             let chunk = &page[i..end];
             let full = chunk[0].full;
             let input: Vec<(u64, &[u8])> = chunk.iter().enumerate().map(|(k, f)| (k as u64, f.bytes.as_slice())).collect();
-            let sums = self.e.parser.summarize(&input, !full).map_err(|e| e.to_string())?;
+            let sums = self.e.parser.summarize(&input, !full, &self.e.roots).map_err(|e| e.to_string())?;
             for (f, s) in chunk.iter().zip(sums) {
                 let Some(summary) = s else {
                     self.refused += 1;
@@ -370,15 +373,18 @@ impl Sink for AccountSink<'_> {
         // New to the index (not a resync of what is here): the rules apply.
         let fresh: Vec<bool> = stored.iter().map(|(uid, _)| self.e.store.at(id, *uid).ok().flatten().is_none()).collect();
         let mut new = Vec::new();
+        let mut all = Vec::new();
         self.e.store.write(|w| {
             for ((uid, m), fresh) in stored.into_iter().zip(fresh) {
                 let msg = w.put(id, account, uid, m)?;
+                all.push(msg);
                 if fresh {
                     new.push((uid, msg));
                 }
             }
             Ok(())
         }).map_err(|e| e.to_string())?;
+        self.e.certs_seen(&all).map_err(|e| e.to_string())?;
         self.e.arrived(account, id, &new).map_err(|e| e.to_string())
     }
 

@@ -30,13 +30,14 @@ mod outbox;
 pub use outbox::{retry_after, Outgoing, SendState};
 pub mod search;
 pub mod senders;
+pub mod certs;
 pub mod later;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
 /// The index's layout; an index of another layout is rebuilt from the blobs
 /// by sync (the store refuses to open it).
-const SCHEMA: u64 = 6;
+const SCHEMA: u64 = 7;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -264,6 +265,7 @@ impl Store {
             tx.open_table(senders::SETTINGS)?;
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
+            tx.open_table(certs::CERTS)?;
             tx.open_table(later::LATER)?;
             tx.open_table(later::LATER_BY_THREAD)?;
             tx.open_table(later::FOLLOW_UPS)?;

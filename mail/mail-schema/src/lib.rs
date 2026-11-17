@@ -57,12 +57,16 @@ pub enum ToJail {
         /// §6.4): no body, so no DKIM check yet; the verdict is `Pending`
         /// for a signed message until its whole text is summarized.
         headers_only: bool,
+        /// Trusted certificates (DER) for S/MIME (the system's and the
+        /// person's added ones), at most [`ROOTS_MAX`] and [`ROOTS_BYTES_MAX`].
+        roots: Vec<Vec<u8>>,
         batch: Vec<Raw>,
     },
     Open {
         authserv_id: Option<String>,
         me: Vec<String>,
         now: i64,
+        roots: Vec<Vec<u8>>,
         message: Raw,
         /// Remote pictures already loaded (§7.4): resource id and their
         /// first bytes (at most [`LOADED_HEAD`] each, [`LOADED_MAX`] of
@@ -138,6 +142,12 @@ pub struct Summary {
     pub text: Option<String>,
     pub preview: String,
     pub sender_check: SenderCheck,
+    /// S/MIME (§10.1): a signature and what was found about it, checked
+    /// only when the whole message is here.
+    pub smime: Option<Smime>,
+    /// The message is S/MIME encrypted (`application/pkcs7-mime`
+    /// enveloped data): its body is opened with the person's key.
+    pub encrypted: bool,
     pub invite: Option<Invite>,
     pub unknown_charset: bool,
     pub truncated: bool,
@@ -151,7 +161,7 @@ pub struct Address {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PartKind { Multipart, Text, Html, Calendar, Inline, Message, Attachment }
+pub enum PartKind { Multipart, Text, Html, Calendar, Inline, Message, Attachment, Signature }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Part {
@@ -176,6 +186,47 @@ pub enum SenderCheck {
     /// A key could not be fetched; check again later.
     Pending,
 }
+
+/// A signature as the parse jail checked it (mail-smime): against the
+/// roots the engine sent, at `now`, for the From address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Smime {
+    pub state: SmimeState,
+    pub signer: Option<SmimeCert>,
+    /// The issuers' names above the signer, nearest first.
+    pub issuers: Vec<String>,
+    pub signed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SmimeState {
+    /// Signed by a certificate for From that chains to a trusted root.
+    Valid,
+    /// The signature matches; the certificate isn't trusted here (why).
+    NotTrusted(String),
+    /// Changed after signing, or unreadable (why).
+    Invalid(String),
+    /// Trusted, but the certificate is for these other addresses.
+    WrongAddress(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmimeCert {
+    pub name: String,
+    pub emails: Vec<String>,
+    pub issuer: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub sha256: [u8; 32],
+    /// The certificate, DER, kept to encrypt to this sender later.
+    pub der: Vec<u8>,
+}
+
+/// Largest signer certificate the engine keeps.
+pub const SMIME_CERT_MAX: usize = 16 << 10;
+/// Roots sent to a jail, and their bytes.
+pub const ROOTS_MAX: usize = 1024;
+pub const ROOTS_BYTES_MAX: usize = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InviteMethod { Request, Cancel, Reply, Publish, Counter, Other }
@@ -357,6 +408,29 @@ impl Summary {
             // Verified means aligned with From: the domain must be From's or its parent.
             let from = self.from.first().and_then(|a| a.addr.rsplit_once('@')).map(|(_, d)| d.to_ascii_lowercase());
             if !from.is_some_and(|f| f == *domain || f.ends_with(&format!(".{domain}"))) { return Err(Lie("verified domain is not From's")) }
+        }
+        if let Some(m) = &self.smime {
+            if m.issuers.len() > 8 { return Err(Lie("too many issuers")) }
+            for i in &m.issuers { short(i, c, "issuer")? }
+            match &m.state {
+                SmimeState::Valid => {}
+                SmimeState::NotTrusted(w) | SmimeState::Invalid(w) => short(w, c, "signature state")?,
+                SmimeState::WrongAddress(l) => { if l.len() > 16 { return Err(Lie("too many addresses")) } for a in l { short(a, c, "address")? } }
+            }
+            match &m.signer {
+                Some(s) => {
+                    for x in [&s.name, &s.issuer] { short(x, c, "certificate")? }
+                    if s.emails.len() > 16 { return Err(Lie("too many certificate addresses")) }
+                    for a in &s.emails { short(a, c, "certificate address")? }
+                    if s.der.len() > SMIME_CERT_MAX { return Err(Lie("certificate too large")) }
+                    use sha2::Digest;
+                    if sha2::Sha256::digest(&s.der)[..] != s.sha256[..] { return Err(Lie("certificate hash")) }
+                    // Valid means for From: one of the certificate's addresses is From's.
+                    let from = self.from.first().map(|a| a.addr.to_ascii_lowercase());
+                    if m.state == SmimeState::Valid && !from.is_some_and(|f| s.emails.contains(&f)) { return Err(Lie("signed by a certificate for another address")) }
+                }
+                None => if !matches!(m.state, SmimeState::Invalid(_)) { return Err(Lie("a signature with no signer")) },
+            }
         }
         if let Some(i) = &self.invite {
             for s in [&i.uid, &i.title, &i.location, &i.organizer] { short(s, c, "invitation field")? }

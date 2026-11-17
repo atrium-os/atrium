@@ -9,3 +9,4 @@ description = "The fixed data format between Mail's engine and its parse jails (
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+sha2 = "0.11.1"
