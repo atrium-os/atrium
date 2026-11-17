@@ -14,9 +14,16 @@ fn a_request_is_an_https_endpoint_and_nothing_more() {
     let f = encode_request("api.example", 443, None);
     let body = &f[4..];
     assert_eq!(u32::from_le_bytes(f[..4].try_into().unwrap()) as usize, body.len());
-    assert_eq!(decode_request(body), Some(("api.example".into(), 443, None)));
+    assert_eq!(decode_request(body), Some((arca_store::Scheme::Https, "api.example".into(), 443, None)));
     let w = encode_request("cdn.example", 443, Some("news.example"));
-    assert_eq!(decode_request(&w[4..]), Some(("cdn.example".into(), 443, Some("news.example".into()))));
+    assert_eq!(decode_request(&w[4..]), Some((arca_store::Scheme::Https, "cdn.example".into(), 443, Some("news.example".into()))));
+    // A mail courier: its scheme travels, and it never has a partition.
+    let m = arca_courierd::encode_request_scheme(arca_store::Scheme::Imaps, "imap.example.org", 993, None);
+    assert_eq!(decode_request(&m[4..]), Some((arca_store::Scheme::Imaps, "imap.example.org".into(), 993, None)));
+    let mp = arca_courierd::encode_request_scheme(arca_store::Scheme::Submissions, "smtp.example.org", 465, Some("example.org"));
+    assert_eq!(decode_request(&mp[4..]), None);
+    let http = arca_courierd::encode_request_scheme(arca_store::Scheme::Http, "example.org", 80, None);
+    assert_eq!(decode_request(&http[4..]), None);
     let bad = encode_request("cdn.example", 443, Some("not a host"));
     assert_eq!(decode_request(&bad[4..]), None, "a partition is a site's host");
     let mut extra = body.to_vec();

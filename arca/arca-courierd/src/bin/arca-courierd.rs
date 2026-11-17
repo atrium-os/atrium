@@ -36,7 +36,7 @@ mod freebsd {
 
     use arca_courierd::jail::{self, Config};
     use arca_courierd::{admit, decode_request, read_request, reply, reset_registry, send_reply, Pool, PER_APP, PER_BROKER, WEB_PERSONA};
-    use arca_store::{Recipient, Scheme};
+    use arca_store::Recipient;
     use arcad::courier::{app_persona, CourierLabel};
     use arcad::label::{Label, Resolver};
     use navigator_fetch::addr;
@@ -186,7 +186,7 @@ mod freebsd {
             _ => return Err(reply::NOT_AN_APP),
         };
         let body = read_request(s).map_err(|_| reply::BAD_ENDPOINT)?;
-        let (host, port, partition) = decode_request(&body).ok_or(reply::BAD_ENDPOINT)?;
+        let (scheme, host, port, partition) = decode_request(&body).ok_or(reply::BAD_ENDPOINT)?;
         // A partition is a web courier: the broker's alone.
         if partition.is_some() && !broker {
             return Err(reply::NOT_AN_APP);
@@ -200,7 +200,7 @@ mod freebsd {
         let label = CourierLabel {
             user: user.clone(),
             persona,
-            endpoint: Recipient::endpoint(Scheme::Https, &host, port, partition.as_deref()).map_err(|_| reply::BAD_ENDPOINT)?,
+            endpoint: Recipient::endpoint(scheme, &host, port, partition.as_deref()).map_err(|_| reply::BAD_ENDPOINT)?,
         };
         let owner = format!("{user} {} {app_id}", label.persona);
         let cap = if partition.is_some() { PER_BROKER } else { PER_APP };

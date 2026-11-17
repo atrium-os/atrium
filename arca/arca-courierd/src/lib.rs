@@ -17,7 +17,7 @@
 //! The app gets one end of a socketpair; the courier has the other as its
 //! stdin and stdout. Nothing else of the courier's is the app's to touch.
 //!
-//! Wire: the app sends `u32 LE len | u8 scheme (1 https) | str host | u16
+//! Wire: the app sends `u32 LE len | u8 scheme (1 https, 3–6 mail) | str host | u16
 //! port [| str partition]` (arcad's endpoint encoding) and reads one status
 //! byte; on [`reply::OK`] the courier's socket rides on that byte
 //! (SCM_RIGHTS). Only the web broker (arca.md §8.2) may name a partition:
@@ -73,8 +73,14 @@ pub mod reply {
 }
 
 pub fn encode_request(host: &str, port: u16, partition: Option<&str>) -> Vec<u8> {
+    encode_request_scheme(arca_store::Scheme::Https, host, port, partition)
+}
+
+/// A request for a courier of any scheme a courier serves: https, or a mail
+/// scheme (mail.md §5.2), which never has a partition.
+pub fn encode_request_scheme(scheme: arca_store::Scheme, host: &str, port: u16, partition: Option<&str>) -> Vec<u8> {
     let mut w = Writer::new();
-    arcad::proto::write_endpoint(&mut w, host, port);
+    arcad::proto::write_endpoint_scheme(&mut w, scheme, host, port);
     if let Some(p) = partition {
         w.str(p);
     }
@@ -86,15 +92,15 @@ pub fn encode_request(host: &str, port: u16, partition: Option<&str>) -> Vec<u8>
 
 /// The endpoint (and partition) asked for, or `None` for anything out of
 /// shape.
-pub fn decode_request(body: &[u8]) -> Option<(String, u16, Option<String>)> {
+pub fn decode_request(body: &[u8]) -> Option<(arca_store::Scheme, String, u16, Option<String>)> {
     let mut r = Reader::new(body);
-    let ep = arcad::proto::read_endpoint(&mut r).ok()?;
+    let ep = arcad::proto::read_endpoint_any(&mut r).ok()?;
     let partition = if r.remaining() > 0 { Some(r.str(arca_store::model::caps::HOST).ok()?.to_string()) } else { None };
     r.end().ok()?;
-    let Recipient::Endpoint { host, port, .. } = ep else { return None };
-    // The same rules as a label's.
-    Recipient::endpoint(arca_store::Scheme::Https, &host, port, partition.as_deref()).ok()?;
-    Some((host, port, partition))
+    let Recipient::Endpoint { scheme, host, port, .. } = ep else { return None };
+    // The same rules as a label's (a mail scheme has no partition).
+    Recipient::endpoint(scheme, &host, port, partition.as_deref()).ok()?;
+    Some((scheme, host, port, partition))
 }
 
 pub fn read_request(s: &mut impl Read) -> io::Result<Vec<u8>> {
@@ -243,8 +249,14 @@ pub fn recv_reply(s: &UnixStream) -> io::Result<(u8, Option<OwnedFd>)> {
 /// The app's side: a courier to `host:port`, as a stream of courier frames
 /// (`arca_courier::schema`), or the launcher's status byte.
 pub fn open(socket: &str, host: &str, port: u16, partition: Option<&str>) -> Result<UnixStream, u8> {
+    open_scheme(socket, arca_store::Scheme::Https, host, port, partition)
+}
+
+/// [`open`] for any courier scheme. For a mail scheme the stream is the
+/// relayed protocol itself (mail.md §5.2), not courier frames.
+pub fn open_scheme(socket: &str, scheme: arca_store::Scheme, host: &str, port: u16, partition: Option<&str>) -> Result<UnixStream, u8> {
     let mut s = UnixStream::connect(socket).map_err(|_| reply::FAILED)?;
-    s.write_all(&encode_request(host, port, partition)).map_err(|_| reply::FAILED)?;
+    s.write_all(&encode_request_scheme(scheme, host, port, partition)).map_err(|_| reply::FAILED)?;
     match recv_reply(&s) {
         Ok((reply::OK, Some(fd))) => Ok(UnixStream::from(fd)),
         Ok((reply::OK, None)) => Err(reply::FAILED),

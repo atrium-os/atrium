@@ -8,6 +8,8 @@
 //!   the client and are never followed.
 //! - [`vault`]: arcad's courier ops.
 
+pub mod mail;
+pub mod mail_filter;
 pub mod schema;
 pub mod send;
 pub mod vault;

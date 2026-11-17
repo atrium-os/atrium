@@ -137,6 +137,64 @@ pub enum Scheme {
     /// bound to `https` is never sent over `http` because the schemes are
     /// different recipients.
     Http = 2,
+    /// IMAP over implicit TLS (RFC 8314), logged in by a mail courier
+    /// (mail.md §5.2). Mail schemes never carry a partition.
+    Imaps = 3,
+    /// SMTP submission over implicit TLS (RFC 8314).
+    Submissions = 4,
+    /// IMAP on a plain port, upgraded with STARTTLS before anything is
+    /// sent; the courier refuses to continue without TLS.
+    Imap = 5,
+    /// SMTP submission on port 587, upgraded with STARTTLS likewise.
+    Submission = 6,
+}
+
+impl Scheme {
+    pub fn from_u8(v: u8) -> Option<Scheme> {
+        Some(match v {
+            1 => Scheme::Https,
+            2 => Scheme::Http,
+            3 => Scheme::Imaps,
+            4 => Scheme::Submissions,
+            5 => Scheme::Imap,
+            6 => Scheme::Submission,
+            _ => return None,
+        })
+    }
+
+    /// The name in labels and logs (`imaps://host:993`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Scheme::Https => "https",
+            Scheme::Http => "http",
+            Scheme::Imaps => "imaps",
+            Scheme::Submissions => "submissions",
+            Scheme::Imap => "imap",
+            Scheme::Submission => "submission",
+        }
+    }
+
+    pub fn from_name(n: &str) -> Option<Scheme> {
+        [Scheme::Https, Scheme::Http, Scheme::Imaps, Scheme::Submissions, Scheme::Imap, Scheme::Submission]
+            .into_iter()
+            .find(|s| s.name() == n)
+    }
+
+    /// A mail protocol, logged in by a mail courier rather than carrying
+    /// HTTP requests.
+    pub fn is_mail(self) -> bool {
+        matches!(self, Scheme::Imaps | Scheme::Submissions | Scheme::Imap | Scheme::Submission)
+    }
+
+    /// IMAP (as opposed to SMTP submission).
+    pub fn is_imap(self) -> bool {
+        matches!(self, Scheme::Imaps | Scheme::Imap)
+    }
+
+    /// TLS from the first byte (as opposed to STARTTLS).
+    pub fn implicit_tls(self) -> bool {
+        !matches!(self, Scheme::Imap | Scheme::Submission | Scheme::Http)
+    }
 }
 
 /// The one party that may receive an item or its effect (arca.md §3).
@@ -257,6 +315,9 @@ impl Recipient {
         if !valid_host(host) || port == 0 {
             return Err(Error::BadRecipient);
         }
+        if scheme.is_mail() && partition.is_some() {
+            return Err(Error::BadRecipient);
+        }
         if let Some(p) = partition {
             if !valid_host(p) {
                 return Err(Error::BadRecipient);
@@ -345,11 +406,7 @@ impl Recipient {
     pub fn decode(r: &mut Reader<'_>) -> Result<Recipient, Error> {
         match r.u8()? {
             1 => {
-                let scheme = match r.u8()? {
-                    1 => Scheme::Https,
-                    2 => Scheme::Http,
-                    _ => return Err(Error::Corrupt("scheme")),
-                };
+                let scheme = Scheme::from_u8(r.u8()?).ok_or(Error::Corrupt("scheme"))?;
                 let host = r.str(caps::HOST)?.to_string();
                 let port = r.u16()?;
                 let partition = match r.u8()? {

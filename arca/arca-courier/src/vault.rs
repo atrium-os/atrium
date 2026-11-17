@@ -89,3 +89,31 @@ impl Vault for Arcad {
         }
     }
 }
+
+impl crate::mail::MailVault for Arcad {
+    fn login(&mut self, item: &[u8; 16]) -> Result<(String, LockedBuf), Refusal> {
+        let mut w = Writer::new();
+        w.u8(courier_op::SOURCE_ITEM);
+        w.raw(item);
+        let (st, b) = self.call(courier_op::LOGIN, &w.buf)?;
+        match st {
+            status::OK => {}
+            status::LOCKED => return Err(Refusal::Locked),
+            status::NEEDS_VERIFICATION => return Err(Refusal::NotVerified),
+            _ => return Err(Refusal::Denied),
+        }
+        let mut r = Reader::new(b.as_ref());
+        let account = r.str(arca_store::model::caps::ACCOUNT).map_err(|_| Refusal::Internal)?.to_string();
+        let v = r.bytes(arca_store::model::caps::VALUE).map_err(|_| Refusal::Internal)?;
+        let v = LockedBuf::from_slice(v).map_err(|_| Refusal::Internal)?;
+        r.end().map_err(|_| Refusal::Internal)?;
+        Ok((account, v))
+    }
+
+    fn anomaly(&mut self, code: u8, detail: &str) {
+        let mut w = Writer::new();
+        w.u8(code);
+        w.str(&detail[..detail.len().min(courier_op::ANOMALY_DETAIL_MAX)]);
+        let _ = self.call(courier_op::ANOMALY, &w.buf);
+    }
+}

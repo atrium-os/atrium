@@ -19,3 +19,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "mail_filter"
+path = "fuzz_targets/mail_filter.rs"
+test = false
+doc = false
+bench = false

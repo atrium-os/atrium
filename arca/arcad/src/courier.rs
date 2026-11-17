@@ -6,7 +6,9 @@
 //! them to. arcad and the courier both read the label from there by uid;
 //! neither believes the courier's client about it.
 //!
-//! Registry lines: `uid user persona https host port [partition]`. A line
+//! Registry lines: `uid user persona scheme host port [partition]`, the
+//! scheme `https` or a mail scheme (`imaps`, `submissions`, `imap`,
+//! `submission`; never with a partition). A line
 //! with any field out of shape is void, and so is a uid outside the range.
 
 use arca_store::model::{valid_persona, valid_user};
@@ -23,7 +25,7 @@ pub const DEFAULT_REGISTRY: &str = "/var/run/atrium/courier-registry";
 pub struct CourierLabel {
     pub user: String,
     pub persona: String,
-    /// Always `Recipient::Endpoint` with scheme https.
+    /// Always `Recipient::Endpoint`, scheme https or a mail scheme.
     pub endpoint: Recipient,
 }
 
@@ -36,12 +38,11 @@ pub fn parse_line(line: &str) -> Option<(u32, CourierLabel)> {
     if !(UID_FIRST..=UID_LAST).contains(&uid) || !valid_user(f[1]) || !valid_persona(f[2]) {
         return None;
     }
-    // Couriers carry secrets over TLS only.
-    if f[3] != "https" {
-        return None;
-    }
+    // Couriers carry secrets over TLS only: https, or a mail scheme whose
+    // courier requires TLS before it logs in (mail.md §5.2).
+    let scheme = Scheme::from_name(f[3]).filter(|s| *s == Scheme::Https || s.is_mail())?;
     let port: u16 = f[5].parse().ok()?;
-    let endpoint = Recipient::endpoint(Scheme::Https, f[4], port, f.get(6).copied()).ok()?;
+    let endpoint = Recipient::endpoint(scheme, f[4], port, f.get(6).copied()).ok()?;
     Some((uid, CourierLabel { user: f[1].into(), persona: f[2].into(), endpoint }))
 }
 
@@ -93,8 +94,8 @@ pub fn append(path: &str, line: &str) -> std::io::Result<()> {
 }
 
 pub fn label_line(uid: u32, l: &CourierLabel) -> Option<String> {
-    let Recipient::Endpoint { host, port, partition, .. } = &l.endpoint else { return None };
-    let mut s = format!("{uid} {} {} https {host} {port}", l.user, l.persona);
+    let Recipient::Endpoint { scheme, host, port, partition } = &l.endpoint else { return None };
+    let mut s = format!("{uid} {} {} {} {host} {port}", l.user, l.persona, scheme.name());
     if let Some(p) = partition {
         s.push(' ');
         s.push_str(p);

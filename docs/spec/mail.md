@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -984,6 +984,27 @@ Stalwart in the cloud VM, and later a real account):
    move to M7.
 2. **M1** the mail courier in Arca (auth, relay, filter), against a local IMAP/SMTP server;
    test that `LOGIN` after auth kills the session and is logged.
+   *Built 2026-11-17 (host-tested):* Arca learned the mail schemes (`imaps`, `submissions`,
+   and `imap`/`submission` that must STARTTLS; never with a partition) in recipients,
+   courier labels and courierd requests; arcad `courier_op::LOGIN` (account + secret,
+   Password/OAuth items only, only to a mail-scheme courier for exactly that endpoint)
+   and `ANOMALY` (logged as `ANOMALY courier:imaps://host:port/… refused-command LOGIN`,
+   first token only, never a value). `arca-courier` runs a mail session when its label is
+   a mail scheme: client hello `u32 LE 17 | u8 1 | item[16]`; connect, TLS (STARTTLS
+   with anything sent in the clear before it refused and pre-TLS capabilities ignored),
+   then `LOGIN` from Arca, `AUTHENTICATE PLAIN` (SASL-IR or continuation) / `AUTH PLAIN`,
+   greeting `* PREAUTH [CAPABILITY …]` or the post-login EHLO reply without AUTH,
+   STARTTLS, SASL-IR, COMPRESS, CHUNKING, BINARYMIME, LOGINDISABLED; EHLO name is an
+   address literal. The relay filter (`mail_filter`) refuses `LOGIN`, `AUTHENTICATE`,
+   `STARTTLS`, `UNAUTHENTICATE`, `COMPRESS` / `AUTH`, `STARTTLS`, `BDAT`; holds client
+   bytes after a synchronising literal until the server's `+` (or its answer, after
+   which they are commands again) and after `DATA` until the 354 (pipelined replies
+   counted); lines ≤ 64 KiB, literals ≤ 80 MiB, held ≤ 64 KiB. Tests: arcad 3, courier
+   8 against scripted TLS IMAP/SMTP servers (LOGIN/STARTTLS/AUTH/BDAT after login
+   refused and logged and never reach the server; smuggling through a refused literal or
+   refused DATA caught; wrong password, locked Arca, wrong certificate with Arca never
+   asked); fuzz `mail_filter` 4 M runs clean (forwarded bytes always a prefix of the
+   client's). Not yet: XOAUTH2/OAUTHBEARER (with §5.3), a VM run against Dovecot.
 3. **M2** engine + sync: read-only IMAP sync into the store, the index, plain-text reading in
    a minimal Pergola window; jailed parse batches.
 4. **M3** the full UI: three panes, conversations, HTML through `doc-viewer`, remote content

@@ -20,6 +20,7 @@
 
 use std::process::ExitCode;
 
+use arca_courier::mail::{self as mailc, MailEndpoint};
 use arca_courier::send::{read_frame, write_frame, Courier, Endpoint};
 use arca_courier::vault::Arcad;
 use arca_store::Recipient;
@@ -58,7 +59,7 @@ fn main() -> ExitCode {
         eprintln!("arca-courier: uid {uid} has no courier label");
         return ExitCode::FAILURE;
     };
-    let Recipient::Endpoint { host, port, .. } = label.endpoint else { return ExitCode::FAILURE };
+    let Recipient::Endpoint { scheme, host, port, .. } = label.endpoint else { return ExitCode::FAILURE };
     let pem = match std::fs::read(env("ARCA_COURIER_CA", "/etc/ssl/cert.pem")) {
         Ok(p) => p,
         Err(e) => {
@@ -97,6 +98,9 @@ fn main() -> ExitCode {
         Some(f) => f,
         None => &Direct,
     };
+    if scheme.is_mail() {
+        return mail(MailEndpoint { scheme, host, port }, net, tls, policy);
+    }
     let mut courier = Courier::new(Endpoint { host, port }, net, tls, policy);
     let mut vault = Arcad::new(env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock"));
     let (mut input, mut output) = (std::io::stdin().lock(), std::io::stdout().lock());
@@ -112,4 +116,30 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// A mail courier (mail.md §5.2): one session, logged in with the item the
+/// client names, then relayed. The client's socket is stdin and stdout,
+/// read and written unbuffered, since the relay polls the descriptor.
+fn mail(ep: MailEndpoint, net: &(dyn Connect + Sync), tls: std::sync::Arc<rustls::ClientConfig>, policy: addr::Policy) -> ExitCode {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fds 0 and 1 are open for the life of the process, and each
+    // is owned by exactly one File here.
+    let (cin, cout) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
+    let mut vault = Arcad::new(env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock"));
+    match mailc::session(&ep, net, tls, policy, cin, cout, &mut vault) {
+        mailc::Ended::Closed => ExitCode::SUCCESS,
+        mailc::Ended::Refused(what) => {
+            eprintln!("arca-courier: {}://{}:{}: client refused: {what}", ep.scheme.name(), ep.host, ep.port);
+            ExitCode::FAILURE
+        }
+        mailc::Ended::LoginFailed => {
+            eprintln!("arca-courier: {}://{}:{}: the server refused the sign-in", ep.scheme.name(), ep.host, ep.port);
+            ExitCode::FAILURE
+        }
+        mailc::Ended::NotLoggedIn(why) => {
+            eprintln!("arca-courier: {}://{}:{}: not logged in: {why:?}", ep.scheme.name(), ep.host, ep.port);
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -230,6 +230,7 @@ impl State {
             Label::TrustedUi => "ui".into(),
             Label::Service(n) => format!("service:{n}"),
             Label::Courier(c) => match &c.endpoint {
+                Recipient::Endpoint { scheme, host, port, .. } if scheme.is_mail() => format!("courier:{}://{host}:{port}/{}@{}", scheme.name(), c.persona, c.user),
                 Recipient::Endpoint { host, port, .. } => format!("courier:{host}:{port}/{}@{}", c.persona, c.user),
                 _ => "courier:?".into(),
             },
@@ -363,7 +364,7 @@ impl State {
                 let kind = field!(r.u16());
                 let class = rep!(class_for_app(field!(r.u8())));
                 let account = field!(r.str(caps::ACCOUNT));
-                let endpoint = field!(crate::proto::read_endpoint(&mut r));
+                let endpoint = field!(crate::proto::read_endpoint_any(&mut r));
                 let value = field!(r.bytes(caps::VALUE));
                 field!(r.end());
                 let Ok(kind) = Kind::from_u16(kind) else { return malformed() };
@@ -387,7 +388,7 @@ impl State {
             }
             op::LIST | op::LIST_FOR => {
                 let (persona, recipient) = if op == op::LIST_FOR {
-                    let ep = field!(crate::proto::read_endpoint(&mut r));
+                    let ep = field!(crate::proto::read_endpoint_any(&mut r));
                     let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
                     (app_persona(publisher, app_id), ep)
                 } else {
@@ -1279,6 +1280,67 @@ impl State {
                     at += 4 + v.len();
                 }
                 Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            courier_op::LOGIN => {
+                let parsed = (|| {
+                    let src = r.u8()?;
+                    let x = r.array::<16>()?;
+                    r.end()?;
+                    Ok::<_, Error>((src, x))
+                })();
+                let Ok((src, x)) = parsed else { return malformed() };
+                if src != courier_op::SOURCE_ITEM {
+                    return malformed();
+                }
+                // Only a mail courier logs in; an https courier fills slots.
+                let Recipient::Endpoint { scheme, .. } = &c.endpoint else { return reply(status::DENIED) };
+                if !scheme.is_mail() {
+                    return reply(status::DENIED);
+                }
+                let Some(store) = self.stores.get(&c.user) else { return reply(status::LOCKED) };
+                let id = ItemId(x);
+                *item = Some(id);
+                let m = tri!(store.meta(&id, &who));
+                if !matches!(m.kind, Kind::Password | Kind::OAuthToken) {
+                    return reply(status::DENIED);
+                }
+                if m.class == Class::VerifyEachUse && !verified {
+                    return reply(status::NEEDS_VERIFICATION);
+                }
+                let uv = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
+                let (_, v) = tri!(store.release(&id, &who, uv));
+                let acct = m.account.as_bytes();
+                let total = 4 + acct.len() + 4 + v.len();
+                let mut out = tri!(LockedBuf::zeroed(total).map_err(Error::Io));
+                let b = out.as_mut();
+                b[..4].copy_from_slice(&(acct.len() as u32).to_le_bytes());
+                b[4..4 + acct.len()].copy_from_slice(acct);
+                let at = 4 + acct.len();
+                b[at..at + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                b[at + 4..].copy_from_slice(v.as_ref());
+                Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            courier_op::ANOMALY => {
+                let parsed = (|| {
+                    let code = r.u8()?;
+                    let detail = r.str(courier_op::ANOMALY_DETAIL_MAX)?;
+                    r.end()?;
+                    Ok::<_, Error>((code, detail.to_string()))
+                })();
+                let Ok((code, detail)) = parsed else { return malformed() };
+                // A name, never a value: only a command-shaped token is kept.
+                let detail: String = detail.split_ascii_whitespace().next().unwrap_or("")
+                    .chars().filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-').collect();
+                let what = match code {
+                    courier_op::anomaly::REFUSED_COMMAND => "refused-command",
+                    courier_op::anomaly::MALFORMED => "malformed",
+                    _ => return malformed(),
+                };
+                if let (Some(f), Recipient::Endpoint { scheme, host, port, .. }) = (self.audit.as_mut(), &c.endpoint) {
+                    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let _ = writeln!(f, "{t} ANOMALY courier:{}://{host}:{port}/{}@{} {what} {detail}", scheme.name(), c.persona, c.user);
+                }
+                ok(Vec::new())
             }
             courier_op::SET_COOKIE => {
                 let parsed = (|| {

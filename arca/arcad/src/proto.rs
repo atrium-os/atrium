@@ -234,10 +234,51 @@ pub mod courier_op {
     /// ticket at its end.
     pub const COOKIES: u16 = 0x82;
 
+    /// A mail courier's login (mail.md §5.2), after TLS is up and only for
+    /// a courier whose label is a mail scheme: `u8 source (1 item) | ref[16]`
+    /// → `str account | bytes value`. Password and OAuth token items only.
+    pub const LOGIN: u16 = 0x83;
+    /// A courier reports an exact anomaly (arca.md §10) before it ends its
+    /// client: `u8 code | str detail` → nothing. Logged, never a value.
+    pub const ANOMALY: u16 = 0x84;
+
+    /// [`ANOMALY`] codes.
+    pub mod anomaly {
+        /// A mail courier's client sent a refused command after login
+        /// (`LOGIN`, `AUTHENTICATE`, `STARTTLS`, `AUTH`, ...): the detail is
+        /// the command's name.
+        pub const REFUSED_COMMAND: u8 = 1;
+        /// The client broke the protocol in a way the relay's parser
+        /// refuses (a line or literal over its limits).
+        pub const MALFORMED: u8 = 2;
+    }
+    /// Longest [`ANOMALY`] detail.
+    pub const ANOMALY_DETAIL_MAX: usize = 32;
+
     pub const SOURCE_ITEM: u8 = 1;
     pub const SOURCE_HANDLE: u8 = 2;
     /// Most slots one request fills.
     pub const MAX_SLOTS: usize = 8;
+}
+
+/// An endpoint on the wire, https or a mail scheme: `u8 scheme | str host |
+/// u16 port`. For storing and listing an app's items and for asking for a
+/// courier; the web broker's ops take https only ([`read_endpoint`]).
+pub fn read_endpoint_any(r: &mut arca_store::codec::Reader<'_>) -> Result<arca_store::Recipient, arca_store::Error> {
+    use arca_store::model::caps;
+    let scheme = arca_store::Scheme::from_u8(r.u8()?).ok_or(arca_store::Error::BadRecipient)?;
+    let host = r.str(caps::HOST)?;
+    let port = r.u16()?;
+    if scheme != arca_store::Scheme::Https && !scheme.is_mail() {
+        return Err(arca_store::Error::BadRecipient);
+    }
+    arca_store::Recipient::endpoint(scheme, host, port, None)
+}
+
+pub fn write_endpoint_scheme(w: &mut arca_store::codec::Writer, scheme: arca_store::Scheme, host: &str, port: u16) {
+    w.u8(scheme as u8);
+    w.str(host);
+    w.u16(port);
 }
 
 /// An endpoint on the wire: `u8 scheme (1 https) | str host | u16 port`.
