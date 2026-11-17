@@ -281,9 +281,14 @@ DHCPv6 as built (2026-11-15):
   `inet6`, leaving a Wi-Fi network did not remove its SLAAC addresses, and the overlap
   check saw only the addresses from start-up). It now reads them once at start and then
   keeps them from the routing socket's RTM_NEWADDR/RTM_DELADDR messages.
-- Seen once each on two fresh boots: no RFC 8981 temporary address on the first run
-  after boot (the kernel makes one only together with a new stable address); later runs
-  have one. Not yet looked into.
+- Fixed 2026-11-17: no RFC 8981 temporary address on the first gate run after a boot. An
+  RA handled before atrium-net starts (here rc.conf's `ifconfig_DEFAULT="... inet6
+  accept_rtadv"`, and the gate LAN's first RA) makes a stable SLAAC address while
+  `use_tempaddr` is still 0, and the kernel adds a temporary address only when it makes a
+  new stable one (`prelist_update`), so none ever came. At start atrium-net now removes,
+  per /64, SLAAC addresses that have no temporary partner (flags by `SIOCGIFAFLAG_IN6`,
+  RAs off while deleting); the next RA makes both. A restart leaves prefixes that have
+  one alone.
 
 ### 7.1 CLASS_NETCONF (new Aqueduct class 18)
 

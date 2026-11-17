@@ -27,6 +27,9 @@ const SIOCDIFGROUP: u64 = ioc(IOC_IN, b'i', 137, IFGROUPREQ);
 const IN6_IFREQ: usize = 288;
 const IN6_NDIREQ: usize = 72;
 const SIOCDIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 25, IN6_IFREQ);
+const SIOCGIFAFLAG_IN6: u64 = ioc(IOC_IN | IOC_OUT, b'i', 73, IN6_IFREQ);
+pub const IN6_IFF_AUTOCONF: u32 = 0x40;
+pub const IN6_IFF_TEMPORARY: u32 = 0x80;
 const IN6_ALIASREQ: usize = 136;
 const SIOCAIFADDR_IN6: u64 = ioc(IOC_IN, b'i', 27, IN6_ALIASREQ);
 const SIOCGIFINFO_IN6: u64 = ioc(IOC_IN | IOC_OUT, b'i', 108, IN6_NDIREQ);
@@ -168,6 +171,19 @@ impl Ifc {
             return err("SIOCAIFADDR_IN6");
         }
         Ok(())
+    }
+
+    /// An IPv6 address's flags (IN6_IFF_*).
+    pub fn addr6_flags(&self, name: &str, a: Ipv6Addr) -> io::Result<u32> {
+        let mut r = [0u8; IN6_IFREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        r[16] = 28;
+        r[17] = libc::AF_INET6 as u8;
+        r[24..40].copy_from_slice(&a.octets());
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCGIFAFLAG_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCGIFAFLAG_IN6");
+        }
+        Ok(u32::from_ne_bytes(r[16..20].try_into().unwrap()))
     }
 
     /// Remove an IPv6 address (SLAAC addresses of a network we left).

@@ -5584,8 +5584,6 @@ answers neighbor solicitations, pings and DNS (AAAA). `vtnet0` keeps ssh.
 
 `sh scripts/aura-sim-gate.sh vms` boots the same VM with the LAN NIC too, so the Aura
 and atrium-net gates share one VM (and one boot of the fork kernel).
-The first n0 run after a fresh boot has twice found no temporary IPv6 address (later
-runs do); run it again before chasing it.
 
 N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP VM):
 

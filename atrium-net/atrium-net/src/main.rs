@@ -745,6 +745,33 @@ mod imp {
             let _ = self.ifc.accept_rtadv(&name, true);
         }
 
+        /// SLAAC addresses made before atrium-net took the port (rc.conf's
+        /// `accept_rtadv`, an earlier owner) were made with temporary
+        /// addresses off, and the kernel adds a temporary address only when
+        /// it makes a new stable one. A prefix with a SLAAC address and no
+        /// temporary one loses its SLAAC addresses here; the next RA (the
+        /// router solicitations follow) makes them again, with a temporary
+        /// address. Prefixes that have one (an atrium-net restart) are left
+        /// alone, so restarts do not break connections.
+        fn clear_unprivate_slaac(&mut self, name: &str, v6: &[Ipv6Addr]) {
+            let p64 = |a: &Ipv6Addr| u64::from_be_bytes(a.octets()[..8].try_into().unwrap());
+            let flagged: Vec<(Ipv6Addr, u32)> = v6.iter().filter(|a| a.segments()[0] & 0xffc0 != 0xfe80).filter_map(|&a| self.ifc.addr6_flags(name, a).ok().map(|f| (a, f))).collect();
+            let auto = |f: u32| f & sys::IN6_IFF_AUTOCONF != 0;
+            let temp = |f: u32| f & sys::IN6_IFF_TEMPORARY != 0;
+            let stale: Vec<Ipv6Addr> = flagged.iter().filter(|(a, f)| auto(*f) && !flagged.iter().any(|(b, g)| temp(*g) && p64(a) == p64(b))).map(|(a, _)| *a).collect();
+            if stale.is_empty() {
+                return;
+            }
+            // RAs off while deleting (the kernel race, §5.3); enable_inet6 turns them on.
+            let _ = self.ifc.accept_rtadv(name, false);
+            for a in stale {
+                match self.ifc.del_addr6(name, a) {
+                    Ok(()) => self.log(&format!("{name}: removed {a} (SLAAC without a temporary address, made before atrium-net)")),
+                    Err(e) => eprintln!("atrium-net: {name}: removing {a}: {e}"),
+                }
+            }
+        }
+
         fn wifi_iface(&mut self) -> Option<usize> {
             self.ifs.iter().position(|i| i.wifi)
         }
@@ -1431,6 +1458,7 @@ mod imp {
             let mac = info.mac.unwrap_or_else(|| die(&format!("{name} has no MAC")));
             let is_wifi = o.wifi.as_deref() == Some(name.as_str());
             net.ifc.up(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
+            net.clear_unprivate_slaac(name, &info.v6);
             if let Err(e) = net.ifc.enable_inet6(name) {
                 eprintln!("atrium-net: {name}: IPv6: {e}");
             }
