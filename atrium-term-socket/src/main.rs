@@ -244,8 +244,8 @@ struct Session {
     /// The strip and the switcher's state; the switcher's targets.
     strip:    render::Strip,
     targets:  Vec<String>,
-    /// A workspace's `pkg` request being asked about (its words).
-    asking:   Option<String>,
+    /// A workspace's request (pkg, Run) being asked about.
+    asking:   Option<pkgask::Ask>,
     /// pkg running (or just run) after Install, drawn over the tab.
     admin:    Option<pkgask::Admin>,
 }
@@ -306,8 +306,8 @@ impl Session {
         self.dirty = true;
     }
 
-    /// A `pkg` request came from this tab's program.
-    fn take_ask(&mut self, words: String) {
+    /// A workspace request (pkg, Run) came from this tab's program.
+    fn take_ask(&mut self, raw: String) {
         if self.asking.is_some() || self.admin.is_some() {
             eprintln!("atrium-term-socket: window {}: a pkg request while one is open; ignored", self.win);
             return;
@@ -317,11 +317,15 @@ impl Session {
             self.io.input(pkgask::CANCEL);
             return;
         };
-        let head = pkgask::heading(ws, &words);
+        let Some(ask) = pkgask::Ask::parse(&raw) else {
+            self.io.input(pkgask::CANCEL);
+            return;
+        };
+        let (head, yes) = ask.question(ws);
         eprintln!("atrium-term-socket: window {}: {head}", self.win);
         self.renderer.menu_w = render::menu_width(&head);
-        self.strip.menu = Some((vec![head, "Install".into(), "Cancel".into()], 1));
-        self.asking = Some(words);
+        self.strip.menu = Some((vec![head, yes.into(), "Cancel".into()], 1));
+        self.asking = Some(ask);
         self.dirty = true;
     }
 
@@ -664,10 +668,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some((i, activation)) = choose.filter(|_| s.asking.is_some()) {
                         match i {
                             1 => {
-                                let words = s.asking.take().unwrap_or_default();
+                                let ask = s.asking.take();
                                 s.close_switcher();
                                 let ws = pkgask::workspace_of(s.app.as_deref()).unwrap_or_default().to_string();
                                 let (cols, rows) = (s.io.grid().cols(), s.io.grid().rows());
+                                let words = match ask {
+                                    Some(pkgask::Ask::Pkg(w)) => w,
+                                    Some(pkgask::Ask::Run(folder)) => {
+                                        match pkgask::run(&ws, &folder, activation) {
+                                            Ok(id) => {
+                                                eprintln!("atrium-term-socket: window {}: ran {folder} of {ws} as {id}", s.win);
+                                                s.strip.hint = format!("running {folder} as {id}");
+                                                s.io.input(&pkgask::ok_reply(0));
+                                            }
+                                            Err(e) => {
+                                                eprintln!("atrium-term-socket: run {folder} of {ws}: {e}");
+                                                s.strip.hint = format!("not run: {e}");
+                                                s.io.input(&pkgask::ok_reply(1));
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    None => continue,
+                                };
                                 match pkgask::Admin::start(&ws, &words, activation, cols, rows) {
                                     Ok(a) => {
                                         eprintln!("atrium-term-socket: window {}: pkg {words} in {ws}", s.win);

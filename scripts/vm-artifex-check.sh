@@ -8,6 +8,7 @@
 # jumps to its line; the Terminal button opens proj's terminal; with clangd
 # on the workspace's PATH (the c-dev layer) a diagnostic comes from it too.
 # Runs on the HOST after cloud-vm.sh up (QEMU fork, TCG_CPU=Haswell-noTSX).
+# CDEV=<c-dev layer tree> installs it first (build-c-dev-layer.sh's output).
 # Ends "artifex: N failed".
 #
 #   sh scripts/vm-artifex-check.sh [out-dir]
@@ -121,6 +122,33 @@ waitstate() { # pattern [secs]
     state | grep -q -- "$1"
 }
 
+# The c-dev layer (clangd), when CDEV names its tree: signed with a gate
+# key standing in for the platform key, as vm-layers-check.sh does. A C
+# workspace made after it gets it on PATH.
+CDEV=${CDEV:-}
+if [ -n "$CDEV" ] && [ -f "$CDEV/atrium.toml" ]; then
+    echo "=== the c-dev layer"
+    (cd "$ROOT/portcullis" && cargo build -q -p opifex) || { echo "host opifex failed"; exit 1; }
+    LH=$(mktemp -d)
+    openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out "$LH/gate.key"
+    openssl ec -in "$LH/gate.key" -pubout -out "$LH/gate.pem" 2>/dev/null
+    # The manifest without its content line (the [layer.env] after it stays).
+    grep -v '^content = ' "$CDEV/atrium.toml" > "$LH/c-dev.toml"
+    "$ROOT/portcullis/target/debug/opifex" layer pack "$CDEV" --manifest "$LH/c-dev.toml" --sign "$LH/gate.key" >/dev/null || bad "pack c-dev"
+    (cd "$(dirname "$CDEV")" && tar -czf "$LH/c-dev.tar.gz" "$(basename "$CDEV")")
+    want=$(sha256sum "$LH/c-dev.tar.gz" | cut -d' ' -f1)
+    scp -q $K -P 2222 "$LH/c-dev.tar.gz" "$LH/gate.pem" root@localhost:$B/
+    [ "$want" = "$(V "sha256 -q $B/c-dev.tar.gz")" ] || bad "c-dev arrived damaged (TCG scp); run again"
+    out=$(V "cd $B && tar -xf c-dev.tar.gz && rm c-dev.tar.gz && mkdir -p /etc/atrium/platform-keys && cp gate.pem /etc/atrium/platform-keys/artifex-gate.pem && \
+       for w in scratch proj; do su -m alice -c \"portcullis workspace stop \$w\" >/dev/null 2>&1; done; \
+       for j in \$(jls name | grep '^ws_alice_'); do jail -r \$j; done; \
+       for m in \$(mount -p | awk '\$2 ~ /toolchains/ {print \$2}' | sort -r); do umount -f \$m; done; \
+       (opifex layer remove c-dev@1 >/dev/null 2>&1; opifex layer install $B/$(basename "$CDEV"))" 2>&1)
+    V "opifex layer list" | grep -q " c-dev@1 " && V "grep -q LD_LIBRARY_PATH /var/lib/atrium/layers/c-dev@1/atrium.toml" \
+        && ok "c-dev installed" || bad "c-dev: $out"
+    rm -rf "$LH"
+fi
+
 echo "=== the workspace"
 V "service atrium-jaild status >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1; sleep 1; test -S /var/run/atrium/jaild.sock" && ok "jaild is up" || bad "no jaild"
 W=/home/alice/.atrium/workspaces
@@ -185,8 +213,8 @@ V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's termin
 shot artifex-4-terminal
 
 echo "=== clangd"
-if V "test -x /atrium/toolchains/c-dev/bin/clangd"; then
-    waitstate 'lsp=Some("clangd' 120 && ok "clangd answers" || bad "clangd: $(state)"
+if V "jexec ws_alice_proj test -x /atrium/toolchains/c-dev/bin/clangd"; then
+    waitstate 'lsp=Some("clangd") diags=[2-9]' 120 && ok "clangd answers, with its own diagnostic" || bad "clangd: $(state)"
 else
     echo "  (no clangd in proj: the c-dev layer isn't installed here; skipped)"
 fi
