@@ -249,6 +249,11 @@ pub mod control {
     /// (`WindowHints.min_size`, resolution-independence.md §6.3), so it
     /// enumerates again and places it to fit.
     pub const EV_WINDOW_MIN_SIZE:        u16 = 0x058f;
+    /// `WindowActivateEvent`, to the WM: bring a window forward and give
+    /// it focus, because a link or a document was just handed to its app
+    /// on a press in another app (opening-links.md §5,
+    /// `activation::op::RAISE`).
+    pub const EV_WINDOW_ACTIVATE:        u16 = 0x0590;
     /// `AppearancePayload`, to every client: the system appearance
     /// changed (light/dark). Redraw in it.
     pub const EV_APPEARANCE_CHANGED:     u16 = 0x058a;
@@ -1546,6 +1551,12 @@ pub struct WindowMinSizeEvent {
     pub window_id: u32,
 }
 
+/// `EV_WINDOW_ACTIVATE` — bring `window_id` forward and focus it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowActivateEvent {
+    pub window_id: u32,
+}
+
 /// `EV_WINDOW_DESTROYED` — a surface was destroyed. The window manager
 /// reconciles to reclaim its slot and re-arrange the survivors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2626,6 +2637,10 @@ pub mod activation {
         pub const CONSUME: u16 = 0x0900;
         /// `Grant` → `GrantResult`; Forum's uid only.
         pub const GRANT: u16 = 0x0901;
+        /// `Raise` → `RaiseResult`: bring forward a window of the app a
+        /// link was just handed to. Only by a caller that spent a `LINK`
+        /// press in the last two minutes, once per press.
+        pub const RAISE: u16 = 0x0902;
     }
 
     /// What a broker spends a token on (§2.2's table decides which kinds fit).
@@ -2713,6 +2728,20 @@ pub mod activation {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum GrantResult {
         Ok { token: Token },
+        Refused { reason: u8 },
+    }
+
+    /// Bring forward the top window of `uid`'s (the app a link went to).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Raise {
+        pub uid: u32,
+    }
+
+    /// `NOT_ALLOWED`: no `LINK` press spent lately; `UNKNOWN`: `uid` has
+    /// no window on screen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum RaiseResult {
+        Ok { window_id: u32 },
         Refused { reason: u8 },
     }
 }
@@ -3007,6 +3036,7 @@ mod tests {
             control::EV_WINDOW_CREATED,
             control::EV_WINDOW_DESTROYED,
             control::EV_WINDOW_MIN_SIZE,
+            control::EV_WINDOW_ACTIVATE,
             control::EV_WINDOW_FILLS_DROPPED,
             control::EV_BUDGET_REFUSED,
             control::EV_WINDOW_EMBED_TOKEN,

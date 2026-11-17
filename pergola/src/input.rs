@@ -54,6 +54,7 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::WindowCreated { .. }
         | fresco_client::Event::WindowDestroyed { .. }
         | fresco_client::Event::WindowMinSize { .. }
+        | fresco_client::Event::WindowActivate { .. }
         // The output changed mode: the App's window keeps its size.
         | fresco_client::Event::DisplayChanged(_)
         // The system appearance: the App's theme follows it, not input.

@@ -67,6 +67,8 @@ pub enum DisplayEvent {
     WindowDestroyed      { window_id: u32 },
     /// A window's minimum size changed: to the WM, which places it again.
     WindowMinSize        { window_id: u32 },
+    /// To the WM: bring the window forward and focus it.
+    WindowActivate       { window_id: u32 },
     /// The display's mode changed; every client lays out again.
     /// `scale_milli`: the scale new windows open at.
     DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32, scale_milli: u32 },
@@ -300,6 +302,10 @@ pub fn encode_event_with(ev: &DisplayEvent, scale_of: &ScaleOf<'_>)
         DisplayEvent::WindowMinSize { window_id } => {
             let p = fresco_protocol::WindowMinSizeEvent { window_id: *window_id };
             Ok((control::EV_WINDOW_MIN_SIZE, encode(&p)?))
+        }
+        DisplayEvent::WindowActivate { window_id } => {
+            let p = fresco_protocol::WindowActivateEvent { window_id: *window_id };
+            Ok((control::EV_WINDOW_ACTIVATE, encode(&p)?))
         }
         DisplayEvent::AppearanceChanged(p) => Ok((control::EV_APPEARANCE_CHANGED, encode(p)?)),
         DisplayEvent::WindowSpan { window_id, tiles, hidden } => {

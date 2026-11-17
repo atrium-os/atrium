@@ -100,6 +100,9 @@ pub enum Event {
     WindowDestroyed { window_id: u32 },
     /// A window's minimum size changed (to the WM): place it again.
     WindowMinSize { window_id: u32 },
+    /// To the WM: bring `window_id` forward and focus it (a link was
+    /// handed to its app).
+    WindowActivate { window_id: u32 },
     /// The display's mode changed (a switch, or a monitor plugged or
     /// swapped): the new screen. Lay out again for it.
     DisplayChanged(DisplayInfoResponse),
@@ -1418,6 +1421,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         control::EV_WINDOW_MIN_SIZE => match decode::<fresco_protocol::WindowMinSizeEvent>(payload) {
             Ok(p) => Event::WindowMinSize { window_id: p.window_id },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_WINDOW_ACTIVATE => match decode::<fresco_protocol::WindowActivateEvent>(payload) {
+            Ok(p) => Event::WindowActivate { window_id: p.window_id },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         control::EV_APPEARANCE_CHANGED => match decode::<fresco_protocol::AppearancePayload>(payload) {

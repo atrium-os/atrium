@@ -339,6 +339,7 @@ fn spawn_input_poller(core: Core) {
             let mut snap_dir: Option<Snap> = None;
             let mut unsnap = false;
             let mut next_monitor = false;
+            let mut activate: Option<u32> = None;
             let mut media_keys = Vec::new();
             let mut volume_keys = Vec::new();
             let mut display: Option<fresco_protocol::DisplayInfoResponse> = None;
@@ -356,6 +357,8 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
                         // An app's minimum size changed (its text grew): place it again.
                         Ok(Some(Event::WindowMinSize { .. })) => surfaces_changed = true,
+                        // A link was handed to its app: bring it forward.
+                        Ok(Some(Event::WindowActivate { window_id })) => activate = Some(window_id),
                         // The output changed (a mode switch or a monitor swap):
                         // keep the latest, re-lay out once below.
                         Ok(Some(Event::DisplayChanged(d))) => display = Some(d),
@@ -587,6 +590,16 @@ fn spawn_input_poller(core: Core) {
                     Ok(Some(f)) => eprintln!("forum-wm: switcher → focus surface {f}"),
                     Ok(None) => {}               // <2 documents — nothing to cycle
                     Err(e) => eprintln!("forum-wm: cycle_focus error: {e}"),
+                }
+            }
+
+            if let Some(w) = activate {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.activate(conn, w) {
+                    Ok(Some(f)) => eprintln!("forum-wm: a link was handed to surface {w}'s app → focus surface {f}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("forum-wm: activate error: {e}"),
                 }
             }
 

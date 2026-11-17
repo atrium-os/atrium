@@ -349,6 +349,7 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         E::DisplayChanged { .. } | E::AppearanceChanged(_) => return Route::All,
         // A window's minimum size: the WM's business alone.
         E::WindowMinSize { .. } => return Route::WmOnly,
+        E::WindowActivate { .. } => return Route::WmOnly,
         E::AnimationFinished(a) => return Route::Owner(owner_of(a.window_id)),
         E::WindowFillsDropped { window_id, .. }
         | E::BudgetRefused { window_id, .. }

@@ -5842,8 +5842,9 @@ manifest takes `http`/`https` links, so its jail has a document channel, which n
 first. Last, `org.test.linkprobe` (monstrator's `link-probe` example: a window, `graphics` and
 `open-uri`) is launched for navtest; Enter in its window sends the fixture's Impluvium page to
 Monstrator with that press, portcullisd hands it to the running Navigator (https's default), and the
-UI opens it in a trail of its own (`trails` up by one). 65 checks; on 2026-11-17 64 passed and the
-65th failed only on its own wording ("an https", portcullisd says "a https"), fixed in the script. 61/61 on
+UI opens it in a trail of its own (`trails` up by one); since the Navigator was running, portcullisd
+asks frescod to bring its window forward (`RAISE`, owed once per `LINK` press it spent) and forum-wm
+does, over link-probe's (`a link was handed to surface` in `wm.log`). 67/67 on 2026-11-17. Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

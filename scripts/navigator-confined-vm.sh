@@ -474,10 +474,14 @@ i=0; while [ $i -lt 90 ] && ! g "grep -q -e 'link-probe: opened' -e 'link-probe:
 g "grep -q 'link-probe: opened' $S/linkprobe.log" && ok "Monstrator took its link with the press, and portcullisd handed it on" || bad "link-probe: $(g "tail -2 $S/linkprobe.log; tail -2 $ML; grep -h link $PL | tail -2" | tr '\n' ';')"
 g "grep -q 'a https link from org.test.linkprobe opened in org.atrium.navigator for navtest' $PL" && ok "…to the Navigator, the default for https" || bad "portcullisd: $(g "grep -h link $PL | tail -3" | tr '\n' ';')"
 until_trace "trails=$((${T0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown" && ok "the Navigator opened it in a trail of its own" || bad "incoming: $(last); $(g "grep -h 'other app' $UL | tail -2")"
-# link-probe's window is over the Navigator's; the shot is taken without it.
-g "pkill -x link-probe; true"
-sleep 5
+# The Navigator was running: portcullisd asks frescod to bring its window
+# forward (once per LINK press it spent), and forum-wm does, over
+# link-probe's window.
+g "grep -q 'org.atrium.navigator.s window [0-9]* brought forward' $PL" && ok "…and its window came forward" || bad "raise: $(g "grep -h 'brought forward' $PL | tail -2; grep -h 'link was handed' $S/wm.log | tail -1")"
+g "grep -q 'a link was handed to surface' $S/wm.log" && ok "…by forum-wm, on frescod's word" || bad "forum-wm: $(g "tail -3 $S/wm.log")"
+sleep 3
 shot confined-5-incoming
+g "pkill -x link-probe; true"
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"

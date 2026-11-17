@@ -273,6 +273,31 @@ pub fn spend_press(sock: &Path, token: [u8; 16], presenter_uid: u32) -> Result<(
     spend_press_for(sock, token, presenter_uid, fresco_protocol::activation::purpose::OPEN)
 }
 
+/// Ask frescod to bring forward `uid`'s top window: the app a link was
+/// just handed to (opening-links.md §5). frescod allows it once per
+/// `LINK` press this daemon spent in the last two minutes.
+pub fn raise(sock: &Path, uid: u32) -> Result<u32, String> {
+    use fresco_protocol::activation::{op, refusal, Raise, RaiseResult};
+    let ask = || -> io::Result<RaiseResult> {
+        let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
+        let mut conn = aqueduct::Connection::connect(sock)?;
+        let payload = postcard::to_stdvec(&Raise { uid }).map_err(|e| bad(e.to_string()))?;
+        conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::RAISE, aqueduct::flag::RESPONSE_EXPECTED, &payload)?;
+        conn.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let m = conn.recv_message()?;
+        if m.op != op::RAISE || m.flags & aqueduct::flag::IS_RESPONSE == 0 {
+            return Err(bad("unexpected reply".into()));
+        }
+        postcard::from_bytes(&m.payload).map_err(|e| bad(e.to_string()))
+    };
+    match ask() {
+        Ok(RaiseResult::Ok { window_id }) => Ok(window_id),
+        Ok(RaiseResult::Refused { reason: refusal::UNKNOWN }) => Err("it has no window on screen".into()),
+        Ok(RaiseResult::Refused { reason }) => Err(format!("frescod refused ({reason})")),
+        Err(e) => Err(format!("frescod: {e}")),
+    }
+}
+
 /// [`spend_press`] for another purpose (an app's console: `CONSOLE`).
 pub fn spend_press_for(sock: &Path, token: [u8; 16], presenter_uid: u32, purpose_: u8) -> Result<(), String> {
     use fresco_protocol::activation::{op, refusal, Consume, ConsumeResult};

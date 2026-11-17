@@ -572,8 +572,9 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
             let (focused, may_consume, may_grant) = (focused.clone(), allowed.consumers.get(&uid).cloned(), allowed.forum == Some(uid));
             let binder = allowed.binders.contains(&uid).then(|| comp.clone());
             let binders = allowed.binders.clone();
+            let all = comp.clone();
             let _ = std::thread::Builder::new().name("frescod-activation-conn".into()).spawn(move || {
-                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused, binder.as_deref(), &binders) {
+                if let Err(e) = conn_loop(s, uid, may_consume, may_grant, &*focused, binder.as_deref(), &binders, &all) {
                     log::debug!("activation connection: {e}");
                 }
             });
@@ -582,11 +583,64 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     Ok(())
 }
 
+/// Raises owed for `LINK` presses spent: (spender uid, when), one each,
+/// for two minutes (a link grant's life, opening-links.md §5).
+#[derive(Default)]
+pub struct Raises(Vec<(u32, u64)>);
+
+pub const RAISE_FOR_NS: u64 = 120_000_000_000;
+
+impl Raises {
+    pub fn add(&mut self, uid: u32, now: u64) {
+        self.0.retain(|&(_, at)| now.saturating_sub(at) < RAISE_FOR_NS);
+        if self.0.len() < 64 {
+            self.0.push((uid, now));
+        }
+    }
+
+    /// Take one of `uid`'s, if it has one still fresh.
+    pub fn take(&mut self, uid: u32, now: u64) -> bool {
+        self.0.retain(|&(_, at)| now.saturating_sub(at) < RAISE_FOR_NS);
+        match self.0.iter().position(|&(u, _)| u == uid) {
+            Some(i) => {
+                self.0.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn raises() -> &'static Mutex<Raises> {
+    static R: std::sync::OnceLock<Mutex<Raises>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// The window `uid` would want forward: its top-level window highest in
+/// the stack (not a slot, a pop-up or hidden), and the WM is told to
+/// bring it forward.
+fn raise(comp: &Mutex<fresco_scene_server::window::Compositor>, uid: u32) -> fresco_protocol::activation::RaiseResult {
+    use fresco_protocol::activation::RaiseResult;
+    let c = comp.lock().unwrap();
+    let owner = |w: &fresco_scene_server::window::Window| crate::socket_server::client_uid(w.owner).unwrap_or(w.owner_uid);
+    let top = c.windows.values()
+        .filter(|w| w.slot.is_none() && w.popup.is_none() && !w.hidden && w.kept_by.is_none() && owner(w) == uid)
+        .max_by_key(|w| w.z)
+        .map(|w| u32::from(w.id));
+    match top {
+        Some(window_id) => {
+            c.emit(fresco_scene_server::window::DisplayEvent::WindowActivate { window_id });
+            RaiseResult::Ok { window_id }
+        }
+        None => RaiseResult::Refused { reason: refusal::UNKNOWN },
+    }
+}
+
 /// One caller's requests: `CONSUME` on its purposes if it is a consumer, `GRANT` (with
 /// its own uid as the granter) if it is Forum; anything else is refused.
-fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Option<Vec<u8>>>, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>, binders: &[u32]) -> std::io::Result<()> {
+fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Option<Vec<u8>>>, may_grant: bool, focused: &(dyn Fn(u32) -> bool + Send + Sync), binder: Option<&Mutex<fresco_scene_server::window::Compositor>>, binders: &[u32], comp: &Mutex<fresco_scene_server::window::Compositor>) -> std::io::Result<()> {
     use aqueduct::envelope::flag;
-    use fresco_protocol::activation::{op, Consume, Grant};
+    use fresco_protocol::activation::{op, Consume, Grant, RaiseResult};
     let raw = s.try_clone()?;
     let mut conn = aqueduct::Connection::wrap(s)?;
     let mut first = true;
@@ -606,7 +660,12 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                 // spends nothing.
                 Ok(c) if may_consume.as_ref().is_some_and(|m| may_spend(m, c.purpose)) || self_spend(uid, &c) => {
                     let now = now_ns();
-                    table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now))
+                    let r = table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now));
+                    // A link press spent: one raise of the app it goes to.
+                    if c.purpose == purpose::LINK && matches!(r, ConsumeResult::Ok { .. }) {
+                        raises().lock().unwrap().add(uid, now);
+                    }
+                    r
                 }
                 Ok(_) => refused(refusal::NOT_ALLOWED),
                 Err(_) => refused(refusal::UNKNOWN),
@@ -615,6 +674,11 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                 Ok(g) if may_grant => table().lock().unwrap().grant(now_ns(), &g.token, uid, g.for_uid, g.purpose),
                 Ok(_) => GrantResult::Refused { reason: refusal::NOT_ALLOWED },
                 Err(_) => GrantResult::Refused { reason: refusal::UNKNOWN },
+            }),
+            op::RAISE => fresco_protocol::encode(&match fresco_protocol::decode::<fresco_protocol::activation::Raise>(&msg.payload) {
+                Ok(r) if raises().lock().unwrap().take(uid, now_ns()) => raise(comp, r.uid),
+                Ok(_) => RaiseResult::Refused { reason: refusal::NOT_ALLOWED },
+                Err(_) => RaiseResult::Refused { reason: refusal::UNKNOWN },
             }),
             fresco_protocol::slot::op::PRESSED => {
                 use fresco_protocol::slot::{refusal as no, PressedQuery, PressedResult};
@@ -653,6 +717,18 @@ mod tests {
     }
     const YES: fn(u32) -> bool = |_| true;
     const NOVIS: fn(u32, u64) -> bool = |_, _| false;
+
+    #[test]
+    fn a_raise_is_owed_once_per_link_press_for_two_minutes() {
+        let mut r = Raises::default();
+        assert!(!r.take(0, 10), "nothing spent");
+        r.add(0, 10);
+        assert!(!r.take(1001, 11), "another uid's");
+        assert!(r.take(0, 12));
+        assert!(!r.take(0, 13), "once");
+        r.add(0, 20);
+        assert!(!r.take(0, 20 + RAISE_FOR_NS), "too late");
+    }
 
     /// 0 when spent, else the refusal.
     fn why(r: ConsumeResult) -> u8 {

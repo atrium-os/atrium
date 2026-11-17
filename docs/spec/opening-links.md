@@ -216,9 +216,14 @@ new trail.
    comes up shows it in a new trail; `navigator-confined-vm.sh` checks the jailed
    navigatord takes up its channel, and (2026-11-17) the whole way: `link-probe`, a jailed
    app with a window and `open-uri`, sends an https link with an Enter in its window, and
-   the jailed Navigator shows it in a trail of its own. Not yet: the Navigator's window
-   doesn't come forward when a link arrives (the asking app's window stays on top); that
-   needs a way for an app to ask forum-wm to raise it on a link it was handed.
+   the jailed Navigator shows it in a trail of its own. *Brought forward, 2026-11-17:* when
+   portcullisd hands a link to an app that is already running, it asks frescod (activation
+   socket, new op `RAISE { uid }`) to bring that app's top window forward. frescod allows
+   one raise per `LINK` press the caller spent, within two minutes, so a raise always
+   follows a person's press; it picks the uid's top-level window highest in the stack (not
+   a slot, pop-up or hidden window) and tells the WM alone (`EV_WINDOW_ACTIVATE`).
+   forum-wm focuses it, switching to its space if it is on another. An app just started
+   for a link needs none: a new document opens focused.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
 
 ## 9. Decisions, with recommendations

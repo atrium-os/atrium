@@ -1839,6 +1839,30 @@ pub mod daemon {
             }
         }
 
+        /// Bring `id` forward and focus it, on its own space (switching to
+        /// it): frescod asks this when a link was just handed to the app
+        /// on a press in another app (opening-links.md §5). Only a
+        /// focusable app surface; `None` for anything else.
+        pub fn activate(&mut self, conn: &mut impl FrescoConn, id: u32)
+            -> io::Result<Option<u32>>
+        {
+            let surfaces = conn.enumerate()?;
+            let Some(s) = surfaces.iter().find(|s| s.surface_id == id) else { return Ok(None) };
+            if !click_focusable(s.role) {
+                return Ok(None);
+            }
+            if let Some(&ws) = self.assignment.get(&id) {
+                if ws != self.active && ws < self.spaces {
+                    self.active = ws;
+                    self.zoomed = None;
+                }
+            }
+            self.focus_intent = Some(id);
+            self.focus_cause.set(fresco_protocol::focus_cause::PROGRAM);
+            let layout = self.declare(conn, &surfaces)?;
+            Ok(Some(layout.focus))
+        }
+
         /// A newly-created surface. Per forum.md §2.3 a new *document* opens
         /// focused; other roles don't steal focus (a dialog grabs it via
         /// `arrange` already; panels/chrome/background never do). Reconciles
@@ -2530,6 +2554,25 @@ mod tests {
         assert_eq!(conn.declared.as_ref().unwrap().focus, 2);
         assert_eq!(wm.focus_click(&mut conn, 9).unwrap(), Some(1), "surface 9 is shown in a slot of 1");
         assert_eq!(wm.focus_click(&mut conn, 77).unwrap(), None, "an unknown window changes nothing");
+    }
+
+    #[test]
+    fn a_window_handed_a_link_comes_forward_on_its_space() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document), surf(3, WmRole::Background)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.focus_click(&mut conn, 2).unwrap();
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 2);
+        assert_eq!(wm.activate(&mut conn, 1).unwrap(), Some(1));
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 1);
+        assert_eq!(wm.activate(&mut conn, 3).unwrap(), None, "not the background");
+        assert_eq!(wm.activate(&mut conn, 77).unwrap(), None);
+        // On another space: the WM goes there.
+        wm.assignment.insert(2, 1);
+        assert_eq!(wm.activate(&mut conn, 2).unwrap(), Some(2));
+        assert_eq!(wm.active, 1);
     }
 
     #[test]

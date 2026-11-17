@@ -1208,7 +1208,14 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 return refuse(format!("{app}'s document channel: {e}"));
             }
             match hub.deliver_link(&g.person, &app, &g.scheme, &url) {
-                Ok(Delivery::Sent) => {}
+                // Running: bring its window forward, as a new one would be.
+                Ok(Delivery::Sent) => match portcullis_peer::uid_for_app(portcullis_peer::DEFAULT_REGISTRY, &g.person, &app) {
+                    Some(uid) => match opens::raise(&opens::activation_socket(), uid) {
+                        Ok(w) => eprintln!("portcullisd: {app}'s window {w} brought forward"),
+                        Err(why) => eprintln!("portcullisd: {app}'s window not brought forward: {why}"),
+                    },
+                    None => eprintln!("portcullisd: {app}'s window not brought forward: no uid for it"),
+                },
                 Ok(Delivery::Queued) => start_for(&app, &g.person, "to open a link"),
                 Err(e) => return refuse(e.to_string()),
             }
