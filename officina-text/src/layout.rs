@@ -171,7 +171,7 @@ impl Loaded {
 impl PinnedFonts {
     pub fn new() -> Result<PinnedFonts, String> {
         let set = navigator_render::fontset::FontSet::shared()?;
-        let fonts = PinnedFonts { set, lib: atrium_fonts::Library::system(), faces: (0..set.faces.len() + atrium_fonts::FACES.len()).map(|_| Default::default()).collect() };
+        let fonts = PinnedFonts { set, lib: atrium_fonts::Library::system(), faces: (0..set.faces.len() + atrium_fonts::faces().len()).map(|_| Default::default()).collect() };
         for i in 0..set.faces.len() {
             fonts.get(i).ok_or("a pinned face doesn't parse")?;
         }
@@ -243,7 +243,7 @@ impl PinnedFonts {
         let k = face as usize;
         match k.checked_sub(self.base()) {
             None => &self.set.faces[k].address,
-            Some(id) => atrium_fonts::FACES.get(id).map_or("", |f| f.address),
+            Some(id) => atrium_fonts::faces().get(id).map_or("", |f| f.address),
         }
     }
     /// The family a face belongs to.
@@ -251,7 +251,7 @@ impl PinnedFonts {
         let k = face as usize;
         match k.checked_sub(self.base()) {
             None => self.set.faces[k].name,
-            Some(id) => atrium_fonts::FACES.get(id).map_or("", |f| f.family),
+            Some(id) => atrium_fonts::faces().get(id).map_or("", |f| f.family),
         }
     }
 }
