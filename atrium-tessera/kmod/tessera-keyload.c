@@ -7,6 +7,9 @@
  *   tessera-keyload load KEY_FILE KEY_ID_HEX UUID_HEX [HIGH_WATER]
  *   tessera-keyload drop KEY_ID_HEX
  *   tessera-keyload gen  KEY_ID_HEX
+ *   tessera-keyload format KEY_ID_HEX UUID_HEX DEVICE [JOURNAL_SECTORS]
+ *       (the kernel formats DEVICE sealed with the loaded key; the key
+ *       never reaches this process)
  *
  * Build: cc -I../core/include -o tessera-keyload tessera-keyload.c
  */
@@ -47,7 +50,8 @@ usage(void)
 {
 	fprintf(stderr, "usage: tessera-keyload load KEY_FILE KEY_ID UUID "
 	    "[HIGH_WATER]\n       tessera-keyload drop KEY_ID\n"
-	    "       tessera-keyload gen KEY_ID\n");
+	    "       tessera-keyload gen KEY_ID\n"
+	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
 }
 
@@ -108,6 +112,28 @@ main(int argc, char **argv)
 			return (1);
 		}
 		printf("dropped\n");
+	} else if (strcmp(argv[1], "format") == 0 && (argc == 5 || argc == 6)) {
+		struct tkey_format f;
+		int dfd;
+
+		memset(&f, 0, sizeof f);
+		if (unhex16(argv[2], f.key_id) != 0 ||
+		    unhex16(argv[3], f.uuid) != 0)
+			usage();
+		if (argc == 6)
+			f.journal_sectors = strtoull(argv[5], NULL, 0);
+		dfd = open(argv[4], O_RDWR);
+		if (dfd < 0) {
+			perror(argv[4]);
+			return (1);
+		}
+		f.fd = dfd;
+		if (ioctl(fd, TKEY_FORMAT, &f) != 0) {
+			perror("TKEY_FORMAT");
+			return (1);
+		}
+		close(dfd);
+		printf("formatted\n");
 	} else if (strcmp(argv[1], "gen") == 0 && argc == 3) {
 		struct tkey_gen g;
 

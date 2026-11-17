@@ -529,7 +529,7 @@ impl TextEngine {
     /// The face that draws `ch` in a run of `primary`: its script's Noto
     /// face for the scripts that need shaping (the system faces have none),
     /// else the run's font, else the library's general fallbacks.
-    fn face_for(&mut self, primary: u32, primary_face: Option<&ttf_parser::Face<'_>>, ch: char, bold: bool) -> u32 {
+    fn face_for(&mut self, primary: u32, primary_face: Option<&ttf_parser::Face<'_>>, ch: char, bold: bool, han: Option<atrium_fonts::Han>) -> u32 {
         let prim_has = primary_face.is_some_and(|f| f.glyph_index(ch).is_some());
         if let Some(fam) = atrium_fonts::Library::script_family(ch) {
             if prim_has && self.fonts.get(&primary).is_some_and(|f| atrium_fonts::Library::resolve(&f.name).is_some_and(|r| r.family == fam)) {
@@ -542,7 +542,7 @@ impl TextEngine {
         if prim_has {
             return primary;
         }
-        for fam in atrium_fonts::Library::fallback(ch) {
+        for fam in atrium_fonts::Library::fallback_in(ch, han) {
             if let Some(f) = self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)) {
                 return f;
             }
@@ -550,7 +550,7 @@ impl TextEngine {
         // No face has it: a font package may have been installed since
         // (opifex.md §8.1); the pin list is read again at most once a second.
         if atrium_fonts::extra::refresh() {
-            for fam in atrium_fonts::extra::families_for(ch) {
+            for fam in atrium_fonts::extra::families_for(ch, han) {
                 if let Some(f) = self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)) {
                     return f;
                 }
@@ -591,6 +591,7 @@ impl TextEngine {
         let prim_bytes = prim.bytes.clone();
         let prim_face = ttf_parser::Face::parse(&prim_bytes, 0).ok();
         let bold = weight >= 600;
+        let han = atrium_fonts::Han::for_text(text);
         // (font, shaped, text)
         let mut segs: Vec<(u32, bool, String)> = Vec::new();
         for ch in text.chars() {
@@ -604,7 +605,7 @@ impl TextEngine {
             let (font, shaped) = match segs.last() {
                 Some(&(f, sh, _)) if ch.is_whitespace() || (sh && is_mark(ch) && self.has_glyph(f, ch)) => (f, sh),
                 _ => {
-                    let f = self.face_for(font_id, prim_face.as_ref(), ch, bold);
+                    let f = self.face_for(font_id, prim_face.as_ref(), ch, bold, han);
                     (f, rtl || f != font_id || atrium_fonts::Library::script_family(ch).is_some())
                 }
             };

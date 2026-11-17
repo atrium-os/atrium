@@ -1593,9 +1593,6 @@ impl<'a> Reader<'a> {
         let first = (self.sec_from..self.doc.blocks.len()).find(|&k| self.doc.cell(k).is_none());
         let x = sect_settings(s);
         self.secs.push((first, x, page_setup(s)));
-        if x.start == SectionStart::OddPage || x.start == SectionStart::EvenPage {
-            self.rep.note(Kind::Approximate, "sections on odd or even pages (on the next page)");
-        }
         self.sec_from = self.doc.blocks.len();
     }
 

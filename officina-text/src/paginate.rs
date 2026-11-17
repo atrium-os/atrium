@@ -132,6 +132,9 @@ pub struct Page {
     pub floats: Vec<PlacedFloat>,
     /// The page's size and margins (its section's, else the document's).
     pub setup: PageSetup,
+    /// Left blank so the section after it starts on an odd (or even) page;
+    /// its `start` is that section's.
+    pub blank: bool,
 }
 
 impl Page {
@@ -154,6 +157,11 @@ fn sections_of(doc: &TextDoc) -> Vec<(usize, Section)> {
     doc.blocks.iter().enumerate().filter_map(|(i, b)| b.as_para().and_then(|p| p.props.section.filter(|_| p.props.cell.is_none()).map(|s| (i, s)))).collect()
 }
 
+/// Whether any section starts on an odd or an even page.
+fn has_parity_sections(s: &[(usize, Section)]) -> bool {
+    s.iter().any(|x| matches!(x.1.start, SectionStart::OddPage | SectionStart::EvenPage))
+}
+
 /// A page setup's content width in layout units.
 pub fn content_width(g: &PageSetup) -> i64 {
     twips((g.width - g.margin_start - g.margin_end).max(720) as i64)
@@ -174,7 +182,8 @@ pub struct Paginator {
     old_at: usize,
     /// The page number the first old page had.
     old_base: usize,
-    /// Even pages have a header of their own.
+    /// Even pages have a header of their own, or sections start on odd or
+    /// even pages: a page moved by one page number may lay out otherwise.
     even_parity: bool,
     /// The headers and footers the pages were laid out with (their height
     /// grows margins).
@@ -238,7 +247,7 @@ impl Paginator {
     /// Throws the pages away (page setup changed).
     pub fn reset(&mut self, doc: &TextDoc) {
         self.base = doc.page;
-        self.even_parity = doc.even_pages.is_some();
+        self.even_parity = doc.even_pages.is_some() || has_parity_sections(&sections_of(doc));
         self.margins = Some(margins_key(doc));
         self.set_page(doc.page);
         self.wraps.clear();
@@ -344,6 +353,7 @@ impl Paginator {
             let moved: Vec<(usize, Section)> = self.sections.iter().filter(|s| (s.0 as isize) < old_last.max(e.last as isize)).map(|&(b, x)| (if b as isize >= old_last { (b as isize + e.delta) as usize } else { b }, x)).chain(self.sections.iter().filter(|s| s.0 as isize >= old_last.max(e.last as isize)).map(|&(b, x)| ((b as isize + e.delta) as usize, x))).collect();
             let changed = moved.iter().filter(|x| !new.contains(x)).chain(new.iter().filter(|x| !moved.contains(x))).map(|x| x.0).max();
             self.sections = new;
+            self.even_parity = doc.even_pages.is_some() || has_parity_sections(&self.sections);
             match changed {
                 Some(at) => self.sections.iter().map(|s| s.0).find(|&b| b > at).unwrap_or(doc.blocks.len() + 1),
                 None => 0,
@@ -418,6 +428,22 @@ impl Paginator {
         }
         let g = self.setup_at(at.block.min(n_blocks.saturating_sub(1)));
         self.set_page(grown(doc, cache, fonts, g, self.pages.len()));
+        // A section that starts on an odd (or even) page, due on the other
+        // kind: a blank page first.
+        if at.line == 0 && at.wrap == 0 && at.block < n_blocks && !self.pages.is_empty() && self.starts_section(at.block) {
+            let odd = match self.section_at(at.block).start {
+                SectionStart::OddPage => Some(true),
+                SectionStart::EvenPage => Some(false),
+                _ => None,
+            };
+            // Page numbers count from 1: the next page is odd when an even number are laid.
+            if odd.is_some_and(|odd| (self.pages.len() % 2 == 0) != odd) {
+                let blank = Page { start: at, slices: Vec::new(), cells: Vec::new(), height: 0, notes: Vec::new(), foot_rule: None, end_rule: None, rules: Vec::new(), floats: Vec::new(), setup: self.cur, blank: true };
+                self.pages.push(blank);
+                self.laid += 1;
+                return true;
+            }
+        }
         let (page, next) = self.page(doc, cache, fonts, at);
         for sl in &page.slices {
             let Some(id) = doc.blocks.get(sl.block).map(|b| b.id()) else { continue };
@@ -710,7 +736,7 @@ impl Paginator {
         let mut cur = start;
         let mut rules: Vec<(i64, i64, i64)> = Vec::new();
         let finish = |f: Fill, y: i64, rules: Vec<(i64, i64, i64)>, next: Option<Checkpoint>, cache: &mut LayoutCache| {
-            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur };
+            let mut page = Page { start, slices: f.slices, cells: f.cells, height: y, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur, blank: false };
             self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
             (page, next)
         };
@@ -759,7 +785,7 @@ impl Paginator {
                 Stop::Full(next) => return finish(f, bottom, rules, Some(next), cache),
                 Stop::End(line) => {
                     // The text has ended: endnotes, if any, follow it.
-                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur };
+                    let mut page = Page { start, slices: f.slices, cells: f.cells, height: bottom, notes: Vec::new(), foot_rule: None, end_rule: None, rules, floats: f.floats, setup: self.cur, blank: false };
                     let next = self.place_endnotes(doc, cache, fonts, &mut page, line, full_h - f.foot_h);
                     self.place_footnotes(doc, cache, fonts, &mut page, &f.foot, f.foot_h);
                     return (page, next);
@@ -1330,6 +1356,33 @@ mod tests {
     }
 
     #[test]
+    fn odd_and_even_sections_leave_a_blank_page() {
+        // Three paragraphs of 3 lines on pages 10 lines tall: one page each
+        // when each starts a section.
+        let mut d = doc_with(&[3, 3, 3, 3], 10);
+        set_section(&mut d, 1, sec(1, SectionStart::OddPage));
+        set_section(&mut d, 2, sec(1, SectionStart::OddPage));
+        set_section(&mut d, 3, sec(1, SectionStart::EvenPage));
+        let (p, _) = all(&d);
+        // Page 1: block 0; page 2 blank; page 3: block 1; page 4 blank; page 5:
+        // block 2; page 6: block 3 (even, no blank needed).
+        let kinds: Vec<(bool, usize)> = p.pages().iter().map(|pg| (pg.blank, pg.start.block)).collect();
+        assert_eq!(kinds, [(false, 0), (true, 1), (false, 1), (true, 2), (false, 2), (false, 3)]);
+        assert!(p.pages().iter().filter(|pg| pg.blank).all(|pg| pg.slices.is_empty()));
+        // The block's page is the one with its text, not the blank before it.
+        assert_eq!(p.page_of(1, 0), 2);
+        // An edit that adds a page before them moves the blanks.
+        let mut c = LayoutCache::default();
+        let mut q = Paginator::new(&d);
+        q.run(&d, &mut c, &FixedFonts, usize::MAX);
+        let text = vec!["x".repeat(39); 12].join(" ");
+        let op = TextOp::Splice { block: 0, at: 0, del: 0, ins: crate::ops::Fragment { text: format!("{text} "), runs: vec![(0, 0)] } };
+        check_edit(&mut d, &mut q, &mut c, op, Edit { first: 0, last: 1, delta: 0 });
+        let kinds: Vec<(bool, usize)> = q.pages().iter().map(|pg| (pg.blank, pg.start.block)).collect();
+        assert_eq!(kinds, [(false, 0), (false, 0), (false, 1), (true, 2), (false, 2), (false, 3)]);
+    }
+
+    #[test]
     fn columns_fill_side_by_side_then_the_next_page() {
         let mut d = doc_with(&[3; 20], 10);
         set_section(&mut d, 0, sec(2, SectionStart::NextPage));
@@ -1414,7 +1467,7 @@ mod tests {
                 }
                 _ => {
                     let mut props = d.para(b).unwrap().props.clone();
-                    let start = [SectionStart::NextPage, SectionStart::Continuous][rnd(2) as usize];
+                    let start = [SectionStart::NextPage, SectionStart::Continuous, SectionStart::OddPage, SectionStart::EvenPage][rnd(4) as usize];
                     props.section = if rnd(3) == 0 { None } else { sec(1 + rnd(3) as u8, start) };
                     let style = d.para(b).unwrap().style;
                     check_edit(&mut d, &mut p, &mut c, TextOp::SetPara { block: b as u32, style, props }, Edit { first: b, last: b + 1, delta: 0 });

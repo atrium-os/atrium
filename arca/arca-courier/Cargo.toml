@@ -21,6 +21,7 @@ navigator-fetch = { path = "../../navigator-fetch" }
 rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 libc            = "0.2"
+ring            = "0.17"
 
 [dev-dependencies]
 rcgen    = { version = "0.13", default-features = false, features = ["ring", "pem"] }

@@ -218,7 +218,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB3).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB4).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -261,7 +261,7 @@ impl State {
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         if !matches!(
             op,
-            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR
+            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR
         ) {
             return reply(status::DENIED);
         }
@@ -402,6 +402,47 @@ impl State {
                 *item = Some(m.id);
                 ok(m.id.0.to_vec())
             }
+            op::KEEP_FOR => {
+                let h = field!(r.array::<16>());
+                let class = rep!(class_for_app(field!(r.u8())));
+                let account = field!(r.str(caps::ACCOUNT)).to_string();
+                let n = field!(r.u8()) as usize;
+                if n == 0 || n > op::KEEP_FOR_MAX {
+                    return malformed();
+                }
+                let mut endpoints = Vec::with_capacity(n);
+                for _ in 0..n {
+                    endpoints.push(field!(crate::proto::read_endpoint_any(&mut r)));
+                }
+                field!(r.end());
+                let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
+                // The field's handle, for exactly this app (a mismatch burns it).
+                let Some(e) = self.handles.take(&h, user, PERSONA, me) else { return reply(status::DENIED) };
+                let value = match e.source {
+                    crate::handles::Source::Pending(v) => v,
+                    crate::handles::Source::Item(src) => {
+                        *item = Some(src);
+                        tri!(store.release(&src, &who, uv())).1
+                    }
+                };
+                let persona = app_persona(publisher, app_id);
+                let mut out = Vec::with_capacity(16 * n);
+                for ep in endpoints {
+                    let m = tri!(store.add(NewItem {
+                        persona: &persona,
+                        recipient: ep,
+                        class,
+                        kind: Kind::Password,
+                        provenance: Provenance::AppMinted,
+                        account: &account,
+                        scope: b"",
+                        value: value.as_ref(),
+                    }));
+                    *item = Some(m.id);
+                    out.extend_from_slice(&m.id.0);
+                }
+                ok(out)
+            }
             op::LIST | op::LIST_FOR => {
                 let (persona, recipient) = if op == op::LIST_FOR {
                     let ep = field!(crate::proto::read_endpoint_any(&mut r));
@@ -532,6 +573,48 @@ impl State {
             };
         }
         let user = field!(r.str(caps::USER)).to_string();
+        if op == volume_op::VK_FIND {
+            // A stick was plugged in: which of the user's personas, if any,
+            // holds its key (§7.2). Not the machine store: sticks are a
+            // person's.
+            let key_id = field!(r.array::<16>());
+            let uuid = field!(r.array::<16>());
+            let group = field!(r.u64());
+            field!(r.end());
+            let me = tri!(Recipient::service(RECIPIENT));
+            if user == MACHINE_USER || !valid_user(&user) {
+                return reply(status::DENIED);
+            }
+            let personas = match self.stores.get(&user) {
+                Some(s) if s.state() == LockState::Unlocked => s.personas_for(&me),
+                Some(_) | None => return reply(status::LOCKED),
+            };
+            for persona in personas {
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { continue };
+                // The scope the key was made for, exactly, or nothing.
+                if decode_scope(&m.scope) != Some((key_id, uuid, group)) {
+                    return reply(status::DENIED);
+                }
+                *item = Some(m.id);
+                let (_, v) = tri!(store.release(&m.id, &Access { persona: &persona, recipient: &me }, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona) };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                return match self.keyring.as_mut().unwrap().load(&info, key) {
+                    Ok(()) => ok(persona.into_bytes()),
+                    Err(e) if e == libc::EEXIST => ok(persona.into_bytes()),
+                    Err(_) => reply(status::INTERNAL),
+                };
+            }
+            return reply(status::DENIED);
+        }
         let persona = field!(r.str(caps::PERSONA)).to_string();
         let me = tri!(Recipient::service(RECIPIENT));
         let label = owner_label(&user, &persona);
@@ -1500,15 +1583,60 @@ impl State {
                 let uv = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
                 let (_, v) = tri!(store.release(&id, &who, uv));
                 let acct = m.account.as_bytes();
-                let total = 4 + acct.len() + 4 + v.len();
+                let total = 4 + acct.len() + 4 + v.len() + 1;
                 let mut out = tri!(LockedBuf::zeroed(total).map_err(Error::Io));
                 let b = out.as_mut();
                 b[..4].copy_from_slice(&(acct.len() as u32).to_le_bytes());
                 b[4..4 + acct.len()].copy_from_slice(acct);
                 let at = 4 + acct.len();
                 b[at..at + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
-                b[at + 4..].copy_from_slice(v.as_ref());
+                b[at + 4..total - 1].copy_from_slice(v.as_ref());
+                b[total - 1] = if m.kind == Kind::OAuthToken { courier_op::LOGIN_OAUTH } else { courier_op::LOGIN_PASSWORD };
                 Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            courier_op::REFRESHED => {
+                let parsed = (|| {
+                    let src = r.u8()?;
+                    let x = r.array::<16>()?;
+                    let v = r.bytes(arca_store::model::caps::VALUE)?;
+                    r.end()?;
+                    Ok::<_, Error>((src, x, v))
+                })();
+                let Ok((src, x, v)) = parsed else { return malformed() };
+                if src != courier_op::SOURCE_ITEM {
+                    return malformed();
+                }
+                let Recipient::Endpoint { scheme, .. } = &c.endpoint else { return reply(status::DENIED) };
+                if !scheme.is_mail() {
+                    return reply(status::DENIED);
+                }
+                // Only an OAuth item of this courier's endpoint (as LOGIN),
+                // and only its refresh token changes: the same provider and
+                // client id, so a courier can't point the item elsewhere.
+                let id = ItemId(x);
+                *item = Some(id);
+                let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
+                let m = tri!(store.meta(&id, &who));
+                if m.kind != Kind::OAuthToken {
+                    return reply(status::DENIED);
+                }
+                let (_, old) = tri!(store.release(&id, &who, None));
+                let head = |g: &[u8]| -> Option<usize> {
+                    let g = g.strip_prefix(b"oauth1 ")?;
+                    let last = g.iter().rposition(|&b| b == b' ')?;
+                    let tok = &g[last + 1..];
+                    (!tok.is_empty() && tok.iter().all(|b| b.is_ascii_graphic())).then_some(7 + last)
+                };
+                let same = match (head(old.as_ref()), head(v)) {
+                    (Some(a), Some(b)) => a == b && old.as_ref()[..a] == v[..b],
+                    _ => false,
+                };
+                drop(old);
+                if !same {
+                    return reply(status::DENIED);
+                }
+                tri!(store.update(&id, &who, v, None));
+                reply(status::OK)
             }
             courier_op::ANOMALY => {
                 let parsed = (|| {

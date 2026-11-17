@@ -220,7 +220,13 @@ fn ref_name(id: BlockId) -> String {
 fn para_key(p: &ParaProps, first: bool, page_change: bool) -> ParaProps {
     let own = p.section.and_then(|s| s.page);
     let new_page = (p.section.is_some_and(|s| s.start != SectionStart::Continuous || page_change) && !first) || (first && own.is_some());
-    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, ..Section::default() }), ..p.clone() }
+    // An odd or even page start goes with the master page (one kept to right
+    // or left pages, as LibreOffice has it).
+    let start = match p.section.map(|s| s.start) {
+        Some(s @ (SectionStart::OddPage | SectionStart::EvenPage)) if !first => s,
+        _ => SectionStart::NextPage,
+    };
+    ParaProps { list: None, cell: None, outline_level: None, section: new_page.then(|| Section { page: own, start, ..Section::default() }), ..p.clone() }
 }
 
 struct Out<'a> {
@@ -265,6 +271,8 @@ struct Out<'a> {
     pages: Vec<officina_text::model::PageSetup>,
     /// Blocks starting a section whose page differs from the section before's.
     page_changes: std::collections::HashSet<usize>,
+    /// Master pages sections start on: (own page, 0 any / 1 right / 2 left).
+    sides: std::collections::HashSet<(Option<usize>, u8)>,
 }
 
 /// The name an annotation goes by.
@@ -285,8 +293,14 @@ impl Out<'_> {
         }
         let n = format!("{}P{}", self.prefix, self.para_styles.len() + 1);
         let parent = self.names.get(style as usize).cloned().unwrap_or_else(|| "Standard".into());
+        let side = |s: &Section| match s.start {
+            SectionStart::OddPage => 1u8,
+            SectionStart::EvenPage => 2,
+            _ => 0,
+        };
+        let suffix = ["", "_Right", "_Left"];
         let master = match key.1.section {
-            Some(Section { page: Some(g), .. }) => {
+            Some(s @ Section { page: Some(g), .. }) => {
                 let k = match self.pages.iter().position(|x| *x == g) {
                     Some(k) => k,
                     None => {
@@ -294,9 +308,13 @@ impl Out<'_> {
                         self.pages.len() - 1
                     }
                 };
-                format!(r#" style:master-page-name="Section_20_Page_{}""#, k + 1)
+                self.sides.insert((Some(k), side(&s)));
+                format!(r#" style:master-page-name="Section_20_Page_{}{}""#, k + 1, suffix[side(&s) as usize])
             }
-            Some(_) => r#" style:master-page-name="Section_20_Page""#.to_string(),
+            Some(s) => {
+                self.sides.insert((None, side(&s)));
+                format!(r#" style:master-page-name="Section_20_Page{}""#, suffix[side(&s) as usize])
+            }
             None => String::new(),
         };
         let _ = write!(self.auto, r#"<style:style style:name="{n}" style:family="paragraph" style:parent-style-name="{}"{master}>{body}</style:style>"#, esc(&parent));
@@ -928,7 +946,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         return write(&doc.without_conflicts(), out);
     }
     let named: Vec<(String, String)> = doc.styles.styles.iter().enumerate().map(|(i, s)| style_name(&s.name, i)).collect();
-    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::collections::HashSet::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new() };
+    let mut o = Out { doc, prefix: "", names: named.iter().map(|n| n.0.clone()).collect(), fonts: vec![doc.styles.default_char.family.to_string()], auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), tables: 0, frames: 0, in_note: 0, marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::collections::HashSet::new(), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new() };
     let mut last_page = None;
     for k in 0..doc.blocks.len() {
         if let Some(x) = doc.para(k).filter(|p| p.props.cell.is_none()).and_then(|p| p.props.section) {
@@ -1116,7 +1134,7 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
             // Its own paragraphs: their automatic styles and pictures go
             // with the master page.
             let prefix = ["MH", "MHL", "MHF", "MF", "MFL", "MFF"][i * 3 + k];
-            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::mem::take(&mut o.common_names), pages: Vec::new(), page_changes: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
+            let mut ho = Out { prefix, auto: String::new(), para_styles: HashMap::new(), text_styles: HashMap::new(), list_styles: HashMap::new(), lists_seen: Vec::new(), media: Vec::new(), image_names: HashMap::new(), marks: HashMap::new(), cur: None, regions: String::new(), nchange: 0, ins_open: None, pending_end: None, targets: std::collections::HashSet::new(), graphic_styles: HashMap::new(), shape_styles: 0, common: String::new(), common_names: std::mem::take(&mut o.common_names), pages: Vec::new(), page_changes: std::collections::HashSet::new(), sides: std::collections::HashSet::new(), in_note: 1, names: o.names.clone(), fonts: o.fonts.clone(), tables: 0, frames: 0, doc };
             let mut x = String::new();
             for p in &hf.paras {
                 let mut q = p.clone();
@@ -1151,6 +1169,19 @@ pub fn write<W: io::Write>(doc: &TextDoc, out: W) -> io::Result<W> {
         let n = k + 1;
         layout += &page_layout(&format!("pmS{n}"), g);
         master += &standard.replacen(r#"style:name="Standard" style:page-layout-name="pm1""#, &format!(r#"style:name="Section_20_Page_{n}" style:display-name="Section Page {n}" style:next-style-name="Section_20_Page_{n}" style:page-layout-name="pmS{n}""#), 1);
+    }
+    // Sections on odd or even pages: their master page's layout kept to right
+    // or left pages, the pages after it on the plain one.
+    let mut sides: Vec<(Option<usize>, u8)> = o.sides.iter().copied().filter(|x| x.1 != 0).collect();
+    sides.sort();
+    for (k, side) in sides {
+        let (usage, suffix, word) = if side == 1 { ("right", "_Right", "Right") } else { ("left", "_Left", "Left") };
+        let (plain, display, g, lname) = match k {
+            Some(k) => (format!("Section_20_Page_{}", k + 1), format!("Section Page {} {word}", k + 1), o.pages[k], format!("pmS{}{}", k + 1, &word[..1])),
+            None => ("Section_20_Page".to_string(), format!("Section Page {word}"), doc.page, format!("pm1{}", &word[..1])),
+        };
+        layout += &page_layout(&lname, &g).replacen(&format!(r#"style:name="{lname}""#), &format!(r#"style:name="{lname}" style:page-usage="{usage}""#), 1);
+        master += &standard.replacen(r#"style:name="Standard" style:page-layout-name="pm1""#, &format!(r#"style:name="{plain}{suffix}" style:display-name="{display}" style:next-style-name="{plain}" style:page-layout-name="{lname}""#), 1);
     }
     let sfonts: String = o.fonts.iter().map(|f| format!(r#"<style:font-face style:name="{0}" svg:font-family="'{0}'"/>"#, esc(f))).collect();
     let styles_xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:font-face-decls>{sfonts}</office:font-face-decls><office:styles>{defaults}{styles}{}</office:styles><office:automatic-styles>{layout}{mp_styles}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#, o.common);

@@ -173,6 +173,14 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		mtx_unlock(&ring_mtx);
 		break;
 	}
+	case TKEY_FORMAT:
+		/* dispensatord, unjailed root; never a jail, arcad's included. */
+		if ((fflag & FWRITE) == 0)
+			return (EBADF);
+		if (jailed(td->td_ucred))
+			return (EPERM);
+		error = tessera_format_dev(td, (struct tkey_format *)data);
+		break;
 	default:
 		error = ENOTTY;
 	}

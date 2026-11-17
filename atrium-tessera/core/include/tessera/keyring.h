@@ -43,11 +43,28 @@ struct tkey_gen {
 	uint64_t generation;          /* out: highest committed under the key */
 };
 
+/* Format a partition sealed (§7.1 step 3) with a loaded key, scope
+ * (key_id, uuid, group 0). fd: the partition, open read-write by the caller.
+ * total_sectors 0 = the whole partition; journal_sectors 0 = the default;
+ * suite 0 = XAES-256-GCM; hash_alg as tessera_format_opts_t. Unjailed
+ * callers only. ENOENT: no such key for that uuid; ENOTBLK: not a disk. */
+struct tkey_format {
+	uint8_t  key_id[16];
+	uint8_t  uuid[16];
+	uint64_t total_sectors;
+	uint64_t journal_sectors;
+	int32_t  fd;
+	uint32_t suite;
+	uint32_t hash_alg;
+	uint32_t flags;               /* none yet; must be 0 */
+};
+
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
 /* ENOENT if not loaded. Mounts keep their derived keys until unmount. */
 #define TKEY_DROP  _IOW('K', 2, struct tkey_id)
 #define TKEY_GEN   _IOWR('K', 3, struct tkey_gen)
+#define TKEY_FORMAT _IOW('K', 4, struct tkey_format)
 
 #ifdef _KERNEL
 /* For the mount path. Copies the key for (key_id, uuid, group) into vk and
@@ -57,6 +74,8 @@ int  tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
          uint64_t group, uint8_t vk[32], uint64_t *high_water);
 /* Record a committed generation under key_id (TKEY_GEN reports the max). */
 void tessera_keyring_note_gen(const uint8_t key_id[16], uint64_t gen);
+struct thread;
+int  tessera_format_dev(struct thread *td, const struct tkey_format *f);
 int  tessera_keyring_init(void);
 void tessera_keyring_fini(void);
 #endif

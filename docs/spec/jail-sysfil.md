@@ -208,8 +208,9 @@ HVF VM (arm64) and KVM on the R9700 box (amd64).
 |---|---|---|---|---|---|
 | `renderer` | Fresco renderers, decoders, Tier-2 executor, Navigator layout/JS workers (`document worker`) | none | base | `unix` | `SOL_SOCKET` basics |
 | `app` (default) | ordinary Pergola apps | none | base + `TIOCGETA`/`TIOCGWINSZ` | `unix` | `SOL_SOCKET` basics |
-| `networked` | Nuntius fetchers, apps with the `network` capability | `sendto`/`recvfrom` family, `accept4`, `listen` | as app | `unix,inet,inet6` | basics + TCP/IP options apps use |
-| `terminal` | the shell and what it runs | `execve`, `fexecve`, `copy_file_range`, POSIX timers, `setsid` | as app + tty control | `unix,inet,inet6` | as networked |
+| `networked` | Nuntius fetchers, apps with the `network` capability | `sendto`/`recvfrom` family, `accept4`, `listen`; read-only module queries | as app + interface flags, lladdr, index (the host's `ifconfig -j` setting up the vnet runs under the filter; setting needs the jail's root) | `unix,inet,inet6,netlink` | basics + TCP/IP options apps use + `NETLINK_EXT_ACK` |
+| `terminal` | the shell and what it runs | `fork`, `vfork`, `rfork` (`posix_spawn`), `wait4`, `copy_file_range`, POSIX timers, `setsid` | as app + tty control | `unix,inet,inet6` | as networked |
+| `develop` | workspaces only, set by portcullisd (dev-tools-plan.md M0) | as `terminal` + `ptrace`, `ktrace`, `utrace`, `procctl`, `thr_kill2`, `sigqueue`, `posix_openpt` | as terminal + `TIOCPTMASTER`, `FIODGNAME` (a pty for the debuggee) | as terminal | as terminal |
 
 "Base" is what Rust std, libc, rtld and libthr call at runtime. Never in any app class:
 `ktrace`, `ptrace`, `setcred`, `jail_*`, `kqueuex`, `sigqueue`, `thr_kill2`, `procctl`,
@@ -304,6 +305,7 @@ The kernel patch is written to be offered to FreeBSD as it is:
 | jaild + policy | done: 81 jaild unit tests and 8 jaild-policy tests pass in the VM, plus the `sysfil_reaches_the_kernel` round trip (jaild creates a filtered jail, `jls` reads the filter back) |
 | jail(8) launch path, as portcullisd renders it (`exec.clean`, `exec.system_jail_user`, `exec.jail_user`) | log mode found what `setusercontext(3)` calls after the attach (`setloginclass`, `setpriority`, `setrlimit`, `seteuid`, `setegid`), now in `base`; in deny mode `/bin/echo` and the Rust std probe then run as the app user with 0 denials |
 | profiles against real binaries | `app` in deny mode runs a Rust std probe (threads, files, sockets, timers, env, process) with 0 denials; `renderer` in deny mode runs `sysfil-bench` with 0 denials. Real Pergola apps, Fresco renderers and Nuntius: pending, through `learn.sh` |
+| Workspaces, the empty console and app consoles in deny mode (dev-tools-plan.md M0) | done 2026-11-17 on the atrium-os kernel: [`vm-sysfil-dev-check.sh`](../../scripts/vm-sysfil-dev-check.sh), 17 checks: `app`/`networked` shells can't fork, `terminal` can but can't trace, `develop` and a workspace run `cc`, `make` and `lldb` with the filter denying. Found and fixed: every vnet jail's network setup was blocked in deny mode |
 | Portcullis manifest `[capabilities] syscalls` to class | done: schema, validation, consent for `terminal`, both launch paths; unit tests in portcullis-jail (`tests/sysfil.rs`, including every shipped app manifest resolving), portcullis-policy and jaild |
 | arm64 build and VM run | done on HVF (Mac): GENERIC-NODEBUG at 62c6fd2a9 boots, filtered runs 0 denials, positive control denied |
 | overhead, cloud TCG (sanity) | done, below |

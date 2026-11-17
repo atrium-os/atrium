@@ -70,10 +70,29 @@ fn uid_of(name: &str) -> Option<u32> {
 
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
+        self.start(app, embed, channel, None)
+    }
+
+    /// The child serves `parent_uid`: under a `per_instance` worker rule it
+    /// runs as a uid of the parent's instance (its person and persona), and
+    /// portcullisd says which.
+    fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+        self.start(app, embed, channel, Some(parent_uid))
+    }
+
+    fn end(&mut self, embed: EmbedId) {
+        if let Some(s) = self.jails.remove(&embed) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Portcullis {
+    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
-        let uid = self.run_as(app)?;
+        let mut uid = self.run_as(app)?;
         no_app_socket(app)?;
-        let go = || -> io::Result<UnixStream> {
+        let mut go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;
             let mut s = UnixStream::connect(path)?;
@@ -91,9 +110,11 @@ impl Launcher for Portcullis {
                 memory_mb: None,
                 cpu_pct: None,
                 require_memory_limit: true,
+                serves,
             })?;
             match read_response(&mut s)? {
                 Response::ReadyForFds => {}
+                Response::ReadyForFdsAs { uid: u } => uid = u,
                 Response::LaunchFailed { stage, message } => return Err(io::Error::other(format!("{stage}: {message}"))),
                 Response::Error { message } => return Err(io::Error::other(message)),
                 other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
@@ -107,11 +128,5 @@ impl Launcher for Portcullis {
         drop(channel);
         self.jails.insert(embed, s);
         Ok(uid)
-    }
-
-    fn end(&mut self, embed: EmbedId) {
-        if let Some(s) = self.jails.remove(&embed) {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
     }
 }

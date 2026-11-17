@@ -261,7 +261,9 @@ impl Session {
                     })
                 }).collect()).unwrap_or_default();
                 ev.push(Event::Frames);
-                if let Some(top) = self.frames.first().map(|f| f.id) {
+                // The locals of the frame the editor shows: the first in the
+                // project (a crash stops deep in libc and the panic machinery).
+                if let Some(top) = self.frames.iter().find(|f| f.file.is_some()).or(self.frames.first()).map(|f| f.id) {
                     self.request(Pending::Scopes, "scopes", json!({ "frameId": top }));
                 }
             }

@@ -143,6 +143,11 @@ n0)
     sv=$("$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock")
     echo "$sv" | grep -q 'dns6=fd77:0:0:88::53,fe80::1' && ok "the LAN's IPv6 DNS servers kept through the rogue RAs" || fail "dns6 after rogue RAs: $sv"
     "$V" 'pgrep -x atrium-lease >/dev/null && pgrep -x atrium-net >/dev/null' && ok "atrium-net and atrium-lease still running" || fail "a process died on hostile RAs"
+    # A resolver restart falls back to forward.conf; atrium-net notices
+    # within 10 s and sets the network's servers again.
+    "$V" 'service local_unbound restart >/dev/null 2>&1'
+    i=0; while [ $i -lt 30 ]; do fw=$("$V" 'local-unbound-control list_forwards 2>&1 | grep "^\. " || true'); echo "$fw" | grep -q 10.88.0.53 && echo "$fw" | grep -q fd77:0:0:88::53 && break; sleep 2; i=$((i + 2)); done
+    echo "$fw" | grep -q 10.88.0.53 && echo "$fw" | grep -q fd77:0:0:88::53 && ok "local_unbound restarted: forwarders set again in ${i}s ($fw)" || fail "forwarders after unbound restart: $fw"
 
     # DHCPv6 (§5.3): the RA's O flag asks for DNS servers by
     # Information-Request, M for an address by Solicit/Request; atrium-lease

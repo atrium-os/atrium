@@ -121,6 +121,65 @@ pub fn mount_toolbox(jail_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The console jail beside an app's (dev-tools-plan.md M0, Shankar's P1,
+/// 2026-11-17): a second jail on the same root, so it sees the same files
+/// through the app's mounts, but with its own system call class, `terminal`.
+/// The app's jail keeps its narrow class; a shell needs `fork` and `wait4`,
+/// which no app class has. It has no network and sees none of the app's
+/// processes. It makes no mounts of its own (no devfs either: the app's is
+/// already on the root), and goes when the app's jail is torn down
+/// (`launch::full_teardown` removes jails named [`launch::CONSOLE_JAIL_PREFIX`]
+/// on the same root).
+pub fn console_jail_name(app_id: &str) -> String {
+    format!("{}{}", crate::launch::CONSOLE_JAIL_PREFIX, portcullis_jail::jail_name_from_app_id(app_id))
+}
+
+fn jid_of(name: &str) -> Option<i32> {
+    let out = Command::new("jls").args(["-j", name, "jid"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The console jail for `app_id` on `jail_path`: joined if it runs, made if
+/// not. The toolbox must already be mounted there ([`mount_toolbox`]).
+pub fn console_jail(app_id: &str, jail_path: &Path) -> Result<i32, String> {
+    use crate::launch;
+    let name = console_jail_name(app_id);
+    if let Some(jid) = jid_of(&name) {
+        return Ok(jid);
+    }
+    let mid = format!("console.{app_id}");
+    let text = format!("[app]\nid = {mid:?}\nname = \"Console\"\nversion = \"1\"\nentry = \"{IN_JAIL}/sh\"\n\n[capabilities]\nnetwork = \"none\"\n");
+    let manifest = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("its manifest: {e}"))?;
+    let sysfil = launch::sysfil_for_class(launch::TERMINAL_CLASS).map_err(|e| format!("{e:?}"))?;
+    let host_identity = portcullis_identity::for_app(&mid).map_err(|e| format!("identity: {e}"))?;
+    let opts = portcullis_jail::BuildOpts {
+        root_path: jail_path.to_path_buf(),
+        host_sockets: PathBuf::from("/atrium/sockets"),
+        user_home: PathBuf::from("/tmp"),
+        user_name: "root".into(),
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
+        instance: None,
+        persist: true,
+        host_identity,
+        sysfil,
+    };
+    let mut jc = portcullis_jail::build(&manifest, &opts).map_err(|e| format!("build: {e}"))?;
+    jc.name = name.clone();
+    // ★ Nothing mounted by this jail: the root's mounts are the app jail's.
+    jc.mounts.clear();
+    jc.devfs_actions.clear();
+    jc.params.retain(|(k, _)| k != "exec.prestart");
+    jc.set("mount.devfs", portcullis_jail::Value::Bool(false));
+    jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
+    launch::create_persistent(&jc, jail_path).map_err(|e| format!("{e:?}"))?;
+    let jid = jid_of(&name).ok_or_else(|| format!("{name} did not start"))?;
+    eprintln!("portcullisd: console jail {name} on {} (jid {jid}, class terminal)", jail_path.display());
+    Ok(jid)
+}
+
 /// The jail's processes all run as `uid`: it is this person's instance.
 pub fn jail_runs_as(jid: i32, uid: u32) -> bool {
     let Ok(o) = Command::new("ps").args(["-J", &jid.to_string(), "-o", "uid="]).output() else { return false };

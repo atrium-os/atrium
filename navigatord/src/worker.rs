@@ -120,6 +120,7 @@ impl Worker {
             memory_mb: None,
             cpu_pct: None,
             require_memory_limit: true,
+            serves: None,
         })?;
         match read_response(&mut s)? {
             Response::ReadyForFds => {}

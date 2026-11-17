@@ -435,7 +435,10 @@ loaded() { g "$KL gen $1 >/dev/null 2>&1 && echo loaded || echo absent"; }
 check "the key is in the kernel" loaded "$(loaded $KID)"
 check "no op returns anything as long as a key" yes "$(as arcavol "vk-sweep alice work $KID $U" | awk -F'[= ]' '{print ($2 < 32) ? "yes" : $0}')"
 g "$KL drop $KID >/dev/null"
-check "another person: refused" "status=1 body=" "$(as arcavol "vk-load bob work $KID $U 0")"
+# Another person, unlocked: their store has no such key. (Locked, arcad can
+# only answer LOCKED: the item would be in that store, which it can't read.)
+as _ostiarius 'unlock vkbob other-horse' >/dev/null
+check "another person: refused" "status=1 body=" "$(as arcavol "vk-load vkbob work $KID $U 0")"
 check "another persona: refused" "status=1 body=" "$(as arcavol "vk-load alice personal $KID $U 0")"
 check "another volume: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $FOREIGN 0")"
 check "another key group: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $U 7")"
@@ -463,7 +466,21 @@ case "$D1/$D2" in md*/md*) made=yes ;; esac
 check "test volumes made" yes "$made"
 check "a volume naming the key's id, of another uuid: refused" refused "$(g "mount -t tessera -r /dev/$D1 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
 check "the key's own uuid under another key id: refused" refused "$(g "mount -t tessera -r /dev/$D2 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
-g "mdconfig -d -u $D1; mdconfig -d -u $D2; $KL drop $KID >/dev/null 2>&1; rm -rf $VK; true"
+# E3 step 1: the kernel formats a volume with arcad's key (TKEY_FORMAT), so
+# no process ever holds it, and the volume mounts with that key alone.
+D3=$(g "truncate -s 64m $VK/kfmt.img && mdconfig -a -t vnode -f $VK/kfmt.img") || D3=
+check "format for another uuid: no such key" "TKEY_FORMAT: No such file or directory" "$(g "$KL format $KID $FOREIGN /dev/$D3 2>&1")"
+g "jail -r vktest >/dev/null 2>&1; jail -c name=vktest path=/ persist allow.tessera_keys=1 >/dev/null"
+check "a jail can't format, even with allow.tessera_keys" "TKEY_FORMAT: Operation not permitted" "$(g "jexec vktest $KL format $KID $U /dev/$D3 2>&1")"
+g "jail -r vktest >/dev/null 2>&1; true"
+check "the kernel formats with arcad's key" formatted "$(g "$KL format $KID $U /dev/$D3 2>&1")"
+check "it mounts read-write with that key" mounted "$(g "mount -t tessera /dev/$D3 /mnt/vk && echo mounted")"
+g "jot -w 'kernel formatted line %06d' 3000 > /mnt/vk/kfmt-secret-notes.txt; sync; umount /mnt/vk"
+check "nothing of it in the clear" 0 "$(g "grep -ac -e 'kernel formatted line' -e kfmt-secret-notes $VK/kfmt.img")"
+check "it reads back after a remount" 3000 "$(g "mount -t tessera -r /dev/$D3 /mnt/vk && wc -l < /mnt/vk/kfmt-secret-notes.txt | tr -d ' '; umount /mnt/vk")"
+g "$KL drop $KID >/dev/null"
+check "with the key dropped it won't mount" refused "$(g "mount -t tessera -r /dev/$D3 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
+g "mdconfig -d -u $D1; mdconfig -d -u $D2; mdconfig -d -u $D3; $KL drop $KID >/dev/null 2>&1; rm -rf $VK; true"
 else
 echo "  SKIP: no /dev/tesserakeys in the guest (load tessera_fs before arcad)"
 fi

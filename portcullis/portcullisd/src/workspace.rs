@@ -722,7 +722,9 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
         launch::full_teardown(&jp, None);
         m
     };
-    let sysfil = launch::app_sysfil(&manifest).map_err(|e| fail(format!("{e:?}")))?;
+    // `develop`: a shell, builds, and debugging the workspace's own
+    // processes (dev-tools-plan.md M0). No app class has `fork` or `ptrace`.
+    let sysfil = launch::sysfil_for_class(launch::DEVELOP_CLASS).map_err(|e| fail(format!("{e:?}")))?;
     let host_identity = portcullis_identity::for_app(&mid).map_err(|e| fail(format!("identity: {e}")))?;
     let opts = portcullis_jail::BuildOpts {
         root_path: jp.clone(),
@@ -740,6 +742,10 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     // account has no home on the host for jail(8) to change to: it runs as
     // the jail's root, in /root.
     jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
+    // ★ Debugging its own processes (lldb on a test binary): this jail only;
+    // the host keeps security.bsd.unprivileged_proc_debug=0, and with
+    // see_other_uids=0 a workspace reaches nothing but its own uid.
+    jc.set("allow.unprivileged_proc_debug", portcullis_jail::Value::Bool(true));
     for b in BASE {
         let src = Path::new("/").join(b);
         if src.is_dir() {

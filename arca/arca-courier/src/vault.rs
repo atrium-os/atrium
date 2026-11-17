@@ -91,7 +91,7 @@ impl Vault for Arcad {
 }
 
 impl crate::mail::MailVault for Arcad {
-    fn login(&mut self, item: &[u8; 16]) -> Result<(String, LockedBuf), Refusal> {
+    fn login(&mut self, item: &[u8; 16]) -> Result<(String, crate::mail::Secret), Refusal> {
         let mut w = Writer::new();
         w.u8(courier_op::SOURCE_ITEM);
         w.raw(item);
@@ -106,8 +106,28 @@ impl crate::mail::MailVault for Arcad {
         let account = r.str(arca_store::model::caps::ACCOUNT).map_err(|_| Refusal::Internal)?.to_string();
         let v = r.bytes(arca_store::model::caps::VALUE).map_err(|_| Refusal::Internal)?;
         let v = LockedBuf::from_slice(v).map_err(|_| Refusal::Internal)?;
+        let kind = r.u8().map_err(|_| Refusal::Internal)?;
         r.end().map_err(|_| Refusal::Internal)?;
-        Ok((account, v))
+        match kind {
+            courier_op::LOGIN_PASSWORD => Ok((account, crate::mail::Secret::Password(v))),
+            courier_op::LOGIN_OAUTH => Ok((account, crate::mail::Secret::OAuth(v))),
+            _ => Err(Refusal::Internal),
+        }
+    }
+
+    fn refreshed(&mut self, item: &[u8; 16], grant: &LockedBuf) -> Result<(), Refusal> {
+        let mut w = Writer::new();
+        w.u8(courier_op::SOURCE_ITEM);
+        w.raw(item);
+        w.bytes(grant.as_ref());
+        let (st, _) = self.call(courier_op::REFRESHED, &w.buf)?;
+        // The request held the token: wipe it.
+        w.buf.iter_mut().for_each(|b| *b = 0);
+        match st {
+            status::OK => Ok(()),
+            status::LOCKED => Err(Refusal::Locked),
+            _ => Err(Refusal::Denied),
+        }
     }
 
     fn anomaly(&mut self, code: u8, detail: &str) {

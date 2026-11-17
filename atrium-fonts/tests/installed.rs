@@ -1,7 +1,7 @@
 //! Installed font packages: the pin list, matching, fallback, the hash
 //! check and a list that grows while the process runs (opifex.md §8.1).
 
-use atrium_fonts::{extra, faces, Library, FACES};
+use atrium_fonts::{extra, faces, Han, Library, FACES};
 
 fn line(pkg: &str, family: &str, name: &str, ranges: &str, bytes: &[u8]) -> String {
     format!("{pkg}\t{family}\t{pkg}/{name}\t400\t0\t{ranges}\tblake3:{}\t{}\n", blake3::hash(bytes).to_hex(), bytes.len())
@@ -47,14 +47,26 @@ fn installed_faces() {
 
     // opifexd installs another package: the list is rewritten, and a
     // refresh (at most once a second) adds it, keeping the old ids.
-    std::fs::write(dir.join("test-two/Two.ttf"), &inter).unwrap();
-    let pins2 = format!("{pins}{}", line("test-two", "Test Two", "Two.ttf", "E200-E2FF", &inter));
+    for f in ["Two", "HanSC", "HanJP"] {
+        std::fs::write(dir.join(format!("test-two/{f}.ttf")), &inter).unwrap();
+    }
+    let pins2 = format!(
+        "{pins}{}{}{}",
+        line("test-two", "Test Two", "Two.ttf", "E200-E2FF", &inter),
+        line("test-two", "Test Han SC", "HanSC.ttf", "E300", &inter),
+        line("test-two", "Test Han JP", "HanJP.ttf", "E300", &inter),
+    );
     std::fs::write(dir.join("pins.tmp"), pins2.as_bytes()).unwrap();
     std::fs::rename(dir.join("pins.tmp"), dir.join("pins")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert!(extra::refresh());
     assert!(!extra::refresh(), "once a second at most");
-    assert_eq!(faces().len(), FACES.len() + 3);
+    assert_eq!(faces().len(), FACES.len() + 5);
+    // A Han character: the convention asked for first, else install order.
+    assert_eq!(Library::fallback_in('\u{E300}', Some(Han::Jp)).next(), Some("Test Han JP"));
+    assert_eq!(Library::fallback_in('\u{E300}', Some(Han::Sc)).next(), Some("Test Han SC"));
+    assert_eq!(Library::fallback_in('\u{E300}', None).next(), Some("Test Han SC"));
+    assert_eq!(Library::fallback_in('\u{E300}', Han::of_text("ひらがな")).next(), Some("Test Han JP"));
     assert_eq!(Library::face("Test Pua", false, false), Some(id));
     let two = Library::face("Test Two", false, false).unwrap();
     assert_eq!(lib.bytes(two).unwrap().len(), inter.len());

@@ -226,3 +226,44 @@ fn no_keyring_no_volume_ops() {
     s.keyring = None;
     assert_eq!(mint(&mut s, &dispensatord(), "alice", "work", UUID).0, status::UNSUPPORTED);
 }
+
+fn find(s: &mut State, who: &Label, user: &str, key_id: &[u8], uuid: [u8; 16], group: u64) -> (u8, Vec<u8>) {
+    let r = s.handle(who, volume_op::VK_FIND, &body(|w| {
+        w.str(user);
+        w.raw(key_id);
+        w.raw(&uuid);
+        w.u64(group);
+    }));
+    (r.status, r.body.bytes().to_vec())
+}
+
+#[test]
+fn a_plugged_in_stick_finds_its_persona() {
+    let (_d, mut s, k) = setup();
+    let (_, work) = mint(&mut s, &dispensatord(), "alice", "work", UUID);
+    let (_, personal) = mint(&mut s, &dispensatord(), "alice", "personal", [0x77; 16]);
+    k.lock().unwrap().loaded.clear();
+
+    let (st, p) = find(&mut s, &dispensatord(), "alice", &work, UUID, 0);
+    assert_eq!((st, p.as_slice()), (status::OK, &b"work"[..]));
+    let (st, p) = find(&mut s, &dispensatord(), "alice", &personal, [0x77; 16], 0);
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!(k.lock().unwrap().loaded.len(), 2);
+    assert_eq!(k.lock().unwrap().loaded[0].0.owner_label, "alice/work");
+    k.lock().unwrap().loaded.clear();
+
+    // Someone else's stick, a key for another volume, an unknown key, the
+    // machine store, an app: nothing found, nothing loaded.
+    assert_eq!(find(&mut s, &dispensatord(), "bob", &work, UUID, 0).0, status::DENIED);
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &work, [0x5b; 16], 0).0, status::DENIED);
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &[9u8; 16], UUID, 0).0, status::DENIED);
+    assert_eq!(find(&mut s, &dispensatord(), MACHINE_USER, &work, UUID, 0).0, status::DENIED);
+    let app = Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into() };
+    assert_ne!(find(&mut s, &app, "alice", &work, UUID, 0).0, status::OK);
+    assert!(k.lock().unwrap().loaded.is_empty());
+
+    // Locked: LOCKED, and the stick waits.
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &work, UUID, 0).0, status::LOCKED);
+    assert!(k.lock().unwrap().loaded.is_empty());
+}

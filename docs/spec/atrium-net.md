@@ -409,8 +409,10 @@ VM from the Aura gates cover them.
   multipath routing on, adding a second default just adds a path.
 - Only BOOTREQUESTs for the interface's own MAC leave through bpf, rate-limited, unicast
   only to the applied lease's server (renewals go to the MAC the ACK came from).
-- Unbound's forwarders are set at run time (`forward`), so an unbound restart falls back
-  to `forward.conf` until the next lease; atrium-net will rewrite it in N1.
+- Unbound's forwarders are set at run time (`forward`). An unbound restart falls back
+  to `forward.conf`; since 2026-11-17 atrium-net reads `list_forwards` every 10 s and
+  sets the network's servers again when they differ (no file is written, so a crash of
+  atrium-net never leaves stale servers on disk).
 - Known gaps then: a dead atrium-lease made atrium-net exit (respawning needs `exec`,
   which capability mode forbids). Fixed 2026-11-17: atrium-net forks a spawner first
   thing, before it opens anything (`spawn.rs`). The spawner reads one byte per request
@@ -444,7 +446,7 @@ VM from the Aura gates cover them.
 - §4.1 behaviour: beacon loss in aura-mlme (8 s), address grace 60 s, reconnect scans
   every ~10 s in the first minute, three failures skip a network for 10 min, DHCP option
   43 `ANDROID_METERED` and the profile's `metered` flag reported as `metered=1`.
-- Not yet: unbound's `forward.conf` rewrite, the cross-network
+- Not yet: the cross-network
   low-signal move (N3), connectivity probe (N3).
 
 ### 10.3 N2 as built (2026-11-14)

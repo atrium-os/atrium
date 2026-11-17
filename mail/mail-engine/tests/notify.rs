@@ -82,3 +82,47 @@ fn quiet_fresh_grouped_and_withdrawn() {
     s2.messages("INBOX", vec![msg(1, "Mum <mum@home.example>", "Dinner", NOW + 590, "", "Sunday?")]).unwrap();
     assert!(n.check(&engine, NOW + 602).is_empty());
 }
+
+#[test]
+fn settings_off_quiet_hours_and_vips() {
+    use mail_engine::prefs::Prefs;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    sink.messages("INBOX", vec![msg(1, "Old <old@x.example>", "Before", NOW - 86_400, "", "Hi.")]).unwrap();
+    assert_eq!(engine.prefs(), Prefs::default());
+    // Quiet 09:00–10:00 (NOW is 09:21 UTC; local = UTC here); the boss is
+    // a VIP, even though their mail is sent by a system.
+    let p = Prefs { quiet: Some((9 * 60, 10 * 60)), vips: vec!["Boss@Acme.example".into(), "not an address".into()], ..Prefs::default() };
+    engine.set_prefs(&p).unwrap();
+    let got = engine.prefs();
+    assert_eq!(got.vips, ["boss@acme.example"]);
+    assert_eq!(got.quiet, Some((540, 600)));
+    let mut n = Notifier::new();
+    assert!(n.check_local(&engine, NOW, 0).is_empty());
+    sink.messages("INBOX", vec![
+        msg(2, "Priya <priya@example.com>", "Inside", NOW - 30, "", "Hi."),
+        msg(3, "Boss <boss@acme.example>", "Urgent", NOW - 20, "Auto-Submitted: auto-generated\r\n", "Now."),
+    ]).unwrap();
+    assert!(n.check_local(&engine, NOW, 0).is_empty(), "held back, VIPs too by default");
+    // An hour later (from 10:00 UTC, or with the local clock 1 h ahead):
+    // one silent summary.
+    let p = n.check_local(&engine, NOW + 60, 3600);
+    assert_eq!(p, [Post::Summary { title: "During quiet hours".into(), body: "2 new, 2 from people (Priya, Boss)".into() }]);
+    // VIPs let through: the boss rings inside quiet hours, Priya waits.
+    engine.set_prefs(&Prefs { vips_through: true, ..engine.prefs() }).unwrap();
+    sink.messages("INBOX", vec![
+        msg(4, "Priya <priya@example.com>", "Again", NOW + 100, "", "Hi."),
+        msg(5, "Boss <boss@acme.example>", "Again", NOW + 110, "", "Now."),
+    ]).unwrap();
+    let p = n.check_local(&engine, NOW + 120, 0);
+    assert!(matches!(&p[..], [Post::One { title, .. }] if title == "Again"), "{p:?}");
+    // Off: nothing at all, and nothing saved up.
+    engine.set_prefs(&Prefs { notify: false, ..engine.prefs() }).unwrap();
+    sink.messages("INBOX", vec![msg(6, "Lena <lena@x.example>", "Lunch", NOW + 130, "", "Hi.")]).unwrap();
+    assert!(n.check_local(&engine, NOW + 140, 0).is_empty());
+    engine.set_prefs(&Prefs { notify: true, quiet: None, ..engine.prefs() }).unwrap();
+    assert!(n.check_local(&engine, NOW + 150, 0).is_empty());
+}

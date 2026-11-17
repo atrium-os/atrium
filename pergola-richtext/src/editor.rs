@@ -1882,6 +1882,99 @@ impl Editor {
         self.set_page("Page Numbers", page, header, footer);
     }
 
+    // ---- outline ----
+
+    /// The document's headings in order: block, outline level (1–9) and
+    /// text. Table cells and contents entries don't count.
+    pub fn headings(&self) -> Vec<(usize, u8, String)> {
+        (0..self.blocks()).filter_map(|k| self.heading_level(k).map(|l| (k, l, self.doc.para(k).expect("in range").text.clone()))).collect()
+    }
+
+    /// Paragraph `b`'s outline level, when it is a heading.
+    pub fn heading_level(&self, b: usize) -> Option<u8> {
+        let p = self.doc.para(b)?;
+        if p.props.toc.is_some() || p.props.cell.is_some() {
+            return None;
+        }
+        self.doc.styles.para_format(p.style, &p.props).0.outline_level.filter(|l| (1..=9).contains(l))
+    }
+
+    /// The blocks heading `b` heads: up to the next heading at its level or
+    /// above, or the end.
+    pub fn heading_span(&self, b: usize) -> std::ops::Range<usize> {
+        let Some(l) = self.heading_level(b) else { return b..b + 1 };
+        let end = (b + 1..self.blocks()).find(|&k| self.heading_level(k).is_some_and(|m| m <= l)).unwrap_or(self.blocks());
+        b..end
+    }
+
+    /// The heading at or before the caret, if any.
+    pub fn heading_at_caret(&self) -> Option<usize> {
+        (0..=self.caret.block.min(self.blocks().saturating_sub(1))).rev().find(|&k| self.heading_level(k).is_some())
+    }
+
+    /// Swaps heading `b`'s part of the document with the one before
+    /// (`up`) or after it at the same level. Not across a higher heading,
+    /// a section break or while changes are tracked.
+    pub fn move_heading(&mut self, b: usize, up: bool) -> bool {
+        let Some(l) = self.heading_level(b) else { return false };
+        if self.doc.tracking {
+            return false;
+        }
+        let me = self.heading_span(b);
+        let (first, second) = if up {
+            let Some(s) = (0..b).rev().find(|&k| self.heading_level(k).is_some_and(|m| m <= l)) else { return false };
+            if self.heading_level(s) != Some(l) {
+                return false;
+            }
+            (s..b, me)
+        } else {
+            if me.end >= self.blocks() || self.heading_level(me.end) != Some(l) {
+                return false;
+            }
+            let next = self.heading_span(me.end);
+            (me, next)
+        };
+        if (first.start..second.end).any(|k| self.doc.para(k).is_some_and(|p| p.props.section.is_some())) {
+            return false;
+        }
+        // Take the second part out and put it in before the first.
+        let blocks: Vec<Block> = self.doc.blocks.iter_from(second.start).take(second.len()).cloned().collect();
+        let ops = vec![TextOp::Remove { at: second.start as u32, n: second.len() as u32 }, TextOp::Insert { at: first.start as u32, blocks }];
+        self.apply(if up { "Move Up" } else { "Move Down" }, ops, Kind::Other);
+        let at = if up { first.start } else { first.start + second.len() };
+        self.set_caret(Pos::new(at, 0), false);
+        true
+    }
+
+    /// Raises (`deeper` false) or lowers heading `b` and the headings
+    /// under it one level: to the "Heading n" style when it has one, else
+    /// by the paragraph's own outline level. Not past levels 1 and 9.
+    pub fn shift_heading_level(&mut self, b: usize, deeper: bool) -> bool {
+        if self.heading_level(b).is_none() {
+            return false;
+        }
+        let mut ops = Vec::new();
+        for k in self.heading_span(b) {
+            let Some(l) = self.heading_level(k) else { continue };
+            let n = if deeper { l + 1 } else { l - 1 };
+            if !(1..=9).contains(&n) {
+                return false;
+            }
+            let p = self.doc.para(k).expect("in range");
+            let mut props = p.props.clone();
+            let mut style = p.style;
+            let own = self.doc.styles.para_format(p.style, &ParaProps::default()).0.outline_level;
+            match self.doc.styles.by_name(&format!("Heading {n}")) {
+                Some(s) if props.outline_level.is_none() => style = s,
+                _ if own == Some(n) => props.outline_level = None,
+                _ => props.outline_level = Some(n),
+            }
+            ops.push(TextOp::SetPara { block: k as u32, style, props });
+        }
+        self.apply(if deeper { "Demote" } else { "Promote" }, ops, Kind::Other);
+        true
+    }
+
     // ---- sections ----
 
     /// The block starting the section the caret is in (0 for the first).
@@ -1904,7 +1997,9 @@ impl Editor {
         }
         let (mut ops, p) = self.delete_selection_ops();
         let cur = Section { start, ..self.section() };
-        let at_start = p.at == 0 && p.block > 0 && self.doc.para(p.block).is_some_and(|q| q.props.section.is_none());
+        // At the start of a paragraph the break goes before it; one that
+        // already starts a section changes how it starts.
+        let at_start = p.at == 0 && p.block > 0;
         let b = if at_start {
             let q = self.doc.para(p.block).expect("in range");
             let mut props = q.props.clone();
@@ -2895,6 +2990,53 @@ pub(crate) mod tests {
         fn misspelled(&self, text: &str) -> Vec<(u32, u32)> {
             text.match_indices("teh").map(|(i, m)| (i as u32, (i + m.len()) as u32)).collect()
         }
+    }
+
+    #[test]
+    fn outline_moves_and_shifts_headings() {
+        let mut d = TextDoc::new();
+        d.blocks.remove(0);
+        let (h1, h2) = (d.styles.by_name("Heading 1").unwrap(), d.styles.by_name("Heading 2").unwrap());
+        d.push_para("Intro", 0, vec![]);
+        d.push_para("A", h1, vec![]);
+        d.push_para("a text", 0, vec![]);
+        d.push_para("A.1", h2, vec![]);
+        d.push_para("a1 text", 0, vec![]);
+        d.push_para("B", h1, vec![]);
+        d.push_para("b text", 0, vec![]);
+        let mut e = Editor::new(d, Rc::new(FixedFonts));
+        e.start_log();
+        assert_eq!(e.headings().iter().map(|h| (h.0, h.1)).collect::<Vec<_>>(), vec![(1, 1), (3, 2), (5, 1)]);
+        assert_eq!(e.heading_span(1), 1..5);
+        assert_eq!(e.heading_span(3), 3..5);
+        e.set_caret(Pos::new(4, 2), false);
+        assert_eq!(e.heading_at_caret(), Some(3));
+        // A.1 has no sibling; B moves above A with its text.
+        assert!(!e.move_heading(3, true) && !e.move_heading(3, false));
+        assert!(!e.move_heading(1, true));
+        assert!(e.move_heading(5, true));
+        assert_eq!(texts(&e), ["Intro", "B", "b text", "A", "a text", "A.1", "a1 text"]);
+        assert_eq!(e.caret.block, 1);
+        assert!(e.move_heading(1, false));
+        assert_eq!(texts(&e), ["Intro", "A", "a text", "A.1", "a1 text", "B", "b text"]);
+        assert_eq!(e.caret.block, 5);
+        // Demoting A takes A.1 with it; level 3 has its style, 4 is direct.
+        assert!(e.shift_heading_level(1, true));
+        assert_eq!(e.headings().iter().map(|h| h.1).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(e.doc.para(1).unwrap().style, h2);
+        assert!(e.shift_heading_level(1, true));
+        assert_eq!(e.headings().iter().map(|h| h.1).collect::<Vec<_>>(), vec![3, 4, 1]);
+        assert_eq!(e.doc.para(3).unwrap().props.outline_level, Some(4));
+        assert!(e.shift_heading_level(3, false));
+        assert_eq!(e.doc.para(3).unwrap().props.outline_level, None, "back to its style's own level");
+        assert!(!e.shift_heading_level(5, false), "not above level 1");
+        assert!(!e.shift_heading_level(0, true), "not a heading");
+        while e.undo() {}
+        assert_eq!(e.headings().iter().map(|h| h.1).collect::<Vec<_>>(), vec![1, 2, 1]);
+        // A section break inside stops a move.
+        e.set_caret(Pos::new(6, 0), false);
+        assert!(e.insert_section_break(SectionStart::NextPage));
+        assert!(!e.move_heading(5, true));
     }
 
     #[test]

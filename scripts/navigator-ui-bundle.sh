@@ -36,7 +36,14 @@ openssl dgst -sha256 -sign "$KEY" -out $B/atrium.toml.sig $B/atrium.toml
 # _atrium-netconf 65036).
 pw groupshow _navui >/dev/null 2>&1 || pw groupadd _navui -g 65037
 id _navui >/dev/null 2>&1 || pw useradd _navui -u 65037 -g _navui -d /nonexistent -s /usr/sbin/nologin -c "Navigator window"
+# ★ per_instance (personas.md §3, navigator-ui.md §2.4): each person's
+# and each persona's run as a uid of their own, named in the launch
+# registry; run_as is kept for the rule's shape and not used. An older
+# rule without it is replaced.
 P=/etc/atrium/policy.toml
+if grep -q "workers.\"$APP\"" $P 2>/dev/null && ! awk -v h="[workers.\"$APP\"]" '$0==h {f=1; next} /^\[/ {f=0} f && /^per_instance *= *true/ {ok=1} END {exit !ok}' $P; then
+    awk -v h="[workers.\"$APP\"]" '$0==h {f=1; next} /^\[/ {f=0} !f' $P > $P.new && mv $P.new $P
+fi
 if ! grep -q "workers.\"$APP\"" $P 2>/dev/null; then
     cat >> $P <<T
 
@@ -44,6 +51,7 @@ if ! grep -q "workers.\"$APP\"" $P 2>/dev/null; then
 caller_apps = ["org.atrium.navigator"]
 run_as      = "_navui"
 concurrent  = 8
+per_instance = true
 T
     chown root:wheel $P && chmod 644 $P
 fi

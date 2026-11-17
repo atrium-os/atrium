@@ -5853,7 +5853,14 @@ UI logs `window persona Work` and its rail chip says Work (`confined-6-work.png`
 has its own page and control sockets named by its uid (the control socket 0600), Work's page
 child redeems its ticket at Work's socket, and its fetcher and converter jails are asked for by
 Work's uid. The checks for those workers read portcullisd's log, whose lines interleave, so they
-look 5 lines after Work's `conn from`. 79/79 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
+look 5 lines after Work's `conn from`. Then a link from Work's own `link-probe` (`--persona
+work`) opens in the Work Navigator (`opened in org.atrium.navigator@work`, Work's trails up by
+one, Personal's unchanged) and Work's window comes forward. The page and UI worker rules are
+`per_instance`: the UI and the pages run as uids of their own per (person, persona), named in
+the launch registry (`<uid> navtest org.atrium.navigator.page [persona=work]`), and portcullisd
+logs `org.atrium.navigator.page for navtest's org.atrium.navigator (work) runs as atrium-app-N`.
+The bundle scripts replace an older rule without `per_instance`. 88/88 on 2026-11-17 (67/67
+before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

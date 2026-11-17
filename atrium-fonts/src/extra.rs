@@ -228,19 +228,24 @@ pub fn render(faces: &[(FaceInfo, Installed)]) -> Result<String, String> {
     Ok(out)
 }
 
-/// Families of installed faces for `ch`, in install order.
-pub fn families_for(ch: char) -> impl Iterator<Item = &'static str> {
+/// Families of installed faces for `ch`, in install order, those that
+/// write `han` first (a Han character's form; see [`crate::Han`]).
+pub fn families_for(ch: char, han: Option<crate::Han>) -> impl Iterator<Item = &'static str> {
     let c = ch as u32;
     let base = crate::FACES.len();
     let all = faces();
-    let mut seen: Vec<&'static str> = Vec::new();
-    current().installed.iter().enumerate().filter_map(move |(i, inst)| {
+    let mut out: Vec<&'static str> = Vec::new();
+    for (i, inst) in current().installed.iter().enumerate() {
         let fam = all[base + i].family;
-        (inst.ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) && !seen.contains(&fam)).then(|| {
-            seen.push(fam);
-            fam
-        })
-    })
+        if inst.ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)) && !out.contains(&fam) {
+            out.push(fam);
+        }
+    }
+    if let Some(h) = han {
+        // Stable: install order within each group.
+        out.sort_by_key(|f| !h.writes(f));
+    }
+    out.into_iter()
 }
 
 /// Where an installed face's file is.

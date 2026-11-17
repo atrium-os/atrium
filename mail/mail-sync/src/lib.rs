@@ -26,6 +26,7 @@
 //! marks anything read.
 
 pub mod jmap;
+pub mod setup;
 pub mod submit;
 
 use std::io::{Read, Write};

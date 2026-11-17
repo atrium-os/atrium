@@ -10,6 +10,7 @@
 
 pub mod mail;
 pub mod mail_filter;
+pub mod oauth;
 pub mod schema;
 pub mod send;
 pub mod vault;

@@ -411,6 +411,9 @@ struct Reader<'a> {
     sec_marks: Vec<(usize, Section, bool)>,
     /// Every master page's page setup, and paragraphs that start one.
     masters: HashMap<String, PageSetup>,
+    /// Master pages kept to right (odd) or left (even) pages: a section
+    /// starting one starts on such a page.
+    usages: HashMap<String, SectionStart>,
     master_marks: Vec<(usize, String)>,
     sec_stack: Vec<Section>,
     /// The last list id per list style, for continued lists.
@@ -1867,7 +1870,8 @@ impl<'a> Reader<'a> {
         let mut cur = self.doc.page;
         for (k, name) in std::mem::take(&mut self.master_marks) {
             let Some(&g) = self.masters.get(&name) else { continue };
-            if g == cur || k >= self.doc.blocks.len() {
+            let usage = self.usages.get(&name).copied().filter(|_| k > 0);
+            if (g == cur && usage.is_none()) || k >= self.doc.blocks.len() {
                 continue;
             }
             cur = g;
@@ -1878,6 +1882,7 @@ impl<'a> Reader<'a> {
                     // A section already starting here keeps how it starts (a
                     // page of another size starts a new page anyway).
                     let start = match q.props.section {
+                        _ if usage.is_some() => usage.unwrap(),
                         Some(x) => x.start,
                         None if k > 0 => SectionStart::NextPage,
                         None => base.start,
@@ -1909,6 +1914,12 @@ impl<'a> Reader<'a> {
         for m in masters.into_iter().flat_map(|m| m.children("style:master-page")).take(256) {
             if let Some(n) = m.attr("style:name") {
                 self.masters.insert(n.to_string(), master_setup(st, m, base).0);
+                let usage = m.attr("style:page-layout-name").and_then(|l| st.child("office:automatic-styles").and_then(|a| a.children("style:page-layout").find(|x| x.attr("style:name") == Some(l)))).and_then(|l| l.attr("style:page-usage"));
+                match usage {
+                    Some("right") => self.usages.insert(n.to_string(), SectionStart::OddPage),
+                    Some("left") => self.usages.insert(n.to_string(), SectionStart::EvenPage),
+                    _ => None,
+                };
             }
         }
         for (tag, header) in [("style:header", true), ("style:footer", false)] {
@@ -1986,7 +1997,7 @@ pub fn read(data: &[u8]) -> Result<(TextDoc, Loaded), OdtError> {
     let text = body.child("office:text").or_else(|| body.els().next().filter(|x| body.els().count() == 1 && !x.name.starts_with("office:spreadsheet") && !x.name.starts_with("office:presentation") && !x.name.starts_with("office:drawing") && x.els().any(|p| matches!(p.name.as_str(), "text:p" | "text:h" | "text:list" | "table:table")))).ok_or_else(|| OdtError::Bad("no text body".into()))?;
     let mut doc = TextDoc::new();
     doc.blocks.remove(0);
-    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
+    let mut r = Reader { archive: &archive, doc, rep: Report::default(), fonts: HashMap::new(), styles: HashMap::new(), ours: HashMap::new(), lists: HashMap::new(), columns: HashMap::new(), graphic: HashMap::new(), sec_styles: HashMap::new(), page_cols: Section::default(), sec_marks: Vec::new(), masters: HashMap::new(), usages: HashMap::new(), master_marks: Vec::new(), sec_stack: Vec::new(), last_list: HashMap::new(), next_list: 0, next_table: 1, images: HashMap::new(), pictures: 0, boxes: Vec::new(), box_depth: 0, shape_text: Vec::new(), in_shape: false, pending: Vec::new(), in_note: false, in_margin: false, margin_els: Vec::new(), annotations: HashMap::new(), reply_to: Vec::new(), ends: annotation_ends(text), active: Vec::new(), events: Vec::new(), regions: HashMap::new(), revs: HashMap::new(), ins_open: Vec::new(), last_cell: None, ref_names: Vec::new(), ref_index: HashMap::new(), ref_shown: HashMap::new(), open_marks: Vec::new(), marks: HashMap::new(), in_toc: false, tabs_from_indent: true };
     if let Some(st) = part(&archive, "settings.xml")? {
         fn item<'e>(e: &'e El, name: &str) -> Option<&'e El> {
             if e.name == "config:config-item" && e.attr("config:name") == Some(name) {

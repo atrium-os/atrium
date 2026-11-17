@@ -6,7 +6,7 @@
 //!
 //! The format (agreed with the SDK's `cargo atrium`): `--list --json` gives
 //! the targets; a run with `--json` prints one JSON object a line:
-//! `progress`, `crash`, `done`.
+//! `progress`, `crash`, `done`, and `error` when the target doesn't build.
 
 use serde_json::Value;
 
@@ -53,6 +53,9 @@ pub struct Fuzz {
     /// Next target of the round.
     pub next: usize,
     pub on: bool,
+    /// The last run's failure (a fuzz target that doesn't build), shown
+    /// until a run of that target gets going.
+    pub run_error: Option<(String, String)>,
 }
 
 pub fn targets(out: &[u8]) -> Result<Vec<Target>, String> {
@@ -78,7 +81,16 @@ impl Fuzz {
     pub fn line(&mut self, target: &str, line: &str) {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { return };
         match v.get("event").and_then(Value::as_str) {
-            Some("progress") => self.execs = v.get("execs").and_then(Value::as_u64).unwrap_or(self.execs),
+            Some("error") => {
+                let m = v.get("message").and_then(Value::as_str).unwrap_or("failed").chars().take(300).collect();
+                self.run_error = Some((target.to_string(), m));
+            }
+            Some("progress") => {
+                if self.run_error.as_ref().is_some_and(|(t, _)| t == target) {
+                    self.run_error = None;
+                }
+                self.execs = v.get("execs").and_then(Value::as_u64).unwrap_or(self.execs);
+            }
             Some("crash") => {
                 let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
                 let c = Crash {
@@ -128,6 +140,9 @@ impl Fuzz {
                 (None, true) => "Between rounds".into(),
                 (None, false) => "Stopped".into(),
             }), None));
+        if let Some((t, m)) = &self.run_error {
+            out.push((None, format!("{t} didn't run: {m}"), None));
+        }
         if self.crashes.is_empty() {
             out.push((None, "No crashes found yet.".into(), None));
         }
@@ -169,6 +184,10 @@ mod tests {
         f.line("core:open-file", r#"{"event":"crash","input":"fuzz/crashes/b","summary":"overflow","frame":"src/main.rs:12","in_core":true,"fix":"Move into a worker (template: viewer)","binary":"target/fuzz/open-file"}"#);
         f.line("core:open-file", r#"{"event":"crash","input":"fuzz/crashes/c","summary":"overflow","frame":"src/main.rs:12","in_core":true}"#);
         f.line("x", "not json");
+        f.line("worker:decode", r#"{"event":"error","message":"could not compile"}"#);
+        assert!(f.lines().iter().any(|l| l.1 == "worker:decode didn't run: could not compile"));
+        f.line("worker:decode", r#"{"event":"progress","execs":5}"#);
+        assert!(f.run_error.is_none());
         assert_eq!(f.crashes.len(), 2);
         assert!(f.crashes[0].in_core, "core crashes first");
         let lines = f.lines();

@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME built on the host, JMAP and OAuth next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1233,7 +1233,46 @@ Stalwart in the cloud VM, and later a real account):
    `arca_sign`), so the reader says it can't decrypt yet; the person's added CAs; opaque
    signed-data (`smime-type=signed-data`) and AuthEnvelopedData (AES-GCM); revocation
    (OCSP/CRL); a certificates page (seen certificates, forgetting one); Bcc recipients
-   show in the envelope's recipient list (as in other clients). JMAP and OAuth are next.
+   show in the envelope's recipient list (as in other clients).
+   **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
+   request builders, bounded readers of every answer, RFC 3339 dates) and
+   `mail-sync::jmap::Client` over the caller's HTTP (the HTTP courier, which adds the
+   `Authorization`, so sync holds no credential). It fills the same `Sink` as IMAP:
+   each mailbox is a folder named by its path, a message gets a local UID in each
+   mailbox it is in, and the JMAP id is its server id, so one message in two mailboxes
+   is one message. First sync is headers first (§6.4): each mailbox's newest messages
+   (up to 5,000, pages of 256) listed from the `headers` property with no download,
+   then a text pass downloads whole messages under 2 MiB for the text window, inbox and
+   Sent first, 200 a pass. Resync is `Email/changes` (moves, flags, new, destroyed);
+   `cannotCalculateChanges` reads everything again without doubling. The person's
+   changes go as one `Email/set` (several changes to one message are one patch); delete
+   from the last mailbox destroys. Send: upload, `Email/import` into Sent (seen),
+   `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
+   `maxDelayedSend` covers a send-later time, else the engine holds it
+   (`Engine::deliver_jmap`). The store keeps the Email state per account. Test: the
+   engine with real jails against an in-process JMAP server (first sync, one message in
+   two mailboxes, a large one by headers only, archive + read made on the server, changes
+   from elsewhere, a too-old state, send with Bcc only in the envelope, refused sender).
+   **OAuth built on the host (2026-11-18)**: `arca-courier::oauth` with Microsoft
+   (authorization code + PKCE S256, `response_mode=query`, redirect to Microsoft's
+   `nativeclient` page for the sign-in sheet to catch, state checked, the provider's
+   error code only). An OAuth item's value is a grant record (provider, client id,
+   refresh token). The mail courier, after TLS to the mail server, gets it with `LOGIN`
+   (which now says password or OAuth), refreshes at the provider's fixed token endpoint
+   through the fetch rules, gives a rotated refresh token back to Arca (new arcad
+   `REFRESHED` op: only an OAuth item of that courier's endpoint, and only the token may
+   change, not the provider or client id), and logs in with `XOAUTH2` (IMAP with or
+   without SASL-IR, SMTP `AUTH XOAUTH2`; a failure's JSON challenge answered empty). A
+   refresh token the provider refuses (`invalid_grant`) ends the session with "Sign in
+   again" before any login. Tests: courier OAuth end to end over TLS (token endpoint,
+   IMAP, SMTP STARTTLS, rotation, refused grant, unknown provider), arcad 1, unit 3.
+   **Not yet** for JMAP and OAuth: the sign-in sheet in Navigator that opens the URL and
+   catches the redirect, and storing the first grant (an arcad op for the sign-in, with
+   the PKCE verifier kept in Arca); Atrium's Microsoft app registration (client id);
+   pf rules letting a mail courier reach its provider's token host; account setup in
+   the app; JMAP push (EventSource), `Mailbox/changes`, fetch on open for large JMAP
+   messages, removing messages destroyed while a state was too old; JMAP over the HTTP
+   courier for real (only the in-process server so far); OAUTHBEARER; Google (§17 D4).
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
 

@@ -338,6 +338,9 @@ pub enum Refusal {
     /// A verify-each-use slot whose check the user refused or didn't
     /// finish (arca.md §6.2): nothing was sent.
     NotVerified = 9,
+    /// An OAuth refresh token the provider no longer takes: the person
+    /// signs in again (mail.md §5.3).
+    SignInAgain = 10,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +395,7 @@ impl Response {
                 6 => Refusal::Http,
                 7 => Refusal::Unsendable,
                 9 => Refusal::NotVerified,
+                10 => Refusal::SignInAgain,
                 _ => Refusal::Internal,
             }),
             _ => return None,

@@ -50,6 +50,14 @@ pub mod op {
     /// a Wi-Fi passphrase field (held with `HOLD_FOR_WIFI`) and nothing
     /// else: not a stored item, not another field's value.
     pub const TAKE_WIFI: u16 = 0x0A;
+    /// Keep what the user typed into (or picked on) this app's credential
+    /// field as a password for one or more of this app's endpoints (mail.md
+    /// §5.1: one password for the IMAP and the SMTP server), the app never
+    /// holding it: `handle[16] | u8 class | str account | u8 n (1..=4) | n ×
+    /// endpoint` → `n × id[16]`. The handle is redeemed once, for this app.
+    pub const KEEP_FOR: u16 = 0x0B;
+    /// Most endpoints one `KEEP_FOR` binds.
+    pub const KEEP_FOR_MAX: usize = 4;
     /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.
@@ -237,6 +245,13 @@ pub mod volume_op {
     /// the key and the item is deleted. Needs Sigillum's `VERIFY_USER`
     /// (`NEEDS_VERIFICATION` first).
     pub const VK_FORGET: u16 = 0xB3;
+    /// `str user | key_id[16] | uuid[16] | u64 group` → the persona's name
+    /// (the whole body, UTF-8): a
+    /// stick was plugged in (tessera-encryption.md §7.2). Looks for the key
+    /// in every persona of the user's store and loads it as `VK_LOAD` does;
+    /// the reply names the persona it belongs to. `DENIED`: not this
+    /// person's (the stick shows Locked), `LOCKED` if the store is.
+    pub const VK_FIND: u16 = 0xB4;
     /// Longest label.
     pub const LABEL_MAX: usize = 128;
 }
@@ -262,8 +277,16 @@ pub mod courier_op {
 
     /// A mail courier's login (mail.md §5.2), after TLS is up and only for
     /// a courier whose label is a mail scheme: `u8 source (1 item) | ref[16]`
-    /// → `str account | bytes value`. Password and OAuth token items only.
+    /// → `str account | bytes value | u8 kind` ([`LOGIN_PASSWORD`] or
+    /// [`LOGIN_OAUTH`], whose value is an OAuth grant record). Password and
+    /// OAuth token items only.
     pub const LOGIN: u16 = 0x83;
+    pub const LOGIN_PASSWORD: u8 = 1;
+    pub const LOGIN_OAUTH: u8 = 2;
+    /// A mail courier hands back the grant the provider rotated (mail.md
+    /// §5.3), for the item it just logged in with, and only an OAuth one:
+    /// `u8 source (1 item) | ref[16] | bytes grant` → nothing.
+    pub const REFRESHED: u16 = 0x85;
     /// A courier reports an exact anomaly (arca.md §10) before it ends its
     /// client: `u8 code | str detail` → nothing. Logged, never a value.
     pub const ANOMALY: u16 = 0x84;

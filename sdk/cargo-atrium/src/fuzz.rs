@@ -81,7 +81,7 @@ pub fn harness(t: &Target, lib_name: &str, project: &Path) -> (String, String) {
         "# Written by cargo atrium fuzz for {name}.\n[package]\nname = {pkg:?}\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
          [dependencies]\nlibfuzzer-sys = {LIBFUZZER_SYS:?}\n{lib_name} = {{ path = {project:?} }}\n\n\
          [[bin]]\nname = {pkg:?}\npath = \"src/main.rs\"\ntest = false\ndoc = false\n\n\
-         [profile.release]\ndebug = 1\n\n[workspace]\n",
+         [profile.release]\ndebug = 2\n\n[workspace]\n",
         name = t.name,
         project = project.display().to_string(),
     );

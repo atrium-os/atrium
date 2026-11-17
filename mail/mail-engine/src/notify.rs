@@ -12,8 +12,14 @@
 //! - a message read elsewhere since is withdrawn;
 //! - Later: once a day after [`REVIEW_HOUR`], "3 due today, 2 overdue".
 //!
-//! Not yet: VIPs, quiet hours per persona, sounds per account, the
-//! digest of everything else, encrypted mail (no S/MIME yet).
+//! - Settings ([`crate::prefs`]): notifications off (only withdrawals),
+//!   VIPs always one by one, and quiet hours: what arrives inside them is
+//!   held back and said in one silent summary when they end (VIPs only get
+//!   through if the person lets them).
+//!
+//! Not yet: quiet hours per persona (one Mail instance is one persona, so
+//! the instance's quiet hours are the persona's), sounds per account, the
+//! digest of everything else.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -70,6 +76,8 @@ pub struct Notifier {
     recent: VecDeque<i64>,
     /// The day (days since 1970) the review was posted.
     reviewed: Option<i64>,
+    /// Arrivals held back during quiet hours, said when they end.
+    quiet: Vec<Arrival>,
 }
 
 impl Notifier {
@@ -80,6 +88,35 @@ impl Notifier {
     /// What to post now. The first look only notes where things are:
     /// what was there before Mail started never notifies.
     pub fn check(&mut self, e: &Engine, now: i64) -> Vec<Post> {
+        self.check_local(e, now, 0)
+    }
+
+    /// [`Notifier::check`] with the local time's offset from UTC (seconds),
+    /// for quiet hours.
+    pub fn check_local(&mut self, e: &Engine, now: i64, offset: i64) -> Vec<Post> {
+        let prefs = e.prefs();
+        let minute = ((now + offset).rem_euclid(86_400) / 60) as u16;
+        let quiet = prefs.is_quiet(minute);
+        let mut out = self.look(e, now, &prefs, quiet);
+        if !prefs.notify {
+            // Off: only take back what was said before.
+            self.quiet.clear();
+            out.retain(|p| matches!(p, Post::Withdraw { .. }));
+            return out;
+        }
+        if !quiet && !self.quiet.is_empty() {
+            let held = std::mem::take(&mut self.quiet);
+            let people: Vec<&Arrival> = held.iter().filter(|a| a.person).collect();
+            let mut body = format!("{} new", held.len());
+            if !people.is_empty() {
+                body += &format!(", {} from people ({})", people.len(), first_names(people.iter().map(|a| a.from.as_str())));
+            }
+            out.push(Post::Summary { title: "During quiet hours".into(), body });
+        }
+        out
+    }
+
+    fn look(&mut self, e: &Engine, now: i64, prefs: &crate::prefs::Prefs, quiet: bool) -> Vec<Post> {
         let mut out = Vec::new();
         let accounts: Vec<AccountId> = e.store.accounts().map(|a| a.into_iter().map(|x| x.0).collect()).unwrap_or_default();
         if !self.started {
@@ -132,9 +169,16 @@ impl Notifier {
                 continue;
             }
             let wrote_in = e.store.thread(m.thread).unwrap_or_default().iter().any(|x| x.msg != id && x.message.summary.from.iter().any(|a| mine.contains(&a.addr.to_ascii_lowercase())));
-            let person = !s.automated && !crate::senders::is_list(s);
+            let vip = s.from.iter().any(|a| prefs.is_vip(&a.addr));
+            let person = vip || (!s.automated && !crate::senders::is_list(s));
             let from = s.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
             let a = Arrival { msg: id, date: m.date, person: person || wrote_in, from, subject: s.subject.clone(), text: new_text(s.text.as_deref().unwrap_or(&s.preview)) };
+            if quiet && !(vip && prefs.vips_through) {
+                if self.quiet.len() < SCAN_MAX {
+                    self.quiet.push(a);
+                }
+                continue;
+            }
             if now - m.date <= FRESH_SECS && m.date <= now + FRESH_SECS {
                 fresh.push(a);
             } else {

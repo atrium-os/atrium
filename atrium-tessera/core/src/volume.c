@@ -629,56 +629,64 @@ format_impl(const tessera_block_io_t *io, const tessera_format_opts_t *opts,
 	if (r != TESSERA_OK) return r;
 
 	/* 6. Seal the superblock; write twice (A and B). */
-	tessera_superblock_t sb;
-	memset(&sb, 0, sizeof sb);
-	memcpy(sb.magic, TESSERA_MAGIC_SUPERBLOCK, 8);
-	sb.version_major          = 1;
-	sb.version_minor          = 0;
-	sb.feature_flags          = TESSERA_FEATURE_UNLINKED_FLAG;
-	sb.incompat_flags         = (opts->hash_alg != TESSERA_HASH_ALG_SHA256)
+	/* Heap, not stack: the kernel module formats too (16 KiB stack). */
+	tessera_superblock_t *sbp = tessera_zalloc(sizeof *sbp);
+	uint8_t *buf = tessera_malloc(TESSERA_SECTOR_SIZE);
+	if (sbp == NULL || buf == NULL) {
+		tessera_free(sbp); tessera_free(buf);
+		return TESSERA_ENOMEM;
+	}
+	memcpy(sbp->magic, TESSERA_MAGIC_SUPERBLOCK, 8);
+	sbp->version_major          = 1;
+	sbp->version_minor          = 0;
+	sbp->feature_flags          = TESSERA_FEATURE_UNLINKED_FLAG;
+	sbp->incompat_flags         = (opts->hash_alg != TESSERA_HASH_ALG_SHA256)
 	    ? TESSERA_INCOMPAT_HASH_ALG : 0;
-	sb.hash_alg               = opts->hash_alg;
-	sb.generation             = 1;
-	memcpy(sb.volume_uuid, opts->volume_uuid, 16);
-	sb.total_sectors          = opts->total_sectors;
-	sb.sector_size            = TESSERA_SECTOR_SIZE;
-	sb.journal_start          = 4;
-	sb.journal_length         = J;
-	sb.inode_root             = inode_root;
-	sb.inode_root_generation  = 1;
-	sb.pack_registry_root     = pack_registry_root;
-	sb.pack_registry_gen      = 1;
-	sb.free_extent_root       = free_extent_root;
-	sb.free_extent_gen        = 1;
-	sb.pack_zone_start        = free_zone_start;
-	sb.pack_zone_length       = opts->total_sectors - free_zone_start;
-	sb.meta_reserve_start     = metadata_zone_start;
-	sb.meta_reserve_length    = meta_zone_sectors;
-	sb.meta_reserve_bump      = fc.bump;       /* runtime starts here */
-	sb.next_inode_no          =
+	sbp->hash_alg               = opts->hash_alg;
+	sbp->generation             = 1;
+	memcpy(sbp->volume_uuid, opts->volume_uuid, 16);
+	sbp->total_sectors          = opts->total_sectors;
+	sbp->sector_size            = TESSERA_SECTOR_SIZE;
+	sbp->journal_start          = 4;
+	sbp->journal_length         = J;
+	sbp->inode_root             = inode_root;
+	sbp->inode_root_generation  = 1;
+	sbp->pack_registry_root     = pack_registry_root;
+	sbp->pack_registry_gen      = 1;
+	sbp->free_extent_root       = free_extent_root;
+	sbp->free_extent_gen        = 1;
+	sbp->pack_zone_start        = free_zone_start;
+	sbp->pack_zone_length       = opts->total_sectors - free_zone_start;
+	sbp->meta_reserve_start     = metadata_zone_start;
+	sbp->meta_reserve_length    = meta_zone_sectors;
+	sbp->meta_reserve_bump      = fc.bump;       /* runtime starts here */
+	sbp->next_inode_no          =
 	    (opts->seed_dirent_name != NULL && opts->seed_dirent_name_len > 0)
 	        ? (uint64_t)opts->seed_dirent_inode + 1
 	        : TESSERA_INODE_FIRST_USER;
-	sb.last_unmount_clean     = 1;
+	sbp->last_unmount_clean     = 1;
 #if VOLUME_SEALING
 	if (seal != NULL) {
-		memcpy(sb.root_tags[TESSERA_BTREE_KIND_INODE], tag_inode, 16);
-		memcpy(sb.root_tags[TESSERA_BTREE_KIND_PACK_REG], tag_reg, 16);
-		memcpy(sb.root_tags[TESSERA_BTREE_KIND_FREE_EXT], tag_free, 16);
-		memcpy(sb.journal_anchor_tag, anchor, 16);
-		sb.total_pack_count = 1;
-		r = tessera_sb_seal(seal, &sb, NULL);
-		if (r != TESSERA_OK) return r;
+		memcpy(sbp->root_tags[TESSERA_BTREE_KIND_INODE], tag_inode, 16);
+		memcpy(sbp->root_tags[TESSERA_BTREE_KIND_PACK_REG], tag_reg, 16);
+		memcpy(sbp->root_tags[TESSERA_BTREE_KIND_FREE_EXT], tag_free, 16);
+		memcpy(sbp->journal_anchor_tag, anchor, 16);
+		sbp->total_pack_count = 1;
+		r = tessera_sb_seal(seal, sbp, NULL);
+		if (r != TESSERA_OK) {
+			tessera_free(buf); tessera_free(sbp);
+			return r;
+		}
 	}
 #endif
 
-	uint8_t buf[TESSERA_SECTOR_SIZE];
-	r = tessera_encode_superblock(&sb, buf);
-	if (r != TESSERA_OK) return r;
-	if (io->write_block(io->ctx, 0, buf) != 0) return TESSERA_EIO;
-	if (io->write_block(io->ctx, 1, buf) != 0) return TESSERA_EIO;
-
-	return TESSERA_OK;
+	r = tessera_encode_superblock(sbp, buf);
+	if (r == TESSERA_OK && (io->write_block(io->ctx, 0, buf) != 0 ||
+	    io->write_block(io->ctx, 1, buf) != 0))
+		r = TESSERA_EIO;
+	tessera_free(buf);
+	tessera_free(sbp);
+	return r;
 }
 
 int
@@ -736,63 +744,72 @@ tessera_volume_commit_roots_ex(tessera_volume_t *v,
 	if (v->seal != NULL || (v->sb.incompat_flags & TESSERA_INCOMPAT_SEALED))
 		return TESSERA_ENOTIMPL;
 
-	tessera_superblock_t sb = v->sb;   /* preserve everything */
+	/* Heap, not stack: this file is linked into the kernel module, whose
+	 * stack is 16 KiB in all (a superblock is 4 KiB). */
+	tessera_superblock_t *sbp = tessera_malloc(sizeof *sbp);
+	uint8_t *buf = tessera_malloc(TESSERA_SECTOR_SIZE);
+	if (sbp == NULL || buf == NULL) {
+		tessera_free(sbp); tessera_free(buf);
+		return TESSERA_ENOMEM;
+	}
+	*sbp = v->sb;   /* preserve everything */
 
-	sb.generation += 1;
-	if (roots->inode_root != sb.inode_root) {
-		sb.inode_root = roots->inode_root;
-		sb.inode_root_generation += 1;
+	sbp->generation += 1;
+	if (roots->inode_root != sbp->inode_root) {
+		sbp->inode_root = roots->inode_root;
+		sbp->inode_root_generation += 1;
 	}
-	if (roots->pack_registry_root != sb.pack_registry_root) {
-		sb.pack_registry_root = roots->pack_registry_root;
-		sb.pack_registry_gen += 1;
+	if (roots->pack_registry_root != sbp->pack_registry_root) {
+		sbp->pack_registry_root = roots->pack_registry_root;
+		sbp->pack_registry_gen += 1;
 	}
-	if (roots->free_extent_root != sb.free_extent_root) {
-		sb.free_extent_root = roots->free_extent_root;
-		sb.free_extent_gen += 1;
+	if (roots->free_extent_root != sbp->free_extent_root) {
+		sbp->free_extent_root = roots->free_extent_root;
+		sbp->free_extent_gen += 1;
 	}
-	if (roots->quota_tree_root != sb.quota_tree_root) {
-		sb.quota_tree_root = roots->quota_tree_root;
-		sb.quota_tree_gen += 1;
+	if (roots->quota_tree_root != sbp->quota_tree_root) {
+		sbp->quota_tree_root = roots->quota_tree_root;
+		sbp->quota_tree_gen += 1;
 	}
-	if (roots->snapshots_root != sb.snapshots_root) {
-		sb.snapshots_root = roots->snapshots_root;
-		sb.snapshots_gen += 1;
+	if (roots->snapshots_root != sbp->snapshots_root) {
+		sbp->snapshots_root = roots->snapshots_root;
+		sbp->snapshots_gen += 1;
 	}
-	if (roots->blob_index_root != sb.blob_index_root) {
-		sb.blob_index_root = roots->blob_index_root;
-		sb.blob_index_gen += 1;
+	if (roots->blob_index_root != sbp->blob_index_root) {
+		sbp->blob_index_root = roots->blob_index_root;
+		sbp->blob_index_gen += 1;
 	}
 	/* dead_extent_root is preserved by default (it is not part of the
 	 * struct's original contract), and moved ONLY on explicit opt-in. */
 	if ((flags & TESSERA_COMMIT_DEAD_EXTENT) &&
-	    roots->dead_extent_root != sb.dead_extent_root) {
-		sb.dead_extent_root = roots->dead_extent_root;
-		sb.dead_extent_gen += 1;
+	    roots->dead_extent_root != sbp->dead_extent_root) {
+		sbp->dead_extent_root = roots->dead_extent_root;
+		sbp->dead_extent_gen += 1;
 	}
 	/* meta_reserve_bump: by default only ever grows (repair consumed
 	 * reserve sectors for the rewritten trees); never let it regress.
 	 * With TESSERA_COMMIT_BUMP_EXACT (repack) set it exactly — repack
 	 * compacts the reserve and legitimately LOWERS the bump. */
 	if (flags & TESSERA_COMMIT_FEATURE_UNLINKED)
-		sb.feature_flags |= TESSERA_FEATURE_UNLINKED_FLAG;
+		sbp->feature_flags |= TESSERA_FEATURE_UNLINKED_FLAG;
 	if (flags & TESSERA_COMMIT_BUMP_EXACT)
-		sb.meta_reserve_bump = roots->meta_reserve_bump;
-	else if (roots->meta_reserve_bump > sb.meta_reserve_bump)
-		sb.meta_reserve_bump = roots->meta_reserve_bump;
+		sbp->meta_reserve_bump = roots->meta_reserve_bump;
+	else if (roots->meta_reserve_bump > sbp->meta_reserve_bump)
+		sbp->meta_reserve_bump = roots->meta_reserve_bump;
 	/* next_inode_no may grow if repair minted an inode (lost+found). */
-	if (roots->next_inode_no > sb.next_inode_no)
-		sb.next_inode_no = roots->next_inode_no;
-	sb.last_unmount_clean = 1;
+	if (roots->next_inode_no > sbp->next_inode_no)
+		sbp->next_inode_no = roots->next_inode_no;
+	sbp->last_unmount_clean = 1;
 
-	uint8_t buf[TESSERA_SECTOR_SIZE];
-	int r = tessera_encode_superblock(&sb, buf);
-	if (r != TESSERA_OK) return r;
-	if (v->io.write_block(v->io.ctx, 0, buf) != 0) return TESSERA_EIO;
-	if (v->io.write_block(v->io.ctx, 1, buf) != 0) return TESSERA_EIO;
-
-	v->sb = sb;   /* keep the handle coherent for any further work */
-	return TESSERA_OK;
+	int r = tessera_encode_superblock(sbp, buf);
+	if (r == TESSERA_OK && (v->io.write_block(v->io.ctx, 0, buf) != 0 ||
+	    v->io.write_block(v->io.ctx, 1, buf) != 0))
+		r = TESSERA_EIO;
+	if (r == TESSERA_OK)
+		v->sb = *sbp;   /* keep the handle coherent for any further work */
+	tessera_free(buf);
+	tessera_free(sbp);
+	return r;
 }
 
 /* ── open ────────────────────────────────────────────────────────── */
@@ -803,41 +820,54 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 	if (io == NULL || out == NULL) return TESSERA_EINVAL;
 	if (io->read_block == NULL) return TESSERA_EINVAL;
 
-	uint8_t  buf_a[TESSERA_SECTOR_SIZE], buf_b[TESSERA_SECTOR_SIZE];
-	tessera_superblock_t sb_a, sb_b;
-	int valid_a = (io->read_block(io->ctx, 0, buf_a) == 0) &&
-	    tessera_decode_superblock(buf_a, &sb_a) == TESSERA_OK;
-	int valid_b = (io->read_block(io->ctx, 1, buf_b) == 0) &&
-	    tessera_decode_superblock(buf_b, &sb_b) == TESSERA_OK;
+	/* Heap, not stack: also linked into the kernel module (16 KiB stack). */
+	uint8_t *buf = tessera_malloc(TESSERA_SECTOR_SIZE);
+	tessera_superblock_t *sb = tessera_zalloc(2 * sizeof *sb);
+	if (buf == NULL || sb == NULL) {
+		tessera_free(buf); tessera_free(sb);
+		return TESSERA_ENOMEM;
+	}
+	int valid_a = (io->read_block(io->ctx, 0, buf) == 0) &&
+	    tessera_decode_superblock(buf, &sb[0]) == TESSERA_OK;
+	int valid_b = (io->read_block(io->ctx, 1, buf) == 0) &&
+	    tessera_decode_superblock(buf, &sb[1]) == TESSERA_OK;
+	tessera_free(buf);
 
-	if (!valid_a && !valid_b) return TESSERA_ECORRUPT;
-	const tessera_superblock_t *active;
-	if (valid_a && valid_b)
-		active = (sb_a.generation >= sb_b.generation) ? &sb_a : &sb_b;
+	int rc = TESSERA_OK;
+	const tessera_superblock_t *active = NULL;
+	if (!valid_a && !valid_b)
+		rc = TESSERA_ECORRUPT;
+	else if (valid_a && valid_b)
+		active = (sb[0].generation >= sb[1].generation) ? &sb[0] : &sb[1];
 	else
-		active = valid_a ? &sb_a : &sb_b;
+		active = valid_a ? &sb[0] : &sb[1];
 
-	if (active->version_major != 1)            return TESSERA_EBADVERSION;
-	if (active->sector_size != TESSERA_SECTOR_SIZE) return TESSERA_EBADVERSION;
-	if ((active->incompat_flags & ~TESSERA_INCOMPAT_HASH_ALG) != 0)
-		return TESSERA_EINCOMPAT;
-	if (active->hash_alg != TESSERA_HASH_ALG_SHA256 &&
-	    active->hash_alg != TESSERA_HASH_ALG_BLAKE3_256)
-		return TESSERA_EINCOMPAT;
+	if (rc != TESSERA_OK)
+		;
+	else if (active->version_major != 1 ||
+	    active->sector_size != TESSERA_SECTOR_SIZE)
+		rc = TESSERA_EBADVERSION;
+	else if ((active->incompat_flags & ~TESSERA_INCOMPAT_HASH_ALG) != 0 ||
+	    (active->hash_alg != TESSERA_HASH_ALG_SHA256 &&
+	     active->hash_alg != TESSERA_HASH_ALG_BLAKE3_256))
+		rc = TESSERA_EINCOMPAT;
 	/* Non-default alg must carry the incompat bit (and vice versa) —
 	 * a mismatch means a corrupt or hand-edited superblock. */
-	if ((active->hash_alg != TESSERA_HASH_ALG_SHA256) !=
-	    ((active->incompat_flags & TESSERA_INCOMPAT_HASH_ALG) != 0))
-		return TESSERA_ECORRUPT;
-	if (tessera_superblock_layout(active, 0, NULL, NULL) != TESSERA_OK)
-		return TESSERA_ECORRUPT;
+	else if ((active->hash_alg != TESSERA_HASH_ALG_SHA256) !=
+	    ((active->incompat_flags & TESSERA_INCOMPAT_HASH_ALG) != 0) ||
+	    tessera_superblock_layout(active, 0, NULL, NULL) != TESSERA_OK)
+		rc = TESSERA_ECORRUPT;
 
-	tessera_volume_t *v = tessera_zalloc(sizeof *v);
-	if (v == NULL) return TESSERA_ENOMEM;
-	v->io = *io;
-	v->sb = *active;
-	*out = v;
-	return TESSERA_OK;
+	tessera_volume_t *v = NULL;
+	if (rc == TESSERA_OK && (v = tessera_zalloc(sizeof *v)) == NULL)
+		rc = TESSERA_ENOMEM;
+	if (rc == TESSERA_OK) {
+		v->io = *io;
+		v->sb = *active;
+		*out = v;
+	}
+	tessera_free(sb);
+	return rc;
 }
 
 /*

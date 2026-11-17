@@ -659,6 +659,17 @@ mod tests {
             let fam = r.families.unwrap();
             assert!(!fam.split(',').any(|f| f == "route"), "{class} allows route sockets");
         }
+        // `develop` (workspaces, dev-tools-plan.md M0): the shell's calls and
+        // debugging; `terminal` has no debugging.
+        let dev = p.sysfil.resolve("develop").unwrap().syscalls.unwrap();
+        for need in ["fork", "wait4", "execve", "ptrace", "ktrace", "procctl"] {
+            assert!(dev.split(',').any(|s| s == need), "develop lacks {need}");
+        }
+        let term = p.sysfil.resolve("terminal").unwrap().syscalls.unwrap();
+        for need in ["fork", "vfork", "wait4"] {
+            assert!(term.split(',').any(|s| s == need), "terminal lacks {need}");
+        }
+        assert!(!term.split(',').any(|s| s == "ptrace"), "terminal allows ptrace");
         let app = p.sysfil.resolve("app").unwrap();
         assert!(!app.ioctls.unwrap().contains("0x20007461"), "TIOCSCTTY outside terminal");
         assert_eq!(app.families.as_deref(), Some("unix"));

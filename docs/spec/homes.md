@@ -131,6 +131,15 @@ Right-click an app's icon (the dock, the Applications grid, the overview),
 - Console sessions are not saved to disk and stoad never starts their
   shells: a shell that exits is gone; when the last one goes, the session
   ends.
+- **The console jail (dev-tools-plan.md M0, Shankar 2026-11-17, P1).** The
+  shell no longer runs in the app's own jail: that jail's system call class
+  (`app` or `networked`) has no `fork` or `wait4`, and widening it while a
+  console is open would weaken the app. portcullisd makes a second jail,
+  `con-<app jail>`, on the same root, with class `terminal`, no network and
+  no mounts of its own; it sees the app's files through the app's mounts but
+  not the app's processes. It is removed with the app's jail. Workspaces get
+  class `develop` (the shell plus debugging their own processes), the empty
+  console `terminal`.
 - Room left for personas (personas.md, proposal): the console runs in the
   jail of what it serves, so it inherits that instance's network and,
   later, its persona.
