@@ -236,6 +236,7 @@ fn restore_sessions(reg: &Reg, path: &Path) {
                 last_sent: stoa_term::Grid::new(cols, rows),
                 restore: Some(ps),
                 pending_clip: None,
+                pending_ask: None,
             }),
         });
         map.insert(name.clone(), state.clone());
@@ -512,6 +513,10 @@ struct Inner {
     /// Text the active window's program wrote to the clipboard (OSC 52),
     /// sent once with the next grid-sync diff.
     pending_clip: Option<String>,
+    /// A `pkg` request (OSC 7770) from the pane input goes to, sent once
+    /// with the next grid-sync diff; the Terminal answers on that pane's
+    /// input (homes.md §5.5).
+    pending_ask: Option<String>,
 }
 
 impl Inner {
@@ -570,6 +575,7 @@ impl Inner {
             stoa_term::StateDiff::between(&self.last_sent, &grid)
         };
         diff.clipboard = self.pending_clip.take();
+        diff.ask = self.pending_ask.take();
         if !full && diff.is_empty() && grid.cursor() == self.last_sent.cursor() {
             return None; // nothing to send
         }
@@ -901,6 +907,7 @@ fn adopt(reg: &Reg, name: &str, app: &str, pid: i32, procdesc: std::os::fd::Owne
                         last_sent: stoa_term::Grid::new(cols, rows),
                         restore: None,
                         pending_clip: None,
+                        pending_ask: None,
                     }),
                 });
                 map.insert(name.to_string(), state.clone());
@@ -1063,6 +1070,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             last_sent: stoa_term::Grid::new(80, 24),
             restore: None,
             pending_clip: None,
+            pending_ask: None,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -1679,6 +1687,7 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
         let bytes = &buf[..n as usize];
         let mut cwd_changed = false;
         let mut clip: Option<String> = None;
+        let mut ask: Option<String> = None;
         let out = {
             let mut inner = state.inner.lock().unwrap();
             let (cols, rows) = (inner.cols, inner.rows);
@@ -1704,10 +1713,17 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
                         write_all_fd(p.pty_fd, &replies);
                     }
                     clip = p.term.take_clipboard();
+                    ask = p.term.take_ask();
                 }
             }
             if clip.is_some() && inner.active == win_idx {
                 inner.pending_clip = clip;
+            }
+            // Only from the pane that has the keys: the answer goes there.
+            let has_keys = inner.active == win_idx
+                && inner.windows.get(win_idx).and_then(|w| w.active()).is_some_and(|p| p.pty_fd == inner.windows[win_idx].panes[pane_idx].pty_fd);
+            if ask.is_some() && has_keys {
+                inner.pending_ask = ask;
             }
             // Stream only when this pane's window is active and not scrolled.
             if inner.active == win_idx && inner.scroll == 0 {

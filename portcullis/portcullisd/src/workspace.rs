@@ -160,6 +160,66 @@ const BASE: &[&str] = &[
     "usr/bin", "usr/include", "usr/lib", "usr/lib32", "usr/libdata", "usr/libexec", "usr/sbin", "usr/share",
 ];
 
+/// pkg's repository in every workspace.
+const PKG_REPO: &str = "FreeBSD: {\n  url: \"pkg+https://pkg.FreeBSD.org/${ABI}/latest\",\n  mirror_type: \"srv\",\n  signature_type: \"fingerprints\",\n  fingerprints: \"/usr/share/keys/pkg\",\n  enabled: yes\n}\n";
+
+/// Where the workspace's own tools are on the host, and in the jail, first
+/// on `PATH`: the `pkg` that asks for a press (dev-tools-plan.md M2).
+pub const WS_BIN: &str = "/var/db/atrium/workspace-bin";
+pub const WS_BIN_IN_JAIL: &str = "atrium/bin";
+
+/// `pkg` in a workspace. Installing needs the jail's root, which only
+/// portcullisd gives, after a press: this asks the terminal it runs in
+/// (an OSC 7770 request, homes.md §5.5). The terminal shows what it asks,
+/// and on the person's press runs it (`WorkspaceAdmin`), shows pkg's output,
+/// and answers `ESC ] 7770 ; ok ; <status> BEL CR` or `ESC ] 7770 ; cancel BEL CR`.
+const PKG_WRAPPER: &str = r#"#!/bin/sh
+# pkg in an Atrium workspace (docs/spec/dev-tools.md §6.1). Installing runs as
+# this workspace's root, never the computer's, and only after you press OK.
+real=/usr/local/sbin/pkg
+case "$1" in
+info|search|query|which|version|audit|stats)
+    [ -x "$real" ] && exec "$real" "$@" ;;
+esac
+for a in "$@"; do
+    case "$a" in
+    ""|*[!A-Za-z0-9._+@/:=,~^*-]*) echo "pkg: "$a" isn't a package name or option" >&2; exit 64 ;;
+    esac
+done
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "pkg: installing needs your OK; run pkg in a Terminal window" >&2
+    exit 1
+fi
+old=$(stty -g)
+trap 'stty "$old"; echo; exit 130' INT TERM
+echo "pkg: asking for your OK in this window (Ctrl-C to cancel)"
+stty -echo
+printf ']7770;pkg;%s' "$*"
+IFS= read -r reply
+stty "$old"
+printf '\033[1A\r\033[2K'    # the "asking" line, answered
+case "$reply" in
+*"]7770;ok;"*) s=${reply##*;}; s=${s%%[!0-9]*}; exit "${s:-1}" ;;
+*"]7770;cancel"*) echo "pkg: cancelled"; exit 1 ;;
+*) echo "pkg: this terminal can't ask for your OK" >&2; exit 1 ;;
+esac
+"#;
+
+/// Write the workspace tools (once per change), root's and read-only.
+fn ensure_ws_bin() -> Result<PathBuf, String> {
+    let dir = PathBuf::from(WS_BIN);
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+    let f = dir.join("pkg");
+    if fs::read_to_string(&f).ok().as_deref() != Some(PKG_WRAPPER) {
+        let tmp = dir.join(".pkg.new");
+        fs::write(&tmp, PKG_WRAPPER).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
+    }
+    Ok(dir)
+}
+
 /// Files the jail's `/etc` starts with, from the host's.
 const ETC: &[&str] = &[
     "login.conf", "login.conf.db", "resolv.conf", "hosts", "services", "protocols",
@@ -650,14 +710,21 @@ fn seed_etc(root: &Path, user: &str, uid: u32, gid: u32, files: u32, home_in: &s
             }
         }
     }
+    // pkg's repository (dev-tools-plan.md M2): ports from pkg.FreeBSD.org
+    // for the base's ABI, rewritten at each start. Not the host's file: no
+    // base or kernel-module repositories in a workspace. (`nobody`, in
+    // passwd above, is who pkg fetches and checks signatures as.)
+    let _ = fs::create_dir_all(etc.join("pkg"));
+    fs::write(etc.join("pkg/FreeBSD.conf"), PKG_REPO).map_err(|e| format!("pkg repository: {e}"))?;
     let _ = fs::remove_file(etc.join("termcap"));
     let _ = std::os::unix::fs::symlink("/usr/share/misc/termcap", etc.join("termcap"));
     let mp = etc.join("master.passwd");
     fs::write(&mp, format!(
-        "root:*:0:0::0:0:Charlie &:/root:/usr/sbin/nologin\n{user}:*:{uid}:{gid}::0:0:Workspace:{home_in}:/bin/sh\n"))
+        "root:*:0:0::0:0:Charlie &:/root:/usr/sbin/nologin\n{user}:*:{uid}:{gid}::0:0:Workspace:{home_in}:/bin/sh\n\
+         nobody:*:65534:65534::0:0:Unprivileged user:/nonexistent:/usr/sbin/nologin\n"))
         .map_err(|e| format!("{}: {e}", mp.display()))?;
     fs::set_permissions(&mp, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    fs::write(etc.join("group"), format!("wheel:*:0:root\n{user}:*:{gid}:\nfiles:*:{files}:{user}\n"))
+    fs::write(etc.join("group"), format!("wheel:*:0:root\n{user}:*:{gid}:\nfiles:*:{files}:{user}\nnobody:*:65534:\n"))
         .map_err(|e| e.to_string())?;
     let st = Command::new("pwd_mkdb").arg("-d").arg(&etc).arg(&mp).status().map_err(|e| format!("pwd_mkdb: {e}"))?;
     if !st.success() {
@@ -688,7 +755,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     };
     // Its toolchain layers: PATH first, then what they set.
     let (layers, layer_dirs) = compose_layers(&r)?;
-    env.insert(0, format!("PATH={}", layers.path));
+    env.insert(0, format!("PATH=/{WS_BIN_IN_JAIL}:{}", layers.path));
     env.extend(layers.env);
     let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
@@ -700,7 +767,10 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     let root = dir.join(".state").join("root");
     for (d, mode, o) in [("", 0o755, 0), ("tmp", 0o1777, 0), ("var", 0o755, 0), ("var/tmp", 0o1777, 0),
                          ("usr", 0o755, 0), ("usr/local", 0o755, uid), ("root", 0o700, 0), ("dev", 0o555, 0),
-                         ("home", 0o755, 0), (&home_in[1..], 0o755, uid), (LINKS, 0o755, 0)] {
+                         ("home", 0o755, 0), (&home_in[1..], 0o755, uid), (LINKS, 0o755, 0),
+                         // pkg's, as the jail's root (M2).
+                         ("var/db", 0o755, 0), ("var/db/pkg", 0o755, 0), ("var/cache", 0o755, 0), ("var/cache/pkg", 0o755, 0),
+                         ("atrium", 0o755, 0), (WS_BIN_IN_JAIL, 0o755, 0)] {
         let p = root.join(d);
         fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let _ = std::os::unix::fs::chown(&p, Some(o), Some(if o == 0 { 0 } else { gid }));
@@ -746,6 +816,16 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     // the host keeps security.bsd.unprivileged_proc_debug=0, and with
     // see_other_uids=0 a workspace reaches nothing but its own uid.
     jc.set("allow.unprivileged_proc_debug", portcullis_jail::Value::Bool(true));
+    // ★ What its root may not do, said outright (M2: `pkg` and package
+    // scripts run as the jail's root): no mounts, no raw sockets, no file
+    // flags, and it sees only its own mounts.
+    for p in ["allow.mount", "allow.raw_sockets", "allow.chflags", "allow.set_hostname"] {
+        jc.set(p, portcullis_jail::Value::Bool(false));
+    }
+    jc.set("enforce_statfs", portcullis_jail::Value::Number(2));
+    jc.set("children.max", portcullis_jail::Value::Number(0));
+    let ws_bin = ensure_ws_bin().map_err(|e| fail(e))?;
+    jc.add_mount(&ws_bin, &jp.join(WS_BIN_IN_JAIL), "nullfs", &["ro"]);
     for b in BASE {
         let src = Path::new("/").join(b);
         if src.is_dir() {

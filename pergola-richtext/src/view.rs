@@ -19,7 +19,7 @@ use std::time::Duration;
 use officina_text::model::CommentId;
 use officina_text::paint::{paint_page, Item};
 use officina_text::twips;
-use pergola::event::{Event, KeyEventKind};
+use pergola::event::{Event, Key, KeyEventKind};
 use pergola::geom::{Point, Rect};
 use pergola::glyphs::Glyph as PGlyph;
 use pergola::interaction::{DragPhase, ScrollInput};
@@ -59,6 +59,11 @@ struct Geom {
     boxes: std::rc::Rc<[PageBox]>,
     /// The widest page.
     max_w: f64,
+    /// Space between pages (a hairline in continuous view).
+    gap: f64,
+    /// What continuous view cuts from the document page's top and bottom.
+    ct: f64,
+    cb: f64,
 }
 
 /// One page's place in the view: its top, size and margins (view units).
@@ -69,12 +74,29 @@ struct PageBox {
     h: f64,
     mx: f64,
     my: f64,
+    /// Cut from the top and bottom in continuous view (else 0): the page
+    /// shows from `top + ct` to `top + h - cb`.
+    ct: f64,
+    cb: f64,
 }
+
+/// The line between pages in continuous view.
+pub const SEAM: f32 = 6.0;
 
 impl Geom {
     fn of(ed: &Editor, rect: Rect, zoom: f32) -> Geom {
-        let k = zoom as f64 * 4.0 / 3.0 / officina_text::LU as f64;
         let g = &ed.doc.page;
+        let zoom = if ed.reading {
+            // The whole page in the view.
+            let (pw, ph) = (twips(g.width as i64) as f64 * 4.0 / 3.0 / officina_text::LU as f64, twips(g.height as i64) as f64 * 4.0 / 3.0 / officina_text::LU as f64);
+            (((rect.h() as f64 - 2.0 * GAP as f64) / ph).min((rect.w() as f64 - 2.0 * GAP as f64) / pw)).clamp(0.25, 5.0) as f32
+        } else {
+            zoom
+        };
+        let k = zoom as f64 * 4.0 / 3.0 / officina_text::LU as f64;
+        let trim = ed.continuous && !ed.reading;
+        let gap = if trim { SEAM as f64 } else { GAP as f64 };
+        let cut = |s: &officina_text::model::PageSetup| if trim { (twips(s.margin_top as i64) as f64 * k, twips(s.margin_bottom as i64) as f64 * k) } else { (0.0, 0.0) };
         let page_w = twips(g.width as i64) as f64 * k;
         let page_h = twips(g.height as i64) as f64 * k;
         // With comments, the page and the balloon column are centred together
@@ -91,32 +113,42 @@ impl Geom {
         let pages = ed.pages.pages();
         let (mut boxes, mut max_w) = (Vec::new(), page_w);
         if pages.iter().any(|p| p.setup != *g) {
-            let mut top = GAP as f64;
+            // Where the next page starts showing.
+            let mut vt = gap;
             for p in pages {
                 let s = &p.setup;
-                let b = PageBox { top, w: twips(s.width as i64) as f64 * k, h: twips(s.height as i64) as f64 * k, mx: twips(s.margin_start as i64) as f64 * k, my: twips(s.margin_top as i64) as f64 * k };
+                let (ct, cb) = cut(s);
+                let b = PageBox { top: vt - ct, w: twips(s.width as i64) as f64 * k, h: twips(s.height as i64) as f64 * k, mx: twips(s.margin_start as i64) as f64 * k, my: twips(s.margin_top as i64) as f64 * k, ct, cb };
                 max_w = max_w.max(b.w);
-                top += b.h + GAP as f64;
+                vt += b.h - ct - cb + gap;
                 boxes.push(b);
             }
         }
-        Geom { rect, k, page_w, page_h, left, margin_x: twips(g.margin_start as i64) as f64 * k, margin_y: twips(g.margin_top as i64) as f64 * k, boxes: boxes.into(), max_w }
+        let (ct, cb) = cut(g);
+        Geom { rect, k, page_w, page_h, left, margin_x: twips(g.margin_start as i64) as f64 * k, margin_y: twips(g.margin_top as i64) as f64 * k, boxes: boxes.into(), max_w, gap, ct, cb }
     }
     /// Page `i`'s place: its own, or the document page's.
     fn page(&self, i: usize) -> PageBox {
         match self.boxes.get(i) {
             Some(b) => *b,
             None => {
-                let (top, n) = match self.boxes.last() {
-                    Some(b) => (b.top + b.h + GAP as f64, self.boxes.len()),
-                    None => (GAP as f64, 0),
+                // Where the first page past the boxes starts showing.
+                let (vt, n) = match self.boxes.last() {
+                    Some(b) => (b.top + b.h - b.cb + self.gap, self.boxes.len()),
+                    None => (self.gap, 0),
                 };
-                PageBox { top: top + (i - n) as f64 * (self.page_h + GAP as f64), w: self.page_w, h: self.page_h, mx: self.margin_x, my: self.margin_y }
+                PageBox { top: vt + (i - n) as f64 * self.pitch() - self.ct, w: self.page_w, h: self.page_h, mx: self.margin_x, my: self.margin_y, ct: self.ct, cb: self.cb }
             }
         }
     }
+    /// From one document page's shown top to the next's.
+    fn pitch(&self) -> f64 {
+        self.page_h - self.ct - self.cb + self.gap
+    }
+    /// Where page `i` starts showing.
     fn page_top(&self, i: usize) -> f64 {
-        self.page(i).top
+        let p = self.page(i);
+        p.top + p.ct
     }
     /// Where page `i`'s left edge sits: pages of other widths centred on the
     /// document's.
@@ -127,11 +159,12 @@ impl Geom {
     /// The page at content y (nearest).
     fn page_at(&self, y: f64, pages: usize) -> usize {
         let n = self.boxes.len();
-        if n > 0 && y < self.page(n).top - GAP as f64 / 2.0 {
-            return self.boxes.partition_point(|b| b.top + b.h + GAP as f64 / 2.0 <= y).min(pages.saturating_sub(1));
+        let half = self.gap / 2.0;
+        if n > 0 && y < self.page_top(n) - half {
+            return self.boxes.partition_point(|b| b.top + b.h - b.cb + half <= y).min(pages.saturating_sub(1));
         }
-        let top = self.page(n).top;
-        (n + ((y - top + GAP as f64 / 2.0) / (self.page_h + GAP as f64)).floor().max(0.0) as usize).min(pages.saturating_sub(1))
+        let top = self.page_top(n);
+        (n + ((y - top + half) / self.pitch()).floor().max(0.0) as usize).min(pages.saturating_sub(1))
     }
 }
 
@@ -218,13 +251,26 @@ impl RichTextView {
         (n, ((n as f64 * total as f64 / reached as f64).ceil() as usize).max(n))
     }
 
+    /// The page read mode shows (the one in the middle of the view).
+    pub fn shown_page(&self) -> usize {
+        let e = self.editor.borrow();
+        let g = Geom::of(&e, self.rect, self.zoom);
+        g.page_at(self.scroll.get().physics.y + self.rect.h() as f64 / 2.0, e.pages.pages().len().max(1))
+    }
+
     /// Scrolls so the editor's caret shows (after a command moved it: find,
-    /// go to).
+    /// go to); in read mode, to the top of the caret's page.
     pub fn reveal_caret(&self) {
         let mut e = self.editor.borrow_mut();
         let g = Geom::of(&e, self.rect, self.zoom);
         let mut st = self.scroll.get();
-        reveal(&mut e, &g, &mut st);
+        if e.reading {
+            let c = e.caret;
+            let pg = e.spot(c).page;
+            show_page(&g, &mut st, pg);
+        } else {
+            reveal(&mut e, &g, &mut st);
+        }
         if st != self.scroll.get() {
             self.scroll.set(st);
         }
@@ -270,7 +316,12 @@ impl RichTextView {
                 let pb = g.page(i);
                 let (px, py) = at(g.left_of(i), pb.top);
                 ctx.key(2 + i as u64);
-                let grp = ctx.push(Node::vstack(Rect::new(px, py, pb.w as f32, pb.h as f32), 0.0));
+                // In continuous view only the part between the margins shows.
+                let grp = if pb.ct > 0.0 || pb.cb > 0.0 {
+                    ctx.push(Node::layer(Rect::new(px - 1.0, py + pb.ct as f32, pb.w as f32 + 2.0, (pb.h - pb.ct - pb.cb) as f32), 1.0, true))
+                } else {
+                    ctx.push(Node::vstack(Rect::new(px, py, pb.w as f32, pb.h as f32), 0.0))
+                };
                 ctx.set_flex(grp, FlexStyle { free: true, ..FlexStyle::default() });
                 ctx.add(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, pb.w as f32 + 2.0, pb.h as f32 + 2.0), fill: t.border_default(), radius: 0.0 });
                 ctx.add(Node::Rect { rect: Rect::new(px, py, pb.w as f32, pb.h as f32), fill: paper, radius: 0.0 });
@@ -580,7 +631,7 @@ impl RichTextView {
             ctx.set_flex(over, FlexStyle { free: true, ..FlexStyle::default() });
             let c = ed.caret;
             let s = ed.spot(c);
-            if s.page >= first && s.page <= last {
+            if s.page >= first && s.page <= last && !ed.reading {
                 let pb = g.page(s.page);
                 let (px, py) = at(g.left_of(s.page) + pb.mx + s.x as f64 * g.k, pb.top + pb.my + s.y as f64 * g.k);
                 ctx.add(Node::Rect { rect: Rect::new(px, py, 1.5, (s.h as f64 * g.k) as f32), fill: t.accent_fg(), radius: 0.0 });
@@ -619,6 +670,26 @@ impl RichTextView {
                     return;
                 }
                 let mut e = ed.borrow_mut();
+                if e.reading {
+                    // Keys turn pages; Escape leaves.
+                    let mut st = sc.get();
+                    if *key == Key::Escape {
+                        // Back where the reading got to.
+                        let n = e.pages.pages().len().max(1);
+                        let pg = g.page_at(st.physics.y + g.rect.h() as f64 / 2.0, n);
+                        if let Some(b) = e.pages.pages().get(pg).map(|p| p.start.block) {
+                            e.set_caret(Pos::new(b, 0), false);
+                        }
+                        e.reading = false;
+                    } else if !turn_page(&e, &g, &mut st, *key, modifiers.shift, chars) {
+                        return;
+                    }
+                    if st != sc.get() {
+                        sc.set(st);
+                    }
+                    rev.set(rev.get().wrapping_add(1));
+                    return;
+                }
                 let page_h = ((g.rect.h() as f64 - 2.0 * GAP as f64) / g.k).max(1.0) as i64;
                 let out = e.key(*key, *modifiers, chars, page_h);
                 match out {
@@ -655,6 +726,10 @@ impl RichTextView {
             ctx.on_drag(body, move |phase, p| {
                 let st = sc.get();
                 let mut e = ed.borrow_mut();
+                if e.reading {
+                    // Nothing edits in read mode.
+                    return;
+                }
                 let (pg, lx, ly) = local(&e, &g, st.physics.y, p);
                 // A press on a floating picture or shape picks it; a drag
                 // moves it (one undo step when let go).
@@ -859,6 +934,32 @@ fn hit(e: &mut Editor, g: &Geom, scroll_y: f64, p: Point) -> Pos {
     e.hit(pg, lx, ly)
 }
 
+/// Read mode's page turn for `key`: the next page (Page Down, Space,
+/// Right, Down), the one before (Page Up, Shift+Space, Backspace, Left,
+/// Up), the first or last (Home, End). False for any other key.
+fn turn_page(e: &Editor, g: &Geom, st: &mut ScrollState, key: Key, shift: bool, chars: &str) -> bool {
+    let n = e.pages.pages().len().max(1);
+    let cur = g.page_at(st.physics.y + g.rect.h() as f64 / 2.0, n);
+    let to = match key {
+        Key::PageDown | Key::Right | Key::Down => cur + 1,
+        Key::Char if chars == " " && !shift => cur + 1,
+        Key::Char if chars == " " => cur.saturating_sub(1),
+        Key::PageUp | Key::Left | Key::Up | Key::Backspace => cur.saturating_sub(1),
+        Key::Home => 0,
+        Key::End => n - 1,
+        _ => return false,
+    }
+    .min(n - 1);
+    show_page(g, st, to);
+    true
+}
+
+/// Scrolls so page `i` fills the view from its top.
+fn show_page(g: &Geom, st: &mut ScrollState, i: usize) {
+    st.physics.stop();
+    st.physics.set_position((g.page_top(i) - g.gap).max(0.0));
+}
+
 /// Scrolls so the caret shows.
 fn reveal(e: &mut Editor, g: &Geom, st: &mut ScrollState) {
     let c = e.caret;
@@ -945,7 +1046,7 @@ mod tests {
     use officina_text::layout::FixedFonts;
     use officina_text::model::TextDoc;
     use pergola::app::App;
-    use pergola::event::{Key, Modifiers};
+    use pergola::event::Modifiers;
     use pergola::node::NodeDelta;
     use std::sync::atomic::AtomicBool;
 
@@ -1056,6 +1157,75 @@ mod tests {
                 assert!(origin.y.abs() < 3.0 * REBASE as f32 + 2000.0, "rebased: {}", origin.y);
             }
         }
+    }
+
+    /// Continuous view drops the margins and gaps; read mode fits a page,
+    /// turns pages by key and edits nothing.
+    #[test]
+    fn continuous_and_read_views() {
+        let (mut app, ed, scroll) = host(400);
+        let r = Rect::new(0.0, 0.0, 900.0, 700.0);
+        let n = ed.borrow().pages.pages().len();
+        let paged = Geom::of(&ed.borrow(), r, 1.0);
+        ed.borrow_mut().continuous = true;
+        app.tick();
+        let g = Geom::of(&ed.borrow(), r, 1.0);
+        let body = paged.page_h - g.ct - g.cb;
+        assert!(g.ct > 0.0 && g.cb > 0.0);
+        for i in 0..n - 1 {
+            let (a, b) = (g.page(i), g.page(i + 1));
+            assert!((g.page_top(i + 1) - (a.top + a.h - a.cb + SEAM as f64)).abs() < 1e-6, "page {i} runs on");
+            assert!((b.top + b.ct - g.page_top(i + 1)).abs() < 1e-6);
+            assert_eq!(g.page_at(g.page_top(i) + body / 2.0, n), i);
+        }
+        assert!(g.page_top(n) < paged.page_top(n) * 0.85, "shorter: {} vs {}", g.page_top(n), paged.page_top(n));
+        // A click on page 3's first line lands on page 3's text.
+        let mut st = scroll.get();
+        st.physics.set_position(g.page_top(3) - 20.0);
+        scroll.set(st);
+        app.tick();
+        let first = ed.borrow().pages.pages()[3].start.block;
+        let y = (g.page_top(3) + 4.0 - scroll.get().physics.y) as f32;
+        let x = (g.left_of(3) + g.margin_x + 30.0) as f32;
+        app.handle_event(Event::PointerDown { at: Point::new(x, y) });
+        app.handle_event(Event::PointerUp { at: Point::new(x, y) });
+        app.tick();
+        assert_eq!(ed.borrow().caret.block, first);
+
+        // Read mode: a whole page shows; keys turn pages and type nothing.
+        {
+            let mut e = ed.borrow_mut();
+            e.continuous = false;
+            e.reading = true;
+        }
+        let g = Geom::of(&ed.borrow(), r, 1.0);
+        assert!(g.page_h <= 700.0 - 2.0 * GAP as f64 + 0.01 && g.page_h > 600.0, "fits: {}", g.page_h);
+        let mut st = scroll.get();
+        st.physics.set_position(0.0);
+        scroll.set(st);
+        app.tick();
+        let key = |app: &mut App<Host>, k: Key, c: &str| {
+            app.handle_event(Event::Key { kind: KeyEventKind::Down, key: k, modifiers: Modifiers::default(), chars: c.into() });
+            app.tick();
+        };
+        let text = ed.borrow().doc.para(0).unwrap().text.clone();
+        let shown = |s: &Mutable<ScrollState>| g.page_at(s.get().physics.y + 350.0, n);
+        key(&mut app, Key::PageDown, "");
+        assert_eq!(shown(&scroll), 1);
+        key(&mut app, Key::Char, " ");
+        assert_eq!(shown(&scroll), 2);
+        key(&mut app, Key::Left, "");
+        assert_eq!(shown(&scroll), 1);
+        key(&mut app, Key::End, "");
+        assert_eq!(shown(&scroll), n - 1);
+        key(&mut app, Key::Char, "x");
+        key(&mut app, Key::Backspace, "");
+        assert_eq!(shown(&scroll), n - 2);
+        assert_eq!(ed.borrow().doc.para(0).unwrap().text, text, "nothing typed");
+        key(&mut app, Key::Escape, "");
+        assert!(!ed.borrow().reading);
+        let start = ed.borrow().pages.pages()[n - 2].start.block;
+        assert_eq!(ed.borrow().caret.block, start, "the caret where the reading got to");
     }
 
     /// Pages of a section with a landscape page of its own sit at their own

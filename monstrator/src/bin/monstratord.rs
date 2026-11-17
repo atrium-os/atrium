@@ -45,7 +45,7 @@ fn portcullis_socket() -> PathBuf {
 }
 
 /// One link from `asker`, start to end.
-fn open(asker: u32, url: &str, activation: [u8; 16]) -> Result<String, String> {
+fn open(asker: u32, url: &str, activation: [u8; 16], choose: bool) -> Result<String, String> {
     let link = atrium_links::check(url)?;
     let mut p = UnixStream::connect(portcullis_socket()).map_err(|e| format!("portcullisd: {e}"))?;
     p.set_read_timeout(Some(Duration::from_secs(10))).ok();
@@ -54,20 +54,22 @@ fn open(asker: u32, url: &str, activation: [u8; 16]) -> Result<String, String> {
         Response::Hello { .. } => {}
         other => return Err(format!("portcullisd: {other:?}")),
     }
-    let (grant, apps) = match ask(&mut p, &Request::LinkGrant { asker_uid: asker, activation, scheme: link.scheme.clone(), app: link.app.clone() })? {
-        Response::LinkGranted { grant, apps, .. } => (grant, apps),
+    let (grant, apps, personas) = match ask(&mut p, &Request::LinkGrant { asker_uid: asker, activation, scheme: link.scheme.clone(), app: link.app.clone() })? {
+        Response::LinkGranted { grant, apps, personas, .. } => (grant, apps, personas),
         Response::Error { message } => return Err(message),
         other => return Err(format!("portcullisd: {other:?}")),
     };
-    let (app, always) = match monstrator::pick(&apps) {
-        Some(a) => (a.to_string(), false),
-        // A choice: the person makes it in Monstrator's own sheet (§5).
-        None => match choose(&link.shown, &link.scheme, apps)? {
-            Outcome::Chose { app, always } => (app, always),
+    // Without "Open with…", the default or the only app; with it, or with
+    // a choice, the person makes it in Monstrator's own sheet (§5), where
+    // another persona may be chosen too (personas.md §6).
+    let (app, always, persona) = match monstrator::pick(&apps).filter(|_| !choose) {
+        Some(a) => (a.to_string(), false, None),
+        None => match self::choose(&link.shown, &link.scheme, apps, personas)? {
+            Outcome::Chose { app, always, persona } => (app, always, persona),
             Outcome::Cancelled => return Err("cancelled".into()),
         },
     };
-    match ask(&mut p, &Request::DeliverLink { grant, app: app.clone(), url: link.url, always })? {
+    match ask(&mut p, &Request::DeliverLink { grant, app: app.clone(), url: link.url, always, persona })? {
         Response::LinkDelivered { .. } => Ok(link.scheme),
         Response::Error { message } => Err(message),
         other => Err(format!("portcullisd: {other:?}")),
@@ -120,13 +122,13 @@ static SHEET: Mutex<()> = Mutex::new(());
 
 /// Ask the person which of `apps` opens the link (§5): Monstrator's own
 /// window on frescod, its rows the window's guard.
-fn choose(shown: &str, scheme: &str, apps: Vec<portcullis_ipc::LinkChoice>) -> Result<Outcome, String> {
+fn choose(shown: &str, scheme: &str, apps: Vec<portcullis_ipc::LinkChoice>, personas: Vec<portcullis_ipc::PersonaChoice>) -> Result<Outcome, String> {
     use fresco_client::{Connection, Event};
     use fresco_protocol::{WindowHints, WmRole};
     use monstrator::sheet::{Do, Key, Sheet};
     use monstrator::view;
     let _one = SHEET.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = Sheet::new(shown, scheme, apps);
+    let mut s = Sheet::with_personas(shown, scheme, apps, personas);
     let n = s.rows().len();
     let fresco = fresco_client::default_socket_path();
     let mut win = Connection::connect(&fresco).map_err(|e| format!("frescod ({}): {e}", fresco.display()))?;
@@ -145,7 +147,8 @@ fn choose(shown: &str, scheme: &str, apps: Vec<portcullis_ipc::LinkChoice>) -> R
         }
     };
     guard(&mut win, size, k);
-    eprintln!("monstratord: asking which of {} apps opens a {scheme} link", n - 2);
+    eprintln!("monstratord: asking which of {} apps opens a {scheme} link{}", s.apps.len(),
+              if s.personas.is_empty() { String::new() } else { format!(", in which of {} personas", s.personas.len()) });
     let until = std::time::Instant::now() + SHEET_FOR;
     let mut dirty = true;
     let out = 'run: loop {
@@ -225,7 +228,7 @@ fn serve(s: UnixStream, busy: Arc<Mutex<HashSet<u32>>>) {
     let mut line = String::new();
     let read = BufReader::new((&s).take(MAX_LINE as u64)).read_line(&mut line);
     let result = match read.ok().and_then(|_| serde_json::from_str::<Ask>(line.trim_end()).ok()) {
-        Some(Ask::OpenLink { url, activation }) => open(uid, &url, activation),
+        Some(Ask::OpenLink { url, activation, choose }) => open(uid, &url, activation, choose),
         None => Err("not a request".into()),
     };
     match result {
@@ -297,18 +300,18 @@ mod tests {
     #[test]
     fn a_link_goes_through_portcullisd_once() {
         let (p, h) = fake(vec![
-            Response::LinkGranted { grant: [9; 16], person: "ana".into(), apps: vec![LinkChoice { id: "org.example.mail".into(), name: "Mail".into(), default: false }] },
+            Response::LinkGranted { grant: [9; 16], person: "ana".into(), apps: vec![LinkChoice { id: "org.example.mail".into(), name: "Mail".into(), default: false }], personas: vec![] },
             Response::LinkDelivered { app: "Mail".into() },
         ]);
         std::env::set_var("PORTCULLIS_SOCKET", &p);
-        assert_eq!(open(50001, "MAILTO:ana@example.org", [1; 16]).unwrap(), "mailto");
+        assert_eq!(open(50001, "MAILTO:ana@example.org", [1; 16], false).unwrap(), "mailto");
         let got = h.join().unwrap();
         assert!(matches!(&got[1], Request::LinkGrant { asker_uid: 50001, activation, scheme, app: None } if *activation == [1; 16] && scheme == "mailto"));
-        assert!(matches!(&got[2], Request::DeliverLink { grant, app, url, always: false } if *grant == [9; 16] && app == "org.example.mail" && url == "mailto:ana@example.org"));
+        assert!(matches!(&got[2], Request::DeliverLink { grant, app, url, always: false, persona: None } if *grant == [9; 16] && app == "org.example.mail" && url == "mailto:ana@example.org"));
         // Refused before portcullisd is asked anything.
         std::env::set_var("PORTCULLIS_SOCKET", "/nonexistent/portcullis.sock");
-        assert!(open(50001, "javascript:alert(1)", [1; 16]).unwrap_err().contains("never opened"));
-        assert!(open(50001, "mailto:a@b\nbcc:c@d", [1; 16]).unwrap_err().contains("control"));
+        assert!(open(50001, "javascript:alert(1)", [1; 16], false).unwrap_err().contains("never opened"));
+        assert!(open(50001, "mailto:a@b\nbcc:c@d", [1; 16], false).unwrap_err().contains("control"));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

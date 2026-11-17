@@ -298,6 +298,48 @@ workspace must not mean rebuilding from nothing.
   project out or trying something risky costs no rebuild. The copy gets
   its own uid; files are re-owned as they are cloned.
 
+### 5.5 Installing packages (`pkg`, dev-tools-plan.md M2)
+
+`pkg` runs as the workspace jail's root, never the host's, and only after the
+person's yes. portcullisd's `WorkspaceAdmin { name, argv, activation }` takes
+`pkg <subcommand> [words]` with subcommand `install`, `delete`, `remove`,
+`upgrade`, `update`, `info`, `search`, `autoremove` or `clean`, and words made of
+package-name characters only. It needs a press (purpose APPROVE) from the Terminal,
+the Workspaces app, or an IDE the workspace was given; the person's own CLI
+(`portcullis workspace pkg <name> install helix`) needs none. The output ends with
+`pkg: exit <status>`.
+
+The workspace jail has `allow.mount`, `allow.raw_sockets`, `allow.chflags` and
+`allow.set_hostname` off, `enforce_statfs=2` and `children.max=0`, all set
+explicitly, so its root can't mount, can't open raw sockets, can't set system
+file flags and can't make jails. The base is read-only, so a package script
+that writes `/usr/bin` fails. Each workspace has its own `/var/db/pkg` and
+`/var/cache/pkg`, a `nobody` account that pkg fetches as, and
+`/etc/pkg/FreeBSD.conf` with only the ports repository from `pkg.FreeBSD.org`
+for the base's ABI. That file is rewritten at each start: no base or kernel-module
+repositories. Packages land in `/usr/local`, owned by the jail's root.
+
+**The `pkg` in a console.** `/atrium/bin/pkg` comes first on the workspace's
+`PATH`. It is a script, read-only and the host's. `info`, `search`, `query`,
+`which`, `version`, `audit` and `stats` run the real pkg as the workspace's own
+uid. Anything else asks the terminal it runs in, because only the terminal can
+show a button the person presses:
+
+1. The script prints a line saying it is asking, turns echo off, and writes
+   `ESC ] 7770 ; pkg ; <words, space-separated> BEL` to the terminal.
+2. The terminal shows what is asked ("Scratch asks to run: pkg install helix")
+   with Install and Cancel. The workspace name comes from the tab, never from the
+   request, so code in one workspace can't name another.
+3. On Install, the terminal sends `WorkspaceAdmin` with the press, shows pkg's
+   output in the tab, and answers on the pty's input
+   `ESC ] 7770 ; ok ; <status> BEL CR`. On Cancel it answers
+   `ESC ] 7770 ; cancel BEL CR`.
+4. The script reads that line, restores the terminal, and exits with the status.
+
+Without a terminal (a build script, a pipe) the script refuses, so code in the
+workspace can't install anything without the person seeing what it asks for.
+An IDE's terminal pane does the same as the Terminal.
+
 ## 6. The host shell
 
 Root's shell is for administration and recovery: Curia's Recovery page opens

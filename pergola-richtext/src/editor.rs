@@ -156,6 +156,13 @@ pub struct Editor {
     /// Review mode: the edits are listed beside the page, the one selected is
     /// shown in place.
     pub review: bool,
+    /// Continuous view: pages shown without their top and bottom margins
+    /// (headers and footers) or the gaps between them, the text running
+    /// on with a line where a page ends.
+    pub continuous: bool,
+    /// Read mode: a page at a time fitted to the view, keys turn pages,
+    /// nothing edits.
+    pub reading: bool,
     /// The selected edit, an index into [`Editor::edits`].
     pub review_at: usize,
     edits_cache: Option<(u64, Rc<Vec<Edit>>)>,
@@ -199,7 +206,7 @@ pub enum DragKind {
 impl Editor {
     pub fn new(doc: TextDoc, fonts: Rc<dyn Fonts>) -> Editor {
         let pages = Paginator::new(&doc);
-        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, review_at: 0, edits_cache: None, dragging: None };
+        let mut e = Editor { doc, history: History::new(), anchor: Pos::default(), caret: Pos::default(), typing: None, goal_x: None, pages, cache: LayoutCache::default(), fonts, last: Kind::Other, revision: 0, field_rounds: 0, log: None, attrs_logged: 0, images_logged: 0, numbering: None, words: WordCounter::default(), checker: None, spelling: std::collections::HashMap::new(), author: "Me".into(), now: "".into(), track_rev: None, review: false, continuous: false, reading: false, review_at: 0, edits_cache: None, dragging: None };
         e.words = WordCounter::new(&e.doc);
         e.paginate(SETTLE);
         e

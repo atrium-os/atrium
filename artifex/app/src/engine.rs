@@ -741,16 +741,8 @@ impl Engine {
         let d = &mut self.docs[i];
         let mut b = d.cells.buffer.get_cloned();
         let path = d.cells.path.clone();
-        // Through a temporary in the same folder, then renamed: a crash
-        // never leaves half a file.
-        let tmp = path.with_file_name(format!(".{}.artifex-save", title_of(&d.rel)));
         let text = b.to_string();
-        let r = std::fs::write(&tmp, &text).and_then(|_| {
-            if let Ok(m) = std::fs::metadata(&path) {
-                let _ = std::fs::set_permissions(&tmp, m.permissions());
-            }
-            std::fs::rename(&tmp, &path)
-        });
+        let r = save_file(&path, &text, &title_of(&d.rel));
         match r {
             Ok(()) => {
                 b.mark_saved();
@@ -769,7 +761,7 @@ impl Engine {
                 }
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(path.with_file_name(format!(".{}.artifex-save", title_of(&d.rel))));
                 s.note = Some((format!("Can't save {}: {e}", d.rel), true));
             }
         }
@@ -1250,6 +1242,30 @@ fn placeholder() -> Doc {
         lsp_sent: 0,
         last_edit: Instant::now(),
     }
+}
+
+/// Save `text` to `path`. Through a temporary in the same folder, then
+/// renamed, so a crash never leaves half a file; but a file someone else
+/// owns (a workspace's, under Artifex's own uid) is rewritten in place, as
+/// a rename would hand it to Artifex (`work` is shared through the
+/// person's files group). One that isn't group-writable is still replaced.
+fn save_file(path: &Path, text: &str, title: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok();
+    let ours = meta.as_ref().is_none_or(|m| m.uid() == unsafe { libc::geteuid() });
+    if !ours {
+        match std::fs::write(path, text) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            r => return r,
+        }
+    }
+    let tmp = path.with_file_name(format!(".{title}.artifex-save"));
+    std::fs::write(&tmp, text).and_then(|_| {
+        if let Some(m) = &meta {
+            let _ = std::fs::set_permissions(&tmp, m.permissions());
+        }
+        std::fs::rename(&tmp, path)
+    })
 }
 
 #[cfg(test)]

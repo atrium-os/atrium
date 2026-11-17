@@ -5859,8 +5859,13 @@ one, Personal's unchanged) and Work's window comes forward. The page and UI work
 `per_instance`: the UI and the pages run as uids of their own per (person, persona), named in
 the launch registry (`<uid> navtest org.atrium.navigator.page [persona=work]`), and portcullisd
 logs `org.atrium.navigator.page for navtest's org.atrium.navigator (work) runs as atrium-app-N`.
-The bundle scripts replace an older rule without `per_instance`. 88/88 on 2026-11-17 (67/67
-before the Work section). Earlier: 61/61 on
+The bundle scripts replace an older rule without `per_instance`. Last, Open with… in the Work
+window (the toolbar's last button): Monstrator's sheet asks with "In: Work"; with navtest's switch
+off, choosing Personal is refused in the sheet (`confined-7-crossing-off.png`) and Escape cancels;
+with `[[crossings]] from = "work" to = "personal" kinds = ["links"]` added and `portcullis daemon
+reload`, the same opens the page in the Personal Navigator in a new trail (`crosses from Work to
+Personal` in portcullisd's log). navtest having a Work persona adds an "In:" row to the mailto
+sheet too, so the keys there step past it. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

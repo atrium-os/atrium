@@ -33,6 +33,7 @@
 mod clipboard;
 mod keymap;
 mod mouse;
+mod pkgask;
 mod pty;
 mod render;
 
@@ -139,8 +140,9 @@ impl Io {
     }
 
     /// Take what is waiting. `Ok(true)`: the screen changed; `Err`: it's
-    /// over. A program's clipboard write (OSC 52) lands in `clip`.
-    fn read(&mut self, buf: &mut [u8], clip: &mut Option<String>) -> Result<bool, ()> {
+    /// over. A program's clipboard write (OSC 52) lands in `clip`, a
+    /// workspace's `pkg` request (OSC 7770) in `ask`.
+    fn read(&mut self, buf: &mut [u8], clip: &mut Option<String>, ask: &mut Option<String>) -> Result<bool, ()> {
         match self {
             Io::Pty { shell, term } => {
                 let mut changed = false;
@@ -161,6 +163,9 @@ impl Io {
                 }
                 if let Some(c) = term.take_clipboard() {
                     *clip = Some(c);
+                }
+                if let Some(a) = term.take_ask() {
+                    *ask = Some(a);
                 }
                 Ok(changed)
             }
@@ -188,6 +193,9 @@ impl Io {
                             if let Some(mut d) = stoa_term::StateDiff::decode(&env.payload) {
                                 if let Some(c) = d.clipboard.take() {
                                     *clip = Some(c);
+                                }
+                                if let Some(a) = d.ask.take() {
+                                    *ask = Some(a);
                                 }
                                 d.apply(grid);
                                 changed = true;
@@ -236,6 +244,10 @@ struct Session {
     /// The strip and the switcher's state; the switcher's targets.
     strip:    render::Strip,
     targets:  Vec<String>,
+    /// A workspace's `pkg` request being asked about (its words).
+    asking:   Option<String>,
+    /// pkg running (or just run) after Install, drawn over the tab.
+    admin:    Option<pkgask::Admin>,
 }
 
 /// What the strip calls a console target.
@@ -283,6 +295,7 @@ impl Session {
             targets.push(format!("workspace/{w}"));
         }
         let sel = targets.iter().position(|t| Some(t.as_str()) == self.app.as_deref()).unwrap_or(0);
+        self.renderer.menu_w = render::MENU_W;
         self.strip.menu = Some((items, sel));
         self.targets = targets;
         self.dirty = true;
@@ -291,6 +304,33 @@ impl Session {
     fn close_switcher(&mut self) {
         self.strip.menu = None;
         self.dirty = true;
+    }
+
+    /// A `pkg` request came from this tab's program.
+    fn take_ask(&mut self, words: String) {
+        if self.asking.is_some() || self.admin.is_some() {
+            eprintln!("atrium-term-socket: window {}: a pkg request while one is open; ignored", self.win);
+            return;
+        }
+        let Some(ws) = pkgask::workspace_of(self.app.as_deref()) else {
+            // Only a workspace's console has a pkg to ask for.
+            self.io.input(pkgask::CANCEL);
+            return;
+        };
+        let head = pkgask::heading(ws, &words);
+        eprintln!("atrium-term-socket: window {}: {head}", self.win);
+        self.renderer.menu_w = render::menu_width(&head);
+        self.strip.menu = Some((vec![head, "Install".into(), "Cancel".into()], 1));
+        self.asking = Some(words);
+        self.dirty = true;
+    }
+
+    /// The person said no (Cancel, Esc).
+    fn cancel_ask(&mut self) {
+        if self.asking.take().is_some() {
+            self.io.input(pkgask::CANCEL);
+        }
+        self.close_switcher();
     }
 }
 
@@ -313,7 +353,7 @@ fn open_window(conn: &mut Connection, font: &Font, title: &str, mut io: Io, app:
     io.resize(COLS, ROWS);
     let strip = render::Strip { place: place_name(app.as_deref()), hint: "switch: click or Ctrl+Shift+O".into(), menu: None };
     Ok(Session { win, title: title.into(), app, io, renderer, shown: title.into(), press: None, offered: None, held: None,
-                 wheel: 0.0, dirty: true, traced: String::new(), strip, targets: Vec::new() })
+                 wheel: 0.0, dirty: true, traced: String::new(), strip, targets: Vec::new(), asking: None, admin: None })
 }
 
 fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
@@ -328,27 +368,30 @@ fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
         s.shown = want;
     }
     conn.set_default_window(s.win as u16);
-    s.renderer.render(conn, s.io.grid(), &s.strip)?;
-    s.dirty = false;
-    if trace {
-        let g = s.io.grid();
+    // pkg's output, while it runs and until a key, over the tab.
+    let grid = s.admin.as_ref().map_or(s.io.grid(), |a| a.view.grid());
+    s.renderer.render(conn, grid, &s.strip)?;
+    let line = trace.then(|| {
+        let g = grid;
         let rows: Vec<String> = (0..g.rows())
             .map(|r| g.row(r).iter().map(|c| if c.c == '\0' { ' ' } else { c.c }).collect::<String>().trim_end().to_string())
             .filter(|l| !l.is_empty())
             .collect();
         let t = rows.join(" | ");
         // The alternate screen (a full-screen program) and the cursor, for
-        // gates: `<alt>`, `@row,col`.
+        // gates: `<alt>`, `@row,col`; `<pkg>`: pkg's output over the tab.
         let alt = if g.mode(stoa_term::mode::ALT_SCREEN) { "<alt> " } else { "" };
         let (cr, cc) = g.cursor();
         let t = match &s.strip.menu {
             Some((items, sel)) => format!("[{}] menu={}@{sel} {alt}{t}", s.strip.place, items.join(",")),
             None => format!("[{}] {alt}@{cr},{cc} {t}", s.strip.place),
         };
-        if t != s.traced {
-            eprintln!("atrium-term: screen “{}”: {t}", s.title);
-            s.traced = t;
-        }
+        if s.admin.is_some() { format!("<pkg> {t}") } else { t }
+    });
+    s.dirty = false;
+    if let Some(t) = line.filter(|t| *t != s.traced) {
+        eprintln!("atrium-term: screen “{}”: {t}", s.title);
+        s.traced = t;
     }
     Ok(())
 }
@@ -570,6 +613,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue; // modifiers alone send nothing; each press carries them
                     }
                     let mut taken = false;
+                    // pkg's output is over the tab: input waits; once it has
+                    // ended, a key (or a click) goes back to the shell.
+                    if let Some(a) = &s.admin {
+                        if matches!(input, Event::Key { pressed: true, .. } | Event::PointerButton { pressed: true, .. }) && a.done.is_some() {
+                            s.admin = None;
+                            s.dirty = true;
+                        }
+                        if matches!(input, Event::Key { .. } | Event::PointerButton { .. } | Event::PointerMotion { .. } | Event::PointerScroll { .. }) {
+                            continue;
+                        }
+                    }
                     match &input {
                         Event::PointerButton { pressed: true, x, y, activation, .. } if s.app.is_some() => {
                             let hit = s.strip.menu.as_ref().and_then(|(items, _)| (0..items.len()).find(|&i| {
@@ -580,28 +634,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 choose = Some((i, *activation));
                             } else if *y < s.renderer.top && s.strip.menu.is_none() {
                                 s.open_switcher();
-                            } else if s.strip.menu.is_some() {
+                            } else if s.strip.menu.is_some() && s.asking.is_none() {
                                 s.close_switcher();
                             }
                         }
                         Event::Key { hid_usage: HID_O, pressed: true, modifiers, repeat: false, .. }
-                            if modifiers & 0x11 != 0 && modifiers & 0x22 != 0 && s.app.is_some() =>
+                            if modifiers & 0x11 != 0 && modifiers & 0x22 != 0 && s.app.is_some() && s.asking.is_none() =>
                         {
                             if s.strip.menu.is_some() { s.close_switcher() } else { s.open_switcher() }
                             taken = true;
                         }
                         Event::Key { hid_usage, pressed: true, activation, repeat, .. } if s.strip.menu.is_some() => {
+                            // The menu's keys are its own, even the Esc that
+                            // closes it (it would reach the shell after).
+                            taken = true;
                             let n = s.strip.menu.as_ref().map(|m| m.0.len()).unwrap_or(0);
                             let sel = s.strip.menu.as_ref().map(|m| m.1).unwrap_or(0);
                             match *hid_usage {
-                                HID_UP => { if let Some(m) = &mut s.strip.menu { m.1 = sel.saturating_sub(1) } s.dirty = true }
+                                // Asking: the first row is the question, not a choice.
+                                HID_UP => { let low = s.asking.is_some() as usize; if let Some(m) = &mut s.strip.menu { m.1 = sel.saturating_sub(1).max(low) } s.dirty = true }
                                 HID_DOWN => { if let Some(m) = &mut s.strip.menu { m.1 = (sel + 1).min(n.saturating_sub(1)) } s.dirty = true }
                                 HID_ENTER if !*repeat => choose = Some((sel, *activation)),
-                                HID_ESC => s.close_switcher(),
+                                HID_ESC => s.cancel_ask(),
                                 _ => {}
                             }
                         }
                         _ => {}
+                    }
+                    if let Some((i, activation)) = choose.filter(|_| s.asking.is_some()) {
+                        match i {
+                            1 => {
+                                let words = s.asking.take().unwrap_or_default();
+                                s.close_switcher();
+                                let ws = pkgask::workspace_of(s.app.as_deref()).unwrap_or_default().to_string();
+                                let (cols, rows) = (s.io.grid().cols(), s.io.grid().rows());
+                                match pkgask::Admin::start(&ws, &words, activation, cols, rows) {
+                                    Ok(a) => {
+                                        eprintln!("atrium-term-socket: window {}: pkg {words} in {ws}", s.win);
+                                        register_read(kq, a.fd())?;
+                                        s.admin = Some(a);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("atrium-term-socket: pkg {words} in {ws}: {e}");
+                                        s.strip.hint = format!("pkg not run: {e}");
+                                        s.io.input(pkgask::CANCEL);
+                                    }
+                                }
+                            }
+                            2 => s.cancel_ask(),
+                            _ => {}
+                        }
+                        continue;
                     }
                     if let Some((i, activation)) = choose {
                         let target = s.targets.get(i).cloned().unwrap_or_default();
@@ -735,6 +818,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     grid.resize(cols, rows);
                                 }
                                 s.io.resize(cols, rows);
+                                if let Some(a) = &mut s.admin {
+                                    a.view.resize(cols, rows);
+                                }
                             }
                             s.dirty = true;
                         }
@@ -744,15 +830,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 }
+            } else if let Some(s) = sessions.iter_mut().find(|s| s.admin.as_ref().is_some_and(|a| a.fd() == fd)) {
+                let a = s.admin.as_mut().unwrap();
+                if a.read(&mut buf) {
+                    let _ = unregister(kq, fd);
+                    let status = a.done.unwrap_or(1);
+                    eprintln!("atrium-term-socket: window {}: pkg: exit {status}", s.win);
+                    s.io.input(&pkgask::ok_reply(status));
+                }
+                s.dirty = true;
             } else if let Some(s) = sessions.iter_mut().find(|s| s.io.fd() == fd) {
                 let mut clip = None;
-                match s.io.read(&mut buf, &mut clip) {
+                let mut ask = None;
+                match s.io.read(&mut buf, &mut clip, &mut ask) {
                     Ok(true) => s.dirty = true,
                     Ok(false) => {}
                     Err(()) => closed.push(s.win),
                 }
                 if let Some(text) = clip {
                     offer_copy(&mut tabula, s, text);
+                }
+                if let Some(words) = ask {
+                    s.take_ask(words);
                 }
                 if matches!(s.io, Io::Pty { .. }) && (ev.flags as u32) & (libc::EV_EOF as u32) != 0 {
                     closed.push(s.win);
@@ -769,6 +868,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(i) = sessions.iter().position(|s| s.win == w) {
                 let s = sessions.remove(i);
                 let _ = unregister(kq, s.io.fd());
+                if let Some(a) = &s.admin {
+                    let _ = unregister(kq, a.fd());
+                }
                 eprintln!("atrium-term-socket: “{}” closed", s.title);
                 let _ = conn.window_destroy(s.win);
             }

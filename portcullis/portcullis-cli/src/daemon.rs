@@ -279,9 +279,21 @@ pub fn run(name: String, project: String) -> DaemonResult<(String, Vec<String>)>
 /// Run a command in one of the person's workspaces (homes.md W6), its
 /// output copied to stdout until it ends.
 pub fn exec(name: String, argv: Vec<String>, cwd: String) -> DaemonResult<()> {
+    streamed(Request::WorkspaceExec { name, argv, cwd })
+}
+
+/// `pkg` as the workspace jail's root (dev-tools-plan.md M2): the person's
+/// own CLI needs no press. Its output, ending `pkg: exit <status>`.
+pub fn pkg(name: String, args: Vec<String>) -> DaemonResult<()> {
+    let mut argv = vec!["pkg".to_string()];
+    argv.extend(args);
+    streamed(Request::WorkspaceAdmin { name, argv, activation: [0; 16] })
+}
+
+fn streamed(req: Request) -> DaemonResult<()> {
     use std::io::Write;
     let Some(mut s) = opened()? else { return Ok(None) };
-    portcullis_ipc::write_request(&mut s, &Request::WorkspaceExec { name, argv, cwd })?;
+    portcullis_ipc::write_request(&mut s, &req)?;
     match portcullis_ipc::read_response_unbuffered(&mut s)? {
         Response::WorkspaceExecStarted { .. } => {}
         Response::Error { message } => return Err(io::Error::other(message)),

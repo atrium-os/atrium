@@ -682,7 +682,14 @@ fn toolbar(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let kept = page.is_some_and(|p| s.store.is_kept(&p.url));
     let st2 = st.clone();
     icon_button(ctx, g.w - em(72.0), em(6.0), ph::STAR, has, if kept { t.accent_fg() } else { t.text_secondary() }, if kept { "Kept · click to stop keeping" } else { "Keep this page (Ctrl-D)" }, move || with(&st2, |s| s.store.toggle_keep()));
-    icon_button(ctx, g.w - em(40.0), em(6.0), ph::DOTS_THREE, true, t.text_secondary(), "More", || {});
+    // Open with… (personas.md §6): another app, or this page in another
+    // persona, asked in Monstrator's sheet.
+    let st2 = st.clone();
+    icon_button(ctx, g.w - em(40.0), em(6.0), ph::ARROW_SQUARE_OUT, has, t.text_secondary(), "Open with\u{2026} (another app or persona)", move || with(&st2, |s| {
+        if s.open_with(pergola::clipboard::current_activation()) {
+            s.last_note = Some("open with: asked Monstrator".into());
+        }
+    }));
 }
 
 /// The Where field at rest (§5.3): the tier chip with its light, the

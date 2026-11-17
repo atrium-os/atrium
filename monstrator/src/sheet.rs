@@ -4,12 +4,14 @@
 //! runs it. A pick counts only once frescod has counted its press
 //! (`PROMPT`, self-spent: the rows are the window's guard).
 
-use portcullis_ipc::LinkChoice;
+use portcullis_ipc::{LinkChoice, PersonaChoice};
 
 /// What the person did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Chose { app: String, always: bool },
+    /// `persona`: another persona to open it in (personas.md §6), by
+    /// name; `None`, the asking app's own.
+    Chose { app: String, always: bool, persona: Option<String> },
     Cancelled,
 }
 
@@ -27,6 +29,8 @@ pub enum Do {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
     App(usize),
+    /// Which persona it opens in (cycles); only with named personas.
+    Persona,
     Always,
     Cancel,
 }
@@ -37,24 +41,77 @@ pub struct Sheet {
     pub shown: String,
     pub scheme: String,
     pub apps: Vec<LinkChoice>,
+    /// The person's personas, the asker's first (empty: none named).
+    pub personas: Vec<PersonaChoice>,
+    /// The one chosen, an index into `personas`.
+    pub into: usize,
     pub always: bool,
     pub focus: usize,
-    /// Said under the text after a press frescod didn't count.
-    pub notice: Option<&'static str>,
+    /// Said under the text: a press frescod didn't count, or a persona
+    /// the link may not go to.
+    pub notice: Option<String>,
 }
 
 impl Sheet {
     pub fn new(shown: &str, scheme: &str, apps: Vec<LinkChoice>) -> Sheet {
-        Sheet { shown: shown.into(), scheme: scheme.into(), apps, always: false, focus: 0, notice: None }
+        Sheet::with_personas(shown, scheme, apps, vec![])
+    }
+
+    /// The sheet with the person's personas: the apps that only another
+    /// persona may get (the asker's own) are rows too, open only there.
+    pub fn with_personas(shown: &str, scheme: &str, mut apps: Vec<LinkChoice>, personas: Vec<PersonaChoice>) -> Sheet {
+        for p in &personas {
+            for a in &p.also {
+                if !apps.iter().any(|x| x.id == a.id) {
+                    apps.push(a.clone());
+                }
+            }
+        }
+        let personas = if personas.len() > 1 { personas } else { vec![] };
+        Sheet { shown: shown.into(), scheme: scheme.into(), apps, personas, into: 0, always: false, focus: 0, notice: None }
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        (0..self.apps.len()).map(Row::App).chain([Row::Always, Row::Cancel]).collect()
+        let p = (!self.personas.is_empty()).then_some(Row::Persona);
+        (0..self.apps.len()).map(Row::App).chain(p).chain([Row::Always, Row::Cancel]).collect()
+    }
+
+    fn persona_name(p: &PersonaChoice) -> String {
+        let mut c = p.name.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    }
+
+    /// Whether app `i` may get the link in the chosen persona: in the
+    /// asker's own, not the asker itself; elsewhere, only with the switch.
+    fn opens(&self, i: usize) -> Result<(), String> {
+        let Some(p) = self.personas.get(self.into) else { return Ok(()) };
+        let here = &self.personas[0];
+        if !p.allowed {
+            return Err(format!("Links from {} to {} are off. Settings, Personas has the switch.", Self::persona_name(here), Self::persona_name(p)));
+        }
+        let only_elsewhere = self.personas.iter().any(|q| q.also.iter().any(|a| a.id == self.apps[i].id));
+        if p.here && only_elsewhere {
+            return Err(format!("{} asked: choose another persona for it.", self.apps[i].name));
+        }
+        Ok(())
     }
 
     pub fn label(&self, r: &Row) -> String {
         match r {
-            Row::App(i) => self.apps[*i].name.clone(),
+            Row::App(i) => {
+                let here = self.personas.get(self.into).is_some_and(|p| p.here);
+                let only_elsewhere = self.personas.iter().any(|q| q.also.iter().any(|a| a.id == self.apps[*i].id));
+                if here && only_elsewhere {
+                    format!("{} (in another persona only)", self.apps[*i].name)
+                } else {
+                    self.apps[*i].name.clone()
+                }
+            }
+            Row::Persona => {
+                let p = &self.personas[self.into];
+                let how = if p.here { " (where it was opened)" } else if p.allowed { "" } else { " (off in Settings)" };
+                format!("In: {}{how}", Self::persona_name(p))
+            }
             Row::Always => format!("{} Always use this app for {} links", if self.always { "[x]" } else { "[ ]" }, self.scheme),
             Row::Cancel => "Cancel".into(),
         }
@@ -68,7 +125,20 @@ impl Sheet {
     /// A click (or Enter) on row `i` with its press `token`.
     pub fn press(&mut self, i: usize, token: [u8; 16]) -> Do {
         match self.rows().get(i) {
-            Some(Row::App(_)) => Do::Spend { row: i, token },
+            Some(Row::App(a)) => match self.opens(*a) {
+                Ok(()) => Do::Spend { row: i, token },
+                Err(why) => {
+                    self.notice = Some(why);
+                    self.focus = i;
+                    Do::Redraw
+                }
+            },
+            Some(Row::Persona) => {
+                self.into = (self.into + 1) % self.personas.len();
+                self.notice = None;
+                self.focus = i;
+                Do::Redraw
+            }
             Some(Row::Always) => {
                 self.always = !self.always;
                 self.focus = i;
@@ -82,9 +152,12 @@ impl Sheet {
     /// What frescod said of the press for row `row`.
     pub fn spent(&mut self, row: usize, counted: bool) -> Do {
         match (self.rows().get(row), counted) {
-            (Some(Row::App(i)), true) => Do::Done(Outcome::Chose { app: self.apps[*i].id.clone(), always: self.always }),
+            (Some(Row::App(i)), true) => {
+                let persona = self.personas.get(self.into).filter(|p| !p.here).map(|p| p.name.clone());
+                Do::Done(Outcome::Chose { app: self.apps[*i].id.clone(), always: self.always, persona })
+            }
             _ => {
-                self.notice = Some("That press didn't count: the sheet was covered or had just moved. Press again.");
+                self.notice = Some("That press didn't count: the sheet was covered or had just moved. Press again.".into());
                 Do::Redraw
             }
         }
@@ -103,7 +176,7 @@ impl Sheet {
                 Do::Redraw
             }
             Key::Enter => self.press(self.focus, token),
-            Key::Space if self.rows()[self.focus] == Row::Always => self.press(self.focus, token),
+            Key::Space if matches!(self.rows()[self.focus], Row::Always | Row::Persona) => self.press(self.focus, token),
             Key::Escape => Do::Done(Outcome::Cancelled),
             _ => Do::Nothing,
         }
@@ -153,7 +226,7 @@ mod tests {
         assert!(s.notice.is_some());
         assert_eq!(s.press(2, [0; 16]), Do::Redraw, "Always toggles");
         assert!(s.always);
-        assert_eq!(s.spent(1, true), Do::Done(Outcome::Chose { app: "org.b.mail".into(), always: true }));
+        assert_eq!(s.spent(1, true), Do::Done(Outcome::Chose { app: "org.b.mail".into(), always: true, persona: None }));
         assert_eq!(s.press(3, [0; 16]), Do::Done(Outcome::Cancelled));
         assert_eq!(s.press(9, [0; 16]), Do::Nothing);
     }
@@ -172,5 +245,33 @@ mod tests {
         assert_eq!(s.key(Key::Escape, [0; 16]), Do::Done(Outcome::Cancelled));
         assert_eq!(Key::from_hid(0x28), Key::Enter);
         assert!(s.label(&Row::Always).contains("mailto links"));
+    }
+
+    fn p(name: &str, here: bool, allowed: bool, also: &[&str]) -> PersonaChoice {
+        PersonaChoice { name: name.into(), colour: None, here, allowed,
+                        also: also.iter().map(|a| LinkChoice { id: (*a).into(), name: "Navigator".into(), default: false }).collect() }
+    }
+
+    #[test]
+    fn a_link_crosses_only_where_the_switch_is_on() {
+        let nav = LinkChoice { id: "org.x.nav2".into(), name: "Other".into(), default: false };
+        // From the Work Navigator: the Personal Navigator is a choice only
+        // in Personal; School's switch is off.
+        let mut s = Sheet::with_personas("https://a.example/", "https", vec![nav],
+            vec![p("work", true, true, &[]), p("personal", false, true, &["org.atrium.navigator"]), p("school", false, false, &["org.atrium.navigator"])]);
+        assert_eq!(s.rows(), vec![Row::App(0), Row::App(1), Row::Persona, Row::Always, Row::Cancel]);
+        assert!(s.label(&Row::Persona).starts_with("In: Work"));
+        assert_eq!(s.press(1, [1; 16]), Do::Redraw, "the asker itself, in its own persona: no");
+        assert!(s.notice.as_deref().unwrap().contains("another persona"));
+        assert_eq!(s.press(2, [0; 16]), Do::Redraw);
+        assert_eq!(s.label(&Row::Persona), "In: Personal");
+        assert_eq!(s.press(1, [1; 16]), Do::Spend { row: 1, token: [1; 16] });
+        assert_eq!(s.spent(1, true), Do::Done(Outcome::Chose { app: "org.atrium.navigator".into(), always: false, persona: Some("personal".into()) }));
+        s.press(2, [0; 16]);
+        assert!(s.label(&Row::Persona).contains("off in Settings"));
+        assert_eq!(s.press(0, [1; 16]), Do::Redraw, "School's switch is off");
+        assert!(s.notice.as_deref().unwrap().contains("Links from Work to School are off"));
+        // No named persona: no persona row.
+        assert!(!Sheet::with_personas("x", "https", vec![], vec![p("personal", true, true, &[])]).rows().contains(&Row::Persona));
     }
 }

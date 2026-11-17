@@ -1334,6 +1334,15 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             Request::Discard { id } => {
                 waiting.lock().unwrap().take(id);
             }
+            Request::Hand { url, how: ctl::Hand::With, press } => {
+                // Open with…: a page we hold, its address as we have it.
+                if !state.lock().unwrap().cache.iter().any(|p| p.url == url) {
+                    send(&w, &Event::Handed { url, ok: false, why: Some("that page is not open".into()) });
+                    continue;
+                }
+                let (cfg, w) = (cfg.clone(), w.clone());
+                std::thread::spawn(move || send(&w, &hand_how(&cfg, &url, press, true)));
+            }
             Request::Hand { url, how, press } => {
                 // The press goes on with the link: portcullisd spends it
                 // (purpose LINK) for the app that asked, us (§2.3a, §7).
@@ -1363,11 +1372,19 @@ fn handed_once(handed: &mut Vec<String>, url: &str, how: ctl::Hand) -> Option<Ev
 
 /// Hand `url` to Monstrator with the person's press (opening-links.md §7).
 fn hand(cfg: &Config, url: &str, press: ctl::Press) -> Event {
+    hand_how(cfg, url, press, false)
+}
+
+/// [`hand`]; `with`: Monstrator asks in its sheet whatever the default
+/// ("Open with…", another app or persona).
+fn hand_how(cfg: &Config, url: &str, press: ctl::Press, with: bool) -> Event {
     let ev = |ok: bool, why: Option<String>| Event::Handed { url: url.to_string(), ok, why };
     if !cfg.monstrator.exists() {
         return ev(false, Some("nothing here takes hand-offs yet".into()));
     }
-    match monstrator::open_link(&cfg.monstrator, url, press, std::time::Duration::from_secs(130)) {
+    let wait = std::time::Duration::from_secs(130);
+    let r = if with { monstrator::open_link_with(&cfg.monstrator, url, press, wait) } else { monstrator::open_link(&cfg.monstrator, url, press, wait) };
+    match r {
         Ok(Ok(())) => {
             eprintln!("navigatord: a hand-off went to Monstrator and was opened");
             ev(true, None)

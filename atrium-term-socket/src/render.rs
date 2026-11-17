@@ -29,13 +29,16 @@ pub struct Renderer {
     pub k:    f32,
     /// The cell the pointer is over (for motion reports and the wheel).
     pub pointer_cell: Option<(u16, u16)>,
+    /// The open menu's width, in points (the switcher's, or wider for a
+    /// pkg question).
+    pub menu_w: f32,
 }
 
 impl Renderer {
     pub fn new(font_id: u32, size_px: f32,
                cell_w: f32, line_h: f32, baseline: f32) -> Self {
         Self { font_id, size_px, cell_w, line_h, baseline,
-               pad_x: 8.0, pad_y: 8.0, top: 0.0, k: 1.0, pointer_cell: None }
+               pad_x: 8.0, pad_y: 8.0, top: 0.0, k: 1.0, pointer_cell: None, menu_w: MENU_W }
     }
 
     /// The cell under (`x`, `y`) points, clamped to the grid.
@@ -54,7 +57,7 @@ impl Renderer {
 
     /// The menu's rows: where each is, in points (x, y, w, h).
     pub fn menu_row(&self, i: usize) -> (f32, f32, f32, f32) {
-        (self.pad_x, self.top + 4.0 + i as f32 * MENU_ROW, MENU_W, MENU_ROW)
+        (self.pad_x, self.top + 4.0 + i as f32 * MENU_ROW, self.menu_w, MENU_ROW)
     }
 
     pub fn render(&self, conn: &mut Connection, grid: &Grid, strip: &Strip) -> std::io::Result<()> {
@@ -171,7 +174,12 @@ impl Renderer {
 /// The strip's height, in points.
 pub const STRIP_H: f32 = 30.0;
 const MENU_ROW: f32 = 30.0;
-const MENU_W: f32 = 300.0;
+pub const MENU_W: f32 = 300.0;
+
+/// A menu wide enough for `label` (14 pt, about 0.6 em a character).
+pub fn menu_width(label: &str) -> f32 {
+    MENU_W.max(label.chars().count() as f32 * 14.0 * 0.6 + 32.0)
+}
 
 /// What the strip shows: where the shell is, a hint, and the switcher
 /// when it is open (its rows and the chosen one).

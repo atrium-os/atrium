@@ -268,9 +268,102 @@ pub fn exec(owner: &str, name: &str, argv: &[String], cwd: &str) -> Result<Start
     Ok((pd.pid, procdesc, in_w, out_r))
 }
 
+/// `pkg`'s subcommands a workspace may run as its jail's root
+/// (dev-tools.md §6.1, dev-tools-plan.md M2). Global options (`-c`, `-j`,
+/// `-r`, `-o`, `-C`) come before the subcommand, so none can be given.
+pub const PKG_SUBCOMMANDS: &[&str] = &[
+    "install", "delete", "remove", "upgrade", "update", "info", "search", "autoremove", "clean",
+];
+
+/// The `pkg` run [`admin`] accepts: `pkg <allowed subcommand> [words]`,
+/// each word package-name characters only (no spaces, quotes, `$`, `;`).
+pub fn check_pkg_argv(argv: &[String]) -> Result<(), String> {
+    if argv.len() < 2 || argv.len() > 256 || argv[0] != "pkg" {
+        return Err("cap.workspace_admin.denied: only `pkg <subcommand> ...`".into());
+    }
+    if !PKG_SUBCOMMANDS.contains(&argv[1].as_str()) {
+        return Err(format!("cap.workspace_admin.denied: `pkg {}` isn't allowed (only {})", argv[1], PKG_SUBCOMMANDS.join(", ")));
+    }
+    let ok = |w: &str| !w.is_empty() && w.len() <= 256
+        && w.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+@/:=,~^*-".contains(&b));
+    match argv[2..].iter().find(|w| !ok(w)) {
+        Some(w) => Err(format!("cap.workspace_admin.denied: {w:?} isn't a package name or option")),
+        None => Ok(()),
+    }
+}
+
+/// Run `pkg` as root inside workspace `name`'s jail (started if it isn't):
+/// the jail's root, not the host's. The base is read-only there, the jail
+/// can't mount, use raw sockets or set file flags (workspace::start), and
+/// package scripts run there too. The press, or the person's own CLI, was
+/// checked by the caller. The output ends with `pkg: exit <status>`.
+pub fn admin(owner: &str, name: &str, argv: &[String]) -> Result<Started, String> {
+    use std::ffi::CString;
+    check_pkg_argv(argv)?;
+    let r = workspace::start(owner, name)?;
+    let c = |v: &str| CString::new(v).map_err(|_| "a NUL in the command".to_string());
+    let sh = c("/bin/sh")?;
+    let mut args = vec![c("/bin/sh")?, c("-c")?,
+                        c("/usr/sbin/pkg \"$@\"; s=$?; echo \"pkg: exit $s\"; exit $s")?, c("pkg")?];
+    for a in &argv[1..] {
+        args.push(c(a)?);
+    }
+    let env = [
+        c("HOME=/root")?, c("USER=root")?, c("TERM=dumb")?,
+        c(&format!("PATH={}", workspace::BASE_PATH))?,
+        c(&format!("ATRIUM_WORKSPACE={name}"))?,
+        // The press was the person's yes.
+        c("ASSUME_ALWAYS_YES=yes")?,
+    ];
+    let dir = c("/root")?;
+    let mut argp: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+    argp.push(std::ptr::null());
+    let mut envp: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    let groups: [libc::gid_t; 1] = [0];
+    let (in_r, in_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+    let (out_r, out_w) = pipe().map_err(|e| format!("pipe: {e}"))?;
+    let pd = jaild::ffi::pdfork().map_err(|e| format!("pdfork: {e}"))?;
+    if pd.pid == 0 {
+        // ====== child: nothing that allocates or locks from here on ======
+        // SAFETY: async-signal-safe calls only, on what was made above.
+        unsafe {
+            if libc::dup2(in_r.as_raw_fd(), 0) < 0 || libc::dup2(out_w.as_raw_fd(), 1) < 0 || libc::dup2(out_w.as_raw_fd(), 2) < 0 {
+                libc::_exit(101)
+            }
+            libc::setsid();
+            if libc::jail_attach(r.jid) != 0 { libc::_exit(102) }
+            if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 || libc::setgid(0) != 0 || libc::setuid(0) != 0 {
+                libc::_exit(104)
+            }
+            if libc::chdir(dir.as_ptr()) != 0 { libc::_exit(103) }
+            libc::umask(0o022);
+            libc::execve(sh.as_ptr(), argp.as_ptr(), envp.as_ptr());
+            libc::_exit(127)
+        }
+    }
+    drop((in_r, out_w));
+    // SAFETY: pdfork's descriptor, ours alone.
+    let procdesc = unsafe { OwnedFd::from_raw_fd(pd.procdesc_fd) };
+    Ok((pd.pid, procdesc, in_w, out_r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pkg_argv() {
+        let v = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for good in ["pkg install helix", "pkg install -y gtk+3 py311-foo@bar", "pkg delete -f helix", "pkg info", "pkg search ^rust"] {
+            assert!(check_pkg_argv(&v(good)).is_ok(), "{good}");
+        }
+        for bad in ["pkg", "sh -c x", "pkg -r /x install a", "pkg -c /x info", "pkg shell", "pkg set -o a:b",
+                    "pkg install a;b", "pkg install $(x)", "pkg install a`b`", "pkg install 'a'"] {
+            assert!(check_pkg_argv(&v(bad)).is_err(), "{bad}");
+        }
+        assert!(check_pkg_argv(&["pkg".into(), "install".into(), "".into()]).is_err());
+    }
 
     #[test]
     fn cwd_stays_in_work() {

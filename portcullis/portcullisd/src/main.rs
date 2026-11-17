@@ -512,6 +512,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             handle_ws_exec(uid, &owner, &name, &argv, &cwd, &mut writer)?;
             continue;
         }
+        /* ★ `pkg` as the workspace jail's root (dev-tools-plan.md M2): a
+         * press in the Terminal, the Workspaces app or an IDE, or the
+         * person's own CLI. */
+        if let Request::WorkspaceAdmin { name, argv, activation } = req {
+            handle_ws_admin(uid, &owner, &name, &argv, activation, &mut writer)?;
+            continue;
+        }
         if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceDuplicate { .. }) {
             let resp = handle_workspace(uid, &owner, req, &shared);
             write_response(&mut writer, &resp)?;
@@ -1270,7 +1277,8 @@ fn handle_open_attachment(
 /// LinkGrant and DeliverLink (opening-links.md §5). `user` is the
 /// caller's own user name: Monstrator's system user, or refused.
 fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
-    use portcullis_ipc::LinkChoice;
+    use portcullis_ipc::{LinkChoice, PersonaChoice};
+    use portcullis_policy::PERSONAL;
     use portcullis_policy::links::LinkDefaults;
     use portcullisd::links::{Grant, Grants, MONSTRATOR_USER};
     use portcullisd::opens::{self, Delivery, Hub};
@@ -1295,6 +1303,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 return refuse(why);
             }
             // The apps it may go to, before the press is spent.
+            let mut asker_takes = false;
             let apps: Vec<(String, String)> = if scheme == atrium_links::APP {
                 let Some(id) = app else { return refuse("an atrium-app: link names its app".into()) };
                 match launch::app_name(&id) {
@@ -1306,11 +1315,39 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 if let Err(why) = atrium_links::declarable(&scheme) {
                     return refuse(why);
                 }
-                launch::apps_taking_link(&scheme).into_iter()
-                    .filter(|(id, _)| id != &asker_app && may_run_unasked(id, &person, shared).is_ok())
-                    .collect()
+                let all: Vec<(String, String)> = launch::apps_taking_link(&scheme).into_iter()
+                    .filter(|(id, _)| may_run_unasked(id, &person, shared).is_ok())
+                    .collect();
+                asker_takes = all.iter().any(|(id, _)| id == &asker_app) && launch::not_instanced(&asker_app).is_none();
+                all.into_iter().filter(|(id, _)| id != &asker_app).collect()
             };
-            if apps.is_empty() {
+            /* The person's personas (personas.md §6), the asker's first:
+             * whether the link may cross into each, by the person's own
+             * switches. The asker's own app is a choice only in another
+             * persona (the Work Navigator's link in the Personal one). */
+            let personas: Vec<PersonaChoice> = {
+                let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+                match st.get_or_load(&person) {
+                    Ok(tp) if !tp.policy.personas.is_empty() && tp.policy.check_personas().is_ok() => {
+                        let pol = &tp.policy;
+                        let here = persona.as_deref();
+                        let mut v: Vec<PersonaChoice> = std::iter::once(None).chain(pol.personas.keys().map(|k| Some(k.as_str())))
+                            .map(|n| {
+                                let is_here = n == here;
+                                let allowed = pol.may_cross(here, n, "links");
+                                let also = if !is_here && asker_takes {
+                                    vec![LinkChoice { id: asker_app.clone(), name: launch::app_name(&asker_app).unwrap_or_else(|| asker_app.clone()), default: false }]
+                                } else { vec![] };
+                                PersonaChoice { name: n.unwrap_or(PERSONAL).to_string(), colour: n.and_then(|k| pol.personas.get(k)).map(|d| d.colour.clone()),
+                                                here: is_here, allowed, also }
+                            }).collect();
+                        v.sort_by_key(|p| !p.here);
+                        v
+                    }
+                    _ => vec![],
+                }
+            };
+            if apps.is_empty() && personas.iter().all(|p| p.also.is_empty()) {
                 return refuse(format!("no app here opens {scheme} links"));
             }
             // Last of the checks: a refusal above doesn't spend the press.
@@ -1321,8 +1358,12 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 LinkDefaults::load(&LinkDefaults::user_path(&person)).unwrap_or_default()
                     .app_for(&scheme, |id| apps.iter().any(|(a, _)| a == id))
             };
+            let mut may: Vec<String> = apps.iter().map(|(a, _)| a.clone()).collect();
+            if personas.iter().any(|p| !p.also.is_empty()) {
+                may.push(asker_app.clone());
+            }
             let grant = match grants.issue(Grant { at: now, person: person.clone(), asker_app: asker_app.clone(), persona: persona.clone(), scheme: scheme.clone(),
-                                                   apps: apps.iter().map(|(a, _)| a.clone()).collect() }) {
+                                                   apps: may }) {
                 Ok(g) => g,
                 Err(why) => return refuse(why),
             };
@@ -1331,9 +1372,9 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 .collect();
             list.sort_by_key(|c| !c.default);
             eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}{}: {} app(s)", persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default(), list.len());
-            Response::LinkGranted { grant, person, apps: list }
+            Response::LinkGranted { grant, person, apps: list, personas }
         }
-        Request::DeliverLink { grant, app, url, always } => {
+        Request::DeliverLink { grant, app, url, always, persona: into } => {
             let g = match grants.take(&grant, &app, &url, std::time::Instant::now()) {
                 Ok(g) => g,
                 Err(why) => return refuse(why),
@@ -1344,7 +1385,25 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
              * once for every persona (Settings, the file manager) is the
              * one exception: it has no other instance. Crossing on purpose
              * is P3. */
-            let persona = if launch::not_instanced(&app).is_some() { None } else { g.persona.clone() };
+            /* Into another persona (personas.md §6): only by the person's
+             * switch for that direction, read again now. */
+            let target = match into.as_deref() {
+                None => g.persona.clone(),
+                Some(PERSONAL) => None,
+                Some(n) => Some(n.to_string()),
+            };
+            let shown = |p: &Option<String>| p.as_deref().map(|n| { let mut c = n.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }).unwrap_or_else(|| "Personal".into());
+            if target != g.persona {
+                let ok = shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(&g.person)
+                    .map(|tp| tp.policy.may_cross(g.persona.as_deref(), target.as_deref(), "links")).unwrap_or(false);
+                if !ok {
+                    return refuse(format!("cap.link.crossing: links from {} to {} are off (Settings, Personas)", shown(&g.persona), shown(&target)));
+                }
+                eprintln!("portcullisd: a {} link crosses from {} to {} for {}, by the person's switch", g.scheme, shown(&g.persona), shown(&target), g.person);
+            } else if app == g.asker_app {
+                return refuse("an app's link to itself".into());
+            }
+            let persona = if launch::not_instanced(&app).is_some() { None } else { target };
             let persona = persona.as_deref();
             let key = opens::channel_key(&app, persona);
             if g.scheme == atrium_links::APP {
@@ -1675,6 +1734,42 @@ fn handle_ws_exec(uid: u32, owner: &str, name: &str, argv: &[String], cwd: &str,
     eprintln!("portcullisd: {app} runs {:?} in workspace {name} of {owner} (pid {pid})", argv.first().map(String::as_str).unwrap_or(""));
     write_response(writer, &Response::WorkspaceExecStarted { pid })?;
     // The caller's copies are all that remain: closing the descriptor ends it.
+    portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
+}
+
+fn handle_ws_admin(uid: u32, owner: &str, name: &str, argv: &[String], activation: [u8; 16], writer: &mut UnixStream) -> std::io::Result<()> {
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: pkg in workspace {name} of {owner} REFUSED: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+        .resolve(uid).map(|(_, a)| a.to_string());
+    let who = match &caller {
+        Some(a) if launch::app_shows_consoles(a) || launch::app_manages_workspaces(a) => a.clone(),
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == name) => a.clone(),
+        Some(a) => return refuse(writer, format!("cap.workspace_admin.denied: {a} may not run pkg in {name}")),
+        None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => format!("{owner}'s CLI"),
+        None => return refuse(writer, "cap.workspace_admin.denied: not a person or an app".into()),
+    };
+    if let Err(why) = ide::check_pkg_argv(argv) {
+        return refuse(writer, why);
+    }
+    if let Err(why) = workspace::work_dir(owner, name) {
+        return refuse(writer, why);
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if caller.is_some() {
+        if let Err(why) = portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
+                                                              fresco_protocol::activation::purpose::APPROVE) {
+            return refuse(writer, why);
+        }
+    }
+    let (pid, procdesc, stdin, output) = match ide::admin(owner, name, argv) {
+        Ok(s) => s,
+        Err(why) => return refuse(writer, why),
+    };
+    eprintln!("portcullisd: {who} runs {} as root in workspace {name} of {owner} (pid {pid})", argv.join(" "));
+    write_response(writer, &Response::WorkspaceExecStarted { pid })?;
     portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
 }
 
@@ -2457,7 +2552,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
-        | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } => Response::Error {
+        | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } | Request::WorkspaceAdmin { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

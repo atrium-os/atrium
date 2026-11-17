@@ -435,9 +435,10 @@ i=0; while [ $i -lt 60 ] && ! g "grep -q 'asking which of 2 apps' $ML"; do sleep
 g "grep -q 'asking which of 2 apps opens a mailto link' $ML" && ok "two apps take mailto: and none is the default: Monstrator asks in its sheet" || bad "no sheet: $(g "tail -3 $ML")"
 sleep 3
 shot confined-4-sheet
-key 0x51; key 0x51        # Down, Down: Always use
+key 0x51; key 0x51; key 0x51   # Down x3: Always use (past "In: Personal",
+                                # navtest has a Work persona)
 key 0x2c                  # Space: ticked
-key 0x52; key 0x52        # Up, Up: Test mail
+key 0x52; key 0x52; key 0x52   # Up x3: Test mail
 key 0x28                  # Enter
 i=0; while [ $i -lt 90 ] && [ "$(links)" != 1 ]; do sleep 3; i=$((i+3)); done
 [ "$(links)" = 1 ] && ok "…the pick counted: the mail app got the link, through Monstrator and portcullisd" \
@@ -543,6 +544,39 @@ last | grep -q "trails=${PT0:-x} " && ok "the Personal window got nothing" || ba
 [ "$(g "grep -c 'org.atrium.navigator.s window [0-9]* brought forward' $PL" | tr -d '\r ')" -ge 2 ] && ok "Work's window came forward" || bad "Work raise: $(g "grep -h -e 'brought forward' $PL | tail -2" | tr '\n' ';')"
 g "pkill -x link-probe; true"
 shot confined-6-work
+# Open with… in the Work window (personas.md §6): Monstrator's sheet offers
+# the Personal Navigator, but navtest's switch for links from Work to
+# Personal is off, so it says so and nothing crosses.
+sheets() { g "grep -c 'asking which' $ML" | tr -d '\r '; }
+S0=$(sheets)
+press $((W - 26)) $((TOP + 20))                        # Open with…
+i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
+g "tail -1 $ML | grep -q 'opens a https link, in which of 2 personas'" && ok "Open with… in Work: Monstrator asks, with the personas" || bad "Open with: $(g "tail -2 $ML; grep -h 'open with' $WL | tail -1" | tr '\n' ';')"
+sleep 3
+key 0x51; key 0x28        # Down to "In: Work", Enter: In: Personal (off)
+shot confined-7-crossing-off
+key 0x52; key 0x28        # Up to Navigator, Enter: refused in the sheet
+key 0x29                  # Escape
+i=0; while [ $i -lt 30 ] && ! g "grep -q 'not handed on' $WL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'atlas.example/wiki/Impluvium not handed on: cancelled' $WL" && ok "…the switch is off: the sheet said so, and nothing crossed" || bad "off: $(g "grep -h 'handed' $WL | tail -2" | tr '\n' ';')"
+g "grep -q 'crosses from Work to Personal' $PL" && bad "a link crossed with the switch off" || ok "portcullisd crossed nothing"
+# The switch on (Curia will ask for user verification; here, the file),
+# then the same: the Work page opens in the Personal Navigator, in a
+# trail of its own.
+g "printf '\n[[crossings]]\nfrom = \"work\"\nto = \"personal\"\nkinds = [\"links\"]\n' >> /var/db/atrium/navtest/policy.toml
+   su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null"
+PT0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
+S0=$(sheets)
+press $((W - 26)) $((TOP + 20))
+i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
+sleep 3
+key 0x51; key 0x28        # In: Personal
+key 0x52; key 0x28        # Navigator
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'crosses from Work to Personal' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'a https link crosses from Work to Personal for navtest, by the person.s switch' $PL" && ok "with the switch on, the link crossed from Work to Personal, on one press" || bad "on: $(g "tail -2 $ML; grep -h -e cross -e 'link from org.atrium.navigator' $PL | tail -2" | tr '\n' ';')"
+g "grep -q 'a https link from org.atrium.navigator opened in org.atrium.navigator for navtest' $PL" && ok "…into the Personal Navigator" || bad "where: $(g "grep -h 'link from org.atrium.navigator' $PL | tail -2" | tr '\n' ';')"
+until_trace "trails=$((${PT0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown" && ok "…which opened it in a trail of its own" || bad "Personal: $(last)"
+shot confined-8-crossed
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"

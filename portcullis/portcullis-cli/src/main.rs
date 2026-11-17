@@ -109,6 +109,7 @@ usage:
     portcullis workspace duplicate <name> <new-name>
     portcullis workspace run <name> [folder]
     portcullis workspace exec <name> [--cwd <folder>] -- <command...>
+    portcullis workspace pkg <name> install|delete|upgrade|update|info|search|autoremove|clean [args]
         Your workspaces (homes.md §5). Their terminals open from Forum.
 
     portcullis policy revoke <app-id>
@@ -1398,6 +1399,20 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("portcullis workspace exec: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("pkg") {
+        // pkg <ws> <subcommand> [args]: as the workspace's root, output to stdout.
+        return match daemon::pkg(name, args[2.min(args.len())..].to_vec()) {
+            Ok(Some(())) => ExitCode::SUCCESS,
+            Ok(None) => {
+                eprintln!("portcullis workspace: portcullisd is not running");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("portcullis workspace pkg: {e}");
                 ExitCode::from(1)
             }
         };
