@@ -99,8 +99,10 @@ program's queries; the Terminal encodes xterm keys, mouse and bracketed paste, a
 copies OSC 52 only with a copy-capable press (tabula.md §2.2). The recordings were
 made with tmux as the oracle (`scripts/terminal-record.sh`, 8 sessions). The gate
 passes on the cloud amd64 VM: vi (insert, motions, write), `less`, `top`, and the
-`pkg` question (below); Helix and Neovim are skipped there because pkg can't fetch
-through the cloud egress, so their on-screen check waits for the Mac VM. Found on
+`pkg` question (below). On the Mac VM (arm64, 2026-11-17) the same gate ran with
+pkg installing Helix and Neovim into Scratch (exit 0): both open the file on the
+alternate screen and quit cleanly, and a click moves Helix's cursor; bracketed
+paste waits for Tabula in that VM. Found on
 the way: consoles had no `/var/tmp`, so vi opened on a recovery-folder error that ate
 the first key (the empty console now has one; app consoles set vi's `recdir`).
 
