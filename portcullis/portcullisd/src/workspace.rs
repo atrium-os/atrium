@@ -197,6 +197,7 @@ stty -echo
 printf ']7770;pkg;%s' "$*"
 IFS= read -r reply
 stty "$old"
+printf '\033[1A\r\033[2K'    # the "asking" line, answered
 case "$reply" in
 *"]7770;ok;"*) s=${reply##*;}; s=${s%%[!0-9]*}; exit "${s:-1}" ;;
 *"]7770;cancel"*) echo "pkg: cancelled"; exit 1 ;;
