@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1039,6 +1039,46 @@ Stalwart in the cloud VM, and later a real account):
 4. **M3** the full UI: three panes, conversations, HTML through `doc-viewer`, remote content
    bar, sender line, link bar through Monstrator, keyboard set. Mail becomes the `mailto`
    app.
+   *Built 2026-11-17 (host-tested):* **Conversations** (§11.1, §11.7): threads in the store,
+   joined by Message-ID, References and In-Reply-To in any arrival order (merging when a
+   late message links two), else by base subject within 14 days for a Re:/Fwd: only; each
+   folder lists them under their newest message; Conversations or Messages per folder,
+   remembered, messages by default for Sent, Drafts, Trash and Junk. The reader opens the
+   newest and the unread, folds the rest to one line, marks where the new ones start, and
+   dedupes a message that is in two folders. **Plain text**: quote levels, a conservative
+   linkifier (https, http, mailto), the quoted tail and the signature folded, format=flowed
+   undone. **Sender line** (§7.5) from the checks, never the message: the verified domain
+   with ✓, else the address and "not verified"; a display name that is an address or a
+   domain is replaced by the address; "Replies go to …". **HTML** (§7.3): the jail's
+   document is kept with the message (opening again parses nothing) and shown in a
+   `doc-viewer` slot under the message's header lines, one message at a time; the
+   message's own pictures (cid:, data:) go to the child by Limen's new `Provide { id }`
+   (limen.md §2.1) with their real sizes read in the jail. **Remote pictures** (§7.4): the
+   bar "N pictures not loaded · Load pictures", "Always for this sender" only for a
+   verified sender; Mail has no network, the press is fetched by Mail's own Nuntius
+   fetcher (`net-fetch`) on a thread, kept with the message, and provided to the open
+   viewer; the jail reads a loaded picture's size from its first 64 KiB, so a remote
+   background is drawn once loaded. Hidden-picture fixes found on the way: the first rule
+   of the normalizer's style block was skipped, and an `<img>` the normalizer drops is now
+   never fetched. **Link bar** (§7.6): a press shows "Opens https://dash.**acme.example**/q4"
+   with Open (Enter, Mail's press for Monstrator, with its activation token), Copy and
+   Escape; Safe Links, URL Defense v2/v3, Google /url and the common social redirectors
+   are peeled (Mimecast keeps its target server-side, so the bar says so); `utm_*` and
+   click ids are removed from what opens; the jail lists each link's visible text so a
+   text naming another site is shown beside the destination. **Keyboard set**: j/k, the
+   arrows, Home/End, e archive, # delete, z undo, Enter and Escape on the link bar;
+   opening reads. List actions apply to the index at once and become ops sync carries to
+   the server after the 10 s undo window (UID STORE, UID MOVE, or COPY and a UIDPLUS
+   expunge of that UID only); a refused op puts the index back; a leaving message stays
+   known to sync so it isn't fetched again. **`mailto`**: Mail's `atrium.toml` declares
+   `[[links]] schemes = ["mailto"]`, `net-fetch` and no network of its own. Tests: store
+   5, parse jail and HTML, engine pictures with a fake Nuntius, the Dovecot end-to-end
+   test (now with read, archive, delete and undo reaching the server), window 5 headless
+   (conversations, HTML framing and the pictures bar, the link bar opening through a fake
+   Monstrator, archive/delete/undo), links 4. Not yet: r/a/f (compose is M4), l/d and /
+   (Later, Done and search are M6), the Ctrl-K palette, the narrow layouts of §15.4,
+   persona-specific link scanning (§7.6), first-contact and look-alike notes (§7.5), and a
+   VM run with frescod (frescod doesn't build on the Linux host).
 5. **M4** compose and send: rich text, drafts, undo send, send later, identities, `mailto:`.
 6. **M5** attachments: quick look, `OpenAttachment`, Save via picker, attachment search
    text.
