@@ -240,7 +240,7 @@ struct SettingsWin {
 }
 
 fn settings_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pergola::embed::Embeds>>>) -> std::io::Result<SettingsWin> {
-    let mut win = Window::open(&WindowDesc::new("Mail settings", SizeSpec::Fixed(640, 720)))?;
+    let mut win = Window::open(&WindowDesc::new("Mail settings", SizeSpec::Fixed(1040, 720)))?;
     if let Some(e) = embeds {
         win.set_slot_binder(pergola::embed::Embeds::binder(e));
     }

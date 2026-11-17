@@ -123,6 +123,8 @@ pub struct Msg {
     pub held: bool,
     /// The S/MIME line (§10.1): who signed, or why not, or encrypted.
     pub smime: Option<(String, sender::Tone)>,
+    /// Its lane and why (E10), for "Always …".
+    pub lane: Option<(mail_engine::lanes::LaneKind, String)>,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -236,6 +238,9 @@ pub struct Search {
 pub enum Lane {
     /// Everything set aside (§11.4), soonest first.
     Later,
+    /// The inbox's lanes (E10).
+    People,
+    Updates,
     Newsletters,
     NewSenders,
     ScreenedOut,
@@ -245,6 +250,8 @@ impl Lane {
     pub fn label(self) -> &'static str {
         match self {
             Lane::Later => "Later",
+            Lane::People => "People",
+            Lane::Updates => "Updates",
             Lane::Newsletters => "Newsletters",
             Lane::NewSenders => "New senders",
             Lane::ScreenedOut => "Screened out",
@@ -607,6 +614,7 @@ impl Mail {
             list_note: None,
             held: !m.held.is_empty(),
             smime: sender::smime_line(s),
+            lane: self.engine.lane_of(msg).ok(),
         }
     }
 
@@ -956,8 +964,8 @@ impl Mail {
     fn views(&self, accounts: &[AccountId]) -> Vec<(Lane, usize)> {
         let e = &self.engine;
         let mut out = vec![(Lane::Later, e.later_items().map(|l| l.len()).unwrap_or(0))];
-        if accounts.iter().any(|a| e.newsletters(*a, 0, 1).is_ok_and(|n| !n.is_empty())) {
-            out.push((Lane::Newsletters, 0));
+        if !accounts.is_empty() {
+            out.extend([(Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0)]);
         }
         let (mut new, mut refused, mut on) = (0, 0, false);
         for a in accounts {
@@ -1001,7 +1009,9 @@ impl Mail {
         for (a, _) in e.store.accounts().unwrap_or_default() {
             match lane {
                 Lane::Later => {}
-                Lane::Newsletters => ids.extend(e.newsletters(a, 0, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
+                Lane::People => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::People, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
+                Lane::Updates => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Updates, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
+                Lane::Newsletters => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Newsletters, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::NewSenders => ids.extend(e.screened(a).map(|s| s.0).unwrap_or_default()),
                 Lane::ScreenedOut => ids.extend(e.screened(a).map(|s| s.1).unwrap_or_default()),
             }
@@ -1187,6 +1197,31 @@ impl Mail {
                 m.list_note = note.clone();
             }
         });
+    }
+
+    /// Mail from this message's sender (or its list) goes to `lane` from
+    /// now on: a rule of the person's own, first in the list.
+    pub fn always_lane(&self, k: usize, lane: mail_engine::lanes::LaneKind) {
+        use mail_engine::lanes::When;
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).cloned() else { return };
+        let (when, who) = match m.list.as_ref().filter(|l| l.key.contains('.') && !l.key.contains('@')) {
+            Some(l) => (When::List(l.key.clone()), l.name.clone()),
+            None => (When::From(m.from.to_ascii_lowercase()), m.from.clone()),
+        };
+        if let Err(e) = self.engine.always_lane(when, lane) {
+            self.set_error(format!("Couldn't keep the rule: {e}"));
+            return;
+        }
+        let lanes: Vec<_> = ui.reading.as_ref().map(|r| r.msgs.iter().map(|m| self.engine.lane_of(m.msg).ok()).collect()).unwrap_or_default();
+        self.change_reading(|r| {
+            for (m, l) in r.msgs.iter_mut().zip(lanes) {
+                m.lane = l;
+            }
+        });
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some((format!("Mail from {who} goes to {} from now on", lane.label()), (self.now)() + 4));
+        self.ui.set(ui);
     }
 
     /// "Block future mail from this list" (or take the block away).
@@ -1742,6 +1777,8 @@ pub enum Item {
     List(usize),
     /// "New sender · Accept · Refuse" (the screener, §11.3).
     Screener(usize),
+    /// "In Updates: a machine sent it · Always People · …" (E10).
+    Lane(usize),
     /// The conversation's Later item: what for, when, Done (§11.4).
     Later,
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
@@ -1784,6 +1821,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         if m.list.is_some() {
             out.push(Item::List(k));
+        }
+        if m.lane.is_some() && k + 1 == r.msgs.len() && !m.held {
+            out.push(Item::Lane(k));
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
@@ -2186,6 +2226,8 @@ impl MailView {
                 Some(Search { view: Some(v), .. }) => {
                     let empty = match v {
                         Lane::Later => "Nothing set aside",
+                        Lane::People => "No mail from people",
+                        Lane::Updates => "No updates",
                         Lane::Newsletters => "No newsletters",
                         Lane::NewSenders => "No one new is waiting",
                         Lane::ScreenedOut => "Nothing screened out",
@@ -2630,6 +2672,26 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
                 area(ctx, Rect::new(bx, cy - em(11.0), lw, em(22.0)), t.bg_window(), on);
                 text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, t.text_primary());
                 text(ctx, bx + lw - em(8.0) - width(k, type_size::XS, Weight::Regular), cy, k, type_size::XS, Weight::Regular, t.text_tertiary());
+                ctx.pop();
+                bx += lw + em(6.0);
+            }
+        }
+        Item::Lane(k) => {
+            use mail_engine::lanes::LaneKind;
+            let m = &s.msgs[*k];
+            let Some((lane, why)) = &m.lane else { return };
+            let label = format!("In {}: {why}", lane.label());
+            let others: Vec<LaneKind> = LaneKind::ALL.into_iter().filter(|l| l != lane).collect();
+            let names: Vec<String> = others.iter().map(|l| format!("Always {}", l.label())).collect();
+            let bw: f32 = names.iter().map(|l| width(l, type_size::XS, Weight::Medium) + em(22.0)).sum();
+            let label = fit(&label, type_size::XS, Weight::Regular, (tw - bw - em(12.0)).max(em(60.0)));
+            text(ctx, x, cy, &label, type_size::XS, Weight::Regular, t.text_secondary());
+            let mut bx = x + width(&label, type_size::XS, Weight::Regular) + em(12.0);
+            for (l, name) in others.into_iter().zip(&names) {
+                let lw = width(name, type_size::XS, Weight::Medium) + em(16.0);
+                let (mm, k) = (mail.clone(), *k);
+                area(ctx, Rect::new(bx, cy - em(11.0), lw, em(22.0)), t.bg_window(), move || mm.always_lane(k, l));
+                text(ctx, bx + em(8.0), cy, name, type_size::XS, Weight::Medium, t.text_primary());
                 ctx.pop();
                 bx += lw + em(6.0);
             }

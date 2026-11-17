@@ -46,7 +46,7 @@ fn settings_window() {
 
     let dirty = Arc::new(AtomicBool::new(true));
     let s = Settings::new(engine.clone(), dirty.clone(), dir.path().join("no-arcad.sock"));
-    let mut app = App::new_with_flag(SettingsView::new(s.clone(), (640.0, 720.0)), dirty);
+    let mut app = App::new_with_flag(SettingsView::new(s.clone(), (1040.0, 720.0)), dirty);
     drawn(&mut app, &["Mail settings", "Done", "No accounts yet.", "Add an account…", "Notify about new mail", "Quiet hours"]);
 
     // Found from the address: a known provider needs no lookups.
@@ -127,6 +127,17 @@ fn settings_window() {
     drawn(&mut app, &["boss@example.org"]);
     s.remove_vip("boss@example.org");
     assert!(engine.prefs().vips.is_empty());
+    // Lane rules: one that reads is kept first; one that doesn't says why.
+    drawn(&mut app, &["LANES"]);
+    s.rule.set(TextEdit::new("from:@GitHub.com Updates"));
+    s.add_rule();
+    assert_eq!(engine.lane_rules().len(), 1);
+    drawn(&mut app, &["from:@github.com updates"]);
+    s.rule.set(TextEdit::new("github updates"));
+    s.add_rule();
+    assert!(s.ui.get_cloned().note.unwrap().starts_with("That rule doesn't read"));
+    s.remove_rule(0);
+    assert!(engine.lane_rules().is_empty());
     s.close();
     assert!(s.closed());
 }

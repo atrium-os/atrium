@@ -60,6 +60,8 @@ pub enum Adding {
 pub struct SettingsUi {
     pub rows: Vec<Row>,
     pub prefs: Prefs,
+    /// The person's lane rules, as written (E10).
+    pub rules: Vec<String>,
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
@@ -118,6 +120,7 @@ pub struct Settings {
     pub quiet_from: Mutable<TextEdit>,
     pub quiet_to: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
+    pub rule: Mutable<TextEdit>,
     pub cred_state: Mutable<CredentialState>,
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
@@ -141,6 +144,7 @@ impl Settings {
             quiet_from: ui.sibling(TextEdit::new(&f)),
             quiet_to: ui.sibling(TextEdit::new(&t)),
             vip: ui.sibling(TextEdit::new("")),
+            rule: ui.sibling(TextEdit::new("")),
             engine,
             ui,
             found: Rc::default(),
@@ -170,11 +174,13 @@ impl Settings {
             })
             .collect();
         let prefs = e.prefs();
+        let rules: Vec<String> = e.lane_rules().iter().map(|r| r.text()).collect();
         let u = self.ui.get_cloned();
-        if u.rows != rows || u.prefs != prefs {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
+                u.rules = rules;
             });
         }
     }
@@ -358,6 +364,38 @@ impl Settings {
         self.set_prefs(|p| p.vips.push(a));
     }
 
+    /// A lane rule as typed (`from:@github.com updates`), first in the list.
+    pub fn add_rule(&self) {
+        let text = self.rule.get_cloned().text().to_string();
+        match mail_engine::lanes::parse_rule(&text) {
+            Ok(r) => {
+                let mut rules = self.engine.lane_rules();
+                rules.retain(|x| x.when != r.when);
+                rules.insert(0, r);
+                match self.engine.set_lane_rules(&rules) {
+                    Ok(()) => {
+                        self.rule.set(TextEdit::new(""));
+                        self.update(|u| u.note = None);
+                    }
+                    Err(e) => self.update(|u| u.note = Some(format!("Couldn't keep the rule: {e:?}"))),
+                }
+            }
+            Err(why) => self.update(|u| u.note = Some(format!("That rule doesn't read: {why}. For example: from:@github.com updates"))),
+        }
+        self.reload();
+    }
+
+    pub fn remove_rule(&self, i: usize) {
+        let mut rules = self.engine.lane_rules();
+        if i < rules.len() {
+            rules.remove(i);
+            if let Err(e) = self.engine.set_lane_rules(&rules) {
+                self.update(|u| u.note = Some(format!("Couldn't change the rules: {e:?}")));
+            }
+        }
+        self.reload();
+    }
+
     pub fn remove_vip(&self, a: &str) {
         self.set_prefs(|p| p.vips.retain(|v| v != a));
     }
@@ -497,22 +535,26 @@ impl View for SettingsView {
         let s = self.s.clone();
         let dw = measure("Done", type_size::SM, Weight::Medium) + em(24.0);
         button(ctx, w - 16.0 - dw, head / 2.0, "Done", true, true, move || s.close());
+        // Two columns: accounts on the left, the rest on the right.
         let x = 20.0;
-        let inner = w - 40.0;
         let mut y = head + em(12.0);
         if let Some(n) = &ui.note {
-            let nh = crate::compose::wrap(n, inner - em(24.0), &sans(type_size::SM, Weight::Regular, t.text_secondary())).len() as f32 * em(type_size::SM) * 1.5;
-            ctx.add(Node::Rect { rect: Rect::new(x, y, inner, nh + em(16.0)), fill: t.bg_window(), radius: 5.0 });
-            para(ctx, x + em(12.0), y + em(8.0), inner - em(24.0), n, type_size::SM, t.text_secondary());
+            let nw = w - 40.0;
+            let nh = crate::compose::wrap(n, nw - em(24.0), &sans(type_size::SM, Weight::Regular, t.text_secondary())).len() as f32 * em(type_size::SM) * 1.5;
+            ctx.add(Node::Rect { rect: Rect::new(x, y, nw, nh + em(16.0)), fill: t.bg_window(), radius: 5.0 });
+            para(ctx, x + em(12.0), y + em(8.0), nw - em(24.0), n, type_size::SM, t.text_secondary());
             y += nh + em(28.0);
         }
-        let section = |ctx: &mut Ctx, y: &mut f32, title: &str| {
+        let top = y;
+        let inner = ((w - 60.0) / 2.0).max(em(200.0));
+        let right = x + inner;
+        let section = |ctx: &mut Ctx, x: f32, y: &mut f32, title: &str| {
             text(ctx, x, *y + em(12.0), title, type_size::XS, Weight::Semibold, t.text_tertiary());
             *y += em(28.0);
         };
 
         // Accounts.
-        section(ctx, &mut y, "ACCOUNTS");
+        section(ctx, x, &mut y, "ACCOUNTS");
         if ui.rows.is_empty() && ui.adding == Adding::Closed {
             text(ctx, x, y + em(12.0), "No accounts yet.", type_size::MD, Weight::Regular, t.text_secondary());
             y += em(28.0);
@@ -523,7 +565,7 @@ impl View for SettingsView {
             let st = crate::view::fit_text(&r.status, type_size::XS, Weight::Regular, (inner - em(260.0)).max(em(120.0)));
             text(ctx, x, y + em(36.0), &st, type_size::XS, Weight::Regular, if r.trouble { t.danger_fg() } else { t.text_secondary() });
             let remove = if ui.removing == Some(r.id) { "Remove it and its mail?" } else { "Remove" };
-            let mut bx = w - 20.0 - measure(remove, type_size::SM, Weight::Medium) - em(24.0);
+            let mut bx = right - measure(remove, type_size::SM, Weight::Medium) - em(24.0);
             let (s, id) = (self.s.clone(), r.id);
             button(ctx, bx, y + rh / 2.0, remove, false, true, move || s.remove(id));
             let scr = if r.screener { "Screener: on" } else { "Screener: off" };
@@ -595,9 +637,12 @@ impl View for SettingsView {
             }
         }
 
-        // Notifications.
-        y += em(8.0);
-        section(ctx, &mut y, "NOTIFICATIONS");
+        let _left_end = y;
+        // Notifications, lanes and VIPs, in the right column.
+        let x = right + 20.0;
+        let right = x + inner;
+        let mut y = top;
+        section(ctx, x, &mut y, "NOTIFICATIONS");
         let s = self.s.clone();
         switch(ctx, x, y + em(14.0), "Notify about new mail", ui.prefs.notify, move || s.toggle_notify());
         y += em(32.0);
@@ -621,9 +666,27 @@ impl View for SettingsView {
             y += em(32.0);
         }
 
+        // Lanes (E10): the person's rules, then what Mail does by itself.
+        y += em(8.0);
+        section(ctx, x, &mut y, "LANES");
+        y += para(ctx, x, y, inner, "Your rules come first, top to bottom; then people you've written to and VIPs go to People, mailing lists to Newsletters, and mail machines send to Updates.", type_size::XS, t.text_tertiary()) + em(8.0);
+        for (i, r) in ui.rules.iter().enumerate() {
+            text(ctx, x, y + em(14.0), r, type_size::SM, Weight::Regular, t.text_primary());
+            let s = self.s.clone();
+            let rw = measure("Remove", type_size::SM, Weight::Medium) + em(24.0);
+            button(ctx, right - rw, y + em(14.0), "Remove", false, true, move || s.remove_rule(i));
+            y += em(30.0);
+        }
+        let fw = (inner - em(80.0)).max(em(160.0));
+        let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+        ctx.place(TextField::new(self.s.rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com updates"));
+        let s = self.s.clone();
+        button(ctx, x + fw + em(8.0), y + em(18.0), "Add", false, true, move || s.add_rule());
+        y += em(40.0);
+
         // VIPs.
         y += em(8.0);
-        section(ctx, &mut y, "VIPS");
+        section(ctx, x, &mut y, "VIPS");
         text(ctx, x, y + em(8.0), "Mail from these people always notifies, newsletters or not.", type_size::XS, Weight::Regular, t.text_tertiary());
         y += em(24.0);
         let fw = (inner - em(80.0)).max(em(160.0));
@@ -640,7 +703,7 @@ impl View for SettingsView {
             text(ctx, x, y + em(14.0), v, type_size::SM, Weight::Regular, t.text_primary());
             let (s, a) = (self.s.clone(), v.clone());
             let rw = measure("Remove", type_size::SM, Weight::Medium) + em(24.0);
-            button(ctx, w - 20.0 - rw, y + em(14.0), "Remove", false, true, move || s.remove_vip(&a));
+            button(ctx, right - rw, y + em(14.0), "Remove", false, true, move || s.remove_vip(&a));
             y += em(30.0);
         }
     }

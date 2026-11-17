@@ -30,6 +30,7 @@ pub mod notify;
 pub mod smime;
 pub mod accounts;
 pub mod prefs;
+pub mod lanes;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};

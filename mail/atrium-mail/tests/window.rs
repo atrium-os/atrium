@@ -577,7 +577,7 @@ fn unsubscribe_block_and_the_screener() {
     use atrium_mail::view::Lane;
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 1, "the stranger waits");
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "Newsletters") && t.iter().any(|x| x == "New senders"), "{t:?}");
 
@@ -587,6 +587,17 @@ fn unsubscribe_block_and_the_screener() {
     app.tick();
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "From the list The Weekly") && t.iter().any(|x| x == "Unsubscribe"), "{t:?}");
+    // Its lane, why, and the other lanes to send its list to (E10).
+    assert!(t.iter().any(|x| x == "In Newsletters: it's from a mailing list") && t.iter().any(|x| x == "Always People") && t.iter().any(|x| x == "Always Updates"), "{t:?}");
+    mail.always_lane(0, mail_engine::lanes::LaneKind::People);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "In People: your rule “list:weekly.list.example people”"), "{t:?}");
+    assert_eq!(engine.lane_rules().len(), 1);
+    assert!(engine.lane(account, mail_engine::lanes::LaneKind::Newsletters, 10).unwrap().is_empty());
+    assert_eq!(engine.lane(account, mail_engine::lanes::LaneKind::People, 10).unwrap().len(), 1);
+    engine.set_lane_rules(&[]).unwrap();
+    assert_eq!(engine.lane(account, mail_engine::lanes::LaneKind::Newsletters, 10).unwrap().len(), 1);
     mail.unsubscribe(0);
     let asked = mail.take_unsubscribes();
     assert_eq!(asked.len(), 1);
@@ -611,7 +622,7 @@ fn unsubscribe_block_and_the_screener() {
     mail.screen(0, true);
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 0);
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
     mail.end_search();
     assert_eq!(mail.ui.get_cloned().count, 2);
 }
