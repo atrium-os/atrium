@@ -214,3 +214,47 @@ fn edits_undo_and_journal() {
     wb.pivot_op(Some(0), None).unwrap().apply(&mut wb);
     assert!(wb.pivots().is_empty() && wb.get(CellAddr::new(0, 0, 7)).is_empty());
 }
+
+#[test]
+fn compact_layout_as_excel_shows_it() {
+    let mut wb = book();
+    let mut p = Pivot::new("PivotTable1", src(), CellAddr::new(0, 0, 7));
+    p.rows = vec![PivotField::new(0), PivotField::new(1)];
+    p.cols = vec![PivotField::new(2)];
+    p.data = vec![sum(3)];
+    p.compact = true;
+    let i = wb.add_pivot(p.clone()).unwrap();
+    assert_eq!(
+        grid(&wb, i),
+        rows(&[
+            &["Sum of Units", "Column Labels"],
+            &["Row Labels", "Q1", "Q2", "Grand Total"],
+            &["East", "", "8", "8"],
+            &["Di", "", "8", "8"],
+            &["North", "16", "20", "36"],
+            &["Ana", "11", "20", "31"],
+            &["Bo", "5", "", "5"],
+            &["South", "7", "3", "10"],
+            &["Cy", "7", "3", "10"],
+            &["Grand Total", "23", "31", "54"],
+        ])
+    );
+    let sh = wb.pivot_shape(i).unwrap().clone();
+    let ind = |r| sh.indent(CellAddr::new(0, r, 7));
+    assert_eq!((ind(2), ind(3), ind(5), ind(9), ind(0)), ((0, true), (1, false), (1, false), (0, false), (0, false)));
+    assert_eq!(ind(3), (1, false));
+    assert_eq!(wb.pivot_at(CellAddr::new(0, 9, 8)).map(|x| x.1), Some(Role::Total));
+    // No subtotals: outer rows carry no values. One row field and no columns.
+    p.subtotals = false;
+    wb.set_pivot(i, p.clone()).unwrap();
+    assert_eq!(grid(&wb, i)[2], ["East"]);
+    p.rows = vec![PivotField::new(0)];
+    p.cols.clear();
+    wb.set_pivot(i, p.clone()).unwrap();
+    assert_eq!(grid(&wb, i), rows(&[&["Row Labels", "Sum of Units"], &["East", "8"], &["North", "36"], &["South", "10"], &["Grand Total", "54"]]));
+    // The native file keeps the form.
+    let mut out = Vec::new();
+    officina_grid::native::save(&wb, &mut out).unwrap();
+    let back = officina_grid::native::load(&out).unwrap();
+    assert!(back.pivots()[0].compact);
+}

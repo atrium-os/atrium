@@ -990,7 +990,7 @@ impl View for Sheets {
                 MenuButton::new(now, self.pivot_agg_menus[k].clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Agg(k, i)))).at(x0 + PIVOT_W - 132.0, y).width(120.0).render(ctx);
                 y += 38.0;
             }
-            for (label, on, which) in [("Grand total row", piv.grand_row, pp::Totals::GrandRow), ("Grand total column", piv.grand_col, pp::Totals::GrandCol), ("Subtotals", piv.subtotals, pp::Totals::Subtotals)] {
+            for (label, on, which) in [("Grand total row", piv.grand_row, pp::Totals::GrandRow), ("Grand total column", piv.grand_col, pp::Totals::GrandCol), ("Subtotals", piv.subtotals, pp::Totals::Subtotals), ("Compact form", piv.compact, pp::Totals::Compact)] {
                 let cmds = self.cmds.clone();
                 pergola::widgets::Checkbox::new(Mutable::new(if on { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), label).at(x0 + 12.0, y).on_change(move |_| cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Totals(which)))).render(ctx);
                 y += 28.0;

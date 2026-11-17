@@ -171,6 +171,8 @@ pub enum Totals {
     GrandRow,
     GrandCol,
     Subtotals,
+    /// Compact form (else tabular).
+    Compact,
 }
 
 pub fn toggle(d: &mut Doc, i: usize, t: Totals) -> Result<(), String> {
@@ -179,6 +181,7 @@ pub fn toggle(d: &mut Doc, i: usize, t: Totals) -> Result<(), String> {
             Totals::GrandRow => &mut p.grand_row,
             Totals::GrandCol => &mut p.grand_col,
             Totals::Subtotals => &mut p.subtotals,
+            Totals::Compact => &mut p.compact,
         };
         *b = !*b;
     })
@@ -248,7 +251,9 @@ mod tests {
         assert_eq!(d.wb.pivots()[0].data[0].field, 0);
         toggle(&mut d, 0, Totals::GrandCol).unwrap();
         assert!(!d.wb.pivots()[0].grand_col);
-        for _ in 0..7 {
+        toggle(&mut d, 0, Totals::Compact).unwrap();
+        assert!(d.wb.pivots()[0].compact);
+        for _ in 0..8 {
             assert!(d.undo());
         }
         assert_eq!(d.wb.pivots()[0], fields_pivot_start(&doc()));
@@ -269,6 +274,12 @@ mod tests {
         // Product is now the first label column, its first item under it.
         let h = (p.dest.row..p.dest.row + 4).find(|&r| cell(&d, r, p.dest.col) == "Product").unwrap();
         assert_eq!(cell(&d, h + 1, p.dest.col), "Fig");
+        // Compact form puts both row fields in one column.
+        toggle(&mut d, 0, Totals::Compact).unwrap();
+        let p = d.wb.pivots()[0].clone();
+        let h = (p.dest.row..p.dest.row + 4).find(|&r| cell(&d, r, p.dest.col) == "Row Labels").unwrap();
+        assert_eq!((cell(&d, h + 1, p.dest.col), cell(&d, h + 2, p.dest.col)), ("Fig".into(), "North".into()));
+        toggle(&mut d, 0, Totals::Compact).unwrap();
         // Moving the first one up again changes nothing.
         let before = d.wb.pivots()[0].clone();
         shift(&mut d, 0, 1, true).unwrap();

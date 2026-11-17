@@ -461,8 +461,15 @@ impl GridSource for SheetSource {
         let id = sh.style_id(r, c);
         let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v) };
         if !d.wb.pivots().is_empty() {
-            if let Some((_, role)) = d.wb.pivot_at(CellAddr::new(d.sheet, r, c)) {
+            let a = CellAddr::new(d.sheet, r, c);
+            if let Some((i, role)) = d.wb.pivot_at(a) {
                 cv = pivot_view(cv, role);
+                // Compact form: inner items indented, outer items bold.
+                let (indent, group) = d.wb.pivot_shape(i).map_or((0, false), |s| s.indent(a));
+                if let Some(v) = cv.as_mut() {
+                    v.indent = indent;
+                    v.bold |= group;
+                }
             }
         }
         if d.wb.cond_formats().is_empty() {
