@@ -38,7 +38,7 @@ pub const FIND_H: f32 = 48.0;
 pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Heading 3"];
 
 /// The Tools menu, in order.
-pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
+pub const TOOLS: [&str; 9] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…", "Continuous View", "Read Mode"];
 
 /// The Insert menu, in order.
 pub const INSERT: [&str; 39] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…"];
@@ -112,6 +112,12 @@ pub enum Cmd {
     StylesPane,
     /// The outline pane shown or hidden.
     OutlinePane,
+    /// Continuous view on or off (pages run on without margins).
+    Continuous,
+    /// Read mode: the window shows a page at a time, nothing else.
+    ReadMode,
+    /// Read mode left.
+    ReadClose,
     /// The caret to the heading at this block.
     OutlineGo(usize),
     /// The caret's heading and what it heads moved up (true) or down.
@@ -476,6 +482,8 @@ pub struct Write {
     /// The styles pane is shown.
     pub pane: Mutable<bool>,
     pub pane_scroll: Mutable<ScrollState>,
+    /// Read mode was on at the last render.
+    pub read_was: Cell<bool>,
     /// The outline pane is shown (never with the styles pane).
     pub outline: Mutable<bool>,
     pub outline_scroll: Mutable<ScrollState>,
@@ -518,7 +526,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), read_was: Cell::new(false), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -559,6 +567,10 @@ impl Write {
     /// Where the pages go: under the toolbar and the find or spelling bar
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
+        if self.doc.borrow().ed.borrow().reading {
+            // Read mode has the window to itself.
+            return Rect::new(0.0, 0.0, w, h);
+        }
         let review = self.doc.borrow().ed.borrow().review;
         let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         let w = if self.pane.get() || self.outline.get() { (w - PANE_W).max(200.0) } else { w };
@@ -1301,6 +1313,39 @@ impl Write {
                         self.changed();
                         return false;
                     }
+                    Cmd::Continuous | Cmd::ReadMode => {
+                        if c == Cmd::Continuous {
+                            e.continuous = !e.continuous;
+                        } else {
+                            e.reading = true;
+                        }
+                        drop(e);
+                        drop(d);
+                        let ed = self.doc.borrow().ed.clone();
+                        let (w, h) = self.size.get();
+                        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::ReadClose => {
+                        drop(e);
+                        drop(d);
+                        // Back where the reading got to.
+                        let ed = self.doc.borrow().ed.clone();
+                        let (w, h) = self.size.get();
+                        let shown = RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), Rect::new(0.0, 0.0, w, h)).shown_page();
+                        {
+                            let mut e = ed.borrow_mut();
+                            if let Some(b) = e.pages.pages().get(shown).map(|p| p.start.block) {
+                                e.set_caret(pergola_richtext::Pos::new(b, 0), false);
+                            }
+                            e.reading = false;
+                        }
+                        self.read_was.set(false);
+                        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+                        self.changed();
+                        return false;
+                    }
                     Cmd::OutlinePane => {
                         drop(e);
                         drop(d);
@@ -1549,6 +1594,26 @@ impl View for Write {
         let st = |size, weight, color| TextStyle { family: font::SANS.into(), size, weight, color };
         ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
 
+        // Read mode: the page and a way out.
+        let reading = self.doc.borrow().ed.borrow().reading;
+        if self.read_was.replace(reading) && !reading {
+            // Left by Escape in the view: the caret it put at the page read.
+            let ed = self.doc.borrow().ed.clone();
+            RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
+        }
+        if reading {
+            let ed = self.doc.borrow().ed.clone();
+            let view = RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h));
+            view.emit(ctx);
+            let n = ed.borrow().pages.pages().len().max(1);
+            let label = format!("Page {} of {n}", view.shown_page() + 1);
+            ctx.add(Node::Text { rect: Rect::new(12.0, h - 22.0, 200.0, 18.0), content: label, style: st(type_size::XS, Weight::Regular, t.text_tertiary()) });
+            let cmds = self.cmds.clone();
+            Button::ghost("Leave Read Mode").at(w - 152.0, 8.0).width(140.0).on_click(move || cmds.lock().unwrap().push(Cmd::ReadClose)).render(ctx);
+            ctx.pop();
+            return;
+        }
+
         // Toolbar: files, history, character and paragraph formatting.
         let mut x = 12.0;
         let mut button = |ctx: &mut Ctx, label: &str, cmd: Cmd, wd: f32, gap: f32| {
@@ -1627,13 +1692,15 @@ impl View for Write {
         }
         {
             let tracking = self.doc.borrow().ed.borrow().doc.tracking;
+            let continuous = self.doc.borrow().ed.borrow().continuous;
             let items: Vec<MenuItem> = TOOLS.iter().enumerate().map(|(i, s)| match i {
                 2 => MenuItem::new(*s).checked(tracking).separated(),
                 4 => MenuItem::new(*s).separated(),
+                7 => MenuItem::new(*s).checked(continuous).separated(),
                 _ => MenuItem::new(*s),
             }).collect();
             let cmds = self.cmds.clone();
-            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith, Cmd::PasswordOpen][i.min(6)])).at(x, 8.0).width(88.0).render(ctx);
+            MenuButton::new("Tools".to_string(), self.tools_menu.clone(), items, move |i| cmds.lock().unwrap().push([Cmd::FindOpen, Cmd::SpellOpen, Cmd::TrackToggle, Cmd::ReviewOpen, Cmd::CompareWith, Cmd::MergeWith, Cmd::PasswordOpen, Cmd::Continuous, Cmd::ReadMode][i.min(8)])).at(x, 8.0).width(88.0).render(ctx);
             x += 104.0;
         }
         {
@@ -2760,6 +2827,51 @@ mod tests {
         run(Cmd::OutlinePane);
         assert!(!w.outline.get());
         assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0);
+    }
+
+    #[test]
+    fn continuous_view_and_read_mode() {
+        use pergola::event::{Event, Key, KeyEventKind, Modifiers};
+        let text: String = (0..300).map(|i| format!("Paragraph {i} with enough words to fill some of a line.\n")).collect();
+        let doc = Doc::from_text("r.txt", text.as_bytes()).unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        while !ed.borrow_mut().paginate(std::time::Duration::from_secs(5)) {}
+        let n = ed.borrow().pages.pages().len();
+        assert!(n >= 4, "{n} pages");
+        run(Cmd::Continuous);
+        assert!(ed.borrow().continuous);
+        assert!(texts().iter().any(|s| s == "Tools"));
+        run(Cmd::Continuous);
+        assert!(!ed.borrow().continuous);
+        // Read mode: no toolbar, the page count, keys turn pages, Leave.
+        run(Cmd::ReadMode);
+        assert!(ed.borrow().reading);
+        assert_eq!(w.pages_rect(1200.0, 800.0), Rect::new(0.0, 0.0, 1200.0, 800.0));
+        let t = texts();
+        assert!(!t.iter().any(|s| s == "Tools"), "no toolbar");
+        assert!(t.iter().any(|s| *s == format!("Page 1 of {n}")), "{t:?}");
+        let mut app = pergola::app::App::new(w.clone());
+        app.tick();
+        app.handle_event(Event::PointerDown { at: pergola::geom::Point::new(600.0, 400.0) });
+        app.handle_event(Event::PointerUp { at: pergola::geom::Point::new(600.0, 400.0) });
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::PageDown, modifiers: Modifiers::default(), chars: String::new() });
+        app.tick();
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::PageDown, modifiers: Modifiers::default(), chars: String::new() });
+        app.tick();
+        assert!(texts().iter().any(|s| *s == format!("Page 3 of {n}")), "{:?}", texts());
+        run(Cmd::ReadClose);
+        assert!(!ed.borrow().reading);
+        assert_eq!(ed.borrow().caret.block, ed.borrow().pages.pages()[2].start.block, "back at the page read");
+        assert!(texts().iter().any(|s| s == "Tools"));
     }
 
     #[test]
