@@ -1,6 +1,6 @@
 # Personas: work and personal side by side
 
-**Status: proposed 2026-11-15**, for Shankar's review. Nothing here is built.
+**Status: accepted 2026-11-17** (Shankar: all §9 decisions as recommended). Nothing here is built yet.
 **Scope:** keeping a person's work and personal lives apart on one machine, in one login:
 app instances per persona, storage, removable devices and security tokens, what may cross
 from one to the other, and how every window shows which side it is on. Network routing
