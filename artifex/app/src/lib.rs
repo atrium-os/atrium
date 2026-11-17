@@ -10,6 +10,7 @@ pub mod composition;
 pub mod dap;
 pub mod engine;
 pub mod exec;
+pub mod fuzz;
 pub mod git;
 pub mod lsp;
 pub mod tasks;
