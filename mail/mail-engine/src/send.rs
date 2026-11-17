@@ -58,7 +58,7 @@ pub enum Delivery {
     NotDue,
 }
 
-fn random16() -> [u8; 16] {
+pub(crate) fn random16() -> [u8; 16] {
     let mut r = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let _ = f.read_exact(&mut r);

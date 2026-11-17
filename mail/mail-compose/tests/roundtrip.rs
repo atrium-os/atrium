@@ -1,6 +1,6 @@
 //! What Mail writes, read back by Mail's own parser.
 
-use mail_compose::{write, Attachment, Draft, Mailbox, Stamp};
+use mail_compose::{write, write_draft, Attachment, Draft, Mailbox, Stamp};
 use mail_parse::{parse, Limits, PartKind};
 
 fn stamp() -> Stamp {
@@ -74,4 +74,24 @@ fn nothing_can_add_a_header() {
     assert!(!raw.contains("\r\nBcc:"), "{raw}");
     assert!(write(&Draft { to: vec![], ..d.clone() }, &stamp()).is_err());
     assert!(write(&Draft { in_reply_to: Some("<x@y> \r\nBcc: z".into()), ..d }, &stamp()).is_err());
+}
+
+#[test]
+fn a_draft_copy() {
+    let d = Draft {
+        from: Mailbox::new("Priya", "priya@example.org"),
+        to: vec![Mailbox::new("", "arun@acme.exa")],
+        bcc: vec![Mailbox::new("", "sam@acme.example")],
+        subject: "Half done".into(),
+        text: "Not yet…".into(),
+        ..Draft::default()
+    };
+    assert!(write(&Draft { to: vec![], bcc: vec![], ..d.clone() }, &stamp()).is_err(), "no recipients: not sendable");
+    let w = write_draft(&Draft { to: vec![Mailbox::new("", "arun@")], ..d.clone() }, &stamp()).unwrap();
+    let raw = String::from_utf8(w.bytes.clone()).unwrap();
+    assert!(!raw.contains("arun@"), "a half-typed address is left out: {raw}");
+    assert!(raw.contains("Bcc: <sam@acme.example>\r\n"), "{raw}");
+    let s = parse(&w.bytes, &Limits::default()).unwrap();
+    assert_eq!(s.subject, "Half done");
+    assert!(s.to.is_empty());
 }

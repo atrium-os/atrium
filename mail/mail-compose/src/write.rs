@@ -308,6 +308,19 @@ fn mime_type(m: &str) -> String {
 
 /// Write `d` as a message.
 pub fn write(d: &Draft, stamp: &Stamp) -> Result<Written, Error> {
+    write_as(d, stamp, false)
+}
+
+/// Write `d` as the copy kept in the server's Drafts folder: it may have no
+/// recipients yet, addresses still being typed are left out, and Bcc is
+/// kept (as a header, for the person's other devices). Never sent.
+pub fn write_draft(d: &Draft, stamp: &Stamp) -> Result<Written, Error> {
+    let ok = |l: &[Mailbox]| l.iter().filter(|m| address(&m.addr).is_ok()).cloned().collect::<Vec<_>>();
+    let d = Draft { to: ok(&d.to), cc: ok(&d.cc), bcc: ok(&d.bcc), ..d.clone() };
+    write_as(&d, stamp, true)
+}
+
+fn write_as(d: &Draft, stamp: &Stamp, draft: bool) -> Result<Written, Error> {
     let from = address(&d.from.addr)?;
     let mut rcpts: Vec<String> = Vec::new();
     for m in d.to.iter().chain(&d.cc).chain(&d.bcc) {
@@ -316,7 +329,7 @@ pub fn write(d: &Draft, stamp: &Stamp) -> Result<Written, Error> {
             rcpts.push(a);
         }
     }
-    if rcpts.is_empty() {
+    if rcpts.is_empty() && !draft {
         return Err(Error::NoRecipients);
     }
     let domain = from.rsplit_once('@').map(|x| x.1).unwrap_or("localhost");
@@ -331,6 +344,9 @@ pub fn write(d: &Draft, stamp: &Stamp) -> Result<Written, Error> {
     }
     if !d.cc.is_empty() {
         h.field("Cc", &list_pieces(&d.cc)?);
+    }
+    if draft && !d.bcc.is_empty() {
+        h.field("Bcc", &list_pieces(&d.bcc)?);
     }
     let subject = clean(&d.subject);
     if !subject.is_empty() {

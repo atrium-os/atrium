@@ -17,4 +17,4 @@ pub mod mailto;
 pub mod reply;
 pub mod write;
 
-pub use write::{write, Attachment, Draft, Error, Mailbox, Stamp, Written};
+pub use write::{write, write_draft, Attachment, Draft, Error, Mailbox, Stamp, Written};

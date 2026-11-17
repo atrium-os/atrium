@@ -214,6 +214,10 @@ namespace inbox {{
   mailbox Sent {{
     special_use = \Sent
   }}
+  mailbox Drafts {{
+    special_use = \Drafts
+    auto = create
+  }}
   mailbox Archive {{
     special_use = \Archive
     auto = create
@@ -536,4 +540,39 @@ fn sending_through_the_courier() {
     assert_eq!(dc.relayed.lock().unwrap().len(), 1, "nothing left early");
     let (_, held) = engine.store.outbox().unwrap().remove(0);
     assert!(!held.hold_on_server && held.due == later);
+
+    // Drafts: saved here, copied to the server's Drafts, each copy
+    // replacing the last; sending one removes its copies.
+    let on_server = || ["cur", "new"].iter().map(|c| std::fs::read_dir(maildir(&dc.dir.path().join("home")).join(".Drafts").join(c)).map(|r| r.count()).unwrap_or(0)).sum::<usize>();
+    let sync = || Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    let copy = |rest| {
+        let mut s = Session::start(courier(&dc)).unwrap();
+        let n = engine.copy_drafts(account, &mut s, rest).unwrap();
+        let _ = s.logout();
+        n
+    };
+    let mut half = Draft { to: vec![Mailbox::new("", "arun@acme")], subject: "Half".into(), ..draft.clone() };
+    let id = engine.save_draft(None, account, &half).unwrap();
+    assert_eq!(copy(3600), 0, "not rested yet");
+    assert_eq!(copy(0), 1);
+    assert_eq!(copy(0), 0, "unchanged");
+    assert_eq!(on_server(), 1, "{}", log());
+    half.text.push_str("More.\n");
+    assert_eq!(engine.save_draft(Some(id), account, &half).unwrap(), id);
+    assert_eq!(copy(0), 1);
+    assert_eq!(on_server(), 2);
+    sync();
+    copy(0);
+    sync();
+    assert_eq!(on_server(), 1, "the replaced copy is deleted: {}", log());
+    assert_eq!(engine.drafts(account).unwrap(), [(id, half.clone())]);
+    let sent = engine.send_draft(Some(id), account, &draft, When::default()).unwrap();
+    assert!(engine.drafts(account).unwrap().is_empty());
+    sync();
+    copy(0);
+    sync();
+    assert_eq!(on_server(), 0, "{}", log());
+    assert!(engine.store.all_drafts().unwrap().is_empty());
+    // Undo of that send gives the draft back.
+    assert_eq!(engine.undo_send(sent).unwrap(), Some(draft.clone()));
 }
