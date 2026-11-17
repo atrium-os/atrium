@@ -1,6 +1,7 @@
 # Developer tools and app composition: implementation plan
 
-**Status:** plan 2026-11-17, waiting for Shankar's review (§9, questions P1–P6).
+**Status:** accepted 2026-11-17 (Shankar: "agreed with your recommendation", P1–P6
+as recommended). Three threads: platform, terminal and Artifex, toolchains and SDK.
 Implements [dev-tools.md](dev-tools.md) (T1–T10) and [app-composition.md](app-composition.md)
 (A1–A8), both accepted 2026-11-17.
 
