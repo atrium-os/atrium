@@ -1,0 +1,15 @@
+[package]
+name = "atrium-message"
+description = "Typed, bounded messages between an Atrium app's core, its workers and services (app-composition.md §5.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+atrium-message-derive = { path = "../atrium-message-derive", version = "0.1.0" }
+
+[dev-dependencies]
+# Only to check the encoding is postcard's.
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }

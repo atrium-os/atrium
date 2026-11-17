@@ -1,0 +1,16 @@
+# The Atrium SDK (dev-tools.md §5.4, app-composition.md §4.2, §5.2):
+# crates a third-party app builds against, versioned together and published
+# to the Atrium crate registry (dev-tools-plan.md M7, M12).
+[workspace]
+resolver = "2"
+members = [
+    "atrium-message",
+    "atrium-message-derive",
+    "atrium-schema",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "MIT OR Apache-2.0"
+repository = "https://github.com/atrium-os/atrium"
