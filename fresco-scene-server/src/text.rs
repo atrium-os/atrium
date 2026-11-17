@@ -554,7 +554,30 @@ impl TextEngine {
     /// per character; runs of a fallback face or of a complex script are
     /// shaped whole (rustybuzz), so Devanagari conjuncts, Tamil vowel
     /// signs and Arabic joining come out right.
+    ///
+    /// Text with right-to-left characters is put in visual order first
+    /// (UAX #9, the run as one line, base direction from its first strong
+    /// character): each level run is laid out in its own direction, and a
+    /// right-to-left one is shaped whole so neutrals and mirrored brackets
+    /// land where they belong.
     fn layout(&mut self, font_id: u32, size_px: f32, weight: u16, text: &str) -> Vec<Item> {
+        use unicode_bidi::BidiClass::{AL, AN, R, RLE, RLI, RLO};
+        if !text.chars().any(|c| matches!(unicode_bidi::bidi_class(c), R | AL | AN | RLE | RLO | RLI)) {
+            return self.layout_dir(font_id, size_px, weight, text, false);
+        }
+        let info = unicode_bidi::BidiInfo::new(text, None);
+        let mut out = Vec::new();
+        for para in &info.paragraphs {
+            let (levels, runs) = info.visual_runs(para, para.range.clone());
+            for r in runs {
+                let rtl = levels[r.start].is_rtl();
+                out.extend(self.layout_dir(font_id, size_px, weight, &text[r], rtl));
+            }
+        }
+        out
+    }
+
+    fn layout_dir(&mut self, font_id: u32, size_px: f32, weight: u16, text: &str, rtl: bool) -> Vec<Item> {
         let Some(prim) = self.fonts.get(&font_id) else { return Vec::new() };
         let prim_bytes = prim.bytes.clone();
         let prim_face = ttf_parser::Face::parse(&prim_bytes, 0).ok();
@@ -573,13 +596,17 @@ impl TextEngine {
                 Some(&(f, sh, _)) if ch.is_whitespace() || (sh && is_mark(ch) && self.has_glyph(f, ch)) => (f, sh),
                 _ => {
                     let f = self.face_for(font_id, prim_face.as_ref(), ch, bold);
-                    (f, f != font_id || atrium_fonts::Library::script_family(ch).is_some())
+                    (f, rtl || f != font_id || atrium_fonts::Library::script_family(ch).is_some())
                 }
             };
             match segs.last_mut() {
                 Some((f, sh, t)) if *f == font && *sh == shaped => t.push(ch),
                 _ => segs.push((font, shaped, ch.to_string())),
             }
+        }
+        if rtl {
+            // Right to left: the last stretch is drawn first.
+            segs.reverse();
         }
         let mut out = Vec::new();
         for (font, shaped, t) in segs {
@@ -594,6 +621,7 @@ impl TextEngine {
             let mut buf = rustybuzz::UnicodeBuffer::new();
             buf.push_str(&t);
             buf.guess_segment_properties();
+            buf.set_direction(if rtl { rustybuzz::Direction::RightToLeft } else { rustybuzz::Direction::LeftToRight });
             let shaped = rustybuzz::shape(&face, &[], buf);
             for (gi, gp) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
                 out.push(Item::Glyph { font, gid: gi.glyph_id as u16, dx: gp.x_offset as f32 * k, dy: -gp.y_offset as f32 * k, adv: gp.x_advance as f32 * k });
@@ -923,6 +951,31 @@ mod tests {
         assert!(w > last.dx, "{w} {}", last.dx);
         // A character no face has is dropped, not a crash.
         assert!(t.shape_text_run(f, 16.0, 0.0, 0.0, [1.0; 4], "\u{10FFFD}", 400).is_some());
+    }
+
+    /// Right-to-left text comes in visual order: a Hebrew sentence's last
+    /// letter is drawn first, Latin inside it keeps its own order, and an
+    /// opening bracket is mirrored.
+    #[test]
+    fn right_to_left_runs_are_in_visual_order() {
+        let mut t = TextEngine::new();
+        let f = plex(&mut t);
+        let gid = |t: &TextEngine, it: &Item, ch: char| match *it {
+            Item::Glyph { font, gid, .. } => ttf_parser::Face::parse(&t.fonts[&font].bytes, 0).unwrap().glyph_index(ch).map(|g| g.0) == Some(gid),
+            Item::Cp(cp) => cp == ch as u32,
+        };
+        let items = t.layout(f, 16.0, 400, "שלום עולם");
+        assert!(gid(&t, &items[0], 'ם'), "{items:?}");
+        assert!(gid(&t, items.last().unwrap(), 'ש'));
+        // An LTR label with a Hebrew word: Latin first, then the word reversed.
+        let items = t.layout(f, 16.0, 400, "ab שלום");
+        assert_eq!(&items[..3], &[Item::Cp('a' as u32), Item::Cp('b' as u32), Item::Cp(' ' as u32)]);
+        assert!(gid(&t, &items[3], 'ם'));
+        // A Hebrew sentence with Latin inside: the Latin word reads left to right.
+        let items = t.layout(f, 16.0, 400, "שלום abc עולם");
+        let a = items.iter().position(|i| gid(&t, i, 'a')).unwrap();
+        let c = items.iter().position(|i| gid(&t, i, 'c')).unwrap();
+        assert!(a < c && gid(&t, &items[0], 'ם'));
     }
 
     #[test]

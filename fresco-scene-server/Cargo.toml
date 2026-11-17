@@ -19,6 +19,7 @@ env_logger = "0.11"
 ttf-parser = "0.25"
 rustybuzz = "0.20"
 swash = "0.1"
+unicode-bidi = "0.3.18"
 libc = "0.2"
 
 aqueduct        = { path = "../aqueduct" }
