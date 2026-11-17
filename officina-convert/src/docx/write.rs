@@ -86,6 +86,9 @@ fn rpr(a: &CharAttrs, styles: &[String]) -> String {
         (Some(false), _) => s += r#"<w:u w:val="none"/>"#,
         _ => {}
     }
+    if let Some(l) = &a.lang_ea {
+        let _ = write!(s, r#"<w:lang w:eastAsia="{}"/>"#, esc(l));
+    }
     if s.is_empty() {
         s
     } else {

@@ -20,6 +20,7 @@ pub mod op {
 
 /// Document formats Prelum sends (§6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Format {
     Pdf,
     PwgRaster,
@@ -37,6 +38,7 @@ impl Format {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Sides {
     OneSided,
     TwoSidedLongEdge,
@@ -54,12 +56,14 @@ impl Sides {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ColorMode {
     Color,
     Monochrome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Quality {
     Draft = 3,
     Normal = 4,
@@ -68,6 +72,7 @@ pub enum Quality {
 
 /// What the person chose in the sheet that the printer itself carries out.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ticket {
     pub copies: u32,
     pub sides: Sides,
@@ -88,6 +93,7 @@ impl Default for Ticket {
 
 /// Who and what the job says about us (§6.3, decision 14).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct JobIdentity {
     /// `atrium` unless the printer needs a real name.
     pub user: String,

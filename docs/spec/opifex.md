@@ -715,7 +715,10 @@ font on demand and a driver from a `nobody` device's notice.
   for the web; a server handing out other bytes refused and nothing kept; a 404; a URL with
   credentials refused); `publish.sh` against a local HTTPS server (check, publish, a wrong
   hash refused). VM gate `scripts/vm-opifex-c4-check.sh` (the hermetic HTTPS fixture of
-  nuntius-vm-check.sh serving the catalog; `run-vm.sh` takes `NETDEV_EXTRA` for it).
+  nuntius-vm-check.sh serving the catalog; `run-vm.sh` takes `NETDEV_EXTRA` for it) on the Mac
+  VM (arm64) 2026-11-17: 0 failed (sync and download through the fetcher's own Nuntius, other
+  bytes refused, a host outside its sites refused, a forked history refused, no jail left). The
+  Mac VM now boots with `kern.racct.enable=1`, which every Nuntius fetcher needs.
 
 ## 15. Decisions, with recommendations
 

@@ -3503,6 +3503,10 @@ Write's Style menu gains Outline Pane, shown beside the pages in the styles pane
 
 Write's Tools menu gains Continuous View and Read Mode, the last two of §7.1's views. Continuous view keeps the pages as laid out but shows only the part of each between its top and bottom margins, the next page's text following a thin seam, so a draft reads as one column; headers and footers are hidden, sections with their own page sizes keep their own widths, and clicks, selection, the caret and scrolling work as in page view (the view's page geometry carries what each page cuts). Read mode gives the window to the pages: no toolbar, bars, panes or status line, the page fitted to the window, Page Down, Space, the right and down arrows turning on, Page Up, Shift+Space, Backspace, the left and up arrows back, Home and End to the ends; nothing edits (keys and pointer drags are not passed to the editor and no caret shows). A small page count and Leave Read Mode stay; Escape also leaves, and the caret goes to the top of the page being read. Both are view settings, not saved with the document. Tests: `pergola-richtext` `continuous_and_read_views`, `atrium-write` `continuous_view_and_read_mode`.
 
+### 16.66 Handles on shapes in line in Write (2026-11-17)
+
+A picked shape that sits in line with the text now shows its yellow adjust handles as a floating one does (an arrow's head, a callout's pointer), and dragging one reshapes it the same way, one undo step; the editor finds a shape's box from the page's floats or, for one in line, from where its character sits on the line. Pictures and shapes in line also gain the corner handle that floating ones have: dragging it sizes the object (pictures keep their proportions), one undo step, the object staying in line. Test: `pergola-richtext` `a_shape_in_line_takes_its_yellow_and_corner_handles`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

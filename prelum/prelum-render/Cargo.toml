@@ -12,3 +12,11 @@ folium-doc = { path = "../../folium-doc" }
 folium-content = { path = "../../folium-content" }
 folium-render = { path = "../../folium-render" }
 prelum-raster = { path = "../prelum-raster" }
+prelum-proto = { path = "../prelum-proto" }
+prelum-ipp-codec = { path = "../prelum-ipp-codec" }
+libc = "0.2"
+
+
+[[bin]]
+name = "atrium-prelum-render"
+path = "src/bin/prelum-render.rs"

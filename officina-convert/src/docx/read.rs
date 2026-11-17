@@ -153,6 +153,12 @@ fn highlight(name: &str) -> Option<u32> {
     })
 }
 
+/// A BCP 47 tag as Officina keeps one, or `None` for anything else.
+pub(crate) fn lang_tag(s: &str) -> Option<Arc<str>> {
+    let s = s.trim();
+    (!s.is_empty() && s.len() <= 35 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')).then(|| Arc::from(s))
+}
+
 /// Character properties (`w:rPr`).
 fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
     let mut a = CharAttrs::default();
@@ -175,7 +181,8 @@ fn rpr(e: &El, rep: &mut Report) -> CharAttrs {
                     a.family = Some(Arc::from(&f[..f.len().min(255)]));
                 }
             }
-            "w:bCs" | "w:iCs" | "w:szCs" | "w:lang" | "w:noProof" | "w:kern" | "w:rStyle" | "w:spacing" | "w:w" | "w:position" | "w:webHidden" | "w:specVanish" | "w:rtl" | "w:cs" | "w:eastAsianLayout" | "w:effect" | "w:ligatures" | "w:numForm" | "w:numSpacing" | "w:stylisticSets" | "w:cntxtAlts" | "w:snapToGrid" | "w:fitText" => {}
+            "w:bCs" | "w:iCs" | "w:szCs" | "w:noProof" | "w:kern" | "w:rStyle" | "w:spacing" | "w:w" | "w:position" | "w:webHidden" | "w:specVanish" | "w:rtl" | "w:cs" | "w:eastAsianLayout" | "w:effect" | "w:ligatures" | "w:numForm" | "w:numSpacing" | "w:stylisticSets" | "w:cntxtAlts" | "w:snapToGrid" | "w:fitText" => {}
+            "w:lang" => a.lang_ea = p.attr("w:eastAsia").and_then(lang_tag),
             "w:vertAlign" => {
                 a.vert = match val(p) {
                     Some("superscript") => Some(VertAlign::Super),

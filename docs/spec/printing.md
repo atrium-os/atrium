@@ -235,8 +235,9 @@ status query needs that printer, gone after an idle minute.
   what the printer advertised). The address is resolved once before start (no DNS
   rebinding), the network-shares.md §4.3 rule. For a USB printer it has no network at
   all, only a socketpair to `prelum-usb`.
-- **HTTP/1.1 and TLS:** the HTTP client code shared with Nuntius (`nuntius` crate:
-  rustls, bounded headers, chunked bodies), POST with a streamed body.
+- **HTTP/1.1 and TLS:** rustls, and the bounded response reader shared with Nuntius
+  (`navigator-fetch::http`: headers, lengths, chunked bodies); the POST with the
+  document as a chunked body is Prelum's own, since Nuntius only fetches (§11.2).
 - **IPP:** our own codec (`prelum-ipp-codec`), every length and count bounded before it is
   allocated, unknown attributes kept as opaque bounded values, a fuzz target. Operations
   used: `Get-Printer-Attributes`, `Validate-Job`, `Create-Job` + `Send-Document` (or
@@ -254,7 +255,7 @@ status query needs that printer, gone after an idle minute.
 
 ### 6.4 prelumd
 
-`prelumd` runs as `_prelum`, one for the machine, on a new Aqueduct class `CLASS_PRINT`.
+`prelumd` runs as `_prelum`, one for the machine, on a new Aqueduct class `CLASS_PRINT` (20).
 It holds:
 
 - **saved printers** per person (`/var/db/atrium/<person>/printers.toml`, 0600): name,
@@ -531,8 +532,113 @@ Found along the way:
   what other AirPrint clients do; `ippeveps` accepted the header, and a real
   AirPrint printer confirms both at R8.
 
-Next: R2, `prelumd`, `prelum-ipp` with HTTP over the Nuntius stack, the
-`prelum-render` jail binary, `prelumctl print`, against `ippeveprinter`.
+### 11.2 R2 as built (2026-11-17)
+
+New crates in `prelum/`:
+
+- **`prelum-proto`**: the messages. Workers talk to prelumd over one socket
+  (their stdin and stdout) in length-prefixed postcard frames, at most 1 MiB,
+  the length checked before anything is allocated. `ipp`: a `Start` (the
+  printer's URI, the address prelumd resolved, IPPS or not, the pinned key
+  and UUID or none to learn them), then `Query`, `Identify`, `Submit` +
+  `Data` + `End`, `Job`, `Cancel`, answered by typed events (`Printer`,
+  `IdentityChanged`, `Unreachable`, `Refused`, `Failed`, `JobCreated`,
+  `Sent`, `Job`, `Done`). `render`: `Started` (sheets and the format it
+  chose), `Data`, `Sheet`, `Done`, `Failed`. `print`: **`CLASS_PRINT`, Aqueduct
+  class 20** (19 is vpn.md's): printers, add, remove, rename, repin, identify,
+  refresh, print (the PDF as the message's descriptor), jobs, cancel, release,
+  with a client.
+- **`prelum-ipp`**: the printer connection, library and jailed binary. One
+  HTTP/1.1 POST per IPP request on a new connection, `Connection: close`;
+  the answer's head and body read with the Navigator fetcher's bounded HTTP
+  reader (`navigator-fetch::http`, the code Nuntius uses; it is GET-only, so
+  the request side, with the document as a chunked body, is Prelum's own).
+  TLS is rustls with a verifier that accepts exactly the pinned SPKI SHA-256
+  (or, when adding, anything, and records it); the handshake is finished
+  before the request is written, so a changed key stops the connection
+  with no request byte sent (unit test: a TLS server counts zero bytes).
+  `Submit` asks `Get-Printer-Attributes` first and refuses unless the
+  `printer-uuid` is the pinned one and the printer lists the format; then
+  `Create-Job` + `Send-Document`, or `Print-Job` for printers without them.
+  A job that fails ends the worker, so a half-sent document is never closed
+  as whole.
+- **`prelum-render`** gained its binary: stdin the job's PDF (read with
+  pread), stdout the socket, the settings as arguments; Capsicum on FreeBSD
+  before the first byte is read. `--format pdf` holds the rewritten PDF
+  until it is complete (up to 256 MB) and falls back to the printer's raster
+  format when the rewrite says `NeedsRaster`.
+- **`prelumd`** (and **`prelumctl`**): saved printers per uid in
+  `<state>/<uid>/printers.toml` (0600), with the pin, the network, and the
+  printer's last answer; one runner thread per printer with work, one job at
+  a time. A job: `Query` with the pin (identity changed: **held**; no answer:
+  **pending, "offline"**, tried again after 5 s, doubling to 30 s; not on the
+  network it was added on: pending), then the plan (format of §6.2,
+  resolution from the printer's list for the quality, colour only if the
+  printer has it, media, sides, back-side rule, ticket), then prelum-render
+  into a spool file (`<spool>/<uid>/<job>.spool`, 0600, 2 GB cap) while a
+  second loop sends what is there to prelum-ipp as it grows, then polling
+  `Get-Job-Attributes` every 2 s for a minute and every 10 s after, until the
+  printer says completed, canceled or aborted. Cancel stops the workers and
+  sends `Cancel-Job` once the printer has an id for the job. "Use the new
+  identity" (`repin`) learns the printer again at its saved address and
+  releases its held jobs. A printer's answer is cut again in prelumd (text,
+  lists, keywords), since prelum-ipp is what a hostile printer would attack.
+  Adding by a bare host tries IPPS on 631, then plain IPP; the sheet shows
+  which (`NOT ENCRYPTED`). Workers run through jaild (`prelumd::jail`), or
+  with `--direct BIN_DIR` as plain children for development off FreeBSD.
+- **jaild `[print_workers]`**: `system-prelum-<uid>` at the instance root,
+  uids 62000–62499, exactly `/usr/local/bin/atrium-prelum-render` (network
+  `Disable` or `Isolated`) or `/usr/local/bin/atrium-prelum-ipp` (`Routed`
+  whose grants are TCP to `/32` addresses on stated ports with
+  `no_resolver`, nothing else; `no_resolver` is new in jaild's grants and
+  leaves out the host-resolver pass a restricted outbound otherwise gets,
+  since the worker is handed an address and DNS would only be a way out);
+  the binaries are `atrium-`-prefixed because jaild runs nothing else from
+  `/usr/local/bin`; both take the caller's stdio;
+  no devices, FUSE, children, locked memory. Root: `/lib`, `/libexec`,
+  `/usr/lib`, `/usr/local/bin` read-only, nothing else. System call classes
+  `renderer` and `networked`. Optional rctl for render (`--rctl`: 1 GB, one
+  CPU).
+
+Checks:
+
+- Unit tests: prelum-proto (frames: cut anywhere fails, oversize refused),
+  prelum-ipp (the pin before any byte, learning, unreachable, URIs), prelumd
+  (store round trip and mode, typed addresses, media names, the plan),
+  jaild's validator (a print worker and only a print worker, 10 refusals).
+- `scripts/prelum-r2-check.sh` on the host, workers unjailed, against three
+  `ippeveprinter`s: 23 of 23. An IPPS printer added by URI with its key
+  pinned (the same SHA-256 openssl reads from its certificate) and its UUID,
+  a PDF job sent as the rewritten PDF (pdfinfo reads what it received); a
+  plain-IPP raster printer marked unencrypted, the job arriving as PWG
+  Raster; cancel while a slow printer prints, which gets `Cancel-Job`; the
+  printer behind a relay that is pulled (job pending "offline", printer
+  shown offline) and put back (job printed); the printer restarted with a
+  new key (refresh shows the change, the job is held and nothing reaches the
+  printer, repin pins the new key and the job prints); another printer at
+  the plain printer's address (a new UUID) likewise.
+- A 13-page document at 600 dpi to a raster printer: 20 MB of PWG Raster
+  streamed from the spool as it was drawn, in 20 s including the printer's
+  own simulated printing.
+- `scripts/prelum-r2-vm.sh` in the arm64 FreeBSD 16-CURRENT cloud VM, workers
+  jailed by jaild, printers on the host: 16 of 16. An IPPS printer added
+  from an ipp jail with its key pinned; a PDF job and a raster job (the PWG
+  Raster drawn in a render jail) printed; render jails seen with
+  `ip4=disable`, ipp jails in their own vnet, each `atrium/<jail>` anchor
+  passing exactly one rule, TCP to its printer's address and port (the
+  first run found a pass to the host's resolver as well, which is why
+  `no_resolver` exists); no worker jail left after its job; a new key held
+  the job with nothing reaching the printer, and repin printed it; cancel
+  while printing reached the printer as `Cancel-Job`. jaild's own tests:
+  91 pass in the guest.
+
+Not yet: the network pin uses a name given to prelumd (`--network`) until
+atrium-net says which network this is (R3); jobs and history are kept in
+memory only (history is R5); IPv6 printers can't be granted to a worker
+jail yet (jaild's grants are IPv4); CA-signed printer certificates are
+pinned by key like the rest.
+
+Next: R3, `prelum-browse` and atrium-net's multicast socket.
 
 ## 12. Decisions, with recommendations
 

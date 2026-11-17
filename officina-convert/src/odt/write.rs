@@ -124,6 +124,15 @@ pub(crate) fn text_props(a: &CharAttrs, fonts: &mut Vec<String>) -> String {
         }
         let _ = write!(s, r#" style:font-name="{}""#, esc(&name));
     }
+    if let Some(l) = &a.lang_ea {
+        let mut parts = l.split('-');
+        let lang = parts.next().unwrap_or("");
+        let _ = write!(s, r#" style:language-asian="{}""#, esc(lang));
+        // ODF has no script subtag: a two-letter region, if any.
+        if let Some(c) = parts.find(|p| p.len() == 2) {
+            let _ = write!(s, r#" style:country-asian="{}""#, esc(c));
+        }
+    }
     if s.is_empty() {
         s
     } else {

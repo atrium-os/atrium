@@ -1062,6 +1062,7 @@ mod run {
             outbound: vec![NetDest { cidr: format!("{addr}/32"), port: Some(port), udp: false }],
             peers: vec![],
             inbound: vec![],
+            no_resolver: false,
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {

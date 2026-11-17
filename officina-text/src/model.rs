@@ -57,6 +57,9 @@ pub struct CharAttrs {
     /// The character (U+FFFC) is a field: it shows a value worked out from
     /// the rest of the document (see [`TextDoc::field_text`]).
     pub field: Option<Field>,
+    /// The language of East Asian text (BCP 47, "ja-JP", "zh-TW"): which
+    /// forms a Han character takes (Word's `w:lang w:eastAsia`).
+    pub lang_ea: Option<Arc<str>>,
 }
 
 /// A value shown in the text and worked out after pagination: a reference
@@ -651,6 +654,7 @@ impl CharAttrs {
             fmt: self.fmt.or(under.fmt),
             conflict: self.conflict.or(under.conflict),
             field: self.field.or(under.field),
+            lang_ea: self.lang_ea.clone().or_else(|| under.lang_ea.clone()),
         }
     }
 }
@@ -678,16 +682,21 @@ pub struct CharFormat {
     pub fmt: Option<FmtChange>,
     pub conflict: Option<ConflictId>,
     pub field: Option<Field>,
+    /// See [`CharAttrs::lang_ea`].
+    pub lang_ea: Option<Arc<str>>,
 }
 
 impl Default for CharFormat {
     fn default() -> Self {
-        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None }
+        CharFormat { bold: false, italic: false, underline: false, strike: false, size: 22, color: 0x000000, highlight: None, family: "IBM Plex Sans".into(), link: None, object: None, vert: VertAlign::Baseline, note: None, comments: None, rev: None, deleted: None, fmt: None, conflict: None, field: None, lang_ea: None }
     }
 }
 
 impl CharFormat {
     fn apply(&mut self, a: &CharAttrs) {
+        if a.lang_ea.is_some() {
+            self.lang_ea = a.lang_ea.clone();
+        }
         if let Some(v) = a.bold {
             self.bold = v;
         }

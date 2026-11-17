@@ -129,7 +129,13 @@ the run means JP, Hangul KR, else the locale (`LC_ALL`, `LC_CTYPE`, `LANG`:
 `ja`, `ko`, `zh_TW`/`zh-Hant` TC, `zh_HK` HK, other `zh` SC), else install
 order. Installed faces whose family ends in that suffix come first
 (`Library::fallback_in`); Write, Slides, the PDF export and frescod's labels
-pass the run's hint. Checked with Noto Sans SC installed before JP: a Chinese
+pass the run's hint. In Write and Slides a document's own East Asian language
+comes between the text and the locale: `CharAttrs::lang_ea` (BCP 47, native
+attribute ext bit 6), read and written as `w:lang w:eastAsia` (.docx, including
+`w:docDefaults`) and `style:language-asian`/`style:country-asian` (.odt, which
+has no script subtag: `zh-Hant` alone comes back as `zh`). A Word file with no
+kana, its paragraphs tagged zh-CN, ja-JP and zh-TW, draws each in SC, JP and
+TC forms with all three packages installed. Checked with Noto Sans SC installed before JP: a Chinese
 line draws 直骨角写次海 in SC forms, the same characters next to kana in JP forms.
 
 Checked with Noto Sans JP 2.004 (static TTF instances, OFL, 5.7 MB a weight,
@@ -158,6 +164,7 @@ a Japanese label in the VM.
   the library can compare that with the pinned value instead of hashing.
 - Colour emoji waits on colour glyph support. CJK packages wait on Opifex
   publishing them (its step C6). Han forms follow the run's kana or Hangul and
-  the locale; a per-person language setting (Curia) and a document language
-  (`w:lang w:eastAsia`, which Write drops today) would be better hints.
+  the document's language, then the locale; a per-person language setting
+  (Curia) would beat the locale. Write has no command yet to set a run's
+  language.
 - Write's style font list (`STYLE_FONTS`) to offer the new families.

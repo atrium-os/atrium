@@ -181,7 +181,7 @@ pub fn render_anchor(ea: &str, app: &str, g: Option<&crate::protocol::NetGrants>
             for d in &g.outbound {
                 r.push_str(&pass(if d.udp { "udp" } else { "tcp" }, &d.cidr, d.port));
             }
-            if !g.outbound.is_empty() {
+            if !g.outbound.is_empty() && !g.no_resolver {
                 for ns in host_resolvers() {
                     r.push_str(&pass("udp", &format!("{ns}/32"), Some(53)));
                     r.push_str(&pass("tcp", &format!("{ns}/32"), Some(53)));
@@ -264,6 +264,7 @@ mod tests {
             outbound: vec![crate::protocol::NetDest { cidr: "140.82.112.3/32".into(), port: Some(443), udp: false }],
             peers: vec![crate::protocol::NetPeer { app_key: "fedcba9876543210".into(), port: 5432 }],
             inbound: vec![8080],
+            no_resolver: false,
         }
     }
 
@@ -277,6 +278,14 @@ mod tests {
         assert_eq!(lines[1], "block in quick on epair3a inet from any to 100.64.0.0/16");
         assert!(lines[2].contains("proto tcp from 100.64.0.14 to 140.82.112.3/32 port 443"), "{a}");
         assert!(a.lines().all(|l| l.contains("on epair3a")), "every rule is bound to this app's interface");
+    }
+
+    #[test]
+    fn no_resolver_leaves_only_the_granted_destinations() {
+        let mut g = grants(); g.peers.clear(); g.no_resolver = true;
+        let a = render_anchor("epair3a", "100.64.0.14", Some(&g));
+        assert_eq!(a, "block in quick on epair3a inet from any to 100.64.0.0/16\n\
+                       pass in quick on epair3a inet proto tcp from 100.64.0.14 to 140.82.112.3/32 port 443 keep state\n");
     }
 
     #[test]

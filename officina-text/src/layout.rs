@@ -264,7 +264,9 @@ impl Fonts for PinnedFonts {
         let mut segs: Vec<(usize, usize, usize)> = Vec::new(); // face, start, end
         // Which CJK forms a Han character takes (kana or Hangul in the run,
         // else the locale).
-        let han = atrium_fonts::Han::for_text(text);
+        // The run's kana or Hangul, else the document's East Asian
+        // language, else the locale.
+        let han = atrium_fonts::Han::of_text(text).or_else(|| f.lang_ea.as_deref().and_then(atrium_fonts::Han::of_locale)).or_else(atrium_fonts::Han::of_system);
         for (i, ch) in text.char_indices() {
             let face = self.face_for(&stack, ch, f, han);
             match segs.last_mut() {

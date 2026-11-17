@@ -37,7 +37,8 @@ pub fn validate_create(
         validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
-        validate_exec(exec, policy, is_instance_root(req, policy), is_courier(req, policy) || is_share_server(req, policy))?;
+        validate_exec(exec, policy, is_instance_root(req, policy),
+                      is_courier(req, policy) || is_share_server(req, policy) || is_print_worker(req, policy))?;
     }
     validate_host_identity(req)?;
     resolve_sysfil(req, policy)?;
@@ -177,6 +178,52 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
         && req.devfs_grant.is_none()
         && req.devfs_grants.is_empty()
         && req.children_max == 0
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// Whether `req` is one of Prelum's workers (`[print_workers]`, printing.md
+/// §6.1, §6.3), named and rooted like a courier's, taking its caller's
+/// stdio, in one of two shapes:
+/// - `render_exec`: no network at all (`Disable` or `Isolated`);
+/// - `ipp_exec`: a routed vnet whose grants pass only TCP to single
+///   addresses on stated ports (the pinned printer), nothing inbound, no
+///   peers, and no resolver (the address arrives resolved).
+/// No devices, no FUSE, no child jails, no locked memory.
+pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
+    use crate::protocol::NetworkConfig;
+    let (Some(c), Some(dir), Some(exec)) =
+        (policy.print_workers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
+    else {
+        return false;
+    };
+    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+        return false;
+    };
+    let network_ok = if exec.path == c.render_exec {
+        matches!(req.network, NetworkConfig::Disable | NetworkConfig::Isolated)
+    } else if exec.path == c.ipp_exec {
+        match &req.network {
+            NetworkConfig::Routed { grants: Some(g), .. } => {
+                !g.outbound_any && g.no_resolver && g.peers.is_empty() && g.inbound.is_empty() && !g.outbound.is_empty()
+                    && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && !d.udp)
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    network_ok
+        && req.name == format!("{}{uid}", c.name_prefix)
+        && (c.uid_first..=c.uid_last).contains(&uid)
+        && exec.uid == uid
+        && exec.gid == uid
+        && exec.stdio
+        && req.fuse.is_none()
+        && req.devfs_grant.is_none()
+        && req.devfs_grants.is_empty()
+        && req.children_max == 0
+        && !req.allow_mlock
+        && !req.allow_tessera_keys
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
@@ -988,6 +1035,57 @@ mod tests {
                      "/usr/local/bin/atrium-arca-courier", 64001), "a non-canonical name"),
         ] {
             assert!(!is_courier(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+    }
+
+    /// Prelum's workers: exactly the policy's name, root, binaries and uid,
+    /// render with no network and ipp reaching only stated printer
+    /// addresses, may take the caller's stdio; anything else is refused.
+    #[test]
+    fn a_print_worker_jail_and_only_a_print_worker_jail() {
+        use crate::protocol::{NetDest, NetGrants, NetworkConfig};
+        let p = load_sample_policy();
+        let grants = |outbound: Vec<NetDest>| NetGrants {
+            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true,
+        };
+        let printer = || vec![NetDest { cidr: "192.168.1.20/32".into(), port: Some(631), udp: false }];
+        let worker = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
+            let mut r = instance_req(name, &format!("/var/lib/atrium/jails/{name}"), exe, true);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.network = net;
+            r
+        };
+        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g) };
+        let render = worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62001, NetworkConfig::Disable);
+        assert!(is_print_worker(&render, &p));
+        validate_create(&render, &p).expect("a render worker");
+        let ipp = worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(grants(printer())));
+        assert!(is_print_worker(&ipp, &p));
+        validate_create(&ipp, &p).expect("an ipp worker");
+        let mut any = grants(vec![]);
+        any.outbound_any = true;
+        let mut dns = grants(printer());
+        dns.no_resolver = false;
+        let mut mlock = render.clone();
+        mlock.allow_mlock = true;
+        for (r, why) in [
+            (worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62001, routed(grants(printer()))), "render with a network"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None }), "ipp reaching anywhere"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(any)), "ipp with outbound_any"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(dns)), "ipp with a resolver"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002,
+                    routed(grants(vec![NetDest { cidr: "192.168.1.0/24".into(), port: Some(631), udp: false }]))), "a whole subnet"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002,
+                    routed(grants(vec![NetDest { cidr: "192.168.1.20/32".into(), port: None, udp: false }]))), "any port"),
+            (worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62002, NetworkConfig::Disable), "uid not the name's"),
+            (worker("system-prelum-61999", "/usr/local/bin/atrium-prelum-render", 61999, NetworkConfig::Disable), "uid below the range"),
+            (worker("system-prelum-62001", "/usr/local/bin/atrium-svc", 62001, NetworkConfig::Disable), "another binary"),
+            (mlock, "locked memory"),
+        ] {
+            assert!(!is_print_worker(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
     }

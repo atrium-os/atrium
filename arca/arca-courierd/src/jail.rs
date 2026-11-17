@@ -113,6 +113,7 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         outbound: addrs.iter().map(|a| NetDest { cidr: format!("{a}/32"), port: Some(port), udp: false }).collect(),
         peers: vec![],
         inbound: vec![],
+        no_resolver: false,
     };
     let list: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
     let mut env = vec![
