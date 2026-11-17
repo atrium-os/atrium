@@ -159,9 +159,8 @@ typ "vi /tmp/gate.txt
 "
 waitscreen "<alt>" 30 && ok "vi takes the alternate screen" || bad "vi: $(screen)"
 waitscreen "| ~ | ~ |" 10 && ok "with its empty-line tildes" || bad "tildes: $(screen)"
-# nvi flushes the input queue as it sets up the terminal (TCSAFLUSH), which
-# under TCG ends well after its first frame: let it settle before typing.
-sleep 5
+# No "press any key" first: vi has its /var/tmp (for vi.recover), so the
+# first key is the program's.
 typ "ihello from vi"
 esc
 waitscreen "hello from vi" 10 && ok "insert shows the text" || bad "insert: $(screen)"
@@ -180,7 +179,7 @@ echo "=== less"
 typ "i=0; while [ \$i -lt 120 ]; do echo row \$i; i=\$((i+1)); done > /tmp/rows; less /tmp/rows
 "
 waitscreen "<alt>" 30 && ok "less takes the alternate screen" || bad "less: $(screen)"
-waitscreen "| row 0 |" 10 && ok "showing the top" || bad "top rows: $(screen)"
+waitscreen " row 0 | row 1 |" 10 && ok "showing the top" || bad "top rows: $(screen)"
 k1 0x2c
 waitscreen "| row 4[0-9] |" 10 && ok "Space pages down" || bad "page: $(screen)"
 typ "q"
