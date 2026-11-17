@@ -549,3 +549,69 @@ fn search_as_you_type_and_a_saved_search() {
     assert!(mail.ui.get_cloned().saved.is_empty());
     assert!(engine.store.saved_searches().unwrap().is_empty());
 }
+
+#[test]
+fn unsubscribe_block_and_the_screener() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    engine.set_screener(account, true).unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Trash".into(), role: Role::Trash, selectable: true },
+        ]).unwrap();
+        // Before the screener was on (dated earlier): let through.
+        let weekly = message(1, "The Weekly <news@list.example>", "Issue 1", "Text.", false, NOW - 300);
+        let weekly = String::from_utf8(weekly).unwrap().replacen("23 Nov 2026", "23 Nov 2020", 1).replacen("MIME-Version", "List-Id: The Weekly <weekly.list.example>\r\nList-Unsubscribe: <https://list.example/u/1>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nMIME-Version", 1).into_bytes();
+        let stranger = b"From: Stranger <who@new.example>\r\nTo: priya@example.org\r\nSubject: Hi there\r\nDate: 02 Jan 2031 10:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nHello.\r\n".to_vec();
+        let f = |uid: u32, bytes: Vec<u8>| Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: None, server_id: None, bytes, full: true };
+        sink.messages("INBOX", vec![f(1, weekly), f(2, stranger)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    use atrium_mail::view::Lane;
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.count, 1, "the stranger waits");
+    assert_eq!(ui.views, [(Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Newsletters") && t.iter().any(|x| x == "New senders"), "{t:?}");
+
+    // The newsletter: Unsubscribe is one press, made by the app.
+    mail.show_view(Lane::Newsletters);
+    mail.open(0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "From the list The Weekly") && t.iter().any(|x| x == "Unsubscribe"), "{t:?}");
+    mail.unsubscribe(0);
+    let asked = mail.take_unsubscribes();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].1, "https://list.example/u/1");
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Unsubscribing…"));
+    mail.unsubscribed(asked[0].0, Ok(()));
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Unsubscribed from The Weekly") && t.iter().any(|x| x == "Block future mail from this list"), "{t:?}");
+    mail.block_list(0, true);
+    assert_eq!(engine.store.list_state(account, "weekly.list.example").unwrap(), mail_store::senders::list::BLOCKED);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "The Weekly is blocked: its mail goes to Trash"));
+
+    // New senders: Accept puts the stranger in the inbox.
+    mail.show_view(Lane::NewSenders);
+    assert_eq!(mail.ui.get_cloned().count, 1);
+    mail.open(0);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Accept"));
+    mail.screen(0, true);
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.count, 0);
+    assert_eq!(ui.views, [(Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
+    mail.end_search();
+    assert_eq!(mail.ui.get_cloned().count, 2);
+}

@@ -168,6 +168,16 @@ pub struct Hit {
 }
 
 impl Engine {
+    /// A message as a result row (for views that aren't searches).
+    pub fn hit(&self, id: MsgId) -> Option<Hit> {
+        let m = self.store.message(id).ok()?;
+        let at = m.locations.iter().chain(&m.held);
+        let flags: Vec<u32> = at.filter_map(|(f, u)| self.store.at(*f, *u).ok().flatten().map(|(_, fl)| fl)).collect();
+        let unread = !flags.is_empty() && flags.iter().all(|f| f & flag::SEEN == 0);
+        let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
+        Some(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), unread })
+    }
+
     /// Run `q` (as [`parse`]d) over every account's mail; newest first, at
     /// most [`RESULTS_MAX`].
     pub fn search(&self, q: &Query) -> Result<Vec<Hit>, Error> {

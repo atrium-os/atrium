@@ -115,6 +115,12 @@ pub struct Msg {
     /// the first of them.
     pub new: bool,
     pub body: Option<Body>,
+    /// The list it came from (§11.3), for Unsubscribe and Block.
+    pub list: Option<mail_engine::senders::ListInfo>,
+    /// "Unsubscribing…", or what came of it.
+    pub list_note: Option<String>,
+    /// Held by the screener: Accept or Refuse.
+    pub held: bool,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -217,6 +223,26 @@ pub struct Search {
     pub hits: Vec<mail_engine::search::Hit>,
     /// The saved search this is, when one was chosen or saved.
     pub saved: Option<u32>,
+    /// A view in place of a query (the newsletter lane, the screener's).
+    pub view: Option<Lane>,
+}
+
+/// The views that aren't folders (§11.3, §15.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Newsletters,
+    NewSenders,
+    ScreenedOut,
+}
+
+impl Lane {
+    pub fn label(self) -> &'static str {
+        match self {
+            Lane::Newsletters => "Newsletters",
+            Lane::NewSenders => "New senders",
+            Lane::ScreenedOut => "Screened out",
+        }
+    }
 }
 
 /// A saved search in the sidebar (a smart folder).
@@ -232,6 +258,8 @@ pub struct SavedPlace {
 pub struct Ui {
     pub search: Option<Search>,
     pub saved: Vec<SavedPlace>,
+    /// The views shown under the folders, with a count where it matters.
+    pub views: Vec<(Lane, usize)>,
     /// Quick look of an attachment (§8.1).
     pub look: Option<LookPane>,
     /// What became of Open or Save ("Opening in Atrium PDF…", or why not).
@@ -293,6 +321,8 @@ pub struct Mail {
     asks: Rc<RefCell<Vec<FileAsk>>>,
     /// The search being typed.
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
+    /// One-press unsubscribes for the app to POST through Nuntius.
+    unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -408,11 +438,15 @@ impl Mail {
             ui.count = 0;
         }
         ui.saved = store.saved_searches().unwrap_or_default().into_iter().map(|(id, s)| SavedPlace { id, name: s.name, query: s.query }).collect();
+        ui.views = self.views(&accounts.iter().map(|a| a.0).collect::<Vec<_>>());
         if let Some(s) = &mut ui.search {
             // What sync brought in may match too; the row read stays put.
             if !s.typing {
                 let shown: Option<MsgId> = ui.cursor.and_then(|c| s.hits.get(c)).map(|h| h.msg);
-                s.hits = self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default();
+                s.hits = match s.view {
+                    Some(v) => self.lane_hits(v),
+                    None => self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default(),
+                };
                 ui.cursor = shown.and_then(|m| s.hits.iter().position(|h| h.msg == m));
                 if ui.cursor.is_none() {
                     ui.reading = None;
@@ -514,6 +548,9 @@ impl Mail {
             open: false,
             new: flags & flag::SEEN == 0,
             body: None,
+            list: self.engine.list_of(msg).ok().flatten(),
+            list_note: None,
+            held: !m.held.is_empty(),
         }
     }
 
@@ -804,6 +841,9 @@ impl Mail {
     /// Put the caret in the search (`/`), keeping what was typed.
     pub fn start_search(&self) {
         let mut ui = self.ui.get_cloned();
+        if ui.search.as_ref().is_some_and(|s| s.view.is_some()) {
+            ui.search = None;
+        }
         let new = ui.search.is_none();
         let s = ui.search.get_or_insert_with(Search::default);
         s.typing = true;
@@ -825,7 +865,11 @@ impl Mail {
     fn run_search(&self, ui: &mut Ui) {
         let Some(s) = &mut ui.search else { return };
         let q = mail_engine::search::parse(&s.query, s.typing);
-        s.hits = match self.engine.search(&q) {
+        let got = match s.view {
+            Some(v) => Ok(self.lane_hits(v)),
+            None => self.engine.search(&q),
+        };
+        s.hits = match got {
             Ok(h) => h,
             Err(e) => {
                 ui.error = Some(format!("Couldn't search: {e}"));
@@ -844,8 +888,162 @@ impl Mail {
     pub fn search_for(&self, query: &str, saved: Option<u32>) {
         let mut ui = self.ui.get_cloned();
         self.find.borrow_mut().set_text(query);
-        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved });
+        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved, view: None });
         self.run_search(&mut ui);
+        self.ui.set(ui);
+    }
+
+    /// The views to show: Newsletters when there are any, the screener's
+    /// when it is on or holds something.
+    fn views(&self, accounts: &[AccountId]) -> Vec<(Lane, usize)> {
+        let e = &self.engine;
+        let mut out = Vec::new();
+        if accounts.iter().any(|a| e.newsletters(*a, 0, 1).is_ok_and(|n| !n.is_empty())) {
+            out.push((Lane::Newsletters, 0));
+        }
+        let (mut new, mut refused, mut on) = (0, 0, false);
+        for a in accounts {
+            on |= e.screener(*a).unwrap_or(false);
+            if let Ok((n, r)) = e.screened(*a) {
+                new += n.len();
+                refused += r.len();
+            }
+        }
+        if on || new > 0 {
+            out.push((Lane::NewSenders, new));
+        }
+        if refused > 0 {
+            out.push((Lane::ScreenedOut, refused));
+        }
+        out
+    }
+
+    /// A view's rows, every account, newest first.
+    fn lane_hits(&self, lane: Lane) -> Vec<mail_engine::search::Hit> {
+        let e = &self.engine;
+        let mut ids = Vec::new();
+        for (a, _) in e.store.accounts().unwrap_or_default() {
+            match lane {
+                Lane::Newsletters => ids.extend(e.newsletters(a, 0, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
+                Lane::NewSenders => ids.extend(e.screened(a).map(|s| s.0).unwrap_or_default()),
+                Lane::ScreenedOut => ids.extend(e.screened(a).map(|s| s.1).unwrap_or_default()),
+            }
+        }
+        let mut hits: Vec<_> = ids.into_iter().filter_map(|m| e.hit(m)).collect();
+        hits.sort_by(|a, b| b.date.cmp(&a.date).then(b.msg.cmp(&a.msg)));
+        hits
+    }
+
+    /// Show a view in the list.
+    pub fn show_view(&self, lane: Lane) {
+        let mut ui = self.ui.get_cloned();
+        self.find.borrow_mut().set_text("");
+        ui.search = Some(Search { view: Some(lane), ..Search::default() });
+        self.run_search(&mut ui);
+        self.ui.set(ui);
+    }
+
+    /// Unsubscribe from message `k`'s list (§11.3): one press does it where
+    /// the list allows (a POST the app makes through Nuntius); a mailto one
+    /// opens a filled message to send; a web one goes to the link bar.
+    pub fn unsubscribe(&self, k: usize) {
+        use mail_engine::senders::Unsubscribe;
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).cloned() else { return };
+        let Some(l) = m.list.clone() else { return };
+        let note = match &l.how {
+            Some(Unsubscribe::OneClick(url)) => {
+                self.unsubs.borrow_mut().push((m.msg, url.clone()));
+                "Unsubscribing…".to_string()
+            }
+            Some(Unsubscribe::Mail(link)) => match self.engine.compose_mailto(l.account, link) {
+                Ok(c) => {
+                    self.composes.borrow_mut().push((c, None));
+                    self.set_list_state(&l, mail_store::senders::list::UNSUBSCRIBED);
+                    "Send the message that opened to finish unsubscribing.".to_string()
+                }
+                Err(e) => format!("Couldn't write the unsubscribe message: {e}"),
+            },
+            Some(Unsubscribe::Web(url)) => {
+                self.link(url);
+                self.set_list_state(&l, mail_store::senders::list::UNSUBSCRIBED);
+                "The list's page says how to unsubscribe: press Open below.".to_string()
+            }
+            None => "This list doesn't say how to unsubscribe.".to_string(),
+        };
+        self.change_reading(|r| {
+            if let Some(x) = r.msgs.get_mut(k) {
+                x.list_note = Some(note);
+            }
+        });
+    }
+
+    /// The one-press unsubscribes for the app to make.
+    pub fn take_unsubscribes(&self) -> Vec<(MsgId, String)> {
+        std::mem::take(&mut *self.unsubs.borrow_mut())
+    }
+
+    /// What came of a one-press unsubscribe.
+    pub fn unsubscribed(&self, msg: MsgId, r: Result<(), String>) {
+        let list = self.engine.list_of(msg).ok().flatten();
+        let note = match (&r, &list) {
+            (Ok(()), Some(l)) => {
+                self.set_list_state(l, mail_store::senders::list::UNSUBSCRIBED);
+                None
+            }
+            (Ok(()), None) => None,
+            (Err(e), _) => Some(format!("Couldn't unsubscribe: {e}")),
+        };
+        self.change_reading(|r| {
+            for m in r.msgs.iter_mut().filter(|m| m.msg == msg) {
+                m.list_note = note.clone();
+            }
+        });
+    }
+
+    /// "Block future mail from this list" (or take the block away).
+    pub fn block_list(&self, k: usize, on: bool) {
+        let ui = self.ui.get_cloned();
+        let Some(l) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).and_then(|m| m.list.clone()) else { return };
+        use mail_store::senders::list;
+        self.set_list_state(&l, if on { list::BLOCKED } else { list::UNSUBSCRIBED });
+    }
+
+    fn set_list_state(&self, l: &mail_engine::senders::ListInfo, state: u8) {
+        if let Err(e) = self.engine.set_list(l.account, &l.key, state) {
+            self.set_error(format!("Couldn't keep that: {e}"));
+            return;
+        }
+        let key = l.key.clone();
+        self.change_reading(|r| {
+            for m in &mut r.msgs {
+                if let Some(x) = m.list.as_mut().filter(|x| x.key == key) {
+                    x.state = state;
+                }
+            }
+        });
+    }
+
+    /// Accept (or refuse) the sender of held message `k` (§11.3).
+    pub fn screen(&self, k: usize, accept: bool) {
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).cloned() else { return };
+        let r = if accept { self.engine.accept_sender(m.account, &m.from) } else { self.engine.refuse_sender(m.account, &m.from) };
+        if let Err(e) = r {
+            self.set_error(format!("Couldn't keep that: {e}"));
+            return;
+        }
+        let mut ui = self.ui.get_cloned();
+        ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+        if ui.search.as_ref().is_some_and(|s| s.view.is_some()) {
+            self.run_search(&mut ui);
+        } else if let Some(r) = &mut ui.reading {
+            for x in r.msgs.iter_mut().filter(|x| x.from.eq_ignore_ascii_case(&m.from)) {
+                x.held = !accept;
+            }
+            r.version += 1;
+        }
+        ui.gen += 1;
         self.ui.set(ui);
     }
 
@@ -1327,6 +1525,10 @@ pub enum Item {
     ShowHtml(usize),
     /// "N pictures not loaded · Load pictures · Always for this sender" (§7.4).
     Pictures(usize),
+    /// "From the list The Weekly · Unsubscribe", then Block (§11.3).
+    List(usize),
+    /// "New sender · Accept · Refuse" (the screener, §11.3).
+    Screener(usize),
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
     /// Quick look, Open, Save (§8.1).
     File { msg: usize, i: usize },
@@ -1354,6 +1556,12 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         if m.sender.replies_to.is_some() {
             out.push(Item::RepliesTo(k));
+        }
+        if m.held {
+            out.push(Item::Screener(k));
+        }
+        if m.list.is_some() {
+            out.push(Item::List(k));
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
@@ -1466,6 +1674,7 @@ impl MailView {
             composes: Rc::default(),
             asks: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
+            unsubs: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -1588,6 +1797,24 @@ impl MailView {
         if ui.places.is_empty() {
             text(ctx, 16.0, y + em(16.0), "No accounts yet", type_size::SM, Weight::Regular, t.text_secondary());
         }
+        // Views (§15.2): the newsletter lane, the screener's.
+        if !ui.views.is_empty() && y < h {
+            y += em(8.0);
+            text(ctx, 16.0, y + em(10.0), "VIEWS", type_size::XS, Weight::Semibold, t.text_tertiary());
+            y += em(20.0);
+            for &(lane, n) in &ui.views {
+                let sel = ui.search.as_ref().is_some_and(|s| s.view == Some(lane));
+                let m = self.mail.clone();
+                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.show_view(lane));
+                let wt = if sel { Weight::Semibold } else { Weight::Regular };
+                let n = if n > 0 { n.to_string() } else { String::new() };
+                let nw = width(&n, type_size::SM, Weight::Regular);
+                text(ctx, 20.0, y + place_h() / 2.0, &fit(lane.label(), type_size::SM, wt, w - 48.0 - nw), type_size::SM, wt, t.text_primary());
+                text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+                y += place_h();
+            }
+        }
         // Saved searches (smart folders, §11.2) under the folders.
         if !ui.saved.is_empty() && y < h {
             y += em(8.0);
@@ -1656,6 +1883,7 @@ impl MailView {
         let t = ctx.theme;
         rect(ctx, Rect::new(x0 + w - 1.0, 0.0, 1.0, h), t.border_default());
         let title = match &ui.search {
+            Some(Search { view: Some(v), .. }) => v.label().to_string(),
             Some(s) => match s.saved.and_then(|id| ui.saved.iter().find(|p| p.id == id)) {
                 Some(p) => p.name.clone(),
                 None if s.query.trim().is_empty() => "Search".into(),
@@ -1674,7 +1902,7 @@ impl MailView {
                     let m = self.mail.clone();
                     buttons.push(("Remove", Box::new(move || m.forget_search(id))));
                 }
-                None if !s.query.trim().is_empty() => {
+                None if !s.query.trim().is_empty() && s.view.is_none() => {
                     let m = self.mail.clone();
                     buttons.push(("Save", Box::new(move || m.save_search())));
                 }
@@ -1709,6 +1937,14 @@ impl MailView {
         }
         if ui.count == 0 {
             match &ui.search {
+                Some(Search { view: Some(v), .. }) => {
+                    let empty = match v {
+                        Lane::Newsletters => "No newsletters",
+                        Lane::NewSenders => "No one new is waiting",
+                        Lane::ScreenedOut => "Nothing screened out",
+                    };
+                    text(ctx, x0 + 16.0, head_h() + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
+                }
                 Some(s) if s.query.trim().is_empty() => {
                     let tips = ["Words anywhere, or from: to: subject:", "has:attachment  is:unread  is:flagged  in:archive", "before:2026-01-31  after:  larger:5M  smaller:"];
                     for (k, tip) in tips.iter().enumerate() {
@@ -2060,6 +2296,37 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::Note(l) => {
             text(ctx, x, cy, l, type_size::SM, Weight::Regular, t.text_secondary());
+        }
+        Item::List(k) | Item::Screener(k) => {
+            let m = &s.msgs[*k];
+            let (label, buttons): (String, Vec<(&str, Box<dyn Fn()>)>) = if matches!(item, Item::Screener(_)) {
+                let (a, b) = (mail.clone(), mail.clone());
+                let k = *k;
+                ("New sender: their mail waits here until you say".into(), vec![("Accept", Box::new(move || a.screen(k, true)) as Box<dyn Fn()>), ("Refuse", Box::new(move || b.screen(k, false)))])
+            } else {
+                let Some(l) = &m.list else { return };
+                use mail_store::senders::list;
+                let k = *k;
+                let (a, b) = (mail.clone(), mail.clone());
+                match (l.state, &m.list_note) {
+                    (_, Some(n)) => (n.clone(), Vec::new()),
+                    (list::BLOCKED, None) => (format!("{} is blocked: its mail goes to Trash", l.name), vec![("Unblock", Box::new(move || a.block_list(k, false)) as Box<dyn Fn()>)]),
+                    (list::UNSUBSCRIBED, None) => (format!("Unsubscribed from {}", l.name), vec![("Block future mail from this list", Box::new(move || a.block_list(k, true)) as Box<dyn Fn()>)]),
+                    _ if l.how.is_some() => (format!("From the list {}", l.name), vec![("Unsubscribe", Box::new(move || a.unsubscribe(k)) as Box<dyn Fn()>), ("Block", Box::new(move || b.block_list(k, true)))]),
+                    _ => (format!("From the list {}", l.name), vec![("Block", Box::new(move || a.block_list(k, true)) as Box<dyn Fn()>)]),
+                }
+            };
+            let bw: f32 = buttons.iter().map(|(l, _)| width(l, type_size::XS, Weight::Medium) + em(22.0)).sum();
+            let label = fit(&label, type_size::XS, Weight::Regular, (tw - bw - em(12.0)).max(em(60.0)));
+            text(ctx, x, cy, &label, type_size::XS, Weight::Regular, t.text_secondary());
+            let mut bx = x + width(&label, type_size::XS, Weight::Regular) + em(12.0);
+            for (l, on) in buttons {
+                let lw = width(l, type_size::XS, Weight::Medium) + em(16.0);
+                area(ctx, Rect::new(bx, cy - em(11.0), lw, em(22.0)), t.bg_window(), on);
+                text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, t.text_primary());
+                ctx.pop();
+                bx += lw + em(6.0);
+            }
         }
         Item::New => {
             let label = "New since you last looked";
