@@ -83,6 +83,11 @@ V "nc -z -w 5 $PUB 443" >/dev/null 2>&1 || die "the guest can't reach $PUB:443: 
 ok "the guest reaches the fixture server"
 
 echo "=== cross-build"
+# As nuntius-vm-check.sh: ring's C code needs the guest's sysroot (assert.h…).
+# llvm-ar is Homebrew's on the Mac, where it isn't on PATH.
+AR_X=$(command -v llvm-ar || ls /opt/homebrew/opt/llvm/bin/llvm-ar /usr/local/opt/llvm/bin/llvm-ar 2>/dev/null | head -1)
+export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd="${AR_X:-llvm-ar}"
+export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$VMDIR/sysroot"
 (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" \
     cargo build -q --release --target "$TARGET") || die "portcullis cross-build"
 (cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo +nightly build -q --release \
@@ -115,7 +120,7 @@ allow_rctl = true
 ' \$P
 else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
 service atrium-jaild restart >/dev/null 2>&1; sleep 2
-pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
+pkill -x portcullisd || true; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
 daemon -f -o $PLOG /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
 test -S $PSOCK
 install -m 0755 $B/opifexd /usr/local/sbin/opifexd
