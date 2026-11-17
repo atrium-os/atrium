@@ -103,7 +103,7 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
     }
     // Bit 15: a second mask follows (tracked deletions and formatting).
     let float = a.object.and_then(|o| o.float);
-    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5;
+    let ext = a.deleted.is_some() as u16 | (a.fmt.is_some() as u16) << 1 | (a.conflict.is_some() as u16) << 2 | (a.field.is_some() as u16) << 3 | (float.is_some() as u16) << 4 | (a.object.is_some_and(|o| o.shape) as u16) << 5 | (a.lang_ea.is_some() as u16) << 6;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -183,12 +183,15 @@ pub fn encode_attrs(w: &mut Writer, a: &CharAttrs) {
         w.ivar(f.y as i64);
         w.ivar(f.gap as i64);
     }
+    if let Some(l) = &a.lang_ea {
+        w.str(l);
+    }
 }
 
 pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 6 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 != 0 && m & (1 << 10) == 0) {
+    if ext >> 7 != 0 || (m >> 15 != 0 && ext == 0) || (ext >> 4 & 3 != 0 && m & (1 << 10) == 0) {
         return Err(WireError::Invalid("attribute mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -317,6 +320,13 @@ pub fn decode_attrs(r: &mut Reader) -> Result<CharAttrs, WireError> {
         if let Some(o) = a.object.as_mut() {
             o.shape = true;
         }
+    }
+    if ext >> 6 & 1 != 0 {
+        let l = r.str("language", 35)?;
+        if l.is_empty() || !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(WireError::Invalid("language"));
+        }
+        a.lang_ea = Some(Arc::from(l));
     }
     Ok(a)
 }
@@ -1934,6 +1944,16 @@ mod tests {
         let r = load(&save_to_vec(&d, &[])).unwrap().doc;
         assert_eq!(r.para(a).unwrap().props.rtl, Some(true));
         assert_eq!(r.para(0).unwrap().props.rtl, None);
+    }
+
+    #[test]
+    fn east_asian_language_round_trips() {
+        let mut d = TextDoc::new();
+        let ja = d.attrs.intern(CharAttrs { lang_ea: Some("ja-JP".into()), bold: Some(true), ..Default::default() });
+        d.push_para("直骨", 0, vec![(0, ja)]);
+        let r = load(&save_to_vec(&d, &[])).unwrap().doc;
+        assert_eq!(r.attrs.get(ja).lang_ea.as_deref(), Some("ja-JP"));
+        assert_eq!(r.attrs.get(ja).bold, Some(true));
     }
 
     #[test]

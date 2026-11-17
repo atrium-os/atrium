@@ -35,6 +35,16 @@ mod tests {
     }
 
     #[test]
+    fn east_asian_language_round_trips() {
+        let mut d = officina_text::model::TextDoc::new();
+        let ja = d.attrs.intern(officina_text::model::CharAttrs { lang_ea: Some("ja-JP".into()), ..Default::default() });
+        d.push_para("直骨です", 0, vec![(0, ja)]);
+        let (r, _) = super::read(&super::write(&d, Vec::new()).unwrap()).unwrap();
+        let langs: Vec<Option<String>> = (0..r.blocks.len()).filter_map(|i| r.para(i)).filter(|p| !p.text.is_empty()).map(|p| r.attrs.get(p.runs[0].1).lang_ea.as_deref().map(String::from)).collect();
+        assert_eq!(langs, [Some("ja-JP".to_string())]);
+    }
+
+    #[test]
     fn headers_keep_their_paragraphs_pictures_and_page_numbers() {
         let d = crate::docx::tests::margin_sample();
         let (r, _) = super::read(&super::write(&d, Vec::new()).unwrap()).unwrap();

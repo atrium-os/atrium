@@ -189,6 +189,14 @@ pub(crate) fn text_props(e: &El, fonts: &HashMap<String, String>) -> CharAttrs {
         let name = fonts.get(f).cloned().unwrap_or_else(|| f.trim_matches(['\'', '"']).to_string());
         a.family = Some(Arc::from(&name[..name.len().min(255)]));
     }
+    // The East Asian language (style:language-asian + style:country-asian).
+    if let Some(l) = e.attr("style:language-asian").filter(|l| *l != "none") {
+        let tag = match e.attr("style:country-asian").filter(|c| *c != "none") {
+            Some(c) => format!("{l}-{c}"),
+            None => l.to_string(),
+        };
+        a.lang_ea = crate::docx::read::lang_tag(&tag);
+    }
     a
 }
 
