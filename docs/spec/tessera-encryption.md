@@ -266,7 +266,7 @@ nothing of the content. It is authenticated rather than encrypted:
 - `encryption_flags` (reserved in format.h as "bit 0 = AES-XTS active, bit 1 =
   convergent") is redefined, which is safe because no volume has ever set it: bit 0 =
   sealed, bit 1 = has key groups. The "convergent" bit is retired (§6).
-- `reserved_e0` becomes the **suite** byte (1 = XAES-256-GCM, 2 = XChaCha20-Poly1305; §5.1).
+- `reserved_e0` becomes the **suite** byte `enc_suite` (1 = XAES-256-GCM, 2 = XChaCha20-Poly1305; §5.1).
 - `master_key_id` holds the VK's key id. A new 32-byte field from the trailing slack
   holds `check` (§4.2).
 - **`hmac[32]`** (reserved in format.h) holds `HMAC-SHA-256(K_meta, superblock with
@@ -274,7 +274,9 @@ nothing of the content. It is authenticated rather than encrypted:
   the CRC is still written so tools can detect corruption without a key.
 - **Root tags.** For every tree root in the superblock (inode, pack registry, free
   extents, quota, blob index, dead extents, snapshots), the slack gains the root block's
-  16-byte AEAD tag. These are 112 bytes of the 1692 bytes of slack.
+  16-byte AEAD tag, indexed by tree kind (`root_tags[7][16]`, 112 bytes), and the
+  tag of the last journal record the superblock covers (`journal_anchor_tag`, §5.3).
+  With `key_check` and `sealed_stats` that is 288 of the 1692 bytes of slack.
 - The advisory counters (`total_blob_count`, `total_pack_count`) and the times
   (`format_time`, `last_mount_time`) are written as zero on a sealed volume. Their real
   values go in a 128-byte sealed record in the slack, so a lost stick does not say when
@@ -310,7 +312,8 @@ and 16-byte tag at the end of the block.
 - **Capacity.** An inode leaf still holds 26 records (4056 − 32 header = 4024 bytes, /
   152). Internal fan-out drops by 16 bytes an entry. Journal record bodies shrink from
   4068 to 4028 bytes per block.
-- **Journal chain.** Each record's AAD also includes the previous record's tag, so
+- **Journal chain.** Each record's AAD also includes the previous record's tag (the
+  first record after a commit chains to the superblock's `journal_anchor_tag`), so
   records cannot be reordered, dropped from the middle or spliced in from an older
   journal. Cutting the tail looks like a crash before the last commit, which replay
   already handles. Because the superblock is rewritten at every commit (tessera-fs.md

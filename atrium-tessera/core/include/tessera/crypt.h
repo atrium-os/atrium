@@ -40,7 +40,7 @@ extern "C" {
 #define TESSERA_TAG_SIZE        16u
 #define TESSERA_SEAL_OVERHEAD   (TESSERA_NONCE_SIZE + TESSERA_TAG_SIZE)
 
-/* Suite byte (superblock reserved_e0, key-group records). 0 = not sealed. */
+/* Suite byte (superblock enc_suite, key-group records). 0 = not sealed. */
 #define TESSERA_SUITE_XAES_256_GCM        1u
 #define TESSERA_SUITE_XCHACHA20_POLY1305  2u
 

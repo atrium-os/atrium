@@ -34,7 +34,7 @@ done
 
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
-      b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c crypt.c"
+      b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c crypt.c seal.c"
 LIBS="${FUZZ_LIBS-}"
 [ -z "${FUZZ_LIBS+x}" ] && [ "$(uname)" = Linux ] && LIBS="-lmd"
 RSLIBS=$(sh "$ROOT/scripts/tessera-decode-lib.sh") || exit 2

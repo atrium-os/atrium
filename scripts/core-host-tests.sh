@@ -52,7 +52,7 @@ done
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
       b3_blake3.c b3_blake3_portable.c b3_shim.c b3_blake3_sse41.c b3_blake3_avx2.c
-      tessera_reader.c crypt.c"
+      tessera_reader.c crypt.c seal.c"
 
 # ★ Keep this list derived from the Makefile, not copied by hand. A test added
 # there and missed here is a test that silently never runs — the same class of
@@ -94,7 +94,7 @@ SAN_CFLAGS="-O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 SAN_RUN_ENV="ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
              UBSAN_OPTIONS=print_stacktrace=1"
 
-# test_crypt needs OpenSSL's libcrypto for its backend (src/crypt_openssl.c).
+# test_crypt and test_seal need OpenSSL's libcrypto for its backend (src/crypt_openssl.c).
 # OPENSSL=<prefix> picks one (macOS: $(brew --prefix openssl@3)); otherwise
 # the system's. Without one, test_crypt is reported as skipped, never passed.
 SSL_CFLAGS=""; SSL_LIBS="-lcrypto"
@@ -160,21 +160,23 @@ run_suite() {
             [ "$KEEPGOING" = "-k" ] || break
         fi
     done
+    for t in test_crypt test_seal; do
     if [ "$SSL_OK" = 1 ]; then
         # shellcheck disable=SC2086
-        if $CC $cflags $SSL_CFLAGS -o "$obj/test_crypt" "$CORE/tests/test_crypt.c" \
+        if $CC $cflags $SSL_CFLAGS -o "$obj/$t" "$CORE/tests/$t.c" \
              "$CORE/src/crypt_openssl.c" "$obj/libtessera_core.a" $LIBS $SSL_LIBS \
-             2>"$obj/test_crypt.buildlog" &&
-           env $SAN_RUN_ENV "$obj/test_crypt" >"$obj/test_crypt.log" 2>&1; then
-            echo "== [$label] test_crypt: PASS"; pass=$((pass+1))
+             2>"$obj/$t.buildlog" &&
+           env $SAN_RUN_ENV "$obj/$t" >"$obj/$t.log" 2>&1; then
+            echo "== [$label] $t: PASS"; pass=$((pass+1))
         else
-            echo "== [$label] test_crypt: FAIL"
-            tail -8 "$obj/test_crypt.buildlog" "$obj/test_crypt.log" 2>/dev/null | sed 's/^/     /'
-            fail=$((fail+1)); total_failed="$total_failed $label/test_crypt"
+            echo "== [$label] $t: FAIL"
+            tail -8 "$obj/$t.buildlog" "$obj/$t.log" 2>/dev/null | sed 's/^/     /'
+            fail=$((fail+1)); total_failed="$total_failed $label/$t"
         fi
     else
-        echo "== [$label] test_crypt: SKIPPED (no OpenSSL libcrypto; set OPENSSL=<prefix>)"
+        echo "== [$label] $t: SKIPPED (no OpenSSL libcrypto; set OPENSSL=<prefix>)"
     fi
+    done
     echo "   [$label] $pass passed, $fail failed"
     total_pass=$((total_pass+pass)); total_fail=$((total_fail+fail))
     return 0

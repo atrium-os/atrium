@@ -84,6 +84,18 @@ typedef uint8_t tessera_hash_t[TESSERA_HASH_SIZE];
 
 /* sb.incompat_flags bits — mount must refuse any bit it doesn't know. */
 #define TESSERA_INCOMPAT_HASH_ALG    (1u << 0)  /* hash_alg != SHA256 */
+/* Sealed volume (tessera-encryption.md §5.2): every metadata block, pack
+ * and blob is an AEAD-sealed unit; the superblock is HMAC'd. */
+#define TESSERA_INCOMPAT_SEALED      (1u << 1)
+/* The volume has key groups (encrypted domains, §5.4–§5.5). */
+#define TESSERA_INCOMPAT_KEY_GROUPS  (1u << 2)
+
+/* Sealed volumes (tessera-encryption.md §5.3): a sealed 4 KiB metadata
+ * block is payload[4056] | nonce[24] | tag[16]. */
+#define TESSERA_SEALED_TRAILER        40u
+#define TESSERA_SEALED_BLOCK_PAYLOAD  (TESSERA_SECTOR_SIZE - TESSERA_SEALED_TRAILER)
+#define TESSERA_SB_ROOT_TAGS          7u    /* tree kinds 0..6 */
+#define TESSERA_SB_SEALED_STATS_SIZE  128u
 
 /* ── Magic strings ───────────────────────────────────────────────── */
 
@@ -115,6 +127,12 @@ typedef uint8_t tessera_hash_t[TESSERA_HASH_SIZE];
  *                    credential → KEK → unwrap)
  *   5 = PKCS#11     (smart-card / HSM)
  *   6 = keyfile     (raw bytes from a file on disk / USB stick)
+ *   7 = Arca        (tessera-encryption.md §5.2: no wrapped key; the
+ *                    key lives in a machine's Arca. credential_id holds
+ *                    the key id, wrapped_key[0..32] the key check)
+ *
+ * tessera-encryption.md uses only 7 and 3 (recovery code, Argon2id).
+ * Types 1, 2, 4, 5, 6 stay reserved: Arca mixes the TPM and FIDO2 in.
  *
  * All slots share the same wrap format: XChaCha20-Poly1305 over
  * the 32-byte volume key, layout = nonce(24) + ct(32) + tag(16) +
@@ -132,6 +150,9 @@ typedef struct TESSERA_PACKED {
 	uint8_t   credential_id[16];         /* FIDO2 / PKCS#11 ref */
 	uint8_t   reserved[96];              /* future slot types */
 } tessera_key_slot_t;
+
+#define TESSERA_KEY_SLOT_RECOVERY  3u
+#define TESSERA_KEY_SLOT_ARCA      7u
 
 /* ── Superblock (4096 bytes) ─────────────────────────────────────── */
 
@@ -186,21 +207,15 @@ typedef struct TESSERA_PACKED {
 	 * size differs (128 vs 144). */
 	uint64_t  quota_tree_root;
 	uint64_t  quota_tree_gen;
-	/* Encryption — reserved by v1 for v3's at-rest encryption.
-	 * v1 mkfs zeros all of these; v1 kmod never reads them.
-	 * v3 will populate `key_slots` with active unlock methods
-	 * (passphrase, TPM2-sealed, recovery key, FIDO2, etc.) and
-	 * use the volume key — recovered by unwrapping any one slot —
-	 * to AES-XTS-encrypt all on-disk sectors. Wiring the format
-	 * slots now avoids an on-disk migration when v3 lands. */
-	uint16_t  encryption_flags;          /* bit 0 = AES-XTS active
-	                                        bit 1 = convergent (opt-in) */
+	/* Encryption (docs/spec/tessera-encryption.md §5.2). Zero on every
+	 * volume made before it; the old "AES-XTS" / "convergent" meanings
+	 * were never written by anything and are retired. */
+	uint16_t  encryption_flags;          /* TESSERA_ENC_* */
 	uint8_t   active_slot_count;         /* number of populated slots */
-	uint8_t   reserved_e0;
+	uint8_t   enc_suite;                 /* TESSERA_SUITE_* (crypt.h);
+	                                        0 = not sealed */
 	uint32_t  reserved_e1;
-	uint8_t   master_key_id[16];         /* unique per-volume; key-rotation
-	                                        tooling uses this to detect a
-	                                        re-encryption */
+	uint8_t   master_key_id[16];         /* sealed: the volume key's id */
 	tessera_key_slot_t  key_slots[8];    /* 8 × 256 = 2 KiB */
 	uint32_t  last_unmount_clean;
 	/* Content-hash algorithm (TESSERA_HASH_ALG_*). 0 = SHA-256, which is
@@ -231,20 +246,46 @@ typedef struct TESSERA_PACKED {
 	 * preceding offsets are unchanged and old volumes decode it as 0. */
 	uint64_t  dead_extent_root;
 	uint64_t  dead_extent_gen;
+	/* Sealed volumes only (tessera-encryption.md §5.2); zero otherwise.
+	 * key_check = HMAC(K_check, "tessera key check") (§4.2): tells a wrong
+	 * key from a corrupt volume before anything is opened. */
+	uint8_t   key_check[32];
+	/* The AEAD tag of each tree's root block, indexed by tree kind
+	 * (TESSERA_BTREE_KIND_INODE .. DEAD_EXT). A root is accepted only if
+	 * its own tag matches this one: the top of the Merkle-by-tag chain. */
+	uint8_t   root_tags[TESSERA_SB_ROOT_TAGS][16];
+	/* Tag of the last journal record this superblock covers: the first
+	 * record written after it chains to this tag (§5.3). Zero = start. */
+	uint8_t   journal_anchor_tag[16];
+	/* Sealed tessera_sb_stats_t (§5.2): the counters and times are zero in
+	 * the clear fields above and kept here instead. nonce | ct | tag. */
+	uint8_t   sealed_stats[TESSERA_SB_SEALED_STATS_SIZE];
 	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
 	 * so any field later carved from it is CRC-covered for free. Sized to
 	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
-	 * field. 1692 = prior 1708 − 16 B taken by dead_extent_root/gen. */
-	uint8_t   reserved[1692];
+	 * field. 1404 = prior 1692 − 288 B taken by the sealed-volume fields. */
+	uint8_t   reserved[1404];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
-	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
-	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
-	 * mac_key = HKDF(volume_key, "tessera-mac") and writes
-	 * HMAC-SHA256(mac_key, sb_bytes_with_hmac_zeroed) here on every
-	 * commit_sb, verifying on mount. CRC32 stays for non-authenticated
-	 * (encryption-off) volumes; HMAC supersedes it when present. */
+	/* Sealed volumes: HMAC-SHA-256(K_meta, superblock with crc32 and hmac
+	 * zeroed) (tessera-encryption.md §5.2), checked before any other field
+	 * is used. The CRC is still written so tools can spot corruption
+	 * without the key. Zero on unsealed volumes. */
 	uint8_t   hmac[32];
 } tessera_superblock_t;
+
+/* encryption_flags bits (tessera-encryption.md §5.2). */
+#define TESSERA_ENC_SEALED      (1u << 0)
+#define TESSERA_ENC_KEY_GROUPS  (1u << 1)
+
+/* The superblock's sealed advisory counters (§5.2): 88 bytes of payload,
+ * sealed as nonce[24] | ct[88] | tag[16] = 128 bytes in sealed_stats. */
+typedef struct TESSERA_PACKED {
+	uint64_t  total_blob_count;
+	uint64_t  total_pack_count;
+	uint64_t  format_time;
+	uint64_t  last_mount_time;
+	uint8_t   reserved[56];
+} tessera_sb_stats_t;
 
 /* Superblock feature flags */
 #define TESSERA_FEATURE_ENCRYPTED       (1u << 0)

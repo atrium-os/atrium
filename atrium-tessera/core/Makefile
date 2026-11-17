@@ -18,7 +18,7 @@ SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
             manifest.c pack.c journal.c extent.c gc.c volume.c quota.c quota_store.c \
             b3_blake3.c b3_blake3_portable.c b3_shim.c \
             b3_blake3_sse41.c b3_blake3_avx2.c \
-            tessera_reader.c crypt.c
+            tessera_reader.c crypt.c seal.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
             include/tessera/format.h \
@@ -34,7 +34,8 @@ INCS=       include/tessera/tessera.h \
             include/tessera/gc.h \
             include/tessera/volume.h \
             include/tessera/quota.h \
-            include/tessera/crypt.h
+            include/tessera/crypt.h \
+            include/tessera/seal.h
 INCSDIR=    /usr/local/include
 
 WARNS?=     6
@@ -96,6 +97,10 @@ ${.OBJDIR}/${t}: lib${LIB}.a ${.CURDIR}/tests/${t}.c
 TEST_BINS+= ${.OBJDIR}/test_crypt
 ${.OBJDIR}/test_crypt: lib${LIB}.a ${.CURDIR}/tests/test_crypt.c ${.CURDIR}/src/crypt_openssl.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_crypt.c \
+	    ${.CURDIR}/src/crypt_openssl.c ${.OBJDIR}/libtessera_core.a -lmd -lcrypto
+TEST_BINS+= ${.OBJDIR}/test_seal
+${.OBJDIR}/test_seal: lib${LIB}.a ${.CURDIR}/tests/test_seal.c ${.CURDIR}/src/crypt_openssl.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_seal.c \
 	    ${.CURDIR}/src/crypt_openssl.c ${.OBJDIR}/libtessera_core.a -lmd -lcrypto
 
 check: ${TEST_BINS}
