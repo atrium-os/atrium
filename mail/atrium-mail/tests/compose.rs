@@ -54,6 +54,10 @@ fn compose_send_undo() {
     let dirty = Arc::new(AtomicBool::new(true));
     let ck = clock.clone();
     let k = Composer::new(engine.clone(), c, draft_id, dirty.clone(), move || ck.get());
+    assert!(k.is_rich(), "rich text by default");
+    k.set_rich(false);
+    assert_eq!(k.draft().text, "\n\n-- \nPriya\n");
+    assert!(k.draft().html.is_none());
     let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
     app.tick();
     let t = texts(&app);
@@ -64,7 +68,7 @@ fn compose_send_undo() {
     k.to.set(TextEdit::new("Arun <arun@acme.example>, lena@acme.example"));
     k.subject.set(TextEdit::new("Q4 numbers"));
     app.tick();
-    let body_at = Point::new(30.0, 48.0 + 40.0 * 4.0 + 8.0 + 4.0);
+    let body_at = Point::new(30.0, 48.0 + 40.0 * 4.0 + 36.0 + 1.0 + 8.0 + 4.0);
     app.handle_event(Event::PointerDown { at: body_at });
     app.handle_event(Event::PointerUp { at: body_at });
     app.tick();
@@ -150,4 +154,64 @@ fn compose_send_undo() {
     k.discard();
     assert!(engine.drafts(account).unwrap().is_empty());
     assert_eq!(k.done(), Some(Done::Discarded));
+}
+
+#[test]
+fn rich_text() {
+    use atrium_mail::compose::Format;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: "/nonexistent".into() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    engine.store.set_identities(account, &[
+        Identity { name: "Priya Raman".into(), addr: "priya@example.org".into(), signature: "Priya".into() },
+        Identity { name: "".into(), addr: "billing@example.org".into(), signature: "Billing".into() },
+    ]).unwrap();
+    let c = engine.compose_new(account, 0).unwrap();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    app.tick();
+    let t = texts(&app);
+    for s in ["B", "I", "U", "• List", "Plain text"] {
+        assert!(t.iter().any(|x| x == s), "{s:?} not drawn: {t:?}");
+    }
+    assert!(app.tree().iter().any(|(_, n)| matches!(n, Node::Glyphs { .. })), "the text is drawn by the rich editor");
+    // Type, then bold the next words, then a list.
+    {
+        let r = k.rich.borrow();
+        let mut e = r.as_ref().unwrap().editor.borrow_mut();
+        e.set_caret(pergola_richtext::Pos::new(0, 0), false);
+        e.insert("Hello ");
+    }
+    k.format(Format::Bold);
+    {
+        let r = k.rich.borrow();
+        let mut e = r.as_ref().unwrap().editor.borrow_mut();
+        e.insert("world");
+    }
+    k.format(Format::Bold);
+    let d = k.draft();
+    let html = d.html.clone().unwrap();
+    assert!(html.contains("<p>Hello <b>world</b></p>"), "{html}");
+    assert_eq!(d.text, "Hello world\n\n-- \nPriya\n");
+    app.tick();
+    // Another From: its signature, the formatting kept.
+    k.set_from(1);
+    let d = k.draft();
+    assert!(d.html.as_deref().unwrap().contains("<b>world</b>"));
+    assert!(d.text.ends_with("-- \nBilling\n"), "{:?}", d.text);
+    // Sent as text and HTML alternatives; Undo opens it as rich text again.
+    k.to.set(TextEdit::new("arun@acme.example"));
+    assert!(k.send(Some([2; 16]), None));
+    let (_, o) = engine.store.outbox().unwrap().remove(0);
+    let raw = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
+    assert!(raw.contains("multipart/alternative") && raw.contains("text/html") && raw.contains("text/plain"), "{raw}");
+    let back = engine.undo_send(engine.store.outbox().unwrap()[0].0).unwrap().unwrap();
+    let c = mail_engine::compose::Compose { account, draft: back, identity: 1, notes: vec![] };
+    let k2 = Composer::new(engine.clone(), c, None, Arc::new(AtomicBool::new(true)), move || NOW);
+    assert!(k2.is_rich());
+    assert!(k2.draft().html.unwrap().contains("<b>world</b>"));
+    // To plain text: the words stay.
+    k2.set_rich(false);
+    assert_eq!(k2.draft().text, "Hello world\n\n-- \nBilling\n");
 }

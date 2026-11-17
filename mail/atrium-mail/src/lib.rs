@@ -10,6 +10,7 @@
 pub mod compose;
 pub mod links;
 pub mod plain;
+pub mod rich;
 pub mod sender;
 pub mod view;
 

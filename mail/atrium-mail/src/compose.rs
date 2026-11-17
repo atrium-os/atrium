@@ -21,7 +21,10 @@ use pergola::node::Node;
 use pergola::text_edit::{KeyOutcome, TextEdit};
 use pergola::theme::{font, size::em, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::TextField;
+use pergola::widgets::{ScrollState, TextField};
+use pergola_richtext::Editor;
+
+use crate::rich;
 use pergola::{Color, Event, Key, Mutable, TextStyle};
 
 /// Change a cell's value in place.
@@ -35,6 +38,16 @@ impl<T: Clone + 'static> Update<T> for Mutable<T> {
         f(&mut v);
         self.set(v);
     }
+}
+
+/// The formatting buttons of rich mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Bold,
+    Italic,
+    Underline,
+    Bullets,
+    Numbers,
 }
 
 /// How a compose window ended.
@@ -143,9 +156,21 @@ fn mentions_attachment(text: &str) -> bool {
     })
 }
 
+/// The text as rich text: the editor, its scroll, its redraw counter.
+pub struct Rich {
+    pub editor: Rc<RefCell<Editor>>,
+    pub scroll: Mutable<ScrollState>,
+    pub rev: Mutable<u64>,
+}
+
+/// New messages are written as rich text (§9.1); "Plain text" switches.
+pub const RICH_BY_DEFAULT: bool = true;
+
 /// The compose window's state and what it does.
 #[derive(Clone)]
 pub struct Composer {
+    /// The text as rich text, when it is (else `body`).
+    pub rich: Rc<RefCell<Option<Rich>>>,
     pub engine: Rc<Engine>,
     pub ui: Mutable<ComposeUi>,
     pub to: Mutable<TextEdit>,
@@ -192,23 +217,94 @@ impl Composer {
             base: Rc::new(RefCell::new(d.clone())),
             saved: Rc::new(RefCell::new((d.clone(), t))),
             now: Rc::new(now),
+            rich: Rc::default(),
         };
         // A reply starts with the caret above the quote.
         let mut b = k.body.get_cloned();
         b.set_caret(0, false);
         k.body.set(b);
+        // Mail's own HTML (a draft, a send taken back) opens as rich text.
+        let html = k.base.borrow_mut().html.take();
+        match html {
+            Some(h) => k.rich_from(rich::from_html(&h)),
+            None if RICH_BY_DEFAULT => k.rich_from(rich::from_text(&d.text)),
+            None => {}
+        }
+        *k.saved.borrow_mut() = (k.draft(), t);
         k
+    }
+
+    fn rich_from(&self, paras: Vec<rich::Para>) {
+        let mut doc = rich::to_doc(&paras);
+        doc.page = rich::page(em(600.0), em(300.0));
+        let ed = Editor::new(doc, rich::fonts());
+        *self.rich.borrow_mut() = Some(Rich { editor: Rc::new(RefCell::new(ed)), scroll: self.ui.sibling(ScrollState::default()), rev: self.ui.sibling(0) });
+    }
+
+    /// The text as the profile's paragraphs, in rich mode.
+    fn paras(&self) -> Option<Vec<rich::Para>> {
+        self.rich.borrow().as_ref().map(|r| rich::from_doc(&r.editor.borrow().doc))
+    }
+
+    pub fn is_rich(&self) -> bool {
+        self.rich.borrow().is_some()
+    }
+
+    /// Switch between rich and plain text. To plain, formatting goes and
+    /// the text stays (lists as "- ", links with their address).
+    pub fn set_rich(&self, on: bool) {
+        if on == self.is_rich() {
+            return;
+        }
+        if on {
+            self.rich_from(rich::from_text(self.body.get_cloned().text()));
+        } else {
+            let text = rich::to_text(&self.paras().unwrap_or_default());
+            let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+            *self.rich.borrow_mut() = None;
+            let mut b = self.body.get_cloned();
+            b.set_text(&text);
+            b.set_caret(0, false);
+            self.body.set(b);
+        }
+        self.ui.update(|u| u.status = None);
+    }
+
+    /// A formatting button in rich mode: bold, italic, underline, a list.
+    pub fn format(&self, f: Format) {
+        let r = self.rich.borrow();
+        let Some(r) = r.as_ref() else { return };
+        {
+            let mut e = r.editor.borrow_mut();
+            match f {
+                Format::Bold => e.toggle(pergola_richtext::editor::Toggle::Bold),
+                Format::Italic => e.toggle(pergola_richtext::editor::Toggle::Italic),
+                Format::Underline => e.toggle(pergola_richtext::editor::Toggle::Underline),
+                Format::Bullets => e.toggle_list(officina_text::model::ListKind::Bullet),
+                Format::Numbers => e.toggle_list(officina_text::model::ListKind::Numbered),
+            }
+        }
+        r.rev.set(r.rev.get() + 1);
     }
 
     /// What the window holds now.
     pub fn draft(&self) -> Draft {
+        let (text, html) = match self.paras() {
+            // Rich: the HTML part, and the plain part made from it.
+            Some(p) => {
+                let t = rich::to_text(&p);
+                (t.strip_suffix('\n').unwrap_or(&t).to_string(), Some(rich::to_html(&p)))
+            }
+            None => (self.body.get_cloned().text().to_string(), None),
+        };
         let b = self.base.borrow();
         Draft {
             to: parse_list(self.to.get_cloned().text()),
             cc: parse_list(self.cc.get_cloned().text()),
             bcc: parse_list(self.bcc.get_cloned().text()),
             subject: self.subject.get_cloned().text().to_string(),
-            text: self.body.get_cloned().text().to_string(),
+            text,
+            html,
             ..b.clone()
         }
     }
@@ -316,6 +412,17 @@ impl Composer {
 
     /// From is identity `to` (its signature replaces the old one).
     pub fn set_from(&self, to: usize) {
+        if let Some(mut paras) = self.paras() {
+            // Rich: the signature's paragraphs change, the rest stays.
+            let ids = self.engine.identities(self.ui.get_cloned().account).unwrap_or_default();
+            let Some(new) = ids.get(to).cloned() else { return };
+            let old = ids.get(self.ui.get_cloned().identity).map(|i| i.signature.clone()).unwrap_or_default();
+            rich::swap_signature(&mut paras, &old, &new.signature);
+            self.rich_from(paras);
+            self.base.borrow_mut().from = Mailbox::new(&new.name, &new.addr);
+            self.ui.update(|u| u.identity = to);
+            return;
+        }
         let mut c = self.compose();
         match self.engine.switch_identity(&mut c, to) {
             Ok(()) => {
@@ -530,8 +637,42 @@ impl View for ComposeView {
             y += row_h;
         }
         ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
-        y += em(8.0);
-        self.body(ctx, Rect::new(16.0, y, w - 32.0, h - y - em(28.0)));
+        // The text's bar: formatting (rich), and the switch.
+        let bar = em(36.0);
+        let rich_on = self.c.is_rich();
+        let mut bx = 16.0;
+        let tool = |ctx: &mut Ctx, x: &mut f32, label: &str, wt: Weight, on: Box<dyn Fn()>| {
+            let lw = measure(label, &sans(type_size::SM, wt, t.text_primary())) + em(16.0);
+            let r = Rect::new(*x, y + (bar - em(26.0)) / 2.0, lw, em(26.0));
+            let id = ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 4.0 });
+            if ctx.is_hovered(id) {
+                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                    *fill = t.state_hover();
+                }
+            }
+            ctx.on_click(id, on);
+            line(ctx, r.x() + em(8.0), r.y() + r.h() / 2.0, label, type_size::SM, wt, t.text_primary());
+            ctx.pop();
+            *x += lw + em(2.0);
+        };
+        if rich_on {
+            for (label, wt, f) in [("B", Weight::Bold, Format::Bold), ("I", Weight::Regular, Format::Italic), ("U", Weight::Regular, Format::Underline), ("• List", Weight::Regular, Format::Bullets), ("1. List", Weight::Regular, Format::Numbers)] {
+                let c = self.c.clone();
+                tool(ctx, &mut bx, label, wt, Box::new(move || c.format(f)));
+            }
+        }
+        let switch = if rich_on { "Plain text" } else { "Rich text" };
+        let mut sx = w - 16.0 - measure(switch, &sans(type_size::SM, Weight::Regular, t.text_primary())) - em(16.0);
+        let c = self.c.clone();
+        tool(ctx, &mut sx, switch, Weight::Regular, Box::new(move || c.set_rich(!rich_on)));
+        y += bar;
+        ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        let body = Rect::new(0.0, y + 1.0, w, h - y - 1.0 - em(28.0));
+        if rich_on {
+            self.rich_body(ctx, body);
+        } else {
+            self.body(ctx, Rect::new(16.0, body.y() + em(8.0), w - 32.0, body.h() - em(8.0)));
+        }
         // The status line.
         if let Some(s) = &ui.status {
             line(ctx, 16.0, h - em(14.0), s, type_size::XS, Weight::Regular, t.text_tertiary());
@@ -566,6 +707,26 @@ impl View for ComposeView {
 }
 
 impl ComposeView {
+    /// The text as rich text: the editor's paged view with one page as
+    /// wide as the window, growing as the text does.
+    fn rich_body(&self, ctx: &mut Ctx, r: Rect) {
+        let rich = self.c.rich.borrow();
+        let Some(rt) = rich.as_ref() else { return };
+        {
+            let mut e = rt.editor.borrow_mut();
+            let gap = pergola_richtext::view::GAP;
+            let mut want = rich::page(r.w() - 2.0 * gap, r.h() - 2.0 * gap);
+            let cur = e.doc.page;
+            let overflow = e.pages.done() && e.pages.pages().len() > 1;
+            want.height = if overflow { want.height.max(cur.height * 2) } else if cur.width == want.width { want.height.max(cur.height) } else { want.height };
+            if want != cur {
+                e.doc.page = want;
+                e.pages = officina_text::paginate::Paginator::new(&e.doc);
+            }
+        }
+        pergola_richtext::RichTextView::new(rt.editor.clone(), rt.scroll.clone(), rt.rev.clone(), r).key(0x6d61_696c).emit(ctx);
+    }
+
     /// The text: wrapped lines, a caret, a selection; keys edit through
     /// Pergola's editing core, Up and Down move by visual line, a press
     /// places the caret, the wheel scrolls.

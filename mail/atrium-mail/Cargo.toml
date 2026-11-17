@@ -19,6 +19,9 @@ pergola = { path = "../../pergola" }
 fresco-client = { path = "../../fresco-client" }
 mail-engine = { path = "../mail-engine" }
 mail-compose = { path = "../mail-compose" }
+# Rich text in compose (mail.md §9.1): RichTextEditor over officina-text.
+pergola-richtext = { path = "../../pergola-richtext" }
+officina-text = { path = "../../officina-text" }
 # mailto: links from Monstrator, on the document channel (mail.md §9.1).
 atrium-open = { path = "../../atrium-open" }
 mail-store = { path = "../mail-store" }
@@ -38,3 +41,8 @@ monstrator = { path = "../../monstrator" }
 [dev-dependencies]
 tempfile = "3"
 mail-sync = { path = "../mail-sync" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch.
+[patch.crates-io]
+pathfinder_simd = { path = "../../navigator-fonts/vendor/pathfinder_simd" }
