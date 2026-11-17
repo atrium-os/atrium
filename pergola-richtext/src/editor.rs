@@ -170,6 +170,17 @@ pub struct Editor {
     pub dragging: Option<ObjectDrag>,
 }
 
+/// Where a shape is drawn on its page (layout units, the content box)
+/// and its id in the shape store.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    id: u32,
+}
+
 /// A floating object being dragged on page `page`: its anchor and the
 /// distance moved so far (layout units).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1605,10 +1616,23 @@ impl Editor {
 
     /// The floating shape anchored at byte `at` of paragraph `b` on page
     /// `page`: its frame and data.
-    fn placed_shape(&self, b: usize, at: u32, page: usize) -> Option<(officina_text::paginate::PlacedFloat, officina_text::model::ShapeData)> {
-        let pf = self.pages.pages().get(page)?.floats.iter().find(|f| f.block == b && f.at == at && f.object.shape)?.clone();
-        let sd = (**self.doc.shapes.get(pf.object.image)?).clone();
-        Some((pf, sd))
+    /// The shape anchored at byte `at` of paragraph `b`, floating or in
+    /// line, as drawn on page `page`: its box (layout units, the page's
+    /// content box), its id in the store and its outline.
+    fn placed_shape(&mut self, b: usize, at: u32, page: usize) -> Option<(Placed, officina_text::model::ShapeData)> {
+        let placed = match self.pages.pages().get(page)?.floats.iter().find(|f| f.block == b && f.at == at && f.object.shape) {
+            Some(f) => Placed { x: f.x, y: f.y, w: f.w, h: f.h, id: f.object.image },
+            None => {
+                let o = self.doc.para(b).and_then(|p| self.doc.attrs.get(p.attr_at(at)).object).filter(|o| o.shape && o.float.is_none())?;
+                let (pg, x, y, w, h) = self.inline_box(b, at)?;
+                if pg != page {
+                    return None;
+                }
+                Placed { x, y, w, h, id: o.image }
+            }
+        };
+        let sd = (**self.doc.shapes.get(placed.id)?).clone();
+        Some((placed, sd))
     }
 
     /// The map from the shape's own box onto the page (turned and flipped
@@ -1623,7 +1647,7 @@ impl Editor {
     /// The yellow handles of the floating shape anchored at byte `at` of
     /// paragraph `b` on page `page`, where they are drawn (layout units,
     /// the page's content box).
-    pub fn shape_handles(&self, b: usize, at: u32, page: usize) -> Vec<(i64, i64)> {
+    pub fn shape_handles(&mut self, b: usize, at: u32, page: usize) -> Vec<(i64, i64)> {
         let Some((pf, sd)) = self.placed_shape(b, at, page) else { return Vec::new() };
         let m = Self::shape_turn(&sd);
         let (cx, cy) = (pf.x as f64 + pf.w as f64 / 2.0, pf.y as f64 + pf.h as f64 / 2.0);
@@ -1653,7 +1677,7 @@ impl Editor {
         if geom == sd.geom {
             return false;
         }
-        self.apply("Adjust", vec![TextOp::SetShape { id: pf.object.image, shape: Some(officina_text::model::ShapeData { geom, ..sd }) }], Kind::Other);
+        self.apply("Adjust", vec![TextOp::SetShape { id: pf.id, shape: Some(officina_text::model::ShapeData { geom, ..sd }) }], Kind::Other);
         true
     }
 

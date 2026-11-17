@@ -518,9 +518,26 @@ impl RichTextView {
                                 DragKind::Inline => {}
                             }
                         }
-                    } else if let Some((pg, x, y, w, h)) = ed.inline_box(b, at).filter(|bx| bx.0 == i) {
-                        let _ = pg;
+                    } else if let Some((_, x, y, w, h)) = ed.inline_box(b, at).filter(|bx| bx.0 == i) {
                         frame(ctx, x, y, w, h, accent);
+                        // The corner handle that sizes it.
+                        let (hx, hy) = (ox + pb.mx + (x + w) as f64 * g.k, oy + pb.my + (y + h) as f64 * g.k);
+                        ctx.add(Node::Rect { rect: Rect::new(q(hx - HANDLE as f64 + 2.0), q(hy - HANDLE as f64 + 2.0), HANDLE, HANDLE), fill: accent, radius: 2.0 });
+                        if o.shape {
+                            for (hx, hy) in ed.shape_handles(b, at, i) {
+                                let (px, py) = (ox + pb.mx + hx as f64 * g.k, oy + pb.my + hy as f64 * g.k);
+                                ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0 - 1.0), q(py - HANDLE as f64 / 2.0 - 1.0), HANDLE + 2.0, HANDLE + 2.0), fill: Color::from_srgb8(0x5c, 0x47, 0x00), radius: HANDLE / 2.0 + 1.0 });
+                                ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: Color::from_srgb8(0xf5, 0xc5, 0x18), radius: HANDLE / 2.0 });
+                            }
+                        }
+                        match drag.map(|d| (d.kind, d)) {
+                            Some((DragKind::Size, d)) => frame(ctx, x, y, w + d.dx, h + d.dy, ghost),
+                            Some((DragKind::Adjust(_), d)) => {
+                                let (px, py) = (ox + pb.mx + (d.sx + d.dx) as f64 * g.k, oy + pb.my + (d.sy + d.dy) as f64 * g.k);
+                                ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: ghost, radius: HANDLE / 2.0 });
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 // Where an object in line being dragged would go.
@@ -759,6 +776,10 @@ impl RichTextView {
                             };
                             e.set_caret(Pos::new(f.block, f.at), false);
                             e.dragging = Some(ObjectDrag { block: f.block, at: f.at, page: pg, dx: 0, dy: 0, kind, sx: lx, sy: ly, drop: None });
+                            start.set((pg, lx, ly));
+                        } else if let Some((b, at)) = picked.filter(|&(b, at)| e.inline_box(b, at).is_some_and(|(p, x, y, w, h)| p == pg && (lx - (x + w)).abs() <= grip && (ly - (y + h)).abs() <= grip)) {
+                            // The picked object in line's corner sizes it.
+                            e.dragging = Some(ObjectDrag { block: b, at, page: pg, dx: 0, dy: 0, kind: DragKind::Size, sx: lx, sy: ly, drop: None });
                             start.set((pg, lx, ly));
                         } else if let Some((b, at)) = e.inline_object_at(pg, lx, ly) {
                             // A picture or shape in line: picked, and a drag
@@ -1350,6 +1371,59 @@ mod tests {
     }
 
     #[test]
+    fn a_shape_in_line_takes_its_yellow_and_corner_handles() {
+        let (mut app, ed, _) = host(20);
+        let (b, at) = {
+            let mut e = ed.borrow_mut();
+            e.set_caret(Pos::new(2, 0), false);
+            assert!(e.insert_shape("rightArrow"));
+            assert!(e.set_wrap(None), "in line");
+            while !e.paginate(Duration::from_secs(5)) {}
+            let (b, at, o) = e.picture_at_caret().expect("picked");
+            assert!(o.float.is_none() && o.shape);
+            (b, at)
+        };
+        app.tick();
+        let g = Geom::of(&ed.borrow(), Rect::new(0.0, 0.0, 900.0, 700.0), 1.0);
+        let pb = g.page(0);
+        let win = |x: i64, y: i64| Point::new((g.left_of(0) + pb.mx + x as f64 * g.k) as f32, (pb.top + pb.my + y as f64 * g.k) as f32);
+        let hs = ed.borrow_mut().shape_handles(b, at, 0);
+        assert_eq!(hs.len(), 2, "an arrow's body and head");
+        let (_, bx, by, bw, bh) = ed.borrow_mut().inline_box(b, at).unwrap();
+        assert!(hs.iter().all(|&(x, y)| x >= bx && x <= bx + bw && y >= by && y <= by + bh), "on the shape: {hs:?}");
+        // The head's handle pulled 30 px left: a longer head, one undo step.
+        let (hx, hy) = hs[1];
+        let at_ = win(hx, hy);
+        let to = Point::new(at_.x - 30.0, at_.y);
+        app.handle_event(Event::PointerDown { at: at_ });
+        app.handle_event(Event::PointerMove { at: Point::new(at_.x - 15.0, at_.y) });
+        app.handle_event(Event::PointerMove { at: to });
+        app.tick();
+        assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Adjust(1)));
+        app.handle_event(Event::PointerUp { at: to });
+        app.tick();
+        let (nx, _) = ed.borrow_mut().shape_handles(b, at, 0)[1];
+        assert!(((hx - nx) as f64 * g.k - 30.0).abs() <= 2.0, "{hx} -> {nx}");
+        ed.borrow_mut().undo();
+        assert_eq!(ed.borrow_mut().shape_handles(b, at, 0)[1], (hx, hy));
+        // Its corner handle sizes it.
+        ed.borrow_mut().set_caret(Pos::new(b, at), false);
+        app.tick();
+        let w0 = ed.borrow().picture_at_caret().unwrap().2.width;
+        let corner = win(bx + bw, by + bh);
+        let to = Point::new(corner.x + 40.0, corner.y + 20.0);
+        app.handle_event(Event::PointerDown { at: corner });
+        app.handle_event(Event::PointerMove { at: Point::new(corner.x + 20.0, corner.y + 10.0) });
+        app.handle_event(Event::PointerMove { at: to });
+        app.tick();
+        assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Size));
+        app.handle_event(Event::PointerUp { at: to });
+        app.tick();
+        let o = ed.borrow().picture_at_caret().unwrap().2;
+        assert!(o.width > w0 && o.float.is_none(), "{} -> {}", w0, o.width);
+    }
+
+    #[test]
     fn a_shapes_yellow_handle_changes_its_outline_even_when_turned() {
         let (mut app, ed, _) = host(20);
         {
@@ -1363,7 +1437,7 @@ mod tests {
         let f = ed.borrow().pages.pages()[0].floats[0].clone();
         let pb = g.page(0);
         let win = |x: i64, y: i64| Point::new((g.left_of(0) + pb.mx + x as f64 * g.k) as f32, (pb.top + pb.my + y as f64 * g.k) as f32);
-        let hs = ed.borrow().shape_handles(f.block, f.at, 0);
+        let hs = ed.borrow_mut().shape_handles(f.block, f.at, 0);
         assert_eq!(hs.len(), 2, "an arrow's body and head");
         // The head's handle, on the top edge, pulled 30 px left: a longer head.
         let (hx, hy) = hs[1];
@@ -1379,7 +1453,7 @@ mod tests {
             let mut e = ed.borrow_mut();
             while !e.paginate(Duration::from_secs(5)) {}
         }
-        let (nx, ny) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        let (nx, ny) = ed.borrow_mut().shape_handles(f.block, f.at, 0)[1];
         assert!(((hx - nx) as f64 * g.k - 30.0).abs() <= 2.0 && ny == hy, "({hx}, {hy}) -> ({nx}, {ny})");
         let adj = match ed.borrow().shape_at_caret().map(|s| s.2.geom) {
             Some(officina_text::model::Geom::Preset { adj, .. }) => adj,
@@ -1388,7 +1462,7 @@ mod tests {
         assert!(adj.iter().any(|(n, v)| &**n == "adj2" && *v > 50_000), "{adj:?}");
         // One undo puts the outline back.
         ed.borrow_mut().undo();
-        assert_eq!(ed.borrow().shape_handles(f.block, f.at, 0)[1], (hx, hy));
+        assert_eq!(ed.borrow_mut().shape_handles(f.block, f.at, 0)[1], (hx, hy));
         // Turned a quarter, the handle is drawn turned, and a drag to a
         // point is read back in the shape's own box.
         {
@@ -1398,13 +1472,13 @@ mod tests {
             while !e.paginate(Duration::from_secs(5)) {}
         }
         let (cx, cy) = (f.x + f.w / 2, f.y + f.h / 2);
-        let (tx, ty) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        let (tx, ty) = ed.borrow_mut().shape_handles(f.block, f.at, 0)[1];
         // Turned clockwise: the top edge is now on the right, the head down.
         let (lx, ly) = (hx - cx, hy - cy);
         assert!((tx - (cx - ly)).abs() <= 1 && (ty - (cy + lx)).abs() <= 1, "({tx}, {ty})");
         let d = officina_text::LU * 10;
         assert!(ed.borrow_mut().adjust_by_drag(f.block, f.at, 0, 1, tx, ty - d));
-        let (ux, uy) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        let (ux, uy) = ed.borrow_mut().shape_handles(f.block, f.at, 0)[1];
         assert!((ux - tx).abs() <= 2 && (uy - (ty - d)).abs() <= 2, "({ux}, {uy})");
     }
 
