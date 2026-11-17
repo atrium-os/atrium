@@ -17,6 +17,7 @@ path = "src/main.rs"
 portcullis-toml = { path = "../portcullis-toml" }
 portcullis-sig  = { path = "../portcullis-sig" }
 portcullis-trust = { path = "../portcullis-trust" }
+opifex-catalog  = { path = "../opifex-catalog" }
 sha2   = "0.10"
 base64 = "0.22"
 toml   = "0.8"

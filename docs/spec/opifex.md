@@ -220,7 +220,8 @@ scope fields, default `kinds = ["app"]`.
 
 ### 6.1 Shape
 
-The catalog is an append-only log of entries. Each entry is one small CBOR record:
+The catalog is an append-only log of entries. Each entry is one small TOML document (the
+same parser the manifests already use; C1 found CBOR bought nothing):
 
 - `release`: id, version, arch, kind, publisher id, the signed `atrium.toml` bytes and its
   signature, archive SHA-256 and size, URLs (main plus alternates), and an extract for local
@@ -231,10 +232,11 @@ The catalog is an append-only log of entries. Each entry is one small CBOR recor
 - `yank`: id, version, reason.
 
 Entries are leaves of a Merkle tree (SHA-256, RFC 6962 hashing). The **tree head**
-(size, root hash, time, expiry) is signed by the catalog key. Files are served as fixed-size
-**tiles** of the tree plus bundles of entries, exactly the static layout Go's checksum
-database uses, so a client that has head N fetches only the tiles and entries after N and
-checks they extend what it had.
+(size, root hash, time, expiry) is signed by the catalog key. Entries are served in bundles of
+256 (`entries/000000`, the last one partial as `entries/000001.p17`), each entry a 4-byte
+length and its text. Because every machine downloads every entry, it rebuilds the tree itself
+and needs no inclusion or consistency proofs: it keeps the leaf hashes it accepted, and a new
+head must extend them exactly. A machine that has head N fetches only the bundles from N on.
 
 ### 6.2 Why whole, why a log
 

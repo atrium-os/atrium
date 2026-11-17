@@ -913,9 +913,22 @@ name = "opifex"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "opifex-catalog",
  "portcullis-sig",
  "portcullis-toml",
  "portcullis-trust",
+ "sha2",
+ "toml",
+]
+
+[[package]]
+name = "opifex-catalog"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "portcullis-sig",
+ "portcullis-toml",
+ "serde",
  "sha2",
  "toml",
 ]
