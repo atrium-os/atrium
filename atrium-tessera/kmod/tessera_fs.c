@@ -67,6 +67,7 @@
 #include <vm/vm_pager.h>
 #include <vm/vnode_pager.h>
 #include <sys/sf_buf.h>
+#include <sys/kdb.h>
 
 #include "tessera/btree.h"
 #include "tessera/codec.h"
@@ -4763,6 +4764,74 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, gate_owner,
  * instead of walking the btree; the flush batch-puts the whole
  * overlay sorted in one COW pass. Replace-on-equal keeps dedup
  * re-publishes of an identical pack_id idempotent. */
+/*
+ * DIAG (sealed bring-up): kern.tessera.seal_trace=1 logs every sealed pack
+ * registration, pack write and pack-space free, keeps the extents of
+ * recently registered packs, and prints a backtrace when a pack write
+ * lands on one of them while it is still registered — the 1 GiB sealed
+ * bench found a registered pack's front rewritten by an unregistered pack
+ * of the same shape. Off by default; costs nothing then.
+ */
+static int tessera_seal_trace = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, seal_trace, CTLFLAG_RW,
+    &tessera_seal_trace, 0,
+    "DIAG: log sealed pack registrations, writes and frees; backtrace a "
+    "write over a still-registered pack");
+#define TESSERA_SEAL_LIVE 1024
+static struct { uint64_t s, n; uint8_t pid[4]; } tessera_seal_live[TESSERA_SEAL_LIVE];
+static unsigned tessera_seal_live_next;
+static unsigned long tessera_stat_meta_write_outside = 0;
+
+static void
+tessera_seal_trace_reg(const uint8_t *pid, uint64_t s, uint64_t n,
+    const uint8_t *tag, void *caller)
+{
+	unsigned i;
+
+	for (i = 0; i < TESSERA_SEAL_LIVE; i++)
+		if (tessera_seal_live[i].n != 0 &&
+		    memcmp(tessera_seal_live[i].pid, pid, 4) == 0)
+			break;
+	if (i == TESSERA_SEAL_LIVE)
+		i = tessera_seal_live_next++ % TESSERA_SEAL_LIVE;
+	tessera_seal_live[i].s = s;
+	tessera_seal_live[i].n = n;
+	memcpy(tessera_seal_live[i].pid, pid, 4);
+	printf("SEAL-TRACE reg pack=%4D start=%ju len=%ju tag=%4D by %p\n",
+	    pid, "", (uintmax_t)s, (uintmax_t)n, tag, "", caller);
+}
+
+static void
+tessera_seal_trace_write(uint64_t s, uint64_t n, void *caller)
+{
+	printf("SEAL-TRACE write start=%ju len=%ju by %p\n", (uintmax_t)s,
+	    (uintmax_t)n, caller);
+	for (unsigned i = 0; i < TESSERA_SEAL_LIVE; i++) {
+		const uint64_t ls = tessera_seal_live[i].s;
+		const uint64_t ln = tessera_seal_live[i].n;
+		if (ln != 0 && s < ls + ln && ls < s + n) {
+			printf("SEAL-TRACE OVERWRITE of registered pack %4D "
+			    "[%ju+%ju] by a write of [%ju+%ju]\n",
+			    tessera_seal_live[i].pid, "", (uintmax_t)ls,
+			    (uintmax_t)ln, (uintmax_t)s, (uintmax_t)n);
+			kdb_backtrace();
+		}
+	}
+}
+
+static void
+tessera_seal_trace_free(uint64_t s, uint64_t n, const char *why)
+{
+	printf("SEAL-TRACE free start=%ju len=%ju (%s)\n", (uintmax_t)s,
+	    (uintmax_t)n, why);
+	kdb_backtrace();
+	for (unsigned i = 0; i < TESSERA_SEAL_LIVE; i++)
+		if (tessera_seal_live[i].n != 0 &&
+		    tessera_seal_live[i].s < s + n &&
+		    s < tessera_seal_live[i].s + tessera_seal_live[i].n)
+			tessera_seal_live[i].n = 0;
+}
+
 static uint32_t
 tessera_reg_ov_bucket(const uint8_t *pack_id)
 {
@@ -4774,6 +4843,14 @@ tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
     const uint8_t *pack_id, const void *value)
 {
 	sbintime_t _t0 = TPROF_T0();
+	if (tessera_seal_trace && tmp_->seal != NULL) {
+		tessera_registry_entry_t _tr;
+		if (tessera_decode_registry_entry(value, &_tr) == TESSERA_OK)
+			tessera_seal_trace_reg(pack_id, _tr.start_sector,
+			    _tr.length_sectors,
+			    (const uint8_t *)value + TESSERA_REGISTRY_ENTRY_SIZE,
+			    __builtin_return_address(0));
+	}
 	struct tessera_reg_ov *ov = malloc(sizeof *ov, M_TESSERA, M_WAITOK);
 	memcpy(ov->pack_id, pack_id, 16);
 	memcpy(ov->val, value, TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
@@ -5676,8 +5753,35 @@ tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
 	struct tessera_kbio_ctx *k = ctx;
 	if (k->mount == NULL || k->mount->extent_alloc == NULL)
 		return (-1);
+	if (tessera_seal_trace && k->mount->seal != NULL)
+		tessera_seal_trace_free(s, n, "data-zone io free");
 	return (tessera_extent_free(k->mount->extent_alloc, s, n)
 	    == TESSERA_OK ? 0 : -1);
+}
+
+/*
+ * Metadata-reserve writes: every tree node this mount writes. A node outside
+ * the reserve would be written over pack space (or the journal); never
+ * observed, so count it and say so loudly rather than assume.
+ */
+static int
+tessera_kbio_meta_write(void *ctx, uint64_t sector, const uint8_t *buf)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	struct tessera_mount *m = k->mount;
+
+	if (m != NULL && (sector < m->sb.meta_reserve_start ||
+	    sector >= m->sb.meta_reserve_start + m->sb.meta_reserve_length)) {
+		if (tessera_stat_meta_write_outside++ < 8) {
+			printf("tessera_fs: WARNING metadata node written at "
+			    "sector %ju, outside the reserve [%ju+%ju]\n",
+			    (uintmax_t)sector,
+			    (uintmax_t)m->sb.meta_reserve_start,
+			    (uintmax_t)m->sb.meta_reserve_length);
+			kdb_backtrace();
+		}
+	}
+	return (tessera_kbio_write_delayed(ctx, sector, buf));
 }
 
 /* Metadata-reserve bump allocator. Used for inode-tree / pack-
@@ -7953,7 +8057,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	/* Metadata-reserve io: alloc bumps sb.meta_reserve_bump. Used by
 	 * inode_tree / pack_registry_tree COW puts and by extent_flush. */
 	tmp_->meta_bio.read_block  = tessera_kbio_read;
-	tmp_->meta_bio.write_block = tessera_kbio_write_delayed;
+	tmp_->meta_bio.write_block = tessera_kbio_meta_write;
 	tmp_->meta_bio.alloc       = tessera_kbio_meta_alloc;
 	tmp_->meta_bio.free        = tessera_kbio_meta_free;
 	tmp_->meta_bio.ctx         = &tmp_->bio_ctx;
@@ -18004,6 +18108,76 @@ meta_mark_post_visitor(void *ctx, uint64_t sector)
 	return (0);
 }
 
+/* One root the pinscan walks: the tree, and its key and value sizes. */
+struct tessera_pinscan_row { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; };
+
+/*
+ * Sealed: every root a pinscan opens needs ITS tag, and outside the gate a
+ * root and a tag fetched separately can belong to different roots (the tree
+ * moves between the two reads); the walk then fails the first node's AEAD
+ * and the whole scan aborts. So take the pairs under the gate, for the live
+ * roots ([0, N)) and both durable sets ([N, 2N), [2N, 3N)). A live root with
+ * no tag is zeroed. Called with the gate held. Separate and __noinline to
+ * keep these locals out of tessera_fs_pinscan_run's frame (#114). NULL on a
+ * plain mount; otherwise the caller frees both arrays.
+ */
+static __noinline uint64_t *
+tessera_fs_pinscan_seal_capture(struct tessera_mount *tmp_,
+    uint8_t (**out_tag)[16])
+{
+	const int N = TESSERA_RESERVE_TREE_COUNT;
+	uint64_t *proot;
+	uint8_t (*ptag)[16];
+
+	*out_tag = NULL;
+	if (tmp_->seal == NULL)
+		return (NULL);
+	proot = malloc(3 * N * sizeof *proot, M_TESSERA, M_WAITOK | M_ZERO);
+	ptag = malloc(3 * N * sizeof *ptag, M_TESSERA, M_WAITOK | M_ZERO);
+	for (int k = 0; k < N; k++) {
+		proot[k] = tessera_fs_sb_root(&tmp_->sb, (uint8_t)k);
+		if (proot[k] != 0 && tessera_fs_root_tag(tmp_, proot[k],
+		    (uint8_t)k, ptag[k]) != 0)
+			proot[k] = 0;   /* no tag: not walkable */
+		for (int d = 0; d < 2; d++) {
+			const int j = (1 + d) * N + k;
+			proot[j] = tessera_fs_sb_root(&tmp_->durable_sb[d],
+			    (uint8_t)k);
+			memcpy(ptag[j], tmp_->durable_sb[d].root_tags[k], 16);
+		}
+	}
+	*out_tag = ptag;
+	return (proot);
+}
+
+/* Sealed: replace the scan's rows with the captured roots (live rows
+ * [0, N), the three GC slots emptied — no GC scan runs on a sealed volume —
+ * then the durable rows that differ). Row i's tag is ptag[i < N ? i : i-3].
+ * Returns 1 when a live root had to be skipped (the scan is incomplete). */
+static __noinline int
+tessera_fs_pinscan_seal_rows(const uint64_t *proot,
+    struct tessera_pinscan_row *roots)
+{
+	const int N = TESSERA_RESERVE_TREE_COUNT;
+	int skipped = 0;
+
+	for (int t = 0; t < N; t++) {
+		const uint64_t d0 = proot[N + t], d1 = proot[2 * N + t];
+
+		if (roots[t].root != 0 && proot[t] == 0) {
+			tessera_stat_pinscan_trunc++;
+			skipped = 1;
+		}
+		roots[t].root = proot[t];
+		roots[N + 3 + t].root = (d0 != proot[t]) ? d0 : 0;
+		roots[2 * N + 3 + t].root =
+		    (d1 != proot[t] && d1 != d0) ? d1 : 0;
+	}
+	for (int g = 0; g < 3; g++)
+		roots[N + g].root = 0;
+	return (skipped);
+}
+
 /*
  * Rebuild meta_pin_bitmap from scratch by walking every meta-reserve
  * sector that's reachable from a root the SB still cares about: the
@@ -18126,36 +18300,10 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		r_gc_reg   = tmp_->gc_scan_registry_root;
 		r_gc_snap  = tmp_->gc_scan_snapshots_root;
 	}
-	/*
-	 * Sealed: every root this scan opens needs ITS tag, and outside the
-	 * gate a root and a tag fetched separately can belong to different
-	 * roots (the tree moves between the two reads) — the walk then fails
-	 * the first node's AEAD and the whole scan aborts. Take the pairs here,
-	 * under the gate, for the live roots and both durable sets. Heap: 384
-	 * bytes is too much for this frame (#114).
-	 */
-	uint64_t *proot = NULL;
+	/* Sealed: each root with its tag, taken under the gate (see
+	 * tessera_fs_pinscan_seal_capture). NULL on a plain mount. */
 	uint8_t (*ptag)[16] = NULL;
-	if (tmp_->seal != NULL) {
-		proot = malloc(3 * TESSERA_RESERVE_TREE_COUNT * sizeof *proot,
-		    M_TESSERA, M_WAITOK | M_ZERO);
-		ptag = malloc(3 * TESSERA_RESERVE_TREE_COUNT * sizeof *ptag,
-		    M_TESSERA, M_WAITOK | M_ZERO);
-		for (int k = 0; k < TESSERA_RESERVE_TREE_COUNT; k++) {
-			proot[k] = tessera_fs_sb_root(&tmp_->sb, (uint8_t)k);
-			if (proot[k] != 0 && tessera_fs_root_tag(tmp_,
-			    proot[k], (uint8_t)k, ptag[k]) != 0)
-				proot[k] = 0;   /* no tag: not walkable */
-			for (int d = 0; d < 2; d++) {
-				const int j = (1 + d) *
-				    TESSERA_RESERVE_TREE_COUNT + k;
-				proot[j] = tessera_fs_sb_root(
-				    &tmp_->durable_sb[d], (uint8_t)k);
-				memcpy(ptag[j],
-				    tmp_->durable_sb[d].root_tags[k], 16);
-			}
-		}
-	}
+	uint64_t *proot = tessera_fs_pinscan_seal_capture(tmp_, &ptag);
 	tmp_->pinscan_active = 1;
 	tessera_fs_flush_gate_exit(tmp_);
 
@@ -18185,8 +18333,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	 */
 #define TESSERA_PINSCAN_ROW(field, kind, ksz, vsz, tier, why) \
 	{ tmp_->sb.field, (int)(kind), (ksz), (vsz) },
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; }
-	    roots[3 * TESSERA_RESERVE_TREE_COUNT + 3] = {
+	struct tessera_pinscan_row roots[3 * TESSERA_RESERVE_TREE_COUNT + 3] = {
 		TESSERA_RESERVE_TREES(TESSERA_PINSCAN_ROW)
 		/* ★ #72/#78: the in-flight GC scan's frozen roots. Not
 		 * superblock state — they are a snapshot of roots already
@@ -18213,28 +18360,8 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		roots[s1].root = (droot1[t] != roots[t].root &&
 		    droot1[t] != droot0[t]) ? droot1[t] : 0;
 	}
-	if (proot != NULL) {
-		/* Sealed: the roots and tags captured under the gate. The live
-		 * root of a tree with no tag here was zeroed — counted as not
-		 * walked below. No GC scan runs on a sealed volume. */
-		for (int t = 0; t < TESSERA_RESERVE_TREE_COUNT; t++) {
-			const int s0 = TESSERA_RESERVE_TREE_COUNT + 3 + t;
-			const int s1 = 2 * TESSERA_RESERVE_TREE_COUNT + 3 + t;
-			const uint64_t d0 =
-			    proot[TESSERA_RESERVE_TREE_COUNT + t];
-			const uint64_t d1 =
-			    proot[2 * TESSERA_RESERVE_TREE_COUNT + t];
-			if (roots[t].root != 0 && proot[t] == 0) {
-				tessera_stat_pinscan_trunc++;
-				stale_skipped = 1;
-			}
-			roots[t].root = proot[t];
-			roots[s0].root = (d0 != proot[t]) ? d0 : 0;
-			roots[s1].root = (d1 != proot[t] && d1 != d0) ? d1 : 0;
-		}
-		for (int g = 0; g < 3; g++)
-			roots[TESSERA_RESERVE_TREE_COUNT + g].root = 0;
-	}
+	if (proot != NULL && tessera_fs_pinscan_seal_rows(proot, roots))
+		stale_skipped = 1;
 	for (int i = 0; i < (int)nitems(roots) && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t;
@@ -19636,7 +19763,7 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 	tessera_btree_cursor_t *c;
 	uint8_t *pids = NULL;
 	uint32_t npids = 0;
-	int rc = ENOENT, r, have = 0;
+	int rc = ENOENT, r, have = 0, bad = 0;
 
 	if (tmp_->pack_registry_tree == NULL)
 		return (EIO);
@@ -19656,10 +19783,19 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 	if (!have && tmp_->blob_index_tree != NULL &&
 	    tessera_btree_get(tmp_->blob_index_tree, id, pid) == TESSERA_OK)
 		have = 1;
+	/*
+	 * A pack that refuses (its front or the blob fails to open) cannot
+	 * hand back wrong bytes, so it is skipped and the search goes on: the
+	 * id may be in another pack. Its error is returned only if no pack
+	 * holds the id, so one damaged pack fails the reads that need it, not
+	 * every cold read that scans past it.
+	 */
 	if (have) {
 		r = tessera_fs_sealed_fetch_from(tmp_, pid, id, out_buf, out_len);
+		if (r == 0)
+			return (0);
 		if (r != ENOENT)
-			return (r);
+			bad = r;
 	}
 
 	/* Packs not yet in the tree: copy their ids out of the overlay. */
@@ -19687,10 +19823,12 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 	for (uint32_t i = 0; i < npids; i++) {
 		r = tessera_fs_sealed_fetch_from(tmp_, pids + (size_t)i * 16,
 		    id, out_buf, out_len);
-		if (r != ENOENT) {
+		if (r == 0) {
 			free(pids, M_TESSERA);
-			return (r);
+			return (0);
 		}
+		if (r != ENOENT && bad == 0)
+			bad = r;
 	}
 	free(pids, M_TESSERA);
 
@@ -19708,10 +19846,12 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 		}
 		r = tessera_fs_sealed_pack_find(tmp_, &re,
 		    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf, out_len);
-		if (r != ENOENT) {
-			rc = r;
+		if (r == 0) {
+			rc = 0;
 			break;
 		}
+		if (r != ENOENT && bad == 0)
+			bad = r;
 		r = tessera_btree_cursor_next(c);
 		if (r == TESSERA_ENOENT)
 			break;
@@ -19721,7 +19861,7 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 		}
 	}
 	tessera_btree_cursor_free(c);
-	return (rc);
+	return (rc == ENOENT && bad != 0 ? bad : rc);
 }
 
 static int
@@ -22981,6 +23121,9 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 			}
 		}
 		out->start_sector   = contig_start;
+		if (tessera_seal_trace && tmp_->seal != NULL)
+			tessera_seal_trace_write(contig_start, n_sectors,
+			    __builtin_return_address(0));
 		if (tessera_gc_trace)
 			printf("GC-TRACE alloc mnt=%s pass=%lu start=%ju len=%ju pack=%8D scan_active=%d\n",
 			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"),
@@ -23328,6 +23471,9 @@ tessera_fs_pack_alloc_rollback(struct tessera_mount *tmp_,
 	 * reach. */
 	tessera_stat_pack_rollback_calls++;
 	tessera_stat_pack_rollback_sectors += pa->length_sectors;
+	if (tessera_seal_trace && tmp_->seal != NULL)
+		tessera_seal_trace_free(pa->start_sector, pa->length_sectors,
+		    "pack rollback");
 	if ((pa->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 		(void)tessera_extent_free(tmp_->extent_alloc,
 		    pa->start_sector, pa->length_sectors);

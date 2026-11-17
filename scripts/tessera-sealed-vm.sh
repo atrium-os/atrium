@@ -269,6 +269,8 @@ for mode in plain sealed; do
         tessera-keyload load $T/bkey $KID $U >/dev/null || fail keyload
     fi
     DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+    # TRACE=1: log sealed pack registrations, writes and frees (diagnostic)
+    [ $mode = sealed ] && [ "${TRACE:-0}" = 1 ] && sysctl kern.tessera.seal_trace=1 >/dev/null
     mount -t tessera $DEV $M || fail "mount $mode"
     w=$(secs "cp /var/tmp/bench.src $M/f && sync")
     umount $M || fail umount
@@ -276,6 +278,7 @@ for mode in plain sealed; do
     r=$(secs "cat $M/f > /dev/null")
     cmp -s $M/f /var/tmp/bench.src || fail "$mode: read back differs"
     umount $M; mdconfig -d -u ${DEV#/dev/md}
+    sysctl kern.tessera.seal_trace=0 >/dev/null 2>&1
     echo "$mode: write $MB MiB in ${w}s = $(echo "$MB / $w" | bc) MiB/s; read in ${r}s = $(echo "$MB / $r" | bc) MiB/s"
 done
 rm -f $IMG $T/bkey
@@ -292,7 +295,7 @@ case "${1:-}" in
         for ko in ${MODULES:-tessera_fs.ko}; do
             echo "== $ko"
             bench_script | "$VSSH" "cat > $T/bench.sh" || exit 1
-            "$VSSH" "sh $T/bench.sh $ko ${BENCH_MB:-1024}" 2>&1 | tr -d '\r' | sed 's/^/   /'
+            "$VSSH" "TRACE=${TRACE:-0} sh $T/bench.sh $ko ${BENCH_MB:-1024}" 2>&1 | tr -d '\r' | sed 's/^/   /'
         done ;;
     run)
         rc=0
