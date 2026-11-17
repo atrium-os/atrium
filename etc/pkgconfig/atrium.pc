@@ -1,0 +1,11 @@
+# The Atrium C SDK (dev-tools.md §5.4): libatrium, in the base.
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include/atrium
+
+Name: atrium
+Description: Atrium app library (Atrium C SDK)
+Version: 0.1
+Libs: -latrium
+Libs.private: -lthr
+Cflags: -I${includedir}

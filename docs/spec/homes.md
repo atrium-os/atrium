@@ -336,6 +336,12 @@ show a button the person presses:
    `ESC ] 7770 ; cancel BEL CR`.
 4. The script reads that line, restores the terminal, and exits with the status.
 
+`/atrium/bin/atrium-run [folder]` (what `make run` calls in `atrium.app.mk`) asks
+the same way with `ESC ] 7770 ; run ; <folder in ~/work> BEL`. The terminal shows
+"<workspace> asks to Run <folder>" with Run and Cancel, sends `WorkspaceRun` for its
+tab's workspace on Run, and answers `ok;0`, or `ok;1` if the Run was refused (after
+showing why).
+
 Without a terminal (a build script, a pipe) the script refuses, so code in the
 workspace can't install anything without the person seeing what it asks for.
 An IDE's terminal pane does the same as the Terminal.

@@ -50,7 +50,7 @@ openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt 
 openssl ec -in "$H/gate.key" -pubout -out "$H/gate.pem" 2>/dev/null
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out "$H/other.key"
 # c-dev keeps its manifest; Rust's comes from pack-rust-layer.sh's template.
-sed -n '1,/^content/p' "$CDEV/atrium.toml" | grep -v '^content' > "$H/c-dev.toml"
+grep -v '^content = ' "$CDEV/atrium.toml" > "$H/c-dev.toml"
 "$HOPIFEX" layer pack "$CDEV" --manifest "$H/c-dev.toml" --sign "$H/gate.key" >/dev/null || die "pack c-dev"
 cat > "$H/rust.toml" <<T
 kind = "layer"

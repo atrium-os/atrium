@@ -60,7 +60,7 @@ sed -e 's/disk  = \["da"\]/disk  = ["md"]/' "$ROOT/capsa/etc/devices.d/50-capsa.
 # Both people have unlocked stores (arcad's own, by ostiarius's uid).
 g "su -m _ostiarius -c '$P $A unlock alice correct-horse' >/dev/null; su -m _ostiarius -c '$P $A unlock bob other-horse' >/dev/null"
 g ": > $T/seat"
-g "daemon -o $T/d.log $D --rules $T/rules --seat $T/seat --media-socket $S --devices-socket $T/devices.sock --state $T/state"
+g "daemon -f -o $T/d.log $D --rules $T/rules --seat $T/seat --media-socket $S --devices-socket $T/devices.sock --state $T/state"
 sleep 2
 MD=$(g "truncate -s 96m $T/stick.img && mdconfig -a -t vnode -f $T/stick.img && true")
 g "gpart create -s gpt $MD >/dev/null && gpart add -t ms-basic-data $MD >/dev/null"

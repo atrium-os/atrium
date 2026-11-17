@@ -200,6 +200,21 @@ builders) for the SDK files, new `etc/mk/atrium.app.mk`.
 `libz` from `pkg` (M2) runs with `make run`; a library reached through a link out
 of `work` is refused; an app linking workspace A's `.so` through a uses link runs.
 
+**As built (2026-11-18).** Run resolves each library as the workspace's loader
+would: `DT_RPATH` or `DT_RUNPATH` (with `$ORIGIN`), then `/lib`, `/usr/lib` and
+`/usr/local/lib`. It looks through the workspace's view (`workspace::view`). Folders
+the workspace can write are opened `O_RESOLVE_BENEATH`, so a link out of them is
+refused before the press is spent. Base libraries keep their paths in the bundle.
+The workspace's own go to `/usr/lib`, where the app's loader looks. The C SDK goes
+into the base with `scripts/install-c-sdk.sh` (`libfresco.so.0` built natively,
+`libatrium.so.0` cross-built, headers in `/usr/include/atrium`, `.pc` files,
+`/usr/share/mk/atrium.app.mk`). `make run` calls `/atrium/bin/atrium-run`, which
+asks the Terminal with OSC 7770 `run` the same way `pkg` does. The Terminal may now
+send `WorkspaceRun` on the person's press. `make bundle` and `[bundle] extra-libs`
+aren't done yet. Found on the way: a workspace had no loader hints, so programs from
+pkg that link `/usr/local/lib` didn't start. pkg runs now end with `ldconfig`. The
+gate `scripts/vm-run-closure-check.sh` passes 17 of 17 with the filter denying.
+
 ## 7. M5: workers (L)
 
 **Code.**

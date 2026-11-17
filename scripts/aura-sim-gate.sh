@@ -25,6 +25,8 @@
 #                                     (etc/atrium.pf, group atrium_egress)
 #   sh scripts/aura-sim-gate.sh svc   atrium-net and atrium-netconf as rc.d
 #                                     services (atrium-net-service.sh)
+#   sh scripts/aura-sim-gate.sh wifi6 IPv6 over Wi-Fi: RAs from the AP
+#                                     (aura/sim-ap/ra6.py), SLAAC, RDNSS
 #
 # AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
 # memory store. The FreeBSD VM must have been started with
@@ -881,6 +883,44 @@ teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
 
+# IPv6 over Wi-Fi (§10.3): ra6.py in the AP VM advertises fd77:0:0:77::/64
+# and RDNSS on br0; the RAs reach us as group frames under the GTK.
+wifi6_cleanup() {
+    sh "$AP" ssh "pkill -f '[r]a6.py'; true" >/dev/null 2>&1 || true
+    "$V" 'ndp -i vtnet0 -- -no_radr >/dev/null 2>&1; true' || true
+    n3_cleanup
+}
+
+wifi6() {
+    v6() { "$V" 'ifconfig wlan0 inet6' | grep 'inet6 fd77::77:' || true; }
+    sh "$AP" ssh "set -e; sysctl -q net.ipv6.conf.br0.disable_ipv6=0; ip -6 addr add fd77:0:0:77::1/64 dev br0 nodad 2>/dev/null || true
+        pkill -f '[r]a6.py' || true; (nohup python3 /tmp/ra6.py br0 >/tmp/ra6.log 2>&1 &); sleep 1; true" || fail "ra6.py"
+    # vtnet0 (QEMU user net, ssh) is not atrium-net's; its RA router would
+    # stay the IPv6 default, so it gives none during this test.
+    "$V" 'ndp -i vtnet0 -- no_radr && ndp -R' >/dev/null || fail "vtnet0 no_radr"
+    start_net
+    r=$("$V" "echo '$PASS' | $CTL remember aura-test --manual") || fail "remember: $r"
+    out=$("$V" "$CTL join aura-test --wait 240 --dhcp wlan0" 2>&1) || fail "join: $out"
+    ok "joined aura-test with atrium-net"
+    i=0; until v6 | grep -q temporary && [ "$(v6 | grep -vc temporary)" -ge 1 ]; do i=$((i + 1)); [ $i -lt 40 ] || break; sleep 3; done
+    a=$(v6)
+    echo "$a" | sed 's/^/    /'
+    echo "$a" | grep -v temporary | grep -q 'prefixlen 64.*autoconf' && echo "$a" | grep -q 'prefixlen 64.*autoconf temporary' \
+        && ok "SLAAC over Wi-Fi in $((i * 3)) s: a stable and a temporary address in fd77:0:0:77::/64" || fail "no SLAAC on wlan0: $a $("$V" 'ifconfig wlan0; ndp -i wlan0; ndp -p; netstat -s -p icmp6 | grep -i "router adv\|bad\|input hist" ; tail -n 20 /tmp/aura/net.log')"
+    rt=$("$V" 'netstat -rn -f inet6 | awk "\$1==\"default\" && /wlan0/"')
+    echo "$rt" | grep -q 'fe80::.*%wlan0' && ok "IPv6 default route via the AP's link-local ($(echo "$rt" | awk '{print $2}'))" || fail "v6 default route: $("$V" 'netstat -rn -f inet6 | head -20')"
+    "$V" 'ping6 -c 3 -t 30 fd77:0:0:77::1' >/dev/null && ok "ping6 to the Wi-Fi network's router" || fail "ping6 fd77:0:0:77::1"
+    tmp=$(echo "$a" | awk '/temporary/{print $2; exit}')
+    sh "$AP" ssh "ping -6 -c 1 -W 5 $tmp >/dev/null && ip -6 neigh show dev br0 | grep -q '$tmp'" && ok "the AP reaches the temporary address $tmp" || fail "AP ping $tmp"
+    st=$("$V" "$CTL status")
+    echo "$st" | grep -q 'dns6=fd77:0:0:77::1' && ok "RA DNS server over Wi-Fi: dns6=fd77:0:0:77::1" || fail "dns6: $st"
+    n=$(sh "$AP" ssh "tail -n 1 /tmp/ra6.log")
+    echo "$n" | grep -q 'rs=[1-9]' && ok "router solicitations answered ($n)" || fail "no RS seen: $n"
+    out=$("$V" "$CTL leave") || true
+    i=0; while [ -n "$(v6)" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
+    [ -z "$(v6)" ] && ok "left the network: its IPv6 addresses removed" || fail "after leave: $(v6)"
+}
+
 case "${1:-}" in
 vms)
     sh "$AP" up
@@ -927,6 +967,14 @@ svc)
     svc_cleanup
     teardown
     echo "atrium-net services: $pass checks passed" ;;
+wifi6)
+    setup hostapd-wpa2.conf
+    trap 'wifi6_cleanup' EXIT
+    wifi6
+    wifi6_cleanup
+    trap - EXIT
+    teardown
+    echo "IPv6 over Wi-Fi: $pass checks passed" ;;
 n3)
     setup hostapd-wpa2.conf
     n3
