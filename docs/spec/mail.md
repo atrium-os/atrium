@@ -1112,7 +1112,7 @@ Stalwart in the cloud VM, and later a real account):
    wide as the window, growing with the text) kept to a mail profile (paragraphs,
    headings, B/I/U/strike, web and mail links, lists, quotes), sent as
    `multipart/alternative` with a plain part from the same paragraphs; drafts keep Mail's
-   HTML and reopen as rich text; a Plain text switch. **Quoted originals** (`b4a1c0de`):
+   HTML and reopen as rich text; a Plain text switch. **Quoted originals** (`4d27ed1d`):
    a reply or forward of an HTML message shows the original under the text in a jailed
    doc-viewer slot, as the reader does (the Navigator's `DocumentView`), with Remove; it is
    sent in a cited blockquote with its formatting, kept to a safe set of elements (no
