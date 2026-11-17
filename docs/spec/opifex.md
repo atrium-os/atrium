@@ -32,7 +32,13 @@ Related: [atrium-bundle-format.md](atrium-bundle-format.md) (the bundle),
 
 ## 1. Short answer
 
-- **One catalog, downloaded whole.** The catalog is a signed, append-only list of every
+- **The Atrium catalog vouches only for what Atrium builds** (Shankar 2026-11-17). It holds
+  `org.atrium.*` apps, fonts, drivers, firmware, layers and the SDK. Atrium has no review
+  team, and a signature proves who published something, not that it is honest, so the
+  project does not put third-party apps in front of people under its name. Anyone else runs
+  their own catalog with the same format and tools (§6.5); a person adds it in Curia with a
+  press, and every install sheet names the catalog and the publisher.
+- **Each catalog downloaded whole.** The catalog is a signed, append-only list of every
   published package version: id, publisher, kind, version, per-architecture hash and size,
   where to fetch it, the capabilities it asks for, the roles it implements, the device ids
   it drives, the scripts a font covers. Every Atrium machine downloads all of it and
@@ -123,7 +129,7 @@ A package is a bundle as in [atrium-bundle-format.md](atrium-bundle-format.md): 
 
 | `kind` | Installs to | Who may sign it (v1) | Who may install |
 |---|---|---|---|
-| `app` (default) | `/var/lib/atrium/apps/<id>/` | any registered publisher, in its id prefix | any person, for themselves (§7.6) |
+| `app` (default) | `/var/lib/atrium/apps/<id>/` | platform in the Atrium catalog; a third-party catalog's publishers in their verified prefixes (§6.5) | any person, for themselves (§7.6) |
 | `service` | `/var/lib/atrium/apps/<id>/` plus `/etc/atrium/services.d/` | platform | admin, with a press |
 | `layer` | `/var/lib/atrium/layers/<name>@<version>/` (toolchains thread's contract) | platform | admin, with a press |
 | `font` | `/usr/share/fonts/atrium-extra/<id>/` | platform | any person (fonts are shared; §8.1) |
@@ -181,15 +187,17 @@ anchor. A new `root.toml` is accepted only if 2 of the current root keys signed 
 
 ### 5.2 Publishers
 
-A publisher is a record in the catalog: a **stable publisher id**, display name, verified
+In the Atrium catalog the only publisher is Atrium (the platform key). Publisher records exist
+so third-party catalogs (§6.5) use the same machinery, and so one catalog can hold several
+publishers. A publisher is a record in a catalog: a **stable publisher id**, display name, verified
 domains, id prefixes, allowed kinds, and its current and past keys. The id is assigned once
 (`pub:` plus a short hash of its first key) and never changes, so key rotation does not
 change who the publisher is.
 
 - **Registering:** the publisher proves control of each domain once, when it registers, by a
   DNS TXT record `_atrium-publisher.<domain>` or `https://<domain>/.well-known/atrium-publisher`
-  containing its key's fingerprint. The publishing CI checks it; a human approves new
-  publishers in v1. Its prefixes are the reversed domains (`example.com` gives `com.example.`).
+  containing its key's fingerprint. The catalog's operator checks it when adding the
+  publisher, and every machine checks it again when it first sees the publisher (§6.5). Its prefixes are the reversed domains (`example.com` gives `com.example.`).
 - **Rotating:** a key change is a catalog entry signed by the old key, naming the new one.
   A lost or stolen key is replaced only by an entry signed by 2 root keys, shown to every
   machine as a recovery (§7.7).
@@ -276,13 +284,29 @@ Any failure keeps the previous local catalog and is reported in Curia.
 - Mirrors (a LAN cache, a company mirror) are additional base URLs in `opifex.toml`; any
   byte from anywhere is checked by hash.
 
-### 6.5 Other catalogs
+### 6.5 Third-party catalogs
 
-An admin can add another catalog (a company's, an experimental one) with its own root key,
-with a press and a plain warning. It is limited to the id prefixes its `root.toml` lists, and
-may never list `org.atrium.` or an id an earlier catalog already has. The same checks apply.
-Per-persona use (a Work persona that installs only from the company catalog) is a later step,
-following personas.md.
+Third-party apps come from catalogs their publishers (or anyone) run. A catalog is a
+`root.toml` with its own root keys, the same log and tiles, on any static host. `opifex
+catalog init|add|sign|publish` and a ready GitHub Actions recipe make running one a matter of
+a repository and a key.
+
+- **Adding one:** a person adds a catalog in Curia by URL, with a Sigillum press and a plain
+  sentence: "Apps from this catalog are checked by nobody but its publisher; Atrium has not
+  reviewed them." Added catalogs are machine-wide (an admin) or for one person (themselves,
+  apps only). Per-persona catalogs (a Work persona that installs only from the company's)
+  follow personas.md, later.
+- **Prefixes, checked by every machine:** a catalog may list only ids under domains its
+  publishers prove (§5.2). When a machine adds the catalog, and when it first sees a new
+  publisher in it, `opifex-fetch` fetches the DNS TXT or `.well-known` proof through Nuntius
+  and `opifex-check` checks it. So a catalog can't publish `com.hdfcbank.` unless whoever
+  controls hdfcbank.com put its key there. `org.atrium.` is never accepted from a third-party
+  catalog, and an id already installed from one catalog is never replaced from another.
+- **Kinds:** third-party catalogs carry `app` only in v1 (§4.1).
+- **Same checks:** signed heads, consistency, publisher signatures, scopes, the install
+  sheet, update rules. The sheet shows the catalog's name next to the publisher.
+- **Removing one:** stops updates for its apps and says so in Curia; installed apps keep
+  running until the person removes them.
 
 ### 6.6 Local queries
 
@@ -476,8 +500,7 @@ When it is, it should reuse the publisher records and keys of §5.2 rather than 
 
 ### 10.1 The pipeline
 
-A publisher (Atrium included) publishes by opening a pull request to `atrium-os/catalog` that
-adds a release file: the signed `atrium.toml`, its signature, the archive URLs, sha256 and
+Atrium publishes by opening a pull request to `atrium-os/catalog` that adds a release file: the signed `atrium.toml`, its signature, the archive URLs, sha256 and
 size. GitHub Actions runs the checks and, when they pass, appends the entry to the log, signs
 the new tree head with the catalog key (a repository secret) and publishes the tiles to Pages.
 `opifex publish` writes the pull request contents; `cargo atrium bundle --sign` produces the
@@ -491,11 +514,10 @@ order and delay, not forge (§1). Root keys never touch CI.
 The CI fetches each archive (it must, to check the hash and the tree) and checks: schema;
 publisher signature; id in prefixes, kind in scopes; content.idx matches the archive;
 self-contained closure; portcullis-toml validation; capabilities on the review list (device
-claims, `network.host`-class grants, `arca`, `embeds` of system roles) wait for a human; new
-publishers wait for a human; typosquatting distance against existing names waits for a human;
-atrium-ax coverage below threshold is refused unless overridden by a maintainer, and an
-override is shown on the sheet. No review of what an app does: the jail and capabilities do
-that work.
+claims, `network.host`-class grants, `arca`, `embeds` of system roles) need Shankar's
+approval on the pull request; atrium-ax coverage below threshold is refused unless overridden,
+and an override is shown on the sheet. Third-party catalogs get the same checks as a CI recipe
+to run themselves; Atrium runs nothing for them.
 
 ### 10.3 Licences
 
@@ -548,7 +570,7 @@ the base rule except dev layers, which dev-tools already allows to carry GPL too
 | **C4** | `opifex-fetch` through Nuntius (as an ordinary launched system bundle with `net-fetch`, no new Nuntius verb); `atrium-os/catalog` repo, Pages, CI pipeline and checks; first platform packages published. | everything online |
 | **C5** | Updates, timing classes, Praeco notices, Curia Updates; key rotation and recovery. | |
 | **C6** | Kinds: fonts (with the fonts thread), drivers and `devices.idx` (with dispensatord), firmware, layers from the catalog, signed SDK registry. | CJK on demand, driver lookup, SDK |
-| **C7** | Third-party publishers: registration with domain proof, prefixes; other catalogs; WebAuthn RP verification; ax coverage in CI. | third-party apps |
+| **C7** | Third-party catalogs: `opifex catalog init/add/sign/publish`, the Actions recipe, domain proofs checked on each machine, Curia's add-a-catalog with a press; WebAuthn RP verification; ax coverage in CI. | third-party apps |
 
 Each step has a VM gate: C0 refuses a tampered file, a setuid file and a `dev.` id; C2
 installs, updates and rolls back an app with a running instance kept on the old tree; C3 shows
@@ -558,8 +580,9 @@ font on demand and a driver from a `nobody` device's notice.
 
 ## 15. Decisions, with recommendations
 
-1. **One downloaded catalog** for all lookups, not per-publisher DNS manifests or per-package
-   queries. *Recommend yes.*
+1. **Each catalog downloaded whole** for all lookups, not per-publisher DNS manifests or
+   per-package queries. *Recommend yes.* **Decided (Shankar 2026-11-17):** the Atrium catalog
+   holds only what Atrium builds; third parties run their own catalogs (§6.5).
 2. **Keyed P-256 signatures as built**, no Sigstore keyless, no ed25519 or minisign for
    packages. Fix bundle-format.md and insula §12 to match. *Recommend yes.*
 3. **Content index named in the signed manifest** (§4.2), required for every non-`dev.`

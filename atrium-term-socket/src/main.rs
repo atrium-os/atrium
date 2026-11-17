@@ -337,9 +337,13 @@ fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
             .filter(|l| !l.is_empty())
             .collect();
         let t = rows.join(" | ");
+        // The alternate screen (a full-screen program) and the cursor, for
+        // gates: `<alt>`, `@row,col`.
+        let alt = if g.mode(stoa_term::mode::ALT_SCREEN) { "<alt> " } else { "" };
+        let (cr, cc) = g.cursor();
         let t = match &s.strip.menu {
-            Some((items, sel)) => format!("[{}] menu={}@{sel} {t}", s.strip.place, items.join(",")),
-            None => format!("[{}] {t}", s.strip.place),
+            Some((items, sel)) => format!("[{}] menu={}@{sel} {alt}{t}", s.strip.place, items.join(",")),
+            None => format!("[{}] {alt}@{cr},{cc} {t}", s.strip.place),
         };
         if t != s.traced {
             eprintln!("atrium-term: screen “{}”: {t}", s.title);

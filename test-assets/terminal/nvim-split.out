@@ -1,0 +1,23 @@
+[?1049h[22;0;0t[?1h=[H[2J]11;?[?2004h[?u[c[?25h[?25l[>4;2m(B[m[H[2J[29BE325: ATTENTION[K[9;30r[9;1H[21M[r[8;1H                                                                                                    
+
+Found a swap file by the name "~/.local/state/nvim/swap//%tmp%tmp.BHbt2IHdAJ%sample.rs.swp"[K
+          owned by: root   dated: Tue Nov 17 19:58:56 2026[K
+         file name: /tmp/tmp.BHbt2IHdAJ/sample.rs[K
+          modified: YES[K
+         user name: root   host name: vm[K
+        process ID: 13680[K
+While opening file "sample.rs"[K
+             dated: Tue Nov 17 19:58:27 2026[K
+[K
+(1) Another program may be editing the same file.  If this is the case,[K
+    be careful not to end up with two different instances of the same[K
+    file when making changes.  Quit, or continue with caution.[K
+(2) An edit session for this file crashed.[K
+    If this is the case, use ":recover" or "vim -r sample.rs"[K
+    to recover the changes (see ":help recovery").[K
+    If you did this already, delete the swap file "/root/.local/state/nvim/swap//%tmp%tmp.BHbt2IHdAJ
+%sample.rs.swp"[K
+    to avoid this message.[K
+[K
+Swap file "~/.local/state/nvim/swap//%tmp%tmp.BHbt2IHdAJ%sample.rs.swp" already exists![K
+[O]pen Read-Only, (E)dit anyway, (R)ecover, (D)elete it, (Q)uit, (A)bort:[K]112[2 q[?25h[?25l[?1004h[?25h
