@@ -12,4 +12,5 @@ pub mod jail;
 pub mod media;
 pub mod plan;
 pub mod rules;
+pub mod sealed;
 pub mod share;

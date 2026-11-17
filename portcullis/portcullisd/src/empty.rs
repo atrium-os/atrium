@@ -1,6 +1,6 @@
 //! The empty console (docs/spec/homes.md §5.3, W7): what Terminal opens on
 //! its own. A shell in a jail that reaches nothing: the console's
-//! read-only toolbox, a private `/tmp`, no home, no network, no app's
+//! read-only toolbox, a private `/tmp` (and `/var/tmp`), no home, no network, no app's
 //! files, as a uid of its own (per person, like an app's). From there the
 //! person switches the tab into a workspace or an app's console, each with
 //! a press.
@@ -64,7 +64,9 @@ pub fn start(owner: &str) -> Result<(i32, u32, u32), String> {
         return Err(format!("{} is a link", jp.display()));
     }
     let _ = fs::remove_dir_all(&jp);
-    for (d, mode) in [("", 0o755), ("tmp", 0o1777), ("dev", 0o555), ("etc", 0o755), ("atrium", 0o755), ("root", 0o700),
+    // `var/tmp`: vi keeps its recovery files in /var/tmp/vi.recover; without
+    // it, it opens on an error that eats the first key.
+    for (d, mode) in [("", 0o755), ("tmp", 0o1777), ("var", 0o755), ("var/tmp", 0o1777), ("dev", 0o555), ("etc", 0o755), ("atrium", 0o755), ("root", 0o700),
                       (crate::console::IN_JAIL, 0o755)] {
         let p = jp.join(d);
         fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;

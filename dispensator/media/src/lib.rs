@@ -15,6 +15,7 @@
 //! | `PICKED` 0x06 | postcard [`Picked`] | `u8 status`, then postcard `String` (where it is in the app's jail, or why not): the system picker puts the folder the user picked into the app's jail |
 //! | `CONNECT` 0x07 | postcard [`Connect`] | `u8 status`, then postcard `String`: the share's `part` (`share-<uid>`), or why not. The file manager connects a network share it saved in Arca (network-shares.md §6.1); `EJECT` of that part disconnects |
 //! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; SMB, `smb 3.1.1 <cipher>`, the fingerprint of the server's GUID, `guid <text>`; or why not (a server below the SMB floor: why) |
+//! | `FORMAT` 0x0A | postcard [`Format`] | `u8 status`, then postcard `String`: erase a stick and make it a sealed one for a persona (tessera-encryption.md §7.1); the key never leaves Arca and the kernel |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -41,6 +42,7 @@ pub mod op {
     pub const LEARN: u16 = 0x08;
     /// Whether a connected share comes back at login, asked or set.
     pub const AT_LOGIN: u16 = 0x09;
+    pub const FORMAT: u16 = 0x0A;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -68,6 +70,21 @@ pub struct Volume {
     pub read_only: bool,
     /// What to call it: empty for a stick (the file manager names it),
     /// `user@host:path` for a network share.
+    pub label: String,
+    /// A trusted (sealed) stick: the persona whose key opened it, for its
+    /// chip (personas.md §5.1). Empty otherwise.
+    pub persona: String,
+    /// A sealed stick this session holds no key for: shown, not mounted
+    /// (`mountpoint` empty). It can be erased with `FORMAT`.
+    pub locked: bool,
+}
+
+/// Erase `part` and make it a sealed stick for `persona` (root or the
+/// session's user). `label` is what Curia and Scrinium call its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Format {
+    pub part: String,
+    pub persona: String,
     pub label: String,
 }
 
@@ -206,6 +223,8 @@ pub mod server {
         /// `uid` (the file manager) asks or sets whether a connected share
         /// comes back at login.
         fn at_login(&self, uid: u32, a: &AtLogin) -> (u8, String);
+        /// Erase and seal a stick (checked here: who, and the request).
+        fn format(&self, f: &Format) -> (u8, String);
     }
 
     pub struct Shared {
@@ -261,6 +280,20 @@ pub mod server {
             let mut st = self.state.lock().unwrap();
             st.subscribers.push((uid, tx));
             Some((st.volumes.clone(), rx))
+        }
+
+        /// Root, or the session's user (the same rule as eject). The part
+        /// need not be listed: a blank stick never is. The daemon checks it
+        /// is a stick it serves.
+        pub fn format(&self, uid: u32, f: &Format) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may format".into());
+            }
+            let ok = |s: &str, max: usize| !s.is_empty() && s.len() <= max && !s.contains('\n') && !s.contains('\0');
+            if !ok(&f.part, 32) || !ok(&f.persona, 64) || !ok(&f.label, 128) || f.part.starts_with("share-") {
+                return (status::MALFORMED, "malformed".into());
+            }
+            self.host.format(f)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -398,6 +431,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::AT_LOGIN, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::FORMAT => {
+                    let (st, msg) = match postcard::from_bytes::<Format>(&m.payload) {
+                        Ok(f) => shared.format(uid, &f),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::FORMAT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -469,6 +509,10 @@ pub mod client {
             Ok((st, m)) => Err((st, m)),
             Err(e) => Err((status::FAILED, e.to_string())),
         }
+    }
+
+    pub fn format(sock: &Path, f: &Format) -> Result<String, (u8, String)> {
+        status_call(sock, op::FORMAT, f)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -606,10 +650,13 @@ mod tests {
         fn at_login(&self, _uid: u32, a: &AtLogin) -> (u8, String) {
             (status::OK, if a.on == Some(true) { "on" } else { "off" }.into())
         }
+        fn format(&self, f: &Format) -> (u8, String) {
+            (status::OK, format!("{} sealed for {}", f.part, f.persona))
+        }
     }
 
     fn vol(p: &str) -> Volume {
-        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new() }
+        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new(), persona: String::new(), locked: false }
     }
 
     /// Over a real socket: list, subscribe, eject, a session change.
@@ -742,5 +789,17 @@ mod tests {
         assert_eq!(client::open(&sock, &Open { part: "da9s1".into(), ..o.clone() }).unwrap_err().0, status::NOT_FOUND);
         assert_eq!(client::attach_all(&sock5).unwrap_err(), (status::NOT_ALLOWED, "5".into()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_is_the_session_users_or_roots() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        shared.update(vec![vol("da0p1"), Volume { mountpoint: String::new(), locked: true, ..vol("da1p1") }], &[]);
+        let f = |part: &str| Format { part: part.into(), persona: "work".into(), label: "Work stick".into() };
+        assert_eq!(shared.format(1000, &f("da0p1")).0, status::OK);
+        assert_eq!(shared.format(0, &f("da1p1")).0, status::OK, "a locked stick can be erased");
+        assert_eq!(shared.format(2000, &f("da0p1")).0, status::NOT_ALLOWED);
+        assert_eq!(shared.format(1000, &Format { persona: String::new(), ..f("da0p1") }).0, status::MALFORMED);
+        assert_eq!(shared.format(1000, &f("share-1001")).0, status::MALFORMED);
     }
 }

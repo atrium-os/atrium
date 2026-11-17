@@ -118,6 +118,13 @@ fn args() -> Result<Args, String> {
             "--media" => a.media_cmd = Some("list".into()),
             "--media-watch" => a.media_cmd = Some("watch".into()),
             "--eject" => a.media_cmd = Some(format!("eject {}", val()?)),
+            // Erase PART and seal it for PERSONA (tessera-encryption.md §7.1).
+            "--format" => {
+                let part = val()?;
+                let persona = it.next().ok_or("--format needs PART PERSONA LABEL")?;
+                let label = it.next().ok_or("--format needs PART PERSONA LABEL")?;
+                a.media_cmd = Some(format!("format {part} {persona} {label}"));
+            }
             // Tests: what the file manager asks for a share.
             "--learn" => a.media_cmd = Some(format!("learn {}", val()?)),
             "--connect" | "--connect-at-login" => {
@@ -170,7 +177,27 @@ fn args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// The arcad call dispensatord makes as `_dispensator-vk` (sealed.rs): one
+/// request, one line out.
+fn arca_vk(args: &[String]) -> ExitCode {
+    use dispensator::sealed::arca;
+    let Some((op, body)) = arca::request(args) else {
+        println!("status 254");
+        return ExitCode::from(2);
+    };
+    let sock = std::env::var("ARCA_SOCKET").unwrap_or_else(|_| arca::SOCKET.into());
+    match std::os::unix::net::UnixStream::connect(&sock).and_then(|mut s| arca::call(&mut s, op, &body)) {
+        Ok((st, b)) => println!("{}", arca::answer(op, st, &b)),
+        Err(e) => println!("status 253 {e}"),
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--arca-vk") {
+        return arca_vk(&argv[1..]);
+    }
     let a = match args() {
         Ok(a) => a,
         Err(e) => {
@@ -381,6 +408,14 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
         let c = atrium_media::Connect { proto, host, port, path: path.into(), user: user.into(), fingerprint: fp.into(), read_only: false, at_login };
         return answer(atrium_media::client::connect(sock, &c));
     }
+    if let Some(rest) = cmd.strip_prefix("format ") {
+        let mut f = rest.splitn(3, ' ');
+        let (Some(part), Some(persona), Some(label)) = (f.next(), f.next(), f.next()) else {
+            println!("error malformed");
+            return ExitCode::FAILURE;
+        };
+        return answer(atrium_media::client::format(sock, &atrium_media::Format { part: part.into(), persona: persona.into(), label: label.into() }));
+    }
     if let Some(rest) = cmd.strip_prefix("at-login ") {
         let (part, on) = rest.split_once(' ').unwrap_or((rest, "ask"));
         let on = match on {
@@ -436,7 +471,16 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             Ok(vs) => {
                 println!("ok");
                 for v in vs {
-                    println!("{} {} {} {}{}", v.part, v.mountpoint, v.size_bytes, v.free_bytes, if v.read_only { " ro" } else { "" });
+                    println!(
+                        "{} {} {} {}{}{}{}",
+                        v.part,
+                        if v.mountpoint.is_empty() { "-" } else { &v.mountpoint },
+                        v.size_bytes,
+                        v.free_bytes,
+                        if v.read_only { " ro" } else { "" },
+                        if v.locked { " locked" } else { "" },
+                        if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) }
+                    );
                 }
                 ExitCode::SUCCESS
             }
@@ -517,6 +561,23 @@ mod run {
         /// Shares to connect at login, resolved off the loop's thread: the
         /// session user each was for.
         logins: (mpsc::Sender<(String, dispensator::share::Share, std::net::Ipv4Addr, bool)>, mpsc::Receiver<(String, dispensator::share::Share, std::net::Ipv4Addr, bool)>),
+        /// Sealed sticks the kernel has mounted with a key from the session
+        /// person's Arca, by partition (tessera-encryption.md §7.2).
+        trusted: BTreeMap<String, Trusted>,
+        /// Sealed sticks the session holds no key for: shown as Locked.
+        locked: std::collections::BTreeSet<String>,
+        /// /dev/tesserakeys, for TKEY_FORMAT and TKEY_DROP (None: no
+        /// tessera_fs, so no sealed sticks).
+        keyring: Option<std::fs::File>,
+    }
+
+    /// A trusted stick: whose key opened it, to record its generation and
+    /// drop the key when it goes.
+    struct Trusted {
+        mnt: String,
+        user: String,
+        persona: String,
+        key_id: [u8; 16],
     }
 
     /// One connected share: its jail runs while `pd` is held.
@@ -553,6 +614,8 @@ mod run {
         Connect(dispensator::share::Share, std::net::Ipv4Addr, bool, bool),
         /// A connected share's "connect at login": asked, or set.
         AtLogin(String, Option<bool>),
+        /// Erase a stick and seal it for a persona (§7.1).
+        Format(atrium_media::Format),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -643,6 +706,91 @@ mod run {
     /// Forced, and by the file system's id rather than its path: a lookup
     /// would ask a wedged FUSE server for its root and hold this daemon
     /// (jaild::ffi::unmount_at).
+    /// The first two sectors of /dev/`dev`: the superblock copies.
+    fn read_header(dev: &str) -> dispensator::sealed::Header {
+        use std::io::Read;
+        let mut b = vec![0u8; 2 * dispensator::sealed::SECTOR];
+        match std::fs::File::open(Path::new("/dev").join(dev)).and_then(|mut f| f.read_exact(&mut b)) {
+            Ok(()) => dispensator::sealed::header(&b),
+            Err(_) => dispensator::sealed::Header::Other,
+        }
+    }
+
+    /// One arcad call as `_dispensator-vk` (sealed.rs): `Ok(answer)` or
+    /// `Err(status)`.
+    fn vk_call(args: &[&str]) -> Result<String, u8> {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().map_err(|_| 252u8)?;
+        let out = std::process::Command::new(exe)
+            .arg("--arca-vk")
+            .args(args)
+            .uid(dispensator::sealed::VK_UID)
+            .gid(dispensator::sealed::VK_UID)
+            .env_clear()
+            .output()
+            .map_err(|_| 252u8)?;
+        let line = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
+        if let Some(a) = line.strip_prefix("ok ") {
+            return Ok(a.to_string());
+        }
+        Err(line.strip_prefix("status ").and_then(|s| s.split(' ').next()?.parse().ok()).unwrap_or(251))
+    }
+
+    // tessera/keyring.h: _IOW('K', 2, struct tkey_id), _IOW('K', 4, struct
+    // tkey_format) (sys/ioccom.h).
+    const fn ioc_in(n: u64, len: u64) -> libc::c_ulong {
+        (0x8000_0000u64 | ((len & 0x1fff) << 16) | ((b'K' as u64) << 8) | n) as libc::c_ulong
+    }
+    #[repr(C)]
+    struct TkeyFormat {
+        key_id: [u8; 16],
+        uuid: [u8; 16],
+        total_sectors: u64,
+        journal_sectors: u64,
+        fd: i32,
+        suite: u32,
+        hash_alg: u32,
+        flags: u32,
+    }
+    const _: () = assert!(std::mem::size_of::<TkeyFormat>() == 64);
+    const TKEY_DROP: libc::c_ulong = ioc_in(2, 16);
+    const TKEY_FORMAT: libc::c_ulong = ioc_in(4, 64);
+
+    /// The kernel formats `dev` sealed with the loaded key (§7.1 step 3).
+    fn tkey_format(ring: &std::fs::File, dev: &str, key_id: [u8; 16], uuid: [u8; 16]) -> std::io::Result<()> {
+        let disk = std::fs::OpenOptions::new().read(true).write(true).open(Path::new("/dev").join(dev))?;
+        let mut f = TkeyFormat { key_id, uuid, total_sectors: 0, journal_sectors: 0, fd: disk.as_raw_fd(), suite: 0, hash_alg: 0, flags: 0 };
+        // SAFETY: a live #[repr(C)] struct of the size the command encodes.
+        if unsafe { libc::ioctl(ring.as_raw_fd(), TKEY_FORMAT, &mut f as *mut TkeyFormat) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn tkey_drop(ring: &std::fs::File, key_id: [u8; 16]) {
+        let mut id = key_id;
+        // SAFETY: 16 bytes, the size the command encodes.
+        let _ = unsafe { libc::ioctl(ring.as_raw_fd(), TKEY_DROP, id.as_mut_ptr()) };
+    }
+
+    /// `mount -t tessera -o nosuid,noexec /dev/<dev> <mnt>`: the kernel
+    /// finds the key by the superblock's key id and refuses without it.
+    fn mount_tessera(dev: &str, mnt: &str) -> std::io::Result<()> {
+        use std::ffi::CString;
+        let kv = [("fstype", "tessera".to_string()), ("fspath", mnt.to_string()), ("from", format!("/dev/{dev}"))];
+        let mut owned = Vec::new();
+        for (k, v) in kv {
+            owned.push(CString::new(k).unwrap());
+            owned.push(CString::new(v).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?);
+        }
+        let mut iov: Vec<libc::iovec> = owned.iter().map(|c| libc::iovec { iov_base: c.as_ptr() as *mut _, iov_len: c.as_bytes_with_nul().len() }).collect();
+        // SAFETY: iov points into `owned`, alive for the call.
+        if unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as libc::c_uint, libc::MNT_NOSUID | libc::MNT_NOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn unmount_force(dir: &Path) {
         let _ = jaild::ffi::unmount_at(&dir.to_string_lossy(), libc::MNT_FORCE);
     }
@@ -741,6 +889,10 @@ mod run {
 
         fn eject(&self, part: &str) -> (u8, String) {
             self.ask(Req::Eject(part.to_string()))
+        }
+
+        fn format(&self, f: &atrium_media::Format) -> (u8, String) {
+            self.ask(Req::Format(f.clone()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1288,6 +1440,9 @@ mod run {
             shares: BTreeMap::new(),
             paused: None,
             logins: mpsc::channel(),
+            trusted: BTreeMap::new(),
+            locked: Default::default(),
+            keyring: std::fs::OpenOptions::new().read(true).write(true).open("/dev/tesserakeys").ok(),
         };
         a.retire_stale_shares();
         a.sweep_orphan_grants();
@@ -1536,7 +1691,11 @@ mod run {
                     Probe::NotMounted => continue,
                 };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new() });
+                let persona = self.trusted.get(&part).map(|t| t.persona.clone()).unwrap_or_default();
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false });
+            }
+            for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
+                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona: String::new(), locked: true });
             }
             // A share's server answers only once it has logged in, so it is
             // never statfs'd here (that would wait on the network): its
@@ -1551,6 +1710,8 @@ mod run {
                     free_bytes: 0,
                     read_only: r.read_only,
                     label: r.label.clone(),
+                    persona: String::new(),
+                    locked: false,
                 });
             }
             shared.update(vols, &std::mem::take(&mut self.ejected_now));
@@ -1570,6 +1731,7 @@ mod run {
             for (r, reply) in reqs {
                 let a = match r {
                     Req::Eject(part) => self.eject(&part),
+                    Req::Format(f) => self.format(&f),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -1960,6 +2122,14 @@ mod run {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            // A sealed stick is the kernel's to mount, with the session
+            // person's key, or nobody's (§7.2): never a FUSE server's.
+            if let Some((dev, mnt, _)) = &p.fuse {
+                if let dispensator::sealed::Header::Sealed { key_id, uuid } = read_header(dev) {
+                    self.start_sealed(device, dev, mnt, key_id, uuid);
+                    return;
+                }
+            }
             // A stick's server takes grants on fd 5, a socket to us (§4.8).
             let req = Self::request(&p);
             let sent = if req.fuse.as_ref().is_some_and(|f| f.control) {
@@ -1994,7 +2164,117 @@ mod run {
             }
         }
 
+        /// A sealed stick in an unlocked session: arcad finds the person's
+        /// key (any persona) and loads it; the kernel mounts it. No key:
+        /// Locked, and nothing on the stick is read further.
+        fn start_sealed(&mut self, device: &str, dev: &str, mnt: &str, key_id: [u8; 16], uuid: [u8; 16]) {
+            use dispensator::sealed::{arca, hex};
+            self.locked.remove(device);
+            let Session::Active { user, .. } = self.session.clone() else { return };
+            if self.keyring.is_none() {
+                eprintln!("atrium-dispensatord: {device}: a sealed stick, but no Tessera keyring here; Locked");
+                self.locked.insert(device.to_string());
+                return;
+            }
+            match vk_call(&["find", &user, &hex(&key_id), &hex(&uuid)]) {
+                Ok(persona) => {
+                    let _ = std::fs::create_dir_all(mnt);
+                    match mount_tessera(dev, mnt) {
+                        Ok(()) => {
+                            eprintln!("atrium-dispensatord: {device}: sealed stick of {user}/{persona}, mounted at {mnt}");
+                            self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id });
+                        }
+                        Err(e) => {
+                            // The key is this person's, but the stick doesn't
+                            // open under it (damaged, or an old copy): Locked.
+                            eprintln!("atrium-dispensatord: {device}: the kernel refused the sealed stick: {e}; Locked");
+                            if let Some(r) = &self.keyring {
+                                tkey_drop(r, key_id);
+                            }
+                            self.locked.insert(device.to_string());
+                        }
+                    }
+                }
+                Err(st) if st == arca::LOCKED => eprintln!("atrium-dispensatord: {device}: {user}'s Arca is locked; waiting"),
+                Err(st) => {
+                    eprintln!("atrium-dispensatord: {device}: a sealed stick {user} holds no key for (arcad {st}); Locked");
+                    self.locked.insert(device.to_string());
+                }
+            }
+        }
+
+        /// Unmount a trusted stick (gently, then by force: it was unplugged
+        /// or the session went), record its generation in the key's item,
+        /// and drop the key from the kernel.
+        fn stop_sealed(&mut self, device: &str) {
+            self.locked.remove(device);
+            let Some(t) = self.trusted.remove(device) else { return };
+            if jaild::ffi::unmount_at(&t.mnt, 0).is_err() {
+                let _ = jaild::ffi::unmount_at(&t.mnt, libc::MNT_FORCE);
+            }
+            match vk_call(&["record", &t.user, &t.persona, &dispensator::sealed::hex(&t.key_id)]) {
+                Ok(hw) => eprintln!("atrium-dispensatord: {device}: generation {hw} recorded"),
+                Err(st) => eprintln!("atrium-dispensatord: {device}: recording the generation failed (arcad {st})"),
+            }
+            if let Some(r) = &self.keyring {
+                tkey_drop(r, t.key_id);
+            }
+        }
+
+        /// Erase a stick and make it a sealed one for a persona of the
+        /// session's person (§7.1): arcad mints the key and loads it, the
+        /// kernel formats with it, and the stick is mounted as theirs.
+        fn format(&mut self, f: &atrium_media::Format) -> (u8, String) {
+            use dispensator::sealed::{arca, hex, unhex16};
+            let Session::Active { user, uid, gid } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session to make the stick for".into());
+            };
+            let Some(ring) = self.keyring.as_ref().and_then(|r| r.try_clone().ok()) else {
+                return (mstatus::FAILED, "no Tessera keyring on this machine".into());
+            };
+            let Some(driver) = self.media.driver_of(&f.part).map(String::from) else {
+                return (mstatus::NOT_FOUND, format!("{} is not a stick here", f.part));
+            };
+            let Some(mnt) = self.mountpoint(&f.part) else { return (mstatus::NOT_FOUND, format!("{} has no mount point", f.part)) };
+            // Everything on it now goes: its server or mount first, and
+            // nothing may hold it open.
+            let inst: Vars = [("part".to_string(), f.part.clone())].into_iter().collect();
+            if jaild::ffi::unmount_at(&mnt, 0).is_err_and(|e| e.raw_os_error() == Some(libc::EBUSY)) {
+                return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
+            }
+            self.stop(&driver, &f.part, &inst);
+            let mut uuid = [0u8; 16];
+            if std::fs::File::open("/dev/urandom").and_then(|mut r| std::io::Read::read_exact(&mut r, &mut uuid)).is_err() {
+                return (mstatus::FAILED, "no randomness".into());
+            }
+            let key_id = match vk_call(&["mint", &user, &f.persona, &hex(&uuid), &f.label]) {
+                Ok(k) => match unhex16(&k) {
+                    Some(k) => k,
+                    None => return (mstatus::FAILED, "arcad gave no key id".into()),
+                },
+                Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
+                Err(st) => return (mstatus::FAILED, format!("arcad refused the key (status {st})")),
+            };
+            if let Err(e) = tkey_format(&ring, &f.part, key_id, uuid) {
+                tkey_drop(&ring, key_id);
+                return (mstatus::FAILED, format!("format {}: {e}", f.part));
+            }
+            let _ = std::fs::create_dir_all(&mnt);
+            if let Err(e) = mount_tessera(&f.part, &mnt) {
+                tkey_drop(&ring, key_id);
+                return (mstatus::FAILED, format!("formatted, but the mount failed: {e}"));
+            }
+            // The new stick is its person's: a private top folder.
+            let _ = std::os::unix::fs::chown(&mnt, Some(uid), Some(gid));
+            let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+            self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id });
+            self.publish();
+            eprintln!("atrium-dispensatord: {}: sealed for {user}/{}, mounted at {mnt}", f.part, f.persona);
+            (mstatus::OK, format!("{} is now {}'s sealed stick", f.part, f.persona))
+        }
+
         fn stop(&mut self, driver: &str, device: &str, vars: &Vars) {
+            self.stop_sealed(device);
             let Some(d) = self.planner.rules().drivers.get(driver) else { return };
             let Some((name, path)) = stop_names(d, vars) else { return };
             let mounts = d.mounts_ro.clone();
