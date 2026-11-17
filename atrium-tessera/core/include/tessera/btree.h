@@ -72,6 +72,35 @@ tessera_btree_t *tessera_btree_create(const tessera_block_io_t *io,
                                       uint32_t value_size,
                                       uint64_t *out_root_sector);
 
+/*
+ * Sealed trees (docs/spec/tessera-encryption.md §5.3). Every node is an
+ * AEAD-sealed unit under the volume's K_meta, and internal entries carry
+ * each child's 16-byte tag beside its sector. The root's tag lives with the
+ * root sector (the superblock's root_tags): pass it to open, and after every
+ * mutation read the new one with tessera_btree_root_tag. A node whose AEAD
+ * fails or whose tag differs from its parent's record (an older copy, a
+ * moved node, another tree's node) is refused with TESSERA_EAUTH and
+ * TESSERA_BTREE_FAIL_AUTH. `seal` belongs to the caller and must outlive the
+ * handle. Fan-out is computed on the 4056-byte sealed payload.
+ */
+struct tessera_seal_keys;
+tessera_btree_t *tessera_btree_open_sealed(const tessera_block_io_t *io,
+                                           const struct tessera_seal_keys *seal,
+                                           uint64_t root_sector,
+                                           const uint8_t root_tag[16],
+                                           uint8_t tree_kind,
+                                           uint32_t key_size,
+                                           uint32_t value_size);
+tessera_btree_t *tessera_btree_create_sealed(const tessera_block_io_t *io,
+                                             const struct tessera_seal_keys *seal,
+                                             uint8_t tree_kind,
+                                             uint32_t key_size,
+                                             uint32_t value_size,
+                                             uint64_t *out_root_sector,
+                                             uint8_t out_root_tag[16]);
+/* The current root's tag (zeros on an unsealed tree). */
+void tessera_btree_root_tag(const tessera_btree_t *t, uint8_t out[16]);
+
 /* O(log n). Returns TESSERA_ENOENT if absent. */
 /* Current root sector of an open tree (DIAG: descent tracing). */
 uint64_t tessera_btree_root(const tessera_btree_t *);
@@ -167,6 +196,10 @@ typedef enum {
 	TESSERA_BTREE_FAIL_IO     = 1,	/* device read failed */
 	TESSERA_BTREE_FAIL_HEADER = 2,	/* not a btree node (magic/CRC) */
 	TESSERA_BTREE_FAIL_KIND   = 3,	/* valid node of ANOTHER tree */
+	/* Sealed tree: AEAD or parent tag mismatch. Says nothing about which
+	 * tree the sector now belongs to (that would need its key and tag),
+	 * so it is never proof of reuse: treat it like IO/HEADER. */
+	TESSERA_BTREE_FAIL_AUTH   = 4,
 } tessera_btree_fail_t;
 
 /* out_sector / out_found_kind may be NULL. found_kind is meaningful only for

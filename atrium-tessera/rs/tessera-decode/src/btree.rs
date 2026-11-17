@@ -1,8 +1,9 @@
 //! B+tree node checks (core/src/btree.c `load_node` and `search_leaf`).
 //!
 //! A node is one 4 KiB sector: a 64-byte header, then `entry_count` entries of
-//! `key_size + value_size` bytes (leaf) or `key_size + 8` (internal, the value
-//! being the child sector). `node_check` is the gate every node read passes;
+//! `key_size + value_size` bytes (leaf) or `key_size + inner_value_size`
+//! (internal: the child sector, 8 bytes, or 24 on a sealed tree, where the
+//! child's AEAD tag follows the sector). `node_check` is the gate every node read passes;
 //! after it, `search` indexes entries through checked sub-slices as well.
 
 use crate::codec::{self, BTREE_NODE_HEADER_SIZE, off};
@@ -21,6 +22,8 @@ pub struct Shape {
     pub tree_kind: u8,
     pub key_size: u32,
     pub value_size: u32,
+    /// Internal entries' value: 8 (sector), 24 on a sealed tree (+ tag).
+    pub inner_value_size: u32,
     pub leaf_fanout: u32,
     pub inner_fanout: u32,
 }
@@ -64,7 +67,7 @@ pub fn node_fields(hdr: &[u8; BTREE_NODE_HEADER_SIZE], s: &Shape) -> Result<(), 
     }
     let ks = u32_at(hdr, off::BH_KEY_SIZE).ok_or(header_fail())?;
     let vs = u32_at(hdr, off::BH_VALUE_SIZE).ok_or(header_fail())?;
-    let want_vs = if node_kind == 0 { s.value_size } else { 8 };
+    let want_vs = if node_kind == 0 { s.value_size } else { s.inner_value_size };
     if (ks != 0 && ks != s.key_size) || (vs != 0 && vs != want_vs) {
         return Err(header_fail());
     }

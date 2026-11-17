@@ -109,7 +109,7 @@ int tessera_rs_pack_blob_hash_at(const uint8_t *data, size_t len,
  * tessera_btree_fail_t) and search_leaf. */
 int tessera_rs_btree_node_check(const uint8_t *block, size_t block_len,
     uint8_t tree_kind, uint32_t key_size, uint32_t value_size,
-    uint32_t leaf_fanout, uint32_t inner_fanout,
+    uint32_t inner_value_size, uint32_t leaf_fanout, uint32_t inner_fanout,
     void *out_hdr, int *out_fail, uint8_t *out_found_kind);
 int tessera_rs_btree_search(const uint8_t *block, size_t block_len,
     uint32_t entry_count, uint32_t key_size, uint32_t entry_size,

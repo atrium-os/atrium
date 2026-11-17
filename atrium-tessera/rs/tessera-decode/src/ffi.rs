@@ -423,11 +423,11 @@ pub unsafe extern "C" fn tessera_rs_pack_blob_hash_at(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tessera_rs_btree_node_check(
     block: *const u8, block_len: usize, tree_kind: u8, key_size: u32, value_size: u32,
-    leaf_fanout: u32, inner_fanout: u32,
+    inner_value_size: u32, leaf_fanout: u32, inner_fanout: u32,
     out_hdr: *mut u8, out_fail: *mut c_int, out_found_kind: *mut u8,
 ) -> c_int {
     let Some(b) = (unsafe { bytes(block, block_len) }) else { return EINVAL };
-    let shape = Shape { tree_kind, key_size, value_size, leaf_fanout, inner_fanout };
+    let shape = Shape { tree_kind, key_size, value_size, inner_value_size, leaf_fanout, inner_fanout };
     // Magic and CRC once: the header goes to out_hdr if they are good, then
     // the remaining checks run on it.
     let hdr = b

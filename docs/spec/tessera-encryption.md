@@ -309,9 +309,13 @@ and 16-byte tag at the end of the block.
   gets a new random nonce, so an older copy of the same node at the same sector has a
   different tag and is refused. Together these make a Merkle tree over all metadata,
   using tags the AEAD computes anyway.
-- **Capacity.** An inode leaf still holds 26 records (4056 − 32 header = 4024 bytes, /
-  152). Internal fan-out drops by 16 bytes an entry. Journal record bodies shrink from
-  4068 to 4028 bytes per block.
+- **Capacity.** A node has 4056 − 64 (header) = 3992 bytes for entries instead of 4032,
+  and an internal entry is 16 bytes longer (sector and tag). An inode leaf holds 26
+  records instead of 27 (4 + 144 bytes each) and an inode internal node 142 children
+  instead of 336; a pack-registry leaf 49 entries instead of 50 and an internal node 99
+  instead of 168. Journal record bodies shrink from 4068 to 4028 bytes per block.
+  Built in core/src/btree.c (`tessera_btree_open_sealed`, `tessera_btree_create_sealed`;
+  tests/test_btree_sealed.c).
 - **Journal chain.** Each record's AAD also includes the previous record's tag (the
   first record after a commit chains to the superblock's `journal_anchor_tag`), so
   records cannot be reordered, dropped from the middle or spliced in from an older
