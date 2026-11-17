@@ -81,7 +81,10 @@ fn main() -> ExitCode {
             {
                 let path = std::env::var("ARCA_TESSERA_KEYRING").unwrap_or_else(|_| arcad::volume::dev::PATH.into());
                 match arcad::volume::dev::Device::open(&path) {
-                    Ok(d) => s.keyring = Some(Box::new(d)),
+                    Ok(d) => {
+                        eprintln!("arcad: Tessera keyring {path} open");
+                        s.keyring = Some(Box::new(d));
+                    }
                     Err(e) => eprintln!("arcad: {path}: {e}; volume keys unavailable"),
                 }
             }

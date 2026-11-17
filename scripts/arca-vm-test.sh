@@ -457,7 +457,10 @@ g "mkdir -p $VK && head -c 32 /dev/random > $VK/k && mkdir -p /mnt/vk"
 dev_of() { g "rm -f $VK/$1.img; /root/sealed/tessera-mkfs-sealed --key-file $VK/k --key-id $2 --uuid $3 --create -s 64 -j 64 $VK/$1.img >/dev/null && mdconfig -a -t vnode -f $VK/$1.img"; }
 D1=$(dev_of foreign $KID $FOREIGN) || D1=
 D2=$(dev_of otherid 0123456789abcdef0123456789abcdef $U) || D2=
-check "test volumes made" yes "$(case "$D1/$D2" in md*/md*) echo yes ;; *) echo "no ($D1/$D2)" ;; esac)"
+# (No case inside $(): macOS's sh, bash 3.2, ends the substitution at a pattern's ")".)
+made="no ($D1/$D2)"
+case "$D1/$D2" in md*/md*) made=yes ;; esac
+check "test volumes made" yes "$made"
 check "a volume naming the key's id, of another uuid: refused" refused "$(g "mount -t tessera -r /dev/$D1 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
 check "the key's own uuid under another key id: refused" refused "$(g "mount -t tessera -r /dev/$D2 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
 g "mdconfig -d -u $D1; mdconfig -d -u $D2; $KL drop $KID >/dev/null 2>&1; rm -rf $VK; true"

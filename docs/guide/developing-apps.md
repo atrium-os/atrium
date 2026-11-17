@@ -162,7 +162,40 @@ pkgconf; the base system has clang, lld and the Atrium headers and
 libraries (`pkg-config --cflags --libs atrium`). **Planned (M4):**
 `atrium.app.mk` with `make run` and `make bundle`, and a C template.
 
-## 7. Running, bundling, fuzzing
+## 7. Fuzzing (built), running and bundling (planned)
+
+Declare what to fuzz in Cargo.toml; each target is a `fn(&[u8])` in the
+project's lib crate:
+
+```toml
+[package.metadata.atrium.fuzz."worker:decode"]
+function = "photos::decode"
+about = "the picture decoder"
+
+[package.metadata.atrium.fuzz."core:album"]
+function = "photos::read_album"     # an input surface of the core
+```
+
+```sh
+cargo atrium fuzz --list [--json]
+cargo atrium fuzz core:album [--max-time 600] [--json]
+```
+
+It writes a libFuzzer harness under `target/atrium-fuzz/`, builds it on
+stable Rust with coverage instrumentation, debug assertions and overflow
+checks, and runs it until the first crash (or `--max-time`). The corpus is
+kept in `fuzz/corpus/<target>/`, crashing inputs in `fuzz/crashes/<target>/`;
+replay one with the harness binary and the input. A crash in a `core:`
+target is the insecure pattern itself: hostile input crashed the process
+that holds your capabilities, and the fix is to move that parsing into a
+worker. `--json` prints one event a line (`progress`, `crash` with input,
+frame, `in_core`, `fix` and `binary`, `done`), which Artifex's fuzz panel
+reads. Without AddressSanitizer (stable Rust), comparisons that go through
+`memcmp` (slice equality) aren't traced, so magic numbers are found slowly;
+seed the corpus with a valid file.
+
+When workers land (M5), each `[[workers]]` entry gets its target without
+being declared.
 
 **Planned:**
 
@@ -170,9 +203,7 @@ libraries (`pkg-config --cflags --libs atrium`). **Planned (M4):**
   the workspace as a dev app (amber window frame).
 - `cargo atrium bundle [--sign]` (M7): a release bundle with its closure,
   signed with your publisher key from Arca.
-- `cargo atrium fuzz` (M7, Artifex panel in M12): fuzz each worker's input
-  and each input surface of the core; a crash in the core comes with "Move
-  into a worker".
+
 
 ## 8. Reference
 
@@ -182,6 +213,7 @@ libraries (`pkg-config --cflags --libs atrium`). **Planned (M4):**
 | `cargo atrium new --list [--json]` | the templates |
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
+| `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |
 | `cargo atrium registry build --out d --url u [--sign key] <seed>...` | for SDK maintainers: pack and sign the registry |
 | `atrium-schema <schema.json> [--prefix p] [--out d] [--name n]` | C types, encoder and decoder |

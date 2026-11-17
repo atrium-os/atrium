@@ -6,3 +6,4 @@ pub mod check;
 pub mod new;
 pub mod cross;
 pub mod registry;
+pub mod fuzz;

@@ -55,6 +55,9 @@ enum Job {
     Check { project: String },
     Templates,
     New { dir: String },
+    FuzzList { project: String },
+    /// Streams JSON lines; `buf` holds the unfinished one.
+    FuzzRun { target: String },
 }
 
 /// Files that make a folder a project (its tasks, its composition).
@@ -278,6 +281,39 @@ impl Engine {
                 }
             }
             Act::Breakpoint(line) => self.toggle_breakpoint(line, s),
+            Act::Fuzz => {
+                if let Some(f) = &mut s.fuzz {
+                    f.on = !f.on;
+                    if !f.on {
+                        self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. }));
+                        f.running = None;
+                    }
+                }
+            }
+            Act::Crash(i) => {
+                let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
+                if let Some(frame) = c.and_then(|c| c.frame) {
+                    let (file, line) = frame.rsplit_once(':').map(|(f, l)| (f.to_string(), l.parse::<usize>().unwrap_or(1))).unwrap_or((frame.clone(), 1));
+                    match join_rel(&s.project, &file) {
+                        Some(rel) => {
+                            self.open(&rel, s);
+                            self.goto(line.saturating_sub(1), Some(0), None);
+                        }
+                        None => s.note = Some((format!("{file} is outside work"), true)),
+                    }
+                }
+            }
+            Act::ReplayCrash(i) => {
+                let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
+                match c {
+                    Some(c) if c.binary.is_some() => {
+                        // The harness with the crashing input, stopped where it crashes.
+                        let input = c.input.clone();
+                        self.start_debug_of(c.binary.as_deref().unwrap(), &[input], s);
+                    }
+                    _ => s.note = Some(("This crash can't be replayed: the fuzzer didn't say which binary".into(), true)),
+                }
+            }
             Act::Frame(i) => {
                 let f = s.debug.as_ref().and_then(|d| d.frames.get(i)).cloned();
                 if let Some((_, Some(rel), line)) = f {
@@ -369,8 +405,19 @@ impl Engine {
         };
         if s.composition.is_some() {
             self.check(s);
-        } else if s.panel == Panel::Composition {
-            s.panel = Panel::Output;
+            if s.fuzz.is_none() {
+                s.fuzz = Some(crate::fuzz::Fuzz::default());
+                let argv: Vec<String> = crate::fuzz::LIST_ARGV.iter().map(|a| a.to_string()).collect();
+                if !self.start_job(Job::FuzzList { project: p.clone() }, &argv, &p, s) {
+                    s.fuzz = None;
+                }
+            }
+        } else {
+            if matches!(s.panel, Panel::Composition | Panel::Fuzz) {
+                s.panel = Panel::Output;
+            }
+            self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. } | Job::FuzzList { .. }));
+            s.fuzz = None;
         }
     }
 
@@ -441,11 +488,20 @@ impl Engine {
     }
 
     fn start_debug(&mut self, s: &mut State) {
-        let (Some(ws), Some(remote)) = (self.ws.clone(), self.remote_root.clone()) else { return };
         let Some(program) = self.program(s) else {
             s.note = Some(("Artifex can't tell what this project runs: debugging needs a Cargo package or one C file".into(), true));
             return;
         };
+        self.start_debug_of(&program, &[], s);
+    }
+
+    /// Debug `program` (in work, or absolute in the workspace) with `args`.
+    fn start_debug_of(&mut self, program: &str, args: &[String], s: &mut State) {
+        let (Some(ws), Some(remote)) = (self.ws.clone(), self.remote_root.clone()) else { return };
+        if self.debugger.is_some() {
+            s.note = Some(("Stop the program being debugged first".into(), true));
+            return;
+        }
         let argv: Vec<String> = dap::ADAPTER.iter().map(|a| a.to_string()).collect();
         let proc = match self.exec.spawn(&ws, &argv, &s.project) {
             Ok(p) => p,
@@ -455,7 +511,7 @@ impl Engine {
             }
         };
         let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
-        let sess = dap::Session::new(&self.root, &remote, &program, &[], &s.project, bps);
+        let sess = dap::Session::new(&self.root, &remote, program, args, &s.project, bps);
         self.debugger = Some((sess, proc));
         s.debug = Some(Debug { run: format!("Starting {program}"), live: true, ..Debug::default() });
         s.output = format!("$ lldb-dap: {program}\n");
@@ -892,6 +948,21 @@ impl Engine {
         self.read_jobs(s);
         self.read_servers(s);
         self.read_debugger(s);
+        // Background fuzzing: the next target, never while a task runs
+        // (they'd fight over the build folder).
+        if s.running.is_none() {
+            if let Some(t) = s.fuzz.as_mut().and_then(|f| f.next_target()) {
+                let p = s.project.clone();
+                if self.start_job(Job::FuzzRun { target: t.clone() }, &crate::fuzz::run_argv(&t), &p, s) {
+                    if let Some(f) = &mut s.fuzz {
+                        f.running = Some(t);
+                        f.execs = 0;
+                    }
+                } else if let Some(f) = &mut s.fuzz {
+                    f.on = false;
+                }
+            }
+        }
         if self.ws.is_some() && now >= self.next_git && !self.jobs.iter().any(|(j, _, _)| matches!(j, Job::Git)) {
             self.next_git = now + GIT_EVERY;
             let argv: Vec<String> = crate::git::STATUS_ARGV.iter().map(|a| a.to_string()).collect();
@@ -914,6 +985,18 @@ impl Engine {
                             cut += 1;
                         }
                         s.output.drain(..cut);
+                    }
+                }
+                Job::FuzzRun { target, .. } => {
+                    buf.extend_from_slice(&got);
+                    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=nl).collect();
+                        if let Some(f) = &mut s.fuzz {
+                            f.line(target, &String::from_utf8_lossy(&line));
+                        }
+                    }
+                    if buf.len() > OUTPUT_MAX {
+                        buf.clear();
                     }
                 }
                 _ => {
@@ -958,6 +1041,24 @@ impl Engine {
                 Job::Check { project } => {
                     if let Some(c) = s.composition.as_mut().filter(|c| c.project == project) {
                         c.take_check(&buf);
+                    }
+                }
+                Job::FuzzList { project } => {
+                    if let Some(f) = s.fuzz.as_mut().filter(|_| s.project == project) {
+                        f.listed = true;
+                        match crate::fuzz::targets(&buf) {
+                            Ok(t) if t.is_empty() => f.error = Some("No fuzz targets: the project has no workers or input surfaces yet".into()),
+                            Ok(t) => f.targets = t,
+                            Err(e) => f.error = Some(e),
+                        }
+                    }
+                }
+                Job::FuzzRun { target, .. } => {
+                    if let Some(f) = &mut s.fuzz {
+                        if !buf.is_empty() {
+                            f.line(&target, &String::from_utf8_lossy(&buf));
+                        }
+                        f.running = None;
                     }
                 }
                 Job::Templates => {
@@ -1303,10 +1404,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(s.composition.as_ref().unwrap().checked);
+        // Fuzz targets are asked for too; without cargo atrium here the
+        // panel says why, and nothing runs.
+        for _ in 0..1000 {
+            e.tick(&mut s);
+            if s.fuzz.as_ref().is_some_and(|f| f.listed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let f = s.fuzz.clone().unwrap();
+        assert!(f.listed && (f.error.is_some() || !f.targets.is_empty()), "{f:?}");
         // Back to a file outside it.
         e.act(Act::Open("hello.c".into()), &mut s);
         assert_eq!(s.project, "");
         assert!(s.composition.is_none());
+        assert!(s.fuzz.is_none());
         assert_eq!(e.new_problem("app").as_deref(), Some("There is a app in work already"));
         assert!(e.new_problem("Bad").is_some());
         assert!(e.new_problem("fresh").is_none());

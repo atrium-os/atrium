@@ -75,6 +75,12 @@ pub enum Act {
     Breakpoint(usize),
     /// Show a frame of the stopped program.
     Frame(usize),
+    /// Fuzzing on or off for the project.
+    Fuzz,
+    /// Go to where a fuzz crash happened.
+    Crash(usize),
+    /// Run the crashing input under the debugger.
+    ReplayCrash(usize),
 }
 
 /// The debugger as the window shows it.
@@ -96,6 +102,7 @@ pub enum Panel {
     Problems,
     Composition,
     Debug,
+    Fuzz,
 }
 
 /// A tab as the bar shows it.
@@ -159,6 +166,7 @@ pub struct State {
     /// Breakpoints: file in work → 0-based lines.
     pub breakpoints: std::collections::BTreeMap<String, Vec<usize>>,
     pub debug: Option<Debug>,
+    pub fuzz: Option<crate::fuzz::Fuzz>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -457,6 +465,9 @@ impl View for ArtifexView {
             if s.debug.is_some() {
                 tabs.push((Panel::Debug, "Debug".to_string()));
             }
+            if let Some(f) = &s.fuzz {
+                tabs.push((Panel::Fuzz, if f.crashes.is_empty() { "Fuzz".to_string() } else { format!("Fuzz ({})", f.crashes.len()) }));
+            }
             for (i, (p, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
                 let bw = em(24.0 + 7.5 * label.len() as f32);
@@ -515,6 +526,37 @@ impl View for ArtifexView {
                     for (i, (name, value)) in d.locals.iter().take(lines_fit.saturating_sub(1)).enumerate() {
                         let y = body_y + (i + 1) as f32 * em(18.0);
                         mono(ctx, side_w() + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
+                    }
+                }
+                Panel::Fuzz => {
+                    let Some(f) = &s.fuzz else { return };
+                    if f.listed && !f.targets.is_empty() {
+                        ctx.key(4030);
+                        Button::ghost(if f.on { "Stop fuzzing" } else { "Start fuzzing" }).at(w - em(220.0), py + em(4.0)).width(em(130.0))
+                            .on_click(plain(q, Act::Fuzz)).render(ctx);
+                    }
+                    for (i, (core, l, crash)) in f.lines().into_iter().take(lines_fit).enumerate() {
+                        let y = body_y + i as f32 * em(18.0);
+                        let color = match core { Some(true) => t.danger_fg(), Some(false) => t.warning_fg(), None => t.text_primary() };
+                        if let Some(c) = crash {
+                            ctx.key(5800 + i as u64);
+                            let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                            if ctx.is_hovered(id) {
+                                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                                    *fill = t.state_hover();
+                                }
+                            }
+                            ctx.on_click(id, plain(q, Act::Crash(c)));
+                            text(ctx, side_w() + em(12.0), y, &fit(&l, width - em(90.0), type_size::SM), type_size::SM, Weight::Regular, color);
+                            if core.is_some() {
+                                ctx.key(1);
+                                Button::ghost("Debug it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
+                                    .on_click(plain(q, Act::ReplayCrash(c))).render(ctx);
+                            }
+                            ctx.pop();
+                        } else {
+                            text(ctx, side_w() + em(12.0), y, &fit(&l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                        }
                     }
                 }
                 Panel::Problems => {
