@@ -534,7 +534,9 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
+ "rustybuzz",
  "sha2",
+ "swash",
  "ttf-parser",
 ]
 
