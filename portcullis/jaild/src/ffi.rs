@@ -192,8 +192,10 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
     }
-    if spec.allow_tessera_keys {
-        // Registered by tessera.ko; jail_set fails (ENOENT) without it.
+    if spec.allow_tessera_keys && tessera_keys_supported() {
+        // Registered by tessera.ko. Without the module there is no keyring
+        // to allow, and jail_set would refuse the unknown parameter, so the
+        // jail (arcad's) is made without it rather than not at all.
         iob.add_i32("allow.tessera_keys", 1);
     }
     let mut errmsg = vec![0u8; 256];
@@ -218,6 +220,21 @@ pub fn sysfil_supported() -> bool {
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn sysfil_supported() -> bool { false }
+
+/// Is tessera.ko loaded, with its `allow.tessera_keys` jail parameter?
+#[cfg(target_os = "freebsd")]
+pub fn tessera_keys_supported() -> bool {
+    let name = c"security.jail.param.allow.tessera_keys";
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query; no output buffer is written.
+    unsafe {
+        libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len,
+                           std::ptr::null(), 0) == 0
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn tessera_keys_supported() -> bool { false }
 
 /// `RLIMIT_CORE` = 0, soft and hard, for the calling (child) process.
 pub fn disable_core_dumps() -> io::Result<()> {
@@ -353,8 +370,10 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
     }
-    if spec.allow_tessera_keys {
-        // Registered by tessera.ko; jail_set fails (ENOENT) without it.
+    if spec.allow_tessera_keys && tessera_keys_supported() {
+        // Registered by tessera.ko. Without the module there is no keyring
+        // to allow, and jail_set would refuse the unknown parameter, so the
+        // jail (arcad's) is made without it rather than not at all.
         iob.add_i32("allow.tessera_keys", 1);
     }
     let mut errmsg = vec![0u8; 256];
