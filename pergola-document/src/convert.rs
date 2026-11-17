@@ -31,7 +31,7 @@ impl Faces {
     pub fn new(fonts: &FontSet) -> Self {
         Faces {
             pinned: fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect(),
-            library: atrium_fonts::FACES.iter().map(|_| Default::default()).collect(),
+            library: atrium_fonts::faces().iter().map(|_| Default::default()).collect(),
         }
     }
 

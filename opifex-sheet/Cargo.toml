@@ -1,0 +1,24 @@
+[package]
+name = "opifex-sheet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The install sheet (docs/spec/opifex.md §7.1): opifex-sheetd shows what an app from the catalog is and may do, and has opifexd install it only on the person's own press."
+
+[[bin]]
+name = "opifex-sheetd"
+path = "src/bin/opifex-sheetd.rs"
+
+[dependencies]
+opifex = { path = "../portcullis/opifex" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+pergola = { path = "../pergola" }
+aqueduct = { path = "../aqueduct" }
+postcard = { version = "1", features = ["use-std"] }
+
+[workspace]

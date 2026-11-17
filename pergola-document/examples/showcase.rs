@@ -165,6 +165,8 @@ fn text_demo(ctx: &mut Ctx) {
             (font::SANS, "हिन्दी में लिखा वाक्य, क्षत्रिय और श्री"),
             (font::SANS, "தமிழ் எழுத்துக்கள் · ಕನ್ನಡ · ไทย ภาษา"),
             (font::SANS, "שלום עולם (Hello) 2026 · مرحبا بالعالم"),
+            // Drawn only with a CJK font package installed (opifex.md §8.1).
+            (font::SANS, "日本語のテキスト：東京、ひらがな、カタカナ"),
         ] {
             ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: s.into(), style: TextStyle { family: family.into(), size: type_size::MD, ..body.clone() } });
         }

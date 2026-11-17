@@ -23,8 +23,8 @@ short: 106 static TrueType faces (about 33 MB on disk).
 Rules: unmodified upstream files, each folder with its licence; OFL or Apache
 2.0 only (no GPL, LGPL, AGPL; no Microsoft or Apple fonts); static TrueType
 outlines only (the PDF writer subsets `glyf` fonts, and a mapped file is drawn
-as is, with no instancing). CJK is left for an on-demand install (16 to 25 MB
-a weight).
+as is, with no instancing). CJK is left for an on-demand install as a font
+package (§5; about 6 MB a weight as static TrueType).
 
 The Navigator's pinned set (`navigator-render::fontset`, IBM Plex and DejaVu,
 compiled in and canonicalized) is unchanged and never reads the library: a
@@ -92,7 +92,42 @@ Sans, Symbols, Symbols 2, Math and Serif.
   one glyph per character, as Pergola measures it. Fallback glyphs share the
   run's atlas page, so a run is still one slot.
 
-## 5. Open
+## 5. Installed font packages
+
+Fonts beyond the shipped set (CJK first) come as Opifex `kind = "font"`
+packages (`docs/spec/opifex.md` §8.1): platform-signed, OFL or Apache 2.0,
+static TrueType. `opifexd` puts each in `/usr/share/fonts/atrium-extra/<id>/`
+and rewrites the root-owned pin list `atrium-extra/pins` atomically.
+`atrium-fonts` (`src/extra.rs`) reads that list, never the fonts' name tables:
+
+```text
+# atrium-fonts pins 1
+<package>\t<family>\t<package>/<file>.ttf\t<weight>\t<0|1 italic>\t<ranges>\t<blake3:hex>\t<size>
+```
+
+`ranges` are the code points the face is for (`3040-30FF,4E00-9FFF`, hex, at
+most 64). A line that breaks a rule (package id, a file outside its package
+folder or not `.ttf`, weight, ranges, address) is skipped; the header must be
+first; at most 4096 faces. An installed face gets the next id after the shipped
+ones (`atrium_fonts::faces()` lists both), is matched by family name like a
+shipped one, and comes in fallback after the character's shipped script face and
+before the general Noto faces (`Library::fallback`). Its file is mapped only when
+its length and BLAKE3 match its line.
+
+A process reads the list once. frescod reads it again (`extra::refresh`, at most
+once a second, only when the list's time or length changed) when no face has a
+character, so an install shows up in Pergola labels without a restart; other
+apps see it at their next start. Ids never move within a process: a newer list
+only adds faces, and an uninstalled face's file fails its check. The Portcullis
+`fonts` capability mounts `/usr/share/fonts`, so `atrium-extra` is in it; the
+Fresco renderer bundle copies it as of the bundle.
+
+Checked with Noto Sans JP 2.004 (static TTF instances, OFL, 5.7 MB a weight,
+from the `@expo-google-fonts/noto-sans-jp` npm package, which carries Google
+Fonts' static files): Write's PDF export embeds subset CJK, and frescod draws
+a Japanese label in the VM.
+
+## 6. Open
 
 - Bidi is built (UAX #9, `unicode-bidi`). frescod: a run is one line in
   visual order, right-to-left level runs shaped right to left. officina-text
@@ -111,6 +146,7 @@ Sans, Symbols, Symbols 2, Math and Serif.
   paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
-- CJK on demand, and colour emoji, wait on the package catalog and colour glyph
-  support.
+- Colour emoji waits on colour glyph support. CJK packages wait on Opifex
+  publishing them; Han characters go to the first installed CJK face, with
+  no language preference yet (SC/TC/JP/KR forms differ).
 - Write's style font list (`STYLE_FONTS`) to offer the new families.

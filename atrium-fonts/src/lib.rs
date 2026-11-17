@@ -21,9 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 mod catalog;
+pub mod extra;
 pub use catalog::FACES;
+pub use extra::faces;
 
-/// One face the library ships.
+/// One face the library ships ([`FACES`]) or a font package installed
+/// ([`extra`]); [`faces`] lists both, by id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaceInfo {
     /// The family, as the font's own name table gives it.
@@ -62,12 +65,15 @@ pub const SYSTEM_ROOT: &str = "/usr/share/fonts/atrium";
 pub struct Library {
     root: PathBuf,
     maps: Vec<OnceLock<Result<memmap2::Mmap, String>>>,
+    /// Installed faces, by id, made when first asked for (leaked: the
+    /// library lives as long as the process).
+    extra: std::sync::Mutex<std::collections::HashMap<usize, &'static OnceLock<Result<memmap2::Mmap, String>>>>,
 }
 
 impl Library {
     /// A library over the files under `root`.
     pub fn at(root: impl Into<PathBuf>) -> Library {
-        Library { root: root.into(), maps: FACES.iter().map(|_| OnceLock::new()).collect() }
+        Library { root: root.into(), maps: FACES.iter().map(|_| OnceLock::new()).collect(), extra: Default::default() }
     }
 
     /// The system's library, one per process: `ATRIUM_FONTS_DIR` when set,
@@ -88,14 +94,22 @@ impl Library {
 
     /// The face's bytes, mapped and checked against its address the first
     /// time. A missing or changed file is an error, every time after too.
+    /// An installed face (id past [`FACES`]) is read from [`extra::dir`].
     pub fn bytes(&self, id: usize) -> Result<&[u8], String> {
-        let info = FACES.get(id).ok_or("no such face")?;
-        let m = self.maps[id].get_or_init(|| {
-            let path = self.root.join(info.file);
+        let info = faces().get(id).ok_or("no such face")?;
+        let cell = match self.maps.get(id) {
+            Some(c) => c,
+            None => *self.extra.lock().unwrap_or_else(|e| e.into_inner()).entry(id).or_insert_with(|| Box::leak(Box::default())),
+        };
+        let m = cell.get_or_init(|| {
+            let path = if id < FACES.len() { self.root.join(info.file) } else { extra::path(info.file) };
             let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             // SAFETY: the file is in a root-owned, read-only system folder;
             // the bytes are checked below before anything reads them.
             let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{}: {e}", path.display()))?;
+            if map.len() as u64 != info.size {
+                return Err(format!("{}: {} bytes, pinned {}", path.display(), map.len(), info.size));
+            }
             let got = format!("blake3:{}", blake3::hash(&map).to_hex());
             if got != info.address {
                 return Err(format!("{}: is {got}, pinned {}", path.display(), info.address));
@@ -107,7 +121,7 @@ impl Library {
 
     /// Faces of `family`, by id.
     pub fn family(family: &str) -> impl Iterator<Item = usize> + '_ {
-        FACES.iter().enumerate().filter(move |(_, f)| f.family == family).map(|(i, _)| i)
+        faces().iter().enumerate().filter(move |(_, f)| f.family == family).map(|(i, _)| i)
     }
 
     /// The face of `family` nearest to the asked weight and slant: the slant
@@ -116,7 +130,7 @@ impl Library {
     pub fn face(family: &str, bold: bool, italic: bool) -> Option<usize> {
         let w = if bold { 700 } else { 400 };
         Library::family(family).min_by_key(|&i| {
-            let f = &FACES[i];
+            let f = &faces()[i];
             ((f.italic != italic) as u32 * 10_000) + (f.weight as i32 - w).unsigned_abs()
         })
     }
@@ -130,7 +144,7 @@ impl Library {
         if key.is_empty() {
             return None;
         }
-        if let Some(f) = FACES.iter().find(|f| normalize(f.family) == key) {
+        if let Some(f) = faces().iter().find(|f| normalize(f.family) == key) {
             return Some(Resolved { family: f.family, metric: true });
         }
         if let Some(&(_, family, metric)) = ALIASES.iter().find(|(n, _, _)| normalize(n) == key) {
@@ -138,7 +152,7 @@ impl Library {
         }
         // A face of a family we know ("Calibri Light", "Arial Black"):
         // the family, but not its widths.
-        let names = FACES.iter().map(|f| (f.family, f.family)).chain(ALIASES.iter().map(|&(n, f, _)| (n, f)));
+        let names = faces().iter().map(|f| (f.family, f.family)).chain(ALIASES.iter().map(|&(n, f, _)| (n, f)));
         if let Some((_, family)) = names.filter(|(n, _)| key.starts_with(&normalize(n))).max_by_key(|(n, _)| normalize(n).len()) {
             return Some(Resolved { family, metric: false });
         }
@@ -151,7 +165,7 @@ impl Library {
     /// The class a font name suggests, for names we have no row for.
     pub fn class(name: &str) -> Option<Class> {
         let key = normalize(first_family(name));
-        if let Some(f) = FACES.iter().find(|f| normalize(f.family) == key) {
+        if let Some(f) = faces().iter().find(|f| normalize(f.family) == key) {
             return Some(family_class(f.family));
         }
         if let Some(&(_, family, _)) = ALIASES.iter().find(|(n, _, _)| normalize(n) == key) {
@@ -165,7 +179,9 @@ impl Library {
     pub fn fallback(ch: char) -> impl Iterator<Item = &'static str> {
         let c = ch as u32;
         let script = SCRIPTS.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&c)).map(|s| s.2);
-        script.into_iter().chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Serif"])
+        // Installed packages (CJK and the like) come after the script's
+        // shipped face and before the general ones.
+        script.into_iter().chain(extra::families_for(ch)).chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Serif"])
     }
 
     /// The family a character's script asks for before any general

@@ -39,7 +39,7 @@ fn world(tag: &str) -> W {
     fs::write(d.join("root.toml"), &text).unwrap();
     let daemon = Daemon {
         root: d.join("root"), state: d.join("state"), root_toml: d.join("root.toml"),
-        check_bin: PathBuf::from(env!("CARGO_BIN_EXE_opifex-check")), sandbox: false, worker_uid: 0,
+        check_bin: PathBuf::from(env!("CARGO_BIN_EXE_opifex-check")), sandbox: false, worker_uid: 0, sheet_uid: Some(65042),
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
     };
@@ -91,7 +91,7 @@ fn catalog_install_update_rollback() {
         other => panic!("{other:?}"),
     }
     assert_eq!(ask(&w, 1001, Request::Search { text: "says hello".into() }), Response::Found { ids: vec![ID.into()] });
-    // A person can't install yet (the sheet is C3).
+    // A person asks through the sheet, not directly.
     assert!(err(ask(&w, 1001, Request::Install { id: ID.into() })).contains("administrator"));
     assert_eq!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { id: ID.into(), version: "1.0".into() });
     let app = w.daemon.root.join("apps").join(ID);
@@ -147,4 +147,34 @@ fn refusals() {
     assert!(err(ask(&w, 0, Request::InstallLocal { path: w.d.join("junk.insula").display().to_string() })).contains("too many"));
     assert_eq!(fs::read(w.daemon.root.join("apps").join(ID).join("bin/hello")).unwrap(), elf(1));
     let _ = Path::new("");
+}
+
+#[test]
+fn the_sheet_installs_what_the_person_saw() {
+    let w = world("sheet");
+    publish(&w, "1.0", &elf(1));
+    sync(&w);
+    let shown = match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+        Response::Described { app } => app.manifest_sha256,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(shown.len(), 64);
+    let approved = |m: &str| Request::InstallApproved { id: ID.into(), manifest_sha256: m.into(), for_uid: 1001 };
+    // Only the sheet's uid (or root) may send it.
+    assert!(err(ask(&w, 1001, approved(&shown))).contains("install sheet"));
+    // A release published after the sheet was shown is not what was approved.
+    publish(&w, "1.1", &elf(2));
+    sync(&w);
+    assert!(err(ask(&w, 65042, approved(&shown))).contains("catalog changed"));
+    assert!(w.daemon.store().get(ID).unwrap().is_none());
+    let now = match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+        Response::Described { app } => app.manifest_sha256,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(ask(&w, 65042, approved(&now)), Response::Done { id: ID.into(), version: "1.1".into() });
+    let rec = w.daemon.store().get(ID).unwrap().unwrap();
+    assert_eq!(rec.installed_by, 1001, "recorded for the person, not the sheet");
+    // The sheet may not remove, roll back, side-load or sync.
+    assert!(err(ask(&w, 65042, Request::Uninstall { id: ID.into() })).contains("administrator"));
+    assert!(err(ask(&w, 65042, Request::Install { id: ID.into() })).contains("administrator"));
 }

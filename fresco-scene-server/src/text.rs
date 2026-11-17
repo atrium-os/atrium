@@ -547,6 +547,15 @@ impl TextEngine {
                 return f;
             }
         }
+        // No face has it: a font package may have been installed since
+        // (opifex.md §8.1); the pin list is read again at most once a second.
+        if atrium_fonts::extra::refresh() {
+            for fam in atrium_fonts::extra::families_for(ch) {
+                if let Some(f) = self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)) {
+                    return f;
+                }
+            }
+        }
         primary
     }
 

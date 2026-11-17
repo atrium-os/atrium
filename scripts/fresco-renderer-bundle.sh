@@ -22,6 +22,9 @@ cp "$BIN" $B/bin/fresco-renderer
 cp -R "$FONTS"/* $B/usr/local/share/fonts/
 # The system font library (docs/spec/fonts.md), where atrium-fonts looks.
 if [ -d /usr/share/fonts/atrium ]; then mkdir -p $B/usr/share/fonts && cp -R /usr/share/fonts/atrium $B/usr/share/fonts/; fi
+# Installed font packages and their pin list (opifex.md §8.1), as of this
+# bundle: a package installed later reaches the renderer with the next bundle.
+if [ -d /usr/share/fonts/atrium-extra ]; then mkdir -p $B/usr/share/fonts && cp -R /usr/share/fonts/atrium-extra $B/usr/share/fonts/; fi
 "$BIN" --seed-kernels $B/usr/local/share/fresco-kernels
 # frescod's own copy (compose; and raster when it takes frames), which its
 # jail mounts read-only (40-atrium-frescod.toml): nothing in it is writable.

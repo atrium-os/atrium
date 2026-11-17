@@ -51,6 +51,11 @@ xb stoa "-p stoa --bin stoad"
 echo "=== install"
 B=/var/tmp/termapps
 V "pkill -x portcullisd; pkill -x frescod; pkill -x stoad; pkill -f atrium-term-socket; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+# The system faces frescod resolves (system-mono is IBM Plex Mono).
+V "mkdir -p /usr/local/share/fonts/ibm-plex"
+for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+    V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
+done
 # A fresh VM has no alice (the open-files gates' user, uid 1011).
 V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
@@ -97,6 +102,9 @@ V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLES
    daemon -f -o $B/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 $B/*.sock /atrium/sockets/fresco/fresco.sock"
+# Tier-2 rendering needs AVX2: on the default Nehalem TCG CPU frescod dies
+# of SIGILL at its first frame (boot with QEMU_BIN=<fork> TCG_CPU=Haswell-noTSX).
+V "grep -q AVX2 /var/run/dmesg.boot" || { bad "the VM's CPU has no AVX2: cloud-vm.sh down, then up with QEMU_BIN=\$HOME/qemu-atrium/build/qemu-system-x86_64 TCG_CPU=Haswell-noTSX"; echo "terminal-apps: $fails failed"; exit 1; }
 V "test -S $B/activation.sock" && ok "frescod is up" || { bad "frescod: $(V "tail -3 $B/frescod.log")"; echo "terminal-apps: $fails failed"; exit 1; }
 inj() { V "printf '%s\n' $(printf "'%s' " "$@") | nc -N -U $B/inject.sock" >/dev/null; }
 press() { inj "MOVE $1 $2" "BTN 1 1" "BTN 1 0"; sleep ${GAP:-4}; }

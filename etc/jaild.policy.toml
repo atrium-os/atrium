@@ -435,6 +435,10 @@ allowed_system_uids = [
              # system worker rule (navigator-ui-bundle.sh, navigator-ui.md §2.3a)
     65038,   # _monstrator: the link opener, monstratord (opening-links.md §6;
              # monstrator-service.sh creates it)
+    # 65041 = _opifex          (opifexd's archive worker, opifex-check: chroot +
+    #                           setuid by opifexd itself, no jail; opifex.md §7.2)
+    65042,   # _opifexsheet: the install sheet, opifex-sheetd (opifex.md §7.1;
+             # opifex-sheet-service.sh creates it)
 ]
 
 [gid]
@@ -460,6 +464,7 @@ allowed_system_gids = [
     65035,   # _navpage
     65037,   # _navui
     65038,   # _monstrator
+    65042,   # _opifexsheet
 ]
 
 

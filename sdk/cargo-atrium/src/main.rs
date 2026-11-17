@@ -20,6 +20,13 @@ Commands:
       Build for Atrium on that arch from Linux, macOS or the other arch:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
       ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
+  registry verify <folder or https URL> [--keys <dir or .pem>]
+      Check the SDK registry's index against the platform keys
+      (default /etc/atrium/platform-keys): index.sig over index.files,
+      and every listed file. Exit status 1 on any mismatch.
+  registry build --out <dir> --url <https://host/sdk> [--sign <key.pem>] <seed>...
+      For the SDK's maintainers: pack every path crate the seed projects
+      reach into a static sparse registry and sign its index.
 
 Run it in the project folder (the one with Cargo.toml and atrium.toml).";
 
@@ -33,6 +40,7 @@ fn main() -> ExitCode {
         Some("check") => cmd_check(&args[1..]),
         Some("new") => cmd_new(&args[1..]),
         Some("cross") => cmd_cross(&args[1..]),
+        Some("registry") => cmd_registry(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -252,5 +260,123 @@ fn cmd_cross(args: &[String]) -> ExitCode {
         Ok(s) if s.success() => ExitCode::SUCCESS,
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(1, 255) as u8),
         Err(e) => fail(format!("{cargo}: {e}")),
+    }
+}
+
+/// The platform keys: one PEM file, or every `.pem` in a folder.
+fn read_keys(dir: &Path) -> Result<Vec<String>, String> {
+    if dir.is_file() {
+        return std::fs::read_to_string(dir).map(|k| vec![k]).map_err(|e| format!("{}: {e}", dir.display()));
+    }
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
+        if e.path().extension().map(|x| x == "pem").unwrap_or(false) {
+            v.push(std::fs::read_to_string(e.path()).map_err(|e| e.to_string())?);
+        }
+    }
+    if v.is_empty() {
+        return Err(format!("{}: no .pem keys", dir.display()));
+    }
+    Ok(v)
+}
+
+fn cmd_registry(args: &[String]) -> ExitCode {
+    use cargo_atrium::registry;
+    let fail = |m: String| {
+        eprintln!("cargo atrium registry: {m}");
+        ExitCode::FAILURE
+    };
+    let (mut out, mut url, mut key, mut keys, mut pos) = (None, None, None, PathBuf::from("/etc/atrium/platform-keys"), Vec::new());
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().map(PathBuf::from),
+            "--url" => url = it.next().cloned(),
+            "--sign" => key = it.next().map(PathBuf::from),
+            "--keys" => keys = it.next().map(PathBuf::from).unwrap_or(keys),
+            o if o.starts_with("--") => return fail(format!("unknown flag {o}")),
+            o => pos.push(o.to_string()),
+        }
+    }
+    match args.first().map(String::as_str) {
+        Some("verify") => {
+            let [src] = &pos[..] else { return fail("verify <folder or URL>".into()) };
+            let keys = match read_keys(&keys) {
+                Ok(k) => k,
+                Err(e) => return fail(e),
+            };
+            let base = src.trim_end_matches('/').to_string();
+            let remote = base.starts_with("https://");
+            let fetch = |p: &str| -> Result<Vec<u8>, String> {
+                if remote {
+                    let u = format!("{base}/index/{p}");
+                    let o = Command::new("curl").args(["-fsS", "--proto", "=https", &u]).output().map_err(|e| format!("curl: {e}"))?;
+                    if o.status.success() { Ok(o.stdout) } else { Err(format!("{u}: {}", String::from_utf8_lossy(&o.stderr).trim())) }
+                } else {
+                    std::fs::read(Path::new(&base).join("index").join(p)).map_err(|e| format!("{p}: {e}"))
+                }
+            };
+            match registry::verify(&fetch, &keys) {
+                Ok(n) => {
+                    println!("cargo atrium registry: {base}: index signed by a platform key, {n} files match");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Some("build") => {
+            let (Some(out), Some(url)) = (out, url) else { return fail("build needs --out and --url".into()) };
+            if pos.is_empty() {
+                return fail("build needs at least one seed project".into());
+            }
+            let key_pem = match key.map(std::fs::read_to_string).transpose() {
+                Ok(k) => k,
+                Err(e) => return fail(format!("--sign: {e}")),
+            };
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let mut metas = Vec::new();
+            for seed in &pos {
+                match Command::new(&cargo).args(["metadata", "--format-version", "1"]).current_dir(seed).output() {
+                    Ok(o) if o.status.success() => match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                        Ok(v) => metas.push(v),
+                        Err(e) => return fail(format!("{seed}: {e}")),
+                    },
+                    Ok(o) => return fail(format!("{seed}: cargo metadata: {}", String::from_utf8_lossy(&o.stderr))),
+                    Err(e) => return fail(format!("{cargo}: {e}")),
+                }
+            }
+            let mut pkgs: Vec<registry::Pkg> = Vec::new();
+            for m in &metas {
+                let roots: Vec<String> = m["workspace_members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| m["packages"].as_array()?.iter().find(|p| p["id"] == *id)?["name"].as_str().map(str::to_string))
+                    .collect();
+                match registry::sdk_packages(m, &roots) {
+                    Ok(ps) => {
+                        for p in ps {
+                            if !pkgs.iter().any(|q| q.name == p.name) {
+                                pkgs.push(p);
+                            }
+                        }
+                    }
+                    Err(e) => return fail(e),
+                }
+            }
+            pkgs.sort_by(|a, b| a.name.cmp(&b.name));
+            let o = registry::BuildOpts { out: &out, url: &url, sign_key_pem: key_pem.as_deref() };
+            match registry::build(&pkgs, &o) {
+                Ok(made) => {
+                    for (n, v, b) in &made {
+                        println!("  {n} {v} ({b} bytes)");
+                    }
+                    println!("cargo atrium registry: {} crates in {}{}", made.len(), out.display(), if key_pem.is_some() { ", index signed" } else { ", index NOT signed" });
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            }
+        }
+        _ => fail("build or verify".into()),
     }
 }

@@ -68,7 +68,7 @@ Related: [atrium-bundle-format.md](atrium-bundle-format.md) (the bundle),
   trusts nothing it gets. `opifex-check`, a worker with no capabilities, parses the catalog
   and unpacks archives. `opifexd`, the only privileged part, never parses an archive or
   touches the network; it checks the signature and re-hashes every file as it copies the
-  checked tree into place. `opifex-sheet` draws the install sheet as a Limen system role.
+  checked tree into place. `opifex-sheet` draws the install sheet (its own window for now; a Limen system role for windowed callers later, §14.4).
 - **Install is one sheet, drawn by the system.** Any app, the Navigator, Monstrator,
   Artifex, a Praeco driver notice or Curia can ask for it; none of them draws it. It shows
   the publisher, what the package may do, its size and licence, and on an update only what
@@ -650,6 +650,36 @@ font on demand and a driver from a `nobody` device's notice.
 - Checked: host tests (archive round trip and refusals; daemon: sync, describe, search,
   person refused, catalog install, update, rollback, uninstall, missing and wrong archive,
   untrusted and trusted side-load, garbage archive). VM gate `scripts/vm-opifex-c2-check.sh`.
+
+### 14.4 C3 as built (2026-11-17)
+
+- `opifex-sheet/` (own crate, like Monstrator): `opifex-sheetd`, jailed as `_opifexsheet`
+  (65042, `etc/services.d/39-atrium-opifex-sheetd.toml`, `scripts/opifex-sheet-service.sh`),
+  no network, no files. Callers connect to `/atrium/sockets/opifex-sheet/opifex-sheet.sock`
+  and send one line, `Install { id }`; they hear `Installed`, `Declined` or `Failed` and
+  nothing else (`opifex_sheet::install(id)` is the client).
+- The sheet is opifex-sheetd's own dialog window on frescod (as Monstrator's), not yet a
+  Limen slot in the caller's window: Monstrator, the first caller, has no window to put a
+  slot in. It shows the name, description, id, version, catalog and signing key, what it
+  may use in plain words with the ones that reach beyond its window marked, the download
+  size, and *Install* (or *Update*) · *Not now*. *Not now* has the focus. *Install* counts
+  only when frescod counts the press (`PROMPT`, the two rows the window's guard, a click or
+  Enter). One sheet at a time; an asker who got *Not now* is answered `Declined` without a
+  sheet for 30 seconds; an app already at the newest version is answered `Installed` with
+  no sheet; anything not of kind `app` is refused.
+- opifexd's `InstallApproved { id, manifest_sha256, for_uid }` is taken from the sheet's uid
+  (`OPIFEX_SHEET_UID`, default 65042) and root only. It installs only the release whose
+  manifest the sheet showed (`Describe` now carries `manifest_sha256`); a release synced
+  after the sheet opened is refused. The record names the asker's uid as `installed_by`.
+  The sheet can't remove, roll back, side-load or sync.
+- Not yet: the Limen `install` role for windowed callers (Curia, Scrinium); side-loading
+  through the sheet (Scrinium's double-clicked `.insula`, which needs the file handed over
+  as a descriptor, not a path); "only what changed" on an update (needs the installed
+  manifest's capabilities); recording the person's `ApproveAccess` with portcullisd; the
+  callers themselves (Monstrator L5, the Navigator prompt), which their threads add.
+- Checked: host tests (sheet state and keys, layout, plain words, opifex-sheetd against a
+  stand-in opifexd, opifexd refusing a person, a forged sender and a changed release).
+  VM gate `scripts/vm-opifex-c3-check.sh` (frescod headless with real presses).
 
 ## 15. Decisions, with recommendations
 

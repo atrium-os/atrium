@@ -1,8 +1,9 @@
 //! opifexd's wire: one JSON request per line, one JSON answer per line, on
 //! `/atrium/sockets/opifex/opifex.sock`. Who may ask what is decided by the
 //! caller's uid (opifex.md §6.6, §7.1): anyone may ask the read-only
-//! questions; installs, removals, rollbacks and syncs are root's until the
-//! install sheet (C3) carries a person's approval.
+//! questions; installs, removals, rollbacks and syncs are root's, except
+//! that the install sheet's uid may install a catalog app a person approved
+//! on it (`InstallApproved`, C3).
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +24,11 @@ pub enum Request {
     Install { id: String },
     /// Install a local bundle folder or `.insula` file (side-load).
     InstallLocal { path: String },
+    /// From the install sheet only (`opifex-sheet`, its own uid): install
+    /// `id` for the person `for_uid`, who approved the release whose
+    /// manifest hashes to `manifest_sha256` (what the sheet showed). A newer
+    /// release synced meanwhile is refused, not installed (C3).
+    InstallApproved { id: String, manifest_sha256: String, for_uid: u32 },
     Uninstall { id: String },
     Rollback { id: String },
     /// Check a catalog folder into the local copy (the network is C4).
@@ -41,6 +47,9 @@ pub struct Described {
     pub capabilities: Vec<String>,
     pub archive_size: u64,
     pub installed: Option<String>,
+    /// sha256 of the release's `atrium.toml`: what the sheet approves.
+    #[serde(default)]
+    pub manifest_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

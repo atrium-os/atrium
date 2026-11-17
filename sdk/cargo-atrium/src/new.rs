@@ -9,9 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// Where the SDK registry's index is (dev-tools.md §5.4; the host is the
-/// package catalog's to settle).
-pub const REGISTRY: &str = "sparse+https://registry.atrium.dev/index/";
+/// Where the SDK registry's index is (opifex.md §8.4: the catalog's Pages
+/// site under /sdk/; a domain later redirects from here).
+pub const REGISTRY: &str = "sparse+https://atrium-os.github.io/catalog/sdk/index/";
 /// The SDK version templates ask for.
 pub const SDK_VERSION: &str = "0.1";
 

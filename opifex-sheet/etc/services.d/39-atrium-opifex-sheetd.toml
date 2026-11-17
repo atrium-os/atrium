@@ -1,0 +1,62 @@
+# /etc/atrium/services.d/39-atrium-opifex-sheetd.toml
+#
+# The jailed launch of opifex-sheetd, the install sheet (docs/spec/opifex.md
+# §7.1, build step C3). atrium-portcullisd-bootstrap reads this, asks jaild
+# to create the jail and supervises opifex-sheetd inside it.
+#
+# opifex-sheetd runs NON-ROOT (_opifexsheet) with no devices, no network and
+# none of anyone's files. It reaches four socket directories: its own
+# (/atrium/sockets/opifex-sheet/, where callers such as monstratord ask),
+# opifexd's (which takes InstallApproved from this uid only), and frescod's
+# and its activation socket for its sheet (its presses are its own, PROMPT).
+# It reads no archive and writes no app: opifexd does both.
+#
+# REQUIRES (scripts/opifex-sheet-service.sh does all of it):
+#   1. The _opifexsheet (65042) system user, in jaild.policy's allowed_system_uids.
+#   2. /atrium/sockets/opifex-sheet, owned _opifexsheet, 0755.
+#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets/{opifex-sheet,opifex,fresco,fresco-activation}}.
+
+enabled       = true
+name          = "atrium-opifex-sheetd"
+path          = "/var/lib/atrium/jails/opifex-sheetd"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: no devices
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/opifex-sheet"           # rw: binds opifex-sheet.sock
+dest   = "atrium/sockets/opifex-sheet"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/opifex"                 # rw: connects to opifexd
+dest   = "atrium/sockets/opifex"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/fresco"                 # rw: the sheet's window
+dest   = "atrium/sockets/fresco"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/fresco-activation"      # rw: spends the sheet's presses (PROMPT, its own)
+dest   = "atrium/sockets/fresco-activation"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-opifex-sheetd"
+argv = ["atrium-opifex-sheetd"]
+uid  = 65042   # _opifexsheet
+gid  = 65042

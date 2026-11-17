@@ -11,5 +11,11 @@ versioned together and published to the Atrium crate registry
 | `cargo-atrium` | `cargo atrium cross amd64|aarch64` (clang + ld.lld with the SDK sysroot from `scripts/layers/sdk-sysroot.sh`), `cargo atrium new` (templates in `templates/`, `--list`; `--sdk-path` builds against this tree instead of the registry) and `cargo atrium check`: manifest lint, the consent text, and the crate-graph lint (parsers and network clients linked into the core that holds the grants, with where to move them) |
 | `atrium-schema` | C types, encoder and decoder from a schema file; `tests/c_parity.rs` holds the C decoder to the Rust one byte for byte (ASan, UBSan) |
 
+The registry: `scripts/sdk/build-registry.sh OUT URL` packs the SDK crates
+and every path crate they reach into a static sparse registry (opifex.md
+§8.4) with `index.sig` over `index.files`; `cargo atrium registry verify`
+checks it against the platform keys. `scripts/layers/sdk-sysroot.sh` makes the
+sysroot archives `cargo atrium cross` uses.
+
 `cargo test` here runs everything; the C parity test needs a C compiler with
 ASan (`CC`, default `cc`).
