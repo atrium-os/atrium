@@ -207,7 +207,15 @@ pub struct Document {
     /// and `data:` URLs), by resource id, for the document viewer; never
     /// decoded by the engine or Mail (§7.3).
     pub pictures: Vec<(String, Vec<u8>)>,
+    /// Each link's destination and its visible text (cut to
+    /// [`LINK_TEXT_MAX`] characters), in document order, at most
+    /// [`LINKS_MAX`]: the link bar shows both when they disagree (§7.6).
+    pub links: Vec<(String, String)>,
 }
+
+/// The most links listed with a document, and the visible text kept of each.
+pub const LINKS_MAX: usize = 1024;
+pub const LINK_TEXT_MAX: usize = 200;
 
 /// The most pictures a document carries, each one's largest size, and all of them together.
 pub const PICTURES_MAX: usize = 64;
@@ -342,6 +350,11 @@ impl Opened {
                 total += b.len();
             }
             if total > PICTURES_BYTES_MAX { return Err(Lie("pictures too large")) }
+            if d.links.len() > LINKS_MAX { return Err(Lie("too many links")) }
+            for (href, text) in &d.links {
+                if href.len() > c.url { return Err(Lie("link too long")) }
+                if text.chars().count() > LINK_TEXT_MAX || text.len() > 4 * LINK_TEXT_MAX { return Err(Lie("link text too long")) }
+            }
         }
         if self.unpacked.len() > c.unpacked { return Err(Lie("too many unpacked files")) }
         for u in &self.unpacked {
@@ -420,6 +433,7 @@ mod tests {
                 resources: vec![res("mail-res:0", Source::Cid("a@b".into())), res("mail-res:1", Source::Remote("https://x.example/p.png".into()))],
                 dropped: vec![],
                 pictures: vec![("mail-res:0".into(), vec![1; 10])],
+                links: vec![],
             }),
             unpacked: vec![],
         };

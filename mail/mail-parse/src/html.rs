@@ -77,7 +77,13 @@ pub struct Converted {
     /// What could not be represented or was removed, by reason, with counts
     /// (the normalizer's report plus this module's own removals).
     pub dropped: BTreeMap<String, usize>,
+    /// Each link's destination and visible text, in document order (§7.6).
+    pub links: Vec<(String, String)>,
 }
+
+/// The most links listed, and the visible text kept of each.
+pub const LINKS_MAX: usize = 1024;
+pub const LINK_TEXT_MAX: usize = 200;
 
 impl Converted {
     /// Remote pictures not loaded, for the bar's "12 pictures not loaded".
@@ -145,6 +151,12 @@ pub fn convert(html: &str, loaded: &BTreeMap<String, (u32, u32)>, fonts: &FontSe
     }
     // A remote reference used again visibly elsewhere stays loadable only if
     // some visible use remains; ids are per reference, so nothing to merge.
+    for a in doc_dom.by_tag_anywhere("a").into_iter().take(LINKS_MAX) {
+        let Some(href) = doc_dom.attr(a, "href").map(str::to_string) else { continue };
+        if href.len() > 8192 { continue }
+        let text: String = doc_dom.text_content(a).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(LINK_TEXT_MAX).collect();
+        out.links.push((href, text));
+    }
     out.document = doc_dom.serialize();
     // A picture the normalizer left out altogether (inside `display: none`,
     // in a dropped element) is not shown, so it is never fetched either. Not

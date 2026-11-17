@@ -130,6 +130,14 @@ impl Shown {
     }
 }
 
+/// The link bar's state: where the link goes, and what became of *Open*.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkBar {
+    pub bar: Result<crate::links::Bar, String>,
+    /// "Opening…", or why it wasn't opened.
+    pub note: Option<String>,
+}
+
 /// The window's state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ui {
@@ -142,6 +150,8 @@ pub struct Ui {
     /// The selected row.
     pub cursor: Option<usize>,
     pub reading: Option<Shown>,
+    /// The link bar (§7.6), after a press on a link in a message.
+    pub link: Option<LinkBar>,
     /// Bumped whenever the index may have changed, to drop cached rows.
     pub gen: u64,
     pub error: Option<String>,
@@ -173,6 +183,10 @@ pub struct Mail {
     /// Messages whose remote pictures the person asked for, for the app
     /// to fetch through Nuntius (§7.4); Mail itself has no network.
     loads: Rc<RefCell<Vec<MsgId>>>,
+    /// Monstrator's answer to *Open*, from the thread that asked.
+    opened: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    /// Where Monstrator listens.
+    monstrator: Rc<std::path::PathBuf>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -400,6 +414,7 @@ impl Mail {
         let mut ui = self.ui.get_cloned();
         let version = ui.reading.as_ref().map_or(0, |r| r.version) + 1;
         ui.cursor = Some(i);
+        ui.link = None;
         ui.reading = Some(Shown {
             subject: if subject.trim().is_empty() { "(no subject)".into() } else { subject },
             people: if n > 1 { format!("{} · {n} messages", people.join(", ")) } else { String::new() },
@@ -531,19 +546,98 @@ impl Mail {
     }
 
     /// A link pressed in a message (plain text, or the doc-viewer's
-    /// `LinkActivated`): shown in the link bar, never opened from here.
+    /// `LinkActivated`): shown in the link bar, never opened from here
+    /// (§7.6). An HTML link's visible text comes from the document the
+    /// jail converted, so the bar can say when it names another site.
     pub fn link(&self, url: &str) {
-        eprintln!("atrium-mail: link {url}");
+        let text = self.framed().and_then(|(_, d, _)| d.0.links.iter().find(|(h, _)| h == url).map(|(_, t)| t.clone()));
+        let bar = crate::links::bar(url, text.as_deref());
+        let mut ui = self.ui.get_cloned();
+        ui.link = Some(LinkBar { bar, note: None });
+        self.ui.set(ui);
     }
 
-    /// j/k and the arrows move through the list and open as they go.
-    /// Whether the key was Mail's.
-    pub fn key(&self, ev: &Event) -> bool {
+    /// *Open* (or Enter) on the bar: Mail's press, handed to Monstrator
+    /// with its activation token at once, from a thread (Monstrator may
+    /// show its sheet and wait for the person).
+    pub fn open_link(&self, activation: Option<[u8; 16]>) {
+        let mut ui = self.ui.get_cloned();
+        let Some(l) = ui.link.as_mut() else { return };
+        let Ok(b) = &l.bar else { return };
+        let Some(token) = activation else {
+            l.note = Some("Press Open to open this link.".into());
+            self.ui.set(ui);
+            return;
+        };
+        let (url, sock, out) = (b.open.clone(), self.monstrator.clone().as_ref().clone(), self.opened.clone());
+        *out.lock().unwrap() = None;
+        std::thread::spawn(move || {
+            let r = match monstrator::open_link(&sock, &url, token, std::time::Duration::from_secs(120)) {
+                Ok(r) => r,
+                Err(e) => Err(format!("the link opener isn't reachable ({e})")),
+            };
+            *out.lock().unwrap() = Some(r);
+        });
+        l.note = Some("Opening…".into());
+        self.ui.set(ui);
+    }
+
+    /// Monstrator answered *Open*: the bar closes, or says why not.
+    pub fn poll_link(&self) {
+        let Some(r) = self.opened.lock().unwrap().take() else { return };
+        let mut ui = self.ui.get_cloned();
+        match r {
+            Ok(()) => ui.link = None,
+            Err(why) => {
+                if let Some(l) = ui.link.as_mut() {
+                    l.note = Some(format!("Not opened: {why}"));
+                }
+            }
+        }
+        self.ui.set(ui);
+    }
+
+    /// *Copy*: the link that would open (peeled, without trackers).
+    pub fn copy_link(&self) {
+        let mut ui = self.ui.get_cloned();
+        let Some(l) = ui.link.as_mut() else { return };
+        let Ok(b) = &l.bar else { return };
+        l.note = Some(match pergola::clipboard::copy_text(&b.open, false) {
+            Ok(()) => "Copied".into(),
+            Err(e) => format!("Couldn't copy: {e:?}"),
+        });
+        self.ui.set(ui);
+    }
+
+    pub fn close_link(&self) {
+        let mut ui = self.ui.get_cloned();
+        if ui.link.take().is_some() {
+            self.ui.set(ui);
+        }
+    }
+
+    /// j/k and the arrows move through the list and open as they go;
+    /// with the link bar up, Enter opens its link (the key's `activation`
+    /// is the press) and Escape closes it. Whether the key was Mail's.
+    pub fn key(&self, ev: &Event, activation: Option<[u8; 16]>) -> bool {
         let Event::Key { kind, key, chars, modifiers } = ev else { return false };
         if *kind == KeyEventKind::Up || modifiers.ctrl || modifiers.alt || modifiers.meta {
             return false;
         }
         let ui = self.ui.get_cloned();
+        if ui.link.is_some() {
+            match key {
+                Key::Enter => {
+                    self.open_link(activation);
+                    return true;
+                }
+                Key::Escape => {
+                    self.close_link();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if ui.count == 0 {
             return false;
         }
@@ -708,6 +802,8 @@ impl MailView {
             now: Rc::new(now),
             dark: Rc::default(),
             loads: Rc::default(),
+            opened: Default::default(),
+            monstrator: Rc::new(monstrator::socket()),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -892,6 +988,15 @@ impl MailView {
 
     fn reader(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
         let t = ctx.theme;
+        // The link bar takes the reader's foot (§7.6, §15.2).
+        let h = match &ui.link {
+            Some(l) => {
+                let bh = link_bar_h(l);
+                self.link_bar(ctx, l, x0, h - bh, w, bh);
+                h - bh
+            }
+            None => h,
+        };
         let Some(s) = &ui.reading else {
             if ui.count > 0 {
                 let msg = "Choose a message to read";
@@ -944,6 +1049,78 @@ impl MailView {
         .key(200)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+    }
+}
+
+fn link_bar_h(l: &LinkBar) -> f32 {
+    let second = l.note.is_some() || l.bar.as_ref().map_or(true, |b| b.says.is_some() || b.via.is_some());
+    if second { em(60.0) } else { em(40.0) }
+}
+
+impl MailView {
+    fn link_bar(&self, ctx: &mut Ctx, l: &LinkBar, x0: f32, y0: f32, w: f32, h: f32) {
+        let t = ctx.theme;
+        rect(ctx, Rect::new(x0 + 1.0, y0, w - 1.0, h), t.bg_window());
+        rect(ctx, Rect::new(x0 + 1.0, y0, w - 1.0, 1.0), t.border_default());
+        let x = x0 + 16.0;
+        let cy = y0 + em(20.0);
+        // The buttons at the right: Open, Copy, close.
+        let mut bx = x0 + w - 12.0;
+        let mut button = |ctx: &mut Ctx, label: &str, primary: bool, on: Box<dyn Fn()>| -> f32 {
+            let lw = width(label, type_size::XS, Weight::Medium) + em(18.0);
+            bx -= lw;
+            let id = ctx.push(Node::Rect { rect: Rect::new(bx, cy - em(12.0), lw, em(24.0)), fill: if primary { t.accent_fg() } else { t.bg_canvas() }, radius: 5.0 });
+            ctx.on_click(id, on);
+            text(ctx, bx + em(9.0), cy, label, type_size::XS, Weight::Medium, if primary { t.bg_canvas() } else { t.text_primary() });
+            ctx.pop();
+            bx -= em(6.0);
+            bx
+        };
+        let m = self.mail.clone();
+        button(ctx, "✕", false, Box::new(move || m.close_link()));
+        let ok = l.bar.is_ok();
+        if ok {
+            let m = self.mail.clone();
+            button(ctx, "Copy", false, Box::new(move || m.copy_link()));
+            let m = self.mail.clone();
+            button(ctx, "Open", true, Box::new(move || m.open_link(pergola::clipboard::current_activation())));
+        }
+        let room = bx - x - em(8.0);
+        match &l.bar {
+            Ok(b) => {
+                // "Opens https://dash.acme.example/q4": the domain bold, the rest light.
+                let mut tx = x;
+                for (s, wt, c) in [
+                    ("Opens ".to_string(), Weight::Regular, t.text_secondary()),
+                    (b.lead.clone(), Weight::Regular, t.text_secondary()),
+                    (b.sub.clone(), Weight::Regular, t.text_secondary()),
+                    (b.domain.clone(), Weight::Semibold, t.text_primary()),
+                    (b.rest.clone(), Weight::Regular, t.text_tertiary()),
+                ] {
+                    if s.is_empty() || tx >= x + room {
+                        continue;
+                    }
+                    let s = fit(&s, type_size::SM, wt, x + room - tx);
+                    text(ctx, tx, cy, &s, type_size::SM, wt, c);
+                    tx += width(&s, type_size::SM, wt);
+                }
+                let second = match (&l.note, &b.says, b.via) {
+                    (Some(n), _, _) => Some((n.clone(), t.text_secondary())),
+                    (None, Some(says), _) => Some((format!("The link's text says {says}, but it goes to {}", b.domain), t.warning_fg())),
+                    (None, None, Some("Mimecast")) => Some(("Through Mimecast, which keeps the destination on its servers".into(), t.text_secondary())),
+                    (None, None, Some(v)) => Some((format!("Unwrapped from {v}"), t.text_secondary())),
+                    _ => None,
+                };
+                if let Some((s, c)) = second {
+                    text(ctx, x, y0 + em(42.0), &fit(&s, type_size::XS, Weight::Regular, w - 32.0), type_size::XS, Weight::Regular, c);
+                }
+            }
+            Err(why) => {
+                text(ctx, x, cy, &fit("This link can't be opened from Mail", type_size::SM, Weight::Semibold, room), type_size::SM, Weight::Semibold, t.danger_fg());
+                text(ctx, x, y0 + em(42.0), &fit(why, type_size::XS, Weight::Regular, w - 32.0), type_size::XS, Weight::Regular, t.text_secondary());
+            }
+        }
+        let _ = h;
     }
 }
 

@@ -95,6 +95,9 @@ fn tracking_pixels_are_marked_and_removed() {
         assert!(r.hidden && !r.loadable(), "{u} must be hidden: {r:?}\n{}", c.document);
         assert!(!c.document.contains(&format!("\"{}\"", r.id)), "{u} still in the document");
     }
+    // The links, with their visible text, for the link bar; never a javascript: one.
+    assert!(c.links.iter().any(|(h, t)| h == "https://shop.example/sale?u=42" && t == "see the sale"), "{:?}", c.links);
+    assert!(!c.links.iter().any(|(h, _)| h.starts_with("javascript")), "{:?}", c.links);
     // product, footer, hero and the td background: what the bar counts.
     assert_eq!(c.remote_pictures(), 4, "{:#?}", c.resources);
 }

@@ -234,6 +234,7 @@ fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, lo
                 used_as: match r.used_as { html::Use::Image => wire::Use::Image, html::Use::Background => wire::Use::Background, html::Use::Other => wire::Use::Other },
                 hidden: r.hidden,
             }).collect(),
+            links: c.links,
             dropped: c.dropped.into_iter().take(256).map(|(k, v)| (k.chars().take(1024).collect(), v.min(u32::MAX as usize) as u32)).collect(),
         }
     });

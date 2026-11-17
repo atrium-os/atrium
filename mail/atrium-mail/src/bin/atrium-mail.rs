@@ -162,7 +162,14 @@ fn main() {
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
         // the cursor doesn't also scroll the list.
-        let first = |ev: &fresco_client::Event| pergola::input::translate(ev).is_some_and(|e| mail.key(&e));
+        let first = |ev: &fresco_client::Event| {
+            // A key's activation token is its press (Enter on the link bar).
+            let activation = match ev {
+                fresco_client::Event::Key { pressed: true, activation, .. } if *activation != [0u8; 16] => Some(*activation),
+                _ => None,
+            };
+            pergola::input::translate(ev).is_some_and(|e| mail.key(&e, activation))
+        };
         match win.step_with(&mut app, Some(Duration::from_millis(250)), first) {
             Ok(StepResult::Closed) => break,
             Ok(_) => {}
@@ -172,6 +179,7 @@ fn main() {
             }
         }
         mail.set_size(win.width, win.height);
+        mail.poll_link();
         // Pictures asked for go to the fetch thread; what came back is kept
         // and, when its message is in the viewer, handed to it.
         for msg in mail.take_loads() {

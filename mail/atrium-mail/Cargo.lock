@@ -43,6 +43,7 @@ dependencies = [
 name = "atrium-mail"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
  "fresco-client",
  "libc",
  "limen",
@@ -50,9 +51,12 @@ dependencies = [
  "mail-schema",
  "mail-store",
  "mail-sync",
+ "monstrator",
  "nuntius",
  "pergola",
+ "psl",
  "tempfile",
+ "url",
 ]
 
 [[package]]
@@ -734,6 +738,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "monstrator"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "atrium-links",
+ "fresco-client",
+ "fresco-protocol",
+ "libc",
+ "pergola",
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nuntius"
 version = "0.1.0"
 dependencies = [
@@ -883,6 +903,21 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "psl"
+version = "2.1.256"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39aa082f2912d769ed2960bb49d543d0d64402f9dd8a756745966cbea1684360"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "quote"

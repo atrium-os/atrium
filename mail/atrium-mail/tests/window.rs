@@ -114,21 +114,21 @@ fn list_and_read() {
 
     // k goes up to Lena's; j back down; k twice more reaches the HTML-only
     // one, which says so, then the one with only its headers.
-    assert!(mail.key(&key("k")));
+    assert!(mail.key(&key("k"), None));
     app.tick();
     assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Lunch on Friday?");
     assert!(texts(&app).iter().any(|x| x == "Shall we try the new place?"));
-    assert!(mail.key(&key("k")));
+    assert!(mail.key(&key("k"), None));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "This week");
     assert_eq!(r.framed, Some(0), "an HTML-only message goes to the doc-viewer");
-    assert!(mail.key(&key("k")));
+    assert!(mail.key(&key("k"), None));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "Headers only so far");
     assert!(note(&r).contains("headers"));
-    assert!(mail.key(&key("k")), "at the top k stays");
+    assert!(mail.key(&key("k"), None), "at the top k stays");
     assert_eq!(mail.ui.get_cloned().cursor, Some(0));
-    assert!(!mail.key(&key("x")), "other keys are not Mail's");
+    assert!(!mail.key(&key("x"), None), "other keys are not Mail's");
 
     // Sent is empty and says so.
     let sent = mail.ui.get_cloned().places[1].folder;
@@ -283,4 +283,77 @@ fn an_html_body_is_framed_for_the_doc_viewer() {
     app.tick();
     let t = texts(&app);
     assert!(!t.iter().any(|x| x.contains("not loaded") || x.contains("Loading")), "{t:?}");
+}
+
+#[test]
+fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
+    use std::io::{BufRead, BufReader, Write};
+    // A Monstrator that answers Opened and keeps what it was asked.
+    let sockdir = tempfile::tempdir().unwrap();
+    let sock = sockdir.path().join("monstrator.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { break };
+            let mut line = String::new();
+            BufReader::new(s.try_clone().unwrap()).read_line(&mut line).unwrap();
+            seen.lock().unwrap().push(line);
+            s.write_all(b"\"Opened\"\n").unwrap();
+        }
+    });
+    std::env::set_var("MONSTRATOR_SOCKET", &sock);
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let wrapped = "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Flogin.evil.example%2Fx%3Futm_source%3Dmail&data=05";
+    let body = format!("<p>Your account: <a href=\"{wrapped}\">https://www.bank.com/login</a></p>");
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let bytes = message(1, "Bank <alerts@bank.example>", "Verify now", &body, true, NOW - 60);
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW - 60), server_id: None, bytes, full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    mail.open(0);
+    // The doc-viewer reports the press as LinkActivated with the href.
+    let doc = mail.framed().unwrap().1;
+    let (href, text) = doc.0.links.first().cloned().unwrap();
+    assert_eq!(text, "https://www.bank.com/login");
+    mail.link(&href);
+    app.tick();
+    let l = mail.ui.get_cloned().link.unwrap();
+    let b = l.bar.clone().unwrap();
+    assert_eq!(b.open, "https://login.evil.example/x", "peeled, without the tracker");
+    assert_eq!((b.sub.as_str(), b.domain.as_str()), ("login.", "evil.example"));
+    assert_eq!(b.says.as_deref(), Some("https://www.bank.com/login"));
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "evil.example") && t.iter().any(|x| x == "Open") && t.iter().any(|x| x == "Copy"), "{t:?}");
+    assert!(t.iter().any(|x| x.starts_with("The link's text says https://www.bank.com/login")), "{t:?}");
+
+    // Enter with no press token doesn't open; with one, Monstrator is asked.
+    let enter = |a| mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Enter, modifiers: Modifiers::default(), chars: String::new() }, a);
+    assert!(enter(None));
+    assert!(asked.lock().unwrap().is_empty());
+    assert!(enter(Some([7; 16])));
+    let t0 = std::time::Instant::now();
+    while mail.ui.get_cloned().link.is_some() && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mail.poll_link();
+    }
+    assert!(mail.ui.get_cloned().link.is_none(), "opened: the bar closes");
+    let line = asked.lock().unwrap().pop().unwrap();
+    assert!(line.contains("https://login.evil.example/x") && !line.contains("safelinks") && line.contains("[7,7,7"), "{line}");
+
+    // A plain-text link, then Escape.
+    mail.link("https://acme.example/report?utm_campaign=q4");
+    assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://acme.example/report");
+    assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
+    assert!(mail.ui.get_cloned().link.is_none());
 }
