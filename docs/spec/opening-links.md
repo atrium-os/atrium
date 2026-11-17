@@ -214,7 +214,11 @@ new trail.
    own and shows it. `navigator-live-vm.sh` hands navigatord a link through a stand-in
    for portcullisd's end (atrium-open's `link-serve`) before any UI is up, and the UI that
    comes up shows it in a new trail; `navigator-confined-vm.sh` checks the jailed
-   navigatord takes up its channel.
+   navigatord takes up its channel, and (2026-11-17) the whole way: `link-probe`, a jailed
+   app with a window and `open-uri`, sends an https link with an Enter in its window, and
+   the jailed Navigator shows it in a trail of its own. Not yet: the Navigator's window
+   doesn't come forward when a link arrives (the asking app's window stays on top); that
+   needs a way for an app to ask forum-wm to raise it on a link it was handed.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
 
 ## 9. Decisions, with recommendations

@@ -142,7 +142,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb navigator-prerender "--bin prerender"
     xb navigator-fetch "--bin navigator-fetchd"
     xb navigatord "--bin navigatord"
-    xb monstrator "--bin monstratord --example monctl"
+    xb monstrator "--bin monstratord --example monctl --example link-probe"
     xb atrium-open "--example open-probe"
 fi
 
@@ -176,6 +176,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" \
          "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem" \
          "$ROOT/monstrator/target/$R/monstratord" "$ROOT/monstrator/target/$R/examples/monctl" \
+         "$ROOT/monstrator/target/$R/examples/link-probe" \
          "$ROOT/atrium-open/target/$R/examples/open-probe" "$ROOT/scripts/monstrator-service.sh" \
          "$ROOT/monstrator/etc/services.d/38-atrium-monstratord.toml" \
          "$ROOT/portcullis/target/$R/atrium-portcullisd-bootstrap"; do
@@ -243,7 +244,13 @@ g "set -e
     rm -f /var/db/atrium/navtest/links.toml
     # Only these two take mailto: here (vm-apps-access-check.sh's own may linger).
     for a in org.test.new org.test.sys; do opifex uninstall \$a >/dev/null 2>&1 || true; done
-    chmod +x $D/monstratord $D/monctl
+    chmod +x $D/monstratord $D/monctl $D/link-probe
+    # An app with a window that opens a web link with a press in it.
+    rm -rf /root/linkprobe-bundle && mkdir -p /root/linkprobe-bundle/bin && cp $D/link-probe /root/linkprobe-bundle/bin/
+    printf '[app]\nid = \"org.test.linkprobe\"\nname = \"Link probe\"\nversion = \"1\"\nentry = \"bin/link-probe\"\n\n[capabilities]\ngraphics = \"fresco\"\nopen-uri = true\n' > /root/linkprobe-bundle/atrium.toml
+    openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/linkprobe-bundle/atrium.toml.sig /root/linkprobe-bundle/atrium.toml
+    opifex install /root/linkprobe-bundle
+    portcullis policy grant --system org.test.linkprobe
     sh $D/monstrator-service.sh $D/monstratord $D/38-atrium-monstratord.toml" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
 for a in org.test.mail:open-probe org.test.mail2:open-probe org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
@@ -450,6 +457,27 @@ N=$(jails)
 sleep 3
 # From the host, through the jail's root (the jail has no test(1)).
 g "test -s \$(jls -j $NJID path)/var/db/navigatord/trails.json" && ok "navigatord keeps the trails in its jail" || bad "no trails.json in the Navigator's jail"
+
+echo "=== a web link from another app (opening-links.md §5)"
+# link-probe, an app of navtest's with a window and open-uri: Enter in its
+# window sends the fixture's Impluvium page to Monstrator with that press;
+# https is the Navigator's (the system's default), so portcullisd hands it
+# to the running Navigator on its document channel, and the UI opens it in
+# a trail of its own.
+T0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
+g "cd $S && daemon -f -o $S/linkprobe.log -u navtest /usr/local/bin/portcullis launch --no-prompt org.test.linkprobe </dev/null"
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'link-probe: up' $S/linkprobe.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: up' $S/linkprobe.log" && ok "link-probe is up in a jail of its own" || bad "link-probe: $(g "tail -3 $S/linkprobe.log")"
+sleep 10
+key 0x28
+i=0; while [ $i -lt 90 ] && ! g "grep -q -e 'link-probe: opened' -e 'link-probe: not opened' $S/linkprobe.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: opened' $S/linkprobe.log" && ok "Monstrator took its link with the press, and portcullisd handed it on" || bad "link-probe: $(g "tail -2 $S/linkprobe.log; tail -2 $ML; grep -h link $PL | tail -2" | tr '\n' ';')"
+g "grep -q 'a https link from org.test.linkprobe opened in org.atrium.navigator for navtest' $PL" && ok "…to the Navigator, the default for https" || bad "portcullisd: $(g "grep -h link $PL | tail -3" | tr '\n' ';')"
+until_trace "trails=$((${T0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown" && ok "the Navigator opened it in a trail of its own" || bad "incoming: $(last); $(g "grep -h 'other app' $UL | tail -2")"
+# link-probe's window is over the Navigator's; the shot is taken without it.
+g "pkill -x link-probe; true"
+sleep 5
+shot confined-5-incoming
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"
