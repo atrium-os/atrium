@@ -19,8 +19,8 @@ pub enum Request {
     Describe { id: String },
     /// Ids whose id, name or description contains `text`.
     Search { text: String },
-    /// Install the newest release of `id` from the local catalog; its archive
-    /// must be in the download folder (fetching it is C4).
+    /// Install the newest release of `id` from the local catalog, downloading
+    /// its archive through the fetcher unless it is in the download folder.
     Install { id: String },
     /// Install a local bundle folder or `.insula` file (side-load).
     InstallLocal { path: String },
@@ -31,7 +31,9 @@ pub enum Request {
     InstallApproved { id: String, manifest_sha256: String, for_uid: u32 },
     Uninstall { id: String },
     Rollback { id: String },
-    /// Check a catalog folder into the local copy (the network is C4).
+    /// Check the catalog into the local copy: from the network (`from` empty:
+    /// where the catalog says it lives; or an `https://` base) through the
+    /// fetcher, or from a folder.
     Sync { from: String },
 }
 

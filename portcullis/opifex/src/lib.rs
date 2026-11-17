@@ -5,6 +5,7 @@ pub mod app;
 pub mod archive;
 pub mod content;
 pub mod daemon;
+pub mod fetch;
 pub mod installed;
 pub mod layer;
 pub mod proto;

@@ -218,7 +218,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB3).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB4).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -573,6 +573,48 @@ impl State {
             };
         }
         let user = field!(r.str(caps::USER)).to_string();
+        if op == volume_op::VK_FIND {
+            // A stick was plugged in: which of the user's personas, if any,
+            // holds its key (§7.2). Not the machine store: sticks are a
+            // person's.
+            let key_id = field!(r.array::<16>());
+            let uuid = field!(r.array::<16>());
+            let group = field!(r.u64());
+            field!(r.end());
+            let me = tri!(Recipient::service(RECIPIENT));
+            if user == MACHINE_USER || !valid_user(&user) {
+                return reply(status::DENIED);
+            }
+            let personas = match self.stores.get(&user) {
+                Some(s) if s.state() == LockState::Unlocked => s.personas_for(&me),
+                Some(_) | None => return reply(status::LOCKED),
+            };
+            for persona in personas {
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { continue };
+                // The scope the key was made for, exactly, or nothing.
+                if decode_scope(&m.scope) != Some((key_id, uuid, group)) {
+                    return reply(status::DENIED);
+                }
+                *item = Some(m.id);
+                let (_, v) = tri!(store.release(&m.id, &Access { persona: &persona, recipient: &me }, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona) };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                return match self.keyring.as_mut().unwrap().load(&info, key) {
+                    Ok(()) => ok(persona.into_bytes()),
+                    Err(e) if e == libc::EEXIST => ok(persona.into_bytes()),
+                    Err(_) => reply(status::INTERNAL),
+                };
+            }
+            return reply(status::DENIED);
+        }
         let persona = field!(r.str(caps::PERSONA)).to_string();
         let me = tri!(Recipient::service(RECIPIENT));
         let label = owner_label(&user, &persona);

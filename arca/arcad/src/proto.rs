@@ -245,6 +245,13 @@ pub mod volume_op {
     /// the key and the item is deleted. Needs Sigillum's `VERIFY_USER`
     /// (`NEEDS_VERIFICATION` first).
     pub const VK_FORGET: u16 = 0xB3;
+    /// `str user | key_id[16] | uuid[16] | u64 group` → the persona's name
+    /// (the whole body, UTF-8): a
+    /// stick was plugged in (tessera-encryption.md §7.2). Looks for the key
+    /// in every persona of the user's store and loads it as `VK_LOAD` does;
+    /// the reply names the persona it belongs to. `DENIED`: not this
+    /// person's (the stick shows Locked), `LOCKED` if the store is.
+    pub const VK_FIND: u16 = 0xB4;
     /// Longest label.
     pub const LABEL_MAX: usize = 128;
 }

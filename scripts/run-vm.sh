@@ -20,6 +20,9 @@
 #   SMP=N        vCPU count, default 4. Lower = less host wakeup overhead
 #                when the guest is idle. 2 is plenty for shell + cargo work.
 #   MEM=MB       guest RAM, default 4096 (4 GiB).
+#   NETDEV_EXTRA=<opts>  appended to the slirp -netdev (net=, guestfwd=), as
+#                in cloud-vm.sh: the hermetic fixture network of the fetch
+#                gates (scripts/vm-opifex-c4-check.sh prints its value).
 #
 #                ★ Lowered from 12288 on 2026-08-07. 12 GiB was ~6x what this
 #                VM uses — measured in-guest: "15M Active, 524M Inact, 252M
@@ -467,7 +470,7 @@ if [ "${VM:-}" != devroot ] && { [ "${VM:-}" = atrium-vm ] || [ ! -f "$BSD_DIR/v
         -drive file="$VMDIR/vm.qcow2",format=qcow2,cache=writeback,if=none,id=zfsd \
         -device virtio-blk-pci,drive=zfsd,bootindex=0 \
         -device virtio-net-pci,netdev=net0 \
-        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} \
         -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
         -device virtio-9p-pci,fsdev=share,mount_tag=bsd_share \
         $NOGRAPHIC \
@@ -495,7 +498,7 @@ exec "$QEMU" \
     -drive file="$BSD_DIR/vm/atrium-scratch.img",format=raw,cache=writeback,if=none,id=scratchdrv \
     -device virtio-blk-pci,drive=scratchdrv,serial=atrium-scratch,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
-    -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+    -netdev user,id=net0,hostfwd=tcp::2222-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
     -device virtio-9p-pci,fsdev=share,mount_tag=bsd_share \
     -fsdev local,id=mesa,path="$BSD_DIR/external/mesa",security_model=none \

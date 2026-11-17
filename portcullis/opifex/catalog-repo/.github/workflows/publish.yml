@@ -1,0 +1,60 @@
+# The Atrium catalog (docs/spec/opifex.md §6.4, §10.1): a pull request adding
+# incoming/*.toml is checked; on main the releases are appended, the head is
+# signed with the catalog key, and site/ is published to GitHub Pages. Weekly,
+# the head is re-signed so it never expires (14 days).
+name: catalog
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: catalog
+  cancel-in-progress: false
+jobs:
+  catalog:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.event_name == 'pull_request' && 'check' || 'github-pages' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: atrium-os/atrium
+          path: atrium
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build opifex
+        run: |
+          cargo build --release --manifest-path atrium/portcullis/Cargo.toml -p opifex --bin opifex
+          echo "OPIFEX=$PWD/atrium/portcullis/target/release/opifex" >> "$GITHUB_ENV"
+      - name: Build cargo-atrium (for the SDK registry check)
+        if: hashFiles('sdk/index/index.sig') != ''
+        run: cargo install --path atrium/sdk/cargo-atrium --locked
+      - name: Check (pull request)
+        if: github.event_name == 'pull_request'
+        run: sh publish.sh check
+      - name: Publish (main)
+        if: github.event_name != 'pull_request'
+        env:
+          CATALOG_KEY_PEM: ${{ secrets.CATALOG_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$CATALOG_KEY_PEM" > "$RUNNER_TEMP/catalog.pem"
+          CATALOG_KEY="$RUNNER_TEMP/catalog.pem" sh publish.sh publish
+          rm -f "$RUNNER_TEMP/catalog.pem"
+          git config user.name "atrium-catalog"
+          git config user.email "catalog@users.noreply.github.com"
+          git add -A site done incoming
+          git commit -m "catalog: publish $(date -u +%Y-%m-%dT%H:%MZ)" || true
+          git push
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        if: github.event_name != 'pull_request'

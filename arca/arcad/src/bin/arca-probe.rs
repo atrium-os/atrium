@@ -26,6 +26,7 @@
 //! arca-probe SOCK vk-record USER PERSONA KEYID             # as a volume service
 //! arca-probe SOCK vk-forget USER PERSONA KEYID             # as a volume service
 //! arca-probe SOCK vk-sweep USER PERSONA KEYID UUIDHEX      # every op: the longest reply
+//! arca-probe SOCK vk-find USER KEYID UUIDHEX               # as a volume service: whose stick
 //! ```
 //!
 //! Prints `status=N` and any body; exits 0 whatever the status, so a
@@ -187,6 +188,13 @@ fn main() -> ExitCode {
             w.raw(&unhex(arg(6)));
             w.u64(arg(7).parse().unwrap_or(0));
             call(sock, volume_op::VK_LOAD, &w.buf)
+        }
+        "vk-find" => {
+            w.str(arg(3));
+            w.raw(&unhex(arg(4)));
+            w.raw(&unhex(arg(5)));
+            w.u64(0);
+            call(sock, volume_op::VK_FIND, &w.buf)
         }
         "vk-record" | "vk-forget" => {
             w.str(arg(3));
