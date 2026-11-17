@@ -100,6 +100,11 @@ tessera_btree_t *tessera_btree_create_sealed(const tessera_block_io_t *io,
                                              uint8_t out_root_tag[16]);
 /* The current root's tag (zeros on an unsealed tree). */
 void tessera_btree_root_tag(const tessera_btree_t *t, uint8_t out[16]);
+/* The current root sector and its tag (NULL tag: sector only) read as one
+ * consistent pair, safe against a concurrent mutation of a live handle. A
+ * root sector read separately from its tag can pair with another root's tag
+ * and then fails to open. */
+uint64_t tessera_btree_root_snapshot(const tessera_btree_t *t, uint8_t tag[16]);
 
 /* O(log n). Returns TESSERA_ENOENT if absent. */
 /* Current root sector of an open tree (DIAG: descent tracing). */

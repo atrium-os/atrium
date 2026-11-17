@@ -564,6 +564,79 @@ the #137 generation guard: replay can re-apply them over the repaired state.");
     }
 }
 
+/// A sealed front at `sector` (prelude + front), opened under `tag`: the
+/// pack id its header names, or None.
+fn try_front(f: &std::fs::File, s: &Sealed, sector: u64, tag: &[u8; 16])
+    -> Option<[u8; 16]> {
+    let mut pre = vec![0u8; SECTOR_SIZE as usize];
+    if !f.read_at(&mut pre, sector * SECTOR_SIZE).map(|n| n == pre.len()).unwrap_or(false)
+        || &pre[..8] != b"TPACKSL1" {
+        return None;
+    }
+    let fl = rd_u32(&pre, 12) as u64;
+    let n = (64 + fl).div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+    if n > 64 * 1024 * 1024 { return None; }
+    let mut buf = vec![0u8; n as usize];
+    if !f.read_at(&mut buf, sector * SECTOR_SIZE).map(|r| r == buf.len()).unwrap_or(false) {
+        return None;
+    }
+    if unsafe { tessera_volume_open_pack_front(s.k, tag.as_ptr(), buf.as_mut_ptr(),
+                                                buf.len()) } != 0 {
+        return None;
+    }
+    // pack header: magic(8) version(4) ... pack_id at offset 16
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&buf[16..32]);
+    Some(id)
+}
+
+/// Why a sealed front failed: does its registry tag open a front elsewhere
+/// (the entry names a stale location), or do the bytes at its start open
+/// under another entry's tag (two entries' placements crossed)? Neither
+/// means the bytes at the start were overwritten after the entry was made.
+fn sealed_front_probe(f: &std::fs::File, s: &Sealed,
+                      ents: &[([u8; 16], u64, [u8; 16])], bad: &[usize],
+                      pz_lo: u64, pz_hi: u64) -> Vec<String> {
+    let h16 = |k: &[u8; 16]| -> String { k[..6].iter().map(|b| format!("{b:02x}")).collect() };
+    let mut out = Vec::new();
+    for &i in bad {
+        let (pid, start, tag) = &ents[i];
+        let mut found = Vec::new();
+        // Its tag against every other registered front, and against any
+        // sealed prelude within 4096 sectors of its start.
+        let mut cand: Vec<u64> = ents.iter().map(|e| e.1).collect();
+        let lo = start.saturating_sub(4096).max(pz_lo);
+        let hi = (start + 4096).min(pz_hi);
+        let mut pre = [0u8; 8];
+        for sct in lo..hi {
+            if f.read_at(&mut pre, sct * SECTOR_SIZE).map(|n| n == 8).unwrap_or(false)
+                && &pre == b"TPACKSL1" {
+                cand.push(sct);
+            }
+        }
+        cand.sort_unstable();
+        cand.dedup();
+        for &c in &cand {
+            if c == *start { continue; }
+            if let Some(id) = try_front(f, s, c, tag) {
+                found.push(format!("its tag opens the front at sector {c} (pack {})", h16(&id)));
+            }
+        }
+        for (j, (opid, ostart, otag)) in ents.iter().enumerate() {
+            if j == i { continue; }
+            if let Some(id) = try_front(f, s, *start, otag) {
+                found.push(format!("the front at its start opens under pack {}'s tag (that entry says sector {ostart}; header names pack {})", h16(opid), h16(&id)));
+            }
+        }
+        if found.is_empty() {
+            found.push("no other tag or location matches: the bytes at its start were rewritten after the entry was made".into());
+        }
+        out.push(format!("sealed front probe, pack {} at sector {start}: {}",
+                         h16(pid), found.join("; ")));
+    }
+    out
+}
+
 fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     -> Result<(i32, u32, bool), String> {
     let f = if repair {
@@ -780,6 +853,10 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // actually hold each blob. Both are byproducts of the registry walk
     // below, so validating the index costs a comparison, not a second pass.
     let mut pack_ids: HashSet<[u8; 16]> = HashSet::new();
+    // Sealed: every registry entry's (pack id, start, front tag), and which
+    // of them failed to open — probed after the walk (sealed_front_probe).
+    let mut sealed_entries: Vec<([u8; 16], u64, [u8; 16])> = Vec::new();
+    let mut bad_fronts: Vec<usize> = Vec::new();
     let mut blob_pack: HashMap<Hash, Vec<[u8; 16]>> = HashMap::new();
     unsafe {
         let t = open_tree(&io, seal.as_ref(), pack_root, TESSERA_BTREE_KIND_PACK_REG, 16,
@@ -853,10 +930,16 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
 
                 // Sealed: the front opens in place under the registry's tag,
                 // leaving a plain pack whose blobs are still sealed units.
+                if seal.is_some() {
+                    let mut tg = [0u8; 16];
+                    tg.copy_from_slice(&val[64..80]);
+                    sealed_entries.push((key, start, tg));
+                }
                 let body = match (body, seal.as_ref()) {
                     (Some(mut buf), Some(s)) => {
                         if tessera_volume_open_pack_front(s.k, val[64..80].as_ptr(),
                             buf.as_mut_ptr(), buf.len()) != 0 {
+                            bad_fronts.push(sealed_entries.len() - 1);
                             fsck.problem(format!("pack {pid}: sealed front does not \
                                 open under its registry tag (tampered, stale or \
                                 another pack's)"));
@@ -960,6 +1043,12 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             }
             if !c.is_null() { tessera_btree_cursor_free(c); }
             tessera_btree_close(t);
+        }
+    }
+    if let (Some(s), false) = (seal.as_ref(), bad_fronts.is_empty()) {
+        for line in sealed_front_probe(&f, s, &sealed_entries, &bad_fronts,
+                                       pz_start, pz_start + pz_len) {
+            fsck.notes.push(line);
         }
     }
     // ── blob→pack index validation ───────────────────────────────

@@ -101,6 +101,12 @@ struct tessera_btree {
 	uint32_t            ptr_size;          /* 8, or 24 sealed */
 	uint32_t            payload;           /* BLOCK_SIZE, or 4056 sealed */
 	uint8_t             root_tag[16];      /* sealed: the root's tag */
+	/* Seqlock over (root, root_tag): odd while set_root rewrites them.
+	 * Readers on a live handle run concurrently with the writer; a
+	 * root sector paired with the tag of another root fails to open on
+	 * a sealed tree (a plain tree reads it regardless), so readers take
+	 * the pair under this and retry when it moved under them. */
+	volatile uint32_t   root_seq;
 	/*
 	 * ★ Per-operation free/alloc log (see op_begin/op_end). A mutation
 	 * frees the nodes it supersedes only once it has SUCCEEDED; until
@@ -146,14 +152,39 @@ ptr_sector(const uint8_t *p)
 	return s;
 }
 
-static void
+/* The root pointer as one consistent (sector, tag) pair; returns the
+ * sequence it was read at (root_moved compares against it). */
+static uint32_t
 root_ptr(const tessera_btree_t *t, uint8_t p[PTR_MAX])
 {
-	memset(p, 0, PTR_MAX);
-	memcpy(p, &t->root, 8);
-	if (t->seal != NULL)
-		memcpy(p + 8, t->root_tag, 16);
+	uint32_t s1, s2;
+
+	for (;;) {
+		s1 = __atomic_load_n(&t->root_seq, __ATOMIC_ACQUIRE);
+		if ((s1 & 1u) != 0)
+			continue;
+		memset(p, 0, PTR_MAX);
+		memcpy(p, (const void *)&t->root, 8);
+		if (t->seal != NULL)
+			memcpy(p + 8, (const void *)t->root_tag, 16);
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		s2 = __atomic_load_n(&t->root_seq, __ATOMIC_RELAXED);
+		if (s1 == s2)
+			return s1;
+	}
 }
+
+/* A sealed reader's descent failed: was it because the root moved since
+ * `seq` (a recycled old root, or the old root's tag)? Then retrying on
+ * the new root is right; otherwise the failure is real. */
+static int
+root_moved(const tessera_btree_t *t, uint32_t seq, int rc)
+{
+	return t->seal != NULL &&
+	    (rc == TESSERA_EAUTH || rc == TESSERA_ECORRUPT) &&
+	    __atomic_load_n(&t->root_seq, __ATOMIC_ACQUIRE) != seq;
+}
+#define ROOT_RETRIES 8
 
 static uint8_t *
 leaf_entries(uint8_t *block)         { return block + HEADER_SIZE; }
@@ -722,9 +753,14 @@ tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet)
 static void
 set_root(tessera_btree_t *t, const uint8_t *ptr)
 {
+	uint32_t s = __atomic_load_n(&t->root_seq, __ATOMIC_RELAXED);
+
+	__atomic_store_n(&t->root_seq, s + 1, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	t->root = ptr_sector(ptr);
 	if (t->seal != NULL)
 		memcpy(t->root_tag, ptr + 8, 16);
+	__atomic_store_n(&t->root_seq, s + 2, __ATOMIC_RELEASE);
 	if (t->io.root_published != NULL)
 		t->io.root_published(t->io.ctx, t->root);
 }
@@ -771,10 +807,22 @@ void
 tessera_btree_root_tag(const tessera_btree_t *t, uint8_t out[16])
 {
 	if (t == NULL || out == NULL) return;
-	if (t->seal != NULL)
-		memcpy(out, t->root_tag, 16);
-	else
-		memset(out, 0, 16);
+	(void)tessera_btree_root_snapshot(t, out);
+}
+
+uint64_t
+tessera_btree_root_snapshot(const tessera_btree_t *t, uint8_t tag[16])
+{
+	uint8_t p[PTR_MAX];
+
+	if (t == NULL) {
+		if (tag != NULL) memset(tag, 0, 16);
+		return 0;
+	}
+	(void)root_ptr(t, p);
+	if (tag != NULL)
+		memcpy(tag, p + 8, 16);   /* zero on a plain tree */
+	return ptr_sector(p);
 }
 
 static tessera_btree_t *
@@ -877,9 +925,13 @@ tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value,
 	 * blob index (root sector 325, depth 0 -> 1) and returns rc=0. */
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	if (block == NULL) return TESSERA_ENOMEM;
-	int _rc = TESSERA_ECORRUPT;         /* depth exceeded, unless set */
+	int _rc;
 	uint8_t cur[PTR_MAX];
-	root_ptr(t, cur);
+	uint32_t seq;
+	int tries = 0;
+again:
+	_rc = TESSERA_ECORRUPT;             /* depth exceeded, unless set */
+	seq = root_ptr(t, cur);
 	if (tr) { tr->depth = 0; tr->leaf_entries = 0; }
 	for (uint32_t depth = 0; depth < MAX_DEPTH; depth++) {
 		if (tr && depth < 16) {
@@ -909,6 +961,9 @@ tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value,
 		memcpy(cur, e + t->key_size, t->ptr_size);
 	}
 out:
+	if (_rc != TESSERA_OK && _rc != TESSERA_ENOENT &&
+	    tries++ < ROOT_RETRIES && root_moved(t, seq, _rc))
+		goto again;
 	tessera_free(block);
 	return _rc;
 }
@@ -916,7 +971,7 @@ out:
 uint64_t
 tessera_btree_root(const tessera_btree_t *t)
 {
-	return t == NULL ? 0 : t->root;
+	return tessera_btree_root_snapshot(t, NULL);
 }
 
 int
@@ -1728,8 +1783,15 @@ tessera_btree_walk_nodes_ex(tessera_btree_t *t,
 	uint64_t tok = 0;
 	uint8_t rp[PTR_MAX];
 	int act = rd_enter(t, &tok);
-	root_ptr(t, rp);
-	int rc = walk_recursive(t, rp, pre, post, ctx, 0);
+	int rc, tries = 0;
+	uint32_t seq;
+	/* A retry re-walks nodes already visited: the visitors here mark
+	 * (pinscan), which is idempotent. */
+	do {
+		seq = root_ptr(t, rp);
+		rc = walk_recursive(t, rp, pre, post, ctx, 0);
+	} while (rc != TESSERA_OK && tries++ < ROOT_RETRIES &&
+	    root_moved(t, seq, rc));
 	rd_exit(t, act, tok);
 	return rc;
 }
@@ -1798,10 +1860,17 @@ tessera_btree_seek_first(tessera_btree_t *t)
 	if (c == NULL) return NULL;
 	c->t = t;
 	c->rd_active = rd_enter(t, &c->rd_token);
-	c->depth = 0;
 	uint8_t rp[PTR_MAX];
-	root_ptr(t, rp);
-	if (descend_to_leftmost(c, rp) != TESSERA_OK) {
+	int r, tries = 0;
+	uint32_t seq;
+	do {
+		c->depth = 0;
+		c->valid = 0;
+		seq = root_ptr(t, rp);
+		r = descend_to_leftmost(c, rp);
+	} while (r != TESSERA_OK && tries++ < ROOT_RETRIES &&
+	    root_moved(t, seq, r));
+	if (r != TESSERA_OK) {
 		cursor_abandon(c);
 		return NULL;
 	}
@@ -1817,12 +1886,18 @@ tessera_btree_seek_at(tessera_btree_t *t, const void *key)
 	c->t = t;
 	c->rd_active = rd_enter(t, &c->rd_token);
 	uint8_t cur[PTR_MAX];
-	root_ptr(t, cur);
+	int tries = 0;
+	uint32_t seq;
+restart:
+	seq = root_ptr(t, cur);
 	c->depth = 0;
 	for (;;) {
 		if (c->depth >= (int)MAX_DEPTH) { cursor_abandon(c); return NULL; }
 		c->path_sectors[c->depth] = ptr_sector(cur);
-		if (load_node(t, cur, c->path_blocks[c->depth]) != TESSERA_OK) {
+		int lr = load_node(t, cur, c->path_blocks[c->depth]);
+		if (lr != TESSERA_OK) {
+			if (tries++ < ROOT_RETRIES && root_moved(t, seq, lr))
+				goto restart;
 			cursor_abandon(c); return NULL;
 		}
 		tessera_btree_node_header_t h;

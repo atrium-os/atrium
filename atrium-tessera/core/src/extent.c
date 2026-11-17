@@ -180,6 +180,12 @@ tessera_extent_root_tag(const tessera_extent_alloc_t *a, uint8_t out[16])
 	memcpy(out, a->root_tag, 16);
 }
 
+uint64_t
+tessera_extent_root(const tessera_extent_alloc_t *a)
+{
+	return a == NULL ? 0 : a->root;
+}
+
 int
 tessera_extent_flush(tessera_extent_alloc_t *a, uint64_t *out_new_root)
 {

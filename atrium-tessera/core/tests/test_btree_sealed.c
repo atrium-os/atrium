@@ -14,11 +14,15 @@
  *   5. Opening with a wrong root tag, the wrong tree kind, other keys, or
  *      without sealing at all is refused.
  *   6. Sealed fan-out is computed on the 4056-byte payload.
+ *   7. Readers on a live handle while a writer moves the root never see
+ *      a root sector paired with another root's tag (kernel readers are
+ *      ungated: each failed such pair was an EAUTH).
  */
 #include "tessera/btree.h"
 #include "tessera/error.h"
 #include "tessera/seal.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -426,6 +430,91 @@ test_fanout(void)
 	tessera_seal_keys_clear(&keys);
 }
 
+/* ── 7. concurrent readers and a moving root ──────────────────────── */
+
+/* A disk whose frees never recycle, so the only way a reader can fail is
+ * the (root, tag) pair itself: every node it can reach stays intact. */
+static int
+d_free_keep(void *ctx, uint64_t s, uint64_t n)
+{
+	(void)ctx; (void)s; (void)n;
+	return 0;
+}
+static int
+d_alloc_bump(void *ctx, uint64_t n, uint64_t *out)
+{
+	(void)ctx;
+	if (n != 1 || next_s >= MAX_SECTORS) return -1;
+	D->used[next_s] = 1;
+	*out = next_s++;
+	return 0;
+}
+static const tessera_block_io_t IO_KEEP = {
+	.read_block = d_read, .write_block = d_write,
+	.alloc = d_alloc_bump, .free = d_free_keep,
+};
+
+struct race {
+	tessera_btree_t *t;
+	volatile int     stop;
+	unsigned long    reads, fails;
+};
+
+static void *
+race_reader(void *arg)
+{
+	struct race *r = arg;
+	uint8_t k[8] = { 0 }, v[8];
+
+	while (!r->stop) {
+		k[7] = (uint8_t)(r->reads % 16);
+		if (tessera_btree_get(r->t, k, v) != TESSERA_OK)
+			__atomic_fetch_add(&r->fails, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&r->reads, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+static void
+test_concurrent_root(uint32_t suite)
+{
+	static const uint8_t vk[32] = { 7 };
+	static const uint8_t uuid[16] = { 8 };
+	tessera_seal_keys_t keys;
+	uint64_t root;
+	uint8_t tag[16], k[8] = { 0 }, v[8] = { 0 };
+	pthread_t th[3];
+	struct race r = { 0 };
+
+	memset(D, 0, sizeof(*D));
+	next_s = 1;
+	CHECK(tessera_seal_keys_init(&keys, suite, vk, uuid) == TESSERA_OK);
+	r.t = tessera_btree_create_sealed(&IO_KEEP, &keys, 0, 8, 8, &root,
+	    tag);
+	CHECK(r.t != NULL);
+	if (r.t == NULL) return;
+	for (uint32_t i = 0; i < 16; i++) {
+		k[7] = (uint8_t)i;
+		CHECK(tessera_btree_put(r.t, k, v, &root) == TESSERA_OK);
+	}
+	for (int i = 0; i < 3; i++)
+		pthread_create(&th[i], NULL, race_reader, &r);
+	/* Each put moves the (single-leaf) root to a fresh sector. */
+	for (uint32_t n = 0; n < MAX_SECTORS - 64; n++) {
+		k[7] = (uint8_t)(n % 16);
+		v[0] = (uint8_t)n;
+		if (tessera_btree_put(r.t, k, v, &root) != TESSERA_OK)
+			break;
+	}
+	r.stop = 1;
+	for (int i = 0; i < 3; i++)
+		pthread_join(th[i], NULL);
+	printf("  concurrent root: %lu reads, %lu failed\n", r.reads, r.fails);
+	CHECK(r.reads > 0 && r.fails == 0);
+	tessera_btree_close(r.t);
+	tessera_seal_keys_clear(&keys);
+}
+
 int
 main(void)
 {
@@ -436,6 +525,8 @@ main(void)
 	run(TESSERA_SUITE_XAES_256_GCM);
 	run(TESSERA_SUITE_XCHACHA20_POLY1305);
 	test_fanout();
+	test_concurrent_root(TESSERA_SUITE_XAES_256_GCM);
+	test_concurrent_root(TESSERA_SUITE_XCHACHA20_POLY1305);
 	free(D);
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);

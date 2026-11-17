@@ -107,6 +107,9 @@ tessera_extent_alloc_t *tessera_extent_open_sealed(const tessera_block_io_t *io,
     const struct tessera_seal_keys *seal, uint64_t free_root_sector,
     const uint8_t root_tag[16], uint64_t lo, uint64_t hi);
 void tessera_extent_root_tag(const tessera_extent_alloc_t *, uint8_t out[16]);
+/* The root sector the allocator's tag belongs to: the tree it was opened
+ * from or last flushed (0 before the first flush of a fresh allocator). */
+uint64_t tessera_extent_root(const tessera_extent_alloc_t *);
 
 void tessera_extent_close(tessera_extent_alloc_t *);
 

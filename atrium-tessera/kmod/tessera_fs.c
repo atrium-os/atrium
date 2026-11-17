@@ -4563,11 +4563,16 @@ tessera_fs_live_tree(struct tessera_mount *tmp_, uint8_t kind)
 }
 
 /*
- * A sealed root's tag, if this mount knows it: the live tree's (its handle
- * carries the tag of every root it moves to), the allocator's for the
- * free-extent tree, else the superblock's or a durable copy's (what a crash
- * would recover to). 0 when known. A root read here without the gate can
- * pair with a tag of a later root; the open then fails rather than misread.
+ * A sealed root's tag, if this mount knows it: the live tree's (root and tag
+ * read as one pair, its handle carrying the tag of every root it moves to),
+ * the allocator's for the free-extent tree it last opened or flushed, else a
+ * durable superblock's (what a crash would recover to). 0 when known.
+ *
+ * Not the in-memory superblock's root_tags: those are refreshed only at
+ * commit (tessera_fs_sync_root_tags) while its roots move with every put, so
+ * between commits they pair a current root with an older root's tag. A root
+ * this function cannot vouch for gets ENOENT and the open is refused, rather
+ * than attempted under a tag that is bound to fail.
  */
 static int
 tessera_fs_root_tag(struct tessera_mount *tmp_, uint64_t root, uint8_t kind,
@@ -4575,17 +4580,11 @@ tessera_fs_root_tag(struct tessera_mount *tmp_, uint64_t root, uint8_t kind,
 {
 	tessera_btree_t *live = tessera_fs_live_tree(tmp_, kind);
 
-	if (live != NULL && tessera_btree_root(live) == root) {
-		tessera_btree_root_tag(live, tag);
+	if (live != NULL && tessera_btree_root_snapshot(live, tag) == root)
 		return (0);
-	}
 	if (kind == TESSERA_BTREE_KIND_FREE_EXT && tmp_->extent_alloc != NULL &&
-	    root == tmp_->sb.free_extent_root) {
+	    root == tessera_extent_root(tmp_->extent_alloc)) {
 		tessera_extent_root_tag(tmp_->extent_alloc, tag);
-		return (0);
-	}
-	if (root == tessera_fs_sb_root(&tmp_->sb, kind)) {
-		memcpy(tag, tmp_->sb.root_tags[kind], 16);
 		return (0);
 	}
 	for (int i = 0; i < 2; i++)
@@ -4594,6 +4593,23 @@ tessera_fs_root_tag(struct tessera_mount *tmp_, uint64_t root, uint8_t kind,
 			return (0);
 		}
 	return (ENOENT);
+}
+
+/* Open a sealed tree under a tag the caller captured with its root (under
+ * the gate, where the pair cannot move); a plain mount ignores the tag. */
+static __noinline tessera_btree_t *
+tessera_fs_tree_open_tagged(struct tessera_mount *tmp_, uint64_t root,
+    uint8_t kind, uint32_t key_size, uint32_t value_size, const uint8_t tag[16])
+{
+	if (tmp_->seal == NULL)
+		return (tessera_btree_open(&tmp_->meta_bio, root, kind,
+		    key_size, value_size));
+	if (root == 0 || tag == NULL)
+		return (NULL);
+	if (kind == TESSERA_BTREE_KIND_PACK_REG)
+		value_size = TESSERA_REGISTRY_ENTRY_SIZE_SEALED;
+	return (tessera_btree_open_sealed(&tmp_->meta_bio, tmp_->seal, root,
+	    tag, kind, key_size, value_size));
 }
 
 /*
@@ -18110,6 +18126,36 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		r_gc_reg   = tmp_->gc_scan_registry_root;
 		r_gc_snap  = tmp_->gc_scan_snapshots_root;
 	}
+	/*
+	 * Sealed: every root this scan opens needs ITS tag, and outside the
+	 * gate a root and a tag fetched separately can belong to different
+	 * roots (the tree moves between the two reads) — the walk then fails
+	 * the first node's AEAD and the whole scan aborts. Take the pairs here,
+	 * under the gate, for the live roots and both durable sets. Heap: 384
+	 * bytes is too much for this frame (#114).
+	 */
+	uint64_t *proot = NULL;
+	uint8_t (*ptag)[16] = NULL;
+	if (tmp_->seal != NULL) {
+		proot = malloc(3 * TESSERA_RESERVE_TREE_COUNT * sizeof *proot,
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		ptag = malloc(3 * TESSERA_RESERVE_TREE_COUNT * sizeof *ptag,
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		for (int k = 0; k < TESSERA_RESERVE_TREE_COUNT; k++) {
+			proot[k] = tessera_fs_sb_root(&tmp_->sb, (uint8_t)k);
+			if (proot[k] != 0 && tessera_fs_root_tag(tmp_,
+			    proot[k], (uint8_t)k, ptag[k]) != 0)
+				proot[k] = 0;   /* no tag: not walkable */
+			for (int d = 0; d < 2; d++) {
+				const int j = (1 + d) *
+				    TESSERA_RESERVE_TREE_COUNT + k;
+				proot[j] = tessera_fs_sb_root(
+				    &tmp_->durable_sb[d], (uint8_t)k);
+				memcpy(ptag[j],
+				    tmp_->durable_sb[d].root_tags[k], 16);
+			}
+		}
+	}
 	tmp_->pinscan_active = 1;
 	tessera_fs_flush_gate_exit(tmp_);
 
@@ -18167,10 +18213,42 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		roots[s1].root = (droot1[t] != roots[t].root &&
 		    droot1[t] != droot0[t]) ? droot1[t] : 0;
 	}
+	if (proot != NULL) {
+		/* Sealed: the roots and tags captured under the gate. The live
+		 * root of a tree with no tag here was zeroed — counted as not
+		 * walked below. No GC scan runs on a sealed volume. */
+		for (int t = 0; t < TESSERA_RESERVE_TREE_COUNT; t++) {
+			const int s0 = TESSERA_RESERVE_TREE_COUNT + 3 + t;
+			const int s1 = 2 * TESSERA_RESERVE_TREE_COUNT + 3 + t;
+			const uint64_t d0 =
+			    proot[TESSERA_RESERVE_TREE_COUNT + t];
+			const uint64_t d1 =
+			    proot[2 * TESSERA_RESERVE_TREE_COUNT + t];
+			if (roots[t].root != 0 && proot[t] == 0) {
+				tessera_stat_pinscan_trunc++;
+				stale_skipped = 1;
+			}
+			roots[t].root = proot[t];
+			roots[s0].root = (d0 != proot[t]) ? d0 : 0;
+			roots[s1].root = (d1 != proot[t] && d1 != d0) ? d1 : 0;
+		}
+		for (int g = 0; g < 3; g++)
+			roots[TESSERA_RESERVE_TREE_COUNT + g].root = 0;
+	}
 	for (int i = 0; i < (int)nitems(roots) && !aborted; i++) {
 		if (roots[i].root == 0) continue;
-		tessera_btree_t *t = tessera_fs_tree_open(tmp_,
-		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
+		tessera_btree_t *t;
+		if (proot != NULL) {
+			/* Row i's captured tag: live rows 0..N-1, durable
+			 * rows after the three GC slots. */
+			const int N = TESSERA_RESERVE_TREE_COUNT;
+			const int j = i < N ? i : i - 3;
+			t = tessera_fs_tree_open_tagged(tmp_, roots[i].root,
+			    roots[i].kind, roots[i].ksz, roots[i].vsz,
+			    ptag[j]);
+		} else
+			t = tessera_fs_tree_open(tmp_, roots[i].root,
+			    roots[i].kind, roots[i].ksz, roots[i].vsz);
 		if (t == NULL) {
 			/* Sealed: a root whose tag this mount could not pair
 			 * with it (it moved under us) was not walked, so the
@@ -18190,6 +18268,10 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 			aborted = 1;
 		}
 		tessera_btree_close(t);
+	}
+	if (proot != NULL) {
+		free(proot, M_TESSERA);
+		free(ptag, M_TESSERA);
 	}
 	/*
 	 * Every retained snapshot's three tree roots.
