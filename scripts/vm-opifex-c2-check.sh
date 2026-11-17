@@ -92,7 +92,7 @@ check "alice can't install" "1" "$(A get $ID | grep -c administrator)"
 echo "=== install from the catalog"
 check "root installs 1.0" "1" "$(Q get $ID | grep -c '1.0: done')"
 check "the tree is in apps/" "yes" "$(V "cmp -s $B/b1.0/bin/hello /var/lib/atrium/apps/$ID/bin/hello && echo yes")"
-check "the record says catalog" "1" "$(V "grep -A3 'id = \"$ID\"' /var/db/atrium/opifex/installed.toml | grep -c 'catalog:Atrium'")"
+check "the record says catalog" "1" "$(V "grep -A9 'id = \"$ID\"' /var/db/atrium/opifex/installed.toml | grep -c 'catalog:Atrium'")"
 check "opifexd logged it" "1" "$(V "grep -c 'uid 0: Install -> ok' $B/opifexd.log")"
 check "unpack folder cleaned up" "0" "$(V "ls /var/db/atrium/opifex/unpack | wc -l | tr -d ' '")"
 
