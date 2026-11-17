@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 /// A name and an address.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Mailbox {
     pub name: String,
     pub addr: String,
@@ -15,7 +15,7 @@ impl Mailbox {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attachment {
     pub name: String,
     /// `type/subtype`; anything else is sent as `application/octet-stream`.
@@ -24,7 +24,7 @@ pub struct Attachment {
 }
 
 /// What the compose window holds.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Draft {
     pub from: Mailbox,
     pub to: Vec<Mailbox>,

@@ -263,6 +263,7 @@ dependencies = [
  "idna",
  "mail-parse",
  "mail-schema",
+ "serde",
 ]
 
 [[package]]

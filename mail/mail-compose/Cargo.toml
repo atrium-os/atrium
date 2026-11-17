@@ -9,6 +9,7 @@ description = "Mail's message writer (docs/spec/mail.md §9): RFC 5322 messages 
 [dependencies]
 mail-schema = { path = "../mail-schema" }
 idna = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 mail-parse = { path = "../mail-parse", default-features = false }

@@ -50,7 +50,83 @@ struct Dovecot {
     child: Child,
     dir: tempfile::TempDir,
     port: u16,
+    /// SMTP submission over TLS; Dovecot relays to `relayed`.
+    sub_port: u16,
+    relayed: Arc<Mutex<Vec<Relayed>>>,
     ca_pem: String,
+}
+
+/// What reached the relay behind Dovecot's submission service.
+#[derive(Debug, Clone, Default)]
+struct Relayed {
+    from: String,
+    rcpts: Vec<String>,
+    data: Vec<u8>,
+}
+
+/// A plain SMTP server on loopback standing for the provider's outbound
+/// relay: takes everything, keeps it.
+fn smtp_sink() -> (u16, Arc<Mutex<Vec<Relayed>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let g = got.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                let mut w = c.try_clone().unwrap();
+                let mut r = BufReader::new(c);
+                let _ = w.write_all(b"220 relay.example.test ESMTP\r\n");
+                let mut cur = Relayed::default();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let u = line.trim_end().to_ascii_uppercase();
+                    let arg = |p: &str| line.trim_end()[p.len()..].trim().trim_start_matches('<').split('>').next().unwrap_or("").to_string();
+                    let reply: &[u8] = if u.starts_with("EHLO") {
+                        b"250-relay.example.test\r\n250-PIPELINING\r\n250 8BITMIME\r\n"
+                    } else if u.starts_with("MAIL FROM:") {
+                        cur = Relayed { from: arg("MAIL FROM:"), ..Default::default() };
+                        b"250 2.1.0 ok\r\n"
+                    } else if u.starts_with("RCPT TO:") {
+                        cur.rcpts.push(arg("RCPT TO:"));
+                        b"250 2.1.5 ok\r\n"
+                    } else if u.starts_with("DATA") {
+                        let _ = w.write_all(b"354 go on\r\n");
+                        let mut data = Vec::new();
+                        loop {
+                            let mut l = Vec::new();
+                            let mut one = [0u8];
+                            while r.read(&mut one).unwrap_or(0) == 1 {
+                                l.push(one[0]);
+                                if one[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            if l.is_empty() || l == b".\r\n" {
+                                break;
+                            }
+                            data.extend_from_slice(if l.starts_with(b"..") { &l[1..] } else { &l });
+                        }
+                        cur.data = data;
+                        g.lock().unwrap().push(std::mem::take(&mut cur));
+                        b"250 2.0.0 queued\r\n"
+                    } else if u.starts_with("QUIT") {
+                        let _ = w.write_all(b"221 bye\r\n");
+                        return;
+                    } else {
+                        b"250 ok\r\n"
+                    };
+                    let _ = w.write_all(reply);
+                }
+            });
+        }
+    });
+    (port, got)
 }
 
 impl Drop for Dovecot {
@@ -103,11 +179,17 @@ fn start_dovecot() -> Option<Dovecot> {
     std::fs::write(d.join("key.pem"), k.serialize_pem()).unwrap();
     std::fs::write(d.join("passwd"), "priya@example.org:{PLAIN}hunter2::::::\n").unwrap();
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let sub_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (relay, relayed) = smtp_sink();
     let conf = format!(
         r#"base_dir = {d}/run
 state_dir = {d}/state
 log_path = {d}/dovecot.log
-protocols = imap
+protocols = imap submission
+hostname = mail.example.test
+submission_relay_host = 127.0.0.1
+submission_relay_port = {relay}
+submission_relay_trusted = yes
 listen = 127.0.0.1
 ssl = required
 ssl_cert = <{d}/cert.pem
@@ -150,6 +232,15 @@ service imap-login {{
     ssl = yes
   }}
 }}
+service submission-login {{
+  inet_listener submission {{
+    port = 0
+  }}
+  inet_listener submissions {{
+    port = {sub_port}
+    ssl = yes
+  }}
+}}
 service anvil {{
   chroot =
 }}
@@ -179,8 +270,8 @@ service stats {{
     chown_r(&home, 65534, 65534);
     let child = Command::new(bin).arg("-F").arg("-c").arg(d.join("dovecot.conf")).spawn().ok()?;
     for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Some(Dovecot { child, dir, port, ca_pem: ca_cert.pem() });
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() && TcpStream::connect(("127.0.0.1", sub_port)).is_ok() {
+            return Some(Dovecot { child, dir, port, sub_port, relayed, ca_pem: ca_cert.pem() });
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -208,15 +299,20 @@ impl MailVault for Vault {
     fn anomaly(&mut self, _: u8, _: &str) {}
 }
 
-/// A courier session to the Dovecot; returns mail-sync's end.
+/// A courier session to the Dovecot's IMAP; returns mail-sync's end.
 fn courier(dc: &Dovecot) -> UnixStream {
+    courier_to(dc, Scheme::Imaps, dc.port)
+}
+
+/// A courier session to `port` speaking `scheme`.
+fn courier_to(dc: &Dovecot, scheme: Scheme, port: u16) -> UnixStream {
     let tls = navigator_fetch::tls_config(dc.ca_pem.as_bytes()).unwrap();
     let (c, courier_end) = UnixStream::pair().unwrap();
-    let at: SocketAddr = ([127, 0, 0, 1], dc.port).into();
+    let at: SocketAddr = ([127, 0, 0, 1], port).into();
     std::thread::spawn(move || {
         let net = Net(at);
         let out = courier_end.try_clone().unwrap();
-        let ep = MailEndpoint { scheme: Scheme::Imaps, host: HOST.into(), port: at.port() };
+        let ep = MailEndpoint { scheme, host: HOST.into(), port: at.port() };
         session(&ep, &net, tls, addr::Policy { grant_private_network: true }, courier_end, out, &mut Vault)
     });
     let mut w = c.try_clone().unwrap();
@@ -367,4 +463,77 @@ fn dovecot_through_the_courier_into_the_store() {
     assert_eq!(count(maildir(&home).join(".Trash")), 1);
     let _ = s2.logout();
     let _ = Arc::new(());
+}
+
+/// M4: a draft written, waiting out Undo, handed to Dovecot's submission
+/// service through the real courier, relayed, and filed in Sent; Send later
+/// held here when the server can't hold it.
+#[test]
+fn sending_through_the_courier() {
+    use mail_compose::{Draft, Mailbox};
+    use mail_engine::send::{Delivery, When};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed (apt-get install dovecot-imapd dovecot-submissiond)");
+        return;
+    };
+    let log = || std::fs::read_to_string(dc.dir.path().join("dovecot.log")).unwrap_or_default();
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.sent_folder(account).unwrap().as_deref(), Some("Sent"));
+    let draft = Draft {
+        from: Mailbox::new("Priya Raman", "priya@example.org"),
+        to: vec![Mailbox::new("Arun", "arun@acme.example")],
+        cc: vec![Mailbox::new("", "lena@acme.example")],
+        bcc: vec![Mailbox::new("", "sam@acme.example")],
+        subject: "Q4 numbers \u{2713}".into(),
+        text: "Hi Arun,\n\n.the numbers are in.\n".into(),
+        ..Default::default()
+    };
+    // Undo inside the window brings the draft back; nothing leaves.
+    let undone = engine.send(account, &draft, When::default()).unwrap();
+    assert_eq!(engine.undo_send(undone).unwrap(), Some(draft.clone()));
+    let id = engine.send(account, &draft, When::default()).unwrap();
+    let no = || -> std::io::Result<UnixStream> { panic!("no connection before it is due") };
+    assert_eq!(engine.deliver(id, no, false).unwrap(), Delivery::NotDue);
+    assert!(engine.due_sends().unwrap().is_empty());
+    // Past the window (made due here rather than waiting 10 s).
+    assert!(engine.send_now(id).unwrap());
+    assert_eq!(engine.due_sends().unwrap().len(), 1);
+    let d = engine.deliver(id, || Ok(courier_to(&dc, Scheme::Submissions, dc.sub_port)), false).unwrap();
+    let Delivery::Sent { copy: Some(copy), rejected, held: false } = d else { panic!("{d:?}\n{}", log()) };
+    assert!(rejected.is_empty());
+    assert!(engine.store.outbox().unwrap().is_empty());
+    assert!(engine.undo_send(id).unwrap().is_none(), "gone: no undo");
+    // The relay got it: every recipient (Bcc too), no Bcc header.
+    let got = dc.relayed.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "{}", log());
+    assert_eq!(got[0].from, "priya@example.org");
+    assert_eq!(got[0].rcpts, ["arun@acme.example", "lena@acme.example", "sam@acme.example"]);
+    let text = String::from_utf8_lossy(&got[0].data);
+    assert!(text.contains("Subject: =?UTF-8?"), "{text}");
+    assert!(!text.to_ascii_lowercase().contains("\nbcc:"), "{text}");
+    assert!(text.contains("\r\n.the numbers are in."), "dot-stuffing undone by the relay: {text}");
+    // Filed in Sent, seen, and synced back.
+    let mut imap = Session::start(courier(&dc)).unwrap();
+    assert!(engine.file_sent(account, &mut imap, &copy).unwrap());
+    let _ = imap.logout();
+    Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    let sent = engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.role == Role::Sent).unwrap().0;
+    let row = engine.store.list(sent, 0, 1).unwrap().remove(0);
+    assert_eq!(row.subject, "Q4 numbers \u{2713}");
+    assert!(row.flags & flag::SEEN != 0);
+    // Send later: Dovecot offers no FUTURERELEASE, so the engine holds it.
+    let later = now() + 3600;
+    let id = engine.send(account, &draft, When { later: Some(later), ..When::default() }).unwrap();
+    let mut o = engine.store.write(|w| w.take_back(id)).unwrap().unwrap();
+    o.due = 0;
+    let id = engine.store.write(|w| w.queue_send(&o)).unwrap();
+    let d = engine.deliver(id, || Ok(courier_to(&dc, Scheme::Submissions, dc.sub_port)), false).unwrap();
+    assert_eq!(d, Delivery::HeldHere { until: later }, "{}", log());
+    assert!(engine.due_sends().unwrap().is_empty());
+    assert_eq!(dc.relayed.lock().unwrap().len(), 1, "nothing left early");
+    let (_, held) = engine.store.outbox().unwrap().remove(0);
+    assert!(!held.hold_on_server && held.due == later);
 }

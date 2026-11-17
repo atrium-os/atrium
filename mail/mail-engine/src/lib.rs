@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 pub mod pictures;
+pub mod send;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
@@ -42,6 +43,10 @@ pub enum Error {
     NotFound,
     /// An action this account can't do, said why.
     Refused(&'static str),
+    /// The draft can't be written as a message (a bad address, too big).
+    Compose(String),
+    /// The server said no (filing in Sent).
+    Sync(String),
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +56,8 @@ impl std::fmt::Display for Error {
             Error::Jail(e) => write!(f, "parse jail: {e}"),
             Error::NotFound => f.write_str("no such message"),
             Error::Refused(why) => f.write_str(why),
+            Error::Compose(e) => f.write_str(e),
+            Error::Sync(e) => write!(f, "server: {e}"),
         }
     }
 }

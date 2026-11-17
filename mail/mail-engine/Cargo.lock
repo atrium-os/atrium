@@ -728,11 +728,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-compose"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "mail-schema",
+ "serde",
+]
+
+[[package]]
 name = "mail-engine"
 version = "0.1.0"
 dependencies = [
  "arca-courier",
  "arca-store",
+ "mail-compose",
  "mail-schema",
  "mail-store",
  "mail-sync",

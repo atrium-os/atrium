@@ -24,6 +24,8 @@ use sha2::{Digest, Sha256};
 
 mod ops;
 pub use ops::{Op, OpKind, LEAVING};
+mod outbox;
+pub use outbox::{retry_after, Outgoing, SendState};
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
@@ -223,6 +225,7 @@ impl Store {
             tx.open_table(SERVER_IDS)?;
             tx.open_table(SENDER_PICTURES)?;
             tx.open_table(ops::OPS)?;
+            tx.open_table(outbox::OUTBOX)?;
             tx.open_table(thread::THREADS)?;
             tx.open_table(thread::MSGID_THREADS)?;
             tx.open_table(thread::SUBJECT_THREADS)?;
