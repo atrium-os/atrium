@@ -15,7 +15,7 @@ Commands:
       and network clients linked into the core, which holds the grants).
       Findings are warnings; the exit status is 1 only for manifest errors.
   new <name> [--template <t>] [--id <app id>] [--sdk-path <atrium checkout>]
-      A project in ./<name> from an SDK template; --list shows them.
+      A project in ./<name> from an SDK template; --list [--json] shows them.
   cross <amd64|aarch64> [--sysroot <dir>] [cargo build args]
       Build for Atrium on that arch from Linux, macOS or the other arch:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
@@ -47,15 +47,12 @@ fn main() -> ExitCode {
 fn cmd_new(args: &[String]) -> ExitCode {
     use cargo_atrium::new;
     let (mut name, mut template, mut id, mut sdk, mut registry) = (None, "app".to_string(), None, None, new::REGISTRY.to_string());
+    let (mut list, mut json) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--list" => {
-                for (t, what, _) in new::TEMPLATES {
-                    println!("  {t:<10} {what}");
-                }
-                return ExitCode::SUCCESS;
-            }
+            "--list" => list = true,
+            "--json" => json = true,
             "--template" => template = it.next().cloned().unwrap_or_default(),
             "--id" => id = it.next().cloned(),
             "--sdk-path" => sdk = it.next().map(PathBuf::from),
@@ -66,6 +63,17 @@ fn cmd_new(args: &[String]) -> ExitCode {
             }
             o => name = Some(o.to_string()),
         }
+    }
+    if list {
+        if json {
+            let v: Vec<_> = new::TEMPLATES.iter().map(|(t, what, _)| serde_json::json!({"name": t, "about": what})).collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        } else {
+            for (t, what, _) in new::TEMPLATES {
+                println!("  {t:<10} {what}");
+            }
+        }
+        return ExitCode::SUCCESS;
     }
     let Some(dir) = name else {
         eprintln!("cargo atrium new: a name, e.g. cargo atrium new hello");
