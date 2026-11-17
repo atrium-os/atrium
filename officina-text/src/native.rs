@@ -1134,6 +1134,21 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
                 }
             }
         }
+        TextOp::PlaceStyle { id, style, stale } => {
+            w.u8(18);
+            w.var(*id as u64);
+            match style {
+                None => w.u8(0),
+                Some(s) => {
+                    w.u8(1);
+                    encode_style(&mut w, s);
+                }
+            }
+            w.var(stale.len() as u64);
+            for a in stale {
+                w.var(*a as u64);
+            }
+        }
         TextOp::SetShape { id, shape } => {
             w.u8(16);
             w.var(*id as u64);
@@ -1278,6 +1293,20 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("style")),
             };
             TextOp::SetStyle { id, style }
+        }
+        18 => {
+            let id = r.len("style", styles.min(MAX_STYLES - 1) as u64)? as u16;
+            let style = match r.u8()? {
+                0 => None,
+                1 => Some(decode_style(&mut r, styles + 1)?),
+                _ => return Err(WireError::Invalid("style")),
+            };
+            let k = r.count("stale attributes", attrs as u64, 1)?;
+            let mut stale = Vec::with_capacity(k);
+            for _ in 0..k {
+                stale.push(r.len("attribute", attrs.saturating_sub(1) as u64)? as AttrId);
+            }
+            TextOp::PlaceStyle { id, style, stale }
         }
         16 => {
             let id = r.len("shape", crate::model::MAX_SHAPES as u64 - 1)? as u32;

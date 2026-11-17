@@ -3409,6 +3409,26 @@ the filter as it was. The list draws only the rows in view (Pergola
 `VirtualList`) and offers at most 10,000 values; a column with more
 says so and points to Show Only and Hide.
 
+### 16.55 Deleting styles in Write (2026-11-17)
+
+The style bar's Delete deletes the caret's paragraph style, or with
+Characters picked its character style. Paragraphs of a deleted paragraph
+style take the style it is based on (Normal if none); text of a deleted
+character style takes its base character style, or none. Styles based on
+it are then based on its base; styles that Enter followed with it keep
+their own style after Enter. Normal can't be deleted. A style used in a
+header, footer, note, shape or tracked deletion is refused in words until
+those change. The whole deletion is one undo step and is kept by crash
+recovery.
+
+The engine op `TextOp::PlaceStyle { id, style, stale }` takes an unused
+style out of the middle of the table or puts one back. Every style id
+the document holds follows, wherever it is: paragraphs in the body,
+headers, notes, shapes and deleted text, styles' base and next, and the
+attribute table's character styles. The op inverts exactly, including
+attribute entries no text uses that still named the style (`stale`).
+Journal tag 18.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

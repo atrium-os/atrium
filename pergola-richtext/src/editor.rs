@@ -2356,6 +2356,59 @@ impl Editor {
         self.change_style("Update Style", id, |x| *x = s)
     }
 
+    /// Deletes style `id`: paragraphs of it take its base style (Normal if
+    /// none), text of a character style its base (or none), styles based
+    /// on it its base, styles followed by it themselves; the styles after
+    /// it move down one. One undo step. `Err` says why not (Normal, or
+    /// used outside the body text).
+    pub fn delete_style(&mut self, id: StyleId) -> Result<(), String> {
+        use officina_text::model::StyleKind;
+        let Some(st) = self.doc.styles.styles.get(id as usize).cloned() else { return Err("There is no such style.".into()) };
+        if id == 0 {
+            return Err("Normal can't be deleted: every other style builds on it.".into());
+        }
+        if self.doc.style_uses(id).elsewhere {
+            return Err(format!("“{}” is used in a header, footer, note, shape or tracked deletion; change those first.", st.name));
+        }
+        let base = st.parent;
+        let mut ops = Vec::new();
+        for (j, x) in self.doc.styles.styles.iter().enumerate() {
+            if j != id as usize && (x.parent == Some(id) || x.next == Some(id)) {
+                let mut y = x.clone();
+                if y.parent == Some(id) {
+                    y.parent = base;
+                }
+                if y.next == Some(id) {
+                    y.next = None;
+                }
+                ops.push(TextOp::SetStyle { id: j as StyleId, style: Some(y) });
+            }
+        }
+        for k in 0..self.doc.blocks.len() {
+            let Some(p) = self.doc.para(k) else { continue };
+            match st.kind {
+                StyleKind::Para if p.style == id => ops.push(TextOp::SetPara { block: k as u32, style: base.unwrap_or(0), props: p.props.clone() }),
+                StyleKind::Char if p.runs.iter().any(|r| self.doc.attrs.get(r.1).style == Some(id)) => {
+                    let n = p.text.len() as u32;
+                    ops.extend(self.doc.format_ops(k, 0, n, &|x: &mut CharAttrs| {
+                        if x.style == Some(id) {
+                            x.style = base;
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+        ops.push(TextOp::PlaceStyle { id, style: None, stale: Vec::new() });
+        let n = self.doc.styles.styles.len();
+        self.apply("Delete Style", ops, Kind::Other);
+        if self.doc.styles.styles.len() < n {
+            Ok(())
+        } else {
+            Err(format!("“{}” couldn't be deleted.", st.name))
+        }
+    }
+
     /// A new paragraph style `name`, based on the caret paragraph's, that
     /// looks as the selection does; the selected paragraphs take it. One
     /// undo step; `None` if the name is empty or taken.
@@ -3166,6 +3219,47 @@ pub(crate) mod tests {
         assert_eq!(e.doc.para(0).unwrap().style, 0);
         e.redo();
         assert_eq!(e.doc.para(0).unwrap().style, id);
+    }
+
+    #[test]
+    fn styles_are_deleted_and_come_back() {
+        let mut e = ed(&["One body line", "Two body line", "Three"]);
+        let sel = |e: &mut Editor, b: usize, a: u32, z: u32| {
+            e.set_caret(Pos::new(b, a), false);
+            e.set_caret(Pos::new(b, z), true);
+        };
+        sel(&mut e, 0, 0, 3);
+        let callout = e.new_style_from_selection("Callout").unwrap();
+        sel(&mut e, 1, 0, 3);
+        let key = e.new_char_style_from_selection("Key").unwrap();
+        sel(&mut e, 2, 0, 2);
+        let later = e.new_style_from_selection("Later").unwrap();
+        assert!(e.change_style("Style", later, |s| s.parent = Some(callout)));
+        let look = |e: &Editor| {
+            let names = |i: StyleId| e.doc.styles.styles[i as usize].name.to_string();
+            let p = |k: usize| names(e.doc.para(k).unwrap().style);
+            let run = e.doc.attrs.get(e.doc.para(1).unwrap().runs[0].1).style.map(names);
+            let later_base = e.doc.styles.styles.iter().find(|s| &*s.name == "Later").and_then(|s| s.parent).map(names);
+            (p(0), run, p(2), later_base, e.doc.styles.styles.len())
+        };
+        let before = look(&e);
+        assert_eq!(before, ("Callout".into(), Some("Key".into()), "Later".into(), Some("Callout".into()), callout as usize + 3));
+        // Callout goes: its paragraph is Normal, Later is based on Normal,
+        // Key and Later keep their names under their new ids.
+        e.delete_style(callout).unwrap();
+        assert_eq!(look(&e), ("Normal".into(), Some("Key".into()), "Later".into(), Some("Normal".into()), callout as usize + 2));
+        e.undo();
+        assert_eq!(look(&e), before);
+        e.redo();
+        // The character style goes: its text has none.
+        let key = e.doc.styles.by_name("Key").unwrap();
+        assert_eq!(key, callout);
+        e.delete_style(key).unwrap();
+        assert_eq!(look(&e).1, None);
+        e.undo();
+        e.undo();
+        assert_eq!(look(&e), before);
+        assert!(e.delete_style(0).unwrap_err().starts_with("Normal"));
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub enum Cmd {
     StyleUpdate,
     /// The caret's style takes the bar's name.
     StyleRename,
+    /// The caret's style deleted (its text takes the style it is based on).
+    StyleDelete,
     /// Its letters a point larger or smaller.
     StyleSize(bool),
     /// Bold, italic or underline on or off (0, 1, 2).
@@ -685,6 +687,13 @@ impl Write {
                 if !e.update_style_to_match() {
                     self.doc.borrow_mut().status = "The style already looks like this".into();
                 }
+            }
+            Cmd::StyleDelete => {
+                let n = e.doc.styles.styles.get(id as usize).map_or(String::new(), |s| s.name.to_string());
+                self.doc.borrow_mut().status = match e.delete_style(id) {
+                    Ok(()) => format!("Style “{n}” deleted"),
+                    Err(m) => m,
+                };
             }
             Cmd::StyleRename => {
                 if !name.is_empty() && !e.change_style("Rename Style", id, |s| s.name = name.as_str().into()) {
@@ -1309,7 +1318,7 @@ impl Write {
                         self.changed();
                         return true;
                     }
-                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleFont(_) | Cmd::StyleBase(_) | Cmd::StyleNext(_) | Cmd::StyleTarget(_) | Cmd::StyleChar(_) | Cmd::StyleClose => {
+                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleDelete | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleFont(_) | Cmd::StyleBase(_) | Cmd::StyleNext(_) | Cmd::StyleTarget(_) | Cmd::StyleChar(_) | Cmd::StyleClose => {
                         drop(e);
                         drop(d);
                         self.style_cmd(c);
@@ -1675,7 +1684,7 @@ impl View for Write {
                 (id, pf, cf)
             };
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 60.0, 20.0), content: "Style".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
-            let fw = (w - 72.0 - 750.0).max(140.0);
+            let fw = (w - 72.0 - 824.0).max(140.0);
             let cmds = self.cmds.clone();
             TextField::new(self.style_name.clone()).placeholder("Style name").at(72.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::StyleRename)).render(ctx);
             let mut x = 72.0 + fw + 8.0;
@@ -1691,7 +1700,7 @@ impl View for Write {
                     }
                 }
             } else {
-                let all: &[(&str, Cmd, f32)] = if cur.is_some() { &[("Rename", Cmd::StyleRename, 76.0), ("New from Selection", Cmd::StyleNew, 156.0), ("Update to Match", Cmd::StyleUpdate, 140.0)] } else { &[("New from Selection", Cmd::StyleNew, 156.0)] };
+                let all: &[(&str, Cmd, f32)] = if cur.is_some() { &[("Rename", Cmd::StyleRename, 76.0), ("New from Selection", Cmd::StyleNew, 156.0), ("Update to Match", Cmd::StyleUpdate, 140.0), ("Delete", Cmd::StyleDelete, 68.0)] } else { &[("New from Selection", Cmd::StyleNew, 156.0)] };
                 for &(label, cmd, wd) in all {
                     Button::secondary(label).at(x, y + 8.0).width(wd).on_click(push(cmd)).render(ctx);
                     x += wd + 6.0;
@@ -2256,6 +2265,23 @@ mod tests {
         ed.borrow_mut().style_named("Heading 2");
         assert_ne!(bar, Some(ed.borrow().style_at_caret()));
         assert!(texts().iter().any(|s| s.starts_with("Edit “Heading 2")), "{:?}", texts());
+        // Deleted: “Opening” goes, its paragraph takes Heading 1 (its base).
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(on, 0), false);
+        run(Cmd::StyleTarget(false));
+        assert!(texts().iter().any(|s| s == "Delete"));
+        let n = ed.borrow().doc.styles.styles.len();
+        run(Cmd::StyleDelete);
+        assert_eq!(w.doc.borrow().status, "Style “Opening” deleted");
+        assert_eq!(ed.borrow().doc.styles.styles.len(), n - 1);
+        assert_eq!(ed.borrow().doc.styles.by_name("Opening"), None);
+        assert_eq!(ed.borrow().style_at_caret(), ed.borrow().doc.styles.by_name("Heading 1").unwrap());
+        assert_eq!(w.style_bar.get_cloned().id, Some(ed.borrow().style_at_caret()), "the bar follows");
+        // Normal stays.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(on, 0), false);
+        ed.borrow_mut().style_named("Normal");
+        run(Cmd::StyleTarget(false));
+        run(Cmd::StyleDelete);
+        assert!(w.doc.borrow().status.starts_with("Normal can't"));
         run(Cmd::StyleClose);
         assert!(!w.style_bar.get_cloned().open);
     }
