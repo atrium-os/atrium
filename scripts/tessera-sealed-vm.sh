@@ -1,6 +1,7 @@
 #!/bin/sh
 # Sealed Tessera volumes in the kernel (docs/spec/tessera-encryption.md, E1):
-# the read-only sealed mount of tessera_fs.ko, in a FreeBSD guest reached
+# the sealed mount of tessera_fs.ko, read-only and read-write, in a FreeBSD
+# guest reached
 # through scripts/vssh.
 #
 #   sh scripts/tessera-sealed-vm.sh deploy   # module + sources to the guest
@@ -18,10 +19,16 @@
 #   3. mount with no key loaded, and with a wrong key under the right id, is
 #      refused; with the key it mounts read-only and the file reads back
 #      byte for byte after a remount;
-#   4. mount -u -o rw is refused (read-only for now);
+#   4. (read-only checks are on a -r mount);
 #   5. one flipped byte in the pack's data area makes the read fail, never
 #      return other bytes; restored, it reads again;
-#   6. one superblock copy damaged: mounts off the other; both: refused.
+#   6. one superblock copy damaged: mounts off the other; both: refused;
+#   7. read-write: a 460 KB file, a directory and a small (inline) file are
+#      written, nothing of them is in the clear, and they read back after a
+#      remount; no key, no rw mount;
+#   8. a crash between the journal commit and the superblock write
+#      (kern.tessera.skip_next_sb, then a copy of the image): the copy
+#      mounts, replays the sealed ROOT_UPDATE and has the last file.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-arm64}"
@@ -99,8 +106,6 @@ cmp -s $M/$NAME $T/content || fail "file differs"
 umount $M && mount -t tessera -r $DEV $M || fail remount
 cmp -s $M/$NAME $T/content || fail "file differs after remount"
 echo "mount and read: ok ($(ls $M))"
-# 4. read-only
-mount -u -o rw $M 2>/dev/null && fail "went read-write"
 umount $M || fail umount
 
 # 5. a flipped byte in the data area (pack zone starts at 4 + 64 + 1024;
@@ -130,7 +135,58 @@ DEV=/dev/$(mdconfig -a -t vnode -f $IMG)
 mount -t tessera -r $DEV $M 2>/dev/null && fail "mounted with both superblocks damaged"
 echo "superblocks: ok"
 
-mdconfig -d -u ${DEV#/dev/md}; rm -f $IMG $T/key $T/wrong
+# 7. read-write
+mdconfig -d -u ${DEV#/dev/md}
+flip 0 300; flip 1 300
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG)
+mount -t tessera $DEV $M || fail "rw mount"
+cmp -s $M/$NAME $T/content || fail "seed file differs on the rw mount"
+NAME2=board-minutes-draft.txt
+jot -w 'second sealed file %06d' 20000 > $T/content2
+cp $T/content2 $M/$NAME2 || fail "write"
+mkdir $M/drafts || fail mkdir
+echo 'tiny sealed note' > $M/drafts/note.txt || fail "small write"
+sync
+umount $M || fail "umount rw"
+grep -q "$NAME2" $IMG && fail "new file name in the clear"
+grep -q drafts $IMG && fail "directory name in the clear"
+grep -qa 'second sealed file' $IMG && fail "new file bytes in the clear"
+grep -qa 'tiny sealed note' $IMG && fail "small file in the clear"
+mount -t tessera -r $DEV $M || fail "ro mount after rw"
+cmp -s $M/$NAME2 $T/content2 || fail "written file differs after remount"
+[ "$(cat $M/drafts/note.txt)" = 'tiny sealed note' ] || fail "small file differs"
+cmp -s $M/$NAME $T/content || fail "seed file differs after rw"
+umount $M
+tessera-keyload drop $KID >/dev/null
+mount -t tessera $DEV $M 2>/dev/null && fail "rw mount with no key"
+tessera-keyload load $T/key $KID $U >/dev/null || fail reload
+mount -t tessera $DEV $M || fail "rw mount again"
+ls $M/drafts >/dev/null || fail "dir after rw remount"
+umount $M
+echo "read-write: ok"
+
+# 8. crash after the journal commit, before the superblock write
+mount -t tessera $DEV $M || fail "rw mount for the crash"
+echo 'written just before the crash' > $M/crash.txt
+sysctl kern.tessera.skip_next_sb=1 >/dev/null
+sync
+cp $IMG $IMG.crash
+umount $M; mdconfig -d -u ${DEV#/dev/md}
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG.crash)
+mount -t tessera $DEV $M || fail "mount after the crash"
+dmesg | grep -E 'crash-injection|replay \(roots-only\)' | tail -2
+dmesg | grep 'replay (roots-only)' | tail -1 | grep -q 'applied 0 ' &&
+    fail "nothing replayed (the skipped commit was overtaken)"
+[ "$(cat $M/crash.txt 2>/dev/null)" = 'written just before the crash' ] ||
+    fail "crash.txt lost"
+cmp -s $M/$NAME2 $T/content2 || fail "earlier file lost after the crash"
+umount $M
+mount -t tessera -r $DEV $M || fail "remount after the crash"
+[ -f $M/crash.txt ] || fail "crash.txt gone after a clean remount"
+umount $M
+echo "crash replay: ok"
+
+mdconfig -d -u ${DEV#/dev/md}; rm -f $IMG $IMG.crash $T/key $T/wrong
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload
 dmesg | tail -60 | grep -iE 'panic|tessera_fs: sealed' | tail -8

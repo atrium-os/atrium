@@ -2330,8 +2330,22 @@ static int tessera_blake3_ok;
  * data, manifest bytes) must go through this so the volume's
  * sb.hash_alg (validated at mount) picks the algorithm. Internal
  * non-format hashing (e.g. dir-name keys inside core) stays SHA-256. */
+/* On a sealed volume every content id is keyed (tessera-encryption.md §6.1):
+ * keyed BLAKE3 or HMAC-SHA-256 by hash_alg, under K_id. */
+#define TESSERA_MP_IDKEY(tmp) \
+	((tmp)->seal != NULL ? (const uint8_t *)(tmp)->seal->id : NULL)
 #define TESSERA_MP_HASH(tmp, buf, len, out) \
-	tessera_content_hash((tmp)->sb.hash_alg, (buf), (len), (out))
+	tessera_fs_content_id((tmp)->sb.hash_alg, TESSERA_MP_IDKEY(tmp), \
+	    (buf), (len), (out))
+static __inline void
+tessera_fs_content_id(uint32_t alg, const uint8_t *id_key, const uint8_t *buf,
+    size_t len, tessera_hash_t out)
+{
+	if (id_key != NULL)
+		(void)tessera_keyed_id(alg, id_key, buf, len, out);
+	else
+		tessera_content_hash(alg, buf, len, out);
+}
 static int tessera_commit_extent(struct tessera_mount *tmp_);
 struct tessera_replay_ctx {
 	struct tessera_mount *tmp_;
@@ -2906,7 +2920,7 @@ struct tessera_pending_manifest {
 struct tessera_reg_ov {
 	LIST_ENTRY(tessera_reg_ov) link;
 	uint8_t pack_id[16];
-	uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 };
 
 /* Blob→pack index overlay: appended at publish (one per new blob), batch-put
@@ -3009,7 +3023,7 @@ static int tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
     uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
     uint32_t owner_inode_no, const uint8_t *precomputed_hash);
 static int tessera_fs_replace_content_build(uint32_t hash_alg,
-    const uint8_t *new_bytes, size_t new_len, uint8_t **out_mft,
+    const uint8_t *id_key, const uint8_t *new_bytes, size_t new_len, uint8_t **out_mft,
     size_t *out_mlen, tessera_hash_t out_mhash);
 static int tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
     uint32_t inode_no, uint8_t *mft, size_t mlen, size_t new_len,
@@ -3908,12 +3922,12 @@ struct tessera_mount {
 	struct cdev              *dev;
 	tessera_superblock_t      sb;
 	/* Sealed volume (docs/spec/tessera-encryption.md §5): the keys derived
-	 * from the volume key at mount, or NULL. Sealed mounts are read-only
-	 * until the sealed write path lands; seal_reg_tree is the pack registry
-	 * with its 80-byte sealed values, kept apart from pack_registry_tree
-	 * (NULL on a sealed mount) so no 64-byte reader ever sees it. */
+	 * from the volume key at mount, or NULL. On a sealed mount the pack
+	 * registry's values are 80 bytes (the entry, then the pack front's
+	 * tag): reg_vsize says which, and every registry buffer is sized for
+	 * the larger. */
 	struct tessera_seal_keys *seal;
-	tessera_btree_t          *seal_reg_tree;
+	uint32_t                  reg_vsize;
 	/*
 	 * ★ The roots a crash would recover to. [0] = the superblock last
 	 * written to sectors 0/1; [1] = the roots of the last journal
@@ -4533,13 +4547,62 @@ tessera_fs_sb_root(const tessera_superblock_t *sb, uint8_t kind)
 	}
 }
 
+/* The live handle of tree kind `kind`, if open (FREE_EXT has none). */
+static tessera_btree_t *
+tessera_fs_live_tree(struct tessera_mount *tmp_, uint8_t kind)
+{
+	switch (kind) {
+	case TESSERA_BTREE_KIND_INODE:      return (tmp_->inode_tree);
+	case TESSERA_BTREE_KIND_PACK_REG:   return (tmp_->pack_registry_tree);
+	case TESSERA_BTREE_KIND_SNAPSHOT:   return (tmp_->snapshots_tree);
+	case TESSERA_BTREE_KIND_QUOTA:      return (tmp_->quota_tree);
+	case TESSERA_BTREE_KIND_BLOB_INDEX: return (tmp_->blob_index_tree);
+	case TESSERA_BTREE_KIND_DEAD_EXT:   return (tmp_->dead_extent_tree);
+	default:                            return (NULL);
+	}
+}
+
+/*
+ * A sealed root's tag, if this mount knows it: the live tree's (its handle
+ * carries the tag of every root it moves to), the allocator's for the
+ * free-extent tree, else the superblock's or a durable copy's (what a crash
+ * would recover to). 0 when known. A root read here without the gate can
+ * pair with a tag of a later root; the open then fails rather than misread.
+ */
+static int
+tessera_fs_root_tag(struct tessera_mount *tmp_, uint64_t root, uint8_t kind,
+    uint8_t tag[16])
+{
+	tessera_btree_t *live = tessera_fs_live_tree(tmp_, kind);
+
+	if (live != NULL && tessera_btree_root(live) == root) {
+		tessera_btree_root_tag(live, tag);
+		return (0);
+	}
+	if (kind == TESSERA_BTREE_KIND_FREE_EXT && tmp_->extent_alloc != NULL &&
+	    root == tmp_->sb.free_extent_root) {
+		tessera_extent_root_tag(tmp_->extent_alloc, tag);
+		return (0);
+	}
+	if (root == tessera_fs_sb_root(&tmp_->sb, kind)) {
+		memcpy(tag, tmp_->sb.root_tags[kind], 16);
+		return (0);
+	}
+	for (int i = 0; i < 2; i++)
+		if (root == tessera_fs_sb_root(&tmp_->durable_sb[i], kind)) {
+			memcpy(tag, tmp_->durable_sb[i].root_tags[kind], 16);
+			return (0);
+		}
+	return (ENOENT);
+}
+
 /*
  * Every metadata tree opens through here. On a sealed volume a node opens
- * only under the tag its parent holds, and the only parent this mount has
- * for a tree root is the superblock (root_tags). A root that is not the
- * superblock's own (a snapshot's, a frozen scan copy) has no tag here, so it
- * is refused rather than read without one. The pack registry is refused too:
- * its sealed values are 80 bytes, and only seal_reg_tree reads them.
+ * only under the tag its parent holds; for a tree root that is the
+ * superblock (tessera_fs_root_tag). A root this mount has no tag for (a
+ * snapshot's, a frozen scan copy) is refused rather than read without one.
+ * The pack registry's sealed values are 80 bytes whatever the caller asked
+ * for.
  */
 /* __noinline: inlined at its seven pinscan call sites it pushed
  * tessera_fs_pinscan_run over the frame limit (#114). */
@@ -4550,11 +4613,94 @@ tessera_fs_tree_open(struct tessera_mount *tmp_, uint64_t root,
 	if (tmp_->seal == NULL)
 		return (tessera_btree_open(&tmp_->meta_bio, root, kind,
 		    key_size, value_size));
-	if (kind >= TESSERA_SB_ROOT_TAGS || kind == TESSERA_BTREE_KIND_PACK_REG ||
-	    root == 0 || root != tessera_fs_sb_root(&tmp_->sb, kind))
+	uint8_t tag[16];
+	if (kind >= TESSERA_SB_ROOT_TAGS || root == 0 ||
+	    tessera_fs_root_tag(tmp_, root, kind, tag) != 0)
 		return (NULL);
+	if (kind == TESSERA_BTREE_KIND_PACK_REG)
+		value_size = TESSERA_REGISTRY_ENTRY_SIZE_SEALED;
 	return (tessera_btree_open_sealed(&tmp_->meta_bio, tmp_->seal, root,
-	    tmp_->sb.root_tags[kind], kind, key_size, value_size));
+	    tag, kind, key_size, value_size));
+}
+
+/* Every metadata tree this mount creates comes from here: a sealed tree on a
+ * sealed volume. Its root tag is read back from the handle at commit
+ * (tessera_fs_sync_root_tags). */
+static tessera_btree_t *
+tessera_fs_tree_create(struct tessera_mount *tmp_, uint8_t kind,
+    uint32_t key_size, uint32_t value_size, uint64_t *out_root)
+{
+	uint8_t tag[16];
+
+	if (tmp_->seal == NULL)
+		return (tessera_btree_create(&tmp_->meta_bio, kind, key_size,
+		    value_size, out_root));
+	return (tessera_btree_create_sealed(&tmp_->meta_bio, tmp_->seal, kind,
+	    key_size, value_size, out_root, tag));
+}
+
+/*
+ * Sealed volume: copy each open tree's root tag into sb.root_tags, the only
+ * parent a root has. A handle whose root is not the superblock's means some
+ * path moved one without the other; committing that would leave a root no
+ * mount can open, so refuse the commit instead.
+ */
+static int
+tessera_fs_sync_root_tags(struct tessera_mount *tmp_)
+{
+	const struct { tessera_btree_t *t; uint8_t kind; } trees[] = {
+		{ tmp_->inode_tree,         TESSERA_BTREE_KIND_INODE },
+		{ tmp_->pack_registry_tree, TESSERA_BTREE_KIND_PACK_REG },
+		{ tmp_->snapshots_tree,     TESSERA_BTREE_KIND_SNAPSHOT },
+		{ tmp_->quota_tree,         TESSERA_BTREE_KIND_QUOTA },
+		{ tmp_->blob_index_tree,    TESSERA_BTREE_KIND_BLOB_INDEX },
+		{ tmp_->dead_extent_tree,   TESSERA_BTREE_KIND_DEAD_EXT },
+	};
+
+	if (tmp_->seal == NULL)
+		return (0);
+	for (size_t i = 0; i < nitems(trees); i++) {
+		uint8_t k = trees[i].kind;
+
+		if (trees[i].t == NULL) {
+			if (tessera_fs_sb_root(&tmp_->sb, k) == 0)
+				memset(tmp_->sb.root_tags[k], 0, 16);
+			continue;
+		}
+		if (tessera_btree_root(trees[i].t) !=
+		    tessera_fs_sb_root(&tmp_->sb, k)) {
+			printf("tessera_fs: sealed commit refused: tree kind %u "
+			    "root %ju is not the superblock's %ju\n", k,
+			    (uintmax_t)tessera_btree_root(trees[i].t),
+			    (uintmax_t)tessera_fs_sb_root(&tmp_->sb, k));
+			return (EIO);
+		}
+		tessera_btree_root_tag(trees[i].t, tmp_->sb.root_tags[k]);
+	}
+	if (tmp_->extent_alloc != NULL)
+		tessera_extent_root_tag(tmp_->extent_alloc,
+		    tmp_->sb.root_tags[TESSERA_BTREE_KIND_FREE_EXT]);
+	return (0);
+}
+
+/* The bytes of a superblock to write. A sealed one is sealed on a copy:
+ * sealing moves the clear counters into sealed_stats and zeroes them. */
+static int
+tessera_fs_sb_encode(struct tessera_mount *tmp_, const tessera_superblock_t *sb,
+    uint8_t *buf)
+{
+	tessera_superblock_t *c;
+	int r;
+
+	if (tmp_->seal == NULL)
+		return (tessera_encode_superblock(sb, buf) == TESSERA_OK ? 0 :
+		    EIO);
+	c = malloc(sizeof *c, M_TESSERA, M_WAITOK);
+	*c = *sb;
+	r = tessera_sb_seal(tmp_->seal, c, NULL) == TESSERA_OK &&
+	    tessera_encode_superblock(c, buf) == TESSERA_OK ? 0 : EIO;
+	free(c, M_TESSERA);
+	return (r);
 }
 
 /*
@@ -4614,7 +4760,7 @@ tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
 	sbintime_t _t0 = TPROF_T0();
 	struct tessera_reg_ov *ov = malloc(sizeof *ov, M_TESSERA, M_WAITOK);
 	memcpy(ov->pack_id, pack_id, 16);
-	memcpy(ov->val, value, TESSERA_REGISTRY_ENTRY_SIZE);
+	memcpy(ov->val, value, TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
 	uint32_t b = tessera_reg_ov_bucket(pack_id);
 	mtx_lock(&tmp_->flush_mtx);
 	struct tessera_reg_ov *e;
@@ -4658,7 +4804,7 @@ tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
 			int _differs = _decoded &&
 			    (_old.start_sector != _new.start_sector ||
 			     _old.length_sectors != _new.length_sectors);
-			memcpy(e->val, value, TESSERA_REGISTRY_ENTRY_SIZE);
+			memcpy(e->val, value, TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
 			mtx_unlock(&tmp_->flush_mtx);
 			if (_differs) {
 				struct tessera_pack_alloc_result _pa;
@@ -4697,7 +4843,7 @@ tessera_fs_registry_get(struct tessera_mount *tmp_,
 		LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
 			if (memcmp(e->pack_id, pack_id, 16) == 0) {
 				memcpy(out_value, e->val,
-				    TESSERA_REGISTRY_ENTRY_SIZE);
+				    TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
 				mtx_unlock(&tmp_->flush_mtx);
 				return (TESSERA_OK);
 			}
@@ -4885,7 +5031,8 @@ tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
 	sbintime_t _t0 = TPROF_T0();
 	uint32_t n = tmp_->reg_ov_count;
 	uint8_t *keys = malloc((size_t)n * 16, M_TESSERA, M_WAITOK);
-	uint8_t *vals = malloc((size_t)n * TESSERA_REGISTRY_ENTRY_SIZE,
+	const uint32_t vsz = tmp_->reg_vsize;
+	uint8_t *vals = malloc((size_t)n * vsz,
 	    M_TESSERA, M_WAITOK);
 	struct tessera_reg_ov **ents = malloc((size_t)n * sizeof *ents,
 	    M_TESSERA, M_WAITOK);
@@ -4912,8 +5059,7 @@ tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
 	}
 	for (uint32_t i = 0; i < cnt; i++) {
 		memcpy(keys + (size_t)i * 16, ents[i]->pack_id, 16);
-		memcpy(vals + (size_t)i * TESSERA_REGISTRY_ENTRY_SIZE,
-		    ents[i]->val, TESSERA_REGISTRY_ENTRY_SIZE);
+		memcpy(vals + (size_t)i * vsz, ents[i]->val, vsz);
 	}
 	/*
 	 * ★ PACK-ZONE LEAK ROOT CAUSE: a cross-flush pack_id collision
@@ -5064,7 +5210,7 @@ tessera_fs_dead_extent_record(struct tessera_mount *tmp_,
 
 	if (tmp_->dead_extent_tree == NULL) {
 		uint64_t root = 0;
-		tmp_->dead_extent_tree = tessera_btree_create(&tmp_->meta_bio,
+		tmp_->dead_extent_tree = tessera_fs_tree_create(tmp_,
 		    TESSERA_BTREE_KIND_DEAD_EXT, TESSERA_DEAD_EXT_KEY_SIZE,
 		    TESSERA_DEAD_EXT_VAL_SIZE, &root);
 		if (tmp_->dead_extent_tree == NULL)
@@ -5265,7 +5411,7 @@ tessera_fs_blob_index_ov_flush(struct tessera_mount *tmp_)
 	/* Lazy-create the tree on first write to a volume that had no index. */
 	if (tmp_->blob_index_tree == NULL) {
 		uint64_t root = 0;
-		tmp_->blob_index_tree = tessera_btree_create(&tmp_->meta_bio,
+		tmp_->blob_index_tree = tessera_fs_tree_create(tmp_,
 		    TESSERA_BTREE_KIND_BLOB_INDEX, TESSERA_BLOB_INDEX_KEY_SIZE,
 		    TESSERA_BLOB_INDEX_VAL_SIZE, &root);
 		if (tmp_->blob_index_tree == NULL)
@@ -5348,8 +5494,11 @@ static inline tessera_manifest_builder_t *
 tessera_fs_mft_begin(struct tessera_mount *tmp, tessera_manifest_kind_t kind)
 {
 	tessera_manifest_builder_t *b = tessera_manifest_begin(kind);
-	if (b != NULL)
+	if (b != NULL) {
 		(void)tessera_manifest_set_hash_alg(b, tmp->sb.hash_alg);
+		if (tmp->seal != NULL)
+			(void)tessera_manifest_set_id_key(b, tmp->seal->id);
+	}
 	return (b);
 }
 
@@ -5393,7 +5542,9 @@ tessera_quota_for_inode(struct tessera_mount *tmp_,
 static int
 tessera_fs_dedup_is_deferred(struct tessera_mount *tmp_, uint32_t owner_inode_no)
 {
-	if (tmp_->quota_nnonglobal == 0 || owner_inode_no == 0)
+	/* Not on a sealed volume yet: the dead-extent log is not sealed. */
+	if (tmp_->quota_nnonglobal == 0 || owner_inode_no == 0 ||
+	    tmp_->seal != NULL)
 		return (0);
 
 	tessera_inode_record_t ino;
@@ -6412,8 +6563,32 @@ tessera_fs_journal_open_dev(struct tessera_mount *tmp_)
 {
 	if (tmp_->journal != NULL)
 		return;
-	tmp_->journal = tessera_journal_open(&tmp_->bio,
-	    tmp_->sb.journal_start, tmp_->sb.journal_length);
+	if (tmp_->seal != NULL) {
+		/*
+		 * Sealed: the journal opens only under the SB's anchor. When it
+		 * does not (a crash between a commit's SB write and the
+		 * checkpoint that starts the SB's epoch, or tampering), the SB
+		 * holds everything and a writable mount starts a fresh journal
+		 * under its anchor (tessera-encryption.md §5.3).
+		 */
+		tmp_->journal = tessera_journal_open_sealed(&tmp_->bio,
+		    tmp_->sb.journal_start, tmp_->sb.journal_length, tmp_->seal,
+		    tmp_->sb.journal_anchor_tag);
+		if (tmp_->journal == NULL && tmp_->dev_writable) {
+			printf("tessera_fs: sealed journal is not of this "
+			    "superblock's epoch; starting a fresh one\n");
+			if (tessera_journal_format_sealed(&tmp_->bio,
+			    tmp_->sb.journal_start, tmp_->sb.journal_length,
+			    tmp_->seal, tmp_->sb.journal_anchor_tag) ==
+			    TESSERA_OK)
+				tmp_->journal = tessera_journal_open_sealed(
+				    &tmp_->bio, tmp_->sb.journal_start,
+				    tmp_->sb.journal_length, tmp_->seal,
+				    tmp_->sb.journal_anchor_tag);
+		}
+	} else
+		tmp_->journal = tessera_journal_open(&tmp_->bio,
+		    tmp_->sb.journal_start, tmp_->sb.journal_length);
 	if (tmp_->journal != NULL)
 		printf("tessera_fs: journal_open OK at sector %lu len %lu\n",
 		    (unsigned long)tmp_->sb.journal_start,
@@ -6654,13 +6829,44 @@ tessera_fs_journal_persist_sb(struct tessera_mount *tmp_)
 {
 	uint8_t *sbbuf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA,
 	    M_WAITOK | M_ZERO);
-	if (tessera_encode_superblock(&tmp_->sb, sbbuf) == TESSERA_OK) {
+	if (tessera_fs_sb_encode(tmp_, &tmp_->sb, sbbuf) == 0) {
 		(void)tessera_kbio_write(&tmp_->bio_ctx, 0, sbbuf);
 		(void)tessera_kbio_write(&tmp_->bio_ctx, 1, sbbuf);
 	}
 	free(sbbuf, M_TESSERA);
 	printf("tessera_fs: recovered SB persisted, gen=%lu\n",
 	    (unsigned long)tmp_->sb.generation);
+}
+
+/*
+ * Sealed journal checkpoint outside a commit (clean unmount): the epoch that
+ * follows is chained to a fresh anchor, which must be in a durable SB before
+ * the journal starts it. The SB written is the in-core one, already
+ * committed, with only the anchor changed.
+ */
+static void
+tessera_fs_journal_rotate_sealed(struct tessera_mount *tmp_)
+{
+	uint8_t anchor[16], old[16];
+	uint8_t *buf;
+
+	if (tmp_->seal == NULL || tmp_->journal == NULL)
+		return;
+	memcpy(old, tmp_->sb.journal_anchor_tag, 16);
+	arc4random_buf(anchor, sizeof anchor);
+	memcpy(tmp_->sb.journal_anchor_tag, anchor, 16);
+	buf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK | M_ZERO);
+	if (tessera_fs_sb_encode(tmp_, &tmp_->sb, buf) != 0 ||
+	    tessera_kbio_write(&tmp_->bio_ctx, 0, buf) != 0 ||
+	    tessera_kbio_write(&tmp_->bio_ctx, 1, buf) != 0) {
+		/* Old epoch kept: its records replay harmlessly by gen. */
+		memcpy(tmp_->sb.journal_anchor_tag, old, 16);
+		free(buf, M_TESSERA);
+		return;
+	}
+	free(buf, M_TESSERA);
+	tessera_kbio_barrier(&tmp_->bio_ctx);
+	(void)tessera_journal_checkpoint_anchor(tmp_->journal, anchor);
 }
 
 /* Wire the deferred (bdwrite) block_io used to drain the dirent/inode redo
@@ -7362,7 +7568,7 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 static void
 tessera_fs_legacy_sweep_kick(struct tessera_mount *tmp_)
 {
-	if (tessera_legacy_orphan_sweep == 0 ||
+	if (tessera_legacy_orphan_sweep == 0 || tmp_->seal != NULL ||
 	    (tmp_->sb.feature_flags & TESSERA_FEATURE_UNLINKED_FLAG))
 		return;
 	if (!tmp_->legacy_tq_init) {
@@ -7403,7 +7609,7 @@ tessera_fs_journal_setup(struct tessera_mount *tmp_)
  * from a copy whose key check and HMAC pass under that key; when either
  * copy says sealed, an unsealed copy is never used. The newest copy that
  * verifies wins, and it must not be older than the key's high-water mark
- * (§8). Read-only until the sealed write path exists.
+ * (§8).
  */
 static int
 tessera_fs_seal_select(tessera_superblock_t *a, int va,
@@ -7416,10 +7622,11 @@ tessera_fs_seal_select(tessera_superblock_t *a, int va,
 	uint64_t hw = 0;
 	int ok[2] = { 0, 0 }, have = -1, r, why = EINTEGRITY;
 
-	if (!ronly || requested_gen != 0) {
-		printf("tessera_fs: sealed volumes mount read-only for now "
+	(void)ronly;
+	if (requested_gen != 0) {
+		printf("tessera_fs: sealed volumes keep no snapshots yet "
 		    "(no tessera.gen); refusing\n");
-		return (EROFS);
+		return (EOPNOTSUPP);
 	}
 	if (tessera_crypt_backend() == NULL) {
 		printf("tessera_fs: sealed volume, but no crypto backend "
@@ -7665,6 +7872,19 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 	tmp_->seal  = seal;
+	if (seal != NULL) {
+		/* Back into the clear fields, so the next seal keeps them. */
+		tessera_sb_stats_t st;
+		if (tessera_sb_verify(seal, &tmp_->sb, &st) == TESSERA_OK) {
+			tmp_->sb.total_blob_count = st.total_blob_count;
+			tmp_->sb.total_pack_count = st.total_pack_count;
+			tmp_->sb.format_time      = st.format_time;
+			tmp_->sb.last_mount_time  = st.last_mount_time;
+		}
+		explicit_bzero(&st, sizeof st);
+	}
+	tmp_->reg_vsize = seal != NULL ?
+	    TESSERA_REGISTRY_ENTRY_SIZE_SEALED : TESSERA_REGISTRY_ENTRY_SIZE;
 	tmp_->zone_lo = zone_lo;
 	tmp_->zone_hi = zone_hi;
 	tmp_->ronly = ronly;
@@ -7856,10 +8076,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * root volume escaped the blanket version only because it mounts ro
 	 * and upgrades, and the upgrade replays after the trees are open.
 	 */
-	/* Sealed (read-only for now): nothing but format has written its
-	 * journal, whose first epoch is empty; replay comes with the sealed
-	 * write path, whose ROOT_UPDATEs must carry the roots' tags. */
-	if (requested_gen == 0 && tmp_->seal == NULL) {
+	/* Sealed: the journal opens only under the SB's anchor, and its
+	 * ROOT_UPDATEs carry the roots' tags (tessera_replay_handler). */
+	if (requested_gen == 0) {
 		int applied = tessera_fs_journal_replay(tmp_, /*roots_only=*/1);
 		if (!ronly && applied > 0 && tmp_->journal != NULL)
 			tessera_fs_journal_persist_sb(tmp_);
@@ -7940,13 +8159,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->pack_registry_tree = tessera_fs_tree_open(tmp_,
 	    tmp_->sb.pack_registry_root, /*tree_kind*/ 1,
 	    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
-	if (tmp_->seal != NULL)
-		tmp_->seal_reg_tree = tessera_btree_open_sealed(&tmp_->meta_bio,
-		    tmp_->seal, tmp_->sb.pack_registry_root,
-		    tmp_->sb.root_tags[TESSERA_BTREE_KIND_PACK_REG],
-		    TESSERA_BTREE_KIND_PACK_REG, 16,
-		    TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
-	if (tmp_->pack_registry_tree == NULL && tmp_->seal_reg_tree == NULL)
+	if (tmp_->pack_registry_tree == NULL)
 		printf("tessera_fs: warning — pack registry open at sector %lu "
 		    "failed; blob lookups will fail\n",
 		    (unsigned long)tmp_->sb.pack_registry_root);
@@ -7988,7 +8201,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * existing one. tree_kind=3 is the snapshot kind; key is the
 	 * 8-byte big-endian generation. Forensic mounts never lazy-
 	 * allocate (would write to disk; we're read-only). */
-	if (tmp_->sb.snapshots_root == 0 && !tmp_->readonly_snapshot && !ronly) {
+	/* Not on a sealed volume yet: a snapshot's roots would need their
+	 * tags kept with them. */
+	if (tmp_->sb.snapshots_root == 0 && !tmp_->readonly_snapshot && !ronly &&
+	    tmp_->seal == NULL) {
 		uint64_t new_root = 0;
 		tmp_->snapshots_tree = tessera_btree_create(&tmp_->meta_bio,
 		    /*tree_kind*/ 3, /*key*/ 8,
@@ -8309,6 +8525,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		 * they never sit in RAM. */
 		tessera_fs_seed_constant_manifests(tmp_);
 	}
+	/* Sealed: no repack, but the constants are seeded the same way. */
+	if (tmp_->seal != NULL && !ronly)
+		tessera_fs_seed_constant_manifests(tmp_);
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL;
 	/*
@@ -8470,11 +8689,6 @@ tessera_mount_impl(struct mount *mp)
 		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
 		if (tmp_ != NULL) {
 			int going_ro = vfs_flagopt(mp->mnt_optnew, "ro", NULL, 0);
-			if (tmp_->ronly && !going_ro && tmp_->seal != NULL) {
-				printf("tessera_fs: a sealed volume stays "
-				    "read-only for now\n");
-				return (EROFS);
-			}
 			if (tmp_->ronly && !going_ro) {
 				/* ro -> rw: acquire write access before any write. */
 				g_topology_lock();
@@ -8679,7 +8893,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		    tessera_btree_seek_first(tmp_->pack_registry_tree);
 		while (_c != NULL) {
 			uint8_t _k[16];
-			uint8_t _v[TESSERA_REGISTRY_ENTRY_SIZE];
+			uint8_t _v[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 			if (tessera_btree_cursor_get(_c, _k, _v) != TESSERA_OK)
 				break;
 			tessera_registry_entry_t _re;
@@ -8817,7 +9031,9 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * cleanly-unmounted volume mounts with an empty journal and
 			 * replays nothing. (Crash recovery still relies on the live
 			 * journal; this only runs on the orderly unmount path.) */
-			if (tmp_->journal != NULL)
+			if (tmp_->journal != NULL && tmp_->seal != NULL)
+				tessera_fs_journal_rotate_sealed(tmp_);
+			else if (tmp_->journal != NULL)
 				(void)tessera_journal_checkpoint(tmp_->journal);
 			} /* tmp_->dev_writable */
 		}
@@ -9023,8 +9239,6 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->quota_tree);
 		if (tmp_->pack_registry_tree != NULL)
 			tessera_btree_close(tmp_->pack_registry_tree);
-		if (tmp_->seal_reg_tree != NULL)
-			tessera_btree_close(tmp_->seal_reg_tree);
 		if (tmp_->blob_index_tree != NULL)
 			tessera_btree_close(tmp_->blob_index_tree);
 		if (tmp_->dead_extent_tree != NULL)
@@ -12187,6 +12401,15 @@ struct tessera_jrec_sb_commit {
 	uint64_t quota_tree_root;
 };
 
+/* A sealed volume's ROOT_UPDATE: the roots above, then the blob index root
+ * and every root's tag, without which replay could not open the trees it
+ * rolls forward to. A sealed mount takes only this form. */
+struct tessera_jrec_sb_commit_sealed {
+	struct tessera_jrec_sb_commit c;
+	uint64_t blob_index_root;
+	uint8_t  root_tags[TESSERA_SB_ROOT_TAGS][16];
+};
+
 /*
  * Retire the OLDEST snapshot record. Returns 1 if one was dropped, 0 if
  * none remained or the delete failed. Does NOT rebuild the pin bitmap —
@@ -12639,7 +12862,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	    (tmp_->quota_ndomains > 0 || tmp_->quota_ndead > 0)) {
 		uint64_t qroot = tmp_->sb.quota_tree_root;
 		if (tmp_->quota_tree == NULL && tmp_->quota_ndomains > 0)
-			tmp_->quota_tree = tessera_btree_create(&tmp_->meta_bio,
+			tmp_->quota_tree = tessera_fs_tree_create(tmp_,
 			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
 			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
 		int qok = (tmp_->quota_tree != NULL);
@@ -12669,6 +12892,10 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			tmp_->quota_ndead = 0;
 		}
 	}
+
+	/* Sealed: every root's tag goes into the SB and the journal record. */
+	if (tessera_fs_sync_root_tags(tmp_) != 0)
+		return (EIO);
 
 	/* Flush devvp's delayed-write buffers to the device BEFORE the
 	 * barrier. Pack content (tessera_fs_pack_alloc_and_write) and the
@@ -12709,7 +12936,10 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		uint64_t tx;
 		if (tessera_journal_tx_begin(tmp_->journal, &tx,
 		    "sb_commit") == TESSERA_OK) {
+			struct tessera_jrec_sb_commit_sealed *sbody = NULL;
 			struct tessera_jrec_sb_commit body;
+			const void *jbody = &body;
+			size_t jlen = sizeof body;
 			body.generation         = tmp_->sb.generation;
 			body.inode_root         = tmp_->sb.inode_root;
 			body.pack_registry_root = tmp_->sb.pack_registry_root;
@@ -12719,11 +12949,24 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			body.next_inode_no      = tmp_->sb.next_inode_no;
 			body.meta_reserve_bump  = tmp_->sb.meta_reserve_bump;
 			body.quota_tree_root    = tmp_->sb.quota_tree_root;
-			if (tessera_journal_append(tmp_->journal, tx,
-			    TESSERA_ROOT_UPDATE, &body, sizeof body)
-			    == TESSERA_OK &&
+			if (tmp_->seal != NULL) {
+				sbody = malloc(sizeof *sbody, M_TESSERA,
+				    M_WAITOK | M_ZERO);
+				sbody->c = body;
+				sbody->blob_index_root =
+				    tmp_->sb.blob_index_root;
+				memcpy(sbody->root_tags, tmp_->sb.root_tags,
+				    sizeof sbody->root_tags);
+				jbody = sbody;
+				jlen = sizeof *sbody;
+			}
+			int jok = tessera_journal_append(tmp_->journal, tx,
+			    TESSERA_ROOT_UPDATE, jbody, jlen) == TESSERA_OK &&
 			    tessera_journal_tx_commit(tmp_->journal, tx)
-			    == TESSERA_OK) {
+			    == TESSERA_OK;
+			if (sbody != NULL)
+				free(sbody, M_TESSERA);
+			if (jok) {
 				/*
 				 * ★ Replay now rolls a crash forward to these
 				 * roots even if the SB write below fails, so
@@ -12761,17 +13004,23 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * kstack overflow when commit_sb is called from a deep frame
 	 * (e.g., mount-time GC: mountfs → gc_data_zone → commit_sb). */
 	_sbt = TPROF_T0();
+	/* Sealed: the journal's next epoch is chained to a fresh anchor that
+	 * this SB carries. Until the checkpoint below starts that epoch, the
+	 * on-disk journal does not open under it, and a mount then formats a
+	 * fresh one: everything in the old epoch is in this SB. */
+	uint8_t new_anchor[16], old_anchor[16];
+	if (tmp_->seal != NULL && tmp_->journal != NULL) {
+		memcpy(old_anchor, tmp_->sb.journal_anchor_tag, 16);
+		arc4random_buf(new_anchor, sizeof new_anchor);
+		memcpy(tmp_->sb.journal_anchor_tag, new_anchor, 16);
+	}
 	uint8_t *buf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK | M_ZERO);
-	if (tessera_encode_superblock(&tmp_->sb, buf) != TESSERA_OK) {
+	if (tessera_fs_sb_encode(tmp_, &tmp_->sb, buf) != 0 ||
+	    tessera_kbio_write(&tmp_->bio_ctx, 0, buf) != 0 ||
+	    tessera_kbio_write(&tmp_->bio_ctx, 1, buf) != 0) {
 		free(buf, M_TESSERA);
-		return (EIO);
-	}
-	if (tessera_kbio_write(&tmp_->bio_ctx, 0, buf) != 0) {
-		free(buf, M_TESSERA);
-		return (EIO);
-	}
-	if (tessera_kbio_write(&tmp_->bio_ctx, 1, buf) != 0) {
-		free(buf, M_TESSERA);
+		if (tmp_->seal != NULL && tmp_->journal != NULL)
+			memcpy(tmp_->sb.journal_anchor_tag, old_anchor, 16);
 		return (EIO);
 	}
 	free(buf, M_TESSERA);
@@ -12794,8 +13043,14 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * push us toward the journal-full wrap. Crash between the SB write
 	 * and the checkpoint is harmless: replay-on-mount checks
 	 * `record.gen > sb.gen` so the already-applied record is skipped. */
-	if (tmp_->journal != NULL)
+	if (tmp_->journal != NULL && tmp_->seal != NULL)
+		(void)tessera_journal_checkpoint_anchor(tmp_->journal,
+		    new_anchor);
+	else if (tmp_->journal != NULL)
 		(void)tessera_journal_checkpoint(tmp_->journal);
+	if (tmp_->seal != NULL)
+		tessera_keyring_note_gen(tmp_->seal->key_id,
+		    tmp_->sb.generation);
 	TPROF_ADD(TPROF_SB_BAR2, _sbt);
 
 	/* The new SB is durable, so the OLD SB no longer references any
@@ -14375,7 +14630,7 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			 * seqlock and must not be skipped with it.
 			 */
 			struct tessera_cas_loc_snap snap_dummy;
-			uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
+			uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 			/* SATB barrier for the reference this dedup is about to
 			 * create. Safe here: flush_mtx was released just above,
 			 * and the note's slow path takes it. */
@@ -14549,8 +14804,8 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, cas_enable, CTLFLAG_RW,
  * too, which is the safe direction to err in.
  */
 static int
-tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *buf, uint32_t len,
-    const tessera_hash_t hash, int cached)
+tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *id_key,
+    const uint8_t *buf, uint32_t len, const tessera_hash_t hash, int cached)
 {
 	int mode = tessera_verify_reads;
 	int is_manifest;
@@ -14574,7 +14829,7 @@ tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *buf, uint32_t len,
 
 	sbintime_t _t0 = sbinuptime();
 	tessera_hash_t check;
-	tessera_content_hash(hash_alg, buf, len, check);
+	tessera_fs_content_id(hash_alg, id_key, buf, len, check);
 	tessera_stat_verify_ns += (unsigned long)sbttons(sbinuptime() - _t0);
 	tessera_stat_verify_bytes += len;
 	if (is_manifest) {
@@ -16234,7 +16489,8 @@ tessera_fs_dc_prep_worker(void *ctx, int pending)
 				j->it[i].kind = 0;
 				j->it[i].error =
 				    tessera_fs_replace_content_build(
-				    tmp_->sb.hash_alg, dc->bytes, dc->size,
+				    tmp_->sb.hash_alg, TESSERA_MP_IDKEY(tmp_),
+				    dc->bytes, dc->size,
 				    &j->it[i].mft, &j->it[i].mlen,
 				    j->it[i].mhash);
 			} else {
@@ -17915,7 +18171,16 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_fs_tree_open(tmp_,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
-		if (t == NULL) continue;
+		if (t == NULL) {
+			/* Sealed: a root whose tag this mount could not pair
+			 * with it (it moved under us) was not walked, so the
+			 * bitmap is incomplete; plain trees open regardless. */
+			if (tmp_->seal != NULL) {
+				tessera_stat_pinscan_trunc++;
+				stale_skipped = 1;
+			}
+			continue;
+		}
 		int _wrc = tessera_btree_walk_nodes_ex(t, meta_mark_visitor,
 		    meta_mark_post_visitor, &mctx);
 		if (_wrc != 0) {
@@ -18632,9 +18897,20 @@ tessera_replay_handler(void *ctx, const tessera_record_header_t *hdr,
 	if (hdr->record_type != (uint32_t)TESSERA_ROOT_UPDATE) return (0);
 	if (hdr->body_length < sizeof(struct tessera_jrec_sb_commit))
 		return (0);
+	/* A sealed volume rolls forward only to roots whose tags it has. */
+	if (rc->tmp_->seal != NULL &&
+	    hdr->body_length < sizeof(struct tessera_jrec_sb_commit_sealed))
+		return (0);
 	struct tessera_jrec_sb_commit rec;
 	memcpy(&rec, body, sizeof rec);
 	if (rec.generation <= rc->tmp_->sb.generation) return (0);
+	if (rc->tmp_->seal != NULL) {
+		const struct tessera_jrec_sb_commit_sealed *sr =
+		    (const struct tessera_jrec_sb_commit_sealed *)body;
+		rc->tmp_->sb.blob_index_root = sr->blob_index_root;
+		memcpy(rc->tmp_->sb.root_tags, sr->root_tags,
+		    sizeof rc->tmp_->sb.root_tags);
+	}
 	rc->tmp_->sb.generation         = rec.generation;
 	rc->tmp_->sb.inode_root         = rec.inode_root;
 	rc->tmp_->sb.pack_registry_root = rec.pack_registry_root;
@@ -18887,7 +19163,7 @@ tessera_fs_pack_extract_blob(const uint8_t *pack, uint32_t packlen,
 	if (dlen > 0)
 		memcpy(buf, pack + blob_off + sizeof(tessera_blob_descriptor_t),
 		    dlen);
-	if (tessera_fs_verify_blob(hash_alg, buf, dlen, hash, /*cached*/ 0)
+	if (tessera_fs_verify_blob(hash_alg, NULL, buf, dlen, hash, /*cached*/ 0)
 	    != 0) {
 		if (buf != dst) free(buf, M_TESSERA);
 		return (EIO);
@@ -19087,8 +19363,8 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
 		/* Content-addressed integrity: the returned bytes must hash to
 		 * the key we looked them up by. Policy + accounting live in
 		 * tessera_fs_verify_blob (kern.tessera.verify_reads, #87). */
-		if (tessera_fs_verify_blob(tmp_->sb.hash_alg, buf, dlen, hash,
-		    /*cached*/ 0) != 0) {
+		if (tessera_fs_verify_blob(tmp_->sb.hash_alg,
+		    TESSERA_MP_IDKEY(tmp_), buf, dlen, hash, /*cached*/ 0) != 0) {
 			free(buf, M_TESSERA);
 			return (EIO);
 		}
@@ -19122,7 +19398,7 @@ tessera_fs_fetch_reloc_ok(struct tessera_mount *tmp_, uint64_t reloc_gen0,
 	if (atomic_load_acq_64(&tmp_->pack_reloc_gen) == reloc_gen0)
 		return (1);
 	tessera_hash_t h;
-	tessera_content_hash(tmp_->sb.hash_alg, buf, len, h);
+	TESSERA_MP_HASH(tmp_, buf, len, h);
 	if (memcmp(h, hash, TESSERA_HASH_SIZE) == 0) {
 		tessera_stat_fetch_reloc_verified++;
 		return (1);
@@ -19247,20 +19523,96 @@ out:
 	return (rc);
 }
 
-/* Sealed fetch: every pack in the registry, in order, until one holds the
- * id. O(packs) per miss; the sealed write path adds the blob index. */
+/* One registry entry's pack, by pack id (overlay first, then the tree). */
+static int
+tessera_fs_sealed_fetch_from(struct tessera_mount *tmp_, const uint8_t pid[16],
+    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+{
+	uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	tessera_registry_entry_t re;
+
+	if (tessera_fs_registry_get(tmp_, pid, val) != TESSERA_OK ||
+	    tessera_decode_registry_entry(val, &re) != TESSERA_OK)
+		return (ENOENT);
+	return (tessera_fs_sealed_pack_find(tmp_, &re,
+	    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf, out_len));
+}
+
+/*
+ * Sealed fetch. The blob index (its overlay, then the tree) names the pack;
+ * a miss there tries the packs published since the last flush, then every
+ * pack in the registry. A sealed pack's front opens only under the tag its
+ * registry entry holds, and its blob only under the id asked for, so a stale
+ * index entry costs a read, never a wrong answer.
+ */
 static int
 tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
     const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
 {
-	uint8_t key[16], val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	uint8_t key[16], val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED], pid[16];
 	tessera_registry_entry_t re;
 	tessera_btree_cursor_t *c;
-	int rc = ENOENT, r;
+	uint8_t *pids = NULL;
+	uint32_t npids = 0;
+	int rc = ENOENT, r, have = 0;
 
-	if (tmp_->seal_reg_tree == NULL)
+	if (tmp_->pack_registry_tree == NULL)
 		return (EIO);
-	c = tessera_btree_seek_first(tmp_->seal_reg_tree);
+	if (tmp_->flush_mtx_init) {
+		uint32_t b = ((uint32_t)id[0] | ((uint32_t)id[1] << 8)) & 63u;
+		struct tessera_blob_ov *e;
+
+		mtx_lock(&tmp_->flush_mtx);
+		LIST_FOREACH(e, &tmp_->blob_ov[b], link)
+			if (memcmp(e->hash, id, 32) == 0) {
+				memcpy(pid, e->pack_id, 16);
+				have = 1;
+				break;
+			}
+		mtx_unlock(&tmp_->flush_mtx);
+	}
+	if (!have && tmp_->blob_index_tree != NULL &&
+	    tessera_btree_get(tmp_->blob_index_tree, id, pid) == TESSERA_OK)
+		have = 1;
+	if (have) {
+		r = tessera_fs_sealed_fetch_from(tmp_, pid, id, out_buf, out_len);
+		if (r != ENOENT)
+			return (r);
+	}
+
+	/* Packs not yet in the tree: copy their ids out of the overlay. */
+	if (tmp_->flush_mtx_init) {
+		struct tessera_reg_ov *e;
+		uint32_t cap;
+
+		mtx_lock(&tmp_->flush_mtx);
+		cap = tmp_->reg_ov_count;
+		mtx_unlock(&tmp_->flush_mtx);
+		if (cap > 0) {
+			pids = malloc((size_t)cap * 16, M_TESSERA, M_WAITOK);
+			mtx_lock(&tmp_->flush_mtx);
+			for (uint32_t b = 0; b < 64 && npids < cap; b++)
+				LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
+					if (npids >= cap)
+						break;
+					memcpy(pids + (size_t)npids * 16,
+					    e->pack_id, 16);
+					npids++;
+				}
+			mtx_unlock(&tmp_->flush_mtx);
+		}
+	}
+	for (uint32_t i = 0; i < npids; i++) {
+		r = tessera_fs_sealed_fetch_from(tmp_, pids + (size_t)i * 16,
+		    id, out_buf, out_len);
+		if (r != ENOENT) {
+			free(pids, M_TESSERA);
+			return (r);
+		}
+	}
+	free(pids, M_TESSERA);
+
+	c = tessera_btree_seek_first(tmp_->pack_registry_tree);
 	if (c == NULL)
 		return (EIO);
 	for (;;) {
@@ -19342,8 +19694,9 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	 * and the skip is counted so the difference is measurable. */
 	if (tessera_cas_byte_lookup(&tmp_->cas_cache, hash,
 	    out_buf, out_len)) {
-		if (tessera_fs_verify_blob(tmp_->sb.hash_alg, *out_buf,
-		    *out_len, hash, /*cached*/ 1) != 0) {
+		if (tessera_fs_verify_blob(tmp_->sb.hash_alg,
+		    TESSERA_MP_IDKEY(tmp_), *out_buf, *out_len, hash,
+		    /*cached*/ 1) != 0) {
 			free(*out_buf, M_TESSERA);
 			*out_buf = NULL;
 			*out_len = 0;
@@ -19400,7 +19753,7 @@ retry_reloc:
 				/* Multi-extent (PEL) pack — fetch the registry
 				 * entry by pack_id (O(log N)) and resolve
 				 * extents. Still much cheaper than scanning. */
-				uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+				uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 				if (tessera_fs_registry_get(tmp_,
 				    snap.pack_id, reg_value) != TESSERA_OK)
 					{ _mt_loc_stale = 1; goto cas_fast_miss; } /* stale entry */
@@ -19541,7 +19894,7 @@ retry_reloc:
 		uint8_t pid[16];
 		if (tessera_btree_get(tmp_->blob_index_tree, hash, pid) == TESSERA_OK) {
 			_mt_idx = 1;
-			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE];
+			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 			tessera_registry_entry_t re;
 			/* Split from the compound condition ONLY so the miss
 			 * trace can distinguish "the index named a pack the
@@ -19616,7 +19969,7 @@ cas_fast_miss:
 	int rc = ENOENT;
 	for (;;) {
 		uint8_t key[16];
-		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		int _crc = tessera_btree_cursor_get(c, key, value);
 		if (_crc != TESSERA_OK) {
 			if (_crc != TESSERA_ENOENT)
@@ -19723,7 +20076,7 @@ next_pack:
 	    reg_override == NULL) {   /* frozen-registry GC walks opt out */
 		struct tessera_ovcand {
 			uint8_t pid[16];
-			uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE];
+			uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		} *cand = NULL;
 		uint32_t ncand = 0, i;
 
@@ -19744,7 +20097,7 @@ next_pack:
 						if (k >= ncand) break;
 						memcpy(cand[k].pid, e->pack_id, 16);
 						memcpy(cand[k].val, e->val,
-						    TESSERA_REGISTRY_ENTRY_SIZE);
+						    TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
 						k++;
 					}
 				}
@@ -20335,6 +20688,9 @@ static int
 tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
     struct tessera_gc_scan *scan)
 {
+	/* Not on a sealed volume yet (GC and repack read packs plain). */
+	if (tmp_->seal != NULL)
+		return (0);
 	const int concurrent = (scan != NULL && scan->concurrent);
 	/* A pass walks FROZEN roots the pinscan pins; it must not hold a
 	 * reader epoch for 55 s and stall every swap. */
@@ -21331,7 +21687,7 @@ snap_next:
 			 * pointer (#81). */
 			tessera_hash_t *bh_all = NULL;
 			uint8_t pkey[16];
-			uint8_t pval[TESSERA_REGISTRY_ENTRY_SIZE];
+			uint8_t pval[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 			if (__predict_false(_GC_TEARDOWN()))
 				break;
 			if (tessera_btree_cursor_get(pc, pkey, pval) != TESSERA_OK)
@@ -21727,7 +22083,7 @@ next_p:
 		 * --repair reclaims genuinely leaked space offline). Present
 		 * but different -> republished since the scan; keep it.
 		 */
-		uint8_t _regv[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t _regv[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		int _grc = tessera_btree_get(tmp_->pack_registry_tree,
 		    deads[i].pack_id, _regv);
 		int _same = 0;
@@ -22131,6 +22487,9 @@ static int
 tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 {
 	if (out_reclaimed != NULL) *out_reclaimed = 0;
+	/* Not on a sealed volume yet (GC and repack read packs plain). */
+	if (tmp_->seal != NULL)
+		return (EOPNOTSUPP);
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
 		return (EROFS);
 	if (tmp_->readonly_snapshot)
@@ -22197,7 +22556,7 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 static void
 tessera_fs_gc_arm(struct tessera_mount *tmp_)
 {
-	if (!tmp_->gc_tq_init || tmp_->flush_unmounting)
+	if (!tmp_->gc_tq_init || tmp_->flush_unmounting || tmp_->seal != NULL)
 		return;
 	if (atomic_cmpset_acq_int((volatile int *)&tmp_->gc_task_armed, 0, 1))
 		taskqueue_enqueue(tmp_->gc_tq, &tmp_->gc_task);
@@ -22295,7 +22654,7 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	    !tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		/* #79: apply-phase-safe lookup — a dedup hit creates a new
 		 * reference that is recorded nowhere else. */
 		if (tessera_fs_registry_get_stable(tmp_,
@@ -22351,7 +22710,7 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 		sbintime_t _tc = TPROF_T0();
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_fs_registry_get_stable(tmp_,
 		    pack_id_local, reg_value, out_hash) == TESSERA_OK) {
 			TPROF_ADD(TPROF_C_PRECHK, _tc);
@@ -22951,6 +23310,11 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
                            const uint8_t pack_id[16],
                            int *out_was_repacked)
 {
+	if (tmp_->seal != NULL) {
+		if (out_was_repacked != NULL)
+			*out_was_repacked = 0;
+		return (EOPNOTSUPP);
+	}
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int rc = tessera_fs_repack_one_pack_inner(tmp_, pack_id,
@@ -22967,7 +23331,7 @@ tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
 	if (out_was_repacked != NULL) *out_was_repacked = 0;
 	if (tmp_->pack_registry_tree == NULL) return (EROFS);
 
-	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_fs_registry_get(tmp_, pack_id, reg_value)
 	    != TESSERA_OK)
 		return (ENOENT);
@@ -23038,7 +23402,7 @@ tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
 	new_re.start_sector   = pa.start_sector;
 	new_re.length_sectors = pa.length_sectors;
 	new_re.flags          = pa.flags;
-	uint8_t new_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t new_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&new_re, new_value) != TESSERA_OK) {
 		/* Should not fail; defensive cleanup of the new copy. */
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -23190,6 +23554,11 @@ tessera_fs_repack_pass(struct tessera_mount *tmp_,
                        uint32_t max_packs, uint32_t max_time_ms,
                        uint32_t *out_repacked)
 {
+	if (tmp_->seal != NULL) {
+		if (out_repacked != NULL)
+			*out_repacked = 0;
+		return (0);
+	}
 	if (tmp_->pack_registry_tree == NULL) return (EROFS);
 
 	struct timeval tv0, tv1;
@@ -23209,7 +23578,7 @@ tessera_fs_repack_pass(struct tessera_mount *tmp_,
 	    tessera_btree_seek_first(tmp_->pack_registry_tree);
 	while (c != NULL && cand_n < max_packs) {
 		uint8_t key[16];
-		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
 			break;
 		tessera_registry_entry_t re;
@@ -23440,7 +23809,7 @@ tessera_fs_count_multi_extent(struct tessera_mount *tmp_, uint32_t *out_count)
 	uint32_t n = 0;
 	for (;;) {
 		uint8_t key[16];
-		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
 			break;
 		tessera_registry_entry_t re;
@@ -23457,14 +23826,15 @@ tessera_fs_count_multi_extent(struct tessera_mount *tmp_, uint32_t *out_count)
 static int
 tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
 {
-	if (tmp_->pack_registry_tree == NULL) return (EROFS);
+	if (tmp_->pack_registry_tree == NULL || tmp_->seal != NULL)
+		return (EROFS);
 	tessera_btree_cursor_t *c =
 	    tessera_btree_seek_first(tmp_->pack_registry_tree);
 	if (c == NULL) return (ENOENT);
 	int err = ENOENT;
 	for (;;) {
 		uint8_t key[16];
-		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
 			break;
 		tessera_registry_entry_t re;
@@ -23479,6 +23849,47 @@ tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
 	}
 	tessera_btree_cursor_free(c);
 	return (err);
+}
+
+/*
+ * Pack building on either kind of volume. On a sealed one (tessera-encryption
+ * §5.5) the pack is laid out with room for the prelude, each blob is sealed
+ * under K_blob bound to its keyed id, and after finalize the front matter is
+ * sealed under K_meta; its tag goes into the registry entry (bytes 64..80).
+ * Sealed packs take one contiguous extent: there is no sealed PEL.
+ */
+static tessera_pack_builder_t *
+tessera_fs_pack_begin(struct tessera_mount *tmp_, uint32_t kind,
+    const uint8_t pack_id[16], uint64_t creator_tx)
+{
+	tessera_pack_builder_t *pb = tessera_pack_begin(kind, pack_id,
+	    creator_tx);
+
+	if (pb != NULL && tmp_->seal != NULL)
+		tessera_pack_set_sealed(pb);
+	return (pb);
+}
+
+static int
+tessera_fs_pack_add(struct tessera_mount *tmp_, tessera_pack_builder_t *pb,
+    const tessera_hash_t id, const uint8_t *bytes, uint32_t len,
+    uint32_t flags)
+{
+	if (tmp_->seal != NULL)
+		return (tessera_pack_add_sealed_blob(pb, &tmp_->seal->blob,
+		    tmp_->seal->uuid, 0, id, bytes, len, flags));
+	return (tessera_pack_add_blob(pb, id, bytes, len, flags));
+}
+
+static int
+tessera_fs_pack_seal(struct tessera_mount *tmp_, uint8_t *pack, size_t len,
+    uint8_t front_tag[16])
+{
+	memset(front_tag, 0, 16);
+	if (tmp_->seal == NULL)
+		return (0);
+	return (tessera_pack_seal_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
+	    pack, len, front_tag) == TESSERA_OK ? 0 : EIO);
 }
 
 static int tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
@@ -23514,9 +23925,9 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	uint8_t pack_id[16];
 	memcpy(pack_id, hash, 16);
 
-	tessera_pack_builder_t *pb = tessera_pack_begin(0, pack_id, 0);
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 0, pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
-	if (tessera_pack_add_blob(pb, hash, manifest_bytes,
+	if (tessera_fs_pack_add(tmp_, pb, hash, manifest_bytes,
 	    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
 		tessera_pack_free(pb);
 		return (EIO);
@@ -23532,11 +23943,16 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+	uint8_t front_tag[16];
+	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+		free(pack_bytes, M_TESSERA);
+		return (EIO);
+	}
 
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/0);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -23556,7 +23972,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = 1;
 	re.flags           = pa.flags;
-	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
 		 * its extents or they leak persistently (GC only sees
@@ -23586,7 +24002,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	 * with today. */
 	if (owner_inode_no != 0 &&
 	    tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
-		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_fs_registry_get_stable(tmp_, pack_id, existing,
 		    hash) == TESSERA_OK) {
 			uint64_t pel = ((pa.flags &
@@ -23606,6 +24022,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 		}
 	}
 
+	memcpy(reg_value + TESSERA_REGISTRY_ENTRY_SIZE, front_tag, 16);
 	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
 	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -23657,7 +24074,7 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 		}
 		uint8_t pack_id[16];
 		memcpy(pack_id, h, 16);
-		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		/* ★ #79: a HIT here skips the publish and so becomes a dedup
 		 * reference recorded nowhere else — same reasoning as the
 		 * other two sites. A MISS is always safe to act on (it just
@@ -23754,7 +24171,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	 * frozen roots will free the pack underneath the reference. Same
 	 * omission as the aggregation drain's dedup. */
 	{
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_fs_registry_get_stable(tmp_, pack_id,
 		    reg_value, agg_hash) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
@@ -23762,12 +24179,12 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 		}
 	}
 
-	tessera_pack_builder_t *pb = tessera_pack_begin(0 /* manifest pack */,
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 0 /* manifest pack */,
 	    pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
 	uint32_t n_pack_blobs = 0;
 	for (uint32_t i = 0; i < n; i++) {
-		int ar = tessera_pack_add_blob(pb, entries[i].hash,
+		int ar = tessera_fs_pack_add(tmp_, pb, entries[i].hash,
 		    entries[i].bytes, entries[i].len,
 		    TESSERA_BLOB_FLAG_MANIFEST);
 		if (ar != TESSERA_OK) {
@@ -23791,11 +24208,16 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+	uint8_t front_tag[16];
+	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+		free(pack_bytes, M_TESSERA);
+		return (EIO);
+	}
 
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/0);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -23815,7 +24237,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
-	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
 		 * its extents or they leak persistently (GC only sees
@@ -23824,6 +24246,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
+	memcpy(reg_value + TESSERA_REGISTRY_ENTRY_SIZE, front_tag, 16);
 	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
 	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -23878,13 +24301,13 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
     const tessera_hash_t manifest_hash,
     uint32_t owner_inode_no)
 {
-	tessera_pack_builder_t *pb = tessera_pack_begin(2 /* mixed */,
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 2 /* mixed */,
 	    pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
 
 	uint32_t n_pack_blobs = 0;
 	for (uint32_t i = 0; i < n; i++) {
-		if (tessera_pack_add_blob(pb, chunks[i].hash, chunks[i].bytes,
+		if (tessera_fs_pack_add(tmp_, pb, chunks[i].hash, chunks[i].bytes,
 		    chunks[i].len, TESSERA_BLOB_FLAG_CHUNK) != TESSERA_OK) {
 			tessera_pack_free(pb);
 			return (EIO);
@@ -23892,7 +24315,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		n_pack_blobs++;
 	}
 	if (manifest_bytes != NULL) {
-		if (tessera_pack_add_blob(pb, manifest_hash, manifest_bytes,
+		if (tessera_fs_pack_add(tmp_, pb, manifest_hash, manifest_bytes,
 		    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
 			tessera_pack_free(pb);
 			return (EIO);
@@ -23910,11 +24333,16 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+	uint8_t front_tag[16];
+	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+		free(pack_bytes, M_TESSERA);
+		return (EIO);
+	}
 
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/0);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -23934,7 +24362,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
-	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
 		 * its extents or they leak persistently (GC only sees
@@ -23953,7 +24381,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	 * (5 blk vs 1039 blk, three rounds). */
 	if (owner_inode_no != 0 &&
 	    tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
-		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_fs_registry_get_stable(tmp_, pack_id, existing,
 		    manifest_hash != NULL ? manifest_hash
 		                          : (const uint8_t *)pack_id)
@@ -23971,6 +24399,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		}
 	}
 
+	memcpy(reg_value + TESSERA_REGISTRY_ENTRY_SIZE, front_tag, 16);
 	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
 	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -24051,7 +24480,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	 * repeated whole-file rewrites land at the same pack_id once
 	 * each chunk's content stops changing. */
 	if (!tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		if (tessera_fs_registry_get_stable(tmp_,
 		    pack_id, reg_value, out_manifest_hash) == TESSERA_OK) {
 			tessera_stat_publish_dedup_chunked++;
@@ -24118,7 +24547,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		 * write while the apply phase frees that batch's pack loses
 		 * the chunks. The generation guard is what closes it; the
 		 * chunk hashes themselves were noted at function entry. */
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 		/* Note the INVERSION vs the other sites: this one emits when
 		 * the lookup MISSES. A deferred writer must emit regardless —
 		 * emit_chunk_pack then keeps the existing entry and records
@@ -28125,14 +28554,18 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
  * shared state; safe on a prepare worker thread. Returns a malloc'd
  * buffer the caller owns (or frees via the _move publish). */
 static int
-tessera_fs_replace_content_build(uint32_t hash_alg, const uint8_t *new_bytes,
+tessera_fs_replace_content_build(uint32_t hash_alg, const uint8_t *id_key,
+    const uint8_t *new_bytes,
     size_t new_len, uint8_t **out_mft, size_t *out_mlen,
     tessera_hash_t out_mhash)
 {
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_INLINE);
-	if (mb != NULL)
+	if (mb != NULL) {
 		(void)tessera_manifest_set_hash_alg(mb, hash_alg);
+		if (id_key != NULL)
+			(void)tessera_manifest_set_id_key(mb, id_key);
+	}
 	if (mb == NULL) return (ENOMEM);
 	if (tessera_manifest_set_inline(mb, new_bytes, new_len) != TESSERA_OK) {
 		tessera_manifest_free(mb);
@@ -28215,7 +28648,7 @@ tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	size_t mlen = 0;
 	tessera_hash_t mhash;
 	int rc = tessera_fs_replace_content_build(tmp_->sb.hash_alg,
-	    new_bytes, new_len, &mft, &mlen, mhash);
+	    TESSERA_MP_IDKEY(tmp_), new_bytes, new_len, &mft, &mlen, mhash);
 	if (rc != 0) return (rc);
 	return (tessera_fs_replace_content_apply(tmp_, inode_no, mft, mlen,
 	    new_len, mhash));
