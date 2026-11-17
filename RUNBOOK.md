@@ -5882,6 +5882,28 @@ a running one holds `/usr/local/bin/portcullisd` and the copy fails (ETXTBSY). j
 - In the cloud VM instead: `MEM=2G sh scripts/cloud-vm.sh up`, `swapoff /dev/gpt/swapfs` before tests.
 - Results: `/mnt/project-files/zram-bench/`; decision record in `docs/spec/atrium-zram-v2.md` §6.
 
+### 13.8b Printing (Prelum) oracle: `scripts/prelum-r0-oracle.sh`
+
+Checks Prelum's own IPP codec, raster writers and mDNS reader against an
+independent implementation, CUPS's `ippeveprinter`, used only as a test
+oracle on the host (never shipped). Cloud container or any Linux host:
+
+- `apt-get install -y cups-ipp-utils` (ippeveprinter, ippeveps; pulls in Avahi).
+- `bash scripts/prelum-r0-oracle.sh`. It starts dbus and Avahi if they are not
+  up, builds a test-only shim when the kernel has no IPv6
+  (`scripts/prelum-oracle-noipv6.c`; ippeveprinter insists on an IPv6
+  listener), runs two test printers on 127.0.0.1:8631 (raster, its command
+  `ippeveps` decodes our PWG Raster and URF) and :8632 (PDF), and checks:
+  every IPP operation Prelum uses; the decoded pixels equal what we drew
+  (`scripts/prelum-r0-pscheck.py`); Avahi's answers read by our mDNS parser.
+  Ends with `PASS: all oracle checks`.
+- Unit tests: `cd prelum && cargo test`. Fuzzers: `cargo fuzz run -O <target>`
+  in `prelum-ipp-codec/fuzz` (decode), `prelum-dnssd/fuzz` (packet),
+  `prelum-raster/fuzz` (read, encode), `prelum-render/fuzz` (rewrite).
+- Render a PDF by hand: `cargo run --release --example render-file -- IN.pdf
+  OUT pwg|urf|pdf [dpi] [media] [pages] [per-sheet] [gray|color]
+  [simplex|long|short] [sheet-back]` in `prelum/`.
+
 ### 13.9 Shared-checkout hygiene
 
 Several threads push to `main` from the cloud and from the Mac.
