@@ -99,6 +99,12 @@ pub enum Cmd {
     /// list (past the end: none).
     StyleChar(usize),
     StyleClose,
+    /// The styles pane shown or hidden.
+    StylesPane,
+    /// The pane's paragraph style put on the selected paragraphs.
+    PaneStyle(StyleId),
+    /// The pane's character style (or none) put on the selection.
+    PaneChar(Option<StyleId>),
     List(ListKind),
     PageNumbers,
     InsertPicture,
@@ -329,6 +335,30 @@ pub struct StyleBar {
     pub chars: bool,
 }
 
+/// The styles pane's width, at the window's right beside the pages.
+pub const PANE_W: f32 = 260.0;
+/// A style's row in the pane.
+pub const PANE_ROW_H: f32 = 34.0;
+
+/// A row of the styles pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneRow {
+    Heading(&'static str),
+    Para(StyleId),
+    /// A character style, or none.
+    Char(Option<StyleId>),
+}
+
+/// The pane's rows: paragraph styles, then character styles after "none".
+pub fn pane_rows(e: &Editor) -> Vec<PaneRow> {
+    let mut v = vec![PaneRow::Heading("Paragraph")];
+    v.extend(e.para_styles().into_iter().map(|s| PaneRow::Para(s.0)));
+    v.push(PaneRow::Heading("Character"));
+    v.push(PaneRow::Char(None));
+    v.extend(e.char_styles().into_iter().map(|s| PaneRow::Char(Some(s.0))));
+    v
+}
+
 /// The fonts a style can take (the pinned set's families).
 pub const STYLE_FONTS: [&str; 18] = [
     "IBM Plex Sans", "IBM Plex Serif", "IBM Plex Mono",
@@ -418,6 +448,9 @@ pub struct Write {
     pub rev: Mutable<u64>,
     pub cmds: Arc<Mutex<Vec<Cmd>>>,
     pub size: Rc<Cell<(f32, f32)>>,
+    /// The styles pane is shown.
+    pub pane: Mutable<bool>,
+    pub pane_scroll: Mutable<ScrollState>,
     pub style_menu: Mutable<MenuState>,
     pub insert_menu: Mutable<MenuState>,
     pub align_menu: Mutable<MenuState>,
@@ -455,7 +488,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -498,6 +531,7 @@ impl Write {
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
         let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let w = if self.pane.get() { (w - PANE_W).max(200.0) } else { w };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -1208,6 +1242,12 @@ impl Write {
                         let all = e.para_styles();
                         match all.get(i) {
                             Some((id, _)) => e.set_paragraphs("Style", Some(*id), |_| {}),
+                            None if i > all.len() => {
+                                drop(e);
+                                drop(d);
+                                self.cmds.lock().unwrap().push(Cmd::StylesPane);
+                                return false;
+                            }
                             None => {
                                 drop(e);
                                 drop(d);
@@ -1216,6 +1256,15 @@ impl Write {
                             }
                         }
                     }
+                    Cmd::StylesPane => {
+                        drop(e);
+                        drop(d);
+                        self.pane.set(!self.pane.get());
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::PaneStyle(id) => e.set_paragraphs("Style", Some(id), |_| {}),
+                    Cmd::PaneChar(id) => e.set_char_style(id),
                     Cmd::List(k) => e.toggle_list(k),
                     Cmd::PageNumbers => e.toggle_page_numbers(),
                     Cmd::SectionBreak(start) => {
@@ -1444,6 +1493,7 @@ impl View for Write {
         {
             let mut items: Vec<MenuItem> = para_styles.iter().map(|(_, s)| MenuItem::new(&**s).radio(**s == *style_name)).collect();
             items.push(MenuItem::new("Edit Styles…").separated());
+            items.push(MenuItem::new("Styles Pane").checked(self.pane.get()));
             let cmds = self.cmds.clone();
             MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
             x += 128.0;
@@ -1954,6 +2004,81 @@ impl View for Write {
         let cmds2 = self.cmds.clone();
         RichTextView::new(ed.clone(), self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).on_find(move || cmds.lock().unwrap().push(Cmd::FindOpen)).on_comment(move |id| cmds2.lock().unwrap().push(Cmd::CommentOpen(id))).emit(ctx);
 
+        // The styles pane: every style in its own look; a click puts it on.
+        if self.pane.get() {
+            let pr = self.pages_rect(w, h);
+            let (x0, y0, ph) = (pr.x() + pr.w(), pr.y(), pr.h());
+            let pw = w - x0;
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, pw, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 14.0, pw - 100.0, 20.0), content: "Styles".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            Button::secondary("Close").at(x0 + pw - 76.0, y0 + 8.0).width(64.0).on_click(push(Cmd::StylesPane)).render(ctx);
+            let (rows, looks, cur, cur_char) = {
+                let e = ed.borrow();
+                let rows = pane_rows(&e);
+                let looks: Vec<(String, f32, bool, bool, bool)> = rows
+                    .iter()
+                    .map(|r| match *r {
+                        PaneRow::Heading(h) => (h.to_string(), 0.0, false, false, false),
+                        PaneRow::Char(None) => ("No Character Style".into(), 0.0, false, false, false),
+                        PaneRow::Para(id) | PaneRow::Char(Some(id)) => {
+                            let s = &e.doc.styles.styles[id as usize];
+                            let (_, base) = e.doc.styles.para_format(0, &Default::default());
+                            let cf = if matches!(r, PaneRow::Para(_)) { e.doc.styles.para_format(id, &Default::default()).1 } else { e.doc.styles.char_format(&base, &officina_text::model::CharAttrs { style: Some(id), ..Default::default() }) };
+                            let mono = ["Mono", "Code", "Courier", "Consolas"].iter().any(|m| cf.family.contains(m));
+                            (s.name.to_string(), cf.size as f32 / 2.0, cf.bold, cf.italic, mono)
+                        }
+                    })
+                    .collect();
+                (rows, looks, e.style_at_caret(), e.char_style_at_caret())
+            };
+            let (rows, looks, cmds) = (Rc::new(rows), Rc::new(looks), self.cmds.clone());
+            let n = rows.len();
+            pergola::widgets::VirtualList::new(self.pane_scroll.clone(), Rect::new(x0 + 1.0, y0 + 48.0, pw - 1.0, (ph - 48.0).max(PANE_ROW_H)), n, PANE_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                let rw = pw - 1.0;
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, rw, PANE_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let (name, pt, bold, italic, mono) = looks[k].clone();
+                match rows[k] {
+                    PaneRow::Heading(_) => {
+                        ctx.add(Node::Text { rect: Rect::new(12.0, 12.0, rw - 24.0, 18.0), content: name, style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Semibold, color: t.text_secondary() } });
+                    }
+                    r => {
+                        let on = match r {
+                            PaneRow::Para(id) => id == cur,
+                            PaneRow::Char(c) => c == cur_char,
+                            _ => false,
+                        };
+                        let cmd = match r {
+                            PaneRow::Para(id) => Cmd::PaneStyle(id),
+                            PaneRow::Char(c) => Cmd::PaneChar(c),
+                            _ => Cmd::StylesPane,
+                        };
+                        let hit = ctx.add(Node::Rect { rect: Rect::new(4.0, 1.0, rw - 8.0, PANE_ROW_H - 2.0), fill: if on { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                        let cmds = cmds.clone();
+                        ctx.on_click(hit, move || cmds.lock().unwrap().push(cmd));
+                        // The name in the style's own look (its size kept to the row).
+                        let px = if pt > 0.0 { (pt * 96.0 / 72.0).clamp(11.0, 20.0) } else { type_size::SM };
+                        let shown = if italic { format!("{name}  (italic)") } else { name };
+                        ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(14.0, (PANE_ROW_H - px * 1.3) / 2.0, rw - 80.0, px * 1.3), content: shown, style: TextStyle { family: if mono { font::MONO.into() } else { font::SANS.into() }, size: px, weight: if bold { Weight::Bold } else { Weight::Regular }, color: t.text_primary() } });
+                        if pt > 0.0 {
+                            ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(rw - 60.0, (PANE_ROW_H - 16.0) / 2.0, 48.0, 16.0), content: format!("{} pt", pt), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() } });
+                        }
+                    }
+                }
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0x57A1)
+            .emit(ctx);
+        }
+
         // Status line: page, pages (≈ while pagination runs), and the last message.
         let sy = h - STATUS_H;
         ctx.add(Node::Rect { rect: Rect::new(0.0, sy, w, STATUS_H), fill: t.bg_surface(), radius: 0.0 });
@@ -2284,6 +2409,61 @@ mod tests {
         assert!(w.doc.borrow().status.starts_with("Normal can't"));
         run(Cmd::StyleClose);
         assert!(!w.style_bar.get_cloned().open);
+    }
+
+    #[test]
+    fn the_styles_pane_lists_and_puts_on_styles() {
+        use pergola::event::Event;
+        let doc = Doc::from_text("p.txt", b"First words here.\nSecond.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        // From the Style menu, past “Edit Styles…”.
+        let n = ed.borrow().para_styles().len();
+        w.cmds.lock().unwrap().push(Cmd::Style(n + 1));
+        w.take_cmds();
+        w.take_cmds();
+        assert!(w.pane.get());
+        assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0 - PANE_W, "the pages make room");
+        let t = texts();
+        for want in ["Styles", "Paragraph", "Normal", "Heading 1", "Character", "No Character Style"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        // A click on Heading 1's row puts it on the caret's paragraph.
+        let rows = pane_rows(&ed.borrow());
+        let h1 = ed.borrow().doc.styles.by_name("Heading 1").unwrap();
+        let k = rows.iter().position(|r| *r == PaneRow::Para(h1)).unwrap();
+        let pr = w.pages_rect(1200.0, 800.0);
+        let at = pergola::geom::Point::new(pr.x() + pr.w() + 40.0, pr.y() + 48.0 + k as f32 * PANE_ROW_H + PANE_ROW_H / 2.0);
+        let mut app = pergola::app::App::new(w.clone());
+        app.tick();
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        w.take_cmds();
+        assert_eq!(ed.borrow().style_at_caret(), h1);
+        // A character style made elsewhere shows; its row puts it on, “none” takes it off.
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(pergola_richtext::Pos::new(1, 0), false);
+            e.set_caret(pergola_richtext::Pos::new(1, 3), true);
+            e.new_char_style_from_selection("Key").unwrap();
+        }
+        assert!(texts().iter().any(|s| s == "Key"));
+        w.cmds.lock().unwrap().push(Cmd::PaneChar(None));
+        w.take_cmds();
+        assert_eq!(ed.borrow().char_style_at_caret(), None);
+        let key = ed.borrow().doc.styles.by_name("Key");
+        w.cmds.lock().unwrap().push(Cmd::PaneChar(key));
+        w.take_cmds();
+        assert_eq!(ed.borrow().char_style_at_caret(), key);
+        w.cmds.lock().unwrap().push(Cmd::StylesPane);
+        w.take_cmds();
+        assert!(!w.pane.get());
+        assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0);
     }
 
     #[test]

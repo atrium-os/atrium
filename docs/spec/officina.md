@@ -3429,6 +3429,20 @@ attribute table's character styles. The op inverts exactly, including
 attribute entries no text uses that still named the style (`stale`).
 Journal tag 18.
 
+### 16.56 The styles pane in Write (2026-11-17)
+
+Style ▸ Styles Pane shows a pane at the window's right, and the pages
+make room for it. It lists the document's paragraph styles, then "No
+Character Style" and the character styles. Each name is drawn in its
+style's own look: weight, a monospace face for code fonts, and the size
+kept between 11 and 20 px, with the size in points beside it. The caret
+paragraph's style and the character style at the caret are highlighted.
+A click on a paragraph style puts it on the selected paragraphs; a click
+on a character style (or "none") puts it on the selection. Each is one
+undo step. The list draws only the rows in view, so documents with up to
+4,096 styles scroll smoothly. Close or the menu item hides the pane.
+Editing styles stays in the style bar (§16.52, §16.55).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
