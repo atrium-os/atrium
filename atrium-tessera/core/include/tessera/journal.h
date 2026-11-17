@@ -29,6 +29,34 @@ int tessera_journal_format(const tessera_block_io_t *io,
                            uint64_t journal_start,
                            uint64_t journal_length);
 
+/*
+ * Sealed journal (docs/spec/tessera-encryption.md §5.3): every block sealed
+ * under the volume's K_meta, record blocks chained by tag from `anchor` (the
+ * superblock's journal_anchor_tag). Open fails if the header block does not
+ * open under this anchor (another epoch's journal, or tampering): the
+ * superblock is then authoritative and the caller formats a fresh journal.
+ * Appends need the chain's last tag: known after format, after
+ * checkpoint_anchor, after open of an empty log, or after a replay that
+ * reached head; otherwise append returns TESSERA_EIO. Replay stops at the
+ * first block that does not open, as at a torn write.
+ */
+struct tessera_seal_keys;
+int tessera_journal_format_sealed(const tessera_block_io_t *io,
+                                  uint64_t journal_start,
+                                  uint64_t journal_length,
+                                  const struct tessera_seal_keys *seal,
+                                  const uint8_t anchor[16]);
+tessera_journal_t *tessera_journal_open_sealed(const tessera_block_io_t *io,
+                                               uint64_t journal_start,
+                                               uint64_t journal_length,
+                                               const struct tessera_seal_keys *seal,
+                                               const uint8_t anchor[16]);
+/* The sealed journal's checkpoint: start a new epoch chained to `anchor`.
+ * Call only once a superblock carrying `anchor` is durable. (Plain
+ * tessera_journal_checkpoint refuses a sealed journal.) */
+int tessera_journal_checkpoint_anchor(tessera_journal_t *,
+                                      const uint8_t anchor[16]);
+
 /* ── Replay ──────────────────────────────────────────────────────── */
 
 /* Caller-provided record handler. Called once per committed record

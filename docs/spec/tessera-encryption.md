@@ -316,12 +316,18 @@ and 16-byte tag at the end of the block.
   instead of 168. Journal record bodies shrink from 4068 to 4028 bytes per block.
   Built in core/src/btree.c (`tessera_btree_open_sealed`, `tessera_btree_create_sealed`;
   tests/test_btree_sealed.c).
-- **Journal chain.** Each record's AAD also includes the previous record's tag (the
-  first record after a commit chains to the superblock's `journal_anchor_tag`), so
-  records cannot be reordered, dropped from the middle or spliced in from an older
-  journal. Cutting the tail looks like a crash before the last commit, which replay
+- **Journal chain.** Every journal block's AAD also includes the record's sequence
+  number and the previous block's tag, so records cannot be reordered, dropped from the
+  middle or spliced in from an older journal. Each checkpoint starts an epoch with a
+  fresh random anchor: the superblock written at that commit carries it as
+  `journal_anchor_tag`, the journal header's AAD includes it, and the first block after
+  the checkpoint chains to it, so a journal or header from an earlier epoch does not
+  open. Replay stops at the first block that does not open, exactly as at a torn
+  write. Cutting the tail looks like a crash before the last commit, which replay
   already handles. Because the superblock is rewritten at every commit (tessera-fs.md
-  §18 step 13), the cut cannot undo anything the superblock already covers.
+  §18 step 13), the cut cannot undo anything the superblock already covers. Built in
+  core/src/journal.c (`tessera_journal_open_sealed`, `tessera_journal_checkpoint_anchor`;
+  tests/test_journal_sealed.c).
 - **Names in journal records** (`DIR_INSERT`, `DIR_REMOVE`) of an inode in an encrypted
   domain are sealed a second time under `K_gmeta`, so the volume key alone never shows a
   name.

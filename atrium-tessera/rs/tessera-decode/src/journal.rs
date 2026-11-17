@@ -8,7 +8,14 @@ use crate::le::u32_at;
 /// Computed in 64 bits: journal.c's 32-bit version wraps for bodies within
 /// 4 KiB of 4 GiB, which made such a record's block count look tiny.
 pub fn sectors_for(body_len: u32) -> u64 {
-    (RECORD_HEADER_SIZE as u64 + u64::from(body_len)).div_ceil(SECTOR as u64)
+    sectors_for_payload(body_len, SECTOR as u32)
+}
+
+/// [`sectors_for`] for blocks carrying `payload` bytes each: 4096 on a plain
+/// volume, 4056 on a sealed one (tessera-encryption.md §5.3), where the
+/// last 40 bytes of every block are the AEAD nonce and tag.
+pub fn sectors_for_payload(body_len: u32, payload: u32) -> u64 {
+    (RECORD_HEADER_SIZE as u64 + u64::from(body_len)).div_ceil(u64::from(payload.max(1)))
 }
 
 /// Largest record body (the C `MAX_BODY` in core/src/journal.c). Real records
@@ -20,15 +27,24 @@ pub const MAX_BODY: u32 = 1 << 20;
 /// needs, and the body is at most [`MAX_BODY`]. `blk` is the record's first
 /// block.
 pub fn record_check(blk: &[u8; SECTOR], cap: u64) -> Result<()> {
+    record_check_payload(blk, cap, SECTOR as u32)
+}
+
+/// [`record_check`] for a journal whose blocks carry `payload` bytes (4056 on
+/// a sealed volume). A payload smaller than a record header is refused.
+pub fn record_check_payload(blk: &[u8; SECTOR], cap: u64, payload: u32) -> Result<()> {
+    if payload < RECORD_HEADER_SIZE as u32 || payload > SECTOR as u32 {
+        return Err(ECORRUPT);
+    }
     let hdr: &[u8; RECORD_HEADER_SIZE] =
         blk.get(..RECORD_HEADER_SIZE).and_then(|h| h.try_into().ok()).ok_or(ECORRUPT)?;
     codec::record_header(hdr)?;
     let bl = u32_at(hdr, off::RH_BODY_LENGTH).ok_or(ECORRUPT)?;
     let bc = u32_at(hdr, off::RH_BLOCK_COUNT).ok_or(ECORRUPT)?;
-    if u64::from(bl) > cap.saturating_mul(SECTOR as u64) || bl > MAX_BODY {
+    if u64::from(bl) > cap.saturating_mul(u64::from(payload)) || bl > MAX_BODY {
         return Err(ECORRUPT);
     }
-    if u64::from(bc) != sectors_for(bl) {
+    if u64::from(bc) != sectors_for_payload(bl, payload) {
         return Err(ECORRUPT);
     }
     Ok(())
@@ -78,6 +94,23 @@ mod tests {
             assert!(record_check(&block(bl, want + 1), cap).is_err(), "bl {bl} +1");
             assert!(record_check(&block(bl, want - 1), cap).is_err(), "bl {bl} -1");
         }
+    }
+
+    #[test]
+    fn sealed_payload_sweep() {
+        // Sealed journal blocks carry 4056 bytes (tessera-encryption.md §5.3).
+        let cap = 64;
+        for bl in (0..=(32 * 1024)).step_by(7) {
+            let want = (RECORD_HEADER_SIZE as u32 + bl).div_ceil(4056);
+            assert_eq!(sectors_for_payload(bl, 4056), u64::from(want));
+            assert!(record_check_payload(&block(bl, want), cap, 4056).is_ok(), "bl {bl}");
+            assert!(record_check_payload(&block(bl, want + 1), cap, 4056).is_err());
+        }
+        // 3992 body bytes fit one sealed block; 3993 need two.
+        assert_eq!(sectors_for_payload(3992, 4056), 1);
+        assert_eq!(sectors_for_payload(3993, 4056), 2);
+        assert!(record_check_payload(&block(0, 1), cap, 63).is_err());
+        assert!(record_check_payload(&block(0, 1), cap, 4097).is_err());
     }
 
     #[test]

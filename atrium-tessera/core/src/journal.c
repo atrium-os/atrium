@@ -32,6 +32,18 @@
  *
  * Journal-full is returned as TESSERA_ENOSPC; the application is
  * responsible for sizing.
+ *
+ * Sealed journal (tessera-encryption.md §5.3): every block is a sealed unit
+ * under K_meta, payload[4056] | nonce | tag, so a record's header and body
+ * fill 4056 bytes a block instead of 4096. The header block's AAD carries
+ * the epoch's anchor (the superblock's journal_anchor_tag); every record
+ * block's AAD carries its sector, the record's sequence and the previous
+ * block's tag, the first block after a checkpoint chaining to the anchor.
+ * So records cannot be reordered, dropped from the middle, spliced in from
+ * another epoch or forged; replay stops at the first block that does not
+ * open, exactly as at a torn write. A new anchor is set at each checkpoint
+ * (tessera_journal_checkpoint_anchor), after the superblock holding it is
+ * durable.
  */
 
 #include "tessera/journal.h"
@@ -39,6 +51,7 @@
 #include "tessera/crc.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
+#include "tessera/seal.h"
 #include "tessera_compat.h"
 #include "tessera_rs.h"
 
@@ -66,7 +79,54 @@ struct tessera_journal {
 	tessera_block_io_t io_deferred;
 	int       has_deferred;
 	int       use_deferred;
+	/* Sealed journal: keys (the caller's, outliving the handle), the
+	 * epoch's anchor, the tag of the last block written or replayed, and
+	 * whether that tag is known (format, checkpoint, or a replay that
+	 * reached head). payload = bytes of record data per block. */
+	const tessera_seal_keys_t *seal;
+	uint8_t   anchor[16];
+	uint8_t   last_tag[16];
+	int       chain_ok;
+	uint32_t  payload;
 };
+
+/* Where a sealed block's tag sits (seal.h: payload | nonce | tag). */
+#define BLOCK_TAG_OFF (TESSERA_SEALED_BLOCK_PAYLOAD + TESSERA_NONCE_SIZE)
+
+#ifdef TESSERA_STAND
+#  define JOURNAL_SEALING 0      /* the loader never opens a sealed volume */
+#else
+#  define JOURNAL_SEALING 1
+#endif
+
+/* Seal a journal block in place: the header block (kind JOURNAL_HDR, chained
+ * to the anchor) or a record block (JOURNAL_REC, chained to *prev, which
+ * becomes this block's tag). */
+static int
+seal_block(const tessera_journal_t *j, uint8_t kind, uint64_t sector,
+    uint64_t ctx, const uint8_t prev[16], uint8_t *blk, uint8_t tag_out[16])
+{
+#if JOURNAL_SEALING
+	return tessera_block_seal(j->seal, kind, sector, ctx, prev, blk,
+	    tag_out);
+#else
+	(void)j; (void)kind; (void)sector; (void)ctx; (void)prev; (void)blk;
+	(void)tag_out;
+	return TESSERA_ENOTIMPL;
+#endif
+}
+
+static int
+open_block(const tessera_seal_keys_t *seal, uint8_t kind, uint64_t sector,
+    uint64_t ctx, const uint8_t prev[16], uint8_t *blk)
+{
+#if JOURNAL_SEALING
+	return tessera_block_open(seal, kind, sector, ctx, prev, NULL, blk);
+#else
+	(void)seal; (void)kind; (void)sector; (void)ctx; (void)prev; (void)blk;
+	return TESSERA_ENOTIMPL;
+#endif
+}
 
 /* Active write io: the deferred io while a deferred batch is open,
  * else the primary (synchronous) io. */
@@ -101,6 +161,9 @@ write_journal_header(tessera_journal_t *j)
 	if (buf == NULL) { tessera_free(h); return TESSERA_ENOMEM; }
 	int r = tessera_encode_journal_header(h, buf);
 	tessera_free(h);                 /* encoded into buf; done with it */
+	if (r == TESSERA_OK && j->seal != NULL)
+		r = seal_block(j, TESSERA_SEAL_KIND_JOURNAL_HDR, j->start, 0,
+		    j->anchor, buf, NULL);
 	if (r != TESSERA_OK) { tessera_free(buf); return r; }
 	const tessera_block_io_t *wio = journal_wio(j);
 	if (wio->write_block(wio->ctx, j->start, buf) != 0) {
@@ -113,6 +176,7 @@ write_journal_header(tessera_journal_t *j)
 
 static int
 read_journal_header(const tessera_block_io_t *io, uint64_t start,
+                    const tessera_seal_keys_t *seal, const uint8_t anchor[16],
                     tessera_journal_header_t *out)
 {
 	uint8_t *buf = tessera_zalloc(BLK);
@@ -122,6 +186,11 @@ read_journal_header(const tessera_block_io_t *io, uint64_t start,
 		tessera_free(buf);
 		return TESSERA_EIO;
 	}
+	if (seal != NULL) {
+		rc = open_block(seal, TESSERA_SEAL_KIND_JOURNAL_HDR, start, 0,
+		    anchor, buf);
+		if (rc != TESSERA_OK) { tessera_free(buf); return rc; }
+	}
 	int r = tessera_decode_journal_header(buf, out);
 	tessera_free(buf);
 	return r;
@@ -129,9 +198,9 @@ read_journal_header(const tessera_block_io_t *io, uint64_t start,
 
 /* ── format / open / close ───────────────────────────────────────── */
 
-int
-tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
-                       uint64_t length)
+static int
+format_impl(const tessera_block_io_t *io, uint64_t start, uint64_t length,
+            const tessera_seal_keys_t *seal, const uint8_t anchor[16])
 {
 	if (io == NULL || length < 4) return TESSERA_EINVAL;
 	/* sizeof(tessera_journal_header_t) == 4096; never on the stack
@@ -150,6 +219,13 @@ tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
 	if (buf == NULL) { tessera_free(h); return TESSERA_ENOMEM; }
 	int r = tessera_encode_journal_header(h, buf);
 	tessera_free(h);
+	if (r == TESSERA_OK && seal != NULL) {
+		tessera_journal_t tmp;
+		memset(&tmp, 0, sizeof tmp);
+		tmp.seal = seal;
+		r = seal_block(&tmp, TESSERA_SEAL_KIND_JOURNAL_HDR, start, 0,
+		    anchor, buf, NULL);
+	}
 	if (r != TESSERA_OK) { tessera_free(buf); return r; }
 	if (io->write_block(io->ctx, start, buf) != 0) {
 		tessera_free(buf);
@@ -181,14 +257,32 @@ tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
 	return TESSERA_OK;
 }
 
-tessera_journal_t *
-tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
-                     uint64_t length)
+int
+tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
+                       uint64_t length)
+{
+	return format_impl(io, start, length, NULL, NULL);
+}
+
+int
+tessera_journal_format_sealed(const tessera_block_io_t *io, uint64_t start,
+                              uint64_t length,
+                              const struct tessera_seal_keys *seal,
+                              const uint8_t anchor[16])
+{
+	if (seal == NULL || anchor == NULL || !JOURNAL_SEALING)
+		return TESSERA_EINVAL;
+	return format_impl(io, start, length, seal, anchor);
+}
+
+static tessera_journal_t *
+open_impl(const tessera_block_io_t *io, uint64_t start, uint64_t length,
+          const tessera_seal_keys_t *seal, const uint8_t anchor[16])
 {
 	if (io == NULL || length < 4) return NULL;
 	tessera_journal_header_t *h = tessera_zalloc(sizeof *h);
 	if (h == NULL) return NULL;
-	if (read_journal_header(io, start, h) != TESSERA_OK) {
+	if (read_journal_header(io, start, seal, anchor, h) != TESSERA_OK) {
 		tessera_free(h);
 		return NULL;
 	}
@@ -202,6 +296,15 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
 	j->head_block = h->head_block;
 	j->tail_block = h->tail_block;
 	j->next_tx_id = 1;
+	j->payload    = seal != NULL ? TESSERA_SEALED_BLOCK_PAYLOAD : BLK;
+	if (seal != NULL) {
+		j->seal = seal;
+		memcpy(j->anchor, anchor, 16);
+		memcpy(j->last_tag, anchor, 16);
+		/* An empty log continues from the anchor; anything else must be
+		 * replayed first to learn the chain's last tag. */
+		j->chain_ok = (h->head_block == h->tail_block);
+	}
 	tessera_free(h);
 	/* head_block and tail_block come off disk and index the ring of data
 	 * blocks 1..length-1. Out of range, replay read blocks outside the
@@ -213,6 +316,23 @@ tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
 		return NULL;
 	}
 	return j;
+}
+
+tessera_journal_t *
+tessera_journal_open(const tessera_block_io_t *io, uint64_t start,
+                     uint64_t length)
+{
+	return open_impl(io, start, length, NULL, NULL);
+}
+
+tessera_journal_t *
+tessera_journal_open_sealed(const tessera_block_io_t *io, uint64_t start,
+                            uint64_t length,
+                            const struct tessera_seal_keys *seal,
+                            const uint8_t anchor[16])
+{
+	if (seal == NULL || anchor == NULL || !JOURNAL_SEALING) return NULL;
+	return open_impl(io, start, length, seal, anchor);
 }
 
 void
@@ -252,10 +372,11 @@ tessera_journal_deferred_end(tessera_journal_t *j)
 /* ── append helpers ──────────────────────────────────────────────── */
 
 static uint32_t
-sectors_for(uint32_t body_len)
+sectors_for_p(uint32_t body_len, uint32_t payload)
 {
-	return (HDR + body_len + (BLK - 1u)) / BLK;
+	return (HDR + body_len + (payload - 1u)) / payload;
 }
+
 
 static uint64_t
 free_sectors(const tessera_journal_t *j)
@@ -275,7 +396,9 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
              const void *body, uint32_t body_len, uint64_t seq)
 {
 	if (body_len > MAX_BODY) return TESSERA_EINVAL;
-	const uint32_t need = sectors_for(body_len);
+	if (j->seal != NULL && !j->chain_ok) return TESSERA_EIO;
+	const uint32_t P = j->payload;
+	const uint32_t need = sectors_for_p(body_len, P);
 	if (free_sectors(j) < need) return TESSERA_ENOSPC;
 
 	tessera_record_header_t rh;
@@ -293,14 +416,24 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 	int r = tessera_encode_record_header(&rh, blk);
 	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 
-	const uint32_t in_first = (body_len > BLK - HDR) ? (BLK - HDR) : body_len;
+	const uint32_t in_first = (body_len > P - HDR) ? (P - HDR) : body_len;
 	if (in_first > 0)
 		memcpy(blk + HDR, body, in_first);
 
 	uint64_t cap = j->length - 1;
 	uint64_t b = j->head_block;
 	const tessera_block_io_t *wio = journal_wio(j);
+	if (j->seal != NULL) {
+		r = seal_block(j, TESSERA_SEAL_KIND_JOURNAL_REC, j->start + b,
+		    seq, j->last_tag, blk, j->last_tag);
+		if (r != TESSERA_OK) {
+			j->chain_ok = 0;
+			tessera_free(blk);
+			return r;
+		}
+	}
 	if (wio->write_block(wio->ctx, j->start + b, blk) != 0) {
+		j->chain_ok = 0;
 		tessera_free(blk);
 		return TESSERA_EIO;
 	}
@@ -316,9 +449,18 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 			b++;
 			if (b > cap) b = 1;
 			memset(cont, 0, BLK);
-			uint32_t take = remaining > BLK ? BLK : remaining;
+			uint32_t take = remaining > P ? P : remaining;
 			if (take > 0) memcpy(cont, src, take);
+			if (j->seal != NULL &&
+			    seal_block(j, TESSERA_SEAL_KIND_JOURNAL_REC,
+			    j->start + b, seq, j->last_tag, cont, j->last_tag) !=
+			    TESSERA_OK) {
+				j->chain_ok = 0;
+				tessera_free(cont);
+				return TESSERA_EIO;
+			}
 			if (wio->write_block(wio->ctx, j->start + b, cont) != 0) {
+				j->chain_ok = 0;
 				tessera_free(cont);
 				return TESSERA_EIO;
 			}
@@ -394,6 +536,25 @@ int
 tessera_journal_checkpoint(tessera_journal_t *j)
 {
 	if (j == NULL) return TESSERA_EINVAL;
+	/* A sealed journal needs the new epoch's anchor. */
+	if (j->seal != NULL) return TESSERA_EINVAL;
+	j->head_seq   = 1;
+	j->tail_seq   = 1;
+	j->head_block = 1;
+	j->tail_block = 1;
+	j->next_tx_id = 1;
+	return write_journal_header(j);
+}
+
+int
+tessera_journal_checkpoint_anchor(tessera_journal_t *j,
+                                  const uint8_t anchor[16])
+{
+	if (j == NULL || anchor == NULL || j->seal == NULL)
+		return TESSERA_EINVAL;
+	memcpy(j->anchor, anchor, 16);
+	memcpy(j->last_tag, anchor, 16);
+	j->chain_ok   = 1;
 	j->head_seq   = 1;
 	j->tail_seq   = 1;
 	j->head_block = 1;
@@ -420,22 +581,34 @@ struct buffered_rec {
 	uint8_t                *body;
 };
 
+/* `chain` (sealed journals): in, the tag the record's first block chains
+ * to; out, the tag of its last block. `seq`: the sequence it must carry. */
 static int
-read_record(tessera_journal_t *j, uint64_t *block,
-            tessera_record_header_t *out_hdr, uint8_t **out_body)
+read_record(tessera_journal_t *j, uint64_t *block, uint64_t seq,
+            uint8_t chain[16], tessera_record_header_t *out_hdr,
+            uint8_t **out_body)
 {
 	const uint64_t cap = j->length - 1;
+	const uint32_t P = j->payload;
 	uint8_t *blk = tessera_zalloc(BLK);
 	if (blk == NULL) return TESSERA_ENOMEM;
 	if (j->io.read_block(j->io.ctx, j->start + *block, blk) != 0) {
 		tessera_free(blk);
 		return TESSERA_EIO;
 	}
+	if (j->seal != NULL) {
+		uint8_t t[16];
+		memcpy(t, blk + BLOCK_TAG_OFF, 16);
+		int sr = open_block(j->seal, TESSERA_SEAL_KIND_JOURNAL_REC,
+		    j->start + *block, seq, chain, blk);
+		if (sr != TESSERA_OK) { tessera_free(blk); return sr; }
+		memcpy(chain, t, 16);
+	}
 
 #ifdef TESSERA_RUST_DECODE
 	/* D3: header magic + CRC and the #126 geometry rule, in Rust
 	 * (rs/tessera-decode/src/journal.rs). */
-	int r = tessera_rs_journal_record_check(blk, cap, out_hdr);
+	int r = tessera_rs_journal_record_check_p(blk, cap, P, out_hdr);
 	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 #else
 	int r = tessera_decode_record_header(blk, out_hdr);
@@ -455,12 +628,12 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	 * replay spinning on one record forever) and block_count enormous
 	 * (which jumped the cursor to an unrelated block, forming a ring —
 	 * see the loop bound in tessera_journal_replay). */
-	if (out_hdr->body_length > cap * BLK ||
+	if (out_hdr->body_length > cap * P ||
 	    out_hdr->body_length > MAX_BODY) {
 		tessera_free(blk);
 		return TESSERA_ECORRUPT;
 	}
-	if (out_hdr->block_count != sectors_for(out_hdr->body_length)) {
+	if (out_hdr->block_count != sectors_for_p(out_hdr->body_length, P)) {
 		tessera_free(blk);
 		return TESSERA_ECORRUPT;
 	}
@@ -473,7 +646,7 @@ read_record(tessera_journal_t *j, uint64_t *block,
 		body = tessera_malloc(bl);
 		if (body == NULL) { tessera_free(blk); return TESSERA_ENOMEM; }
 		const uint32_t in_first =
-		    (bl > BLK - HDR) ? (BLK - HDR) : bl;
+		    (bl > P - HDR) ? (P - HDR) : bl;
 		memcpy(body, blk + HDR, in_first);
 		tessera_free(blk); blk = NULL;
 		uint32_t remaining = bl - in_first;
@@ -490,7 +663,20 @@ read_record(tessera_journal_t *j, uint64_t *block,
 					tessera_free(cont);
 					return TESSERA_EIO;
 				}
-				uint32_t take = remaining > BLK ? BLK : remaining;
+				if (j->seal != NULL) {
+					uint8_t t[16];
+					memcpy(t, cont + BLOCK_TAG_OFF, 16);
+					int sr = open_block(j->seal,
+					    TESSERA_SEAL_KIND_JOURNAL_REC,
+					    j->start + b, seq, chain, cont);
+					if (sr != TESSERA_OK) {
+						tessera_free(body);
+						tessera_free(cont);
+						return sr;
+					}
+					memcpy(chain, t, 16);
+				}
+				uint32_t take = remaining > P ? P : remaining;
 				memcpy(body + bl - remaining, cont, take);
 				remaining -= take;
 			}
@@ -549,6 +735,10 @@ tessera_journal_replay(tessera_journal_t *j,
 	 * even if some future field reopens a cycle. */
 	uint64_t steps = 0;
 	const uint64_t max_steps = j->length;   /* >= records the region holds */
+	uint64_t seq = j->tail_seq;
+	uint8_t chain[16];
+	memcpy(chain, j->anchor, 16);           /* zeros when unsealed */
+	int reached_head = 1;
 
 	while (cur != j->head_block) {
 		if (++steps > max_steps) {
@@ -565,10 +755,17 @@ tessera_journal_replay(tessera_journal_t *j,
 		}
 		tessera_record_header_t hdr;
 		uint8_t *body = NULL;
-		int r = read_record(j, &cur, &hdr, &body);
+		uint8_t next[16];
+		memcpy(next, chain, 16);
+		int r = read_record(j, &cur, seq, next, &hdr, &body);
 		if (r != TESSERA_OK) {
+			reached_head = 0;
 			break;
 		}
+		/* A sealed record's sequence is bound by its AAD already; an
+		 * unsealed one is not checked (older journals). */
+		memcpy(chain, next, 16);
+		seq++;
 
 		if (hdr.record_type == (uint32_t)TESSERA_TX_BEGIN) {
 			for (size_t i = 0; i < buf_count; i++)
@@ -633,5 +830,14 @@ tessera_journal_replay(tessera_journal_t *j,
 cleanup:
 	for (size_t i = 0; i < buf_count; i++) tessera_free(buf[i].body);
 	tessera_free(buf);
+	/* Sealed: appends continue the chain only from a replay that reached
+	 * head; after an early stop (torn or refused block) the caller must
+	 * checkpoint with a new anchor first. */
+	if (j->seal != NULL && rc == TESSERA_OK && reached_head) {
+		memcpy(j->last_tag, chain, 16);
+		j->chain_ok = 1;
+	} else if (j->seal != NULL) {
+		j->chain_ok = 0;
+	}
 	return rc;
 }

@@ -141,6 +141,8 @@ int tessera_rs_superblock_layout(const void *sb, uint64_t device_sectors,
 /* journal.c: read_record's header and geometry checks, and the ring step. */
 int tessera_rs_journal_record_check(const uint8_t *blk, uint64_t cap,
     void *out_hdr);
+int tessera_rs_journal_record_check_p(const uint8_t *blk, uint64_t cap,
+    uint32_t payload, void *out_hdr);
 uint64_t tessera_rs_journal_advance(uint64_t block, uint32_t block_count,
     uint64_t cap);
 

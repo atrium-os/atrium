@@ -603,6 +603,24 @@ pub unsafe extern "C" fn tessera_rs_journal_record_check(blk: *const u8, cap: u6
     rc(journal::record_check(b, cap))
 }
 
+/// `tessera_rs_journal_record_check` for a journal of `payload`-byte blocks
+/// (4056 on a sealed volume; the caller has already opened the block).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_rs_journal_record_check_p(
+    blk: *const u8, cap: u64, payload: u32, out_hdr: *mut u8,
+) -> c_int {
+    let Some(b) = (unsafe { arr::<SECTOR>(blk) }) else { return EINVAL };
+    if out_hdr.is_null() {
+        return EINVAL;
+    }
+    if let Some(h) = b.get(..RECORD_HEADER_SIZE).and_then(|h| <&[u8; RECORD_HEADER_SIZE]>::try_from(h).ok()) {
+        if codec::record_header(h).is_ok() {
+            unsafe { copy_out(h, out_hdr) };
+        }
+    }
+    rc(journal::record_check_payload(b, cap, payload))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn tessera_rs_journal_advance(block: u64, block_count: u32, cap: u64) -> u64 {
     journal::advance(block, block_count, cap)
