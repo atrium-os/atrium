@@ -16,6 +16,10 @@ Commands:
       Findings are warnings; the exit status is 1 only for manifest errors.
   new <name> [--template <t>] [--id <app id>] [--sdk-path <atrium checkout>]
       A project in ./<name> from an SDK template; --list shows them.
+  cross <amd64|aarch64> [--sysroot <dir>] [cargo build args]
+      Build for Atrium on that arch from Linux, macOS or the other arch:
+      clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
+      ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
 
 Run it in the project folder (the one with Cargo.toml and atrium.toml).";
 
@@ -28,6 +32,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => cmd_check(&args[1..]),
         Some("new") => cmd_new(&args[1..]),
+        Some("cross") => cmd_cross(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -162,4 +167,82 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
     if errors { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn cmd_cross(args: &[String]) -> ExitCode {
+    use cargo_atrium::cross;
+    let fail = |m: String| {
+        eprintln!("cargo atrium cross: {m}");
+        ExitCode::FAILURE
+    };
+    let (mut arch, mut given, mut rest) = (None, None, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--sysroot" => given = it.next().map(PathBuf::from),
+            o if arch.is_none() && !o.starts_with('-') => arch = Some(o.to_string()),
+            o => rest.push(o.to_string()),
+        }
+    }
+    let Some(t) = arch.as_deref().and_then(cross::target) else {
+        return fail("which arch? amd64 or aarch64".into());
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let sysroot = match cross::sysroot(t, given.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
+        Ok(s) => std::fs::canonicalize(&s).unwrap_or(s),
+        Err(e) => return fail(e),
+    };
+    let path = std::env::var("PATH").unwrap_or_default();
+    let clang = match std::env::var_os("ATRIUM_CLANG").map(PathBuf::from) {
+        Some(c) => c,
+        None => match cross::find_tool(&["clang", "clang-21", "clang-20", "clang-19", "clang-18"], &path) {
+            Some(c) => c,
+            None => return fail("no clang on PATH (set ATRIUM_CLANG)".into()),
+        },
+    };
+    if cross::find_tool(&["ld.lld"], &path).is_none() && !clang.with_file_name("ld.lld").is_file() {
+        return fail("no ld.lld on PATH or next to clang (install lld)".into());
+    }
+    let ar = cross::find_tool(&["llvm-ar", "llvm-ar-21", "llvm-ar-20", "llvm-ar-19", "llvm-ar-18"], &path);
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let build_std = rest.iter().any(|a| a.starts_with("-Zbuild-std"));
+    match Command::new(&rustc).args(["--print", "target-libdir", "--target", t.triple]).output() {
+        _ if build_std => {}
+        Ok(o) if o.status.success() && cross::has_std(Path::new(String::from_utf8_lossy(&o.stdout).trim())) => {}
+        _ => return fail(format!("this rustc has no std for {}: {}", t.triple, cross::std_hint(t))),
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let tdir = match Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).output() {
+        Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout)
+            .ok()
+            .and_then(|v| v["target_directory"].as_str().map(PathBuf::from)),
+        _ => None,
+    };
+    let Some(tdir) = tdir else { return fail("cargo metadata failed; run it in the project folder".into()) };
+    let wdir = tdir.join("atrium-cross").join(t.arch);
+    let mut wrappers = Vec::new();
+    for kind in ["cc", "c++"] {
+        let p = wdir.join(format!("{}-freebsd-{kind}", t.cpu));
+        let r = std::fs::create_dir_all(&wdir).and_then(|_| std::fs::write(&p, cross::wrapper(t, &clang, &sysroot, kind)));
+        #[cfg(unix)]
+        let r = r.and_then(|_| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+        });
+        if let Err(e) = r {
+            return fail(format!("{}: {e}", p.display()));
+        }
+        wrappers.push(p);
+    }
+    eprintln!("cargo atrium cross: {} with {} and {}", t.triple, clang.display(), sysroot.display());
+    let st = Command::new(&cargo)
+        .args(["build", "--target", t.triple])
+        .args(&rest)
+        .envs(cross::env(t, &wrappers[0], &wrappers[1], ar.as_deref(), &sysroot))
+        .status();
+    match st {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(1, 255) as u8),
+        Err(e) => fail(format!("{cargo}: {e}")),
+    }
 }
