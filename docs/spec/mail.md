@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1273,6 +1273,34 @@ Stalwart in the cloud VM, and later a real account):
    the app; JMAP push (EventSource), `Mailbox/changes`, fetch on open for large JMAP
    messages, removing messages destroyed while a state was too old; JMAP over the HTTP
    courier for real (only the in-process server so far); OAUTHBEARER; Google (§17 D4).
+   **Day-to-day use built on the host (2026-11-18)**, before M8. *Account setup*
+   (`mail-sync::setup`): settings from the address, in order a known provider (Google,
+   Microsoft, iCloud, Fastmail, Yahoo), JMAP's well-known session (checked as a JMAP
+   session), autoconfig (`autoconfig.<domain>`, then the domain's `.well-known`), SRV,
+   the MX's provider (shown as "handled by …", which needs a press), else a guess
+   (`imap.`/`smtp.`, said to be one); lookups through Mail's own Nuntius fetcher. The
+   password is typed into Arca's own field (Limen `credential` role in the settings
+   window) and a new arcad app op `KEEP_FOR` redeems that field's handle into Password
+   items for the account's servers (IMAP and SMTP, or the JMAP host) in Mail's persona,
+   available after first unlock; Mail gets only the item ids, kept with the account's
+   settings in the store (`account_config`). *Sync and send loop*: `Engine::pass` runs
+   one pass for an account (IMAP: sync, drafts to the server after 30 s, due sends,
+   copies to Sent unless the provider files them itself; JMAP: sync and sends over the
+   HTTP courier with the item as a bearer) and keeps how it went (up to date, sign in
+   again, failed and why). The app runs passes on a thread of its own with its own
+   engine over the same store, at the next due send or every 5 minutes, and at once
+   after a send, `g`, or a new account. *Settings window* (`,`, the sidebar, and by
+   itself when there is no account): accounts with their state, add, remove (second
+   press; local mail goes), screener per account; notifications on/off, quiet hours
+   (local time; what came in is summed up afterwards), VIPs (notify through quiet hours
+   if chosen, and always count as a person). Tests: a configured account syncs and sends
+   in one pass against Dovecot through the couriers; arcad keeps a typed password for
+   IMAP and SMTP without the app seeing it; settings window without a display; quiet
+   hours, notifications off and VIPs in the notifier. **Not yet**: DNS SRV/MX from the
+   app (Nuntius is HTTP only, so those steps find nothing), removing an account's Arca
+   items with it, the OAuth sign-in sheet (Microsoft accounts are found but can't be
+   added), JMAP needing an API token as its password (bearer only; an API host other
+   than the session's is refused; uploads up to 1 MiB), IMAP IDLE.
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
 

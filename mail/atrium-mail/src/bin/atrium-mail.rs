@@ -228,6 +228,29 @@ fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<per
     Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false, attach: None })
 }
 
+/// The settings window and Arca's password field in it.
+struct SettingsWin {
+    win: Window,
+    app: App<atrium_mail::settings::SettingsView>,
+    s: atrium_mail::settings::Settings,
+    size: pergola::Mutable<(f32, f32)>,
+    /// Arca's field, while an account is being added.
+    cred: Option<limen::proto::EmbedId>,
+    next_ask: Instant,
+}
+
+fn settings_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pergola::embed::Embeds>>>) -> std::io::Result<SettingsWin> {
+    let mut win = Window::open(&WindowDesc::new("Mail settings", SizeSpec::Fixed(640, 720)))?;
+    if let Some(e) = embeds {
+        win.set_slot_binder(pergola::embed::Embeds::binder(e));
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let s = atrium_mail::settings::Settings::new(engine.clone(), dirty.clone(), atrium_mail::accounts::arca_socket());
+    let view = atrium_mail::settings::SettingsView::new(s.clone(), (win.width, win.height));
+    let size = view.size.clone();
+    Ok(SettingsWin { win, app: App::new_with_flag(view, dirty), s, size, cred: None, next_ask: Instant::now() })
+}
+
 /// The drafts whose windows were open, so a crash or a restart opens them
 /// again (`open-drafts` in the store's folder, one id per line).
 fn remember_open(store_dir: &std::path::Path, wins: &[ComposeWin]) {
@@ -282,6 +305,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Sync and sends run on a thread of their own with their own engine
+    // over the same store; every connection is an Arca courier.
+    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Box::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
     let engine = Rc::new(Engine::new(store, Parser { program: jail }));
     // A send Mail was in the middle of when it stopped may have gone: it
     // waits for the person instead of going twice.
@@ -341,6 +367,11 @@ fn main() {
             }
         }
     }
+    // With no account yet, the settings window opens to add one.
+    let mut settings: Option<SettingsWin> = None;
+    if engine.configured().is_empty() {
+        mail.ask_settings();
+    }
     let mut notifier = mail_engine::notify::Notifier::new();
     let notes = notifications();
     let mut ticked = Instant::now();
@@ -355,7 +386,7 @@ fn main() {
             };
             pergola::input::translate(ev).is_some_and(|e| mail.key(&e, activation))
         };
-        let wait = if composes.is_empty() { 250 } else { 16 };
+        let wait = if composes.is_empty() && settings.is_none() { 250 } else { 16 };
         match win.step_with(&mut app, Some(Duration::from_millis(wait)), first) {
             Ok(StepResult::Closed) => break,
             Ok(_) => {}
@@ -456,11 +487,69 @@ fn main() {
                 None => true,
                 Some(Done::Sent { send, label }) => {
                     mail.sent(send, label);
+                    let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
                     false
                 }
                 Some(Done::Discarded | Done::Kept) => false,
             }
         });
+        // The settings window.
+        if mail.take_settings_ask() {
+            match &settings {
+                Some(_) => {}
+                None => match settings_window(&engine, embeds.as_ref()) {
+                    Ok(w) => settings = Some(w),
+                    Err(e) => eprintln!("atrium-mail: the settings window: {e}"),
+                },
+            }
+        }
+        if mail.take_get_mail() {
+            let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
+        }
+        let mut close_settings = false;
+        if let Some(sw) = settings.as_mut() {
+            match sw.win.step(&mut sw.app, Some(Duration::ZERO)) {
+                Ok(StepResult::Closed) => close_settings = true,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("atrium-mail: the settings window: {e}");
+                    close_settings = true;
+                }
+            }
+            sw.size.set((sw.win.width, sw.win.height));
+            sw.s.tick();
+            if sw.s.take_added() {
+                let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
+                mail.refresh();
+            }
+            close_settings |= sw.s.closed();
+            // Arca's password field, while an account is being added.
+            if let Some(e) = &embeds {
+                match (sw.s.wants_field() && !close_settings, sw.cred) {
+                    (true, None) if Instant::now() >= sw.next_ask => {
+                        sw.next_ask = Instant::now() + Duration::from_secs(2);
+                        if let Some(token) = sw.win.embed_token() {
+                            let asked = e.borrow_mut().request("credential", token, sw.s.cred.slot_key());
+                            match asked {
+                                Ok(id) => {
+                                    let _ = e.borrow_mut().send(id, sw.s.cred.configure().encode());
+                                    sw.cred = Some(id);
+                                }
+                                Err(err) => eprintln!("atrium-mail: Arca's password field: {err:?}"),
+                            }
+                        }
+                    }
+                    (false, Some(id)) => {
+                        let _ = e.borrow_mut().detach_embed(id);
+                        sw.cred = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if close_settings {
+            settings = None;
+        }
         if opened || save || composes.len() != before {
             remember_open(&store_dir, &composes);
         }
@@ -667,6 +756,19 @@ fn main() {
                         looked = None;
                         mail.look_failed("The viewer went away");
                     }
+                    // Arca's field in the settings window: filled, or its handle.
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if settings.as_ref().is_some_and(|s| s.cred == Some(embed)) => {
+                        if let (Some(m), Some(sw)) = (limen::credential::ToParent::decode(&bytes), settings.as_ref()) {
+                            sw.s.cred.apply(m);
+                        }
+                    }
+                    // Arca's side went: what was typed went with it.
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if settings.as_ref().is_some_and(|s| s.cred == Some(embed)) => {
+                        if let Some(sw) = settings.as_mut() {
+                            sw.cred = None;
+                            sw.s.cred_state.set(Default::default());
+                        }
+                    }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if frame.as_ref().is_some_and(|f| f.embed == embed) => {
                         eprintln!("atrium-mail: the doc-viewer went away");
                         failed = frame.take().map(|f| f.msg);
@@ -681,11 +783,17 @@ fn main() {
             }
         }
         // The index changes under the window as sync stores mail.
-        if refreshed.elapsed() > Duration::from_secs(5) {
+        let synced = syncer.changed.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if synced || refreshed.elapsed() > Duration::from_secs(5) {
             refreshed = Instant::now();
             mail.refresh();
-            // What to tell Praeco, posted from its own thread.
-            for p in notifier.check(&engine, now_secs()) {
+            if let Some(sw) = &settings {
+                sw.s.reload();
+            }
+            // What to tell Praeco, posted from its own thread (quiet hours
+            // are the person's local time).
+            let now = now_secs();
+            for p in notifier.check_local(&engine, now, atrium_mail::settings::local_offset(now)) {
                 let _ = notes.send(p);
             }
         }
@@ -705,4 +813,5 @@ fn main() {
             }
         }
     }
+    let _ = syncer.wake.send(atrium_mail::accounts::Wake::Stop);
 }

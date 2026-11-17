@@ -55,7 +55,6 @@ pub enum Post {
 #[derive(Debug, Clone)]
 struct Arrival {
     msg: MsgId,
-    date: i64,
     person: bool,
     from: String,
     subject: String,
@@ -172,7 +171,7 @@ impl Notifier {
             let vip = s.from.iter().any(|a| prefs.is_vip(&a.addr));
             let person = vip || (!s.automated && !crate::senders::is_list(s));
             let from = s.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
-            let a = Arrival { msg: id, date: m.date, person: person || wrote_in, from, subject: s.subject.clone(), text: new_text(s.text.as_deref().unwrap_or(&s.preview)) };
+            let a = Arrival { msg: id, person: person || wrote_in, from, subject: s.subject.clone(), text: new_text(s.text.as_deref().unwrap_or(&s.preview)) };
             if quiet && !(vip && prefs.vips_through) {
                 if self.quiet.len() < SCAN_MAX {
                     self.quiet.push(a);

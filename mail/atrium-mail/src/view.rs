@@ -337,6 +337,10 @@ pub struct Mail {
     /// Unwraps an encrypted message's content key with the person's
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
+    /// The settings window was asked for (`,`, or the sidebar).
+    settings_asked: Rc<std::cell::Cell<bool>>,
+    /// "Get mail" (`g`): the sync thread looks now.
+    get_asked: Rc<std::cell::Cell<bool>>,
 }
 
 /// See [`Mail::unwrapper`]: (certificate, wrapped key) → content key.
@@ -1145,6 +1149,24 @@ impl Mail {
     }
 
     /// The one-press unsubscribes for the app to make.
+    /// Open the settings window.
+    pub fn ask_settings(&self) {
+        self.settings_asked.set(true);
+    }
+
+    pub fn take_settings_ask(&self) -> bool {
+        self.settings_asked.take()
+    }
+
+    /// Look for new mail now.
+    pub fn get_mail(&self) {
+        self.get_asked.set(true);
+    }
+
+    pub fn take_get_mail(&self) -> bool {
+        self.get_asked.take()
+    }
+
     pub fn take_unsubscribes(&self) -> Vec<(MsgId, String)> {
         std::mem::take(&mut *self.unsubs.borrow_mut())
     }
@@ -1635,6 +1657,14 @@ impl Mail {
                 return true;
             }
             (Key::Char, "z") => return self.undo(),
+            (Key::Char, ",") => {
+                self.ask_settings();
+                return true;
+            }
+            (Key::Char, "g") => {
+                self.get_mail();
+                return true;
+            }
             (Key::Char, "l") if ui.reading.is_some() => {
                 self.ask_later();
                 return true;
@@ -1868,6 +1898,8 @@ impl MailView {
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
             unwrapper: Rc::default(),
+            settings_asked: Rc::default(),
+            get_asked: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -1886,6 +1918,11 @@ fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, colo
 
 fn width(s: &str, size: f32, weight: Weight) -> f32 {
     Node::measure_text(s, &sans(size, weight, Color::TRANSPARENT)).w
+}
+
+/// `s` cut with "…" to fit `max` (in the sans face).
+pub fn fit_text(s: &str, size: f32, weight: Weight, max: f32) -> String {
+    fit(s, size, weight, max)
 }
 
 /// `s` cut with "…" to fit `max`.
@@ -1989,6 +2026,11 @@ impl MailView {
         }
         if ui.places.is_empty() {
             text(ctx, 16.0, y + em(16.0), "No accounts yet", type_size::SM, Weight::Regular, t.text_secondary());
+            let m = self.mail.clone();
+            let aw = width("Add an account…", type_size::SM, Weight::Medium) + em(16.0);
+            area(ctx, Rect::new(8.0, y + em(32.0), aw, place_h() - 2.0), Color::TRANSPARENT, move || m.ask_settings());
+            text(ctx, 16.0, y + em(32.0) + place_h() / 2.0, "Add an account…", type_size::SM, Weight::Medium, t.accent_fg());
+            ctx.pop();
         }
         // Views (§15.2): the newsletter lane, the screener's.
         if !ui.views.is_empty() && y < h {
@@ -2027,6 +2069,15 @@ impl MailView {
                     break;
                 }
             }
+        }
+        // Settings (,), kept at the foot of the sidebar.
+        {
+            let fy = h - place_h() - 8.0;
+            rect(ctx, Rect::new(0.0, fy - 8.0, w - 1.0, place_h() + 16.0), t.bg_window());
+            let m = self.mail.clone();
+            area(ctx, Rect::new(8.0, fy, w - 16.0, place_h()), Color::TRANSPARENT, move || m.ask_settings());
+            text(ctx, 20.0, fy + place_h() / 2.0, "Settings", type_size::SM, Weight::Regular, t.text_secondary());
+            ctx.pop();
         }
     }
 

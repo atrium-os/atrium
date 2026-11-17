@@ -14,6 +14,7 @@ pub mod links;
 pub mod plain;
 pub mod rich;
 pub mod sender;
+pub mod settings;
 pub mod signing;
 pub mod view;
 
