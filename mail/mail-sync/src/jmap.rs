@@ -20,6 +20,15 @@ pub trait Http {
     fn post(&mut self, url: &str, content_type: &str, body: &[u8], max: usize) -> std::result::Result<Vec<u8>, String>;
 }
 
+impl<T: Http + ?Sized> Http for Box<T> {
+    fn get(&mut self, url: &str, max: usize) -> std::result::Result<Vec<u8>, String> {
+        (**self).get(url, max)
+    }
+    fn post(&mut self, url: &str, content_type: &str, body: &[u8], max: usize) -> std::result::Result<Vec<u8>, String> {
+        (**self).post(url, content_type, body, max)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 

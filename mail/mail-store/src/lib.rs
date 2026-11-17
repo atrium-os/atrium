@@ -224,8 +224,11 @@ pub struct Row {
     pub has_text: bool,
 }
 
+/// Cheap to clone: the window and sync share one open index (redb
+/// allows one opener per file) from their own threads.
+#[derive(Clone)]
 pub struct Store {
-    db: Database,
+    db: std::sync::Arc<Database>,
     blobs: PathBuf,
 }
 
@@ -285,7 +288,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok(Store { db, blobs: dir.join("blobs") })
+        Ok(Store { db: std::sync::Arc::new(db), blobs: dir.join("blobs") })
     }
 
     // ── blobs ───────────────────────────────────────────────────────
