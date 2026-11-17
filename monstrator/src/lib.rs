@@ -26,7 +26,14 @@ pub const MAX_LINE: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ask {
     /// Open `url` in the app that takes it, on the press `activation`.
-    OpenLink { url: String, activation: [u8; 16] },
+    OpenLink {
+        url: String,
+        activation: [u8; 16],
+        /// Ask in the sheet even when an app is the default: the app's
+        /// "Open with…" (another app, or another persona: personas.md §6).
+        #[serde(default)]
+        choose: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,9 +50,19 @@ pub fn socket() -> PathBuf {
 /// Ask Monstrator at `sock` to open `url` on the press `activation`.
 /// `Ok(Err(why))`: it answered no.
 pub fn open_link(sock: &Path, url: &str, activation: [u8; 16], wait: Duration) -> io::Result<Result<(), String>> {
+    ask(sock, Ask::OpenLink { url: url.into(), activation, choose: false }, wait)
+}
+
+/// [`open_link`], always asking in the sheet: "Open with…", where the
+/// person may also choose another persona (personas.md §6).
+pub fn open_link_with(sock: &Path, url: &str, activation: [u8; 16], wait: Duration) -> io::Result<Result<(), String>> {
+    ask(sock, Ask::OpenLink { url: url.into(), activation, choose: true }, wait)
+}
+
+fn ask(sock: &Path, a: Ask, wait: Duration) -> io::Result<Result<(), String>> {
     let mut s = UnixStream::connect(sock)?;
     s.set_read_timeout(Some(wait))?;
-    let mut line = serde_json::to_vec(&Ask::OpenLink { url: url.into(), activation }).map_err(io::Error::other)?;
+    let mut line = serde_json::to_vec(&a).map_err(io::Error::other)?;
     line.push(b'\n');
     s.write_all(&line)?;
     let mut r = BufReader::new(s);
@@ -82,7 +99,9 @@ mod tests {
 
     #[test]
     fn asks_and_answers_on_the_wire() {
-        let a = Ask::OpenLink { url: "mailto:a@b".into(), activation: [7; 16] };
+        let a = Ask::OpenLink { url: "mailto:a@b".into(), activation: [7; 16], choose: true };
+        let old: Ask = serde_json::from_str(r#"{"OpenLink":{"url":"mailto:a@b","activation":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]}}"#).unwrap();
+        assert_eq!(old, Ask::OpenLink { url: "mailto:a@b".into(), activation: [7; 16], choose: false }, "an older asker");
         let s = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<Ask>(&s).unwrap(), a);
         assert!(s.len() < MAX_LINE);

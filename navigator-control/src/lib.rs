@@ -183,6 +183,10 @@ pub enum Hand {
     /// An `atrium-app:` link in an ephemeral jail that keeps nothing
     /// (insula trial launch).
     Try,
+    /// The page's own address, "Open with…": Monstrator's sheet always
+    /// asks, for another app or another persona (personas.md §6). Only
+    /// for a page navigatord holds.
+    With,
 }
 
 /// Files bigger than this are not kept for saving (navigatord holds them in

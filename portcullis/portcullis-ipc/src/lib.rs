@@ -334,6 +334,11 @@ pub enum Request {
         url:    String,
         #[serde(default)]
         always: bool,
+        /// Open it in another persona (personas.md §6): one `LinkGranted`
+        /// listed as allowed, by name (`personal` for Personal). `None`:
+        /// the asker's own.
+        #[serde(default)]
+        persona: Option<String>,
     },
 
     /// ★ A console in an app's jail (docs/spec/homes.md §4): a shell as the
@@ -524,6 +529,25 @@ pub struct LinkChoice {
     pub default: bool,
 }
 
+/// A persona a link may open in, on Monstrator's sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaChoice {
+    /// By name; `personal` for Personal.
+    pub name: String,
+    /// One of the persona colours (Personal: none).
+    #[serde(default)]
+    pub colour: Option<String>,
+    /// The asking app's own persona.
+    pub here: bool,
+    /// Whether the person's switch lets the link cross into it.
+    pub allowed: bool,
+    /// Apps taking the link that only this persona may get: the asker's
+    /// own app in another persona (the Work Navigator's link opening in
+    /// the Personal one).
+    #[serde(default)]
+    pub also: Vec<LinkChoice>,
+}
+
 /// A link scheme in Settings' Links section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkScheme {
@@ -631,7 +655,13 @@ pub enum Response {
     OpenApps { apps: Vec<OpenChoice> },
     /// LinkGrant → a grant for one link, for `person`, and the apps that
     /// take the scheme there (the asker left out), the default first.
-    LinkGranted { grant: [u8; 16], person: String, apps: Vec<LinkChoice> },
+    LinkGranted {
+        grant: [u8; 16], person: String, apps: Vec<LinkChoice>,
+        /// The person's personas, the asker's first, each with whether the
+        /// link may cross into it (personas.md §6). Empty: no named persona.
+        #[serde(default)]
+        personas: Vec<PersonaChoice>,
+    },
     /// DeliverLink → handed to `app` (its name).
     LinkDelivered { app: String },
     /// Links → each scheme an app takes, by scheme.

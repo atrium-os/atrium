@@ -721,6 +721,16 @@ impl Shell {
 
     /// The presence control pressed: its menu opens (§6.2). On a site
     /// that knows you, navigatord is asked which accounts Arca holds for it.
+    /// "Open with…" (the toolbar's button): the shown page's address to
+    /// Monstrator with the press, whose sheet offers the apps that take it
+    /// and the person's other personas (personas.md §6).
+    pub fn open_with(&mut self, press: Option<navigator_control::Press>) -> bool {
+        let Some(LivePage::Shown(u)) = self.live.as_ref() else { return false };
+        let url = u.clone();
+        self.outbox.push(Out::Hand { url, how: navigator_control::Hand::With, press: press.unwrap_or([0; 16]) });
+        true
+    }
+
     pub fn toggle_presence_menu(&mut self) {
         if self.presence_open {
             self.presence_open = false;
@@ -1429,6 +1439,15 @@ mod tests {
         s.consented("https://news.example/a");
         assert!(s.store.knows("news.example"));
         assert!(matches!(s.outbox.as_slice(), [Out::Reload { .. }]), "{:?}", s.outbox);
+    }
+
+    #[test]
+    fn open_with_sends_the_shown_page_with_its_press() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        assert!(!s.open_with(Some([3; 16])), "no page shown");
+        s.live = Some(LivePage::Shown("https://atlas.example/wiki/Atrium".into()));
+        assert!(s.open_with(Some([3; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "https://atlas.example/wiki/Atrium".into(), how: navigator_control::Hand::With, press: [3; 16] }));
     }
 
     #[test]

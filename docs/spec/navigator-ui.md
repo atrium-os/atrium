@@ -279,8 +279,10 @@ so rctl limits, and anything that tells instances apart by uid, follow the insta
   the uid, not from the Navigator.
 - **Links stay in their persona.** Each persona instance of an app has its own document channel
   (`<id>@<persona>`), and a link opens in the asking app's persona: from Work Mail into the Work
-  Navigator, never the Personal one (opening-links.md §5). Crossing on purpose, with its switch,
-  is personas.md P3.
+  Navigator, never the Personal one (opening-links.md §5). Crossing on purpose: the toolbar's
+  **Open with…** button (where the empty More button was) hands the shown page's address to
+  Monstrator with the press (`Hand::With`, only for a page navigatord holds); its sheet offers
+  the other apps and the other personas, and the person's switch decides (personas.md §6).
 - Not yet: downloads into the persona's folder (P2), a Work window's network routes (vpn.md V2),
   and choosing the persona from the Navigator's own New window menu.
 

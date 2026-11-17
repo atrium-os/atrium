@@ -134,7 +134,7 @@ pub fn draw(conn: &mut Connection, font: Font, s: &Sheet, w: f32, h: f32, k: f32
         px.text(font, title_pt, PAD, y, th.text_primary(), truncate(&title, w - 2.0 * PAD, title_pt))?;
         y += body_pt * 1.8;
         px.text(font, body_pt, PAD, y, th.text_secondary(), truncate(&line, w - 2.0 * PAD, body_pt))?;
-        if let Some(n) = s.notice {
+        if let Some(n) = &s.notice {
             y += body_pt * 1.8;
             px.text(font, body_pt, PAD, y, th.danger_fg(), truncate(n, w - 2.0 * PAD, body_pt))?;
         }

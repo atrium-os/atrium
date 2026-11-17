@@ -54,7 +54,25 @@ pub struct Policy {
     /// them through it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub personas: BTreeMap<String, PersonaDef>,
+    /// The crossing switches (personas.md §6): what may cross from one
+    /// persona to another, each direction its own. None: nothing crosses.
+    /// Turned on in Curia behind user verification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crossings: Vec<Crossing>,
 }
+
+/// One crossing switch: `from` may send `kinds` to `to` (personas.md §6).
+/// Personas by name; Personal is `personal` (never a named persona's name).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Crossing {
+    pub from: String,
+    pub to: String,
+    /// `links`, `files`, `clipboard`, `share`, `workspace-links`.
+    pub kinds: Vec<String>,
+}
+
+/// Personal's name in [`Crossing`].
+pub const PERSONAL: &str = "personal";
 
 /// The colours a persona may take (personas.md §2): a fixed set, distinct
 /// from one another by design, so "close colours" cannot happen. frescod and
@@ -151,6 +169,20 @@ impl Policy {
             }
         }
         Ok(())
+    }
+
+    /// Whether `kind` may cross from persona `from` to `to` (`None`:
+    /// Personal). Within one persona, always; across, only with a switch
+    /// naming both, and only between personas the person has.
+    pub fn may_cross(&self, from: Option<&str>, to: Option<&str>, kind: &str) -> bool {
+        if from == to {
+            return true;
+        }
+        if !self.has_persona(from) || !self.has_persona(to) {
+            return false;
+        }
+        let (f, t) = (from.unwrap_or(PERSONAL), to.unwrap_or(PERSONAL));
+        self.crossings.iter().any(|c| c.from == f && c.to == t && c.kinds.iter().any(|k| k == kind))
     }
 
     /// Whether `persona` may be launched in: `None` (Personal) always; a
@@ -739,6 +771,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn crossing_is_off_unless_a_switch_names_that_direction() {
+        let p: Policy = toml::from_str(r#"
+[personas.work]
+colour = "blue"
+
+[[crossings]]
+from = "work"
+to = "personal"
+kinds = ["links"]
+"#).unwrap();
+        assert!(p.may_cross(Some("work"), Some("work"), "links"), "within a persona");
+        assert!(p.may_cross(Some("work"), None, "links"));
+        assert!(!p.may_cross(None, Some("work"), "links"), "the other direction is its own switch");
+        assert!(!p.may_cross(Some("work"), None, "files"), "and each kind");
+        assert!(!p.may_cross(Some("school"), None, "links"), "not a persona of theirs");
+        assert!(!Policy::default().may_cross(None, Some("work"), "links"));
+    }
 
     #[test]
     fn a_worker_rule_may_name_its_caller_by_app() {
