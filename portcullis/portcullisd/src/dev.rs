@@ -19,8 +19,16 @@
 //!   decision for that manifest (a changed manifest is a new grant);
 //! - gone, with its grant, when its workspace is deleted.
 //!
-//! Only the manifest and the entry are copied: a build that needs more
-//! files ships them in its entry for now.
+//! The manifest, the entry and the entry's libraries are copied
+//! (dev-tools-plan.md M4). Each library is found the way the workspace's
+//! loader would find it (`DT_RPATH`/`DT_RUNPATH` with `$ORIGIN`, then
+//! `/lib`, `/usr/lib`, `/usr/local/lib`), in the workspace's own view:
+//! the base is the host's, `/usr/local` its root's, `~/work` its `work`,
+//! `/workspaces/<A>` A's `work`. In a folder the workspace can write, every
+//! open is `O_RESOLVE_BENEATH` that folder, so a link out of it is refused.
+//! Base libraries keep their paths in the bundle; the rest go to
+//! `/usr/lib`, where the app's loader looks. Anything else a build needs
+//! (data files, plugins it `dlopen`s) it ships in its entry for now.
 
 use std::fs;
 use std::io::Read;
@@ -102,6 +110,8 @@ pub struct Prepared {
     pub manifest: String,
     entry:        String,
     bytes:        Vec<u8>,
+    /// The entry's libraries and the loader: (path in the bundle, bytes).
+    libs:         Vec<(PathBuf, Vec<u8>)>,
 }
 
 pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String> {
@@ -146,6 +156,11 @@ pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String>
     }
     let entry = m.entry().trim_start_matches('/').to_string();
     let bytes = read_file(open_beneath(&proj, &entry, libc::O_RDONLY)?, &entry, ENTRY_MAX)?;
+    // Its libraries, before the press is spent: a refusal costs nothing.
+    let (view, home_in) = workspace::view(owner, ws)?;
+    let in_jail = format!("{home_in}/{}/{}{entry}", workspace::WORK,
+                          if project.is_empty() || project == "." { String::new() } else { format!("{project}/") });
+    let libs = closure(&bytes, &in_jail, &view)?;
     let dev = dev_id(owner, ws, &id);
     // The installed manifest: the same, under the dev id.
     let mut v: toml::Value = text.parse().map_err(|e| format!("atrium.toml: {e}"))?;
@@ -153,7 +168,7 @@ pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String>
         .insert("id".into(), toml::Value::String(dev.clone()));
     let manifest = toml::to_string(&v).map_err(|e| e.to_string())?;
     portcullis_toml::Manifest::from_str(&manifest).map_err(|e| format!("the dev manifest: {e}"))?;
-    Ok(Prepared { id: dev, manifest, entry, bytes })
+    Ok(Prepared { id: dev, manifest, entry, bytes, libs })
 }
 
 /// Install a prepared bundle (replacing the last Run's), signed by the dev
@@ -175,10 +190,14 @@ pub fn install(p: &Prepared) -> Result<PathBuf, String> {
     fs::write(&ep, &p.bytes).map_err(e)?;
     fs::set_permissions(&ep, fs::Permissions::from_mode(0o555)).map_err(e)?;
     // An app's jail is its bundle: the entry's libraries and the loader go
-    // in too, from the base system (what the workspace built against).
-    if let Err(why) = stage_libraries(&p.bytes, &tmp) {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err(why);
+    // in too, as the workspace's loader found them.
+    for (at, bytes) in &p.libs {
+        let to = tmp.join(at);
+        if let Some(d) = to.parent() {
+            fs::create_dir_all(d).map_err(e)?;
+        }
+        fs::write(&to, bytes).map_err(e)?;
+        fs::set_permissions(&to, fs::Permissions::from_mode(0o555)).map_err(e)?;
     }
     let _ = fs::remove_dir_all(&tree);
     fs::rename(&tmp, &tree).map_err(e)?;
@@ -199,45 +218,124 @@ pub fn remove(id: &str) {
     }
 }
 
-/// Base-system library folders a dev build's libraries come from (the
-/// workspace's base is the host's, read-only).
-const LIB_DIRS: [&str; 2] = ["/lib", "/usr/lib"];
+/// Where the loader looks after an object's own paths: FreeBSD's default
+/// path, and `/usr/local/lib` as ldconfig's hints have it.
+const DEFAULT_LIB_DIRS: [&str; 3] = ["/lib", "/usr/lib", "/usr/local/lib"];
+/// Libraries a bundle may carry, and their bytes in all.
+const LIBS_MAX: usize = 512;
+const LIBS_BYTES_MAX: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Copy the loader and the entry's DT_NEEDED closure into `dest` at their
-/// absolute paths. The entry is parsed, never run.
-fn stage_libraries(entry: &[u8], dest: &Path) -> Result<(), String> {
-    let needed = elf_needed(entry, Path::new("the entry"))?;
-    if needed.is_empty() {
-        return Ok(()); // static
+/// Open `path` (a path in the workspace's jail) through its view, or
+/// `None` if it isn't there. A link out of a folder the workspace can
+/// write is an error, as is a path outside every folder of the view.
+fn open_in_view(view: &[workspace::ViewMount], path: &str) -> Result<Option<(OwnedFd, bool)>, String> {
+    let m = view.iter().find(|m| m.in_jail == "/" || path == m.in_jail || path.starts_with(&format!("{}/", m.in_jail)))
+        .ok_or_else(|| format!("{path}: not in the workspace"))?;
+    let rel = path[m.in_jail.len()..].trim_start_matches('/');
+    let host = m.host.join(rel);
+    if !m.untrusted {
+        return match fs::File::open(&host) {
+            Ok(f) => Ok(Some((OwnedFd::from(f), false))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{path}: {e}")),
+        };
     }
-    let copy = |abs: &Path| -> Result<PathBuf, String> {
-        let to = dest.join(abs.strip_prefix("/").unwrap_or(abs));
-        if !to.exists() {
-            if let Some(d) = to.parent() {
-                fs::create_dir_all(d).map_err(|e| e.to_string())?;
-            }
-            fs::copy(abs, &to).map_err(|e| format!("{}: {e}", abs.display()))?;
-            fs::set_permissions(&to, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
-        }
-        Ok(to)
-    };
-    copy(Path::new("/libexec/ld-elf.so.1"))?;
+    let c = std::ffi::CString::new(m.host.as_os_str().as_encoded_bytes()).map_err(|_| "a NUL".to_string())?;
+    // SAFETY: a NUL-terminated path. The folder itself must not be a link.
+    let dfd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if dfd < 0 {
+        return Ok(None);
+    }
+    // SAFETY: just opened, ours alone.
+    let dir = unsafe { OwnedFd::from_raw_fd(dfd) };
+    if rel.is_empty() || rel.split('/').any(|c| c == "..") {
+        return Err(format!("{path}: not a library path"));
+    }
+    let r = std::ffi::CString::new(rel).map_err(|_| "a NUL".to_string())?;
+    // SAFETY: a valid directory descriptor and a NUL-terminated path.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), r.as_ptr(), libc::O_RDONLY | libc::O_RESOLVE_BENEATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ENOTDIR) => Ok(None),
+            Some(libc::ENOTCAPABLE) | Some(libc::EXDEV) =>
+                Err(format!("{path} is reached through a link out of {}: refused", m.in_jail)),
+            _ => Err(format!("{path}: {err}")),
+        };
+    }
+    // SAFETY: just opened, ours alone.
+    Ok(Some((unsafe { OwnedFd::from_raw_fd(fd) }, true)))
+}
+
+/// The folder part of a path in the jail.
+fn dir_of(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &p[..i],
+        None => "/",
+    }
+}
+
+/// The loader and the entry's `DT_NEEDED` closure, found as the workspace's
+/// loader would, read now: (path in the bundle, bytes). `entry_in_jail` is
+/// where the entry is in the workspace, for `$ORIGIN`. Parsed, never run.
+fn closure(entry: &[u8], entry_in_jail: &str, view: &[workspace::ViewMount]) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    let first = elf_dynamic(entry, Path::new("the entry"))?;
+    if first.needed.is_empty() {
+        return Ok(Vec::new()); // static
+    }
+    let mut out: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
+    let ld = fs::read("/libexec/ld-elf.so.1").map_err(|e| format!("the loader: {e}"))?;
+    out.push((PathBuf::from("libexec/ld-elf.so.1"), ld));
     let mut seen = std::collections::BTreeSet::new();
-    let mut queue = needed;
-    while let Some(so) = queue.pop() {
+    // (soname, who needs it, that object's search path)
+    let paths = |d: &Dynamic, origin: &str| -> Vec<String> {
+        let own = if d.runpath.is_some() { &d.runpath } else { &d.rpath };
+        let mut v: Vec<String> = own.as_deref().unwrap_or("").split(':').filter(|p| !p.is_empty())
+            .filter_map(|p| {
+                let p = p.replace("${ORIGIN}", origin).replace("$ORIGIN", origin);
+                (p.starts_with('/') && !p.contains('$')).then_some(p)
+            }).collect();
+        v.extend(DEFAULT_LIB_DIRS.iter().map(|s| s.to_string()));
+        v
+    };
+    let mut queue: Vec<(String, String, Vec<String>)> = first.needed.iter()
+        .map(|n| (n.clone(), entry_in_jail.to_string(), paths(&first, dir_of(entry_in_jail)))).collect();
+    while let Some((so, by, dirs)) = queue.pop() {
         if !seen.insert(so.clone()) {
             continue;
         }
         if so.contains('/') || so.starts_with('.') || so.is_empty() {
-            return Err(format!("the entry needs {so:?}: not a library name"));
+            return Err(format!("{by} needs {so:?}: not a library name"));
         }
-        let abs = LIB_DIRS.iter().map(|d| Path::new(d).join(&so)).find(|p| p.is_file())
-            .ok_or_else(|| format!("the entry needs {so}, which the base system hasn't (a library from the workspace's own /usr/local isn't carried yet)"))?;
-        let to = copy(&abs)?;
-        let bytes = fs::read(&to).map_err(|e| e.to_string())?;
-        queue.extend(elf_needed(&bytes, &abs)?);
+        if seen.len() > LIBS_MAX {
+            return Err(format!("more than {LIBS_MAX} libraries"));
+        }
+        let mut found = None;
+        for d in &dirs {
+            let at = format!("{}/{so}", d.trim_end_matches('/'));
+            if let Some((fd, untrusted)) = open_in_view(view, &at)? {
+                found = Some((fd, untrusted, at));
+                break;
+            }
+        }
+        let (fd, untrusted, at) = found.ok_or_else(|| format!("{by} needs {so}, which isn't in {}", dirs.join(", ")))?;
+        let bytes = read_file(fd, &at, ENTRY_MAX)?;
+        total += bytes.len() as u64;
+        if total > LIBS_BYTES_MAX {
+            return Err(format!("its libraries pass {LIBS_BYTES_MAX} bytes"));
+        }
+        let d = elf_dynamic(&bytes, Path::new(&at))?;
+        for n in &d.needed {
+            queue.push((n.clone(), at.clone(), paths(&d, dir_of(&at))));
+        }
+        // The base's keep their place; the workspace's go where the app's
+        // loader looks without hints or the workspace's paths.
+        let dest = if untrusted { PathBuf::from("usr/lib").join(&so) } else { PathBuf::from(at.trim_start_matches('/')) };
+        out.push((dest, bytes));
     }
-    Ok(())
+    Ok(out)
 }
 
 // A minimal ELF64 reader, as opifex's (opifex/src/main.rs), with every
@@ -250,9 +348,17 @@ fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
 }
 
-/// Return the DT_NEEDED sonames of an ELF64 little-endian object. A static
-/// binary (no PT_DYNAMIC) yields an empty vec, which is not an error.
-fn elf_needed(b: &[u8], what: &Path) -> Result<Vec<String>, String> {
+/// What the loader reads from an object's dynamic section.
+#[derive(Default)]
+struct Dynamic {
+    needed:  Vec<String>,
+    rpath:   Option<String>,
+    runpath: Option<String>,
+}
+
+/// The DT_NEEDED sonames and DT_RPATH/DT_RUNPATH of an ELF64 little-endian
+/// object. A static binary (no PT_DYNAMIC) has none, which is not an error.
+fn elf_dynamic(b: &[u8], what: &Path) -> Result<Dynamic, String> {
     let bad = |m: &str| format!("{}: {m}", what.display());
     if b.len() < 64 || &b[0..4] != b"\x7fELF" {
         return Err(bad("not an ELF file"));
@@ -282,7 +388,7 @@ fn elf_needed(b: &[u8], what: &Path) -> Result<Vec<String>, String> {
         }
     }
     let Some((dyn_off, dyn_sz)) = dynamic else {
-        return Ok(Vec::new()); // static binary
+        return Ok(Dynamic::default()); // static binary
     };
 
     let vaddr_to_off = |v: u64| -> Option<usize> {
@@ -297,6 +403,7 @@ fn elf_needed(b: &[u8], what: &Path) -> Result<Vec<String>, String> {
     // First pass for DT_STRTAB (a vaddr), second for the DT_NEEDED offsets.
     let mut strtab: Option<usize> = None;
     let mut needed_offs: Vec<u64> = Vec::new();
+    let (mut rpath_off, mut runpath_off) = (None, None);
     let mut i = dyn_off;
     while i + 16 <= dyn_off.saturating_add(dyn_sz) {
         let tag = rd_u64(b, i).ok_or_else(|| bad("truncated Elf64_Dyn"))?;
@@ -305,23 +412,27 @@ fn elf_needed(b: &[u8], what: &Path) -> Result<Vec<String>, String> {
             0 => break,                       // DT_NULL
             1 => needed_offs.push(val),       // DT_NEEDED
             5 => strtab = vaddr_to_off(val),  // DT_STRTAB
+            15 => rpath_off = Some(val),      // DT_RPATH
+            29 => runpath_off = Some(val),    // DT_RUNPATH
             _ => {}
         }
         i += 16;
     }
     let Some(strtab) = strtab else {
         if needed_offs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Dynamic::default());
         }
         return Err(bad("has DT_NEEDED but no resolvable DT_STRTAB"));
     };
-
-    let mut out = Vec::with_capacity(needed_offs.len());
-    for n in needed_offs {
-        let start = strtab.checked_add(n as usize).ok_or_else(|| bad("soname out of range"))?;
-        let rest = b.get(start..).ok_or_else(|| bad("soname out of range"))?;
-        let end = rest.iter().position(|&c| c == 0).ok_or_else(|| bad("unterminated soname"))?;
-        out.push(String::from_utf8_lossy(&rest[..end]).into_owned());
-    }
-    Ok(out)
+    let string = |n: u64| -> Result<String, String> {
+        let start = strtab.checked_add(n as usize).ok_or_else(|| bad("string out of range"))?;
+        let rest = b.get(start..).ok_or_else(|| bad("string out of range"))?;
+        let end = rest.iter().position(|&c| c == 0).ok_or_else(|| bad("unterminated string"))?;
+        Ok(String::from_utf8_lossy(&rest[..end]).into_owned())
+    };
+    Ok(Dynamic {
+        needed:  needed_offs.into_iter().map(string).collect::<Result<_, _>>()?,
+        rpath:   rpath_off.map(string).transpose()?,
+        runpath: runpath_off.map(string).transpose()?,
+    })
 }

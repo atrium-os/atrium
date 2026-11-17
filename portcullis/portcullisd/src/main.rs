@@ -1621,7 +1621,9 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
     let app = match &caller {
-        Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) => true,
+        // The Terminal too, for `make run` in a workspace's console
+        // (atrium-run, OSC 7770 `run`), on the person's press.
+        Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => true,
         Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
         None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
         None => return refuse("cap.workspace.denied: not a person or a launcher".into()),

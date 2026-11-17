@@ -1,0 +1,11 @@
+# The Atrium C SDK (dev-tools.md §5.4): Fresco's client library, in the base.
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include/atrium
+
+Name: fresco
+Description: Fresco scene-graph client library (Atrium C SDK)
+Version: 0.1
+Libs: -lfresco
+Libs.private: -lmd
+Cflags: -I${includedir}

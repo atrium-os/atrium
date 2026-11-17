@@ -205,17 +205,50 @@ case "$reply" in
 esac
 "#;
 
+/// `atrium-run [folder]` (and `make run`, atrium.app.mk): Run what this
+/// workspace built in `~/work/<folder>`, asked of the terminal as `pkg` is
+/// (OSC 7770 `run`, homes.md §5.5): the terminal shows what it asks, and
+/// on the person's press sends `WorkspaceRun` for its tab's workspace.
+const RUN_WRAPPER: &str = r#"#!/bin/sh
+# Run what this workspace built, as an app (docs/spec/homes.md §5.3), after
+# you press Run in the Terminal. The folder is in ~/work (default: ~/work).
+p=${1:-.}
+case "$p" in
+""|/*|*..*|*[!A-Za-z0-9._/-]*) echo "atrium-run: "$p" isn't a folder in ~/work" >&2; exit 64 ;;
+esac
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "atrium-run: Run needs your OK; run it in a Terminal window" >&2
+    exit 1
+fi
+old=$(stty -g)
+trap 'stty "$old"; echo; exit 130' INT TERM
+echo "atrium-run: asking for your OK in this window (Ctrl-C to cancel)"
+stty -echo
+printf ']7770;run;%s' "$p"
+IFS= read -r reply
+stty "$old"
+printf '[1A
+[2K'
+case "$reply" in
+*"]7770;ok;"*) s=${reply##*;}; s=${s%%[!0-9]*}; exit "${s:-1}" ;;
+*"]7770;cancel"*) echo "atrium-run: cancelled"; exit 1 ;;
+*) echo "atrium-run: this terminal can't ask for your OK" >&2; exit 1 ;;
+esac
+"#;
+
 /// Write the workspace tools (once per change), root's and read-only.
 fn ensure_ws_bin() -> Result<PathBuf, String> {
     let dir = PathBuf::from(WS_BIN);
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
-    let f = dir.join("pkg");
-    if fs::read_to_string(&f).ok().as_deref() != Some(PKG_WRAPPER) {
-        let tmp = dir.join(".pkg.new");
-        fs::write(&tmp, PKG_WRAPPER).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
+    for (name, text) in [("pkg", PKG_WRAPPER), ("atrium-run", RUN_WRAPPER)] {
+        let f = dir.join(name);
+        if fs::read_to_string(&f).ok().as_deref() != Some(text) {
+            let tmp = dir.join(format!(".{name}.new"));
+            fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
+            fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
+        }
     }
     Ok(dir)
 }
@@ -224,6 +257,8 @@ fn ensure_ws_bin() -> Result<PathBuf, String> {
 const ETC: &[&str] = &[
     "login.conf", "login.conf.db", "resolv.conf", "hosts", "services", "protocols",
     "shells", "nsswitch.conf", "libmap.conf", "networks",
+    // Package scripts source these (pkg's own post-install does).
+    "rc.subr", "defaults/rc.conf",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +724,9 @@ fn seed_etc(root: &Path, user: &str, uid: u32, gid: u32, files: u32, home_in: &s
     for f in ETC {
         let src = Path::new("/etc").join(f);
         if src.is_file() {
+            if let Some(d) = etc.join(f).parent() {
+                let _ = fs::create_dir_all(d);
+            }
             let _ = fs::copy(&src, etc.join(f));
         }
     }
@@ -733,6 +771,41 @@ fn seed_etc(root: &Path, user: &str, uid: u32, gid: u32, files: u32, home_in: &s
     Ok(())
 }
 
+/// One folder of a workspace's file system as its jail sees it, and where
+/// it is on the host (dev-tools-plan.md M4: Run resolves a build's
+/// libraries the way the workspace's loader would). `untrusted` folders
+/// are the workspace's to write: opened only beneath their host folder.
+pub struct ViewMount {
+    pub in_jail:   String,
+    pub host:      PathBuf,
+    pub untrusted: bool,
+}
+
+/// The workspace's file system, longest folder first: the base (the
+/// host's, read-only), its toolchain layers, `~/work`, what it uses at
+/// `/workspaces/<name>`, and its own root (`/usr/local` and the rest).
+/// Also the home folder in the jail (`/home/<its user>`).
+pub fn view(owner: &str, name: &str) -> Result<(Vec<ViewMount>, String), String> {
+    let (home, files) = person(owner)?;
+    let dir = root_dir(&home, files)?.join(name);
+    let r = load(&dir).filter(|_| valid_name(name)).ok_or_else(|| format!("no workspace {name:?}"))?;
+    let (_, user) = launch::resolve_app_uid(owner, &reg_id(name), None).map_err(|e| format!("{e:?}"))?;
+    let home_in = format!("/home/{user}");
+    let mut v: Vec<ViewMount> = BASE.iter()
+        .map(|b| ViewMount { in_jail: format!("/{b}"), host: Path::new("/").join(b), untrusted: false }).collect();
+    let (_, layer_dirs) = compose_layers(&r)?;
+    for (src, at) in layer_dirs {
+        v.push(ViewMount { in_jail: format!("/{}", at.trim_start_matches('/')), host: src, untrusted: false });
+    }
+    v.push(ViewMount { in_jail: format!("{home_in}/{WORK}"), host: dir.join(WORK), untrusted: true });
+    for u in &r.uses {
+        v.push(ViewMount { in_jail: format!("/{LINKS}/{u}"), host: home.join(".atrium/workspaces").join(u).join(WORK), untrusted: true });
+    }
+    v.push(ViewMount { in_jail: "/".into(), host: dir.join(".state").join("root"), untrusted: true });
+    v.sort_by_key(|m| std::cmp::Reverse(m.in_jail.len()));
+    Ok((v, home_in))
+}
+
 /// Start the workspace if it isn't running, and say where it is.
 pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     let (home, files) = person(owner)?;
@@ -756,6 +829,11 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     // Its toolchain layers: PATH first, then what they set.
     let (layers, layer_dirs) = compose_layers(&r)?;
     env.insert(0, format!("PATH=/{WS_BIN_IN_JAIL}:{}", layers.path));
+    // What it uses, for pkg-config (dev-tools.md §4.3): each one's prefix.
+    if !r.uses.is_empty() {
+        let pc: Vec<String> = r.uses.iter().map(|u| format!("/{LINKS}/{u}/.atrium/prefix/lib/pkgconfig")).collect();
+        env.push(format!("PKG_CONFIG_PATH={}", pc.join(":")));
+    }
     env.extend(layers.env);
     let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
@@ -769,7 +847,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
                          ("usr", 0o755, 0), ("usr/local", 0o755, uid), ("root", 0o700, 0), ("dev", 0o555, 0),
                          ("home", 0o755, 0), (&home_in[1..], 0o755, uid), (LINKS, 0o755, 0),
                          // pkg's, as the jail's root (M2).
-                         ("var/db", 0o755, 0), ("var/db/pkg", 0o755, 0), ("var/cache", 0o755, 0), ("var/cache/pkg", 0o755, 0),
+                         ("var/db", 0o755, 0), ("var/db/pkg", 0o755, 0), ("var/run", 0o755, 0), ("var/cache", 0o755, 0), ("var/cache/pkg", 0o755, 0),
                          ("atrium", 0o755, 0), (WS_BIN_IN_JAIL, 0o755, 0)] {
         let p = root.join(d);
         fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;

@@ -30,7 +30,7 @@ libfresco.a: ${OBJS}
 	${AR} rcs ${.TARGET} ${OBJS}
 
 libfresco.so: ${OBJS}
-	${CC} ${LDFLAGS} -shared -o ${.TARGET} ${OBJS} ${LIBS}
+	${CC} ${LDFLAGS} -shared -Wl,-soname,libfresco.so.0 -o ${.TARGET} ${OBJS} ${LIBS}
 
 examples/smoke: examples/smoke.c libfresco.a
 	${CC} ${CFLAGS} ${LDFLAGS} -o ${.TARGET} examples/smoke.c libfresco.a ${LIBS}

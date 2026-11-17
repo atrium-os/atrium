@@ -296,7 +296,9 @@ pub fn check_pkg_argv(argv: &[String]) -> Result<(), String> {
 /// the jail's root, not the host's. The base is read-only there, the jail
 /// can't mount, use raw sockets or set file flags (workspace::start), and
 /// package scripts run there too. The press, or the person's own CLI, was
-/// checked by the caller. The output ends with `pkg: exit <status>`.
+/// checked by the caller. Then the loader's hints are rewritten (the jail
+/// has no rc to do it), so what pkg put in `/usr/local/lib` is found. The
+/// output ends with `pkg: exit <status>`.
 pub fn admin(owner: &str, name: &str, argv: &[String]) -> Result<Started, String> {
     use std::ffi::CString;
     check_pkg_argv(argv)?;
@@ -304,7 +306,7 @@ pub fn admin(owner: &str, name: &str, argv: &[String]) -> Result<Started, String
     let c = |v: &str| CString::new(v).map_err(|_| "a NUL in the command".to_string());
     let sh = c("/bin/sh")?;
     let mut args = vec![c("/bin/sh")?, c("-c")?,
-                        c("/usr/sbin/pkg \"$@\"; s=$?; echo \"pkg: exit $s\"; exit $s")?, c("pkg")?];
+                        c("/usr/sbin/pkg \"$@\"; s=$?; /sbin/ldconfig -elf /lib /usr/lib /usr/local/lib; echo \"pkg: exit $s\"; exit $s")?, c("pkg")?];
     for a in &argv[1..] {
         args.push(c(a)?);
     }
