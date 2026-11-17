@@ -250,6 +250,31 @@ Named personas are the browser "container" idea (two accounts on one site, work 
 home). They cost nothing new in the jail design, only a key in Arca. **Recommend shipping
 Personal and Unrecorded first, and named personas when someone asks** (§13, D5).
 
+**Named personas as built (2026-11-17, personas.md §3).** Work made them needed, and they came
+as personas.md's system-wide personas rather than as jars inside one Navigator: **one persona per
+window**, each its own Navigator instance. `portcullis launch --persona work
+org.atrium.navigator` starts a second navigatord with its own uid, jail, overlay (trails, page
+store, downloads) and synthetic host identity; its converter and fetcher jails run as its uid,
+since a worker runs as whoever asks; and Arca keys its items by that uid. Its page and UI jails
+run as the shared `_navpage` and `_navui` uids, as every person's do: they hold no files and no
+network, and a page reaches only the navigatord whose ticket it holds.
+- **Sockets per instance.** Every navigatord serves in the same shared directories, so each
+  names its sockets by its uid: the page socket `navigator-page/<uid>.sock`
+  (`navigator_control::PAGE_SOCKET`, `{instance}` filled in) and the control socket where the
+  settings say `{instance}`. A ticket carries the issuing uid in its first 4 bytes and 96 random
+  bits after, so the page child knows which socket redeems it. Before this, two people's
+  Navigators collided on one page socket too. The control socket is mode 0600 when the UI is
+  navigatord's own worker: another instance cannot drive this one.
+- **Which persona.** navigatord asks portcullisd (`Request::Persona`), which answers from the
+  launch registry by the peer uid, never from what the app says, with the colour from the
+  person's policy. navigatord passes it to the UI as `NAVIGATOR_UI_PERSONA`; the rail's persona
+  chip names the window's persona ("Work") for recorded trails, and Unrecorded trails stay
+  Unrecorded inside it. frescod's strip chip and forum-wm's frame (personas.md P1) come from
+  the uid, not from the Navigator.
+- Not yet: link crossing into a Work window (personas.md P3; a persona instance has no document
+  channel until then), downloads into the persona's folder (P2), a Work window's network routes
+  (vpn.md V2), and choosing the persona from the Navigator's own New window menu.
+
 ---
 
 ## 3. First principles: what is different here, and what it buys the UI
@@ -1287,7 +1312,7 @@ Each step runs in the VM on headless frescod before the next.
      branch out is not built. Checked in `scripts/navigator-live-vm.sh` (Ctrl held in the chrome
      opens a link beside, then the button).
      Consent buttons pressed in a page: built 2026-11-14/15 (§6.2, legacy-web §5.4.1e).
-     Not yet: named personas (D5: when someone asks).
+     Named personas: one per window, each its own Navigator instance (§2.4, built 2026-11-17).
 6. **Islands and prompts.** The `island` slot kind, the prompt row with its press rule, downloads,
    app hand-off. *Built 2026-11-14*:
    - **The prompt row's rules** (§6.4), in `navigator-ui/src/shell.rs`: a press counts only once

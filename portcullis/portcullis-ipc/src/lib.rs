@@ -439,6 +439,12 @@ pub enum Request {
     /// output and error together. Read the answer with
     /// [`read_response_unbuffered`] so the descriptors aren't lost.
     WorkspaceExec { name: String, argv: Vec<String>, #[serde(default)] cwd: String },
+
+    /// The caller's own persona (personas.md §3), read from the launch
+    /// registry by its PEER UID, never from anything it sends: an app
+    /// that runs once per persona (the Navigator) names its windows by
+    /// it. Answer: `Persona`.
+    Persona,
 }
 
 /// Who allowed what an app has now (curia.md §13).
@@ -648,6 +654,11 @@ pub enum Response {
     /// the uid the shell actually runs as inside the jail (the jail's
     /// app-uid, or 0 if `want_root` was granted) — for the caller's logs.
     JailExecStarted { pid: i32, uid: u32 },
+
+    /// Persona → the caller's: `None` for Personal, else the named
+    /// persona and its colour (one of portcullis-policy's
+    /// `PERSONA_COLOURS`).
+    Persona { name: Option<String>, colour: Option<String> },
 }
 
 /// Send one request and read one response over a connected stream.

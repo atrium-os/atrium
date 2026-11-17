@@ -400,8 +400,11 @@ impl State {
     fn ticket(&mut self, p: Arc<Page>) -> Ticket {
         let now = Instant::now();
         self.tickets.retain(|_, (_, t)| now.duration_since(*t) < TICKET_LIFE);
-        let mut t = [0u8; 16];
-        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut t)).expect("/dev/urandom");
+        let mut r = [0u8; 12];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut r)).expect("/dev/urandom");
+        // Our uid first: the page child redeems it at our socket, not
+        // another instance's (personas.md §3).
+        let t = ctl::ticket_for(unsafe { libc::getuid() }, r);
         self.tickets.insert(t, (p, now));
         t
     }
@@ -1495,11 +1498,14 @@ fn main() {
     });
     // In a directory of its own: the page child's jail mounts that
     // directory (the `navigator-page` capability) and nothing else of ours.
-    let page_path = settings::path("NAVIGATORD_PAGE_SOCKET", "/atrium/sockets/navigator-page/navigator-page.sock");
+    // Shared with every other navigatord (each person's, each persona's):
+    // ours is named by our uid, which our tickets carry.
+    let me = unsafe { libc::getuid() };
+    let page_path = ctl::instance_path(&settings::path("NAVIGATORD_PAGE_SOCKET", ctl::PAGE_SOCKET), me);
     if let Some(dir) = Path::new(&page_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let ctl_path = settings::path("NAVIGATORD_SOCKET", "/var/run/atrium/navigatord.sock");
+    let ctl_path = ctl::instance_path(&settings::path("NAVIGATORD_SOCKET", "/var/run/atrium/navigatord.sock"), me);
     let pages = listen(&page_path);
     let st = state.clone();
     std::thread::spawn(move || {
@@ -1509,6 +1515,13 @@ fn main() {
         }
     });
     let ui = listen(&ctl_path);
+    // With the UI our own worker, only our own uid may come here: in the
+    // shared directory, another person's or another persona's Navigator
+    // must not drive this one (personas.md §3).
+    if cfg.ui.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&ctl_path, std::fs::Permissions::from_mode(0o600));
+    }
     eprintln!("navigatord: control on {ctl_path}, pages on {page_path}");
     document_channel();
     // The UI as our worker: its control channel is one end of a pair, and
@@ -1518,7 +1531,21 @@ fn main() {
             eprintln!("navigatord: UI channel: {e}");
             std::process::exit(1)
         });
-        let pairs = settings::ui_pairs();
+        let mut pairs = settings::ui_pairs();
+        // The window's persona (personas.md §3), for the rail; frescod
+        // draws the strip chip itself, from our uid.
+        if !cfg.unconfined {
+            pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA"));
+            match worker::persona() {
+                Ok(Some((name, colour))) => {
+                    eprintln!("navigatord: persona {name} ({colour})");
+                    pairs.push(("NAVIGATOR_UI_PERSONA".into(), name));
+                    pairs.push(("NAVIGATOR_UI_PERSONA_COLOUR".into(), colour));
+                }
+                Ok(None) => eprintln!("navigatord: persona Personal"),
+                Err(e) => eprintln!("navigatord: persona unknown, Personal shown: {e}"),
+            }
+        }
         if let Err(e) = ctl::write_frame(&mut &ours, &Event::Settings { pairs }) {
             eprintln!("navigatord: UI settings: {e}");
             std::process::exit(1);

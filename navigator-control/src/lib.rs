@@ -39,6 +39,32 @@ pub fn is_image_address(a: &str) -> bool {
 
 pub type Ticket = [u8; 16];
 
+/// navigatord's page socket, as the `navigator-page` capability mounts it:
+/// one per navigatord instance (a person's, or a persona's: personas.md §3),
+/// all in the one shared directory, named by the instance's uid.
+pub const PAGE_SOCKET: &str = "/atrium/sockets/navigator-page/{instance}.sock";
+
+/// A fresh ticket from the navigatord running as `instance` (its uid): the
+/// uid first, so the page child knows whose socket redeems it, then 96
+/// random bits, which are what make it unguessable.
+pub fn ticket_for(instance: u32, random: [u8; 12]) -> Ticket {
+    let mut t = [0u8; 16];
+    t[..4].copy_from_slice(&instance.to_le_bytes());
+    t[4..].copy_from_slice(&random);
+    t
+}
+
+/// The instance a ticket names.
+pub fn ticket_instance(t: &Ticket) -> u32 {
+    u32::from_le_bytes([t[0], t[1], t[2], t[3]])
+}
+
+/// A socket path with `{instance}` filled in (a path without it is taken
+/// as it is: a test's own).
+pub fn instance_path(path: &str, instance: u32) -> String {
+    path.replace("{instance}", &instance.to_string())
+}
+
 /// The most page records one `Clear` names.
 pub const CLEAR_MAX: usize = 512;
 /// The largest trail store navigatord keeps for the UI (navigator-ui.md
@@ -402,6 +428,16 @@ pub fn raw(s: &impl AsRawFd) -> RawFd { s.as_raw_fd() }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_ticket_names_the_instance_whose_socket_redeems_it() {
+        let t = ticket_for(70012, [9; 12]);
+        assert_eq!(ticket_instance(&t), 70012);
+        assert_eq!(&t[4..], &[9; 12]);
+        assert_eq!(instance_path(PAGE_SOCKET, ticket_instance(&t)), "/atrium/sockets/navigator-page/70012.sock");
+        assert_eq!(instance_path("/tmp/p.sock", 70012), "/tmp/p.sock");
+    }
+
     use super::*;
 
     #[test]

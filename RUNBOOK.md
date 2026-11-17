@@ -5844,7 +5844,16 @@ first. Last, `org.test.linkprobe` (monstrator's `link-probe` example: a window, 
 Monstrator with that press, portcullisd hands it to the running Navigator (https's default), and the
 UI opens it in a trail of its own (`trails` up by one); since the Navigator was running, portcullisd
 asks frescod to bring its window forward (`RAISE`, owed once per `LINK` press it spent) and forum-wm
-does, over link-probe's (`a link was handed to surface` in `wm.log`). 67/67 on 2026-11-17. Earlier: 61/61 on
+does, over link-probe's (`a link was handed to surface` in `wm.log`). Then a Work Navigator
+(personas.md §3, navigator-ui.md §2.4): navtest's policy gets `[personas.work]`, and
+`portcullis launch --persona work org.atrium.navigator` starts a second navigatord in its own jail
+as another uid, registry line `persona=work`; portcullisd tells each its persona by its uid
+(`navigatord: persona work (blue)` in `navigatord-work.log`, `persona Personal` in the first), the
+UI logs `window persona Work` and its rail chip says Work (`confined-6-work.png`); each instance
+has its own page and control sockets named by its uid (the control socket 0600), Work's page
+child redeems its ticket at Work's socket, and its fetcher and converter jails are asked for by
+Work's uid. The checks for those workers read portcullisd's log, whose lines interleave, so they
+look 5 lines after Work's `conn from`. 79/79 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds
