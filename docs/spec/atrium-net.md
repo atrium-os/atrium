@@ -446,8 +446,7 @@ VM from the Aura gates cover them.
 - §4.1 behaviour: beacon loss in aura-mlme (8 s), address grace 60 s, reconnect scans
   every ~10 s in the first minute, three failures skip a network for 10 min, DHCP option
   43 `ANDROID_METERED` and the profile's `metered` flag reported as `metered=1`.
-- Not yet: the cross-network
-  low-signal move (N3), connectivity probe (N3).
+- The cross-network low-signal move and the connectivity probe came in N3 (§10.4).
 
 ### 10.3 N2 as built (2026-11-14)
 
@@ -472,8 +471,11 @@ VM from the Aura gates cover them.
   addresses made and deleted under the flood with no panic or hang, 10 minutes clean, the
   gate 28/28 on that kernel. Pushed to atrium-os/freebsd-src branch `atrium-os` as
   92ffd19c3; a private report to the FreeBSD Security Officer is drafted, not sent.
-- Not yet: the AP VM's radvd for IPv6 over Wi-Fi (the code path is the same as
-  wired), RA MTU beyond what the kernel applies.
+- IPv6 over Wi-Fi checked 2026-11-17 (`aura-sim-gate.sh wifi6`, 11/11): the AP VM's
+  `ra6.py` advertises fd77:0:0:77::/64 and RDNSS on br0; RAs arrive as group frames
+  under the GTK; SLAAC stable and temporary addresses, the AP as default router, ping6
+  both ways, `dns6=` from RDNSS, and the addresses gone when we leave. Not yet: RA MTU
+  beyond what the kernel applies.
 
 ### 10.4 N3 as built (2026-11-14)
 
