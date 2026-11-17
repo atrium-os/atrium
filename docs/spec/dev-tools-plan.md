@@ -120,6 +120,18 @@ package whose post-install script writes `/usr/bin/x` fails (base read-only); th
 host's `/var/db/pkg` is untouched; `pkg` without a press is refused; argv other
 than the allowed words is refused.
 
+**As built (2026-11-18).** Done except the Terminal's half of the press
+(homes.md §5.5 has the contract: the wrapper asks with OSC 7770, the Terminal shows
+Install/Cancel and sends `WorkspaceAdmin`). Two changes from the plan. There is no
+separate `pkg` class: a jail has one filter, so pkg runs under the workspace's
+`develop` class, which gained `chflags`, `symlink` and `eaccess` (with
+`allow.chflags` off, no system flag can be set). `update` and `remove` were added to
+the allowed subcommands. The gate `scripts/vm-workspace-pkg-check.sh` passes 26 of
+26 with the filter denying: pkg bootstraps and installs into one workspace only,
+the host's `/var/db/pkg` is untouched, the jail's root can't write the base, mount
+or set flags, and refused words stay refused. An app asking without a press isn't
+tested yet, because that needs frescod.
+
 ## 5. M3: toolchain layers (L)
 
 **Format.** A layer is a signed tree like a bundle (`atrium.toml` with `kind =

@@ -512,6 +512,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             handle_ws_exec(uid, &owner, &name, &argv, &cwd, &mut writer)?;
             continue;
         }
+        /* ★ `pkg` as the workspace jail's root (dev-tools-plan.md M2): a
+         * press in the Terminal, the Workspaces app or an IDE, or the
+         * person's own CLI. */
+        if let Request::WorkspaceAdmin { name, argv, activation } = req {
+            handle_ws_admin(uid, &owner, &name, &argv, activation, &mut writer)?;
+            continue;
+        }
         if matches!(req, Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceDuplicate { .. }) {
             let resp = handle_workspace(uid, &owner, req, &shared);
             write_response(&mut writer, &resp)?;
@@ -1678,6 +1685,42 @@ fn handle_ws_exec(uid: u32, owner: &str, name: &str, argv: &[String], cwd: &str,
     portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
 }
 
+fn handle_ws_admin(uid: u32, owner: &str, name: &str, argv: &[String], activation: [u8; 16], writer: &mut UnixStream) -> std::io::Result<()> {
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: pkg in workspace {name} of {owner} REFUSED: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+        .resolve(uid).map(|(_, a)| a.to_string());
+    let who = match &caller {
+        Some(a) if launch::app_shows_consoles(a) || launch::app_manages_workspaces(a) => a.clone(),
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == name) => a.clone(),
+        Some(a) => return refuse(writer, format!("cap.workspace_admin.denied: {a} may not run pkg in {name}")),
+        None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => format!("{owner}'s CLI"),
+        None => return refuse(writer, "cap.workspace_admin.denied: not a person or an app".into()),
+    };
+    if let Err(why) = ide::check_pkg_argv(argv) {
+        return refuse(writer, why);
+    }
+    if let Err(why) = workspace::work_dir(owner, name) {
+        return refuse(writer, why);
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if caller.is_some() {
+        if let Err(why) = portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
+                                                              fresco_protocol::activation::purpose::APPROVE) {
+            return refuse(writer, why);
+        }
+    }
+    let (pid, procdesc, stdin, output) = match ide::admin(owner, name, argv) {
+        Ok(s) => s,
+        Err(why) => return refuse(writer, why),
+    };
+    eprintln!("portcullisd: {who} runs {} as root in workspace {name} of {owner} (pid {pid})", argv.join(" "));
+    write_response(writer, &Response::WorkspaceExecStarted { pid })?;
+    portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
+}
+
 fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
@@ -2457,7 +2500,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
-        | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } => Response::Error {
+        | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } | Request::WorkspaceAdmin { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },
         Request::Console { .. } => Response::Error {

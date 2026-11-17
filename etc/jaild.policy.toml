@@ -804,6 +804,7 @@ sockopts = [
     "0:3",          # IP_TOS
     "0:4",          # IP_TTL
     "41:4",         # IPV6_UNICAST_HOPS
+    "6:4",          # TCP_NOPUSH (fetch(3), pkg)
     "270:11",       # NETLINK_EXT_ACK (ifconfig, route)
 ]
 
@@ -815,7 +816,7 @@ syscalls = [
     "fork", "vfork", "pdfork", "rfork", "wait4", "wait6", "setsid", "setpgid",
     "getpgid", "getpgrp", "getsid", "copy_file_range", "ktimer_create",
     "ktimer_settime", "ktimer_gettime", "ktimer_delete", "setitimer",
-    "getitimer", "setpriority", "getpriority", "chown", "fchown", "lchown",
+    "getitimer", "setpriority", "getpriority", "chown", "fchown", "lchown", "eaccess", "symlink",
     "fchownat", "statfs", "getfsstat", "pathconf", "fpathconf",
 ]
 ioctls = [
@@ -840,6 +841,9 @@ include  = ["terminal"]
 syscalls = [
     "ptrace", "ktrace", "utrace", "procctl", "thr_kill2", "sigqueue",
     "posix_openpt",
+    # pkg, as the workspace jail's root, clears flags on what it replaces
+    # (M2); the jail has allow.chflags off, so no system flag can be set.
+    "chflags", "lchflags", "fchflags", "chflagsat",
 ]
 # A pty of its own: lldb gives the program it runs one (learnt in log mode,
 # M0 gate), and so do tmux and script(1).

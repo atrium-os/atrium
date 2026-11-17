@@ -445,6 +445,15 @@ pub enum Request {
     /// output and error together. Read the answer with
     /// [`read_response_unbuffered`] so the descriptors aren't lost.
     WorkspaceExec { name: String, argv: Vec<String>, #[serde(default)] cwd: String },
+    /// Run `pkg` as root inside workspace `name`'s jail (dev-tools.md §6.1,
+    /// dev-tools-plan.md M2): `argv` is `["pkg", <subcommand>, ...]` with an
+    /// allowed subcommand (install, delete, upgrade, info, search,
+    /// autoremove, clean). From an app (the Terminal, the Workspaces app, an
+    /// IDE given the workspace) only with `activation`, a press in its
+    /// window on what `argv` shows (purpose APPROVE); the person's own CLI
+    /// needs none. Answered as [`Request::WorkspaceExec`]:
+    /// `WorkspaceExecStarted`, then `[procdesc, stdin, output]`.
+    WorkspaceAdmin { name: String, argv: Vec<String>, #[serde(default)] activation: [u8; 16] },
 
     /// The caller's own persona (personas.md §3), read from the launch
     /// registry by its PEER UID, never from anything it sends: an app
