@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1133,7 +1133,33 @@ Stalwart in the cloud VM, and later a real account):
    recipient plain text, inline images and tables in the profile, a link button, time
    zones, and a VM run with frescod.
 6. **M5** attachments: quick look, `OpenAttachment`, Save via picker, attachment search
-   text.
+   text. **Built 2026-11-18 on the host.** The parse jail lists a message's attachments
+   (a `winmail.dat` replaced by its files, pictures no HTML shows, forwarded messages) with
+   their first 4 KiB, and a new `Attachment` op decodes one alone, with its text when it is
+   text; the engine keeps the list with the converted document, keeps names and text per
+   message for M6's search, and gives a saved copy's origin. The reader shows a row per
+   attachment: type icon, name, kind and size from the bytes (atrium-types), a name that
+   lies or a program said in warning colour with no Open; Quick look draws text itself and
+   embeds `doc-viewer` (HTML, pictures), `pdf-viewer` and `media-player` in a slot under
+   the list; nothing is ever written to a temporary file: viewers and apps get a sealed,
+   read-only memfd. **`OpenAttachment`** (portcullisd): only for an app whose installed
+   manifest holds the new `open-attachments` capability (Mail's does); the descriptor must
+   be a regular file sealed against write, grow and shrink; portcullisd decides the type
+   from its bytes and name, refuses programs, shortcuts and names that lie, narrows it
+   read-only, spends the press last and hands it to the person's default app (or the
+   first that opens the type). **Save**: Limen's picker gained a Save target
+   (`Kind::Save`, a name and an origin); Scrinium makes a new file in the picked folder
+   (never over another: "q4 (2).csv"; never through a link; 0644), writes
+   `atrium.origin`, and hands it over for writing; Mail writes the bytes. **Compose**:
+   Attach… opens the picker over the window (several files), each file's type from its
+   bytes, a row each with Remove, a warning over 20 MB; a forward carries the original's
+   files. Tests: jail listing and decoding, engine list/decode/index/origin, picker save
+   filter, Scrinium save target and `create_new`, window strip and quick look, compose
+   attach and forward. **Not yet**: Open with… (another app than the default), office
+   files in quick look (Officina converters), encrypted ZIP/PDF passwords via Arca, "all
+   files in a thread / from a person" and the Files view (M6 search), the picker over home
+   places (homes.md W4: today it shows sticks and shares), attachment text from PDFs and
+   office files, and a VM run with limend, Scrinium and portcullisd.
 7. **M6** search, smart folders, unsubscribe, newsletter lane, screener, snooze, follow-up,
    notifications.
 8. **M7** S/MIME with Sigillum tokens and Arca certificates; JMAP; OAuth (Microsoft first).
