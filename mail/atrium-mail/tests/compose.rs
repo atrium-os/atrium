@@ -138,6 +138,11 @@ fn compose_send_undo() {
     assert!(t.iter().any(|x| x == "Bcc"), "Bcc shown when the link fills it");
     assert_eq!(k.draft().bcc[0].addr, "spy@x.example");
     assert_eq!(k.title(), "Hello");
+    // Remind me if nobody replies: pressed once, three days.
+    assert!(texts(&app).iter().any(|x| x == "Remind me"));
+    k.ui.set(atrium_mail::compose::ComposeUi { follow_up: Some(3), ..k.ui.get_cloned() });
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Remind if no reply: 3 days"));
     // Send later: the choices, then a scheduled send.
     k.ui.set(atrium_mail::compose::ComposeUi { later: true, ..k.ui.get_cloned() });
     app.tick();

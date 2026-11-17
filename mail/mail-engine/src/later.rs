@@ -195,6 +195,17 @@ impl Engine {
     /// once; anything else waits for the date with it.
     pub(crate) fn later_arrived(&self, account: AccountId, folder: mail_store::FolderId, role: Role, uid: u32, msg: MsgId) -> Result<(), Error> {
         let Ok(m) = self.store.message(msg) else { return Ok(()) };
+        // The sent copy of a message sent with "remind me": a Waiting item.
+        if role == Role::Sent {
+            if let Some(mid) = m.summary.message_id.as_deref() {
+                if let Some((_, due)) = self.store.write(|w| w.take_follow_up(mid))? {
+                    if self.store.later_of(m.thread)?.is_none() {
+                        self.set_later(msg, kind::WAITING, due, "")?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let Some((id, mut l)) = self.store.later_of(m.thread)? else { return Ok(()) };
         let me: Vec<String> = self.identities(account)?.into_iter().map(|i| i.addr.to_ascii_lowercase()).collect();
         let from_me = m.summary.from.iter().any(|a| me.contains(&a.addr.to_ascii_lowercase()));

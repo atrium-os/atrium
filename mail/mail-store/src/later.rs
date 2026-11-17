@@ -12,6 +12,10 @@ pub(crate) const LATER: TableDefinition<u64, &[u8]> = TableDefinition::new("late
 /// thread → its open item.
 pub(crate) const LATER_BY_THREAD: TableDefinition<u64, u64> = TableDefinition::new("later_by_thread");
 
+/// Message-ID (without `<>`) → (account, when): a follow-up asked for on
+/// send, waiting for the sent copy to arrive in Sent (§9, §11.4).
+pub(crate) const FOLLOW_UPS: TableDefinition<&str, (u32, i64)> = TableDefinition::new("follow_ups");
+
 /// What an item is for.
 pub mod kind {
     pub const REPLY: u8 = 1;
@@ -75,6 +79,17 @@ impl Writer<'_> {
         self.tx.open_table(LATER)?.insert(id, enc(item).as_slice())?;
         self.tx.open_table(LATER_BY_THREAD)?.insert(item.thread, id)?;
         Ok(id)
+    }
+
+    /// Remind if nobody replies to the message `message_id` by `due`.
+    pub fn set_follow_up(&mut self, message_id: &str, account: AccountId, due: i64) -> Result<()> {
+        self.tx.open_table(FOLLOW_UPS)?.insert(message_id.trim_matches(['<', '>']), (account, due))?;
+        Ok(())
+    }
+
+    /// The follow-up asked for on `message_id`, taken.
+    pub fn take_follow_up(&mut self, message_id: &str) -> Result<Option<(AccountId, i64)>> {
+        Ok(self.tx.open_table(FOLLOW_UPS)?.remove(message_id.trim_matches(['<', '>']))?.map(|v| v.value()))
     }
 
     /// Close an item (done, dropped, or closed by a reply).

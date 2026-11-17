@@ -266,6 +266,7 @@ impl Store {
             tx.open_table(senders::LANES)?;
             tx.open_table(later::LATER)?;
             tx.open_table(later::LATER_BY_THREAD)?;
+            tx.open_table(later::FOLLOW_UPS)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();

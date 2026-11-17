@@ -34,11 +34,14 @@ pub struct When {
     pub undo_secs: i64,
     /// Send later: the time (seconds since 1970).
     pub later: Option<i64>,
+    /// Remind if nobody replies within this many seconds of it leaving: a
+    /// *Waiting* item once the sent copy is in Sent (§9, §11.4).
+    pub follow_up: Option<i64>,
 }
 
 impl Default for When {
     fn default() -> Self {
-        When { undo_secs: UNDO_SEND_SECS, later: None }
+        When { undo_secs: UNDO_SEND_SECS, later: None, follow_up: None }
     }
 }
 
@@ -97,7 +100,13 @@ impl Engine {
             tries: 0,
             last_error: None,
         };
-        Ok(self.store.write(|wr| wr.queue_send(&o))?)
+        let follow_up = when.follow_up.map(|s| later.unwrap_or(t) + s);
+        Ok(self.store.write(|wr| {
+            if let Some(due) = follow_up {
+                wr.set_follow_up(&o.message_id, account, due)?;
+            }
+            wr.queue_send(&o)
+        })?)
     }
 
     /// Undo a send not yet handed over: its draft, to open in compose

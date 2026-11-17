@@ -85,3 +85,31 @@ fn set_aside_comes_back_and_closes() {
     assert!(subjects().contains(&"Lunch".to_string()));
     assert!(engine.later_items().unwrap().is_empty());
 }
+
+#[test]
+fn remind_me_if_nobody_replies() {
+    use mail_compose::{Draft, Mailbox};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[
+        RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true },
+        RemoteFolder { name: "Sent".into(), role: mail_sync::Role::Sent, selectable: true },
+    ]).unwrap();
+    let draft = Draft { from: Mailbox::new("Arun", "arun@example.org"), to: vec![Mailbox::new("Sam", "sam@acme.example")], subject: "Contract".into(), text: "Signed?\n".into(), ..Default::default() };
+    let when = mail_engine::send::When { follow_up: Some(3 * 86_400), ..Default::default() };
+    let id = engine.send(account, &draft, when).unwrap();
+    let o = engine.store.outbox().unwrap().into_iter().find(|(k, _)| *k == id).unwrap().1;
+    // The sent copy arrives in Sent: a Waiting item three days out.
+    let bytes = engine.store.blob(&o.message).unwrap();
+    sink.messages("Sent", vec![f(1, bytes)]).unwrap();
+    let items = engine.later_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1.kind, kind::WAITING);
+    assert!(items[0].1.due > o.due + 3 * 86_400 - 60);
+    // Sam answers: closed.
+    let mid = o.message_id.trim_matches(['<', '>']).to_string();
+    sink.messages("INBOX", vec![f(1, msg("Sam <sam@acme.example>", "arun@example.org", "Re: Contract", 20, "s9@x", &mid))]).unwrap();
+    assert!(engine.later_items().unwrap().is_empty());
+}
